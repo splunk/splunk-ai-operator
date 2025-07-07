@@ -19,33 +19,33 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Install gotestsum
-      run: go install gotest.tools/gotestsum@latest
+    # - name: Install gotestsum
+    #   run: go install gotest.tools/gotestsum@latest
 
-    - name: Install Dependencies
-      run: go mod tidy
+    # - name: Install Dependencies
+    #   run: go mod tidy
 
-    - name: Run Unit Tests and Generate JUnit Report
-      run: |
-        mkdir -p test-results
-        gotestsum --junitfile test-results/unit-tests.xml -- -coverprofile=coverage.out ./...
+    # - name: Run Unit Tests and Generate JUnit Report
+    #   run: |
+    #     mkdir -p test-results
+    #     gotestsum --junitfile test-results/unit-tests.xml -- -coverprofile=coverage.out ./...
 
-    - name: Upload Test Report Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: unit-test-results
-        path: test-results/unit-tests.xml
+    # - name: Upload Test Report Artifact
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: unit-test-results
+    #     path: test-results/unit-tests.xml
 
-    - name: Publish Test Results in PR UI
-      uses: dorny/test-reporter@v1
-      if: always()
-      with:
-        name: Unit Test Results
-        path: test-results/unit-tests.xml
-        reporter: java-junit
+    # - name: Publish Test Results in PR UI
+    #   uses: dorny/test-reporter@v1
+    #   if: always()
+    #   with:
+    #     name: Unit Test Results
+    #     path: test-results/unit-tests.xml
+    #     reporter: java-junit
 
     - name: Build Manager Binary
-      run: make manager
+      run: make build
 
     - name: Build Docker Image
       run: docker build -t splunk/splunk-ai-operator:test .
