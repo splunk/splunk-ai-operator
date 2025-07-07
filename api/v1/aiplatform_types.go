@@ -68,8 +68,8 @@ type AIPlatformSpec struct {
 
 	// Weaviate       WeaviateSpec     `json:"weaviate,omitempty"`
 	Storage           StorageSpec                `json:"storage,omitempty"`
-	GPUSchedulingSpec *SchedulingSpec            `json:"gpuScheduling,inline"` // inlines NodeSelector, Tolerations, Affinity
-	CPUSchedulingSpec *SchedulingSpec            `json:"cpuScheduling,inline"` // inlines NodeSelector, Tolerations, Affinity
+	GPUSchedulingSpec *SchedulingSpec            `json:"gpuScheduling,omitempty"` // NodeSelector, Tolerations, Affinity
+	CPUSchedulingSpec *SchedulingSpec            `json:"cpuScheduling,omitempty"` // NodeSelector, Tolerations, Affinity
 	Ingress           corev1.LoadBalancerIngress `json:",inline"`
 }
 type Images struct {
@@ -115,21 +115,21 @@ type WeaviateSpec struct {
 	// Image              string                      `json:"image"`
 	Resources          corev1.ResourceRequirements `json:"resources,omitempty"`
 	ServiceAccountName string                      `json:"serviceAccountName,omitempty"`
-	SchedulingSpec     `json:",inline"`            // inlines NodeSelector, Tolerations, Affinity
+	SchedulingSpec     `json:",omitempty"`         // NodeSelector, Tolerations, Affinity
 }
 
 type HeadGroupSpec struct {
-	ServiceAccountName string           `json:"serviceAccountName,omitempty"`
-	SchedulingSpec     `json:",inline"` // inlines NodeSelector, Tolerations, Affinity
+	ServiceAccountName string              `json:"serviceAccountName,omitempty"`
+	SchedulingSpec     `json:",omitempty"` // NodeSelector, Tolerations, Affinity
 	// image registries for Ray
 	ImageRegistry string `json:"imageRegistry,omitempty"`
 }
 
 type WorkerGroupSpec struct {
-	ServiceAccountName string           `json:"serviceAccountName,omitempty"`
-	ImageRegistry      string           `json:"imageRegistry,omitempty"`
-	GPUConfigs         []GPUConfig      `json:"gpuConfigs,omitempty"`
-	SchedulingSpec     `json:",inline"` // inlines NodeSelector, Tolerations, Affinity
+	ServiceAccountName string              `json:"serviceAccountName,omitempty"`
+	ImageRegistry      string              `json:"imageRegistry,omitempty"`
+	GPUConfigs         []GPUConfig         `json:"gpuConfigs,omitempty"`
+	SchedulingSpec     `json:",omitempty"` // NodeSelector, Tolerations, Affinity
 }
 
 // GPUConfig defines one worker-tier with scheduling and accelerator settings.
