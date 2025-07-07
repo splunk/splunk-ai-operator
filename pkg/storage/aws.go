@@ -24,6 +24,9 @@ type s3Client struct {
 	prefix string
 }
 
+// Duplicate code from minio.go, but we need to use the same
+// AWS SDK for AWS compatibility.
+// nolint:all
 func NewS3Client(
 	k8sClient client.Client,
 	namespace, bucket, prefix string,

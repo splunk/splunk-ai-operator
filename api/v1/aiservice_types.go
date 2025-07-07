@@ -36,7 +36,7 @@ type AIServiceSpec struct {
 	AIPlatformRef       corev1.ObjectReference `json:"aiPlatformRef,omitempty"`
 	Replicas            int32                  `json:"replicas,omitempty"`
 	ServiceAccountName  string                 `json:"serviceAccountName,omitempty"`
-	//Port specifies the default port for the service
+	// Port specifies the default port for the service
 	Port        int32               `json:"port,omitempty" default:"80"`
 	Env         map[string]string   `json:"env,omitempty"`
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
@@ -97,7 +97,7 @@ type AIService struct {
 	Status AIServiceStatus `json:"status,omitempty"`
 }
 
-//+kubebuilder:object:root=true
+// +kubebuilder:object:root=true
 
 // AIServiceList contains a list of AIService
 type AIServiceList struct {

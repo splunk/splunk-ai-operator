@@ -37,7 +37,8 @@ func (b *Builder) ReconcileServeConfigMap(ctx context.Context, p *aiApi.AIPlatfo
 
 	// 4️⃣ Load the user’s apps fragment
 	appsCM := &corev1.ConfigMap{}
-	if err := b.Client.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Name + "-applications"}, appsCM); err != nil {
+	if err := b.Client.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Name + "-applications"},
+		appsCM); err != nil {
 		log.Error(err, "failed to get applications configmap")
 		return err
 	}

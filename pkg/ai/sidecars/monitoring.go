@@ -140,14 +140,17 @@ func (s *Builder) reconcilePrometheusRule(ctx context.Context, p *aiApi.AIPlatfo
 						{
 							"record": "ray:kube_pod_status_phase",
 							"expr": fmt.Sprintf(
-								`kube_pod_status_phase{namespace='%s', pod=~".*worker.*"} * on(pod, namespace) group_left(created_by_name) kube_pod_info{created_by_name=~'%s.*'}`,
+								`kube_pod_status_phase{namespace='%s', pod=~".*worker.*"} * on(pod, namespace) `+
+									`group_left(created_by_name) kube_pod_info{created_by_name=~'%s.*'}`,
 								p.Namespace, p.Name,
 							),
 						},
 						{
 							"record": "ray:kube_pod_container_status_restarts_total",
 							"expr": fmt.Sprintf(
-								`kube_pod_container_status_restarts_total{container=~"autoscaler|istio-proxy|ray-head|ray-worker", namespace='%s'} * on(pod, namespace) group_left(created_by_name) kube_pod_info{created_by_name=~'%s.*'}`,
+								`kube_pod_container_status_restarts_total{container=~"autoscaler|istio-proxy|ray-head|`+
+									`ray-worker", namespace='%s'} * on(pod, namespace) group_left(created_by_name) `+
+									`kube_pod_info{created_by_name=~'%s.*'}`,
 								p.Namespace, p.Name,
 							),
 						},

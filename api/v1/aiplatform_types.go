@@ -46,9 +46,9 @@ type AIPlatformSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	Features []Features `json:"features,omitempty"`
-	//HeadGroupSpec          HeadGroupSpec   `json:"headGroupSpec,omitempty"`
-	//WorkerGroupSpec        WorkerGroupSpec `json:"workerGroupSpec,omitempty"`
-	//DefaultAcceleratorType string          `json:"defaultAcceleratorType"`
+	// HeadGroupSpec          HeadGroupSpec   `json:"headGroupSpec,omitempty"`
+	// WorkerGroupSpec        WorkerGroupSpec `json:"workerGroupSpec,omitempty"`
+	// DefaultAcceleratorType string          `json:"defaultAcceleratorType"`
 	// Which sidecars to inject
 	Sidecars SidecarConfig `json:"sidecars,omitempty"`
 
@@ -66,7 +66,7 @@ type AIPlatformSpec struct {
 	// SplunkConfiguration instance reference
 	SplunkConfiguration SplunkConfiguration `json:"splunkConfiguration,omitempty"`
 
-	//Weaviate       WeaviateSpec     `json:"weaviate,omitempty"`
+	// Weaviate       WeaviateSpec     `json:"weaviate,omitempty"`
 	Storage           StorageSpec                `json:"storage,omitempty"`
 	GPUSchedulingSpec *SchedulingSpec            `json:"gpuScheduling,inline"` // inlines NodeSelector, Tolerations, Affinity
 	CPUSchedulingSpec *SchedulingSpec            `json:"cpuScheduling,inline"` // inlines NodeSelector, Tolerations, Affinity
@@ -112,7 +112,7 @@ type Features struct {
 type WeaviateSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas"`
-	//Image              string                      `json:"image"`
+	// Image              string                      `json:"image"`
 	Resources          corev1.ResourceRequirements `json:"resources,omitempty"`
 	ServiceAccountName string                      `json:"serviceAccountName,omitempty"`
 	SchedulingSpec     `json:",inline"`            // inlines NodeSelector, Tolerations, Affinity

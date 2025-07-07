@@ -258,9 +258,27 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		"mode":  "sidecar",
 		"image": "otel/opentelemetry-collector-contrib:0.122.1",
 		"env": []map[string]interface{}{
-			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
-			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
-			{"name": "NAMESPACE", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.namespace"}}},
+			{
+				"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{
+					"secretKeyRef": map[string]interface{}{
+						"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token",
+					},
+				},
+			},
+			{
+				"name": "POD_NAME", "valueFrom": map[string]interface{}{
+					"fieldRef": map[string]interface{}{
+						"fieldPath": "metadata.name",
+					},
+				},
+			},
+			{
+				"name": "NAMESPACE", "valueFrom": map[string]interface{}{
+					"fieldRef": map[string]interface{}{
+						"fieldPath": "metadata.namespace",
+					},
+				},
+			},
 			{"name": "CLUSTER_NAME", "value": s.ai.Spec.ClusterDomain},
 		},
 		"config": cfg,
@@ -268,7 +286,9 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 
 	// CreateOrUpdate the Collector
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(schema.GroupVersionKind{Group: "opentelemetry.io", Version: "v1beta1", Kind: "OpenTelemetryCollector"})
+	u.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "opentelemetry.io", Version: "v1beta1", Kind: "OpenTelemetryCollector",
+	})
 	u.SetName(s.ai.Name + "-otel-coll")
 	u.SetNamespace(s.ai.Namespace)
 
@@ -384,7 +404,15 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 			},
 			"telemetry": map[string]interface{}{
 				"metrics": map[string]interface{}{
-					"readers": []map[string]interface{}{{"pull": map[string]interface{}{"exporter": map[string]interface{}{"prometheus": map[string]interface{}{"host": "0.0.0.0", "port": 8888}}}}},
+					"readers": []map[string]interface{}{{
+						"pull": map[string]interface{}{
+							"exporter": map[string]interface{}{
+								"prometheus": map[string]interface{}{
+									"host": "0.0.0.0", "port": 8888,
+								},
+							},
+						},
+					}},
 				},
 			},
 		},
@@ -423,6 +451,8 @@ func renderFluentBitConf() string {
 }
 
 // renderParserConf generates the parser configuration for FluentBit.
+// Lines exceed the 120-character limit within raw string literal.
+// nolint:all
 func renderParserConf() string {
 	return `
 	[PARSER]
@@ -435,6 +465,8 @@ func renderParserConf() string {
 }
 
 // renderEnvoyConf generates the Envoy configuration for the given AIPlatform.
+// Lines exceed the 120-character limit within raw string literal.
+// nolint:all
 func renderEnvoyConf() string {
 	return `
     static_resources:

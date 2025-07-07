@@ -507,7 +507,7 @@ func (b *Builder) ReconcileApplicationsConfigMap(ctx context.Context, p *aiApi.A
 				return err
 			}
 			cm.Data["applications.yaml"] = string(content)
-			//cm.Data["applications.yaml"] = DefaultApplicationsYaml
+			// cm.Data["applications.yaml"] = DefaultApplicationsYaml
 		}
 		return controllerutil.SetOwnerReference(p, cm, b.Scheme)
 	})

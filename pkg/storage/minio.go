@@ -12,6 +12,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// Duplicated code from aws.go, but we need to use the same
+// AWS SDK for MinIO compatibility.
+// nolint:all
 func NewMinioClient(
 	k8sClient client.Client,
 	namespace, bucket, prefix string,

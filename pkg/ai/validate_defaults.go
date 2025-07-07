@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"os"
 
-	//corev1 "k8s.io/api/core/v1"
-	//"k8s.io/apimachinery/pkg/api/resource"
+	// corev1 "k8s.io/api/core/v1"
+	// "k8s.io/apimachinery/pkg/api/resource"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 )

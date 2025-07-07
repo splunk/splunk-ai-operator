@@ -38,7 +38,7 @@ type Application struct {
 	RuntimeEnv  *RuntimeEnv            `json:"runtime_env,omitempty"`
 
 	// catch any unmodeled keys:
-	//Extras map[string]interface{} `json:",inline"`
+	// Extras map[string]interface{} `json:",inline"`
 }
 
 // RuntimeEnv mirrors the runtime_env field in rayService

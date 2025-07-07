@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	//corev1 "k8s.io/api/core/v1"
+	// corev1 "k8s.io/api/core/v1"
 )
 
 type AIPlatformReconciler struct {
@@ -22,7 +22,8 @@ type AIPlatformReconciler struct {
 	Recorder record.EventRecorder
 }
 
-func New(p *aiApi.AIPlatform, client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) *AIPlatformReconciler {
+func New(p *aiApi.AIPlatform, client client.Client, scheme *runtime.Scheme,
+	recorder record.EventRecorder) *AIPlatformReconciler {
 	return &AIPlatformReconciler{
 		p:        p,
 		Client:   client,
@@ -33,23 +34,8 @@ func New(p *aiApi.AIPlatform, client client.Client, scheme *runtime.Scheme, reco
 
 func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatform) (reconcile.Result, error) {
 
-	var conditions []metav1.Condition
-	defer func() {
-		// Fetch the latest version of the CR before updating the status
-		latest := &aiApi.AIPlatform{}
-		namespacedName := client.ObjectKey{Namespace: p.Namespace, Name: p.Name}
-		if err := r.Get(ctx, namespacedName, latest); err != nil {
-			log.FromContext(ctx).Error(err, "failed to fetch latest CR")
-			return
-		}
-		latest.Status = p.Status
-		latest.Status.Conditions = conditions
-		latest.Status.ObservedGeneration = p.Generation
-		_ = r.Status().Update(ctx, latest)
-	}()
 	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
 	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
-
 	stages := []struct {
 		name string
 		fn   func(context.Context, *aiApi.AIPlatform) error
@@ -64,6 +50,20 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		{"RayServiceStatus", raybuilder.ReconcileRayServiceStatus},
 		{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
 	}
+	conditions := make([]metav1.Condition, 0, len(stages)+1)
+	defer func() {
+		// Fetch the latest version of the CR before updating the status
+		latest := &aiApi.AIPlatform{}
+		namespacedName := client.ObjectKey{Namespace: p.Namespace, Name: p.Name}
+		if err := r.Get(ctx, namespacedName, latest); err != nil {
+			log.FromContext(ctx).Error(err, "failed to fetch latest CR")
+			return
+		}
+		latest.Status = p.Status
+		latest.Status.Conditions = conditions
+		latest.Status.ObservedGeneration = p.Generation
+		_ = r.Status().Update(ctx, latest)
+	}()
 
 	for _, stage := range stages {
 		err := stage.fn(ctx, p)
@@ -78,10 +78,11 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 			cond.Status = metav1.ConditionFalse
 			cond.Reason = "Error"
 			cond.Message = err.Error()
-			//r.Recorder.Event(p, corev1.EventTypeWarning, stage.name+"Failed", err.Error())
-		} else {
-			//r.Recorder.Event(p, corev1.EventTypeNormal, stage.name+"Succeeded", "stage succeeded")
+			// r.Recorder.Event(p, corev1.EventTypeWarning, stage.name+"Failed", err.Error())
 		}
+		// else {
+		// 	// r.Recorder.Event(p, corev1.EventTypeNormal, stage.name+"Succeeded", "stage succeeded")
+		// }
 		conditions = append(conditions, cond)
 		if err != nil {
 			return reconcile.Result{}, err

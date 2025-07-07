@@ -24,9 +24,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	//"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	// "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	True = "true"
 )
 
 // Builder encapsulates RayService generation logic.
@@ -92,7 +96,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *aiApi.AIPlatform) 
 		var current rayv1.RayService
 		if err := b.Client.Get(ctx, key, &current); err != nil {
 			if errors.IsNotFound(err) {
-				controllerutil.SetOwnerReference(p, rayService, b.Scheme)
+				_ = controllerutil.SetOwnerReference(p, rayService, b.Scheme)
 				return b.Client.Create(ctx, rayService)
 			}
 			b.Recorder.Eventf(p, corev1.EventTypeWarning, "ReconcileFailed", "Failed to reconcile RayService %v", err)
@@ -102,7 +106,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *aiApi.AIPlatform) 
 		// mutate current.Spec to match desired svc.Spec
 		current.Spec = rs.Spec
 		// now try update
-		controllerutil.SetOwnerReference(p, &current, b.Scheme)
+		_ = controllerutil.SetOwnerReference(p, &current, b.Scheme)
 		return b.Client.Update(ctx, &current)
 	})
 }
@@ -133,7 +137,7 @@ func (b *Builder) ReconcileRayAutoscalerRBAC(ctx context.Context, p *aiApi.AIPla
 	if err := b.Client.Create(ctx, role); err != nil && !errors.IsAlreadyExists(err) {
 		return err
 	}
-	controllerutil.SetOwnerReference(p, role, b.Scheme)
+	_ = controllerutil.SetOwnerReference(p, role, b.Scheme)
 
 	roleBinding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -157,7 +161,7 @@ func (b *Builder) ReconcileRayAutoscalerRBAC(ctx context.Context, p *aiApi.AIPla
 	if err := b.Client.Create(ctx, roleBinding); err != nil && !errors.IsAlreadyExists(err) {
 		return err
 	}
-	controllerutil.SetOwnerReference(p, roleBinding, b.Scheme)
+	_ = controllerutil.SetOwnerReference(p, roleBinding, b.Scheme)
 	return nil
 }
 
@@ -173,7 +177,7 @@ func (b *Builder) ReconcileRayServiceStatus(
 	}
 
 	// 2️⃣ mirror its status into your CR
-	p.Status.RayServiceStatus = rs.Status.ServiceStatus
+	p.Status.RayServiceStatus = rs.Status.ServiceStatus // nolint:all // TODO: update to non-deprecated field
 
 	// Add Ray head service name to status
 	p.Status.RayServiceName = fmt.Sprintf("%s-head-svc", p.Name)
@@ -182,7 +186,7 @@ func (b *Builder) ReconcileRayServiceStatus(
 	ready := metav1.ConditionFalse
 	reason := "RayServiceStatus"
 	msg := "ray service is not yet ready"
-	if rs.Status.ServiceStatus == rayv1.Running {
+	if rs.Status.ServiceStatus == rayv1.Running { // nolint:all // TODO: update to non-deprecated field
 		ready = metav1.ConditionTrue
 		reason = "RayServiceReady"
 		msg = "ray service is running"
@@ -242,25 +246,30 @@ func (b *Builder) buildClusterConfig() rayv1.RayClusterSpec {
 	nodeList := &corev1.NodeList{}
 	if err := b.Client.List(context.Background(), nodeList); err != nil {
 		// If we can't list nodes, fallback to static config
-		/* for i, cfg := range b.ai.Spec.GPUs {
-			annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
-			wg := rayv1.WorkerGroupSpec{
-				GroupName:   cfg.Tier,
-				MinReplicas: &cfg.MinReplicas,
-				MaxReplicas: &cfg.MaxReplicas,
-				RayStartParams: map[string]string{
-					"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":%d}"`, b.ai.Spec.DefaultAcceleratorType, i, cfg.GPUsPerPod),
-				},
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: annotations,
-						Labels:      labels,
+		/*
+			for i, cfg := range b.ai.Spec.GPUs {
+				annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
+				wg := rayv1.WorkerGroupSpec{
+					GroupName:   cfg.Tier,
+					MinReplicas: &cfg.MinReplicas,
+					MaxReplicas: &cfg.MaxReplicas,
+					RayStartParams: map[string]string{
+						"resources": fmt.Sprintf(
+							`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":%d}"`,
+							b.ai.Spec.DefaultAcceleratorType, i, cfg.GPUsPerPod,
+						),
 					},
-					Spec: b.makeWorkerTemplate(cfg).Spec,
-				},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: annotations,
+							Labels:      labels,
+						},
+						Spec: b.makeWorkerTemplate(cfg).Spec,
+					},
+				}
+				workers = append(workers, wg)
 			}
-			workers = append(workers, wg)
-		} */
+		*/
 	} else {
 		// Map GPU nodes by GPU type
 		gpuNodes := map[string][]corev1.Node{}
@@ -290,7 +299,7 @@ func (b *Builder) buildClusterConfig() rayv1.RayClusterSpec {
 				Tier:        model, // Use model name as tier/group
 				MinReplicas: replicas,
 				MaxReplicas: replicas,
-				//GPUsPerPod:  cfg.TPSize,
+				// GPUsPerPod:  cfg.TPSize,
 			}
 			annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, gpuConfig)
 			wg := rayv1.WorkerGroupSpec{
@@ -298,7 +307,10 @@ func (b *Builder) buildClusterConfig() rayv1.RayClusterSpec {
 				MinReplicas: &replicas,
 				MaxReplicas: &replicas,
 				RayStartParams: map[string]string{
-					"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count\":%d}"`, b.ai.Spec.DefaultAcceleratorType, cfg.TPSize),
+					"resources": fmt.Sprintf(
+						`"{\"accelerator_type:%s\":1,\"gpu_count\":%d}"`,
+						b.ai.Spec.DefaultAcceleratorType, cfg.TPSize,
+					),
 				},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
@@ -425,10 +437,11 @@ func (b *Builder) makeWorkerTemplate(cfg aiApi.GPUConfig) corev1.PodTemplateSpec
 			},
 			Env: []corev1.EnvVar{
 				{Name: "DEFAULT_ACCELERATOR_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
-				{Name: "RAY_HEAD_SERVICE_HOST", Value: fmt.Sprintf("%s.%s.svc.%s", b.ai.Name+"-head-svc", b.ai.Namespace, os.Getenv("CLUSTER_DOMAIN"))},
+				{Name: "RAY_HEAD_SERVICE_HOST", Value: fmt.Sprintf("%s.%s.svc.%s",
+					b.ai.Name+"-head-svc", b.ai.Namespace, os.Getenv("CLUSTER_DOMAIN"))},
 				{Name: "SERVICE_NAME", Value: b.ai.Name},
 				{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
-				{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
+				{Name: "USE_SYSTEM_PERMISSIONS", Value: True},
 				{Name: "GPG_PUBLICKEY_PATH", Value: "kv-splunk/al-platform.ray-worker-sa/gpgkey"}, // FIXME
 				{Name: "GPU_TYPE", Value: "L40S"},                                                 // FIXME
 				{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"},
@@ -496,7 +509,8 @@ func SetImageRegistry(key, defaultValue string) string {
 	return defaultValue
 }
 
-func buildWorkerAnnotationsAndLabels(aiPlatform *aiApi.AIPlatform, cfg aiApi.GPUConfig) (map[string]string, map[string]string) {
+func buildWorkerAnnotationsAndLabels(aiPlatform *aiApi.AIPlatform,
+	cfg aiApi.GPUConfig) (map[string]string, map[string]string) {
 	annotations := make(map[string]string)
 	labels := make(map[string]string)
 
@@ -522,10 +536,10 @@ func buildWorkerAnnotationsAndLabels(aiPlatform *aiApi.AIPlatform, cfg aiApi.GPU
 	annotations["prometheus.io/path"] = "/metrics"
 	annotations["prometheus.io/port"] = "8080"
 	annotations["prometheus.io/scheme"] = "http"
-	annotations["ray.io/overwrite-container-cmd"] = "true"
+	annotations["ray.io/overwrite-container-cmd"] = True
 	if aiPlatform.Spec.Sidecars.Otel {
 		annotations["sidecar.opentelemetry.io/inject"] = fmt.Sprintf("%s-otel-coll", aiPlatform.Name)
-		annotations["sidecar.opentelemetry.io/auto-instrument"] = "true"
+		annotations["sidecar.opentelemetry.io/auto-instrument"] = True
 	}
 
 	// Add any additional logic as needed
@@ -557,11 +571,11 @@ func buildHeadAnnotationsAndLabels(aiPlatform *aiApi.AIPlatform) (map[string]str
 	annotations["prometheus.io/path"] = "/metrics"
 	annotations["prometheus.io/port"] = "8080"
 	annotations["prometheus.io/scheme"] = "http"
-	annotations["ray.io/overwrite-container-cmd"] = "true"
+	annotations["ray.io/overwrite-container-cmd"] = True
 
 	if aiPlatform.Spec.Sidecars.Otel {
 		annotations["sidecar.opentelemetry.io/inject"] = fmt.Sprintf("%s-otel-coll", aiPlatform.Name)
-		annotations["sidecar.opentelemetry.io/auto-instrument"] = "true"
+		annotations["sidecar.opentelemetry.io/auto-instrument"] = True
 	}
 
 	return annotations, labels
