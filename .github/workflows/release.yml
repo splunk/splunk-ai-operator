@@ -1,20 +1,14 @@
-name: Pre-Release Workflow
+name: Release Workflow
 on:
-  workflow_dispatch:
-    inputs:
-      old_operator_version:
-        description: 'OLD OPERATOR VERSION'
-        required: true
-      new_operator_version:
-        description: 'NEW OPERATOR VERSION'
-        required: true
+  push:
+    branches:
+      - main
+      - helm_chart_releaser
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
-  package-helm:
-    uses: ./.github/workflows/release-package-helm.yml
-    with:
-      old_operator_version: ${{ github.event.inputs.old_operator_version }}
-      new_operator_version: ${{ github.event.inputs.new_operator_version }}
+  release-charts:
+    uses: ./.github/workflows/release-helm-charts.yml
