@@ -43,9 +43,9 @@ jobs:
         run: |
           helm package helm-chart/splunk-ai-operator
           cp splunk-ai-operator-${{ github.event.inputs.new_operator_version }}.tgz docs/
-          mv splunk-ai-operator-${{ github.event.inputs.new_operator_version }}.tgz helm-chart/splunk-enterprise/charts
-          helm package helm-chart/splunk-enterprise
-          mv splunk-enterprise-${{ github.event.inputs.new_operator_version }}.tgz docs/
+          mv splunk-ai-operator-${{ github.event.inputs.new_operator_version }}.tgz helm-chart/splunk-ai-platform/charts
+          helm package helm-chart/splunk-ai-platform
+          mv splunk-ai-platform-${{ github.event.inputs.new_operator_version }}.tgz docs/
           helm repo index --url https://splunk.github.io/splunk-ai-operator/ docs/
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v3.10.1

@@ -3,9 +3,9 @@ entries:
   splunk-ai-operator:
   - apiVersion: v2
     appVersion: 0.1.0
-    created: "2025-09-30T13:14:58.315565118Z"
+    created: "2025-10-08T14:40:29.315465-05:00"
     description: A Helm chart for deploying the Splunk AI Operator
-    digest: 8bba3cb29b37732ecbc261b75fb0883783b347e1ec8ffa122b9763f9449b9d49
+    digest: ae5923c44852f6952477f27dafd7d010a0417fb7e0eb6d7eb19d4999a94bdcc9
     home: https://github.com/splunk/splunk-ai-operator
     icon: https://example.com/icon.png
     keywords:
@@ -22,4 +22,47 @@ entries:
     urls:
     - https://splunk.github.io/splunk-ai-operator/splunk-ai-operator-0.1.0.tgz
     version: 0.1.0
-generated: "2025-09-30T13:14:58.312776182Z"
+  splunk-ai-platform:
+  - apiVersion: v2
+    appVersion: v4.0.0
+    created: "2025-10-08T14:40:29.340171-05:00"
+    dependencies:
+    - condition: splunk-ai-operator.enabled
+      name: splunk-ai-operator
+      repository: file://../splunk-ai-operator
+      version: 0.1.0
+    - condition: kuberay-operator.enabled
+      name: kuberay-operator
+      repository: https://ray-project.github.io/kuberay-helm
+      version: 1.3.2
+    - condition: cert-manager.enabled
+      name: cert-manager
+      repository: https://charts.jetstack.io
+      version: 1.18.0
+    - condition: prometheus.enabled
+      name: kube-prometheus-stack
+      repository: https://prometheus-community.github.io/helm-charts
+      version: 72.4.0
+    - condition: opentelemetry-operator.enabled
+      name: opentelemetry-operator
+      repository: https://open-telemetry.github.io/opentelemetry-helm-charts
+      version: 0.88.6
+    description: A Helm chart for deploying Splunk AIPlatform custom resources
+    digest: ac96373226e6783c6a4c80f497dbadcbf0c7e497e243bdf6dee8ebf1085d3e74
+    home: https://github.com/splunk/splunk-ai-operator
+    icon: https://example.com/icon.png
+    keywords:
+    - splunk
+    - ai
+    - kuberay
+    maintainers:
+    - email: splunkai@cisco.com
+      name: Splunk AI Team
+    name: splunk-ai-platform
+    sources:
+    - https://github.com/splunk/splunk-ai-operator
+    type: application
+    urls:
+    - https://splunk.github.io/splunk-ai-operator/splunk-ai-platform-0.1.0.tgz
+    version: 0.1.0
+generated: "2025-10-08T14:40:29.314084-05:00"
