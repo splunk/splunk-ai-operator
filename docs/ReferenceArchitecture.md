@@ -617,7 +617,8 @@ kubectl apply -f storageclass.yaml
 There are a few deployments that have to be available in order for the Splunk AI Operator to work correctly. Install the following to continue with the setup.
 
 ### Cluster Autoscaler
-The cluster autoscaler requires an iamserviceaccount to be created. Start by running the following command:
+[Cluster Autoscaler](https://github.com/kubernetes/autoscaler)
+The cluster autoscaler requires an iamserviceaccount to be created. Start by running the following command on and AWS EKS cluster, or similar service account for other cloud providers:
 ```bash
 eksctl create iamserviceaccount  --cluster "cluster-name" \
     --name "cluster-autoscaler" \
@@ -651,6 +652,7 @@ helm_retry 5 upgrade --install "cluster-autoscaler" autoscaler/cluster-autoscale
 ```
 
 ### NVIDIA Device Plugin
+[NVIDIA Device Plugin](https://github.com/NVIDIA/k8s-device-plugin)
 The NVIDIA device plugin allows for managing the GPUs on the cluster. Install it with the following commands:
 ```bash
 kubectl apply -n kube-system -f "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.3/deployments/static/nvidia-device-plugin.yml"
@@ -673,6 +675,7 @@ kubectl uncordon "<node-name>"
 ```
 
 ### Kube Prometheus Stack
+[Kube Prometheus Stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
 Set up Kubernetes cluster monitoring with the kube prometheus stack deployment.
 
 First, verify the helm chart is up to date.
@@ -687,6 +690,7 @@ helm_retry 5 upgrade --install kube-prometheus prometheus-community/kube-prometh
 ```
 
 ### Cert Manager
+[Cert Manager](https://cert-manager.io/docs/)
 Cert manager is required to create and manage TLS certificates on the cluster.
 
 First, verify the helm chart is up to date.
@@ -701,6 +705,7 @@ helm_retry 5 upgrade --install cert-manager jetstack/cert-manager --namespace ce
 ```
 
 ### OpenTelemtry Operator
+[OpenTelemetry Operator](https://opentelemetry.io/docs/platforms/kubernetes/operator/)
 OpenTelemetry facilitates the generation, export, and collection of telemetry data.
 
 First, verify the helm chart is up to date.
@@ -782,6 +787,7 @@ kubectl apply --server-side --force-conflicts -f otel_collector_config.yaml
 ```
 
 ### Ray Operator
+[KubeRay Operator](https://docs.ray.io/en/latest/cluster/kubernetes/getting-started/kuberay-operator-installation.html)
 The Ray Operator aides in managing Ray services for scaling the AI application.
 
 Install the Ray Operator with the following command:
