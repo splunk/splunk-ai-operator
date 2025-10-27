@@ -3,13 +3,31 @@
 To set up the Splunk AI Operator, follow the steps in this document to verify everything in your setup exists as expected.
 
 - [Reference Architecture](#reference-architecture)
-  - [AWS EKS Setup](#aws-eks-setup)
-    - [Create a Cluster Config](#create-a-cluster-config)
-    - [Deploy the Cluster Config](#deploy-the-cluster-config)
-    - [Ensure OIDC Provider](#ensure-oidc-provider)
-    - [Install Cluster Add Ons](#install-cluster-add-ons)
-    - [EBS Pod Identity Role and Association](#ebs-pod-identity-role-and-association)
-    - [Create gp3 Storage Class](#create-gp3-storage-class)
+  - [Cluster Setup](#cluster-setup)
+    - [AWS EKS Setup](#aws-eks-setup)
+      - [Create a Cluster Config](#create-a-cluster-config)
+      - [Deploy the Cluster Config](#deploy-the-cluster-config)
+      - [Ensure OIDC Provider](#ensure-oidc-provider)
+      - [Install Cluster Add Ons](#install-cluster-add-ons)
+      - [EBS Pod Identity Role and Association](#ebs-pod-identity-role-and-association)
+      - [Create gp3 Storage Class](#create-gp3-storage-class)
+    - [Azure AKS Setup](#azure-aks-setup)
+      - [Create Resource Group](#create-resource-group)
+      - [Create the AKS Cluster](#create-the-aks-cluster)
+      - [Configure kubectl Access](#configure-kubectl-access)
+      - [Enable OIDC Issuer and Workload Identity](#enable-oidc-issuer-and-workload-identity)
+      - [Install Azure Disk CSI Driver](#install-azure-disk-csi-driver)
+      - [Create Managed Identities and Federated Credentials](#create-managed-identities-and-federated-credentials)
+      - [Create Premium SSD Storage Class](#create-premium-ssd-storage-class)
+    - [Google Cloud GKE Setup](#google-cloud-gke-setup)
+      - [Set Project and Region](#set-project-and-region)
+      - [Enable Required APIs](#enable-required-apis)
+      - [Create the GKE Cluster](#create-the-gke-cluster)
+      - [Configure kubectl Access](#configure-kubectl-access-1)
+      - [Enable Workload Identity](#enable-workload-identity)
+      - [Verify GKE CSI Driver](#verify-gke-csi-driver)
+      - [Create Service Accounts and Workload Identity Bindings](#create-service-accounts-and-workload-identity-bindings)
+      - [Create pd-balanced Storage Class](#create-pd-balanced-storage-class)
   - [Prerequisite App Installation](#prerequisite-app-installation)
     - [Cluster Autoscaler](#cluster-autoscaler)
     - [NVIDIA Device Plugin](#nvidia-device-plugin)
@@ -19,18 +37,30 @@ To set up the Splunk AI Operator, follow the steps in this document to verify ev
     - [OpenTelemetry Operator](#opentelemtry-operator)
     - [Ray Operator](#ray-operator)
   - [Splunk Setup](#splunk-setup)
-    - [Splunk Operator Installation](#splunk-operator-installation)
+    - [Splunk Operator Installation (Optional)](#splunk-operator-installation-optional)
     - [Splunk AI Operator Installation](#splunk-ai-operator-installation)
-    - [S3 Bucket Setup](#s3-bucket-setup)
+    - [AWS S3 Bucket Setup](#aws-s3-bucket-setup)
       - [IAM Policy for S3 Bucket](#iam-policy-for-s3-bucket)
       - [IRSA for Service Accounts](#irsa-for-service-accounts)
+    - [Azure Blob Storage Setup](#azure-blob-storage-setup)
+      - [Role Assignments for Managed Identities](#role-assignments-for-managed-identities)
+      - [Create Azure Storage Secret](#create-azure-storage-secret)
+    - [Google Cloud Storage Setup](#google-cloud-storage-setup)
+      - [IAM Policy Bindings for Service Accounts](#iam-policy-bindings-for-service-accounts)
+      - [Create GCS Secret](#create-gcs-secret)
     - [Splunk Standalone Installation](#splunk-standalone-installation)
+      - [Option 1: Splunk Already Installed](#option-1-splunk-already-installed)
+      - [Option 2: Install Splunk Standalone](#option-2-install-splunk-standalone-using-the-splunk-operator-for-kubernetes)
     - [Splunk AI Platform CR Installation](#splunk-ai-platform-cr-installation)
+      - [Option 1](#option-1-splunk-instance-deployed-through-other-avenues)
+      - [Option 2](#option-2-splunk-instance-deployed-through-splunk-operator-for-kubernetes)
 
-## AWS EKS Setup
-The first step is creating a Kubernetes cluster that the Splunk AI operator and Splunk AI Operator CRs will run on. For now, the supported insfrastructure is AWS EKS clusters.
+## Cluster Setup
+The first step is creating a Kubernetes cluster that the Splunk AI operator and Splunk AI Operator CRs will run on.
 
-### Create a Cluster Config
+### AWS EKS Setup
+
+#### Create a Cluster Config
 The cluster config should include the following:
  - name
  - region
@@ -100,7 +130,7 @@ managedNodeGroups:
         effect: "NoSchedule"
 ```
 
-### Deploy the Cluster Config
+#### Deploy the Cluster Config
 Now that the cluster config is created, next is to deploy the cluster config using the following command:
 ```bash
 eksctl create cluster -f eks-cluster-config.yaml
@@ -108,7 +138,7 @@ eksctl create cluster -f eks-cluster-config.yaml
 
 The cluster creation will take a few minutes. When the command completes, verify that the kubeconfig has been updated to point to the newly created cluster to continue with the deployments.
 
-### Ensure OIDC Provider
+#### Ensure OIDC Provider
 An OIDC Provider is required to create pvcs and other storage requirements during dpeloyment. Verify the OIDC provider is active with the following command:
 ```bash
 aws eks describe-cluster --name "cluster-name" --query 'cluster.identity.oidc.issuer' --output text
@@ -119,14 +149,14 @@ If there is no output, or the output is None, then run the following command to 
 eksctl utils associate-iam-oidc-provider --region "us-west-2" --cluster "cluster-name" --approve
 ```
 
-### Install Cluster Add Ons
+#### Install Cluster Add Ons
 The eks-pod-identity-agent and aws-ebs-csi-driver add ons are required for the cluster. Create them with the following commands:
 ```bash
 eksctl create addon --cluster "cluster-name" --name eks-pod-identity-agent --force
 eksctl create addon --cluster "cluster-name" --name aws-ebs-csi-driver --force 
 ```
 
-### EBS Pod Identity Role and Association
+#### EBS Pod Identity Role and Association
 For the eks-pod-identity-agent and aws-ebs-csi-driver add ons to work, they need roles and associations created.
 
 1. Create the policy file. Update the `__REGION__` and `__ACCOUNT_ID__` fields with the information for your cluster.
@@ -160,7 +190,7 @@ aws iam attach-role-policy --role-name "role-name" --policy-arn "arn:aws:iam::aw
 aws eks create-pod-identity-association --cluster-name "cluster-name" --namespace "kube-system" --service-account "ebs-csi-controller-sa" --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/role-name"
 ```
 
-### Create gp3 Storage Class
+#### Create gp3 Storage Class
 Create the storage class file to apply. In the following examples, the file name is `storageclass.yaml`.
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -175,6 +205,407 @@ parameters:
   fsType: ext4
 reclaimPolicy: Retain
 volumeBindingMode: WaitForFirstConsumer
+```
+
+Apply the storage class with the following command:
+```bash
+kubectl apply -f storageclass.yaml
+```
+
+### Azure AKS Setup
+
+#### Create Resource Group
+Create a resource group to contain the AKS cluster and related resources. Update the `--name` and `--location` fields with your desired values.
+```bash
+az group create --name "aks-resource-group" --location "eastus"
+```
+
+#### Create the AKS Cluster
+Create the AKS cluster with the required configuration including:
+- name
+- resource group
+- location
+- node pools (system and user node pools with CPU and GPU nodes)
+- enable managed identity
+- network configuration
+
+Create the cluster with the following command:
+```bash
+az aks create \
+  --resource-group "aks-resource-group" \
+  --name "cluster-name" \
+  --location "eastus" \
+  --node-count 4 \
+  --node-vm-size "Standard_D4s_v3" \
+  --nodepool-name "cpunodes" \
+  --node-osdisk-size 500 \
+  --node-osdisk-type "Managed" \
+  --enable-managed-identity \
+  --enable-addons monitoring \
+  --enable-cluster-autoscaler \
+  --min-count 2 \
+  --max-count 8 \
+  --network-plugin azure \
+  --enable-oidc-issuer \
+  --enable-workload-identity \
+  --generate-ssh-keys \
+  --tags "Environment=prod" "Name=cluster-name-cpu"
+```
+
+Add a GPU node pool with the following command:
+```bash
+az aks nodepool add \
+  --resource-group "aks-resource-group" \
+  --cluster-name "cluster-name" \
+  --name "gpunodes" \
+  --node-count 1 \
+  --node-vm-size "Standard_NC24ads_A100_v4" \
+  --node-osdisk-size 1000 \
+  --min-count 0 \
+  --max-count 3 \
+  --enable-cluster-autoscaler \
+  --node-taints "dedicated=gpu:NoSchedule" \
+  --tags "Environment=prod" "Name=cluster-name-gpu"
+```
+
+#### Configure kubectl Access
+Get credentials for the newly created cluster to configure kubectl access:
+```bash
+az aks get-credentials --resource-group "aks-resource-group" --name "cluster-name" --overwrite-existing
+```
+
+Verify the connection to the cluster:
+```bash
+kubectl get nodes
+```
+
+#### Enable OIDC Issuer and Workload Identity
+If not enabled during cluster creation, enable the OIDC issuer and workload identity with the following commands:
+```bash
+az aks update --resource-group "aks-resource-group" --name "cluster-name" --enable-oidc-issuer --enable-workload-identity
+```
+
+Get the OIDC issuer URL for later use:
+```bash
+az aks show --resource-group "aks-resource-group" --name "cluster-name" --query "oidcIssuerProfile.issuerUrl" -o tsv
+```
+
+Save this OIDC issuer URL as it will be needed for creating federated credentials.
+
+#### Install Azure Disk CSI Driver
+The Azure Disk CSI driver is required for dynamic provisioning of persistent volumes. Verify if it is already installed:
+```bash
+kubectl get pods -n kube-system | grep csi
+```
+
+If not present, install the Azure Disk CSI driver:
+```bash
+az aks update --resource-group "aks-resource-group" --name "cluster-name" --enable-disk-driver
+```
+
+Verify the CSI driver pods are running:
+```bash
+kubectl get pods -n kube-system -l app=csi-azuredisk-node
+kubectl get pods -n kube-system -l app=csi-azuredisk-controller
+```
+
+#### Create Managed Identities and Federated Credentials
+Create managed identities for the service accounts that will access Azure resources.
+
+1. Get the AKS cluster's OIDC issuer URL (from the previous step):
+```bash
+export OIDC_ISSUER=$(az aks show --resource-group "aks-resource-group" --name "cluster-name" --query "oidcIssuerProfile.issuerUrl" -o tsv)
+```
+
+2. Create a namespace for the AI platform if it doesn't exist:
+```bash
+kubectl create ns ai-platform
+```
+
+3. Create managed identity for Ray Head service account:
+```bash
+az identity create --resource-group "aks-resource-group" --name "ray-head-identity"
+```
+
+4. Get the managed identity client ID:
+```bash
+export RAY_HEAD_CLIENT_ID=$(az identity show --resource-group "aks-resource-group" --name "ray-head-identity" --query "clientId" -o tsv)
+```
+
+5. Create federated credential for Ray Head service account:
+```bash
+az identity federated-credential create \
+  --name "ray-head-federated-credential" \
+  --identity-name "ray-head-identity" \
+  --resource-group "aks-resource-group" \
+  --issuer "${OIDC_ISSUER}" \
+  --subject "system:serviceaccount:ai-platform:ray-head-sa" \
+  --audience "api://AzureADTokenExchange"
+```
+
+6. Repeat the process for Ray Worker and SAIA service accounts:
+```bash
+# Ray Worker Identity
+az identity create --resource-group "aks-resource-group" --name "ray-worker-identity"
+export RAY_WORKER_CLIENT_ID=$(az identity show --resource-group "aks-resource-group" --name "ray-worker-identity" --query "clientId" -o tsv)
+az identity federated-credential create \
+  --name "ray-worker-federated-credential" \
+  --identity-name "ray-worker-identity" \
+  --resource-group "aks-resource-group" \
+  --issuer "${OIDC_ISSUER}" \
+  --subject "system:serviceaccount:ai-platform:ray-worker-sa" \
+  --audience "api://AzureADTokenExchange"
+
+# SAIA Service Identity
+az identity create --resource-group "aks-resource-group" --name "saia-service-identity"
+export SAIA_CLIENT_ID=$(az identity show --resource-group "aks-resource-group" --name "saia-service-identity" --query "clientId" -o tsv)
+az identity federated-credential create \
+  --name "saia-service-federated-credential" \
+  --identity-name "saia-service-identity" \
+  --resource-group "aks-resource-group" \
+  --issuer "${OIDC_ISSUER}" \
+  --subject "system:serviceaccount:ai-platform:saia-service-sa" \
+  --audience "api://AzureADTokenExchange"
+```
+
+#### Create Premium SSD Storage Class
+Create the storage class file for Azure Premium SSD. In the following examples, the file name is `storageclass.yaml`.
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-premium-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+  kind: Managed
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+Apply the storage class with the following command:
+```bash
+kubectl apply -f storageclass.yaml
+```
+
+### Google Cloud GKE Setup
+
+#### Set Project and Region
+Set the default project and region for your GKE cluster. Update the `PROJECT_ID` and `REGION` values with your desired configuration.
+```bash
+export PROJECT_ID="your-project-id"
+export REGION="us-central1"
+export ZONE="us-central1-a"
+
+gcloud config set project "${PROJECT_ID}"
+gcloud config set compute/region "${REGION}"
+gcloud config set compute/zone "${ZONE}"
+```
+
+#### Enable Required APIs
+Enable the required Google Cloud APIs for GKE, including container, compute, and IAM APIs:
+```bash
+gcloud services enable container.googleapis.com
+gcloud services enable compute.googleapis.com
+gcloud services enable iam.googleapis.com
+gcloud services enable cloudresourcemanager.googleapis.com
+```
+
+#### Create the GKE Cluster
+Create the GKE cluster with the required configuration including:
+- name
+- zone/region
+- node pools (default pool for CPU nodes)
+- enable Workload Identity
+- enable cluster autoscaling
+- release channel
+
+Create the cluster with CPU nodes:
+```bash
+gcloud container clusters create "cluster-name" \
+  --region "${REGION}" \
+  --machine-type "n2-standard-4" \
+  --disk-size "500" \
+  --disk-type "pd-balanced" \
+  --num-nodes 2 \
+  --min-nodes 2 \
+  --max-nodes 8 \
+  --enable-autoscaling \
+  --enable-autorepair \
+  --enable-autoupgrade \
+  --workload-pool="${PROJECT_ID}.svc.id.goog" \
+  --addons HorizontalPodAutoscaling,HttpLoadBalancing,GcePersistentDiskCsiDriver \
+  --release-channel regular \
+  --labels "environment=prod,name=cluster-name-cpu"
+```
+
+Add a GPU node pool to the cluster:
+```bash
+gcloud container node-pools create "gpu-pool" \
+  --cluster "cluster-name" \
+  --region "${REGION}" \
+  --machine-type "a2-highgpu-1g" \
+  --accelerator "type=nvidia-tesla-a100,count=1" \
+  --disk-size "1000" \
+  --disk-type "pd-balanced" \
+  --num-nodes 0 \
+  --min-nodes 0 \
+  --max-nodes 3 \
+  --enable-autoscaling \
+  --enable-autorepair \
+  --enable-autoupgrade \
+  --node-taints "dedicated=gpu:NoSchedule" \
+  --labels "environment=prod,name=cluster-name-gpu"
+```
+
+Install the NVIDIA GPU device drivers on the GPU nodes:
+```bash
+kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded-latest.yaml
+```
+
+#### Configure kubectl Access
+Get credentials for the newly created cluster to configure kubectl access:
+```bash
+gcloud container clusters get-credentials "cluster-name" --region "${REGION}"
+```
+
+Verify the connection to the cluster:
+```bash
+kubectl get nodes
+```
+
+#### Enable Workload Identity
+Workload Identity should already be enabled if the `--workload-pool` flag was used during cluster creation. Verify Workload Identity is enabled:
+```bash
+gcloud container clusters describe "cluster-name" --region "${REGION}" --format="value(workloadIdentityConfig.workloadPool)"
+```
+
+The output should show `${PROJECT_ID}.svc.id.goog`. If Workload Identity is not enabled, enable it with:
+```bash
+gcloud container clusters update "cluster-name" --region "${REGION}" --workload-pool="${PROJECT_ID}.svc.id.goog"
+```
+
+Update existing node pools to use Workload Identity:
+```bash
+gcloud container node-pools update "default-pool" \
+  --cluster "cluster-name" \
+  --region "${REGION}" \
+  --workload-metadata=GKE_METADATA
+
+gcloud container node-pools update "gpu-pool" \
+  --cluster "cluster-name" \
+  --region "${REGION}" \
+  --workload-metadata=GKE_METADATA
+```
+
+#### Verify GKE CSI Driver
+The GKE CSI driver (GcePersistentDiskCsiDriver) should be enabled by default or was enabled during cluster creation. Verify the CSI driver is running:
+```bash
+kubectl get pods -n kube-system | grep csi
+```
+
+If not present, you can enable it with:
+```bash
+gcloud container clusters update "cluster-name" --region "${REGION}" --update-addons=GcePersistentDiskCsiDriver=ENABLED
+```
+
+Verify the CSI driver pods are running:
+```bash
+kubectl get pods -n kube-system -l k8s-app=gcp-compute-persistent-disk-csi-driver
+```
+
+#### Create Service Accounts and Workload Identity Bindings
+Create Google Service Accounts (GSAs) and bind them to Kubernetes Service Accounts (KSAs) for Workload Identity.
+
+1. Set the cluster namespace:
+```bash
+export NAMESPACE="ai-platform"
+kubectl create ns "${NAMESPACE}"
+```
+
+2. Create Google Service Account for Ray Head:
+```bash
+gcloud iam service-accounts create ray-head-sa \
+  --display-name="Ray Head Service Account" \
+  --project="${PROJECT_ID}"
+```
+
+3. Create the Kubernetes service account and annotate it for Workload Identity:
+```bash
+kubectl create serviceaccount ray-head-sa --namespace="${NAMESPACE}"
+
+kubectl annotate serviceaccount ray-head-sa \
+  --namespace="${NAMESPACE}" \
+  iam.gke.io/gcp-service-account="ray-head-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+```
+
+4. Bind the Google Service Account to the Kubernetes Service Account:
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  "ray-head-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/ray-head-sa]"
+```
+
+5. Repeat the process for Ray Worker service account:
+```bash
+# Create GSA
+gcloud iam service-accounts create ray-worker-sa \
+  --display-name="Ray Worker Service Account" \
+  --project="${PROJECT_ID}"
+
+# Create KSA and annotate
+kubectl create serviceaccount ray-worker-sa --namespace="${NAMESPACE}"
+kubectl annotate serviceaccount ray-worker-sa \
+  --namespace="${NAMESPACE}" \
+  iam.gke.io/gcp-service-account="ray-worker-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+
+# Bind GSA to KSA
+gcloud iam service-accounts add-iam-policy-binding \
+  "ray-worker-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/ray-worker-sa]"
+```
+
+6. Repeat the process for SAIA service account:
+```bash
+# Create GSA
+gcloud iam service-accounts create saia-service-sa \
+  --display-name="SAIA Service Account" \
+  --project="${PROJECT_ID}"
+
+# Create KSA and annotate
+kubectl create serviceaccount saia-service-sa --namespace="${NAMESPACE}"
+kubectl annotate serviceaccount saia-service-sa \
+  --namespace="${NAMESPACE}" \
+  iam.gke.io/gcp-service-account="saia-service-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+
+# Bind GSA to KSA
+gcloud iam service-accounts add-iam-policy-binding \
+  "saia-service-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/saia-service-sa]"
+```
+
+#### Create pd-balanced Storage Class
+Create the storage class file for Google Cloud Persistent Disk. In the following examples, the file name is `storageclass.yaml`.
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pd-balanced
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-balanced
+  fstype: ext4
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
 ```
 
 Apply the storage class with the following command:
@@ -360,8 +791,8 @@ kubectl apply -k "github.com/ray-project/kuberay/ray-operator/config/default?ref
 
 ## Splunk Setup
 
-### Splunk Operator Installation
-The Splunk Operator creates and manages Splunk custom resources. A Splunk instance is requried to run the Splunk AI Assitant app.
+### Splunk Operator Installation (Optional)
+The Splunk Operator creates and manages Splunk custom resources. A Splunk instance is requried to run the Splunk AI Assitant app. **If you do not have a Splunk instance running**, use these steps to deploy one using the Splunk Operator for Kubernetes.
 
 Install the Splunk Operator with the following command:
 ```bash
@@ -373,6 +804,7 @@ Verify that the Splunk Operator and Splunk Enterprise versions used support the 
 ### Splunk AI Operator Installation
 The Splunk AI Operator handles the Ray Services, and AI Platform and AI Service custom resources to install the Splunk AI Assistant app on the deployed splunk instance.
 
+TODO: explain where to get artifacts.yaml. Will it be on VOC or add a link to the github repo?
 First, download the artifacts.yaml file for the Splunk AI Operator. 
 
 Next, create the namespace if it does not exist yet with the following command:
@@ -385,10 +817,10 @@ Install the Splunk AI Operator with the following command:
 kubectl apply -f artifacts.yaml --server-side --force-conflicts
 ```
 
-### S3 Bucket Setup
-The AI Platform expects the S3 bucket to have specific prefixes for the folders, and apps uploaded.
+### AWS S3 Bucket Setup
+The AI Platform expects the S3 compatible bucket to have specific prefixes for the folders, and apps uploaded.
 
-Create an S3 bucket with a unique name that will be used in the CRs. In the bucket, create three folders, with the exact names `artifacts/`, `apps/`, and `tasks/`. Upload the Splunk_AI_Assistant_Cloud.tgz app into the `apps/` folder.
+Create an S3 compatible bucket with a unique name that will be used in the CRs. In the bucket, create three folders, with the exact names `artifacts/`, `apps/`, and `tasks/`. Upload the Splunk_AI_Assistant_Cloud.tgz app into the `apps/` folder.
 
 Next, create the namespace where the Splunk and Splunk IA Platform deployment will be created with the following command:
 ```bash
@@ -451,8 +883,244 @@ eksctl create iamserviceaccount \
     --override-existing-serviceaccounts
 ```
 
+### Azure Blob Storage Setup
+The AI Platform expects the Azure Blob Storage container to have specific prefixes for the folders, and apps uploaded.
+
+Create an Azure Storage Account and Blob container with a unique name that will be used in the CRs. In the container, create three folders with the exact names `artifacts/`, `apps/`, and `tasks/`. Upload the Splunk_AI_Assistant_Cloud.tgz app into the `apps/` folder.
+
+First, create the storage account:
+```bash
+export STORAGE_ACCOUNT_NAME="splunkaistorage"
+export RESOURCE_GROUP="aks-resource-group"
+export LOCATION="eastus"
+export CONTAINER_NAME="ai-platform-data"
+
+az storage account create \
+  --name "${STORAGE_ACCOUNT_NAME}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  --location "${LOCATION}" \
+  --sku Standard_LRS \
+  --kind StorageV2
+```
+
+Create the blob container:
+```bash
+az storage container create \
+  --name "${CONTAINER_NAME}" \
+  --account-name "${STORAGE_ACCOUNT_NAME}" \
+  --auth-mode login
+```
+
+Upload the folder structure and app:
+```bash
+# Create folder structure (using empty blobs as markers)
+az storage blob upload \
+  --account-name "${STORAGE_ACCOUNT_NAME}" \
+  --container-name "${CONTAINER_NAME}" \
+  --name "artifacts/.keep" \
+  --file /dev/null \
+  --auth-mode login
+
+az storage blob upload \
+  --account-name "${STORAGE_ACCOUNT_NAME}" \
+  --container-name "${CONTAINER_NAME}" \
+  --name "apps/.keep" \
+  --file /dev/null \
+  --auth-mode login
+
+az storage blob upload \
+  --account-name "${STORAGE_ACCOUNT_NAME}" \
+  --container-name "${CONTAINER_NAME}" \
+  --name "tasks/.keep" \
+  --file /dev/null \
+  --auth-mode login
+
+# Upload the Splunk AI Assistant app
+az storage blob upload \
+  --account-name "${STORAGE_ACCOUNT_NAME}" \
+  --container-name "${CONTAINER_NAME}" \
+  --name "apps/Splunk_AI_Assistant_Cloud.tgz" \
+  --file "path/to/Splunk_AI_Assistant_Cloud.tgz" \
+  --auth-mode login
+```
+
+Next, create the namespace where the Splunk and Splunk AI Platform deployment will be created with the following command (if not already created):
+```bash
+kubectl create ns ai-platform
+```
+
+#### Role Assignments for Managed Identities
+Grant the managed identities permissions to access the Azure Blob Storage container.
+
+1. Get the storage account resource ID:
+```bash
+export STORAGE_ACCOUNT_ID=$(az storage account show \
+  --name "${STORAGE_ACCOUNT_NAME}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  --query "id" -o tsv)
+```
+
+2. Assign the "Storage Blob Data Contributor" role to Ray Head managed identity:
+```bash
+export RAY_HEAD_PRINCIPAL_ID=$(az identity show \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "ray-head-identity" \
+  --query "principalId" -o tsv)
+
+az role assignment create \
+  --role "Storage Blob Data Contributor" \
+  --assignee-object-id "${RAY_HEAD_PRINCIPAL_ID}" \
+  --assignee-principal-type ServicePrincipal \
+  --scope "${STORAGE_ACCOUNT_ID}"
+```
+
+3. Assign the role to Ray Worker managed identity:
+```bash
+export RAY_WORKER_PRINCIPAL_ID=$(az identity show \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "ray-worker-identity" \
+  --query "principalId" -o tsv)
+
+az role assignment create \
+  --role "Storage Blob Data Contributor" \
+  --assignee-object-id "${RAY_WORKER_PRINCIPAL_ID}" \
+  --assignee-principal-type ServicePrincipal \
+  --scope "${STORAGE_ACCOUNT_ID}"
+```
+
+4. Assign the role to SAIA Service managed identity:
+```bash
+export SAIA_PRINCIPAL_ID=$(az identity show \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "saia-service-identity" \
+  --query "principalId" -o tsv)
+
+az role assignment create \
+  --role "Storage Blob Data Contributor" \
+  --assignee-object-id "${SAIA_PRINCIPAL_ID}" \
+  --assignee-principal-type ServicePrincipal \
+  --scope "${STORAGE_ACCOUNT_ID}"
+```
+
+#### Create Azure Storage Secret
+Create a Kubernetes secret with the Azure Storage account credentials:
+```bash
+export STORAGE_ACCOUNT_KEY=$(az storage account keys list \
+  --resource-group "${RESOURCE_GROUP}" \
+  --account-name "${STORAGE_ACCOUNT_NAME}" \
+  --query "[0].value" -o tsv)
+
+kubectl -n ai-platform create secret generic azure-storage-secret \
+  --from-literal=azure_storage_account="${STORAGE_ACCOUNT_NAME}" \
+  --from-literal=azure_storage_key="${STORAGE_ACCOUNT_KEY}"
+```
+
+### Google Cloud Storage Setup
+The AI Platform expects the Google Cloud Storage bucket to have specific prefixes for the folders, and apps uploaded.
+
+Create a Google Cloud Storage bucket with a unique name that will be used in the CRs. In the bucket, create three folders with the exact names `artifacts/`, `apps/`, and `tasks/`. Upload the Splunk_AI_Assistant_Cloud.tgz app into the `apps/` folder.
+
+First, create the GCS bucket:
+```bash
+export BUCKET_NAME="splunk-ai-platform-${PROJECT_ID}"
+export REGION="us-central1"
+
+gsutil mb -p "${PROJECT_ID}" -c STANDARD -l "${REGION}" "gs://${BUCKET_NAME}"
+```
+
+Create the folder structure and upload the app:
+```bash
+# Create folder structure (using empty objects as markers)
+echo "" | gsutil cp - "gs://${BUCKET_NAME}/artifacts/.keep"
+echo "" | gsutil cp - "gs://${BUCKET_NAME}/apps/.keep"
+echo "" | gsutil cp - "gs://${BUCKET_NAME}/tasks/.keep"
+
+# Upload the Splunk AI Assistant app
+gsutil cp "path/to/Splunk_AI_Assistant_Cloud.tgz" "gs://${BUCKET_NAME}/apps/"
+```
+
+Next, create the namespace where the Splunk and Splunk AI Platform deployment will be created with the following command (if not already created):
+```bash
+kubectl create ns ai-platform
+```
+
+#### IAM Policy Bindings for Service Accounts
+Grant the Google Service Accounts permissions to access the GCS bucket.
+
+1. Assign the "Storage Object Admin" role to Ray Head service account:
+```bash
+gsutil iam ch "serviceAccount:ray-head-sa@${PROJECT_ID}.iam.gserviceaccount.com:roles/storage.objectAdmin" "gs://${BUCKET_NAME}"
+```
+
+Alternatively, use gcloud to grant project-level access:
+```bash
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:ray-head-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin" \
+  --condition=None
+```
+
+2. Assign the role to Ray Worker service account:
+```bash
+gsutil iam ch "serviceAccount:ray-worker-sa@${PROJECT_ID}.iam.gserviceaccount.com:roles/storage.objectAdmin" "gs://${BUCKET_NAME}"
+```
+
+Or with gcloud:
+```bash
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:ray-worker-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin" \
+  --condition=None
+```
+
+3. Assign the role to SAIA service account:
+```bash
+gsutil iam ch "serviceAccount:saia-service-sa@${PROJECT_ID}.iam.gserviceaccount.com:roles/storage.objectAdmin" "gs://${BUCKET_NAME}"
+```
+
+Or with gcloud:
+```bash
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:saia-service-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin" \
+  --condition=None
+```
+
+#### Create GCS Secret
+Create a Kubernetes secret with the GCS bucket information:
+```bash
+# For Workload Identity, the service accounts use their annotations
+# But if you need explicit credentials, create a service account key:
+gcloud iam service-accounts keys create gcs-key.json \
+  --iam-account="saia-service-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+
+kubectl -n ai-platform create secret generic gcs-secret \
+  --from-file=gcs-key.json=gcs-key.json
+
+# Clean up the local key file
+rm gcs-key.json
+```
+
+Note: With Workload Identity properly configured, explicit credentials may not be necessary as the service accounts will automatically authenticate using their annotated identities.
+
 ### Splunk Standalone Installation
-A Splunk Standalone instance is needed to install and use the Splunk AI Assistant app. 
+A Splunk Standalone instance is needed to install and use the Splunk AI Assistant app.
+
+#### Option 1: Splunk Already Installed
+If a Splunk instance is already deployed, you can use the existing instance to connect to the AI tier. 
+
+First, update the /opt/splunk/etc/system/local/authentication.conf file to include the following contents
+```
+[oauth2_settings]
+issuer_uri=https://splunk-splunk-standalone-standalone-service:8089
+certFile=$SPLUNK_HOME/etc/auth/server.pem
+sslPassword=password
+```
+
+Then, install the Splunk AI Assistant App on your splunk instance.
+
+#### Option 2: Install Splunk Standalone Using the Splunk Operator for Kubernetes
+The instructions here are specific to an AWS EKS cluster. Please follow the instructions in the [App Framework documentation](https://github.com/splunk/splunk-operator/blob/main/docs/AppFramework.md) from the Splunk Operator for Kubernetes for other storage types regarding the secret and app framework configuration.
 
 First, create an s3 secret to connect to the s3 bucket with the following command:
 ```bash
@@ -562,6 +1230,7 @@ spec:
 kubectl -n ai-platform apply --server-side --force-conflicts -f cert_manager.yaml
 ```
 
+The `splunkConfiguration` section in the following spec should point to your Splunk instance. The example includes the splunkConfiguration deployed by the Splunk Operator for Kubernetes in earlier steps.
 Apply the AI Platform CR with the following spec:
 ```yaml
 apiVersion: ai.splunk.com/v1
@@ -637,6 +1306,39 @@ spec:
 kubectl -n ai-platform apply --server-side --force-conflicts -f ai_platform.yaml
 ```
 
+TODO: Is it required to add the saia_sok_url? Or will that be done by the app? If it is done by the app, we need to change this section on how to get the url and walk through setting it up in the app.
+#### Option 1: Splunk Instance Deployed through Other Avenues
+Verify that the Splunk AI Assistant app is deployed on the standalone instance.
+
+Edit the splunkaiassistant.conf file on the standalone pod to set the configurations. Find the splunkaiassistant.conf file on the pod.
+```bash
+cd /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/default
+cat splunkaiassistant.conf
+```
+If the file does not exist, create it.
+
+Edit the contents of splunkaiassistant.conf to be the following:
+```
+[splunk_ai_assistant]
+feedback_enabled=true
+
+[cloud_connected_configurations]
+
+[cloud_connected_configurations:proxy_settings]
+
+[saia_sok_configurations]
+saia_sok_enabled=true
+saia_sok_url=<url to splunk instance>
+```
+
+Restart the Splunk instance with the following command:
+```bash
+/opt/bin/splunk restart
+```
+
+Wait for the instance to come up, connect to it, and start using the Splunk AI Assistant app!
+
+#### Option 2: Splunk Instance Deployed through Splunk Operator for Kubernetes
 Verify that the Splunk AI Assistant app is deployed on the standalone instance. Run the following command and see that the deploy status is complete:
 ```bash
 kubectl get standalone splunk-standalone -n ai-platform -o yaml
