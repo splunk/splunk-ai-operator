@@ -34,7 +34,7 @@ To set up the Splunk AI Operator, follow the steps in this document to verify ev
     - [Uncordon Ready Nodes](#uncordon-ready-nodes)
     - [Kube Prometheus Stack](#kube-prometheus-stack)
     - [Cert Manager](#cert-manager)
-    - [OpenTelemetry Operator](#opentelemtry-operator)
+    - [OpenTelemetry Operator](#opentelemetry-operator)
     - [Ray Operator](#ray-operator)
   - [Splunk Setup](#splunk-setup)
     - [Splunk Operator Installation (Optional)](#splunk-operator-installation-optional)
@@ -52,8 +52,8 @@ To set up the Splunk AI Operator, follow the steps in this document to verify ev
       - [Option 1: Splunk Already Installed](#option-1-splunk-already-installed)
       - [Option 2: Install Splunk Standalone](#option-2-install-splunk-standalone-using-the-splunk-operator-for-kubernetes)
     - [Splunk AI Platform CR Installation](#splunk-ai-platform-cr-installation)
-      - [Option 1](#option-1-splunk-instance-deployed-through-other-avenues)
-      - [Option 2](#option-2-splunk-instance-deployed-through-splunk-operator-for-kubernetes)
+      - [Option 1: Splunk Deployed through Other Avenues](#option-1-splunk-instance-deployed-through-other-avenues)
+      - [Option 2: Splunk Deployed through Splunk Operator](#option-2-splunk-instance-deployed-through-splunk-operator-for-kubernetes)
 
 ## Cluster Setup
 The first step is creating a Kubernetes cluster that the Splunk AI operator and Splunk AI Operator CRs will run on.
@@ -139,7 +139,7 @@ eksctl create cluster -f eks-cluster-config.yaml
 The cluster creation will take a few minutes. When the command completes, verify that the kubeconfig has been updated to point to the newly created cluster to continue with the deployments.
 
 #### Ensure OIDC Provider
-An OIDC Provider is required to create pvcs and other storage requirements during dpeloyment. Verify the OIDC provider is active with the following command:
+An OIDC Provider is required to create pvcs and other storage requirements during deployment. Verify the OIDC provider is active with the following command:
 ```bash
 aws eks describe-cluster --name "cluster-name" --query 'cluster.identity.oidc.issuer' --output text
 ```
@@ -618,7 +618,7 @@ There are a few deployments that have to be available in order for the Splunk AI
 
 ### Cluster Autoscaler
 [Cluster Autoscaler](https://github.com/kubernetes/autoscaler)
-The cluster autoscaler requires an iamserviceaccount to be created. Start by running the following command on and AWS EKS cluster, or similar service account for other cloud providers:
+The cluster autoscaler requires an iamserviceaccount to be created. Start by running the following command on an AWS EKS cluster, or similar service account for other cloud providers:
 ```bash
 eksctl create iamserviceaccount  --cluster "cluster-name" \
     --name "cluster-autoscaler" \
@@ -704,7 +704,7 @@ Then, install the cert-manager helm chart with the following command:
 helm_retry 5 upgrade --install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --set installCRDs=true --wait --timeout 15m
 ```
 
-### OpenTelemtry Operator
+### OpenTelemetry Operator
 [OpenTelemetry Operator](https://opentelemetry.io/docs/platforms/kubernetes/operator/)
 OpenTelemetry facilitates the generation, export, and collection of telemetry data.
 
@@ -798,7 +798,7 @@ kubectl apply -k "github.com/ray-project/kuberay/ray-operator/config/default?ref
 ## Splunk Setup
 
 ### Splunk Operator Installation (Optional)
-The Splunk Operator creates and manages Splunk custom resources. A Splunk instance is requried to run the Splunk AI Assitant app. **If you do not have a Splunk instance running**, use these steps to deploy one using the Splunk Operator for Kubernetes.
+The Splunk Operator creates and manages Splunk custom resources. A Splunk instance is required to run the Splunk AI Assistant app. **If you do not have a Splunk instance running**, use these steps to deploy one using the Splunk Operator for Kubernetes.
 
 Install the Splunk Operator with the following command:
 ```bash
