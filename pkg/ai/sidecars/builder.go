@@ -209,7 +209,7 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 		return map[string]interface{}{"error": "hec_token field not found in secret"}
 	}
 
-	endpoint := fmt.Sprintf("%s/services/collector", cr.Spec.SplunkConfiguration.Endpoint)
+	endpoint := fmt.Sprintf("https://splunk-%s:8088/services/collector", cr.Spec.SplunkConfiguration.Endpoint)
 	return map[string]interface{}{
 		"exporters": map[string]interface{}{
 			"splunk_hec": map[string]interface{}{
@@ -217,7 +217,7 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 				"endpoint":            endpoint,
 				"source":              "otel",
 				"sourcetype":          "otel",
-				"index":               "metrics",
+				"index":               "_metrics",
 				"disable_compression": false,
 				"timeout":             "10s",
 				"tls":                 map[string]interface{}{"insecure_skip_verify": true},

@@ -12,10 +12,10 @@ export KUBE_EDITOR=cat
 export LANG=C LC_ALL=C
 
 # Force all aws invocations in this script to skip the pager
-aws() { command /usr/bin/env aws --no-cli-pager "$@"; }
+aws() { command /usr/bin/env aws "$@"; }
 
 # ====== CONFIG ======
-CLUSTER_NAME="cluster-name" # change me!
+CLUSTER_NAME="conf-gpu-cpu-5"
 REGION="us-west-2"
 K8S_VERSION="1.31"
 
@@ -47,7 +47,7 @@ SPLUNK_AI_FILE="./artifacts.yaml"   # local bundle for Splunk AI Operator
 AI_NS="ai-platform"
 S3_BUCKET_RAW="${CLUSTER_NAME}"
 S3_BUCKET="$(echo "${S3_BUCKET_RAW}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')"
-S3_BUCKET="ai-platform-dev-vivekr"
+S3_BUCKET="ai-platform-bucket-us-west-2"
 S3_PREFIXES=("artifacts/" "apps/" "tasks/")
 AI_STANDALONE_NAME="splunk-standalone"
 AI_PLATFORM_NAME="splunk-ai-stack"
@@ -61,11 +61,12 @@ ENABLE_CPU=true
 ENABLE_GPU=true
 
 # VPC subnets
-PRIVATE_2C="subnet-0f4af6d2f36fbe73f"
-PRIVATE_2D="subnet-024d4edaabe647586"
-PUBLIC_2B="subnet-0439b4f08a984ae52"
-PUBLIC_2C="subnet-06aef8e454c0e5542"
-PUBLIC_2D="subnet-0a183703673334cb4"
+PRIVATE_2A="subnet-073c013016df5c3eb"
+PRIVATE_2B="subnet-0d009b9d42a1a0db2"
+PRIVATE_2D="subnet-0ed6f0842d28992fc"
+PUBLIC_2A="subnet-00b88b41317f0762a"
+PUBLIC_2B="subnet-0cfb9b590fe21e071"
+PUBLIC_2D="subnet-02034918dee3a7d69"
 
 # ---- logging ----
 log()   { echo -e "\033[1;32m[INFO]\033[0m $*" >&2; }
@@ -337,11 +338,12 @@ addons:
 vpc:
   subnets:
     private:
-      us-west-2c: { id: ${PRIVATE_2C} }
+      us-west-2a: { id: ${PRIVATE_2A} }
+      us-west-2b: { id: ${PRIVATE_2B} }
       us-west-2d: { id: ${PRIVATE_2D} }
     public:
+      us-west-2a: { id: ${PUBLIC_2A} }
       us-west-2b: { id: ${PUBLIC_2B} }
-      us-west-2c: { id: ${PUBLIC_2C} }
       us-west-2d: { id: ${PUBLIC_2D} }
 managedNodeGroups:
 $(generate_node_groups)
@@ -565,8 +567,8 @@ install_splunk_operator() {
   kubectl apply -f ./splunk-operator-cluster.yaml --server-side --force-conflicts
   kubectl set env deployment/splunk-operator-controller-manager  -n splunk-operator RELATED_IMAGE_SPLUNK_ENTERPRISE=vivekrsplunk/splunk:ef65e8205e4d-6d943f7-28228924
   kubectl set env deployment/splunk-operator-controller-manager  -n splunk-operator SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com
-  check_ready splunk-operator "name=splunk-operator"
-  wait_for_crd standalones.enterprise.splunk.com 600
+#  check_ready splunk-operator "name=splunk-operator"
+#  wait_for_crd standalones.enterprise.splunk.com 600
 }
 
 install_splunk_ai_operator() {
@@ -952,41 +954,15 @@ spec:
     - name: saia
       version: "1.1.0"
       serviceAccountName: saia-service-sa
+      scaleFactor: 1
+  sidecars:
+    otel: true
   storage:
     vectorDB:
       size: 50Gi
       storageClassName: gp3
-  workerGroupSpec:
+  workerGroupConfig:
     serviceAccountName: ray-worker-sa
-    gpuConfigs:
-      - tier: g6e.12xlarge-0-gpu
-        minReplicas: 0
-        maxReplicas: 10
-        gpusPerPod: 0
-        resources:
-          limits: { cpu: "16", memory: "32Gi", ephemeral-storage: "10Gi", nvidia.com/gpu: "0" }
-          requests: { cpu: "4" }
-      - tier: g6e.12xlarge-1-gpu
-        minReplicas: 0
-        maxReplicas: 10
-        gpusPerPod: 1
-        resources:
-          requests: { cpu: "4" }
-          limits: { cpu: "16", memory: "16Gi", ephemeral-storage: "50Gi", nvidia.com/gpu: "1" }
-      - tier: g6e.12xlarge-2-gpu
-        minReplicas: 0
-        maxReplicas: 10
-        gpusPerPod: 2
-        resources:
-          requests: { cpu: "1" }
-          limits: { cpu: "2", memory: "48Gi", ephemeral-storage: "100Gi", nvidia.com/gpu: "2" }
-      - tier: g6e.12xlarge-4-gpu
-        minReplicas: 0
-        maxReplicas: 10
-        gpusPerPod: 4
-        resources:
-          requests: { cpu: "1" }
-          limits: { cpu: "4", memory: "64Gi", ephemeral-storage: "200Gi", nvidia.com/gpu: "4" }
   cpuScheduler: {}
   gpuScheduler:
     tolerations:
@@ -1320,7 +1296,7 @@ preflight_env() {
   [[ -n "$region_id" ]] && pf_ok "CLI default region: ${region_id}" || pf_warn "No CLI default region; script uses REGION=${REGION}"
 
   pf_header "Subnets exist"
-  local subs=("$PRIVATE_2C" "$PRIVATE_2D" "$PUBLIC_2B" "$PUBLIC_2C" "$PUBLIC_2D")
+  local subs=("$PRIVATE_2A" "$PRIVATE_2B" "$PRIVATE_2D" "$PUBLIC_2A" "$PUBLIC_2B" "$PUBLIC_2D")
   for s in "${subs[@]}"; do
     if aws ec2 describe-subnets --subnet-ids "$s" --region "${REGION}" >/dev/null 2>&1; then
       pf_ok "Subnet ${s} exists"
@@ -1357,7 +1333,7 @@ preflight_api_connectivity() {
   fi
 
   if command -v nc >/dev/null 2>&1; then
-    if nc -z "${host}" 443 timeout 5; then pf_ok "TCP 443 reachable"; else pf_fail "Cannot reach ${host}:443 (TCP test failed)"; fi
+    if nc -z -w 5 "${host}" 443; then pf_ok "TCP 443 reachable"; else pf_fail "Cannot reach ${host}:443 (TCP test failed)"; fi
   else
     if bash -lc "cat < /dev/null > /dev/tcp/${host}/443" timeout 10 2>/dev/null; then pf_ok "TCP 443 reachable"; else pf_fail "Cannot reach ${host}:443"; fi
   fi
