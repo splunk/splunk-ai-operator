@@ -1,0 +1,157 @@
+# ===================================================================
+# EKS Cluster Configuration for Splunk AI Platform
+# ===================================================================
+# Edit this file to customize your deployment. The script will read
+# these values and apply them idempotently.
+# ===================================================================
+
+# ---------- Cluster Configuration ----------
+cluster:
+  name: "conf-gpu-cpu-5"                    # EKS cluster name (must be DNS-1123 compliant)
+  region: "us-west-2"                     # AWS region
+  k8sVersion: "1.31"                      # Kubernetes version
+
+  # VPC Subnets (update these for your environment)
+  subnets:
+    private:
+      - id: "subnet-073c013016df5c3eb"    # us-west-2a
+        az: "us-west-2a"
+      - id: "subnet-0d009b9d42a1a0db2"    # us-west-2b
+        az: "us-west-2b"
+      - id: "subnet-0ed6f0842d28992fc"    # us-west-2b
+        az: "us-west-2d"
+    public:
+      - id: "subnet-00b88b41317f0762a"    # us-west-2a
+        az: "us-west-2a"
+      - id: "subnet-0cfb9b590fe21e071"    # us-west-2b
+        az: "us-west-2b"
+      - id: "subnet-02034918dee3a7d69"    # us-west-2d
+        az: "us-west-2d"
+
+# ---------- Node Groups ----------
+nodeGroups:
+  cpu:
+    enabled: true
+    instanceType: "m5.xlarge"
+    desiredCapacity: 4
+    minSize: 2
+    maxSize: 8
+    volumeSize: 500
+    volumeType: "gp3"
+
+  gpu:
+    enabled: true
+    instanceType: "g6e.12xlarge"
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 4
+    volumeSize: 1000
+    volumeType: "gp3"
+
+# ---------- Storage Configuration ----------
+storage:
+  s3Bucket: "ai-platform-bucket-us-west-2"      # S3 bucket for artifacts/apps/tasks
+  storageClass: "gp3"                     # Default storage class for PVCs
+  vectorDbSize: "50Gi"                    # VectorDB PVC size
+
+# ---------- Operator Versions ----------
+operators:
+  splunk:
+    image: "vivekrsplunk/splunk:ef65e8205e4d-6d943f7-28228924"
+
+  ray:
+    version: "v1.2.2"                     # Ray operator version
+
+  certManager:
+    installCRDs: true
+
+  nvidia:
+    devicePluginVersion: "v0.17.3"
+
+# ---------- AI Platform Configuration ----------
+aiPlatform:
+  namespace: "ai-platform"
+  name: "splunk-ai-stack"
+
+  # Service Accounts
+  serviceAccounts:
+    rayHead: "ray-head-sa"
+    rayWorker: "ray-worker-sa"
+    saiaService: "saia-service-sa"
+
+  # Default accelerator type
+  defaultAcceleratorType: "L40S"
+
+  # Features to enable
+  features:
+    - name: "saia"
+      version: "1.1.0"
+      serviceAccountName: "saia-service-sa"
+
+  # Worker Group Configuration (replaces gpuConfigs)
+  workerGroupConfig:
+    serviceAccountName: "ray-worker-sa"
+    imageRegistry: ""                     # Leave empty for default
+
+  # CPU Scheduling
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+
+  # GPU Scheduling
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+  # Ingress Configuration
+  ingress:
+    enabled: true
+    className: "nginx"
+    host: "ai.example.com"
+    tlsSecretName: "ai-platform-tls"
+
+  # Certificate configuration
+  certificate:
+    issuerName: "platform-issuer"
+
+# ---------- Splunk Standalone Configuration ----------
+splunkStandalone:
+  name: "splunk-standalone"
+  serviceAccount: "saia-service-sa"
+
+  appRepo:
+    enabled: true
+    appInstallPeriodSeconds: 90
+    appsRepoPollIntervalSeconds: 60
+    installMaxRetries: 2
+
+  # Optional: Path to local Splunk app to upload
+  # Leave empty to skip app upload
+  localAppPath: ""                        # e.g., "/path/to/Splunk_AI_Assistant_Cloud.tgz"
+
+# ---------- File Paths ----------
+files:
+  splunkOperatorManifest: "./splunk-operator-cluster.yaml"
+  splunkAiOperatorManifest: "./artifacts.yaml"
+
+# ---------- Advanced Settings ----------
+advanced:
+  # Cluster Autoscaler settings
+  clusterAutoscaler:
+    balanceSimilarNodeGroups: true
+    skipNodesWithSystemPods: false
+    expander: "least-waste"
+
+  # Monitoring
+  monitoring:
+    kubePrometheus: true
+
+  # OpenTelemetry
+  openTelemetry:
+    enabled: true
+    namespace: "observability"
+    collectorImage: "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest"

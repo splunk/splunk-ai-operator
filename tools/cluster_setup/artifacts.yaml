@@ -1046,6 +1046,12 @@ spec:
                       - saia
                       - seca
                       type: string
+                    scaleFactor:
+                      description: ScaleFactor is the desired fixed number of replicas
+                        for the feature.
+                      format: int32
+                      minimum: 1
+                      type: integer
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
                         to use for the feature
@@ -2770,97 +2776,12 @@ spec:
                         type: string
                     type: object
                 type: object
-              workerGroupSpec:
+              workerGroupConfig:
                 description: |-
                   RayService defines the Ray cluster configuration
                   HeadGroupSpec *HeadGroupSpec `json:"headGroupSpec,omitempty"`
                   WorkerGroupSpec defines the Ray worker group configuration
                 properties:
-                  gpuConfigs:
-                    description: GPUConfigs defines the GPU worker tiers
-                    items:
-                      description: GPUConfig defines one worker-tier with scheduling
-                        and accelerator settings.
-                      properties:
-                        gpusPerPod:
-                          format: int32
-                          type: integer
-                        maxReplicas:
-                          format: int32
-                          type: integer
-                        minReplicas:
-                          format: int32
-                          type: integer
-                        resources:
-                          description: ResourceRequirements describes the compute
-                            resource requirements.
-                          properties:
-                            claims:
-                              description: |-
-                                Claims lists the names of resources, defined in spec.resourceClaims,
-                                that are used by this container.
-
-                                This is an alpha field and requires enabling the
-                                DynamicResourceAllocation feature gate.
-
-                                This field is immutable. It can only be set for containers.
-                              items:
-                                description: ResourceClaim references one entry in
-                                  PodSpec.ResourceClaims.
-                                properties:
-                                  name:
-                                    description: |-
-                                      Name must match the name of one entry in pod.spec.resourceClaims of
-                                      the Pod where this field is used. It makes that resource available
-                                      inside a container.
-                                    type: string
-                                  request:
-                                    description: |-
-                                      Request is the name chosen for a request in the referenced claim.
-                                      If empty, everything from the claim is made available, otherwise
-                                      only the result of this request.
-                                    type: string
-                                required:
-                                - name
-                                type: object
-                              type: array
-                              x-kubernetes-list-map-keys:
-                              - name
-                              x-kubernetes-list-type: map
-                            limits:
-                              additionalProperties:
-                                anyOf:
-                                - type: integer
-                                - type: string
-                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                                x-kubernetes-int-or-string: true
-                              description: |-
-                                Limits describes the maximum amount of compute resources allowed.
-                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                              type: object
-                            requests:
-                              additionalProperties:
-                                anyOf:
-                                - type: integer
-                                - type: string
-                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                                x-kubernetes-int-or-string: true
-                              description: |-
-                                Requests describes the minimum amount of compute resources required.
-                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                              type: object
-                          type: object
-                        tier:
-                          type: string
-                      required:
-                      - gpusPerPod
-                      - maxReplicas
-                      - minReplicas
-                      - tier
-                      type: object
-                    type: array
                   imageRegistry:
                     description: ImageRegistry is the image registry to use for Ray
                       worker groups
@@ -4034,6 +3955,12 @@ spec:
                     - saia
                     - seca
                     type: string
+                  scaleFactor:
+                    description: ScaleFactor is the desired fixed number of replicas
+                      for the feature.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
@@ -5212,7 +5139,6 @@ rules:
 - apiGroups:
   - ray.io
   resources:
-  - jobs
   - rayclusters
   - rayjobs
   - rayservices
@@ -5373,22 +5299,23 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-13
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:build-15
         - name: RELATED_IMAGE_RAY_WORKER
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-13
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-15
         - name: RELATED_IMAGE_WEAVIATE
           value: semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/vivek/ml-platform/saia/saia-api:build-10
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/vivek/ml-platform/saia/saia-api:build-11
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/vivek/ml-platform/saia/ai-helm-post-hook:build-10
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/vivek/ml-platform/saia/ai-helm-post-hook:build-11
         - name: RELATED_IMAGE_FLUENT_BIT
           value: fluent/fluent-bit:1.9.6
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: 667741767953.dkr.ecr.us-west-2.amazonaws.com/vivek/splunk/splunk-ai-operator:21Oct2025
+        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/vivek/splunk/splunk-ai-operator:ai-35
+        imagePullPolicy: Always
         livenessProbe:
           httpGet:
             path: /healthz
@@ -5422,9 +5349,4 @@ spec:
           type: RuntimeDefault
       serviceAccountName: splunk-ai-operator-controller-manager
       terminationGracePeriodSeconds: 10
-      tolerations:
-      - effect: NoSchedule
-        key: dedicated
-        operator: Equal
-        value: cpu
       volumes: []
