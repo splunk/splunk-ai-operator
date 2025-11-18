@@ -34,7 +34,7 @@ jobs:
         with:
           version: ${{ steps.dotenv.outputs.KUBECTL_VERSION }}
 
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v6
 
       - name: Install AWS CLI
         run: |
