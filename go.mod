@@ -21,7 +21,7 @@ require (
 	github.com/prometheus/client_golang v1.22.0
 	github.com/ray-project/kuberay/ray-operator v1.3.2
 	github.com/splunk/splunk-operator v0.0.0-20250509062254-b2c69b161847
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	google.golang.org/api v0.235.0
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.33.1
