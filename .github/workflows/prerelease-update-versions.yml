@@ -55,7 +55,7 @@ jobs:
           replace: "${{ github.event.inputs.new_operator_version }}"
           include: "**.md"
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v3.10.1
+        uses: peter-evans/create-pull-request@v7.0.8
         with:
           branch: "release/${{ github.event.inputs.new_operator_version }}"
           title: "Splunk AI Operator ${{ github.event.inputs.new_operator_version }} release"
