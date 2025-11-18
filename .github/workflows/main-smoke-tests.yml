@@ -42,7 +42,7 @@ jobs:
           unzip awscliv2.zip
           sudo ./aws/install --update
 
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.dotenv.outputs.GO_VERSION }}
 

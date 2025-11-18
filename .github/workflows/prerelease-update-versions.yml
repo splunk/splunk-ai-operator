@@ -36,7 +36,7 @@ jobs:
           fi
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.dotenv.outputs.GO_VERSION }}
           cache: true
