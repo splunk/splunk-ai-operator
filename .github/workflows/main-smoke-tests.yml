@@ -21,20 +21,20 @@ jobs:
       - name: Set Test Cluster Name
         run: echo "TEST_CLUSTER_NAME=eks-integration-test-cluster-${{ matrix.test }}-$GITHUB_RUN_ID" >> $GITHUB_ENV
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
-      - uses: falti/dotenv-action@d4d12eaa0e1dd06d5bdc3d7af3bf4c8c93cb5359
+      - uses: falti/dotenv-action@f4656c46de6bc223dda660f6724d52537bc0642a
         id: dotenv
 
       - name: Set SPLUNK_ENTERPRISE_IMAGE for main branch
         if: github.ref == 'refs/heads/main'
         run: echo "SPLUNK_ENTERPRISE_IMAGE=${{ steps.dotenv.outputs.SPLUNK_ENTERPRISE_RELEASE_IMAGE }}" >> $GITHUB_ENV
 
-      - uses: Azure/setup-kubectl@v3
+      - uses: Azure/setup-kubectl@v4
         with:
           version: ${{ steps.dotenv.outputs.KUBECTL_VERSION }}
 
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v6
 
       - name: Install AWS CLI
         run: |
@@ -42,7 +42,7 @@ jobs:
           unzip awscliv2.zip
           sudo ./aws/install --update
 
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.dotenv.outputs.GO_VERSION }}
 
@@ -59,14 +59,14 @@ jobs:
           curl -sL "https://github.com/weaveworks/eksctl/releases/download/${{ steps.dotenv.outputs.EKSCTL_VERSION }}/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
           sudo mv /tmp/eksctl /usr/local/bin
 
-      - uses: docker/setup-buildx-action@v2.5.0
+      - uses: docker/setup-buildx-action@v3.11.1
 
       - name: Install Operator SDK
         run: |
           sudo curl -L -o /usr/local/bin/operator-sdk https://github.com/operator-framework/operator-sdk/releases/download/${{ steps.dotenv.outputs.OPERATOR_SDK_VERSION }}/operator-sdk-${{ steps.dotenv.outputs.OPERATOR_SDK_VERSION }}-x86_64-linux-gnu
           sudo chmod +x /usr/local/bin/operator-sdk
 
-      - uses: docker/login-action@v1
+      - uses: docker/login-action@v3
         continue-on-error: true
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -77,13 +77,13 @@ jobs:
 
       - run: docker pull ${{ env.SPLUNK_ENTERPRISE_IMAGE }}
 
-      - uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
-      - uses: aws-actions/amazon-ecr-login@v1
+      - uses: aws-actions/amazon-ecr-login@v2
 
       - name: Tag and Push Splunk Enterprise Image
         run: |
@@ -96,7 +96,7 @@ jobs:
           go install sigs.k8s.io/kubetest2/kubetest2-eks@latest
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
-      - uses: aws-actions/configure-aws-credentials@v2
+      - uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
           aws-region: us-west-2
@@ -124,7 +124,7 @@ jobs:
           mkdir -p /tmp/pod_logs
           find ./test -name "*.log" -exec cp {} /tmp/pod_logs \;
 
-      - uses: actions/upload-artifact@v4.4.0
+      - uses: actions/upload-artifact@v5.0.0
         if: ${{ always() }}
         with:
           name: "splunk-pods-logs--artifacts-${{ matrix.test }}"
