@@ -2091,8 +2091,7 @@ delete_cluster_ebs_volumes() {
   while IFS= read -r vol_id; do
     [[ -n "$vol_id" ]] && volume_ids+=("$vol_id")
   done < <(aws ec2 describe-volumes --region "${REGION}" \
-    --filters "Name=tag:ebs.csi.aws.com/cluster,Values=true" \
-              "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
+    --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
     --query 'Volumes[].VolumeId' --output text 2>/dev/null | tr '\t' '\n')
   
   # Also find volumes tagged with KubernetesCluster tag
@@ -2107,6 +2106,7 @@ delete_cluster_ebs_volumes() {
     [[ -n "$vol_id" ]] && volume_ids+=("$vol_id")
   done < <(aws ec2 describe-volumes --region "${REGION}" \
     --filters "Name=tag:ebs.csi.aws.com/cluster,Values=true" \
+              "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
     --query "Volumes[?Tags[?Key=='kubernetes.io/created-for/pvc/namespace']].VolumeId" \
     --output text 2>/dev/null | tr '\t' '\n')
   
