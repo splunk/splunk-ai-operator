@@ -1517,7 +1517,7 @@ spec:
       - name: volume_app_repo
         provider: aws
         storageType: s3
-        endpoint: https://s3-${REGION}.amazonaws.com
+        endpoint: https://s3.${REGION}.amazonaws.com
         region: ${REGION}
         path: ${S3_BUCKET}
         secretRef: s3-secret
