@@ -101,10 +101,13 @@ images:
 
   # Splunk Enterprise Images
   splunk:
-    # Splunk Enterprise image
-    # Default behavior: If no registry in path, uses Docker Hub
-    #   "splunk/splunk:10.2.0" → Docker Hub
-    #   "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0" → ECR
+    # Option 1: Relative path (uses registry prefix)
+    #   image: "splunk/splunk:10.2.0"
+    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0"
+    #
+    # Option 2: Full path (ignores registry prefix)
+    #   image: "docker.io/myorg/splunk:10.2.0"
+    #   Result: "docker.io/myorg/splunk:10.2.0"
     image: "splunk/splunk:10-2-ai-custom"
 
     # Splunk Operator image (optional - has default)

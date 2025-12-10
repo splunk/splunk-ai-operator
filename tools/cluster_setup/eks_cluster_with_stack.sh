@@ -1208,7 +1208,8 @@ install_splunk_operator() {
   log "Installing Splunk Operator (cluster-scope manifest in CWD)..."
   need_file "${SPLUNK_OPERATOR_FILE}"
   kubectl apply -f "${SPLUNK_OPERATOR_FILE}" --server-side --force-conflicts
-  kubectl set env deployment/splunk-operator-controller-manager -n splunk-operator RELATED_IMAGE_SPLUNK_ENTERPRISE="${SPLUNK_IMAGE}"
+  local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
+  kubectl set env deployment/splunk-operator-controller-manager -n splunk-operator RELATED_IMAGE_SPLUNK_ENTERPRISE="${splunk_full}"
   kubectl set env deployment/splunk-operator-controller-manager -n splunk-operator SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com
   check_ready splunk-operator "name=splunk-operator"
   wait_for_crd standalones.enterprise.splunk.com 600
@@ -1516,7 +1517,7 @@ spec:
       - name: volume_app_repo
         provider: aws
         storageType: s3
-        endpoint: https://s3.amazonaws.com
+        endpoint: https://s3.${REGION}.amazonaws.com
         region: ${REGION}
         path: ${S3_BUCKET}
         secretRef: s3-secret
@@ -2082,6 +2083,105 @@ empty_and_delete_bucket() {
   aws s3api delete-bucket --bucket "$bucket" --region "${REGION}" || true
 }
 
+delete_cluster_ebs_volumes() {
+  log "Finding and deleting EBS volumes associated with cluster ${CLUSTER_NAME}..."
+  
+  # Find volumes tagged with the cluster name
+  local volume_ids=()
+  while IFS= read -r vol_id; do
+    [[ -n "$vol_id" ]] && volume_ids+=("$vol_id")
+  done < <(aws ec2 describe-volumes --region "${REGION}" \
+    --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
+    --query 'Volumes[].VolumeId' --output text 2>/dev/null | tr '\t' '\n')
+  
+  # Also find volumes tagged with KubernetesCluster tag
+  while IFS= read -r vol_id; do
+    [[ -n "$vol_id" ]] && volume_ids+=("$vol_id")
+  done < <(aws ec2 describe-volumes --region "${REGION}" \
+    --filters "Name=tag:KubernetesCluster,Values=${CLUSTER_NAME}" \
+    --query 'Volumes[].VolumeId' --output text 2>/dev/null | tr '\t' '\n')
+  
+  # Also find volumes created by the EBS CSI driver for this cluster
+  while IFS= read -r vol_id; do
+    [[ -n "$vol_id" ]] && volume_ids+=("$vol_id")
+  done < <(aws ec2 describe-volumes --region "${REGION}" \
+    --filters "Name=tag:ebs.csi.aws.com/cluster,Values=true" \
+              "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
+    --query "Volumes[?Tags[?Key=='kubernetes.io/created-for/pvc/namespace']].VolumeId" \
+    --output text 2>/dev/null | tr '\t' '\n')
+  
+  # Remove duplicates
+  local unique_volumes=($(printf "%s\n" "${volume_ids[@]}" | sort -u))
+  
+  if [[ ${#unique_volumes[@]} -eq 0 ]]; then
+    log "No EBS volumes found associated with cluster ${CLUSTER_NAME}"
+    return 0
+  fi
+  
+  log "Found ${#unique_volumes[@]} EBS volume(s) to delete..."
+  
+  for vol_id in "${unique_volumes[@]}"; do
+    [[ -z "$vol_id" ]] && continue
+    
+    # Get volume info for logging
+    local vol_info
+    vol_info=$(aws ec2 describe-volumes --region "${REGION}" \
+      --volume-ids "$vol_id" \
+      --query 'Volumes[0].[VolumeId,State,Size,Tags[?Key==`Name`].Value|[0]]' \
+      --output text 2>/dev/null || true)
+    
+    local state=$(echo "$vol_info" | awk '{print $2}')
+    local size=$(echo "$vol_info" | awk '{print $3}')
+    local name=$(echo "$vol_info" | awk '{print $4}')
+    
+    log "  Deleting volume ${vol_id} (${size}GB, state: ${state}, name: ${name:-N/A})"
+    
+    # If volume is attached, try to detach it first
+    if [[ "$state" == "in-use" ]]; then
+      log "    Volume is attached, attempting to detach..."
+      local attachment_info
+      attachment_info=$(aws ec2 describe-volumes --region "${REGION}" \
+        --volume-ids "$vol_id" \
+        --query 'Volumes[0].Attachments[0].[InstanceId,Device]' \
+        --output text 2>/dev/null || true)
+      
+      if [[ -n "$attachment_info" ]]; then
+        local instance_id=$(echo "$attachment_info" | awk '{print $1}')
+        aws ec2 detach-volume --region "${REGION}" --volume-id "$vol_id" --force 2>/dev/null || true
+        log "    Detached from instance ${instance_id}, waiting for volume to be available..."
+        
+        # Wait for volume to become available (max 60 seconds)
+        local waited=0
+        while [[ $waited -lt 60 ]]; do
+          local current_state
+          current_state=$(aws ec2 describe-volumes --region "${REGION}" \
+            --volume-ids "$vol_id" \
+            --query 'Volumes[0].State' --output text 2>/dev/null || echo "deleted")
+          
+          if [[ "$current_state" == "available" ]]; then
+            break
+          elif [[ "$current_state" == "deleted" ]]; then
+            log "    Volume already deleted"
+            continue 2
+          fi
+          
+          sleep 2
+          waited=$((waited + 2))
+        done
+      fi
+    fi
+    
+    # Delete the volume
+    if aws ec2 delete-volume --region "${REGION}" --volume-id "$vol_id" 2>/dev/null; then
+      log "    ✓ Deleted volume ${vol_id}"
+    else
+      warn "    Failed to delete volume ${vol_id} (may already be deleted or in use)"
+    fi
+  done
+  
+  log "✓ EBS volume cleanup complete"
+}
+
 # ---------- Minimal delete with comprehensive AWS cleanup ----------
 delete_cluster_minimal() {
   log "===================================================================="
@@ -2208,6 +2308,10 @@ delete_cluster_minimal() {
   delete_oidc_provider_if_exists "${OIDC_ARN}"
   echo ""
 
+  log "Step 10: Deleting EBS volumes..."
+  delete_cluster_ebs_volumes
+  echo ""
+
   log "===================================================================="
   log "  Comprehensive cleanup complete for ${CLUSTER_NAME}"
   log "===================================================================="
@@ -2220,6 +2324,7 @@ delete_cluster_minimal() {
   log "  ✓ CloudFormation Stacks: All eksctl-created stacks"
   log "  ✓ OIDC Provider: IAM OIDC provider"
   log "  ✓ EKS Cluster: ${CLUSTER_NAME}"
+  log "  ✓ EBS Volumes: All cluster-associated volumes"
   echo ""
   log "Verification commands:"
   echo "  # Check for remaining IAM roles:"
@@ -2230,6 +2335,9 @@ delete_cluster_minimal() {
   echo ""
   echo "  # Check for remaining CloudFormation stacks:"
   echo "  aws cloudformation list-stacks --query \"StackSummaries[?contains(StackName, 'eksctl-${CLUSTER_NAME}')].StackName\""
+  echo ""
+  echo "  # Check for remaining EBS volumes:"
+  echo "  aws ec2 describe-volumes --region ${REGION} --filters \"Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned\" --query 'Volumes[].VolumeId'"
   echo ""
 }
 
