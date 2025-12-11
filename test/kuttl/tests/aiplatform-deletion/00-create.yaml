@@ -1,0 +1,29 @@
+# Test: AIPlatform Deletion and Finalizer Handling
+# Step 1: Create AIPlatform
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: test-splunk-secret
+type: Opaque
+stringData:
+  hec_token: "test-hec-token-12345"
+  password: "TestPassword123!"
+---
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-deletion-platform
+spec:
+  objectStorage:
+    path: s3://test-bucket/artifacts
+    region: us-west-2
+
+  defaultAcceleratorType: nvidia-tesla-t4
+  serviceAccountName: default
+
+  splunkConfiguration:
+    endpoint: http://test-splunk.default.svc.cluster.local:8088
+    secretRef:
+      name: test-splunk-secret
+      

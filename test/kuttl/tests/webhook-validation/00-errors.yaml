@@ -1,0 +1,9 @@
+# KUTTL will check that the previous resource fails to create
+# This is done by checking for specific error patterns
+
+# Expected error: objectStorage is required
+# Expected error: splunkConfiguration is required
+
+# Note: KUTTL automatically fails the test if resources in XX-*.yaml
+# are successfully created. For webhook tests, we want creation to fail.
+# Use TestStep with expectedFailures in kuttl-test.yaml or use commands

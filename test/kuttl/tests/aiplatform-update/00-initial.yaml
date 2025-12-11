@@ -1,0 +1,34 @@
+# Test: AIPlatform Update/Modification
+# Step 1: Create initial AIPlatform
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: test-splunk-secret
+type: Opaque
+stringData:
+  hec_token: "test-hec-token-12345"
+  password: "TestPassword123!"
+---
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-update-platform
+spec:
+  objectStorage:
+    path: s3://test-bucket/artifacts
+    region: us-west-2
+
+  defaultAcceleratorType: nvidia-tesla-t4
+  serviceAccountName: default
+
+  storage:
+    vectorDB:
+      size: 10Gi
+      storageClassName: standard
+
+  splunkConfiguration:
+    endpoint: http://test-splunk.default.svc.cluster.local:8088
+    secretRef:
+      name: test-splunk-secret
+      

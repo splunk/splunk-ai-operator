@@ -1,0 +1,49 @@
+# KUTTL Test Suite Configuration
+# https://kuttl.dev/docs/
+
+apiVersion: kuttl.dev/v1beta1
+kind: TestSuite
+metadata:
+  name: splunk-ai-operator-test-suite
+# Timeout for each test step (in seconds)
+# Increased to 900s to allow Splunk Standalone to start
+timeout: 900
+# Parallel execution
+parallel: 1
+# Start a kind cluster for testing
+startKIND: false  # Set to true if you want KUTTL to create a kind cluster
+# If startKIND is false, KUTTL will use your current kubectl context
+kindContext: splunk-ai-operator-test
+# Kubernetes version for kind cluster
+kindVersion: v1.28.0
+# Number of nodes in kind cluster
+kindNodeCache: true
+# Test directories
+testDirs:
+  - tests/
+# Commands to run before tests
+commands:
+  - command: kubectl kuttl version
+    ignoreFailure: true
+# Artifacts to collect on test failure
+artifactsDir: _output/kuttl-artifacts
+# Report format
+reportFormat: JSON
+reportName: kuttl-report
+# Skip deletion of test resources (useful for debugging)
+skipDelete: false
+# Suppress logs
+suppress:
+  - events
+# Start control plane for testing (alternative to kind)
+startControlPlane: false
+# Control plane config
+controlPlaneArgs:
+  - --service-cluster-ip-range=10.96.0.0/12
+# Apply CRDs before tests
+crdDir: ../../helm-chart/splunk-ai-operator/crds
+# Manifest directories to apply before tests
+manifestDirs:
+  - ./setup
+# Namespace for tests (if not specified, random namespace is created)
+namespace: ""  # Empty means create random namespace for each test

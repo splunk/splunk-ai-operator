@@ -1,0 +1,35 @@
+# Assert that child resources are created
+# Step 2: Verify RayCluster is created
+
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: test-basic-platform-ray
+status:
+  # Ray cluster should be created
+  state: ready
+---
+# Assert that Weaviate StatefulSet is created
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-basic-platform-weaviate
+  labels:
+    ai.splunk.com/platform: test-basic-platform
+    ai.splunk.com/component: weaviate
+status:
+  readyReplicas: 1
+---
+# Assert that PVC is created for Weaviate
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    ai.splunk.com/platform: test-basic-platform
+    ai.splunk.com/component: weaviate
+spec:
+  resources:
+    requests:
+      storage: 10Gi
+status:
+  phase: Bound

@@ -1,0 +1,32 @@
+# Step 0: Create s3-secret (required by Splunk Standalone for appRepo)
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-secret
+type: Opaque
+stringData:
+  s3_access_key: ""
+  s3_secret_key: ""
+
+---
+# Create Splunk Standalone instance with appRepo configuration
+# This will automatically create a versioned secret that AIPlatform can reference
+
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: test-splunk
+  finalizers:
+    - enterprise.splunk.com/delete-pvc
+spec:
+  replicas: 1
+
+  # Use specific image version
+  image: docker.io/splunk/splunk:10.0.0
+
+  # AppRepo configuration - required for testing
+  appRepo:
+    appInstallPeriodSeconds: 90
+    appsRepoPollIntervalSeconds: 60
+    installMaxRetries: 2

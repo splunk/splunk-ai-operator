@@ -1,0 +1,35 @@
+# Step 2: Update the AIPlatform resource
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-update-platform
+spec:
+  objectStorage:
+    path: s3://test-bucket/artifacts
+    region: us-west-2
+
+  defaultAcceleratorType: nvidia-tesla-t4
+  serviceAccountName: default
+
+  # Update storage size
+  storage:
+    vectorDB:
+      size: 20Gi  # Changed from 10Gi to 20Gi
+      storageClassName: standard
+
+  # Add ingress
+  ingress:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: updated-platform.test.local
+        paths:
+          - path: /
+            pathType: Prefix
+
+  splunkConfiguration:
+    endpoint: http://test-splunk.default.svc.cluster.local:8088
+    secretRef:
+      name: test-splunk-secret
+      

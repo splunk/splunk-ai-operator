@@ -1,0 +1,23 @@
+# Step 0: Wait for Splunk Standalone and its versioned secret
+# Splunk Operator will create a secret with label: app.kubernetes.io/component=versionedSecrets
+
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: test-splunk
+status:
+  # Wait for Standalone to be ready
+  phase: Ready
+
+---
+# Wait for the versioned secret to be created by Splunk Operator
+# The secret name follows pattern: test-splunk-standalone-secret-v1
+# We check for the label rather than specific name since version may vary
+
+apiVersion: v1
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/component: versionedSecrets
+    app.kubernetes.io/managed-by: splunk-operator
+type: Opaque

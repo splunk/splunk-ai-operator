@@ -1,0 +1,25 @@
+# Assert that updates are applied
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-update-platform
+spec:
+  storage:
+    vectorDB:
+      size: 20Gi  # Updated value
+  ingress:
+    enabled: true  # New field
+status:
+  observedGeneration: 2  # Generation should increment
+---
+# Assert Ingress was created after update
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-update-platform
+  labels:
+    ai.splunk.com/platform: test-update-platform
+spec:
+  rules:
+    - host: updated-platform.test.local

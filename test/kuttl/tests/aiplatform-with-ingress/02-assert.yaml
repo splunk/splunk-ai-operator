@@ -1,0 +1,22 @@
+# Assert Ingress resource is created
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress-platform
+  labels:
+    ai.splunk.com/platform: test-ingress-platform
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ai-platform.test.local
+---
+# Assert AIPlatform status has IngressReady condition
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-ingress-platform
+status:
+  conditions:
+    - type: IngressReady
+      status: "True"
