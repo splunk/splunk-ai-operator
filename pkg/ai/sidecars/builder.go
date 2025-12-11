@@ -136,9 +136,17 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 	}
 
 	// construct spec
+	// Priority: 1) CR spec, 2) environment variable, 3) default
+	otelImage := s.ai.Spec.Images.OTelImage
+	if otelImage == "" {
+		otelImage = os.Getenv("RELATED_IMAGE_OTEL_COLLECTOR")
+	}
+	if otelImage == "" {
+		otelImage = "otel/opentelemetry-collector-contrib:0.122.1"
+	}
 	specMap := map[string]interface{}{
 		"mode":  "sidecar",
-		"image": "otel/opentelemetry-collector-contrib:0.122.1",
+		"image": otelImage,
 		"env": []map[string]interface{}{
 			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
 			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
