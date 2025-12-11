@@ -2799,7 +2799,11 @@ usage() {
   echo "  delete-full  uninstall CRs/operators then run comprehensive AWS cleanup"
   echo ""
   echo "Options:"
-  echo "  --no-eksctl  Disable the use of eksctl for cluster operations"
+  echo "  --no-eksctl  Disable the use of eksctl for cluster operations, only available with install command"
+  echo ""
+  echo "Examples:"
+  echo "  $0 install --no-eksctl"
+  echo "  $0 delete"
 }
 
 # ====== PARSE FLAGS ======
