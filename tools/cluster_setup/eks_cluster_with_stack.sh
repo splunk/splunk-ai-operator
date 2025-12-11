@@ -17,6 +17,9 @@ aws() { command /usr/bin/env aws "$@"; }
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/cluster-config.yaml}"
 
+# ====== GLOBAL FLAGS ======
+USE_EKSCTL=true
+
 # ====== LOAD CONFIGURATION FROM YAML ======
 load_config() {
   local cfg="$CONFIG_FILE"
@@ -847,12 +850,16 @@ ensure_oidc() {
   # First check if cluster has OIDC issuer configured
   local issuer; issuer=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || true)
   if [[ -z "$issuer" || "$issuer" == "None" ]]; then
-    log "Cluster does not have OIDC issuer configured. Associating OIDC provider..."
-    if ! eksctl utils associate-iam-oidc-provider --region "${REGION}" --cluster "${CLUSTER_NAME}" --approve; then
-      err "Failed to associate OIDC provider with cluster"
+    if [[ "$USE_EKSCTL" == "true" ]]; then
+      log "Cluster does not have OIDC issuer configured. Associating OIDC provider..."
+      if ! eksctl utils associate-iam-oidc-provider --region "${REGION}" --cluster "${CLUSTER_NAME}" --approve; then
+        err "Failed to associate OIDC provider with cluster"
+      fi
+      # Re-fetch issuer after association
+      issuer=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || true)
+    else
+      err "Cluster does not have OIDC issuer configured. Please associate the OIDC cluster issuer with the cluster."
     fi
-    # Re-fetch issuer after association
-    issuer=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || true)
   fi
 
   log "Cluster OIDC issuer: ${issuer}"
@@ -860,14 +867,18 @@ ensure_oidc() {
   # Check if IAM OIDC provider actually exists
   log "Checking if IAM OIDC provider exists..."
   local oidc_arn; oidc_arn="$(get_oidc_provider_arn || true)"
-
+  
   if [[ -z "$oidc_arn" ]]; then
-    log "OIDC provider ARN not found. Creating IAM OIDC provider..."
-    if ! eksctl utils associate-iam-oidc-provider --region "${REGION}" --cluster "${CLUSTER_NAME}" --approve; then
-      err "Failed to create IAM OIDC provider"
+    if [[ "$USE_EKSCTL" == "true" ]]; then
+      log "OIDC provider ARN not found. Creating IAM OIDC provider..."
+      if ! eksctl utils associate-iam-oidc-provider --region "${REGION}" --cluster "${CLUSTER_NAME}" --approve; then
+        err "Failed to create IAM OIDC provider"
+      fi
+      # Re-fetch ARN after creation
+      oidc_arn="$(get_oidc_provider_arn || true)"
+    else
+      err "OIDC provider ARN not found. Please create the IAM OIDC provider."
     fi
-    # Re-fetch ARN after creation
-    oidc_arn="$(get_oidc_provider_arn || true)"
   fi
 
   # Verify OIDC provider exists in IAM
@@ -877,15 +888,19 @@ ensure_oidc() {
   fi
 
   if ! aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$oidc_arn" >/dev/null 2>&1; then
-    log "IAM OIDC provider not found in IAM. Creating it now..."
-    if ! eksctl utils associate-iam-oidc-provider --region "${REGION}" --cluster "${CLUSTER_NAME}" --approve; then
-      err "Failed to create IAM OIDC provider even after retry"
-    fi
+    if [[ "$USE_EKSCTL" == "true" ]]; then
+      log "IAM OIDC provider not found in IAM. Creating it now..."
+      if ! eksctl utils associate-iam-oidc-provider --region "${REGION}" --cluster "${CLUSTER_NAME}" --approve; then
+        err "Failed to create IAM OIDC provider even after retry"
+      fi
 
-    # Final verification
-    sleep 5  # Give IAM a moment to propagate
-    if ! aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$oidc_arn" >/dev/null 2>&1; then
-      err "OIDC provider ARN $oidc_arn not found in IAM after creation. IAM propagation may be delayed."
+      # Final verification
+      sleep 5  # Give IAM a moment to propagate
+      if ! aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$oidc_arn" >/dev/null 2>&1; then
+        err "OIDC provider ARN $oidc_arn not found in IAM after creation. IAM propagation may be delayed."
+      fi
+    else
+      err "IAM OIDC provider not found in IAM. Please create the IAM OIDC provider."
     fi
   fi
 
@@ -904,19 +919,28 @@ install_ebs_csi_addon() {
   fi
   log "✓ IAM role ${EBS_IRSA_ROLE_NAME} exists"
 
-  # Use eksctl to create addon with IRSA
-  log "Creating aws-ebs-csi-driver addon..."
-  if ! eksctl create addon \
-    --cluster "${CLUSTER_NAME}" \
-    --name aws-ebs-csi-driver \
-    --service-account-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/${EBS_IRSA_ROLE_NAME}" \
-    --force; then
-    warn "Addon creation command failed. Checking if addon already exists..."
-    # Check if addon exists (idempotent behavior)
-    if aws eks describe-addon --cluster-name "${CLUSTER_NAME}" --addon-name aws-ebs-csi-driver >/dev/null 2>&1; then
-      log "Addon already exists, continuing..."
+  # Check addon with IRSA
+  log "Checking for aws-ebs-csi-driver addon..."
+  if aws eks describe-addon --cluster-name "${CLUSTER_NAME}" --addon-name aws-ebs-csi-driver >/dev/null 2>&1; then
+    log "Addon already exists, continuing..."
+  else
+    if [[ "$USE_EKSCTL" == "true" ]]; then
+      log "Creating aws-ebs-csi-driver addon..."
+      if ! eksctl create addon \
+        --cluster "${CLUSTER_NAME}" \
+        --name aws-ebs-csi-driver \
+        --service-account-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/${EBS_IRSA_ROLE_NAME}" \
+        --force; then
+        warn "Addon creation command failed. Checking if addon already exists..."
+        # Check if addon exists (idempotent behavior)
+        if aws eks describe-addon --cluster-name "${CLUSTER_NAME}" --addon-name aws-ebs-csi-driver >/dev/null 2>&1; then
+          log "Addon created, continuing..."
+        else
+          err "Failed to create EBS CSI addon. Check: aws eks describe-addon --cluster-name ${CLUSTER_NAME} --addon-name aws-ebs-csi-driver"
+        fi
+      fi
     else
-      err "Failed to create EBS CSI addon. Check: aws eks describe-addon --cluster-name ${CLUSTER_NAME} --addon-name aws-ebs-csi-driver"
+      err "EBS CSI addon does not exist. Check: aws eks describe-addon --cluster-name ${CLUSTER_NAME} --addon-name aws-ebs-csi-driver"
     fi
   fi
 
@@ -987,15 +1011,19 @@ install_ebs_csi_addon() {
 ensure_ebs_irsa_role() {
   log "Ensuring EBS CSI IRSA role and service account..."
 
-  # Create IRSA for EBS CSI using eksctl (handles role creation, trust policy, and SA annotation)
-  eksctl create iamserviceaccount \
-    --cluster "${CLUSTER_NAME}" \
-    --namespace "${EBS_NS}" \
-    --name "${EBS_SA}" \
-    --role-name "${EBS_IRSA_ROLE_NAME}" \
-    --attach-policy-arn "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" \
-    --approve \
-    --override-existing-serviceaccounts
+  if [[ "$USE_EKSCTL" == "true" ]]; then
+    # Create IRSA for EBS CSI using eksctl (handles role creation, trust policy, and SA annotation)
+    eksctl create iamserviceaccount \
+      --cluster "${CLUSTER_NAME}" \
+      --namespace "${EBS_NS}" \
+      --name "${EBS_SA}" \
+      --role-name "${EBS_IRSA_ROLE_NAME}" \
+      --attach-policy-arn "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" \
+      --approve \
+      --override-existing-serviceaccounts
+  fi
+
+  wait_resource_exists "${EBS_NS}" sa "${EBS_SA}" 180
 
   log "✓ EBS CSI IRSA role and service account configured"
 }
@@ -1072,14 +1100,17 @@ get_autoscaler_version() {
 
 install_cluster_autoscaler() {
   log "Installing Cluster Autoscaler with IRSA..."
-  eksctl create iamserviceaccount \
-    --cluster "${CLUSTER_NAME}" \
-    --name "${AUTOSCALER_SA}" \
-    --namespace "${AUTOSCALER_NS}" \
-    --role-name "${AUTOSCALER_ROLE_NAME}" \
-    --attach-policy-arn arn:aws:iam::aws:policy/AutoScalingFullAccess \
-    --approve \
-    --override-existing-serviceaccounts
+
+  if [[ "$USE_EKSCTL" == "true" ]]; then
+    eksctl create iamserviceaccount \
+      --cluster "${CLUSTER_NAME}" \
+      --name "${AUTOSCALER_SA}" \
+      --namespace "${AUTOSCALER_NS}" \
+      --role-name "${AUTOSCALER_ROLE_NAME}" \
+      --attach-policy-arn arn:aws:iam::aws:policy/AutoScalingFullAccess \
+      --approve \
+      --override-existing-serviceaccounts
+  fi
 
   helm repo add autoscaler https://kubernetes.github.io/autoscaler
   helm repo update
@@ -1387,14 +1418,16 @@ ensure_irsa_for_sa() {
 
   # Ensure SA+Role via eksctl (idempotent)
   log "Ensuring IRSA (role ${role}) for ${ns}/${sa} with policy ${policy_arn}"
-  eksctl create iamserviceaccount \
-    --cluster "${CLUSTER_NAME}" \
-    --namespace "${ns}" \
-    --name "${sa}" \
-    --role-name "${role}" \
-    --attach-policy-arn "${policy_arn}" \
-    --approve \
-    --override-existing-serviceaccounts
+  if [[ "$USE_EKSCTL" == "true" ]]; then
+    eksctl create iamserviceaccount \
+      --cluster "${CLUSTER_NAME}" \
+      --namespace "${ns}" \
+      --name "${sa}" \
+      --role-name "${role}" \
+      --attach-policy-arn "${policy_arn}" \
+      --approve \
+      --override-existing-serviceaccounts
+  fi
 
   wait_resource_exists "${ns}" sa "${sa}" 180
 
@@ -2419,9 +2452,13 @@ preflight_env() {
   fi
 
   pf_header "Tools"
-  for t in aws eksctl kubectl helm git jq; do
+  for t in aws kubectl helm git jq; do
     if command -v "$t" >/dev/null 2>&1; then pf_ok "$t found ($(command -v $t))"; else pf_fail "$t not found in PATH"; fi
   done
+
+  if [[ "$USE_EKSCTL" == "true" ]]; then
+    if command -v "eksctl" >/dev/null 2>&1; then pf_ok "eksctl found ($(command -v eksctl))"; else pf_fail "eksctl not found in PATH"; fi
+  fi
 
   pf_header "AWS identity & region"
   local acct region_id
@@ -2710,7 +2747,10 @@ reconcile_flow() {
 
 # ---------- MAIN ----------
 main_install() {
-  for t in aws eksctl kubectl helm git jq; do need "$t"; done
+  for t in aws kubectl helm git jq; do need "$t"; done
+  if [[ "$USE_EKSCTL" == "true" ]]; then
+    need eksctl
+  fi
 
   # Load configuration from YAML file
   load_config
@@ -2751,13 +2791,45 @@ main_install() {
 }
 
 usage() {
-  echo "Usage: $0 {install|delete|delete-full}"
+  echo "Usage: $0 {install|delete|delete-full} [OPTIONS]"
+  echo ""
+  echo "Commands:"
   echo "  install      preflight + create/reconcile cluster and components (idempotent)"
   echo "  delete       delete cluster and ALL AWS resources/roles/policies created by this script"
   echo "  delete-full  uninstall CRs/operators then run comprehensive AWS cleanup"
+  echo ""
+  echo "Options:"
+  echo "  --no-eksctl  Disable the use of eksctl for cluster operations"
 }
 
-case "${1:-install}" in
+# ====== PARSE FLAGS ======
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-eksctl)
+      USE_EKSCTL=false
+      shift
+      ;;
+    install|delete|delete-full)
+      COMMAND="$1"
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option or command: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+# Default to install if no command specified
+COMMAND="${COMMAND:-install}"
+
+case "$COMMAND" in
   install)
     main_install
     ;;
