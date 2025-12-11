@@ -429,7 +429,7 @@ cd /path/to/splunk-ai-operator/tools/cluster_setup
     - IAM OIDC provider
     - IAM service account in the `kube-system` namespace with the name `ebs-csi-controller-sa`, role name `EBSCSIDriverRole-${CLUSTER_NAME}`, and attached policy arn `arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy`
     - IAM service account in the `kube-system` namespace with the name `cluster-autoscaler`, role name `ClusterAutoscalerRole-${CLUSTER_NAME}`, and attached policy arn `arn:aws:iam::aws:policy/AutoScalingFullAccess`
-    - IAM policy with the name `S3Access-${CLUSTER_NAME}-ai-platform`, policy arn `arn:aws:iam::{ACCOUNT_ID}:policy/S3Access-${CLUSTER_NAME}-ai-platform`, and policy document
+    - IAM policy with the name `S3Access-${CLUSTER_NAME}-ai-platform`, policy arn `arn:aws:iam::${ACCOUNT_ID}:policy/S3Access-${CLUSTER_NAME}-ai-platform`, and policy document
       ```
       {
         "Version": "2012-10-17",
@@ -1058,9 +1058,6 @@ aiPlatform:
 
 # Full cleanup (including S3 buckets, IAM roles)
 ./eks_cluster_with_stack.sh delete-full
-
-# Check AIPlatform status
-./eks_cluster_with_stack.sh status
 ```
 
 ### Post-Installation Tasks
@@ -1123,7 +1120,7 @@ kubectl get secret splunk-splunk-standalone-standalone-secret-v1 \
 
 # Port forward Splunk Web UI
 kubectl port-forward -n ai-platform \
-  svc/splunk-standalone-standalone-service 8000:8000
+  svc/splunk-splunk-standalone-standalone-service 8000:8000
 
 # Access at http://localhost:8000
 # Username: admin
