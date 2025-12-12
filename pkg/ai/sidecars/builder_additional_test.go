@@ -210,8 +210,9 @@ func TestRenderOtelConf(t *testing.T) {
 	recorder := record.NewFakeRecorder(100)
 	builder := New(fakeClient, scheme, recorder, platform)
 
-	conf := builder.renderOtelConf(ctx, platform)
+	conf, err := builder.renderOtelConf(ctx, platform)
 
+	assert.NoError(t, err)
 	assert.NotNil(t, conf)
 
 	// Verify structure
@@ -221,7 +222,8 @@ func TestRenderOtelConf(t *testing.T) {
 	splunkHec, ok := exporters["splunk_hec"].(map[string]interface{})
 	require.True(t, ok, "splunk_hec exporter should be present")
 
-	assert.Equal(t, "test-token-123", splunkHec["token"])
+	// Token should now be an environment variable reference, not the actual token
+	assert.Equal(t, "${SPLUNK_ACCESS_TOKEN}", splunkHec["token"])
 	assert.Equal(t, "https://splunk.example.com/services/collector", splunkHec["endpoint"])
 
 	// Verify receivers
@@ -264,13 +266,11 @@ func TestRenderOtelConf_SecretMissing(t *testing.T) {
 	recorder := record.NewFakeRecorder(100)
 	builder := New(fakeClient, scheme, recorder, platform)
 
-	conf := builder.renderOtelConf(ctx, platform)
+	conf, err := builder.renderOtelConf(ctx, platform)
 
-	assert.NotNil(t, conf)
-	// Should return error map
-	errorMsg, ok := conf["error"].(string)
-	assert.True(t, ok)
-	assert.Contains(t, errorMsg, "loading secret")
+	assert.Error(t, err)
+	assert.Nil(t, conf)
+	assert.Contains(t, err.Error(), "failed to validate secret")
 }
 
 func TestRenderOtelConf_TokenMissing(t *testing.T) {
@@ -310,10 +310,9 @@ func TestRenderOtelConf_TokenMissing(t *testing.T) {
 	recorder := record.NewFakeRecorder(100)
 	builder := New(fakeClient, scheme, recorder, platform)
 
-	conf := builder.renderOtelConf(ctx, platform)
+	conf, err := builder.renderOtelConf(ctx, platform)
 
-	assert.NotNil(t, conf)
-	errorMsg, ok := conf["error"].(string)
-	assert.True(t, ok)
-	assert.Contains(t, errorMsg, "hec_token field not found")
+	assert.Error(t, err)
+	assert.Nil(t, conf)
+	assert.Contains(t, err.Error(), "hec_token")
 }

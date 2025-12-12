@@ -14,6 +14,7 @@ patches:
     \ - name: RELATED_IMAGE_WEAVIATE\n    value: \"semitechnologies/weaviate:stable-v1.28-007846a\"\n
     \ - name: RELATED_IMAGE_SAIA_API\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1\"\n
     \ - name: RELATED_IMAGE_POST_INSTALL_HOOK\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1\"\n
+    \ - name: RELATED_IMAGE_OTEL_COLLECTOR\n    value: \"otel/opentelemetry-collector-contrib:0.122.1\"\n
     \ - name: RELATED_IMAGE_FLUENT_BIT\n    value: \"fluent/fluent-bit:1.9.6\"\n  -
     name: MODEL_VERSION\n    value: \"v0.3.14-36-g1549f5a\"\n  - name: RAY_VERSION\n
     \   value: \"2.44.0\""

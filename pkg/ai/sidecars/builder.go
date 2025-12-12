@@ -135,10 +135,16 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		return fmt.Errorf("json unmarshal: %w", err)
 	}
 
+	// Get OTEL collector image from environment variable
+	otelImage := os.Getenv("RELATED_IMAGE_OTEL_COLLECTOR")
+	if otelImage == "" {
+		otelImage = "otel/opentelemetry-collector-contrib:0.122.1" // fallback default
+	}
+
 	// construct spec
 	specMap := map[string]interface{}{
 		"mode":  "sidecar",
-		"image": "otel/opentelemetry-collector-contrib:0.122.1",
+		"image": otelImage,
 		"env": []map[string]interface{}{
 			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
 			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
@@ -183,7 +189,10 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 			cm.Data = map[string]string{}
 		}
 		if _, exists := cm.Data["otel-config.yaml"]; !exists {
-			content := s.renderOtelConf(ctx, p)
+			content, err := s.renderOtelConf(ctx, p)
+			if err != nil {
+				return fmt.Errorf("rendering otel config: %w", err)
+			}
 			yamlBytes, err := syaml.Marshal(content)
 			if err != nil {
 				return fmt.Errorf("marshaling otel config: %w", err)
@@ -199,16 +208,23 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 }
 
 // renderOtelConf builds the OpenTelemetry Collector config map data.
-func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[string]interface{} {
+// Returns the config and an error if validation fails.
+func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) (map[string]interface{}, error) {
+	// Validate that the secret reference is provided
+	if cr.Spec.SplunkConfiguration.SecretRef.Name == "" {
+		return nil, fmt.Errorf("SplunkConfiguration.SecretRef.Name is required for OTEL sidecar")
+	}
+
+	// Validate that the secret exists
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: cr.Spec.SplunkConfiguration.SecretRef.Name, Namespace: cr.Namespace}
 	if err := s.Client.Get(ctx, key, secret); err != nil {
-		return map[string]interface{}{"error": fmt.Sprintf("loading secret %q: %v", key.Name, err)}
+		return nil, fmt.Errorf("failed to validate secret %q: %w", key.Name, err)
 	}
 
-	token, ok := secret.Data["hec_token"]
-	if !ok {
-		return map[string]interface{}{"error": "hec_token field not found in secret"}
+	// Verify the secret has the required key
+	if _, ok := secret.Data["hec_token"]; !ok {
+		return nil, fmt.Errorf("secret %q does not contain required key 'hec_token'", key.Name)
 	}
 
 	endpoint := fmt.Sprintf("%s/services/collector", cr.Spec.SplunkConfiguration.Endpoint)
@@ -219,7 +235,9 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 	return map[string]interface{}{
 		"exporters": map[string]interface{}{
 			"splunk_hec": map[string]interface{}{
-				"token":               string(token),
+				// Use environment variable reference instead of embedding the token
+				// The SPLUNK_ACCESS_TOKEN env var is injected by the OpenTelemetryCollector CR
+				"token":               "${SPLUNK_ACCESS_TOKEN}",
 				"endpoint":            endpoint,
 				"source":              "otel",
 				"sourcetype":          "otel",
@@ -275,7 +293,7 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 				},
 			},
 		},
-	}
+	}, nil
 }
 
 // renderEnvoyConf generates the Envoy configuration for the given AIPlatform.

@@ -10,11 +10,22 @@ spec:
     path: s3://test-bucket/artifacts
     region: us-west-2
 
-  # Default accelerator type
-  defaultAcceleratorType: nvidia-tesla-t4
+  # Default accelerator type (must match instance.yaml)
+  defaultAcceleratorType: L40S
 
   # Service account
   serviceAccountName: default
+
+  # Worker group configuration
+  workerGroupConfig:
+    serviceAccountName: default
+
+  # GPU scheduler configuration
+  gpuScheduler:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
 
   # Splunk configuration - Reference the secret created by Splunk Standalone
   # Note: The operator doesn't have Splunk Standalone CRD registered, so we use direct secretRef

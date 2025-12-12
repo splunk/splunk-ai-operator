@@ -25,6 +25,15 @@ spec:
   # Use specific image version
   image: docker.io/splunk/splunk:10.0.0
 
+  # Accept Splunk license
+  # Required by Splunk Standalone to start
+  # See: https://www.splunk.com/en_us/legal/splunk-software-license-agreement.html
+  commonConfig:
+    splunkCommonSpec:
+      env:
+        - name: SPLUNK_GENERAL_TERMS
+          value: "yes"
+
   # AppRepo configuration - required for testing
   appRepo:
     appInstallPeriodSeconds: 90

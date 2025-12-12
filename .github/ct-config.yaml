@@ -10,6 +10,7 @@ chart-repos:
   - prometheus-community=https://prometheus-community.github.io/helm-charts
   - opentelemetry=https://open-telemetry.github.io/opentelemetry-helm-charts
   - kuberay=https://ray-project.github.io/kuberay-helm
+  - splunk=https://splunk.github.io/splunk-operator/
 
 # Target branch for comparison (used in PRs)
 target-branch: main

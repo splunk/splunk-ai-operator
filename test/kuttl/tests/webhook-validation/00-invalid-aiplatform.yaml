@@ -8,4 +8,4 @@ metadata:
 spec:
   # Missing required field: objectStorage
   # Missing required field: splunkConfiguration
-  defaultAcceleratorType: nvidia-tesla-t4
+  defaultAcceleratorType: L40S

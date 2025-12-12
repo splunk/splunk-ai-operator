@@ -76,11 +76,9 @@ func (d *AIPlatformCustomDefaulter) Default(_ context.Context, obj runtime.Objec
 		aiplatform.Spec.ClusterDomain = "cluster.local"
 	}
 
-	// Default Sidecars
-	if !aiplatform.Spec.Sidecars.Otel && !aiplatform.Spec.Sidecars.PrometheusOperator {
-		aiplatform.Spec.Sidecars.Otel = true
-		aiplatform.Spec.Sidecars.PrometheusOperator = true
-	}
+	// Default Sidecars - removed automatic defaulting to true
+	// Users must explicitly enable sidecars in their configuration
+	// This allows users to disable sidecars by setting them to false
 
 	// Default Storage size for VectorDB if not specified
 	if aiplatform.Spec.Storage.VectorDB.Size == "" && aiplatform.Spec.Storage.VectorDB.PVCName == "" {

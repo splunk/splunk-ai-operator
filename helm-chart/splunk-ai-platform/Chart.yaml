@@ -46,24 +46,11 @@ annotations:
     - kind: added
       description: Initial release with full observability stack
 
+# Dependencies
+# The splunk-ai-operator chart includes all required operator dependencies
+# (cert-manager, kuberay, opentelemetry, prometheus, splunk-operator)
 dependencies:
   - name: splunk-ai-operator
     version: "0.1.0"
     repository: "file://../splunk-ai-operator"
     condition: splunk-ai-operator.enabled
-  - name: kuberay-operator
-    version: "1.3.2"
-    repository: "https://ray-project.github.io/kuberay-helm"
-    condition: kuberay-operator.enabled
-  - name: cert-manager
-    version: "1.18.0"
-    repository: "https://charts.jetstack.io"
-    condition: cert-manager.enabled
-  - name: kube-prometheus-stack
-    version: "72.4.0"
-    repository: "https://prometheus-community.github.io/helm-charts"
-    condition: prometheus.enabled
-  - name: opentelemetry-operator
-    version: "0.88.6"
-    repository: "https://open-telemetry.github.io/opentelemetry-helm-charts"
-    condition: opentelemetry-operator.enabled

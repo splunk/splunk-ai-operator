@@ -19,8 +19,19 @@ spec:
     path: s3://test-bucket/artifacts
     region: us-west-2
 
-  defaultAcceleratorType: nvidia-tesla-t4
+  defaultAcceleratorType: L40S
   serviceAccountName: default
+
+  # Worker group configuration
+  workerGroupConfig:
+    serviceAccountName: default
+
+  # GPU scheduler configuration
+  gpuScheduler:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
 
   splunkConfiguration:
     endpoint: http://test-splunk.default.svc.cluster.local:8088
