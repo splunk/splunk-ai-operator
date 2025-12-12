@@ -55,6 +55,7 @@ var _ = Describe("AIService Controller", func() {
 		os.Setenv("RELATED_IMAGE_POST_INSTALL_HOOK", "test-post-install:latest")
 		os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
 		os.Setenv("RELATED_IMAGE_SAIA_API", "saia-api:latest")
+		os.Setenv("RELATED_IMAGE_OTEL_COLLECTOR", "otel/opentelemetry-collector-contrib:latest")
 
 		// Create a fake client with proper scheme
 		s := scheme.Scheme
