@@ -394,7 +394,7 @@ func TestReconcileOpenTelemetryCollector_DefaultImage(t *testing.T) {
 	// Build the expected spec map (mimicking what reconcileOpenTelemetryCollector does)
 	specMap := map[string]interface{}{
 		"mode":  "sidecar",
-		"image": SetImageRegistry("RELATED_IMAGE_OTEL_COLLECTOR", platform.Spec.Images.OTelImage),
+		"image": ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", platform.Spec.Images.OTelImage),
 		"env": []map[string]interface{}{
 			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": platform.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
 			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
@@ -439,7 +439,7 @@ func TestReconcileOpenTelemetryCollector_CustomImage(t *testing.T) {
 
 	// Set the environment variable to a custom image
 	envKey := "RELATED_IMAGE_OTEL_COLLECTOR"
-	customImage := "custom-registry.example.com/opentelemetry-collector-contrib1.0.0"
+	customImage := "custom-registry.example.com/opentelemetry-collector-contrib:1.0.0"
 	originalValue := os.Getenv(envKey)
 	os.Setenv(envKey, customImage)
 	defer func() {
@@ -510,7 +510,7 @@ func TestReconcileOpenTelemetryCollector_CustomImage(t *testing.T) {
 	// Build the expected spec map (mimicking what reconcileOpenTelemetryCollector does)
 	specMap := map[string]interface{}{
 		"mode":  "sidecar",
-		"image": SetImageRegistry("RELATED_IMAGE_OTEL_COLLECTOR", platform.Spec.Images.OTelImage),
+		"image": ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", platform.Spec.Images.OTelImage),
 		"env": []map[string]interface{}{
 			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": platform.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
 			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},

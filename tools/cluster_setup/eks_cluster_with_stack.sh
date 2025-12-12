@@ -509,6 +509,7 @@ validate_images_exist() {
     "$saia_api_full"
     "$saia_dataloader_full"
     "$fluent_bit_full"
+    "$otel_collector_full"
   )
 
   # Check each image
