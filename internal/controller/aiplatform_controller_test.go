@@ -58,6 +58,7 @@ var _ = Describe("AIPlatform Controller", func() {
 		os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
 		os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
 		os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
+		os.Setenv("RELATED_IMAGE_OTEL_COLLECTOR", "otel/opentelemetry-collector-contrib:latest")
 		os.Setenv("INSTANCE_FILE", "../../config/configs/instance.yaml")
 		os.Setenv("APPLICATION_FILE", "../../config/configs/applications.yaml")
 
@@ -398,6 +399,7 @@ var _ = Describe("AIPlatform Requeue Scenarios", func() {
 		os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
 		os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
 		os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
+		os.Setenv("RELATED_IMAGE_OTEL_COLLECTOR", "otel/opentelemetry-collector-contrib:latest")
 		os.Setenv("INSTANCE_FILE", "../../config/configs/instance.yaml")
 		os.Setenv("APPLICATION_FILE", "../../config/configs/applications.yaml")
 

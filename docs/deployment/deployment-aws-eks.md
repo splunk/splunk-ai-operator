@@ -257,22 +257,24 @@ The Splunk AI Operator deployment in `artifacts.yaml` contains environment varia
 ```yaml
 env:
   - name: RELATED_IMAGE_RAY_HEAD
-    value: YOUR_REGISTRY/ray-head:YOUR_TAG           # ← UPDATE THIS
+    value: YOUR_REGISTRY/ray-head:YOUR_TAG               # ← UPDATE THIS
   - name: RELATED_IMAGE_RAY_WORKER
-    value: YOUR_REGISTRY/ray-worker-gpu:YOUR_TAG     # ← UPDATE THIS
+    value: YOUR_REGISTRY/ray-worker-gpu:YOUR_TAG         # ← UPDATE THIS
   - name: RELATED_IMAGE_WEAVIATE
-    value: YOUR_REGISTRY/weaviate:YOUR_TAG           # ← UPDATE THIS (or use public: semitechnologies/weaviate:stable-v1.28-007846a)
+    value: YOUR_REGISTRY/weaviate:YOUR_TAG               # ← UPDATE THIS (or use public: semitechnologies/weaviate:stable-v1.28-007846a)
   - name: RELATED_IMAGE_SAIA_API
-    value: YOUR_REGISTRY/saia-api:YOUR_TAG           # ← UPDATE THIS
+    value: YOUR_REGISTRY/saia-api:YOUR_TAG               # ← UPDATE THIS
   - name: RELATED_IMAGE_POST_INSTALL_HOOK
-    value: YOUR_REGISTRY/saia-data-loader:YOUR_TAG   # ← UPDATE THIS
+    value: YOUR_REGISTRY/saia-data-loader:YOUR_TAG       # ← UPDATE THIS
   - name: RELATED_IMAGE_FLUENT_BIT
-    value: fluent/fluent-bit:1.9.6                   # ← Public image, usually no change needed
+    value: fluent/fluent-bit:1.9.6                       # ← Public image, usually no change needed
+  - name: RELATED_IMAGE_OTEL_COLLECTOR
+    value: otel/opentelemetry-collector-contrib:0.122.1  # ← Public image, usually no change needed
   - name: MODEL_VERSION
-    value: v0.3.14-36-g1549f5a                       # ← Update to your model version
+    value: v0.3.14-36-g1549f5a                           # ← Update to your model version
   - name: RAY_VERSION
-    value: 2.44.0                                    # ← Ray version (usually no change needed)
-image: YOUR_REGISTRY/splunk-ai-operator:YOUR_TAG     # ← UPDATE THIS (operator image itself)
+    value: 2.44.0                                        # ← Ray version (usually no change needed)
+image: YOUR_REGISTRY/splunk-ai-operator:YOUR_TAG         # ← UPDATE THIS (operator image itself)
 ```
 
 **Example with your own ECR registry:**
@@ -291,6 +293,8 @@ env:
     value: 123456789012.dkr.ecr.us-west-2.amazonaws.com/my-ai-platform/saia-data-loader:v1.1.0
   - name: RELATED_IMAGE_FLUENT_BIT
     value: fluent/fluent-bit:1.9.6  # Public image
+  - name: RELATED_IMAGE_OTEL_COLLECTOR
+    value: otel/opentelemetry-collector-contrib:0.122.1  # Public image
   - name: MODEL_VERSION
     value: v0.3.14-36-g1549f5a
   - name: RAY_VERSION

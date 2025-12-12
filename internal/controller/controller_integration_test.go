@@ -57,6 +57,7 @@ var _ = Describe("AIPlatform Reconcile Error Handling", func() {
 		os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
 		os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
 		os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
+		os.Setenv("RELATED_IMAGE_OTEL_COLLECTOR", "otel/opentelemetry-collector-contrib:latest")
 		os.Setenv("INSTANCE_FILE", "../../config/configs/instance.yaml")
 		os.Setenv("APPLICATION_FILE", "../../config/configs/applications.yaml")
 
@@ -290,6 +291,7 @@ var _ = Describe("AIService Reconcile with Feature Handler", func() {
 		os.Setenv("RELATED_IMAGE_POST_INSTALL_HOOK", "test-post-install:latest")
 		os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
 		os.Setenv("RELATED_IMAGE_SAIA_API", "saia-api:latest")
+		os.Setenv("RELATED_IMAGE_OTEL_COLLECTOR", "otel/opentelemetry-collector-contrib:latest")
 
 		s := scheme.Scheme
 		_ = aiv1.AddToScheme(s)
