@@ -1304,6 +1304,181 @@ install_splunk_ai_operator() {
   log "Splunk AI Operator ready (ns=${ai_operator_ns}, deploy=${dep:-unknown})"
 }
 
+# ====== CONFIGURE AI OPERATOR CONFIGS ======
+# Configure AI Operator with instance.yaml and features ConfigMap
+# This is required for the operator to create Ray worker groups
+configure_ai_operator_configs() {
+  log "Creating AI Operator config ConfigMap with instance.yaml and features..."
+  
+  local ai_operator_ns="splunk-ai-operator-system"
+  
+  # Create ConfigMap with instance.yaml and features/saia.yaml
+  kubectl apply -f - <<'CONFIGMAP_EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-operator-configs
+  namespace: splunk-ai-operator-system
+data:
+  instance.yaml: |
+    L40S:
+      - tier: l40s-0-gpu
+        gpusPerPod: 0
+        env:
+          NVIDIA_VISIBLE_DEVICES: void
+        resources:
+          limits:
+            cpu: "16"
+            memory: "32Gi"
+            ephemeral-storage: "10Gi"
+            nvidia.com/gpu: "0"
+          requests:
+            cpu: "4"
+      - tier: l40s-1-gpu
+        gpusPerPod: 1
+        resources:
+          requests:
+            cpu: "4"
+          limits:
+            cpu: "16"
+            memory: "16Gi"
+            ephemeral-storage: "50Gi"
+            nvidia.com/gpu: "1"
+      - tier: l40s-2-gpu
+        gpusPerPod: 2
+        resources:
+          requests:
+            cpu: "1"
+          limits:
+            cpu: "2"
+            memory: "48Gi"
+            ephemeral-storage: "100Gi"
+            nvidia.com/gpu: "2"
+    H100_NVL:
+      - tier: h100-nvl-0-gpu
+        gpusPerPod: 0
+        resources:
+          limits:
+            cpu: "16"
+            memory: "32Gi"
+            ephemeral-storage: "10Gi"
+            nvidia.com/gpu: "0"
+          requests:
+            cpu: "4"
+      - tier: h100-nvl-1-gpu
+        gpusPerPod: 1
+        resources:
+          requests:
+            cpu: "4"
+          limits:
+            cpu: "16"
+            memory: "48Gi"
+            ephemeral-storage: "100Gi"
+            nvidia.com/gpu: "1"
+    H100:
+      - tier: h100-0-gpu
+        gpusPerPod: 0
+        resources:
+          limits:
+            cpu: "16"
+            memory: "32Gi"
+            ephemeral-storage: "10Gi"
+            nvidia.com/gpu: "0"
+          requests:
+            cpu: "4"
+      - tier: h100-1-gpu
+        gpusPerPod: 1
+        resources:
+          requests:
+            cpu: "4"
+          limits:
+            cpu: "16"
+            memory: "48Gi"
+            ephemeral-storage: "100Gi"
+            nvidia.com/gpu: "1"
+  saia.yaml: |
+    applicationScale:
+      AllMinilmL6V2: 1
+      BiEncoder: 1
+      CrossEncoder: 1
+      E5LanguageClassifier: 1
+      Entrypoint: 1
+      Llama31Instruct: 1
+      Llama3170bInstructAwq: 1
+      MbartTranslator: 1
+      PromptInjectionClassifier: 1
+      PromptInjectionCrossEncoder: 1
+      PromptInjectionTfidf: 1
+      UaeLarge: 1
+      XlmRobertaLanguageClassifier: 1
+    instanceScale:
+      L40S:
+        l40s-0-gpu: 1
+        l40s-1-gpu: 2
+        l40s-2-gpu: 1
+      H100_NVL:
+        h100-nvl-0-gpu: 1
+        h100-nvl-1-gpu: 2
+      H100:
+        h100-0-gpu: 1
+        h100-1-gpu: 2
+CONFIGMAP_EOF
+
+  log "Patching AI Operator deployment to mount config files..."
+  
+  # Get the deployment name
+  local dep
+  dep="$(kubectl -n "${ai_operator_ns}" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -m1 -E 'splunk-ai-operator|ai-operator')"
+  
+  if [[ -z "$dep" ]]; then
+    warn "Could not find AI Operator deployment to patch; skipping config mount"
+    return 0
+  fi
+
+  # Check if volume already exists
+  if kubectl get deployment "${dep}" -n "${ai_operator_ns}" -o jsonpath='{.spec.template.spec.volumes[*].name}' | grep -q "ai-configs"; then
+    log "ConfigMap volume already mounted in ${dep}"
+    return 0
+  fi
+
+  # Patch the deployment to add the ConfigMap volume and mounts
+  # IMPORTANT: Mount to / (root) because Dockerfile sets WORKDIR / and ENV INSTANCE_FILE=/instance.yaml
+  kubectl patch deployment "${dep}" -n "${ai_operator_ns}" --type='json' -p='[
+    {
+      "op": "add",
+      "path": "/spec/template/spec/volumes/-",
+      "value": {
+        "name": "ai-configs",
+        "configMap": {
+          "name": "ai-operator-configs"
+        }
+      }
+    },
+    {
+      "op": "add",
+      "path": "/spec/template/spec/containers/0/volumeMounts/-",
+      "value": {
+        "name": "ai-configs",
+        "mountPath": "/instance.yaml",
+        "subPath": "instance.yaml"
+      }
+    },
+    {
+      "op": "add",
+      "path": "/spec/template/spec/containers/0/volumeMounts/-",
+      "value": {
+        "name": "ai-configs",
+        "mountPath": "/features/saia.yaml",
+        "subPath": "saia.yaml"
+      }
+    }
+  ]'
+
+  # Wait for the patched deployment to roll out
+  wait_rollout "${ai_operator_ns}" deploy "${dep}"
+  log "AI Operator configured with instance.yaml and features (ns=${ai_operator_ns}, deploy=${dep})"
+}
+
 # ====== CREATE MINIO SECRET FOR AI PLATFORM ======
 create_minio_secret() {
   local ns="$1"
@@ -1833,6 +2008,9 @@ install_ai_platform_stack() {
 
   # Install AI Platform operator
   install_splunk_ai_operator
+
+  # Configure AI Operator with instance.yaml and features ConfigMap
+  configure_ai_operator_configs
 
   # Create image pull secrets from configuration
   create_image_pull_secrets "${AI_NS}"

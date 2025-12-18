@@ -14,7 +14,7 @@
 # ---------- Cluster Configuration ----------
 cluster:
   useExisting: false
-  name: "my-ai-cluster"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  name: "ai-tier-sok-test-in"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
   region: "us-west-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
 
@@ -48,16 +48,20 @@ nodeGroups:
 
   gpu:
     enabled: true                         # Set to false to skip GPU nodes (saves cost)
-    instanceType: "g6e.12xlarge"          # GPU instance type (g6e.12xlarge=4xL40S GPUs, g5.xlarge=1xA10G)
+    instanceType: "p5.4xlarge"            # GPU instance type (p5.4xlarge=H100 with capacity reservation)
     desiredCapacity: 2                    # Initial number of GPU nodes
     minSize: 2                            # Minimum GPU nodes
-    maxSize: 4                            # Maximum GPU nodes
+    maxSize: 2                            # Maximum GPU nodes (match capacity reservation)
     volumeSize: 1000                      # EBS volume size per GPU node (GB) - larger for model storage
     volumeType: "gp3"                     # EBS volume type
+    # Capacity Reservation settings (for scarce GPU types like P5/H100)
+    capacityReservation:
+      id: "cr-0a66f47311422041c"          # Capacity reservation ID
+      az: "us-west-2c"                    # AZ where capacity reservation exists
 
 # ---------- Storage Configuration ----------
 storage:
-  s3Bucket: "my-company-ai-platform-bucket"  # CHANGE THIS: Globally unique S3 bucket name
+  s3Bucket: "ai-platform-bucket-us-west-2"  # CHANGE THIS: Globally unique S3 bucket name
   storageClass: "gp3"                        # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
 
@@ -82,7 +86,7 @@ images:
   #
   # REQUIRED: Specify your private registry URL for custom images
   # Leave empty to use Docker Hub defaults for all images
-  registry: "1234567890.dkr.ecr.us-west-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
   # ==================================================================================
   # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
@@ -105,7 +109,7 @@ images:
     # Default behavior: If no registry in path, uses Docker Hub
     #   "splunk/splunk:10.2.0" → Docker Hub
     #   "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0" → ECR
-    image: "splunk/splunk:10-2-ai-custom"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
 
     # Splunk Operator image (optional - has default)
     # Default: "docker.io/splunk/splunk-operator:3.0.0"
@@ -120,8 +124,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "ml-platform/ray/ray-head:build-17"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-17"
+    headImage: "ml-platform/ray/ray-head:build-v1alpha1"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-v1alpha1"
 
   # Weaviate Vector Database
   weaviate:
@@ -133,8 +137,8 @@ images:
   # SAIA (Splunk AI Assistant) Images
   saia:
     # Relative paths - registry prefix auto-applied
-    apiImage: "ml-platform/saia/saia-api:build-1"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-1"
+    apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
 
   # Supporting Images
   fluentBit:
@@ -168,7 +172,7 @@ aiPlatform:
     saiaService: "saia-service-sa" # no change
 
   # Default accelerator type
-  defaultAcceleratorType: "L40S" 
+  defaultAcceleratorType: "H100" 
 
   # Features to enable
   features: # no change

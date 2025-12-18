@@ -20,3 +20,6 @@ instanceScale:
   H100_NVL:
     h100-nvl-0-gpu: 1
     h100-nvl-1-gpu: 2
+  H100:
+    h100-0-gpu: 1
+    h100-1-gpu: 2

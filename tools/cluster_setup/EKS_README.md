@@ -9,6 +9,7 @@ Complete guide for deploying Splunk AI Platform on AWS Elastic Kubernetes Servic
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+  - [Using H100 GPUs (Advanced)](#using-h100-gpus-advanced)
 - [Usage](#usage)
 - [Architecture](#architecture)
 - [Image Pull Secrets](#image-pull-secrets)
@@ -632,9 +633,14 @@ nodeGroups:
 
   gpu:
     enabled: true                  # ← Set false to skip GPU nodes
-    instanceType: "g6e.12xlarge"   # ← Change for different GPU type
+    instanceType: "g6e.12xlarge"   # ← Default: L40S GPUs (recommended)
     desiredCapacity: 2             # ← Adjust number of GPU nodes
+
+aiPlatform:
+  defaultAcceleratorType: "L40S"   # ← Default GPU type (L40S recommended)
 ```
+
+> **💡 Using H100 GPUs?** If you need H100 GPUs instead of the default L40S, see [Using H100 GPUs (Advanced)](#using-h100-gpus-advanced). H100 requires an AWS Capacity Block reservation and uses `p5.48xlarge` instances.
 
 ### 7. Deploy the Cluster
 
@@ -950,7 +956,7 @@ aiPlatform:
     tlsSecretName: "ai-platform-tls"
 ```
 
-#### Example 3: GPU-Heavy Workload
+#### Example 3: GPU-Heavy Workload (L40S - Default)
 
 ```yaml
 # gpu-heavy-config.yaml - For AI training/inference intensive workloads
@@ -973,7 +979,7 @@ nodeGroups:
 
   gpu:
     enabled: true
-    instanceType: "g5.12xlarge"      # 4x A10G GPUs, 48 vCPU, 192GB RAM
+    instanceType: "g6e.12xlarge"     # 4x L40S GPUs, 48 vCPU, 192GB RAM
     desiredCapacity: 4               # More GPU nodes
     minSize: 2
     maxSize: 10
@@ -994,8 +1000,61 @@ operators:
 aiPlatform:
   namespace: "ai-platform"
   name: "splunk-ai-stack"
-  defaultAcceleratorType: "L40S"
+  defaultAcceleratorType: "L40S"     # Default GPU type
 ```
+
+#### Example 4: H100 GPU Cluster (Requires Capacity Block)
+
+```yaml
+# h100-config.yaml - For maximum AI performance with H100 GPUs
+# ⚠️ Requires AWS Capacity Block reservation before deployment
+
+cluster:
+  name: "h100-ai-cluster"
+  region: "us-west-2"                # Must match Capacity Block region
+  k8sVersion: "1.31"
+
+nodeGroups:
+  cpu:
+    enabled: true
+    instanceType: "m5.4xlarge"
+    desiredCapacity: 4
+    minSize: 2
+    maxSize: 8
+    volumeSize: 500
+    volumeType: "gp3"
+
+  gpu:
+    enabled: true
+    instanceType: "p5.48xlarge"      # 8x H100 GPUs, 192 vCPU, 2TB RAM
+    desiredCapacity: 1               # Match your Capacity Block quantity
+    minSize: 1
+    maxSize: 1                       # Match your Capacity Block quantity
+    volumeSize: 2000                 # Large volumes for LLM models
+    volumeType: "gp3"
+    # ⚠️ REQUIRED for P5/H100 instances
+    capacityReservation:
+      id: "cr-XXXXXXXXXXXX"          # ← Replace with your Capacity Block ID
+      az: "us-west-2c"               # ← AZ where your Capacity Block is located
+
+storage:
+  s3Bucket: "h100-ai-platform-data"
+  storageClass: "gp3"
+  vectorDbSize: "200Gi"
+
+operators:
+  splunk:
+    image: "splunk/splunk:10.2.0-dev1"
+  ray:
+    version: "v1.2.2"
+
+aiPlatform:
+  namespace: "ai-platform"
+  name: "splunk-ai-stack"
+  defaultAcceleratorType: "H100"     # ← Use H100 GPU type
+```
+
+> **📋 Before deploying H100:** You must have an active AWS Capacity Block reservation. See [Using H100 GPUs (Advanced)](#using-h100-gpus-advanced) for details on purchasing Capacity Blocks.
 
 ### Instance Type Selection Guide
 
@@ -1015,13 +1074,170 @@ aiPlatform:
 | Instance Type | GPUs | GPU Memory | vCPU | Memory | Use Case | Approx Cost/hr |
 |---------------|------|------------|------|--------|----------|----------------|
 | g5.xlarge | 1x A10G | 24 GB | 4 | 16 GB | Dev/Small Models | $1.01 |
-| g5.2xlarge | 1x A10G | 24 GB | 8 | 32 GB | **Recommended** | $1.21 |
+| g5.2xlarge | 1x A10G | 24 GB | 8 | 32 GB | Small Models | $1.21 |
 | g5.4xlarge | 1x A10G | 24 GB | 16 | 64 GB | Large Single-GPU | $1.62 |
 | g5.12xlarge | 4x A10G | 96 GB | 48 | 192 GB | Multi-GPU Training | $5.67 |
+| g6e.12xlarge | 4x L40S | 192 GB | 48 | 192 GB | **Default - Recommended** | $7.68 |
 | p3.2xlarge | 1x V100 | 16 GB | 8 | 61 GB | ML Training | $3.06 |
 | p4d.24xlarge | 8x A100 | 320 GB | 96 | 1152 GB | Large-Scale Training | $32.77 |
+| p5.48xlarge | 8x H100 | 640 GB | 192 | 2048 GB | H100 - Requires Capacity Block | $98.32 |
 
 **Note:** Prices are approximate for US East/West regions and may vary. Check [AWS Pricing](https://aws.amazon.com/ec2/pricing/on-demand/) for current rates.
+
+### Using H100 GPUs (Advanced)
+
+By default, the platform uses **L40S GPUs** (`g6e.12xlarge` instances) which are widely available and offer excellent price/performance for most AI workloads. However, if you need **H100 GPUs** for maximum performance, follow this guide.
+
+#### Why H100?
+
+| Feature | L40S (Default) | H100 |
+|---------|----------------|------|
+| GPU Memory | 48 GB GDDR6 | 80 GB HBM3 |
+| Memory Bandwidth | 864 GB/s | 3.35 TB/s |
+| FP16 Performance | 181 TFLOPS | 1,979 TFLOPS |
+| Best For | Most inference & fine-tuning | Large model training, highest throughput |
+| Availability | Generally available | **Requires Capacity Block reservation** |
+| Cost | ~$1.92/hr per GPU | ~$12.29/hr per GPU |
+
+#### H100 Configuration Steps
+
+**⚠️ Important:** H100 instances (P5 family) are scarce and require an **AWS Capacity Block reservation**. You must purchase a Capacity Block before configuring H100.
+
+##### Step 1: Purchase a Capacity Block Reservation
+
+```bash
+# Check Capacity Block availability
+aws ec2 describe-capacity-block-offerings \
+  --instance-type p5.48xlarge \
+  --instance-count 1 \
+  --capacity-duration-hours 24 \
+  --region us-west-2
+
+# Purchase a Capacity Block (review pricing carefully!)
+# This requires a purchase - see AWS documentation
+# https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-blocks.html
+```
+
+##### Step 2: Update cluster-config.yaml for H100
+
+```yaml
+# cluster-config.yaml - H100 Configuration
+
+cluster:
+  name: "my-h100-cluster"
+  region: "us-west-2"           # Must match Capacity Block region
+  k8sVersion: "1.31"
+
+nodeGroups:
+  cpu:
+    enabled: true
+    instanceType: "m5.4xlarge"
+    desiredCapacity: 4
+    minSize: 2
+    maxSize: 8
+    volumeSize: 500
+    volumeType: "gp3"
+
+  gpu:
+    enabled: true
+    instanceType: "p5.48xlarge"           # ← H100 instance type
+    desiredCapacity: 1                    # ← Match Capacity Block quantity
+    minSize: 1
+    maxSize: 1                            # ← Match Capacity Block quantity
+    volumeSize: 2000                      # ← H100 needs larger storage for models
+    volumeType: "gp3"
+    # Capacity Block settings (REQUIRED for P5/H100)
+    capacityReservation:
+      id: "cr-0a66f47311422041c"          # ← Your Capacity Block ID
+      az: "us-west-2c"                    # ← AZ where Capacity Block exists
+
+aiPlatform:
+  namespace: "ai-platform"
+  name: "splunk-ai-stack"
+  defaultAcceleratorType: "H100"          # ← Change from "L40S" to "H100"
+  # ... rest of config
+```
+
+##### Step 3: Deploy the Cluster
+
+```bash
+CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
+```
+
+The script automatically:
+1. Detects the Capacity Block configuration
+2. Creates a Launch Template with `MarketType: capacity-block`
+3. Creates an EKS Managed Node Group with `CapacityType: CAPACITY_BLOCK`
+4. Configures nodes in the correct Availability Zone
+
+#### H100 Instance Types
+
+| Instance Type | GPUs | GPU Memory | vCPU | Memory | Notes |
+|---------------|------|------------|------|--------|-------|
+| p5.48xlarge | 8x H100 | 640 GB | 192 | 2048 GB | Full node, 8 GPUs |
+
+**Note:** P5 instances only come in `p5.48xlarge` size with 8 GPUs. For smaller workloads, consider using L40S instances instead.
+
+#### H100 vs L40S Decision Guide
+
+**Use L40S (Default)** if:
+- ✅ You want generally available GPU capacity
+- ✅ Your models fit in 48GB GPU memory
+- ✅ You need cost-effective inference
+- ✅ You want simpler deployment (no Capacity Block needed)
+
+**Use H100** if:
+- ✅ You need maximum training throughput
+- ✅ Your models require >48GB GPU memory
+- ✅ You're running distributed training across multiple GPUs
+- ✅ You've secured a Capacity Block reservation
+- ✅ You need the highest memory bandwidth (3.35 TB/s)
+
+#### Troubleshooting H100 Deployment
+
+**Error: "InsufficientInstanceCapacity"**
+```
+Could not launch On-Demand Instances. InsufficientInstanceCapacity - 
+We currently do not have sufficient p5.48xlarge capacity...
+```
+
+**Solution:** H100/P5 instances require a Capacity Block reservation. On-demand P5 capacity is extremely limited.
+
+**Error: "The market type (purchasing) option is not valid"**
+```
+InvalidRequestException: The market type (purchasing) option is not valid
+```
+
+**Solution:** Ensure your `cluster-config.yaml` has the `capacityReservation` section configured with a valid Capacity Block ID.
+
+**Error: "Launch template should not specify an instance profile"**
+```
+InvalidParameterException: Launch template should not specify an instance profile
+```
+
+**Solution:** This is handled automatically by the script. If you see this error, ensure you're using the latest version of `eks_cluster_with_stack.sh`.
+
+#### Reverting to L40S
+
+To switch back to L40S (default):
+
+```yaml
+# cluster-config.yaml - Revert to L40S
+
+nodeGroups:
+  gpu:
+    enabled: true
+    instanceType: "g6e.12xlarge"          # ← L40S instance
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 4
+    volumeSize: 1000
+    volumeType: "gp3"
+    # Remove or comment out capacityReservation section
+
+aiPlatform:
+  defaultAcceleratorType: "L40S"          # ← Change back to L40S
+```
 
 ---
 
