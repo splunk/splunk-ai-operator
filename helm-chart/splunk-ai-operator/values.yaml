@@ -44,6 +44,9 @@ weaviateImage: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 saiaApiImage: "docker.io/splunk/saia-api:1.1.0"
 saiaSchemaImage: "docker.io/splunk/saia-data-loader:1.1.0"
 
+# OpenTelemetry Collector sidecar image
+otelCollectorImage: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
 # Set security context for Splunk Operator pod
 # reference: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.24/#podsecuritycontext-v1-core
 securityContext:

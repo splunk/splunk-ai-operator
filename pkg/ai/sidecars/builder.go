@@ -90,6 +90,16 @@ func (s *Builder) createOrUpdateConfigMap(
 	return nil
 }
 
+func ResolveImage(key, defaultValue string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	if defaultValue == "" {
+		defaultValue = "otel/opentelemetry-collector-contrib:0.122.1"
+	}
+	return defaultValue
+}
+
 // reconcileEnvoyConfig ensures the Envoy sidecar ConfigMap exists and is up-to-date
 func (s *Builder) reconcileEnvoyConfig(ctx context.Context, p *aiApi.AIPlatform) error {
 	if !p.Spec.Sidecars.Envoy {
@@ -138,7 +148,7 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 	// construct spec
 	specMap := map[string]interface{}{
 		"mode":  "sidecar",
-		"image": "otel/opentelemetry-collector-contrib:0.122.1",
+		"image": ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", s.ai.Spec.Images.OTelImage),
 		"env": []map[string]interface{}{
 			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
 			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},

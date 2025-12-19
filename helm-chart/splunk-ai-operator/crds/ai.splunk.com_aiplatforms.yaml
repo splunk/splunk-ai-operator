@@ -2077,6 +2077,11 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                     type: array
+                  otelImage:
+                    default: otel/opentelemetry-collector-contrib:0.122.1
+                    description: OTelImage is the OpenTelemetry Collector sidecar
+                      image
+                    type: string
                   rayHeadGroupImage:
                     description: Ray head group image, e.g. "rayproject/ray-head:latest"
                     type: string

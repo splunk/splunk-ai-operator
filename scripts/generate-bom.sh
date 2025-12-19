@@ -41,6 +41,7 @@ declare -A IMAGES=(
     ["saia-api"]="${RELATED_IMAGE_SAIA_API:-unknown}"
     ["post-install-hook"]="${RELATED_IMAGE_POST_INSTALL_HOOK:-unknown}"
     ["fluent-bit"]="${RELATED_IMAGE_FLUENT_BIT:-fluent/fluent-bit:1.9.6}"
+    ["otel-collector"]="${RELATED_IMAGE_OTEL_COLLECTOR:-otel/opentelemetry-collector-contrib:0.122.1}"
 )
 
 # Additional metadata

@@ -91,6 +91,7 @@ load_config() {
     SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$cfg")"
     SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$cfg")"
     FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$cfg")"
+    OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$cfg")"
 
     # Subnets - read as arrays (Bash 3.2 compatible)
     PRIVATE_SUBNETS=()
@@ -243,6 +244,11 @@ validate_image_config() {
     log "Using default Fluent Bit image: $FLUENT_BIT_IMAGE"
   fi
 
+  if [[ -z "$OTEL_COLLECTOR_IMAGE" || "$OTEL_COLLECTOR_IMAGE" == "null" ]]; then
+    OTEL_COLLECTOR_IMAGE="otel/opentelemetry-collector-contrib:0.122.1"
+    log "Using default OpenTelemetry Collector image: $OTEL_COLLECTOR_IMAGE"
+  fi
+
   if [[ -z "$MODEL_VERSION" || "$MODEL_VERSION" == "null" ]]; then
     MODEL_VERSION="v0.3.14-36-g1549f5a"
     log "Using default Model version: $MODEL_VERSION"
@@ -335,6 +341,7 @@ configure_images() {
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
+  local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
 
   # Escape special characters for sed
   local ray_head_escaped=$(echo "$ray_head_full" | sed 's/[\/&]/\\&/g')
@@ -343,6 +350,7 @@ configure_images() {
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
+  local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
   local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
 
   SEDOPTION="-i"
@@ -357,6 +365,7 @@ configure_images() {
   sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
 
@@ -370,6 +379,7 @@ configure_images() {
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
+  log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
   log "  ✓ Updated operator image: $operator_full"
   log "  ✓ Updated MODEL_VERSION: $MODEL_VERSION"
   log "  ✓ Updated RAY_VERSION: $RAY_RUNTIME_VERSION"
@@ -487,6 +497,7 @@ validate_images_exist() {
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
+  local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
 
   images_to_check=(
     "$operator_full"
@@ -498,6 +509,7 @@ validate_images_exist() {
     "$saia_api_full"
     "$saia_dataloader_full"
     "$fluent_bit_full"
+    "$otel_collector_full"
   )
 
   # Check each image

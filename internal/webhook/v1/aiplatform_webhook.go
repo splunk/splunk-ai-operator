@@ -99,6 +99,11 @@ func (d *AIPlatformCustomDefaulter) Default(_ context.Context, obj runtime.Objec
 		aiplatform.Spec.MTLS.Termination = "operator"
 	}
 
+	// Default OTelImage if not specified
+	if aiplatform.Spec.Images.OTelImage == "" {
+		aiplatform.Spec.Images.OTelImage = "otel/opentelemetry-collector-contrib:0.122.1"
+	}
+
 	aiplatformlog.Info("Defaulting complete for AIPlatform", "name", aiplatform.GetName())
 	return nil
 }
