@@ -1,0 +1,62 @@
+# KUTTL Test values for splunk-ai-platform Helm chart
+# This file provides configuration for running KUTTL integration tests
+
+# Global configuration
+global:
+  imageRegistry: ""  # Use default registry
+
+# Splunk AI Operator configuration
+splunk-ai-operator:
+  enabled: true  # Install the operator
+
+# Splunk Operator configuration
+splunk-operator:
+  enabled: true  # Install splunk operator for Standalone support
+  acceptGeneralTerms: true
+  splunkOperator:
+    splunkGeneralTerms: "--accept-sgt-current-at-splunk-com"
+
+# Cert Manager
+cert-manager:
+  enabled: true
+  installCRDs: true
+
+# KubeRay Operator
+kuberay-operator:
+  enabled: true
+
+# OpenTelemetry Operator (disabled for basic tests)
+opentelemetry-operator:
+  enabled: false
+
+# Prometheus (disabled for basic tests)
+kube-prometheus-stack:
+  enabled: false
+
+# DO NOT create AIPlatform CR from Helm chart
+# The KUTTL tests will create it manually
+createAIPlatform: false
+
+# Test configuration values (used when createAIPlatform: true)
+# These are NOT used since we're setting createAIPlatform: false
+objectStorage:
+  path: "s3://test-bucket/artifacts"
+  region: "us-west-2"
+
+defaultAcceleratorType: "L40S"
+serviceAccountName: "default"
+
+splunkConfiguration:
+  endpoint: "http://test-splunk-standalone-headless:8088"
+  secretRef:
+    name: "test-splunk-standalone-secret-v1"
+
+sidecars:
+  envoy: false
+  otel: false
+  prometheusOperator: false
+
+storage:
+  vectorDB:
+    size: "10Gi"
+    storageClassName: "gp2"

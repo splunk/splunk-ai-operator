@@ -38,10 +38,25 @@ splunk-operator:
   image:
     repository: docker.io/splunk/splunk-operator
     tag: 3.0.0
-  # Environment variables for splunk-operator
-  env:
-    - name: SPLUNK_GENERAL_TERMS
-      value: "--accept-sgt-current-at-splunk-com"
+
+  # IMPORTANT: You MUST accept Splunk General Terms to use Splunk Operator
+  # Review terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.html
+  #
+  # To accept, set this value to true:
+  #   --set splunk-operator.acceptGeneralTerms=true
+  #
+  # Or in your values.yaml:
+  #   splunk-operator:
+  #     acceptGeneralTerms: true
+  #
+  acceptGeneralTerms: false  # Must be explicitly set to true by user
+
+  # Splunk-operator specific configuration
+  splunkOperator:
+    # SPLUNK_GENERAL_TERMS environment variable
+    # When acceptGeneralTerms=true, this will be automatically set to "--accept-sgt-current-at-splunk-com"
+    # Leave empty by default to force user to explicitly accept terms
+    splunkGeneralTerms: ""
 
 # ============================================================================
 # Splunk AI Operator Configuration

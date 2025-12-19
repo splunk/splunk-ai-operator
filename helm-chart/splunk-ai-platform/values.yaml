@@ -7,11 +7,19 @@
 # Operator Installation
 # ============================================================================
 # The Splunk AI Operator and all its dependencies (cert-manager, kuberay,
-# opentelemetry, prometheus, splunk-operator) are installed automatically.
-# Set to false if the operator is already installed in your cluster.
+# opentelemetry, prometheus, splunk-operator) should be installed separately.
+#
+# RECOMMENDED INSTALLATION (Two-step):
+#   Step 1: helm install splunk-ai-operator ./splunk-ai-operator --namespace splunk-ai-operator-system --create-namespace
+#   Step 2: helm install my-platform ./splunk-ai-platform --namespace my-namespace -f my-values.yaml
+#
+# For single-command installation (not recommended for production), set enabled=true:
+#   helm install my-platform ./splunk-ai-platform --set splunk-ai-operator.enabled=true
 
 splunk-ai-operator:
-  enabled: true
+  # Set to true ONLY if you want to install the operator as part of this release
+  # This can cause CRD ownership conflicts if you install multiple platform instances
+  enabled: false
 
   # You can override dependency settings here if needed
   # For example, to disable specific operators:

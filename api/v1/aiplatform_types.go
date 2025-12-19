@@ -135,6 +135,9 @@ type Images struct {
 	// Ray worker group image, e.g. "rayproject/ray-worker:latest"
 	// +kubebuilder:validation:Optional
 	RayWorkerGroupImage string `json:"rayWorkerGroupImage,omitempty"`
+	// OpenTelemetry Collector image for observability sidecars, e.g. "otel/opentelemetry-collector-contrib:0.122.1"
+	// +kubebuilder:validation:Optional
+	OTelImage string `json:"otelImage,omitempty"`
 	// ImagePullSecrets is a list of secret names for pulling container images from private registries
 	// If specified, these secrets will be added to ALL pods created by the operator
 	// (Ray head, Ray workers, Weaviate, SAIA, jobs, etc.)
