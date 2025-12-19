@@ -1,6 +1,0 @@
----
-apiVersion: kuttl.dev/v1beta1
-kind: TestStep
-commands:
-  - command: helm install splunk-ai-operator ${HELM_REPO_PATH}/splunk-ai-operator --set image.repository=${KUTTL_SPLUNK_AI_OPERATOR_IMAGE} --set installCRDs="true"
-    namespaced: true
