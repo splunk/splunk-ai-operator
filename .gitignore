@@ -29,3 +29,8 @@ Dockerfile.cross
 # Skaffold local configuration
 skaffold.env.local
 .skaffold/
+
+# Helm build artifacts
+*.tgz
+helm-chart/**/charts/
+!helm-chart/**/charts/.gitkeep

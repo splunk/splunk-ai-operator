@@ -1,0 +1,6 @@
+dependencies:
+- name: splunk-ai-operator
+  repository: file://../splunk-ai-operator
+  version: 0.1.0
+digest: sha256:660852891fc2693999711524e511e7d5a4eda969bcfab16a1b72ef926cec81df
+generated: "2025-12-19T11:04:40.10824-08:00"
