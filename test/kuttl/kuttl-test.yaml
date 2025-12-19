@@ -41,6 +41,8 @@ startControlPlane: false
 controlPlaneArgs:
   - --service-cluster-ip-range=10.96.0.0/12
 # Apply CRDs before tests
+# NOTE: Path is relative to the directory where kuttl is executed (test/kuttl/)
+# This points to: test/kuttl/../../helm-chart/splunk-ai-operator/crds
 crdDir: ../../helm-chart/splunk-ai-operator/crds
 # Manifest directories to apply before tests
 manifestDirs:

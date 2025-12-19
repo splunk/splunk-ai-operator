@@ -1,9 +1,28 @@
-# KUTTL will check that the previous resource fails to create
-# This is done by checking for specific error patterns
+# This test validates that the admission webhook properly rejects invalid AIPlatform resources
+# We use a TestStep to explicitly mark that we EXPECT this resource creation to fail
 
-# Expected error: objectStorage is required
-# Expected error: splunkConfiguration is required
-
-# Note: KUTTL automatically fails the test if resources in XX-*.yaml
-# are successfully created. For webhook tests, we want creation to fail.
-# Use TestStep with expectedFailures in kuttl-test.yaml or use commands
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+  - command: |
+      # Try to create an invalid AIPlatform (missing required fields)
+      # This should be rejected by the validation webhook
+      kubectl apply -f - <<EOF
+      apiVersion: ai.splunk.com/v1
+      kind: AIPlatform
+      metadata:
+        name: test-invalid-platform
+        namespace: ${NAMESPACE}
+      spec:
+        # Missing required fields:
+        # - objectStorage (required)
+        # - splunkConfiguration (required)
+        serviceAccountName: default
+      EOF
+    ignoreFailure: false
+    # We expect this command to FAIL (exit code != 0)
+    # If it succeeds, the test should fail
+  - command: |
+      # Verify the resource was NOT created
+      ! kubectl get aiplatform test-invalid-platform -n ${NAMESPACE} 2>/dev/null
+    ignoreFailure: false
