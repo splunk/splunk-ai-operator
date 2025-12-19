@@ -54,7 +54,8 @@ splunk-operator:
   # Splunk-operator specific configuration
   splunkOperator:
     # SPLUNK_GENERAL_TERMS environment variable
-    # When acceptGeneralTerms=true, this will be automatically set to "--accept-sgt-current-at-splunk-com"
+    # This value must be obtained from the Splunk Operator README:
+    # https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance
     # Leave empty by default to force user to explicitly accept terms
     splunkGeneralTerms: ""
 

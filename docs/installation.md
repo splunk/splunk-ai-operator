@@ -27,8 +27,10 @@ helm install splunk-ai-operator \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms=--accept-sgt-current-at-splunk-com
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 **With custom values:**
 ```bash
@@ -38,7 +40,7 @@ cat > my-values.yaml <<EOF
 splunk-operator:
   acceptGeneralTerms: true
   splunkOperator:
-    splunkGeneralTerms: "--accept-sgt-current-at-splunk-com"
+    splunkGeneralTerms: "<required value>"
 
 # Custom operator configuration
 replicaCount: 2
@@ -58,6 +60,8 @@ helm install splunk-ai-operator \
   --create-namespace \
   --values my-values.yaml
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 **View available versions:**
 ```bash
@@ -98,8 +102,10 @@ helm install splunk-ai-operator \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms=--accept-sgt-current-at-splunk-com
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ---
 
@@ -142,8 +148,10 @@ helm install splunk-ai-operator \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms=--accept-sgt-current-at-splunk-com
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ### Namespace-Scoped
 
@@ -157,9 +165,11 @@ helm install splunk-ai-operator \
   --namespace my-app-namespace \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms=--accept-sgt-current-at-splunk-com \
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>" \
   --set watchNamespace=my-app-namespace
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ---
 
