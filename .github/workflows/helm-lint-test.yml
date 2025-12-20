@@ -48,6 +48,8 @@ jobs:
       - name: Lint splunk-ai-operator chart
         run: |
           echo "::group::Linting splunk-ai-operator"
+          # Build dependencies first
+          helm dependency build helm-chart/splunk-ai-operator
           helm lint helm-chart/splunk-ai-operator
           echo "::endgroup::"
 
@@ -62,6 +64,7 @@ jobs:
       - name: Template splunk-ai-operator chart
         run: |
           echo "::group::Templating splunk-ai-operator"
+          # Note: Dependencies already built in lint step above
           helm template test-release helm-chart/splunk-ai-operator \
             --namespace splunk-ai-operator-system \
             --create-namespace \
