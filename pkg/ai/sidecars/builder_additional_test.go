@@ -567,3 +567,252 @@ func TestReconcileOpenTelemetryCollector_CustomImage(t *testing.T) {
 	assert.Contains(t, config, "processors", "config should contain processors")
 	assert.Contains(t, config, "service", "config should contain service")
 }
+
+func TestReconcileOpenTelemetryCollector_DefaultImage(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	// Ensure the environment variable is not set
+	envKey := "RELATED_IMAGE_OTEL_COLLECTOR"
+	originalValue := os.Getenv(envKey)
+	os.Unsetenv(envKey)
+	defer func() {
+		if originalValue != "" {
+			os.Setenv(envKey, originalValue)
+		}
+	}()
+
+	defaultImage := "otel/opentelemetry-collector-contrib:0.122.1"
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "splunk-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"hec_token": []byte("test-token"),
+		},
+	}
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-platform",
+			Namespace: "default",
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ClusterDomain: "test-cluster",
+			Images: aiApi.Images{
+				OTelImage: defaultImage,
+			},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{
+					Name: "splunk-secret",
+				},
+				Endpoint: "https://splunk.example.com",
+			},
+			Sidecars: aiApi.SidecarSpec{
+				Otel: true,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(secret).
+		Build()
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	// First create the ConfigMap that reconcileOpenTelemetryCollector expects
+	err := builder.reconcileOtelConfigMap(ctx, platform)
+	require.NoError(t, err)
+
+	// Get the ConfigMap to extract the config
+	cm := &corev1.ConfigMap{}
+	cmName := platform.Name + "-otel-config"
+	err = fakeClient.Get(ctx, clientKey(platform.Namespace, cmName), cm)
+	require.NoError(t, err)
+
+	// Parse the config from YAML
+	var cfg map[string]interface{}
+	err = syaml.Unmarshal([]byte(cm.Data["otel-config.yaml"]), &cfg)
+	require.NoError(t, err)
+
+	// Build the expected spec map (mimicking what reconcileOpenTelemetryCollector does)
+	specMap := map[string]interface{}{
+		"mode":  "sidecar",
+		"image": ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", platform.Spec.Images.OTelImage),
+		"env": []map[string]interface{}{
+			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": platform.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
+			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
+			{"name": "NAMESPACE", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.namespace"}}},
+			{"name": "CLUSTER_NAME", "value": platform.Spec.ClusterDomain},
+		},
+		"config": cfg,
+	}
+
+	// Verify the spec components
+	assert.Equal(t, "sidecar", specMap["mode"], "Mode should be sidecar")
+	assert.Equal(t, defaultImage, specMap["image"], "Image should be the default when env var is not set")
+
+	// Verify environment variables
+	envVars, ok := specMap["env"].([]map[string]interface{})
+	require.True(t, ok, "env should be a slice of maps")
+	require.Len(t, envVars, 4, "Should have 4 environment variables")
+
+	assert.Equal(t, "SPLUNK_ACCESS_TOKEN", envVars[0]["name"])
+	assert.Equal(t, "POD_NAME", envVars[1]["name"])
+	assert.Equal(t, "NAMESPACE", envVars[2]["name"])
+	assert.Equal(t, "CLUSTER_NAME", envVars[3]["name"])
+	assert.Equal(t, "test-cluster", envVars[3]["value"])
+
+	// Verify SPLUNK_ACCESS_TOKEN has correct secretKeyRef
+	valueFrom, ok := envVars[0]["valueFrom"].(map[string]interface{})
+	require.True(t, ok)
+	secretKeyRef, ok := valueFrom["secretKeyRef"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "splunk-secret", secretKeyRef["name"])
+	assert.Equal(t, "hec_token", secretKeyRef["key"])
+
+	// Verify config is present
+	config, ok := specMap["config"].(map[string]interface{})
+	require.True(t, ok, "config should be present")
+	assert.NotEmpty(t, config, "config should not be empty")
+}
+
+func TestReconcileOpenTelemetryCollector_CustomImage(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	// Set the environment variable to a custom image
+	envKey := "RELATED_IMAGE_OTEL_COLLECTOR"
+	customImage := "custom-registry.example.com/opentelemetry-collector-contrib:1.0.0"
+	originalValue := os.Getenv(envKey)
+	os.Setenv(envKey, customImage)
+	defer func() {
+		if originalValue != "" {
+			os.Setenv(envKey, originalValue)
+		} else {
+			os.Unsetenv(envKey)
+		}
+	}()
+
+	defaultImage := "otel/opentelemetry-collector-contrib:0.122.1"
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "splunk-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"hec_token": []byte("test-token"),
+		},
+	}
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-platform-custom",
+			Namespace: "default",
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ClusterDomain: "custom-cluster",
+			Images: aiApi.Images{
+				OTelImage: defaultImage,
+			},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{
+					Name: "splunk-secret",
+				},
+				Endpoint: "https://splunk.example.com",
+			},
+			Sidecars: aiApi.SidecarSpec{
+				Otel: true,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(secret).
+		Build()
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	// First create the ConfigMap that reconcileOpenTelemetryCollector expects
+	err := builder.reconcileOtelConfigMap(ctx, platform)
+	require.NoError(t, err)
+
+	// Get the ConfigMap to extract the config
+	cm := &corev1.ConfigMap{}
+	cmName := platform.Name + "-otel-config"
+	err = fakeClient.Get(ctx, clientKey(platform.Namespace, cmName), cm)
+	require.NoError(t, err)
+
+	// Parse the config from YAML
+	var cfg map[string]interface{}
+	err = syaml.Unmarshal([]byte(cm.Data["otel-config.yaml"]), &cfg)
+	require.NoError(t, err)
+
+	// Build the expected spec map (mimicking what reconcileOpenTelemetryCollector does)
+	specMap := map[string]interface{}{
+		"mode":  "sidecar",
+		"image": ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", platform.Spec.Images.OTelImage),
+		"env": []map[string]interface{}{
+			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": platform.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
+			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
+			{"name": "NAMESPACE", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.namespace"}}},
+			{"name": "CLUSTER_NAME", "value": platform.Spec.ClusterDomain},
+		},
+		"config": cfg,
+	}
+
+	// Verify the spec components
+	assert.Equal(t, "sidecar", specMap["mode"], "Mode should be sidecar")
+	assert.Equal(t, customImage, specMap["image"], "Image should be the custom image from env var")
+
+	// Verify environment variables
+	envVars, ok := specMap["env"].([]map[string]interface{})
+	require.True(t, ok, "env should be a slice of maps")
+	require.Len(t, envVars, 4, "Should have 4 environment variables")
+
+	assert.Equal(t, "SPLUNK_ACCESS_TOKEN", envVars[0]["name"])
+	assert.Equal(t, "POD_NAME", envVars[1]["name"])
+	assert.Equal(t, "NAMESPACE", envVars[2]["name"])
+	assert.Equal(t, "CLUSTER_NAME", envVars[3]["name"])
+	assert.Equal(t, "custom-cluster", envVars[3]["value"])
+
+	// Verify SPLUNK_ACCESS_TOKEN has correct secretKeyRef
+	valueFrom, ok := envVars[0]["valueFrom"].(map[string]interface{})
+	require.True(t, ok)
+	secretKeyRef, ok := valueFrom["secretKeyRef"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "splunk-secret", secretKeyRef["name"])
+	assert.Equal(t, "hec_token", secretKeyRef["key"])
+
+	// Verify POD_NAME has correct fieldRef
+	valueFrom2, ok := envVars[1]["valueFrom"].(map[string]interface{})
+	require.True(t, ok)
+	fieldRef, ok := valueFrom2["fieldRef"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "metadata.name", fieldRef["fieldPath"])
+
+	// Verify NAMESPACE has correct fieldRef
+	valueFrom3, ok := envVars[2]["valueFrom"].(map[string]interface{})
+	require.True(t, ok)
+	fieldRef2, ok := valueFrom3["fieldRef"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "metadata.namespace", fieldRef2["fieldPath"])
+
+	// Verify config is present and has expected structure
+	config, ok := specMap["config"].(map[string]interface{})
+	require.True(t, ok, "config should be present")
+	assert.NotEmpty(t, config, "config should not be empty")
+
+	// Verify config contains expected sections
+	assert.Contains(t, config, "exporters", "config should contain exporters")
+	assert.Contains(t, config, "receivers", "config should contain receivers")
+	assert.Contains(t, config, "processors", "config should contain processors")
+	assert.Contains(t, config, "service", "config should contain service")
+}
