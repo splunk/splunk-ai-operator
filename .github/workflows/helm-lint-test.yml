@@ -182,7 +182,7 @@ jobs:
           echo "::group::Testing splunk-ai-operator installation (dry-run)"
           # Use dry-run to test chart installation without pulling images
           # This validates the Helm chart structure and Kubernetes manifests
-          # Disable optional dependencies to avoid CRD validation issues
+          # Disable all dependencies to avoid CRD validation issues in test cluster
           helm install test-operator helm-chart/splunk-ai-operator \
             --namespace splunk-ai-operator-system \
             --create-namespace \
@@ -190,6 +190,8 @@ jobs:
             --debug \
             --set image.repository=ghcr.io/splunk/splunk-ai-operator \
             --set image.tag=0.1.0 \
+            --set cert-manager.enabled=false \
+            --set kuberay-operator.enabled=false \
             --set kube-prometheus-stack.enabled=false \
             --set opentelemetry-operator.enabled=false \
             --set splunk-operator.enabled=false
@@ -207,6 +209,8 @@ jobs:
             --debug \
             --set image.repository=ghcr.io/splunk/splunk-ai-operator \
             --set image.tag=0.1.0 \
+            --set cert-manager.enabled=false \
+            --set kuberay-operator.enabled=false \
             --set kube-prometheus-stack.enabled=false \
             --set opentelemetry-operator.enabled=false \
             --set splunk-operator.enabled=false
