@@ -167,45 +167,25 @@ jobs:
       # 3. Dry-run validates chart structure and manifest generation
       # Full E2E tests with actual installation are in test/e2e/
 
-      - name: Install CRDs
-        run: |
-          echo "::group::Installing CRDs"
-          # Install cert-manager CRDs
-          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.crds.yaml
-
-          # Install our operator CRDs
-          kubectl apply -f helm-chart/splunk-ai-operator/crds/
-
-          # Install prometheus operator CRDs (required for kube-prometheus-stack dependency)
-          echo "Installing Prometheus Operator CRDs..."
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_alertmanagerconfigs.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_alertmanagers.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_probes.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_prometheusagents.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_prometheuses.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_prometheusrules.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_scrapeconfigs.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
-          kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_thanosrulers.yaml
-
-          # Install OpenTelemetry CRDs (only if testing with otel enabled)
-          # kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/download/v0.102.0/opentelemetry-operator.yaml || true
-
-          echo "CRDs installed successfully"
-          echo "::endgroup::"
+      # NOTE: CRD installation removed - Helm chart dependencies manage their own CRDs
+      # The dry-run installation tests below will use whatever CRDs the chart provides
+      # - name: Install CRDs
+      #   run: |
+      #     echo "::group::Installing CRDs"
+      #     # Install our operator CRDs only (others managed by chart dependencies)
+      #     kubectl apply -f helm-chart/splunk-ai-operator/crds/
+      #     echo "CRDs installed successfully"
+      #     echo "::endgroup::"
 
       - name: Test install splunk-ai-operator chart (dry-run)
         run: |
           echo "::group::Testing splunk-ai-operator installation (dry-run)"
           # Use dry-run to test chart installation without pulling images
           # This validates the Helm chart structure and Kubernetes manifests
-          # Skip CRDs since they're already installed and Helm would complain about ownership
           helm install test-operator helm-chart/splunk-ai-operator \
             --namespace splunk-ai-operator-system \
             --create-namespace \
             --dry-run \
-            --skip-crds \
             --debug \
             --set image.repository=ghcr.io/splunk/splunk-ai-operator \
             --set image.tag=0.1.0
@@ -220,7 +200,6 @@ jobs:
             --namespace splunk-ai-operator-system \
             --install \
             --dry-run \
-            --skip-crds \
             --debug \
             --set image.repository=ghcr.io/splunk/splunk-ai-operator \
             --set image.tag=0.1.0
@@ -235,7 +214,6 @@ jobs:
             --namespace ai-platform \
             --create-namespace \
             --dry-run \
-            --skip-crds \
             --debug \
             --set objectStorage.path="s3://test-bucket/artifacts" \
             --set objectStorage.region="us-west-2" \
@@ -256,7 +234,6 @@ jobs:
             --namespace ai-platform \
             --install \
             --dry-run \
-            --skip-crds \
             --debug \
             --set objectStorage.path="s3://test-bucket/artifacts" \
             --set objectStorage.region="us-west-2" \
