@@ -1,9 +1,0 @@
----
-apiVersion: kuttl.dev/v1beta1
-kind: TestStep
-commands:
-  - script: helm uninstall splunk-stdl -n $NAMESPACE || true
-  - script: kubectl delete pvc pvc-etc-splunk-splunk-standalone-standalone-0 pvc-var-splunk-splunk-standalone-standalone-0 -n $NAMESPACE || true
-  - script: kubectl delete configmap splunk-$NAMESPACE-probe-configmap -n $NAMESPACE || true
-  - script: kubectl delete secret s3-secret -n $NAMESPACE || true
-  - script: kubectl delete -f s1_configmap.yaml -n $NAMESPACE || true

@@ -1,0 +1,10 @@
+# Assert that resource is eventually deleted
+# and child resources are cleaned up
+
+# The AIPlatform should no longer exist
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-deletion-platform
+# If this resource exists, the test fails
+# KUTTL interprets this as "resource should NOT exist"

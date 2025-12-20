@@ -1,3 +1,68 @@
+# ============================================================================
+# Dependency Management
+# ============================================================================
+# These operators are required by the Splunk AI Operator and are installed
+# automatically as dependencies. Set to false if already installed in your cluster.
+
+# cert-manager - Required for webhook certificates and mTLS
+cert-manager:
+  enabled: true
+  crds:
+    enabled: true
+
+# KubeRay Operator - Required for Ray cluster management
+kuberay-operator:
+  enabled: true
+
+# OpenTelemetry Operator - Required for observability sidecars
+opentelemetry-operator:
+  enabled: true
+  manager:
+    collectorImage:
+      repository: "otel/opentelemetry-collector-k8s"
+      tag: "0.102.1"
+
+# Kube Prometheus Stack - Required for Prometheus monitoring
+kube-prometheus-stack:
+  enabled: true
+  prometheus:
+    enabled: true
+  grafana:
+    enabled: false  # Minimal installation
+  alertmanager:
+    enabled: false  # Minimal installation
+
+# Splunk Operator - Required for managing Splunk Enterprise instances
+splunk-operator:
+  enabled: true
+  image:
+    repository: docker.io/splunk/splunk-operator
+    tag: 3.0.0
+
+  # IMPORTANT: You MUST accept Splunk General Terms to use Splunk Operator
+  # Review terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.html
+  #
+  # To accept, set this value to true:
+  #   --set splunk-operator.acceptGeneralTerms=true
+  #
+  # Or in your values.yaml:
+  #   splunk-operator:
+  #     acceptGeneralTerms: true
+  #
+  acceptGeneralTerms: false  # Must be explicitly set to true by user
+
+  # Splunk-operator specific configuration
+  splunkOperator:
+    # SPLUNK_GENERAL_TERMS environment variable
+    # This value must be obtained from the Splunk Operator README:
+    # https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance
+    # Leave empty by default to force user to explicitly accept terms
+    splunkGeneralTerms: ""
+
+# ============================================================================
+# Splunk AI Operator Configuration
+# ============================================================================
+
 # Metadata overrides:
 # Override the Splunk AI Operator helm chart name
 nameOverride: ""
@@ -56,10 +121,10 @@ securityContext:
 
 # Splunk AI Operator image and pull policy
 # reference: https://github.com/splunk/splunk-ai-operator
-# Default uses GitHub Container Registry (ghcr.io) for official releases
-# You can also use Docker Hub: docker.io/splunk/splunk-ai-operator
+# Default uses Docker Hub for public releases
+# You can also use GitHub Container Registry: ghcr.io/splunk/splunk-ai-operator
 image:
-  repository: ghcr.io/splunk/splunk-ai-operator
+  repository: docker.io/splunk/splunk-ai-operator
   tag: "v0.1.0"
   pullPolicy: IfNotPresent
 

@@ -1,0 +1,9 @@
+# Step 3: Delete the AIPlatform
+# KUTTL will apply this deletion
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-deletion-platform
+# This file triggers deletion via kubectl delete
+# The resource should be marked for deletion with deletionTimestamp

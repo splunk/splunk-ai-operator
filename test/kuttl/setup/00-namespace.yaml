@@ -1,0 +1,5 @@
+# Common resources to apply before all tests
+# These are applied once at the beginning
+
+# Note: KUTTL creates a random namespace for each test by default
+# This file can be used for cluster-scoped resources if needed

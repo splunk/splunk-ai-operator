@@ -3,34 +3,30 @@
 # This is a YAML-formatted file.
 # Users can override these (e.g. via --values) to configure both the CR and the Ingress.
 
-# Deploy Splunk AI Operator chart
-# Disable if the Splunk Operator is already deployed
+# ============================================================================
+# Operator Installation
+# ============================================================================
+# The Splunk AI Operator and all its dependencies (cert-manager, kuberay,
+# opentelemetry, prometheus, splunk-operator) should be installed separately.
+#
+# RECOMMENDED INSTALLATION (Two-step):
+#   Step 1: helm install splunk-ai-operator ./splunk-ai-operator --namespace splunk-ai-operator-system --create-namespace
+#   Step 2: helm install my-platform ./splunk-ai-platform --namespace my-namespace -f my-values.yaml
+#
+# For single-command installation (not recommended for production), set enabled=true:
+#   helm install my-platform ./splunk-ai-platform --set splunk-ai-operator.enabled=true
+
 splunk-ai-operator:
-  enabled: true
+  # Set to true ONLY if you want to install the operator as part of this release
+  # This can cause CRD ownership conflicts if you install multiple platform instances
+  enabled: false
 
-# Deploy KubeRay Operator chart
-# Disable if the KubeRay Operator is already deployed
-kuberay-operator:
-  enabled: true
-
-# Deploy Cert Manager chart
-# Disable if the Cert Manager is already deployed
-cert-manager:
-  enabled: true
-
-# Deploy Kube Prometheus Stack chart
-# Disable if the Kube Prometheus Stack is already deployed
-prometheus:
-  enabled: true
-
-# Deploy OpenTelemetry Operator chart
-# Disable if the OpenTelemetry Operator is already deployed
-opentelemetry-operator:
-  enabled: true
-  manager:
-    collectorImage:
-      repository: "otel/opentelemetry-collector-k8s"
-      tag: "0.102.1"
+  # You can override dependency settings here if needed
+  # For example, to disable specific operators:
+  # cert-manager:
+  #   enabled: false
+  # kuberay-operator:
+  #   enabled: false
 
 # Metadata overrides:
 # Override the Splunk AI Platform helm chart name
@@ -133,27 +129,29 @@ images:
 # Default GPU type to use for Ray worker groups
 defaultAcceleratorType: ""
 
-# SplunkConfigurationSpec instance reference
-splunkConfiguration:
-  # CR of the SplunkConfiguration instance
-  splunkCustomResourceRef:
-    {}
-    # kind: "Standalone"
-    # namespace: "default"
-    # name: "splunk-standalone-stdln-0"
-    # apiVersion: "enterprise.splunk.com/v4"
-  # Splunk secret reference
-  secretRef:
-    {}
-    # name: "splunk-secret"
-    # namespace: "default"
-  endpoint: "https://splunk.default.svc.cluster.local:8089"
-  # Optional, if not using secretRef
-  token: ""
-  # Whether token comes from Kubernetes Secret or Vault Agent, e.g. "kubernetes" or "vault"
-  secretSource: "kubernetes"
-  # Path where Vault Agent injects the Splunk HEC token
-  vaultFilePath: ""
+# SplunkConfigurationSpec instance reference (optional)
+# Set to null or comment out if Splunk is not configured
+# Uncomment and configure when Splunk integration is needed
+splunkConfiguration: {}
+# Example configuration:
+# splunkConfiguration:
+#   # CR of the SplunkConfiguration instance
+#   splunkCustomResourceRef:
+#     kind: "Standalone"
+#     namespace: "default"
+#     name: "splunk-standalone-stdln-0"
+#     apiVersion: "enterprise.splunk.com/v4"
+#   # Splunk secret reference
+#   secretRef:
+#     name: "splunk-secret"
+#     namespace: "default"
+#   endpoint: "https://splunk.default.svc.cluster.local:8089"
+#   # Optional, if not using secretRef
+#   token: ""
+#   # Whether token comes from Kubernetes Secret or Vault Agent, e.g. "kubernetes" or "vault"
+#   secretSource: "kubernetes"
+#   # Path where Vault Agent injects the Splunk HEC token
+#   vaultFilePath: ""
 
 # Specifies object storage for AI artifacts (e.g., S3 or GCS bucket)
 storage:

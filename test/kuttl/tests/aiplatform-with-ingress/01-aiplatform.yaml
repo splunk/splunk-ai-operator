@@ -1,0 +1,44 @@
+# AIPlatform with ingress enabled
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-ingress-platform
+spec:
+  objectStorage:
+    path: s3://test-bucket/artifacts
+    region: us-west-2
+
+  defaultAcceleratorType: L40S
+  serviceAccountName: default
+
+  # Worker group configuration
+  workerGroupConfig:
+    serviceAccountName: default
+
+  # GPU scheduler configuration
+  gpuScheduler:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+  # Ingress configuration
+  ingress:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: ai-platform.test.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - hosts:
+          - ai-platform.test.local
+        secretName: ai-platform-tls
+
+  splunkConfiguration:
+    endpoint: http://test-splunk.default.svc.cluster.local:8088
+    secretRef:
+      name: test-splunk-secret
+      

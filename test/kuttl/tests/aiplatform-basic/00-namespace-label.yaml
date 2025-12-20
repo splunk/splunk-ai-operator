@@ -1,0 +1,9 @@
+# Label the test namespace to skip Zarf mutations
+# This must be the first step before creating any resources
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: placeholder
+  labels:
+    zarf.dev/agent: ignore

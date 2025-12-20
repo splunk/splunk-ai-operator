@@ -1,0 +1,36 @@
+# AIPlatform with SAIA feature enabled
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-saia-platform
+spec:
+  objectStorage:
+    path: s3://test-bucket/artifacts
+    region: us-west-2
+
+  defaultAcceleratorType: L40S
+  serviceAccountName: default
+
+  # Worker group configuration
+  workerGroupConfig:
+    serviceAccountName: default
+
+  # GPU scheduler configuration
+  gpuScheduler:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+  # SAIA feature configuration
+  features:
+    - name: saia
+      version: "1.1.0"
+      serviceAccountName: saia-service-account
+
+  splunkConfiguration:
+    endpoint: http://test-splunk.default.svc.cluster.local:8088
+    secretRef:
+      name: test-splunk-secret
+      

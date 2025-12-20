@@ -1,0 +1,25 @@
+# Assert SAIA resources are created
+
+# Assert SAIA API deployment exists
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    ai.splunk.com/platform: test-saia-platform
+    ai.splunk.com/component: saia-api
+spec:
+  replicas: 1
+status:
+  readyReplicas: 1
+---
+# Assert SAIA data loader job is created
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    ai.splunk.com/platform: test-saia-platform
+    ai.splunk.com/component: saia-data-loader
+spec:
+  template:
+    spec:
+      serviceAccountName: saia-service-account

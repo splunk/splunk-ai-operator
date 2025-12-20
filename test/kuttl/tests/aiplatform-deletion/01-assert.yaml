@@ -1,0 +1,10 @@
+# Assert resource is created with finalizer
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-deletion-platform
+  finalizers:
+    - aiplatform.ai.splunk.com/finalizer
+status:
+  observedGeneration: 1

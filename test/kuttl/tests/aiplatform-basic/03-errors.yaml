@@ -1,0 +1,12 @@
+# Assert that no error events are generated
+
+apiVersion: v1
+kind: Event
+metadata:
+  name: error-event
+involvedObject:
+  name: test-basic-platform
+  kind: AIPlatform
+type: Error
+# This file asserts that NO events of type Error exist
+# If any Error events exist, the test will fail

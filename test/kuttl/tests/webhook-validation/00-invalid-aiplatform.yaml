@@ -1,0 +1,11 @@
+# Test: Webhook Validation - Missing Required Fields
+# This should be rejected by the validating webhook
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-invalid-platform
+spec:
+  # Missing required field: objectStorage
+  # Missing required field: splunkConfiguration
+  defaultAcceleratorType: L40S

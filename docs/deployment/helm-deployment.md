@@ -63,9 +63,19 @@ Umbrella chart that includes:
 
 ### Deploy Operator + AIPlatform (All-in-One)
 
+**IMPORTANT:** You must explicitly accept the Splunk General Terms before installing.
+Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.html
+
 ```bash
 # Create a values file
 cat > my-platform-values.yaml <<EOF
+# Accept Splunk General Terms (REQUIRED)
+splunk-ai-operator:
+  splunk-operator:
+    acceptGeneralTerms: true
+    splunkOperator:
+      splunkGeneralTerms: "<required value>"
+
 # Object storage configuration
 objectStorage:
   path: "s3://my-bucket/artifacts"
@@ -92,15 +102,24 @@ helm install my-ai-platform \
   --values my-platform-values.yaml
 ```
 
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
+
 ### Deploy Operator Only
+
+**IMPORTANT:** You must explicitly accept the Splunk General Terms.
+Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.html
 
 ```bash
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
   --version 0.1.0 \
   --namespace splunk-ai-operator-system \
-  --create-namespace
+  --create-namespace \
+  --set splunk-operator.acceptGeneralTerms=true \
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ## Installation Methods
 
@@ -110,11 +129,14 @@ Requires Helm 3.8+:
 
 ```bash
 # Install operator
+# NOTE: Requires Splunk General Terms acceptance
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
   --version 0.1.0 \
   --namespace splunk-ai-operator-system \
-  --create-namespace
+  --create-namespace \
+  --set splunk-operator.acceptGeneralTerms=true \
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 
 # Install platform
 helm install my-ai-platform \
@@ -125,16 +147,21 @@ helm install my-ai-platform \
   --values values.yaml
 ```
 
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
+
 ### Method 2: GitHub Releases
 
 Compatible with Helm 3.0+:
 
 ```bash
 # Install operator
+# NOTE: Requires Splunk General Terms acceptance
 helm install splunk-ai-operator \
   https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/splunk-ai-operator-0.1.0.tgz \
   --namespace splunk-ai-operator-system \
-  --create-namespace
+  --create-namespace \
+  --set splunk-operator.acceptGeneralTerms=true \
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 
 # Install platform
 helm install my-ai-platform \
@@ -143,6 +170,8 @@ helm install my-ai-platform \
   --create-namespace \
   --values values.yaml
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ### Method 3: kubectl (Manifests)
 
@@ -158,19 +187,32 @@ Use this when you want to manually create AIPlatform resources via kubectl.
 
 ### Basic Installation
 
+**IMPORTANT:** You must explicitly accept the Splunk General Terms.
+Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.html
+
 ```bash
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
   --version 0.1.0 \
   --namespace splunk-ai-operator-system \
-  --create-namespace
+  --create-namespace \
+  --set splunk-operator.acceptGeneralTerms=true \
+  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required value>"
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ### Custom Configuration
 
 Create `operator-values.yaml`:
 
 ```yaml
+# Accept Splunk General Terms (REQUIRED)
+splunk-operator:
+  acceptGeneralTerms: true
+  splunkOperator:
+    splunkGeneralTerms: "<required value>"
+
 # Operator image configuration
 image:
   repository: ghcr.io/splunk/splunk-ai-operator
@@ -220,6 +262,8 @@ helm install splunk-ai-operator \
   --create-namespace \
   --values operator-values.yaml
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ### View Operator Configuration Options
 
@@ -497,8 +541,14 @@ helm install my-platform \
 ### Example 1: Private Registry Configuration
 
 ```yaml
-# Use images from AWS ECR
+# Accept Splunk General Terms (REQUIRED)
 splunk-ai-operator:
+  splunk-operator:
+    acceptGeneralTerms: true
+    splunkOperator:
+      splunkGeneralTerms: "<required value>"
+
+  # Use images from AWS ECR
   image:
     repository: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk-ai-operator"
     tag: "v0.1.0"
@@ -513,6 +563,8 @@ images:
     - name: ecr-registry-secret
 ```
 
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
+
 Create the image pull secret:
 
 ```bash
@@ -526,6 +578,13 @@ kubectl create secret docker-registry ecr-registry-secret \
 ### Example 2: Development/Testing Setup
 
 ```yaml
+# Accept Splunk General Terms (REQUIRED)
+splunk-ai-operator:
+  splunk-operator:
+    acceptGeneralTerms: true
+    splunkOperator:
+      splunkGeneralTerms: "<required value>"
+
 # Minimal configuration for testing
 objectStorage:
   path: "s3://test-bucket"
@@ -566,9 +625,18 @@ opentelemetry-operator:
   enabled: false
 ```
 
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
+
 ### Example 3: Production Setup with HA
 
 ```yaml
+# Accept Splunk General Terms (REQUIRED)
+splunk-ai-operator:
+  splunk-operator:
+    acceptGeneralTerms: true
+    splunkOperator:
+      splunkGeneralTerms: "<required value>"
+
 objectStorage:
   path: "s3://prod-ai-bucket/artifacts"
   region: "us-west-2"
@@ -625,6 +693,8 @@ sidecars:
   otel: true
   prometheusOperator: true
 ```
+
+**Note**: For the required value for `splunkGeneralTerms`, see the [Splunk Operator README](https://github.com/splunk/splunk-operator?tab=readme-ov-file#splunk-general-terms-acceptance).
 
 ## Upgrading
 

@@ -56,3 +56,36 @@ version: "0.1.0"
 # follow Semantic Versioning. They should reflect the version the application is using.
 # It is recommended to use it with quotes.
 appVersion: "0.1.0"
+
+# Dependencies required by the Splunk AI Operator
+# These operators must be installed for the AI Operator to function correctly
+dependencies:
+  # cert-manager - Required for webhook certificates and mTLS
+  - name: cert-manager
+    version: "1.18.0"
+    repository: "https://charts.jetstack.io"
+    condition: cert-manager.enabled
+
+  # KubeRay Operator - Required for Ray cluster management
+  - name: kuberay-operator
+    version: "1.2.2"
+    repository: "https://ray-project.github.io/kuberay-helm"
+    condition: kuberay-operator.enabled
+
+  # OpenTelemetry Operator - Required for observability sidecars
+  - name: opentelemetry-operator
+    version: "0.88.6"
+    repository: "https://open-telemetry.github.io/opentelemetry-helm-charts"
+    condition: opentelemetry-operator.enabled
+
+  # Kube Prometheus Stack - Required for Prometheus monitoring
+  - name: kube-prometheus-stack
+    version: "72.4.0"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: kube-prometheus-stack.enabled
+
+  # Splunk Operator - Required for managing Splunk Enterprise instances
+  - name: splunk-operator
+    version: "3.0.0"
+    repository: "https://splunk.github.io/splunk-operator"
+    condition: splunk-operator.enabled

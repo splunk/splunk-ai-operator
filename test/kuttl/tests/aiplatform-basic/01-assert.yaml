@@ -1,0 +1,13 @@
+# Step 1: Assert that AIPlatform resource was created and is ready
+# Wait for AIPlatform to be validated and sidecars configured
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-basic-platform
+status:
+  conditions:
+  - type: ValidateReady
+    status: "True"
+  - type: SidecarsReady
+    status: "True"

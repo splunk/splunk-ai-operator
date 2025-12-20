@@ -1,6 +1,0 @@
----
-apiVersion: kuttl.dev/v1beta1
-kind: TestStep
-commands:
-  - command: helm uninstall splunk-ai-platform
-    namespaced: true

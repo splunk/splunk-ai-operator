@@ -1,0 +1,49 @@
+# Create a basic AIPlatform resource
+
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: test-basic-platform
+spec:
+  # Object storage configuration
+  objectStorage:
+    path: s3://test-bucket/artifacts
+    region: us-west-2
+
+  # Default accelerator type (must match instance.yaml)
+  defaultAcceleratorType: L40S
+
+  # Service account
+  serviceAccountName: default
+
+  # Worker group configuration
+  workerGroupConfig:
+    serviceAccountName: default
+
+  # GPU scheduler configuration
+  gpuScheduler:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+  # Splunk configuration - Reference the secret created by Splunk Standalone
+  # Note: The operator doesn't have Splunk Standalone CRD registered, so we use direct secretRef
+  splunkConfiguration:
+    # Splunk Standalone creates a versioned secret: <standalone-name>-standalone-secret-v1
+    endpoint: http://splunk-test-splunk-standalone-service:8088
+    secretRef:
+      name: splunk-test-splunk-standalone-secret-v1
+
+  # Disable sidecars that require additional operators
+  # OpenTelemetry Operator is not installed in test environment
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+
+  # Storage configuration
+  storage:
+    vectorDB:
+      size: 10Gi
+      storageClassName: standard
