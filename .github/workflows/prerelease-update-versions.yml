@@ -11,7 +11,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
       - name: Deep Fetch
         run: |
@@ -36,7 +36,7 @@ jobs:
           fi
 
       - name: Setup Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v5
         with:
           go-version: ${{ steps.dotenv.outputs.GO_VERSION }}
           cache: true
@@ -55,7 +55,7 @@ jobs:
           replace: "${{ github.event.inputs.new_operator_version }}"
           include: "**.md"
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@7380612b49221684fefa025244f2ef4008ae50ad # v3.10.1
+        uses: peter-evans/create-pull-request@98357b18bf14b5342f975ff684046ec3b2a07725 # v8.0.0
         with:
           branch: "release/${{ github.event.inputs.new_operator_version }}"
           title: "Splunk AI Operator ${{ github.event.inputs.new_operator_version }} release"
