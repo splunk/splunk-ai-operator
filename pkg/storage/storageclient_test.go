@@ -117,6 +117,28 @@ func TestNewStorageClient(t *testing.T) {
 				return fake.NewClientBuilder().WithScheme(s)
 			},
 		},
+		{
+			name: "Azure path without container name",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:   "azure:///model_artifacts",
+				Region: "eastus",
+			},
+			wantErr: true,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
+		{
+			name: "S3 path without bucket name",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:   "s3:///prefix",
+				Region: "us-west-2",
+			},
+			wantErr: true,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
 	}
 
 	for _, tt := range tests {

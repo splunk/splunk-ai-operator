@@ -13,27 +13,32 @@
 
 # ---------- Cluster Configuration ----------
 cluster:
-  useExisting: false
-  name: "my-ai-cluster"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
-  region: "us-west-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
+  useExisting: false   # true = do not create cluster; use existing one (script fails if cluster not found)
+  name: "ai-tier-sok-test-east2"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
+  # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).
+  preserveVpcOnDelete: false              # Set true to keep VPC on delete and redeploy without recreating VPC
 
-  # If you donot provide any subnet information, eksctl will create a new VPC with public and private subnets automatically.
+  # To use an EXISTING VPC: provide subnets below; eksctl will not create a new VPC. Idempotent: cluster is only created if it does not exist.
+  # If you do not provide subnets, eksctl creates a new VPC and subnets automatically.
   # VPC Subnets - CHANGE ALL OF THESE to your actual subnet IDs
   # Find your subnets: aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxxxx" --region us-west-2
-  #subnets:
-  #  private:                              # Private subnets (at least 2 in different AZs)
-  #    - id: "subnet-1a2b3c4d5e6f7g8h"    # CHANGE THIS: Your private subnet 1
-  #      az: "us-west-2a"                  # CHANGE THIS: Availability zone for subnet 1
-  #    - id: "subnet-9h8g7f6e5d4c3b2a"    # CHANGE THIS: Your private subnet 2
-  #      az: "us-west-2b"                  # CHANGE THIS: Availability zone for subnet 2
-  #  public:                               # Public subnets (at least 2 in different AZs)
-  #    - id: "subnet-a1b2c3d4e5f6g7h8"    # CHANGE THIS: Your public subnet 1
-  #      az: "us-west-2a"                  # CHANGE THIS: Availability zone for subnet 1
-  #    - id: "subnet-h8g7f6e5d4c3b2a1"    # CHANGE THIS: Your public subnet 2
-  #      az: "us-west-2b"                  # CHANGE THIS: Availability zone for subnet 2
-  #    - id: "subnet-1h2g3f4e5d6c7b8a"    # OPTIONAL: Additional public subnet for HA
-  #      az: "us-west-2c"                  # OPTIONAL: Third availability zone
+# subnets:
+#    private:                              # Private subnets (at least 2 in different AZs)
+#      - id: "subnet-02734905b10e7ad5a"    # CHANGE THIS: Your private subnet 1
+#        az: "us-east-2b"                  # CHANGE THIS: Availability zone for subnet 1
+#      - id: "subnet-0c1d7dc49788d11dc"    # CHANGE THIS: Your private subnet 2
+#        az: "us-east-2c"                  # CHANGE THIS: Availability zone for subnet 2
+#      - id: "subnet-0f8f94998d65dfcd2"    # CHANGE THIS: Your private subnet 2
+#        az: "us-east-2a"   
+#    public:                               # Public subnets (at least 2 in different AZs)
+#      - id: "subnet-0f0ea3b190a618540"    # CHANGE THIS: Your public subnet 1
+#        az: "us-east-2c"                  # CHANGE THIS: Availability zone for subnet 1
+#      - id: "subnet-02b736130e7c2a787"    # CHANGE THIS: Your public subnet 2
+#        az: "us-east-2a"                  # CHANGE THIS: Availability zone for subnet 2
+#      - id: "subnet-02c35a8cd0b5d90a5"    # OPTIONAL: Additional public subnet for HA
+#        az: "us-east-2b"                  # OPTIONAL: Third availability zone
 
 # ---------- Node Groups ----------
 nodeGroups:
@@ -57,9 +62,24 @@ nodeGroups:
 
 # ---------- Storage Configuration ----------
 storage:
-  s3Bucket: "my-company-ai-platform-bucket"  # CHANGE THIS: Globally unique S3 bucket name
+  s3Bucket: "ai-platform-bucket-minio-us-east-2"  # CHANGE THIS: Globally unique S3 bucket name (used when minio.enabled is false)
   storageClass: "gp3"                        # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
+
+  # Optional: MinIO (S3-compatible object storage). Use in-cluster or external (e.g. EC2).
+  minio:
+    enabled: true                           # Set true to use MinIO for object storage
+    external: true                          # true = MinIO runs outside cluster (e.g. EC2); set endpoint below
+    endpoint: "http://13.59.216.105:9000"                             # When external=true: e.g. "http://10.0.1.50:9000" (EC2 private IP or hostname)
+    namespace: "minio"                       # Namespace for in-cluster MinIO (ignored when external=true)
+    bucket: "ai-platform-bucket-minio-us-east-2"                    # Bucket name (must exist on MinIO)
+    replicas: 1                             # In-cluster only: number of MinIO replicas
+    persistence:
+      size: "150Gi"
+      storageClass: ""
+    auth:
+      rootUser: "minioadmin"
+      rootPassword: "minioadmin"                       # Leave empty for in-cluster auto-generate; required for external
 
 # ---------- Container Images Configuration ----------
 images:
@@ -82,7 +102,7 @@ images:
   #
   # REQUIRED: Specify your private registry URL for custom images
   # Leave empty to use Docker Hub defaults for all images
-  registry: "1234567890.dkr.ecr.us-west-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
   # ==================================================================================
   # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
@@ -97,18 +117,15 @@ images:
     # Option 2: Full path (ignores registry prefix)
     #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
-    image: "docker.io/splunk/splunk-ai-operator:0.1.0"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.1"
 
   # Splunk Enterprise Images
   splunk:
-    # Option 1: Relative path (uses registry prefix)
-    #   image: "splunk/splunk:10.2.0"
-    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0"
-    #
-    # Option 2: Full path (ignores registry prefix)
-    #   image: "docker.io/myorg/splunk:10.2.0"
-    #   Result: "docker.io/myorg/splunk:10.2.0"
-    image: "splunk/splunk:10-2-ai-custom"
+    # Splunk Enterprise image
+    # Default behavior: If no registry in path, uses Docker Hub
+    #   "splunk/splunk:10.2.0" → Docker Hub
+    #   "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0" → ECR
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
 
     # Splunk Operator image (optional - has default)
     # Default: "docker.io/splunk/splunk-operator:3.0.0"
@@ -123,8 +140,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "ml-platform/ray/ray-head:build-17"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-17"
+    headImage: "ml-platform/ray/ray-head:build-v1alpha1"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-v1alpha1"
 
   # Weaviate Vector Database
   weaviate:
@@ -136,8 +153,8 @@ images:
   # SAIA (Splunk AI Assistant) Images
   saia:
     # Relative paths - registry prefix auto-applied
-    apiImage: "ml-platform/saia/saia-api:build-1"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-1"
+    apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
 
   # Supporting Images
   fluentBit:
@@ -145,6 +162,11 @@ images:
     # OR specify your mirrored image:
     #   image: "fluent-bit:1.9.6"  → uses registry prefix
     image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  # OpenTelemetry Collector (use full URL so it is not rewritten to ECR)
+  otelCollector:
+    # Public image - full path so registry prefix is NOT applied; validation checks this URL
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
 
 # ---------- Operator Versions ----------
 operators:
