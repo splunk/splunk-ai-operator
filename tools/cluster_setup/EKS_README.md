@@ -53,13 +53,14 @@ The script installs everything needed for the AI Platform:
 4. **EBS CSI Driver** - Persistent volumes backed by AWS EBS
 5. **Cluster Autoscaler** - Automatic node scaling based on demand
 6. **Cert-Manager** - Automated certificate management
-7. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
-8. **OpenTelemetry Operator** - Distributed tracing and telemetry
-9. **NVIDIA Device Plugin** - GPU support for AI workloads
-10. **KubeRay Operator** - Ray cluster management for distributed AI
-11. **Splunk Operator** - Splunk Enterprise management
-12. **Splunk AI Platform Operator** - AI platform orchestration
-13. **AI Platform CR** - Complete AI deployment with features
+7. **MinIO (optional)** - S3-compatible object storage in-cluster when `storage.minio.enabled: true`
+8. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
+9. **OpenTelemetry Operator** - Distributed tracing and telemetry
+10. **NVIDIA Device Plugin** - GPU support for AI workloads
+11. **KubeRay Operator** - Ray cluster management for distributed AI
+12. **Splunk Operator** - Splunk Enterprise management
+13. **Splunk AI Platform Operator** - AI platform orchestration
+14. **AI Platform CR** - Complete AI deployment with features
 
 ### AWS Integration Features
 
@@ -539,10 +540,18 @@ storage:
                                       #          (3-63 chars, lowercase, numbers, hyphens)
 ```
 
+**Optional: MinIO (in-cluster or external EC2)**  
+- **In-cluster:** Set `storage.minio.enabled: true`. The script deploys MinIO via Helm and configures the AIPlatform CR.
+- **External (e.g. EC2):** Set `storage.minio.enabled: true`, `storage.minio.external: true`, and `storage.minio.endpoint: "http://<host>:9000"` (and matching `bucket`/`auth`). Use the companion script to install MinIO on an EC2 instance in the same VPC: `CONFIG_FILE=./cluster-config.yaml ./install_minio_ec2.sh --launch-ec2` launches an EC2 in the EKS VPC; then SSH to it and run `./install_minio_ec2.sh --bucket ai-platform --user minioadmin --password '<pass>'`. Pre-populate artifacts in MinIO before cluster setup. If you use MinIO, the Splunk app (when using `splunkStandalone.localAppPath`) is not uploaded automatically; upload it to MinIO at `apps/` via MinIO console or `mc`/`aws s3 --endpoint-url`.
+
+**Idempotency and existing VPC**  
+- The install is **idempotent**: if the EKS cluster already exists, the script skips cluster creation and only runs reconcile (addons, operators, AIPlatform). Set `cluster.useExisting: true` to require an existing cluster (script fails if the cluster is not found).
+- **Use an existing VPC:** Provide `cluster.subnets` (private and public subnet IDs and AZs). eksctl will use that VPC and will not create a new one.
+
 **Important Notes:**
 - **Cluster Name**: Must be DNS-1123 compliant (lowercase letters, numbers, hyphens; start/end with alphanumeric)
-- **S3 Bucket**: Must be globally unique across all AWS accounts
-- **Subnets**: If provided, script validates NAT Gateway, Internet Gateway, and route tables exist
+- **S3 Bucket**: Must be globally unique across all AWS accounts (ignored when MinIO is enabled)
+- **Subnets**: If provided, script validates NAT Gateway, Internet Gateway, and route tables exist; cluster uses this existing VPC
 - **Subnets**: Leave empty or comment out to let eksctl create a new VPC automatically
 
 **What each section configures:**
@@ -551,8 +560,10 @@ storage:
 |---------|--------------|------------------|
 | `cluster.name` | EKS cluster name | ✅ **REQUIRED:** Change to your cluster name |
 | `cluster.region` | AWS region | ✅ **REQUIRED:** Change to your region |
-| `cluster.subnets` | VPC subnets for nodes | ⚙️ **OPTIONAL:** Leave empty for new VPC or provide existing subnet IDs |
-| `storage.s3Bucket` | S3 bucket for AI artifacts | ✅ **REQUIRED:** Choose unique name |
+| `cluster.useExisting` | Use existing cluster only (do not create) | ⚙️ Set `true` to skip cluster creation; script fails if cluster not found |
+| `cluster.subnets` | VPC subnets for nodes | ⚙️ **OPTIONAL:** Leave empty for new VPC or provide existing subnet IDs to use existing VPC |
+| `storage.s3Bucket` | S3 bucket for AI artifacts (used when MinIO is disabled) | ✅ **REQUIRED** if not using MinIO |
+| `storage.minio` | MinIO (in-cluster or external) | ⚙️ `enabled: true`; for EC2 set `external: true` and `endpoint: "http://<ip>:9000"` |
 | `images.registry` | Container registry URL | ✅ **REQUIRED:** Your ECR/Docker registry |
 | `images.*` | All container images | ✅ **REQUIRED:** Configure all image paths |
 | `nodeGroups.cpu` | CPU node group settings | ⚙️ Optional: adjust size/type |
@@ -723,18 +734,93 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
 
 ### 4. Verify Installation
 
+After running `eks_cluster_with_stack.sh install` (or upgrade) with the latest operator image, use the commands below to verify the setup. Default namespace and AIPlatform name come from `cluster-config.yaml` (`aiPlatform.namespace` and `aiPlatform.name`); if you use a custom config, set `AI_NS` and `AI_PLATFORM_NAME` accordingly.
+
 ```bash
 # Set kubeconfig (done automatically by script)
 export KUBECONFIG=~/.kube/config
 
-# Check cluster
+# ----- Optional: load namespace/name from your config -----
+# CONFIG_FILE="${CONFIG_FILE:-./cluster-config.yaml}"
+# AI_NS="$(yq eval '.aiPlatform.namespace' "$CONFIG_FILE")"
+# AI_PLATFORM_NAME="$(yq eval '.aiPlatform.name' "$CONFIG_FILE")"
+# Or use defaults:
+export AI_NS="${AI_NS:-ai-platform}"
+export AI_PLATFORM_NAME="${AI_PLATFORM_NAME:-splunk-ai-stack}"
+export SPLUNK_AI_NS="${SPLUNK_AI_NS:-splunk-ai-operator-system}"
+```
+
+**1. Cluster and nodes**
+
+```bash
 kubectl get nodes
+kubectl get nodes -o wide
+```
 
-# Check AI Platform
-kubectl get aiplatform -n ai-platform
+**2. Splunk AI Operator (confirm it is running the image you deployed)**
 
-# Check all pods
-kubectl get pods --all-namespaces
+```bash
+kubectl get deploy -n "$SPLUNK_AI_NS" -l app.kubernetes.io/name=splunk-ai-operator -o wide
+kubectl get pods -n "$SPLUNK_AI_NS" -l app.kubernetes.io/name=splunk-ai-operator
+# Show operator image (replace deployment name if different)
+kubectl get deploy -n "$SPLUNK_AI_NS" -o jsonpath='{.items[0].spec.template.spec.containers[0].image}'; echo
+```
+
+**3. AIPlatform CR and status**
+
+```bash
+kubectl get aiplatform "$AI_PLATFORM_NAME" -n "$AI_NS"
+kubectl get aiplatform "$AI_PLATFORM_NAME" -n "$AI_NS" -o jsonpath='{.status.conditions[*].type}{"\n"}{.status.conditions[*].status}'; echo
+# Detailed readiness (expect Ready=True when healthy)
+kubectl get aiplatform "$AI_PLATFORM_NAME" -n "$AI_NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")]}' | jq .
+```
+
+**4. Object storage secret (MinIO/S3 credentials for serve config)**
+
+```bash
+# Secret name comes from AIPlatform spec.objectStorage.secretRef
+SECRET_NAME="$(kubectl get aiplatform "$AI_PLATFORM_NAME" -n "$AI_NS" -o jsonpath='{.spec.objectStorage.secretRef}')"
+echo "SecretRef: ${SECRET_NAME:-<not set>}"
+kubectl get secret "${SECRET_NAME:-minio-credentials}" -n "$AI_NS" 2>/dev/null && echo "✓ Secret exists" || echo "✗ Secret missing"
+kubectl get secret "${SECRET_NAME:-minio-credentials}" -n "$AI_NS" -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' | grep -E 's3_access_key|s3_secret_key' && echo "✓ Required keys present" || echo "✗ Check s3_access_key / s3_secret_key"
+```
+
+**5. RayService and serve config (MinIO credentials in apps)**
+
+```bash
+kubectl get rayservice "$AI_PLATFORM_NAME" -n "$AI_NS"
+# Count MINIO_ACCESS_KEY in serve config (expect > 0 when using MinIO)
+kubectl get rayservice "$AI_PLATFORM_NAME" -n "$AI_NS" -o jsonpath='{.spec.serveConfigV2}' | grep -o 'MINIO_ACCESS_KEY' | wc -l
+```
+
+**6. Ray and application pods**
+
+```bash
+kubectl get pods -n "$AI_NS" -l ray.io/cluster="$AI_PLATFORM_NAME"
+kubectl get pods -n "$AI_NS" -l ai.splunk.com/platform="$AI_PLATFORM_NAME"
+```
+
+**7. Services (Ray Serve, Weaviate)**
+
+```bash
+kubectl get svc -n "$AI_NS" -l ray.io/cluster="$AI_PLATFORM_NAME"
+kubectl get svc -n "$AI_NS" | grep -E "ray|weaviate"
+```
+
+**8. Events (recent issues)**
+
+```bash
+kubectl get events -n "$AI_NS" --sort-by='.lastTimestamp' | tail -30
+kubectl describe aiplatform "$AI_PLATFORM_NAME" -n "$AI_NS" | tail -40
+```
+
+**Quick one-liner summary**
+
+```bash
+echo "--- Operator ---"; kubectl get deploy -n "$SPLUNK_AI_NS" -o 'custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,IMAGE:.spec.template.spec.containers[0].image'
+echo "--- AIPlatform ---"; kubectl get aiplatform "$AI_PLATFORM_NAME" -n "$AI_NS" -o 'custom-columns=NAME:.metadata.name,READY:.status.conditions[0].status'
+echo "--- RayService ---"; kubectl get rayservice "$AI_PLATFORM_NAME" -n "$AI_NS"
+echo "--- Pods ---"; kubectl get pods -n "$AI_NS" --no-headers | wc -l; kubectl get pods -n "$AI_NS" | head -20
 ```
 
 ---
@@ -2135,6 +2221,40 @@ EOF
 ---
 
 ## Troubleshooting
+
+### Ray / AI model deployment: "Invalid repository ID or local directory"
+
+If a Ray Serve replica (e.g. `Llama31Instruct:LLMDeploymentL40S`) fails with:
+
+```text
+Invalid repository ID or local directory specified: '/home/ray/.cache/s3/artifacts/model_artifacts/llama31-8b-instruct'.
+Please verify the following requirements:
+1. Provide a valid Hugging Face repository ID.
+2. Specify a local directory that contains a recognized configuration file (e.g. config.json).
+```
+
+the model is loaded from object storage (S3/MinIO) into that path inside the pod. The path is missing or incomplete because the download from object storage failed or the model was never uploaded.
+
+**Checklist:**
+
+1. **Model is in MinIO/S3**  
+   Upload the model so the bucket has the prefix `model_artifacts/llama31-8b-instruct/` with at least `config.json` and the model weights (see [artifacts README](../artifacts_download_upload_scripts/README.md)):
+   - Download: `./tools/artifacts_download_upload_scripts/download_from_huggingface.sh`
+   - Upload: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `MINIO_ENDPOINT`, `MINIO_BUCKET`, and credentials to match your `cluster-config.yaml`).
+
+2. **External MinIO reachable from EKS**  
+   If using external MinIO (e.g. EC2), ensure:
+   - `storage.minio.endpoint` in `cluster-config.yaml` is correct (e.g. `http://<ec2-ip>:9000`).
+   - The EC2 security group allows **inbound TCP 9000** from your EKS node security group or VPC CIDR (see `install_minio_ec2.sh` output).
+   - From a Ray worker pod:  
+     `kubectl exec -it <ray-worker-pod> -n <namespace> -- curl -s -o /dev/null -w "%{http_code}" http://<minio-endpoint>/minio/health/live`
+
+3. **Credentials secret**  
+   AIPlatform must have `objectStorage.secretRef` set (e.g. `minio-credentials`). The secret must contain `s3_access_key` and `s3_secret_key` matching the MinIO user that can read the bucket:
+   - `kubectl get secret minio-credentials -n <namespace> -o jsonpath='{.data}'`
+
+4. **Full troubleshooting steps**  
+   See [Troubleshooting: Invalid repository ID or local directory](../../docs/troubleshooting.md) in the main docs for verification commands and details.
 
 ### Script Execution Issues
 

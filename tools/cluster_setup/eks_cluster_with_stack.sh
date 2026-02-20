@@ -29,6 +29,7 @@ load_config() {
     CLUSTER_NAME="$(yq eval '.cluster.name' "$cfg")"
     REGION="$(yq eval '.cluster.region' "$cfg")"
     K8S_VERSION="$(yq eval '.cluster.k8sVersion' "$cfg")"
+    USE_EXISTING_CLUSTER="$(yq eval '.cluster.useExisting // false' "$cfg")"
 
     # Node groups
     ENABLE_CPU="$(yq eval '.nodeGroups.cpu.enabled' "$cfg")"
@@ -47,10 +48,24 @@ load_config() {
     GPU_VOLUME_SIZE="$(yq eval '.nodeGroups.gpu.volumeSize' "$cfg")"
     GPU_VOLUME_TYPE="$(yq eval '.nodeGroups.gpu.volumeType' "$cfg")"
 
+    # Cluster options
+    PRESERVE_VPC_ON_DELETE="$(yq eval '.cluster.preserveVpcOnDelete // false' "$cfg")"
+
     # Storage
     S3_BUCKET="$(yq eval '.storage.s3Bucket' "$cfg")"
     STORAGE_CLASS="$(yq eval '.storage.storageClass' "$cfg")"
     VECTORDB_SIZE="$(yq eval '.storage.vectorDbSize' "$cfg")"
+    # MinIO (optional S3-compatible object storage)
+    MINIO_ENABLED="$(yq eval '.storage.minio.enabled // false' "$cfg")"
+    MINIO_EXTERNAL="$(yq eval '.storage.minio.external // false' "$cfg")"
+    MINIO_ENDPOINT="$(yq eval '.storage.minio.endpoint // ""' "$cfg")"
+    MINIO_NS="$(yq eval '.storage.minio.namespace // "minio"' "$cfg")"
+    MINIO_BUCKET="$(yq eval '.storage.minio.bucket // "ai-platform"' "$cfg")"
+    MINIO_REPLICAS="$(yq eval '.storage.minio.replicas // 1' "$cfg")"
+    MINIO_PVC_SIZE="$(yq eval '.storage.minio.persistence.size // "100Gi"' "$cfg")"
+    MINIO_PVC_STORAGE_CLASS="$(yq eval '.storage.minio.persistence.storageClass // ""' "$cfg")"
+    MINIO_ROOT_USER="$(yq eval '.storage.minio.auth.rootUser // "minioadmin"' "$cfg")"
+    MINIO_ROOT_PASSWORD="$(yq eval '.storage.minio.auth.rootPassword // ""' "$cfg")"
 
     # AI Platform
     AI_NS="$(yq eval '.aiPlatform.namespace' "$cfg")"
@@ -93,32 +108,44 @@ load_config() {
     FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$cfg")"
     OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$cfg")"
 
-    # Subnets - read as arrays (Bash 3.2 compatible)
+    # Subnets - read as arrays (support both cluster.subnets and top-level subnets)
     PRIVATE_SUBNETS=()
     while IFS= read -r subnet; do
       [[ -n "$subnet" ]] && PRIVATE_SUBNETS+=("$subnet")
-    done < <(yq eval '.cluster.subnets.private[].id' "$cfg")
+    done < <(yq eval '.cluster.subnets.private[].id // .subnets.private[].id' "$cfg")
 
     PRIVATE_SUBNETS_AZ=()
     while IFS= read -r az; do
       [[ -n "$az" ]] && PRIVATE_SUBNETS_AZ+=("$az")
-    done < <(yq eval '.cluster.subnets.private[].az' "$cfg")
+    done < <(yq eval '.cluster.subnets.private[].az // .subnets.private[].az' "$cfg")
 
     PUBLIC_SUBNETS=()
     while IFS= read -r subnet; do
       [[ -n "$subnet" ]] && PUBLIC_SUBNETS+=("$subnet")
-    done < <(yq eval '.cluster.subnets.public[].id' "$cfg")
+    done < <(yq eval '.cluster.subnets.public[].id // .subnets.public[].id' "$cfg")
 
     PUBLIC_SUBNETS_AZ=()
     while IFS= read -r az; do
       [[ -n "$az" ]] && PUBLIC_SUBNETS_AZ+=("$az")
-    done < <(yq eval '.cluster.subnets.public[].az' "$cfg")
+    done < <(yq eval '.cluster.subnets.public[].az // .subnets.public[].az' "$cfg")
   else
     # Fallback: simple grep-based parsing (less robust but works without yq)
     CLUSTER_NAME="$(grep 'name:' "$cfg" | head -1 | sed 's/.*name: *"\(.*\)".*/\1/')"
     REGION="$(grep 'region:' "$cfg" | head -1 | sed 's/.*region: *"\(.*\)".*/\1/')"
     K8S_VERSION="$(grep 'k8sVersion:' "$cfg" | sed 's/.*k8sVersion: *"\(.*\)".*/\1/')"
+    USE_EXISTING_CLUSTER="false"
+    PRESERVE_VPC_ON_DELETE="false"
     S3_BUCKET="$(grep 's3Bucket:' "$cfg" | sed 's/.*s3Bucket: *"\(.*\)".*/\1/')"
+    MINIO_ENABLED="false"
+    MINIO_EXTERNAL="false"
+    MINIO_ENDPOINT=""
+    MINIO_NS="minio"
+    MINIO_BUCKET="ai-platform"
+    MINIO_REPLICAS="1"
+    MINIO_PVC_SIZE="150Gi"
+    MINIO_PVC_STORAGE_CLASS=""
+    MINIO_ROOT_USER="minioadmin"
+    MINIO_ROOT_PASSWORD="AAnwWE2sLfFduYTpPy4v7PcyczSHGrVM"
     AI_NS="$(grep 'namespace:' "$cfg" | grep -A2 'aiPlatform:' | tail -1 | sed 's/.*namespace: *"\(.*\)".*/\1/')"
     AI_PLATFORM_NAME="splunk-ai-stack"
     AI_STANDALONE_NAME="splunk-standalone"
@@ -163,6 +190,7 @@ load_config() {
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
   S3_PREFIXES=("artifacts/" "apps/" "tasks/")
   AI_BUCKET_POLICY_NAME="S3Access-${CLUSTER_NAME}-ai-platform"
+  AI_ECR_ONLY_POLICY_NAME="ECRAccess-${CLUSTER_NAME}-ai-platform"
 
   # IRSA for EBS CSI
   EBS_IRSA_ROLE_NAME="EBSCSIDriverRole-${CLUSTER_NAME}"
@@ -1134,6 +1162,109 @@ install_cert_manager() {
   check_ready cert-manager "app.kubernetes.io/instance=cert-manager,app.kubernetes.io/component=controller"
 }
 
+# ---------- MinIO (optional S3-compatible object storage) ----------
+install_minio() {
+  if [[ "${MINIO_ENABLED}" != "true" ]]; then
+    log "MinIO is disabled (storage.minio.enabled != true); skipping."
+    return 0
+  fi
+
+  # External MinIO (e.g. on EC2): only create credentials secret; no in-cluster install
+  if [[ "${MINIO_EXTERNAL}" == "true" ]]; then
+    log "Using external MinIO (storage.minio.external=true); skipping in-cluster install."
+    if [[ -z "${MINIO_ENDPOINT}" ]]; then
+      warn "storage.minio.endpoint is empty; set it to the MinIO URL (e.g. http://<ec2-ip>:9000) for AIPlatform to use external MinIO."
+    fi
+    if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
+      err "External MinIO requires storage.minio.auth.rootPassword to be set (same as on the MinIO server)."
+      return 1
+    fi
+    ensure_namespace "${AI_NS}"
+    local secret_name="minio-credentials"
+    kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
+      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    log "✓ External MinIO credentials secret ${AI_NS}/${secret_name} ready"
+    return 0
+  fi
+
+  log "Installing MinIO in ${MINIO_NS}..."
+  ensure_namespace "${MINIO_NS}"
+
+  # Auto-generate root password if not set
+  local minio_password="${MINIO_ROOT_PASSWORD}"
+  if [[ -z "$minio_password" ]]; then
+    minio_password="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
+    MINIO_ROOT_PASSWORD="$minio_password"
+    log "Generated MinIO root password (saved for secret creation)"
+  fi
+
+  helm repo add bitnami https://charts.bitnami.com/bitnami
+  helm repo update
+
+  local helm_args=(
+    --namespace "${MINIO_NS}"
+    --set auth.rootUser="${MINIO_ROOT_USER}"
+    --set auth.rootPassword="${MINIO_ROOT_PASSWORD}"
+    --set defaultBuckets="${MINIO_BUCKET}"
+    --set persistence.size="${MINIO_PVC_SIZE}"
+    --set replicas="${MINIO_REPLICAS}"
+  )
+  [[ -n "${MINIO_PVC_STORAGE_CLASS}" ]] && helm_args+=(--set persistence.storageClass="${MINIO_PVC_STORAGE_CLASS}")
+
+  helm_retry 5 upgrade --install minio bitnami/minio "${helm_args[@]}" --wait --timeout 10m
+
+  # Wait for MinIO deployment to be ready
+  local minio_deploy="minio"
+  kubectl -n "${MINIO_NS}" rollout status deployment/"${minio_deploy}" --timeout=300s 2>/dev/null || true
+
+  # Create credentials secret in AI platform namespace for AIPlatform CR (objectStorage.secretRef).
+  # SAIA and pkg/storage expect s3_access_key/s3_secret_key; models/SAIA expect MINIO_ACCESS_KEY/MINIO_SECRET_KEY.
+  ensure_namespace "${AI_NS}"
+  local secret_name="minio-credentials"
+  kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
+    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+
+  # Create prefix "folders" in MinIO bucket (artifacts/, apps/, tasks/) via placeholder objects
+  log "Creating MinIO bucket prefixes (artifacts/, apps/, tasks/)..."
+  cat <<YAML | kubectl -n "${MINIO_NS}" apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-setup-prefixes
+spec:
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
+              mc cp /dev/null myminio/${MINIO_BUCKET}/artifacts/.keep || true
+              mc cp /dev/null myminio/${MINIO_BUCKET}/apps/.keep || true
+              mc cp /dev/null myminio/${MINIO_BUCKET}/tasks/.keep || true
+YAML
+  kubectl -n "${MINIO_NS}" wait --for=condition=complete job/minio-setup-prefixes --timeout=120s 2>/dev/null || true
+
+  log "✓ MinIO installed; bucket=${MINIO_BUCKET}; credentials secret ${AI_NS}/${secret_name}"
+}
+
 # ---------- OTEL Operator + contrib collector (idempotent) ----------
 install_otel_operator_and_contrib_collector() {
   log "Installing OpenTelemetry Operator (Helm)..."
@@ -1328,6 +1459,62 @@ EOF
   printf "%s" "$arn"
 }
 
+# ECR-only policy for IRSA when using MinIO (no S3) - allows pulling images from ECR
+ensure_ecr_only_policy() {
+  local name="${AI_ECR_ONLY_POLICY_NAME}"
+  local expected_arn="arn:aws:iam::${ACCOUNT_ID}:policy/${name}"
+  if aws iam get-policy --policy-arn "$expected_arn" >/dev/null 2>&1; then
+    printf "%s" "$expected_arn"
+    return 0
+  fi
+  local arn
+  arn="$(get_policy_arn_by_name "$name")"
+  if [[ -z "$arn" ]]; then
+    log "Creating IAM policy ${name} (ECR read-only, for MinIO-only mode)"
+    local pd; pd="$(mktemp)"; TMP_FILES+=("$pd")
+    cat > "$pd" <<'ECRPOL'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage"
+      ],
+      "Resource": "arn:aws:ecr:*:*:repository/*"
+    }
+  ]
+}
+ECRPOL
+    local create_out rc
+    set +e
+    create_out="$(aws iam create-policy --policy-name "${name}" --policy-document "file://${pd}" --query 'Policy.Arn' --output text 2>&1)"
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+      arn="$(normalize_arn "$create_out")"
+    else
+      if grep -qi 'EntityAlreadyExists' <<<"$create_out"; then
+        arn="$(get_policy_arn_by_name "$name")"
+      else
+        err "Failed to create IAM policy ${name}: $create_out"
+      fi
+    fi
+  fi
+  arn="$(normalize_arn "$arn")"
+  [[ -z "$arn" ]] && err "Failed to resolve ARN for policy ${name}"
+  printf "%s" "$arn"
+}
+
 # ------- IRSA helpers: ensure & validate -------
 generate_irsa_trust_policy() {
   local ns="$1" sa="$2"
@@ -1385,6 +1572,18 @@ validate_irsa_for_sa() {
 ensure_irsa_for_sa() {
   local sa="$1" ns="$2" policy_arn_raw="${3:-}"
   local role="IRSA-${CLUSTER_NAME}-${sa}"
+
+  # Fail fast if kubectl cannot reach the cluster (e.g. wrong KUBECONFIG or context)
+  local kerr
+  kerr="$(kubectl get ns "${ns}" 2>&1)" || true
+  if echo "${kerr}" | grep -q "connection refused\|localhost:8080\|dial tcp.*8080"; then
+    err "kubectl cannot reach the cluster (API server connection refused). \
+Fix: run 'aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${REGION}' and ensure KUBECONFIG (if set) points to that file. \
+Then re-run this script."
+  fi
+  if ! kubectl get ns "${ns}" >/dev/null 2>&1; then
+    err "Cannot access namespace ${ns} (kubectl get ns failed). Ensure the cluster is reachable and the namespace exists."
+  fi
 
   # Resolve/repair policy ARN if invalid
   local policy_arn; policy_arn="$(normalize_arn "$policy_arn_raw")"
@@ -1454,28 +1653,34 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
-  # Create IRSA for Splunk Standalone (recommended approach)
+  # IRSA for Splunk Standalone: S3 bucket policy when using S3, ECR-only when using MinIO
   log "Setting up IRSA for Splunk Standalone service account..."
-  local policy_arn; policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  local policy_arn
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    policy_arn="$(ensure_ecr_only_policy)"
+  else
+    policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  fi
   ensure_irsa_for_sa "${STANDALONE_SA}" "${AI_NS}" "${policy_arn}"
 
-  # DEPRECATED: Create s3-secret using AWS credentials
-  # This is legacy approach - IRSA above is preferred, but Splunk Operator may still require the secret
-  log "Creating s3-secret for Splunk Standalone (fallback if IRSA not fully supported)..."
-  if resolve_aws_creds_for_secret 2>/dev/null; then
-    local ak="${AWS_ACCESS_KEY_ID:-}"; local sk="${AWS_SECRET_ACCESS_KEY:-}"; local st="${AWS_SESSION_TOKEN:-}"
-    if [[ -n "$ak" && -n "$sk" ]]; then
-      kubectl -n "${AI_NS}" create secret generic s3-secret \
-        --from-literal=s3_access_key="${ak}" \
-        --from-literal=s3_secret_key="${sk}" \
-        $( [[ -n "$st" ]] && printf -- "--from-literal=s3_session_token=%s" "$st" ) \
-        --dry-run=client -o yaml | kubectl apply -f -
-      log "✓ Created s3-secret with explicit credentials"
+  if [[ "${MINIO_ENABLED}" != "true" ]]; then
+    # Create s3-secret for Standalone when using S3 (fallback if IRSA not fully supported)
+    log "Creating s3-secret for Splunk Standalone (S3 mode)..."
+    if resolve_aws_creds_for_secret 2>/dev/null; then
+      local ak="${AWS_ACCESS_KEY_ID:-}"; local sk="${AWS_SECRET_ACCESS_KEY:-}"; local st="${AWS_SESSION_TOKEN:-}"
+      if [[ -n "$ak" && -n "$sk" ]]; then
+        kubectl -n "${AI_NS}" create secret generic s3-secret \
+          --from-literal=s3_access_key="${ak}" \
+          --from-literal=s3_secret_key="${sk}" \
+          $( [[ -n "$st" ]] && printf -- "--from-literal=s3_session_token=%s" "$st" ) \
+          --dry-run=client -o yaml | kubectl apply -f -
+        log "✓ Created s3-secret with explicit credentials"
+      else
+        warn "No AWS credentials available - s3-secret not created. Splunk Standalone will use IRSA."
+      fi
     else
-      warn "No AWS credentials available - s3-secret not created. Splunk Standalone will use IRSA."
+      warn "AWS credentials not available - s3-secret not created. Splunk Standalone will use IRSA via ${STANDALONE_SA}."
     fi
-  else
-    warn "AWS credentials not available - s3-secret not created. Splunk Standalone will use IRSA via ${STANDALONE_SA}."
   fi
 
   cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
@@ -1497,7 +1702,48 @@ data:
                 sslPassword: password
 YAML
 
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  # Standalone app repo: MinIO (S3-compatible) when storage.minio.enabled=true, else S3
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    local minio_endpoint="${MINIO_ENDPOINT}"
+    [[ -z "$minio_endpoint" ]] && minio_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: ${AI_STANDALONE_NAME}
+  namespace: ${AI_NS}
+spec:
+  serviceAccount: ${STANDALONE_SA}
+  etcVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  varVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  volumes:
+    - name: defaults
+      configMap:
+        name: splunk-defaults
+  defaultsUrl: /mnt/defaults/default.yml
+  appRepo:
+    appInstallPeriodSeconds: 90
+    appSources:
+      - name: apps
+        scope: local
+        location: apps
+    appsRepoPollIntervalSeconds: 60
+    defaults:
+      scope: local
+      volumeName: volume_app_repo
+    installMaxRetries: 2
+    volumes:
+      - name: volume_app_repo
+        provider: aws
+        storageType: s3
+        endpoint: ${minio_endpoint}
+        path: ${MINIO_BUCKET}
+        secretRef: minio-credentials
+YAML
+  else
+    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
@@ -1534,6 +1780,7 @@ spec:
         path: ${S3_BUCKET}
         secretRef: s3-secret
 YAML
+  fi
 
   local sts="splunk-${AI_STANDALONE_NAME}-standalone"
   wait_resource_exists "${AI_NS}" statefulset "${sts}" 600
@@ -1861,6 +2108,22 @@ spec:
   ca: { secretName: root-secret }
 YAML
 
+  # objectStorage: use MinIO when enabled (in-cluster or external), otherwise S3
+  local obj_path obj_endpoint obj_secret
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    obj_path="minio://${MINIO_BUCKET}"
+    if [[ "${MINIO_EXTERNAL}" == "true" && -n "${MINIO_ENDPOINT}" ]]; then
+      obj_endpoint="${MINIO_ENDPOINT}"
+    else
+      obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+    fi
+    obj_secret="minio-credentials"
+  else
+    obj_path="s3://${S3_BUCKET}"
+    obj_endpoint=""
+    obj_secret=""
+  fi
+
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -1868,8 +2131,10 @@ metadata:
   name: ${AI_PLATFORM_NAME}
 spec:
   objectStorage:
-    path: s3://${S3_BUCKET}
+    path: ${obj_path}
     region: ${REGION}
+    $( [[ -n "$obj_endpoint" ]] && echo "endpoint: \"${obj_endpoint}\"" )
+    $( [[ -n "$obj_secret" ]] && echo "secretRef: ${obj_secret}" )
   serviceAccountName: ${RAY_HEAD_SA}
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
   features:
@@ -2199,6 +2464,9 @@ delete_cluster_minimal() {
   log "===================================================================="
   log "  Starting comprehensive cleanup for cluster ${CLUSTER_NAME}"
   log "===================================================================="
+  if [[ "${PRESERVE_VPC_ON_DELETE}" == "true" && ( ${#PRIVATE_SUBNETS[@]} -gt 0 || ${#PUBLIC_SUBNETS[@]} -gt 0 ) ]]; then
+    log "  (VPC preserved: cluster was created in existing VPC; only EKS and related resources will be deleted)"
+  fi
   echo ""
 
   # Store OIDC ARN before deleting cluster
@@ -2309,7 +2577,11 @@ delete_cluster_minimal() {
   echo ""
 
   log "Step 7: Deleting IAM policies..."
-  delete_policy_if_exists "${AI_BUCKET_POLICY_NAME}"
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    delete_policy_if_exists "${AI_ECR_ONLY_POLICY_NAME}"
+  else
+    delete_policy_if_exists "${AI_BUCKET_POLICY_NAME}"
+  fi
   echo ""
 
   log "Step 8: Purging all IRSA roles associated with this cluster's OIDC provider..."
@@ -2330,7 +2602,11 @@ delete_cluster_minimal() {
   echo ""
   log "Summary of deleted resources:"
   log "  ✓ IAM Roles: Cluster Autoscaler, Ray (head/worker), SAIA, EBS Pod Identity"
-  log "  ✓ IAM Policies: S3 access policy for AI platform"
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    log "  ✓ IAM Policies: ECR-only policy for AI platform (MinIO mode)"
+  else
+    log "  ✓ IAM Policies: S3 access policy for AI platform"
+  fi
   log "  ✓ Pod Identity: EBS CSI driver association"
   log "  ✓ EKS Addons: EBS CSI driver, Pod Identity agent"
   log "  ✓ CloudFormation Stacks: All eksctl-created stacks"
@@ -2419,7 +2695,11 @@ preflight_env() {
   [[ -n "$CLUSTER_NAME" ]] && pf_ok "CLUSTER_NAME=${CLUSTER_NAME}" || pf_fail "CLUSTER_NAME is empty"
   dns1123_ok "$CLUSTER_NAME" || pf_fail "CLUSTER_NAME must be DNS-1123 compliant"
   [[ "$K8S_VERSION" =~ ^1\.[0-9]+$ ]] && pf_ok "K8S_VERSION=${K8S_VERSION}" || pf_fail "K8S_VERSION format invalid"
-  s3_name_ok "$S3_BUCKET" && pf_ok "S3 bucket name valid: ${S3_BUCKET}" || pf_fail "S3 bucket name invalid: ${S3_BUCKET}"
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    pf_ok "MinIO enabled: object storage via MinIO (S3 bucket not used)"
+  else
+    s3_name_ok "$S3_BUCKET" && pf_ok "S3 bucket name valid: ${S3_BUCKET}" || pf_fail "S3 bucket name invalid: ${S3_BUCKET}"
+  fi
 
   pf_header "Required files"
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "SPLUNK_OPERATOR_FILE present: ${SPLUNK_OPERATOR_FILE}" || pf_fail "SPLUNK_OPERATOR_FILE missing: ${SPLUNK_OPERATOR_FILE}"
@@ -2445,6 +2725,13 @@ preflight_env() {
   pf_header "Subnets exist"
   # Check if subnets are provided (arrays may be empty)
   local subnet_count=$((${#PRIVATE_SUBNETS[@]} + ${#PUBLIC_SUBNETS[@]}))
+  if [[ "${PRESERVE_VPC_ON_DELETE}" == "true" ]]; then
+    if [[ ${#PRIVATE_SUBNETS[@]} -lt 2 ]]; then
+      pf_fail "cluster.preserveVpcOnDelete is true: you must specify at least 2 private subnets under cluster.subnets.private so the cluster uses an existing VPC (VPC will not be deleted on 'delete')."
+    else
+      pf_ok "Preserve VPC on delete: using existing VPC (subnets specified); VPC will not be deleted when you run delete."
+    fi
+  fi
   if [[ $subnet_count -eq 0 ]]; then
     pf_ok "No subnets specified - eksctl will create new VPC and subnets automatically"
   else
@@ -2668,11 +2955,20 @@ add_ecr_permissions_to_role() {
 # ---------- Orchestrator for AI Platform setup ----------
 install_ai_platform_stack() {
   log "=== Setting up Splunk AI Platform stack ==="
-  ensure_s3_bucket_and_prefixes
-  ensure_s3_upload_splunk_app
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    log "Using MinIO for object storage (storage.minio.enabled=true); skipping S3 bucket creation; using ECR-only policy for IRSA."
+  else
+    ensure_s3_bucket_and_prefixes
+    ensure_s3_upload_splunk_app
+  fi
   ensure_namespace "${AI_NS}"
 
-  local policy_arn; policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  local policy_arn
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    policy_arn="$(ensure_ecr_only_policy)"
+  else
+    policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  fi
 
   ensure_irsa_for_sa "${RAY_HEAD_SA}"      "${AI_NS}" "${policy_arn}"
   ensure_irsa_for_sa "${RAY_WORKER_SA}"    "${AI_NS}" "${policy_arn}"
@@ -2711,6 +3007,7 @@ reconcile_flow() {
   uncordon_ready_nodes
   install_kube_prometheus
   install_cert_manager
+  install_minio
   install_otel_operator_and_contrib_collector
   install_ray_operator
   install_splunk_operator
@@ -2750,9 +3047,16 @@ main_install() {
     pf_summary
   fi
 
+  # Idempotent: create cluster only if it does not exist. When cluster.useExisting is true, fail if cluster is missing.
   if ! cluster_exists; then
+    if [[ "${USE_EXISTING_CLUSTER}" == "true" ]]; then
+      err "cluster.useExisting is true but cluster '${CLUSTER_NAME}' was not found in ${REGION}. Create the cluster first or set useExisting: false."
+      exit 1
+    fi
     create_cluster_flow
     ensure_kubeconfig
+  else
+    log "Cluster ${CLUSTER_NAME} already exists; skipping cluster creation (idempotent)."
   fi
 
   preflight_api_connectivity

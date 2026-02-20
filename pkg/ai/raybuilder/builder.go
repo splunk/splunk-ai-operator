@@ -45,7 +45,11 @@ type Builder struct {
 
 type ApplicationParams struct {
 	ArtifactBucketName string           `yaml:"ARTIFACTS_S3_BUCKET"`
+	ArtifactsProvider  string           `yaml:"ARTIFACTS_PROVIDER"`
 	CloudProvider      string           `yaml:"CLOUD_PROVIDER"`
+	MinioEndpointUrl   string           `yaml:"MINIO_ENDPOINT_URL"`
+	MinioAccessKey     string           `yaml:"MINIO_ACCESS_KEY"`
+	MinioSecretKey     string           `yaml:"MINIO_SECRET_KEY"`
 	Replicas           map[string]int32 `yaml:"REPLICAS"`
 }
 
@@ -89,15 +93,25 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		return err
 	}
 
-	// Set CloudProvider based on URL scheme
-	var cloudProvider string
+	// Set CloudProvider and artifacts provider/bucket from URL scheme (for SDK model loaders).
+	// ARTIFACTS_PROVIDER matches storage client GetProvider(): s3/minio -> "s3", gs/gcs -> "gcs", azure -> "azure".
+	var cloudProvider, artifactsProvider string
 	switch u.Scheme {
 	case "s3":
 		cloudProvider = "aws"
-	case "gs":
+		artifactsProvider = "s3"
+	case "minio":
+		cloudProvider = "minio"
+		artifactsProvider = "s3" // MinIO is S3-compatible; SDK uses s3 client
+	case "gs", "gcs":
 		cloudProvider = "gcp"
+		artifactsProvider = "gcs"
+	case "azure":
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
 	default:
-		cloudProvider = "azure" // TODO: FIX THIS, need to support minio
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
 	}
 
 	// Initialize the replicas map by iterating through features
@@ -135,9 +149,34 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
+	minioEndpoint := ""
+	if u.Scheme == "minio" && p.Spec.ObjectStorage.Endpoint != "" {
+		minioEndpoint = p.Spec.ObjectStorage.Endpoint
+	}
+
+	var minioAccessKey, minioSecretKey string
+	if u.Scheme == "minio" && p.Spec.ObjectStorage.SecretRef != "" {
+		var secret corev1.Secret
+		secretRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Spec.ObjectStorage.SecretRef}
+		if err := b.Get(ctx, secretRef, &secret); err != nil {
+			logger.Error(err, "Failed to get object storage secret for MinIO credentials", "secret", p.Spec.ObjectStorage.SecretRef)
+			return err
+		}
+		if raw, ok := secret.Data["s3_access_key"]; ok {
+			minioAccessKey = string(raw)
+		}
+		if raw, ok := secret.Data["s3_secret_key"]; ok {
+			minioSecretKey = string(raw)
+		}
+	}
+
 	param := ApplicationParams{
 		ArtifactBucketName: u.Host,
+		ArtifactsProvider:  artifactsProvider,
 		CloudProvider:      cloudProvider,
+		MinioEndpointUrl:   minioEndpoint,
+		MinioAccessKey:     minioAccessKey,
+		MinioSecretKey:     minioSecretKey,
 		Replicas:           replicasMap,
 	}
 
@@ -670,7 +709,41 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	}, nil
 }
 
+// objectStorageSecretEnv returns env vars for MINIO_ACCESS_KEY and MINIO_SECRET_KEY from
+// the objectStorage secret (s3_access_key/s3_secret_key) so models and SAIA can access MinIO/S3.
+func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
+	if b.ai.Spec.ObjectStorage.SecretRef == "" {
+		return nil
+	}
+	secretName := b.ai.Spec.ObjectStorage.SecretRef
+	return []corev1.EnvVar{
+		{
+			Name: "MINIO_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "s3_access_key",
+				},
+			},
+		},
+		{
+			Name: "MINIO_SECRET_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "s3_secret_key",
+				},
+			},
+		},
+	}
+}
+
 func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
+	headEnv := []corev1.EnvVar{
+		{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
+		{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
+	}
+	headEnv = append(headEnv, b.objectStorageSecretEnv()...)
 	spec := corev1.PodSpec{
 		Containers: []corev1.Container{{
 			Name:            "ray-head",
@@ -684,10 +757,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 				"-lc",
 				"--",
 			},
-			Env: []corev1.EnvVar{
-				{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
-				{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
-			},
+			Env: headEnv,
 			Lifecycle: &corev1.Lifecycle{
 				PreStop: &corev1.LifecycleHandler{
 					Exec: &corev1.ExecAction{
@@ -783,6 +853,8 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 			combinedEnv = append(combinedEnv, corev1.EnvVar{Name: key, Value: value})
 		}
 	}
+	// MinIO/S3 credentials for models and SAIA (MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
+	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
 	rayCommand := fmt.Sprintf(`echo %s worker;
         ulimit -n 65536;
     	export PATH="/home/ray/anaconda3/bin:$PATH";

@@ -43,12 +43,24 @@ func NewStorageClient(
 
 	switch u.Scheme {
 	case "s3":
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid volume URI %q: S3 path must include bucket name (e.g. s3://bucket-name/prefix)", vs.Path)
+		}
 		return NewS3Client(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "gs", "gcs":
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid volume URI %q: GCS path must include bucket name (e.g. gs://bucket-name/prefix)", vs.Path)
+		}
 		return NewGCSClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "azure":
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid volume URI %q: Azure path must include container name (e.g. azure://container-name/prefix). Without it, model deployments fail with 'Please specify a container name'", vs.Path)
+		}
 		return NewAzureClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "minio":
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid volume URI %q: MinIO path must include bucket name (e.g. minio://bucket-name/prefix)", vs.Path)
+		}
 		// everything after "//" is host (bucket) and path.  We treat u.Host as bucket,
 		// vs.Endpoint *must* be set to our MinIO URL for this case.
 		return NewMinioClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
