@@ -195,14 +195,7 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 		warnings = append(warnings, createWarnings...)
 	}
 
-	// Validate immutable fields
-	if oldPlatform.Spec.ObjectStorage.Path != aiplatform.Spec.ObjectStorage.Path {
-		allErrs = append(allErrs, field.Forbidden(
-			field.NewPath("spec").Child("objectStorage").Child("path"),
-			"objectStorage.path is immutable",
-		))
-	}
-
+	// Validate immutable fields (path is mutable to allow switching storage backends, e.g. MinIO to SeaweedFS)
 	if oldPlatform.Spec.ObjectStorage.Region != aiplatform.Spec.ObjectStorage.Region {
 		allErrs = append(allErrs, field.Forbidden(
 			field.NewPath("spec").Child("objectStorage").Child("region"),
@@ -237,8 +230,8 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 	if objStorage.Path == "" {
 		allErrs = append(allErrs, field.Required(fldPath.Child("path"), "objectStorage.path must be specified"))
 	} else {
-		// Validate path format (s3://, gs://, azure://, minio://)
-		validPrefixes := []string{"s3://", "gs://", "azure://", "minio://"}
+		// Validate path format (s3://, gs://, azure://, s3compat://, minio://, seaweedfs://)
+		validPrefixes := []string{"s3://", "gs://", "azure://", "s3compat://", "minio://", "seaweedfs://"}
 		hasValidPrefix := false
 		for _, prefix := range validPrefixes {
 			if strings.HasPrefix(objStorage.Path, prefix) {
@@ -250,7 +243,7 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 			allErrs = append(allErrs, field.Invalid(
 				fldPath.Child("path"),
 				objStorage.Path,
-				"path must start with s3://, gs://, azure://, or minio://",
+				"path must start with s3://, gs://, azure://, s3compat://, minio://, or seaweedfs://",
 			))
 		}
 	}

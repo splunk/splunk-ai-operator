@@ -57,13 +57,21 @@ func NewStorageClient(
 			return nil, fmt.Errorf("invalid volume URI %q: Azure path must include container name (e.g. azure://container-name/prefix). Without it, model deployments fail with 'Please specify a container name'", vs.Path)
 		}
 		return NewAzureClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
+	case "s3compat":
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid volume URI %q: S3-compatible path must include bucket name (e.g. s3compat://bucket-name/prefix)", vs.Path)
+		}
+		return NewS3CompatibleClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "minio":
 		if u.Host == "" {
 			return nil, fmt.Errorf("invalid volume URI %q: MinIO path must include bucket name (e.g. minio://bucket-name/prefix)", vs.Path)
 		}
-		// everything after "//" is host (bucket) and path.  We treat u.Host as bucket,
-		// vs.Endpoint *must* be set to our MinIO URL for this case.
-		return NewMinioClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
+		return NewS3CompatibleClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
+	case "seaweedfs":
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid volume URI %q: SeaweedFS path must include bucket name (e.g. seaweedfs://bucket-name/prefix)", vs.Path)
+		}
+		return NewS3CompatibleClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "fixture":
 		// fixture:// is a special scheme for testing purposes, using a fake client.
 		// It does not require any credentials or endpoint.

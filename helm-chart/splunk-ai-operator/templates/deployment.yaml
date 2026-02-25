@@ -40,7 +40,7 @@ spec:
 {{- toYaml .Values.securityContext | nindent 8 }}
       containers:
         - name: manager
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion | default "latest" }}"
+          image: "{{ if .Values.image.digest }}{{ .Values.image.repository }}@{{ .Values.image.digest }}{{ else }}{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion | default "latest" }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
           - --metrics-bind-address=:8443

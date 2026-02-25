@@ -275,7 +275,7 @@ func (v *AIServiceCustomValidator) validateTaskVolume(taskVolume *aiv1.ObjectSto
 	} else {
 		// Validate path format
 		/*
-			validPrefixes := []string{"s3://", "gs://", "azure://", "minio://"}
+			validPrefixes := []string{"s3://", "gs://", "azure://", "s3compat://", "minio://", "seaweedfs://"}
 			hasValidPrefix := false
 			for _, prefix := range validPrefixes {
 				if strings.HasPrefix(taskVolume.Path, prefix) {
@@ -287,7 +287,7 @@ func (v *AIServiceCustomValidator) validateTaskVolume(taskVolume *aiv1.ObjectSto
 				allErrs = append(allErrs, field.Invalid(
 					fldPath.Child("path"),
 					taskVolume.Path,
-					"path must start with s3://, gs://, azure://, or minio://",
+					"path must start with s3://, gs://, azure://, s3compat://, minio://, or seaweedfs://",
 				))
 			}
 		*/

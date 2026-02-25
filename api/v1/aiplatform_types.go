@@ -364,13 +364,13 @@ type SidecarSpec struct {
 // ObjectStorageSpec defines object storage configuration for AI artifacts, tasks, and models
 type ObjectStorageSpec struct {
 	// Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-	// azure://containername/<path prefix>, or minio://bucketname/<path prefix>
+	// azure://containername/<path prefix>, s3compat://bucketname/<path prefix> (generic S3-compatible), minio://, or seaweedfs://
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=`^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$`
+	// +kubebuilder:validation:Pattern=`^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$`
 	Path string `json:"path"`
 
-	// Optional override endpoint (only needed for S3-compatible services like MinIO)
-	// Must be a valid HTTP/HTTPS URL
+	// Optional override endpoint (only needed for S3-compatible services like MinIO, SeaweedFS)
+	// Must be a valid HTTP/HTTPS URL. When set with s3:// path, backend is treated as S3-compatible (MinIO, SeaweedFS, etc.)
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Pattern=`^https?://.*$`
 	Endpoint string `json:"endpoint,omitempty"`
@@ -380,11 +380,17 @@ type ObjectStorageSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Region string `json:"region"`
 
-	// Secret name containing storage credentials
+	// Secret name containing storage credentials (e.g. s3_access_key, s3_secret_key for S3-compatible backends)
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	SecretRef string `json:"secretRef,omitempty"`
+
+	// Provider is an optional hint for documentation and tooling. Operator derives behavior from path scheme and endpoint.
+	// Values: aws, minio, seaweedfs, s3compat, gcs, azure
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=aws;minio;seaweedfs;s3compat;gcs;azure
+	Provider string `json:"provider,omitempty"`
 }
 
 // IngressSpec defines Ingress configuration for external access to platform services

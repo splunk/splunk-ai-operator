@@ -75,12 +75,52 @@ func TestNewStorageClient(t *testing.T) {
 			},
 		},
 		{
-			name: "MinIO storage",
+			name: "MinIO storage (S3-compatible)",
 			volumeSpec: ai.ObjectStorageSpec{
 				Path:     "minio://my-bucket/prefix",
 				Endpoint: "http://minio.default.svc:9000",
+				Region:   "us-east-1",
 			},
-			wantType: "minio",
+			wantType: "s3",
+			wantErr:  false,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
+		{
+			name: "S3-compatible storage (generic s3compat scheme)",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:     "s3compat://my-bucket/prefix",
+				Endpoint: "http://s3compat.default.svc:9000",
+				Region:   "us-east-1",
+			},
+			wantType: "s3",
+			wantErr:  false,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
+		{
+			name: "SeaweedFS storage (S3-compatible)",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:     "seaweedfs://my-bucket/prefix",
+				Endpoint: "http://seaweedfs.default.svc:8333",
+				Region:   "us-east-1",
+			},
+			wantType: "s3",
+			wantErr:  false,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
+		{
+			name: "S3 with custom endpoint (S3-compatible)",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:     "s3://my-bucket/prefix",
+				Endpoint: "http://custom-s3.example.com:9000",
+				Region:   "us-east-1",
+			},
+			wantType: "s3",
 			wantErr:  false,
 			setupClient: func() *fake.ClientBuilder {
 				return fake.NewClientBuilder().WithScheme(s)
@@ -91,7 +131,7 @@ func TestNewStorageClient(t *testing.T) {
 			volumeSpec: ai.ObjectStorageSpec{
 				Path: "fixture://test-bucket/prefix",
 			},
-			wantType: "fixture",
+			wantType: "s3", // fixtureClient.GetProvider() returns "s3" for artifact compatibility
 			wantErr:  false,
 			setupClient: func() *fake.ClientBuilder {
 				return fake.NewClientBuilder().WithScheme(s)
@@ -139,6 +179,30 @@ func TestNewStorageClient(t *testing.T) {
 				return fake.NewClientBuilder().WithScheme(s)
 			},
 		},
+		{
+			name: "S3-compatible path without bucket name",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:     "s3compat:///prefix",
+				Endpoint: "http://s3compat:9000",
+				Region:   "us-east-1",
+			},
+			wantErr: true,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
+		{
+			name: "SeaweedFS path without bucket name",
+			volumeSpec: ai.ObjectStorageSpec{
+				Path:     "seaweedfs:///prefix",
+				Endpoint: "http://seaweedfs:8333",
+				Region:   "us-east-1",
+			},
+			wantErr: true,
+			setupClient: func() *fake.ClientBuilder {
+				return fake.NewClientBuilder().WithScheme(s)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -156,7 +220,7 @@ func TestNewStorageClient(t *testing.T) {
 
 				// Verify provider matches expected type
 				provider := client.GetProvider()
-				assert.NotEmpty(t, provider)
+				assert.Equal(t, tt.wantType, provider, "GetProvider() should match wantType")
 
 				// Verify bucket/container is extracted
 				bucket := client.GetBucket()
