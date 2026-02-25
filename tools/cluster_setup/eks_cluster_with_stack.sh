@@ -55,17 +55,21 @@ load_config() {
     S3_BUCKET="$(yq eval '.storage.s3Bucket' "$cfg")"
     STORAGE_CLASS="$(yq eval '.storage.storageClass' "$cfg")"
     VECTORDB_SIZE="$(yq eval '.storage.vectorDbSize' "$cfg")"
-    # MinIO (optional S3-compatible object storage)
-    MINIO_ENABLED="$(yq eval '.storage.minio.enabled // false' "$cfg")"
-    MINIO_EXTERNAL="$(yq eval '.storage.minio.external // false' "$cfg")"
-    MINIO_ENDPOINT="$(yq eval '.storage.minio.endpoint // ""' "$cfg")"
-    MINIO_NS="$(yq eval '.storage.minio.namespace // "minio"' "$cfg")"
-    MINIO_BUCKET="$(yq eval '.storage.minio.bucket // "ai-platform"' "$cfg")"
-    MINIO_REPLICAS="$(yq eval '.storage.minio.replicas // 1' "$cfg")"
-    MINIO_PVC_SIZE="$(yq eval '.storage.minio.persistence.size // "100Gi"' "$cfg")"
-    MINIO_PVC_STORAGE_CLASS="$(yq eval '.storage.minio.persistence.storageClass // ""' "$cfg")"
-    MINIO_ROOT_USER="$(yq eval '.storage.minio.auth.rootUser // "minioadmin"' "$cfg")"
-    MINIO_ROOT_PASSWORD="$(yq eval '.storage.minio.auth.rootPassword // ""' "$cfg")"
+    # Object storage: objectStore.type (aws | s3compat | minio | seaweedfs); default aws when unset
+    OBJ_STORE_TYPE="$(yq eval '.storage.objectStore.type // "aws"' "$cfg")"
+    OBJ_STORE_BUCKET="$(yq eval '.storage.objectStore.bucket // .storage.s3Bucket // "ai-platform"' "$cfg")"
+    OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "$cfg")"
+    OBJ_STORE_NS="$(yq eval '.storage.objectStore.namespace // "minio"' "$cfg")"
+    _obj_user="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "$cfg")"
+    _obj_pw="$(yq eval '.storage.objectStore.auth.rootPassword // ""' "$cfg")"
+    # External S3-compatible only (no in-cluster MinIO install). True when type is s3compat, minio, or seaweedfs.
+    USE_EXTERNAL_OBJ_STORE="false"
+    case "${OBJ_STORE_TYPE}" in s3compat|minio|seaweedfs) USE_EXTERNAL_OBJ_STORE="true"; esac
+    MINIO_ENDPOINT="${OBJ_STORE_ENDPOINT}"
+    MINIO_NS="${OBJ_STORE_NS}"
+    MINIO_BUCKET="${OBJ_STORE_BUCKET}"
+    MINIO_ROOT_USER="${MINIO_ROOT_USER:-$_obj_user}"
+    MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$_obj_pw}"
 
     # AI Platform
     AI_NS="$(yq eval '.aiPlatform.namespace' "$cfg")"
@@ -136,16 +140,16 @@ load_config() {
     USE_EXISTING_CLUSTER="false"
     PRESERVE_VPC_ON_DELETE="false"
     S3_BUCKET="$(grep 's3Bucket:' "$cfg" | sed 's/.*s3Bucket: *"\(.*\)".*/\1/')"
-    MINIO_ENABLED="false"
-    MINIO_EXTERNAL="false"
+    OBJ_STORE_TYPE=""
+    OBJ_STORE_BUCKET="${S3_BUCKET}"
+    OBJ_STORE_ENDPOINT=""
+    OBJ_STORE_NS="minio"
+    USE_EXTERNAL_OBJ_STORE="false"
     MINIO_ENDPOINT=""
     MINIO_NS="minio"
     MINIO_BUCKET="ai-platform"
-    MINIO_REPLICAS="1"
-    MINIO_PVC_SIZE="150Gi"
-    MINIO_PVC_STORAGE_CLASS=""
-    MINIO_ROOT_USER="minioadmin"
-    MINIO_ROOT_PASSWORD="AAnwWE2sLfFduYTpPy4v7PcyczSHGrVM"
+    MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
+    MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-}"
     AI_NS="$(grep 'namespace:' "$cfg" | grep -A2 'aiPlatform:' | tail -1 | sed 's/.*namespace: *"\(.*\)".*/\1/')"
     AI_PLATFORM_NAME="splunk-ai-stack"
     AI_STANDALONE_NAME="splunk-standalone"
@@ -1162,69 +1166,22 @@ install_cert_manager() {
   check_ready cert-manager "app.kubernetes.io/instance=cert-manager,app.kubernetes.io/component=controller"
 }
 
-# ---------- MinIO (optional S3-compatible object storage) ----------
-install_minio() {
-  if [[ "${MINIO_ENABLED}" != "true" ]]; then
-    log "MinIO is disabled (storage.minio.enabled != true); skipping."
+# ---------- External S3-compatible object storage (credentials only; no in-cluster install) ----------
+ensure_s3compat_credentials() {
+  # Only create credentials secret when using external S3-compatible storage (s3compat, minio, seaweedfs).
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
     return 0
   fi
 
-  # External MinIO (e.g. on EC2): only create credentials secret; no in-cluster install
-  if [[ "${MINIO_EXTERNAL}" == "true" ]]; then
-    log "Using external MinIO (storage.minio.external=true); skipping in-cluster install."
-    if [[ -z "${MINIO_ENDPOINT}" ]]; then
-      warn "storage.minio.endpoint is empty; set it to the MinIO URL (e.g. http://<ec2-ip>:9000) for AIPlatform to use external MinIO."
-    fi
-    if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
-      err "External MinIO requires storage.minio.auth.rootPassword to be set (same as on the MinIO server)."
-      return 1
-    fi
-    ensure_namespace "${AI_NS}"
-    local secret_name="minio-credentials"
-    kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
-      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-    log "✓ External MinIO credentials secret ${AI_NS}/${secret_name} ready"
-    return 0
+  log "Object store type is ${OBJ_STORE_TYPE}; creating credentials secret for external S3-compatible storage."
+  if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
+    err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
+    return 1
   fi
-
-  log "Installing MinIO in ${MINIO_NS}..."
-  ensure_namespace "${MINIO_NS}"
-
-  # Auto-generate root password if not set
-  local minio_password="${MINIO_ROOT_PASSWORD}"
-  if [[ -z "$minio_password" ]]; then
-    minio_password="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
-    MINIO_ROOT_PASSWORD="$minio_password"
-    log "Generated MinIO root password (saved for secret creation)"
+  if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
+    err "External S3-compatible storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
+    return 1
   fi
-
-  helm repo add bitnami https://charts.bitnami.com/bitnami
-  helm repo update
-
-  local helm_args=(
-    --namespace "${MINIO_NS}"
-    --set auth.rootUser="${MINIO_ROOT_USER}"
-    --set auth.rootPassword="${MINIO_ROOT_PASSWORD}"
-    --set defaultBuckets="${MINIO_BUCKET}"
-    --set persistence.size="${MINIO_PVC_SIZE}"
-    --set replicas="${MINIO_REPLICAS}"
-  )
-  [[ -n "${MINIO_PVC_STORAGE_CLASS}" ]] && helm_args+=(--set persistence.storageClass="${MINIO_PVC_STORAGE_CLASS}")
-
-  helm_retry 5 upgrade --install minio bitnami/minio "${helm_args[@]}" --wait --timeout 10m
-
-  # Wait for MinIO deployment to be ready
-  local minio_deploy="minio"
-  kubectl -n "${MINIO_NS}" rollout status deployment/"${minio_deploy}" --timeout=300s 2>/dev/null || true
-
-  # Create credentials secret in AI platform namespace for AIPlatform CR (objectStorage.secretRef).
-  # SAIA and pkg/storage expect s3_access_key/s3_secret_key; models/SAIA expect MINIO_ACCESS_KEY/MINIO_SECRET_KEY.
   ensure_namespace "${AI_NS}"
   local secret_name="minio-credentials"
   kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
@@ -1235,34 +1192,7 @@ install_minio() {
     --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
     --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
     --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-
-  # Create prefix "folders" in MinIO bucket (artifacts/, apps/, tasks/) via placeholder objects
-  log "Creating MinIO bucket prefixes (artifacts/, apps/, tasks/)..."
-  cat <<YAML | kubectl -n "${MINIO_NS}" apply -f -
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-setup-prefixes
-spec:
-  ttlSecondsAfterFinished: 60
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: mc
-          image: minio/mc:latest
-          command:
-            - /bin/sh
-            - -c
-            - |
-              mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
-              mc cp /dev/null myminio/${MINIO_BUCKET}/artifacts/.keep || true
-              mc cp /dev/null myminio/${MINIO_BUCKET}/apps/.keep || true
-              mc cp /dev/null myminio/${MINIO_BUCKET}/tasks/.keep || true
-YAML
-  kubectl -n "${MINIO_NS}" wait --for=condition=complete job/minio-setup-prefixes --timeout=120s 2>/dev/null || true
-
-  log "✓ MinIO installed; bucket=${MINIO_BUCKET}; credentials secret ${AI_NS}/${secret_name}"
+  log "✓ External S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
 }
 
 # ---------- OTEL Operator + contrib collector (idempotent) ----------
@@ -1653,17 +1583,17 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
-  # IRSA for Splunk Standalone: S3 bucket policy when using S3, ECR-only when using MinIO
+  # IRSA for Splunk Standalone: S3 bucket policy when using AWS S3, ECR-only when using external S3-compatible
   log "Setting up IRSA for Splunk Standalone service account..."
   local policy_arn
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
     policy_arn="$(ensure_ecr_only_policy)"
   else
     policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
   fi
   ensure_irsa_for_sa "${STANDALONE_SA}" "${AI_NS}" "${policy_arn}"
 
-  if [[ "${MINIO_ENABLED}" != "true" ]]; then
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
     # Create s3-secret for Standalone when using S3 (fallback if IRSA not fully supported)
     log "Creating s3-secret for Splunk Standalone (S3 mode)..."
     if resolve_aws_creds_for_secret 2>/dev/null; then
@@ -1702,10 +1632,9 @@ data:
                 sslPassword: password
 YAML
 
-  # Standalone app repo: MinIO (S3-compatible) when storage.minio.enabled=true, else S3
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    local minio_endpoint="${MINIO_ENDPOINT}"
-    [[ -z "$minio_endpoint" ]] && minio_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+  # Standalone app repo: external S3-compatible when objectStore.type is s3compat/minio/seaweedfs, else S3
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    local minio_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
     cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
@@ -2108,21 +2037,30 @@ spec:
   ca: { secretName: root-secret }
 YAML
 
-  # objectStorage: use MinIO when enabled (in-cluster or external), otherwise S3
+  # objectStorage: path/endpoint/secret by object store type (aws | s3compat | minio | seaweedfs)
   local obj_path obj_endpoint obj_secret
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    obj_path="minio://${MINIO_BUCKET}"
-    if [[ "${MINIO_EXTERNAL}" == "true" && -n "${MINIO_ENDPOINT}" ]]; then
-      obj_endpoint="${MINIO_ENDPOINT}"
-    else
-      obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
-    fi
-    obj_secret="minio-credentials"
-  else
-    obj_path="s3://${S3_BUCKET}"
-    obj_endpoint=""
-    obj_secret=""
-  fi
+  case "${OBJ_STORE_TYPE}" in
+    s3compat)
+      obj_path="s3compat://${OBJ_STORE_BUCKET}"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      obj_secret="minio-credentials"
+      ;;
+    minio)
+      obj_path="minio://${MINIO_BUCKET}"
+      obj_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
+      obj_secret="minio-credentials"
+      ;;
+    seaweedfs)
+      obj_path="seaweedfs://${OBJ_STORE_BUCKET}"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      obj_secret="minio-credentials"
+      ;;
+    aws|*)
+      obj_path="s3://${S3_BUCKET}"
+      obj_endpoint=""
+      obj_secret=""
+      ;;
+  esac
 
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
@@ -2577,7 +2515,7 @@ delete_cluster_minimal() {
   echo ""
 
   log "Step 7: Deleting IAM policies..."
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
     delete_policy_if_exists "${AI_ECR_ONLY_POLICY_NAME}"
   else
     delete_policy_if_exists "${AI_BUCKET_POLICY_NAME}"
@@ -2602,8 +2540,8 @@ delete_cluster_minimal() {
   echo ""
   log "Summary of deleted resources:"
   log "  ✓ IAM Roles: Cluster Autoscaler, Ray (head/worker), SAIA, EBS Pod Identity"
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    log "  ✓ IAM Policies: ECR-only policy for AI platform (MinIO mode)"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "  ✓ IAM Policies: ECR-only policy for AI platform (external S3-compatible mode)"
   else
     log "  ✓ IAM Policies: S3 access policy for AI platform"
   fi
@@ -2695,8 +2633,15 @@ preflight_env() {
   [[ -n "$CLUSTER_NAME" ]] && pf_ok "CLUSTER_NAME=${CLUSTER_NAME}" || pf_fail "CLUSTER_NAME is empty"
   dns1123_ok "$CLUSTER_NAME" || pf_fail "CLUSTER_NAME must be DNS-1123 compliant"
   [[ "$K8S_VERSION" =~ ^1\.[0-9]+$ ]] && pf_ok "K8S_VERSION=${K8S_VERSION}" || pf_fail "K8S_VERSION format invalid"
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    pf_ok "MinIO enabled: object storage via MinIO (S3 bucket not used)"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    pf_ok "Object storage: external S3-compatible (${OBJ_STORE_TYPE}); endpoint required"
+    if [[ "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+      if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
+        pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
+      else
+        pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}"
+      fi
+    fi
   else
     s3_name_ok "$S3_BUCKET" && pf_ok "S3 bucket name valid: ${S3_BUCKET}" || pf_fail "S3 bucket name invalid: ${S3_BUCKET}"
   fi
@@ -2955,8 +2900,8 @@ add_ecr_permissions_to_role() {
 # ---------- Orchestrator for AI Platform setup ----------
 install_ai_platform_stack() {
   log "=== Setting up Splunk AI Platform stack ==="
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    log "Using MinIO for object storage (storage.minio.enabled=true); skipping S3 bucket creation; using ECR-only policy for IRSA."
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "Using external S3-compatible object storage (${OBJ_STORE_TYPE}); skipping S3 bucket creation; using ECR-only policy for IRSA."
   else
     ensure_s3_bucket_and_prefixes
     ensure_s3_upload_splunk_app
@@ -2964,7 +2909,7 @@ install_ai_platform_stack() {
   ensure_namespace "${AI_NS}"
 
   local policy_arn
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
     policy_arn="$(ensure_ecr_only_policy)"
   else
     policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
@@ -3007,7 +2952,7 @@ reconcile_flow() {
   uncordon_ready_nodes
   install_kube_prometheus
   install_cert_manager
-  install_minio
+  ensure_s3compat_credentials
   install_otel_operator_and_contrib_collector
   install_ray_operator
   install_splunk_operator
