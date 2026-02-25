@@ -120,9 +120,11 @@ load_config() {
   CPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.cpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "m5.4xlarge")
   GPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.gpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "g5.2xlarge")
 
-  # MinIO configuration
-  MINIO_ACCESS_KEY=$(yq eval '.minio.accessKey' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin")
-  MINIO_SECRET_KEY=$(yq eval '.minio.secretKey' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin123")
+  # MinIO configuration: prefer environment variables (secure); fall back to config
+  _minio_ak=$(yq eval '.minio.accessKey' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin")
+  _minio_sk=$(yq eval '.minio.secretKey' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin123")
+  MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-$_minio_ak}"
+  MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-$_minio_sk}"
   MINIO_BUCKET=$(yq eval '.minio.bucket' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform-data")
 
   # Kubernetes namespace

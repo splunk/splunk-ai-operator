@@ -390,7 +390,7 @@ The script installs everything needed for the AI Platform:
 
 1. **k0s Kubernetes Cluster** (v1.30+) - CNCF certified Kubernetes
 2. **Calico CNI** - High-performance networking with VXLAN
-3. **MinIO** - S3-compatible object storage (replaces AWS S3)
+3. **MinIO** - S3-compatible object storage (replaces AWS S3). The AI Platform also supports SeaweedFS and other S3-compatible stores via `s3compat://`, `minio://`, or `seaweedfs://`; see [Object storage](../../docs/configuration/object-storage.md) for path schemes and configuration.
 4. **Cert-Manager** - Automated certificate management
 5. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
 6. **OpenTelemetry Operator** - Distributed tracing and telemetry

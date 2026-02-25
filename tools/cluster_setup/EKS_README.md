@@ -53,7 +53,7 @@ The script installs everything needed for the AI Platform:
 4. **EBS CSI Driver** - Persistent volumes backed by AWS EBS
 5. **Cluster Autoscaler** - Automatic node scaling based on demand
 6. **Cert-Manager** - Automated certificate management
-7. **MinIO (optional)** - S3-compatible object storage in-cluster when `storage.minio.enabled: true`
+7. **Object storage** - AWS S3 or external S3-compatible only (MinIO, SeaweedFS, etc.; no in-cluster MinIO install)
 8. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
 9. **OpenTelemetry Operator** - Distributed tracing and telemetry
 10. **NVIDIA Device Plugin** - GPU support for AI workloads
@@ -540,9 +540,44 @@ storage:
                                       #          (3-63 chars, lowercase, numbers, hyphens)
 ```
 
-**Optional: MinIO (in-cluster or external EC2)**  
-- **In-cluster:** Set `storage.minio.enabled: true`. The script deploys MinIO via Helm and configures the AIPlatform CR.
-- **External (e.g. EC2):** Set `storage.minio.enabled: true`, `storage.minio.external: true`, and `storage.minio.endpoint: "http://<host>:9000"` (and matching `bucket`/`auth`). Use the companion script to install MinIO on an EC2 instance in the same VPC: `CONFIG_FILE=./cluster-config.yaml ./install_minio_ec2.sh --launch-ec2` launches an EC2 in the EKS VPC; then SSH to it and run `./install_minio_ec2.sh --bucket ai-platform --user minioadmin --password '<pass>'`. Pre-populate artifacts in MinIO before cluster setup. If you use MinIO, the Splunk app (when using `splunkStandalone.localAppPath`) is not uploaded automatically; upload it to MinIO at `apps/` via MinIO console or `mc`/`aws s3 --endpoint-url`.
+**Generic object store (`storage.objectStore.type`)**  
+Only **AWS S3** or **external S3-compatible** storage is supported (no in-cluster MinIO install). Set `storage.objectStore.type` to `aws`, `s3compat`, `minio`, or `seaweedfs` (default is `aws` when unset). The script sets the AIPlatform `objectStorage.path` and creates a credentials secret for s3compat/minio/seaweedfs; you must provide `endpoint` and credentials. See [Object Storage Selection](../../docs/configuration/object-storage.md).
+
+**External S3-compatible (MinIO, SeaweedFS, etc.)**  
+Set `storage.objectStore.type` to `minio`, `s3compat`, or `seaweedfs`, and set `storage.objectStore.endpoint` (e.g. `http://<host>:9000` for MinIO) and credentials. You can run MinIO or SeaweedFS on EC2 or elsewhere; use `install_minio_ec2.sh` to install MinIO on an EC2 in the same VPC if desired. Pre-populate artifacts before cluster setup. The Splunk app (when using `splunkStandalone.localAppPath`) is not uploaded to external object storage automatically; upload it to your bucket at `apps/` via console or `mc`/`aws s3 --endpoint-url`.
+
+**S3-compatible / SeaweedFS (bring your own)**  
+- **Generic (`s3compat`):** Set `storage.objectStore.type: s3compat`, `storage.objectStore.endpoint`, `storage.objectStore.bucket`, and credentials. The script creates the credentials secret and sets the path to `s3compat://bucket`; it does not install any storage. Use for any S3-compatible backend (Ceph, custom gateway, etc.).
+- **SeaweedFS:** Set `storage.objectStore.type: seaweedfs`, `storage.objectStore.endpoint` (e.g. `http://seaweedfs-s3:8333`), `storage.objectStore.bucket`, and credentials (env `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` or `objectStore.auth`). The script does not install SeaweedFS; it only creates the credentials secret and sets the AIPlatform path to `seaweedfs://bucket`. Ensure your SeaweedFS S3 gateway is reachable from the cluster.
+
+**Ensuring SeaweedFS is used (not MinIO)**  
+To force the stack to use SeaweedFS instead of MinIO:
+
+1. **Config:** In `cluster-config.yaml` set `storage.objectStore.type: "seaweedfs"` and `storage.objectStore.endpoint` to your SeaweedFS S3 URL with **port 8333** (e.g. `http://3.144.157.201:8333`). MinIO uses port 9000; using 8333 avoids pointing at MinIO by mistake.
+2. **Preflight:** When you run the install script, preflight prints `Object storage: external S3-compatible (seaweedfs)` and `SeaweedFS endpoint: ...`. If the endpoint shows `:9000`, the script warns you to use `:8333` for SeaweedFS.
+3. **After install:** Confirm the AIPlatform CR uses SeaweedFS:
+   ```bash
+   kubectl -n ai-platform get aiplatform -o yaml | grep -A6 objectStorage
+   ```
+   You should see `path: seaweedfs://<bucket>` and `endpoint: "http://...:8333"`. The secret name remains `minio-credentials` (used for any S3-compatible store).
+
+**Secure MinIO credentials (recommended)**  
+The script reads MinIO credentials in this order: **environment variables first**, then config file. Prefer not storing passwords in `cluster-config.yaml` (e.g. to avoid committing secrets to Git).
+
+| Approach | How | When to use |
+|----------|-----|-------------|
+| **Environment variables** | Export before running the script: `export MINIO_ROOT_USER=minioadmin` and `export MINIO_ROOT_PASSWORD='<your-password>'`. You can leave `storage.objectStore.auth.rootUser` / `rootPassword` empty or omit them in config; env takes precedence. | Local runs, CI/CD (set secrets in pipeline), one-off setups. |
+| **Config file only** | Set `storage.objectStore.auth.rootUser` and `storage.objectStore.auth.rootPassword` in `cluster-config.yaml`. | Quick testing only; avoid if the file is in version control. |
+| **Pre-created Kubernetes Secret** | Create the secret yourself (e.g. from Vault or AWS Secrets Manager) in the AI platform namespace as `minio-credentials` with keys `s3_access_key` and `s3_secret_key`. The script can still create the secret from env/config; for stricter control, use a separate flow that only references the existing secret. | GitOps, when you already have a secrets pipeline. |
+| **External secret manager** | Store credentials in AWS Secrets Manager, HashiCorp Vault, or similar. Before running the script, fetch the secret and set `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` (e.g. via a wrapper or CI step). Do not put the password in config. | Production; keeps secrets out of config and Git. |
+
+Example (MinIO credentials from environment only; no secrets in config):
+
+```bash
+export MINIO_ROOT_USER=minioadmin
+export MINIO_ROOT_PASSWORD='your-secure-password'
+CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
+```
 
 **Idempotency and existing VPC**  
 - The install is **idempotent**: if the EKS cluster already exists, the script skips cluster creation and only runs reconcile (addons, operators, AIPlatform). Set `cluster.useExisting: true` to require an existing cluster (script fails if the cluster is not found).
@@ -562,8 +597,8 @@ storage:
 | `cluster.region` | AWS region | ✅ **REQUIRED:** Change to your region |
 | `cluster.useExisting` | Use existing cluster only (do not create) | ⚙️ Set `true` to skip cluster creation; script fails if cluster not found |
 | `cluster.subnets` | VPC subnets for nodes | ⚙️ **OPTIONAL:** Leave empty for new VPC or provide existing subnet IDs to use existing VPC |
-| `storage.s3Bucket` | S3 bucket for AI artifacts (used when MinIO is disabled) | ✅ **REQUIRED** if not using MinIO |
-| `storage.minio` | MinIO (in-cluster or external) | ⚙️ `enabled: true`; for EC2 set `external: true` and `endpoint: "http://<ip>:9000"` |
+| `storage.s3Bucket` | S3 bucket for AI artifacts (used when `objectStore.type` is aws) | ✅ **REQUIRED** if not using MinIO/SeaweedFS |
+| `storage.objectStore` | Object store: `type` (aws \| s3compat \| minio \| seaweedfs), `bucket`, `endpoint`, `auth`. Default type is `aws` when unset. External only (no in-cluster install). | ⚙️ Required for s3compat/minio/seaweedfs: set `endpoint` and credentials. See [Object Storage Selection](../../docs/configuration/object-storage.md). |
 | `images.registry` | Container registry URL | ✅ **REQUIRED:** Your ECR/Docker registry |
 | `images.*` | All container images | ✅ **REQUIRED:** Configure all image paths |
 | `nodeGroups.cpu` | CPU node group settings | ⚙️ Optional: adjust size/type |
@@ -2244,7 +2279,7 @@ the model is loaded from object storage (S3/MinIO) into that path inside the pod
 
 2. **External MinIO reachable from EKS**  
    If using external MinIO (e.g. EC2), ensure:
-   - `storage.minio.endpoint` in `cluster-config.yaml` is correct (e.g. `http://<ec2-ip>:9000`).
+   - `storage.objectStore.endpoint` in `cluster-config.yaml` is correct (e.g. `http://<ec2-ip>:9000`).
    - The EC2 security group allows **inbound TCP 9000** from your EKS node security group or VPC CIDR (see `install_minio_ec2.sh` output).
    - From a Ray worker pod:  
      `kubectl exec -it <ray-worker-pod> -n <namespace> -- curl -s -o /dev/null -w "%{http_code}" http://<minio-endpoint>/minio/health/live`

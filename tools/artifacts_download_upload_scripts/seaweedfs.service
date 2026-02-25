@@ -1,0 +1,39 @@
+# SeaweedFS all-in-one server (master, volume, filer, S3).
+# Install: see tools/cluster_setup/SEAWEEDFS_SYSTEMD.md or run install_seaweedfs_systemd.sh
+# Credentials: set in /etc/default/seaweedfs or use the drop-in below.
+
+[Unit]
+Description=SeaweedFS server (master, volume, filer, S3)
+Documentation=https://github.com/seaweedfs/seaweedfs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+# Data directory (must exist and be writable by User). Override via drop-in if needed.
+Environment="SEAWEEDFS_DIR=/home/ec2-user/data"
+# Max volumes per volume server. Override via drop-in if needed.
+Environment="SEAWEEDFS_VOLUME_MAX=100"
+# S3 credentials (must match upload script / mc alias)
+Environment="AWS_ACCESS_KEY_ID=minioadmin"
+Environment="AWS_SECRET_ACCESS_KEY=minioadmin"
+# Override with /etc/default/seaweedfs or systemd drop-in if needed:
+# EnvironmentFile=-/etc/default/seaweedfs
+
+# Use explicit paths so ExecStart works even if env expansion is not applied (e.g. after copy from Windows).
+ExecStart=/usr/local/bin/weed server -s3 -ip.bind=0.0.0.0 -dir=/home/ec2-user/data -volume.max=100
+WorkingDirectory=/home/ec2-user
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=seaweedfs
+
+# Security: no new privileges, restrict to usual caps
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
