@@ -1,0 +1,74 @@
+cluster:
+  name: airgap-cluster
+  # region: us-east-2  # Ignored for on-prem, but required in config
+  sshUser: ec2-user
+  sshKeyPath: /Users/mohaari2/.ssh/ai-key-arif.pem
+
+nodes:
+  controllers: 1
+  cpuWorkers: 1  # Not used with existingIPs
+  gpuWorkers: 2  # Not used with existingIPs
+
+  existingIPs:
+    controllers:
+      - 3.144.14.96     # Your controller server IP
+    workers:
+      - 3.14.134.16     # CPU worker 1
+      - 13.59.78.115     # GPU worker 1
+      - 3.15.20.136     # GPU worker 2
+
+minio:
+  enabled: true                             # Set true to use MinIO for object storage
+  external: true                            # true = MinIO runs outside cluster (e.g. EC2); set endpoint below
+  endpoint: "http://13.59.216.105:9000"     # When external=true: e.g. "http://<ip>:9000"
+  namespace: "minio"                 # Namespace for in-cluster MinIO (ignored when external=true)
+  bucket: "ai-platform-bucket-minio-us-east-2"
+  replicas: 1
+  persistence:
+    size: "150Gi"
+    storageClass: ""
+  auth:
+    rootUser: "minioadmin"
+    rootPassword: "minioadmin"
+
+kubernetes:
+  namespace: ai-platform
+
+# File paths for manifests
+files:
+  splunkOperator: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/splunk-operator-cluster.yaml"
+  aiPlatform: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/artifacts.yaml"
+
+splunk:
+  standaloneName: splunk-standalone
+
+# ---------- AI Platform CR Configuration ----------
+aiPlatform:
+  # GPU accelerator type — determines which Ray worker tiers are created.
+  # Supported values: "L40S", "H100_NVL" (must match keys in config/configs/instance.yaml)
+  # Leave empty ("") to skip worker group creation (head-only / no GPU inference).
+  defaultAcceleratorType: "L40S"
+
+  workerGroupConfig:
+    imageRegistry: ""                         # Registry prefix for Ray worker images (leave empty for default)
+  storage:
+    vectorDbSize: "50Gi"                      # VectorDB (Weaviate) persistent volume size
+    storageClassName: "local-path"            # Storage class for PVCs
+
+imagePullSecrets:
+  secrets:
+    - ecr-registry-secret
+  autoCreateECR: true  # Enable ECR authentication
+
+ecr:
+  account: "658391232643"  # e.g., 123456789012
+  region: us-east-2
+
+# aiplatform:
+#   vectordb:
+#     storageSize: "50Gi"
+#   workers:
+#     cpu:
+#       maxReplicas: 4
+#     gpu:
+#       maxReplicas: 2

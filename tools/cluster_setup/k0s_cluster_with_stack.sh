@@ -10,8 +10,11 @@ set -euo pipefail
 #   2. AWS EC2: Automatically create EC2 instances for testing
 # =============================================================================
 
-# --- Unset conflicting AWS credentials ---
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE 2>/dev/null || true
+# --- AWS credentials handling ---
+# Don't unset AWS credentials - they may be needed for ECR access in on-prem/air-gapped scenarios
+# The original unset was to prevent conflicts, but it breaks SSO/assumed-role credentials
+# If you need to clear credentials, do it explicitly before running the script
+# unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE 2>/dev/null || true
 
 # --- Non-interactive setup ---
 export AWS_PAGER=""
@@ -45,7 +48,7 @@ helm_retry() {
     set -e
     if (( rc == 0 )); then printf "%s\n" "$out"; return 0; fi
     # Check for transient errors that should be retried
-    if grep -qiE 'timed out|operation timed out|i/o timeout|connection reset|TLS handshake timeout|could not get information about the resource' <<<"$out"; then
+    if grep -qiE 'timed out|operation timed out|i/o timeout|connection reset|TLS handshake timeout|could not get information about the resource|context deadline exceeded|not ready' <<<"$out"; then
       warn "Helm transient error (attempt $i/$tries). Retrying in ${backoff}s…"
       warn "$out"
       sleep "$backoff"; backoff=$(( backoff*2 )); (( i++ ))
@@ -120,10 +123,17 @@ load_config() {
   CPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.cpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "m5.4xlarge")
   GPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.gpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "g5.2xlarge")
 
-  # MinIO configuration
-  MINIO_ACCESS_KEY=$(yq eval '.minio.accessKey' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin")
-  MINIO_SECRET_KEY=$(yq eval '.minio.secretKey' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin123")
+  # MinIO configuration (optional S3-compatible object storage)
+  MINIO_ENABLED=$(yq eval '.minio.enabled // true' "${CONFIG_FILE}" 2>/dev/null || echo "true")
+  MINIO_EXTERNAL=$(yq eval '.minio.external // false' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  MINIO_ENDPOINT=$(yq eval '.minio.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  MINIO_NS=$(yq eval '.minio.namespace // "minio-system"' "${CONFIG_FILE}" 2>/dev/null || echo "minio-system")
   MINIO_BUCKET=$(yq eval '.minio.bucket' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform-data")
+  MINIO_REPLICAS=$(yq eval '.minio.replicas // 1' "${CONFIG_FILE}" 2>/dev/null || echo "1")
+  MINIO_PVC_SIZE=$(yq eval '.minio.persistence.size // "200Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "200Gi")
+  MINIO_PVC_STORAGE_CLASS=$(yq eval '.minio.persistence.storageClass // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
+  MINIO_ROOT_USER=$(yq eval '.minio.accessKey // .minio.auth.rootUser // "minioadmin"' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin")
+  MINIO_ROOT_PASSWORD=$(yq eval '.minio.secretKey // .minio.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
@@ -131,8 +141,18 @@ load_config() {
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
+  # AI Platform CR configuration (accelerator type, worker image registry, storage)
+  DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  VECTORDB_SIZE=$(yq eval '.aiPlatform.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
+  STORAGE_CLASS=$(yq eval '.aiPlatform.storage.storageClassName // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
+
+  # NVIDIA device plugin version (matches EKS script: operators.nvidia.devicePluginVersion)
+  NVIDIA_VERSION=$(yq eval '.operators.nvidia.devicePluginVersion // "v0.17.3"' "${CONFIG_FILE}" 2>/dev/null || echo "v0.17.3")
+
   # ECR configuration (for private image repositories)
   ECR_ACCOUNT=$(yq eval '.ecr.account' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  ECR_REGION=$(yq eval '.ecr.region' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Get AWS account if using EC2
   if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
@@ -145,6 +165,7 @@ load_config() {
   fi
 
   # ImagePullSecrets configuration - read which registries are enabled
+  # TODO add the below definitions to the readme file
   IMAGE_PULL_SECRETS_ECR_ENABLED=$(yq eval '.imagePullSecrets.autoCreateECR' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED=$(yq eval '.imagePullSecrets.dockerHub.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_GCR_ENABLED=$(yq eval '.imagePullSecrets.gcr.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
@@ -156,8 +177,17 @@ load_config() {
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    if [[ "${MINIO_EXTERNAL}" == "true" ]]; then
+      log "MinIO: external (endpoint=${MINIO_ENDPOINT:-not set}, bucket=${MINIO_BUCKET})"
+    else
+      log "MinIO: in-cluster (namespace=${MINIO_NS}, bucket=${MINIO_BUCKET})"
+    fi
+  else
+    log "MinIO: disabled (using S3 for object storage)"
+  fi
   if [[ -n "${ECR_ACCOUNT}" ]]; then
-    log "ECR Account: ${ECR_ACCOUNT}"
+    log "ECR Account: ${ECR_ACCOUNT}, ECR Region: ${ECR_REGION:-not set}"
   fi
 
   # Log which image pull secrets are enabled
@@ -545,6 +575,165 @@ EOF
   SSH_KEY_PATH="${HOME}/.ssh/${KEY_NAME}.pem"
 }
 
+# ====== PREPARE NODES (RHEL/Fedora compatibility + k0s binary) ======
+prepare_nodes_for_k0s() {
+  local node_ips=("$@")
+  log "Preparing ${#node_ips[@]} node(s) for k0s (OS compatibility + binary)..."
+  for node_ip in "${node_ips[@]}"; do
+    log "  Preparing node ${node_ip}..."
+    ssh_exec "${node_ip}" "
+      # Disable firewalld if active (blocks k0s ports: 6443, 10250, 8472, etc.)
+      if systemctl is-active firewalld >/dev/null 2>&1; then
+        echo 'Disabling firewalld...'
+        sudo systemctl stop firewalld
+        sudo systemctl disable firewalld
+      fi
+
+      # Ensure iptables is available (RHEL 10+ ships only nftables)
+      if ! command -v iptables >/dev/null 2>&1; then
+        if command -v dnf >/dev/null 2>&1 && dnf list available iptables-nft 2>/dev/null | grep -q iptables-nft; then
+          echo 'Installing iptables-nft...'
+          sudo dnf install -y iptables-nft >/dev/null 2>&1
+        fi
+      fi
+
+      # Ensure python3 + PyYAML are available (used for k0s config generation)
+      if ! python3 -c 'import yaml' 2>/dev/null; then
+        if command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
+        elif command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get install -y python3-yaml 2>/dev/null || true
+        fi
+      fi
+
+      # Install k0s binary if not present
+      if ! command -v k0s >/dev/null 2>&1; then
+        echo 'Installing k0s binary...'
+        curl -sSLf https://get.k0s.sh | sudo sh
+      fi
+
+      # Ensure k0s is in sudo secure_path
+      if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then
+        sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s
+      fi
+    " || warn "  Preparation had issues on ${node_ip}"
+  done
+}
+
+# ====== MOUNT NVMe INSTANCE STORE FOR EPHEMERAL STORAGE ======
+# GPU instance types (g5, g6, p4, p5) typically come with large NVMe instance
+# store drives but tiny 10 GB EBS root volumes. Kubernetes counts ephemeral
+# storage from the filesystem backing /var/lib/k0s/kubelet, so we mount an
+# unused NVMe drive there to prevent "Insufficient ephemeral-storage" errors.
+mount_nvme_instance_store() {
+  if [[ ${GPU_WORKER_COUNT} -eq 0 ]]; then
+    return 0
+  fi
+
+  # Ensure WORKER_IPS is populated
+  if [[ -z "${WORKER_IPS+x}" || ${#WORKER_IPS[@]} -eq 0 ]]; then
+    if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+      IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+    else
+      return 0
+    fi
+  fi
+
+  local gpu_ips=()
+  local idx=0
+  for ip in "${WORKER_IPS[@]}"; do
+    if [[ ${idx} -ge ${CPU_WORKER_COUNT} ]]; then
+      gpu_ips+=("${ip}")
+    fi
+    idx=$((idx + 1))
+  done
+
+  if [[ ${#gpu_ips[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  log "Checking NVMe instance store volumes on GPU workers..."
+
+  for gpu_ip in "${gpu_ips[@]}"; do
+    ssh_exec "${gpu_ip}" "
+      # Skip if /var/lib/k0s is already on a large filesystem (>50 GB)
+      k0s_avail_gb=\$(df --output=avail /var/lib/k0s 2>/dev/null | tail -1 | awk '{print int(\$1/1048576)}')
+      if [ \"\${k0s_avail_gb:-0}\" -ge 50 ]; then
+        echo 'NVMe mount: /var/lib/k0s already has >=50 GB, skipping'
+        exit 0
+      fi
+
+      # Find the first NVMe device that is NOT the root disk and has no partitions
+      ROOT_DEV=\$(lsblk -no PKNAME \$(findmnt -n -o SOURCE /) 2>/dev/null | head -1)
+      NVME_DEV=''
+      for dev in /dev/nvme*n1; do
+        [ -b \"\$dev\" ] || continue
+        dev_name=\$(basename \"\$dev\")
+        # Skip the root device
+        [ \"\$dev_name\" = \"\$ROOT_DEV\" ] && continue
+        # Skip devices that already have partitions (they are in use)
+        if lsblk -n \"\$dev\" 2>/dev/null | grep -q part; then continue; fi
+        # Skip devices already mounted
+        if mount | grep -q \"\$dev\"; then continue; fi
+        NVME_DEV=\"\$dev\"
+        break
+      done
+
+      if [ -z \"\$NVME_DEV\" ]; then
+        echo 'NVMe mount: no unused NVMe instance store found, skipping'
+        exit 0
+      fi
+
+      echo \"NVMe mount: formatting \$NVME_DEV and mounting to /var/lib/k0s\"
+
+      # Format
+      sudo mkfs.xfs -f \"\$NVME_DEV\" >/dev/null 2>&1
+
+      # If k0s is running, stop it and preserve existing data
+      if systemctl is-active k0sworker >/dev/null 2>&1; then
+        sudo systemctl stop k0sworker 2>/dev/null || true
+        sleep 3
+        sudo pkill -9 k0s 2>/dev/null || true
+        sudo pkill -9 containerd 2>/dev/null || true
+        sudo pkill -9 containerd-shim 2>/dev/null || true
+        sleep 2
+      fi
+
+      # Lazy unmount anything stuck under /var/lib/k0s
+      for mp in \$(mount | grep '/var/lib/k0s' | awk '{print \$3}' | sort -r); do
+        sudo umount -l \"\$mp\" 2>/dev/null || true
+      done
+
+      # Copy existing data if present
+      if [ -d /var/lib/k0s ] && [ \"\$(ls -A /var/lib/k0s 2>/dev/null)\" ]; then
+        sudo mkdir -p /mnt/nvme-staging
+        sudo mount \"\$NVME_DEV\" /mnt/nvme-staging
+        sudo cp -a /var/lib/k0s/. /mnt/nvme-staging/ 2>/dev/null || true
+        sudo umount /mnt/nvme-staging
+        sudo rmdir /mnt/nvme-staging
+      fi
+
+      # Mount
+      sudo rm -rf /var/lib/k0s 2>/dev/null || true
+      sudo mkdir -p /var/lib/k0s
+      sudo mount \"\$NVME_DEV\" /var/lib/k0s
+
+      # Persist in fstab
+      NVME_UUID=\$(sudo blkid -s UUID -o value \"\$NVME_DEV\")
+      if ! grep -q \"\$NVME_UUID\" /etc/fstab 2>/dev/null; then
+        echo \"UUID=\$NVME_UUID /var/lib/k0s xfs defaults,nofail 0 2\" | sudo tee -a /etc/fstab >/dev/null
+      fi
+
+      # Restart k0s if it was running
+      if systemctl is-enabled k0sworker >/dev/null 2>&1; then
+        sudo systemctl start k0sworker 2>/dev/null || true
+      fi
+
+      echo \"NVMe mount: done — \$(df -h \$NVME_DEV | tail -1 | awk '{print \$2}') available on /var/lib/k0s\"
+    " 2>/dev/null || warn "  NVMe mount on ${gpu_ip} had issues — may need manual setup"
+  done
+}
+
 # ====== K0S CLUSTER INSTALLATION ======
 install_k0s_cluster() {
   log "Installing k0s cluster..."
@@ -553,20 +742,26 @@ install_k0s_cluster() {
   if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
     IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
     IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+    log "Using existing infrastructure - IPs from config"
   fi
 
-  local controller_ip="${CONTROLLER_IPS[0]}"  # Public IP for SSH
-  local controller_private_ip="${CONTROLLER_PRIVATE_IPS[0]}"  # Private IP for k0s
-  local controller_public_ip="${CONTROLLER_PUBLIC_IPS[0]}"  # Public IP for kubectl access
+  local controller_ip="${CONTROLLER_IPS[0]}"
 
-  log "Primary controller - Public IP: ${controller_public_ip}, Private IP: ${controller_private_ip}"
+  log "Primary controller IP: ${controller_ip}"
+
+  # Prepare all nodes (firewalld, iptables, python3)
+  local all_ips=("${CONTROLLER_IPS[@]}")
+  if [[ ${#WORKER_IPS[@]} -gt 0 ]]; then
+    all_ips+=("${WORKER_IPS[@]}")
+  fi
+  prepare_nodes_for_k0s "${all_ips[@]}"
 
   # Generate k0s config
   log "Generating k0s configuration..."
   ssh_exec "${controller_ip}" "k0s config create > /tmp/k0s.yaml"
 
-  # Configure k0s to use private IP for internal communication, add public IP to SANs for external access
-  log "Configuring k0s: Private IP ${controller_private_ip} for internal, Public IP ${controller_public_ip} for external access..."
+  # Configure k0s API with the controller IP for SANs and externalAddress
+  log "Configuring k0s with controller IP ${controller_ip}..."
   ssh_exec "${controller_ip}" "cat > /tmp/k0s-config-update.py <<'PYSCRIPT'
 import yaml
 
@@ -574,7 +769,7 @@ import yaml
 with open('/tmp/k0s.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
-# Add SANs to API section - include BOTH private and public IPs
+# Add the controller IP to SANs (for kubectl access and cluster communication)
 if 'spec' not in config:
     config['spec'] = {}
 if 'api' not in config['spec']:
@@ -582,14 +777,10 @@ if 'api' not in config['spec']:
 if 'sans' not in config['spec']['api']:
     config['spec']['api']['sans'] = []
 
-# Add private IP (for internal cluster communication)
-config['spec']['api']['sans'].append('${controller_private_ip}')
-# Add public IP (for kubectl access from outside)
-config['spec']['api']['sans'].append('${controller_public_ip}')
+config['spec']['api']['sans'].append('${controller_ip}')
 
-# CRITICAL: Use public IP for externalAddress so konnectivity-agents can connect
-# konnectivity-agents run in pods and need to reach API server via routable address
-config['spec']['api']['externalAddress'] = '${controller_public_ip}'
+# Use the same IP for externalAddress so konnectivity-agents can connect
+config['spec']['api']['externalAddress'] = '${controller_ip}'
 
 # Set Calico as network provider
 if 'network' not in config['spec']:
@@ -611,8 +802,25 @@ PYSCRIPT"
 
   ssh_exec "${controller_ip}" "python3 /tmp/k0s-config-update.py"
 
-  log "Verifying k0s configuration includes public IP..."
+  log "Verifying k0s configuration includes controller IP..."
   ssh_exec "${controller_ip}" "grep -A3 'api:' /tmp/k0s.yaml | head -5"
+
+  # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
+  ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
+
+  # Clean stale k0s state from any previous run
+  ssh_exec "${controller_ip}" "
+    sudo systemctl stop k0scontroller 2>/dev/null || true
+    sudo systemctl reset-failed k0scontroller 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0scontroller.service 2>/dev/null || true
+    sudo systemctl stop k0sworker 2>/dev/null || true
+    sudo systemctl reset-failed k0sworker 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0sworker.service 2>/dev/null || true
+    sudo pkill -9 containerd-shim 2>/dev/null || true
+    sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s 2>/dev/null || true
+    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+    sudo systemctl daemon-reload
+  " 2>/dev/null || true
 
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."
@@ -633,8 +841,19 @@ PYSCRIPT"
 
   for worker_ip in "${WORKER_IPS[@]}"; do
     log "  Installing k0s worker on ${worker_ip}..."
+    # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
+    ssh_exec "${worker_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
+
+    # Clean stale k0sworker state from any previous run (service file, data dirs, systemd failed state)
+    ssh_exec "${worker_ip}" "
+      sudo systemctl stop k0sworker 2>/dev/null || true
+      sudo systemctl reset-failed k0sworker 2>/dev/null || true
+      sudo rm -f /etc/systemd/system/k0sworker.service 2>/dev/null || true
+      sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s /tmp/k0s-token 2>/dev/null || true
+      sudo systemctl daemon-reload
+    " 2>/dev/null || true
+
     # Write token to temp file first (stdin pipe doesn't work reliably over SSH)
-    # Note: Token file must remain until worker bootstraps, so we don't delete it here
     if ssh_exec "${worker_ip}" "echo '${worker_token}' | sudo tee /tmp/k0s-token >/dev/null && sudo k0s install worker --token-file=/tmp/k0s-token"; then
       log "  ✓ k0s installed on ${worker_ip}"
     else
@@ -736,9 +955,9 @@ PYSCRIPT"
   mkdir -p "${HOME}/.kube"
   ssh_exec "${controller_ip}" "sudo cat /var/lib/k0s/pki/admin.conf" > "${HOME}/.kube/k0s-${CLUSTER_NAME}"
 
-  # Update server address to use public IP for kubectl access from local machine
-  log "Configuring kubeconfig to use public IP for external access..."
-  sed -i.bak "s|server: .*|server: https://${controller_public_ip}:6443|" "${HOME}/.kube/k0s-${CLUSTER_NAME}"
+  # Update server address to use the controller IP for kubectl access from local machine
+  log "Configuring kubeconfig to use controller IP for external access..."
+  sed -i.bak "s|server: .*|server: https://${controller_ip}:6443|" "${HOME}/.kube/k0s-${CLUSTER_NAME}"
 
   export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
 
@@ -747,6 +966,18 @@ PYSCRIPT"
 
   # Label nodes for proper workload scheduling
   label_nodes
+}
+
+# ====== RESOLVE NODE NAME ======
+# Maps a config IP to its Kubernetes node name by SSHing to the node
+# and reading its hostname (which is what k0s uses as the node name).
+# Usage: node_name=$(resolve_node_name "1.2.3.4")
+resolve_node_name() {
+  local ip="$1"
+  # SSH to the node and get the hostname that k0s registered it with
+  local node_name
+  node_name=$(ssh_exec "${ip}" "hostname -f 2>/dev/null || hostname" 2>/dev/null || echo "")
+  echo "${node_name}"
 }
 
 # ====== LABEL NODES FOR WORKLOAD SCHEDULING ======
@@ -768,67 +999,80 @@ label_nodes() {
     fi
   done
 
-  # Get all nodes
-  local all_nodes
-  all_nodes=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}')
-
   # Label controller nodes
   for controller_ip in "${CONTROLLER_IPS[@]}"; do
-    # Find node by IP
     local node_name
-    node_name=$(kubectl get nodes -o json | jq -r ".items[] | select(.status.addresses[]? | select(.type==\"InternalIP\" and .address==\"${controller_ip}\")) | .metadata.name" | head -1)
+    node_name=$(resolve_node_name "${controller_ip}")
 
-    if [[ -n "${node_name}" ]]; then
-      log "Labeling controller node: ${node_name}"
+    if [[ -z "${node_name}" ]]; then
+      warn "  Could not resolve hostname for controller ${controller_ip}, skipping..."
+      continue
+    fi
+
+    # Verify this node exists in the cluster
+    if ! kubectl get node "${node_name}" &>/dev/null; then
+      warn "  Node '${node_name}' (from ${controller_ip}) not found in cluster, skipping..."
+      continue
+    fi
+
+    log "Labeling controller node: ${node_name} (${controller_ip})"
+    kubectl label nodes "${node_name}" \
+      splunk.ai/node-role=controller \
+      splunk.ai/workload-type=control-plane \
+      node.kubernetes.io/role=controller \
+      --overwrite
+
+    # For single-node clusters (controller with --enable-worker), also add CPU workload labels
+    if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
+      log "  → Single-node cluster detected, adding CPU workload labels to controller..."
       kubectl label nodes "${node_name}" \
-        splunk.ai/node-role=controller \
-        splunk.ai/workload-type=control-plane \
-        node.kubernetes.io/role=controller \
+        splunk.ai/workload-type=cpu \
+        node.kubernetes.io/workload=ai-cpu \
+        splunk.ai/instance-type=cpu-worker \
         --overwrite
-
-      # For single-node clusters (controller with --enable-worker), also add CPU workload labels
-      if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
-        log "  → Single-node cluster detected, adding CPU workload labels to controller..."
-        kubectl label nodes "${node_name}" \
-          splunk.ai/workload-type=cpu \
-          node.kubernetes.io/workload=ai-cpu \
-          splunk.ai/instance-type=cpu-worker \
-          --overwrite
-        log "  ✓ CPU workload labels added to controller node"
-      fi
+      log "  ✓ CPU workload labels added to controller node"
     fi
   done
 
   # Label worker nodes based on their configuration
   local worker_index=0
   for worker_ip in "${WORKER_IPS[@]}"; do
-    # Find node by IP
     local node_name
-    node_name=$(kubectl get nodes -o json | jq -r ".items[] | select(.status.addresses[]? | select(.type==\"InternalIP\" and .address==\"${worker_ip}\")) | .metadata.name" | head -1)
+    node_name=$(resolve_node_name "${worker_ip}")
 
-    if [[ -n "${node_name}" ]]; then
-      # Determine if this is a GPU or CPU worker based on index
-      # First CPU_WORKER_COUNT workers are CPU, rest are GPU
-      if [[ ${worker_index} -lt ${CPU_WORKER_COUNT} ]]; then
-        log "Labeling CPU worker node: ${node_name}"
-        kubectl label nodes "${node_name}" \
-          splunk.ai/node-role=worker \
-          splunk.ai/workload-type=cpu \
-          node.kubernetes.io/workload=ai-cpu \
-          splunk.ai/instance-type=cpu-worker \
-          --overwrite
-      else
-        log "Labeling GPU worker node: ${node_name}"
-        kubectl label nodes "${node_name}" \
-          splunk.ai/node-role=worker \
-          splunk.ai/workload-type=gpu \
-          node.kubernetes.io/workload=ai-gpu \
-          splunk.ai/instance-type=gpu-worker \
-          nvidia.com/gpu=true \
-          --overwrite
-      fi
+    if [[ -z "${node_name}" ]]; then
+      warn "  Could not resolve hostname for worker ${worker_ip}, skipping..."
       worker_index=$((worker_index + 1))
+      continue
     fi
+
+    if ! kubectl get node "${node_name}" &>/dev/null; then
+      warn "  Node '${node_name}' (from ${worker_ip}) not found in cluster, skipping..."
+      worker_index=$((worker_index + 1))
+      continue
+    fi
+
+    # Determine if this is a GPU or CPU worker based on index
+    # First CPU_WORKER_COUNT workers are CPU, rest are GPU
+    if [[ ${worker_index} -lt ${CPU_WORKER_COUNT} ]]; then
+      log "Labeling CPU worker node: ${node_name} (${worker_ip})"
+      kubectl label nodes "${node_name}" \
+        splunk.ai/node-role=worker \
+        splunk.ai/workload-type=cpu \
+        node.kubernetes.io/workload=ai-cpu \
+        splunk.ai/instance-type=cpu-worker \
+        --overwrite
+    else
+      log "Labeling GPU worker node: ${node_name} (${worker_ip})"
+      kubectl label nodes "${node_name}" \
+        splunk.ai/node-role=worker \
+        splunk.ai/workload-type=gpu \
+        node.kubernetes.io/workload=ai-gpu \
+        splunk.ai/instance-type=gpu-worker \
+        nvidia.com/gpu=true \
+        --overwrite
+    fi
+    worker_index=$((worker_index + 1))
   done
 
   # Add taints to GPU nodes to prevent non-GPU workloads from scheduling there
@@ -869,16 +1113,48 @@ ensure_namespace() {
 }
 
 # ====== INSTALL MINIO ======
+# TODO remove
 install_minio() {
-  log "Installing MinIO..."
+  if [[ "${MINIO_ENABLED}" != "true" ]]; then
+    log "MinIO is disabled (minio.enabled != true); skipping."
+    return 0
+  fi
 
-  ensure_namespace "minio-system"
+  # Auto-generate root password if not set
+  if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
+    MINIO_ROOT_PASSWORD="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
+    log "Generated MinIO root password (saved for secret creation)"
+  fi
+
+  # External MinIO (e.g. on EC2): only create credentials secret; no in-cluster install
+  if [[ "${MINIO_EXTERNAL}" == "true" ]]; then
+    log "Using external MinIO (minio.external=true); skipping in-cluster install."
+    if [[ -z "${MINIO_ENDPOINT}" ]]; then
+      warn "minio.endpoint is empty; set it to the MinIO URL (e.g. http://<ip>:9000) for AIPlatform to use external MinIO."
+    fi
+    ensure_namespace "${AI_NS}"
+    local secret_name="minio-credentials"
+    kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
+      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    log "✓ External MinIO credentials secret ${AI_NS}/${secret_name} ready"
+    return 0
+  fi
+
+  # In-cluster MinIO installation
+  log "Installing MinIO in ${MINIO_NS}..."
+  ensure_namespace "${MINIO_NS}"
 
   # Create MinIO secret
   kubectl create secret generic minio-creds \
-    --namespace=minio-system \
-    --from-literal=accesskey="${MINIO_ACCESS_KEY}" \
-    --from-literal=secretkey="${MINIO_SECRET_KEY}" \
+    --namespace="${MINIO_NS}" \
+    --from-literal=accesskey="${MINIO_ROOT_USER}" \
+    --from-literal=secretkey="${MINIO_ROOT_PASSWORD}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
   # Deploy MinIO
@@ -887,20 +1163,20 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: minio-pvc
-  namespace: minio-system
+  namespace: ${MINIO_NS}
 spec:
-  storageClassName: local-path
+  storageClassName: ${MINIO_PVC_STORAGE_CLASS}
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 200Gi
+      storage: ${MINIO_PVC_SIZE}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: minio
-  namespace: minio-system
+  namespace: ${MINIO_NS}
 spec:
   type: ClusterIP
   ports:
@@ -917,9 +1193,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: minio
-  namespace: minio-system
+  namespace: ${MINIO_NS}
 spec:
-  replicas: 1
+  replicas: ${MINIO_REPLICAS}
   selector:
     matchLabels:
       app: minio
@@ -969,13 +1245,26 @@ spec:
 EOF
 
   log "Waiting for MinIO to be ready..."
-  kubectl wait --for=condition=ready pod -l app=minio -n minio-system --timeout=300s
+  kubectl wait --for=condition=ready pod -l app=minio -n "${MINIO_NS}" --timeout=300s
+
+  # Create credentials secret in AI platform namespace
+  # SAIA and pkg/storage expect s3_access_key/s3_secret_key; models/SAIA expect MINIO_ACCESS_KEY/MINIO_SECRET_KEY.
+  ensure_namespace "${AI_NS}"
+  local secret_name="minio-credentials"
+  kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
+    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
 
   # Create bucket and directories using a job
   log "Verifying MinIO bucket: ${MINIO_BUCKET}..."
 
   # Delete existing job if it exists (Jobs are immutable, can't be updated)
-  kubectl delete job minio-create-bucket -n minio-system --ignore-not-found=true 2>/dev/null || true
+  kubectl delete job minio-create-bucket -n "${MINIO_NS}" --ignore-not-found=true 2>/dev/null || true
   sleep 2
 
   cat <<EOF | kubectl apply -f -
@@ -983,9 +1272,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: minio-create-bucket
-  namespace: minio-system
+  namespace: ${MINIO_NS}
 spec:
   backoffLimit: 3
+  ttlSecondsAfterFinished: 60
   template:
     spec:
       restartPolicy: OnFailure
@@ -998,7 +1288,7 @@ spec:
         - |
           set -e
           echo "Configuring MinIO client..."
-          mc alias set myminio http://minio.minio-system.svc.cluster.local:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY}
+          mc alias set myminio http://minio.${MINIO_NS}.svc.cluster.local:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
 
           echo ""
           echo "Checking if bucket exists..."
@@ -1080,16 +1370,18 @@ spec:
 EOF
 
   log "Waiting for bucket verification job to complete..."
-  if kubectl wait --for=condition=complete job/minio-create-bucket -n minio-system --timeout=120s; then
+  if kubectl wait --for=condition=complete job/minio-create-bucket -n "${MINIO_NS}" --timeout=120s; then
     log "✓ MinIO bucket structure verified"
 
     # Show job logs for verification
-    kubectl logs -n minio-system job/minio-create-bucket --tail=20 2>/dev/null || true
+    kubectl logs -n "${MINIO_NS}" job/minio-create-bucket --tail=20 2>/dev/null || true
   else
     warn "Bucket verification job did not complete in time, checking status..."
-    kubectl describe job/minio-create-bucket -n minio-system || true
-    kubectl logs -n minio-system job/minio-create-bucket --tail=50 || true
+    kubectl describe job/minio-create-bucket -n "${MINIO_NS}" || true
+    kubectl logs -n "${MINIO_NS}" job/minio-create-bucket --tail=50 || true
   fi
+
+  log "✓ MinIO installed; bucket=${MINIO_BUCKET}; credentials secret ${AI_NS}/${secret_name}"
 }
 
 # ====== INSTALL CERT-MANAGER ======
@@ -1147,25 +1439,266 @@ EOF
   log "cert-manager installed successfully"
 }
 
-# ====== INSTALL NVIDIA GPU OPERATOR ======
-install_nvidia_device_plugin() {
+# ====== INSTALL NVIDIA DRIVERS ON GPU NODES (bare-metal / EC2) ======
+# EKS GPU AMIs ship with NVIDIA drivers pre-installed.
+# For k0s on generic AMIs (e.g. Amazon Linux 2023), we must install them
+# on the host before the Kubernetes device-plugin can expose GPUs.
+install_nvidia_host_drivers() {
   if [[ ${GPU_WORKER_COUNT} -eq 0 ]]; then
-    log "Skipping NVIDIA GPU operator (no GPU workers)"
+    log "Skipping NVIDIA host driver install (no GPU workers)"
     return 0
   fi
 
-  log "Installing NVIDIA GPU Operator..."
+  log "Installing NVIDIA drivers & container toolkit on GPU worker nodes..."
 
-  helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
-  helm repo update
+  # Ensure WORKER_IPS is populated (it may not be if install_k0s_cluster was skipped)
+  if [[ -z "${WORKER_IPS+x}" || ${#WORKER_IPS[@]} -eq 0 ]]; then
+    if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+      IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+      log "  Loaded ${#WORKER_IPS[@]} worker IP(s) from config: ${WORKER_IPS[*]}"
+    else
+      warn "No worker IPs available; skipping host driver install"
+      return 0
+    fi
+  fi
 
-  helm_retry 3 upgrade --install gpu-operator nvidia/gpu-operator \
-    --namespace gpu-operator --create-namespace \
-    --set driver.enabled=true \
-    --set toolkit.enabled=true \
-    --wait --timeout=10m
+  # Identify GPU worker IPs (workers after the first CPU_WORKER_COUNT)
+  local gpu_ips=()
+  local idx=0
+  for ip in "${WORKER_IPS[@]}"; do
+    if [[ ${idx} -ge ${CPU_WORKER_COUNT} ]]; then
+      gpu_ips+=("${ip}")
+    fi
+    idx=$((idx + 1))
+  done
 
-  log "NVIDIA GPU Operator installed successfully"
+  if [[ ${#gpu_ips[@]} -eq 0 ]]; then
+    warn "No GPU worker IPs found; skipping host driver install"
+    return 0
+  fi
+
+  for gpu_ip in "${gpu_ips[@]}"; do
+    log "Checking NVIDIA driver on ${gpu_ip}..."
+
+    # Check if driver is already installed
+    if ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" &>/dev/null; then
+      local driver_ver
+      driver_ver=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" || echo "unknown")
+      log "  ✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
+    else
+      log "  Installing NVIDIA driver on ${gpu_ip}..."
+      ssh_exec "${gpu_ip}" "
+        set -e
+        # Install kernel headers (needed for DKMS driver build)
+        sudo dnf install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
+          sudo yum install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
+          sudo apt-get install -y linux-headers-\$(uname -r) 2>/dev/null || true
+
+        # Detect OS and add appropriate NVIDIA repo
+        if [ -f /etc/amzn-release ] || grep -qi 'amzn' /etc/os-release 2>/dev/null; then
+          sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo 2>/dev/null || true
+          sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
+            sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || true
+        elif [ -f /etc/redhat-release ]; then
+          RHEL_MAJOR=\$(rpm -E %{rhel} 2>/dev/null || echo 9)
+          if [ \"\${RHEL_MAJOR}\" -ge 10 ]; then
+            # Add RHEL 10 CUDA repo only; remove any stale rhel9 repo to prevent GPG conflicts
+            sudo rm -f /etc/yum.repos.d/cuda-rhel9.repo 2>/dev/null || true
+            sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/cuda-rhel10.repo 2>/dev/null || true
+
+            # RHEL 10 removed DNF modularity; DKMS kmod requires EPEL
+            if ! rpm -q epel-release >/dev/null 2>&1; then
+              echo 'Installing EPEL for dkms...'
+              sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm 2>/dev/null || true
+            fi
+            sudo dnf install -y dkms 2>/dev/null || true
+
+            sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
+              sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
+              sudo dnf install -y --nobest nvidia-open 2>/dev/null || true
+          else
+            sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo 2>/dev/null || true
+            sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || \
+              sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || true
+          fi
+        elif [ -f /etc/debian_version ]; then
+          curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update && sudo apt-get install -y nvidia-driver-550 2>/dev/null || true
+        fi
+
+        # Load nvidia kernel module immediately (avoids needing a reboot)
+        sudo modprobe nvidia 2>/dev/null || true
+      " || warn "Driver install on ${gpu_ip} had issues — check manually"
+
+      # Verify
+      if ssh_exec "${gpu_ip}" "nvidia-smi 2>/dev/null" &>/dev/null; then
+        log "  ✓ NVIDIA driver installed successfully on ${gpu_ip}"
+      else
+        warn "  NVIDIA driver may need a reboot on ${gpu_ip} to take effect"
+      fi
+    fi
+
+    # Install NVIDIA Container Toolkit (needed for GPU containers in k0s)
+    log "  Ensuring NVIDIA Container Toolkit on ${gpu_ip}..."
+    ssh_exec "${gpu_ip}" "
+      if command -v nvidia-ctk &>/dev/null; then
+        echo 'nvidia-ctk already installed'
+      else
+        # Add NVIDIA Container Toolkit repo
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+          sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null 2>/dev/null || true
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+          sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
+
+        # Install
+        sudo dnf install -y nvidia-container-toolkit 2>/dev/null || \
+          sudo yum install -y nvidia-container-toolkit 2>/dev/null || \
+          sudo apt-get install -y nvidia-container-toolkit 2>/dev/null || true
+      fi
+
+      # Configure for k0s containerd (k0s uses /run/k0s/containerd.sock)
+      if [ -d /etc/k0s/containerd.d ]; then
+        # nvidia-ctk writes to /etc/containerd/conf.d/ by default, not the
+        # k0s drop-in dir. Generate it first, then copy with fixups.
+        sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
+
+        # Copy the generated config to k0s drop-in location
+        if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
+          sudo cp /etc/containerd/conf.d/99-nvidia.toml /etc/k0s/containerd.d/nvidia.toml
+          sudo rm -f /etc/containerd/conf.d/99-nvidia.toml
+        elif [ ! -s /etc/k0s/containerd.d/nvidia.toml ]; then
+          # Fallback: nvidia-ctk may have written directly; try explicit config path
+          sudo nvidia-ctk runtime configure --runtime=containerd \
+            --config=/etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+        fi
+
+        # Strip version/imports lines so the file is treated as a drop-in
+        # snippet, not a full containerd config (prevents node NotReady).
+        sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \
+          /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+      elif [ -f /etc/containerd/config.toml ]; then
+        sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
+      fi
+
+      # Generate CDI (Container Device Interface) specs so the device
+      # plugin can discover GPUs via CDI when using the nvidia RuntimeClass.
+      sudo mkdir -p /etc/cdi
+      sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml 2>/dev/null || true
+
+      # Kill any leftover containerd-shim processes from previous runs
+      # before restarting the worker. Stale shims keep the old containerd
+      # socket busy and cause ping-containerd-timeout errors on restart.
+      sudo systemctl stop k0sworker 2>/dev/null || true
+      sleep 3
+      sudo pkill -9 containerd-shim 2>/dev/null || true
+      sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+
+      # Restart k0s worker to pick up containerd config changes
+      sudo systemctl start k0sworker 2>/dev/null || true
+    " || warn "  Container toolkit setup on ${gpu_ip} had issues — check manually"
+
+    log "  ✓ GPU node ${gpu_ip} setup complete"
+  done
+
+  # Wait for GPU workers to rejoin and verify they are Ready
+  log "Waiting for GPU worker nodes to rejoin cluster and become Ready..."
+  local gpu_wait_timeout=180
+  local gpu_wait_elapsed=0
+  local all_gpu_ready=false
+
+  while [[ ${gpu_wait_elapsed} -lt ${gpu_wait_timeout} ]]; do
+    all_gpu_ready=true
+    for gpu_ip in "${gpu_ips[@]}"; do
+      # Resolve GPU node name via SSH hostname lookup
+      local gpu_node
+      gpu_node=$(resolve_node_name "${gpu_ip}")
+
+      if [[ -z "${gpu_node}" ]] || ! kubectl get node "${gpu_node}" &>/dev/null; then
+        all_gpu_ready=false
+        break
+      fi
+
+      local ready_status
+      ready_status=$(kubectl get node "${gpu_node}" -o json 2>/dev/null | \
+        jq -r '.status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || echo "")
+      if [[ "${ready_status}" != "True" ]]; then
+        all_gpu_ready=false
+        break
+      fi
+    done
+
+    if [[ "${all_gpu_ready}" == "true" ]]; then
+      log "✓ All GPU worker nodes are Ready"
+      break
+    fi
+
+    sleep 10
+    gpu_wait_elapsed=$((gpu_wait_elapsed + 10))
+    log "  Waiting for GPU nodes to be Ready... ${gpu_wait_elapsed}/${gpu_wait_timeout}s"
+  done
+
+  if [[ "${all_gpu_ready}" != "true" ]]; then
+    warn "Some GPU nodes may not be Ready yet. Check with: kubectl get nodes"
+    warn "GPU nodes may need a reboot if NVIDIA drivers were freshly installed."
+  fi
+
+  # Verify GPUs are visible to Kubernetes
+  log "Checking if GPUs are visible to Kubernetes..."
+  local gpu_capacity
+  gpu_capacity=$(kubectl get nodes -l splunk.ai/workload-type=gpu -o json 2>/dev/null | \
+    jq '[.items[].status.capacity["nvidia.com/gpu"] // "0" | tonumber] | add' 2>/dev/null || echo "0")
+  if [[ "${gpu_capacity}" -gt 0 ]]; then
+    log "✓ Total GPUs visible to Kubernetes: ${gpu_capacity}"
+  else
+    warn "No GPUs visible to Kubernetes yet — the NVIDIA device plugin may still be starting"
+    warn "Check with: kubectl get nodes -o json | jq '.items[].status.capacity'"
+  fi
+
+  log "NVIDIA host driver installation complete"
+}
+
+# ====== INSTALL NVIDIA DEVICE PLUGIN (matches EKS approach) ======
+# Ref: eks_cluster_with_stack.sh — uses the simple DaemonSet, NOT the GPU Operator.
+# The GPU Operator's driver container images don't exist for Amazon Linux 2023.
+install_nvidia_device_plugin() {
+  if [[ ${GPU_WORKER_COUNT} -eq 0 ]]; then
+    log "Skipping NVIDIA device plugin (no GPU workers)"
+    return 0
+  fi
+
+  local ver="${NVIDIA_VERSION:-v0.17.3}"
+  log "Installing NVIDIA device plugin DaemonSet (${ver})..."
+
+  # Create the nvidia RuntimeClass so pods (including the device plugin
+  # itself) can use the NVIDIA container runtime for GPU access.
+  log "  Creating nvidia RuntimeClass..."
+  cat <<'RTEOF' | kubectl apply -f -
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
+RTEOF
+
+  kubectl apply -n kube-system \
+    -f "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml"
+
+  # Patch the device plugin DaemonSet:
+  #  1) runtimeClassName: nvidia — so the plugin container can access NVML/CDI
+  #     (without this it reports "Incompatible strategy detected auto" / "No devices found")
+  #  2) nodeSelector for GPU nodes — the nvidia runtime handler only exists on
+  #     GPU workers; non-GPU nodes would fail to start pods with this RuntimeClass
+  log "  Patching device plugin: nvidia RuntimeClass + GPU nodeSelector..."
+  kubectl patch daemonset nvidia-device-plugin-daemonset -n kube-system --type='json' \
+    -p='[
+      {"op": "add", "path": "/spec/template/spec/runtimeClassName", "value": "nvidia"},
+      {"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {"splunk.ai/workload-type": "gpu"}}
+    ]' 2>/dev/null || true
+
+  kubectl -n kube-system rollout status ds/nvidia-device-plugin-daemonset --timeout=3m || true
+
+  log "NVIDIA device plugin installed successfully"
 }
 
 # ====== INSTALL PROMETHEUS OPERATOR ======
@@ -1173,7 +1706,8 @@ install_kube_prometheus() {
   log "Installing kube-prometheus-stack..."
 
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-  helm repo update
+  # TODO uncomment
+  # helm repo update prometheus-community  # Only update the specific repo we need
 
   helm_retry 3 upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
@@ -1188,8 +1722,12 @@ install_kube_prometheus() {
 install_otel_operator_and_contrib_collector() {
   log "Installing OpenTelemetry Operator..."
 
+  # OTEL operator uses cert-manager for webhook certs — ensure webhook is ready
+  wait_for_cert_manager_webhook 30 10
+
   helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
-  helm repo update
+  # TODO uncomment
+  # helm repo update open-telemetry  # Only update the specific repo we need
 
   # Use cert-manager for webhook certificates (now that konnectivity is fixed)
   helm_retry 3 upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
@@ -1208,7 +1746,8 @@ install_ray_operator() {
   log "Installing KubeRay Operator..."
 
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  helm repo update
+  # TODO uncomment
+  # helm repo update kuberay  # Only update the specific repo we need
 
   helm_retry 3 upgrade --install kuberay-operator kuberay/kuberay-operator \
     --namespace ray-system --create-namespace \
@@ -1230,6 +1769,14 @@ install_splunk_operator() {
     return 0
   fi
 
+  # Determine the namespace from the YAML file or use default
+  local splunk_operator_ns="splunk-operator"
+  ensure_namespace "${splunk_operator_ns}"
+
+  # Create image pull secrets in splunk-operator namespace BEFORE applying manifests
+  log "Creating image pull secrets in ${splunk_operator_ns} namespace..."
+  create_image_pull_secrets "${splunk_operator_ns}" >/dev/null 2>&1 || true
+
   # Use kubectl replace --force for CRDs to avoid annotation size limits
   # This deletes and recreates the resource, avoiding the annotation issue
   log "Installing/updating Splunk Operator CRDs and resources..."
@@ -1243,9 +1790,109 @@ install_splunk_operator() {
     kubectl replace --force -f "${SPLUNK_OPERATOR_FILE}" 2>&1 | grep -v "Warning: --force is deprecated" || true
   fi
 
+  # Patch splunk-operator deployment with imagePullSecrets if any exist
+  log "Checking for imagePullSecrets to add to Splunk Operator deployment..."
+  local secrets_patch=""
+  for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
+    if kubectl get secret "${secret_name}" -n "${splunk_operator_ns}" &>/dev/null 2>&1; then
+      secrets_patch+='{"name":"'"${secret_name}"'"},'
+      log "  Found secret: ${secret_name}"
+    fi
+  done
+
+  if [[ -n "${secrets_patch}" ]]; then
+    secrets_patch="${secrets_patch%,}"
+    local dep_name
+    dep_name=$(kubectl -n "${splunk_operator_ns}" get deploy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+    if [[ -n "${dep_name}" ]]; then
+      log "Patching Splunk Operator deployment (${dep_name}) with imagePullSecrets..."
+      kubectl -n "${splunk_operator_ns}" patch deployment "${dep_name}" \
+        --type='json' \
+        -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":['"${secrets_patch}"']}]' \
+        2>/dev/null || log "  imagePullSecrets may already exist"
+
+      # Restart to apply changes
+      kubectl rollout restart deployment "${dep_name}" -n "${splunk_operator_ns}" 2>/dev/null || true
+    fi
+  fi
+
   wait_for_crd standalones.enterprise.splunk.com 300
 
   log "Splunk Operator installed successfully"
+}
+
+# ====== WAIT FOR CERT-MANAGER WEBHOOK ======
+# Ensures cert-manager webhook is responsive before applying resources that
+# contain Certificate/Issuer CRs (e.g. artifacts.yaml).
+wait_for_cert_manager_webhook() {
+  local max_attempts="${1:-30}"
+  local sleep_interval="${2:-10}"
+
+  log "Verifying cert-manager webhook is responsive..."
+
+  # 1. Ensure webhook pod is running
+  if ! kubectl get namespace cert-manager &>/dev/null; then
+    warn "cert-manager namespace not found, skipping webhook check"
+    return 0
+  fi
+
+  kubectl wait --for=condition=ready pod \
+    -l app.kubernetes.io/component=webhook \
+    -n cert-manager --timeout=120s 2>/dev/null \
+    || warn "cert-manager webhook pod may not be fully ready"
+
+  # 2. Ensure webhook endpoint has addresses
+  local attempt=0
+  while (( attempt < max_attempts )); do
+    local webhook_ip
+    webhook_ip=$(kubectl -n cert-manager get endpoints cert-manager-webhook \
+      -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || echo "")
+
+    if [[ -n "${webhook_ip}" ]]; then
+      log "cert-manager webhook endpoint: ${webhook_ip}"
+      break
+    fi
+
+    log "  Waiting for cert-manager webhook endpoint... (${attempt}/${max_attempts})"
+    sleep "${sleep_interval}"
+    attempt=$((attempt + 1))
+  done
+
+  if (( attempt >= max_attempts )); then
+    warn "cert-manager webhook endpoint not found after ${max_attempts} attempts"
+    return 1
+  fi
+
+  # 3. Functional test: create and delete a test Issuer
+  local test_ok=false
+  for i in $(seq 1 "${max_attempts}"); do
+    if kubectl apply -f - <<'TESTEOF' 2>/dev/null
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: cert-manager-webhook-test
+  namespace: cert-manager
+spec:
+  selfSigned: {}
+TESTEOF
+    then
+      kubectl delete issuer cert-manager-webhook-test -n cert-manager \
+        --ignore-not-found=true 2>/dev/null || true
+      test_ok=true
+      log "✓ cert-manager webhook is responsive"
+      break
+    fi
+    log "  cert-manager webhook not yet accepting requests... (${i}/${max_attempts})"
+    sleep "${sleep_interval}"
+  done
+
+  if [[ "${test_ok}" != "true" ]]; then
+    warn "cert-manager webhook did not become responsive after ${max_attempts} attempts"
+    return 1
+  fi
+
+  return 0
 }
 
 # ====== INSTALL SPLUNK AI OPERATOR ======
@@ -1262,13 +1909,60 @@ install_splunk_ai_operator() {
   local ai_operator_ns="splunk-ai-operator-system"
   ensure_namespace "${ai_operator_ns}"
 
+  # Create image pull secrets in operator namespace BEFORE applying manifests
+  log "Creating image pull secrets in ${ai_operator_ns} namespace..."
+  create_image_pull_secrets "${ai_operator_ns}" >/dev/null 2>&1 || true
+
+  # Ensure cert-manager webhook is ready before applying (artifacts.yaml contains
+  # Certificate and Issuer resources that require the webhook to be responsive)
+  wait_for_cert_manager_webhook 30 10
+
   # Apply the artifacts.yaml file (contains CRDs and operator deployment)
   log "Applying Splunk AI Operator manifests..."
 
-  # First try to apply normally
-  if kubectl apply -f "${SPLUNK_AI_FILE}" 2>&1 | grep -q "field is immutable\|too long"; then
-    log "Standard apply failed, using server-side apply with force..."
-    kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}"
+  # Use server-side apply with force to ensure all fields are updated including images
+  log "Using server-side apply to ensure image URLs are updated..."
+  local apply_output
+  apply_output=$(kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1) || true
+  echo "${apply_output}"
+
+  # Check if any cert-manager resources (Certificate/Issuer) failed due to webhook errors
+  if echo "${apply_output}" | grep -qi "webhook.*cert-manager\|failed calling webhook.*cert-manager\|i/o timeout"; then
+    warn "Some cert-manager resources failed on first attempt, retrying..."
+
+    # Wait for webhook to stabilize and retry
+    sleep 15
+    wait_for_cert_manager_webhook 15 10
+
+    log "Retrying full apply for cert-manager resources..."
+    kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1 | \
+      grep -iE "certificate|issuer|error|warning" || true
+  fi
+
+  # Verify that the critical Certificate and Issuer resources exist
+  log "Verifying cert-manager resources were created..."
+  local cm_retries=0
+  local cm_max=12
+  while (( cm_retries < cm_max )); do
+    local serving_cert
+    serving_cert=$(kubectl get certificate splunk-ai-operator-serving-cert \
+      -n "${ai_operator_ns}" -o jsonpath='{.metadata.name}' 2>/dev/null || echo "")
+
+    if [[ -n "${serving_cert}" ]]; then
+      log "✓ Certificate 'splunk-ai-operator-serving-cert' exists"
+      break
+    fi
+
+    log "  Waiting for cert-manager resources to be created... (${cm_retries}/${cm_max})"
+    sleep 10
+    # Re-apply on each retry to ensure cert-manager resources are processed
+    kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1 | \
+      grep -iE "certificate|issuer" || true
+    cm_retries=$((cm_retries + 1))
+  done
+
+  if (( cm_retries >= cm_max )); then
+    warn "Certificate resources may not have been created — the AI operator webhook may not work"
   fi
 
   # Specifically ensure ClusterRole is updated (common RBAC update issue)
@@ -1291,6 +1985,31 @@ install_splunk_ai_operator() {
     # Remove 'deployment.apps/' prefix if present
     dep="${dep#deployment.apps/}"
     log "Found deployment: ${dep}"
+
+    # Patch deployment with imagePullSecrets if any exist
+    log "Checking for imagePullSecrets to add to operator deployment..."
+    local secrets_patch=""
+    for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
+      if kubectl get secret "${secret_name}" -n "${ai_operator_ns}" &>/dev/null 2>&1; then
+        secrets_patch+='{"name":"'"${secret_name}"'"},'
+        log "  Found secret: ${secret_name}"
+      fi
+    done
+
+    if [[ -n "${secrets_patch}" ]]; then
+      # Remove trailing comma
+      secrets_patch="${secrets_patch%,}"
+      log "Patching operator deployment with imagePullSecrets..."
+      kubectl -n "${ai_operator_ns}" patch deployment "${dep}" \
+        --type='json' \
+        -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":['"${secrets_patch}"']}]' \
+        2>/dev/null || log "  imagePullSecrets may already exist or path differs"
+    fi
+
+    # Force restart the deployment to pick up new environment variables (image URLs)
+    log "Restarting operator deployment to apply updated image configuration..."
+    kubectl rollout restart deployment "${dep}" -n "${ai_operator_ns}"
+
     wait_rollout "${ai_operator_ns}" deploy "${dep}"
   else
     warn "Could not find operator deployment, will wait for CRDs instead"
@@ -1313,8 +2032,8 @@ create_minio_secret() {
 
   kubectl create secret generic minio-credentials \
     --namespace="${ns}" \
-    --from-literal=accessKey="${MINIO_ACCESS_KEY}" \
-    --from-literal=secretKey="${MINIO_SECRET_KEY}" \
+    --from-literal=accessKey="${MINIO_ROOT_USER}" \
+    --from-literal=secretKey="${MINIO_ROOT_PASSWORD}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
   log "MinIO credentials secret created"
@@ -1324,8 +2043,10 @@ create_minio_secret() {
 # ====== SETUP ECR REPOSITORY PERMISSIONS ======
 setup_ecr_permissions() {
   local repo_prefix="${1:-ml-platform}"
+  # Use ECR_REGION from config, fallback to REGION, then us-east-2
+  local ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
 
-  log "Checking ECR repository permissions for: ${repo_prefix}..."
+  log "Checking ECR repository permissions for: ${repo_prefix} in region ${ecr_region}..."
 
   # Check if AWS credentials are available
   if ! aws sts get-caller-identity &>/dev/null; then
@@ -1339,8 +2060,8 @@ setup_ecr_permissions() {
 
   # List repositories matching prefix
   local repos
-  repos=$(aws ecr describe-repositories --region "${REGION}" 2>/dev/null | \
-    jq -r ".repositories[] | select(.repositoryName | startswith(\"${repo_prefix}\")) | .repositoryName" || echo "")
+  repos=$(aws ecr describe-repositories --region "${ecr_region}" 2>/dev/null | \
+    jq -r --arg prefix "${repo_prefix}" '.repositories[] | select(.repositoryName | startswith($prefix)) | .repositoryName' || echo "")
 
   if [[ -z "${repos}" ]]; then
     warn "No ECR repositories found with prefix: ${repo_prefix}"
@@ -1360,7 +2081,7 @@ setup_ecr_permissions() {
 
     # Get current policy
     local policy
-    policy=$(aws ecr get-repository-policy --repository-name "${repo}" --region "${REGION}" 2>/dev/null | jq -r '.policyText' || echo "")
+    policy=$(aws ecr get-repository-policy --repository-name "${repo}" --region "${ecr_region}" 2>/dev/null | jq -r '.policyText' || echo "")
 
     if [[ -z "${policy}" ]]; then
       log "  No policy found, creating one to allow pull access..."
@@ -1388,7 +2109,7 @@ EOF
 
       if aws ecr set-repository-policy \
         --repository-name "${repo}" \
-        --region "${REGION}" \
+        --region "${ecr_region}" \
         --policy-text "file:///tmp/ecr-policy-${repo//\//-}.json" &>/dev/null; then
         log "  ✓ Pull permissions granted for repository: ${repo}"
       else
@@ -1418,8 +2139,10 @@ create_image_pull_secrets() {
   # 1. Create ECR secret if enabled
   if [[ "${IMAGE_PULL_SECRETS_ECR_ENABLED}" == "true" ]]; then
     log "Creating ECR secret..."
-    local ecr_region="${REGION:-us-west-2}"
+    # Use ECR_REGION from config, fallback to REGION, then us-east-2
+    local ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
     local ecr_account="${ECR_ACCOUNT:-}"
+    log "  ECR Region: ${ecr_region}, ECR Account: ${ecr_account}"
 
     # Check if AWS credentials are available
     if ! aws sts get-caller-identity &>/dev/null; then
@@ -1555,7 +2278,8 @@ create_image_pull_secrets() {
 # ====== CREATE ECR IMAGE PULL SECRET (Legacy - kept for compatibility) ======
 create_ecr_secret() {
   local ns="$1"
-  local region="${REGION:-us-west-2}"
+  # Use ECR_REGION from config, fallback to REGION, then us-east-2
+  local region="${ECR_REGION:-${REGION:-us-east-2}}"
   local ecr_account="${ECR_ACCOUNT:-}"
 
   ensure_namespace "${ns}"
@@ -1616,12 +2340,29 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
-  # Create MinIO secret for Splunk (S3-compatible credentials)
-  log "Creating S3-compatible secret for Splunk App Framework..."
-  kubectl -n "${AI_NS}" create secret generic s3-secret \
-    --from-literal=s3_access_key="${MINIO_ACCESS_KEY}" \
-    --from-literal=s3_secret_key="${MINIO_SECRET_KEY}" \
-    --dry-run=client -o yaml | kubectl apply -f -
+  # Create credentials secret for Splunk App Framework
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    # MinIO mode: ensure minio-credentials secret exists (created by install_minio)
+    log "Using MinIO credentials for Splunk App Framework..."
+    if ! kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
+      log "Creating minio-credentials secret in ${AI_NS}..."
+      kubectl -n "${AI_NS}" create secret generic minio-credentials \
+        --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+        --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+        --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+        --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+        --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    fi
+  else
+    # S3 mode: create s3-secret with AWS credentials
+    log "Creating S3-compatible secret for Splunk App Framework..."
+    kubectl -n "${AI_NS}" create secret generic s3-secret \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  fi
 
   # Create splunk-defaults ConfigMap (optional but recommended)
   cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
@@ -1643,8 +2384,20 @@ data:
                 sslPassword: password
 YAML
 
-  # Create Splunk Standalone with App Framework (not SmartStore)
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  # Ensure default ServiceAccount has imagePullSecrets for ECR
+  if kubectl get secret ecr-registry-secret -n "${AI_NS}" &>/dev/null; then
+    log "Patching default ServiceAccount with ecr-registry-secret..."
+    kubectl patch serviceaccount default -n "${AI_NS}" \
+      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || \
+      warn "Could not patch default ServiceAccount"
+  fi
+
+  # Create Splunk Standalone with App Framework
+  # Standalone app repo: MinIO (S3-compatible) when minio.enabled=true, else S3
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    local minio_endpoint="${MINIO_ENDPOINT}"
+    [[ -z "$minio_endpoint" ]] && minio_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
@@ -1652,21 +2405,15 @@ metadata:
   namespace: ${AI_NS}
 spec:
   replicas: 1
-
-  # Storage configuration for etc and var volumes
   etcVolumeStorageConfig:
     storageClassName: local-path
   varVolumeStorageConfig:
     storageClassName: local-path
-
-  # Mount defaults ConfigMap
   volumes:
     - name: defaults
       configMap:
         name: splunk-defaults
   defaultsUrl: /mnt/defaults/default.yml
-
-  # App Framework configuration (uses MinIO as S3-compatible storage)
   appRepo:
     appInstallPeriodSeconds: 90
     appSources:
@@ -1682,11 +2429,49 @@ spec:
       - name: volume_app_repo
         provider: aws
         storageType: s3
-        endpoint: http://minio.minio-system.svc.cluster.local:9000
+        endpoint: ${minio_endpoint}
+        path: ${MINIO_BUCKET}
+        secretRef: minio-credentials
+YAML
+  else
+    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: ${AI_STANDALONE_NAME}
+  namespace: ${AI_NS}
+spec:
+  replicas: 1
+  etcVolumeStorageConfig:
+    storageClassName: local-path
+  varVolumeStorageConfig:
+    storageClassName: local-path
+  volumes:
+    - name: defaults
+      configMap:
+        name: splunk-defaults
+  defaultsUrl: /mnt/defaults/default.yml
+  appRepo:
+    appInstallPeriodSeconds: 90
+    appSources:
+      - name: apps
+        scope: local
+        location: apps
+    appsRepoPollIntervalSeconds: 60
+    defaults:
+      scope: local
+      volumeName: volume_app_repo
+    installMaxRetries: 2
+    volumes:
+      - name: volume_app_repo
+        provider: aws
+        storageType: s3
+        endpoint: http://minio.${MINIO_NS}.svc.cluster.local:9000
         region: us-east-1
         path: ${MINIO_BUCKET}
         secretRef: s3-secret
 YAML
+  fi
 
   log "Waiting for Splunk Standalone to be ready..."
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
@@ -1700,17 +2485,44 @@ install_ai_platform_cr() {
   log "Creating AIPlatform Custom Resource"
   log "============================================"
 
+  # Clean up any failed jobs/pods from previous runs (they may have wrong image references)
+  # Use --wait=false to avoid hanging on deletions
+  log "Cleaning up failed jobs and ImagePullBackOff pods from previous runs..."
+  kubectl delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
+  kubectl delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
+  # Delete pods stuck in ImagePullBackOff or ErrImagePull (use jq to avoid bash 3.x jsonpath parsing issues)
+  kubectl get pods -n "${AI_NS}" -o json 2>/dev/null | \
+    jq -r '.items[] | select(.status.containerStatuses[]? | .state.waiting?.reason? == "ImagePullBackOff") | .metadata.name' 2>/dev/null | \
+    xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
+  kubectl get pods -n "${AI_NS}" -o json 2>/dev/null | \
+    jq -r '.items[] | select(.status.containerStatuses[]? | .state.waiting?.reason? == "ErrImagePull") | .metadata.name' 2>/dev/null | \
+    xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
+  log "✓ Cleanup complete"
+
   # Get Splunk secret name (for HEC endpoint)
   local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
   log "Using Splunk secret: ${splunk_secret}"
 
-  # Ensure s3-secret exists in AI namespace (for MinIO credentials)
-  log "Creating/updating MinIO credentials secret (s3-secret) in ${AI_NS}..."
-  kubectl -n "${AI_NS}" create secret generic s3-secret \
-    --from-literal=s3_access_key="${MINIO_ACCESS_KEY}" \
-    --from-literal=s3_secret_key="${MINIO_SECRET_KEY}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-  log "✓ MinIO credentials secret ready"
+  # Ensure object storage credentials secret exists in AI namespace
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    log "Creating/updating MinIO credentials secret (minio-credentials) in ${AI_NS}..."
+    kubectl -n "${AI_NS}" create secret generic minio-credentials \
+      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    log "✓ MinIO credentials secret ready"
+  else
+    log "Creating/updating S3 credentials secret (s3-secret) in ${AI_NS}..."
+    kubectl -n "${AI_NS}" create secret generic s3-secret \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    log "✓ S3 credentials secret ready"
+  fi
 
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
@@ -1734,6 +2546,22 @@ EOF
     log "No imagePullSecrets found, using public images only"
   fi
 
+  # objectStorage: use MinIO when enabled (in-cluster or external), otherwise S3
+  local obj_path obj_endpoint obj_secret
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
+    obj_path="minio://${MINIO_BUCKET}"
+    if [[ "${MINIO_EXTERNAL}" == "true" && -n "${MINIO_ENDPOINT}" ]]; then
+      obj_endpoint="${MINIO_ENDPOINT}"
+    else
+      obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+    fi
+    obj_secret="minio-credentials"
+  else
+    obj_path="s3://${MINIO_BUCKET}"
+    obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+    obj_secret="s3-secret"
+  fi
+
   # Apply AIPlatform CR (matching EKS script pattern)
   log "Applying AIPlatform CR: ${CLUSTER_NAME}-ai-platform"
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
@@ -1742,16 +2570,18 @@ kind: AIPlatform
 metadata:
   name: ${CLUSTER_NAME}-ai-platform
 spec:
-  # MinIO object storage (S3-compatible with credentials)
   objectStorage:
-    path: s3://${MINIO_BUCKET}
+    path: ${obj_path}
     region: us-east-1
-    endpoint: http://minio.minio-system.svc.cluster.local:9000
-    secretRef: s3-secret
+    endpoint: ${obj_endpoint}
+    secretRef: ${obj_secret}
 
   # Image configuration (including pull secrets for private registries)
   images:
 ${image_pull_secrets}
+
+  # GPU accelerator type (determines Ray worker tiers: L40S, H100_NVL, or empty for no workers)
+  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
   # Features configuration
   features:
@@ -1761,12 +2591,12 @@ ${image_pull_secrets}
   # Storage configuration
   storage:
     vectorDB:
-      size: "50Gi"
-      storageClassName: local-path
+      size: ${VECTORDB_SIZE}
+      storageClassName: ${STORAGE_CLASS}
 
   # Worker configuration
   workerGroupConfig:
-    imageRegistry: "rayproject/ray:2.9.0"
+    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
 
   # CPU scheduler
   cpuScheduler:
@@ -1817,25 +2647,28 @@ YAML
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
 
-  ensure_namespace "${AI_NS}"
+  # ensure_namespace "${AI_NS}"
 
-  # Install infrastructure components
-  install_minio
-  install_cert_manager
-  install_kube_prometheus
-  install_otel_operator_and_contrib_collector
-  install_nvidia_device_plugin
-  install_ray_operator
+  # # Install infrastructure components
+  # install_minio
+  # install_cert_manager
+  # install_kube_prometheus
+  # install_otel_operator_and_contrib_collector
+  # mount_nvme_instance_store         # Step 0: Mount NVMe instance store for ephemeral storage on GPU workers
+  # install_nvidia_host_drivers       # Step 1: Install drivers on GPU hosts via SSH (bare-metal only)
+  # install_nvidia_device_plugin      # Step 2: Deploy device plugin DaemonSet (same as EKS)
+  # install_ray_operator
 
   # Install Splunk components
   install_splunk_operator
+
+  # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
+  create_image_pull_secrets "${AI_NS}"
+
   install_splunk_standalone
 
   # Install AI Platform operator
   install_splunk_ai_operator
-
-  # Create image pull secrets from configuration
-  create_image_pull_secrets "${AI_NS}"
 
   # Install AI Platform CR
   install_ai_platform_cr
@@ -1878,11 +2711,15 @@ check_platform_health() {
 
   # Check 3: MinIO
   log "Checking MinIO..."
-  if kubectl get pod -n minio-system -l app=minio 2>/dev/null | grep -q "Running"; then
+  if [[ "${MINIO_ENABLED}" != "true" ]]; then
+    log "⏭️  MinIO disabled; skipping check"
+  elif [[ "${MINIO_EXTERNAL}" == "true" ]]; then
+    log "⏭️  External MinIO; skipping in-cluster check"
+  elif kubectl get pod -n "${MINIO_NS}" -l app=minio 2>/dev/null | grep -q "Running"; then
     log "✅ MinIO is running"
   else
     warn "MinIO pod not in Running state"
-    kubectl get pods -n minio-system
+    kubectl get pods -n "${MINIO_NS}"
     ((health_issues++))
   fi
   log ""
@@ -2018,12 +2855,12 @@ show_platform_access_info() {
   log "  API URL: http://localhost:9000"
   log "  "
   log "  💡 Access MinIO Console:"
-  log "     kubectl port-forward svc/minio -n minio-system 9001:9001"
+  log "     kubectl port-forward svc/minio -n ${MINIO_NS} 9001:9001"
   log "     Open: http://localhost:9001"
   log "  "
   log "  🔑 Credentials:"
-  log "     Username: ${MINIO_ACCESS_KEY}"
-  log "     Password: ${MINIO_SECRET_KEY}"
+  log "     Username: ${MINIO_ROOT_USER}"
+  log "     Password: ${MINIO_ROOT_PASSWORD}"
   log ""
 
   # AI Platform information
@@ -2174,6 +3011,25 @@ main_install() {
         log ""
         log "Skipping k0s installation, using existing cluster"
         use_existing_cluster=true
+
+        # Prepare all nodes for OS compatibility (iptables, firewalld, etc.)
+        local all_node_ips=("${CONTROLLER_IPS[@]}")
+        if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+          IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+          all_node_ips+=("${WORKER_IPS[@]}")
+        fi
+        prepare_nodes_for_k0s "${all_node_ips[@]}"
+
+        # Ensure all expected workers are joined
+        if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+          local current_node_count
+          current_node_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          local expected_total=$(( ${#CONTROLLER_IPS[@]} + ${#WORKER_IPS[@]} ))
+          if [[ "${current_node_count}" -lt "${expected_total}" ]]; then
+            log "Cluster has ${current_node_count} nodes but ${expected_total} expected — joining missing workers..."
+            join_workers
+          fi
+        fi
       elif [[ "${USE_EXISTING}" == "force" ]]; then
         err "useExisting=force but no k0s cluster found on provided nodes"
       fi
@@ -2222,6 +3078,25 @@ main_install() {
         log ""
         log "Skipping k0s installation, using existing cluster"
         use_existing_cluster=true
+
+        # Prepare all nodes for OS compatibility (iptables, firewalld, etc.)
+        local all_node_ips2=("${CONTROLLER_IPS[@]}")
+        if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+          IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+          all_node_ips2+=("${WORKER_IPS[@]}")
+        fi
+        prepare_nodes_for_k0s "${all_node_ips2[@]}"
+
+        # Ensure all expected workers are joined
+        if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+          local current_node_count
+          current_node_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          local expected_total=$(( ${#CONTROLLER_IPS[@]} + ${#WORKER_IPS[@]} ))
+          if [[ "${current_node_count}" -lt "${expected_total}" ]]; then
+            log "Cluster has ${current_node_count} nodes but ${expected_total} expected — joining missing workers..."
+            join_workers
+          fi
+        fi
       fi
     fi
 
@@ -2614,13 +3489,61 @@ Notes:
     * Includes retry logic for ENI detachment
     * Provides detailed cleanup summary
   - 'clean-all' adds aggressive node-level cleanup (on-prem only):
-    * Removes k0s binaries and data directories
+    * Removes k0s data directories (preserves k0s binary)
     * Cleans kubelet, CNI, and Calico files
     * Flushes iptables rules
   - For EC2 mode, 'delete' terminates all instances and cleans AWS resources
   - For on-prem mode, machines remain running but k0s is stopped and reset
   - All commands are idempotent and safe to run multiple times
 EOF
+}
+
+# ====== VERIFY WORKER STATUS ======
+# Check if a worker is properly connected to the cluster
+verify_worker_status() {
+  local worker_ip="$1"
+  local controller_ip="$2"
+
+  log "  Verifying worker ${worker_ip} status..."
+
+  # Check 1: Is k0s running on the worker?
+  local k0s_status
+  k0s_status=$(ssh_exec "${worker_ip}" "sudo k0s status 2>&1" || echo "not running")
+
+  if echo "${k0s_status}" | grep -q "Kube-api probing successful: true"; then
+    log "    ✓ k0s running and API reachable"
+    return 0
+  elif echo "${k0s_status}" | grep -q "Role: worker"; then
+    # k0s is running but API not reachable yet
+    log "    ⏳ k0s running but API not yet reachable"
+    return 1
+  else
+    log "    ✗ k0s not running"
+    return 2
+  fi
+}
+
+# ====== THOROUGH WORKER CLEANUP ======
+# Completely clean up k0s on a worker node (for fresh rejoin)
+cleanup_worker_k0s() {
+  local worker_ip="$1"
+
+  log "  Performing thorough k0s cleanup on ${worker_ip}..."
+
+  ssh_exec "${worker_ip}" "
+    sudo systemctl stop k0sworker 2>/dev/null || true
+    sudo systemctl disable k0sworker 2>/dev/null || true
+    sudo systemctl reset-failed k0sworker 2>/dev/null || true
+    sudo pkill -9 k0s 2>/dev/null || true
+    sudo pkill -9 kubelet 2>/dev/null || true
+    sudo pkill -9 containerd-shim 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0sworker.service
+    sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s /tmp/k0s-token
+    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+    sudo systemctl daemon-reload
+  " 2>/dev/null || true
+
+  log "    ✓ Cleanup complete"
 }
 
 # ====== JOIN WORKERS (Resume/Retry Worker Joins) ======
@@ -2691,25 +3614,68 @@ join_workers() {
   log "Controller IP: ${controller_ip}"
   log "Worker IPs: ${WORKER_IPS[*]}"
 
-  # Check which workers are already joined
+  # Check which workers are already joined AND healthy
   log "Checking current cluster nodes..."
   kubectl get nodes -o wide || true
 
   local already_joined_ips=()
+  local needs_rejoin_ips=()
+
+  # Get all cluster nodes once for matching
+  local cluster_nodes_json
+  cluster_nodes_json=$(kubectl get nodes -o json 2>/dev/null || echo '{"items":[]}')
+
   for worker_ip in "${WORKER_IPS[@]}"; do
-    # Check if node with this IP already exists in cluster
-    local node_exists
-    node_exists=$(kubectl get nodes -o json | jq -r ".items[] | select(.status.addresses[]? | select(.type==\"InternalIP\" and .address==\"${worker_ip}\")) | .metadata.name" 2>/dev/null || echo "")
+    # Resolve the Kubernetes node name by SSHing to the worker and getting its hostname
+    local node_exists=""
+    node_exists=$(resolve_node_name "${worker_ip}")
+
+    # Verify this node actually exists in the cluster
+    if [[ -n "${node_exists}" ]]; then
+      local found_in_cluster
+      found_in_cluster=$(echo "${cluster_nodes_json}" | jq -r --arg name "${node_exists}" \
+        '.items[] | select(.metadata.name==$name) | .metadata.name' 2>/dev/null | head -1 || echo "")
+      if [[ -z "${found_in_cluster}" ]]; then
+        node_exists=""
+      fi
+    fi
 
     if [[ -n "${node_exists}" ]]; then
-      log "  ✓ Worker ${worker_ip} already joined as ${node_exists}"
-      already_joined_ips+=("${worker_ip}")
+      # Node exists in cluster, check if it's Ready
+      local node_ready
+      node_ready=$(echo "${cluster_nodes_json}" | jq -r --arg name "${node_exists}" \
+        '.items[] | select(.metadata.name==$name) | .status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || echo "Unknown")
+
+      if [[ "${node_ready}" == "True" ]]; then
+        log "  ✓ Worker ${worker_ip} joined and Ready as ${node_exists}"
+        already_joined_ips+=("${worker_ip}")
+      else
+        log "  ⚠ Worker ${worker_ip} exists as ${node_exists} but not Ready (${node_ready})"
+        needs_rejoin_ips+=("${worker_ip}")
+      fi
     else
-      log "  ✗ Worker ${worker_ip} not joined yet"
+      # Node doesn't exist in cluster, check k0s status on worker
+      log "  Checking k0s status on ${worker_ip}..."
+      if verify_worker_status "${worker_ip}" "${controller_ip}"; then
+        log "  ⏳ Worker ${worker_ip} k0s running, waiting for cluster sync..."
+        # Give it more time to appear in cluster
+      else
+        log "  ✗ Worker ${worker_ip} not properly connected"
+        needs_rejoin_ips+=("${worker_ip}")
+      fi
     fi
   done
 
+  # If all workers are joined, nothing to do
+  if [[ ${#already_joined_ips[@]} -eq ${#WORKER_IPS[@]} ]]; then
+    log ""
+    log "✓ All ${#WORKER_IPS[@]} workers are already joined and healthy!"
+    kubectl get nodes -o wide
+    return 0
+  fi
+
   # Generate worker token from controller
+  log ""
   log "Generating worker join token..."
   local worker_token
   worker_token=$(ssh_exec "${controller_ip}" "sudo k0s token create --role=worker" 2>/dev/null)
@@ -2718,26 +3684,38 @@ join_workers() {
     err "Failed to generate worker token from controller"
   fi
 
-  log "Worker token generated successfully"
+  log "Worker token generated successfully (${#worker_token} chars)"
 
-  # Install and join workers that aren't already joined
+  # Join workers that need to be joined/rejoined
   local workers_joined=0
+  local workers_to_process=()
+
+  # Build list of workers to process (use ${arr[@]+...} to avoid unbound-variable on empty arrays)
   for worker_ip in "${WORKER_IPS[@]}"; do
-    # Skip if already joined
-    local skip_worker=false
+    local skip=false
     if [[ ${#already_joined_ips[@]} -gt 0 ]]; then
       for joined_ip in "${already_joined_ips[@]}"; do
         if [[ "${joined_ip}" == "${worker_ip}" ]]; then
-          skip_worker=true
+          skip=true
           break
         fi
       done
     fi
-
-    if [[ "${skip_worker}" == "true" ]]; then
-      continue
+    if [[ "${skip}" == "false" ]]; then
+      workers_to_process+=("${worker_ip}")
     fi
+  done
 
+  log ""
+  log "Workers to join/rejoin: ${workers_to_process[*]:-none}"
+
+  if [[ ${#workers_to_process[@]} -eq 0 ]]; then
+    log "No workers need joining"
+    return 0
+  fi
+
+  for worker_ip in "${workers_to_process[@]}"; do
+    log ""
     log "============================================"
     log "Joining worker: ${worker_ip}"
     log "============================================"
@@ -2754,15 +3732,17 @@ join_workers() {
       log "  ✓ k0s already installed"
     fi
 
-    # Stop k0s if it's running (to rejoin cleanly)
-    log "  Stopping any existing k0s worker process..."
-    ssh_exec "${worker_ip}" "sudo k0s stop 2>/dev/null || true"
-    ssh_exec "${worker_ip}" "sudo k0s reset 2>/dev/null || true"
+    # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
+    ssh_exec "${worker_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
 
-    # Install worker
+    # Thorough cleanup before rejoining (handles stale configurations)
+    cleanup_worker_k0s "${worker_ip}"
+
+    # RHEL/Fedora compatibility (firewalld, iptables-nft, python3-pyyaml, k0s binary)
+    prepare_nodes_for_k0s "${worker_ip}"
+
+    # Install worker with fresh token
     log "  Installing k0s worker configuration..."
-    # Write token to temp file first (stdin pipe doesn't work reliably over SSH)
-    # Note: Token file must remain until worker bootstraps, so we don't delete it here
     if ssh_exec "${worker_ip}" "echo '${worker_token}' | sudo tee /tmp/k0s-token >/dev/null && sudo k0s install worker --token-file=/tmp/k0s-token"; then
       log "  ✓ Worker configuration installed"
     else
@@ -2770,22 +3750,36 @@ join_workers() {
       continue
     fi
 
-    # Start worker
+    # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."
-    if ssh_exec "${worker_ip}" "sudo k0s start"; then
-      log "  ✓ Worker started successfully"
-      workers_joined=$((workers_joined + 1))
+    if ssh_exec "${worker_ip}" "sudo systemctl start k0sworker"; then
+      log "  ✓ Worker service started"
     else
       warn "  Failed to start k0s worker on ${worker_ip}"
-      continue
+      # Try fallback
+      ssh_exec "${worker_ip}" "sudo k0s start" || continue
+    fi
+
+    # Wait briefly and verify
+    log "  Waiting for worker to initialize (15s)..."
+    sleep 15
+
+    # Verify worker status
+    if verify_worker_status "${worker_ip}" "${controller_ip}"; then
+      log "  ✓ Worker ${worker_ip} connected successfully!"
+      workers_joined=$((workers_joined + 1))
+    else
+      warn "  Worker ${worker_ip} may still be connecting..."
+      workers_joined=$((workers_joined + 1))  # Count as attempted
     fi
   done
 
   if [[ ${workers_joined} -gt 0 ]]; then
     log ""
-    log "Waiting for workers to join cluster (60s)..."
-    sleep 60
+    log "Waiting for workers to appear in cluster (45s)..."
+    sleep 45
 
+    log ""
     log "Current cluster nodes:"
     kubectl get nodes -o wide
 
@@ -2796,11 +3790,23 @@ join_workers() {
 
     log ""
     log "============================================"
-    log "✓ Successfully joined ${workers_joined} worker(s)"
+    log "✓ Processed ${workers_joined} worker(s)"
     log "============================================"
+
+    # Final verification
+    local final_count
+    final_count=$(kubectl get nodes --no-headers | wc -l)
+    local expected_count=$((${#CONTROLLER_IPS[@]} + ${#WORKER_IPS[@]}))
+
+    if [[ ${final_count} -ge ${expected_count} ]]; then
+      log "✓ All ${expected_count} nodes are now in the cluster!"
+    else
+      warn "Only ${final_count}/${expected_count} nodes in cluster. Some workers may need more time."
+      warn "Run '$0 join-workers' again if workers don't appear within a few minutes."
+    fi
   else
     log ""
-    log "All workers already joined or no new workers to join"
+    log "No workers needed to be joined"
   fi
 }
 
@@ -2816,6 +3822,7 @@ case "${1:-install}" in
     clean_all
     ;;
   join-workers)
+  # TODO fix this flow
     join_workers
     ;;
   *)

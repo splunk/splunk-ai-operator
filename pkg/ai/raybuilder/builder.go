@@ -787,7 +787,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
         ulimit -n 65536;
     	export PATH="/home/ray/anaconda3/bin:$PATH";
         KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
-        $KUBERAY_GEN_RAY_START_CMD;`, cfg.Tier)
+        $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
 		Affinity:           b.ai.Spec.GPUSchedulingSpec.Affinity,
 		Tolerations:        b.ai.Spec.GPUSchedulingSpec.Tolerations,

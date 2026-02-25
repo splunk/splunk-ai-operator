@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test script to diagnose MinIO connectivity and bucket creation issues
 
-MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
+MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://13.59.216.105:9000}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
 MINIO_BUCKET="${MINIO_BUCKET:-personal}"

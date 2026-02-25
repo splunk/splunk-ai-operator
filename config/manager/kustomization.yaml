@@ -7,7 +7,7 @@ resources:
 patches:
 - patch: "- op: add\n  path: /spec/template/spec/containers/0/env\n  value: \n  -
     name: WATCH_NAMESPACE\n    value: WATCH_NAMESPACE_VALUE\n  - name: RELATED_IMAGE_SPLUNK_ENTERPRISE\n
-    \   value: splunk/splunk:10.2.0-dev1\n  - name: OPERATOR_NAME\n    value:
+    \   value: splunk/splunk:10-2-ai-custom\n  - name: OPERATOR_NAME\n    value:
     splunk-operator\n  - name: POD_NAME\n    valueFrom:\n      fieldRef:\n        fieldPath:
     metadata.name\n  - name: RELATED_IMAGE_RAY_HEAD\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17\"\n
     \ - name: RELATED_IMAGE_RAY_WORKER\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17\"\n

@@ -43,7 +43,10 @@ COPY LICENSE LICENSE-2.0.txt
 COPY --from=builder /certs/tls.crt /certs/tls.crt
 COPY --from=builder /certs/tls.key /certs/tls.key
 
-USER 65532:65532
+# USER 65532:65532
+# TODO needed ?
+# Run as non-root user (UBI micro has no useradd, use numeric UID)
+USER 1001:0
 ENV INSTANCE_FILE=/instance.yaml
 ENV APPLICATION_FILE=/applications.yaml
 ENTRYPOINT ["/manager"]
