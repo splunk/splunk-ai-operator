@@ -619,8 +619,8 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		{Name: "S3_BUCKET", Value: extractBucketName(ai.Spec.TaskVolume.Path)},
 	}
 
-	// MinIO support: Add MinIO-specific environment variables if endpoint is configured
-	if strings.HasPrefix(ai.Spec.TaskVolume.Path, "minio") && ai.Spec.TaskVolume.Endpoint != "" {
+	// MinIO/S3-compatible: SAIA service expects MINIO_ENDPOINT_URL when using custom endpoint (MinIO or S3-compatible)
+	if ai.Spec.TaskVolume.Endpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "MINIO_ENDPOINT_URL", Value: ai.Spec.TaskVolume.Endpoint})
 	}
 
@@ -932,14 +932,16 @@ func (r *SaiaReconciler) createOrUpdateConfigMap(
 }
 
 // extractBucketName extracts the bucket name from an object storage path.
-// Supports s3://, minio://, gs://, and azure:// prefixes.
+// Supports s3://, s3compat://, minio://, seaweedfs://, gs://, and azure:// prefixes.
 // Examples:
 //   - "s3://my-bucket/path/to/dir" -> "my-bucket"
+//   - "s3compat://bucket-name" -> "bucket-name"
 //   - "minio://bucket-name" -> "bucket-name"
+//   - "seaweedfs://my-bucket/prefix" -> "my-bucket"
 //   - "gs://my-bucket" -> "my-bucket"
 func extractBucketName(path string) string {
 	// Remove supported prefixes
-	prefixes := []string{"s3://", "minio://", "gs://", "azure://"}
+	prefixes := []string{"s3://", "s3compat://", "minio://", "seaweedfs://", "gs://", "azure://"}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(path, prefix) {
 			path = strings.TrimPrefix(path, prefix)

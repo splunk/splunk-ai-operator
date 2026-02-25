@@ -2237,8 +2237,8 @@ spec:
                   path:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-                      azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
+                      azure://containername/<path prefix>, minio://bucketname/<path prefix>, seaweedfs://bucketname/<path prefix>, or s3compat://bucketname/<path prefix>
+                    pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -4873,8 +4873,8 @@ spec:
                   path:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-                      azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
+                      azure://containername/<path prefix>, minio://bucketname/<path prefix>, seaweedfs://bucketname/<path prefix>, or s3compat://bucketname/<path prefix>
+                    pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for

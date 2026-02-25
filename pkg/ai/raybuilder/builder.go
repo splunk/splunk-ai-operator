@@ -94,15 +94,20 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	}
 
 	// Set CloudProvider and artifacts provider/bucket from URL scheme (for SDK model loaders).
-	// ARTIFACTS_PROVIDER matches storage client GetProvider(): s3/minio -> "s3", gs/gcs -> "gcs", azure -> "azure".
+	// ARTIFACTS_PROVIDER matches storage client GetProvider(): s3/minio/seaweedfs/s3compat -> "s3", gs/gcs -> "gcs", azure -> "azure".
+	// S3 (AWS) uses cloudProvider "aws" when no custom endpoint; s3compat/minio/seaweedfs use "s3compat".
 	var cloudProvider, artifactsProvider string
 	switch u.Scheme {
 	case "s3":
-		cloudProvider = "aws"
+		if p.Spec.ObjectStorage.Endpoint != "" {
+			cloudProvider = "s3compat"
+		} else {
+			cloudProvider = "aws"
+		}
 		artifactsProvider = "s3"
-	case "minio":
-		cloudProvider = "minio"
-		artifactsProvider = "s3" // MinIO is S3-compatible; SDK uses s3 client
+	case "s3compat", "minio", "seaweedfs":
+		cloudProvider = "s3compat"
+		artifactsProvider = "s3"
 	case "gs", "gcs":
 		cloudProvider = "gcp"
 		artifactsProvider = "gcs"
@@ -149,17 +154,19 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
+	// S3-compatible backends (s3compat, MinIO, SeaweedFS) need custom endpoint and credentials. S3 (AWS) uses region/IRSA only.
+	s3CompatScheme := (u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs")
 	minioEndpoint := ""
-	if u.Scheme == "minio" && p.Spec.ObjectStorage.Endpoint != "" {
+	if s3CompatScheme && p.Spec.ObjectStorage.Endpoint != "" {
 		minioEndpoint = p.Spec.ObjectStorage.Endpoint
 	}
 
 	var minioAccessKey, minioSecretKey string
-	if u.Scheme == "minio" && p.Spec.ObjectStorage.SecretRef != "" {
+	if p.Spec.ObjectStorage.SecretRef != "" && s3CompatScheme {
 		var secret corev1.Secret
 		secretRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Spec.ObjectStorage.SecretRef}
 		if err := b.Get(ctx, secretRef, &secret); err != nil {
-			logger.Error(err, "Failed to get object storage secret for MinIO credentials", "secret", p.Spec.ObjectStorage.SecretRef)
+			logger.Error(err, "Failed to get object storage secret for S3-compatible credentials", "secret", p.Spec.ObjectStorage.SecretRef)
 			return err
 		}
 		if raw, ok := secret.Data["s3_access_key"]; ok {
@@ -859,7 +866,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
         ulimit -n 65536;
     	export PATH="/home/ray/anaconda3/bin:$PATH";
         KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
-        $KUBERAY_GEN_RAY_START_CMD;`, cfg.Tier)
+        $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
 		Affinity:           b.ai.Spec.GPUSchedulingSpec.Affinity,
 		Tolerations:        b.ai.Spec.GPUSchedulingSpec.Tolerations,
