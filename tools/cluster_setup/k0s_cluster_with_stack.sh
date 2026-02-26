@@ -123,17 +123,25 @@ load_config() {
   CPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.cpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "m5.4xlarge")
   GPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.gpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "g5.2xlarge")
 
-  # MinIO configuration (optional S3-compatible object storage)
-  MINIO_ENABLED=$(yq eval '.minio.enabled // true' "${CONFIG_FILE}" 2>/dev/null || echo "true")
-  MINIO_EXTERNAL=$(yq eval '.minio.external // false' "${CONFIG_FILE}" 2>/dev/null || echo "false")
-  MINIO_ENDPOINT=$(yq eval '.minio.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  MINIO_NS=$(yq eval '.minio.namespace // "minio-system"' "${CONFIG_FILE}" 2>/dev/null || echo "minio-system")
-  MINIO_BUCKET=$(yq eval '.minio.bucket' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform-data")
-  MINIO_REPLICAS=$(yq eval '.minio.replicas // 1' "${CONFIG_FILE}" 2>/dev/null || echo "1")
-  MINIO_PVC_SIZE=$(yq eval '.minio.persistence.size // "200Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "200Gi")
-  MINIO_PVC_STORAGE_CLASS=$(yq eval '.minio.persistence.storageClass // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
-  MINIO_ROOT_USER=$(yq eval '.minio.accessKey // .minio.auth.rootUser // "minioadmin"' "${CONFIG_FILE}" 2>/dev/null || echo "minioadmin")
-  MINIO_ROOT_PASSWORD=$(yq eval '.minio.secretKey // .minio.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  # Storage configuration
+  STORAGE_CLASS=$(yq eval '.storage.storageClass // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
+  VECTORDB_SIZE=$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
+
+  # Object storage: objectStore.type (aws | s3compat | minio | seaweedfs); default minio when unset
+  OBJ_STORE_TYPE="$(yq eval '.storage.objectStore.type // "minio"' "$CONFIG_FILE" 2>/dev/null || echo "minio")"
+  OBJ_STORE_BUCKET="$(yq eval '.storage.objectStore.bucket // "ai-platform-data"' "$CONFIG_FILE" 2>/dev/null || echo "ai-platform-data")"
+  OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  _obj_user="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "$CONFIG_FILE" 2>/dev/null || echo "minioadmin")"
+  _obj_pw="$(yq eval '.storage.objectStore.auth.rootPassword // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  USE_EXTERNAL_OBJ_STORE="false"
+  case "${OBJ_STORE_TYPE}" in s3compat|minio|seaweedfs) USE_EXTERNAL_OBJ_STORE="true"; esac
+  MINIO_ENDPOINT="${OBJ_STORE_ENDPOINT}"
+  MINIO_BUCKET="${OBJ_STORE_BUCKET}"
+  MINIO_ROOT_USER="${MINIO_ROOT_USER:-$_obj_user}"
+  MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$_obj_pw}"
+
+  # Legacy compat: MINIO_NS for in-cluster MinIO (unused when external)
+  MINIO_NS="minio-system"
 
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
@@ -141,18 +149,33 @@ load_config() {
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
-  # AI Platform CR configuration (accelerator type, worker image registry, storage)
+  # Container images
+  IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  OPERATOR_IMAGE="$(yq eval '.images.operator.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SPLUNK_IMAGE="$(yq eval '.images.splunk.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SPLUNK_OPERATOR_IMAGE="$(yq eval '.images.splunk.operatorImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  RAY_HEAD_IMAGE="$(yq eval '.images.ray.headImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  RAY_WORKER_IMAGE="$(yq eval '.images.ray.workerImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+
+  # Operator versions
+  MODEL_VERSION="$(yq eval '.operators.ray.modelVersion // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  RAY_RUNTIME_VERSION="$(yq eval '.operators.ray.rayVersion // "2.44.0"' "$CONFIG_FILE" 2>/dev/null || echo "2.44.0")"
+
+  # AI Platform CR configuration
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  VECTORDB_SIZE=$(yq eval '.aiPlatform.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
-  STORAGE_CLASS=$(yq eval '.aiPlatform.storage.storageClassName // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
 
-  # NVIDIA device plugin version (matches EKS script: operators.nvidia.devicePluginVersion)
+  # NVIDIA device plugin version
   NVIDIA_VERSION=$(yq eval '.operators.nvidia.devicePluginVersion // "v0.17.3"' "${CONFIG_FILE}" 2>/dev/null || echo "v0.17.3")
 
   # ECR configuration (for private image repositories)
   ECR_ACCOUNT=$(yq eval '.ecr.account' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  ECR_REGION=$(yq eval '.ecr.region' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  ECR_REGION=$(yq eval '.ecr.region // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Get AWS account if using EC2
   if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
@@ -177,17 +200,13 @@ load_config() {
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    if [[ "${MINIO_EXTERNAL}" == "true" ]]; then
-      log "MinIO: external (endpoint=${MINIO_ENDPOINT:-not set}, bucket=${MINIO_BUCKET})"
-    else
-      log "MinIO: in-cluster (namespace=${MINIO_NS}, bucket=${MINIO_BUCKET})"
-    fi
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "Object storage: external S3-compatible (${OBJ_STORE_TYPE}), endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   else
-    log "MinIO: disabled (using S3 for object storage)"
+    log "Object storage: AWS S3, bucket=${OBJ_STORE_BUCKET}"
   fi
   if [[ -n "${ECR_ACCOUNT}" ]]; then
-    log "ECR Account: ${ECR_ACCOUNT}, ECR Region: ${ECR_REGION:-not set}"
+    log "ECR Account: ${ECR_ACCOUNT}"
   fi
 
   # Log which image pull secrets are enabled
@@ -201,6 +220,148 @@ load_config() {
   if [[ ${#enabled_registries[@]} -gt 0 ]]; then
     log "ImagePullSecrets enabled for: ${enabled_registries[*]}"
   fi
+}
+
+# ====== IMAGE HELPERS ======
+build_image_url() {
+  local registry="$1"
+  local image_path="$2"
+  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
+    echo "$image_path"
+    return 0
+  fi
+  if [[ -n "$registry" && "$registry" != "null" ]]; then
+    echo "${registry}/${image_path}"
+  else
+    echo "$image_path"
+  fi
+}
+
+validate_image_config() {
+  log "Validating image configuration..."
+
+  if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.operator.image must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.ray.headImage must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$RAY_WORKER_IMAGE" || "$RAY_WORKER_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.ray.workerImage must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.weaviate.image must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.saia.apiImage must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
+  fi
+  if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
+    SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
+    log "Using default Splunk Operator image: $SPLUNK_OPERATOR_IMAGE"
+  fi
+  if [[ -z "$FLUENT_BIT_IMAGE" || "$FLUENT_BIT_IMAGE" == "null" ]]; then
+    FLUENT_BIT_IMAGE="fluent/fluent-bit:1.9.6"
+    log "Using default Fluent Bit image: $FLUENT_BIT_IMAGE"
+  fi
+  if [[ -z "$OTEL_COLLECTOR_IMAGE" || "$OTEL_COLLECTOR_IMAGE" == "null" ]]; then
+    OTEL_COLLECTOR_IMAGE="otel/opentelemetry-collector-contrib:0.122.1"
+    log "Using default OpenTelemetry Collector image: $OTEL_COLLECTOR_IMAGE"
+  fi
+  if [[ -z "$MODEL_VERSION" || "$MODEL_VERSION" == "null" ]]; then
+    MODEL_VERSION="v0.3.14-36-g1549f5a"
+    log "Using default Model version: $MODEL_VERSION"
+  fi
+  if [[ -z "$RAY_RUNTIME_VERSION" || "$RAY_RUNTIME_VERSION" == "null" ]]; then
+    RAY_RUNTIME_VERSION="2.44.0"
+    log "Using default Ray runtime version: $RAY_RUNTIME_VERSION"
+  fi
+
+  log "✓ Image configuration validated successfully"
+}
+
+configure_images() {
+  log "Configuring container images in manifest files..."
+
+  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
+    log "Creating backup: ${SPLUNK_AI_FILE}.original"
+    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
+  fi
+  if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
+    log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
+    cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
+  fi
+
+  log "Restoring from clean originals to ensure idempotent updates..."
+  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
+  cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+
+  log "Updating $SPLUNK_AI_FILE..."
+
+  local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
+  local ray_head_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_HEAD_IMAGE")
+  local ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
+  local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
+  local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
+  local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
+  local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
+
+  local ray_head_escaped=$(echo "$ray_head_full" | sed 's/[\/&]/\\&/g')
+  local ray_worker_escaped=$(echo "$ray_worker_full" | sed 's/[\/&]/\\&/g')
+  local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
+  local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
+  local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
+  local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
+  local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
+
+  SEDOPTION="-i"
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    SEDOPTION="-i ''"
+  fi
+
+  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
+
+  log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
+  log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
+  log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
+  log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
+  log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
+  log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
+  log "  ✓ Updated operator image: $operator_full"
+  log "  ✓ Updated MODEL_VERSION: $MODEL_VERSION"
+  log "  ✓ Updated RAY_VERSION: $RAY_RUNTIME_VERSION"
+
+  log "Updating $SPLUNK_OPERATOR_FILE..."
+
+  local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
+  local splunk_operator_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
+
+  local splunk_escaped=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
+  local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
+
+  sed $SEDOPTION "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
+  sed $SEDOPTION "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+
+  log "  ✓ Updated Splunk Enterprise image: $splunk_full"
+  log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
+  log "✓ All images configured successfully"
 }
 
 # ====== PREFLIGHT CHECKS ======
@@ -225,6 +386,23 @@ preflight_checks() {
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
   [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "AI platform file: ${SPLUNK_AI_FILE}" || pf_warn "AI platform file not found: ${SPLUNK_AI_FILE}"
+
+  pf_header "Object storage"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    pf_ok "Object storage: external S3-compatible (${OBJ_STORE_TYPE})"
+    if [[ "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+      if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
+        pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
+      else
+        pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}"
+      fi
+    else
+      [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "External object store requires endpoint"
+    fi
+    [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required"
+  else
+    pf_ok "Object storage: in-cluster MinIO or AWS S3 (bucket=${OBJ_STORE_BUCKET})"
+  fi
 
   pf_header "Infrastructure mode"
   if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
@@ -1115,8 +1293,10 @@ ensure_namespace() {
 # ====== INSTALL MINIO ======
 # TODO remove
 install_minio() {
-  if [[ "${MINIO_ENABLED}" != "true" ]]; then
-    log "MinIO is disabled (minio.enabled != true); skipping."
+  # When using external S3-compatible storage, skip in-cluster MinIO; credentials
+  # are created by ensure_s3compat_credentials() instead.
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "Using external S3-compatible storage (${OBJ_STORE_TYPE}); skipping in-cluster MinIO install."
     return 0
   fi
 
@@ -1124,26 +1304,6 @@ install_minio() {
   if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
     MINIO_ROOT_PASSWORD="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
     log "Generated MinIO root password (saved for secret creation)"
-  fi
-
-  # External MinIO (e.g. on EC2): only create credentials secret; no in-cluster install
-  if [[ "${MINIO_EXTERNAL}" == "true" ]]; then
-    log "Using external MinIO (minio.external=true); skipping in-cluster install."
-    if [[ -z "${MINIO_ENDPOINT}" ]]; then
-      warn "minio.endpoint is empty; set it to the MinIO URL (e.g. http://<ip>:9000) for AIPlatform to use external MinIO."
-    fi
-    ensure_namespace "${AI_NS}"
-    local secret_name="minio-credentials"
-    kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
-      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-    log "✓ External MinIO credentials secret ${AI_NS}/${secret_name} ready"
-    return 0
   fi
 
   # In-cluster MinIO installation
@@ -1165,12 +1325,12 @@ metadata:
   name: minio-pvc
   namespace: ${MINIO_NS}
 spec:
-  storageClassName: ${MINIO_PVC_STORAGE_CLASS}
+  storageClassName: ${STORAGE_CLASS}
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: ${MINIO_PVC_SIZE}
+      storage: 200Gi
 ---
 apiVersion: v1
 kind: Service
@@ -1195,7 +1355,7 @@ metadata:
   name: minio
   namespace: ${MINIO_NS}
 spec:
-  replicas: ${MINIO_REPLICAS}
+  replicas: 1
   selector:
     matchLabels:
       app: minio
@@ -1382,6 +1542,34 @@ EOF
   fi
 
   log "✓ MinIO installed; bucket=${MINIO_BUCKET}; credentials secret ${AI_NS}/${secret_name}"
+}
+
+# ====== External S3-compatible object storage (credentials only; no in-cluster install) ======
+ensure_s3compat_credentials() {
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
+    return 0
+  fi
+
+  log "Object store type is ${OBJ_STORE_TYPE}; creating credentials secret for external S3-compatible storage."
+  if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
+    err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
+    return 1
+  fi
+  if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
+    err "External S3-compatible storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
+    return 1
+  fi
+  ensure_namespace "${AI_NS}"
+  local secret_name="minio-credentials"
+  kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
+    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+  log "✓ External S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
 }
 
 # ====== INSTALL CERT-MANAGER ======
@@ -1577,6 +1765,19 @@ install_nvidia_host_drivers() {
         # snippet, not a full containerd config (prevents node NotReady).
         sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \
           /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+
+        # Set nvidia as the default containerd runtime on GPU nodes so that
+        # all pods automatically get GPU access without needing runtimeClassName.
+        # This matches EKS behavior where the GPU AMI's default runtime handles
+        # GPU passthrough. The nvidia runtime is a superset of runc — non-GPU
+        # containers run unchanged.
+        # Insert inside the existing [plugins."...".containerd] section (not as
+        # a new top-level section, which would create a duplicate TOML table).
+        if ! grep -q 'default_runtime_name' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null; then
+          sudo sed -i '/\[plugins\.\"io\.containerd\.grpc\.v1\.cri\"\.containerd\]$/{
+            a\      default_runtime_name = \"nvidia\"
+          }' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+        fi
       elif [ -f /etc/containerd/config.toml ]; then
         sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
       fi
@@ -1684,15 +1885,11 @@ RTEOF
   kubectl apply -n kube-system \
     -f "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml"
 
-  # Patch the device plugin DaemonSet:
-  #  1) runtimeClassName: nvidia — so the plugin container can access NVML/CDI
-  #     (without this it reports "Incompatible strategy detected auto" / "No devices found")
-  #  2) nodeSelector for GPU nodes — the nvidia runtime handler only exists on
-  #     GPU workers; non-GPU nodes would fail to start pods with this RuntimeClass
-  log "  Patching device plugin: nvidia RuntimeClass + GPU nodeSelector..."
+  # Constrain the device plugin to GPU-labeled nodes only — non-GPU nodes
+  # don't have the NVIDIA drivers and the plugin pods would fail there.
+  log "  Patching device plugin: GPU nodeSelector..."
   kubectl patch daemonset nvidia-device-plugin-daemonset -n kube-system --type='json' \
     -p='[
-      {"op": "add", "path": "/spec/template/spec/runtimeClassName", "value": "nvidia"},
       {"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {"splunk.ai/workload-type": "gpu"}}
     ]' 2>/dev/null || true
 
@@ -2341,9 +2538,8 @@ install_splunk_standalone() {
   wait_for_crd standalones.enterprise.splunk.com 600
 
   # Create credentials secret for Splunk App Framework
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    # MinIO mode: ensure minio-credentials secret exists (created by install_minio)
-    log "Using MinIO credentials for Splunk App Framework..."
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "Using external S3-compatible credentials for Splunk App Framework..."
     if ! kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
       log "Creating minio-credentials secret in ${AI_NS}..."
       kubectl -n "${AI_NS}" create secret generic minio-credentials \
@@ -2356,7 +2552,6 @@ install_splunk_standalone() {
         --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
     fi
   else
-    # S3 mode: create s3-secret with AWS credentials
     log "Creating S3-compatible secret for Splunk App Framework..."
     kubectl -n "${AI_NS}" create secret generic s3-secret \
       --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
@@ -2392,11 +2587,9 @@ YAML
       warn "Could not patch default ServiceAccount"
   fi
 
-  # Create Splunk Standalone with App Framework
-  # Standalone app repo: MinIO (S3-compatible) when minio.enabled=true, else S3
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    local minio_endpoint="${MINIO_ENDPOINT}"
-    [[ -z "$minio_endpoint" ]] && minio_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
+  # Standalone app repo: external S3-compatible when objectStore.type is s3compat/minio/seaweedfs, else S3
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    local minio_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
     cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
@@ -2406,9 +2599,9 @@ metadata:
 spec:
   replicas: 1
   etcVolumeStorageConfig:
-    storageClassName: local-path
+    storageClassName: ${STORAGE_CLASS}
   varVolumeStorageConfig:
-    storageClassName: local-path
+    storageClassName: ${STORAGE_CLASS}
   volumes:
     - name: defaults
       configMap:
@@ -2443,9 +2636,9 @@ metadata:
 spec:
   replicas: 1
   etcVolumeStorageConfig:
-    storageClassName: local-path
+    storageClassName: ${STORAGE_CLASS}
   varVolumeStorageConfig:
-    storageClassName: local-path
+    storageClassName: ${STORAGE_CLASS}
   volumes:
     - name: defaults
       configMap:
@@ -2504,8 +2697,8 @@ install_ai_platform_cr() {
   log "Using Splunk secret: ${splunk_secret}"
 
   # Ensure object storage credentials secret exists in AI namespace
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    log "Creating/updating MinIO credentials secret (minio-credentials) in ${AI_NS}..."
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "Creating/updating external S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
     kubectl -n "${AI_NS}" create secret generic minio-credentials \
       --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
       --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
@@ -2514,7 +2707,7 @@ install_ai_platform_cr() {
       --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
       --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
       --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-    log "✓ MinIO credentials secret ready"
+    log "✓ Object storage credentials secret ready"
   else
     log "Creating/updating S3 credentials secret (s3-secret) in ${AI_NS}..."
     kubectl -n "${AI_NS}" create secret generic s3-secret \
@@ -2546,21 +2739,30 @@ EOF
     log "No imagePullSecrets found, using public images only"
   fi
 
-  # objectStorage: use MinIO when enabled (in-cluster or external), otherwise S3
+  # objectStorage: path/endpoint/secret by object store type (aws | s3compat | minio | seaweedfs)
   local obj_path obj_endpoint obj_secret
-  if [[ "${MINIO_ENABLED}" == "true" ]]; then
-    obj_path="minio://${MINIO_BUCKET}"
-    if [[ "${MINIO_EXTERNAL}" == "true" && -n "${MINIO_ENDPOINT}" ]]; then
-      obj_endpoint="${MINIO_ENDPOINT}"
-    else
+  case "${OBJ_STORE_TYPE}" in
+    s3compat)
+      obj_path="s3compat://${OBJ_STORE_BUCKET}"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      obj_secret="minio-credentials"
+      ;;
+    minio)
+      obj_path="minio://${MINIO_BUCKET}"
+      obj_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
+      obj_secret="minio-credentials"
+      ;;
+    seaweedfs)
+      obj_path="seaweedfs://${OBJ_STORE_BUCKET}"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      obj_secret="minio-credentials"
+      ;;
+    aws|*)
+      obj_path="s3://${OBJ_STORE_BUCKET}"
       obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
-    fi
-    obj_secret="minio-credentials"
-  else
-    obj_path="s3://${MINIO_BUCKET}"
-    obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
-    obj_secret="s3-secret"
-  fi
+      obj_secret="s3-secret"
+      ;;
+  esac
 
   # Apply AIPlatform CR (matching EKS script pattern)
   log "Applying AIPlatform CR: ${CLUSTER_NAME}-ai-platform"
@@ -2573,8 +2775,8 @@ spec:
   objectStorage:
     path: ${obj_path}
     region: us-east-1
-    endpoint: ${obj_endpoint}
-    secretRef: ${obj_secret}
+    $( [[ -n "$obj_endpoint" ]] && echo "endpoint: \"${obj_endpoint}\"" )
+    $( [[ -n "$obj_secret" ]] && echo "secretRef: ${obj_secret}" )
 
   # Image configuration (including pull secrets for private registries)
   images:
@@ -2647,17 +2849,18 @@ YAML
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
 
-  # ensure_namespace "${AI_NS}"
+  ensure_namespace "${AI_NS}"
 
-  # # Install infrastructure components
-  # install_minio
-  # install_cert_manager
-  # install_kube_prometheus
-  # install_otel_operator_and_contrib_collector
-  # mount_nvme_instance_store         # Step 0: Mount NVMe instance store for ephemeral storage on GPU workers
-  # install_nvidia_host_drivers       # Step 1: Install drivers on GPU hosts via SSH (bare-metal only)
-  # install_nvidia_device_plugin      # Step 2: Deploy device plugin DaemonSet (same as EKS)
-  # install_ray_operator
+  # Install infrastructure components
+  install_minio
+  install_cert_manager
+  install_kube_prometheus
+  ensure_s3compat_credentials
+  install_otel_operator_and_contrib_collector
+  mount_nvme_instance_store
+  install_nvidia_host_drivers
+  install_nvidia_device_plugin
+  install_ray_operator
 
   # Install Splunk components
   install_splunk_operator
@@ -2709,12 +2912,10 @@ check_platform_health() {
   fi
   log ""
 
-  # Check 3: MinIO
-  log "Checking MinIO..."
-  if [[ "${MINIO_ENABLED}" != "true" ]]; then
-    log "⏭️  MinIO disabled; skipping check"
-  elif [[ "${MINIO_EXTERNAL}" == "true" ]]; then
-    log "⏭️  External MinIO; skipping in-cluster check"
+  # Check 3: MinIO / Object Storage
+  log "Checking object storage..."
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "⏭️  External S3-compatible storage (${OBJ_STORE_TYPE}); skipping in-cluster check"
   elif kubectl get pod -n "${MINIO_NS}" -l app=minio 2>/dev/null | grep -q "Running"; then
     log "✅ MinIO is running"
   else
@@ -2947,6 +3148,10 @@ show_platform_access_info() {
 # ====== MAIN INSTALL FLOW ======
 main_install() {
   load_config
+
+  validate_image_config
+  configure_images
+
   preflight_checks
 
   # Check if existing Kubernetes cluster should be used
