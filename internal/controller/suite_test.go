@@ -71,8 +71,14 @@ var _ = BeforeSuite(func() {
 	}
 
 	// Retrieve the first found binary directory to allow running tests from IDEs
-	if getFirstFoundEnvTestBinaryDir() != "" {
-		testEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
+	binaryDir := getFirstFoundEnvTestBinaryDir()
+	if binaryDir != "" {
+		testEnv.BinaryAssetsDirectory = binaryDir
+	} else if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		// No envtest binaries: skip this suite so "go test ./..." can pass without make setup-envtest.
+		// Run "make setup-envtest" or "make test" to download binaries and run controller tests.
+		Skip("envtest binaries not found (no bin/k8s, KUBEBUILDER_ASSETS unset). Run 'make setup-envtest' from repo root to run controller tests.")
+		return
 	}
 
 	// cfg is defined in this file globally.
@@ -88,8 +94,10 @@ var _ = BeforeSuite(func() {
 var _ = AfterSuite(func() {
 	By("tearing down the test environment")
 	cancel()
-	err := testEnv.Stop()
-	Expect(err).NotTo(HaveOccurred())
+	if cfg != nil {
+		err := testEnv.Stop()
+		Expect(err).NotTo(HaveOccurred())
+	}
 })
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
