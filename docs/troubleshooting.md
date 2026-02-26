@@ -213,16 +213,16 @@ the model loader is trying to use a **local path** where the model should have b
 1. **Model not in object storage**  
    The prefix `model_artifacts/llama31-8b-instruct` must exist in your bucket with a full Hugging Face–style layout (including `config.json` and weight files).
    - Download: `./tools/artifacts_download_upload_scripts/download_from_huggingface.sh`
-   - Upload to MinIO: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `MINIO_ENDPOINT`, `MINIO_BUCKET`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` as in the [artifacts README](../tools/artifacts_download_upload_scripts/README.md)).
+   - Upload to MinIO/S3-compatible: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, and credentials as in the [artifacts README](../tools/artifacts_download_upload_scripts/README.md); `MINIO_*` env vars are also accepted).
 
 2. **Ray workers cannot reach MinIO/S3**  
    - For **external MinIO** (e.g. EC2): ensure the MinIO endpoint in `cluster-config.yaml` (`storage.minio.endpoint`) is reachable from EKS (security groups, VPC, and if using a public IP, that nodes can egress to it).
    - From a Ray worker pod:  
-     `kubectl exec -it -n <namespace> <ray-worker-pod> -- env | grep -E 'MINIO|ARTIFACTS|S3'`  
-     then test connectivity (e.g. curl to the MinIO endpoint or use the same client the SDK uses).
+     `kubectl exec -it -n <namespace> <ray-worker-pod> -- env | grep -E 'OBJECT_STORE|ARTIFACTS|S3'`  
+     then test connectivity (e.g. curl to the object store endpoint or use the same client the SDK uses).
 
 3. **Wrong or missing credentials**  
-   AIPlatform must have `objectStorage.secretRef` pointing to a secret with `s3_access_key` and `s3_secret_key` (and the operator passes these as `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` to Ray). Verify the secret exists and matches the MinIO/S3 account that can read the bucket:
+   AIPlatform must have `objectStorage.secretRef` pointing to a secret with `s3_access_key` and `s3_secret_key` (the operator passes these as `S3COMPAT_OBJECT_STORE_ACCESS_KEY` / `S3COMPAT_OBJECT_STORE_SECRET_KEY` to Ray). Verify the secret exists and matches the S3-compatible account that can read the bucket:
    - `kubectl get secret minio-credentials -n <namespace> -o jsonpath='{.data}'`
 
 4. **Bucket/prefix mismatch**  
@@ -230,7 +230,7 @@ the model loader is trying to use a **local path** where the model should have b
 
 **Quick checks:**
 
-- List objects in MinIO for the model prefix (from a host with `mc` or AWS CLI configured for MinIO):
+- List objects in the object store for the model prefix (from a host with `mc` or AWS CLI configured):
   - `mc ls myminio/<bucket>/model_artifacts/llama31-8b-instruct/`  
   You should see at least `config.json` and the model weight files.
 - From a Ray worker pod, confirm env vars and that the path is writable:
@@ -239,7 +239,7 @@ the model loader is trying to use a **local path** where the model should have b
 
 **Full reset when the deployment keeps failing (e.g. Llama31Instruct / LLMDeploymentL40S):**
 
-If the model is correct in MinIO and credentials are in the serve config but the replica still fails with "Invalid repository ID or local directory", clear the artifact cache and restart Ray so replicas run a fresh download and load.
+If the model is correct in object storage and credentials are in the serve config but the replica still fails with "Invalid repository ID or local directory", clear the artifact cache and restart Ray so replicas run a fresh download and load.
 
 1. **Clear the artifact cache on all workers**  
    Either remove only the failing model prefix or the entire `model_artifacts` tree (more thorough):
@@ -258,7 +258,7 @@ If the model is correct in MinIO and credentials are in the serve config but the
    done
    ```
 
-2. **Restart worker pods** so new replicas run and download from MinIO:
+2. **Restart worker pods** so new replicas run and download from object storage:
 
    ```bash
    kubectl delete pods -n "$AI_NS" -l ray.io/node-type=worker
@@ -280,9 +280,9 @@ If the model is correct in MinIO and credentials are in the serve config but the
    kubectl exec -n "$AI_NS" "$WORKER" -c ray-worker -- sh -c 'ls /home/ray/.cache/s3/artifacts/model_artifacts/llama31-8b-instruct/*.safetensors 2>/dev/null || echo "No safetensors"'
    ```
 
-### MinIO credentials and serve config verification
+### Object store credentials and serve config verification
 
-When using MinIO, the operator injects credentials from the object storage secret into the Ray Serve config so replicas can download model artifacts. Use these steps to verify the secret and that the updated serve config is applied.
+When using S3-compatible object storage (MinIO, SeaweedFS, etc.), the operator injects credentials from the object storage secret into the Ray Serve config so replicas can download model artifacts. Use these steps to verify the secret and that the updated serve config is applied.
 
 **1. Check that the AIPlatform object storage secret exists and has the required keys**
 
@@ -313,7 +313,7 @@ kubectl -n <namespace> create secret generic <secret-name> \
 
 **2. Reconcile or restart the operator with the new image**
 
-After updating the operator image (with the change that injects MinIO credentials into the serve config), either trigger a reconcile or restart the operator so it rewrites `RayService.spec.serveConfigV2`.
+After updating the operator image (with the change that injects object store credentials into the serve config), either trigger a reconcile or restart the operator so it rewrites `RayService.spec.serveConfigV2`.
 
 - **Option A – Restart the operator deployment** (simplest; causes one reconcile when the pod comes back):
 
@@ -332,28 +332,28 @@ After updating the operator image (with the change that injects MinIO credential
 
   The operator will reconcile and regenerate the RayService; ensure the operator is already running the new image before doing this.
 
-**3. Confirm RayService.spec.serveConfigV2 includes MINIO_ACCESS_KEY and MINIO_SECRET_KEY**
+**3. Confirm RayService.spec.serveConfigV2 includes S3COMPAT_OBJECT_STORE_ACCESS_KEY and S3COMPAT_OBJECT_STORE_SECRET_KEY**
 
-The serve config is a JSON string in `RayService.spec.serveConfigV2`. Check that it contains the MinIO env vars for the apps (e.g. after the operator has reconciled).
+The serve config is a JSON string in `RayService.spec.serveConfigV2`. Check that it contains the object store env vars for the apps (e.g. after the operator has reconciled).
 
 ```bash
 # Set your AIPlatform namespace and RayService name (often the same as AIPlatform name, e.g. splunk-ai-stack)
 NAMESPACE="<namespace>"
 RAY_SERVICE_NAME="<rayservice-name>"
 
-# Count occurrences of MINIO_ACCESS_KEY in the serve config (expect > 0 when using MinIO)
-kubectl get rayservice "$RAY_SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.serveConfigV2}' | jq -Rs 'split("MINIO_ACCESS_KEY") | length - 1'
+# Count occurrences of S3COMPAT_OBJECT_STORE_ACCESS_KEY in the serve config (expect > 0 when using S3-compatible storage)
+kubectl get rayservice "$RAY_SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.serveConfigV2}' | jq -Rs 'split("S3COMPAT_OBJECT_STORE_ACCESS_KEY") | length - 1'
 
 # Show a snippet to confirm the keys are present (values are redacted in output)
-kubectl get rayservice "$RAY_SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.serveConfigV2}' | grep -o '"MINIO_ACCESS_KEY"[^,]*' | head -1
-kubectl get rayservice "$RAY_SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.serveConfigV2}' | grep -o '"MINIO_SECRET_KEY"[^,]*' | head -1
+kubectl get rayservice "$RAY_SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.serveConfigV2}' | grep -o '"S3COMPAT_OBJECT_STORE_ACCESS_KEY"[^,]*' | head -1
+kubectl get rayservice "$RAY_SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.serveConfigV2}' | grep -o '"S3COMPAT_OBJECT_STORE_SECRET_KEY"[^,]*' | head -1
 ```
 
 If the count is 0, the operator may not be using the new image, or `objectStorage.secretRef` may be unset. Ensure:
 
-- The AIPlatform has `spec.objectStorage.path` with scheme `minio://...` and `spec.objectStorage.secretRef` set to the secret name.
+- The AIPlatform has `spec.objectStorage.path` with scheme `s3compat://`, `minio://`, or `seaweedfs://` and `spec.objectStorage.secretRef` set to the secret name.
 - The secret exists in the AIPlatform namespace and contains `s3_access_key` and `s3_secret_key`.
-- The operator deployment has been restarted (or reconciled) with the image that injects MinIO credentials into the applications template.
+- The operator deployment has been restarted (or reconciled) with the image that injects object store credentials into the applications template.
 
 After confirming, restart Ray workers if needed so they pick up the new env (e.g. scale down and up the Ray cluster or wait for rolling restart), then re-check replica logs and the cache path `/home/ray/.cache/s3/artifacts/model_artifacts/...`.
 

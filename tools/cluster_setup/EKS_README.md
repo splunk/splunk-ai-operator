@@ -820,12 +820,12 @@ kubectl get secret "${SECRET_NAME:-minio-credentials}" -n "$AI_NS" 2>/dev/null &
 kubectl get secret "${SECRET_NAME:-minio-credentials}" -n "$AI_NS" -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' | grep -E 's3_access_key|s3_secret_key' && echo "✓ Required keys present" || echo "✗ Check s3_access_key / s3_secret_key"
 ```
 
-**5. RayService and serve config (MinIO credentials in apps)**
+**5. RayService and serve config (object store credentials in apps)**
 
 ```bash
 kubectl get rayservice "$AI_PLATFORM_NAME" -n "$AI_NS"
-# Count MINIO_ACCESS_KEY in serve config (expect > 0 when using MinIO)
-kubectl get rayservice "$AI_PLATFORM_NAME" -n "$AI_NS" -o jsonpath='{.spec.serveConfigV2}' | grep -o 'MINIO_ACCESS_KEY' | wc -l
+# Count S3COMPAT_OBJECT_STORE_ACCESS_KEY in serve config (expect > 0 when using S3-compatible storage)
+kubectl get rayservice "$AI_PLATFORM_NAME" -n "$AI_NS" -o jsonpath='{.spec.serveConfigV2}' | grep -o 'S3COMPAT_OBJECT_STORE_ACCESS_KEY' | wc -l
 ```
 
 **6. Ray and application pods**
@@ -2275,7 +2275,7 @@ the model is loaded from object storage (S3/MinIO) into that path inside the pod
 1. **Model is in MinIO/S3**  
    Upload the model so the bucket has the prefix `model_artifacts/llama31-8b-instruct/` with at least `config.json` and the model weights (see [artifacts README](../artifacts_download_upload_scripts/README.md)):
    - Download: `./tools/artifacts_download_upload_scripts/download_from_huggingface.sh`
-   - Upload: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `MINIO_ENDPOINT`, `MINIO_BUCKET`, and credentials to match your `cluster-config.yaml`).
+   - Upload: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, and credentials to match your `cluster-config.yaml`; `MINIO_*` env vars are also accepted).
 
 2. **External MinIO reachable from EKS**  
    If using external MinIO (e.g. EC2), ensure:

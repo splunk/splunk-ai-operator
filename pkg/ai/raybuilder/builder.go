@@ -44,13 +44,13 @@ type Builder struct {
 }
 
 type ApplicationParams struct {
-	ArtifactBucketName string           `yaml:"ARTIFACTS_S3_BUCKET"`
-	ArtifactsProvider  string           `yaml:"ARTIFACTS_PROVIDER"`
-	CloudProvider      string           `yaml:"CLOUD_PROVIDER"`
-	MinioEndpointUrl   string           `yaml:"MINIO_ENDPOINT_URL"`
-	MinioAccessKey     string           `yaml:"MINIO_ACCESS_KEY"`
-	MinioSecretKey     string           `yaml:"MINIO_SECRET_KEY"`
-	Replicas           map[string]int32 `yaml:"REPLICAS"`
+	ArtifactBucketName   string           `yaml:"ARTIFACTS_S3_BUCKET"`
+	ArtifactsProvider    string           `yaml:"ARTIFACTS_PROVIDER"`
+	CloudProvider        string           `yaml:"CLOUD_PROVIDER"`
+	S3CompatObjectStoreEndpointUrl string        `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
+	S3CompatObjectStoreAccessKey   string        `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
+	S3CompatObjectStoreSecretKey   string        `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
+	Replicas             map[string]int32 `yaml:"REPLICAS"`
 }
 
 type WorkerConfigs map[string][]InstanceDetail
@@ -154,14 +154,14 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
-	// S3-compatible backends (s3compat, MinIO, SeaweedFS) need custom endpoint and credentials. S3 (AWS) uses region/IRSA only.
+	// S3-compatible backends (s3compat, minio, seaweedfs) need custom endpoint and credentials. S3 (AWS) uses region/IRSA only.
 	s3CompatScheme := (u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs")
-	minioEndpoint := ""
+	s3CompatObjectStoreEndpoint := ""
 	if s3CompatScheme && p.Spec.ObjectStorage.Endpoint != "" {
-		minioEndpoint = p.Spec.ObjectStorage.Endpoint
+		s3CompatObjectStoreEndpoint = p.Spec.ObjectStorage.Endpoint
 	}
 
-	var minioAccessKey, minioSecretKey string
+	var s3CompatObjectStoreAccessKey, s3CompatObjectStoreSecretKey string
 	if p.Spec.ObjectStorage.SecretRef != "" && s3CompatScheme {
 		var secret corev1.Secret
 		secretRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Spec.ObjectStorage.SecretRef}
@@ -170,21 +170,21 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 			return err
 		}
 		if raw, ok := secret.Data["s3_access_key"]; ok {
-			minioAccessKey = string(raw)
+			s3CompatObjectStoreAccessKey = string(raw)
 		}
 		if raw, ok := secret.Data["s3_secret_key"]; ok {
-			minioSecretKey = string(raw)
+			s3CompatObjectStoreSecretKey = string(raw)
 		}
 	}
 
 	param := ApplicationParams{
-		ArtifactBucketName: u.Host,
-		ArtifactsProvider:  artifactsProvider,
-		CloudProvider:      cloudProvider,
-		MinioEndpointUrl:   minioEndpoint,
-		MinioAccessKey:     minioAccessKey,
-		MinioSecretKey:     minioSecretKey,
-		Replicas:           replicasMap,
+		ArtifactBucketName:             u.Host,
+		ArtifactsProvider:              artifactsProvider,
+		CloudProvider:                  cloudProvider,
+		S3CompatObjectStoreEndpointUrl: s3CompatObjectStoreEndpoint,
+		S3CompatObjectStoreAccessKey:   s3CompatObjectStoreAccessKey,
+		S3CompatObjectStoreSecretKey:   s3CompatObjectStoreSecretKey,
+		Replicas:                       replicasMap,
 	}
 
 	// Use embedded applications.yaml content
@@ -716,8 +716,8 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	}, nil
 }
 
-// objectStorageSecretEnv returns env vars for MINIO_ACCESS_KEY and MINIO_SECRET_KEY from
-// the objectStorage secret (s3_access_key/s3_secret_key) so models and SAIA can access MinIO/S3.
+// objectStorageSecretEnv returns env vars for S3COMPAT_OBJECT_STORE_ACCESS_KEY and S3COMPAT_OBJECT_STORE_SECRET_KEY from
+// the objectStorage secret (s3_access_key/s3_secret_key) for S3-compatible object storage.
 func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 	if b.ai.Spec.ObjectStorage.SecretRef == "" {
 		return nil
@@ -725,7 +725,7 @@ func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 	secretName := b.ai.Spec.ObjectStorage.SecretRef
 	return []corev1.EnvVar{
 		{
-			Name: "MINIO_ACCESS_KEY",
+			Name: "S3COMPAT_OBJECT_STORE_ACCESS_KEY",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
@@ -734,7 +734,7 @@ func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 			},
 		},
 		{
-			Name: "MINIO_SECRET_KEY",
+			Name: "S3COMPAT_OBJECT_STORE_SECRET_KEY",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
@@ -860,7 +860,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 			combinedEnv = append(combinedEnv, corev1.EnvVar{Name: key, Value: value})
 		}
 	}
-	// MinIO/S3 credentials for models and SAIA (MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
+	// S3-compatible object store credentials for models and SAIA (S3COMPAT_OBJECT_STORE_*)
 	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
 	rayCommand := fmt.Sprintf(`echo %s worker;
         ulimit -n 65536;

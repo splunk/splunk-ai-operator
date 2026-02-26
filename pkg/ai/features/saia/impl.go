@@ -619,16 +619,16 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		{Name: "S3_BUCKET", Value: extractBucketName(ai.Spec.TaskVolume.Path)},
 	}
 
-	// MinIO/S3-compatible: SAIA service expects MINIO_ENDPOINT_URL when using custom endpoint (MinIO or S3-compatible)
+	// S3-compatible object store: set S3COMPAT_OBJECT_STORE_ENDPOINT_URL for custom endpoint (MinIO, SeaweedFS, etc.).
 	if ai.Spec.TaskVolume.Endpoint != "" {
-		env = append(env, corev1.EnvVar{Name: "MINIO_ENDPOINT_URL", Value: ai.Spec.TaskVolume.Endpoint})
+		env = append(env, corev1.EnvVar{Name: "S3COMPAT_OBJECT_STORE_ENDPOINT_URL", Value: ai.Spec.TaskVolume.Endpoint})
 	}
 
-	// MinIO credentials: If secretRef is provided, add MINIO_ACCESS_KEY and MINIO_SECRET_KEY from secret
+	// S3-compatible object store credentials from secretRef (S3COMPAT_OBJECT_STORE_ACCESS_KEY, S3COMPAT_OBJECT_STORE_SECRET_KEY).
 	if ai.Spec.TaskVolume.SecretRef != "" {
 		env = append(env,
 			corev1.EnvVar{
-				Name: "MINIO_ACCESS_KEY",
+				Name: "S3COMPAT_OBJECT_STORE_ACCESS_KEY",
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
@@ -637,7 +637,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 				},
 			},
 			corev1.EnvVar{
-				Name: "MINIO_SECRET_KEY",
+				Name: "S3COMPAT_OBJECT_STORE_SECRET_KEY",
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
