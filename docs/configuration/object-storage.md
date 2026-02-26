@@ -99,7 +99,7 @@ spec:
     secretRef: minio-credentials
 ```
 
-The same Kubernetes secret format is used for all S3-compatible backends: keys `s3_access_key` and `s3_secret_key`. Pods receive these as `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `MINIO_ENDPOINT_URL` (when endpoint is set).
+The same Kubernetes secret format is used for all S3-compatible backends: keys `s3_access_key` and `s3_secret_key`. Pods receive **`S3COMPAT_OBJECT_STORE_ENDPOINT_URL`** (when endpoint is set), **`S3COMPAT_OBJECT_STORE_ACCESS_KEY`**, and **`S3COMPAT_OBJECT_STORE_SECRET_KEY`** from the operator.
 
 ## Adding new S3-compatible backends
 
