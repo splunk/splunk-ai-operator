@@ -139,6 +139,11 @@ images:
     apiImage: "ml-platform/saia/saia-api:build-1"
     dataLoaderImage: "ml-platform/saia/saia-data-loader:build-1"
 
+  # SLIM API Service Image
+  slim:
+    # Relative path - registry prefix auto-applied
+    apiImage: "ml-platform/slim/slim-api:build-1"
+
   # Supporting Images
   fluentBit:
     # Docker Hub public image (has full path, registry prefix ignored)

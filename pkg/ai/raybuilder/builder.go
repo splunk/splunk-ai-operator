@@ -677,7 +677,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 			Image:           SetImageRegistry("RELATED_IMAGE_RAY_HEAD", b.ai.Spec.Images.RayHeadGroupImage),
 			ImagePullPolicy: corev1.PullAlways,
 			Args: []string{
-				"ulimit -n 65536; echo head; $KUBERAY_GEN_RAY_START_CMD",
+				"ulimit -n 65536 && echo head && $KUBERAY_GEN_RAY_START_CMD",
 			},
 			Command: []string{
 				"/bin/bash",
@@ -783,10 +783,10 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 			combinedEnv = append(combinedEnv, corev1.EnvVar{Name: key, Value: value})
 		}
 	}
-	rayCommand := fmt.Sprintf(`echo %s worker;
-        ulimit -n 65536;
-    	export PATH="/home/ray/anaconda3/bin:$PATH";
-        KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
+	rayCommand := fmt.Sprintf(`echo %s worker
+        ulimit -n 65536
+    	export PATH="/home/ray/anaconda3/bin:$PATH"
+        KUBERAY_GEN_RAY_START_CMD=$(echo "$KUBERAY_GEN_RAY_START_CMD" | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g')
         $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
 		Affinity:           b.ai.Spec.GPUSchedulingSpec.Affinity,

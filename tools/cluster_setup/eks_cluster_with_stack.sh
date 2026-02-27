@@ -90,6 +90,7 @@ load_config() {
     WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$cfg")"
     SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$cfg")"
     SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$cfg")"
+    SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$cfg")"
     FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$cfg")"
     OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$cfg")"
 
@@ -233,6 +234,10 @@ validate_image_config() {
     err "REQUIRED: images.saia.dataLoaderImage must be specified in cluster-config.yaml"
   fi
 
+  if [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.slim.apiImage must be specified in cluster-config.yaml"
+  fi
+
   # Optional with defaults
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
@@ -340,6 +345,7 @@ configure_images() {
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  local slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
 
@@ -349,6 +355,7 @@ configure_images() {
   local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  local slim_api_escaped=$(echo "$slim_api_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
   local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
   local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
@@ -364,6 +371,7 @@ configure_images() {
   sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
@@ -378,6 +386,7 @@ configure_images() {
   log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
   log "  ✓ Updated operator image: $operator_full"
@@ -496,6 +505,7 @@ validate_images_exist() {
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  local slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
 
@@ -508,6 +518,7 @@ validate_images_exist() {
     "$weaviate_full"
     "$saia_api_full"
     "$saia_dataloader_full"
+    "$slim_api_full"
     "$fluent_bit_full"
     "$otel_collector_full"
   )

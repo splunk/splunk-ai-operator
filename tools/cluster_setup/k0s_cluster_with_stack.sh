@@ -159,6 +159,7 @@ load_config() {
   WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
 
@@ -188,7 +189,6 @@ load_config() {
   fi
 
   # ImagePullSecrets configuration - read which registries are enabled
-  # TODO add the below definitions to the readme file
   IMAGE_PULL_SECRETS_ECR_ENABLED=$(yq eval '.imagePullSecrets.autoCreateECR' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED=$(yq eval '.imagePullSecrets.dockerHub.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_GCR_ENABLED=$(yq eval '.imagePullSecrets.gcr.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
@@ -261,6 +261,9 @@ validate_image_config() {
   if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
     err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
   fi
+  if [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.slim.apiImage must be specified in k0s-cluster-config.yaml"
+  fi
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
     log "Using default Splunk Operator image: $SPLUNK_OPERATOR_IMAGE"
@@ -309,6 +312,7 @@ configure_images() {
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  local slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
 
@@ -317,6 +321,7 @@ configure_images() {
   local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  local slim_api_escaped=$(echo "$slim_api_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
   local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
   local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
@@ -331,6 +336,7 @@ configure_images() {
   sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
@@ -342,6 +348,7 @@ configure_images() {
   log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
   log "  ✓ Updated operator image: $operator_full"

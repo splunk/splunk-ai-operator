@@ -179,7 +179,7 @@ type AIServiceStatus struct {
 // +k8s:openapi-gen=true
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:path=aiservices,scope=Namespaced,shortName=saia;aiservice
+// +kubebuilder:resource:path=aiservices,scope=Namespaced,shortName=saia;slim;aiservice
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Service ready status"
 // +kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".spec.replicas",description="Number of replicas"
 // +kubebuilder:printcolumn:name="Platform",type="string",JSONPath=".spec.aiPlatformRef.name",description="AI Platform reference"

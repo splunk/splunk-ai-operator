@@ -22,6 +22,9 @@ spec:
     - name: seca
       version: "1.0.0"
       serviceAccountName: saia-secure-account
+    - name: slim
+      version: "1.0.0"
+      serviceAccountName: slim-service-account
 
   # // storage allows to extend
   storage:

@@ -200,6 +200,7 @@ func main() {
 		DebugRayEndpoint:      "http://localhost:8265",
 		DebugWeaviateEndpoint: "http://localhost:8080",
 		DebugSaiaEndpoint:     "http://localhost:9000",
+		DebugSlimEndpoint:     "http://localhost:9001",
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{

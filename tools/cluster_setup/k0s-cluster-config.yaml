@@ -53,7 +53,7 @@ images:
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
   operator:
-    image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.3"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.5"
 
   splunk:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
@@ -69,6 +69,9 @@ images:
   saia:
     apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
     dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
+
+  slim:
+    apiImage: "658391232643.dkr.ecr.us-east-2.amazonaws.com/udaya/slim-api:v0.0.1"
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"

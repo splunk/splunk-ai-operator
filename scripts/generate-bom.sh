@@ -40,6 +40,7 @@ declare -A IMAGES=(
     ["weaviate"]="${RELATED_IMAGE_WEAVIATE:-semitechnologies/weaviate:stable-v1.28-007846a}"
     ["saia-api"]="${RELATED_IMAGE_SAIA_API:-unknown}"
     ["post-install-hook"]="${RELATED_IMAGE_POST_INSTALL_HOOK:-unknown}"
+    ["slim-api"]="${RELATED_IMAGE_SLIM_API:-unknown}"
     ["fluent-bit"]="${RELATED_IMAGE_FLUENT_BIT:-fluent/fluent-bit:1.9.6}"
     ["otel-collector"]="${RELATED_IMAGE_OTEL_COLLECTOR:-otel/opentelemetry-collector-contrib:0.122.1}"
 )

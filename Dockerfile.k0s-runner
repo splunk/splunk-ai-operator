@@ -1,0 +1,19 @@
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+RUN dnf install -y --allowerasing openssh-clients git jq && dnf clean all
+
+ARG TARGETARCH
+
+# kubectl
+RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" \
+      -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+
+# helm
+RUN curl -fsSL "https://get.helm.sh/helm-v3.17.1-linux-${TARGETARCH}.tar.gz" | tar xz -C /tmp \
+      && mv /tmp/linux-${TARGETARCH}/helm /usr/local/bin/helm && rm -rf /tmp/linux-${TARGETARCH}
+
+# yq
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${TARGETARCH}" \
+      -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+WORKDIR /workspace

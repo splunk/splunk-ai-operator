@@ -1062,10 +1062,11 @@ spec:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
                     name:
-                      description: Name of the feature, e.g. "saia" or "seca"
+                      description: Name of the feature, e.g. "saia", "seca", or "slim"
                       enum:
                       - saia
                       - seca
+                      - slim
                       type: string
                     scaleFactor:
                       description: ScaleFactor is the desired fixed number of replicas
@@ -2238,7 +2239,7 @@ spec:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
                       azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    pattern: ^(s3|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -4085,10 +4086,11 @@ spec:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
                   name:
-                    description: Name of the feature, e.g. "saia" or "seca"
+                    description: Name of the feature, e.g. "saia", "seca", or "slim"
                     enum:
                     - saia
                     - seca
+                    - slim
                     type: string
                   scaleFactor:
                     description: ScaleFactor is the desired fixed number of replicas
@@ -4874,7 +4876,7 @@ spec:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
                       azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    pattern: ^(s3|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -5532,6 +5534,8 @@ spec:
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-1
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
+        - name: RELATED_IMAGE_SLIM_API
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/udaya/slim-api:v0.0.1
         - name: SPLUNK_METRICS_INDEX_NAME
           value: _metrics
         - name: RELATED_IMAGE_FLUENT_BIT
