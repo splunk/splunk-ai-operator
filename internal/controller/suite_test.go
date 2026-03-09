@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -112,6 +113,9 @@ func getFirstFoundEnvTestBinaryDir() string {
 	basePath := filepath.Join("..", "..", "bin", "k8s")
 	entries, err := os.ReadDir(basePath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ""
+		}
 		logf.Log.Error(err, "Failed to read directory", "path", basePath)
 		return ""
 	}
