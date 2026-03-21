@@ -1,6 +1,6 @@
 applications:
   - name: Entrypoint
-    import_path: splunkai_models_apps.custom.deployments.entrypoint.main:SERVE_APP
+    import_path: main:SERVE_APP
     route_prefix: /
     runtime_env:
       env_vars:
@@ -55,7 +55,7 @@ applications:
           object_storage:
             prefix: model_artifacts/uae-large
     name: UaeLarge
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /uae_large
     runtime_env:
       env_vars:
@@ -104,7 +104,7 @@ applications:
           object_storage:
             prefix: model_artifacts/all-minilm-l6-v2
     name: AllMinilmL6V2
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /all_minilm_l6_v2
     runtime_env:
       env_vars:
@@ -153,7 +153,7 @@ applications:
           object_storage:
             prefix: model_artifacts/bi-encoder
     name: BiEncoder
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /bi_encoder
     runtime_env:
       env_vars:
@@ -198,7 +198,7 @@ applications:
           object_storage:
             prefix: model_artifacts/mbart-translator
     name: MbartTranslator
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /mbart_translator
     runtime_env:
       env_vars:
@@ -254,7 +254,7 @@ applications:
           object_storage:
             prefix: model_artifacts/xlm-roberta-language-classifier
     name: XlmRobertaLanguageClassifier
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /xlm_roberta_language_classifier
     runtime_env:
       env_vars:
@@ -279,7 +279,7 @@ applications:
       custom_deployment_import_path: prompt_injection_tfidf:PromptInjectionTfidfDeployment
       deployment_type: custom_deployment
     name: PromptInjectionTfidf
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /prompt_injection_tfidf
     runtime_env:
       env_vars:
@@ -329,7 +329,7 @@ applications:
             prefix: model_artifacts/cross-encoder
         model_type: vllm_scoring_model
     name: CrossEncoder
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /cross_encoder
     runtime_env:
       env_vars:
@@ -405,7 +405,7 @@ applications:
               - tokenizer.json
             prefix: model_artifacts/llama31-8b-instruct
     name: Llama31Instruct
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /llama31_instruct
     runtime_env:
       env_vars:
@@ -462,7 +462,7 @@ applications:
           object_storage:
             prefix: model_artifacts/e5-language-classifier
     name: E5LanguageClassifier
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /e5_language_classifier
     runtime_env:
       env_vars:
@@ -547,7 +547,7 @@ applications:
               - tokenizer.json
             prefix: model_artifacts/llama31-70b-instruct-awq
     name: Llama3170bInstructAwq
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /llama31_70b_instruct_awq
     runtime_env:
       env_vars:
@@ -593,7 +593,7 @@ applications:
             local_path: /home/ray/local_model_artifacts/prompt-injection-cross-encoder-1114
         model_type: sentence_transformer_cross_encoder
     name: PromptInjectionCrossEncoder
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /prompt_injection_cross_encoder
     runtime_env:
       env_vars:
@@ -624,7 +624,7 @@ applications:
             local_path: /home/ray/local_model_artifacts/prompt-injection-classifier-01052025
         model_type: custom_model
     name: PromptInjectionClassifier
-    import_path: splunkai_models_apps.main:create_serve_app
+    import_path: main:create_serve_app
     route_prefix: /prompt_injection_classifier
     runtime_env:
       env_vars:
