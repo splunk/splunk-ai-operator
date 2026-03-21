@@ -1,0 +1,212 @@
+# ===================================================================
+# EKS Cluster Configuration Template for Splunk AI Platform
+# ===================================================================
+# IMPORTANT: This is a template file with placeholder values.
+# Copy this file and replace ALL placeholder values with your actual AWS resources.
+#
+# Quick Start:
+#   1. Copy: cp cluster-config.yaml my-cluster-config.yaml
+#   2. Edit: vi my-cluster-config.yaml
+#   3. Replace all values marked with "CHANGE THIS"
+#   4. Run: CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
+# ===================================================================
+
+# ---------- Cluster Configuration ----------
+cluster:
+  useExisting: false
+  name: "my-ai-cluster-kb2" # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  region: "us-west-2" # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
+  k8sVersion: "1.31" # Kubernetes version (1.29, 1.30, 1.31 supported)
+  # If you donot provide any subnet information, eksctl will create a new VPC with public and private subnets automatically.
+  # VPC Subnets - CHANGE ALL OF THESE to your actual subnet IDs
+  # Find your subnets: aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxxxx" --region us-west-2
+  #subnets:
+  #  private:                              # Private subnets (at least 2 in different AZs)
+  #    - id: "subnet-1a2b3c4d5e6f7g8h"    # CHANGE THIS: Your private subnet 1
+  #      az: "us-west-2a"                  # CHANGE THIS: Availability zone for subnet 1
+  #    - id: "subnet-9h8g7f6e5d4c3b2a"    # CHANGE THIS: Your private subnet 2
+  #      az: "us-west-2b"                  # CHANGE THIS: Availability zone for subnet 2
+  #  public:                               # Public subnets (at least 2 in different AZs)
+  #    - id: "subnet-a1b2c3d4e5f6g7h8"    # CHANGE THIS: Your public subnet 1
+  #      az: "us-west-2a"                  # CHANGE THIS: Availability zone for subnet 1
+  #    - id: "subnet-h8g7f6e5d4c3b2a1"    # CHANGE THIS: Your public subnet 2
+  #      az: "us-west-2b"                  # CHANGE THIS: Availability zone for subnet 2
+  #    - id: "subnet-1h2g3f4e5d6c7b8a"    # OPTIONAL: Additional public subnet for HA
+  #      az: "us-west-2c"                  # OPTIONAL: Third availability zone
+
+  subnets:
+    private:
+      - id: subnet-0b58a7ec0dd013990
+        az: us-west-2b
+      - id: subnet-09b18a601683bb0fe
+        az: us-west-2c
+    public:
+      - id: subnet-07aeab12d855bb8c0
+        az: us-west-2b
+      - id: subnet-0f67b445d5082bf9d
+        az: us-west-2c
+# ---------- Node Groups ----------
+nodeGroups:
+  cpu:
+    enabled: true # Set to false to skip CPU node group
+    instanceType: "m5.xlarge" # CPU instance type (m5.xlarge=4vCPU/16GB, m5.2xlarge=8vCPU/32GB)
+    desiredCapacity: 4 # Initial number of CPU nodes
+    minSize: 2 # Minimum nodes (for autoscaling)
+    maxSize: 8 # Maximum nodes (for autoscaling)
+    volumeSize: 500 # EBS volume size per node (GB)
+    volumeType: "gp3" # EBS volume type (gp3 recommended, gp2, io1, io2)
+# ---------- Storage Configuration ----------
+storage:
+  s3Bucket: "my-company-ai-platform--kb" # CHANGE THIS: Globally unique S3 bucket name
+  storageClass: "gp3" # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
+  vectorDbSize: "50Gi" # VectorDB persistent volume size
+# ---------- Container Images Configuration ----------
+images:
+  # ==================================================================================
+  # REGISTRY PREFIX - Applied to ALL images (unless image has full registry path)
+  # ==================================================================================
+  # This registry is automatically prepended to ALL image paths below UNLESS
+  # the image path already contains a registry (e.g., docker.io/..., ghcr.io/...)
+  #
+  # HOW IT WORKS:
+  # --------------
+  # 1. If image path has NO registry → prepends 'registry' value
+  #    Example: "ray/ray-head:v1" → "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-head:v1"
+  #
+  # 2. If image path has FULL registry → uses as-is (ignores 'registry' value)
+  #    Example: "docker.io/splunk/splunk:10.2.0" → "docker.io/splunk/splunk:10.2.0"
+  #
+  # 3. If 'registry' is empty → assumes Docker Hub for images without registry
+  #    Example: "splunk/splunk:10.2.0" → "splunk/splunk:10.2.0" (Docker Hub)
+  #
+  # REQUIRED: Specify your private registry URL for custom images
+  # Leave empty to use Docker Hub defaults for all images
+  registry: "1234567890.dkr.ecr.us-west-2.amazonaws.com" # CHANGE THIS: Your ECR/Docker/Harbor registry
+  # ==================================================================================
+  # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
+  # ==================================================================================
+
+  # Splunk AI Operator Image
+  operator:
+    # Option 1: Relative path (uses registry prefix)
+    #   image: "splunk-ai-operator:v1.0.0"
+    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk-ai-operator:v1.0.0"
+    #
+    # Option 2: Full path (ignores registry prefix)
+    #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
+    #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
+    image: "docker.io/kbhos698/splunk-ai-operator:weaviate-service-v4"
+  # Splunk Enterprise Images
+  splunk:
+    # Option 1: Relative path (uses registry prefix)
+    #   image: "splunk/splunk:10.2.0"
+    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0"
+    #
+    # Option 2: Full path (ignores registry prefix)
+    #   image: "docker.io/myorg/splunk:10.2.0"
+    #   Result: "docker.io/myorg/splunk:10.2.0"
+    image: "docker.io/splunk/splunk:10.2"
+    # Splunk Operator image (optional - has default)
+    # Default: "docker.io/splunk/splunk-operator:3.0.0"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+  # Weaviate Vector Database
+  weaviate:
+    # Docker Hub public image (has full path, registry prefix ignored)
+    # OR specify your mirrored image:
+    #   image: "weaviate/weaviate:1.28.0"  → uses registry prefix
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+  # SAIA (Splunk AI Assistant) Images
+  saia:
+    # Relative paths - registry prefix auto-applied
+    apiImage: "ml-platform/saia/saia-api:build-1"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-1"
+  # Supporting Images
+  fluentBit:
+    # Docker Hub public image (has full path, registry prefix ignored)
+    # OR specify your mirrored image:
+    #   image: "fluent-bit:1.9.6"  → uses registry prefix
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+# ---------- Operator Versions ----------
+operators:
+  ray:
+    version: "v1.2.2" # do not change Ray operator version
+    modelVersion: "v0.3.14-36-g1549f5a" # Model version for Ray
+    rayVersion: "2.44.0" # Ray runtime version
+  certManager:
+    installCRDs: true # no change
+  nvidia:
+    devicePluginVersion: "v0.17.3" # no change
+# ---------- AI Platform Configuration ----------
+aiPlatform:
+  enabled: false # Set to false for Weaviate-only mode (skips AIPlatform, Ray Operator, and Splunk standalone)
+  namespace: "ai-platform" # no change
+  name: "splunk-ai-stack" # no change
+  # Service Accounts
+  serviceAccounts:
+    rayHead: "ray-head-sa" # no change
+    rayWorker: "ray-worker-sa" # no change
+    saiaService: "saia-service-sa" # no change
+  # Default accelerator type
+  defaultAcceleratorType: "L40S"
+  # Features to enable
+  features: # no change
+    - name: weaviate-service
+      version: 1.0.0
+      serviceAccountName: saia-service-sa
+  # Worker Group Configuration (replaces gpuConfigs)
+  workerGroupConfig:
+    serviceAccountName: "ray-worker-sa"
+    imageRegistry: "" # Leave empty for default
+  # CPU Scheduling
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+  # GPU Scheduling
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+  # Ingress Configuration
+  ingress: # not used
+    enabled: false
+    className: "nginx"
+    host: "ai.example.com"
+    tlsSecretName: "ai-platform-tls"
+  # Certificate configuration
+  certificate: # no change from user
+    issuerName: "platform-issuer"
+# ---------- Splunk Standalone Configuration ----------
+splunkStandalone: # no change
+  name: "splunk-standalone"
+  serviceAccount: "saia-service-sa"
+  appRepo:
+    enabled: true
+    appInstallPeriodSeconds: 90
+    appsRepoPollIntervalSeconds: 60
+    installMaxRetries: 2
+  # Optional: Path to local Splunk app to upload
+  # Leave empty to skip app upload
+  localAppPath: "" # e.g., "/path/to/Splunk_AI_Assistant_Cloud.tgz"
+# ---------- File Paths ----------
+files:
+  splunkOperatorManifest: "./splunk-operator-cluster.yaml"
+  splunkAiOperatorManifest: "./artifacts.yaml"
+# ---------- Advanced Settings ----------
+advanced:
+  skipImageValidation: true
+  # Cluster Autoscaler settings
+  clusterAutoscaler:
+    balanceSimilarNodeGroups: true
+    skipNodesWithSystemPods: false
+    expander: "least-waste"
+  # Monitoring
+  monitoring:
+    kubePrometheus: true
+  # OpenTelemetry
+  openTelemetry:
+    enabled: true
+    namespace: "observability"
+    collectorImage: "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest"
