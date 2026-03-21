@@ -91,6 +91,7 @@ load_config() {
     RAY_HEAD_IMAGE="$(yq eval '.images.ray.headImage' "$cfg")"
     RAY_WORKER_IMAGE="$(yq eval '.images.ray.workerImage' "$cfg")"
     WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$cfg")"
+    WEAVIATE_PROXY_IMAGE="$(yq eval '.images.weaviate.proxyImage // ""' "$cfg")"
     SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$cfg")"
     SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$cfg")"
     FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$cfg")"
@@ -161,6 +162,7 @@ load_config() {
     GPU_VOLUME_TYPE="gp3"
     SPLUNK_APP_LOCAL_PATH=""
     CONFIG_SKIP_IMAGE_VALIDATION="false"
+    WEAVIATE_PROXY_IMAGE=""
 
     # Hardcoded subnets for fallback
     PRIVATE_SUBNETS=("subnet-0f4af6d2f36fbe73f" "subnet-024d4edaabe647586")
@@ -265,6 +267,10 @@ validate_image_config() {
 
   if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
     err "REQUIRED: images.weaviate.image must be specified in cluster-config.yaml"
+  fi
+  if [[ -z "${WEAVIATE_PROXY_IMAGE:-}" || "${WEAVIATE_PROXY_IMAGE}" == "null" ]]; then
+    WEAVIATE_PROXY_IMAGE="docker.io/kbhos698/weaviate-proxy:v1.0.28-6-g2cbe7b7"
+    log "Using default Weaviate proxy image: ${WEAVIATE_PROXY_IMAGE}"
   fi
 
   if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
@@ -380,6 +386,7 @@ configure_images() {
   local ray_head_full=""
   local ray_worker_full=""
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
+  local weaviate_proxy_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_PROXY_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
@@ -393,6 +400,7 @@ configure_images() {
   local ray_head_escaped=""
   local ray_worker_escaped=""
   local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
+  local weaviate_proxy_escaped=$(echo "$weaviate_proxy_full" | sed 's/[\/&]/\\&/g')
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
@@ -413,7 +421,8 @@ configure_images() {
     sed $SEDOPTION "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
     sed $SEDOPTION "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
   fi
-  sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name:[[:space:]]*RELATED_IMAGE_WEAVIATE$/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name:[[:space:]]*RELATED_IMAGE_WEAVIATE_PROXY$/,/value:/ s|value:.*|value: ${weaviate_proxy_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
@@ -432,6 +441,7 @@ configure_images() {
     log "  ~ Skipped RELATED_IMAGE_RAY_HEAD/WORKER updates (feature=${AI_FEATURE_NAME})"
   fi
   log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
+  log "  ✓ Updated RELATED_IMAGE_WEAVIATE_PROXY: $weaviate_proxy_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
@@ -549,6 +559,7 @@ validate_images_exist() {
   local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
   local splunk_operator_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
+  local weaviate_proxy_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_PROXY_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
@@ -559,6 +570,7 @@ validate_images_exist() {
     "$splunk_full"
     "$splunk_operator_full"
     "$weaviate_full"
+    "$weaviate_proxy_full"
     "$saia_api_full"
     "$saia_dataloader_full"
     "$fluent_bit_full"
