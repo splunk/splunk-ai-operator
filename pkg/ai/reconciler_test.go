@@ -342,3 +342,46 @@ func TestCheckAIServiceStatus_FailsWhenServiceHasFailedCondition(t *testing.T) {
 	assert.Contains(t, err.Error(), "PostInstallHookReady")
 	assert.Contains(t, err.Error(), "still running")
 }
+
+func TestFeatureRequiresRay(t *testing.T) {
+	assert.False(t, featureRequiresRay("weaviate-service"))
+	assert.False(t, featureRequiresRay("WEAVIATE-SERVICE"))
+	assert.True(t, featureRequiresRay("saia"))
+	assert.True(t, featureRequiresRay("seca"))
+	assert.True(t, featureRequiresRay("unknown"))
+}
+
+func TestPlatformRequiresRay(t *testing.T) {
+	tests := []struct {
+		name     string
+		features []aiApi.FeatureSpec
+		want     bool
+	}{
+		{
+			name:     "empty feature list keeps backward compatibility",
+			features: nil,
+			want:     true,
+		},
+		{
+			name: "weaviate service only disables ray",
+			features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			want: false,
+		},
+		{
+			name: "mixed features still require ray",
+			features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+				{Name: "saia"},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, platformRequiresRay(tt.features))
+		})
+	}
+}

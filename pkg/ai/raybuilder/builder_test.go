@@ -498,3 +498,11 @@ func TestSetImageRegistry(t *testing.T) {
 		})
 	}
 }
+
+func TestFeatureRequiresRay(t *testing.T) {
+	assert.False(t, featureRequiresRay("weaviate-service"))
+	assert.False(t, featureRequiresRay("WEAVIATE-SERVICE"))
+	assert.True(t, featureRequiresRay("saia"))
+	assert.True(t, featureRequiresRay("seca"))
+	assert.True(t, featureRequiresRay("unknown"))
+}

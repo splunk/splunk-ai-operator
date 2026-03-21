@@ -104,6 +104,10 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	replicasMap := make(map[string]int32)
 
 	for _, feature := range p.Spec.Features {
+		if !featureRequiresRay(feature.Name) {
+			logger.Info("Skipping non-Ray feature for Ray application scaling", "feature", feature.Name)
+			continue
+		}
 		// Read YAML file for this feature
 		fileName := filepath.Join("features", feature.Name+".yaml")
 		yamlData, err := os.ReadFile(fileName)
@@ -616,6 +620,9 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	// initialize instanceScale to avoid nil map assignment panic
 	instanceScale := make(map[string]int32)
 	for _, feature := range b.ai.Spec.Features {
+		if !featureRequiresRay(feature.Name) {
+			continue
+		}
 		// Read YAML file for this feature
 		fileName := filepath.Join("features", feature.Name+".yaml")
 		yamlData, err := os.ReadFile(fileName)
@@ -752,6 +759,15 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 	spec.ImagePullSecrets = b.ai.Spec.Images.ImagePullSecrets
 	// FIXME need to find better way to add sidecars
 	return corev1.PodTemplateSpec{Spec: spec}
+}
+
+func featureRequiresRay(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "weaviate-service":
+		return false
+	default:
+		return true
+	}
 }
 
 func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec {

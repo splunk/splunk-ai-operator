@@ -1041,6 +1041,7 @@ spec:
                     enum:
                     - saia
                     - seca
+                    - weaviate-service
                     type: string
                   scaleFactor:
                     description: ScaleFactor is the desired fixed number of replicas
