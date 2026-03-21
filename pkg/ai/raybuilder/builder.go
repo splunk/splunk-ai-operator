@@ -44,13 +44,15 @@ type Builder struct {
 }
 
 type ApplicationParams struct {
-	ArtifactBucketName   string           `yaml:"ARTIFACTS_S3_BUCKET"`
-	ArtifactsProvider    string           `yaml:"ARTIFACTS_PROVIDER"`
-	CloudProvider        string           `yaml:"CLOUD_PROVIDER"`
-	S3CompatObjectStoreEndpointUrl string        `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
-	S3CompatObjectStoreAccessKey   string        `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
-	S3CompatObjectStoreSecretKey   string        `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
-	Replicas             map[string]int32 `yaml:"REPLICAS"`
+	ArtifactBucketName             string           `yaml:"ARTIFACTS_S3_BUCKET"`
+	ArtifactsProvider              string           `yaml:"ARTIFACTS_PROVIDER"`
+	CloudProvider                  string           `yaml:"CLOUD_PROVIDER"`
+	S3CompatObjectStoreEndpointUrl string           `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
+	S3CompatObjectStoreAccessKey   string           `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
+	S3CompatObjectStoreSecretKey   string           `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
+	Replicas                       map[string]int32 `yaml:"REPLICAS"`
+	WorkingDirBase                 string           `yaml:"WORKING_DIR_BASE"`
+	ModelVersion                   string           `yaml:"MODEL_VERSION"`
 }
 
 type WorkerConfigs map[string][]InstanceDetail
@@ -75,6 +77,14 @@ func New(ai *enterpriseApi.AIPlatform, client client.Client, scheme *runtime.Sch
 		Scheme:   scheme,
 		Recorder: recorder,
 	}
+}
+
+// effectiveAcceleratorType returns spec.defaultAcceleratorType or L40S when unset, matching instance.yaml keys (L40S, H100_NVL).
+func (b *Builder) effectiveAcceleratorType() string {
+	if s := strings.TrimSpace(b.ai.Spec.DefaultAcceleratorType); s != "" {
+		return s
+	}
+	return "L40S"
 }
 
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
@@ -177,6 +187,10 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
+	// Build working_dir base: {scheme}://{bucket}/ray-services/ai-platform/applications
+	// Apps append "/{AppName}-{ModelVersion}.zip" to this in the template.
+	workingDirBase := fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", u.Scheme, u.Host)
+
 	param := ApplicationParams{
 		ArtifactBucketName:             u.Host,
 		ArtifactsProvider:              artifactsProvider,
@@ -185,6 +199,8 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		S3CompatObjectStoreAccessKey:   s3CompatObjectStoreAccessKey,
 		S3CompatObjectStoreSecretKey:   s3CompatObjectStoreSecretKey,
 		Replicas:                       replicasMap,
+		WorkingDirBase:                 workingDirBase,
+		ModelVersion:                   os.Getenv("MODEL_VERSION"),
 	}
 
 	// Use embedded applications.yaml content
@@ -624,6 +640,7 @@ func (b *Builder) Build(ctx context.Context) (*rayv1.RayService, error) {
 }
 
 func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec, error) {
+	acceleratorType := b.effectiveAcceleratorType()
 	annotations, labels := buildHeadAnnotationsAndLabels(b.ai)
 	head := rayv1.HeadGroupSpec{
 		RayStartParams: map[string]string{
@@ -674,7 +691,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse feature YAML file %s: %v", fileName, err)
 		}
-		for k, val := range featureConfig.InstanceScale[b.ai.Spec.DefaultAcceleratorType] {
+		for k, val := range featureConfig.InstanceScale[acceleratorType] {
 			old_val, ok := instanceScale[k]
 			if ok {
 				instanceScale[k] = old_val + val
@@ -685,17 +702,23 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	}
 
 	var workers []rayv1.WorkerGroupSpec
-	var gpuConfigs = instanceMap[b.ai.Spec.DefaultAcceleratorType]
+	gpuConfigs := instanceMap[acceleratorType]
+	if len(gpuConfigs) == 0 {
+		return nil, fmt.Errorf("instance.yaml has no worker tiers for defaultAcceleratorType %q; keys must match exactly (e.g. L40S, H100_NVL)", acceleratorType)
+	}
 	for _, cfg := range gpuConfigs {
 		annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
 
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
+		replicas := instanceScale[cfg.Tier]
 		wg := rayv1.WorkerGroupSpec{
-			GroupName: cfg.Tier,
-			Replicas:  int32Ptr(instanceScale[cfg.Tier]),
+			GroupName:   cfg.Tier,
+			Replicas:    int32Ptr(replicas),
+			MinReplicas: int32Ptr(replicas),
+			MaxReplicas: int32Ptr(replicas + 5),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
-				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, b.ai.Spec.DefaultAcceleratorType, cfg.GPUsPerPod),
+				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -747,7 +770,7 @@ func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 
 func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 	headEnv := []corev1.EnvVar{
-		{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
+		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
 		{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
 	}
 	headEnv = append(headEnv, b.objectStorageSecretEnv()...)
@@ -833,13 +856,13 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 
 func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec {
 	defaultEnv := []corev1.EnvVar{
-		{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
+		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
 		{Name: "RAY_HEAD_SERVICE_HOST", Value: fmt.Sprintf("%s.%s.svc.%s", b.ai.Name+"-head-svc", b.ai.Namespace, os.Getenv("CLUSTER_DOMAIN"))},
 		{Name: "SERVICE_NAME", Value: b.ai.Name},
 		{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
 		{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
 		{Name: "GPG_PUBLICKEY_PATH", Value: "kv-splunk/al-platform.ray-worker-sa/gpgkey"}, // FIXME
-		{Name: "GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},                       // FIXME
+		{Name: "GPU_TYPE", Value: b.effectiveAcceleratorType()},                          // FIXME
 	}
 
 	// Combine defaultEnv with cfg.Env to create combinedEnv
