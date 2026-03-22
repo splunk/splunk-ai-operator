@@ -131,6 +131,9 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 		svc.Namespace = platform.Namespace
 
 		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &svc, func() error {
+			// After client Get, svc holds the live AIService (empty on first create).
+			preservedResources := svc.Spec.Resources
+
 			// Ensure ownership
 			if err := controllerutil.SetControllerReference(platform, &svc, r.Scheme); err != nil {
 				return err
@@ -141,6 +144,12 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 
 			// Copy desired spec
 			svc.Spec = built.Spec
+
+			// buildAIService does not set Resources; without this, every AIPlatform reconcile
+			// wipes kubectl patches / user-set limits (e.g. SAIA memory) back to empty → 2Gi defaults.
+			if resourceRequirementsNonEmpty(preservedResources) {
+				svc.Spec.Resources = preservedResources
+			}
 
 			// Merge labels
 			if svc.Labels == nil {
@@ -187,6 +196,10 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 	}
 
 	return nil
+}
+
+func resourceRequirementsNonEmpty(r corev1.ResourceRequirements) bool {
+	return len(r.Requests) > 0 || len(r.Limits) > 0
 }
 
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {

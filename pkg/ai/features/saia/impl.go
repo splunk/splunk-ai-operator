@@ -162,17 +162,17 @@ func (r *SaiaReconciler) validateAIService(
 		return fmt.Errorf("VectorDbUrl must be set (either from AIPlatformRef or explicitly)")
 	}
 
-	// Default resources
+	// Default resources — SAIA API needs headroom beyond 2Gi or the kubelet OOMKills during startup.
 	if ai.Spec.Resources.Requests == nil {
 		ai.Spec.Resources.Requests = corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("500m"),
-			corev1.ResourceMemory: resource.MustParse("1Gi"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
 		}
 	}
 	if ai.Spec.Resources.Limits == nil {
 		ai.Spec.Resources.Limits = corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("1"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+			corev1.ResourceCPU:    resource.MustParse("2"),
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		}
 	}
 	if ai.Spec.TaskVolume.Path == "" {
