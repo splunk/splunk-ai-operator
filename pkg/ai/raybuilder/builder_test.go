@@ -498,3 +498,33 @@ func TestSetImageRegistry(t *testing.T) {
 		})
 	}
 }
+
+func TestRayWorkingDirBase(t *testing.T) {
+	const bucket = "my-bucket"
+	const ep = "http://minio:9000"
+	tests := []struct {
+		name     string
+		scheme   string
+		endpoint string
+		want     string
+	}{
+		// S3-compatible with endpoint → use HTTP endpoint directly (Ray s3:// ignores AWS_ENDPOINT_URL)
+		{name: "minio with endpoint", scheme: "minio", endpoint: ep, want: ep + "/" + bucket + "/ray-services/ai-platform/applications"},
+		{name: "s3compat with endpoint", scheme: "s3compat", endpoint: ep, want: ep + "/" + bucket + "/ray-services/ai-platform/applications"},
+		{name: "seaweedfs with endpoint", scheme: "seaweedfs", endpoint: ep, want: ep + "/" + bucket + "/ray-services/ai-platform/applications"},
+		{name: "s3 with custom endpoint", scheme: "s3", endpoint: ep, want: ep + "/" + bucket + "/ray-services/ai-platform/applications"},
+		// endpoint trailing slash stripped
+		{name: "endpoint trailing slash", scheme: "minio", endpoint: ep + "/", want: ep + "/" + bucket + "/ray-services/ai-platform/applications"},
+		// Plain AWS S3 (no endpoint) → s3://
+		{name: "s3 aws no endpoint", scheme: "s3", endpoint: "", want: "s3://" + bucket + "/ray-services/ai-platform/applications"},
+		// GCS → gs://
+		{name: "gcs", scheme: "gcs", endpoint: "", want: "gs://" + bucket + "/ray-services/ai-platform/applications"},
+		// Azure → azure://
+		{name: "azure", scheme: "azure", endpoint: "", want: "azure://" + bucket + "/ray-services/ai-platform/applications"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, rayWorkingDirBase(tt.scheme, bucket, tt.endpoint))
+		})
+	}
+}

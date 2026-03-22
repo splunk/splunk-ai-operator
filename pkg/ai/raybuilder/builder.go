@@ -87,18 +87,35 @@ func (b *Builder) effectiveAcceleratorType() string {
 	return "L40S"
 }
 
-// rayRuntimeWorkingDirScheme maps AIPlatform object storage for runtime_env.working_dir URIs.
-// Ray Serve's ServeDeploySchema only allows specific protocols (e.g. S3, HTTPS, GCS)—not minio:// or s3compat://.
-// All S3 API backends (AWS, MinIO, s3compat, SeaweedFS) therefore use s3:// here; non-AWS endpoints use
-// S3COMPAT_OBJECT_STORE_ENDPOINT_URL and optional keys in runtime_env.
-func rayRuntimeWorkingDirScheme(scheme string) string {
+// rayWorkingDirBase builds the base URL for runtime_env.working_dir zip files.
+//
+// Ray's S3 protocol handler (protocol.py) creates a plain boto3 client with no endpoint_url,
+// so it always hits AWS S3 regardless of AWS_ENDPOINT_URL. For S3-compatible stores (MinIO,
+// SeaweedFS, s3compat) we therefore use the MinIO HTTP endpoint directly as an https:// URL:
+//
+//	https://<endpoint-host>/<bucket>/ray-services/ai-platform/applications
+//
+// Ray's https handler uses urllib which respects no special AWS config and works fine for
+// publicly-accessible or pre-signed URLs. If the bucket is private, the zips must be made
+// publicly readable or the MinIO endpoint must be accessible without auth (internal cluster).
+//
+// For plain AWS S3 (no custom endpoint) we keep s3:// so Ray uses its normal AWS credential chain.
+// For GCS we use gs://.
+func rayWorkingDirBase(scheme, bucket, endpoint string) string {
+	s3CompatScheme := scheme == "s3compat" || scheme == "minio" || scheme == "seaweedfs"
+	s3WithEndpoint := scheme == "s3" && endpoint != ""
+	if (s3CompatScheme || s3WithEndpoint) && endpoint != "" {
+		// Strip trailing slash from endpoint, then append bucket and path.
+		ep := strings.TrimRight(endpoint, "/")
+		return fmt.Sprintf("%s/%s/ray-services/ai-platform/applications", ep, bucket)
+	}
 	switch strings.ToLower(scheme) {
 	case "s3", "s3compat", "minio", "seaweedfs":
-		return "s3"
+		return fmt.Sprintf("s3://%s/ray-services/ai-platform/applications", bucket)
 	case "gcs":
-		return "gs"
+		return fmt.Sprintf("gs://%s/ray-services/ai-platform/applications", bucket)
 	default:
-		return scheme
+		return fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", scheme, bucket)
 	}
 }
 
@@ -202,8 +219,9 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
-	// Build working_dir base (always s3:// for S3 API stores—required by Ray Serve; see rayRuntimeWorkingDirScheme).
-	workingDirBase := fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", rayRuntimeWorkingDirScheme(u.Scheme), u.Host)
+	// Build working_dir base. For S3-compatible stores we use the MinIO HTTP endpoint directly
+	// (https://endpoint/bucket/path) because Ray's s3:// handler ignores AWS_ENDPOINT_URL.
+	workingDirBase := rayWorkingDirBase(u.Scheme, u.Host, strings.TrimSpace(p.Spec.ObjectStorage.Endpoint))
 
 	param := ApplicationParams{
 		ArtifactBucketName:             u.Host,
@@ -782,8 +800,9 @@ func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 	}
 }
 
-// rayS3DownloadEnv sets AWS_* variables so Ray's runtime_env agent (boto3/smart_open) resolves s3:// working_dir
-// URIs against the configured S3-compatible endpoint. S3COMPAT_OBJECT_STORE_* is for application code only.
+// rayS3DownloadEnv sets AWS_* variables so application code (boto3) can reach S3-compatible stores.
+// Note: Ray's runtime_env s3:// handler ignores AWS_ENDPOINT_URL (creates a bare boto3 client with no endpoint_url),
+// so working_dir uses the MinIO HTTP endpoint directly instead — see rayWorkingDirBase.
 func (b *Builder) rayS3DownloadEnv() []corev1.EnvVar {
 	u, err := url.Parse(b.ai.Spec.ObjectStorage.Path)
 	if err != nil {
@@ -797,9 +816,6 @@ func (b *Builder) rayS3DownloadEnv() []corev1.EnvVar {
 	}
 	var out []corev1.EnvVar
 	out = append(out, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
-	// MinIO and other S3-compatible stores require path-style addressing (endpoint/bucket/key).
-	// Without this, boto3 defaults to virtual-hosted style (bucket.endpoint) which fails DNS resolution.
-	out = append(out, corev1.EnvVar{Name: "AWS_S3_ADDRESSING_STYLE", Value: "path"})
 	if r := strings.TrimSpace(b.ai.Spec.ObjectStorage.Region); r != "" {
 		out = append(out,
 			corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: r},
