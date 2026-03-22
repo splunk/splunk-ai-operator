@@ -53,7 +53,7 @@ applications:
             tensor_parallel_size: 1
         model_id: uae_large
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/uae-large
     name: UaeLarge
     import_path: main:create_serve_app
@@ -103,7 +103,7 @@ applications:
             tensor_parallel_size: 1
         model_id: all_minilm_l6_v2
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/all-minilm-l6-v2
     name: AllMinilmL6V2
     import_path: main:create_serve_app
@@ -153,7 +153,7 @@ applications:
             tensor_parallel_size: 1
         model_id: bi_encoder
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/bi-encoder
     name: BiEncoder
     import_path: main:create_serve_app
@@ -199,7 +199,7 @@ applications:
       model_definition:
         model_id: mbart_translator
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/mbart-translator
     name: MbartTranslator
     import_path: main:create_serve_app
@@ -256,7 +256,7 @@ applications:
             tensor_parallel_size: 1
         model_id: xlm_roberta_language_classifier
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/xlm-roberta-language-classifier
     name: XlmRobertaLanguageClassifier
     import_path: main:create_serve_app
@@ -332,7 +332,7 @@ applications:
             tensor_parallel_size: 1
         model_id: cross_encoder
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/cross-encoder
         model_type: vllm_scoring_model
     name: CrossEncoder
@@ -401,12 +401,12 @@ applications:
               tensor_parallel_size: 4
         model_id: llama31_instruct
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/llama31-8b-instruct
       tokenizer_definition:
         model_id: llama31_instruct
         model_loader:
-          object_storage:
+          blob_storage:
             artifacts_list:
               - config.json
               - tokenizer_config.json
@@ -468,7 +468,7 @@ applications:
             tensor_parallel_size: 1
         model_id: e5_language_classifier
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/e5-language-classifier
     name: E5LanguageClassifier
     import_path: main:create_serve_app
@@ -545,12 +545,12 @@ applications:
               tensor_parallel_size: 8
         model_id: llama31_70b_instruct_awq
         model_loader:
-          object_storage:
+          blob_storage:
             prefix: model_artifacts/llama31-70b-instruct-awq
       tokenizer_definition:
         model_id: llama31_70b_instruct_awq
         model_loader:
-          object_storage:
+          blob_storage:
             artifacts_list:
               - config.json
               - tokenizer_config.json

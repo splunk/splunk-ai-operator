@@ -87,6 +87,21 @@ func (b *Builder) effectiveAcceleratorType() string {
 	return "L40S"
 }
 
+// rayRuntimeWorkingDirScheme maps AIPlatform object storage for runtime_env.working_dir URIs.
+// Ray Serve's ServeDeploySchema only allows specific protocols (e.g. S3, HTTPS, GCS)—not minio:// or s3compat://.
+// All S3 API backends (AWS, MinIO, s3compat, SeaweedFS) therefore use s3:// here; non-AWS endpoints use
+// S3COMPAT_OBJECT_STORE_ENDPOINT_URL and optional keys in runtime_env.
+func rayRuntimeWorkingDirScheme(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "s3", "s3compat", "minio", "seaweedfs":
+		return "s3"
+	case "gcs":
+		return "gs"
+	default:
+		return scheme
+	}
+}
+
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
 func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPlatform) error {
 	logger := log.FromContext(ctx) // Define logger
@@ -187,9 +202,8 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
-	// Build working_dir base: {scheme}://{bucket}/ray-services/ai-platform/applications
-	// Apps append "/{AppName}-{ModelVersion}.zip" to this in the template.
-	workingDirBase := fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", u.Scheme, u.Host)
+	// Build working_dir base (always s3:// for S3 API stores—required by Ray Serve; see rayRuntimeWorkingDirScheme).
+	workingDirBase := fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", rayRuntimeWorkingDirScheme(u.Scheme), u.Host)
 
 	param := ApplicationParams{
 		ArtifactBucketName:             u.Host,
@@ -768,11 +782,63 @@ func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 	}
 }
 
+// rayS3DownloadEnv sets AWS_* variables so Ray's runtime_env agent (boto3/smart_open) resolves s3:// working_dir
+// URIs against the configured S3-compatible endpoint. S3COMPAT_OBJECT_STORE_* is for application code only.
+func (b *Builder) rayS3DownloadEnv() []corev1.EnvVar {
+	u, err := url.Parse(b.ai.Spec.ObjectStorage.Path)
+	if err != nil {
+		return nil
+	}
+	endpoint := strings.TrimSpace(b.ai.Spec.ObjectStorage.Endpoint)
+	s3CompatScheme := u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs"
+	s3WithCustomEndpoint := u.Scheme == "s3" && endpoint != ""
+	if (!s3CompatScheme && !s3WithCustomEndpoint) || endpoint == "" {
+		return nil
+	}
+	var out []corev1.EnvVar
+	out = append(out, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
+	// MinIO and other S3-compatible stores require path-style addressing (endpoint/bucket/key).
+	// Without this, boto3 defaults to virtual-hosted style (bucket.endpoint) which fails DNS resolution.
+	out = append(out, corev1.EnvVar{Name: "AWS_S3_ADDRESSING_STYLE", Value: "path"})
+	if r := strings.TrimSpace(b.ai.Spec.ObjectStorage.Region); r != "" {
+		out = append(out,
+			corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: r},
+			corev1.EnvVar{Name: "AWS_REGION", Value: r},
+		)
+	}
+	if b.ai.Spec.ObjectStorage.SecretRef == "" {
+		return out
+	}
+	sn := b.ai.Spec.ObjectStorage.SecretRef
+	out = append(out,
+		corev1.EnvVar{
+			Name: "AWS_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: sn},
+					Key:                  "s3_access_key",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: sn},
+					Key:                  "s3_secret_key",
+				},
+			},
+		},
+	)
+	return out
+}
+
 func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 	headEnv := []corev1.EnvVar{
 		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
 		{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
 	}
+	headEnv = append(headEnv, b.rayS3DownloadEnv()...)
 	headEnv = append(headEnv, b.objectStorageSecretEnv()...)
 	spec := corev1.PodSpec{
 		Containers: []corev1.Container{{
@@ -883,7 +949,8 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 			combinedEnv = append(combinedEnv, corev1.EnvVar{Name: key, Value: value})
 		}
 	}
-	// S3-compatible object store credentials for models and SAIA (S3COMPAT_OBJECT_STORE_*)
+	// S3-compatible: boto3 for Ray runtime_env working_dir + app-level S3COMPAT_* keys
+	combinedEnv = append(combinedEnv, b.rayS3DownloadEnv()...)
 	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
 	rayCommand := fmt.Sprintf(`echo %s worker;
         ulimit -n 65536;
