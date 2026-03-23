@@ -3,7 +3,7 @@ applications:
     import_path: main:SERVE_APP
     route_prefix: /
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/Entrypoint-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: entrypoint
@@ -59,7 +59,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /uae_large
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/UaeLarge-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: uae_large
@@ -109,7 +109,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /all_minilm_l6_v2
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/AllMinilmL6V2-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: all_minilm_l6_v2
@@ -159,7 +159,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /bi_encoder
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/BiEncoder-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: bi_encoder
@@ -205,7 +205,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /mbart_translator
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/MbartTranslator-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: mbart_translator
@@ -262,7 +262,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /xlm_roberta_language_classifier
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/XlmRobertaLanguageClassifier-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: xlm_roberta_language_classifier
@@ -339,7 +339,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /cross_encoder
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/CrossEncoder-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: cross_encoder
@@ -416,7 +416,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /llama31_instruct
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/Llama31Instruct-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: llama31_instruct
@@ -474,7 +474,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /e5_language_classifier
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/E5LanguageClassifier-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: e5_language_classifier
@@ -560,7 +560,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /llama31_70b_instruct_awq
     runtime_env:
-      working_dir: "{{.WorkingDirBase}}/Llama3170bInstructAwq-{{.ModelVersion}}.zip"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: llama31_70b_instruct_awq

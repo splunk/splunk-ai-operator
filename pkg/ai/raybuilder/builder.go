@@ -87,32 +87,20 @@ func (b *Builder) effectiveAcceleratorType() string {
 	return "L40S"
 }
 
-// rayWorkingDirBase builds the base URL for runtime_env.working_dir zip files.
+// rayWorkingDirBase builds the base URI for runtime_env.working_dir application zips.
 //
-// Ray's S3 protocol handler (protocol.py) creates a plain boto3 client with no endpoint_url,
-// so it always hits AWS S3 regardless of AWS_ENDPOINT_URL. For S3-compatible stores (MinIO,
-// SeaweedFS, s3compat) we therefore use the MinIO HTTP endpoint directly as an https:// URL:
+// Ray's Serve config rejects plain http:// for remote working_dir URIs; allowed schemes include
+// s3 and https. We always use s3:// for S3 and S3-compatible backends (AWS, MinIO, SeaweedFS, etc.).
+// Ray pods receive AWS_ENDPOINT_URL plus AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (when applicable)
+// from rayS3DownloadEnv; modern boto3/botocore honor AWS_ENDPOINT_URL for the S3 client used to
+// fetch runtime_env packages.
 //
-//	https://<endpoint-host>/<bucket>/ray-services/ai-platform/applications
-//
-// Ray's https handler uses urllib which respects no special AWS config and works fine for
-// publicly-accessible or pre-signed URLs. If the bucket is private, the zips must be made
-// publicly readable or the MinIO endpoint must be accessible without auth (internal cluster).
-//
-// For plain AWS S3 (no custom endpoint) we keep s3:// so Ray uses its normal AWS credential chain.
-// For GCS we use gs://.
-func rayWorkingDirBase(scheme, bucket, endpoint string) string {
-	s3CompatScheme := scheme == "s3compat" || scheme == "minio" || scheme == "seaweedfs"
-	s3WithEndpoint := scheme == "s3" && endpoint != ""
-	if (s3CompatScheme || s3WithEndpoint) && endpoint != "" {
-		// Strip trailing slash from endpoint, then append bucket and path.
-		ep := strings.TrimRight(endpoint, "/")
-		return fmt.Sprintf("%s/%s/ray-services/ai-platform/applications", ep, bucket)
-	}
+// For GCS we use gs:// (scheme may be gs or gcs in objectStorage.path).
+func rayWorkingDirBase(scheme, bucket string) string {
 	switch strings.ToLower(scheme) {
 	case "s3", "s3compat", "minio", "seaweedfs":
 		return fmt.Sprintf("s3://%s/ray-services/ai-platform/applications", bucket)
-	case "gcs":
+	case "gs", "gcs":
 		return fmt.Sprintf("gs://%s/ray-services/ai-platform/applications", bucket)
 	default:
 		return fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", scheme, bucket)
@@ -219,9 +207,8 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
-	// Build working_dir base. For S3-compatible stores we use the MinIO HTTP endpoint directly
-	// (https://endpoint/bucket/path) because Ray's s3:// handler ignores AWS_ENDPOINT_URL.
-	workingDirBase := rayWorkingDirBase(u.Scheme, u.Host, strings.TrimSpace(p.Spec.ObjectStorage.Endpoint))
+	// Build working_dir base (s3:// or gs://; see rayWorkingDirBase).
+	workingDirBase := rayWorkingDirBase(u.Scheme, u.Host)
 
 	param := ApplicationParams{
 		ArtifactBucketName:             u.Host,
@@ -800,9 +787,8 @@ func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
 	}
 }
 
-// rayS3DownloadEnv sets AWS_* variables so application code (boto3) can reach S3-compatible stores.
-// Note: Ray's runtime_env s3:// handler ignores AWS_ENDPOINT_URL (creates a bare boto3 client with no endpoint_url),
-// so working_dir uses the MinIO HTTP endpoint directly instead — see rayWorkingDirBase.
+// rayS3DownloadEnv sets AWS_* variables so application code and Ray's runtime_env S3 fetch use the
+// configured S3-compatible endpoint (via AWS_ENDPOINT_URL) and credentials when present.
 func (b *Builder) rayS3DownloadEnv() []corev1.EnvVar {
 	u, err := url.Parse(b.ai.Spec.ObjectStorage.Path)
 	if err != nil {
