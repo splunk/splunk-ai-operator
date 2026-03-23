@@ -288,7 +288,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_tfidf
     runtime_env:
-      working_dir: "file:///home/ray/ray/applications/generic_application"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         APPLICATION_NAME: "PromptInjectionTfidf"
         API_VERSION: "v1"
@@ -607,7 +607,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_cross_encoder
     runtime_env:
-      working_dir: "file:///home/ray/ray/applications/generic_application"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: prompt_injection_cross_encoder
@@ -639,7 +639,7 @@ applications:
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_classifier
     runtime_env:
-      working_dir: "file:///home/ray/ray/applications/generic_application"
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: prompt_injection_classifier
