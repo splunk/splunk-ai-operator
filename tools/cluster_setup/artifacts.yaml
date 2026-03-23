@@ -5533,20 +5533,20 @@ spec:
         - name: RELATED_IMAGE_WEAVIATE_PROXY
           value: docker.io/kbhos698/weaviate-proxy:v1.0.28-6-g2cbe7b7
         - name: RELATED_IMAGE_SAIA_API
-          value: splunk/ai/saia/saia-api:build-1
+          value: 1234567890.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: splunk/ai/saia/saia-data-loader:build-1
+          value: 1234567890.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
         - name: SPLUNK_METRICS_INDEX_NAME
           value: _metrics
         - name: RELATED_IMAGE_FLUENT_BIT
           value: docker.io/fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR
-          value: docker.io/otel/opentelemetry-collector-contrib:0.122.1
+          value: 1234567890.dkr.ecr.us-west-2.amazonaws.com/otel/opentelemetry-collector-contrib:0.122.1
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: splunk/ai/splunk-ai-operator:build-v1alpha1
+        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v4
         livenessProbe:
           httpGet:
             path: /healthz
