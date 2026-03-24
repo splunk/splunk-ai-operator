@@ -54,7 +54,7 @@ applications:
         model_id: uae_large
         model_loader:
           blob_storage:
-            prefix: model_artifacts/uae-large
+            blob_prefix: model_artifacts/uae-large
     name: UaeLarge
     import_path: main:create_serve_app
     route_prefix: /uae_large
@@ -104,7 +104,7 @@ applications:
         model_id: all_minilm_l6_v2
         model_loader:
           blob_storage:
-            prefix: model_artifacts/all-minilm-l6-v2
+            blob_prefix: model_artifacts/all-minilm-l6-v2
     name: AllMinilmL6V2
     import_path: main:create_serve_app
     route_prefix: /all_minilm_l6_v2
@@ -154,7 +154,7 @@ applications:
         model_id: bi_encoder
         model_loader:
           blob_storage:
-            prefix: model_artifacts/bi-encoder
+            blob_prefix: model_artifacts/bi-encoder
     name: BiEncoder
     import_path: main:create_serve_app
     route_prefix: /bi_encoder
@@ -200,7 +200,7 @@ applications:
         model_id: mbart_translator
         model_loader:
           blob_storage:
-            prefix: model_artifacts/mbart-translator
+            blob_prefix: model_artifacts/mbart-translator
     name: MbartTranslator
     import_path: main:create_serve_app
     route_prefix: /mbart_translator
@@ -257,7 +257,7 @@ applications:
         model_id: xlm_roberta_language_classifier
         model_loader:
           blob_storage:
-            prefix: model_artifacts/xlm-roberta-language-classifier
+            blob_prefix: model_artifacts/xlm-roberta-language-classifier
     name: XlmRobertaLanguageClassifier
     import_path: main:create_serve_app
     route_prefix: /xlm_roberta_language_classifier
@@ -333,7 +333,7 @@ applications:
         model_id: cross_encoder
         model_loader:
           blob_storage:
-            prefix: model_artifacts/cross-encoder
+            blob_prefix: model_artifacts/cross-encoder
         model_type: vllm_scoring_model
     name: CrossEncoder
     import_path: main:create_serve_app
@@ -402,7 +402,7 @@ applications:
         model_id: llama31_instruct
         model_loader:
           blob_storage:
-            prefix: model_artifacts/llama31-8b-instruct
+            blob_prefix: model_artifacts/llama31-8b-instruct
       tokenizer_definition:
         model_id: llama31_instruct
         model_loader:
@@ -411,7 +411,7 @@ applications:
               - config.json
               - tokenizer_config.json
               - tokenizer.json
-            prefix: model_artifacts/llama31-8b-instruct
+            blob_prefix: model_artifacts/llama31-8b-instruct
     name: Llama31Instruct
     import_path: main:create_serve_app
     route_prefix: /llama31_instruct
@@ -469,7 +469,7 @@ applications:
         model_id: e5_language_classifier
         model_loader:
           blob_storage:
-            prefix: model_artifacts/e5-language-classifier
+            blob_prefix: model_artifacts/e5-language-classifier
     name: E5LanguageClassifier
     import_path: main:create_serve_app
     route_prefix: /e5_language_classifier
@@ -546,7 +546,7 @@ applications:
         model_id: llama31_70b_instruct_awq
         model_loader:
           blob_storage:
-            prefix: model_artifacts/llama31-70b-instruct-awq
+            blob_prefix: model_artifacts/llama31-70b-instruct-awq
       tokenizer_definition:
         model_id: llama31_70b_instruct_awq
         model_loader:
@@ -555,7 +555,7 @@ applications:
               - config.json
               - tokenizer_config.json
               - tokenizer.json
-            prefix: model_artifacts/llama31-70b-instruct-awq
+            blob_prefix: model_artifacts/llama31-70b-instruct-awq
     name: Llama3170bInstructAwq
     import_path: main:create_serve_app
     route_prefix: /llama31_70b_instruct_awq
