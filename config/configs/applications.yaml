@@ -252,7 +252,6 @@ applications:
         model_config:
           engine_args:
             gpu_memory_utilization: 0.1
-            task: classify
             tensor_parallel_size: 1
         model_id: xlm_roberta_language_classifier
         model_loader:
@@ -464,7 +463,6 @@ applications:
         model_config:
           engine_args:
             gpu_memory_utilization: 0.1
-            task: classify
             tensor_parallel_size: 1
         model_id: e5_language_classifier
         model_loader:
