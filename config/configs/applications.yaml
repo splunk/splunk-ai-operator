@@ -3,7 +3,7 @@ applications:
     import_path: main:SERVE_APP
     route_prefix: /
     runtime_env:
-      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
+      working_dir: "file:///home/ray/ray/applications/entrypoint.zip"
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: entrypoint
