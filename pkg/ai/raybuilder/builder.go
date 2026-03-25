@@ -731,10 +731,11 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
 		replicas := instanceScale[cfg.Tier]
 		wg := rayv1.WorkerGroupSpec{
-			GroupName:   cfg.Tier,
-			Replicas:    int32Ptr(replicas),
-			MinReplicas: int32Ptr(replicas),
-			MaxReplicas: int32Ptr(replicas + 5),
+			GroupName:          cfg.Tier,
+			Replicas:           int32Ptr(replicas),
+			MinReplicas:        int32Ptr(replicas),
+			MaxReplicas:        int32Ptr(replicas + 5),
+			IdleTimeoutSeconds: int32Ptr(600),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
 				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
