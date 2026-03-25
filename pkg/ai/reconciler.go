@@ -62,77 +62,44 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
 	rayRequired := platformRequiresRay(p.Spec.Features)
 
-	stages := []struct {
+	type stage struct {
 		name string
 		fn   func(context.Context, *aiApi.AIPlatform) error
-	}{
+	}
+
+	stages := []stage{
 		{"Validate", r.validate},
 		//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
 		//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
 		//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
 	}
 	if rayRequired {
-		stages = append(stages, struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"Sidecars", sidecarBuilder.Reconcile})
-	}
-	if rayRequired {
 		stages = append(stages,
-			struct {
-				name string
-				fn   func(context.Context, *aiApi.AIPlatform) error
-			}{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
-			struct {
-				name string
-				fn   func(context.Context, *aiApi.AIPlatform) error
-			}{"RayService", raybuilder.ReconcileRayService},
+			stage{"Sidecars", sidecarBuilder.Reconcile},
+			stage{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
+			stage{"RayService", raybuilder.ReconcileRayService},
 		)
 	} else {
 		// Ray is intentionally disabled when all configured features are Ray-independent.
 		p.Status.RayServiceName = ""
 		p.Status.RayServiceStatus = ""
-		stages = append(stages, struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"RayServiceCleanup", r.cleanupRayService})
+		stages = append(stages, stage{"RayServiceCleanup", r.cleanupRayService})
 	}
 
 	stages = append(stages,
-		struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
-		struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"Ingress", r.ReconcileIngress},
+		stage{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
+		stage{"Ingress", r.ReconcileIngress},
 	)
 
 	// collect status of each stage
 	if rayRequired {
-		stages = append(stages, struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"RayServiceStatus", raybuilder.ApplyNormalizedConditions})
+		stages = append(stages, stage{"RayServiceStatus", raybuilder.ApplyNormalizedConditions})
 	}
 	stages = append(stages,
-		struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
-		struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"IngressStatus", r.UpdateIngressStatus},
-		struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"AIService", r.ReconcileFeatures},
-		struct {
-			name string
-			fn   func(context.Context, *aiApi.AIPlatform) error
-		}{"AIServiceStatus", r.CheckAIServiceStatus},
+		stage{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
+		stage{"IngressStatus", r.UpdateIngressStatus},
+		stage{"AIService", r.ReconcileFeatures},
+		stage{"AIServiceStatus", r.CheckAIServiceStatus},
 	)
 
 	for _, stage := range stages {
