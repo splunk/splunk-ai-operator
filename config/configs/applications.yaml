@@ -359,9 +359,6 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 1
-                runtime_env:
-                  env_vars:
-                    VLLM_ATTENTION_BACKEND: TRITON_ATTN
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.GptOss20b}}
@@ -404,6 +401,7 @@ applications:
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: gpt_oss_20b
+        VLLM_ATTENTION_BACKEND: TRITON_ATTN
         ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
         S3_BUCKET: "{{.ArtifactBucketName}}"
         ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
@@ -483,9 +481,6 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 4
-                runtime_env:
-                  env_vars:
-                    VLLM_ATTENTION_BACKEND: TRITON_ATTN
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.GptOss120b}}
@@ -528,6 +523,7 @@ applications:
       env_vars:
         API_VERSION: "v1"
         APPLICATION_NAME: gpt_oss_120b
+        VLLM_ATTENTION_BACKEND: TRITON_ATTN
         ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
         S3_BUCKET: "{{.ArtifactBucketName}}"
         ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
