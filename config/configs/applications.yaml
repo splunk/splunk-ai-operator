@@ -196,11 +196,6 @@ applications:
             ray_actor_options:
               num_gpus: 0.2
       deployment_type: custom_deployment
-      model_definition:
-        model_id: mbart_translator
-        model_loader:
-          blob_storage:
-            blob_prefix: model_artifacts/mbart-translator
     name: MbartTranslator
     import_path: main:create_serve_app
     route_prefix: /mbart_translator
