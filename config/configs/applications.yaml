@@ -352,68 +352,58 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
   - args:
-      application_name: Llama31Instruct
+      application_name: GptOss20b
       deployment_configs:
         LLMDeployment:
           gpu_type_options_override:
-            A10G:
-              ray_actor_options:
-                num_gpus: 2
-            H100:
-              ray_actor_options:
-                num_gpus: 0.5
             L40S:
               ray_actor_options:
                 num_gpus: 1
-            T4:
-              ray_actor_options:
-                num_gpus: 4
                 runtime_env:
-                  pip:
-                    - triton==3.2.0
+                  env_vars:
+                    VLLM_ATTENTION_BACKEND: TRITON_ATTN
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.Llama31Instruct}}
-              min_replicas: {{.Replicas.Llama31Instruct}}
+              max_replicas: {{.Replicas.GptOss20b}}
+              min_replicas: {{.Replicas.GptOss20b}}
       deployment_type: text_gen_model_deployment
       gpu_types: '["L40S"]'
       model_definition:
         gpu_type_model_config_override:
-          A10G:
-            engine_args:
-              tensor_parallel_size: 2
-          H100:
-            engine_args:
-              gpu_memory_utilization: 0.5
-              tensor_parallel_size: 1
           L40S:
             engine_args:
+              gpu_memory_utilization: 0.90
               tensor_parallel_size: 1
-          T4:
-            engine_args:
-              dtype: half
-              tensor_parallel_size: 4
-        model_id: llama31_instruct
+        model_config:
+          openai_serving_config:
+            chat:
+              enable_auto_tools: true
+              tool_parser: openai
+            responses:
+              enable_auto_tools: true
+              tool_parser: openai
+        model_id: gpt_oss_20b
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/llama31-8b-instruct
+            blob_prefix: model_artifacts/gpt-oss-20b
       tokenizer_definition:
-        model_id: llama31_instruct
+        model_id: gpt_oss_20b
         model_loader:
           blob_storage:
             artifacts_list:
+              - chat_template.jinja
               - config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/llama31-8b-instruct
-    name: Llama31Instruct
+            blob_prefix: model_artifacts/gpt-oss-20b
+    name: GptOss20b
     import_path: main:create_serve_app
-    route_prefix: /llama31_instruct
+    route_prefix: /gpt_oss_20b
     runtime_env:
       working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
-        APPLICATION_NAME: llama31_instruct
+        APPLICATION_NAME: gpt_oss_20b
         ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
         S3_BUCKET: "{{.ArtifactBucketName}}"
         ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
@@ -486,77 +476,58 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
   - args:
-      application_name: Llama3170bInstructAwq
+      application_name: GptOss120b
       deployment_configs:
         LLMDeployment:
           gpu_type_options_override:
-            A100:
-              ray_actor_options:
-                num_gpus: 4
-            A10G:
-              ray_actor_options:
-                num_gpus: 4
-            H100:
-              ray_actor_options:
-                num_gpus: 1
             L40S:
               ray_actor_options:
-                num_gpus: 2
-            T4:
-              ray_actor_options:
-                num_gpus: 8
+                num_gpus: 4
                 runtime_env:
-                  pip:
-                    - triton==3.2.0
+                  env_vars:
+                    VLLM_ATTENTION_BACKEND: TRITON_ATTN
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.Llama3170bInstructAwq}}
-              min_replicas: {{.Replicas.Llama3170bInstructAwq}}
-            max_ongoing_requests: 4
+              max_replicas: {{.Replicas.GptOss120b}}
+              min_replicas: {{.Replicas.GptOss120b}}
       deployment_type: text_gen_model_deployment
-      gpu_types: '["L40S"] '
+      gpu_types: '["L40S"]'
       model_definition:
         gpu_type_model_config_override:
-          A100:
-            engine_args:
-              tensor_parallel_size: 4
-          A10G:
-            engine_args:
-              gpu_memory_utilization: 0.95
-              tensor_parallel_size: 4
-          H100:
-            engine_args:
-              gpu_memory_utilization: 0.95
-              tensor_parallel_size: 1
           L40S:
             engine_args:
-              gpu_memory_utilization: 0.95
-              tensor_parallel_size: 2
-          T4:
-            engine_args:
-              dtype: half
-              tensor_parallel_size: 8
-        model_id: llama31_70b_instruct_awq
+              gpu_memory_utilization: 0.90
+              tensor_parallel_size: 4
+        model_config:
+          openai_serving_config:
+            chat:
+              enable_auto_tools: true
+              tool_parser: openai
+            responses:
+              enable_auto_tools: true
+              tool_parser: openai
+        model_id: gpt_oss_120b
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/llama31-70b-instruct-awq
+            blob_prefix: model_artifacts/gpt-oss-120b
       tokenizer_definition:
-        model_id: llama31_70b_instruct_awq
+        model_id: gpt_oss_120b
         model_loader:
           blob_storage:
             artifacts_list:
+              - chat_template.jinja
               - config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/llama31-70b-instruct-awq
-    name: Llama3170bInstructAwq
+            blob_prefix: model_artifacts/gpt-oss-120b
+    name: GptOss120b
     import_path: main:create_serve_app
-    route_prefix: /llama31_70b_instruct_awq
+    route_prefix: /gpt_oss_120b
     runtime_env:
       working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
-        APPLICATION_NAME: llama31_70b_instruct_awq
+        APPLICATION_NAME: gpt_oss_120b
         ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
         S3_BUCKET: "{{.ArtifactBucketName}}"
         ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
