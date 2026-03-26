@@ -424,6 +424,26 @@ cd /path/to/splunk-ai-operator/tools/cluster_setup
 - Valid AWS credentials with appropriate permissions
 - Existing VPC with public and private subnets in multiple AZs **OR** let eksctl create a new VPC automatically
 - Required tools installed: `eksctl`, `kubectl`, `helm`, `jq`, `yq`
+  - **If you are setting your cluster up without eksctl**
+    - An aws eks cluster with OIDC, 2 managed node groups: one for CPU nodes, and one for GPU nodes, and addons vpc-cni, kube-proxy, coredns, and eks-pod-identity-agent
+    - IAM OIDC provider
+    - IAM service account in the `kube-system` namespace with the name `ebs-csi-controller-sa`, role name `EBSCSIDriverRole-${CLUSTER_NAME}`, and attached policy arn `arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy`
+    - IAM service account in the `kube-system` namespace with the name `cluster-autoscaler`, role name `ClusterAutoscalerRole-${CLUSTER_NAME}`, and attached policy arn `arn:aws:iam::aws:policy/AutoScalingFullAccess`
+    - IAM policy with the name `S3Access-${CLUSTER_NAME}-ai-platform`, policy arn `arn:aws:iam::${ACCOUNT_ID}:policy/S3Access-${CLUSTER_NAME}-ai-platform`, and policy document
+      ```
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          { "Sid":"ListBucket","Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::${S3_BUCKET_NAME}" },
+          { "Sid":"ObjectRW","Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts","s3:ListBucketMultipartUploads"],"Resource":"arn:aws:s3:::${S3_BUCKET_NAME}/*" }
+        ]
+      }
+      ```
+    - IAM service account in the `ai-platform` namespace with the name `saia-service-sa`, role name `IRSA-${CLUSTER_NAME}-saia-service-sa`, and attached policy arn `arn:aws:iam::${ACCOUNT_ID}:policy/S3Access-${CLUSTER_NAME}-ai-platform`
+    - IAM service account in the `ai-platform` namespace with the name `ray-head-sa`, role name `IRSA-${CLUSTER_NAME}-ray-head-sa`, and attached policy arn `arn:aws:iam::${ACCOUNT_ID}:policy/S3Access-${CLUSTER_NAME}-ai-platform`
+    - IAM service account in the `ai-platform` namespace with the name `ray-worker-sa`, role name `IRSA-${CLUSTER_NAME}-ray-worker-sa`, and attached policy arn `arn:aws:iam::${ACCOUNT_ID}:policy/S3Access-${CLUSTER_NAME}-ai-platform`
+    - aws-ebs-csi-driver add on with the service-account-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/EBSCSIDriverRole-${CLUSTER_NAME}"
+  - **NOTE** eksctl is required for automated teardown using the script
 
 **🔐 Set AWS Credentials:**
 ```bash
@@ -1033,14 +1053,14 @@ aiPlatform:
 # Install EKS cluster and AI Platform
 ./eks_cluster_with_stack.sh install
 
+# Install AI Platform on a cluster created using a tool other than eksctl
+./eks_cluster_with_stack.sh install --no-eksctl
+
 # Delete entire cluster and all AWS resources
 ./eks_cluster_with_stack.sh delete
 
 # Full cleanup (including S3 buckets, IAM roles)
 ./eks_cluster_with_stack.sh delete-full
-
-# Check AIPlatform status
-./eks_cluster_with_stack.sh status
 ```
 
 ### Post-Installation Tasks
@@ -1103,7 +1123,7 @@ kubectl get secret splunk-splunk-standalone-standalone-secret-v1 \
 
 # Port forward Splunk Web UI
 kubectl port-forward -n ai-platform \
-  svc/splunk-standalone-standalone-service 8000:8000
+  svc/splunk-splunk-standalone-standalone-service 8000:8000
 
 # Access at http://localhost:8000
 # Username: admin
