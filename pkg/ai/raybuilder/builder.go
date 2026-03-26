@@ -731,11 +731,10 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
 		replicas := instanceScale[cfg.Tier]
 		wg := rayv1.WorkerGroupSpec{
-			GroupName:          cfg.Tier,
-			Replicas:           int32Ptr(replicas),
-			MinReplicas:        int32Ptr(replicas),
-			MaxReplicas:        int32Ptr(replicas + 5),
-			IdleTimeoutSeconds: int32Ptr(600),
+			GroupName:   cfg.Tier,
+			Replicas:    int32Ptr(replicas),
+			MinReplicas: int32Ptr(replicas),
+			MaxReplicas: int32Ptr(replicas + 5),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
 				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
@@ -751,9 +750,11 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		workers = append(workers, wg)
 	}
 
+	idleTimeout := int32Ptr(600)
 	return &rayv1.RayClusterSpec{
 		RayVersion:              os.Getenv("RAY_VERSION"),
 		EnableInTreeAutoscaling: boolPtr(true),
+		AutoscalerOptions:       &rayv1.AutoscalerOptions{IdleTimeoutSeconds: idleTimeout},
 		HeadGroupSpec:           head,
 		WorkerGroupSpecs:        workers,
 	}, nil
