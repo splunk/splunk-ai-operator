@@ -480,7 +480,7 @@ applications:
           gpu_type_options_override:
             L40S:
               ray_actor_options:
-                num_gpus: 1
+                num_gpus: 2
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.GptOss120b}}
@@ -492,7 +492,7 @@ applications:
           L40S:
             engine_args:
               gpu_memory_utilization: 0.90
-              tensor_parallel_size: 1
+              tensor_parallel_size: 2
         model_config:
           openai_serving_config:
             chat:
