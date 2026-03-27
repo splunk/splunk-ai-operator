@@ -13,6 +13,6 @@ dependencies:
   version: 72.4.0
 - name: splunk-operator
   repository: https://splunk.github.io/splunk-operator
-  version: 3.0.0
-digest: sha256:41032e66994109109208bc66b07b6f10890c9c8dafe019aa480d73d4effe915a
-generated: "2025-12-11T11:23:06.233099-08:00"
+  version: 3.1.0
+digest: sha256:bc5e962d5c6b465b26a13a91660d7fa45687c394e124abe2beb96e4a2e3760df
+generated: "2026-03-27T11:00:29.228964+05:30"
