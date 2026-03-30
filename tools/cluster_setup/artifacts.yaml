@@ -5539,9 +5539,9 @@ spec:
         - name: SPLUNK_METRICS_INDEX_NAME
           value: _metrics
         - name: RELATED_IMAGE_FLUENT_BIT
-          value: 1234567890.dkr.ecr.us-west-2.amazonaws.com/fluent/fluent-bit:1.9.6
+          value: docker.io/fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR
-          value: 1234567890.dkr.ecr.us-west-2.amazonaws.com/otel/opentelemetry-collector-contrib:0.122.1
+          value: docker.io/otel/opentelemetry-collector-contrib:0.122.1
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION

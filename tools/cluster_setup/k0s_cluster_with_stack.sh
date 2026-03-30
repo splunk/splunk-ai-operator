@@ -34,6 +34,10 @@ log()   { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 need()  { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
+is_nonempty_value() {
+  local v="${1:-}"
+  [[ -n "$v" && "$v" != "null" ]]
+}
 
 # ====== HELM RETRY LOGIC ======
 # Retries helm commands with exponential backoff on transient errors
@@ -143,11 +147,19 @@ load_config() {
   # Legacy compat: MINIO_NS for in-cluster MinIO (unused when external)
   MINIO_NS="minio-system"
 
-  # Kubernetes namespace
+  # Kubernetes namespace and AI platform settings
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
+  AI_PLATFORM_NAME=$(yq eval '.aiPlatform.name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  RAY_HEAD_SA=$(yq eval '.aiPlatform.serviceAccounts.rayHead // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  RAY_WORKER_SA=$(yq eval '.aiPlatform.serviceAccounts.rayWorker // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  SAIA_SERVICE_SA=$(yq eval '.aiPlatform.serviceAccounts.saiaService // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  AI_FEATURE_NAME=$(yq eval '.aiPlatform.features[0].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  AI_FEATURE_VERSION=$(yq eval '.aiPlatform.features[0].version // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  AI_FEATURE_SA=$(yq eval '.aiPlatform.features[0].serviceAccountName // .aiPlatform.features[0].serviceAccount // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
+  STANDALONE_SA=$(yq eval '.splunkStandalone.serviceAccount // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -157,11 +169,13 @@ load_config() {
   RAY_HEAD_IMAGE="$(yq eval '.images.ray.headImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   RAY_WORKER_IMAGE="$(yq eval '.images.ray.workerImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  WEAVIATE_PROXY_IMAGE="$(yq eval '.images.weaviate.proxyImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  CONFIG_SKIP_IMAGE_VALIDATION="$(yq eval '.advanced.skipImageValidation // "false"' "$CONFIG_FILE" 2>/dev/null || echo "false")"
 
   # Operator versions
   MODEL_VERSION="$(yq eval '.operators.ray.modelVersion // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -169,6 +183,9 @@ load_config() {
 
   # AI Platform CR configuration
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ "${DEFAULT_ACCELERATOR}" == "null" || "${DEFAULT_ACCELERATOR}" == "~" ]]; then
+    DEFAULT_ACCELERATOR=""
+  fi
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # NVIDIA device plugin version
@@ -199,7 +216,38 @@ load_config() {
   SPLUNK_OPERATOR_FILE=$(yq eval '.files.splunkOperator' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
 
-  log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
+  if [[ -z "${AI_PLATFORM_NAME:-}" || "${AI_PLATFORM_NAME}" == "null" ]]; then
+    AI_PLATFORM_NAME="${CLUSTER_NAME}-ai-platform"
+  fi
+  if [[ -z "${AI_FEATURE_NAME:-}" || "${AI_FEATURE_NAME}" == "null" ]]; then
+    AI_FEATURE_NAME="saia"
+  fi
+  if [[ -z "${AI_FEATURE_VERSION:-}" || "${AI_FEATURE_VERSION}" == "null" ]]; then
+    AI_FEATURE_VERSION="1.1.0"
+  fi
+  if [[ -z "${AI_FEATURE_SA:-}" || "${AI_FEATURE_SA}" == "null" ]]; then
+    if is_nonempty_value "${SAIA_SERVICE_SA:-}"; then
+      AI_FEATURE_SA="${SAIA_SERVICE_SA}"
+    elif is_nonempty_value "${STANDALONE_SA:-}"; then
+      AI_FEATURE_SA="${STANDALONE_SA}"
+    else
+      AI_FEATURE_SA=""
+    fi
+  fi
+  AI_FEATURE_NAME_NORMALIZED="$(echo "${AI_FEATURE_NAME}" | tr '[:upper:]' '[:lower:]')"
+  RAY_REQUIRED="true"
+  if [[ "${AI_FEATURE_NAME_NORMALIZED}" == "weaviate-service" ]]; then
+    RAY_REQUIRED="false"
+  fi
+  if [[ -z "${SKIP_IMAGE_VALIDATION:-}" ]]; then
+    SKIP_IMAGE_VALIDATION="${CONFIG_SKIP_IMAGE_VALIDATION:-false}"
+  fi
+  SKIP_IMAGE_VALIDATION="$(echo "${SKIP_IMAGE_VALIDATION}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${SKIP_IMAGE_VALIDATION}" != "true" ]]; then
+    SKIP_IMAGE_VALIDATION="false"
+  fi
+
+  log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}, feature=${AI_FEATURE_NAME}@${AI_FEATURE_VERSION}, ray_required=${RAY_REQUIRED}, skip_image_validation=${SKIP_IMAGE_VALIDATION}"
   if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
     log "Object storage: external S3-compatible (${OBJ_STORE_TYPE}), endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   else
@@ -246,23 +294,41 @@ validate_image_config() {
   if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
     err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml"
   fi
-  if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.ray.headImage must be specified in k0s-cluster-config.yaml"
-  fi
-  if [[ -z "$RAY_WORKER_IMAGE" || "$RAY_WORKER_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.ray.workerImage must be specified in k0s-cluster-config.yaml"
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    if ! is_nonempty_value "${RAY_HEAD_SA:-}"; then
+      err "REQUIRED: aiPlatform.serviceAccounts.rayHead must be specified when feature requires Ray"
+    fi
+    if ! is_nonempty_value "${RAY_WORKER_SA:-}"; then
+      err "REQUIRED: aiPlatform.serviceAccounts.rayWorker must be specified when feature requires Ray"
+    fi
+    if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.ray.headImage must be specified when feature requires Ray"
+    fi
+    if [[ -z "$RAY_WORKER_IMAGE" || "$RAY_WORKER_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.ray.workerImage must be specified when feature requires Ray"
+    fi
+  else
+    log "Skipping Ray image requirements for feature '${AI_FEATURE_NAME}'"
   fi
   if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
     err "REQUIRED: images.weaviate.image must be specified in k0s-cluster-config.yaml"
   fi
-  if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.saia.apiImage must be specified in k0s-cluster-config.yaml"
+  if [[ -z "$WEAVIATE_PROXY_IMAGE" || "$WEAVIATE_PROXY_IMAGE" == "null" ]]; then
+    WEAVIATE_PROXY_IMAGE="docker.io/kbhos698/weaviate-proxy:v1.0.28-6-g2cbe7b7"
+    log "Using default Weaviate proxy image: $WEAVIATE_PROXY_IMAGE"
   fi
-  if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
+  if [[ "${AI_FEATURE_NAME_NORMALIZED}" != "weaviate-service" ]]; then
+    if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.saia.apiImage must be specified in k0s-cluster-config.yaml"
+    fi
+    if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
+    fi
+  else
+    log "Skipping SAIA image requirements for feature '${AI_FEATURE_NAME}'"
   fi
-  if [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.slim.apiImage must be specified in k0s-cluster-config.yaml"
+  if ! is_nonempty_value "${AI_FEATURE_SA:-}"; then
+    err "REQUIRED: aiPlatform.features[0].serviceAccountName (or fallback via aiPlatform.serviceAccounts.saiaService / splunkStandalone.serviceAccount)"
   fi
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
@@ -306,49 +372,115 @@ configure_images() {
 
   log "Updating $SPLUNK_AI_FILE..."
 
-  local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
-  local ray_head_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_HEAD_IMAGE")
-  local ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
-  local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
-  local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
-  local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
-  local slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
-  local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
-  local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
+  local operator_full
+  local ray_head_full=""
+  local ray_worker_full=""
+  local weaviate_full
+  local weaviate_proxy_full
+  local saia_api_full=""
+  local saia_dataloader_full=""
+  local slim_api_full=""
+  local fluent_bit_full
+  local otel_collector_full
 
-  local ray_head_escaped=$(echo "$ray_head_full" | sed 's/[\/&]/\\&/g')
-  local ray_worker_escaped=$(echo "$ray_worker_full" | sed 's/[\/&]/\\&/g')
-  local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
-  local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
-  local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
-  local slim_api_escaped=$(echo "$slim_api_full" | sed 's/[\/&]/\\&/g')
-  local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
-  local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
-  local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
+  operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
+  weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
+  weaviate_proxy_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_PROXY_IMAGE")
+  fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
+  otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
+  if is_nonempty_value "$SAIA_API_IMAGE"; then
+    saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
+  fi
+  if is_nonempty_value "$SAIA_DATALOADER_IMAGE"; then
+    saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  fi
+  if is_nonempty_value "$SLIM_API_IMAGE"; then
+    slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
+  fi
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    ray_head_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_HEAD_IMAGE")
+    ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
+  fi
+
+  local ray_head_escaped=""
+  local ray_worker_escaped=""
+  local weaviate_escaped
+  local weaviate_proxy_escaped
+  local saia_api_escaped=""
+  local saia_dataloader_escaped=""
+  local slim_api_escaped=""
+  local fluent_bit_escaped
+  local otel_collector_escaped
+  local operator_escaped
+
+  weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
+  weaviate_proxy_escaped=$(echo "$weaviate_proxy_full" | sed 's/[\/&]/\\&/g')
+  fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
+  otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
+  operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
+  if is_nonempty_value "$saia_api_full"; then
+    saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
+  fi
+  if is_nonempty_value "$saia_dataloader_full"; then
+    saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  fi
+  if is_nonempty_value "$slim_api_full"; then
+    slim_api_escaped=$(echo "$slim_api_full" | sed 's/[\/&]/\\&/g')
+  fi
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    ray_head_escaped=$(echo "$ray_head_full" | sed 's/[\/&]/\\&/g')
+    ray_worker_escaped=$(echo "$ray_worker_full" | sed 's/[\/&]/\\&/g')
+  fi
 
   SEDOPTION="-i"
   if [[ "$OSTYPE" == "darwin"* ]]; then
     SEDOPTION="-i ''"
   fi
 
-  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    sed $SEDOPTION "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
+    sed $SEDOPTION "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
+  fi
   sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_escaped}|" "$SPLUNK_AI_FILE"
+  sed $SEDOPTION "/name:[[:space:]]*RELATED_IMAGE_WEAVIATE_PROXY$/,/value:/ s|value:.*|value: ${weaviate_proxy_escaped}|" "$SPLUNK_AI_FILE"
+  if is_nonempty_value "$saia_api_escaped"; then
+    sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
+  fi
+  if is_nonempty_value "$saia_dataloader_escaped"; then
+    sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  fi
+  if is_nonempty_value "$slim_api_escaped"; then
+    sed $SEDOPTION "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_escaped}|" "$SPLUNK_AI_FILE"
+  fi
   sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
   sed $SEDOPTION "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
 
-  log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
-  log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
+    log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
+  else
+    log "  ~ Skipped RELATED_IMAGE_RAY_HEAD/WORKER updates (feature=${AI_FEATURE_NAME})"
+  fi
   log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
-  log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
-  log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
-  log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
+  log "  ✓ Updated RELATED_IMAGE_WEAVIATE_PROXY: $weaviate_proxy_full"
+  if is_nonempty_value "$saia_api_full"; then
+    log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
+  else
+    log "  ~ Skipped RELATED_IMAGE_SAIA_API update (not configured)"
+  fi
+  if is_nonempty_value "$saia_dataloader_full"; then
+    log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  else
+    log "  ~ Skipped RELATED_IMAGE_POST_INSTALL_HOOK update (not configured)"
+  fi
+  if is_nonempty_value "$slim_api_full"; then
+    log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
+  else
+    log "  ~ Skipped RELATED_IMAGE_SLIM_API update (not configured)"
+  fi
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
   log "  ✓ Updated operator image: $operator_full"
@@ -954,7 +1086,7 @@ import yaml
 with open('/tmp/k0s.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
-# Add the controller IP to SANs (for kubectl access and cluster communication)
+# Add the controller IP to SANs (for kubectl access from local machine)
 if 'spec' not in config:
     config['spec'] = {}
 if 'api' not in config['spec']:
@@ -962,10 +1094,19 @@ if 'api' not in config['spec']:
 if 'sans' not in config['spec']['api']:
     config['spec']['api']['sans'] = []
 
-config['spec']['api']['sans'].append('${controller_ip}')
+if '${controller_ip}' not in config['spec']['api']['sans']:
+    config['spec']['api']['sans'].append('${controller_ip}')
 
-# Use the same IP for externalAddress so konnectivity-agents can connect
-config['spec']['api']['externalAddress'] = '${controller_ip}'
+# Prefer internal API address for in-cluster control-plane communication.
+# When controller_ip is a public address, workers inside VPC may not be able
+# to reach it reliably via IGW hairpin routing.
+internal_api_addr = config['spec']['api'].get('address')
+if internal_api_addr:
+    if internal_api_addr not in config['spec']['api']['sans']:
+        config['spec']['api']['sans'].append(internal_api_addr)
+    config['spec']['api']['externalAddress'] = internal_api_addr
+else:
+    config['spec']['api']['externalAddress'] = '${controller_ip}'
 
 # Set Calico as network provider
 if 'network' not in config['spec']:
@@ -2771,13 +2912,30 @@ EOF
       ;;
   esac
 
+  local platform_service_account="${AI_FEATURE_SA}"
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    platform_service_account="${RAY_HEAD_SA}"
+  elif ! is_nonempty_value "${platform_service_account}"; then
+    platform_service_account="${STANDALONE_SA}"
+  fi
+
+  local worker_group_config_block=""
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    worker_group_config_block="$(cat <<EOF
+  workerGroupConfig:
+    serviceAccountName: ${RAY_WORKER_SA}
+    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
+EOF
+)"
+  fi
+
   # Apply AIPlatform CR (matching EKS script pattern)
-  log "Applying AIPlatform CR: ${CLUSTER_NAME}-ai-platform"
+  log "Applying AIPlatform CR: ${AI_PLATFORM_NAME}"
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
 metadata:
-  name: ${CLUSTER_NAME}-ai-platform
+  name: ${AI_PLATFORM_NAME}
 spec:
   objectStorage:
     path: ${obj_path}
@@ -2788,14 +2946,16 @@ spec:
   # Image configuration (including pull secrets for private registries)
   images:
 ${image_pull_secrets}
+  serviceAccountName: ${platform_service_account}
 
   # GPU accelerator type (determines Ray worker tiers: L40S, H100_NVL, or empty for no workers)
-  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
+  defaultAcceleratorType: "${DEFAULT_ACCELERATOR}"
 
   # Features configuration
   features:
-    - name: saia
-      version: "1.1.0"
+    - name: ${AI_FEATURE_NAME}
+      version: "${AI_FEATURE_VERSION}"
+      serviceAccountName: ${AI_FEATURE_SA}
 
   # Storage configuration
   storage:
@@ -2803,9 +2963,7 @@ ${image_pull_secrets}
       size: ${VECTORDB_SIZE}
       storageClassName: ${STORAGE_CLASS}
 
-  # Worker configuration
-  workerGroupConfig:
-    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
+${worker_group_config_block}
 
   # CPU scheduler
   cpuScheduler:
@@ -2836,7 +2994,7 @@ YAML
 
   # Wait for AIPlatform resource to exist
   local timeout=60 elapsed=0
-  while ! kubectl get aiplatform ${CLUSTER_NAME}-ai-platform -n ${AI_NS} >/dev/null 2>&1; do
+  while ! kubectl get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" >/dev/null 2>&1; do
     sleep 5
     elapsed=$((elapsed + 5))
     if [[ ${elapsed} -ge ${timeout} ]]; then
@@ -2847,7 +3005,7 @@ YAML
 
   # Show AIPlatform status
   log "AIPlatform status:"
-  kubectl get aiplatform ${CLUSTER_NAME}-ai-platform -n ${AI_NS} -o wide || true
+  kubectl get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" -o wide || true
 
   log "AIPlatform CR installed successfully"
 }
@@ -2864,10 +3022,14 @@ install_ai_platform_stack() {
   install_kube_prometheus
   ensure_s3compat_credentials
   install_otel_operator_and_contrib_collector
-  mount_nvme_instance_store
-  install_nvidia_host_drivers
-  install_nvidia_device_plugin
-  install_ray_operator
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    mount_nvme_instance_store
+    install_nvidia_host_drivers
+    install_nvidia_device_plugin
+    install_ray_operator
+  else
+    log "Skipping Ray/GPU components for feature '${AI_FEATURE_NAME}'"
+  fi
 
   # Install Splunk components
   install_splunk_operator
@@ -2970,15 +3132,20 @@ check_platform_health() {
   log ""
 
   # Check 7: Ray Operator
-  log "Checking KubeRay Operator..."
-  if kubectl get pods -n ray-system 2>/dev/null | grep -q "Running"; then
-    log "✅ KubeRay Operator is running"
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    log "Checking KubeRay Operator..."
+    if kubectl get pods -n ray-system 2>/dev/null | grep -q "Running"; then
+      log "✅ KubeRay Operator is running"
+    else
+      warn "KubeRay Operator not ready"
+      kubectl get pods -n ray-system
+      ((health_issues++))
+    fi
+    log ""
   else
-    warn "KubeRay Operator not ready"
-    kubectl get pods -n ray-system
-    ((health_issues++))
+    log "⏭️  Skipping KubeRay Operator check (feature=${AI_FEATURE_NAME})"
+    log ""
   fi
-  log ""
 
   # Check 8: Splunk AI Operator
   log "Checking Splunk AI Operator..."
@@ -3106,15 +3273,17 @@ show_platform_access_info() {
   log ""
 
   # Ray information
-  log "🚀 Ray Clusters:"
-  log "  Check Ray Services:"
-  log "     kubectl get rayservice -n ${AI_NS}"
-  log "     kubectl get raycluster -n ${AI_NS}"
-  log "  "
-  log "  Ray Dashboard (once Ray is running):"
-  log "     kubectl port-forward -n ${AI_NS} svc/<ray-head-svc> 8265:8265"
-  log "     Open: http://localhost:8265"
-  log ""
+  if [[ "${RAY_REQUIRED}" == "true" ]]; then
+    log "🚀 Ray Clusters:"
+    log "  Check Ray Services:"
+    log "     kubectl get rayservice -n ${AI_NS}"
+    log "     kubectl get raycluster -n ${AI_NS}"
+    log "  "
+    log "  Ray Dashboard (once Ray is running):"
+    log "     kubectl port-forward -n ${AI_NS} svc/<ray-head-svc> 8265:8265"
+    log "     Open: http://localhost:8265"
+    log ""
+  fi
 
   # Quick checks
   log "🔍 Quick Health Checks:"
