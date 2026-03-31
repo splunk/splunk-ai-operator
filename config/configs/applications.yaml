@@ -28,7 +28,7 @@ applications:
           gpu_type_options_override:
             H100:
               ray_actor_options:
-                num_gpus: 0.025
+                num_gpus: 0.0375
             L40S:
               ray_actor_options:
                 num_gpus: 0.05
@@ -43,7 +43,7 @@ applications:
         gpu_type_model_config_override:
           H100:
             engine_args:
-              gpu_memory_utilization: 0.025
+              gpu_memory_utilization: 0.0375
           L40S:
             engine_args:
               gpu_memory_utilization: 0.05
@@ -356,6 +356,9 @@ applications:
       deployment_configs:
         LLMDeployment:
           gpu_type_options_override:
+            H100:
+              ray_actor_options:
+                num_gpus: 0.5
             L40S:
               ray_actor_options:
                 num_gpus: 1
@@ -364,9 +367,13 @@ applications:
               max_replicas: {{.Replicas.GptOss20b}}
               min_replicas: {{.Replicas.GptOss20b}}
       deployment_type: text_gen_model_deployment
-      gpu_types: '["L40S"]'
+      gpu_types: '["{{.AcceleratorType}}"]'
       model_definition:
         gpu_type_model_config_override:
+          H100:
+            engine_args:
+              gpu_memory_utilization: 0.90
+              tensor_parallel_size: 1
           L40S:
             engine_args:
               gpu_memory_utilization: 0.90
@@ -478,6 +485,9 @@ applications:
       deployment_configs:
         LLMDeployment:
           gpu_type_options_override:
+            H100:
+              ray_actor_options:
+                num_gpus: 1
             L40S:
               ray_actor_options:
                 num_gpus: 2
@@ -486,9 +496,13 @@ applications:
               max_replicas: {{.Replicas.GptOss120b}}
               min_replicas: {{.Replicas.GptOss120b}}
       deployment_type: text_gen_model_deployment
-      gpu_types: '["L40S"]'
+      gpu_types: '["{{.AcceleratorType}}"]'
       model_definition:
         gpu_type_model_config_override:
+          H100:
+            engine_args:
+              gpu_memory_utilization: 0.90
+              tensor_parallel_size: 1
           L40S:
             engine_args:
               gpu_memory_utilization: 0.90

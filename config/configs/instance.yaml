@@ -31,6 +31,30 @@ L40S:
         memory: "48Gi"
         ephemeral-storage: "100Gi"
         nvidia.com/gpu: "2"
+H100:
+  - tier: h100-0-gpu
+    gpusPerPod: 0
+    env:
+      NVIDIA_VISIBLE_DEVICES: void
+    resources:
+      limits:
+        cpu: "16"
+        memory: "32Gi"
+        ephemeral-storage: "10Gi"
+        nvidia.com/gpu: "0"
+      requests:
+        cpu: "4"
+  - tier: h100-1-gpu
+    gpusPerPod: 1
+    # No NVIDIA_VISIBLE_DEVICES here - GPUs must be visible for vLLM
+    resources:
+      requests:
+        cpu: "4"
+      limits:
+        cpu: "16"
+        memory: "48Gi"
+        ephemeral-storage: "100Gi"
+        nvidia.com/gpu: "1"
 H100_NVL:
   - tier: h100-nvl-0-gpu
     gpusPerPod: 0

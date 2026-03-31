@@ -53,6 +53,7 @@ type ApplicationParams struct {
 	Replicas                       map[string]int32 `yaml:"REPLICAS"`
 	WorkingDirBase                 string           `yaml:"WORKING_DIR_BASE"`
 	ModelVersion                   string           `yaml:"MODEL_VERSION"`
+	AcceleratorType                string           `yaml:"ACCELERATOR_TYPE"`
 }
 
 type WorkerConfigs map[string][]InstanceDetail
@@ -220,6 +221,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		Replicas:                       replicasMap,
 		WorkingDirBase:                 workingDirBase,
 		ModelVersion:                   os.Getenv("MODEL_VERSION"),
+		AcceleratorType:                b.effectiveAcceleratorType(),
 	}
 
 	// Use embedded applications.yaml content

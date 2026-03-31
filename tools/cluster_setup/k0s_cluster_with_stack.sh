@@ -178,20 +178,13 @@ load_config() {
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
-  for tool in ssh kubectl helm git jq; do
+  for tool in ssh kubectl helm git jq yq; do
     if command -v "$tool" >/dev/null 2>&1; then
       pf_ok "$tool found"
     else
       pf_fail "$tool not found in PATH"
     fi
   done
-
-  # Check for yq
-  if command -v yq >/dev/null 2>&1; then
-    pf_ok "yq found"
-  else
-    pf_warn "yq not found - using fallback parsing (install yq for better results)"
-  fi
 
   pf_header "Configuration"
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"

@@ -2656,7 +2656,7 @@ preflight_env() {
   fi
 
   pf_header "Tools"
-  for t in aws eksctl kubectl helm git jq; do
+  for t in aws eksctl kubectl helm git jq yq; do
     if command -v "$t" >/dev/null 2>&1; then pf_ok "$t found ($(command -v $t))"; else pf_fail "$t not found in PATH"; fi
   done
 
@@ -2964,7 +2964,7 @@ reconcile_flow() {
 
 # ---------- MAIN ----------
 main_install() {
-  for t in aws eksctl kubectl helm git jq; do need "$t"; done
+  for t in aws eksctl kubectl helm git jq yq; do need "$t"; done
 
   # Load configuration from YAML file
   load_config
