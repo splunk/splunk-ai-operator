@@ -125,7 +125,7 @@ The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI Platform o
 - **Pod Network (10.244.0.0/16)**: Calico VXLAN overlay network
 - **Service Network (10.96.0.0/16)**: Kubernetes ClusterIP services
 - All pod-to-pod communication happens over VXLAN (no cloud networking)
-- MinIO storage is local to the cluster (no S3)
+- Object storage is internal / external to the cluster (SeaweedFS, MinIO, or S3-compatible endpoint)
 
 ### Configuration Example (Pure On-Premises)
 
@@ -514,7 +514,7 @@ Open the following ports between nodes:
 - Sufficient EC2 quotas:
   - t3.xlarge (controllers): 1+ instances
   - m5.4xlarge (CPU workers): 2+ instances
-  - g5.2xlarge (GPU workers): 1+ instances
+  - g5.2xlarge (GPU workers): 2+ instances
 
 **Verify AWS Access:**
 ```bash
@@ -1795,27 +1795,6 @@ EOF
 
 ### Backup and Restore
 
-#### Backup MinIO Data
-
-```bash
-# Install MinIO client
-wget https://dl.min.io/client/mc/release/linux-amd64/mc
-chmod +x mc
-sudo mv mc /usr/local/bin/
-
-# Configure alias
-mc alias set k0s-minio \
-  http://localhost:9000 \
-  minioadmin \
-  minioadmin123
-
-# Backup bucket
-mc mirror k0s-minio/ai-platform-bucket ./backup/minio-data
-
-# Backup configuration
-kubectl get secret -n minio-system minio-creds -o yaml > backup/minio-secret.yaml
-```
-
 #### Backup etcd
 
 ```bash
@@ -1834,9 +1813,6 @@ scp ubuntu@controller-ip:/tmp/etcd-backup.db ./backup/
 scp ./backup/etcd-backup.db ubuntu@controller-ip:/tmp/
 ssh ubuntu@controller-ip
 sudo k0s etcd snapshot restore /tmp/etcd-backup.db
-
-# Restore MinIO data
-mc mirror ./backup/minio-data k0s-minio/ai-platform-bucket
 ```
 
 ---

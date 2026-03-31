@@ -367,9 +367,9 @@ type SidecarSpec struct {
 // ObjectStorageSpec defines object storage configuration for AI artifacts, tasks, and models
 type ObjectStorageSpec struct {
 	// Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-	// azure://containername/<path prefix>, or minio://bucketname/<path prefix>
+	// azure://containername/<path prefix>, minio://bucketname/<path prefix>, or seaweedfs://bucketname/<path prefix>
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=`^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$`
+	// +kubebuilder:validation:Pattern=`^(s3|s3compat|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$`
 	Path string `json:"path"`
 
 	// Optional override endpoint (only needed for S3-compatible services like MinIO)

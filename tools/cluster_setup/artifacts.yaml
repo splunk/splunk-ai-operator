@@ -2239,7 +2239,7 @@ spec:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
                       azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    pattern: ^(s3|s3compat|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -4876,7 +4876,7 @@ spec:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
                       azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    pattern: ^(s3|s3compat|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -5525,15 +5525,15 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:build-17
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:087e40e
         - name: RELATED_IMAGE_RAY_WORKER
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-19
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:087e40e
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-1
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v1alpha1
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v1alpha1
         - name: RELATED_IMAGE_SLIM_API
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/udaya/slim-api:v0.0.1
         - name: SPLUNK_METRICS_INDEX_NAME
@@ -5545,10 +5545,10 @@ spec:
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
-          value: 2.44.0
-        image: docker.io/kpratyush775/splunk-ai-operator:v0.1.1
-        # image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.3
-        # image: docker.io/kpratyush775/splunk-ai-operator:v0.1.3
+          value: 2.53.0
+        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.7
+        # image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.7
+        # image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.7
         livenessProbe:
           httpGet:
             path: /healthz

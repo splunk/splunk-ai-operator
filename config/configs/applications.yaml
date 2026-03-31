@@ -514,6 +514,80 @@ applications:
         USE_SYSTEM_PERMISSIONS: "true"
         VLLM_WORKER_MULTIPROC_METHOD: spawn
   - args:
+      application_name: FoundationSec11Instruct
+      deployment_configs:
+        LLMDeployment:
+          gpu_type_options_override:
+            A10G:
+              ray_actor_options:
+                num_gpus: 2
+            H100:
+              ray_actor_options:
+                num_gpus: 0.5
+            L40S:
+              ray_actor_options:
+                num_gpus: 1
+            T4:
+              ray_actor_options:
+                num_gpus: 4
+                runtime_env:
+                  pip:
+                    - triton==3.2.0
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.FoundationSec11Instruct}}
+              min_replicas: {{.Replicas.FoundationSec11Instruct}}
+      deployment_type: text_gen_model_deployment
+      gpu_types: '["L40S"]'
+      model_definition:
+        gpu_type_model_config_override:
+          A10G:
+            engine_args:
+              tensor_parallel_size: 2
+          H100:
+            engine_args:
+              gpu_memory_utilization: 0.5
+              tensor_parallel_size: 1
+          L40S:
+            engine_args:
+              tensor_parallel_size: 1
+          T4:
+            engine_args:
+              dtype: half
+              tensor_parallel_size: 4
+        model_config:
+          engine_args: {}
+        model_id: foundation_sec_11_8b_instruct
+        model_loader:
+          object_storage:
+            prefix: model_artifacts/foundation_sec_11_8b_instruct
+      tokenizer_definition:
+        model_id: foundation_sec_11_8b_instruct
+        model_loader:
+          object_storage:
+            artifacts_list:
+              - config.json
+              - tokenizer_config.json
+              - tokenizer.json
+              - chat_template.jinja
+            prefix: model_artifacts/foundation_sec_11_8b_instruct
+    name: FoundationSec11Instruct
+    import_path: splunkai_models_apps.main:create_serve_app
+    route_prefix: /foundation_sec_11_instruct
+    runtime_env:
+      env_vars:
+        API_VERSION: "v1"
+        APPLICATION_NAME: foundation_sec_11_instruct
+        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
+        CLOUD_PROVIDER: "{{.CloudProvider}}"
+        ENABLE_AUTHN: "false"
+        ENABLE_AUTHZ: "false"
+        SERVICE_EXTERNAL_NAME: "ai-platform-models"
+        SERVICE_INTERNAL_NAME: "ai_platform_models"
+        SERVICE_NAME: "ai_platform_models"
+        SKIP_VERIFICATION: "true"
+        USE_SYSTEM_PERMISSIONS: "true"
+  - args:
       application_name: PromptInjectionCrossEncoder
       deployment_configs:
         ScoringModelDeployment:
@@ -545,6 +619,44 @@ applications:
         API_VERSION: "v1"
         APPLICATION_NAME: prompt_injection_cross_encoder
         ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
+        CLOUD_PROVIDER: "{{.CloudProvider}}"
+        ENABLE_AUTHN: "false"
+        ENABLE_AUTHZ: "false"
+        SERVICE_EXTERNAL_NAME: "ai-platform-models"
+        SERVICE_INTERNAL_NAME: "ai_platform_models"
+        SERVICE_NAME: "ai_platform_models"
+        SKIP_VERIFICATION: "true"
+        USE_SYSTEM_PERMISSIONS: "true"
+  - args:
+      application_name: FmTimeseries
+      custom_deployment_import_path: fm_timeseries.main:FMTimeseriesDeployment
+      deployment_configs:
+        FMTimeseriesDeployment:
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.FmTimeseries}}
+              min_replicas: {{.Replicas.FmTimeseries}}
+            ray_actor_options:
+              num_gpus: 0.1
+      deployment_type: custom_deployment
+      model_definition:
+        model_config:
+          num_layers: 25
+        model_id: fm_timeseries
+        model_loader:
+          object_storage:
+            artifacts_list:
+              - torch_model.pt
+            prefix: model_artifacts/ctsm_250m_bidirectional-rc-1.0
+    name: FmTimeseries
+    import_path: splunkai_models_apps.main:create_serve_app
+    route_prefix: /fm_timeseries
+    runtime_env:
+      env_vars:
+        API_VERSION: "v1"
+        APPLICATION_NAME: fm_timeseries
+        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
+        CHECKPOINT_FILE: "torch_model.pt"
         CLOUD_PROVIDER: "{{.CloudProvider}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"

@@ -889,6 +889,7 @@ func Test_Reconcile_stageOrdering(t *testing.T) {
 		"ServiceAccountReady",
 		"SlimConfigMapReady",
 		"FeatureConfigMapReady",
+		"OtelConfigMapReady",
 	}
 
 	condTypes := make(map[string]bool)
@@ -899,4 +900,276 @@ func Test_Reconcile_stageOrdering(t *testing.T) {
 	for _, stage := range expectedStages {
 		assert.True(t, condTypes[stage], "Expected condition %s to be set", stage)
 	}
+}
+
+// ---------- reconcileOtelConfigMap ----------
+
+func Test_reconcileOtelConfigMap_skipsWhenOtelDisabled(t *testing.T) {
+	s := buildTestScheme(t)
+	plat := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "plat", Namespace: "default"},
+		Spec: aiv1.AIPlatformSpec{
+			Sidecars: aiv1.SidecarSpec{Otel: false},
+		},
+	}
+
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim-svc", Namespace: "default", UID: "test-uid"},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "default"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ai, plat).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &SlimReconciler{Client: fakeClient, Scheme: s, Recorder: recorder}
+
+	err := r.reconcileOtelConfigMap(context.Background(), ai)
+	assert.NoError(t, err)
+
+	cm := &corev1.ConfigMap{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "slim-svc-otel-config", Namespace: "default",
+	}, cm)
+	assert.Error(t, err, "OTEL ConfigMap should not be created when OTEL is disabled")
+}
+
+func Test_reconcileOtelConfigMap_createsWhenOtelEnabled(t *testing.T) {
+	s := buildTestScheme(t)
+	plat := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "plat", Namespace: "default"},
+		Spec: aiv1.AIPlatformSpec{
+			Sidecars: aiv1.SidecarSpec{Otel: true},
+			SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+				Endpoint:  "https://splunk:8088",
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+			},
+		},
+	}
+
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim-svc", Namespace: "default", UID: "test-uid"},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "default"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ai, plat).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &SlimReconciler{Client: fakeClient, Scheme: s, Recorder: recorder}
+
+	err := r.reconcileOtelConfigMap(context.Background(), ai)
+	assert.NoError(t, err)
+
+	cm := &corev1.ConfigMap{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "slim-svc-otel-config", Namespace: "default",
+	}, cm)
+	assert.NoError(t, err)
+	assert.Contains(t, cm.Data["otel-config.yaml"], "slim-api-metrics")
+	assert.Contains(t, cm.Data["otel-config.yaml"], "localhost:8088")
+	assert.Contains(t, cm.Data["otel-config.yaml"], "splunk_hec/metrics")
+	assert.Contains(t, cm.Data["otel-config.yaml"], "splunk_hec/logs")
+	assert.Contains(t, cm.Data["otel-config.yaml"], "https://splunk:8088/services/collector")
+}
+
+// ---------- OTEL sidecar in deployment ----------
+
+func Test_reconcileSlimDeployment_withOtelSidecar(t *testing.T) {
+	os.Setenv("RELATED_IMAGE_SLIM_API", "splunk/slim-api:latest")
+	os.Setenv("RELATED_IMAGE_OTEL_COLLECTOR", "otel/collector:test")
+	defer os.Unsetenv("RELATED_IMAGE_SLIM_API")
+	defer os.Unsetenv("RELATED_IMAGE_OTEL_COLLECTOR")
+
+	s := buildTestScheme(t)
+	plat := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "plat", Namespace: "default"},
+		Spec: aiv1.AIPlatformSpec{
+			Sidecars: aiv1.SidecarSpec{Otel: true},
+			SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+				Endpoint:  "https://splunk:8088",
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+			},
+		},
+	}
+
+	otelCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim-svc-otel-config", Namespace: "default"},
+		Data:       map[string]string{"otel-config.yaml": "receivers: {}"},
+	}
+
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim-svc", Namespace: "default", UID: "test-uid"},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef:      corev1.ObjectReference{Name: "plat", Namespace: "default"},
+			AIPlatformUrl:      "ray.default.svc.cluster.local:8000",
+			ServiceAccountName: "slim-sa",
+			Replicas:           1,
+			SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ai, plat, otelCM).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &SlimReconciler{Client: fakeClient, Scheme: s, Recorder: recorder}
+
+	err := r.reconcileSlimDeployment(context.Background(), ai)
+	assert.NoError(t, err)
+
+	deploy := &appsv1.Deployment{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "slim-svc-slim-deployment", Namespace: "default",
+	}, deploy)
+	assert.NoError(t, err)
+
+	assert.Len(t, deploy.Spec.Template.Spec.Containers, 2, "should have slim-api + otel-collector")
+
+	otelContainer := deploy.Spec.Template.Spec.Containers[1]
+	assert.Equal(t, "otel-collector", otelContainer.Name)
+	assert.Equal(t, "otel/collector:test", otelContainer.Image)
+	assert.Len(t, otelContainer.Ports, 3)
+
+	portNames := make([]string, len(otelContainer.Ports))
+	for i, p := range otelContainer.Ports {
+		portNames[i] = p.Name
+	}
+	assert.Contains(t, portNames, "otlp-grpc")
+	assert.Contains(t, portNames, "otlp-http")
+	assert.Contains(t, portNames, "otel-metrics")
+
+	hasOtelVolume := false
+	for _, v := range deploy.Spec.Template.Spec.Volumes {
+		if v.Name == "otel-config" {
+			hasOtelVolume = true
+		}
+	}
+	assert.True(t, hasOtelVolume, "otel-config volume should be present")
+}
+
+// ---------- OTEL port on Service ----------
+
+func Test_reconcileSlimService_withOtelPort(t *testing.T) {
+	s := buildTestScheme(t)
+	plat := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "plat", Namespace: "default"},
+		Spec: aiv1.AIPlatformSpec{
+			Sidecars: aiv1.SidecarSpec{Otel: true},
+		},
+	}
+
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim-svc", Namespace: "default", UID: "test-uid"},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "default"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ai, plat).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &SlimReconciler{Client: fakeClient, Scheme: s, Recorder: recorder}
+
+	err := r.reconcileSlimService(context.Background(), ai)
+	assert.NoError(t, err)
+
+	svc := &corev1.Service{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "slim-svc-slim-service", Namespace: "default",
+	}, svc)
+	assert.NoError(t, err)
+	assert.Len(t, svc.Spec.Ports, 3, "should have http + metrics + otel-metrics")
+
+	portNames := make([]string, len(svc.Spec.Ports))
+	for i, p := range svc.Spec.Ports {
+		portNames[i] = p.Name
+	}
+	assert.Contains(t, portNames, "otel-metrics")
+}
+
+// ---------- isOtelEnabled ----------
+
+func Test_isOtelEnabled_true(t *testing.T) {
+	s := buildTestScheme(t)
+	plat := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "plat", Namespace: "default"},
+		Spec:       aiv1.AIPlatformSpec{Sidecars: aiv1.SidecarSpec{Otel: true}},
+	}
+
+	ai := &aiv1.AIService{
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "default"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(plat).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: s}
+
+	assert.True(t, r.isOtelEnabled(context.Background(), ai))
+}
+
+func Test_isOtelEnabled_false(t *testing.T) {
+	s := buildTestScheme(t)
+	plat := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "plat", Namespace: "default"},
+		Spec:       aiv1.AIPlatformSpec{Sidecars: aiv1.SidecarSpec{Otel: false}},
+	}
+
+	ai := &aiv1.AIService{
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "default"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(plat).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: s}
+
+	assert.False(t, r.isOtelEnabled(context.Background(), ai))
+}
+
+func Test_isOtelEnabled_noPlatformRef(t *testing.T) {
+	s := buildTestScheme(t)
+	ai := &aiv1.AIService{}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: s}
+
+	assert.False(t, r.isOtelEnabled(context.Background(), ai))
+}
+
+// ---------- ConfigMap OTEL defaults ----------
+
+func Test_reconcileSlimConfigMap_hasOtelDefaults(t *testing.T) {
+	s := buildTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim-svc", Namespace: "default", UID: "test-uid"},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ai).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &SlimReconciler{Client: fakeClient, Scheme: s, Recorder: recorder}
+
+	err := r.reconcileSlimConfigMap(context.Background(), ai)
+	assert.NoError(t, err)
+
+	cm := &corev1.ConfigMap{}
+	_ = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "slim-svc-slim-config", Namespace: "default",
+	}, cm)
+	assert.Equal(t, "true", cm.Data["OTEL_ENABLED"])
+	assert.Equal(t, "http://localhost:4317", cm.Data["OTEL_EXPORTER_OTLP_ENDPOINT"])
+	assert.Equal(t, "slim-api", cm.Data["OTEL_SERVICE_NAME"])
+	assert.Equal(t, "json", cm.Data["LOG_FORMAT"])
+	assert.Equal(t, "otlp", cm.Data["OTEL_METRICS_EXPORTER"])
+	assert.Equal(t, "otlp", cm.Data["OTEL_LOGS_EXPORTER"])
 }

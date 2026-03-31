@@ -31,6 +31,9 @@ func NewAzureClient(
 	namespace, container, prefix string,
 	vs ai.ObjectStorageSpec,
 ) (StorageClient, error) {
+	if container == "" {
+		return nil, fmt.Errorf("Azure Blob storage requires a container name; use path format azure://container-name/prefix (e.g. azure://my-container/model_artifacts). Without it, model deployments fail with 'Please specify a container name'")
+	}
 	var cred azcore.TokenCredential
 	var err error
 

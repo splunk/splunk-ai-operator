@@ -26,6 +26,7 @@ import (
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	common "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -53,6 +54,7 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		{"ServiceAccount", r.reconcileServiceAccount},
 		{"SlimConfigMap", r.reconcileSlimConfigMap},
 		{"FeatureConfigMap", r.reconcileFeatureConfigMap},
+		{"OtelConfigMap", r.reconcileOtelConfigMap},
 		{"Certificate", r.reconcileCertificate},
 		{"SlimDeployment", r.reconcileSlimDeployment},
 		{"SlimService", r.reconcileSlimService},
@@ -206,13 +208,22 @@ func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AI
 	defaults := map[string]string{
 		"SERVICE_NAME":                 "slim-api",
 		"SERVICE_INTERNAL_NAME":        "SLIM",
-		"SLIM_SERVICE_CMP":            "true",
-		"SPLUNK_ISSUERS":              "https://splunk-splunk-standalone-standalone-service:8089",
+		"SLIM_SERVICE_CMP":             "true",
+		"SPLUNK_ISSUERS":               "https://splunk-splunk-standalone-standalone-service:8089",
 		"ENABLE_AUTHZ":                 "false",
 		"ENABLE_AUTHN":                 "false",
 		"API_VERSION":                  "v1alpha1",
 		"FEATURE_CONFIG_FILE_LOCATION": "/etc/config/features_config.yaml",
 		"LOG_LEVEL":                    "info",
+		"LOG_FORMAT":                   "json",
+		"OTEL_ENABLED":                 "true",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317",
+		"OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+		"OTEL_SERVICE_NAME":           "slim-api",
+		"OTEL_RESOURCE_ATTRIBUTES":    "service.namespace=ai-platform,service.version=v1alpha1",
+		"OTEL_METRICS_EXPORTER":       "otlp",
+		"OTEL_LOGS_EXPORTER":          "otlp",
+		"OTEL_TRACES_EXPORTER":        "otlp",
 	}
 
 	found := &corev1.ConfigMap{}
@@ -311,6 +322,140 @@ func hasOwnerReference(obj metav1.Object, owner metav1.Object) bool {
 		}
 	}
 	return false
+}
+
+func (r *SlimReconciler) reconcileOtelConfigMap(ctx context.Context, ai *aiv1.AIService) error {
+	cmName := fmt.Sprintf("%s-otel-config", ai.Name)
+
+	aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	if err != nil {
+		return fmt.Errorf("fetching AIPlatform for OTEL config: %w", err)
+	}
+
+	if !aiPlatform.Spec.Sidecars.Otel {
+		return nil
+	}
+
+	otelConfig := r.renderSlimOtelConfig(ctx, ai, aiPlatform)
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: ai.Namespace,
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data["otel-config.yaml"] = otelConfig
+		return controllerutil.SetControllerReference(ai, cm, r.Scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("create/update OTEL ConfigMap %q: %w", cmName, err)
+	}
+	return nil
+}
+
+func (r *SlimReconciler) renderSlimOtelConfig(_ context.Context, ai *aiv1.AIService, aiPlatform *aiv1.AIPlatform) string {
+	hecEndpoint := fmt.Sprintf("%s/services/collector", aiPlatform.Spec.SplunkConfiguration.Endpoint)
+	secretName := aiPlatform.Spec.SplunkConfiguration.SecretRef.Name
+
+	_ = secretName // used only as reference; actual token injected via env var
+
+	return fmt.Sprintf(`receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+      http:
+        endpoint: "0.0.0.0:4318"
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "slim-api-metrics"
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["localhost:8088"]
+              labels:
+                service: "slim-api"
+                component: "%s"
+                namespace: "${NAMESPACE}"
+                pod: "${POD_NAME}"
+
+processors:
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+  attributes:
+    actions:
+      - key: service.name
+        value: "slim-api"
+        action: upsert
+      - key: service.namespace
+        value: "%s"
+        action: upsert
+      - key: deployment.environment
+        value: "production"
+        action: upsert
+  resource:
+    attributes:
+      - key: k8s.namespace.name
+        value: "%s"
+        action: upsert
+      - key: k8s.pod.name
+        value: "${POD_NAME}"
+        action: upsert
+
+exporters:
+  splunk_hec/metrics:
+    token: "${SPLUNK_ACCESS_TOKEN}"
+    endpoint: "%s"
+    source: "slim-api"
+    sourcetype: "slim-api:metrics"
+    index: "_metrics"
+    disable_compression: false
+    timeout: 10s
+    tls:
+      insecure_skip_verify: true
+  splunk_hec/logs:
+    token: "${SPLUNK_ACCESS_TOKEN}"
+    endpoint: "%s"
+    source: "slim-api"
+    sourcetype: "slim-api:logs"
+    index: "main"
+    disable_compression: false
+    timeout: 10s
+    tls:
+      insecure_skip_verify: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [batch, attributes, resource]
+      exporters: [splunk_hec/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [batch, attributes, resource]
+      exporters: [splunk_hec/logs]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: "0.0.0.0"
+                port: 8889
+`,
+		ai.Name,
+		ai.Namespace,
+		ai.Namespace,
+		hecEndpoint,
+		hecEndpoint,
+	)
 }
 
 func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AIService) error {
@@ -473,6 +618,56 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		return fmt.Errorf("ownerref on Deployment: %w", err)
 	}
 
+	otelEnabled := r.isOtelEnabled(ctx, ai)
+
+	containers := []corev1.Container{{
+		Name:            ai.Name,
+		Image:           os.Getenv("RELATED_IMAGE_SLIM_API"),
+		ImagePullPolicy: corev1.PullAlways,
+		Ports:           ports,
+		VolumeMounts:    mounts,
+		Resources:       ai.Spec.Resources,
+		Env:             env,
+		EnvFrom:         envFrom,
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
+			},
+			PeriodSeconds:    30,
+			FailureThreshold: 10,
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
+			},
+			PeriodSeconds:    30,
+			FailureThreshold: 10,
+		},
+		StartupProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
+			},
+			InitialDelaySeconds: 30,
+			PeriodSeconds:       30,
+			FailureThreshold:    10,
+		},
+	}}
+
+	if otelEnabled {
+		otelConfigName := fmt.Sprintf("%s-otel-config", ai.Name)
+		volumes = append(volumes, corev1.Volume{
+			Name: "otel-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: otelConfigName},
+				},
+			},
+		})
+
+		otelContainer := r.buildOtelSidecar(ctx, ai)
+		containers = append(containers, otelContainer)
+	}
+
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
 		deployment.ObjectMeta.Annotations = annotations
@@ -491,42 +686,11 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
-				Containers: []corev1.Container{{
-					Name:            ai.Name,
-					Image:           os.Getenv("RELATED_IMAGE_SLIM_API"),
-					ImagePullPolicy: corev1.PullAlways,
-					Ports:           ports,
-					VolumeMounts:    mounts,
-					Resources:       ai.Spec.Resources,
-					Env:             env,
-					EnvFrom:         envFrom,
-					LivenessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
-						},
-						PeriodSeconds:    30,
-						FailureThreshold: 10,
-					},
-					ReadinessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
-						},
-						PeriodSeconds:    30,
-						FailureThreshold: 10,
-					},
-					StartupProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
-						},
-						InitialDelaySeconds: 30,
-						PeriodSeconds:       30,
-						FailureThreshold:    10,
-					},
-				}},
-				Volumes:          volumes,
-				Affinity:         &ai.Spec.Affinity,
-				Tolerations:      ai.Spec.Tolerations,
-				ImagePullSecrets: ai.Spec.ImagePullSecrets,
+				Containers:         containers,
+				Volumes:            volumes,
+				Affinity:           &ai.Spec.Affinity,
+				Tolerations:        ai.Spec.Tolerations,
+				ImagePullSecrets:   ai.Spec.ImagePullSecrets,
 			},
 		}
 		return nil
@@ -535,6 +699,74 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		return fmt.Errorf("create/update Deployment: %w", err)
 	}
 	return nil
+}
+
+func (r *SlimReconciler) isOtelEnabled(ctx context.Context, ai *aiv1.AIService) bool {
+	if ai.Spec.AIPlatformRef.Name == "" {
+		return false
+	}
+	aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	if err != nil {
+		return false
+	}
+	return aiPlatform.Spec.Sidecars.Otel
+}
+
+func (r *SlimReconciler) buildOtelSidecar(_ context.Context, ai *aiv1.AIService) corev1.Container {
+	otelImage := sidecars.ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", "")
+
+	return corev1.Container{
+		Name:            "otel-collector",
+		Image:           otelImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Args:            []string{"--config=/etc/otel/otel-config.yaml"},
+		Ports: []corev1.ContainerPort{
+			{Name: "otlp-grpc", ContainerPort: 4317, Protocol: corev1.ProtocolTCP},
+			{Name: "otlp-http", ContainerPort: 4318, Protocol: corev1.ProtocolTCP},
+			{Name: "otel-metrics", ContainerPort: 8889, Protocol: corev1.ProtocolTCP},
+		},
+		Env: []corev1.EnvVar{
+			{Name: "SPLUNK_ACCESS_TOKEN", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.SplunkConfiguration.SecretRef.Name},
+					Key:                  "hec_token",
+				},
+			}},
+			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			}},
+			{Name: "NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			}},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "otel-config", MountPath: "/etc/otel", ReadOnly: true},
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(13133)},
+			},
+			PeriodSeconds:    30,
+			FailureThreshold: 5,
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(13133)},
+			},
+			PeriodSeconds:    10,
+			FailureThreshold: 3,
+		},
+	}
 }
 
 func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AIService) error {
@@ -548,6 +780,11 @@ func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AISe
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		ports = append(ports, corev1.ServicePort{
 			Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443),
+		})
+	}
+	if r.isOtelEnabled(ctx, ai) {
+		ports = append(ports, corev1.ServicePort{
+			Name: "otel-metrics", Port: 8889, TargetPort: intstr.FromInt(8889),
 		})
 	}
 	svc := &corev1.Service{
@@ -610,15 +847,26 @@ func (r *SlimReconciler) reconcileServiceMonitor(ctx context.Context, ai *aiv1.A
 	if !ai.Spec.Metrics.Enabled {
 		return nil
 	}
+
+	endpoints := []monitoringv1.Endpoint{
+		{Port: "metrics", Path: ai.Spec.Metrics.Path, Scheme: "http"},
+	}
+
+	if r.isOtelEnabled(ctx, ai) {
+		endpoints = append(endpoints, monitoringv1.Endpoint{
+			Port:   "otel-metrics",
+			Path:   "/metrics",
+			Scheme: "http",
+		})
+	}
+
 	sm := &monitoringv1.ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{Name: ai.Name + "-metrics", Namespace: ai.Namespace},
 		Spec: monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": ai.Name, "component": ai.Name},
 			},
-			Endpoints: []monitoringv1.Endpoint{
-				{Port: "metrics", Path: ai.Spec.Metrics.Path, Scheme: "http"},
-			},
+			Endpoints: endpoints,
 		},
 	}
 	if err := controllerutil.SetControllerReference(ai, sm, r.Scheme); err != nil {
@@ -629,9 +877,7 @@ func (r *SlimReconciler) reconcileServiceMonitor(ctx context.Context, ai *aiv1.A
 			Selector: metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": ai.Name, "component": ai.Name},
 			},
-			Endpoints: []monitoringv1.Endpoint{
-				{Port: "metrics", Path: ai.Spec.Metrics.Path, Scheme: "http"},
-			},
+			Endpoints: endpoints,
 		}
 		return nil
 	})

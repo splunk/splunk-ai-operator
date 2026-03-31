@@ -44,9 +44,13 @@ type Builder struct {
 }
 
 type ApplicationParams struct {
-	ArtifactBucketName string           `yaml:"ARTIFACTS_S3_BUCKET"`
-	CloudProvider      string           `yaml:"CLOUD_PROVIDER"`
-	Replicas           map[string]int32 `yaml:"REPLICAS"`
+	ArtifactBucketName   string           `yaml:"ARTIFACTS_S3_BUCKET"`
+	ArtifactsProvider    string           `yaml:"ARTIFACTS_PROVIDER"`
+	CloudProvider        string           `yaml:"CLOUD_PROVIDER"`
+	S3CompatObjectStoreEndpointUrl string        `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
+	S3CompatObjectStoreAccessKey   string        `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
+	S3CompatObjectStoreSecretKey   string        `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
+	Replicas             map[string]int32 `yaml:"REPLICAS"`
 }
 
 type WorkerConfigs map[string][]InstanceDetail
@@ -89,15 +93,30 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		return err
 	}
 
-	// Set CloudProvider based on URL scheme
-	var cloudProvider string
+	// Set CloudProvider and artifacts provider/bucket from URL scheme (for SDK model loaders).
+	// ARTIFACTS_PROVIDER matches storage client GetProvider(): s3/minio/seaweedfs/s3compat -> "s3", gs/gcs -> "gcs", azure -> "azure".
+	// S3 (AWS) uses cloudProvider "aws" when no custom endpoint; s3compat/minio/seaweedfs use "s3compat".
+	var cloudProvider, artifactsProvider string
 	switch u.Scheme {
 	case "s3":
-		cloudProvider = "aws"
-	case "gs":
+		if p.Spec.ObjectStorage.Endpoint != "" {
+			cloudProvider = "s3compat"
+		} else {
+			cloudProvider = "aws"
+		}
+		artifactsProvider = "s3"
+	case "s3compat", "minio", "seaweedfs":
+		cloudProvider = "s3compat"
+		artifactsProvider = "s3"
+	case "gs", "gcs":
 		cloudProvider = "gcp"
+		artifactsProvider = "gcs"
+	case "azure":
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
 	default:
-		cloudProvider = "azure" // TODO: FIX THIS, need to support minio
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
 	}
 
 	// Initialize the replicas map by iterating through features
@@ -135,10 +154,37 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
+	// S3-compatible backends (s3compat, minio, seaweedfs) need custom endpoint and credentials. S3 (AWS) uses region/IRSA only.
+	s3CompatScheme := (u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs")
+	s3CompatObjectStoreEndpoint := ""
+	if s3CompatScheme && p.Spec.ObjectStorage.Endpoint != "" {
+		s3CompatObjectStoreEndpoint = p.Spec.ObjectStorage.Endpoint
+	}
+
+	var s3CompatObjectStoreAccessKey, s3CompatObjectStoreSecretKey string
+	if p.Spec.ObjectStorage.SecretRef != "" && s3CompatScheme {
+		var secret corev1.Secret
+		secretRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Spec.ObjectStorage.SecretRef}
+		if err := b.Get(ctx, secretRef, &secret); err != nil {
+			logger.Error(err, "Failed to get object storage secret for S3-compatible credentials", "secret", p.Spec.ObjectStorage.SecretRef)
+			return err
+		}
+		if raw, ok := secret.Data["s3_access_key"]; ok {
+			s3CompatObjectStoreAccessKey = string(raw)
+		}
+		if raw, ok := secret.Data["s3_secret_key"]; ok {
+			s3CompatObjectStoreSecretKey = string(raw)
+		}
+	}
+
 	param := ApplicationParams{
-		ArtifactBucketName: u.Host,
-		CloudProvider:      cloudProvider,
-		Replicas:           replicasMap,
+		ArtifactBucketName:             u.Host,
+		ArtifactsProvider:              artifactsProvider,
+		CloudProvider:                  cloudProvider,
+		S3CompatObjectStoreEndpointUrl: s3CompatObjectStoreEndpoint,
+		S3CompatObjectStoreAccessKey:   s3CompatObjectStoreAccessKey,
+		S3CompatObjectStoreSecretKey:   s3CompatObjectStoreSecretKey,
+		Replicas:                       replicasMap,
 	}
 
 	// Use embedded applications.yaml content
@@ -670,24 +716,55 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	}, nil
 }
 
+// objectStorageSecretEnv returns env vars for S3COMPAT_OBJECT_STORE_ACCESS_KEY and S3COMPAT_OBJECT_STORE_SECRET_KEY from
+// the objectStorage secret (s3_access_key/s3_secret_key) for S3-compatible object storage.
+func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
+	if b.ai.Spec.ObjectStorage.SecretRef == "" {
+		return nil
+	}
+	secretName := b.ai.Spec.ObjectStorage.SecretRef
+	return []corev1.EnvVar{
+		{
+			Name: "S3COMPAT_OBJECT_STORE_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "s3_access_key",
+				},
+			},
+		},
+		{
+			Name: "S3COMPAT_OBJECT_STORE_SECRET_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "s3_secret_key",
+				},
+			},
+		},
+	}
+}
+
 func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
+	headEnv := []corev1.EnvVar{
+		{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
+		{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
+	}
+	headEnv = append(headEnv, b.objectStorageSecretEnv()...)
 	spec := corev1.PodSpec{
 		Containers: []corev1.Container{{
 			Name:            "ray-head",
 			Image:           SetImageRegistry("RELATED_IMAGE_RAY_HEAD", b.ai.Spec.Images.RayHeadGroupImage),
 			ImagePullPolicy: corev1.PullAlways,
 			Args: []string{
-				"ulimit -n 65536 && echo head && $KUBERAY_GEN_RAY_START_CMD",
+				"ulimit -n 65536; echo head; $KUBERAY_GEN_RAY_START_CMD",
 			},
 			Command: []string{
 				"/bin/bash",
 				"-lc",
 				"--",
 			},
-			Env: []corev1.EnvVar{
-				{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
-				{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
-			},
+			Env: headEnv,
 			Lifecycle: &corev1.Lifecycle{
 				PreStop: &corev1.LifecycleHandler{
 					Exec: &corev1.ExecAction{
@@ -783,10 +860,12 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 			combinedEnv = append(combinedEnv, corev1.EnvVar{Name: key, Value: value})
 		}
 	}
-	rayCommand := fmt.Sprintf(`echo %s worker
-        ulimit -n 65536
-    	export PATH="/home/ray/anaconda3/bin:$PATH"
-        KUBERAY_GEN_RAY_START_CMD=$(echo "$KUBERAY_GEN_RAY_START_CMD" | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g')
+	// S3-compatible object store credentials for models and SAIA (S3COMPAT_OBJECT_STORE_*)
+	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
+	rayCommand := fmt.Sprintf(`echo %s worker;
+        ulimit -n 65536;
+    	export PATH="/home/ray/anaconda3/bin:$PATH";
+        KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
         $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
 		Affinity:           b.ai.Spec.GPUSchedulingSpec.Affinity,

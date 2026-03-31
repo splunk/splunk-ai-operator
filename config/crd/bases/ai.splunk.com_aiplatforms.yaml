@@ -2239,7 +2239,7 @@ spec:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
                       azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    pattern: ^(s3|s3compat|gs|azure|minio|seaweedfs)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
