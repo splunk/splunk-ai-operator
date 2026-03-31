@@ -219,6 +219,8 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	// The feature implementation is responsible for creating its own subdirectories
 	// (e.g., /tasks, /models, /artifacts) as needed
 	taskObjectStorage := platform.Spec.ObjectStorage
+	featureMetadata := feature
+	featureMetadata.Env = nil
 	// Don't append feature name - just pass the bucket path directly
 	// taskObjectStorage.Path is already set from platform.Spec.ObjectStorage
 	return &aiApi.AIService{
@@ -231,7 +233,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			},
 		},
 		Spec: aiApi.AIServiceSpec{
-			Feature: feature,
+			Feature: featureMetadata,
 			Version: feature.Version,
 			AIPlatformRef: corev1.ObjectReference{
 				APIVersion: "ai.splunk.com/v1",
@@ -243,6 +245,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			TaskVolume:          taskObjectStorage,
 			SplunkConfiguration: platform.Spec.SplunkConfiguration,
 			VectorDbUrl:         vectorDbUrl,
+			Env:                 cloneStringMap(feature.Env),
 			Replicas:            1,
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
@@ -254,6 +257,17 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
 		},
 	}
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // CheckAIServiceStatus verifies that all AIService children have successful conditions.

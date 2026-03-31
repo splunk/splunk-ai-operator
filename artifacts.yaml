@@ -5546,7 +5546,7 @@ spec:
         - name: RELATED_IMAGE_RAY_WORKER
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17
         - name: RELATED_IMAGE_WEAVIATE
-          value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
+          value: semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_WEAVIATE_PROXY
           value: docker.io/kbhos698/weaviate-proxy:v1.0.28-6-g2cbe7b7
         - name: RELATED_IMAGE_SAIA_API
@@ -5554,14 +5554,14 @@ spec:
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
         - name: RELATED_IMAGE_FLUENT_BIT
-          value: docker.io/fluent/fluent-bit:1.9.6
+          value: fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR
-          value: docker.io/otel/opentelemetry-collector-contrib:0.122.1
+          value: otel/opentelemetry-collector-contrib:0.122.1
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v5
+        image: docker.io/splunk/splunk-ai-operator:0.1.0
         livenessProbe:
           httpGet:
             path: /healthz

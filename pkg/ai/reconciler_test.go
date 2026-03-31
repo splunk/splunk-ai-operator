@@ -55,6 +55,9 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 		Name:               "feature1",
 		Version:            "v1",
 		ServiceAccountName: "svc-account",
+		Env: map[string]string{
+			"WEAVIATE_PROXY_AUTH_MODE": "true",
+		},
 	}
 
 	r := &AIPlatformReconciler{Scheme: scheme}
@@ -66,9 +69,11 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	assert.Equal(t, "feature1", service.Spec.Feature.Name)
 	assert.Equal(t, "svc-account", service.Spec.ServiceAccountName)
 	assert.Equal(t, "weaviate-db", service.Spec.VectorDbUrl)
+	assert.Equal(t, map[string]string{"WEAVIATE_PROXY_AUTH_MODE": "true"}, service.Spec.Env)
 	assert.Equal(t, int32(1), service.Spec.Replicas)
 	assert.True(t, service.Spec.Metrics.Enabled)
 	assert.Equal(t, "/metrics", service.Spec.Metrics.Path)
+	assert.Nil(t, service.Spec.Feature.Env)
 
 	// Labels should include platform and feature
 	assert.Equal(t, "my-ai", service.Labels["aiplatform"])
@@ -87,7 +92,14 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 		},
 		Spec: aiApi.AIPlatformSpec{
 			Features: []aiApi.FeatureSpec{
-				{Name: "feature1", Version: "v1", ServiceAccountName: "svc-account"},
+				{
+					Name:               "feature1",
+					Version:            "v1",
+					ServiceAccountName: "svc-account",
+					Env: map[string]string{
+						"WEAVIATE_PROXY_AUTH_MODE": "true",
+					},
+				},
 			},
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
 		},
@@ -136,6 +148,7 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 	assert.Equal(t, "feature1", created.Spec.Feature.Name)
 	assert.Equal(t, "my-ai", created.Spec.AIPlatformRef.Name)
 	assert.Equal(t, "weaviate-db", created.Spec.VectorDbUrl)
+	assert.Equal(t, map[string]string{"WEAVIATE_PROXY_AUTH_MODE": "true"}, created.Spec.Env)
 }
 
 func TestReconcileFeatures_DoesNotRecreateExistingAIService(t *testing.T) {

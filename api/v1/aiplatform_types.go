@@ -184,6 +184,9 @@ type FeatureSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
 	Version string `json:"version,omitempty"`
+	// Env specifies environment variables to propagate to the child AIService.
+	// +kubebuilder:validation:Optional
+	Env map[string]string `json:"env,omitempty"`
 	// ScaleFactor is the desired fixed number of replicas for the feature.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
