@@ -48,6 +48,18 @@ load_config() {
     GPU_VOLUME_SIZE="$(yq eval '.nodeGroups.gpu.volumeSize' "$cfg")"
     GPU_VOLUME_TYPE="$(yq eval '.nodeGroups.gpu.volumeType' "$cfg")"
 
+    # GPU Availability Zones (optional - for capacity-constrained instance types like P5/H100)
+    GPU_AVAILABILITY_ZONES=()
+    while IFS= read -r az; do
+      [[ -n "$az" ]] && GPU_AVAILABILITY_ZONES+=("$az")
+    done < <(yq eval '.nodeGroups.gpu.availabilityZones[]' "$cfg" 2>/dev/null)
+
+    # Capacity Reservation (optional - for H100/P5 instances)
+    GPU_CAPACITY_RESERVATION_ID="$(yq eval '.nodeGroups.gpu.capacityReservation.id' "$cfg" 2>/dev/null)"
+    GPU_CAPACITY_RESERVATION_AZ="$(yq eval '.nodeGroups.gpu.capacityReservation.az' "$cfg" 2>/dev/null)"
+    [[ "$GPU_CAPACITY_RESERVATION_ID" == "null" ]] && GPU_CAPACITY_RESERVATION_ID=""
+    [[ "$GPU_CAPACITY_RESERVATION_AZ" == "null" ]] && GPU_CAPACITY_RESERVATION_AZ=""
+
     # Cluster options
     PRESERVE_VPC_ON_DELETE="$(yq eval '.cluster.preserveVpcOnDelete // false' "$cfg")"
 
@@ -183,6 +195,9 @@ load_config() {
     GPU_MAX=4
     GPU_VOLUME_SIZE=1000
     GPU_VOLUME_TYPE="gp3"
+    GPU_AVAILABILITY_ZONES=()
+    GPU_CAPACITY_RESERVATION_ID=""
+    GPU_CAPACITY_RESERVATION_AZ=""
     SPLUNK_APP_LOCAL_PATH=""
 
     # Hardcoded subnets for fallback
@@ -794,7 +809,11 @@ generate_node_groups() {
       k8s.io/cluster-autoscaler/enabled: \"true\"
       k8s.io/cluster-autoscaler/${CLUSTER_NAME}: owned"
   fi
-  if [[ "$ENABLE_GPU" == "true" ]]; then
+  # H100 with capacity reservation: node group created separately via CloudFormation
+  # All other GPU types (L40S, H100_NVL): standard eksctl managed node group
+  if [[ "$ENABLE_GPU" == "true" && "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    log "GPU nodes will be created separately with capacity reservation ${GPU_CAPACITY_RESERVATION_ID}"
+  elif [[ "$ENABLE_GPU" == "true" ]]; then
     nodes+="
   - name: gpu-nodes
     instanceType: ${GPU_INSTANCE_TYPE}
@@ -802,7 +821,17 @@ generate_node_groups() {
     minSize: ${GPU_MIN}
     maxSize: ${GPU_MAX}
     volumeSize: ${GPU_VOLUME_SIZE}
-    volumeType: ${GPU_VOLUME_TYPE}
+    volumeType: ${GPU_VOLUME_TYPE}"
+    # Lock to specific AZ when availabilityZones are specified (e.g. for H100_NVL)
+    if [[ ${#GPU_AVAILABILITY_ZONES[@]} -gt 0 ]]; then
+      nodes+="
+    availabilityZones:"
+      for az in "${GPU_AVAILABILITY_ZONES[@]}"; do
+        nodes+="
+      - ${az}"
+      done
+    fi
+    nodes+="
     tags:
       Name: ${CLUSTER_NAME}-gpu
       Environment: prod
@@ -884,6 +913,174 @@ EOF
 }
 
 create_cluster() { log "Creating EKS cluster..."; eksctl create cluster -f eks-cluster-config.yaml; ensure_kubeconfig; }
+
+# Create GPU node group with Capacity Block using CloudFormation.
+# Only called when DEFAULT_ACCELERATOR=H100 and GPU_CAPACITY_RESERVATION_ID is set.
+create_gpu_nodegroup_with_capacity_block() {
+  if [[ "$DEFAULT_ACCELERATOR" != "H100" || -z "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    return 0
+  fi
+
+  log "Creating GPU node group with Capacity Block (H100)..."
+  log "  Reservation: ${GPU_CAPACITY_RESERVATION_ID} in ${GPU_CAPACITY_RESERVATION_AZ}"
+
+  local stack_name="${CLUSTER_NAME}-gpu-capacity-block"
+  local cfn_template_file="/tmp/${stack_name}-template.yaml"
+
+  # Get cluster info
+  local cluster_info vpc_id cluster_sg
+  cluster_info=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" --query 'cluster')
+  vpc_id=$(echo "$cluster_info" | jq -r '.resourcesVpcConfig.vpcId')
+  cluster_sg=$(echo "$cluster_info" | jq -r '.resourcesVpcConfig.clusterSecurityGroupId')
+  log "  VPC: ${vpc_id}, Security Group: ${cluster_sg}"
+
+  # Get EKS GPU AMI
+  local ami_id
+  ami_id=$(aws ssm get-parameter \
+    --name "/aws/service/eks/optimized-ami/${K8S_VERSION}/amazon-linux-2-gpu/recommended/image_id" \
+    --region "${REGION}" --query 'Parameter.Value' --output text)
+  log "  AMI: ${ami_id}"
+
+  # Get node IAM role created by eksctl for the CPU node group
+  local node_role_arn
+  node_role_arn=$(aws iam list-roles \
+    --query "Roles[?contains(RoleName, '${CLUSTER_NAME}') && contains(RoleName, 'NodeInstanceRole')].Arn" \
+    --output text | head -1)
+  log "  Node Role: ${node_role_arn}"
+
+  if [[ -z "$node_role_arn" || "$node_role_arn" == "None" ]]; then
+    err "Node role not found — ensure CPU node group was created first."
+  fi
+
+  # Find subnet in the capacity reservation AZ
+  local subnet_id
+  subnet_id=$(aws ec2 describe-subnets --region "${REGION}" \
+    --filters "Name=availability-zone,Values=${GPU_CAPACITY_RESERVATION_AZ}" \
+              "Name=vpc-id,Values=${vpc_id}" \
+              "Name=tag:Name,Values=*eksctl-${CLUSTER_NAME}*Private*" \
+    --query 'Subnets[0].SubnetId' --output text)
+  if [[ -z "$subnet_id" || "$subnet_id" == "None" ]]; then
+    subnet_id=$(aws ec2 describe-subnets --region "${REGION}" \
+      --filters "Name=availability-zone,Values=${GPU_CAPACITY_RESERVATION_AZ}" \
+                "Name=vpc-id,Values=${vpc_id}" \
+      --query 'Subnets[0].SubnetId' --output text)
+  fi
+  if [[ -z "$subnet_id" || "$subnet_id" == "None" ]]; then
+    err "Subnet not found in ${GPU_CAPACITY_RESERVATION_AZ} for VPC ${vpc_id}"
+  fi
+  log "  Subnet: ${subnet_id}"
+
+  # Generate CloudFormation template
+  cat > "${cfn_template_file}" <<CFEOF
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS GPU Node Group with Capacity Block for H100'
+Parameters:
+  ClusterName:    { Type: String }
+  ReservationId:  { Type: String }
+  SubnetId:       { Type: String }
+  NodeRoleArn:    { Type: String }
+  SecurityGroupId:{ Type: String }
+  AmiId:          { Type: String }
+  InstanceType:   { Type: String }
+  VolumeSize:     { Type: Number }
+  DesiredCapacity:{ Type: Number }
+Resources:
+  GPULaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '\${ClusterName}-capacity-block-gpu'
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref AmiId
+        InstanceMarketOptions:
+          MarketType: capacity-block
+        CapacityReservationSpecification:
+          CapacityReservationTarget:
+            CapacityReservationId: !Ref ReservationId
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            /etc/eks/bootstrap.sh \${ClusterName} --kubelet-extra-args '--node-labels=eks.amazonaws.com/nodegroup=gpu-nodes,nvidia.com/gpu=true --register-with-taints=nvidia.com/gpu=true:NoSchedule'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '\${ClusterName}-gpu-node' }
+  GPUNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: gpu-nodes
+      NodeRole: !Ref NodeRoleArn
+      Subnets:
+        - !Ref SubnetId
+      CapacityType: CAPACITY_BLOCK
+      ScalingConfig:
+        MinSize: !Ref DesiredCapacity
+        MaxSize: !Ref DesiredCapacity
+        DesiredSize: !Ref DesiredCapacity
+      Labels:
+        nvidia.com/gpu: "true"
+      Taints:
+        - { Key: nvidia.com/gpu, Value: "true", Effect: NO_SCHEDULE }
+      LaunchTemplate:
+        Id: !Ref GPULaunchTemplate
+        Version: !GetAtt GPULaunchTemplate.LatestVersionNumber
+CFEOF
+
+  # Delete failed/rolled-back stack if present
+  local stack_status
+  stack_status=$(aws cloudformation describe-stacks --stack-name "${stack_name}" --region "${REGION}" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_EXISTS")
+
+  if [[ "$stack_status" == "CREATE_COMPLETE" || "$stack_status" == "UPDATE_COMPLETE" ]]; then
+    log "GPU node group already exists and is healthy — skipping."
+    rm -f "${cfn_template_file}"; return 0
+  elif [[ "$stack_status" != "NOT_EXISTS" ]]; then
+    log "Deleting ${stack_status} stack before retry..."
+    aws cloudformation delete-stack --stack-name "${stack_name}" --region "${REGION}"
+    aws cloudformation wait stack-delete-complete --stack-name "${stack_name}" --region "${REGION}" || true
+  fi
+
+  aws cloudformation deploy \
+    --template-file "${cfn_template_file}" \
+    --stack-name "${stack_name}" \
+    --region "${REGION}" \
+    --parameter-overrides \
+      ClusterName="${CLUSTER_NAME}" \
+      ReservationId="${GPU_CAPACITY_RESERVATION_ID}" \
+      SubnetId="${subnet_id}" \
+      NodeRoleArn="${node_role_arn}" \
+      SecurityGroupId="${cluster_sg}" \
+      AmiId="${ami_id}" \
+      InstanceType="${GPU_INSTANCE_TYPE}" \
+      VolumeSize="${GPU_VOLUME_SIZE}" \
+      DesiredCapacity="${GPU_DESIRED}" \
+    --capabilities CAPABILITY_IAM \
+    --no-fail-on-empty-changeset
+
+  rm -f "${cfn_template_file}"
+
+  local final_status
+  final_status=$(aws cloudformation describe-stacks --stack-name "${stack_name}" --region "${REGION}" \
+    --query 'Stacks[0].StackStatus' --output text)
+  if [[ "$final_status" != "CREATE_COMPLETE" && "$final_status" != "UPDATE_COMPLETE" ]]; then
+    err "CloudFormation stack failed: ${final_status}. Check: aws cloudformation describe-stack-events --stack-name ${stack_name} --region ${REGION}"
+  fi
+
+  log "GPU node group with Capacity Block created successfully."
+  log "Waiting for nodes to join cluster..."
+  sleep 30
+  kubectl get nodes -l nvidia.com/gpu=true 2>/dev/null || log "(Nodes may still be joining...)"
+}
 
 ensure_oidc() {
   log "Ensuring IAM OIDC provider is associated..."
@@ -1034,6 +1231,7 @@ ensure_ebs_irsa_role() {
   # Create IRSA for EBS CSI using eksctl (handles role creation, trust policy, and SA annotation)
   eksctl create iamserviceaccount \
     --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
     --namespace "${EBS_NS}" \
     --name "${EBS_SA}" \
     --role-name "${EBS_IRSA_ROLE_NAME}" \
@@ -1118,6 +1316,7 @@ install_cluster_autoscaler() {
   log "Installing Cluster Autoscaler with IRSA..."
   eksctl create iamserviceaccount \
     --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
     --name "${AUTOSCALER_SA}" \
     --namespace "${AUTOSCALER_NS}" \
     --role-name "${AUTOSCALER_ROLE_NAME}" \
@@ -1530,6 +1729,7 @@ Then re-run this script."
   log "Ensuring IRSA (role ${role}) for ${ns}/${sa} with policy ${policy_arn}"
   eksctl create iamserviceaccount \
     --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
     --namespace "${ns}" \
     --name "${sa}" \
     --role-name "${role}" \
@@ -2939,7 +3139,14 @@ install_ai_platform_stack() {
 }
 
 # ---------- CREATE / RECONCILE / DELETE FLOWS ----------
-create_cluster_flow() { create_cluster_config; create_cluster; }
+create_cluster_flow() {
+  create_cluster_config
+  create_cluster
+  # H100 with capacity reservation: eksctl cannot manage these nodes — create via CloudFormation
+  if [[ "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    create_gpu_nodegroup_with_capacity_block
+  fi
+}
 
 reconcile_flow() {
   ensure_oidc
@@ -2950,6 +3157,16 @@ reconcile_flow() {
   install_cluster_autoscaler
   install_nvidia_device_plugin
   uncordon_ready_nodes
+  # H100 with capacity reservation: create GPU node group if not already present
+  if [[ "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    local gpu_node_count
+    gpu_node_count=$(kubectl get nodes -l nvidia.com/gpu=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$gpu_node_count" -lt 1 ]]; then
+      create_gpu_nodegroup_with_capacity_block
+    else
+      log "Found ${gpu_node_count} H100 GPU node(s) — skipping capacity block creation."
+    fi
+  fi
   install_kube_prometheus
   install_cert_manager
   ensure_s3compat_credentials
@@ -2968,6 +3185,11 @@ main_install() {
 
   # Load configuration from YAML file
   load_config
+
+  # Force region for all AWS CLI and eksctl commands
+  export AWS_DEFAULT_REGION="${REGION}"
+  export AWS_REGION="${REGION}"
+  log "Using AWS Region: ${REGION}"
 
   # Validate and configure container images
   validate_image_config

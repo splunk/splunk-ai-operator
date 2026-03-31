@@ -157,7 +157,11 @@ load_config() {
   SPLUNK_OPERATOR_FILE=$(yq eval '.files.splunkOperator' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
 
-  log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
+  # Default accelerator type (must match a key in instance.yaml: L40S | H100 | H100_NVL)
+  DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "$DEFAULT_ACCELERATOR" == "null" || -z "$DEFAULT_ACCELERATOR" ]] && DEFAULT_ACCELERATOR="L40S"
+
+  log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}, accelerator=${DEFAULT_ACCELERATOR}"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi

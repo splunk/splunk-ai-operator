@@ -41,6 +41,28 @@ cluster:
 #        az: "us-east-2b"                  # OPTIONAL: Third availability zone
 
 # ---------- Node Groups ----------
+#
+# GPU TYPE QUICK REFERENCE — set instanceType and defaultAcceleratorType (under aiPlatform) together:
+#
+#   L40S  (default):
+#     instanceType:        g6e.12xlarge    (4x L40S GPUs, 48 GB VRAM each)
+#     defaultAcceleratorType: L40S
+#     capacityReservation: not required
+#     availabilityZones:   not required
+#
+#   H100:
+#     instanceType:        p5.4xlarge      (8x H100 GPUs, 80 GB VRAM each; capacity reservation required)
+#     defaultAcceleratorType: H100
+#     capacityReservation: required — uncomment block below and set id + az
+#     availabilityZones:   required — must match capacityReservation.az
+#     maxSize:             must equal desiredCapacity (capacity reservations are fixed-size)
+#
+#   H100_NVL:
+#     instanceType:        p4de.24xlarge   (8x H100 NVL GPUs, 94 GB VRAM each)
+#     defaultAcceleratorType: H100_NVL
+#     capacityReservation: not required
+#     availabilityZones:   not required
+#
 nodeGroups:
   cpu:
     enabled: true                         # Set to false to skip CPU node group
@@ -53,12 +75,25 @@ nodeGroups:
 
   gpu:
     enabled: true                         # Set to false to skip GPU nodes (saves cost)
-    instanceType: "g6e.12xlarge"          # GPU instance type (g6e.12xlarge=4xL40S GPUs, g5.xlarge=1xA10G)
+    instanceType: "g6e.12xlarge"          # CHANGE THIS: see GPU TYPE QUICK REFERENCE above
     desiredCapacity: 2                    # Initial number of GPU nodes
     minSize: 2                            # Minimum GPU nodes
-    maxSize: 4                            # Maximum GPU nodes
+    maxSize: 4                            # Maximum GPU nodes (set equal to desiredCapacity for H100)
     volumeSize: 1000                      # EBS volume size per GPU node (GB) - larger for model storage
     volumeType: "gp3"                     # EBS volume type
+
+    # ── H100 ONLY ──────────────────────────────────────────────────────────────
+    # Capacity Reservation: required for P5/H100 instances (scarce capacity).
+    # Uncomment and fill in when defaultAcceleratorType is H100.
+    # capacityReservation:
+    #   id: "cr-xxxxxxxxxxxxxxxxx"        # CHANGE THIS: your capacity reservation ID
+    #   az: "us-east-2c"                  # CHANGE THIS: AZ where the reservation exists
+
+    # Availability Zones: lock GPU nodes to the AZ matching the capacity reservation.
+    # Uncomment and fill in when defaultAcceleratorType is H100.
+    # availabilityZones:
+    #   - "us-east-2c"                    # CHANGE THIS: must match capacityReservation.az
+    # ───────────────────────────────────────────────────────────────────────────
 
 # ---------- Storage Configuration ----------
 # Object storage: only AWS S3 or external S3-compatible (no in-cluster MinIO install).
@@ -69,12 +104,13 @@ storage:
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
 
   # Object store: aws (S3) or external S3-compatible (s3compat, minio, seaweedfs). No in-cluster install.
-  # - MinIO: endpoint port 9000 (e.g. http://host:9000)
-  # - SeaweedFS S3: endpoint port 8333 (e.g. http://host:8333); start SeaweedFS with AWS_ACCESS_KEY_ID/SECRET matching auth below
+  # - s3compat: generic S3 API (MinIO :9000, SeaweedFS S3 :8333, etc.) — AIPlatform path uses s3compat://bucket
+  # - minio: same wiring as s3compat but path uses minio:// (use if an older operator webhook rejects s3compat://)
+  # - seaweedfs: path uses seaweedfs:// (requires operator webhook that allows that scheme)
   objectStore:
-    type: "seaweedfs"                        # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    type: "minio"                         # aws | s3compat | minio | seaweedfs (external only for non-aws)
     bucket: "ai-platform-bucket-minio-us-east-2"
-    endpoint: "http://3.144.157.201:8333"    # SeaweedFS S3 (port 8333). For MinIO use port 9000.
+    endpoint: "http://13.59.216.105:9000"    # MinIO API (9000) or SeaweedFS S3 gateway (8333)
     auth:
       rootUser: "minioadmin"
       rootPassword: "minioadmin"              # Must match SeaweedFS env (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) or MinIO root
@@ -115,7 +151,9 @@ images:
     # Option 2: Full path (ignores registry prefix)
     #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
-    image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.3"
+    # Bump tag after building fixed operator (SAIA 8Gi default, SchemaJobId persist, feature config)
+    #image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.31"
 
   # Splunk Enterprise Images
   splunk:
@@ -138,8 +176,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "ml-platform/ray/ray-head:build-v1alpha1"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-v1alpha1"
+    headImage: "ml-platform/ray/ray-head:build-008"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-008"
 
   # Weaviate Vector Database
   weaviate:
@@ -151,8 +189,8 @@ images:
   # SAIA (Splunk AI Assistant) Images
   saia:
     # Relative paths - registry prefix auto-applied
-    apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
+    apiImage: "ml-platform/saia/saia-api:build-005"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003"
 
   # Supporting Images
   fluentBit:
@@ -190,8 +228,12 @@ aiPlatform:
     rayWorker: "ray-worker-sa" # no change
     saiaService: "saia-service-sa" # no change
 
-  # Default accelerator type
-  defaultAcceleratorType: "L40S" 
+  # Default accelerator type — must match a top-level key in instance.yaml.
+  # Must be changed in sync with nodeGroups.gpu.instanceType (see GPU TYPE QUICK REFERENCE above).
+  #   L40S     → instanceType: g6e.12xlarge
+  #   H100     → instanceType: p5.4xlarge    (also uncomment capacityReservation + availabilityZones)
+  #   H100_NVL → instanceType: p4de.24xlarge
+  defaultAcceleratorType: "L40S"
 
   # Features to enable
   features: # no change

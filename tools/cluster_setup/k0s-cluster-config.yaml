@@ -1,0 +1,119 @@
+# ===================================================================
+# k0s Cluster Configuration Template for Splunk AI Platform
+# ===================================================================
+# IMPORTANT: This is a template file with placeholder values.
+# Copy this file and replace ALL placeholder values with your actual resources.
+#
+# Quick Start:
+#   1. Copy: cp k0s-cluster-config.yaml my-cluster-config.yaml
+#   2. Edit: vi my-cluster-config.yaml
+#   3. Replace all values marked with "CHANGE THIS"
+#   4. Run: CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+# ===================================================================
+
+# ---------- Cluster Configuration ----------
+cluster:
+  name: "my-ai-cluster"              # CHANGE THIS: Your cluster name
+  useExisting: "auto"                # auto | force | never
+  region: "us-east-2"               # CHANGE THIS: AWS region (used when creating EC2 instances)
+  sshUser: "ubuntu"                  # SSH username for nodes
+  sshKeyPath: "~/.ssh/id_rsa"       # CHANGE THIS: Path to SSH private key
+
+# ---------- Node Configuration ----------
+#
+# GPU TYPE QUICK REFERENCE — set gpuWorker instanceType and defaultAcceleratorType together:
+#
+#   L40S  (default):
+#     gpuWorker instanceType: g6e.12xlarge    (4x L40S GPUs, 48 GB VRAM each)
+#     defaultAcceleratorType: L40S
+#
+#   H100:
+#     gpuWorker instanceType: p5.4xlarge      (8x H100 GPUs, 80 GB VRAM each)
+#     defaultAcceleratorType: H100
+#
+#   H100_NVL:
+#     gpuWorker instanceType: p4de.24xlarge   (8x H100 NVL GPUs, 94 GB VRAM each)
+#     defaultAcceleratorType: H100_NVL
+#
+# On-premises (existing hardware):
+#   Set existingIPs below — instanceTypes are ignored when IPs are provided.
+#   The defaultAcceleratorType must still match the physical GPU in your nodes.
+#
+nodes:
+  controllers: 1                     # 1 (single) or 3 (HA)
+  cpuWorkers: 2                      # Number of CPU worker nodes (EC2 mode only)
+  gpuWorkers: 1                      # Number of GPU worker nodes (EC2 mode only)
+
+  # On-premises / existing nodes: provide IPs to skip EC2 instance creation.
+  # Leave lists empty to create new EC2 instances automatically.
+  existingIPs:
+    controllers: []                  # e.g. ["10.0.0.1"] or ["10.0.0.1", "10.0.0.2", "10.0.0.3"] for HA
+    workers: []                      # e.g. ["10.0.1.1", "10.0.1.2", "10.0.2.1"]
+
+# ---------- EC2 Instance Types (ignored when existingIPs are set) ----------
+instanceTypes:
+  controller: "t3.xlarge"            # Controller node (4 vCPU, 16 GB RAM)
+  cpuWorker: "m5.4xlarge"            # CPU worker (16 vCPU, 64 GB RAM)
+  gpuWorker: "g6e.12xlarge"          # CHANGE THIS: see GPU TYPE QUICK REFERENCE above
+
+# ---------- EC2 Network (required when creating EC2 instances) ----------
+ec2:
+  vpcId: ""                          # CHANGE THIS: your VPC ID (e.g. vpc-xxxxxxxxxxxxxxxxx)
+  subnetId: ""                       # CHANGE THIS: your subnet ID (e.g. subnet-xxxxxxxxxxxxxxxxx)
+  keyName: ""                        # CHANGE THIS: your EC2 key pair name
+
+# ---------- MinIO Object Storage ----------
+minio:
+  accessKey: "minioadmin"            # CHANGE THIS: MinIO admin username
+  secretKey: "minioadmin"            # CHANGE THIS: MinIO admin password
+  bucket: "ai-platform-data"        # MinIO bucket name
+
+# ---------- Kubernetes ----------
+kubernetes:
+  namespace: "ai-platform"           # no change
+
+# ---------- Splunk ----------
+splunk:
+  standaloneName: "splunk-standalone" # no change
+
+# ---------- ECR (for private AWS image repositories) ----------
+ecr:
+  account: ""                        # CHANGE THIS: your AWS account ID (e.g. "123456789012")
+                                     # Leave empty to auto-detect from AWS CLI
+
+# ---------- Image Pull Secrets ----------
+imagePullSecrets:
+  autoCreateECR: false               # Set true to auto-create ECR pull secret
+  dockerHub:
+    enabled: false                   # Set true if images are on Docker Hub (private)
+    username: ""
+    password: ""
+  gcr:
+    enabled: false
+  acr:
+    enabled: false
+  custom:
+    enabled: false
+
+# ---------- File Paths ----------
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"
+
+# ---------- AI Platform Configuration ----------
+aiPlatform:
+  namespace: "ai-platform"           # no change
+  name: "splunk-ai-stack"            # no change
+
+  # Service Accounts
+  serviceAccounts:
+    rayHead: "ray-head-sa"           # no change
+    rayWorker: "ray-worker-sa"       # no change
+    saiaService: "saia-service-sa"   # no change
+
+  # Default accelerator type — must match a top-level key in instance.yaml.
+  # Must be changed in sync with instanceTypes.gpuWorker (see GPU TYPE QUICK REFERENCE above).
+  #   L40S     → gpuWorker: g6e.12xlarge
+  #   H100     → gpuWorker: p5.4xlarge
+  #   H100_NVL → gpuWorker: p4de.24xlarge
+  defaultAcceleratorType: "L40S"
