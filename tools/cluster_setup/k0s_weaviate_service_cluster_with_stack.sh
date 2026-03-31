@@ -249,9 +249,9 @@ load_config() {
     fi
   fi
   AI_FEATURE_NAME_NORMALIZED="$(echo "${AI_FEATURE_NAME}" | tr '[:upper:]' '[:lower:]')"
-  RAY_REQUIRED="true"
-  if [[ "${AI_FEATURE_NAME_NORMALIZED}" == "weaviate-service" ]]; then
-    RAY_REQUIRED="false"
+  RAY_REQUIRED="$(yq eval '.aiPlatform.features[0].env.RAY_REQUIRED // "true"' "${CONFIG_FILE}" 2>/dev/null || true)"
+  if [[ -z "${RAY_REQUIRED}" || "${RAY_REQUIRED}" == "null" ]]; then
+    RAY_REQUIRED="true"
   fi
   if [[ -z "${SKIP_IMAGE_VALIDATION:-}" ]]; then
     SKIP_IMAGE_VALIDATION="${CONFIG_SKIP_IMAGE_VALIDATION:-false}"

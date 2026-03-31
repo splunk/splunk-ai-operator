@@ -196,9 +196,9 @@ load_config() {
     fi
   fi
   AI_FEATURE_NAME_NORMALIZED="$(echo "${AI_FEATURE_NAME}" | tr '[:upper:]' '[:lower:]')"
-  RAY_REQUIRED="true"
-  if [[ "${AI_FEATURE_NAME_NORMALIZED}" == "weaviate-service" ]]; then
-    RAY_REQUIRED="false"
+  RAY_REQUIRED="$(yq eval '.aiPlatform.features[0].env.RAY_REQUIRED // "true"' "$cfg" 2>/dev/null || true)"
+  if [[ -z "${RAY_REQUIRED}" || "${RAY_REQUIRED}" == "null" ]]; then
+    RAY_REQUIRED="true"
   fi
 
   # Allow configuring image validation skip in CONFIG_FILE.
