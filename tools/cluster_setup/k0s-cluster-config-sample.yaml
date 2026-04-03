@@ -1,0 +1,46 @@
+cluster:
+  name: "my-ai-cluster"
+  region: "us-east-2"
+  sshUser: "ubuntu"
+  sshKeyPath: "/Users/<username>/.ssh/key-pair.pem"        # CHANGE THIS
+
+nodes:
+  existingIPs:
+    controllers:
+      - 3.129.208.144                                    # CHANGE THIS: Your controller server IP
+    workers:
+      - 18.216.76.189
+
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "50Gi"
+  objectStore:
+    type: "aws"                                          # keeps in-cluster MinIO flow in this script
+    bucket: "my-company-ai-platform"
+
+kubernetes:
+  namespace: "ai-platform"
+
+splunk:
+  standaloneName: "splunk-standalone"
+
+images:
+  operator:
+    image: "docker.io/kbhos698/splunk-ai-operator:weaviate-service-v7"
+  splunk:
+    image: "docker.io/splunk/splunk:10.2"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+    proxyImage: "docker.io/kbhos698/weaviate-service:v1.0.1"
+
+aiPlatform:
+  name: "splunk-ai-stack"
+  features:
+    - name: "weaviate-service"
+      version: "1.0.0"
+      serviceAccountName: "saia-service-sa"
+
+files:
+  splunkOperator: "splunk-operator-cluster.yaml"
+  aiPlatform: "artifacts.yaml"

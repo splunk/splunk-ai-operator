@@ -56,7 +56,7 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 		Version:            "v1",
 		ServiceAccountName: "svc-account",
 		Env: map[string]string{
-			"WEAVIATE_PROXY_AUTH_MODE": "true",
+			"ENABLE_INTERACTIVE_TOKEN_AUTH": "true",
 		},
 	}
 
@@ -69,7 +69,7 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	assert.Equal(t, "feature1", service.Spec.Feature.Name)
 	assert.Equal(t, "svc-account", service.Spec.ServiceAccountName)
 	assert.Equal(t, "weaviate-db", service.Spec.VectorDbUrl)
-	assert.Equal(t, map[string]string{"WEAVIATE_PROXY_AUTH_MODE": "true"}, service.Spec.Env)
+	assert.Equal(t, map[string]string{"ENABLE_INTERACTIVE_TOKEN_AUTH": "true"}, service.Spec.Env)
 	assert.Equal(t, int32(1), service.Spec.Replicas)
 	assert.True(t, service.Spec.Metrics.Enabled)
 	assert.Equal(t, "/metrics", service.Spec.Metrics.Path)
@@ -97,7 +97,7 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 					Version:            "v1",
 					ServiceAccountName: "svc-account",
 					Env: map[string]string{
-						"WEAVIATE_PROXY_AUTH_MODE": "true",
+						"ENABLE_INTERACTIVE_TOKEN_AUTH": "true",
 					},
 				},
 			},
@@ -148,7 +148,7 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 	assert.Equal(t, "feature1", created.Spec.Feature.Name)
 	assert.Equal(t, "my-ai", created.Spec.AIPlatformRef.Name)
 	assert.Equal(t, "weaviate-db", created.Spec.VectorDbUrl)
-	assert.Equal(t, map[string]string{"WEAVIATE_PROXY_AUTH_MODE": "true"}, created.Spec.Env)
+	assert.Equal(t, map[string]string{"ENABLE_INTERACTIVE_TOKEN_AUTH": "true"}, created.Spec.Env)
 }
 
 func TestReconcileFeatures_DoesNotRecreateExistingAIService(t *testing.T) {

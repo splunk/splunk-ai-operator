@@ -8,7 +8,8 @@ set -euo pipefail
 # `weaviate-service` feature on an existing k0s cluster.
 # =============================================================================
 
-CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/k0s-cluster-config.yaml}"
 
 log()  { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
@@ -49,9 +50,9 @@ render_feature_env_block_from_config() {
   local feature_env_yaml=""
 
   printf '      env:\n'
-  printf '        WEAVIATE_PROXY_AUTH_MODE: "true"\n'
+  printf '        ENABLE_INTERACTIVE_TOKEN_AUTH: "true"\n'
 
-  feature_env_yaml="$(yq eval '(.aiPlatform.features[0].env // {}) | del(.WEAVIATE_PROXY_AUTH_MODE) | del(.RAY_REQUIRED)' "${CONFIG_FILE}" 2>/dev/null || true)"
+  feature_env_yaml="$(yq eval '(.aiPlatform.features[0].env // {}) | del(.ENABLE_INTERACTIVE_TOKEN_AUTH) | del(.RAY_REQUIRED)' "${CONFIG_FILE}" 2>/dev/null || true)"
   if [[ -n "${feature_env_yaml}" && "${feature_env_yaml}" != "null" && "${feature_env_yaml}" != "{}" ]]; then
     printf '%s\n' "${feature_env_yaml}" | sed 's/^/        /'
   fi
@@ -108,6 +109,9 @@ load_config() {
   log "Loading configuration from: ${CONFIG_FILE}"
   [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
   need yq
+
+  local config_dir
+  config_dir="$(cd -- "$(dirname -- "${CONFIG_FILE}")" && pwd)"
 
   CLUSTER_NAME="$(yq eval '.cluster.name // ""' "${CONFIG_FILE}")"
   SSH_USER="$(yq eval '.cluster.sshUser // "ubuntu"' "${CONFIG_FILE}")"
