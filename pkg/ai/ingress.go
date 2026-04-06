@@ -239,6 +239,9 @@ func ingressBackendForPath(p *aiApi.AIPlatform, path string) (string, int32, err
 		}
 		return fmt.Sprintf("%s-head-svc", p.Name), 8265, nil
 	case "/weaviate", "/weaviate/*":
+		if proxyServiceName, ok := weaviateServiceIngressBackend(p); ok {
+			return proxyServiceName, 80, nil
+		}
 		if p.Status.VectorDbServiceName == "" {
 			return "", 0, fmt.Errorf("ingress path %q requires a Weaviate backend service, but VectorDbServiceName is not populated yet", path)
 		}
@@ -249,4 +252,15 @@ func ingressBackendForPath(p *aiApi.AIPlatform, path string) (string, int32, err
 		}
 		return p.Status.RayServiceName, 8000, nil
 	}
+}
+
+func weaviateServiceIngressBackend(p *aiApi.AIPlatform) (string, bool) {
+	for _, feature := range p.Spec.Features {
+		if strings.EqualFold(strings.TrimSpace(feature.Name), "weaviate-service") {
+			// ReconcileFeatures names the AIService "<platform>-<feature>" and the feature Service
+			// "<aiservice>-weaviate-service".
+			return fmt.Sprintf("%s-%s-weaviate-service", p.Name, feature.Name), true
+		}
+	}
+	return "", false
 }

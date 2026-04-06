@@ -40,7 +40,9 @@ aiPlatform:
     - name: "weaviate-service"
       version: "1.0.0"
       serviceAccountName: "saia-service-sa"
+      env:
+        SPLUNK_ISSUERS: "https://splunk-splunk-standalone-standalone-service:8089"
 
 files:
-  splunkOperator: "splunk-operator-cluster.yaml"
-  aiPlatform: "artifacts.yaml"
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"

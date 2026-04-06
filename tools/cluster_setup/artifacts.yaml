@@ -5561,7 +5561,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v7
+        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v8
         livenessProbe:
           httpGet:
             path: /healthz

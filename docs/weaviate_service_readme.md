@@ -34,20 +34,31 @@ The k0s weaviate-service script enables `WEAVIATE_PROXY_AUTH_MODE=true` by defau
 
 For k0s:
 
-```bash
-cd /path/to/splunk-ai-operator
+Copy the sample config into `tools/cluster_setup` and update it for your environment:
 
-CONFIG_FILE=config/samples/k0s-cluster-config-sample.yaml \
-bash tools/cluster_setup/k0s_weaviate_service_cluster_with_stack.sh install
+```bash
+cd tools/cluster_setup
+
+cp ../../config/samples/k0s-cluster-config-sample.yaml \
+  k0s-cluster-config-local.yaml
+```
+
+Then install using the copied config:
+
+```bash
+cd tools/cluster_setup
+
+CONFIG_FILE=k0s-cluster-config-local.yaml \
+bash k0s_weaviate_service_cluster_with_stack.sh install
 ```
 
 For EKS:
 
 ```bash
-cd /path/to/splunk-ai-operator
+cd tools/cluster_setup
 
-CONFIG_FILE=config/samples/eks-cluster-config.yaml \
-bash tools/cluster_setup/eks_weaviate_service_cluster_with_stack.sh install
+CONFIG_FILE=eks-cluster-config.yaml \
+bash eks_weaviate_service_cluster_with_stack.sh install
 ```
 
 ## Verify
