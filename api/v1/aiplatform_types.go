@@ -40,6 +40,42 @@ type AIPlatform struct {
 	Status AIPlatformStatus `json:"status,omitempty"`
 }
 
+// WorkerTierSpec defines a single worker tier for a GPU type (mirrors instance.yaml structure).
+type WorkerTierSpec struct {
+	// Tier is the name of this worker tier, e.g. "h200-0-gpu"
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Tier string `json:"tier"`
+
+	// GPUsPerPod is the number of GPUs allocated per pod (0 for CPU-only tiers)
+	// +kubebuilder:validation:Minimum=0
+	GPUsPerPod int32 `json:"gpusPerPod"`
+
+	// Env defines environment variables to set on pods of this tier (e.g. NVIDIA_VISIBLE_DEVICES)
+	// +kubebuilder:validation:Optional
+	Env map[string]string `json:"env,omitempty"`
+
+	// Resources defines the compute resources for pods of this tier
+	// +kubebuilder:validation:Optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// GPUWorkerConfig defines the GPU type configuration to inject into the operator
+// without requiring an image rebuild. Entries here are merged into the
+// <name>-instances and <name>-feature-<feature> ConfigMaps at reconcile time.
+// Existing ConfigMap keys are never overwritten — only new GPU type keys are added.
+type GPUWorkerConfig struct {
+	// InstanceTypes maps GPU type keys (e.g. "H200") to their worker tier definitions.
+	// These are merged into the <name>-instances ConfigMap.
+	// +kubebuilder:validation:Optional
+	InstanceTypes map[string][]WorkerTierSpec `json:"instanceTypes,omitempty"`
+
+	// InstanceScale maps GPU type keys to per-tier replica counts.
+	// These are merged into the <name>-feature-<feature> ConfigMap under instanceScale.
+	// +kubebuilder:validation:Optional
+	InstanceScale map[string]map[string]int32 `json:"instanceScale,omitempty"`
+}
+
 // AIPlatformSpec defines the desired state
 type AIPlatformSpec struct {
 	// ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
@@ -91,6 +127,12 @@ type AIPlatformSpec struct {
 	// Examples: "nvidia-tesla-t4", "nvidia-tesla-v100", "nvidia-a100"
 	// +kubebuilder:validation:Optional
 	DefaultAcceleratorType string `json:"defaultAcceleratorType,omitempty"`
+
+	// GPUWorkerConfig defines custom GPU type configurations to inject at reconcile time.
+	// Use this to add support for new GPU types (e.g. H200) without rebuilding the operator image.
+	// Entries are merged into the instances and feature ConfigMaps — existing keys are never overwritten.
+	// +kubebuilder:validation:Optional
+	GPUWorkerConfig *GPUWorkerConfig `json:"gpuWorkerConfig,omitempty"`
 
 	// SplunkConfiguration defines the Splunk integration configuration
 	// +kubebuilder:validation:Optional

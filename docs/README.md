@@ -20,6 +20,7 @@ Welcome to the Splunk AI Operator documentation!
 - **[Storage Artifacts](configuration/storage-artifacts.md)** - S3/GCS/Azure storage for AI models
 - **[Ingress Configuration](configuration/ingress-configuration.md)** - Expose AI services externally
 - **[Webhook Certificates](configuration/webhook-certificates.md)** - Configure admission webhook TLS
+- **[Custom GPU Accelerator](configuration/custom-gpu-accelerator.md)** - Add support for a new GPU type (H200, A100, etc.)
 
 ## Project Documentation
 

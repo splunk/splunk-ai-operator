@@ -153,20 +153,34 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	// Initialize the replicas map by iterating through features
 	replicasMap := make(map[string]int32)
 
+	featureDir := os.Getenv("FEATURE_CONFIG_DIR")
+	if featureDir == "" {
+		featureDir = "features"
+	}
 	for _, feature := range p.Spec.Features {
-		// Read YAML file for this feature
-		fileName := filepath.Join("features", feature.Name+".yaml")
-		yamlData, err := os.ReadFile(fileName)
-		if err != nil {
-			logger.Error(err, "Failed to read feature YAML file", "feature", feature.Name, "file", fileName)
-			continue
+		// Read feature YAML: prefer <name>-feature-<feature> ConfigMap, fall back to image file.
+		var yamlData []byte
+		featureCM := &corev1.ConfigMap{}
+		featureCMName := p.Name + "-feature-" + feature.Name
+		if err := b.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: featureCMName}, featureCM); err == nil {
+			if val, ok := featureCM.Data[feature.Name+".yaml"]; ok {
+				yamlData = []byte(val)
+			}
+		}
+		if len(yamlData) == 0 {
+			fileName := filepath.Join(featureDir, feature.Name+".yaml")
+			var readErr error
+			yamlData, readErr = os.ReadFile(fileName)
+			if readErr != nil {
+				logger.Error(readErr, "Failed to read feature YAML file", "feature", feature.Name, "file", fileName)
+				continue
+			}
 		}
 
 		// Parse the YAML content into a map
 		var featureConfig FeatureConfig
-		err = yaml.UnmarshalStrict(yamlData, &featureConfig)
-		if err != nil {
-			logger.Error(err, "Failed to parse feature YAML", "feature", feature.Name, "file", fileName)
+		if parseErr := yaml.UnmarshalStrict(yamlData, &featureConfig); parseErr != nil {
+			logger.Error(parseErr, "Failed to parse feature YAML", "feature", feature.Name)
 			continue
 		}
 
@@ -224,15 +238,26 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		AcceleratorType:                b.effectiveAcceleratorType(),
 	}
 
-	// Use embedded applications.yaml content
-	applicationFile := os.Getenv("APPLICATION_FILE")
-	if applicationFile == "" {
-		applicationFile = "applications.yaml" // fallback for backward compatibility
+	// Read applications.yaml: prefer <name>-applications ConfigMap (user-editable), fall back to image file.
+	var templateData []byte
+	appsCM := &corev1.ConfigMap{}
+	appsCMName := p.Name + "-applications"
+	if err := b.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: appsCMName}, appsCM); err == nil {
+		if val, ok := appsCM.Data["applications.yaml"]; ok {
+			templateData = []byte(val)
+		}
 	}
-	templateData, err := os.ReadFile(applicationFile)
-	if err != nil {
-		logger.Error(err, "Failed to read embedded applications.yaml")
-		return err
+	if len(templateData) == 0 {
+		applicationFile := os.Getenv("APPLICATION_FILE")
+		if applicationFile == "" {
+			applicationFile = "applications.yaml"
+		}
+		var readErr error
+		templateData, readErr = os.ReadFile(applicationFile)
+		if readErr != nil {
+			logger.Error(readErr, "Failed to read applications.yaml")
+			return readErr
+		}
 	}
 
 	// Create a new template and parse the embedded YAML as a template
@@ -682,35 +707,60 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	head.Template.ObjectMeta.Annotations = annotations
 	head.Template.ObjectMeta.Labels = labels
 
-	instanceFile := os.Getenv("INSTANCE_FILE")
-	if instanceFile == "" {
-		instanceFile = "instance.yaml" // fallback for backward compatibility
+	// Read instance.yaml: prefer <name>-instances ConfigMap (user-editable), fall back to image file.
+	var instanceYamlData []byte
+	instanceCM := &corev1.ConfigMap{}
+	instanceCMName := b.ai.Name + "-instances"
+	if err := b.Get(ctx, types.NamespacedName{Namespace: b.ai.Namespace, Name: instanceCMName}, instanceCM); err == nil {
+		if val, ok := instanceCM.Data["instance.yaml"]; ok {
+			instanceYamlData = []byte(val)
+		}
 	}
-	instanceYamlFile, err := os.ReadFile(instanceFile)
-	if err != nil {
-		return nil, fmt.Errorf("error reading YAML file: %v", err)
+	if len(instanceYamlData) == 0 {
+		instanceFile := os.Getenv("INSTANCE_FILE")
+		if instanceFile == "" {
+			instanceFile = "instance.yaml"
+		}
+		var readErr error
+		instanceYamlData, readErr = os.ReadFile(instanceFile)
+		if readErr != nil {
+			return nil, fmt.Errorf("error reading instance.yaml: %v", readErr)
+		}
 	}
 
 	var instanceMap WorkerConfigs
 	// must use sigs.k8s.io/yaml , stdlib yaml doesn't understand corev1
-	if err := k8syaml.UnmarshalStrict(instanceYamlFile, &instanceMap); err != nil {
-		return nil, fmt.Errorf("error reading YAML file: %v", err)
+	if err := k8syaml.UnmarshalStrict(instanceYamlData, &instanceMap); err != nil {
+		return nil, fmt.Errorf("error parsing instance.yaml: %v", err)
 	}
 
 	// initialize instanceScale to avoid nil map assignment panic
 	instanceScale := make(map[string]int32)
+	featureDir := os.Getenv("FEATURE_CONFIG_DIR")
+	if featureDir == "" {
+		featureDir = "features"
+	}
 	for _, feature := range b.ai.Spec.Features {
-		// Read YAML file for this feature
-		fileName := filepath.Join("features", feature.Name+".yaml")
-		yamlData, err := os.ReadFile(fileName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read feature YAML file %s: %v", feature.Name, err)
-
+		// Read feature YAML: prefer <name>-feature-<feature> ConfigMap, fall back to image file.
+		var yamlData []byte
+		featureCM := &corev1.ConfigMap{}
+		featureCMName := b.ai.Name + "-feature-" + feature.Name
+		if err := b.Get(ctx, types.NamespacedName{Namespace: b.ai.Namespace, Name: featureCMName}, featureCM); err == nil {
+			if val, ok := featureCM.Data[feature.Name+".yaml"]; ok {
+				yamlData = []byte(val)
+			}
+		}
+		if len(yamlData) == 0 {
+			filePath := filepath.Join(featureDir, feature.Name+".yaml")
+			var readErr error
+			yamlData, readErr = os.ReadFile(filePath)
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read feature YAML file %s: %v", feature.Name, readErr)
+			}
 		}
 		var featureConfig FeatureConfig
-		err = yaml.UnmarshalStrict(yamlData, &featureConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse feature YAML file %s: %v", fileName, err)
+		if parseErr := yaml.UnmarshalStrict(yamlData, &featureConfig); parseErr != nil {
+			return nil, fmt.Errorf("failed to parse feature YAML file %s: %v", feature.Name, parseErr)
 		}
 		for k, val := range featureConfig.InstanceScale[acceleratorType] {
 			old_val, ok := instanceScale[k]
@@ -843,6 +893,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 	headEnv := []corev1.EnvVar{
 		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
 		{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
+		{Name: "SPLUNK_AI_PLATFORM_MODELS_CMP", Value: "true"},
 	}
 	headEnv = append(headEnv, b.rayS3DownloadEnv()...)
 	headEnv = append(headEnv, b.objectStorageSecretEnv()...)
@@ -934,7 +985,8 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 		{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
 		{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
 		{Name: "GPG_PUBLICKEY_PATH", Value: "kv-splunk/al-platform.ray-worker-sa/gpgkey"}, // FIXME
-		{Name: "GPU_TYPE", Value: b.effectiveAcceleratorType()},                          // FIXME
+		{Name: "GPU_TYPE", Value: b.effectiveAcceleratorType()},                           // FIXME
+		{Name: "SPLUNK_AI_PLATFORM_MODELS_CMP", Value: "true"},
 	}
 
 	// Combine defaultEnv with cfg.Env to create combinedEnv

@@ -2,8 +2,8 @@ package raybuilder
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"path"
 
 	enterpriseApi "github.com/splunk/splunk-ai-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -500,14 +500,17 @@ func (b *Builder) ReconcileApplicationsConfigMap(ctx context.Context, p *enterpr
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
+		// Only seed from image on first creation — preserve user edits thereafter.
 		if _, exists := cm.Data["applications.yaml"]; !exists {
-			home := os.Getenv("HOME")
-			content, err := os.ReadFile(path.Join(home, "applications.yaml"))
+			applicationFile := os.Getenv("APPLICATION_FILE")
+			if applicationFile == "" {
+				applicationFile = "applications.yaml"
+			}
+			content, err := os.ReadFile(applicationFile)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to read applications.yaml from image: %w", err)
 			}
 			cm.Data["applications.yaml"] = string(content)
-			//cm.Data["applications.yaml"] = DefaultApplicationsYaml
 		}
 		return controllerutil.SetOwnerReference(p, cm, b.Scheme)
 	})

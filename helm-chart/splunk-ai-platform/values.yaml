@@ -126,8 +126,45 @@ images:
   # - name: ecr-registry-secret
   # - name: dockerhub-secret
 
-# Default GPU type to use for Ray worker groups
-defaultAcceleratorType: ""
+# Default GPU type to use for Ray worker groups (must match a top-level key in the operator's instance.yaml, e.g. L40S)
+defaultAcceleratorType: "L40S"
+
+# gpuWorkerConfig defines custom GPU type configurations injected at reconcile time.
+# Use this to add support for a new GPU type without rebuilding the operator image.
+# New GPU type keys are merged into the instances and feature ConfigMaps.
+# Existing keys are never overwritten — image defaults are preserved.
+#
+# Example: adding H200 support
+# gpuWorkerConfig:
+#   instanceTypes:
+#     H200:
+#       - tier: h200-0-gpu
+#         gpusPerPod: 0
+#         env:
+#           NVIDIA_VISIBLE_DEVICES: void
+#         resources:
+#           limits:
+#             cpu: "16"
+#             memory: "32Gi"
+#             ephemeral-storage: "10Gi"
+#             nvidia.com/gpu: "0"
+#           requests:
+#             cpu: "4"
+#       - tier: h200-1-gpu
+#         gpusPerPod: 1
+#         resources:
+#           requests:
+#             cpu: "4"
+#           limits:
+#             cpu: "16"
+#             memory: "96Gi"
+#             ephemeral-storage: "100Gi"
+#             nvidia.com/gpu: "1"
+#   instanceScale:
+#     H200:
+#       h200-0-gpu: 1
+#       h200-1-gpu: 2
+gpuWorkerConfig: {}
 
 # SplunkConfigurationSpec instance reference (optional)
 # Set to null or comment out if Splunk is not configured
