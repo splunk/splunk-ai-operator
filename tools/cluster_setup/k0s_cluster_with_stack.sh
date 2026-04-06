@@ -161,6 +161,16 @@ load_config() {
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType' "${CONFIG_FILE}" 2>/dev/null || echo "")
   [[ "$DEFAULT_ACCELERATOR" == "null" || -z "$DEFAULT_ACCELERATOR" ]] && DEFAULT_ACCELERATOR="L40S"
 
+  # GPU worker config — optional, used to add new GPU types without rebuilding the operator image.
+  # Reads the full gpuWorkerConfig block and indents it for embedding in the AIPlatform CR spec.
+  local _gpu_worker_config_raw
+  _gpu_worker_config_raw=$(yq eval '.aiPlatform.gpuWorkerConfig' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ "$_gpu_worker_config_raw" == "null" || -z "$_gpu_worker_config_raw" ]]; then
+    GPU_WORKER_CONFIG_YAML=""
+  else
+    GPU_WORKER_CONFIG_YAML=$(echo "$_gpu_worker_config_raw" | sed 's/^/  /')
+  fi
+
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}, accelerator=${DEFAULT_ACCELERATOR}"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
@@ -1156,7 +1166,7 @@ install_nvidia_device_plugin() {
   log "Installing NVIDIA GPU Operator..."
 
   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
-  helm repo update
+  helm repo update nvidia
 
   helm_retry 3 upgrade --install gpu-operator nvidia/gpu-operator \
     --namespace gpu-operator --create-namespace \
@@ -1172,7 +1182,7 @@ install_kube_prometheus() {
   log "Installing kube-prometheus-stack..."
 
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-  helm repo update
+  helm repo update prometheus-community
 
   helm_retry 3 upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
@@ -1188,7 +1198,7 @@ install_otel_operator_and_contrib_collector() {
   log "Installing OpenTelemetry Operator..."
 
   helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
-  helm repo update
+  helm repo update open-telemetry
 
   # Use cert-manager for webhook certificates (now that konnectivity is fixed)
   helm_retry 3 upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
@@ -1207,7 +1217,7 @@ install_ray_operator() {
   log "Installing KubeRay Operator..."
 
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  helm repo update
+  helm repo update kuberay
 
   helm_retry 3 upgrade --install kuberay-operator kuberay/kuberay-operator \
     --namespace ray-system --create-namespace \
@@ -1735,6 +1745,19 @@ EOF
 
   # Apply AIPlatform CR (matching EKS script pattern)
   log "Applying AIPlatform CR: ${CLUSTER_NAME}-ai-platform"
+
+  # Build optional gpuWorkerConfig block — only included when set in config file
+  local gpu_worker_config_block=""
+  if [[ -n "${GPU_WORKER_CONFIG_YAML}" ]]; then
+    gpu_worker_config_block=$(cat <<EOF
+
+  # GPU worker config — custom GPU types injected at reconcile time (no image rebuild needed)
+  gpuWorkerConfig:
+${GPU_WORKER_CONFIG_YAML}
+EOF
+)
+  fi
+
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -1747,6 +1770,9 @@ spec:
     region: us-east-1
     endpoint: http://minio.minio-system.svc.cluster.local:9000
     secretRef: s3-secret
+
+  # Default GPU accelerator type
+  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
   # Image configuration (including pull secrets for private registries)
   images:
@@ -1789,6 +1815,7 @@ ${image_pull_secrets}
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
+${gpu_worker_config_block}
 YAML
 
   log "AIPlatform CR created successfully"

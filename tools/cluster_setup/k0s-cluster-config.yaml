@@ -117,3 +117,38 @@ aiPlatform:
   #   H100     → gpuWorker: p5.4xlarge
   #   H100_NVL → gpuWorker: p4de.24xlarge
   defaultAcceleratorType: "L40S"
+
+  # gpuWorkerConfig: define custom GPU types without rebuilding the operator image.
+  # The operator merges these into the <name>-instances and <name>-feature-saia ConfigMaps
+  # at reconcile time. Existing keys are never overwritten.
+  # Uncomment and fill in when adding a GPU type not built into the operator image.
+  #
+  # gpuWorkerConfig:
+  #   instanceTypes:
+  #     H200:
+  #       - tier: h200-0-gpu
+  #         gpusPerPod: 0
+  #         env:
+  #           NVIDIA_VISIBLE_DEVICES: void
+  #         resources:
+  #           limits:
+  #             cpu: "16"
+  #             memory: "32Gi"
+  #             ephemeral-storage: "10Gi"
+  #             nvidia.com/gpu: "0"
+  #           requests:
+  #             cpu: "4"
+  #       - tier: h200-1-gpu
+  #         gpusPerPod: 1
+  #         resources:
+  #           requests:
+  #             cpu: "4"
+  #           limits:
+  #             cpu: "16"
+  #             memory: "96Gi"
+  #             ephemeral-storage: "100Gi"
+  #             nvidia.com/gpu: "1"
+  #   instanceScale:
+  #     H200:
+  #       h200-0-gpu: 1
+  #       h200-1-gpu: 2
