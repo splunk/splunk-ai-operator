@@ -17,6 +17,7 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	enterpriseApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/internal/telemetry"
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder/raystatus"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
@@ -104,7 +105,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	replicasMap := make(map[string]int32)
 
 	for _, feature := range p.Spec.Features {
-		if !featureRequiresRay(feature.Name) {
+		if !featuresregistry.RequiresRay(feature.Name) {
 			logger.Info("Skipping non-Ray feature for Ray application scaling", "feature", feature.Name)
 			continue
 		}
@@ -620,7 +621,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	// initialize instanceScale to avoid nil map assignment panic
 	instanceScale := make(map[string]int32)
 	for _, feature := range b.ai.Spec.Features {
-		if !featureRequiresRay(feature.Name) {
+		if !featuresregistry.RequiresRay(feature.Name) {
 			continue
 		}
 		// Read YAML file for this feature
@@ -759,15 +760,6 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 	spec.ImagePullSecrets = b.ai.Spec.Images.ImagePullSecrets
 	// FIXME need to find better way to add sidecars
 	return corev1.PodTemplateSpec{Spec: spec}
-}
-
-func featureRequiresRay(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "weaviate-service":
-		return false
-	default:
-		return true
-	}
 }
 
 func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec {

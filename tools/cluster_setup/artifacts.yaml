@@ -5547,7 +5547,7 @@ spec:
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
-        - name: RELATED_IMAGE_WEAVIATE_PROXY
+        - name: RELATED_IMAGE_WEAVIATE_SERVICE
           value: docker.io/kbhos698/weaviate-service:v1.0.1
         - name: RELATED_IMAGE_SAIA_API
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1

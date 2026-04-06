@@ -60,6 +60,8 @@ kubectl get svc -n ai-platform
 
 ## Access With Interactive Token
 
+Use the `weaviate-service` Kubernetes Service for in-cluster access, and the Ingress host with a `/weaviate` prefix for outside-cluster access when Ray is disabled.
+
 Run these from a test pod inside the `ai-platform` namespace.
 
 Create an interactive token from Splunk:
@@ -88,4 +90,52 @@ GET schema / collections:
 curl -sS \
   -H "Authorization: Bearer $INTERACTIVE_TOKEN" \
   "http://splunk-ai-stack-weaviate-service-weaviate-service.ai-platform.svc.cluster.local/v1/schema" | jq .
+```
+
+Example outside the cluster through Ingress:
+
+```bash
+INGRESS_HOST=ai.example.com
+
+curl -sS \
+  -H "Authorization: Bearer $INTERACTIVE_TOKEN" \
+  "http://${INGRESS_HOST}/weaviate/v1/meta" | jq .
+```
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $INTERACTIVE_TOKEN" \
+  "http://${INGRESS_HOST}/weaviate/v1/schema" | jq .
+```
+
+Create a sample collection:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer $INTERACTIVE_TOKEN" \
+  -H "Content-Type: application/json" \
+  "http://${INGRESS_HOST}/weaviate/v1/schema" \
+  -d '{
+    "class": "SampleDocs",
+    "vectorizer": "none",
+    "properties": [
+      { "name": "text", "dataType": ["text"] }
+    ]
+  }' | jq .
+```
+
+The equivalent external request uses the `/weaviate` prefix:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer $INTERACTIVE_TOKEN" \
+  -H "Content-Type: application/json" \
+  "http://${INGRESS_HOST}/weaviate/v1/schema" \
+  -d '{
+    "class": "SampleDocs",
+    "vectorizer": "none",
+    "properties": [
+      { "name": "text", "dataType": ["text"] }
+    ]
+  }' | jq .
 ```

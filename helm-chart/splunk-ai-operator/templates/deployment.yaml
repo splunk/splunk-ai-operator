@@ -74,7 +74,7 @@ spec:
             value: {{ .Values.rayWorkerImage }}
           - name: RELATED_IMAGE_WEAVIATE
             value: {{ .Values.weaviateImage }}
-          - name: RELATED_IMAGE_WEAVIATE_PROXY
+          - name: RELATED_IMAGE_WEAVIATE_SERVICE
             value: {{ .Values.weaviateProxyImage }}
           - name: RELATED_IMAGE_SAIA_API
             value: {{ .Values.saiaApiImage }}

@@ -188,7 +188,7 @@ validate_image_config() {
   is_nonempty_value "${AI_FEATURE_SA}" || err "REQUIRED: aiPlatform.features[0].serviceAccountName"
 
   if ! is_nonempty_value "${WEAVIATE_PROXY_IMAGE}"; then
-    WEAVIATE_PROXY_IMAGE="docker.io/kbhos698/weaviate-proxy:v1.0.28-6-g2cbe7b7"
+    WEAVIATE_PROXY_IMAGE="docker.io/kbhos698/weaviate-service:v1.0.1"
     log "Using default Weaviate proxy image: ${WEAVIATE_PROXY_IMAGE}"
   fi
   if ! is_nonempty_value "${SPLUNK_OPERATOR_IMAGE}"; then
@@ -233,7 +233,7 @@ configure_images() {
   weaviate_proxy_escaped="$(echo "${weaviate_proxy_full}" | sed 's/[\/&]/\\&/g')"
 
   sed_in_place "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "${SPLUNK_AI_FILE}"
-  sed_in_place "/name:[[:space:]]*RELATED_IMAGE_WEAVIATE_PROXY$/,/value:/ s|value:.*|value: ${weaviate_proxy_escaped}|" "${SPLUNK_AI_FILE}"
+  sed_in_place "/name:[[:space:]]*RELATED_IMAGE_WEAVIATE_SERVICE$/,/value:/ s|value:.*|value: ${weaviate_proxy_escaped}|" "${SPLUNK_AI_FILE}"
   sed_in_place "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "${SPLUNK_AI_FILE}"
 
   sed_in_place "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "${SPLUNK_OPERATOR_FILE}"

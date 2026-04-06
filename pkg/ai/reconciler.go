@@ -3,10 +3,10 @@ package ai_platform
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
@@ -88,6 +88,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 
 	stages = append(stages,
 		stage{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
+		stage{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
 		stage{"Ingress", r.ReconcileIngress},
 	)
 
@@ -96,7 +97,6 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		stages = append(stages, stage{"RayServiceStatus", raybuilder.ApplyNormalizedConditions})
 	}
 	stages = append(stages,
-		stage{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
 		stage{"IngressStatus", r.UpdateIngressStatus},
 		stage{"AIService", r.ReconcileFeatures},
 		stage{"AIServiceStatus", r.CheckAIServiceStatus},
@@ -315,20 +315,11 @@ func platformRequiresRay(features []aiApi.FeatureSpec) bool {
 		return true
 	}
 	for _, feature := range features {
-		if featureRequiresRay(feature.Name) {
+		if featuresregistry.RequiresRay(feature.Name) {
 			return true
 		}
 	}
 	return false
-}
-
-func featureRequiresRay(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "weaviate-service":
-		return false
-	default:
-		return true
-	}
 }
 
 func (r *AIPlatformReconciler) cleanupRayService(ctx context.Context, p *aiApi.AIPlatform) error {

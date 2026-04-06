@@ -12,6 +12,8 @@ import (
 
 type WeaviateServiceFactory struct{}
 
+func (f *WeaviateServiceFactory) RequiresRay() bool { return false }
+
 func (f *WeaviateServiceFactory) New(ctx context.Context, c client.Client, scheme *runtime.Scheme, ai *aiv1.AIService, recorder record.EventRecorder) (common.FeatureHandler, error) {
 	return &WeaviateServiceReconciler{
 		Client:   c,

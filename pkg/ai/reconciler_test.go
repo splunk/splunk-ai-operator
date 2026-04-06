@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -357,11 +358,11 @@ func TestCheckAIServiceStatus_FailsWhenServiceHasFailedCondition(t *testing.T) {
 }
 
 func TestFeatureRequiresRay(t *testing.T) {
-	assert.False(t, featureRequiresRay("weaviate-service"))
-	assert.False(t, featureRequiresRay("WEAVIATE-SERVICE"))
-	assert.True(t, featureRequiresRay("saia"))
-	assert.True(t, featureRequiresRay("seca"))
-	assert.True(t, featureRequiresRay("unknown"))
+	assert.False(t, featuresregistry.RequiresRay("weaviate-service"))
+	assert.False(t, featuresregistry.RequiresRay("WEAVIATE-SERVICE"))
+	assert.True(t, featuresregistry.RequiresRay("saia"))
+	assert.True(t, featuresregistry.RequiresRay("seca"))
+	assert.True(t, featuresregistry.RequiresRay("unknown"))
 }
 
 func TestPlatformRequiresRay(t *testing.T) {

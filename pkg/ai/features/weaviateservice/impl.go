@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/splunkutils"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -89,9 +90,17 @@ func (r *WeaviateServiceReconciler) Reconcile(ctx context.Context, aiservice *ai
 }
 
 func (r *WeaviateServiceReconciler) validateAIService(ctx context.Context, ai *aiv1.AIService) error {
-	image := resolveWeaviateProxyImage()
+	image := resolveWeaviateServiceImage()
 	if image == "" {
-		return fmt.Errorf("RELATED_IMAGE_WEAVIATE_PROXY or RELATED_IMAGE_WEAVIATE must be set")
+		return fmt.Errorf("RELATED_IMAGE_WEAVIATE_SERVICE must be set")
+	}
+
+	if ai.Spec.SplunkConfiguration.Endpoint == "" && ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != "" {
+		endpoint, err := splunkutils.ResolveSplunkEndpoint(ctx, r.Client, ai.Namespace, ai.Spec.SplunkConfiguration, ai.Spec.ClusterDomain)
+		if err != nil {
+			return fmt.Errorf("resolving Splunk endpoint: %w", err)
+		}
+		ai.Spec.SplunkConfiguration.Endpoint = endpoint
 	}
 
 	if ai.Spec.VectorDbUrl == "" && ai.Spec.AIPlatformRef.Name != "" {
@@ -189,7 +198,7 @@ func (r *WeaviateServiceReconciler) reconcileDeployment(ctx context.Context, ai 
 
 		container := corev1.Container{
 			Name:            "weaviate-proxy",
-			Image:           resolveWeaviateProxyImage(),
+			Image:           resolveWeaviateServiceImage(),
 			ImagePullPolicy: corev1.PullAlways,
 			Resources:       ai.Spec.Resources,
 			Ports: []corev1.ContainerPort{
@@ -264,7 +273,7 @@ func (r *WeaviateServiceReconciler) buildEnv(ai *aiv1.AIService) []corev1.EnvVar
 	envMap := map[string]string{
 		"SERVICE_NAME":          defaultServiceName,
 		"SERVICE_INTERNAL_NAME": defaultServiceInternal,
-		"SPLUNK_ISSUERS":        defaultSplunkIssuer,
+		"SPLUNK_ISSUERS":        defaultSplunkIssuerForAIService(ai),
 		"WEAVIATE_URL":          weaviateURL,
 	}
 
@@ -285,11 +294,15 @@ func (r *WeaviateServiceReconciler) buildEnv(ai *aiv1.AIService) []corev1.EnvVar
 	return out
 }
 
-func resolveWeaviateProxyImage() string {
-	if image := os.Getenv("RELATED_IMAGE_WEAVIATE_PROXY"); image != "" {
-		return image
+func resolveWeaviateServiceImage() string {
+	return os.Getenv("RELATED_IMAGE_WEAVIATE_SERVICE")
+}
+
+func defaultSplunkIssuerForAIService(ai *aiv1.AIService) string {
+	if endpoint := strings.TrimSpace(ai.Spec.SplunkConfiguration.Endpoint); endpoint != "" {
+		return endpoint
 	}
-	return os.Getenv("RELATED_IMAGE_WEAVIATE")
+	return defaultSplunkIssuer
 }
 
 func normalizeWeaviateURL(vectorDBURL, namespace, clusterDomain string) string {
