@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # =============================================================================
 # k0s Weaviate-Service Stack Script
@@ -15,6 +15,14 @@ log()  { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
+
+on_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  local cmd="$3"
+  echo -e "\033[1;31m[ERROR]\033[0m Command failed with exit code ${exit_code} at line ${line_no}: ${cmd}" >&2
+}
+trap 'on_error $? ${LINENO} "${BASH_COMMAND}"' ERR
 
 is_nonempty_value() {
   local v="${1:-}"
@@ -65,8 +73,10 @@ wait_rollout() {
   local timeout="${4:-300}"
 
   log "Waiting for ${kind}/${name} rollout in ${ns} (timeout: ${timeout}s)..."
-  kubectl rollout status "${kind}/${name}" -n "${ns}" --timeout="${timeout}s" || \
-    warn "Timeout waiting for ${kind}/${name} rollout in ${ns}"
+  if ! kubectl rollout status "${kind}/${name}" -n "${ns}" --timeout="${timeout}s"; then
+    kubectl get "${kind}" "${name}" -n "${ns}" -o wide || true
+    err "Timed out waiting for ${kind}/${name} rollout in ${ns}"
+  fi
 }
 
 wait_for_crd() {
@@ -83,6 +93,103 @@ wait_for_crd() {
     fi
   done
   log "CRD ${crd_name} is ready"
+}
+
+wait_for_pods_ready() {
+  local ns="$1"
+  local selector="$2"
+  local timeout="${3:-300}"
+  local description="${4:-pods matching ${selector}}"
+
+  log "Waiting for ${description} in ${ns} (timeout: ${timeout}s)..."
+  if ! kubectl wait --for=condition=ready pod -l "${selector}" -n "${ns}" --timeout="${timeout}s"; then
+    kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
+    err "Timed out waiting for ${description} in ${ns}"
+  fi
+}
+
+wait_for_job_complete() {
+  local ns="$1"
+  local job_name="$2"
+  local timeout="${3:-120}"
+
+  log "Waiting for job/${job_name} completion in ${ns} (timeout: ${timeout}s)..."
+  if ! kubectl wait --for=condition=complete "job/${job_name}" -n "${ns}" --timeout="${timeout}s"; then
+    kubectl describe job "${job_name}" -n "${ns}" || true
+    kubectl logs -n "${ns}" -l "job-name=${job_name}" --tail=100 || true
+    err "Timed out waiting for job/${job_name} completion in ${ns}"
+  fi
+}
+
+wait_for_resource_deletion() {
+  local kind="$1"
+  local name="$2"
+  local ns="$3"
+  local timeout="${4:-180}"
+  local elapsed=0
+
+  log "Waiting for ${kind}/${name} deletion in ${ns} (timeout: ${timeout}s)..."
+  while kubectl get "${kind}" "${name}" -n "${ns}" >/dev/null 2>&1; do
+    sleep 5
+    elapsed=$((elapsed + 5))
+    if [[ ${elapsed} -ge ${timeout} ]]; then
+      warn "${kind}/${name} is still present in ${ns}"
+      kubectl get "${kind}" "${name}" -n "${ns}" -o jsonpath='{.metadata.deletionTimestamp}{" finalizers="}{.metadata.finalizers}{"\n"}' 2>/dev/null || true
+      err "Timed out waiting for ${kind}/${name} deletion in ${ns}"
+    fi
+  done
+  log "${kind}/${name} deleted from ${ns}"
+}
+
+delete_named_resource() {
+  local kind="$1"
+  local name="$2"
+  local ns="$3"
+  local timeout="${4:-180}"
+
+  if ! kubectl get "${kind}" "${name}" -n "${ns}" >/dev/null 2>&1; then
+    log "${kind}/${name} not found in ${ns}, skipping delete"
+    return 0
+  fi
+
+  log "Deleting ${kind}/${name} in ${ns}..."
+  kubectl delete "${kind}" "${name}" -n "${ns}" --ignore-not-found=true --wait=false >/dev/null
+  wait_for_resource_deletion "${kind}" "${name}" "${ns}" "${timeout}"
+}
+
+report_namespace_blockers() {
+  local ns="$1"
+
+  if ! kubectl get namespace "${ns}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "Namespace ${ns} is still present. Current phase and finalizers:"
+  kubectl get namespace "${ns}" -o jsonpath='{.status.phase}{" finalizers="}{.spec.finalizers}{"\n"}' 2>/dev/null || true
+  warn "Remaining common resources in ${ns}:"
+  kubectl get all,cm,secret,pvc,sa,role,rolebinding -n "${ns}" 2>/dev/null || true
+}
+
+wait_for_namespace_deletion() {
+  local ns="$1"
+  local timeout="${2:-180}"
+  local elapsed=0
+
+  if ! kubectl get namespace "${ns}" >/dev/null 2>&1; then
+    log "Namespace ${ns} is already absent"
+    return 0
+  fi
+
+  log "Waiting for namespace ${ns} deletion (timeout: ${timeout}s)..."
+  while kubectl get namespace "${ns}" >/dev/null 2>&1; do
+    sleep 5
+    elapsed=$((elapsed + 5))
+    if [[ ${elapsed} -ge ${timeout} ]]; then
+      report_namespace_blockers "${ns}"
+      err "Timed out waiting for namespace ${ns} deletion"
+    fi
+  done
+  log "Namespace ${ns} deleted"
 }
 
 ensure_namespace() {
@@ -410,7 +517,7 @@ spec:
           claimName: minio-pvc
 EOF
 
-  kubectl wait --for=condition=ready pod -l app=minio -n "${MINIO_NS}" --timeout=300s
+  wait_for_pods_ready "${MINIO_NS}" "app=minio" 300 "MinIO pods"
 
   ensure_namespace "${AI_NS}"
   kubectl -n "${AI_NS}" create secret generic minio-credentials \
@@ -451,38 +558,20 @@ spec:
           done
 EOF
 
-  kubectl wait --for=condition=complete job/minio-create-bucket -n "${MINIO_NS}" --timeout=120s || true
+  wait_for_job_complete "${MINIO_NS}" "minio-create-bucket" 120
   log "MinIO is ready"
 }
 
-ensure_s3compat_credentials() {
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
-    return 0
-  fi
 
-  is_nonempty_value "${OBJ_STORE_ENDPOINT}" || err "storage.objectStore.endpoint is required for ${OBJ_STORE_TYPE}"
-  is_nonempty_value "${MINIO_ROOT_PASSWORD}" || err "storage.objectStore.auth.rootPassword is required for ${OBJ_STORE_TYPE}"
-
-  ensure_namespace "${AI_NS}"
-  kubectl -n "${AI_NS}" create secret generic minio-credentials \
-    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-  log "External object storage credentials secret is ready"
-}
 
 install_cert_manager() {
   log "Installing cert-manager..."
   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
 
   wait_for_crd certificates.cert-manager.io 300
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s || true
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=webhook -n cert-manager --timeout=120s || true
-  sleep 15
+  wait_for_pods_ready cert-manager "app.kubernetes.io/instance=cert-manager" 300 "cert-manager pods"
+  wait_for_pods_ready cert-manager "app.kubernetes.io/component=webhook" 120 "cert-manager webhook pods"
+  wait_for_cert_manager_webhook 30 10 || err "cert-manager webhook did not become responsive"
 }
 
 wait_for_cert_manager_webhook() {
@@ -623,23 +712,18 @@ install_splunk_operator() {
   log "Installing Splunk Operator..."
 
   ensure_namespace "${ns}"
-  create_image_pull_secrets "${ns}" >/dev/null 2>&1 || true
-
-  if kubectl create -f "${SPLUNK_OPERATOR_FILE}" >/dev/null 2>&1; then
-    log "Splunk Operator resources created"
-  else
-    kubectl replace --force -f "${SPLUNK_OPERATOR_FILE}" 2>&1 | grep -v "Warning: --force is deprecated" || true
-  fi
+  create_image_pull_secrets "${ns}" >/dev/null
+  kubectl apply -f "${SPLUNK_OPERATOR_FILE}" --server-side --force-conflicts
 
   local secrets_patch=""
+  local dep_name=""
   for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
     if kubectl get secret "${secret_name}" -n "${ns}" >/dev/null 2>&1; then
       secrets_patch+='{"name":"'"${secret_name}"'"},'
     fi
   done
+  dep_name="$(kubectl -n "${ns}" get deploy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   if [[ -n "${secrets_patch}" ]]; then
-    local dep_name
-    dep_name="$(kubectl -n "${ns}" get deploy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -n "${dep_name}" ]]; then
       kubectl -n "${ns}" patch deployment "${dep_name}" \
         --type='json' \
@@ -647,6 +731,10 @@ install_splunk_operator() {
         >/dev/null 2>&1 || true
       kubectl rollout restart deployment "${dep_name}" -n "${ns}" >/dev/null 2>&1 || true
     fi
+  fi
+
+  if [[ -n "${dep_name}" ]]; then
+    wait_rollout "${ns}" deploy "${dep_name}" 600
   fi
 
   wait_for_crd standalones.enterprise.splunk.com 300
@@ -658,18 +746,22 @@ install_splunk_ai_operator() {
   log "Installing Splunk AI Operator from ${SPLUNK_AI_FILE}..."
 
   ensure_namespace "${ns}"
-  create_image_pull_secrets "${ns}" >/dev/null 2>&1 || true
-  wait_for_cert_manager_webhook 30 10 || true
+  create_image_pull_secrets "${ns}" >/dev/null
+  wait_for_cert_manager_webhook 30 10 || err "cert-manager webhook did not become responsive"
 
-  local apply_output
-  apply_output="$(kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1)" || true
+  local apply_output=""
+  local apply_status=0
+  apply_output="$(kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1)" || apply_status=$?
   echo "${apply_output}"
 
-  if echo "${apply_output}" | grep -qi "webhook.*cert-manager\|failed calling webhook.*cert-manager\|i/o timeout"; then
+  if (( apply_status != 0 )) && echo "${apply_output}" | grep -qi "webhook.*cert-manager\|failed calling webhook.*cert-manager\|i/o timeout"; then
     sleep 15
-    wait_for_cert_manager_webhook 15 10 || true
-    kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" >/dev/null 2>&1 || true
+    wait_for_cert_manager_webhook 15 10 || err "cert-manager webhook retry did not become responsive"
+    apply_status=0
+    apply_output="$(kubectl apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1)" || apply_status=$?
+    echo "${apply_output}"
   fi
+  (( apply_status == 0 )) || err "Failed to apply Splunk AI Operator manifest"
 
   local dep
   dep="$(kubectl -n "${ns}" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -m1 -E 'splunk-ai-operator|ai-operator|controller-manager' || true)"
@@ -818,7 +910,7 @@ spec:
 YAML
   fi
 
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance="${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=600s || true
+  wait_for_pods_ready "${AI_NS}" "app.kubernetes.io/instance=${AI_STANDALONE_NAME}" 600 "Splunk Standalone pods"
   log "Splunk Standalone installed successfully"
 }
 
@@ -913,10 +1005,10 @@ install_ai_platform_stack() {
   ensure_namespace "${AI_NS}"
   ensure_cpu_node_labels
   install_minio
-  ensure_s3compat_credentials
+
   install_cert_manager
   install_splunk_operator
-  create_image_pull_secrets "${AI_NS}" >/dev/null 2>&1 || true
+  create_image_pull_secrets "${AI_NS}" >/dev/null
   install_splunk_standalone
   install_splunk_ai_operator
   install_ai_platform_cr
@@ -979,8 +1071,8 @@ main_delete() {
   fi
 
   log "Deleting AIPlatform and Splunk resources..."
-  kubectl delete aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" --ignore-not-found=true --timeout=120s || true
-  kubectl delete standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --ignore-not-found=true --timeout=120s || true
+  delete_named_resource aiplatform "${AI_PLATFORM_NAME}" "${AI_NS}" 180
+  delete_named_resource standalone "${AI_STANDALONE_NAME}" "${AI_NS}" 180
 
   if [[ -f "${SPLUNK_AI_FILE}" ]]; then
     kubectl delete -f "${SPLUNK_AI_FILE}" --ignore-not-found=true >/dev/null 2>&1 || true
@@ -989,11 +1081,15 @@ main_delete() {
     kubectl delete -f "${SPLUNK_OPERATOR_FILE}" --ignore-not-found=true >/dev/null 2>&1 || true
   fi
 
-  kubectl delete namespace "${AI_NS}" --ignore-not-found=true --timeout=180s || true
-  kubectl delete namespace splunk-ai-operator-system --ignore-not-found=true --timeout=180s || true
-  kubectl delete namespace splunk-operator --ignore-not-found=true --timeout=180s || true
+  kubectl delete namespace "${AI_NS}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  kubectl delete namespace splunk-ai-operator-system --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  kubectl delete namespace splunk-operator --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  wait_for_namespace_deletion "${AI_NS}" 300
+  wait_for_namespace_deletion splunk-ai-operator-system 300
+  wait_for_namespace_deletion splunk-operator 300
   if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
-    kubectl delete namespace "${MINIO_NS}" --ignore-not-found=true --timeout=180s || true
+    kubectl delete namespace "${MINIO_NS}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+    wait_for_namespace_deletion "${MINIO_NS}" 300
   fi
 
   log "Weaviate-service stack cleanup complete"

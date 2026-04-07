@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # =============================================================================
 # EKS Weaviate-Service Stack Script
@@ -19,6 +19,14 @@ warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
 need_file() { [[ -f "$1" ]] || err "Missing file: $1"; }
+
+on_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  local cmd="$3"
+  echo -e "\033[1;31m[ERROR]\033[0m Command failed with exit code ${exit_code} at line ${line_no}: ${cmd}" >&2
+}
+trap 'on_error $? ${LINENO} "${BASH_COMMAND}"' ERR
 
 is_nonempty_value() {
   local v="${1:-}"
@@ -79,8 +87,10 @@ wait_rollout() {
   local timeout="${4:-300}"
 
   log "Waiting for ${kind}/${name} rollout in ${ns} (timeout: ${timeout}s)..."
-  kubectl rollout status "${kind}/${name}" -n "${ns}" --timeout="${timeout}s" || \
-    warn "Timeout waiting for ${kind}/${name} rollout in ${ns}"
+  if ! kubectl rollout status "${kind}/${name}" -n "${ns}" --timeout="${timeout}s"; then
+    kubectl get "${kind}" "${name}" -n "${ns}" -o wide || true
+    err "Timed out waiting for ${kind}/${name} rollout in ${ns}"
+  fi
 }
 
 wait_for_crd() {
@@ -97,6 +107,90 @@ wait_for_crd() {
     fi
   done
   log "CRD ${crd_name} is ready"
+}
+
+wait_for_pods_ready() {
+  local ns="$1"
+  local selector="$2"
+  local timeout="${3:-300}"
+  local description="${4:-pods matching ${selector}}"
+
+  log "Waiting for ${description} in ${ns} (timeout: ${timeout}s)..."
+  if ! kubectl wait --for=condition=ready pod -l "${selector}" -n "${ns}" --timeout="${timeout}s"; then
+    kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
+    err "Timed out waiting for ${description} in ${ns}"
+  fi
+}
+
+wait_for_resource_deletion() {
+  local kind="$1"
+  local name="$2"
+  local ns="$3"
+  local timeout="${4:-180}"
+  local elapsed=0
+
+  log "Waiting for ${kind}/${name} deletion in ${ns} (timeout: ${timeout}s)..."
+  while kubectl get "${kind}" "${name}" -n "${ns}" >/dev/null 2>&1; do
+    sleep 5
+    elapsed=$((elapsed + 5))
+    if [[ ${elapsed} -ge ${timeout} ]]; then
+      warn "${kind}/${name} is still present in ${ns}"
+      kubectl get "${kind}" "${name}" -n "${ns}" -o jsonpath='{.metadata.deletionTimestamp}{" finalizers="}{.metadata.finalizers}{"\n"}' 2>/dev/null || true
+      err "Timed out waiting for ${kind}/${name} deletion in ${ns}"
+    fi
+  done
+  log "${kind}/${name} deleted from ${ns}"
+}
+
+delete_named_resource() {
+  local kind="$1"
+  local name="$2"
+  local ns="$3"
+  local timeout="${4:-180}"
+
+  if ! kubectl get "${kind}" "${name}" -n "${ns}" >/dev/null 2>&1; then
+    log "${kind}/${name} not found in ${ns}, skipping delete"
+    return 0
+  fi
+
+  log "Deleting ${kind}/${name} in ${ns}..."
+  kubectl delete "${kind}" "${name}" -n "${ns}" --ignore-not-found=true --wait=false >/dev/null
+  wait_for_resource_deletion "${kind}" "${name}" "${ns}" "${timeout}"
+}
+
+report_namespace_blockers() {
+  local ns="$1"
+
+  if ! kubectl get namespace "${ns}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "Namespace ${ns} is still present. Current phase and finalizers:"
+  kubectl get namespace "${ns}" -o jsonpath='{.status.phase}{" finalizers="}{.spec.finalizers}{"\n"}' 2>/dev/null || true
+  warn "Remaining common resources in ${ns}:"
+  kubectl get all,cm,secret,pvc,sa,role,rolebinding -n "${ns}" 2>/dev/null || true
+}
+
+wait_for_namespace_deletion() {
+  local ns="$1"
+  local timeout="${2:-180}"
+  local elapsed=0
+
+  if ! kubectl get namespace "${ns}" >/dev/null 2>&1; then
+    log "Namespace ${ns} is already absent"
+    return 0
+  fi
+
+  log "Waiting for namespace ${ns} deletion (timeout: ${timeout}s)..."
+  while kubectl get namespace "${ns}" >/dev/null 2>&1; do
+    sleep 5
+    elapsed=$((elapsed + 5))
+    if [[ ${elapsed} -ge ${timeout} ]]; then
+      report_namespace_blockers "${ns}"
+      err "Timed out waiting for namespace ${ns} deletion"
+    fi
+  done
+  log "Namespace ${ns} deleted"
 }
 
 ensure_namespace() {
@@ -456,7 +550,7 @@ spec:
         secretRef: s3-secret
 YAML
 
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance="${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=600s || true
+  wait_for_pods_ready "${AI_NS}" "app.kubernetes.io/instance=${AI_STANDALONE_NAME}" 600 "Splunk Standalone pods"
   log "Splunk Standalone installed successfully"
 }
 
@@ -621,8 +715,8 @@ main_delete() {
   fi
 
   log "Deleting AIPlatform and Splunk resources..."
-  kubectl delete aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" --ignore-not-found=true --timeout=120s || true
-  kubectl delete standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --ignore-not-found=true --timeout=120s || true
+  delete_named_resource aiplatform "${AI_PLATFORM_NAME}" "${AI_NS}" 180
+  delete_named_resource standalone "${AI_STANDALONE_NAME}" "${AI_NS}" 180
 
   if [[ -f "${SPLUNK_AI_FILE}" ]]; then
     kubectl delete -f "${SPLUNK_AI_FILE}" --ignore-not-found=true >/dev/null 2>&1 || true
@@ -631,9 +725,12 @@ main_delete() {
     kubectl delete -f "${SPLUNK_OPERATOR_FILE}" --ignore-not-found=true >/dev/null 2>&1 || true
   fi
 
-  kubectl delete namespace "${AI_NS}" --ignore-not-found=true --timeout=180s || true
-  kubectl delete namespace "${SPLUNK_AI_NS}" --ignore-not-found=true --timeout=180s || true
-  kubectl delete namespace splunk-operator --ignore-not-found=true --timeout=180s || true
+  kubectl delete namespace "${AI_NS}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  kubectl delete namespace "${SPLUNK_AI_NS}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  kubectl delete namespace splunk-operator --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  wait_for_namespace_deletion "${AI_NS}" 300
+  wait_for_namespace_deletion "${SPLUNK_AI_NS}" 300
+  wait_for_namespace_deletion splunk-operator 300
 
   log "Weaviate-service stack cleanup complete"
 }
