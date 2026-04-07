@@ -38,7 +38,7 @@ func TestNew(t *testing.T) {
 		},
 		Spec: aiv1.AIPlatformSpec{
 			ServiceAccountName: "test-sa",
-			ObjectStorage: aiv1.ObjectStorageSpec{
+			ObjectStorage: &aiv1.ObjectStorageSpec{
 				Path:   "s3://test-bucket/artifacts",
 				Region: "us-west-2",
 			},
@@ -97,7 +97,7 @@ func TestBuilder_Build(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -132,7 +132,7 @@ func TestBuilder_Build(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -208,7 +208,7 @@ func TestBuilder_ReconcileRayService(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -326,7 +326,7 @@ func TestBuilder_createRayServiceRBAC(t *testing.T) {
 		},
 		Spec: aiv1.AIPlatformSpec{
 			ServiceAccountName: "test-sa",
-			ObjectStorage: aiv1.ObjectStorageSpec{
+			ObjectStorage: &aiv1.ObjectStorageSpec{
 				Path:   "s3://test-bucket/artifacts",
 				Region: "us-west-2",
 			},

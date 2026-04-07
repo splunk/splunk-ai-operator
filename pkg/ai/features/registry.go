@@ -19,6 +19,10 @@ type rayAwareFactory interface {
 	RequiresRay() bool
 }
 
+type storageAwareFactory interface {
+	RequiresObjectStorage() bool
+}
+
 // RequiresRay reports whether the named feature requires Ray infrastructure.
 // Unknown features default to requiring Ray to preserve existing behavior.
 func RequiresRay(name string) bool {
@@ -29,6 +33,20 @@ func RequiresRay(name string) bool {
 	}
 	if rf, ok := factory.(rayAwareFactory); ok {
 		return rf.RequiresRay()
+	}
+	return true
+}
+
+// RequiresObjectStorage reports whether the named feature requires object storage.
+// Unknown features default to requiring object storage to preserve existing behavior.
+func RequiresObjectStorage(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	factory, ok := FeatureFactories[normalized]
+	if !ok {
+		return true
+	}
+	if sf, ok := factory.(storageAwareFactory); ok {
+		return sf.RequiresObjectStorage()
 	}
 	return true
 }

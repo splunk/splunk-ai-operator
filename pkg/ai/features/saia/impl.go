@@ -175,7 +175,7 @@ func (r *SaiaReconciler) validateAIService(
 			corev1.ResourceMemory: resource.MustParse("2Gi"),
 		}
 	}
-	if ai.Spec.TaskVolume.Path == "" {
+	if ai.Spec.TaskVolume == nil || ai.Spec.TaskVolume.Path == "" {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "task volume path must be set")
 		return fmt.Errorf("task volume path must be set")
 	}

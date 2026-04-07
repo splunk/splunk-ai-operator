@@ -42,10 +42,11 @@ type AIPlatform struct {
 
 // AIPlatformSpec defines the desired state
 type AIPlatformSpec struct {
-	// ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
+	// ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models.
+	// It is optional for platforms that only enable features that do not require object storage.
 	// Supported providers: S3, GCS, Azure Blob Storage, MinIO
-	// +kubebuilder:validation:Required
-	ObjectStorage ObjectStorageSpec `json:"objectStorage"`
+	// +kubebuilder:validation:Optional
+	ObjectStorage *ObjectStorageSpec `json:"objectStorage,omitempty"`
 
 	// ServiceAccountName is the name of the service account to use for the AIPlatform
 	// Used for Ray, Weaviate, SAIA, etc and also IAM role for S3 access

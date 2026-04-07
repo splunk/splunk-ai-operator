@@ -2237,7 +2237,8 @@ spec:
                 type: object
               objectStorage:
                 description: |-
-                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
+                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models.
+                  It is optional for platforms that only enable features that do not require object storage.
                   Supported providers: S3, GCS, Azure Blob Storage, MinIO
                 properties:
                   endpoint:
@@ -2920,8 +2921,6 @@ spec:
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                 type: object
-            required:
-            - objectStorage
             type: object
           status:
             description: AIPlatformStatus defines observed state
@@ -5561,7 +5560,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v9
+        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v10
         livenessProbe:
           httpGet:
             path: /healthz

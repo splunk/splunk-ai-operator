@@ -83,6 +83,10 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		return err
 	}
 
+	if p.Spec.ObjectStorage == nil {
+		return fmt.Errorf("object storage is required for Ray features")
+	}
+
 	// Load applications.yaml and parameterize ARTIFACTS_S3_BUCKET
 	u, err := url.Parse(p.Spec.ObjectStorage.Path)
 	if err != nil {

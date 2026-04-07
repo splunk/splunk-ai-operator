@@ -14,9 +14,6 @@ nodes:
 storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
-  objectStore:
-    type: "aws"                                          # keeps in-cluster MinIO flow in this script
-    bucket: "my-company-ai-platform"
 
 kubernetes:
   namespace: "ai-platform"

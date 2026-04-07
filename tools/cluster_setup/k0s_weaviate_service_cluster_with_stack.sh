@@ -100,25 +100,60 @@ wait_for_pods_ready() {
   local selector="$2"
   local timeout="${3:-300}"
   local description="${4:-pods matching ${selector}}"
+  local elapsed=0
+  local interval=5
 
   log "Waiting for ${description} in ${ns} (timeout: ${timeout}s)..."
-  if ! kubectl wait --for=condition=ready pod -l "${selector}" -n "${ns}" --timeout="${timeout}s"; then
-    kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
-    err "Timed out waiting for ${description} in ${ns}"
-  fi
+  while (( elapsed < timeout )); do
+    if kubectl get pods -n "${ns}" -l "${selector}" --no-headers 2>/dev/null | grep -q .; then
+      if kubectl wait --for=condition=ready pod -l "${selector}" -n "${ns}" --timeout="${interval}s" >/dev/null 2>&1; then
+        log "Ready: ${description} in ${ns}"
+        return 0
+      fi
+    fi
+
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+
+  kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
+  err "$(date '+%Y-%m-%d %H:%M:%S %Z') Timed out waiting for ${description} in ${ns} after ${timeout}s"
 }
 
-wait_for_job_complete() {
+wait_for_splunk_standalone_ready() {
   local ns="$1"
-  local job_name="$2"
-  local timeout="${3:-120}"
+  local name="$2"
+  local timeout="${3:-600}"
+  local elapsed=0
+  local interval=5
 
-  log "Waiting for job/${job_name} completion in ${ns} (timeout: ${timeout}s)..."
-  if ! kubectl wait --for=condition=complete "job/${job_name}" -n "${ns}" --timeout="${timeout}s"; then
-    kubectl describe job "${job_name}" -n "${ns}" || true
-    kubectl logs -n "${ns}" -l "job-name=${job_name}" --tail=100 || true
-    err "Timed out waiting for job/${job_name} completion in ${ns}"
+  log "Waiting for Splunk Standalone ${name} in ${ns} (timeout: ${timeout}s)..."
+  while (( elapsed < timeout )); do
+    if kubectl get standalone "${name}" -n "${ns}" >/dev/null 2>&1; then
+      local desired ready phase
+      desired="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+      ready="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+      phase="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+
+      if [[ -n "${desired}" && "${ready:-0}" == "${desired}" && "${phase}" == "Ready" ]]; then
+        log "Ready: Splunk Standalone ${name} in ${ns}"
+        return 0
+      fi
+    fi
+
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+
+  kubectl get standalone "${name}" -n "${ns}" -o yaml | sed -n '1,220p' || true
+  local selector
+  selector="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.status.selector}' 2>/dev/null || true)"
+  if [[ -n "${selector}" ]]; then
+    kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
+  else
+    kubectl get pods -n "${ns}" -o wide || true
   fi
+  err "$(date '+%Y-%m-%d %H:%M:%S %Z') Timed out waiting for Splunk Standalone ${name} in ${ns} after ${timeout}s"
 }
 
 wait_for_resource_deletion() {
@@ -228,19 +263,6 @@ load_config() {
   STORAGE_CLASS="$(yq eval '.storage.storageClass // "local-path"' "${CONFIG_FILE}")"
   VECTORDB_SIZE="$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}")"
 
-  OBJ_STORE_TYPE="$(yq eval '.storage.objectStore.type // "minio"' "${CONFIG_FILE}")"
-  OBJ_STORE_BUCKET="$(yq eval '.storage.objectStore.bucket // "ai-platform-data"' "${CONFIG_FILE}")"
-  OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "${CONFIG_FILE}")"
-  MINIO_ROOT_USER="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "${CONFIG_FILE}")"
-  MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}")}"
-  USE_EXTERNAL_OBJ_STORE="false"
-  case "${OBJ_STORE_TYPE}" in
-    s3compat|minio|seaweedfs) USE_EXTERNAL_OBJ_STORE="true" ;;
-  esac
-  MINIO_NS="minio-system"
-  MINIO_ENDPOINT="${OBJ_STORE_ENDPOINT}"
-  MINIO_BUCKET="${OBJ_STORE_BUCKET}"
-
   AI_NS="$(yq eval '.kubernetes.namespace // "ai-platform"' "${CONFIG_FILE}")"
   AI_PLATFORM_NAME="$(yq eval '.aiPlatform.name // ""' "${CONFIG_FILE}")"
   AI_FEATURE_NAME="$(yq eval '.aiPlatform.features[0].name // ""' "${CONFIG_FILE}")"
@@ -279,11 +301,6 @@ load_config() {
     err "This script only supports aiPlatform.features[0].name=weaviate-service"
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}, feature=${AI_FEATURE_NAME}@${AI_FEATURE_VERSION}"
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "Object storage: external ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
-  else
-    log "Object storage: in-cluster MinIO, bucket=${OBJ_STORE_BUCKET}"
-  fi
 }
 
 validate_image_config() {
@@ -363,9 +380,6 @@ preflight_checks() {
   if [[ "${IMAGE_PULL_SECRETS_ECR_ENABLED}" == "true" ]]; then
     need aws
   fi
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" && -z "${MINIO_ROOT_PASSWORD}" ]]; then
-    need openssl
-  fi
 
   if [[ -n "${KUBECONFIG:-}" ]]; then
     log "Using KUBECONFIG=${KUBECONFIG}"
@@ -418,150 +432,6 @@ ensure_cpu_node_labels() {
     log "  Labeled ${node} with splunk.ai/workload-type=cpu"
   done
 }
-
-install_minio() {
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "Using external S3-compatible storage (${OBJ_STORE_TYPE}); skipping in-cluster MinIO install."
-    return 0
-  fi
-
-  if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
-    MINIO_ROOT_PASSWORD="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
-  fi
-
-  log "Installing MinIO in ${MINIO_NS}..."
-  ensure_namespace "${MINIO_NS}"
-
-  kubectl create secret generic minio-creds \
-    --namespace="${MINIO_NS}" \
-    --from-literal=accesskey="${MINIO_ROOT_USER}" \
-    --from-literal=secretkey="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-  cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: minio-pvc
-  namespace: ${MINIO_NS}
-spec:
-  storageClassName: ${STORAGE_CLASS}
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 200Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: minio
-  namespace: ${MINIO_NS}
-spec:
-  type: ClusterIP
-  ports:
-    - port: 9000
-      targetPort: 9000
-      name: api
-    - port: 9001
-      targetPort: 9001
-      name: console
-  selector:
-    app: minio
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: minio
-  namespace: ${MINIO_NS}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: minio
-  template:
-    metadata:
-      labels:
-        app: minio
-    spec:
-      containers:
-      - name: minio
-        image: minio/minio:latest
-        args:
-        - server
-        - /data
-        - --console-address
-        - ":9001"
-        env:
-        - name: MINIO_ROOT_USER
-          valueFrom:
-            secretKeyRef:
-              name: minio-creds
-              key: accesskey
-        - name: MINIO_ROOT_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: minio-creds
-              key: secretkey
-        ports:
-        - containerPort: 9000
-          name: api
-        - containerPort: 9001
-          name: console
-        volumeMounts:
-        - name: data
-          mountPath: /data
-      volumes:
-      - name: data
-        persistentVolumeClaim:
-          claimName: minio-pvc
-EOF
-
-  wait_for_pods_ready "${MINIO_NS}" "app=minio" 300 "MinIO pods"
-
-  ensure_namespace "${AI_NS}"
-  kubectl -n "${AI_NS}" create secret generic minio-credentials \
-    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-
-  kubectl delete job minio-create-bucket -n "${MINIO_NS}" --ignore-not-found=true >/dev/null 2>&1 || true
-  cat <<EOF | kubectl apply -f -
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-create-bucket
-  namespace: ${MINIO_NS}
-spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 60
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-      - name: mc
-        image: minio/mc:latest
-        command:
-        - /bin/sh
-        - -c
-        - |
-          set -e
-          mc alias set myminio http://minio.${MINIO_NS}.svc.cluster.local:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
-          mc ls myminio/${MINIO_BUCKET} >/dev/null 2>&1 || mc mb myminio/${MINIO_BUCKET}
-          mc anonymous set download myminio/${MINIO_BUCKET} || true
-          for dir in apps artifacts model_artifacts tasks; do
-            mc ls myminio/${MINIO_BUCKET}/\$dir/ >/dev/null 2>&1 || echo "placeholder" | mc pipe myminio/${MINIO_BUCKET}/\$dir/.keep
-          done
-EOF
-
-  wait_for_job_complete "${MINIO_NS}" "minio-create-bucket" 120
-  log "MinIO is ready"
-}
-
 
 
 install_cert_manager() {
@@ -793,22 +663,6 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    kubectl -n "${AI_NS}" create secret generic minio-credentials \
-      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-  else
-    kubectl -n "${AI_NS}" create secret generic s3-secret \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl apply -f -
-  fi
-
   cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -833,8 +687,7 @@ YAML
       -p '{"imagePullSecrets":[{"name":"ecr-registry-secret"}]}' >/dev/null 2>&1 || true
   fi
 
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
@@ -851,66 +704,9 @@ spec:
       configMap:
         name: splunk-defaults
   defaultsUrl: /mnt/defaults/default.yml
-  appRepo:
-    appInstallPeriodSeconds: 90
-    appSources:
-      - name: apps
-        scope: local
-        location: apps
-    appsRepoPollIntervalSeconds: 60
-    defaults:
-      scope: local
-      volumeName: volume_app_repo
-    installMaxRetries: 2
-    volumes:
-      - name: volume_app_repo
-        provider: aws
-        storageType: s3
-        endpoint: ${MINIO_ENDPOINT}
-        path: ${MINIO_BUCKET}
-        secretRef: minio-credentials
 YAML
-  else
-    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
-apiVersion: enterprise.splunk.com/v4
-kind: Standalone
-metadata:
-  name: ${AI_STANDALONE_NAME}
-  namespace: ${AI_NS}
-spec:
-  replicas: 1
-  etcVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  varVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  volumes:
-    - name: defaults
-      configMap:
-        name: splunk-defaults
-  defaultsUrl: /mnt/defaults/default.yml
-  appRepo:
-    appInstallPeriodSeconds: 90
-    appSources:
-      - name: apps
-        scope: local
-        location: apps
-    appsRepoPollIntervalSeconds: 60
-    defaults:
-      scope: local
-      volumeName: volume_app_repo
-    installMaxRetries: 2
-    volumes:
-      - name: volume_app_repo
-        provider: aws
-        storageType: s3
-        endpoint: http://minio.${MINIO_NS}.svc.cluster.local:9000
-        region: us-east-1
-        path: ${MINIO_BUCKET}
-        secretRef: s3-secret
-YAML
-  fi
 
-  wait_for_pods_ready "${AI_NS}" "app.kubernetes.io/instance=${AI_STANDALONE_NAME}" 600 "Splunk Standalone pods"
+  wait_for_splunk_standalone_ready "${AI_NS}" "${AI_STANDALONE_NAME}" 600
   log "Splunk Standalone installed successfully"
 }
 
@@ -921,7 +717,7 @@ install_ai_platform_cr() {
   kubectl delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false >/dev/null 2>&1 || true
 
   local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
-  local feature_env_block image_pull_secrets obj_path obj_endpoint obj_secret
+  local feature_env_block image_pull_secrets
   local secrets_yaml=""
 
   for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
@@ -939,16 +735,6 @@ EOF
     image_pull_secrets=""
   fi
 
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    obj_path="s3://${OBJ_STORE_BUCKET}"
-    obj_endpoint="${MINIO_ENDPOINT}"
-    obj_secret="minio-credentials"
-  else
-    obj_path="s3://${MINIO_BUCKET}"
-    obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
-    obj_secret="s3-secret"
-  fi
-
   feature_env_block="$(render_feature_env_block_from_config)"
 
 
@@ -958,12 +744,6 @@ kind: AIPlatform
 metadata:
   name: ${AI_PLATFORM_NAME}
 spec:
-  objectStorage:
-    path: ${obj_path}
-    region: us-east-1
-    endpoint: "${obj_endpoint}"
-    secretRef: ${obj_secret}
-
   images:
 ${image_pull_secrets}
   serviceAccountName: ${AI_FEATURE_SA}
@@ -1004,7 +784,6 @@ YAML
 install_ai_platform_stack() {
   ensure_namespace "${AI_NS}"
   ensure_cpu_node_labels
-  install_minio
 
   install_cert_manager
   install_splunk_operator
@@ -1022,9 +801,6 @@ check_platform_health() {
   kubectl get aiservice -n "${AI_NS}" || true
   kubectl get pods -n splunk-operator || true
   kubectl get pods -n splunk-ai-operator-system || true
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
-    kubectl get pods -n "${MINIO_NS}" || true
-  fi
 }
 
 show_platform_access_info() {
@@ -1087,11 +863,6 @@ main_delete() {
   wait_for_namespace_deletion "${AI_NS}" 300
   wait_for_namespace_deletion splunk-ai-operator-system 300
   wait_for_namespace_deletion splunk-operator 300
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
-    kubectl delete namespace "${MINIO_NS}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
-    wait_for_namespace_deletion "${MINIO_NS}" 300
-  fi
-
   log "Weaviate-service stack cleanup complete"
 }
 

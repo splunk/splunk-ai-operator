@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -134,8 +135,19 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 	var warnings admission.Warnings
 
 	// Validate ObjectStorage
-	if errs := v.validateObjectStorage(&aiplatform.Spec.ObjectStorage, field.NewPath("spec").Child("objectStorage")); len(errs) > 0 {
-		allErrs = append(allErrs, errs...)
+	if platformRequiresObjectStorage(aiplatform.Spec.Features) {
+		if aiplatform.Spec.ObjectStorage == nil {
+			allErrs = append(allErrs, field.Required(
+				field.NewPath("spec").Child("objectStorage"),
+				"objectStorage is required for the enabled features",
+			))
+		} else if errs := v.validateObjectStorage(aiplatform.Spec.ObjectStorage, field.NewPath("spec").Child("objectStorage")); len(errs) > 0 {
+			allErrs = append(allErrs, errs...)
+		}
+	} else if aiplatform.Spec.ObjectStorage != nil {
+		if errs := v.validateObjectStorage(aiplatform.Spec.ObjectStorage, field.NewPath("spec").Child("objectStorage")); len(errs) > 0 {
+			allErrs = append(allErrs, errs...)
+		}
 	}
 
 	// Validate SplunkConfiguration
@@ -196,14 +208,18 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 	}
 
 	// Validate immutable fields
-	if oldPlatform.Spec.ObjectStorage.Path != aiplatform.Spec.ObjectStorage.Path {
+	oldPath := objectStoragePath(oldPlatform.Spec.ObjectStorage)
+	newPath := objectStoragePath(aiplatform.Spec.ObjectStorage)
+	if oldPath != newPath {
 		allErrs = append(allErrs, field.Forbidden(
 			field.NewPath("spec").Child("objectStorage").Child("path"),
 			"objectStorage.path is immutable",
 		))
 	}
 
-	if oldPlatform.Spec.ObjectStorage.Region != aiplatform.Spec.ObjectStorage.Region {
+	oldRegion := objectStorageRegion(oldPlatform.Spec.ObjectStorage)
+	newRegion := objectStorageRegion(aiplatform.Spec.ObjectStorage)
+	if oldRegion != newRegion {
 		allErrs = append(allErrs, field.Forbidden(
 			field.NewPath("spec").Child("objectStorage").Child("region"),
 			"objectStorage.region is immutable",
@@ -215,6 +231,32 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 	}
 
 	return warnings, nil
+}
+
+func platformRequiresObjectStorage(features []aiv1.FeatureSpec) bool {
+	if len(features) == 0 {
+		return true
+	}
+	for _, feature := range features {
+		if featuresregistry.RequiresObjectStorage(feature.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func objectStoragePath(spec *aiv1.ObjectStorageSpec) string {
+	if spec == nil {
+		return ""
+	}
+	return spec.Path
+}
+
+func objectStorageRegion(spec *aiv1.ObjectStorageSpec) string {
+	if spec == nil {
+		return ""
+	}
+	return spec.Region
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type AIPlatform.

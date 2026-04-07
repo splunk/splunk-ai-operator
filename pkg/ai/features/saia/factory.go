@@ -12,7 +12,8 @@ import (
 
 type SaiaFactory struct{}
 
-func (f *SaiaFactory) RequiresRay() bool { return true }
+func (f *SaiaFactory) RequiresRay() bool           { return true }
+func (f *SaiaFactory) RequiresObjectStorage() bool { return true }
 
 func (f *SaiaFactory) New(ctx context.Context, c client.Client, scheme *runtime.Scheme, ai *aiv1.AIService, recorder record.EventRecorder) (common.FeatureHandler, error) {
 	return &SaiaReconciler{

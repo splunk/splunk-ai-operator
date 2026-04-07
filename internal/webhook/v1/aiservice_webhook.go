@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -164,8 +165,19 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 	}
 
 	// Validate TaskVolume
-	if errs := v.validateTaskVolume(&aiservice.Spec.TaskVolume, field.NewPath("spec").Child("taskVolume")); len(errs) > 0 {
-		allErrs = append(allErrs, errs...)
+	if serviceRequiresObjectStorage(aiservice.Spec.Feature.Name) {
+		if aiservice.Spec.TaskVolume == nil {
+			allErrs = append(allErrs, field.Required(
+				field.NewPath("spec").Child("taskVolume"),
+				"taskVolume is required for the enabled feature",
+			))
+		} else if errs := v.validateTaskVolume(aiservice.Spec.TaskVolume, field.NewPath("spec").Child("taskVolume")); len(errs) > 0 {
+			allErrs = append(allErrs, errs...)
+		}
+	} else if aiservice.Spec.TaskVolume != nil {
+		if errs := v.validateTaskVolume(aiservice.Spec.TaskVolume, field.NewPath("spec").Child("taskVolume")); len(errs) > 0 {
+			allErrs = append(allErrs, errs...)
+		}
 	}
 
 	// Validate SplunkConfiguration
@@ -239,7 +251,7 @@ func (v *AIServiceCustomValidator) ValidateUpdate(ctx context.Context, oldObj, n
 		))
 	}
 
-	if oldService.Spec.TaskVolume.Path != aiservice.Spec.TaskVolume.Path {
+	if taskVolumePath(oldService.Spec.TaskVolume) != taskVolumePath(aiservice.Spec.TaskVolume) {
 		allErrs = append(allErrs, field.Forbidden(
 			field.NewPath("spec").Child("taskVolume").Child("path"),
 			"taskVolume.path is immutable",
@@ -251,6 +263,20 @@ func (v *AIServiceCustomValidator) ValidateUpdate(ctx context.Context, oldObj, n
 	}
 
 	return warnings, nil
+}
+
+func serviceRequiresObjectStorage(featureName string) bool {
+	if featureName == "" {
+		return true
+	}
+	return featuresregistry.RequiresObjectStorage(featureName)
+}
+
+func taskVolumePath(spec *aiv1.ObjectStorageSpec) string {
+	if spec == nil {
+		return ""
+	}
+	return spec.Path
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type AIService.

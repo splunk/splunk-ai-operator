@@ -2229,7 +2229,8 @@ spec:
                 type: object
               objectStorage:
                 description: |-
-                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
+                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models.
+                  It is optional for platforms that only enable features that do not require object storage.
                   Supported providers: S3, GCS, Azure Blob Storage, MinIO
                 properties:
                   endpoint:
@@ -2912,8 +2913,6 @@ spec:
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                 type: object
-            required:
-            - objectStorage
             type: object
           status:
             description: AIPlatformStatus defines observed state

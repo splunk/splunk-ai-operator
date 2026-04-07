@@ -39,7 +39,7 @@ type AIServiceSpec struct {
 
 	// TaskVolume specifies the object storage volume for tasks
 	// +kubebuilder:validation:Optional
-	TaskVolume ObjectStorageSpec `json:"taskVolume,omitempty"`
+	TaskVolume *ObjectStorageSpec `json:"taskVolume,omitempty"`
 
 	// SplunkConfiguration specifies the Splunk configuration for the AIService
 	// +kubebuilder:validation:Optional
