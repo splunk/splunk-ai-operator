@@ -1053,11 +1053,18 @@ spec:
                 items:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
+                    env:
+                      additionalProperties:
+                        type: string
+                      description: Env specifies environment variables to propagate
+                        to the child AIService.
+                      type: object
                     name:
                       description: Name of the feature, e.g. "saia" or "seca"
                       enum:
                       - saia
                       - seca
+                      - weaviate-service
                       type: string
                     scaleFactor:
                       description: ScaleFactor is the desired fixed number of replicas

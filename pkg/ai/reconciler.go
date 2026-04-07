@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
-	//"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	//"k8s.io/apimachinery/pkg/types"
@@ -57,27 +60,47 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	}()
 	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
 	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
+	rayRequired := platformRequiresRay(p.Spec.Features)
 
-	stages := []struct {
+	type stage struct {
 		name string
 		fn   func(context.Context, *aiApi.AIPlatform) error
-	}{
+	}
+
+	stages := []stage{
 		{"Validate", r.validate},
 		//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
 		//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
 		//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
-		{"Sidecars", sidecarBuilder.Reconcile},
-		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
-		{"RayService", raybuilder.ReconcileRayService},
-		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
-		{"Ingress", r.ReconcileIngress},
-		// collect status of each stage
-		{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
-		{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
-		{"IngressStatus", r.UpdateIngressStatus},
-		{"AIService", r.ReconcileFeatures},
-		{"AIServiceStatus", r.CheckAIServiceStatus},
 	}
+	if rayRequired {
+		stages = append(stages,
+			stage{"Sidecars", sidecarBuilder.Reconcile},
+			stage{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
+			stage{"RayService", raybuilder.ReconcileRayService},
+		)
+	} else {
+		// Ray is intentionally disabled when all configured features are Ray-independent.
+		p.Status.RayServiceName = ""
+		p.Status.RayServiceStatus = ""
+		stages = append(stages, stage{"RayServiceCleanup", r.cleanupRayService})
+	}
+
+	stages = append(stages,
+		stage{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
+		stage{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
+		stage{"Ingress", r.ReconcileIngress},
+	)
+
+	// collect status of each stage
+	if rayRequired {
+		stages = append(stages, stage{"RayServiceStatus", raybuilder.ApplyNormalizedConditions})
+	}
+	stages = append(stages,
+		stage{"IngressStatus", r.UpdateIngressStatus},
+		stage{"AIService", r.ReconcileFeatures},
+		stage{"AIServiceStatus", r.CheckAIServiceStatus},
+	)
 
 	for _, stage := range stages {
 		err := stage.fn(ctx, p)
@@ -196,6 +219,8 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	// The feature implementation is responsible for creating its own subdirectories
 	// (e.g., /tasks, /models, /artifacts) as needed
 	taskObjectStorage := platform.Spec.ObjectStorage
+	featureMetadata := feature
+	featureMetadata.Env = nil
 	// Don't append feature name - just pass the bucket path directly
 	// taskObjectStorage.Path is already set from platform.Spec.ObjectStorage
 	return &aiApi.AIService{
@@ -208,7 +233,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			},
 		},
 		Spec: aiApi.AIServiceSpec{
-			Feature: feature,
+			Feature: featureMetadata,
 			Version: feature.Version,
 			AIPlatformRef: corev1.ObjectReference{
 				APIVersion: "ai.splunk.com/v1",
@@ -220,6 +245,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			TaskVolume:          taskObjectStorage,
 			SplunkConfiguration: platform.Spec.SplunkConfiguration,
 			VectorDbUrl:         vectorDbUrl,
+			Env:                 cloneStringMap(feature.Env),
 			Replicas:            1,
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
@@ -231,6 +257,17 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
 		},
 	}
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // CheckAIServiceStatus verifies that all AIService children have successful conditions.
@@ -269,5 +306,36 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 
 	// Use V(1) for verbose logging - only errors are important at info level
 	log.V(1).Info("All AIService children have successful conditions", "count", len(children.Items))
+	return nil
+}
+
+func platformRequiresRay(features []aiApi.FeatureSpec) bool {
+	// Preserve existing behavior when no features are declared.
+	if len(features) == 0 {
+		return true
+	}
+	for _, feature := range features {
+		if featuresregistry.RequiresRay(feature.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *AIPlatformReconciler) cleanupRayService(ctx context.Context, p *aiApi.AIPlatform) error {
+	raySvc := &rayv1.RayService{}
+	key := client.ObjectKey{Namespace: p.Namespace, Name: p.Name}
+	if err := r.Get(ctx, key, raySvc); err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
+	if err := r.Delete(ctx, raySvc); err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
 	return nil
 }

@@ -202,6 +202,168 @@ func TestReconcileIngress_MultipleHosts(t *testing.T) {
 	assert.Equal(t, "ai-dashboard.example.com", ingress.Spec.Rules[1].Host)
 }
 
+func TestReconcileIngress_RaylessWeaviatePath(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+	platformName := "test-platform"
+
+	instance := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformName,
+			Namespace: ns,
+			UID:       types.UID("test-uid"),
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{
+				Path:   "s3://test-bucket/models",
+				Region: "us-west-2",
+			},
+			Features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			Ingress: &aiApi.IngressSpec{
+				Enabled: true,
+				Hosts: []aiApi.IngressHost{
+					{
+						Host: "weaviate.example.com",
+						Paths: []aiApi.IngressPath{
+							{
+								Path:     "/weaviate",
+								PathType: "Prefix",
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: aiApi.AIPlatformStatus{
+			VectorDbServiceName: "test-weaviate",
+		},
+	}
+
+	s := setupSchemeForTests()
+	_ = networkingv1.AddToScheme(s)
+
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(instance).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &AIPlatformReconciler{Client: fc, Scheme: s, Recorder: recorder}
+
+	err := r.ReconcileIngress(ctx, instance)
+	assert.NoError(t, err)
+
+	ingress := &networkingv1.Ingress{}
+	err = fc.Get(ctx, types.NamespacedName{Name: platformName, Namespace: ns}, ingress)
+	assert.NoError(t, err)
+	assert.Equal(t, "test-platform-weaviate-service-weaviate-service", ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Name)
+}
+
+func TestReconcileIngress_WeaviatePathFallsBackToRawWeaviateWithoutFeature(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+	platformName := "test-platform"
+
+	instance := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformName,
+			Namespace: ns,
+			UID:       types.UID("test-uid"),
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{
+				Path:   "s3://test-bucket/models",
+				Region: "us-west-2",
+			},
+			Ingress: &aiApi.IngressSpec{
+				Enabled: true,
+				Hosts: []aiApi.IngressHost{
+					{
+						Host: "weaviate.example.com",
+						Paths: []aiApi.IngressPath{
+							{
+								Path:     "/weaviate",
+								PathType: "Prefix",
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: aiApi.AIPlatformStatus{
+			VectorDbServiceName: "test-weaviate",
+		},
+	}
+
+	s := setupSchemeForTests()
+	_ = networkingv1.AddToScheme(s)
+
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(instance).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &AIPlatformReconciler{Client: fc, Scheme: s, Recorder: recorder}
+
+	err := r.ReconcileIngress(ctx, instance)
+	assert.NoError(t, err)
+
+	ingress := &networkingv1.Ingress{}
+	err = fc.Get(ctx, types.NamespacedName{Name: platformName, Namespace: ns}, ingress)
+	assert.NoError(t, err)
+	assert.Equal(t, "test-weaviate", ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Name)
+}
+
+func TestReconcileIngress_RaylessDefaultPathFails(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+	platformName := "test-platform"
+
+	instance := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformName,
+			Namespace: ns,
+			UID:       types.UID("test-uid"),
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{
+				Path:   "s3://test-bucket/models",
+				Region: "us-west-2",
+			},
+			Features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			Ingress: &aiApi.IngressSpec{
+				Enabled: true,
+				Hosts: []aiApi.IngressHost{
+					{
+						Host: "ai.example.com",
+						Paths: []aiApi.IngressPath{
+							{
+								Path:     "/",
+								PathType: "Prefix",
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: aiApi.AIPlatformStatus{
+			VectorDbServiceName: "test-weaviate",
+		},
+	}
+
+	s := setupSchemeForTests()
+	_ = networkingv1.AddToScheme(s)
+
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(instance).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &AIPlatformReconciler{Client: fc, Scheme: s, Recorder: recorder}
+
+	err := r.ReconcileIngress(ctx, instance)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "requires Ray")
+
+	ingress := &networkingv1.Ingress{}
+	err = fc.Get(ctx, types.NamespacedName{Name: platformName, Namespace: ns}, ingress)
+	assert.Error(t, err, "Ingress should not be created when the backend is invalid")
+}
+
 func TestUpdateIngressStatus_NotEnabled(t *testing.T) {
 	ctx := context.Background()
 	ns := "test-ns"

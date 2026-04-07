@@ -5,19 +5,40 @@ resources:
 
 # currently patch is set to change deployment environment variables
 patches:
-- patch: "- op: add\n  path: /spec/template/spec/containers/0/env\n  value: \n  -
-    name: WATCH_NAMESPACE\n    value: WATCH_NAMESPACE_VALUE\n  - name: RELATED_IMAGE_SPLUNK_ENTERPRISE\n
-    \   value: splunk/splunk:10.2.0-dev1\n  - name: OPERATOR_NAME\n    value:
-    splunk-operator\n  - name: POD_NAME\n    valueFrom:\n      fieldRef:\n        fieldPath:
-    metadata.name\n  - name: RELATED_IMAGE_RAY_HEAD\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17\"\n
-    \ - name: RELATED_IMAGE_RAY_WORKER\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17\"\n
-    \ - name: RELATED_IMAGE_WEAVIATE\n    value: \"semitechnologies/weaviate:stable-v1.28-007846a\"\n
-    \ - name: RELATED_IMAGE_SAIA_API\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1\"\n
-    \ - name: RELATED_IMAGE_POST_INSTALL_HOOK\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1\"\n
-    \ - name: RELATED_IMAGE_FLUENT_BIT\n    value: \"fluent/fluent-bit:1.9.6\"\n
-    \ - name: RELATED_IMAGE_OTEL_COLLECTOR\n    value: \"otel/opentelemetry-collector-contrib:0.122.1\"\n  -
-    name: MODEL_VERSION\n    value: \"v0.3.14-36-g1549f5a\"\n  - name: RAY_VERSION\n
-    \   value: \"2.44.0\""
+- patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/env
+      value:
+        - name: WATCH_NAMESPACE
+          value: WATCH_NAMESPACE_VALUE
+        - name: RELATED_IMAGE_SPLUNK_ENTERPRISE
+          value: splunk/splunk:10.2.0-dev1
+        - name: OPERATOR_NAME
+          value: splunk-operator
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: RELATED_IMAGE_RAY_HEAD
+          value: "667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17"
+        - name: RELATED_IMAGE_RAY_WORKER
+          value: "667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17"
+        - name: RELATED_IMAGE_WEAVIATE
+          value: "semitechnologies/weaviate:stable-v1.28-007846a"
+        - name: RELATED_IMAGE_WEAVIATE_SERVICE
+          value: "docker.io/kbhos698/weaviate-service:v1.0.1"
+        - name: RELATED_IMAGE_SAIA_API
+          value: "667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1"
+        - name: RELATED_IMAGE_POST_INSTALL_HOOK
+          value: "667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1"
+        - name: RELATED_IMAGE_FLUENT_BIT
+          value: "fluent/fluent-bit:1.9.6"
+        - name: RELATED_IMAGE_OTEL_COLLECTOR
+          value: "otel/opentelemetry-collector-contrib:0.122.1"
+        - name: MODEL_VERSION
+          value: "v0.3.14-36-g1549f5a"
+        - name: RAY_VERSION
+          value: "2.44.0"
   target:
     kind: Deployment
     name: controller-manager

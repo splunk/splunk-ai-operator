@@ -180,6 +180,73 @@ func TestValidate_PropagatesErrorFromValidateAndEnrich(t *testing.T) {
 	assert.Equal(t, expectedErr, err, "should propagate the error from ValidateAndEnrichSplunkConfig")
 }
 
+func TestValidate_RaylessIngressRejectsNonWeaviatePaths(t *testing.T) {
+	r := newFakeReconciler()
+	p := &aiApi.AIPlatform{
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			Features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			Ingress: &aiApi.IngressSpec{
+				Enabled: true,
+				Hosts: []aiApi.IngressHost{
+					{
+						Host: "ai.example.com",
+						Paths: []aiApi.IngressPath{
+							{Path: "/", PathType: "Prefix"},
+						},
+					},
+				},
+			},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
+		},
+	}
+
+	err := r.validate(context.Background(), p)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "requires Ray")
+}
+
+func TestValidate_RaylessIngressAllowsWeaviatePath(t *testing.T) {
+	r := newFakeReconciler()
+	p := &aiApi.AIPlatform{
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			Features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			Ingress: &aiApi.IngressSpec{
+				Enabled: true,
+				Hosts: []aiApi.IngressHost{
+					{
+						Host: "ai.example.com",
+						Paths: []aiApi.IngressPath{
+							{Path: "/weaviate", PathType: "Prefix"},
+						},
+					},
+				},
+			},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
+		},
+	}
+
+	patchValidateAndEnrich(func(
+		ctx context.Context,
+		c client.Client,
+		namespace, clusterDomain string,
+		config *aiApi.SplunkConfigurationSpec,
+		resolver splunkutils.SplunkSecretResolver,
+	) error {
+		return nil
+	})
+	defer restoreValidateAndEnrich()
+
+	err := r.validate(context.Background(), p)
+	assert.NoError(t, err)
+}
+
 //
 // --- Tests for SetImageRegistry() ---
 //

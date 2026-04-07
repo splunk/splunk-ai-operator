@@ -62,6 +62,8 @@ features: []
 # - name: "saia"
 #   serviceAccountName: "saia-service-sa"
 #   version: "1.1.0"
+#   env:
+#     ENABLE_INTERACTIVE_TOKEN_AUTH: "true"
 #   scaleFactor: 1  # Optional: fixed number of replicas
 
 # headGroupSpec:

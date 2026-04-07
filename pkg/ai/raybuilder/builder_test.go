@@ -7,6 +7,7 @@ import (
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -497,4 +498,12 @@ func TestSetImageRegistry(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestFeatureRequiresRay(t *testing.T) {
+	assert.False(t, featuresregistry.RequiresRay("weaviate-service"))
+	assert.False(t, featuresregistry.RequiresRay("WEAVIATE-SERVICE"))
+	assert.True(t, featuresregistry.RequiresRay("saia"))
+	assert.True(t, featuresregistry.RequiresRay("seca"))
+	assert.True(t, featuresregistry.RequiresRay("unknown"))
 }

@@ -1061,11 +1061,18 @@ spec:
                 items:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
+                    env:
+                      additionalProperties:
+                        type: string
+                      description: Env specifies environment variables to propagate
+                        to the child AIService.
+                      type: object
                     name:
                       description: Name of the feature, e.g. "saia" or "seca"
                       enum:
                       - saia
                       - seca
+                      - weaviate-service
                       type: string
                     scaleFactor:
                       description: ScaleFactor is the desired fixed number of replicas
@@ -2085,6 +2092,11 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                     type: array
+                  otelImage:
+                    default: otel/opentelemetry-collector-contrib:0.122.1
+                    description: OTelImage is the OpenTelemetry Collector sidecar
+                      image
+                    type: string
                   rayHeadGroupImage:
                     description: Ray head group image, e.g. "rayproject/ray-head:latest"
                     type: string
@@ -4084,11 +4096,18 @@ spec:
               features:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
+                  env:
+                    additionalProperties:
+                      type: string
+                    description: Env specifies environment variables to propagate
+                      to the child AIService.
+                    type: object
                   name:
                     description: Name of the feature, e.g. "saia" or "seca"
                     enum:
                     - saia
                     - seca
+                    - weaviate-service
                     type: string
                   scaleFactor:
                     description: ScaleFactor is the desired fixed number of replicas
@@ -5523,26 +5542,26 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: splunk/ai/ray/ray-head:build-17
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17
         - name: RELATED_IMAGE_RAY_WORKER
-          value: splunk/ai/ray/ray-worker-gpu:build-17
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
+        - name: RELATED_IMAGE_WEAVIATE_SERVICE
+          value: docker-test.repo.splunkdev.net/ml-platform/vector-db/weaviate-proxy:v1.0.0-interactive-token
         - name: RELATED_IMAGE_SAIA_API
-          value: splunk/ai/saia/saia-api:build-1
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: splunk/ai/saia/saia-data-loader:build-1
-        - name: SPLUNK_METRICS_INDEX_NAME
-          value: _metrics
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
         - name: RELATED_IMAGE_FLUENT_BIT
-          value: docker.io/fluent/fluent-bit:1.9.6
+          value: fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR
-          value: docker.io/otel/opentelemetry-collector-contrib:0.122.1
+          value: otel/opentelemetry-collector-contrib:0.122.1
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: splunk/ai/splunk-ai-operator:build-v1alpha1
+        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v9
         livenessProbe:
           httpGet:
             path: /healthz

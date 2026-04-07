@@ -104,6 +104,7 @@ rayWorkerImage: "docker.io/rayproject/ray:2.44.0-gpu"
 
 # Weaviate vector database image
 weaviateImage: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+weaviateProxyImage: "docker.io/kbhos698/weaviate-service:v1.0.1"
 
 # SAIA (Splunk AI Assistant) images
 saiaApiImage: "docker.io/splunk/saia-api:1.1.0"

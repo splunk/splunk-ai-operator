@@ -34,6 +34,9 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 			Affinity:     &corev1.Affinity{},
 		}
 	}
+	if err := validateIngressPathsForFeatures(p); err != nil {
+		return err
+	}
 
 	var resolver splunkutils.SplunkSecretResolver
 	if p.Spec.SplunkConfiguration.SecretSource == aiApi.SecretSourceVault {
@@ -58,4 +61,23 @@ func SetImageRegistry(key, defaultValue string) string {
 		return val
 	}
 	return defaultValue
+}
+
+func validateIngressPathsForFeatures(p *aiApi.AIPlatform) error {
+	if p.Spec.Ingress == nil || !p.Spec.Ingress.Enabled || platformRequiresRay(p.Spec.Features) {
+		return nil
+	}
+
+	for _, hostSpec := range p.Spec.Ingress.Hosts {
+		for _, pathSpec := range hostSpec.Paths {
+			switch pathSpec.Path {
+			case "/weaviate", "/weaviate/*":
+				continue
+			default:
+				return fmt.Errorf("ingress path %q requires Ray; only /weaviate and /weaviate/* are supported when Ray is disabled", pathSpec.Path)
+			}
+		}
+	}
+
+	return nil
 }

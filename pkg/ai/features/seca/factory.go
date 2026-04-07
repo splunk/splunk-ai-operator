@@ -12,6 +12,8 @@ import (
 
 type SecaFactory struct{}
 
+func (f *SecaFactory) RequiresRay() bool { return true }
+
 func (f *SecaFactory) New(ctx context.Context, c client.Client, scheme *runtime.Scheme, ai *aiv1.AIService, recorder record.EventRecorder) (common.FeatureHandler, error) {
 	return &SecaReconciler{
 		Client:   c,

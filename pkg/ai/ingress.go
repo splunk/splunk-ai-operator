@@ -63,18 +63,9 @@ func (r *AIPlatformReconciler) ReconcileIngress(ctx context.Context, p *aiApi.AI
 		paths := []networkingv1.HTTPIngressPath{}
 		for _, pathSpec := range hostSpec.Paths {
 			pathType := parsePathType(pathSpec.PathType)
-
-			// Determine which service to route to based on path
-			serviceName := p.Status.RayServiceName
-			servicePort := int32(8000) // Ray Serve default port
-
-			// Support routing to different services
-			if pathSpec.Path == "/dashboard" || pathSpec.Path == "/dashboard/*" {
-				serviceName = fmt.Sprintf("%s-head-svc", p.Name)
-				servicePort = 8265 // Ray Dashboard port
-			} else if pathSpec.Path == "/weaviate" || pathSpec.Path == "/weaviate/*" {
-				serviceName = p.Status.VectorDbServiceName
-				servicePort = 80 // Weaviate port
+			serviceName, servicePort, err := ingressBackendForPath(p, pathSpec.Path)
+			if err != nil {
+				return err
 			}
 
 			paths = append(paths, networkingv1.HTTPIngressPath{
@@ -238,4 +229,38 @@ func parsePathType(pathType string) networkingv1.PathType {
 		// Default to Prefix if not specified
 		return networkingv1.PathTypePrefix
 	}
+}
+
+func ingressBackendForPath(p *aiApi.AIPlatform, path string) (string, int32, error) {
+	switch path {
+	case "/dashboard", "/dashboard/*":
+		if p.Status.RayServiceName == "" {
+			return "", 0, fmt.Errorf("ingress path %q requires Ray; dashboard backend is unavailable", path)
+		}
+		return fmt.Sprintf("%s-head-svc", p.Name), 8265, nil
+	case "/weaviate", "/weaviate/*":
+		if proxyServiceName, ok := weaviateServiceIngressBackend(p); ok {
+			return proxyServiceName, 80, nil
+		}
+		if p.Status.VectorDbServiceName == "" {
+			return "", 0, fmt.Errorf("ingress path %q requires a Weaviate backend service, but VectorDbServiceName is not populated yet", path)
+		}
+		return p.Status.VectorDbServiceName, 80, nil
+	default:
+		if p.Status.RayServiceName == "" {
+			return "", 0, fmt.Errorf("ingress path %q requires Ray; only /weaviate and /weaviate/* are supported when Ray is disabled", path)
+		}
+		return p.Status.RayServiceName, 8000, nil
+	}
+}
+
+func weaviateServiceIngressBackend(p *aiApi.AIPlatform) (string, bool) {
+	for _, feature := range p.Spec.Features {
+		if strings.EqualFold(strings.TrimSpace(feature.Name), "weaviate-service") {
+			// ReconcileFeatures names the AIService "<platform>-<feature>" and the feature Service
+			// "<aiservice>-weaviate-service".
+			return fmt.Sprintf("%s-%s-weaviate-service", p.Name, feature.Name), true
+		}
+	}
+	return "", false
 }

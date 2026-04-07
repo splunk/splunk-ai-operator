@@ -132,6 +132,9 @@ images:
     # OR specify your mirrored image:
     #   image: "weaviate/weaviate:1.28.0"  → uses registry prefix
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+    # Weaviate proxy image used by SAIA/weaviate-service frontends
+    # Set this explicitly to avoid falling back to the raw Weaviate image.
+    proxyImage: "docker.io/kbhos698/weaviate-service:v1.0.1"
 
   # SAIA (Splunk AI Assistant) Images
   saia:

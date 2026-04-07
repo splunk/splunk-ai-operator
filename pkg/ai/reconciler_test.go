@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	featuresregistry "github.com/splunk/splunk-ai-operator/pkg/ai/features"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -55,6 +56,9 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 		Name:               "feature1",
 		Version:            "v1",
 		ServiceAccountName: "svc-account",
+		Env: map[string]string{
+			"ENABLE_INTERACTIVE_TOKEN_AUTH": "true",
+		},
 	}
 
 	r := &AIPlatformReconciler{Scheme: scheme}
@@ -66,9 +70,11 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	assert.Equal(t, "feature1", service.Spec.Feature.Name)
 	assert.Equal(t, "svc-account", service.Spec.ServiceAccountName)
 	assert.Equal(t, "weaviate-db", service.Spec.VectorDbUrl)
+	assert.Equal(t, map[string]string{"ENABLE_INTERACTIVE_TOKEN_AUTH": "true"}, service.Spec.Env)
 	assert.Equal(t, int32(1), service.Spec.Replicas)
 	assert.True(t, service.Spec.Metrics.Enabled)
 	assert.Equal(t, "/metrics", service.Spec.Metrics.Path)
+	assert.Nil(t, service.Spec.Feature.Env)
 
 	// Labels should include platform and feature
 	assert.Equal(t, "my-ai", service.Labels["aiplatform"])
@@ -87,7 +93,14 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 		},
 		Spec: aiApi.AIPlatformSpec{
 			Features: []aiApi.FeatureSpec{
-				{Name: "feature1", Version: "v1", ServiceAccountName: "svc-account"},
+				{
+					Name:               "feature1",
+					Version:            "v1",
+					ServiceAccountName: "svc-account",
+					Env: map[string]string{
+						"ENABLE_INTERACTIVE_TOKEN_AUTH": "true",
+					},
+				},
 			},
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
 		},
@@ -136,6 +149,7 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 	assert.Equal(t, "feature1", created.Spec.Feature.Name)
 	assert.Equal(t, "my-ai", created.Spec.AIPlatformRef.Name)
 	assert.Equal(t, "weaviate-db", created.Spec.VectorDbUrl)
+	assert.Equal(t, map[string]string{"ENABLE_INTERACTIVE_TOKEN_AUTH": "true"}, created.Spec.Env)
 }
 
 func TestReconcileFeatures_DoesNotRecreateExistingAIService(t *testing.T) {
@@ -341,4 +355,47 @@ func TestCheckAIServiceStatus_FailsWhenServiceHasFailedCondition(t *testing.T) {
 	assert.Contains(t, err.Error(), "my-ai-feature1")
 	assert.Contains(t, err.Error(), "PostInstallHookReady")
 	assert.Contains(t, err.Error(), "still running")
+}
+
+func TestFeatureRequiresRay(t *testing.T) {
+	assert.False(t, featuresregistry.RequiresRay("weaviate-service"))
+	assert.False(t, featuresregistry.RequiresRay("WEAVIATE-SERVICE"))
+	assert.True(t, featuresregistry.RequiresRay("saia"))
+	assert.True(t, featuresregistry.RequiresRay("seca"))
+	assert.True(t, featuresregistry.RequiresRay("unknown"))
+}
+
+func TestPlatformRequiresRay(t *testing.T) {
+	tests := []struct {
+		name     string
+		features []aiApi.FeatureSpec
+		want     bool
+	}{
+		{
+			name:     "empty feature list keeps backward compatibility",
+			features: nil,
+			want:     true,
+		},
+		{
+			name: "weaviate service only disables ray",
+			features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			want: false,
+		},
+		{
+			name: "mixed features still require ray",
+			features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+				{Name: "saia"},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, platformRequiresRay(tt.features))
+		})
+	}
 }

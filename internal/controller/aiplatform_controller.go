@@ -29,8 +29,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -183,9 +185,6 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			common.AnnotationChangedPredicate(),
 		))).
 		// Infra owned by AIPlatform itself - with specific predicates
-		// Ray resources - only reconcile on generation changes
-		Owns(&rayv1.RayService{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&rayv1.RayCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Weaviate pieces - whatever we create at the platform level
 		Owns(&appsv1.StatefulSet{}, builder.WithPredicates(common.StatefulSetChangedPredicate())). // if platform creates Weaviate as a StatefulSet
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(common.DeploymentChangedPredicate())).   // or a Deployment, if that's how we run it
@@ -206,7 +205,30 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: aiv1.TotalWorker,
 		})
 
+	// Ray watches are optional so the operator can run in weaviate-only environments
+	// where KubeRay CRDs are intentionally not installed.
+	if hasRESTMapping(mgr, rayv1.GroupVersion.WithKind("RayService").GroupKind(), rayv1.GroupVersion.Version) &&
+		hasRESTMapping(mgr, rayv1.GroupVersion.WithKind("RayCluster").GroupKind(), rayv1.GroupVersion.Version) {
+		b = b.
+			Owns(&rayv1.RayService{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			Owns(&rayv1.RayCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+	} else {
+		ctrl.Log.WithName("setup").Info("Ray CRDs not found; skipping Ray watches for AIPlatform controller")
+	}
+
 	return b.Complete(r)
+}
+
+func hasRESTMapping(mgr ctrl.Manager, gk schema.GroupKind, versions ...string) bool {
+	_, err := mgr.GetRESTMapper().RESTMapping(gk, versions...)
+	if err == nil {
+		return true
+	}
+	if apimeta.IsNoMatchError(err) {
+		return false
+	}
+	ctrl.Log.WithName("setup").Error(err, "unable to check REST mapping", "groupKind", gk.String())
+	return false
 }
 
 // finalizePlatform deletes platform‑owned children and waits until they are gone.
