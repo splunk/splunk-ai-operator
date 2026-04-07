@@ -5548,7 +5548,7 @@ spec:
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_WEAVIATE_SERVICE
-          value: docker.io/kbhos698/weaviate-service:v1.0.1
+          value: docker-test.repo.splunkdev.net/ml-platform/vector-db/weaviate-proxy:v1.0.0-interactive-token
         - name: RELATED_IMAGE_SAIA_API
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
@@ -5561,7 +5561,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.44.0
-        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v8
+        image: docker.io/kbhos698/splunk-ai-operator:weaviate-service-v9
         livenessProbe:
           httpGet:
             path: /healthz

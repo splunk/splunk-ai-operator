@@ -26,13 +26,13 @@ splunk:
 
 images:
   operator:
-    image: "docker.io/kbhos698/splunk-ai-operator:weaviate-service-v7"
+    image: "docker.io/kbhos698/splunk-ai-operator:weaviate-service-v9"
   splunk:
     image: "docker.io/splunk/splunk:10.2"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
-    proxyImage: "docker.io/kbhos698/weaviate-service:v1.0.1"
+    proxyImage: "docker-test.repo.splunkdev.net/ml-platform/vector-db/weaviate-proxy:v1.0.0-interactive-token"
 
 aiPlatform:
   name: "splunk-ai-stack"

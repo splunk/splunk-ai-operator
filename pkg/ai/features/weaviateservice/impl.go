@@ -199,7 +199,7 @@ func (r *WeaviateServiceReconciler) reconcileDeployment(ctx context.Context, ai 
 		container := corev1.Container{
 			Name:            "weaviate-proxy",
 			Image:           resolveWeaviateServiceImage(),
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Resources:       ai.Spec.Resources,
 			Ports: []corev1.ContainerPort{
 				{Name: "http", ContainerPort: 8080},
