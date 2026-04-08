@@ -130,7 +130,7 @@ func (r *SecaReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 			corev1.ResourceMemory: resource.MustParse("2Gi"),
 		}
 	}
-	if ai.Spec.TaskVolume.Path == "" {
+	if ai.Spec.TaskVolume == nil || ai.Spec.TaskVolume.Path == "" {
 		return fmt.Errorf("task volume path must be set")
 	}
 	if ai.Spec.Replicas == 0 {

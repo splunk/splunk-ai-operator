@@ -43,7 +43,7 @@ func TestBuilder_ReconcileRayAutoscalerRBAC(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -69,7 +69,7 @@ func TestBuilder_ReconcileRayAutoscalerRBAC(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "", // No service account
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -96,7 +96,7 @@ func TestBuilder_ReconcileRayAutoscalerRBAC(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa-2",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -187,7 +187,7 @@ func TestBuilder_ApplyNormalizedConditions(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -211,7 +211,7 @@ func TestBuilder_ApplyNormalizedConditions(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -668,7 +668,7 @@ func TestBuilder_ReconcileRayService_EdgeCases(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "gs://my-gcs-bucket/artifacts",
 						Region: "us-central1",
 					},
@@ -694,7 +694,7 @@ func TestBuilder_ReconcileRayService_EdgeCases(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "azure://my-container/artifacts",
 						Region: "eastus",
 					},
@@ -720,7 +720,7 @@ func TestBuilder_ReconcileRayService_EdgeCases(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "://invalid-url",
 						Region: "us-west-2",
 					},
@@ -747,7 +747,7 @@ func TestBuilder_ReconcileRayService_EdgeCases(t *testing.T) {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},

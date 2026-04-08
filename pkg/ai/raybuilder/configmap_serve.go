@@ -21,7 +21,11 @@ import (
 func (b *Builder) ReconcileServeConfigMap(ctx context.Context, p *enterpriseApi.AIPlatform) error {
 	log := log.FromContext(ctx) // Define logger
 
-	var storObj = p.Spec.ObjectStorage
+	if p.Spec.ObjectStorage == nil {
+		return fmt.Errorf("object storage is required for Ray features")
+	}
+
+	var storObj = *p.Spec.ObjectStorage
 	storObj.Path = fmt.Sprintf("%s/%s", storObj.Path, "ray-services/ai-platform/applications")
 
 	// 2️⃣ List actual artifacts in storage
@@ -31,7 +35,7 @@ func (b *Builder) ReconcileServeConfigMap(ctx context.Context, p *enterpriseApi.
 		return err
 	}
 
-	var artfObj = p.Spec.ObjectStorage
+	var artfObj = *p.Spec.ObjectStorage
 	artfObj.Path = fmt.Sprintf("%s/%s", artfObj.Path, "model_artifacts")
 	artfCli, err := storage.NewStorageClient(ctx, b.Client, p.Namespace, artfObj)
 	if err != nil {

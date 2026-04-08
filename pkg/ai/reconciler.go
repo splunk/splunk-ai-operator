@@ -218,7 +218,11 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	// Pass the bucket path as-is to the AIService
 	// The feature implementation is responsible for creating its own subdirectories
 	// (e.g., /tasks, /models, /artifacts) as needed
-	taskObjectStorage := platform.Spec.ObjectStorage
+	var taskObjectStorage *aiApi.ObjectStorageSpec
+	if platform.Spec.ObjectStorage != nil {
+		taskCopy := *platform.Spec.ObjectStorage
+		taskObjectStorage = &taskCopy
+	}
 	featureMetadata := feature
 	featureMetadata.Env = nil
 	// Don't append feature name - just pass the bucket path directly
@@ -316,6 +320,19 @@ func platformRequiresRay(features []aiApi.FeatureSpec) bool {
 	}
 	for _, feature := range features {
 		if featuresregistry.RequiresRay(feature.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func platformRequiresObjectStorage(features []aiApi.FeatureSpec) bool {
+	// Preserve existing behavior when no features are declared.
+	if len(features) == 0 {
+		return true
+	}
+	for _, feature := range features {
+		if featuresregistry.RequiresObjectStorage(feature.Name) {
 			return true
 		}
 	}

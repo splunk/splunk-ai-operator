@@ -101,7 +101,7 @@ func Test_validateAIService_defaults(t *testing.T) {
 		},
 		Spec: aiv1.AIServiceSpec{
 			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "ns"},
-			TaskVolume:    aiv1.ObjectStorageSpec{Path: "/data"},
+			TaskVolume:    &aiv1.ObjectStorageSpec{Path: "/data"},
 		},
 	}
 

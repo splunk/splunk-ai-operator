@@ -90,7 +90,7 @@ var _ = Describe("AIService reconcileStatus", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -139,7 +139,7 @@ var _ = Describe("AIService reconcileStatus", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -232,7 +232,7 @@ var _ = Describe("AIService Reconcile Edge Cases", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "non-existent-feature",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -271,7 +271,7 @@ var _ = Describe("AIService Reconcile Edge Cases", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "", // Empty feature name
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -311,7 +311,7 @@ var _ = Describe("AIService Reconcile Edge Cases", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},

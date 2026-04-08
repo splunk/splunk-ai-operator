@@ -114,12 +114,60 @@ wait_for_pods_ready() {
   local selector="$2"
   local timeout="${3:-300}"
   local description="${4:-pods matching ${selector}}"
+  local elapsed=0
+  local interval=5
 
   log "Waiting for ${description} in ${ns} (timeout: ${timeout}s)..."
-  if ! kubectl wait --for=condition=ready pod -l "${selector}" -n "${ns}" --timeout="${timeout}s"; then
+  while (( elapsed < timeout )); do
+    if kubectl get pods -n "${ns}" -l "${selector}" --no-headers 2>/dev/null | grep -q .; then
+      if kubectl wait --for=condition=ready pod -l "${selector}" -n "${ns}" --timeout="${interval}s" >/dev/null 2>&1; then
+        log "Ready: ${description} in ${ns}"
+        return 0
+      fi
+    fi
+
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+
+  kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
+  err "$(date '+%Y-%m-%d %H:%M:%S %Z') Timed out waiting for ${description} in ${ns} after ${timeout}s"
+}
+
+wait_for_splunk_standalone_ready() {
+  local ns="$1"
+  local name="$2"
+  local timeout="${3:-600}"
+  local elapsed=0
+  local interval=5
+
+  log "Waiting for Splunk Standalone ${name} in ${ns} (timeout: ${timeout}s)..."
+  while (( elapsed < timeout )); do
+    if kubectl get standalone "${name}" -n "${ns}" >/dev/null 2>&1; then
+      local desired ready phase
+      desired="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+      ready="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+      phase="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+
+      if [[ -n "${desired}" && "${ready:-0}" == "${desired}" && "${phase}" == "Ready" ]]; then
+        log "Ready: Splunk Standalone ${name} in ${ns}"
+        return 0
+      fi
+    fi
+
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+
+  kubectl get standalone "${name}" -n "${ns}" -o yaml | sed -n '1,220p' || true
+  local selector
+  selector="$(kubectl get standalone "${name}" -n "${ns}" -o jsonpath='{.status.selector}' 2>/dev/null || true)"
+  if [[ -n "${selector}" ]]; then
     kubectl get pods -n "${ns}" -l "${selector}" -o wide || true
-    err "Timed out waiting for ${description} in ${ns}"
+  else
+    kubectl get pods -n "${ns}" -o wide || true
   fi
+  err "$(date '+%Y-%m-%d %H:%M:%S %Z') Timed out waiting for Splunk Standalone ${name} in ${ns} after ${timeout}s"
 }
 
 wait_for_resource_deletion() {
@@ -214,7 +262,6 @@ load_config() {
 
   STORAGE_CLASS="$(yq eval '.storage.storageClass // "gp3"' "${CONFIG_FILE}")"
   VECTORDB_SIZE="$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}")"
-  S3_BUCKET="$(yq eval '.storage.s3Bucket // ""' "${CONFIG_FILE}")"
 
   AI_NS="$(yq eval '.aiPlatform.namespace // "ai-platform"' "${CONFIG_FILE}")"
   AI_PLATFORM_NAME="$(yq eval '.aiPlatform.name // ""' "${CONFIG_FILE}")"
@@ -223,7 +270,6 @@ load_config() {
   AI_FEATURE_SA="$(yq eval '.aiPlatform.features[0].serviceAccountName // .aiPlatform.features[0].serviceAccount // ""' "${CONFIG_FILE}")"
 
   AI_STANDALONE_NAME="$(yq eval '.splunkStandalone.name // "splunk-standalone"' "${CONFIG_FILE}")"
-  SPLUNK_APP_LOCAL_PATH="$(yq eval '.splunkStandalone.localAppPath // ""' "${CONFIG_FILE}")"
   SPLUNK_SERVICE_NAME="splunk-${AI_STANDALONE_NAME}-standalone-service"
 
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "${CONFIG_FILE}")"
@@ -243,8 +289,6 @@ load_config() {
   AI_FEATURE_NAME="$(echo "${AI_FEATURE_NAME}" | tr '[:upper:]' '[:lower:]')"
   [[ "${AI_FEATURE_NAME}" == "weaviate-service" ]] || \
     err "This script only supports aiPlatform.features[0].name=weaviate-service"
-
-  S3_PREFIXES=("artifacts/" "apps/" "tasks/")
   SPLUNK_AI_NS="splunk-ai-operator-system"
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, region=${REGION}, namespace=${AI_NS}, feature=${AI_FEATURE_NAME}@${AI_FEATURE_VERSION}"
@@ -255,7 +299,6 @@ validate_image_config() {
 
   is_nonempty_value "${CLUSTER_NAME}" || err "REQUIRED: cluster.name"
   is_nonempty_value "${REGION}" || err "REQUIRED: cluster.region"
-  is_nonempty_value "${S3_BUCKET}" || err "REQUIRED: storage.s3Bucket"
   is_nonempty_value "${OPERATOR_IMAGE}" || err "REQUIRED: images.operator.image"
   is_nonempty_value "${SPLUNK_IMAGE}" || err "REQUIRED: images.splunk.image"
   is_nonempty_value "${WEAVIATE_IMAGE}" || err "REQUIRED: images.weaviate.image"
@@ -419,79 +462,11 @@ install_splunk_ai_operator() {
   wait_for_crd aiservices.ai.splunk.com 600
 }
 
-ensure_s3_bucket_and_prefixes() {
-  log "Ensuring S3 bucket s3://${S3_BUCKET} in ${REGION}"
-  if ! aws s3api head-bucket --bucket "${S3_BUCKET}" 2>/dev/null; then
-    log "Creating bucket ${S3_BUCKET}"
-    aws s3api create-bucket \
-      --bucket "${S3_BUCKET}" \
-      --region "${REGION}" \
-      --create-bucket-configuration LocationConstraint="${REGION}" >/dev/null
-    aws s3api put-bucket-versioning --bucket "${S3_BUCKET}" --versioning-configuration Status=Enabled >/dev/null
-  fi
-
-  local key
-  for key in "${S3_PREFIXES[@]}"; do
-    aws s3api put-object --bucket "${S3_BUCKET}" --key "${key}" >/dev/null
-  done
-}
-
-ensure_s3_upload_splunk_app() {
-  if [[ -z "${SPLUNK_APP_LOCAL_PATH}" || "${SPLUNK_APP_LOCAL_PATH}" == "null" ]]; then
-    return 0
-  fi
-  if [[ ! -f "${SPLUNK_APP_LOCAL_PATH}" ]]; then
-    warn "splunkStandalone.localAppPath not found: ${SPLUNK_APP_LOCAL_PATH}"
-    return 0
-  fi
-
-  local base key
-  base="$(basename "${SPLUNK_APP_LOCAL_PATH}")"
-  key="apps/${base}"
-  log "Uploading ${base} to s3://${S3_BUCKET}/${key}"
-  aws s3 cp "${SPLUNK_APP_LOCAL_PATH}" "s3://${S3_BUCKET}/${key}" >/dev/null
-}
-
-resolve_aws_creds_for_secret() {
-  if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
-    return 0
-  fi
-
-  if [[ -n "${AWS_PROFILE:-}" ]]; then
-    local tmpf
-    tmpf="$(mktemp)"
-    if aws configure export-credentials --profile "${AWS_PROFILE}" --format env > "${tmpf}" 2>/dev/null; then
-      # shellcheck disable=SC1090
-      source "${tmpf}"
-      rm -f "${tmpf}"
-      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-      return 0
-    fi
-    rm -f "${tmpf}"
-  fi
-
-  err "AWS credentials not set. Export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or use AWS_PROFILE with a logged-in profile."
-}
-
 install_splunk_standalone() {
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
 
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
-
-  resolve_aws_creds_for_secret
-
-  local ak="${AWS_ACCESS_KEY_ID:-}" sk="${AWS_SECRET_ACCESS_KEY:-}" st="${AWS_SESSION_TOKEN:-}"
-  local -a secret_args=(
-    --from-literal=s3_access_key="${ak}"
-    --from-literal=s3_secret_key="${sk}"
-  )
-  if [[ -n "${st}" ]]; then
-    secret_args+=(--from-literal=s3_session_token="${st}")
-  fi
-  kubectl -n "${AI_NS}" create secret generic s3-secret \
-    "${secret_args[@]}" \
-    --dry-run=client -o yaml | kubectl apply -f -
 
   cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
@@ -529,28 +504,9 @@ spec:
       configMap:
         name: splunk-defaults
   defaultsUrl: /mnt/defaults/default.yml
-  appRepo:
-    appInstallPeriodSeconds: 90
-    appSources:
-      - name: apps
-        scope: local
-        location: apps
-    appsRepoPollIntervalSeconds: 60
-    defaults:
-      scope: local
-      volumeName: volume_app_repo
-    installMaxRetries: 2
-    volumes:
-      - name: volume_app_repo
-        provider: aws
-        storageType: s3
-        endpoint: https://s3.${REGION}.amazonaws.com
-        region: ${REGION}
-        path: ${S3_BUCKET}
-        secretRef: s3-secret
 YAML
 
-  wait_for_pods_ready "${AI_NS}" "app.kubernetes.io/instance=${AI_STANDALONE_NAME}" 600 "Splunk Standalone pods"
+  wait_for_splunk_standalone_ready "${AI_NS}" "${AI_STANDALONE_NAME}" 600
   log "Splunk Standalone installed successfully"
 }
 
@@ -608,11 +564,6 @@ kind: AIPlatform
 metadata:
   name: ${AI_PLATFORM_NAME}
 spec:
-  objectStorage:
-    path: s3://${S3_BUCKET}
-    region: ${REGION}
-    secretRef: s3-secret
-
   images:
 ${image_pull_secrets}
   serviceAccountName: ${AI_FEATURE_SA}
@@ -652,8 +603,6 @@ YAML
 install_ai_platform_stack() {
   ensure_namespace "${AI_NS}"
   create_gp3_storageclass
-  ensure_s3_bucket_and_prefixes
-  ensure_s3_upload_splunk_app
   install_cert_manager
   install_splunk_operator
   install_splunk_standalone

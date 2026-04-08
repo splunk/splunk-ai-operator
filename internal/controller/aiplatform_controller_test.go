@@ -127,7 +127,7 @@ var _ = Describe("AIPlatform Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -171,7 +171,7 @@ var _ = Describe("AIPlatform Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "", // Missing path
 						Region: "us-west-2",
 					},
@@ -200,7 +200,7 @@ var _ = Describe("AIPlatform Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -242,7 +242,7 @@ var _ = Describe("AIPlatform Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -308,7 +308,7 @@ var _ = Describe("AIPlatform Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -458,7 +458,7 @@ var _ = Describe("AIPlatform Requeue Scenarios", func() {
 			},
 			Spec: aiv1.AIPlatformSpec{
 				ServiceAccountName: "test-sa",
-				ObjectStorage: aiv1.ObjectStorageSpec{
+				ObjectStorage: &aiv1.ObjectStorageSpec{
 					Path:   "s3://test-bucket/artifacts",
 					Region: "us-west-2",
 				},

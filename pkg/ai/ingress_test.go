@@ -25,7 +25,7 @@ func TestReconcileIngress_Disabled(t *testing.T) {
 			Namespace: ns,
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},
@@ -63,7 +63,7 @@ func TestReconcileIngress_Enabled(t *testing.T) {
 			UID:       types.UID("test-uid"),
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},
@@ -146,7 +146,7 @@ func TestReconcileIngress_MultipleHosts(t *testing.T) {
 			UID:       types.UID("test-uid"),
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},
@@ -214,7 +214,7 @@ func TestReconcileIngress_RaylessWeaviatePath(t *testing.T) {
 			UID:       types.UID("test-uid"),
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},
@@ -269,7 +269,7 @@ func TestReconcileIngress_WeaviatePathFallsBackToRawWeaviateWithoutFeature(t *te
 			UID:       types.UID("test-uid"),
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},
@@ -321,7 +321,7 @@ func TestReconcileIngress_RaylessDefaultPathFails(t *testing.T) {
 			UID:       types.UID("test-uid"),
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},
@@ -375,7 +375,7 @@ func TestUpdateIngressStatus_NotEnabled(t *testing.T) {
 			Namespace: ns,
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{
+			ObjectStorage: &aiApi.ObjectStorageSpec{
 				Path:   "s3://test-bucket/models",
 				Region: "us-west-2",
 			},

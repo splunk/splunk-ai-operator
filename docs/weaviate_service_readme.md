@@ -7,7 +7,8 @@ This flow is intended for users who want a smaller setup focused on:
 - Splunk standalone
 - weaviate
 - weaviate-service
-- object storage for AIPlatform
+
+This lightweight flow does not require MinIO or external object storage.
 
 ## Prerequisites
 

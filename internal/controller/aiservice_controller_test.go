@@ -118,7 +118,7 @@ var _ = Describe("AIService Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "platform-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -158,7 +158,7 @@ var _ = Describe("AIService Controller", func() {
 						ServiceAccountName: "saia-sa",
 						Version:            "1.0.0",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -206,7 +206,7 @@ var _ = Describe("AIService Controller", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -242,7 +242,7 @@ var _ = Describe("AIService Controller", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -302,7 +302,7 @@ var _ = Describe("AIService Controller", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "platform-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -338,7 +338,7 @@ var _ = Describe("AIService Controller", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},

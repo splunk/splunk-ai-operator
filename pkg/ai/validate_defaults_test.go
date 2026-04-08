@@ -49,11 +49,14 @@ func newFakeReconciler() *AIPlatformReconciler {
 //
 
 // 1️⃣ Test required field validation
-func TestValidate_ObjectStoragePathRequired(t *testing.T) {
+func TestValidate_ObjectStoragePathRequiredForStorageBackedFeatures(t *testing.T) {
 	r := newFakeReconciler()
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage:       aiApi.ObjectStorageSpec{Path: ""}, // missing path
+			Features: []aiApi.FeatureSpec{
+				{Name: "saia"},
+			},
+			ObjectStorage:       &aiApi.ObjectStorageSpec{Path: ""}, // missing path
 			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
 		},
 	}
@@ -64,12 +67,38 @@ func TestValidate_ObjectStoragePathRequired(t *testing.T) {
 	assert.Contains(t, err.Error(), "object storage is required")
 }
 
+func TestValidate_AllowsWeaviateServiceWithoutObjectStorage(t *testing.T) {
+	r := newFakeReconciler()
+	p := &aiApi.AIPlatform{
+		Spec: aiApi.AIPlatformSpec{
+			Features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
+		},
+	}
+
+	patchValidateAndEnrich(func(
+		ctx context.Context,
+		c client.Client,
+		namespace, clusterDomain string,
+		config *aiApi.SplunkConfigurationSpec,
+		resolver splunkutils.SplunkSecretResolver,
+	) error {
+		return nil
+	})
+	defer restoreValidateAndEnrich()
+
+	err := r.validate(context.Background(), p)
+	assert.NoError(t, err)
+}
+
 // 2️⃣ Test defaulting behavior for nil SchedulingSpecs
 func TestValidate_DefaultsSchedulingSpecs(t *testing.T) {
 	r := newFakeReconciler()
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 			// CPUSchedulingSpec and GPUSchedulingSpec are nil → should be defaulted
 			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
 		},
@@ -120,7 +149,7 @@ func TestValidate_ResolverSelection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := &aiApi.AIPlatform{
 				Spec: aiApi.AIPlatformSpec{
-					ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+					ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 					SplunkConfiguration: aiApi.SplunkConfigurationSpec{
 						SecretSource: tt.secretSource,
 					},
@@ -158,7 +187,7 @@ func TestValidate_PropagatesErrorFromValidateAndEnrich(t *testing.T) {
 	r := newFakeReconciler()
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage:       aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage:       &aiApi.ObjectStorageSpec{Path: "/data"},
 			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
 		},
 	}
@@ -184,7 +213,7 @@ func TestValidate_RaylessIngressRejectsNonWeaviatePaths(t *testing.T) {
 	r := newFakeReconciler()
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 			Features: []aiApi.FeatureSpec{
 				{Name: "weaviate-service"},
 			},
@@ -213,7 +242,7 @@ func TestValidate_RaylessIngressAllowsWeaviatePath(t *testing.T) {
 	r := newFakeReconciler()
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 			Features: []aiApi.FeatureSpec{
 				{Name: "weaviate-service"},
 			},

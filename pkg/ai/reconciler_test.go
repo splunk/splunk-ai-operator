@@ -41,7 +41,7 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: aiApi.AIPlatformSpec{
-			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
 				Endpoint: "splunk-endpoint",
 			},
@@ -102,7 +102,7 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 					},
 				},
 			},
-			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 		},
 		Status: aiApi.AIPlatformStatus{
 			VectorDbServiceName: "weaviate-db",
@@ -171,7 +171,7 @@ func TestReconcileFeatures_DoesNotRecreateExistingAIService(t *testing.T) {
 			Features: []aiApi.FeatureSpec{
 				{Name: "feature1", Version: "v1", ServiceAccountName: "svc-account"},
 			},
-			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ObjectStorage: &aiApi.ObjectStorageSpec{Path: "/data"},
 		},
 		Status: aiApi.AIPlatformStatus{
 			VectorDbServiceName: "weaviate-db",
@@ -365,6 +365,14 @@ func TestFeatureRequiresRay(t *testing.T) {
 	assert.True(t, featuresregistry.RequiresRay("unknown"))
 }
 
+func TestFeatureRequiresObjectStorage(t *testing.T) {
+	assert.False(t, featuresregistry.RequiresObjectStorage("weaviate-service"))
+	assert.False(t, featuresregistry.RequiresObjectStorage("WEAVIATE-SERVICE"))
+	assert.True(t, featuresregistry.RequiresObjectStorage("saia"))
+	assert.True(t, featuresregistry.RequiresObjectStorage("seca"))
+	assert.True(t, featuresregistry.RequiresObjectStorage("unknown"))
+}
+
 func TestPlatformRequiresRay(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -396,6 +404,41 @@ func TestPlatformRequiresRay(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, platformRequiresRay(tt.features))
+		})
+	}
+}
+
+func TestPlatformRequiresObjectStorage(t *testing.T) {
+	tests := []struct {
+		name     string
+		features []aiApi.FeatureSpec
+		want     bool
+	}{
+		{
+			name:     "empty feature list keeps backward compatibility",
+			features: nil,
+			want:     true,
+		},
+		{
+			name: "weaviate service only does not require object storage",
+			features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+			},
+			want: false,
+		},
+		{
+			name: "mixed features still require object storage",
+			features: []aiApi.FeatureSpec{
+				{Name: "weaviate-service"},
+				{Name: "saia"},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, platformRequiresObjectStorage(tt.features))
 		})
 	}
 }

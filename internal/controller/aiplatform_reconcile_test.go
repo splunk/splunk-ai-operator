@@ -86,7 +86,7 @@ var _ = Describe("AIPlatform reconcileStatus", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket",
 						Region: "us-west-2",
 					},
@@ -128,7 +128,7 @@ var _ = Describe("AIPlatform reconcileStatus", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket",
 						Region: "us-west-2",
 					},
@@ -210,7 +210,7 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket",
 						Region: "us-west-2",
 					},
@@ -236,7 +236,7 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket",
 						Region: "us-west-2",
 					},
@@ -265,7 +265,7 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -303,7 +303,7 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket",
 						Region: "us-west-2",
 					},
@@ -330,7 +330,7 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket",
 						Region: "us-west-2",
 					},

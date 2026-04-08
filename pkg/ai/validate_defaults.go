@@ -16,9 +16,8 @@ import (
 
 // Validate checks required fields and backfills defaults on the AIPlatform spec.
 func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform) error {
-	// Required volume paths
-	if p.Spec.ObjectStorage.Path == "" {
-		return fmt.Errorf("object storage is required")
+	if platformRequiresObjectStorage(p.Spec.Features) && (p.Spec.ObjectStorage == nil || p.Spec.ObjectStorage.Path == "") {
+		return fmt.Errorf("object storage is required for the enabled features")
 	}
 	if p.Spec.CPUSchedulingSpec == nil {
 		p.Spec.CPUSchedulingSpec = &aiApi.SchedulingSpec{

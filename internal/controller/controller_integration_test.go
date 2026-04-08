@@ -126,7 +126,7 @@ var _ = Describe("AIPlatform Reconcile Error Handling", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -169,7 +169,7 @@ var _ = Describe("AIPlatform Reconcile Error Handling", func() {
 					Feature: aiv1.FeatureSpec{
 						Name: "saia",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
@@ -207,7 +207,7 @@ var _ = Describe("AIPlatform Reconcile Error Handling", func() {
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
+					ObjectStorage: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/artifacts",
 						Region: "us-west-2",
 					},
@@ -349,7 +349,7 @@ var _ = Describe("AIService Reconcile with Feature Handler", func() {
 			},
 			Spec: aiv1.AIPlatformSpec{
 				ServiceAccountName: "platform-sa",
-				ObjectStorage: aiv1.ObjectStorageSpec{
+				ObjectStorage: &aiv1.ObjectStorageSpec{
 					Path:   "s3://test-bucket/artifacts",
 					Region: "us-west-2",
 				},
@@ -391,7 +391,7 @@ var _ = Describe("AIService Reconcile with Feature Handler", func() {
 						ServiceAccountName: "saia-sa",
 						Version:            "1.0.0",
 					},
-					TaskVolume: aiv1.ObjectStorageSpec{
+					TaskVolume: &aiv1.ObjectStorageSpec{
 						Path:   "s3://test-bucket/tasks",
 						Region: "us-west-2",
 					},
