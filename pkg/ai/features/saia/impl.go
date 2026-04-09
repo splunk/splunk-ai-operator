@@ -62,6 +62,8 @@ func (r *SaiaReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		{"PostInstallHook", r.reconcilePostInstallHook},
 		{"SAIADeployment", r.reconcileSAIADeployment},
 		{"SAIAService", r.reconcileSAIAService},
+		{"NginxProxyConfigMap", r.reconcileNginxProxyConfigMap},
+		{"NginxProxyDeployment", r.reconcileNginxProxyDeployment},
 		{"ServiceMonitor", r.reconcileServiceMonitor},
 	}
 
@@ -955,6 +957,144 @@ func extractBucketName(path string) string {
 	}
 
 	return path
+}
+
+// reconcileNginxProxyConfigMap creates or updates the Nginx ConfigMap when the proxy is enabled.
+func (r *SaiaReconciler) reconcileNginxProxyConfigMap(
+	ctx context.Context,
+	ai *aiv1.AIService,
+) error {
+	if !ai.Spec.NginxProxy.Enabled {
+		return nil
+	}
+
+	nginxConf := fmt.Sprintf(`server {
+    listen 8080;
+
+    location /saia/v1/ {
+        proxy_pass %s/;
+        proxy_pass_request_headers on;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location /saia/v2/ {
+        proxy_pass %s/;
+        proxy_pass_request_headers on;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}`, ai.Spec.NginxProxy.V1Upstream, ai.Spec.NginxProxy.V2Upstream)
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ai.Name + "-nginx-proxy-config",
+			Namespace: ai.Namespace,
+		},
+	}
+	if err := controllerutil.SetControllerReference(ai, cm, r.Scheme); err != nil {
+		return fmt.Errorf("ownerref on Nginx ConfigMap: %w", err)
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		cm.Data = map[string]string{"default.conf": nginxConf}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("create/update Nginx ConfigMap: %w", err)
+	}
+	return nil
+}
+
+// reconcileNginxProxyDeployment creates or updates the Nginx Deployment and Service when the proxy is enabled.
+func (r *SaiaReconciler) reconcileNginxProxyDeployment(
+	ctx context.Context,
+	ai *aiv1.AIService,
+) error {
+	if !ai.Spec.NginxProxy.Enabled {
+		return nil
+	}
+
+	replicas := ai.Spec.NginxProxy.Replicas
+	if replicas == 0 {
+		replicas = 2
+	}
+
+	nginxImage := "nginx:1.27-alpine"
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ai.Name + "-nginx-proxy",
+			Namespace: ai.Namespace,
+		},
+	}
+	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
+		return fmt.Errorf("ownerref on Nginx Deployment: %w", err)
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+		deployment.Labels = map[string]string{"app": ai.Name + "-nginx-proxy"}
+		deployment.Spec.Replicas = &replicas
+		if deployment.Spec.Selector == nil {
+			deployment.Spec.Selector = &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": ai.Name + "-nginx-proxy"},
+			}
+		}
+		deployment.Spec.Template = corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{"app": ai.Name + "-nginx-proxy"},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:            "nginx",
+					Image:           nginxImage,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Ports:           []corev1.ContainerPort{{ContainerPort: 8080}},
+					VolumeMounts: []corev1.VolumeMount{{
+						Name:      "nginx-config",
+						MountPath: "/etc/nginx/conf.d",
+					}},
+				}},
+				Volumes: []corev1.Volume{{
+					Name: "nginx-config",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: ai.Name + "-nginx-proxy-config",
+							},
+						},
+					},
+				}},
+				ImagePullSecrets: ai.Spec.ImagePullSecrets,
+			},
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("create/update Nginx Deployment: %w", err)
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ai.Name + "-nginx-proxy-svc",
+			Namespace: ai.Namespace,
+		},
+	}
+	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
+		return fmt.Errorf("ownerref on Nginx Service: %w", err)
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Spec.Selector = map[string]string{"app": ai.Name + "-nginx-proxy"}
+		svc.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       8080,
+			TargetPort: intstr.FromInt(8080),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		svc.Spec.Type = corev1.ServiceTypeClusterIP
+		return nil
+	}); err != nil {
+		return fmt.Errorf("create/update Nginx Service: %w", err)
+	}
+	return nil
 }
 
 // cleanServiceTemplate removes server-generated metadata fields that shouldn't be set during updates.

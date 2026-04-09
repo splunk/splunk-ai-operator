@@ -117,6 +117,11 @@ type AIServiceSpec struct {
 	// +kubebuilder:default="cluster.local"
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	ClusterDomain string `json:"clusterDomain,omitempty"`
+
+	// NginxProxy configures the Nginx reverse proxy that routes SAIA App traffic
+	// to versioned SAIA Service endpoints (/saia/v1/ and /saia/v2/).
+	// +kubebuilder:validation:Optional
+	NginxProxy NginxProxyConfig `json:"nginxProxy,omitempty"`
 }
 
 // MetricsConfig defines the metrics configuration for monitoring
@@ -164,6 +169,29 @@ type MTLSConfig struct {
 	// +kubebuilder:default="operator"
 	// +kubebuilder:validation:Enum=operator;mesh
 	Termination string `json:"termination,omitempty"`
+}
+
+// NginxProxyConfig defines the Nginx reverse proxy configuration for routing
+// SAIA App traffic to versioned SAIA Service endpoints.
+type NginxProxyConfig struct {
+	// Enabled determines whether to deploy the Nginx reverse proxy
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Replicas is the number of Nginx proxy replicas
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=2
+	// +kubebuilder:validation:Minimum=1
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// V1Upstream is the upstream URL for SAIA Service v1
+	// +kubebuilder:validation:Optional
+	V1Upstream string `json:"v1Upstream,omitempty"`
+
+	// V2Upstream is the upstream URL for SAIA Service v2
+	// +kubebuilder:validation:Optional
+	V2Upstream string `json:"v2Upstream,omitempty"`
 }
 
 // AIServiceStatus defines the observed state of AIService
