@@ -1054,10 +1054,11 @@ spec:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
                     name:
-                      description: Name of the feature, e.g. "saia" or "seca"
+                      description: Name of the feature, e.g. "saia", "seca", or "slim"
                       enum:
                       - saia
                       - seca
+                      - slim
                       type: string
                     scaleFactor:
                       description: ScaleFactor is the desired fixed number of replicas
@@ -2091,6 +2092,9 @@ spec:
                   saiaImage:
                     description: SAIA service image
                     type: string
+                  slimImage:
+                    description: SLIM API service image
+                    type: string
                   weaviateImage:
                     description: Weaviate vector database image, e.g. "docker.io/weaviate:latest"
                     type: string
@@ -2222,25 +2226,24 @@ spec:
                 type: object
               objectStorage:
                 description: |-
-                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models.
-                  Supported: AWS S3, MinIO, SeaweedFS, any S3-compatible (s3:// + endpoint), GCS, Azure Blob.
-                  Backend is selected by path scheme; when endpoint is set with s3://, backend is S3-compatible.
+                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
+                  Supported providers: S3, GCS, Azure Blob Storage, MinIO
                 properties:
                   endpoint:
                     description: |-
-                      Optional override endpoint (only needed for S3-compatible services like MinIO, SeaweedFS).
-                      Must be a valid HTTP/HTTPS URL. When set with s3:// path, backend is treated as S3-compatible.
+                      Optional override endpoint (only needed for S3-compatible services like MinIO, SeaweedFS)
+                      Must be a valid HTTP/HTTPS URL. When set with s3:// path, backend is treated as S3-compatible (MinIO, SeaweedFS, etc.)
                     pattern: ^https?://.*$
                     type: string
                   path:
                     description: |-
-                      Remote volume URI: s3://bucket/prefix, gs://bucket/prefix, azure://container/prefix,
-                      minio://bucket/prefix, or seaweedfs://bucket/prefix
+                      Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
+                      azure://containername/<path prefix>, s3compat://bucketname/<path prefix> (generic S3-compatible), minio://, or seaweedfs://
                     pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   provider:
                     description: |-
-                      Optional hint for documentation and tooling. Operator derives behavior from path scheme and endpoint.
+                      Provider is an optional hint for documentation and tooling. Operator derives behavior from path scheme and endpoint.
                       Values: aws, minio, seaweedfs, s3compat, gcs, azure
                     enum:
                     - aws
@@ -2256,7 +2259,8 @@ spec:
                     minLength: 1
                     type: string
                   secretRef:
-                    description: Secret name containing storage credentials (e.g. s3_access_key, s3_secret_key for S3-compatible)
+                    description: Secret name containing storage credentials (e.g.
+                      s3_access_key, s3_secret_key for S3-compatible backends)
                     maxLength: 253
                     minLength: 1
                     type: string

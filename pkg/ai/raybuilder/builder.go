@@ -850,7 +850,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 		Containers: []corev1.Container{{
 			Name:            "ray-head",
 			Image:           SetImageRegistry("RELATED_IMAGE_RAY_HEAD", b.ai.Spec.Images.RayHeadGroupImage),
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Args: []string{
 				"ulimit -n 65536; echo head; $KUBERAY_GEN_RAY_START_CMD",
 			},
@@ -971,7 +971,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 		Containers: []corev1.Container{{
 			Name:            "ray-worker",
 			Image:           SetImageRegistry("RELATED_IMAGE_RAY_WORKER", b.ai.Spec.WorkerGroupConfig.ImageRegistry),
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Command: []string{
 				"/bin/bash",
 				"-lc",

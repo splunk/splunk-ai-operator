@@ -543,7 +543,7 @@ func TestBuilder_makeWorkerTemplate(t *testing.T) {
 				// Verify ray-worker container (first container is always ray-worker)
 				rayWorker := template.Spec.Containers[0]
 				assert.Equal(t, "ray-worker", rayWorker.Name)
-				assert.Equal(t, corev1.PullAlways, rayWorker.ImagePullPolicy)
+				assert.Equal(t, corev1.PullIfNotPresent, rayWorker.ImagePullPolicy)
 				assert.Contains(t, rayWorker.Command, "/bin/bash")
 
 				// Verify environment variables

@@ -192,9 +192,10 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 
 		// Container definition
 		sts.Spec.Template.Spec.Containers = []corev1.Container{{
-			Name:         "weaviate",
-			Image:        weaviateImage,
-			Resources:    resources,
+			Name:            "weaviate",
+			Image:           weaviateImage,
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Resources:       resources,
 			VolumeMounts: volumeMounts,
 			Ports: []corev1.ContainerPort{{
 				Name:          "http",

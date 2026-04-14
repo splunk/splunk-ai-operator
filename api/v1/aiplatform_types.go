@@ -135,6 +135,9 @@ type Images struct {
 	// Ray worker group image, e.g. "rayproject/ray-worker:latest"
 	// +kubebuilder:validation:Optional
 	RayWorkerGroupImage string `json:"rayWorkerGroupImage,omitempty"`
+	// SLIM API service image
+	// +kubebuilder:validation:Optional
+	SlimImage string `json:"slimImage,omitempty"`
 	// OTelImage is the OpenTelemetry Collector sidecar image
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default="otel/opentelemetry-collector-contrib:0.122.1"
@@ -177,8 +180,8 @@ type VectorDBStorageSpec struct {
 
 // FeatureSpec defines the features to enable in the AIPlatform
 type FeatureSpec struct {
-	// Name of the feature, e.g. "saia" or "seca"
-	// +kubebuilder:validation:Enum=saia;seca
+	// Name of the feature, e.g. "saia", "seca", or "slim"
+	// +kubebuilder:validation:Enum=saia;seca;slim
 	Name string `json:"name,omitempty"`
 	// ServiceAccountName is the name of the service account to use for the feature
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`

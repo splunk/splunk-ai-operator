@@ -5549,7 +5549,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.53.0
-        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.9
+        image: splunk/ai/splunk-ai-operator:build-v1alpha1
         livenessProbe:
           httpGet:
             path: /healthz

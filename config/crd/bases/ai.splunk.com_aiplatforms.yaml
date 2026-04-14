@@ -1054,10 +1054,11 @@ spec:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
                     name:
-                      description: Name of the feature, e.g. "saia" or "seca"
+                      description: Name of the feature, e.g. "saia", "seca", or "slim"
                       enum:
                       - saia
                       - seca
+                      - slim
                       type: string
                     scaleFactor:
                       description: ScaleFactor is the desired fixed number of replicas
@@ -2090,6 +2091,9 @@ spec:
                     type: string
                   saiaImage:
                     description: SAIA service image
+                    type: string
+                  slimImage:
+                    description: SLIM API service image
                     type: string
                   weaviateImage:
                     description: Weaviate vector database image, e.g. "docker.io/weaviate:latest"

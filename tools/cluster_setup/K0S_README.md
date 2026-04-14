@@ -16,6 +16,7 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
 - [Advanced Topics](#advanced-topics)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
+- [Internet Dependencies](#internet-dependencies)
 - [Migration Guide](#migration-guide)
 
 ---
@@ -24,10 +25,11 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
 
 The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI Platform on k0s Kubernetes, supporting:
 
-- **On-premises deployments** with existing hardware
-- **Bare metal servers** with customer-managed infrastructure
-- **AWS EC2 instances** for testing and simulation
-- **Air-gapped environments** with MinIO object storage
+- **Bare metal / on-premises deployments** with existing hardware and SSH access
+- **AWS EC2 instances** for testing and simulation (auto-creates instances)
+- **External S3-compatible object storage** (SeaweedFS, MinIO, or any S3-compatible endpoint)
+- **In-cluster MinIO** as a fallback when no external storage is configured
+- **Air-gapped environments** with private registries
 
 ### What is k0s?
 
@@ -47,8 +49,8 @@ The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI Platform o
 
 ### What Works Without AWS
 
-✅ **Complete AI Platform Stack** - All features work in pure on-prem environments
-✅ **MinIO Object Storage** - Replaces AWS S3, runs entirely in your cluster
+✅ **Complete AI Platform Stack** - All features (SAIA, Slim, SECA) work in pure on-prem environments
+✅ **Flexible Object Storage** - External SeaweedFS/MinIO/S3-compatible, or in-cluster MinIO
 ✅ **No Cloud Dependencies** - No AWS services required
 ✅ **Air-Gapped Support** - Can run completely disconnected from the internet
 ✅ **Private Registries** - Use your own container registry instead of ECR
@@ -123,52 +125,74 @@ The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI Platform o
 - **Pod Network (10.244.0.0/16)**: Calico VXLAN overlay network
 - **Service Network (10.96.0.0/16)**: Kubernetes ClusterIP services
 - All pod-to-pod communication happens over VXLAN (no cloud networking)
-- MinIO storage is local to the cluster (no S3)
+- Object storage is internal / external to the cluster (SeaweedFS, MinIO, or S3-compatible endpoint)
 
 ### Configuration Example (Pure On-Premises)
 
 ```yaml
 cluster:
   name: onprem-ai-cluster
-  region: us-west-2  # Ignored for on-prem, but required in config
   sshUser: ubuntu
   sshKeyPath: ~/.ssh/onprem-key
 
 nodes:
   controllers: 1
-  cpuWorkers: 0  # Not used with existingIPs
-  gpuWorkers: 0  # Not used with existingIPs
+  cpuWorkers: 2  # First 2 workers are CPU
+  gpuWorkers: 2  # Remaining 2 workers are GPU
 
   existingIPs:
     controllers:
       - 10.0.1.10     # Your controller server IP
     workers:
-      - 10.0.1.20     # CPU worker 1
-      - 10.0.1.21     # CPU worker 2
-      - 10.0.1.30     # GPU worker 1
-      - 10.0.1.31     # GPU worker 2
+      - 10.0.1.20     # CPU worker 1 (index 0)
+      - 10.0.1.21     # CPU worker 2 (index 1)
+      - 10.0.1.30     # GPU worker 1 (index 2)
+      - 10.0.1.31     # GPU worker 2 (index 3)
 
-minio:
-  accessKey: minio-admin
-  secretKey: SuperSecurePassword123!
-  bucket: ai-platform-data
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "100Gi"
+  objectStore:
+    type: "minio"                        # External MinIO endpoint
+    bucket: "ai-platform-data"
+    endpoint: "http://10.0.1.50:9000"
+    auth:
+      rootUser: "minio-admin"
+      rootPassword: "SuperSecurePassword123!"
+
+images:
+  registry: "registry.yourcompany.com"
+  operator:
+    image: "registry.yourcompany.com/splunk/splunk-ai-operator:v0.1.5"
+  splunk:
+    image: "registry.yourcompany.com/splunk/splunk:latest"
+    operatorImage: "registry.yourcompany.com/splunk/splunk-operator:3.0.0"
+  ray:
+    headImage: "registry.yourcompany.com/ray/ray-head:build-v1alpha1"
+    workerImage: "registry.yourcompany.com/ray/ray-worker-gpu:build-v1alpha1"
+  weaviate:
+    image: "registry.yourcompany.com/weaviate:stable-v1.28"
+  saia:
+    apiImage: "registry.yourcompany.com/saia/saia-api:build-v1alpha1"
+    dataLoaderImage: "registry.yourcompany.com/saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "registry.yourcompany.com/slim/slim-api:v0.0.1"
 
 kubernetes:
   namespace: ai-platform
 
 imagePullSecrets:
   secrets:
-    - private-registry-secret  # Your private registry
-  autoCreateECR: false  # No AWS ECR
+    - private-registry-secret
+  autoCreateECR: false
 
-aiplatform:
-  vectordb:
-    storageSize: "100Gi"
-  workers:
-    cpu:
-      maxReplicas: 4
-    gpu:
-      maxReplicas: 2
+aiPlatform:
+  name: "onprem-ai-stack"
+  features:
+    - name: "saia"
+      version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
 ```
 
 ### Installation Steps (Pure On-Premises)
@@ -388,31 +412,33 @@ sudo iptables -A INPUT -p tcp --dport 179 -s 10.0.0.0/16 -j ACCEPT
 
 The script installs everything needed for the AI Platform:
 
-1. **k0s Kubernetes Cluster** (v1.30+) - CNCF certified Kubernetes
+1. **k0s Kubernetes Cluster** - CNCF certified, single-binary Kubernetes
 2. **Calico CNI** - High-performance networking with VXLAN
-3. **MinIO** - S3-compatible object storage (replaces AWS S3). The AI Platform also supports SeaweedFS and other S3-compatible stores via `s3compat://`, `minio://`, or `seaweedfs://`; see [Object storage](../../docs/configuration/object-storage.md) for path schemes and configuration.
-4. **Cert-Manager** - Automated certificate management
-5. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
-6. **OpenTelemetry Operator** - Distributed tracing and telemetry
-7. **NVIDIA GPU Operator** - GPU support for AI workloads (optional)
-8. **KubeRay Operator** - Ray cluster management for distributed AI
-9. **Splunk Operator** - Splunk Enterprise management
-10. **Splunk AI Platform Operator** - AI platform orchestration
-11. **AI Platform CR** - Complete AI deployment with features
+3. **local-path Storage Provisioner** - Default StorageClass for PVCs
+4. **Object Storage** - External S3-compatible (SeaweedFS/MinIO) or in-cluster MinIO
+5. **Cert-Manager v1.13.0** - Automated certificate management
+6. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
+7. **OpenTelemetry Operator** - Distributed tracing and telemetry
+8. **NVIDIA Host Drivers + Device Plugin** - GPU support for AI workloads (optional, bare-metal driver install)
+9. **KubeRay Operator v1.0.0** - Ray cluster management for distributed AI
+10. **Splunk Operator** - Splunk Enterprise management
+11. **Splunk AI Platform Operator** - AI platform orchestration (SAIA, Slim, SECA features)
+12. **AIPlatform CR** - Complete AI deployment with features, scheduling, and secrets
 
 ### Two Deployment Modes
 
-#### Mode 1: On-Premises/Baremetal ✅
-- Provide existing IP addresses
+#### Mode 1: Bare Metal / On-Premises
+- Provide existing IP addresses in `nodes.existingIPs`
+- Script SSHs into each node and installs k0s, NVIDIA drivers (if GPU), iptables, and PyYAML
 - Passwordless SSH with sudo access required
 - Production-ready for on-prem deployments
-- Air-gapped support with MinIO
+- Air-gapped support with private registries
 
-#### Mode 2: AWS EC2 (Testing) 🧪
-- Automatically creates EC2 instances
-- Simulates on-prem environment
-- Quick setup for testing/validation
-- Uses AWS networking
+#### Mode 2: AWS EC2 (Testing / Simulation)
+- Automatically creates EC2 instances (controller, CPU workers, GPU workers)
+- Creates or reuses a Security Group with required k0s ports open
+- User-data bootstraps nodes with `curl`, `wget`, `jq`, and k0s binary
+- Quick setup for testing and validation before on-prem rollout
 
 ### Image Pull Secrets Support 🔐
 
@@ -488,7 +514,7 @@ Open the following ports between nodes:
 - Sufficient EC2 quotas:
   - t3.xlarge (controllers): 1+ instances
   - m5.4xlarge (CPU workers): 2+ instances
-  - g5.2xlarge (GPU workers): 1+ instances
+  - g5.2xlarge (GPU workers): 2+ instances
 
 **Verify AWS Access:**
 ```bash
@@ -561,23 +587,26 @@ kubectl get pods --all-namespaces
 The `k0s-cluster-config.yaml` file controls all aspects of the deployment:
 
 ```yaml
-cluster:           # Cluster-wide settings
-nodes:             # Node configuration
-ec2:               # AWS EC2 settings (if using EC2 mode)
-instanceTypes:     # EC2 instance types
-minio:             # MinIO object storage
-kubernetes:        # Kubernetes settings
-splunk:            # Splunk configuration
-ecr:               # ECR configuration
-imagePullSecrets:  # Private registry secrets
-aiplatform:        # AI Platform settings
+cluster:           # Cluster name, useExisting, region, SSH user/key
+nodes:             # Controller/worker counts and existingIPs
+storage:           # storageClass, vectorDbSize, objectStore (type/endpoint/auth)
+images:            # registry prefix, operator, splunk, ray, weaviate, saia, slim, fluentBit, otelCollector
+operators:         # ray (version/modelVersion/rayVersion), certManager, nvidia devicePluginVersion
+kubernetes:        # namespace
+files:             # splunkOperator, aiPlatform manifest paths
+splunk:            # standaloneName
+aiPlatform:        # defaultAcceleratorType, workerGroupConfig, features, scheduling
+imagePullSecrets:  # secrets list, autoCreateECR, dockerHub, gcr, acr, custom
+ecr:               # account, region
+ec2:               # vpcId, subnetId, keyName (EC2 mode)
+instanceTypes:     # controller, cpuWorker, gpuWorker (EC2 mode)
 ```
 
 ### Configuration Examples
 
-#### Example 1: On-Premises Production Cluster
+#### Example 1: On-Premises / Bare Metal Production Cluster
 
-**Use Case:** Production deployment on existing hardware
+**Use Case:** Production deployment on existing hardware with external object storage
 
 ```yaml
 cluster:
@@ -587,43 +616,65 @@ cluster:
 
 nodes:
   controllers: 1
-  cpuWorkers: 0  # Ignored when using existingIPs
-  gpuWorkers: 0  # Ignored when using existingIPs
+  cpuWorkers: 2      # First 2 workers treated as CPU
+  gpuWorkers: 2      # Remaining 2 workers treated as GPU
 
   existingIPs:
     controllers:
       - 10.0.1.10     # Physical server 1
     workers:
-      - 10.0.1.20     # Physical server 2 (CPU)
-      - 10.0.1.21     # Physical server 3 (CPU)
-      - 10.0.1.22     # Physical server 4 (GPU)
-      - 10.0.1.23     # Physical server 5 (GPU)
+      - 10.0.1.20     # Physical server 2 (CPU - worker index 0)
+      - 10.0.1.21     # Physical server 3 (CPU - worker index 1)
+      - 10.0.1.22     # Physical server 4 (GPU - worker index 2)
+      - 10.0.1.23     # Physical server 5 (GPU - worker index 3)
 
-minio:
-  accessKey: admin
-  secretKey: Change-This-Strong-Password-123!
-  bucket: ai-platform-production
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "200Gi"
+  objectStore:
+    type: "seaweedfs"
+    bucket: "ai-platform-production"
+    endpoint: "http://10.0.1.50:8333"
+    auth:
+      rootUser: "admin"
+      rootPassword: "Change-This-Strong-Password-123!"
+
+images: # TODO update images with released versions (from docker.io / how ?)
+  registry: "registry.corp.com"
+  operator:
+    image: "registry.corp.com/splunk/splunk-ai-operator:v0.1.5"
+  splunk:
+    image: "registry.corp.com/splunk/splunk:latest"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+  ray:
+    headImage: "registry.corp.com/ray/ray-head:build-v1alpha1"
+    workerImage: "registry.corp.com/ray/ray-worker-gpu:build-v1alpha1"
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28"
+  saia:
+    apiImage: "registry.corp.com/saia/saia-api:build-v1alpha1"
+    dataLoaderImage: "registry.corp.com/saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "registry.corp.com/slim/slim-api:v0.0.1"
 
 kubernetes:
   namespace: ai-platform
 
 splunk:
   standaloneName: splunk-prod
-  index: ai-platform
 
 imagePullSecrets:
   secrets:
-    - ecr-registry-secret
-  autoCreateECR: false  # Manually create in air-gapped
+    - private-registry-secret
+  autoCreateECR: false
 
-aiplatform:
-  vectordb:
-    storageSize: "200Gi"  # Large storage for production
-  workers:
-    cpu:
-      maxReplicas: 8
-    gpu:
-      maxReplicas: 4
+aiPlatform:
+  name: "prod-ai-stack"
+  features:
+    - name: "saia"
+      version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
 ```
 
 #### Example 2: AWS EC2 Testing Cluster
@@ -634,22 +685,20 @@ aiplatform:
 cluster:
   name: test-ai-platform
   region: us-west-2
-  useExisting: auto
-  sshUser: ubuntu
+  sshUser: ec2-user
   sshKeyPath: ~/.ssh/test-key.pem
 
 nodes:
   controllers: 1
   cpuWorkers: 2
   gpuWorkers: 1
-
   existingIPs:
     controllers: []  # Empty = auto-create EC2
     workers: []      # Empty = auto-create EC2
 
 ec2:
   vpcId: vpc-0123456789abcdef0
-  subnetId: ""  # Auto-select first available
+  subnetId: ""
   keyName: test-key
 
 instanceTypes:
@@ -657,17 +706,29 @@ instanceTypes:
   cpuWorker: m5.2xlarge
   gpuWorker: g5.xlarge
 
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "50Gi"
+  objectStore:
+    type: "minio"
+    bucket: "ai-platform-test"
+    endpoint: "http://minio-host:9000"
+    auth:
+      rootUser: "minioadmin"
+      rootPassword: "minioadmin123"
+
+images:
+  registry: "123456789012.dkr.ecr.us-west-2.amazonaws.com"
+  operator:
+    image: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk-ai-operator:latest"
+
 ecr:
-  account: "123456789012"  # Your AWS account ID
+  account: "123456789012" # Your AWS account ID
+  region: us-west-2
 
 imagePullSecrets:
-  secrets: []  # Auto-added when autoCreateECR=true
-  autoCreateECR: true  # Automatically create ECR secret
-
-minio:
-  accessKey: minioadmin
-  secretKey: minioadmin123
-  bucket: ai-platform-test
+  secrets: []
+  autoCreateECR: true
 
 kubernetes:
   namespace: ai-platform
@@ -686,16 +747,17 @@ cluster:
 
 nodes:
   controllers: 1
-  cpuWorkers: 2      # Will create 2 new EC2 CPU workers
-  gpuWorkers: 0      # No new GPU workers
+  cpuWorkers: 2      # First 2 workers are CPU (on-prem), + 2 EC2 CPU workers created
+  gpuWorkers: 2      # Remaining 2 on-prem workers are GPU
 
   existingIPs:
     controllers:
       - 192.168.1.10  # Existing on-prem controller
     workers:
-      - 192.168.1.20  # Existing GPU worker 1
-      - 192.168.1.21  # Existing GPU worker 2
-    # + 2 CPU workers will be created in EC2
+      - 192.168.1.20  # Existing on-prem worker (CPU - index 0)
+      - 192.168.1.21  # Existing on-prem worker (CPU - index 1)
+      - 192.168.1.30  # Existing on-prem worker (GPU - index 2)
+      - 192.168.1.31  # Existing on-prem worker (GPU - index 3)
 
 ec2:
   vpcId: vpc-0123456789abcdef0
@@ -720,8 +782,8 @@ cluster:
 
 nodes:
   controllers: 3  # HA setup
-  cpuWorkers: 0
-  gpuWorkers: 0
+  cpuWorkers: 2   # First 2 workers are CPU
+  gpuWorkers: 1   # Last worker is GPU
 
   existingIPs:
     controllers:
@@ -729,14 +791,25 @@ nodes:
       - 172.16.0.11
       - 172.16.0.12
     workers:
-      - 172.16.0.20
-      - 172.16.0.21
-      - 172.16.0.22
+      - 172.16.0.20  # CPU
+      - 172.16.0.21  # CPU
+      - 172.16.0.22  # GPU
 
-minio:
-  accessKey: secure-admin
-  secretKey: Very-Long-Secure-Password-456!
-  bucket: airgap-storage
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "100Gi"
+  objectStore:
+    type: "minio"
+    bucket: "airgap-storage"
+    endpoint: "http://172.16.0.50:9000"
+    auth:
+      rootUser: "secure-admin"
+      rootPassword: "Very-Long-Secure-Password-456!"
+
+images:
+  registry: "registry.airgap.local"
+  operator:
+    image: "registry.airgap.local/splunk-ai-operator:v0.1.5"
 
 imagePullSecrets:
   secrets:
@@ -744,6 +817,7 @@ imagePullSecrets:
   autoCreateECR: false
 
 # Note: Pre-pull all images to local registry before installation
+# See the "Internet Dependencies" section for the full list of images
 ```
 
 ### Configuration Reference
@@ -759,7 +833,9 @@ cluster:
   # Options: auto (detect), force (fail if not found), never (always create)
   useExisting: auto
 
-  # AWS region (required for EC2 mode)
+  # AWS region. Required for EC2 mode. Also used as fallback for ecr.region
+  # when pulling images from ECR (even in bare-metal mode).
+  # Not needed for pure on-prem with no AWS.
   region: us-west-2
 
   # SSH configuration
@@ -774,29 +850,152 @@ nodes:
   # Number of controller nodes (1 or 3 for HA)
   controllers: 1
 
-  # Number of CPU worker nodes (only for EC2 mode)
+  # Number of CPU workers. In EC2 mode: instances to create.
+  # In bare-metal mode: first N entries in workers[] are CPU, rest are GPU.
+  # Controls node labeling, NVIDIA driver install, and GPU device plugin.
   cpuWorkers: 2
 
-  # Number of GPU worker nodes (only for EC2 mode)
+  # Number of GPU workers. In EC2 mode: instances to create.
+  # In bare-metal mode: workers after the first cpuWorkers are treated as GPU.
   gpuWorkers: 1
 
-  # Existing IP addresses (on-prem mode)
+  # Existing IP addresses (bare-metal / on-prem mode)
   existingIPs:
     controllers: []  # Leave empty for EC2 auto-creation
     workers: []      # Leave empty for EC2 auto-creation
 ```
 
+#### Storage Section
+
+```yaml
+storage:
+  storageClass: "local-path"          # Kubernetes StorageClass for PVCs
+  vectorDbSize: "50Gi"                # Weaviate PersistentVolume size
+
+  objectStore:
+    type: "seaweedfs"                 # aws | s3compat | minio | seaweedfs
+    bucket: "ai-platform-bucket"      # S3 bucket name
+    endpoint: "http://host:8333"      # S3-compatible endpoint URL
+    auth:
+      rootUser: "admin"               # Access key / root user
+      rootPassword: "password"        # Secret key / root password
+```
+
+#### Images Section
+
+Short image paths (without a FQDN) are automatically prefixed with `images.registry`.
+
+```yaml
+images:
+  registry: "myregistry.com"          # Prefix applied to short image paths
+  operator:
+    image: "myregistry.com/splunk-ai-operator:v0.1.5"
+  splunk:
+    image: "myregistry.com/splunk:latest"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+  ray:
+    headImage: "ray/ray-head:build-v1alpha1"
+    workerImage: "ray/ray-worker-gpu:build-v1alpha1"
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28"
+  saia:
+    apiImage: "saia/saia-api:build-v1alpha1"
+    dataLoaderImage: "saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "myregistry.com/slim-api:v0.0.1"
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+```
+
+**Image patching chain:** The script reads these config values, resolves them via `build_image_url()` (prepends registry if needed), then uses `sed` to patch the corresponding `RELATED_IMAGE_*` env vars in the manifest files:
+
+| Config field | Env var patched | Target file |
+|---|---|---|
+| `images.operator.image` | Container `image:` field | `artifacts.yaml` |
+| `images.splunk.image` | `RELATED_IMAGE_SPLUNK_ENTERPRISE` | `splunk-operator-cluster.yaml` only |
+| `images.splunk.operatorImage` | Container `image:` field | `splunk-operator-cluster.yaml` |
+| `images.ray.headImage` | `RELATED_IMAGE_RAY_HEAD` | `artifacts.yaml` |
+| `images.ray.workerImage` | `RELATED_IMAGE_RAY_WORKER` | `artifacts.yaml` |
+| `images.weaviate.image` | `RELATED_IMAGE_WEAVIATE` | `artifacts.yaml` |
+| `images.saia.apiImage` | `RELATED_IMAGE_SAIA_API` | `artifacts.yaml` |
+| `images.saia.dataLoaderImage` | `RELATED_IMAGE_POST_INSTALL_HOOK` | `artifacts.yaml` |
+| `images.slim.apiImage` | `RELATED_IMAGE_SLIM_API` | `artifacts.yaml` |
+| `images.fluentBit.image` | `RELATED_IMAGE_FLUENT_BIT` | `artifacts.yaml` |
+| `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
+| `operators.ray.modelVersion` | `MODEL_VERSION` | `artifacts.yaml` |
+| `operators.ray.rayVersion` | `RAY_VERSION` | `artifacts.yaml` |
+
+> **Note:** `RELATED_IMAGE_SPLUNK_ENTERPRISE` also exists in `artifacts.yaml` but is only
+> patched in `splunk-operator-cluster.yaml`. `SPLUNK_METRICS_INDEX_NAME` in `artifacts.yaml`
+> is not configurable from the config file.
+
+#### Operators Section
+
+```yaml
+operators:
+  ray:
+    version: "v1.2.2"                 # KubeRay operator Helm chart version
+    modelVersion: "v0.3.14-36-g1549f5a"  # Model version label for Ray
+    rayVersion: "2.44.0"              # Ray runtime version
+  certManager:
+    installCRDs: true                 # Install cert-manager CRDs
+  nvidia:
+    devicePluginVersion: "v0.17.3"    # NVIDIA k8s device plugin version
+```
+
+#### AI Platform Section
+
+```yaml
+aiPlatform:
+  defaultAcceleratorType: "L40S"      # GPU tier: L40S, H100_NVL, or ""
+  workerGroupConfig:
+    imageRegistry: ""                 # Override registry for Ray worker images
+  # Note: name, features, cpuScheduling, gpuScheduling are defined
+  # for reference but currently hardcoded in the script's CR template
+```
+
 #### Image Pull Secrets Section
+
+The `secrets` list is **not consumed** by the script. Instead, the script auto-detects
+which secrets exist in the namespace by checking for hardcoded names: `ecr-registry-secret`,
+`docker-hub-secret`, `gcr-secret`, `acr-secret`, `custom-registry-secret`.
 
 ```yaml
 imagePullSecrets:
-  # List of secret names to use
-  secrets:
+  secrets:                            # Pre-existing secret names; NOT consumed; script auto-detects secrets in namespace
     - ecr-registry-secret
     - docker-hub-secret
+  autoCreateECR: true                 # Auto-create ECR secret from AWS creds
 
-  # Auto-create ECR secret
-  autoCreateECR: true  # Requires AWS credentials
+  # Docker Hub (optional)
+  dockerHub:
+    enabled: false
+    username: ""
+    password: ""
+    email: ""
+
+  # Google Container Registry (optional)
+  gcr:
+    enabled: false
+    jsonKey: ""                       # GCP service account JSON key
+
+  # Azure Container Registry (optional)
+  acr:
+    enabled: false
+    registry: ""                      # e.g. myregistry.azurecr.io
+    username: ""
+    password: ""
+
+  # Custom Docker-compatible registry (optional)
+  custom:
+    enabled: false
+    name: "custom-registry-secret"
+    server: ""
+    username: ""
+    password: ""
+    email: ""
 ```
 
 ---
@@ -812,11 +1011,11 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
 # Delete entire cluster
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh delete
 
-# Health check
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh health
+# Clean all k0s state from bare-metal nodes (stop/reset/remove)
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh clean-all
 
-# Get cluster info
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh info
+# Join additional workers to an existing cluster
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 ### Advanced Commands
@@ -825,15 +1024,8 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh info
 # Install without confirmation prompts
 AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
 
-# Skip specific components
-SKIP_MINIO=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
-SKIP_GPU_OPERATOR=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
-
-# Use existing cluster (skip k0s installation)
+# Use existing cluster (skip k0s installation, deploy stack only)
 USE_EXISTING=force CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
-
-# Join additional workers
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 ### Post-Installation Tasks
@@ -1018,7 +1210,7 @@ graph TB
 
     subgraph "AI Platform Namespace"
         AIPLATFORM[AIPlatform CR<br/>Custom Resource]
-        AISERVICE[AIService CRs<br/>saia, dspy, etc.]
+        AISERVICE[AIService CRs<br/>saia, slim, seca]
         RAYSERVICE[RayService<br/>Ray Serve + Cluster]
         RAYCLUSTER[RayCluster<br/>Head + Workers]
         WEAVIATE[Weaviate<br/>Vector Database]
@@ -1198,6 +1390,7 @@ graph TB
 
             subgraph "AI Services"
                 SAIA[AIService: saia<br/>Splunk AI Assistant]
+                SLIM[AIService: slim<br/>Slim API]
             end
 
             subgraph "Ray Infrastructure"
@@ -1230,9 +1423,8 @@ graph TB
             end
         end
 
-        subgraph "gpu-operator Namespace"
-            GPUOP[NVIDIA GPU Operator]
-            GPUPLUGIN[NVIDIA Device Plugin]
+        subgraph "kube-system (GPU)"
+            GPUPLUGIN[NVIDIA Device Plugin<br/>DaemonSet]
         end
     end
 
@@ -1281,7 +1473,6 @@ graph TB
     RAYWORKER1 -->|sends traces| OTELCOL
     OTELCOL -->|forwards to| SPLUNK
 
-    GPUOP -->|installs| GPUPLUGIN
     GPUPLUGIN -->|provides GPUs to| RAYWORKER2
 
     style AIOP fill:#e1f5ff,stroke:#01579b,stroke-width:3px
@@ -1604,27 +1795,6 @@ EOF
 
 ### Backup and Restore
 
-#### Backup MinIO Data
-
-```bash
-# Install MinIO client
-wget https://dl.min.io/client/mc/release/linux-amd64/mc
-chmod +x mc
-sudo mv mc /usr/local/bin/
-
-# Configure alias
-mc alias set k0s-minio \
-  http://localhost:9000 \
-  minioadmin \
-  minioadmin123
-
-# Backup bucket
-mc mirror k0s-minio/ai-platform-bucket ./backup/minio-data
-
-# Backup configuration
-kubectl get secret -n minio-system minio-creds -o yaml > backup/minio-secret.yaml
-```
-
 #### Backup etcd
 
 ```bash
@@ -1643,9 +1813,6 @@ scp ubuntu@controller-ip:/tmp/etcd-backup.db ./backup/
 scp ./backup/etcd-backup.db ubuntu@controller-ip:/tmp/
 ssh ubuntu@controller-ip
 sudo k0s etcd snapshot restore /tmp/etcd-backup.db
-
-# Restore MinIO data
-mc mirror ./backup/minio-data k0s-minio/ai-platform-bucket
 ```
 
 ---
@@ -1806,13 +1973,11 @@ kubectl logs -n local-path-storage deployment/local-path-provisioner
 
 #### GPU Not Detected
 
-```bash
-# Check GPU operator pods
-kubectl get pods -n gpu-operator
+The script installs NVIDIA host drivers and the device plugin DaemonSet directly (not the GPU Operator).
 
-# All pods should be Running
-# If not, check logs:
-kubectl logs -n gpu-operator deployment/gpu-operator
+```bash
+# Check NVIDIA device plugin pods
+kubectl get pods -n kube-system -l name=nvidia-device-plugin-ds
 
 # Check node GPU resources
 kubectl get nodes -o json | jq '.items[].status.capacity | select(.["nvidia.com/gpu"] != null)'
@@ -2106,6 +2271,76 @@ EOF
 
 ---
 
+## Internet Dependencies
+
+The script downloads various binaries, manifests, Helm charts, OS packages, and container images from the internet. This section lists every external download grouped by where it occurs, which is important for air-gapped planning and security review.
+
+### Downloads from the Local Machine (where the script runs)
+
+| What | URL / Source |
+|------|-------------|
+| Public IP detection | `https://checkip.amazonaws.com`, `https://ipinfo.io/ip`, `https://api.ipify.org` |
+| cert-manager manifest | `https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml` |
+| NVIDIA k8s device plugin | `https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/<version>/deployments/static/nvidia-device-plugin.yml` |
+| local-path-provisioner | `https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml` |
+| Prometheus Helm repo | `https://prometheus-community.github.io/helm-charts` |
+| kube-prometheus-stack chart | `prometheus-community/kube-prometheus-stack` (via `helm install`) |
+| OpenTelemetry Helm repo | `https://open-telemetry.github.io/opentelemetry-helm-charts` |
+| OpenTelemetry Operator chart | `open-telemetry/opentelemetry-operator` (via `helm install`) |
+| KubeRay Helm repo | `https://ray-project.github.io/kuberay-helm/` |
+| KubeRay Operator chart | `kuberay/kuberay-operator` version `1.0.0` (via `helm install`) |
+
+### Downloads on EC2 Nodes (user-data bootstrap, EC2 mode only)
+
+| What | URL / Source |
+|------|-------------|
+| System packages | `apt-get install -y curl wget jq` |
+| k0s binary | `curl -sSLf https://get.k0s.sh \| sh` |
+
+### Downloads on All Nodes via SSH (bare-metal & EC2)
+
+| What | URL / Source |
+|------|-------------|
+| iptables-nft | `dnf install -y iptables-nft` (RHEL/Fedora, if missing) |
+| python3-pyyaml | `dnf install -y python3-pyyaml` or `apt-get install -y python3-yaml` or `pip3 install pyyaml` |
+| k0s binary | `curl -sSLf https://get.k0s.sh \| sudo sh` (if not already installed) |
+
+### Downloads on GPU Worker Nodes via SSH
+
+| What | URL / Source |
+|------|-------------|
+| Kernel headers | `dnf/yum install kernel-devel-$(uname -r) kernel-headers-$(uname -r)` or `apt-get install linux-headers-$(uname -r)` |
+| NVIDIA GPU driver (AL2023) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo` |
+| NVIDIA GPU driver (RHEL 9/10) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/rhel{9,10}/x86_64/...` |
+| NVIDIA GPU driver (Ubuntu) | `https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb` + `nvidia-driver-550` |
+| EPEL for dkms (RHEL 10) | `https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm` |
+| NVIDIA Container Toolkit | Repo: `https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo`, GPG: `https://nvidia.github.io/libnvidia-container/gpgkey` |
+
+### Container Images Pulled by Kubernetes at Runtime
+
+These images are pulled from registries when pods are scheduled. They can be pre-pulled for air-gapped environments.
+
+| Image | Default Source |
+|-------|---------------|
+| Splunk AI Operator | ECR or configured registry |
+| Ray Head / Ray Worker GPU | ECR or configured registry |
+| Weaviate | `docker.io/semitechnologies/weaviate:...` |
+| SAIA API / Data Loader | ECR or configured registry |
+| Slim API | ECR or configured registry |
+| Fluent Bit | `docker.io/fluent/fluent-bit:1.9.6` |
+| OpenTelemetry Collector | `docker.io/otel/opentelemetry-collector-contrib:0.122.1` |
+| Splunk Enterprise | ECR or configured registry |
+| Splunk Operator | `docker.io/splunk/splunk-operator:3.0.0` |
+| MinIO + MinIO Client | `minio/minio:latest`, `minio/mc:latest` (only when in-cluster MinIO is deployed) |
+| Prometheus, Grafana, Alertmanager | Pulled by kube-prometheus-stack Helm chart |
+| KubeRay Operator | Pulled by kuberay Helm chart |
+| OpenTelemetry Operator | Pulled by opentelemetry-operator Helm chart |
+| cert-manager (controller, webhook, cainjector) | Pulled by cert-manager manifest |
+| NVIDIA device plugin | Pulled by DaemonSet manifest |
+| local-path-provisioner | Pulled by provisioner manifest |
+
+---
+
 ## Migration Guide
 
 ### From EKS to k0s
@@ -2245,21 +2480,110 @@ See the main repository LICENSE file.
 cluster:
   name: my-cluster                    # Cluster identifier
   useExisting: auto                   # auto|force|never
-  region: us-west-2                   # AWS region (EC2 mode)
-  sshUser: ubuntu                     # SSH username
-  sshKeyPath: ~/.ssh/key.pem          # SSH private key
+  region: us-west-2                   # EC2 mode + ECR fallback region (not needed for pure on-prem)
+  sshUser: ubuntu                     # SSH username for node access
+  sshKeyPath: ~/.ssh/key.pem          # SSH private key path
 
 nodes:
   controllers: 1                      # 1 or 3 for HA
-  cpuWorkers: 2                       # For EC2 mode
-  gpuWorkers: 1                       # For EC2 mode
+  cpuWorkers: 2                       # EC2: create count. Bare metal: first N workers = CPU
+  gpuWorkers: 1                       # EC2: create count. Bare metal: remaining workers = GPU
   existingIPs:
-    controllers: []                   # Empty = create EC2
-    workers: []                       # Or list of IPs
+    controllers: []                   # Empty = create EC2, or list of IPs (bare metal)
+    workers: []                       # Empty = create EC2, or list of IPs (bare metal)
 
+# --- Storage ---
+storage:
+  storageClass: "local-path"          # StorageClass for PVCs
+  vectorDbSize: "50Gi"                # Weaviate PV size
+  objectStore:
+    type: "seaweedfs"                 # aws | s3compat | minio | seaweedfs
+    bucket: "ai-platform-bucket"      # S3 bucket name
+    endpoint: "http://host:8333"      # S3-compatible endpoint
+    auth:
+      rootUser: "admin"               # Access key
+      rootPassword: "password"        # Secret key
+
+# --- Container Images ---
+images:
+  registry: "myregistry.com"          # Registry prefix for short image paths
+  operator:
+    image: "myregistry.com/splunk-ai-operator:v0.1.5"
+  splunk:
+    image: "myregistry.com/splunk:latest"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+  ray:
+    headImage: "myregistry.com/ray/ray-head:build-v1alpha1"
+    workerImage: "myregistry.com/ray/ray-worker-gpu:build-v1alpha1"
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28"
+  saia:
+    apiImage: "myregistry.com/saia/saia-api:build-v1alpha1"
+    dataLoaderImage: "myregistry.com/saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "myregistry.com/slim-api:v0.0.1"
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+# --- Operator Versions ---
+operators:
+  ray:
+    version: "v1.2.2"                 # KubeRay operator chart version
+    modelVersion: "v0.3.14-36-g1549f5a"  # Model version label
+    rayVersion: "2.44.0"             # Ray runtime version
+  certManager:
+    installCRDs: true
+  nvidia:
+    devicePluginVersion: "v0.17.3"   # NVIDIA k8s device plugin tag
+
+# --- Kubernetes ---
+kubernetes:
+  namespace: ai-platform              # AI Platform namespace
+
+# --- File Paths ---
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"  # Splunk Operator manifest path
+  aiPlatform: "./artifacts.yaml"                    # AI Operator manifest path
+
+# --- Splunk ---
+splunk:
+  standaloneName: splunk-standalone   # Splunk Standalone CR name
+
+# --- AI Platform ---
+# NOTE: defaultAcceleratorType and workerGroupConfig.imageRegistry are consumed
+# by the script. The remaining fields are NOT consumed and are hardcoded in
+# the AIPlatform CR template inside the script:
+#   - name: hardcoded as "${CLUSTER_NAME}-ai-platform"
+#   - features: hardcoded to only "saia" (slim/seca must be added manually)
+#   - cpuScheduling/gpuScheduling: hardcoded with node selectors
+#   - objectStorage.region: hardcoded to "us-east-1"
+aiPlatform:
+  name: "splunk-ai-stack"             # Reference only; NOT consumed; CR name = ${CLUSTER_NAME}-ai-platform
+  defaultAcceleratorType: "L40S"      # Consumed → AIPlatform CR spec
+  workerGroupConfig:
+    imageRegistry: ""                 # Override registry for Ray worker images
+  features:                           # Reference only (hardcoded in script)
+    - name: "saia"
+      version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
+  cpuScheduling:                      # Reference only (hardcoded in script)
+    nodeSelector: {}
+    tolerations: []
+  gpuScheduling:                      # Reference only (hardcoded in script)
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+# --- EC2 Mode (optional) ---
 ec2:
-  vpcId: vpc-xxx                      # Required for EC2
-  subnetId: subnet-xxx                # Optional
+  vpcId: vpc-xxx                      # Required for EC2 mode
+  subnetId: subnet-xxx                # Optional, auto-selects first available
   keyName: my-key                     # AWS key pair name
 
 instanceTypes:
@@ -2267,48 +2591,45 @@ instanceTypes:
   cpuWorker: m5.4xlarge               # 16 CPU, 64GB RAM
   gpuWorker: g5.2xlarge               # 8 CPU, 24GB RAM, A10G GPU
 
-minio:
-  accessKey: admin                    # MinIO admin user
-  secretKey: password123              # MinIO admin password
-  bucket: ai-platform-data            # Default bucket
+# --- Image Pull Secrets ---
+# NOTE: secrets[] list is NOT consumed by the script. The script auto-detects
+# which secrets exist in the namespace by checking hardcoded names:
+# ecr-registry-secret, docker-hub-secret, gcr-secret, acr-secret, custom-registry-secret.
+imagePullSecrets:
+  secrets: []                         # NOT consumed; script auto-detects in namespace
+  autoCreateECR: true                 # Consumed → creates ECR secret from AWS creds
 
-kubernetes:
-  namespace: ai-platform              # AI Platform namespace
+  # Docker Hub private registry
+  dockerHub:
+    enabled: false
+    username: ""
+    password: ""                      # Use token, not plaintext password
+    email: ""
 
-splunk:
-  standaloneName: splunk-standalone   # Splunk instance name
-  hecEndpoint: ""                     # Optional external HEC
-  hecToken: ""                        # Optional HEC token
-  index: ai-platform                  # Splunk index name
+  # Google Container Registry
+  gcr:
+    enabled: false
+    jsonKey: ""                       # GCP service account JSON key
+
+  # Azure Container Registry
+  acr:
+    enabled: false
+    registry: ""                      # e.g. myregistry.azurecr.io
+    username: ""
+    password: ""
+
+  # Custom Docker-compatible registry
+  custom:
+    enabled: false
+    name: "custom-registry-secret"    # Secret name to create
+    server: ""                        # Registry URL
+    username: ""
+    password: ""
+    email: ""
 
 ecr:
   account: "123456789012"             # AWS account ID
-
-imagePullSecrets:
-  secrets: []                         # Manual secret names
-  autoCreateECR: true                 # Auto-create ECR secret
-
-aiplatform:
-  ray:
-    version: "2.9.0"
-    image: "rayproject/ray:2.9.0"
-  vectordb:
-    image: "semitechnologies/weaviate:1.28.0"
-    storageSize: "50Gi"
-  workers:
-    cpu:
-      minReplicas: 1
-      maxReplicas: 5
-      resourcesPerWorker:
-        cpu: "4"
-        memory: "16Gi"
-    gpu:
-      minReplicas: 0
-      maxReplicas: 2
-      resourcesPerWorker:
-        cpu: "8"
-        memory: "32Gi"
-        nvidia.com/gpu: "1"
+  region: us-east-2                   # ECR region
 ```
 
 ### Environment Variables
@@ -2320,17 +2641,8 @@ CONFIG_FILE=./my-config.yaml
 # Skip confirmation prompts
 AUTO_APPROVE=true
 
-# Use existing cluster
+# Use existing cluster (skip k0s installation)
 USE_EXISTING=force
-
-# Skip components
-SKIP_MINIO=true
-SKIP_GPU_OPERATOR=true
-SKIP_PROMETHEUS=true
-SKIP_OTEL=true
-
-# Debug mode
-DEBUG=true
 ```
 
 ### Common Recipes
@@ -2361,6 +2673,6 @@ CONFIG_FILE=dev.yaml AUTO_APPROVE=true ./k0s_cluster_with_stack.sh install
 
 ---
 
-**Version:** 1.0
-**Last Updated:** 2024
+**Version:** 2.0
+**Last Updated:** February 2026
 **Maintainer:** Splunk AI Platform Team
