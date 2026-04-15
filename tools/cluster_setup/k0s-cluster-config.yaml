@@ -1,119 +1,150 @@
 # ===================================================================
-# k0s Cluster Configuration Template for Splunk AI Platform
+# k0s Cluster Configuration for Splunk AI Platform
 # ===================================================================
-# IMPORTANT: This is a template file with placeholder values.
-# Copy this file and replace ALL placeholder values with your actual resources.
+# Mirrors cluster-config.yaml (EKS) but adapted for k0s on bare-metal / EC2.
 #
 # Quick Start:
-#   1. Copy: cp k0s-cluster-config.yaml my-cluster-config.yaml
-#   2. Edit: vi my-cluster-config.yaml
+#   1. Copy: cp k0s-cluster-config.yaml my-k0s-config.yaml
+#   2. Edit: vi my-k0s-config.yaml
 #   3. Replace all values marked with "CHANGE THIS"
-#   4. Run: CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+#   4. Run: CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
 # ===================================================================
 
 # ---------- Cluster Configuration ----------
 cluster:
-  name: "my-ai-cluster"              # CHANGE THIS: Your cluster name
-  useExisting: "auto"                # auto | force | never
-  region: "us-east-2"               # CHANGE THIS: AWS region (used when creating EC2 instances)
-  sshUser: "ubuntu"                  # SSH username for nodes
-  sshKeyPath: "~/.ssh/id_rsa"       # CHANGE THIS: Path to SSH private key
+  name: airgap-cluster
+  # region: us-east-2                    # Ignored for on-prem, but required in config
+  sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
+  sshKeyPath: /Users/mohaari2/.ssh/ai-key-arif.pem  # CHANGE THIS: Path to SSH private key
 
 # ---------- Node Configuration ----------
-#
-# GPU TYPE QUICK REFERENCE — set gpuWorker instanceType and defaultAcceleratorType together:
-#
-#   L40S  (default):
-#     gpuWorker instanceType: g6e.12xlarge    (4x L40S GPUs, 48 GB VRAM each)
-#     defaultAcceleratorType: L40S
-#
-#   H100:
-#     gpuWorker instanceType: p5.4xlarge      (8x H100 GPUs, 80 GB VRAM each)
-#     defaultAcceleratorType: H100
-#
-#   H100_NVL:
-#     gpuWorker instanceType: p4de.24xlarge   (8x H100 NVL GPUs, 94 GB VRAM each)
-#     defaultAcceleratorType: H100_NVL
-#
-# On-premises (existing hardware):
-#   Set existingIPs below — instanceTypes are ignored when IPs are provided.
-#   The defaultAcceleratorType must still match the physical GPU in your nodes.
-#
 nodes:
-  controllers: 1                     # 1 (single) or 3 (HA)
-  cpuWorkers: 2                      # Number of CPU worker nodes (EC2 mode only)
-  gpuWorkers: 1                      # Number of GPU worker nodes (EC2 mode only)
+  controllers: 1
+  cpuWorkers: 1                           # Not used with existingIPs
+  gpuWorkers: 2                           # Not used with existingIPs
 
-  # On-premises / existing nodes: provide IPs to skip EC2 instance creation.
-  # Leave lists empty to create new EC2 instances automatically.
   existingIPs:
-    controllers: []                  # e.g. ["10.0.0.1"] or ["10.0.0.1", "10.0.0.2", "10.0.0.3"] for HA
-    workers: []                      # e.g. ["10.0.1.1", "10.0.1.2", "10.0.2.1"]
+    controllers:
+      - 3.144.14.96                       # CHANGE THIS: Your controller server IP
+    workers:
+      - 3.14.134.16                       # CHANGE THIS: CPU worker 1
+      - 13.59.78.115                      # CHANGE THIS: GPU worker 1
+      - 3.15.20.136                       # CHANGE THIS: GPU worker 2
 
-# ---------- EC2 Instance Types (ignored when existingIPs are set) ----------
-instanceTypes:
-  controller: "t3.xlarge"            # Controller node (4 vCPU, 16 GB RAM)
-  cpuWorker: "m5.4xlarge"            # CPU worker (16 vCPU, 64 GB RAM)
-  gpuWorker: "g6e.12xlarge"          # CHANGE THIS: see GPU TYPE QUICK REFERENCE above
+# ---------- Storage Configuration ----------
+# Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).
+# Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
+storage:
+  s3Bucket: "ai-platform-bucket-minio-us-east-2"  # Used when objectStore.type is aws
+  storageClass: "local-path"                 # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
+  vectorDbSize: "50Gi"                       # VectorDB persistent volume size
 
-# ---------- EC2 Network (required when creating EC2 instances) ----------
-ec2:
-  vpcId: ""                          # CHANGE THIS: your VPC ID (e.g. vpc-xxxxxxxxxxxxxxxxx)
-  subnetId: ""                       # CHANGE THIS: your subnet ID (e.g. subnet-xxxxxxxxxxxxxxxxx)
-  keyName: ""                        # CHANGE THIS: your EC2 key pair name
+  objectStore:
+    # type: "minio"                            # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    type: "seaweedfs"                            # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-minio-us-east-2"
+    # endpoint: "http://13.59.216.105:9000"    # MinIO port 9000. For SeaweedFS use port 8333.
+    endpoint: "http://3.144.157.201:8333"
+    auth:
+      rootUser: "minioadmin"
+      rootPassword: "minioadmin"
 
-# ---------- MinIO Object Storage ----------
-minio:
-  accessKey: "minioadmin"            # CHANGE THIS: MinIO admin username
-  secretKey: "minioadmin"            # CHANGE THIS: MinIO admin password
-  bucket: "ai-platform-data"        # MinIO bucket name
+# ---------- Container Images Configuration ----------
+images:
+  # Registry prefix - applied to images without a full registry path
+  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+
+  operator:
+    # image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.29"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.9"
+
+  splunk:
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+
+  ray:
+    # headImage: "ml-platform/ray/ray-head:build-v1alpha1"
+    # headImage: "ml-platform/ray/ray-head:087e40e"
+    # headImage: "ml-platform/ray/ray-head:build-010"
+    headImage: "ml-platform/ray/ray-head:9a24502-ai-tier"
+
+    # workerImage: "ml-platform/ray/ray-worker-gpu:build-v1alpha1"
+    # workerImage: "ml-platform/ray/ray-worker-gpu:087e40e"
+    # workerImage: "ml-platform/ray/ray-worker-gpu:build-010"
+    workerImage: "ml-platform/ray/ray-worker-gpu:9a24502-ai-tier"
+
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+
+  saia:
+    # apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
+    apiImage: "ml-platform/saia/saia-api:build-006"
+    
+    # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003"
+
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+# ---------- Operator Versions ----------
+operators:
+  ray:
+    version: "v1.2.2"
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.53.0"
+
+  certManager:
+    installCRDs: true
+
+  nvidia:
+    devicePluginVersion: "v0.17.3"
 
 # ---------- Kubernetes ----------
 kubernetes:
-  namespace: "ai-platform"           # no change
-
-# ---------- Splunk ----------
-splunk:
-  standaloneName: "splunk-standalone" # no change
-
-# ---------- ECR (for private AWS image repositories) ----------
-ecr:
-  account: ""                        # CHANGE THIS: your AWS account ID (e.g. "123456789012")
-                                     # Leave empty to auto-detect from AWS CLI
-
-# ---------- Image Pull Secrets ----------
-imagePullSecrets:
-  autoCreateECR: false               # Set true to auto-create ECR pull secret
-  dockerHub:
-    enabled: false                   # Set true if images are on Docker Hub (private)
-    username: ""
-    password: ""
-  gcr:
-    enabled: false
-  acr:
-    enabled: false
-  custom:
-    enabled: false
+  namespace: ai-platform
 
 # ---------- File Paths ----------
 files:
-  splunkOperator: "./splunk-operator-cluster.yaml"
-  aiPlatform: "./artifacts.yaml"
+  splunkOperator: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/splunk-operator-cluster.yaml"
+  aiPlatform: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/artifacts.yaml"
+
+# ---------- Splunk Configuration ----------
+splunk:
+  standaloneName: splunk-standalone
 
 # ---------- AI Platform Configuration ----------
 aiPlatform:
-  namespace: "ai-platform"           # no change
-  name: "splunk-ai-stack"            # no change
-
-  # Service Accounts
-  serviceAccounts:
-    rayHead: "ray-head-sa"           # no change
-    rayWorker: "ray-worker-sa"       # no change
-    saiaService: "saia-service-sa"   # no change
-
-  # Default accelerator type — must match a top-level key in instance.yaml.
-  # Must be changed in sync with instanceTypes.gpuWorker (see GPU TYPE QUICK REFERENCE above).
-  #   L40S     → gpuWorker: g6e.12xlarge
-  #   H100     → gpuWorker: p5.4xlarge
-  #   H100_NVL → gpuWorker: p4de.24xlarge
+  name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
+
+  workerGroupConfig:
+    imageRegistry: ""
+
+  features:
+    - name: "saia"
+      version: "1.1.0"
+
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+# ---------- Image Pull Secrets ----------
+imagePullSecrets:
+  secrets:
+    - ecr-registry-secret
+  autoCreateECR: true
+
+ecr:
+  account: "658391232643"
+  region: us-east-2

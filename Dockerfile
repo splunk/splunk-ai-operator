@@ -43,7 +43,9 @@ COPY LICENSE LICENSE-2.0.txt
 COPY --from=builder /certs/tls.crt /certs/tls.crt
 COPY --from=builder /certs/tls.key /certs/tls.key
 
-USER 65532:65532
+# USER 65532:65532
+# GID 0 required for Red Hat / OpenShift SCC compatibility on k0s nodes
+USER 1001:0
 ENV INSTANCE_FILE=/instance.yaml
 ENV APPLICATION_FILE=/applications.yaml
 ENTRYPOINT ["/manager"]

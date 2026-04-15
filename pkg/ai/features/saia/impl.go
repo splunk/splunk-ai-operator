@@ -312,6 +312,8 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 		"SAIA_API_VERSION":                "0.3.1",    // TODO make configurable
 		"TELEMETRY_ENV":                   "NOTLOCAL", // TODO make configurable
 		"LOG_LEVEL":                       "info",
+		"USE_GPT_OSS":                     "true",
+		"SCS_TOKEN":                       "no-auth-required",
 	}
 
 	found := &corev1.ConfigMap{}
@@ -555,7 +557,7 @@ func (r *SaiaReconciler) reconcilePostInstallHook(
 						{
 							Name:            "vector-db-setup-container",
 							Image:           hookImage,
-							ImagePullPolicy: corev1.PullAlways,
+							ImagePullPolicy: corev1.PullIfNotPresent,
 							Env: []corev1.EnvVar{
 								{Name: "VECTOR_DB_URL", Value: uri},
 								{Name: "SPLUNK_AI_ASSISTANT_SERVICE_CMP", Value: "true"},
@@ -740,7 +742,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 				Containers: []corev1.Container{{
 					Name:            ai.Name,
 					Image:           os.Getenv("RELATED_IMAGE_SAIA_API"),
-					ImagePullPolicy: corev1.PullAlways,
+					ImagePullPolicy: corev1.PullIfNotPresent,
 					Ports:           ports,
 					VolumeMounts:    mounts,
 					Resources:       ai.Spec.Resources,
