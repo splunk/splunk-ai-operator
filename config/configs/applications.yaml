@@ -22,6 +22,152 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
   - args:
+      application_name: GptOss120b
+      deployment_configs:
+        LLMDeployment:
+          gpu_type_options_override:
+            H100:
+              ray_actor_options:
+                num_gpus: 1
+            L40S:
+              ray_actor_options:
+                num_gpus: 2
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.GptOss120b}}
+              min_replicas: {{.Replicas.GptOss120b}}
+      deployment_type: text_gen_model_deployment
+      gpu_types: '["{{.AcceleratorType}}"]'
+      model_definition:
+        gpu_type_model_config_override:
+          H100:
+            engine_args:
+              gpu_memory_utilization: 0.90
+              tensor_parallel_size: 1
+          L40S:
+            engine_args:
+              gpu_memory_utilization: 0.90
+              tensor_parallel_size: 2
+        model_config:
+          openai_serving_config:
+            chat:
+              enable_auto_tools: true
+              tool_parser: openai
+            responses:
+              enable_auto_tools: true
+              tool_parser: openai
+        model_id: gpt_oss_120b
+        model_loader:
+          blob_storage:
+            blob_prefix: model_artifacts/gpt-oss-120b
+      tokenizer_definition:
+        model_id: gpt_oss_120b
+        model_loader:
+          blob_storage:
+            artifacts_list:
+              - chat_template.jinja
+              - config.json
+              - tokenizer_config.json
+              - tokenizer.json
+            blob_prefix: model_artifacts/gpt-oss-120b
+    name: GptOss120b
+    import_path: main:create_serve_app
+    route_prefix: /gpt_oss_120b
+    runtime_env:
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
+      env_vars:
+        API_VERSION: "v1"
+        APPLICATION_NAME: gpt_oss_120b
+        VLLM_ATTENTION_BACKEND: TRITON_ATTN
+        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
+        S3_BUCKET: "{{.ArtifactBucketName}}"
+        ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
+        CLOUD_PROVIDER: "{{.CloudProvider}}"
+        S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
+        S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
+        S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        ENABLE_AUTHN: "false"
+        ENABLE_AUTHZ: "false"
+        SERVICE_EXTERNAL_NAME: "ai-platform-models"
+        SERVICE_INTERNAL_NAME: "ai_platform_models"
+        SERVICE_NAME: "ai_platform_models"
+        SKIP_VERIFICATION: "true"
+        USE_SYSTEM_PERMISSIONS: "true"
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+  - args:
+      application_name: GptOss20b
+      deployment_configs:
+        LLMDeployment:
+          gpu_type_options_override:
+            H100:
+              ray_actor_options:
+                num_gpus: 0.5
+            L40S:
+              ray_actor_options:
+                num_gpus: 1
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.GptOss20b}}
+              min_replicas: {{.Replicas.GptOss20b}}
+      deployment_type: text_gen_model_deployment
+      gpu_types: '["{{.AcceleratorType}}"]'
+      model_definition:
+        gpu_type_model_config_override:
+          H100:
+            engine_args:
+              gpu_memory_utilization: 0.5
+              tensor_parallel_size: 1
+          L40S:
+            engine_args:
+              gpu_memory_utilization: 0.95
+              tensor_parallel_size: 1
+        model_config:
+          openai_serving_config:
+            chat:
+              enable_auto_tools: true
+              tool_parser: openai
+            responses:
+              enable_auto_tools: true
+              tool_parser: openai
+        model_id: gpt_oss_20b
+        model_loader:
+          blob_storage:
+            blob_prefix: model_artifacts/gpt-oss-20b
+      tokenizer_definition:
+        model_id: gpt_oss_20b
+        model_loader:
+          blob_storage:
+            artifacts_list:
+              - chat_template.jinja
+              - config.json
+              - tokenizer_config.json
+              - tokenizer.json
+            blob_prefix: model_artifacts/gpt-oss-20b
+    name: GptOss20b
+    import_path: main:create_serve_app
+    route_prefix: /gpt_oss_20b
+    runtime_env:
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
+      env_vars:
+        API_VERSION: "v1"
+        APPLICATION_NAME: gpt_oss_20b
+        VLLM_ATTENTION_BACKEND: TRITON_ATTN
+        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
+        S3_BUCKET: "{{.ArtifactBucketName}}"
+        ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
+        CLOUD_PROVIDER: "{{.CloudProvider}}"
+        S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
+        S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
+        S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        ENABLE_AUTHN: "false"
+        ENABLE_AUTHZ: "false"
+        SERVICE_EXTERNAL_NAME: "ai-platform-models"
+        SERVICE_INTERNAL_NAME: "ai_platform_models"
+        SERVICE_NAME: "ai_platform_models"
+        SKIP_VERIFICATION: "true"
+        USE_SYSTEM_PERMISSIONS: "true"
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+  - args:
       application_name: UaeLarge
       deployment_configs:
         EmbeddingModelDeployment:
@@ -31,13 +177,13 @@ applications:
                 num_gpus: 0.0375
             L40S:
               ray_actor_options:
-                num_gpus: 0.05
+                num_gpus: 0.075
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.UaeLarge}}
               min_replicas: {{.Replicas.UaeLarge}}
             ray_actor_options:
-              num_gpus: 0.1
+              num_gpus: 0.15
       deployment_type: embedding_model_deployment
       model_definition:
         gpu_type_model_config_override:
@@ -46,10 +192,10 @@ applications:
               gpu_memory_utilization: 0.0375
           L40S:
             engine_args:
-              gpu_memory_utilization: 0.05
+              gpu_memory_utilization: 0.075
         model_config:
           engine_args:
-            gpu_memory_utilization: 0.1
+            gpu_memory_utilization: 0.15
             tensor_parallel_size: 1
         model_id: uae_large
         model_loader:
@@ -352,79 +498,6 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
   - args:
-      application_name: GptOss20b
-      deployment_configs:
-        LLMDeployment:
-          gpu_type_options_override:
-            H100:
-              ray_actor_options:
-                num_gpus: 0.5
-            L40S:
-              ray_actor_options:
-                num_gpus: 1
-          options:
-            autoscaling_config:
-              max_replicas: {{.Replicas.GptOss20b}}
-              min_replicas: {{.Replicas.GptOss20b}}
-      deployment_type: text_gen_model_deployment
-      gpu_types: '["{{.AcceleratorType}}"]'
-      model_definition:
-        gpu_type_model_config_override:
-          H100:
-            engine_args:
-              gpu_memory_utilization: 0.90
-              tensor_parallel_size: 1
-          L40S:
-            engine_args:
-              gpu_memory_utilization: 0.90
-              tensor_parallel_size: 1
-        model_config:
-          openai_serving_config:
-            chat:
-              enable_auto_tools: true
-              tool_parser: openai
-            responses:
-              enable_auto_tools: true
-              tool_parser: openai
-        model_id: gpt_oss_20b
-        model_loader:
-          blob_storage:
-            blob_prefix: model_artifacts/gpt-oss-20b
-      tokenizer_definition:
-        model_id: gpt_oss_20b
-        model_loader:
-          blob_storage:
-            artifacts_list:
-              - chat_template.jinja
-              - config.json
-              - tokenizer_config.json
-              - tokenizer.json
-            blob_prefix: model_artifacts/gpt-oss-20b
-    name: GptOss20b
-    import_path: main:create_serve_app
-    route_prefix: /gpt_oss_20b
-    runtime_env:
-      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
-      env_vars:
-        API_VERSION: "v1"
-        APPLICATION_NAME: gpt_oss_20b
-        VLLM_ATTENTION_BACKEND: TRITON_ATTN
-        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
-        S3_BUCKET: "{{.ArtifactBucketName}}"
-        ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
-        CLOUD_PROVIDER: "{{.CloudProvider}}"
-        S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
-        S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
-        S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
-        ENABLE_AUTHN: "false"
-        ENABLE_AUTHZ: "false"
-        SERVICE_EXTERNAL_NAME: "ai-platform-models"
-        SERVICE_INTERNAL_NAME: "ai_platform_models"
-        SERVICE_NAME: "ai_platform_models"
-        SKIP_VERIFICATION: "true"
-        USE_SYSTEM_PERMISSIONS: "true"
-        VLLM_WORKER_MULTIPROC_METHOD: spawn
-  - args:
       application_name: E5LanguageClassifier
       deployment_configs:
         ClassificationModelDeployment:
@@ -480,79 +553,6 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
-  - args:
-      application_name: GptOss120b
-      deployment_configs:
-        LLMDeployment:
-          gpu_type_options_override:
-            H100:
-              ray_actor_options:
-                num_gpus: 1
-            L40S:
-              ray_actor_options:
-                num_gpus: 2
-          options:
-            autoscaling_config:
-              max_replicas: {{.Replicas.GptOss120b}}
-              min_replicas: {{.Replicas.GptOss120b}}
-      deployment_type: text_gen_model_deployment
-      gpu_types: '["{{.AcceleratorType}}"]'
-      model_definition:
-        gpu_type_model_config_override:
-          H100:
-            engine_args:
-              gpu_memory_utilization: 0.90
-              tensor_parallel_size: 1
-          L40S:
-            engine_args:
-              gpu_memory_utilization: 0.90
-              tensor_parallel_size: 2
-        model_config:
-          openai_serving_config:
-            chat:
-              enable_auto_tools: true
-              tool_parser: openai
-            responses:
-              enable_auto_tools: true
-              tool_parser: openai
-        model_id: gpt_oss_120b
-        model_loader:
-          blob_storage:
-            blob_prefix: model_artifacts/gpt-oss-120b
-      tokenizer_definition:
-        model_id: gpt_oss_120b
-        model_loader:
-          blob_storage:
-            artifacts_list:
-              - chat_template.jinja
-              - config.json
-              - tokenizer_config.json
-              - tokenizer.json
-            blob_prefix: model_artifacts/gpt-oss-120b
-    name: GptOss120b
-    import_path: main:create_serve_app
-    route_prefix: /gpt_oss_120b
-    runtime_env:
-      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
-      env_vars:
-        API_VERSION: "v1"
-        APPLICATION_NAME: gpt_oss_120b
-        VLLM_ATTENTION_BACKEND: TRITON_ATTN
-        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
-        S3_BUCKET: "{{.ArtifactBucketName}}"
-        ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
-        CLOUD_PROVIDER: "{{.CloudProvider}}"
-        S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
-        S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
-        S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
-        ENABLE_AUTHN: "false"
-        ENABLE_AUTHZ: "false"
-        SERVICE_EXTERNAL_NAME: "ai-platform-models"
-        SERVICE_INTERNAL_NAME: "ai_platform_models"
-        SERVICE_NAME: "ai_platform_models"
-        SKIP_VERIFICATION: "true"
-        USE_SYSTEM_PERMISSIONS: "true"
-        VLLM_WORKER_MULTIPROC_METHOD: spawn
   - args:
       application_name: PromptInjectionCrossEncoder
       deployment_configs:

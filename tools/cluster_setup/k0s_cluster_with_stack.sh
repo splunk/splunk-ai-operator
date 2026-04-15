@@ -1004,8 +1004,17 @@ PYSCRIPT"
   ssh_exec "${controller_ip}" "sudo k0s install controller --config /tmp/k0s.yaml --enable-worker"
   ssh_exec "${controller_ip}" "sudo k0s start"
 
-  log "Waiting for controller to be ready (60s)..."
-  sleep 60
+  log "Waiting for controller API server to be ready..."
+  local ctrl_retries=0
+  while (( ctrl_retries < 60 )); do
+    if ssh_exec "${controller_ip}" "sudo k0s kubectl get --raw /healthz 2>/dev/null" &>/dev/null; then
+      log "  ✓ Controller API server is ready (${ctrl_retries}s)"
+      break
+    fi
+    sleep 5
+    ctrl_retries=$((ctrl_retries + 5))
+    log "  Waiting... ${ctrl_retries}/300s"
+  done
 
   # Generate worker token
   log "Generating worker join token..."
@@ -1069,8 +1078,21 @@ PYSCRIPT"
     warn "Some workers failed to install/start: ${failed_workers[*]}"
   fi
 
-  log "Waiting for workers to join (60s)..."
-  sleep 60
+  log "Waiting for workers to join the cluster..."
+  local expected_join=$((${#CONTROLLER_IPS[@]} + ${#WORKER_IPS[@]}))
+  local join_retries=0
+  while (( join_retries < 120 )); do
+    local current_nodes
+    current_nodes=$(ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    current_nodes=$(echo "${current_nodes}" | tr -d '[:space:]')
+    if [[ "${current_nodes}" -ge "${expected_join}" ]]; then
+      log "  ✓ All ${current_nodes} node(s) joined (${join_retries}s)"
+      break
+    fi
+    sleep 10
+    join_retries=$((join_retries + 10))
+    log "  Waiting... ${current_nodes}/${expected_join} nodes joined (${join_retries}/120s)"
+  done
 
   # Verify workers actually joined
   log "Verifying worker nodes joined the cluster..."
@@ -1604,9 +1626,9 @@ install_cert_manager() {
     warn "cert-manager webhook endpoint not found after ${max_retries} retries"
   fi
 
-  # Give webhooks extra time to stabilize and register with API server
-  log "Waiting for webhooks to stabilize (30s)..."
-  sleep 30
+  # Brief pause for webhook registration with API server
+  log "Waiting for webhooks to stabilize (10s)..."
+  sleep 10
 
   # Test webhook by creating a test Certificate resource
   log "Testing cert-manager webhook functionality..."
@@ -1627,6 +1649,123 @@ EOF
 }
 
 # ====== INSTALL NVIDIA DRIVERS ON GPU NODES (bare-metal / EC2) ======
+# Per-node NVIDIA driver + container toolkit install (called in parallel).
+_install_nvidia_on_node() {
+  local gpu_ip="$1"
+
+  # Check if driver is already installed
+  if ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" &>/dev/null; then
+    local driver_ver
+    driver_ver=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" || echo "unknown")
+    echo "✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
+  else
+    echo "Installing NVIDIA driver on ${gpu_ip}..."
+    ssh_exec "${gpu_ip}" "
+      set -e
+      # Install kernel headers (needed for DKMS driver build)
+      sudo dnf install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
+        sudo yum install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
+        sudo apt-get install -y linux-headers-\$(uname -r) 2>/dev/null || true
+
+      # Detect OS and add appropriate NVIDIA repo
+      if [ -f /etc/amzn-release ] || grep -qi 'amzn' /etc/os-release 2>/dev/null; then
+        sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo 2>/dev/null || true
+        sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
+          sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || true
+      elif [ -f /etc/redhat-release ]; then
+        RHEL_MAJOR=\$(rpm -E %{rhel} 2>/dev/null || echo 9)
+        if [ \"\${RHEL_MAJOR}\" -ge 10 ]; then
+          # Add RHEL 10 CUDA repo only; remove any stale rhel9 repo to prevent GPG conflicts
+          sudo rm -f /etc/yum.repos.d/cuda-rhel9.repo 2>/dev/null || true
+          sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/cuda-rhel10.repo 2>/dev/null || true
+
+          # RHEL 10 removed DNF modularity; DKMS kmod requires EPEL
+          if ! rpm -q epel-release >/dev/null 2>&1; then
+            echo 'Installing EPEL for dkms...'
+            sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm 2>/dev/null || true
+          fi
+          sudo dnf install -y dkms 2>/dev/null || true
+
+          sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
+            sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
+            sudo dnf install -y --nobest nvidia-open 2>/dev/null || true
+        else
+          sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo 2>/dev/null || true
+          sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || \
+            sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || true
+        fi
+      elif [ -f /etc/debian_version ]; then
+        curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
+        sudo dpkg -i /tmp/cuda-keyring.deb
+        sudo apt-get update && sudo apt-get install -y nvidia-driver-550 2>/dev/null || true
+      fi
+
+      # Load nvidia kernel module immediately (avoids needing a reboot)
+      sudo modprobe nvidia 2>/dev/null || true
+    " || { echo "Driver install on ${gpu_ip} had issues"; return 1; }
+
+    # Verify
+    if ssh_exec "${gpu_ip}" "nvidia-smi 2>/dev/null" &>/dev/null; then
+      echo "✓ NVIDIA driver installed successfully on ${gpu_ip}"
+    else
+      echo "⚠ NVIDIA driver may need a reboot on ${gpu_ip} to take effect"
+    fi
+  fi
+
+  # Install NVIDIA Container Toolkit
+  echo "Ensuring NVIDIA Container Toolkit on ${gpu_ip}..."
+  ssh_exec "${gpu_ip}" "
+    if command -v nvidia-ctk &>/dev/null; then
+      echo 'nvidia-ctk already installed'
+    else
+      # Add NVIDIA Container Toolkit repo
+      curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+        sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null 2>/dev/null || true
+      curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+        sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
+
+      # Install
+      sudo dnf install -y nvidia-container-toolkit 2>/dev/null || \
+        sudo yum install -y nvidia-container-toolkit 2>/dev/null || \
+        sudo apt-get install -y nvidia-container-toolkit 2>/dev/null || true
+    fi
+
+    # Configure for k0s containerd (k0s uses /run/k0s/containerd.sock)
+    if [ -d /etc/k0s/containerd.d ]; then
+      sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
+
+      if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
+        sudo cp /etc/containerd/conf.d/99-nvidia.toml /etc/k0s/containerd.d/nvidia.toml
+        sudo rm -f /etc/containerd/conf.d/99-nvidia.toml
+      elif [ ! -s /etc/k0s/containerd.d/nvidia.toml ]; then
+        sudo nvidia-ctk runtime configure --runtime=containerd \
+          --config=/etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+      fi
+
+      sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \
+        /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+
+      if ! grep -q 'default_runtime_name' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null; then
+        sudo sed -i '/\[plugins\.\"io\.containerd\.grpc\.v1\.cri\"\.containerd\]$/{
+          a\      default_runtime_name = \"nvidia\"
+        }' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+      fi
+    elif [ -f /etc/containerd/config.toml ]; then
+      sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
+    fi
+
+    sudo mkdir -p /etc/cdi
+    sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml 2>/dev/null || true
+
+    sudo systemctl stop k0sworker 2>/dev/null || true
+    sleep 3
+    sudo pkill -9 containerd-shim 2>/dev/null || true
+    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+
+    sudo systemctl start k0sworker 2>/dev/null || true
+  " || { echo "Container toolkit setup on ${gpu_ip} had issues"; return 1; }
+}
+
 # EKS GPU AMIs ship with NVIDIA drivers pre-installed.
 # For k0s on generic AMIs (e.g. Amazon Linux 2023), we must install them
 # on the host before the Kubernetes device-plugin can expose GPUs.
@@ -1664,142 +1803,45 @@ install_nvidia_host_drivers() {
     return 0
   fi
 
+  # Run driver + toolkit install on all GPU nodes in parallel
+  log "Installing NVIDIA drivers on ${#gpu_ips[@]} GPU node(s) in parallel..."
+  local pids=()
+  local logdir
+  logdir=$(mktemp -d)
+
   for gpu_ip in "${gpu_ips[@]}"; do
-    log "Checking NVIDIA driver on ${gpu_ip}..."
-
-    # Check if driver is already installed
-    if ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" &>/dev/null; then
-      local driver_ver
-      driver_ver=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" || echo "unknown")
-      log "  ✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
-    else
-      log "  Installing NVIDIA driver on ${gpu_ip}..."
-      ssh_exec "${gpu_ip}" "
-        set -e
-        # Install kernel headers (needed for DKMS driver build)
-        sudo dnf install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
-          sudo yum install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
-          sudo apt-get install -y linux-headers-\$(uname -r) 2>/dev/null || true
-
-        # Detect OS and add appropriate NVIDIA repo
-        if [ -f /etc/amzn-release ] || grep -qi 'amzn' /etc/os-release 2>/dev/null; then
-          sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo 2>/dev/null || true
-          sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
-            sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || true
-        elif [ -f /etc/redhat-release ]; then
-          RHEL_MAJOR=\$(rpm -E %{rhel} 2>/dev/null || echo 9)
-          if [ \"\${RHEL_MAJOR}\" -ge 10 ]; then
-            # Add RHEL 10 CUDA repo only; remove any stale rhel9 repo to prevent GPG conflicts
-            sudo rm -f /etc/yum.repos.d/cuda-rhel9.repo 2>/dev/null || true
-            sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/cuda-rhel10.repo 2>/dev/null || true
-
-            # RHEL 10 removed DNF modularity; DKMS kmod requires EPEL
-            if ! rpm -q epel-release >/dev/null 2>&1; then
-              echo 'Installing EPEL for dkms...'
-              sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm 2>/dev/null || true
-            fi
-            sudo dnf install -y dkms 2>/dev/null || true
-
-            sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
-              sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
-              sudo dnf install -y --nobest nvidia-open 2>/dev/null || true
-          else
-            sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo 2>/dev/null || true
-            sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || \
-              sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || true
-          fi
-        elif [ -f /etc/debian_version ]; then
-          curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
-          sudo dpkg -i /tmp/cuda-keyring.deb
-          sudo apt-get update && sudo apt-get install -y nvidia-driver-550 2>/dev/null || true
-        fi
-
-        # Load nvidia kernel module immediately (avoids needing a reboot)
-        sudo modprobe nvidia 2>/dev/null || true
-      " || warn "Driver install on ${gpu_ip} had issues — check manually"
-
-      # Verify
-      if ssh_exec "${gpu_ip}" "nvidia-smi 2>/dev/null" &>/dev/null; then
-        log "  ✓ NVIDIA driver installed successfully on ${gpu_ip}"
-      else
-        warn "  NVIDIA driver may need a reboot on ${gpu_ip} to take effect"
-      fi
-    fi
-
-    # Install NVIDIA Container Toolkit (needed for GPU containers in k0s)
-    log "  Ensuring NVIDIA Container Toolkit on ${gpu_ip}..."
-    ssh_exec "${gpu_ip}" "
-      if command -v nvidia-ctk &>/dev/null; then
-        echo 'nvidia-ctk already installed'
-      else
-        # Add NVIDIA Container Toolkit repo
-        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
-          sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null 2>/dev/null || true
-        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-          sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
-
-        # Install
-        sudo dnf install -y nvidia-container-toolkit 2>/dev/null || \
-          sudo yum install -y nvidia-container-toolkit 2>/dev/null || \
-          sudo apt-get install -y nvidia-container-toolkit 2>/dev/null || true
-      fi
-
-      # Configure for k0s containerd (k0s uses /run/k0s/containerd.sock)
-      if [ -d /etc/k0s/containerd.d ]; then
-        # nvidia-ctk writes to /etc/containerd/conf.d/ by default, not the
-        # k0s drop-in dir. Generate it first, then copy with fixups.
-        sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
-
-        # Copy the generated config to k0s drop-in location
-        if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
-          sudo cp /etc/containerd/conf.d/99-nvidia.toml /etc/k0s/containerd.d/nvidia.toml
-          sudo rm -f /etc/containerd/conf.d/99-nvidia.toml
-        elif [ ! -s /etc/k0s/containerd.d/nvidia.toml ]; then
-          # Fallback: nvidia-ctk may have written directly; try explicit config path
-          sudo nvidia-ctk runtime configure --runtime=containerd \
-            --config=/etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
-        fi
-
-        # Strip version/imports lines so the file is treated as a drop-in
-        # snippet, not a full containerd config (prevents node NotReady).
-        sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \
-          /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
-
-        # Set nvidia as the default containerd runtime on GPU nodes so that
-        # all pods automatically get GPU access without needing runtimeClassName.
-        # This matches EKS behavior where the GPU AMI's default runtime handles
-        # GPU passthrough. The nvidia runtime is a superset of runc — non-GPU
-        # containers run unchanged.
-        # Insert inside the existing [plugins."...".containerd] section (not as
-        # a new top-level section, which would create a duplicate TOML table).
-        if ! grep -q 'default_runtime_name' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null; then
-          sudo sed -i '/\[plugins\.\"io\.containerd\.grpc\.v1\.cri\"\.containerd\]$/{
-            a\      default_runtime_name = \"nvidia\"
-          }' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
-        fi
-      elif [ -f /etc/containerd/config.toml ]; then
-        sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
-      fi
-
-      # Generate CDI (Container Device Interface) specs so the device
-      # plugin can discover GPUs via CDI when using the nvidia RuntimeClass.
-      sudo mkdir -p /etc/cdi
-      sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml 2>/dev/null || true
-
-      # Kill any leftover containerd-shim processes from previous runs
-      # before restarting the worker. Stale shims keep the old containerd
-      # socket busy and cause ping-containerd-timeout errors on restart.
-      sudo systemctl stop k0sworker 2>/dev/null || true
-      sleep 3
-      sudo pkill -9 containerd-shim 2>/dev/null || true
-      sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
-
-      # Restart k0s worker to pick up containerd config changes
-      sudo systemctl start k0sworker 2>/dev/null || true
-    " || warn "  Container toolkit setup on ${gpu_ip} had issues — check manually"
-
-    log "  ✓ GPU node ${gpu_ip} setup complete"
+    (
+      _install_nvidia_on_node "${gpu_ip}" > "${logdir}/${gpu_ip}.log" 2>&1
+      echo $? > "${logdir}/${gpu_ip}.rc"
+    ) &
+    pids+=($!)
+    log "  Started NVIDIA install on ${gpu_ip} (pid $!)"
   done
+
+  # Wait for all background installs to finish
+  local failed=0
+  for i in "${!pids[@]}"; do
+    local pid=${pids[$i]}
+    local gpu_ip=${gpu_ips[$i]}
+    if wait "${pid}"; then
+      log "  ✓ NVIDIA setup completed on ${gpu_ip}"
+    else
+      warn "  NVIDIA setup on ${gpu_ip} had issues"
+      failed=$((failed + 1))
+    fi
+    # Stream the per-node log so output is visible
+    while IFS= read -r line; do
+      log "    [${gpu_ip}] ${line}"
+    done < "${logdir}/${gpu_ip}.log"
+  done
+
+  rm -rf "${logdir}"
+
+  if [[ ${failed} -gt 0 ]]; then
+    warn "${failed} GPU node(s) had NVIDIA install issues — check logs above"
+  else
+    log "NVIDIA drivers installed successfully on all ${#gpu_ips[@]} GPU node(s)"
+  fi
 
   # Wait for GPU workers to rejoin and verify they are Ready
   log "Waiting for GPU worker nodes to rejoin cluster and become Ready..."
@@ -2861,10 +2903,15 @@ spec:
 YAML
   fi
 
+  log "Splunk Standalone CR applied (pod starts in background)"
+}
+
+# Blocks until Splunk Standalone pod is ready. Called at the end of the
+# install flow so the operator and CR can deploy while Splunk boots.
+wait_for_splunk_standalone() {
   log "Waiting for Splunk Standalone to be ready..."
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
-
-  log "Splunk Standalone installed successfully"
+  log "Splunk Standalone is ready"
 }
 
 # ====== INSTALL AI PLATFORM CR ======
@@ -3070,19 +3117,69 @@ install_ai_platform_stack() {
 
   ensure_namespace "${AI_NS}"
 
-  # Install infrastructure components
-  install_minio
-  install_cert_manager
-  install_kube_prometheus
-  ensure_s3compat_credentials
-  install_otel_operator_and_contrib_collector
-  mount_nvme_instance_store
-  install_nvidia_host_drivers
-  install_nvidia_device_plugin
-  install_ray_operator
+  # --- Phase 1: Independent infrastructure (parallel) ---
+  log "Phase 1: Installing independent infrastructure components in parallel..."
+  local phase1_pids=() phase1_names=() phase1_logdir
+  phase1_logdir=$(mktemp -d)
 
-  # Install Splunk components
-  install_splunk_operator
+  install_minio > "${phase1_logdir}/minio.log" 2>&1 &
+  phase1_pids+=($!); phase1_names+=("minio")
+
+  install_cert_manager > "${phase1_logdir}/cert-manager.log" 2>&1 &
+  phase1_pids+=($!); phase1_names+=("cert-manager")
+
+  install_kube_prometheus > "${phase1_logdir}/kube-prometheus.log" 2>&1 &
+  phase1_pids+=($!); phase1_names+=("kube-prometheus")
+
+  # These don't need cert-manager — run in parallel too
+  mount_nvme_instance_store > "${phase1_logdir}/nvme.log" 2>&1 &
+  phase1_pids+=($!); phase1_names+=("nvme-mount")
+
+  install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
+  phase1_pids+=($!); phase1_names+=("nvidia-drivers")
+
+  for i in "${!phase1_pids[@]}"; do
+    if wait "${phase1_pids[$i]}"; then
+      log "  ✓ ${phase1_names[$i]} completed"
+    else
+      warn "  ✗ ${phase1_names[$i]} had issues"
+    fi
+    while IFS= read -r line; do
+      log "    [${phase1_names[$i]}] ${line}"
+    done < "${phase1_logdir}/${phase1_names[$i]}.log"
+  done
+  rm -rf "${phase1_logdir}"
+
+  ensure_s3compat_credentials
+
+  # --- Phase 2: cert-manager-dependent components (parallel) ---
+  log "Phase 2: Installing cert-manager-dependent components in parallel..."
+  local phase2_pids=() phase2_names=() phase2_logdir
+  phase2_logdir=$(mktemp -d)
+
+  install_otel_operator_and_contrib_collector > "${phase2_logdir}/otel.log" 2>&1 &
+  phase2_pids+=($!); phase2_names+=("otel-operator")
+
+  install_ray_operator > "${phase2_logdir}/ray.log" 2>&1 &
+  phase2_pids+=($!); phase2_names+=("ray-operator")
+
+  install_splunk_operator > "${phase2_logdir}/splunk-operator.log" 2>&1 &
+  phase2_pids+=($!); phase2_names+=("splunk-operator")
+
+  install_nvidia_device_plugin > "${phase2_logdir}/nvidia-plugin.log" 2>&1 &
+  phase2_pids+=($!); phase2_names+=("nvidia-device-plugin")
+
+  for i in "${!phase2_pids[@]}"; do
+    if wait "${phase2_pids[$i]}"; then
+      log "  ✓ ${phase2_names[$i]} completed"
+    else
+      warn "  ✗ ${phase2_names[$i]} had issues"
+    fi
+    while IFS= read -r line; do
+      log "    [${phase2_names[$i]}] ${line}"
+    done < "${phase2_logdir}/${phase2_names[$i]}.log"
+  done
+  rm -rf "${phase2_logdir}"
 
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
@@ -3090,13 +3187,15 @@ install_ai_platform_stack() {
   # Deploy CronJob that auto-refreshes ECR credentials every 6 hours (tokens expire at 12h)
   install_ecr_credential_refresher
 
+  # Apply Splunk Standalone CR (non-blocking — pod boots in background)
   install_splunk_standalone
 
-  # Install AI Platform operator
+  # Install AI Platform operator and CR while Splunk Standalone boots
   install_splunk_ai_operator
-
-  # Install AI Platform CR
   install_ai_platform_cr
+
+  # Now wait for Splunk Standalone to be ready (likely already done by now)
+  wait_for_splunk_standalone
 
   log "AI Platform stack installation complete!"
 }

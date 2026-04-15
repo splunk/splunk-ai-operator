@@ -732,11 +732,17 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
 		replicas := instanceScale[cfg.Tier]
+
+		maxReplicas := replicas + 5
+		if cfg.GPUsPerPod > 0 {
+			maxReplicas = replicas
+		}
+
 		wg := rayv1.WorkerGroupSpec{
 			GroupName:   cfg.Tier,
 			Replicas:    int32Ptr(replicas),
 			MinReplicas: int32Ptr(replicas),
-			MaxReplicas: int32Ptr(replicas + 5),
+			MaxReplicas: int32Ptr(maxReplicas),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
 				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
@@ -934,7 +940,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 		{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
 		{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
 		{Name: "GPG_PUBLICKEY_PATH", Value: "kv-splunk/al-platform.ray-worker-sa/gpgkey"}, // FIXME
-		{Name: "GPU_TYPE", Value: b.effectiveAcceleratorType()},                          // FIXME
+		{Name: "GPU_TYPE", Value: b.effectiveAcceleratorType()},                           // FIXME
 	}
 
 	// Combine defaultEnv with cfg.Env to create combinedEnv
