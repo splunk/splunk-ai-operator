@@ -28,28 +28,16 @@ Set these values in your config file:
 - `images.splunk.image`
 - `images.weaviate.image`
 
-The k0s weaviate-service script enables `WEAVIATE_PROXY_AUTH_MODE=true` by default.
-
+## Refer tools/cluster_setup/K0S_README.md for cluster creation details
 
 ## Install
 
 For k0s:
 
-Copy the sample config into `tools/cluster_setup` and update it for your environment:
-
 ```bash
 cd tools/cluster_setup
 
-cp ../../config/samples/k0s-cluster-config-sample.yaml \
-  k0s-cluster-config-local.yaml
-```
-
-Then install using the copied config:
-
-```bash
-cd tools/cluster_setup
-
-CONFIG_FILE=k0s-cluster-config-local.yaml \
+CONFIG_FILE=k0s-cluster-config.yaml \
 bash k0s_weaviate_service_cluster_with_stack.sh install
 ```
 
@@ -65,6 +53,8 @@ bash eks_weaviate_service_cluster_with_stack.sh install
 ## Verify
 
 ```bash
+export KUBECONFIG=~/.kube/k0s-my-ai-cluster 
+
 kubectl get pods -n ai-platform
 kubectl get aiplatform,aiservice -n ai-platform
 kubectl get svc -n ai-platform
