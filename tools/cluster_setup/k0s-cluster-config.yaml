@@ -1,4 +1,5 @@
 cluster:
+  useExisting: auto
   name: "my-ai-cluster"
   region: "us-east-2"
   sshUser: "ubuntu"
@@ -7,9 +8,9 @@ cluster:
 nodes:
   existingIPs:
     controllers:
-      - 3.129.208.144                                    # CHANGE THIS: Your controller server IP
+      - 3.129.208.144                                      # CHANGE THIS: Your controller server IP
     workers:
-      - 18.216.76.189
+      - 18.216.76.189                                      # CHANGE THIS: Your worker server IP
 
 storage:
   storageClass: "local-path"
@@ -23,13 +24,13 @@ splunk:
 
 images:
   operator:
-    image: "docker.io/kbhos698/splunk-ai-operator:weaviate-service-v9"
+    image: "docker.io/splunk/splunk-ai-operator:v0.1-weaviate-alpha"
   splunk:
     image: "docker.io/splunk/splunk:10.2"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
-    proxyImage: "docker-test.repo.splunkdev.net/ml-platform/vector-db/weaviate-proxy:v1.0.0-interactive-token"
+    proxyImage: "docker-test.repo.splunkdev.net/ml-platform/vector-db/weaviate-service:v1.0.1"
 
 aiPlatform:
   name: "splunk-ai-stack"
