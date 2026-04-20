@@ -684,9 +684,16 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 // before the worker runs; the data-loader Job is the canonical bootstrap step
 // for this (see scripts/data_loader/ in saia-service).
 //
-// AWS_ENDPOINT_URL: the v2 S3StorageAdapter reads this canonical name. v1's
-// S3_COMPAT_* env vars are already set in buildSAIABaseEnv but are NOT read
-// by the v2 adapter, so we must set AWS_ENDPOINT_URL explicitly here.
+// AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY: the v2
+// S3StorageAdapter (used by S3FieldDescriptionRepository, see
+// app/repositories/field_description/factory.py) constructs boto3 directly and
+// reads the canonical AWS_* names. v1's S3COMPAT_OBJECT_STORE_* env vars are
+// already set in buildSAIABaseEnv but are NOT read by boto3, so without
+// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY the worker would silently fall back
+// to no-credentials (NoCredentialsError caught by the repository as
+// StorageAdapterError, returning an empty cache and degraded search results).
+// Sourcing them from the same secret keys as the S3-compat creds keeps a
+// single source of truth for object-store auth.
 func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{Name: "ML_PLATFORM_URL", Value: ai.Spec.AIPlatformUrl},
@@ -709,6 +716,31 @@ func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
 			Name:  "AWS_ENDPOINT_URL",
 			Value: ai.Spec.TaskVolume.Endpoint,
 		})
+	}
+	// boto3-canonical credentials for the v2 S3StorageAdapter. Mirrors the
+	// S3COMPAT_OBJECT_STORE_ACCESS_KEY/_SECRET_KEY plumbing in buildSAIABaseEnv;
+	// see s3compat secret schema in raybuilder/builder.go and ai.Spec.TaskVolume.SecretRef.
+	if ai.Spec.TaskVolume.SecretRef != "" {
+		env = append(env,
+			corev1.EnvVar{
+				Name: "AWS_ACCESS_KEY_ID",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
+						Key:                  "s3_access_key",
+					},
+				},
+			},
+			corev1.EnvVar{
+				Name: "AWS_SECRET_ACCESS_KEY",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
+						Key:                  "s3_secret_key",
+					},
+				},
+			},
+		)
 	}
 	return env
 }

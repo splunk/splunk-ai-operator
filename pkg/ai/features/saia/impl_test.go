@@ -672,6 +672,51 @@ func Test_buildV2ExtraEnv_FieldDescriptionBackend(t *testing.T) {
 		assert.False(t, has,
 			"AWS_ENDPOINT_URL must be omitted when TaskVolume.Endpoint is empty (cloud S3 case)")
 	})
+
+	// SecretRef present → AWS_ACCESS_KEY_ID/SECRET sourced from same keys as
+	// the S3COMPAT_* envs in buildSAIABaseEnv. Required so that the v2
+	// S3StorageAdapter (used by S3FieldDescriptionRepository) can authenticate
+	// to SeaweedFS / MinIO.
+	t.Run("AWS credentials sourced from SecretRef", func(t *testing.T) {
+		ai := newTestAIService() // already sets SecretRef = "s3-creds"
+		env := buildV2ExtraEnv(ai)
+
+		var foundID, foundSecret bool
+		for _, e := range env {
+			if e.Name == "AWS_ACCESS_KEY_ID" {
+				foundID = true
+				if assert.NotNil(t, e.ValueFrom) && assert.NotNil(t, e.ValueFrom.SecretKeyRef) {
+					assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
+					assert.Equal(t, "s3_access_key", e.ValueFrom.SecretKeyRef.Key)
+				}
+			}
+			if e.Name == "AWS_SECRET_ACCESS_KEY" {
+				foundSecret = true
+				if assert.NotNil(t, e.ValueFrom) && assert.NotNil(t, e.ValueFrom.SecretKeyRef) {
+					assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
+					assert.Equal(t, "s3_secret_key", e.ValueFrom.SecretKeyRef.Key)
+				}
+			}
+		}
+		assert.True(t, foundID, "AWS_ACCESS_KEY_ID must be present so boto3 can auth to S3-compat endpoint")
+		assert.True(t, foundSecret, "AWS_SECRET_ACCESS_KEY must be present so boto3 can auth to S3-compat endpoint")
+	})
+
+	// No SecretRef → AWS_* must be omitted (cloud deployments use IAM role,
+	// not env-var creds; setting empty values would otherwise mask the IAM
+	// chain inside boto3).
+	t.Run("AWS credentials omitted when SecretRef empty", func(t *testing.T) {
+		ai := newTestAIService()
+		ai.Spec.TaskVolume.SecretRef = ""
+		env := buildV2ExtraEnv(ai)
+
+		for _, e := range env {
+			assert.NotEqual(t, "AWS_ACCESS_KEY_ID", e.Name,
+				"AWS_ACCESS_KEY_ID must be omitted in cloud (IAM-role) case")
+			assert.NotEqual(t, "AWS_SECRET_ACCESS_KEY", e.Name,
+				"AWS_SECRET_ACCESS_KEY must be omitted in cloud (IAM-role) case")
+		}
+	})
 }
 
 func Test_buildSAIABaseEnv(t *testing.T) {
