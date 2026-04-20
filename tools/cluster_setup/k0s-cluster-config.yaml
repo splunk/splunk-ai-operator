@@ -61,7 +61,12 @@ images:
 
   operator:
     # image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.29"
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.20"
+    # v0.1.21 adds ServiceTemplate propagation (AIPlatform → AIService) so the
+    # aiPlatform.serviceTemplate block in this config actually takes effect.
+    # Build & push with:
+    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.21 \
+    #     make docker-build-amd64 docker-push
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.21"
 
   splunk:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
@@ -84,13 +89,16 @@ images:
   saia:
     # apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
     # apiImage: "ml-platform/saia/saia-api:build-006" #saia v1.5
-    apiImage: "ml-platform/saia/saia-api:v2.0.4-23-g2fc91e9" #saia v2
+    # apiImage: "ml-platform/saia/saia-api:v2.0.4-23-g2fc91e9" #saia v2
+    apiImage: "ml-platform/saia/saia-api:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
 
-    apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-23-g2fc91e9" #saia v2
-    
+    # apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-23-g2fc91e9" #saia v2
+    apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
+
     # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
     # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003" #saia v1.5
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-23-g2fc91e9" #saia v2
+    # dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-23-g2fc91e9" #saia v2
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
@@ -138,6 +146,33 @@ aiPlatform:
 
   workerGroupConfig:
     imageRegistry: ""
+
+  # ---------- SAIA public exposure (OPTIONAL) ----------
+  # The SAIA "public" Service (nginx reverse proxy in front of v1+v2 API pods)
+  # defaults to ClusterIP, meaning it is only reachable from inside the cluster.
+  #
+  # Two call patterns hit this Service:
+  #   (A) Splunk Enterprise pod      → saia-service   (works with ClusterIP)
+  #   (B) End user's browser         → saia-service   (needs external exposure)
+  #
+  # Pattern B is used by the v2 chat UI (/query streaming, conversations,
+  # feedback, admin endpoints). Without external exposure the v2 chat UI
+  # breaks for users, even though v1 one-shot SPL features still work.
+  #
+  # To DISABLE external exposure (use ClusterIP only), either:
+  #   * Delete / comment-out the entire `serviceTemplate:` block below, OR
+  #   * Set `type: ClusterIP` explicitly.
+  # Either is treated identically — the installer skips emitting serviceTemplate
+  # into the AIPlatform CR and the operator falls through to the ClusterIP
+  # default in reconcileSAIAService().
+  #
+  # To ENABLE external exposure for on-prem / airgap customers, NodePort is the
+  # recommended default: any k8s node IP + the configured nodePort yields a
+  # reachable endpoint from VPN-connected users. No cloud LB / cert-manager
+  # needed. Use LoadBalancer only if the customer runs MetalLB or a cloud LB.
+  serviceTemplate:
+    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
+    nodePort: 30080         # Fixed NodePort (30000-32767). Required for stable DNS.
 
   features:
     - name: "saia"

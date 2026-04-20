@@ -134,6 +134,12 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &svc, func() error {
 			// After client Get, svc holds the live AIService (empty on first create).
 			preservedResources := svc.Spec.Resources
+			// Preserve any direct `kubectl patch aiservice` edit of ServiceTemplate.
+			// Without this, an admin who patches the public SAIA Service type
+			// (e.g. to NodePort for browser-direct v2 traffic) would see their
+			// change revert on the next AIPlatform reconcile, same footgun as
+			// Resources above.
+			preservedServiceTemplate := svc.Spec.ServiceTemplate
 
 			// Ensure ownership
 			if err := controllerutil.SetControllerReference(platform, &svc, r.Scheme); err != nil {
@@ -150,6 +156,12 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 			// wipes kubectl patches / user-set limits (e.g. SAIA memory) back to empty → 2Gi defaults.
 			if resourceRequirementsNonEmpty(preservedResources) {
 				svc.Spec.Resources = preservedResources
+			}
+			// If the admin already patched serviceTemplate (non-empty
+			// spec.type), keep that override. Otherwise fall through to the
+			// value buildAIService() just set from AIPlatform.spec.
+			if preservedServiceTemplate.Spec.Type != "" {
+				svc.Spec.ServiceTemplate = preservedServiceTemplate
 			}
 
 			// Merge labels
@@ -240,7 +252,14 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				Port:    8080,
 				Path:    "/metrics",
 			},
-			MTLS:             platform.Spec.MTLS,
+			MTLS: platform.Spec.MTLS,
+			// Propagate public-exposure preference from AIPlatform. Customers deploy
+			// the higher-level AIPlatform CR, so any NodePort / LoadBalancer setting
+			// they configure at that level must flow down to the AIService. Without
+			// this copy, the spec lands on AIPlatform and is silently ignored.
+			// Deep-copy because corev1.Service is a value type with nested
+			// slices/maps; a shallow copy would share state across children.
+			ServiceTemplate:  *platform.Spec.ServiceTemplate.DeepCopy(),
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
 		},
 	}

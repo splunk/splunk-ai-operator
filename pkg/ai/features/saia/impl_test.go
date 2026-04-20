@@ -515,6 +515,116 @@ func Test_reconcileSAIAService_pointsToNginx(t *testing.T) {
 	assert.Equal(t, int32(8080), svc.Spec.Ports[0].Port)
 }
 
+func Test_reconcileSAIAService_ServiceTypeVariations(t *testing.T) {
+	// Lock in the contract that the customer's k0s-cluster-config.yaml can
+	// omit / empty / explicitly-set serviceTemplate and get the expected
+	// Service.Type. Without this test, a future refactor could silently break
+	// the "just omit the block = ClusterIP" escape hatch documented in
+	// tools/cluster_setup/k0s-cluster-config.yaml.
+	scheme := buildFullTestScheme(t)
+
+	cases := []struct {
+		name         string
+		template     corev1.Service
+		wantType     corev1.ServiceType
+		wantNodePort int32 // 0 = don't check
+	}{
+		{
+			name:     "omitted/empty template → ClusterIP",
+			template: corev1.Service{}, // zero value, what yq-absent produces
+			wantType: corev1.ServiceTypeClusterIP,
+		},
+		{
+			name: "explicit ClusterIP → ClusterIP",
+			template: corev1.Service{
+				Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+			},
+			wantType: corev1.ServiceTypeClusterIP,
+		},
+		{
+			name: "NodePort without explicit port → NodePort auto-allocated",
+			template: corev1.Service{
+				Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
+			},
+			wantType: corev1.ServiceTypeNodePort,
+			// wantNodePort == 0 means we don't assert a specific value
+		},
+		{
+			name: "NodePort with explicit 30080 → NodePort 30080",
+			template: corev1.Service{
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeNodePort,
+					Ports: []corev1.ServicePort{
+						{Name: "http", NodePort: 30080},
+					},
+				},
+			},
+			wantType:     corev1.ServiceTypeNodePort,
+			wantNodePort: 30080,
+		},
+		{
+			name: "LoadBalancer → LoadBalancer",
+			template: corev1.Service{
+				Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+			},
+			wantType: corev1.ServiceTypeLoadBalancer,
+		},
+		{
+			name: "Unknown garbage type → ClusterIP (safe default)",
+			template: corev1.Service{
+				Spec: corev1.ServiceSpec{Type: corev1.ServiceType("Bogus")},
+			},
+			wantType: corev1.ServiceTypeClusterIP,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ai := newTestAIService()
+			ai.Name = "svctype-" + sanitize(tc.name)
+			ai.Spec.ServiceTemplate = tc.template
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+			r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+			require.NoError(t, r.reconcileSAIAService(context.Background(), ai))
+
+			svc := &corev1.Service{}
+			require.NoError(t, fakeClient.Get(context.Background(),
+				types.NamespacedName{Name: ai.Name + "-saia-service", Namespace: "default"}, svc))
+
+			assert.Equal(t, tc.wantType, svc.Spec.Type)
+			if tc.wantNodePort != 0 {
+				require.NotEmpty(t, svc.Spec.Ports)
+				assert.Equal(t, tc.wantNodePort, svc.Spec.Ports[0].NodePort)
+			}
+		})
+	}
+}
+
+// sanitize turns a free-form subtest name into a valid k8s resource name.
+func sanitize(s string) string {
+	s = strings.ToLower(s)
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			out = append(out, c)
+		default:
+			if len(out) > 0 && out[len(out)-1] != '-' {
+				out = append(out, '-')
+			}
+		}
+	}
+	// Trim trailing hyphen
+	for len(out) > 0 && out[len(out)-1] == '-' {
+		out = out[:len(out)-1]
+	}
+	return string(out)
+}
+
 func Test_buildSAIABaseEnv(t *testing.T) {
 	ai := newTestAIService()
 	env := buildSAIABaseEnv(ai)

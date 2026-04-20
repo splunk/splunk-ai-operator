@@ -3034,6 +3034,25 @@ EOF
       ;;
   esac
 
+  # Build SAIA public-Service exposure block.
+  # The AIPlatform reconciler copies AIPlatform.spec.serviceTemplate down to
+  # each AIService; the SAIA feature reconciler uses it as the spec for the
+  # public saia-service.  For on-prem / airgap customers, NodePort is the
+  # recommended default (no cloud LB, no cert-manager, browser on VPN can
+  # reach any node IP for Pattern-B v2 APIs like /query streaming).
+  local svc_template_yaml=""
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${svc_type}" && "${svc_type}" != "null" && "${svc_type}" != "ClusterIP" ]]; then
+    local svc_node_port
+    svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    svc_template_yaml="  serviceTemplate:"$'\n'"    spec:"$'\n'"      type: ${svc_type}"$'\n'
+    if [[ -n "${svc_node_port}" && "${svc_node_port}" != "null" && "${svc_type}" == "NodePort" ]]; then
+      svc_template_yaml+="      ports:"$'\n'"      - name: http"$'\n'"        port: 8080"$'\n'"        targetPort: 8080"$'\n'"        nodePort: ${svc_node_port}"$'\n'
+    fi
+    log "SAIA public exposure: ${svc_type}${svc_node_port:+ (nodePort=${svc_node_port})}"
+  fi
+
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
   local feature_count
@@ -3084,6 +3103,7 @@ ${image_pull_secrets}
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}
+${svc_template_yaml}
   # Storage configuration
   storage:
     vectorDB:
