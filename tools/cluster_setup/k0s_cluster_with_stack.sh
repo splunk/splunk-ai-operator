@@ -158,9 +158,11 @@ load_config() {
   RAY_WORKER_IMAGE="$(yq eval '.images.ray.workerImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  NGINX_IMAGE="$(yq eval '.images.nginx.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
 
   # Operator versions
   MODEL_VERSION="$(yq eval '.operators.ray.modelVersion // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -257,6 +259,9 @@ validate_image_config() {
   if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
     err "REQUIRED: images.saia.apiImage must be specified in k0s-cluster-config.yaml"
   fi
+  if [[ -z "$SAIA_API_V2_IMAGE" || "$SAIA_API_V2_IMAGE" == "null" ]]; then
+    err "REQUIRED: images.saia.apiV2Image must be specified in k0s-cluster-config.yaml"
+  fi
   if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
     err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
   fi
@@ -271,6 +276,10 @@ validate_image_config() {
   if [[ -z "$OTEL_COLLECTOR_IMAGE" || "$OTEL_COLLECTOR_IMAGE" == "null" ]]; then
     OTEL_COLLECTOR_IMAGE="otel/opentelemetry-collector-contrib:0.122.1"
     log "Using default OpenTelemetry Collector image: $OTEL_COLLECTOR_IMAGE"
+  fi
+  if [[ -z "$NGINX_IMAGE" || "$NGINX_IMAGE" == "null" ]]; then
+    NGINX_IMAGE="docker.io/library/nginx:1.27-alpine"
+    log "Using default Nginx image: $NGINX_IMAGE"
   fi
   if [[ -z "$MODEL_VERSION" || "$MODEL_VERSION" == "null" ]]; then
     MODEL_VERSION="v0.3.14-36-g1549f5a"
@@ -307,42 +316,61 @@ configure_images() {
   local ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
+  local saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
+  # Nginx is an upstream image; don't rewrite it to the ECR registry unless the
+  # user explicitly put it under their registry. build_image_url already
+  # preserves a fully-qualified image path, so `docker.io/library/nginx:...`
+  # stays intact and `nginx:1.27-alpine` gets prefixed with $IMAGE_REGISTRY.
+  local nginx_full=$(build_image_url "$IMAGE_REGISTRY" "$NGINX_IMAGE")
 
   local ray_head_escaped=$(echo "$ray_head_full" | sed 's/[\/&]/\\&/g')
   local ray_worker_escaped=$(echo "$ray_worker_full" | sed 's/[\/&]/\\&/g')
   local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
+  local saia_api_v2_escaped=$(echo "$saia_api_v2_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
   local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
+  local nginx_escaped=$(echo "$nginx_full" | sed 's/[\/&]/\\&/g')
   local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
 
-  SEDOPTION="-i"
+  # BSD (macOS) sed requires an explicit backup-suffix arg after -i.
+  # GNU (Linux) sed accepts -i without the suffix arg.
+  # Use a bash array so the empty-string "" is preserved as a distinct argv entry
+  # on macOS; without this, unquoted $SEDOPTION word-splitting created stray
+  # "filename''" backup files next to each artifact.
+  local SED_INPLACE
   if [[ "$OSTYPE" == "darwin"* ]]; then
-    SEDOPTION="-i ''"
+    SED_INPLACE=(sed -i "")
+  else
+    SED_INPLACE=(sed -i)
   fi
 
-  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
 
   log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
   log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
   log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
+  log "  ✓ Updated RELATED_IMAGE_SAIA_API_V2: $saia_api_v2_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
+  log "  ✓ Updated RELATED_IMAGE_NGINX: $nginx_full"
   log "  ✓ Updated operator image: $operator_full"
   log "  ✓ Updated MODEL_VERSION: $MODEL_VERSION"
   log "  ✓ Updated RAY_VERSION: $RAY_RUNTIME_VERSION"
@@ -355,8 +383,8 @@ configure_images() {
   local splunk_escaped=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
   local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
-  sed $SEDOPTION "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
-  sed $SEDOPTION "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
+  "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
 
   log "  ✓ Updated Splunk Enterprise image: $splunk_full"
   log "  ✓ Updated Splunk Operator image: $splunk_operator_full"

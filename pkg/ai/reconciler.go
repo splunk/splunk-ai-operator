@@ -3,6 +3,7 @@ package ai_platform
 import (
 	"context"
 	"fmt"
+	"os"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
@@ -211,7 +212,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	taskObjectStorage := platform.Spec.ObjectStorage
 	// Don't append feature name - just pass the bucket path directly
 	// taskObjectStorage.Path is already set from platform.Spec.ObjectStorage
-	return &aiApi.AIService{
+	svc := &aiApi.AIService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: platform.Namespace,
@@ -239,11 +240,18 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				Port:    8080,
 				Path:    "/metrics",
 			},
-			MTLS: platform.Spec.MTLS,
-			// Propagate imagePullSecrets from AIPlatform to AIService
+			MTLS:             platform.Spec.MTLS,
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
 		},
 	}
+
+	// SAIA v2: populate from operator env var if set
+	if v2Image := os.Getenv("RELATED_IMAGE_SAIA_API_V2"); v2Image != "" {
+		svc.Spec.V2 = aiApi.SAIAv2Config{Image: v2Image, Replicas: 1}
+		svc.Spec.V2Worker = aiApi.SAIAWorkerConfig{Replicas: 1}
+	}
+
+	return svc
 }
 
 // CheckAIServiceStatus verifies that all AIService children have successful conditions.

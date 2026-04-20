@@ -150,11 +150,33 @@ func TestReconcileWeaviateDatabase(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "weaviate:test", sts.Spec.Template.Spec.Containers[0].Image)
 
-		// Verify Service created
+		// Verify container exposes both http (8080) and grpc (50051) ports
+		containerPorts := sts.Spec.Template.Spec.Containers[0].Ports
+		portNames := map[string]int32{}
+		for _, p := range containerPorts {
+			portNames[p.Name] = p.ContainerPort
+		}
+		assert.Equal(t, int32(8080), portNames["http"])
+		assert.Equal(t, int32(50051), portNames["grpc"])
+
+		// Verify container has GRPC_PORT env var (gRPC server is enabled by default in
+		// Weaviate v1.19+, GRPC_PORT is set explicitly to make the port contract clear).
+		envMap := map[string]string{}
+		for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+			envMap[e.Name] = e.Value
+		}
+		assert.Equal(t, "50051", envMap["GRPC_PORT"])
+
+		// Verify Service created with both http and grpc ports
 		svc := &corev1.Service{}
 		err = fc.Get(ctx, types.NamespacedName{Name: platformName + "-weaviate", Namespace: ns}, svc)
 		assert.NoError(t, err)
-		assert.Equal(t, int32(80), svc.Spec.Ports[0].Port)
+		svcPorts := map[string]int32{}
+		for _, p := range svc.Spec.Ports {
+			svcPorts[p.Name] = p.Port
+		}
+		assert.Equal(t, int32(80), svcPorts["http"])
+		assert.Equal(t, int32(50051), svcPorts["grpc"])
 	})
 }
 

@@ -76,10 +76,14 @@ spec:
             value: {{ .Values.weaviateImage }}
           - name: RELATED_IMAGE_SAIA_API
             value: {{ .Values.saiaApiImage }}
+          - name: RELATED_IMAGE_SAIA_API_V2
+            value: {{ .Values.saiaApiV2Image }}
           - name: RELATED_IMAGE_POST_INSTALL_HOOK
             value: {{ .Values.saiaSchemaImage }}
           - name: RELATED_IMAGE_OTEL_COLLECTOR
             value: {{ .Values.otelCollectorImage }}
+          - name: RELATED_IMAGE_NGINX
+            value: {{ .Values.nginxImage }}
           - name: MODEL_VERSION
             value: v0.3.14-36-g1549f5a
           - name: RAY_VERSION

@@ -2,16 +2,22 @@ package saia
 
 import (
 	"context"
-	//"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -102,6 +108,7 @@ func Test_validateAIService_defaults(t *testing.T) {
 		Spec: aiv1.AIServiceSpec{
 			AIPlatformRef: corev1.ObjectReference{Name: "plat", Namespace: "ns"},
 			TaskVolume:    aiv1.ObjectStorageSpec{Path: "/data"},
+			V2:            aiv1.SAIAv2Config{Image: "saia-v2:latest"},
 		},
 	}
 
@@ -113,6 +120,8 @@ func Test_validateAIService_defaults(t *testing.T) {
 	assert.NotNil(t, ai.Spec.Resources.Limits)
 	assert.Equal(t, "ray.ns.svc.cluster.local:8000", ai.Spec.AIPlatformUrl)
 	assert.Equal(t, "vec.ns.svc.cluster.local", ai.Spec.VectorDbUrl)
+	assert.Equal(t, int32(1), ai.Spec.V2.Replicas)
+	assert.Equal(t, int32(1), ai.Spec.V2Worker.Replicas)
 }
 
 func Test_getAIPlatform_success(t *testing.T) {
@@ -154,3 +163,412 @@ func Test_getAIPlatform_error(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, got)
 }
+
+func Test_validateAIService_missingV2Image(t *testing.T) {
+	os.Setenv("RELATED_IMAGE_POST_INSTALL_HOOK", "dummy")
+	defer os.Unsetenv("RELATED_IMAGE_POST_INSTALL_HOOK")
+
+	r := &SaiaReconciler{
+		Recorder: record.NewFakeRecorder(10),
+		Client:   fake.NewClientBuilder().WithScheme(buildTestScheme(t)).Build(),
+	}
+
+	ai := &aiv1.AIService{
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformUrl: "http://platform:8000",
+			VectorDbUrl:   "weaviate:80",
+			TaskVolume:    aiv1.ObjectStorageSpec{Path: "s3://bucket"},
+		},
+	}
+	err := r.validateAIService(context.Background(), ai)
+	assert.ErrorContains(t, err, "v2.image must be set")
+}
+
+// buildFullTestScheme creates a scheme that includes apps/v1 for Deployment testing.
+func buildFullTestScheme(t *testing.T) *runtime.Scheme {
+	s := buildTestScheme(t)
+	require.NoError(t, appsv1.AddToScheme(s))
+	return s
+}
+
+// newTestAIService returns a minimal AIService for reconciliation tests.
+func newTestAIService() *aiv1.AIService {
+	return &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       "uid-123",
+		},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformUrl:      "http://platform:8000",
+			VectorDbUrl:        "weaviate:80",
+			Replicas:           1,
+			ServiceAccountName: "test-sa",
+			TaskVolume: aiv1.ObjectStorageSpec{
+				Path:      "s3://test-bucket/saia",
+				Endpoint:  "http://seaweedfs:8333",
+				SecretRef: "s3-creds",
+			},
+			V2: aiv1.SAIAv2Config{
+				Image:    "saia-v2:latest",
+				Replicas: 1,
+			},
+			V2Worker: aiv1.SAIAWorkerConfig{Replicas: 1},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    *mustParseQuantity("500m"),
+					corev1.ResourceMemory: *mustParseQuantity("2Gi"),
+				},
+			},
+		},
+	}
+}
+
+func mustParseQuantity(s string) *resource.Quantity {
+	q := resource.MustParse(s)
+	return &q
+}
+
+func Test_reconcilePostInstallHook_SetsGRPCEnvForV2DataLoader(t *testing.T) {
+	// Regression: the saia-data-loader v2 image (>= v2.0.4-13-g3b677604) uses
+	// the Weaviate v4 Python client, which performs a gRPC health check on
+	// connect. Its url_compat shim defaults VECTOR_DB_GRPC_HOST to
+	// "grpc.{host}" and VECTOR_DB_GRPC_PORT to "443" (Splunk production
+	// convention). In k0s airgap, Weaviate exposes gRPC on the same Service at
+	// :50051. The operator MUST pass these vars explicitly so the shim's
+	// setdefault() calls are no-ops.
+	t.Setenv("RELATED_IMAGE_POST_INSTALL_HOOK", "dummy-hook-image:latest")
+
+	scheme := buildFullTestScheme(t)
+	require.NoError(t, batchv1.AddToScheme(scheme))
+	ai := newTestAIService()
+	ai.Spec.VectorDbUrl = "weaviate.ai-platform.svc.cluster.local"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	// First call creates the Job and returns "waiting" as a sentinel error.
+	err := r.reconcilePostInstallHook(context.Background(), ai)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "created Job")
+
+	job := &batchv1.Job{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-vector-db-setup-posthook", Namespace: "default"}, job))
+
+	// Collect env var names/values.
+	envMap := envToMap(job.Spec.Template.Spec.Containers[0].Env)
+
+	assert.Equal(t, "http://weaviate.ai-platform.svc.cluster.local:80", envMap["VECTOR_DB_URL"])
+	assert.Equal(t, "weaviate.ai-platform.svc.cluster.local", envMap["VECTOR_DB_HOST"])
+	assert.Equal(t, "80", envMap["VECTOR_DB_PORT"])
+	// Critical: GRPC host must NOT be "grpc.<host>"; it's the same Service.
+	assert.Equal(t, "weaviate.ai-platform.svc.cluster.local", envMap["VECTOR_DB_GRPC_HOST"])
+	assert.Equal(t, "50051", envMap["VECTOR_DB_GRPC_PORT"])
+	assert.Equal(t, "false", envMap["VECTOR_DB_SECURE"])
+	assert.Equal(t, "false", envMap["VECTOR_DB_AUTH_ENABLED"])
+	assert.Equal(t, "true", envMap["SPLUNK_AI_ASSISTANT_SERVICE_CMP"])
+}
+
+func Test_reconcileSAIAv2Deployment(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Deployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-deployment", Namespace: "default"}, dep)
+	require.NoError(t, err)
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, "saia-v2:latest", container.Image)
+	assert.Equal(t, "saia-v2-api", container.Name)
+
+	// v2 API listens on 8000
+	assert.Equal(t, int32(8000), container.Ports[0].ContainerPort)
+	assert.Equal(t, "/health", container.ReadinessProbe.HTTPGet.Path)
+	assert.Equal(t, 8000, container.ReadinessProbe.HTTPGet.Port.IntValue())
+
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])
+	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
+	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])
+}
+
+func Test_reconcileSAIAv2Worker(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Worker(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-worker", Namespace: "default"}, dep)
+	require.NoError(t, err)
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, "saia-v2:latest", container.Image)
+	assert.Equal(t, "saia-v2-worker", container.Name)
+	assert.Equal(t, []string{"/bin/sh", "-c"}, container.Command)
+	assert.Contains(t, container.Args[0], "app.workers.ingestion_worker")
+
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "600", envMap["RUN_TASKS_DELAY_S"])
+	// Heartbeat path must match saia-v2's default (app/core/config.py).
+	assert.Equal(t, "/tmp/ingestion_worker_heartbeat", envMap["WORKER_HEARTBEAT_PATH"])
+	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])
+
+	// Liveness uses exec (heartbeat file check), not HTTP
+	assert.NotNil(t, container.LivenessProbe.Exec)
+	assert.Nil(t, container.LivenessProbe.HTTPGet)
+	// Probe must use python3 (not coreutils) because the saia-v2 base image lacks date/cat/cut.
+	assert.Equal(t, "python3", container.LivenessProbe.Exec.Command[0])
+	assert.Contains(t, container.LivenessProbe.Exec.Command[2], "WORKER_HEARTBEAT_PATH")
+
+	// Only metrics port, no HTTP API port
+	assert.Len(t, container.Ports, 1)
+	assert.Equal(t, int32(8088), container.Ports[0].ContainerPort)
+}
+
+func Test_reconcileNginxConfigMap(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileNginxConfigMap(context.Background(), ai)
+	require.NoError(t, err)
+
+	cm := &corev1.ConfigMap{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm)
+	require.NoError(t, err)
+
+	conf := cm.Data["nginx.conf"]
+	assert.NotEmpty(t, conf)
+
+	// v2 routing: ANY path containing "/saia-api-v2/" — with or without a
+	// tenant prefix — must be sent to the v2 upstream. The regex must NOT
+	// require a path segment before "saia-api-v2" (that would silently route
+	// tenant-less probes to v1).
+	assert.Contains(t, conf, "location ~ /saia-api-v2/")
+	assert.Contains(t, conf, "proxy_pass http://saia_v2")
+
+	// v1 is the default
+	assert.Contains(t, conf, "location /")
+	assert.Contains(t, conf, "proxy_pass http://saia_v1")
+
+	// Upstream names reference the correct internal service names
+	assert.Contains(t, conf, "test-saia-v1-service:8080")
+	assert.Contains(t, conf, "test-saia-v2-service:8000")
+
+	// SSE/streaming friendliness
+	assert.Contains(t, conf, "proxy_buffering off")
+	assert.Contains(t, conf, "proxy_http_version 1.1")
+
+	// Health and status endpoints — stub_status must be loopback-only.
+	assert.Contains(t, conf, "location = /nginx_health")
+	assert.Contains(t, conf, "location = /nginx_status")
+	assert.Contains(t, conf, "deny all;")
+}
+
+func Test_reconcileNginxDeployment(t *testing.T) {
+	// Ensure no env override leaks from other tests in the package.
+	os.Unsetenv("RELATED_IMAGE_NGINX")
+
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileNginxDeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-nginx", Namespace: "default"}, dep)
+	require.NoError(t, err)
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, "nginx:1.27-alpine", container.Image)
+	assert.Equal(t, "nginx", container.Name)
+	assert.Equal(t, int32(8080), container.Ports[0].ContainerPort)
+
+	// ConfigMap volume mount
+	assert.Equal(t, "/etc/nginx/nginx.conf", container.VolumeMounts[0].MountPath)
+	assert.Equal(t, "nginx.conf", container.VolumeMounts[0].SubPath)
+
+	// Health probes use nginx_health
+	assert.Equal(t, "/nginx_health", container.LivenessProbe.HTTPGet.Path)
+	assert.Equal(t, "/nginx_health", container.ReadinessProbe.HTTPGet.Path)
+}
+
+func Test_reconcileNginxDeployment_imageOverride(t *testing.T) {
+	os.Setenv("RELATED_IMAGE_NGINX", "private.registry.example.com/nginx:1.29-alpine")
+	defer os.Unsetenv("RELATED_IMAGE_NGINX")
+
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Name = "override"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "override-saia-nginx", Namespace: "default"}, dep))
+
+	assert.Equal(t, "private.registry.example.com/nginx:1.29-alpine",
+		dep.Spec.Template.Spec.Containers[0].Image)
+}
+
+func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
+	// Regression: the pre-existing code did not initialize svc.Annotations, so
+	// any user-provided annotation on the AIService caused a "assignment to
+	// entry in nil map" panic when reconciling the public service.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Annotations = map[string]string{
+		"operator.splunk.com/example":              "v1",
+		"kubectl.kubernetes.io/restartedAt":        "should-be-skipped",
+		"kubectl.kubernetes.io/last-applied-configuration": "should-be-skipped",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NotPanics(t, func() {
+		err := r.reconcileSAIAService(context.Background(), ai)
+		require.NoError(t, err)
+	})
+
+	svc := &corev1.Service{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-service", Namespace: "default"}, svc))
+
+	assert.Equal(t, "v1", svc.Annotations["operator.splunk.com/example"])
+	assert.NotContains(t, svc.Annotations, "kubectl.kubernetes.io/restartedAt")
+	assert.NotContains(t, svc.Annotations, "kubectl.kubernetes.io/last-applied-configuration")
+}
+
+func Test_reconcileSAIAv1Service(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv1Service(context.Background(), ai)
+	require.NoError(t, err)
+
+	svc := &corev1.Service{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v1-service", Namespace: "default"}, svc)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{"app": "test", "component": "test"}, svc.Spec.Selector)
+	assert.Equal(t, int32(8080), svc.Spec.Ports[0].Port)
+}
+
+func Test_reconcileSAIAv2Service(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Service(context.Background(), ai)
+	require.NoError(t, err)
+
+	svc := &corev1.Service{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-service", Namespace: "default"}, svc)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{"app": "test", "component": "test-v2-api"}, svc.Spec.Selector)
+	assert.Equal(t, int32(8000), svc.Spec.Ports[0].Port)
+}
+
+func Test_reconcileSAIAService_pointsToNginx(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAService(context.Background(), ai)
+	require.NoError(t, err)
+
+	svc := &corev1.Service{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-service", Namespace: "default"}, svc)
+	require.NoError(t, err)
+
+	// Public service must target nginx, not v1 directly
+	assert.Equal(t, map[string]string{"app": "test", "component": "test-nginx"}, svc.Spec.Selector)
+	assert.Equal(t, int32(8080), svc.Spec.Ports[0].Port)
+}
+
+func Test_buildSAIABaseEnv(t *testing.T) {
+	ai := newTestAIService()
+	env := buildSAIABaseEnv(ai)
+	envMap := envToMap(env)
+
+	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])
+	assert.Equal(t, "weaviate:80", envMap["VECTOR_DB_URL"])
+	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
+	assert.Equal(t, "http://seaweedfs:8333", envMap["S3COMPAT_OBJECT_STORE_ENDPOINT_URL"])
+	assert.Equal(t, "test-bucket", envMap["S3COMPAT_OBJECT_STORE_BUCKET"])
+
+	// S3 creds come from secretRef
+	found := false
+	for _, e := range env {
+		if e.Name == "S3COMPAT_OBJECT_STORE_ACCESS_KEY" {
+			found = true
+			assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
+			assert.Equal(t, "s3_access_key", e.ValueFrom.SecretKeyRef.Key)
+		}
+	}
+	assert.True(t, found, "S3COMPAT_OBJECT_STORE_ACCESS_KEY should be present")
+}
+
+func Test_extractBucketName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"s3://my-bucket/path", "my-bucket"},
+		{"s3compat://bucket-name", "bucket-name"},
+		{"minio://bucket-name", "bucket-name"},
+		{"seaweedfs://my-bucket/prefix", "my-bucket"},
+		{"gs://my-bucket", "my-bucket"},
+		{"plain-bucket", "plain-bucket"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			assert.Equal(t, tt.want, extractBucketName(tt.input))
+		})
+	}
+}
+
+// envToMap converts a slice of EnvVar to a map for easy assertion.
+// Only includes env vars with direct values (not ValueFrom).
+func envToMap(envs []corev1.EnvVar) map[string]string {
+	m := make(map[string]string)
+	for _, e := range envs {
+		if e.ValueFrom == nil {
+			m[e.Name] = e.Value
+		}
+	}
+	return m
+}
+
+// Suppress unused import warnings
+var _ = fmt.Sprintf
+var _ = strings.Contains

@@ -117,6 +117,45 @@ type AIServiceSpec struct {
 	// +kubebuilder:default="cluster.local"
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	ClusterDomain string `json:"clusterDomain,omitempty"`
+
+	// V2 configures the SAIA v2 deployment. v2 is always deployed alongside v1 behind nginx.
+	// Users toggle Agent Mode (v1 vs v2) from the Splunk Settings UI.
+	// +kubebuilder:validation:Optional
+	V2 SAIAv2Config `json:"v2,omitempty"`
+
+	// V2Worker configures the v2 SAIA worker deployment (same v2 image, command=run-worker.sh).
+	// +kubebuilder:validation:Optional
+	V2Worker SAIAWorkerConfig `json:"v2Worker,omitempty"`
+}
+
+// SAIAv2Config defines the configuration for the SAIA v2 API deployment.
+type SAIAv2Config struct {
+	// Image is the container image for the v2 API pod
+	// +kubebuilder:validation:Optional
+	Image string `json:"image,omitempty"`
+
+	// Replicas is the number of v2 API replicas
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Resources defines the compute resources for the v2 API pods
+	// +kubebuilder:validation:Optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// SAIAWorkerConfig defines the configuration for a SAIA worker deployment.
+type SAIAWorkerConfig struct {
+	// Replicas is the number of worker replicas
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Resources defines the compute resources for the worker pods
+	// +kubebuilder:validation:Optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // MetricsConfig defines the metrics configuration for monitoring

@@ -107,10 +107,15 @@ weaviateImage: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
 # SAIA (Splunk AI Assistant) images
 saiaApiImage: "docker.io/splunk/saia-api:1.1.0"
+saiaApiV2Image: "docker.io/splunk/saia-api-v2:1.1.0"
 saiaSchemaImage: "docker.io/splunk/saia-data-loader:1.1.0"
 
 # OpenTelemetry Collector sidecar image
 otelCollectorImage: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+# Nginx reverse proxy image used by the SAIA reconciler to route v1/v2 traffic.
+# Override this in airgapped installs to point at your internal mirror.
+nginxImage: "nginx:1.27-alpine"
 
 # Set security context for Splunk Operator pod
 # reference: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.24/#podsecuritycontext-v1-core

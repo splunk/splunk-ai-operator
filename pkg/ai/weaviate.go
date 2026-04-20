@@ -196,16 +196,18 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 			Image:           weaviateImage,
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Resources:       resources,
-			VolumeMounts: volumeMounts,
-			Ports: []corev1.ContainerPort{{
-				Name:          "http",
-				ContainerPort: 8080,
-			}},
+			VolumeMounts:    volumeMounts,
+			Ports: []corev1.ContainerPort{
+				{Name: "http", ContainerPort: 8080},
+				{Name: "grpc", ContainerPort: 50051},
+			},
 			Env: []corev1.EnvVar{
-				{
-					Name:  "PERSISTENCE_DATA_PATH",
-					Value: "/var/lib/weaviate",
-				},
+				{Name: "PERSISTENCE_DATA_PATH", Value: "/var/lib/weaviate"},
+				// gRPC server is enabled by default in Weaviate v1.19+. Setting GRPC_PORT
+				// explicitly matches the Splunk vector-db reference chart and makes the
+				// port contract explicit for the 50051 containerPort/service declared below.
+				// Required by SAIA v2 which uses the Weaviate python v4 gRPC client.
+				{Name: "GRPC_PORT", Value: "50051"},
 			},
 		}}
 		return nil
@@ -230,11 +232,18 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Spec.Selector = labels
-		svc.Spec.Ports = []corev1.ServicePort{{
-			Name:       "http",
-			Port:       80,
-			TargetPort: intstr.FromInt(8080),
-		}}
+		svc.Spec.Ports = []corev1.ServicePort{
+			{
+				Name:       "http",
+				Port:       80,
+				TargetPort: intstr.FromInt(8080),
+			},
+			{
+				Name:       "grpc",
+				Port:       50051,
+				TargetPort: intstr.FromInt(50051),
+			},
+		}
 		return nil
 	}); err != nil {
 		return err
