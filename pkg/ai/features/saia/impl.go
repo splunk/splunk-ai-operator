@@ -666,8 +666,29 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 // buildV2ExtraEnv returns additional env vars needed by the SAIA v2 image.
 // v2 uses different env var names: VECTOR_DB_HOST (not VECTOR_DB_URL),
 // ML_PLATFORM_URL (not PLATFORM_URL), and needs vector DB TLS/auth disabled.
+//
+// SAIA V2 FieldDescription backend selection (required by both v2 API and v2
+// worker, else FieldDescriptionRepositoryFactory.get() raises ValueError at
+// startup and the worker enters a restart loop).
+//
+// Per Confluence ERD "ERD - AI Tier v0.2 - Bare Metal - SAIA 2.0", section
+// 3.8.1.2 + decision A.3: Option B (clean architecture) — use the new `s3`
+// backend that reads the global field-descriptions JSON from the same
+// S3-compatible object store (SeaweedFS/MinIO/CVFS) that SAIA already uses
+// for tenant data. The alternatives:
+//   - `dynamodb` — ERD assumption 2.1 explicitly disallows DynamoDB in AI Tier.
+//   - `file`     — requires the saia-v2 Dockerfile to `COPY dataset/`, which
+//     the current image (v2.0.4-31-g9efe1fc) does NOT do.
+//
+// The JSON object must be pre-uploaded to S3_BUCKET/FIELD_DESCRIPTION_S3_KEY
+// before the worker runs; the data-loader Job is the canonical bootstrap step
+// for this (see scripts/data_loader/ in saia-service).
+//
+// AWS_ENDPOINT_URL: the v2 S3StorageAdapter reads this canonical name. v1's
+// S3_COMPAT_* env vars are already set in buildSAIABaseEnv but are NOT read
+// by the v2 adapter, so we must set AWS_ENDPOINT_URL explicitly here.
 func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
-	return []corev1.EnvVar{
+	env := []corev1.EnvVar{
 		{Name: "ML_PLATFORM_URL", Value: ai.Spec.AIPlatformUrl},
 		{Name: "VECTOR_DB_AUTH_ENABLED", Value: "false"},
 		{Name: "VECTOR_DB_GRPC_HOST", Value: ai.Spec.VectorDbUrl},
@@ -675,7 +696,21 @@ func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
 		{Name: "VECTOR_DB_HOST", Value: ai.Spec.VectorDbUrl},
 		{Name: "VECTOR_DB_PORT", Value: "80"},
 		{Name: "VECTOR_DB_SECURE", Value: "false"},
+		// FieldDescription S3 backend (see doc-comment above).
+		{Name: "FIELD_DESCRIPTION_BACKEND", Value: "s3"},
+		{Name: "FIELD_DESCRIPTION_S3_KEY", Value: "field-descriptions/global-field-descriptions.json"},
 	}
+	// Only expose AWS_ENDPOINT_URL when the operator was configured with an
+	// explicit S3-compatible endpoint (SeaweedFS/MinIO). Omitting it lets the
+	// v2 adapter use the default AWS S3 endpoint when running in a real cloud
+	// deployment.
+	if ai.Spec.TaskVolume.Endpoint != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "AWS_ENDPOINT_URL",
+			Value: ai.Spec.TaskVolume.Endpoint,
+		})
+	}
+	return env
 }
 
 // buildSAIATLSEnv appends TLS-related env vars and returns updated env, volumes, and mounts.

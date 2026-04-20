@@ -61,12 +61,15 @@ images:
 
   operator:
     # image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.29"
-    # v0.1.21 adds ServiceTemplate propagation (AIPlatform → AIService) so the
+    # v0.1.21 added ServiceTemplate propagation (AIPlatform → AIService) so the
     # aiPlatform.serviceTemplate block in this config actually takes effect.
+    # v0.1.22 sets FIELD_DESCRIPTION_BACKEND=s3 + FIELD_DESCRIPTION_S3_KEY +
+    # AWS_ENDPOINT_URL on the v2 API and v2 worker pods so the worker no longer
+    # crash-loops on saia-v2 >= v2.0.4-13-g3b677604 (Confluence ERD 3.8.1.2).
     # Build & push with:
-    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.21 \
+    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.22 \
     #     make docker-build-amd64 docker-push
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.21"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.22"
 
   splunk:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"

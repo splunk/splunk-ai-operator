@@ -297,6 +297,18 @@ func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])
 	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
 	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])
+
+	// SAIA V2 FieldDescription backend is REQUIRED (worker and API both call
+	// FieldDescriptionRepositoryFactory.get() which raises ValueError on empty
+	// backend). Per Confluence ERD section 3.8.1.2 decision A.3 we use the
+	// S3-compatible backend for AI Tier.
+	assert.Equal(t, "s3", envMap["FIELD_DESCRIPTION_BACKEND"])
+	assert.Equal(t, "field-descriptions/global-field-descriptions.json",
+		envMap["FIELD_DESCRIPTION_S3_KEY"])
+	// AWS_ENDPOINT_URL is what the v2 S3StorageAdapter reads (vs v1's
+	// S3COMPAT_OBJECT_STORE_ENDPOINT_URL). Only set when the AIService has
+	// an explicit endpoint — e.g. for SeaweedFS/MinIO.
+	assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
 }
 
 func Test_reconcileSAIAv2Worker(t *testing.T) {
@@ -324,6 +336,15 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	// Heartbeat path must match saia-v2's default (app/core/config.py).
 	assert.Equal(t, "/tmp/ingestion_worker_heartbeat", envMap["WORKER_HEARTBEAT_PATH"])
 	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])
+
+	// SAIA V2 FieldDescription backend is REQUIRED — without this, the worker
+	// immediately raises ValueError and enters a restart loop. Ref Confluence
+	// ERD 3.8.1.2 + A.3: Option B (S3-compatible object store). These three
+	// vars are the minimum to make the worker bootstrap cleanly.
+	assert.Equal(t, "s3", envMap["FIELD_DESCRIPTION_BACKEND"])
+	assert.Equal(t, "field-descriptions/global-field-descriptions.json",
+		envMap["FIELD_DESCRIPTION_S3_KEY"])
+	assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
 
 	// Liveness uses exec (heartbeat file check), not HTTP
 	assert.NotNil(t, container.LivenessProbe.Exec)
@@ -623,6 +644,34 @@ func sanitize(s string) string {
 		out = out[:len(out)-1]
 	}
 	return string(out)
+}
+
+func Test_buildV2ExtraEnv_FieldDescriptionBackend(t *testing.T) {
+	// Explicit AIService with seaweedfs-style endpoint → AWS_ENDPOINT_URL is set.
+	t.Run("with S3-compatible endpoint", func(t *testing.T) {
+		ai := newTestAIService() // already sets TaskVolume.Endpoint = "http://seaweedfs:8333"
+		envMap := envToMap(buildV2ExtraEnv(ai))
+
+		assert.Equal(t, "s3", envMap["FIELD_DESCRIPTION_BACKEND"])
+		assert.Equal(t, "field-descriptions/global-field-descriptions.json",
+			envMap["FIELD_DESCRIPTION_S3_KEY"])
+		assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
+	})
+
+	// No explicit endpoint (= real AWS S3 deployment) → AWS_ENDPOINT_URL must
+	// be omitted so boto3 falls back to the default AWS regional endpoint.
+	t.Run("without S3-compatible endpoint", func(t *testing.T) {
+		ai := newTestAIService()
+		ai.Spec.TaskVolume.Endpoint = ""
+		envMap := envToMap(buildV2ExtraEnv(ai))
+
+		assert.Equal(t, "s3", envMap["FIELD_DESCRIPTION_BACKEND"])
+		assert.Equal(t, "field-descriptions/global-field-descriptions.json",
+			envMap["FIELD_DESCRIPTION_S3_KEY"])
+		_, has := envMap["AWS_ENDPOINT_URL"]
+		assert.False(t, has,
+			"AWS_ENDPOINT_URL must be omitted when TaskVolume.Endpoint is empty (cloud S3 case)")
+	})
 }
 
 func Test_buildSAIABaseEnv(t *testing.T) {
