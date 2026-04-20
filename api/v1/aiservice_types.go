@@ -53,6 +53,12 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Optional
 	AIPlatformUrl string `json:"aiPlatformUrl,omitempty"`
 
+	// AIPlatformScheme specifies the URL scheme for the AI Platform service ("http" or "https")
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default="http"
+	// +kubebuilder:validation:Enum=http;https
+	AIPlatformScheme string `json:"aiPlatformScheme,omitempty"`
+
 	// AIPlatformRef is a reference to the AIPlatform resource
 	// +kubebuilder:validation:Required
 	AIPlatformRef corev1.ObjectReference `json:"aiPlatformRef"`

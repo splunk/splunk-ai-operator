@@ -149,8 +149,12 @@ func (r *SaiaReconciler) validateAIService(
 			clusterDomain = "cluster.local"
 		}
 		if ai.Spec.AIPlatformUrl == "" {
-			ai.Spec.AIPlatformUrl = fmt.Sprintf("%s.%s.svc.%s:8000",
-				aiPlatform.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, clusterDomain)
+			scheme := ai.Spec.AIPlatformScheme
+			if scheme == "" {
+				scheme = "http"
+			}
+			ai.Spec.AIPlatformUrl = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
+				scheme, aiPlatform.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, clusterDomain)
 		}
 		if ai.Spec.VectorDbUrl == "" {
 			ai.Spec.VectorDbUrl = fmt.Sprintf("%s.%s.svc.%s",

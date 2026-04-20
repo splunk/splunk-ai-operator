@@ -104,7 +104,11 @@ func (r *SecaReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		); err != nil {
 			return fmt.Errorf("fetching AIPlatform: %w", err)
 		}
-		ai.Spec.AIPlatformUrl = fmt.Sprintf("%s.%s.svc.%s:8000", plat.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, "cluster.local")
+		scheme := ai.Spec.AIPlatformScheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		ai.Spec.AIPlatformUrl = fmt.Sprintf("%s://%s.%s.svc.%s:8000", scheme, plat.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, "cluster.local")
 		ai.Spec.VectorDbUrl = fmt.Sprintf("%s.%s.svc.%s", plat.Status.VectorDbServiceName, ai.Spec.AIPlatformRef.Namespace, "cluster.local")
 	}
 	if ai.Spec.AIPlatformRef.Name == "" && ai.Spec.AIPlatformUrl == "" {
