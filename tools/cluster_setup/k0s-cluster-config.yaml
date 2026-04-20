@@ -63,13 +63,23 @@ images:
     # image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.29"
     # v0.1.21 added ServiceTemplate propagation (AIPlatform → AIService) so the
     # aiPlatform.serviceTemplate block in this config actually takes effect.
-    # v0.1.22 sets FIELD_DESCRIPTION_BACKEND=s3 + FIELD_DESCRIPTION_S3_KEY +
-    # AWS_ENDPOINT_URL on the v2 API and v2 worker pods so the worker no longer
-    # crash-loops on saia-v2 >= v2.0.4-13-g3b677604 (Confluence ERD 3.8.1.2).
+    # v0.1.21 also sets FIELD_DESCRIPTION_BACKEND=s3 + FIELD_DESCRIPTION_S3_KEY +
+    # AWS_ENDPOINT_URL on the v2 API and v2 worker pods (Confluence ERD 3.8.1.2)
+    # and wires AWS_ACCESS_KEY_ID/SECRET from TaskVolume.SecretRef so boto3 can
+    # actually auth to the S3-compatible endpoint (otherwise field-description
+    # lookups silently return empty and sourcetype metadata is degraded).
+    # v0.1.22 prefixes http:// on the auto-generated AIPlatformUrl so v2's
+    # httpx/openai adapters can parse it — without the scheme they raise
+    # UnsupportedProtocol and every ingestion task fails.
+    # v0.1.23 lowers RUN_TASKS_DELAY_S from 600s to 10s on the v2 worker.
+    # The saia-v2 IngestionWorker only refreshes its heartbeat at the top of
+    # each poll iteration, and the liveness probe kills the pod at 120s stale.
+    # At 600s (the v1 scheduler cadence) the worker got SIGKILLed every time
+    # the tenant lock was busy or the queue was empty.
     # Build & push with:
-    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.22 \
+    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.23 \
     #     make docker-build-amd64 docker-push
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.22"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.23"
 
   splunk:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"

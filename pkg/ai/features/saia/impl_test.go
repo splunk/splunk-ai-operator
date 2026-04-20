@@ -332,7 +332,11 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	assert.Contains(t, container.Args[0], "app.workers.ingestion_worker")
 
 	envMap := envToMap(container.Env)
-	assert.Equal(t, "600", envMap["RUN_TASKS_DELAY_S"])
+	// RUN_TASKS_DELAY_S controls the v2 worker's poll sleep (saia-v2
+	// IngestionWorker.run). The value MUST stay well under the liveness probe
+	// threshold (120s) because the heartbeat file is only refreshed at the top
+	// of each iteration. 10s matches saia-v2's own Settings default.
+	assert.Equal(t, "10", envMap["RUN_TASKS_DELAY_S"])
 	// Heartbeat path must match saia-v2's default (app/core/config.py).
 	assert.Equal(t, "/tmp/ingestion_worker_heartbeat", envMap["WORKER_HEARTBEAT_PATH"])
 	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])

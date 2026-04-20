@@ -1147,8 +1147,17 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	// Keep heartbeat path in sync with saia-v2's default (app/core/config.py:
 	// worker_heartbeat_path = "/tmp/ingestion_worker_heartbeat"). The ingestion
 	// worker writes a floating-point unix timestamp to this file every poll cycle.
+	//
+	// RUN_TASKS_DELAY_S (run_tasks_delay_s) is the per-iteration sleep in
+	// IngestionWorker.run() when the queue is empty OR the tenant lock is busy.
+	// The heartbeat is written only at the top of process_next(), so this sleep
+	// directly controls heartbeat cadence. The liveness probe rejects heartbeats
+	// older than 120s, so we MUST keep this well under that threshold — 10s
+	// matches the saia-v2 default (see Settings.run_tasks_delay_s). Do NOT
+	// conflate with the v1 worker APScheduler cron (which uses 600s for weekly
+	// jobs); v2 reuses the same env name for a different purpose.
 	env = append(env,
-		corev1.EnvVar{Name: "RUN_TASKS_DELAY_S", Value: "600"},
+		corev1.EnvVar{Name: "RUN_TASKS_DELAY_S", Value: "10"},
 		corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"},
 		corev1.EnvVar{Name: "WORKER_HEARTBEAT_PATH", Value: "/tmp/ingestion_worker_heartbeat"},
 	)
