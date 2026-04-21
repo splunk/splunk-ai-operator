@@ -322,13 +322,24 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 	cmName := fmt.Sprintf("%s-saia-config", ai.Name)
 
 	// Defaults for static keys (override in user-managed CM if desired).
+	//
+	// ENABLE_AUTHZ MUST be "true" for SAIAAuthorizer.authorize() to run its
+	// CMP interactive-token validation branch, which is the ONLY code path
+	// that sets request.state.cmp_splunk_url on a successful token. The admin
+	// endpoints (AdminCapabilityAuthorizer) read that attribute to bridge the
+	// Splunk.interactive bearer into an EC-equivalent token. With "false" the
+	// main authorizer early-returns, the attribute is never set, and every
+	// /admin/* request fails with:
+	//   403 {"detail":"Admin endpoints require an authenticated EC user token."}
+	// There is no authorization-skip value that also preserves CMP bridging —
+	// the value IS "true" even in airgap CMP mode.
 	defaults := map[string]string{
 		// previously hardcoded
 		"SERVICE_NAME":                    "splunk_ai_assistant",
 		"SERVICE_INTERNAL_NAME":           "SAIA",
 		"SPLUNK_ISSUERS":                  "https://splunk-splunk-standalone-standalone-service:8089",
 		"SPLUNK_AI_ASSISTANT_SERVICE_CMP": "true",
-		"ENABLE_AUTHZ":                    "false", // FIXME remove when ready
+		"ENABLE_AUTHZ":                    "true",
 		"FEATURE_CONFIG_FILE_LOCATION":    "/etc/config/features_config.yaml",
 		"PLATFORM_VERSION":                "0.3.0",    // TODO make configurable
 		"SAIA_API_VERSION":                "0.3.1",    // TODO make configurable
@@ -1276,6 +1287,15 @@ http {
         server %s:8000;
     }
 
+    # Reflect Access-Control-Request-Headers back on preflight. If the browser
+    # didn't send any (rare), fall back to a broad default. Safer than a
+    # hardcoded allowlist because spl-copilot (and future clients) may add
+    # custom headers like x-requested-with, x-csrf-token, x-splunk-*, etc.
+    map $http_access_control_request_headers $cors_allow_headers {
+        default $http_access_control_request_headers;
+        ""      "authorization, content-type, x-ec-token, x-es-tenant-bearer, x-stack-url, x-stack-url-legacy, splunk-client, x-conversation-key, x-request-id, x-admin-preferences-filename, x-requested-with";
+    }
+
     server {
         listen 8080;
 
@@ -1304,6 +1324,28 @@ http {
         # Word boundary via "/saia-api-v2/" (not "saia-api-v2" substring)
         # prevents accidental matches like /foo/saia-api-v2-legacy/.
         location ~ /saia-api-v2/ {
+            # CORS preflight short-circuit. Browser preflights are
+            # unauthenticated by spec; SAIA v2's TenantConversationKeyMiddleware
+            # rejects them with 400 before FastAPI's CORSMiddleware can respond,
+            # which makes the browser block the real request with "No
+            # Access-Control-Allow-Origin header present". Answer preflight
+            # here and never proxy OPTIONS upstream.
+            #
+            # IMPORTANT: Do NOT emit Access-Control-Allow-Origin on non-OPTIONS
+            # responses — FastAPI's CORSMiddleware already sets it on real
+            # responses. A second ACAO from nginx would produce duplicate
+            # "*, http://origin" values that browsers reject.
+            if ($request_method = OPTIONS) {
+                add_header Access-Control-Allow-Origin $http_origin always;
+                add_header Access-Control-Allow-Credentials true always;
+                add_header Access-Control-Allow-Methods 'GET, POST, PUT, DELETE, PATCH, OPTIONS' always;
+                add_header Access-Control-Allow-Headers $cors_allow_headers always;
+                add_header Access-Control-Max-Age 3600 always;
+                add_header Content-Length 0 always;
+                add_header Content-Type 'text/plain charset=UTF-8' always;
+                return 204;
+            }
+
             proxy_pass http://saia_v2;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -1318,6 +1360,21 @@ http {
 
         # v1: everything else (including /health, /{tenant}/saia-api/v1alpha1/...)
         location / {
+            # Mirror the CORS preflight short-circuit for v1 routes; spl-copilot's
+            # Pattern B (direct browser fetch) may hit v1 admin endpoints too. Same
+            # rationale as v2: SAIA v1 middlewares authenticate on OPTIONS and would
+            # reject the preflight before CORS headers are emitted.
+            if ($request_method = OPTIONS) {
+                add_header Access-Control-Allow-Origin $http_origin always;
+                add_header Access-Control-Allow-Credentials true always;
+                add_header Access-Control-Allow-Methods 'GET, POST, PUT, DELETE, PATCH, OPTIONS' always;
+                add_header Access-Control-Allow-Headers $cors_allow_headers always;
+                add_header Access-Control-Max-Age 3600 always;
+                add_header Content-Length 0 always;
+                add_header Content-Type 'text/plain charset=UTF-8' always;
+                return 204;
+            }
+
             proxy_pass http://saia_v1;
             proxy_http_version 1.1;
             proxy_set_header Host $host;

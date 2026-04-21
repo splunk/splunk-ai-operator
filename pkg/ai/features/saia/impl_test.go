@@ -118,7 +118,11 @@ func Test_validateAIService_defaults(t *testing.T) {
 	assert.Equal(t, int32(1), ai.Spec.Replicas)
 	assert.NotNil(t, ai.Spec.Resources.Requests)
 	assert.NotNil(t, ai.Spec.Resources.Limits)
-	assert.Equal(t, "ray.ns.svc.cluster.local:8000", ai.Spec.AIPlatformUrl)
+	// AIPlatformUrl is built as "<scheme>://<ray-svc>.<ns>.svc.<cluster-domain>:8000".
+	// When AIPlatformScheme is unset, the operator defaults to "http" (see
+	// validateAIService). This makes the URL usable directly by httpx/openai
+	// clients in SAIA v2 without a second string-concat step.
+	assert.Equal(t, "http://ray.ns.svc.cluster.local:8000", ai.Spec.AIPlatformUrl)
 	assert.Equal(t, "vec.ns.svc.cluster.local", ai.Spec.VectorDbUrl)
 	assert.Equal(t, int32(1), ai.Spec.V2.Replicas)
 	assert.Equal(t, int32(1), ai.Spec.V2Worker.Replicas)
@@ -270,6 +274,61 @@ func Test_reconcilePostInstallHook_SetsGRPCEnvForV2DataLoader(t *testing.T) {
 	assert.Equal(t, "true", envMap["SPLUNK_AI_ASSISTANT_SERVICE_CMP"])
 }
 
+func Test_reconcileSAIAConfigMap_EnablesAuthzForCMPBridging(t *testing.T) {
+	// Regression: ENABLE_AUTHZ=true is REQUIRED for the SAIAAuthorizer's
+	// CMP interactive-token path to run. That path sets request.state.cmp_splunk_url,
+	// which AdminCapabilityAuthorizer needs to bridge a Splunk.interactive bearer
+	// into an EC-equivalent token. ENABLE_AUTHZ=false early-returns before the
+	// attribute is set, and /admin/* requests then fail with:
+	//   403 {"detail":"Admin endpoints require an authenticated EC user token."}
+	// Even in airgap CMP mode, ENABLE_AUTHZ must be "true" — there's no value
+	// that both skips authorization AND preserves the CMP bridge.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t, "true", cm.Data["ENABLE_AUTHZ"],
+		"ENABLE_AUTHZ must default to 'true' so CMP interactive-token bridging works on /admin/* routes")
+	assert.Equal(t, "true", cm.Data["SPLUNK_AI_ASSISTANT_SERVICE_CMP"],
+		"CMP mode flag must be set alongside ENABLE_AUTHZ so the authorizer picks the interactive-token branch")
+}
+
+func Test_reconcileSAIAConfigMap_PreservesUserOverride(t *testing.T) {
+	// If an operator explicitly disables authz on an existing ConfigMap
+	// (e.g. for development/debugging), our reconcile must NOT clobber that
+	// value back to the "true" default. The merge logic fills in missing or
+	// empty keys only.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-saia-config",
+			Namespace: "default",
+		},
+		Data: map[string]string{"ENABLE_AUTHZ": "false"},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t, "false", cm.Data["ENABLE_AUTHZ"],
+		"user-set ENABLE_AUTHZ=false must be preserved across reconciles")
+}
+
 func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
@@ -402,6 +461,61 @@ func Test_reconcileNginxConfigMap(t *testing.T) {
 	assert.Contains(t, conf, "location = /nginx_health")
 	assert.Contains(t, conf, "location = /nginx_status")
 	assert.Contains(t, conf, "deny all;")
+}
+
+func Test_reconcileNginxConfigMap_CORSPreflight(t *testing.T) {
+	// Regression: saia-v2's TenantConversationKeyMiddleware rejects
+	// unauthenticated CORS preflight OPTIONS requests with 400 before
+	// FastAPI's CORSMiddleware can respond, causing browsers to block the
+	// subsequent real request with "No Access-Control-Allow-Origin header
+	// present". The nginx reverse proxy MUST short-circuit OPTIONS at the
+	// proxy layer and respond with permissive CORS headers so the browser
+	// accepts the preflight. See:
+	//   saia-service/saia-v2/app/middleware/tenant_conversation_key.py
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+
+	conf := cm.Data["nginx.conf"]
+
+	// OPTIONS short-circuit must be present on BOTH v1 (/) and v2
+	// (/saia-api-v2/) locations. Without it, v1 admin routes (Pattern B
+	// direct browser fetch) would also fail the same way.
+	assert.Equal(t, 2, strings.Count(conf, "if ($request_method = OPTIONS)"),
+		"OPTIONS short-circuit must exist in both v1 and v2 location blocks")
+	assert.Contains(t, conf, "return 204",
+		"preflight must return 204 No Content")
+
+	// 'map' directive dynamically reflects Access-Control-Request-Headers
+	// so any custom header the client sends is auto-allowed (avoids drift
+	// between nginx allowlist and client's evolving header set).
+	assert.Contains(t, conf, "map $http_access_control_request_headers $cors_allow_headers",
+		"must use 'map' to reflect Access-Control-Request-Headers back to client")
+	assert.Contains(t, conf, "add_header Access-Control-Allow-Headers $cors_allow_headers",
+		"preflight response must echo the requested headers via $cors_allow_headers")
+
+	// ACAO must be reflected from Origin (not a hardcoded wildcard) so that
+	// Access-Control-Allow-Credentials=true is valid (browsers reject
+	// Allow-Origin="*" + Allow-Credentials=true).
+	assert.Contains(t, conf, "add_header Access-Control-Allow-Origin $http_origin",
+		"preflight ACAO must be reflected from Origin to support Allow-Credentials=true")
+
+	// CRITICAL: ACAO must ONLY appear in OPTIONS branches. FastAPI's
+	// CORSMiddleware already sets ACAO on real responses; adding it again
+	// from nginx produces duplicate "*, http://origin" values that browsers
+	// reject ("The 'Access-Control-Allow-Origin' header contains multiple
+	// values '*, http://localhost:18000', but only one is allowed").
+	assert.Equal(t, 2, strings.Count(conf, "add_header Access-Control-Allow-Origin"),
+		"ACAO must appear EXACTLY TWICE (once per OPTIONS branch). Adding it "+
+			"on real responses duplicates FastAPI's header and breaks the browser.")
 }
 
 func Test_reconcileNginxDeployment(t *testing.T) {

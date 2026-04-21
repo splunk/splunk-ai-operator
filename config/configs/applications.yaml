@@ -94,6 +94,17 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
         VLLM_WORKER_MULTIPROC_METHOD: spawn
+        # Disable the Redis-backed Responses API store (see ai-platform-models
+        # commit c1f9aef3: "feat: add a no-op store"). When True, the vLLM
+        # TextGen deployment constructs NoOpOpenAIServingResponses instead of
+        # RedisOpenAIServingResponses, so /v1/responses works without a Redis
+        # infra. Without this flag the deployment raises
+        #   RuntimeError: Responses Redis URL not set
+        # on every request, which surfaces as an empty SSE stream and the SAIA
+        # v2 /query path fails with "An error occurred processing your request".
+        # Airgap k0s has no Redis; cloud sets this to "False" and wires
+        # RESPONSES_REDIS_ADDRESS to its in-namespace Redis StatefulSet.
+        DISABLE_RESPONSES_API_REDIS: "True"
   - args:
       application_name: GptOss20b
       deployment_configs:
@@ -167,6 +178,9 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
         VLLM_WORKER_MULTIPROC_METHOD: spawn
+        # See GptOss120b above for rationale. Must be "True" in airgap (no
+        # Redis) so vLLM uses NoOpOpenAIServingResponses.
+        DISABLE_RESPONSES_API_REDIS: "True"
   - args:
       application_name: UaeLarge
       deployment_configs:

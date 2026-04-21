@@ -5682,15 +5682,15 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:9a24502-ai-tier
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:build-v2-002
         - name: RELATED_IMAGE_RAY_WORKER
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:9a24502-ai-tier
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-v2-002
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:v2.0.4-31-g9efe1fc
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v2-002
         - name: RELATED_IMAGE_SAIA_API_V2
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:v2.0.4-31-g9efe1fc
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-002
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:v2.0.4-31-g9efe1fc
         - name: SPLUNK_METRICS_INDEX_NAME
@@ -5705,7 +5705,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.53.0
-        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.24
+        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.25
         livenessProbe:
           httpGet:
             path: /healthz
