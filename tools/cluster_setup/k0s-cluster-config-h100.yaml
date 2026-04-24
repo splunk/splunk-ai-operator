@@ -25,11 +25,11 @@ nodes:
 
   existingIPs:
     controllers:
-      - 18.191.66.248                       # CHANGE THIS: Your controller server IP
+      - 3.149.241.167                       # CHANGE THIS: Your controller server IP
     workers:
-      - 18.220.129.123                       # CHANGE THIS: CPU worker 1
-      - 3.15.10.138                      # CHANGE THIS: GPU worker 1
-      - 18.219.68.93                       # CHANGE THIS: GPU worker 2
+      - 18.221.244.241                       # CHANGE THIS: CPU worker 1
+      - 18.191.19.128                      # CHANGE THIS: GPU worker 1
+      - 3.137.209.219                       # CHANGE THIS: GPU worker 2
 
 # ---------- Storage Configuration ----------
 # Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).

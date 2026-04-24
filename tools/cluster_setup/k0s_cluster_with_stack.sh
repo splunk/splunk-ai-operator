@@ -782,55 +782,15 @@ prepare_nodes_for_k0s() {
         sudo systemctl disable firewalld
       fi
 
-      # Load kernel modules required by Calico and kube-proxy.
-      # On RHEL 10 the legacy xtables extension modules (xt_conntrack, xt_comment,
-      # br_netfilter) are not built into the kernel at all, so they cannot be
-      # modprobed. However nf_conntrack (the core conntrack module) is built as a
-      # module (=m) and must be loaded — Calico's VXLAN dataplane and kube-proxy
-      # nftables mode both require it.
-      # overlay is needed by containerd for container overlay filesystems.
-      for mod in nf_conntrack overlay; do
+      # Load kernel modules required by Calico and kube-proxy
+      for mod in br_netfilter overlay nf_conntrack; do
         if ! lsmod | grep -q "^${mod} "; then
           sudo modprobe "${mod}" 2>/dev/null || echo "WARN: could not load kernel module ${mod}"
         fi
       done
       # Persist across reboots
       sudo mkdir -p /etc/modules-load.d
-      printf 'nf_conntrack\noverlay\n' | sudo tee /etc/modules-load.d/k0s.conf >/dev/null
-
-      # Ensure iptables is available (RHEL 10+ ships only nftables).
-      # Do NOT use 'command -v iptables' or 'iptables --version' as the guard:
-      # on RHEL 10 both can return exit 0 even when no binary exists (shell PATH
-      # edge case). Use rpm -q as the ground truth on RPM-based systems; fall
-      # back to testing whether the binary actually produces output.
-      _iptables_ok=false
-      if rpm -q iptables-nft >/dev/null 2>&1 || rpm -q iptables >/dev/null 2>&1; then
-        _iptables_ok=true
-      elif [ -n "$(iptables --version 2>/dev/null)" ]; then
-        _iptables_ok=true
-      fi
-      if ! $_iptables_ok; then
-        if command -v dnf >/dev/null 2>&1; then
-          echo 'Installing iptables-nft...'
-          if sudo dnf install -y iptables-nft; then
-            echo 'iptables-nft installed successfully'
-          else
-            echo 'ERROR: dnf install iptables-nft failed — kube-proxy will fail to program ClusterIP NAT rules. Ensure AppStream repo is enabled.' >&2
-            exit 1
-          fi
-        elif command -v apt-get >/dev/null 2>&1; then
-          echo 'Installing iptables...'
-          if sudo apt-get install -y iptables; then
-            echo 'iptables installed successfully'
-          else
-            echo 'ERROR: apt-get install iptables failed — cannot proceed.' >&2
-            exit 1
-          fi
-        else
-          echo 'ERROR: No package manager found to install iptables — cannot proceed.' >&2
-          exit 1
-        fi
-      fi
+      printf 'br_netfilter\noverlay\nnf_conntrack\n' | sudo tee /etc/modules-load.d/k0s.conf >/dev/null
 
       # Ensure python3 + PyYAML are available (used for k0s config generation)
       if ! python3 -c 'import yaml' 2>/dev/null; then
@@ -853,110 +813,6 @@ prepare_nodes_for_k0s() {
       fi
 REMOTE_SCRIPT
   done
-}
-
-# ====== FIX KUBE-PROXY MODE (iptables → nftables) IF NEEDED ======
-# RHEL 10 kernel 6.12.0-124.38+ removed the legacy xtables extension modules
-# (xt_conntrack, xt_comment, xt_nat, nft_compat). kube-proxy in "iptables"
-# mode cannot program NAT rules without them, even with iptables-nft installed.
-# Older RHEL 10 kernels (6.12.0-124.21) still ship xt_* modules so iptables
-# mode works fine there — we only patch when the modules are truly absent.
-#
-# k0s manages kube-proxy via a stack manifest at
-#   /var/lib/k0s/manifests/kubeproxy/kube-proxy.yaml
-# and continuously reconciles the ConfigMap from it. Patching the ConfigMap
-# alone is overwritten within seconds. We must patch the on-disk manifest
-# FIRST, then the ConfigMap, then bounce the pods.
-fix_kube_proxy_mode_if_needed() {
-  local controller_ip="$1"
-
-  # Check current mode from ConfigMap
-  local current_mode
-  current_mode=$(kubectl get cm kube-proxy -n kube-system \
-    -o jsonpath='{.data.config\.conf}' 2>/dev/null \
-    | grep '^mode:' | awk '{print $2}' | tr -d '"')
-
-  if [[ "${current_mode}" != "iptables" ]]; then
-    log "kube-proxy mode is '${current_mode}' — no patch needed"
-    return 0
-  fi
-
-  # Check if the controller kernel actually has xt_conntrack
-  local has_xt
-  has_xt=$(ssh_exec "${controller_ip}" \
-    "modprobe -n xt_conntrack 2>/dev/null && echo yes || echo no") || has_xt="no"
-  has_xt=$(echo "${has_xt}" | tr -d '[:space:]')
-
-  if [[ "${has_xt}" == "yes" ]]; then
-    log "kube-proxy mode is iptables and kernel has xt_conntrack — no patch needed"
-    return 0
-  fi
-
-  log "kube-proxy is in iptables mode but kernel lacks xt_conntrack — patching to nftables..."
-
-  # 1. Patch the on-disk manifest so k0s reconciliation preserves the change
-  ssh_exec "${controller_ip}" \
-    "sudo sed -i 's/mode: \"iptables\"/mode: \"nftables\"/' /var/lib/k0s/manifests/kubeproxy/kube-proxy.yaml" \
-    || warn "  Could not patch on-disk kube-proxy manifest"
-
-  # 2. Patch the ConfigMap for immediate effect
-  kubectl get cm kube-proxy -n kube-system -o json 2>/dev/null \
-    | python3 -c "
-import json, sys
-cm = json.load(sys.stdin)
-cm['data']['config.conf'] = cm['data']['config.conf'].replace('mode: \"iptables\"', 'mode: \"nftables\"')
-print(json.dumps(cm))
-" | kubectl apply -f - 2>/dev/null
-
-  # 3. Force-kill kube-proxy pods so replacements start with the new ConfigMap.
-  #    --wait=false is not enough: the old pods keep running with the stale
-  #    iptables-mode config until graceful shutdown completes, and the new pods
-  #    may mount the ConfigMap volume before k8s propagates the update.
-  log "  Force-restarting kube-proxy pods to pick up nftables mode..."
-  kubectl delete pods -n kube-system -l k8s-app=kube-proxy \
-    --force --grace-period=0 2>/dev/null || true
-  sleep 5  # give DaemonSet controller time to schedule replacements
-
-  local deadline=$(( $(date +%s) + 90 ))
-  while true; do
-    local not_ready
-    not_ready=$(kubectl get pods -n kube-system -l k8s-app=kube-proxy \
-      --no-headers 2>/dev/null | grep -cv '1/1.*Running') || not_ready=99
-    [[ "${not_ready}" -eq 0 ]] && { log "  ✓ kube-proxy pods Running in nftables mode"; break; }
-    [[ $(date +%s) -ge ${deadline} ]] && { warn "  Timed out waiting for kube-proxy pods"; break; }
-    sleep 3
-  done
-}
-
-bounce_calico_if_needed() {
-  log "Checking if calico-node pods need a restart (install-cni CrashLoop)..."
-  local crashing
-  crashing=$(kubectl get pods -n kube-system -l k8s-app=calico-node \
-    --no-headers 2>/dev/null | grep -cE 'Init:Error|CrashLoopBackOff|Init:CrashLoopBackOff') || crashing=0
-  if [[ "${crashing}" -gt 0 ]]; then
-    log "  Found ${crashing} crashing calico-node pod(s) — deleting so they restart with working kube-proxy..."
-    kubectl delete pods -n kube-system -l k8s-app=calico-node --wait=false 2>/dev/null || true
-
-    local deadline=$(( $(date +%s) + 120 ))
-    log "  Waiting up to 120s for calico-node pods to become Running..."
-    while true; do
-      local not_running
-      not_running=$(kubectl get pods -n kube-system -l k8s-app=calico-node \
-        --no-headers 2>/dev/null | grep -cv 'Running') || not_running=99
-      if [[ "${not_running}" -eq 0 ]]; then
-        log "  ✓ All calico-node pods are Running"
-        break
-      fi
-      if [[ $(date +%s) -ge ${deadline} ]]; then
-        warn "  Timed out waiting for calico-node pods — current state:"
-        kubectl get pods -n kube-system -l k8s-app=calico-node 2>/dev/null || true
-        break
-      fi
-      sleep 5
-    done
-  else
-    log "  calico-node pods look healthy, no restart needed"
-  fi
 }
 
 # ====== MOUNT NVMe INSTANCE STORE FOR EPHEMERAL STORAGE ======
@@ -1324,11 +1180,6 @@ PYSCRIPT"
 
   log "k0s cluster installed successfully!"
   kubectl get nodes
-
-  # On newer RHEL 10 kernels (6.12.0-124.38+) the xt_conntrack module is gone,
-  # so kube-proxy in iptables mode can't program NAT rules. Detect and fix.
-  fix_kube_proxy_mode_if_needed "${controller_ip}"
-  bounce_calico_if_needed
 
   # Label nodes for proper workload scheduling
   label_nodes
@@ -4271,8 +4122,6 @@ main_install() {
           all_node_ips+=("${WORKER_IPS[@]}")
         fi
         prepare_nodes_for_k0s "${all_node_ips[@]}"
-        fix_kube_proxy_mode_if_needed "${controller_ip}"
-        bounce_calico_if_needed
 
         # Ensure all expected workers are joined
         if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
@@ -4340,8 +4189,6 @@ main_install() {
           all_node_ips2+=("${WORKER_IPS[@]}")
         fi
         prepare_nodes_for_k0s "${all_node_ips2[@]}"
-        fix_kube_proxy_mode_if_needed "${controller_ip}"
-        bounce_calico_if_needed
 
         # Ensure all expected workers are joined
         if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
@@ -4994,7 +4841,7 @@ join_workers() {
     # Thorough cleanup before rejoining (handles stale configurations)
     cleanup_worker_k0s "${worker_ip}"
 
-    # RHEL/Fedora compatibility (firewalld, iptables-nft, python3-pyyaml, k0s binary)
+    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary)
     prepare_nodes_for_k0s "${worker_ip}"
 
     # Install worker with fresh token
