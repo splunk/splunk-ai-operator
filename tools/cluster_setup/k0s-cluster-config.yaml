@@ -16,7 +16,6 @@ cluster:
   # region: us-east-2                    # Ignored for on-prem, but required in config
   sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
   sshKeyPath: /Users/mohaari2/.ssh/ai-key-arif.pem  # CHANGE THIS: Path to SSH private key
-  # sshKeyPath: /Users/mohaari2/.ssh/ai-key-arif1.pem  # CHANGE THIS: Path to SSH private key
 
 # ---------- Node Configuration ----------
 nodes:
@@ -27,14 +26,10 @@ nodes:
   existingIPs:
     controllers:
       - 3.144.14.96                       # CHANGE THIS: Your controller server IP
-      # - 10.0.34.164
     workers:
       - 3.14.134.16                       # CHANGE THIS: CPU worker 1
       - 13.59.78.115                      # CHANGE THIS: GPU worker 1
       - 3.15.20.136                       # CHANGE THIS: GPU worker 2
-      # - 10.0.34.168
-      # - 10.0.34.142
-      # - 10.0.34.153
 
 # ---------- Storage Configuration ----------
 # Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).
@@ -45,11 +40,20 @@ storage:
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
 
   objectStore:
-    # type: "minio"                            # aws | s3compat | minio | seaweedfs (external only for non-aws)
-    type: "seaweedfs"                            # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    # 2026-04-21: switched from seaweedfs to minio because SeaweedFS returns
+    # S3 InternalError/500 (not NoSuchKey/404) for GetObjectTagging on a
+    # missing key. The SAIA v2 S3ConversationStore (added by Tony in
+    # saia-service commits 3d3756f3/8e2a9f40, shipped in image build-v2-002)
+    # calls GetObjectTagging on the conversation key *before* the first
+    # PutObject, so every brand-new draft: conversation hit a 502 from the
+    # SDK's 5-retry backoff. MinIO is AWS-spec compliant (NoSuchKey/404) and
+    # hosts the same bucket name at :9000, so swapping the endpoint is
+    # sufficient. Fallback: flip back by setting type: "seaweedfs" and
+    # endpoint to :8333 (but note the 502 on every draft conversation).
+    type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
     bucket: "ai-platform-bucket-minio-us-east-2"
-    # endpoint: "http://13.59.216.105:9000"    # MinIO port 9000. For SeaweedFS use port 8333.
-    endpoint: "http://3.144.157.201:8333"
+    # endpoint: "http://3.144.157.201:8333"      # SeaweedFS (deprecated — see comment above)
+    endpoint: "http://13.59.216.105:9000"        # MinIO (AWS-spec compliant GetObjectTagging semantics)
     auth:
       rootUser: "minioadmin"
       rootPassword: "minioadmin"
@@ -84,13 +88,25 @@ images:
     # env var the vLLM RedisOpenAIServingResponses constructor raises
     # RuntimeError('Responses Redis URL not set') on every /v1/responses
     # call and the SAIA v2 /query path fails with SearchStreamError.
+    # v0.1.26 switches the SAIA v2 conversation store from the ephemeral
+    # "filesystem" default to "s3" (S3ConversationStore) by setting
+    # CONVERSATION_STORE=s3 and CONVERSATION_S3_BUCKET=<bucket> on both the
+    # v2 API and v2 worker pods. Before this, chat history lived on the
+    # pod's container overlay and every pod restart produced spurious
+    # "Conversation <id> not found" 404s on GET /conversations/<id>/items
+    # (the Splunk UI's saia_v2_audit_index_log_proxy flow surfaced them as
+    # "Failed to fetch SAIA V2 conversation items"). Reuses the same
+    # AWS_ENDPOINT_URL + AWS_ACCESS_KEY_ID/SECRET that v0.1.21 wired for
+    # the FieldDescription S3 adapter. Pairs with saia-service image
+    # build-v2-002 which ships Tony's S3ConversationStore (commits
+    # 3d3756f3, 8e2a9f40, merged via 9efe1fce into ai-tier-v2.0).
     # Build & push with:
-    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.25 \
+    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.26 \
     #     make docker-build-amd64 docker-push
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.25"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.28"
 
   splunk:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom" #TODO this update
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   ray:
@@ -99,14 +115,14 @@ images:
     # headImage: "ml-platform/ray/ray-head:build-010"
     # headImage: "ml-platform/ray/ray-head:9a24502-ai-tier" # arif rebase to main
     # headImage: "ml-platform/ray/ray-head:build-v2-001" # tony redis changes
-    headImage: "ml-platform/ray/ray-head:build-v2-002" # tony redis changes + fixes
+    headImage: "ml-platform/ray/ray-head:build-v2-008" # tony redis changes + fixes
 
     # workerImage: "ml-platform/ray/ray-worker-gpu:build-v1alpha1"
     # workerImage: "ml-platform/ray/ray-worker-gpu:087e40e"
     # workerImage: "ml-platform/ray/ray-worker-gpu:build-010"
     # workerImage: "ml-platform/ray/ray-worker-gpu:9a24502-ai-tier" # arif rebase to main
     # workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-001" # tony redis changes
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-002" # tony redis changes + fixes
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-008" # tony redis changes + fixes
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
@@ -116,16 +132,17 @@ images:
     # apiImage: "ml-platform/saia/saia-api:build-006" #saia v1.5
     # apiImage: "ml-platform/saia/saia-api:v2.0.4-23-g2fc91e9" #saia v2
     # apiImage: "ml-platform/saia/saia-api:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
-    apiImage: "ml-platform/saia/saia-api:build-v2-002" #saia v2 + tony changes
+    apiImage: "ml-platform/saia/saia-api:build-v2-009" #saia v2 + tony changes
 
     # apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-23-g2fc91e9" #saia v2
     # apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
-    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-002" #saia v2 + tony changes
+    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-009" #saia v2 + tony changes
 
     # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
     # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003" #saia v1.5
     # dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-23-g2fc91e9" #saia v2
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
+    # dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-009" #saia v2 + tony changes + personalization fix
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"

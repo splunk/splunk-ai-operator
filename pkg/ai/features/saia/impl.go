@@ -635,8 +635,13 @@ func (r *SaiaReconciler) reconcilePostInstallHook(
 // (v1 API, v1 worker, v2 API, v2 worker). Callers append pod-specific vars.
 func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 	bucketName := extractBucketName(ai.Spec.TaskVolume.Path)
+	// WEAVIATE_PLATFORM_URL points directly at the native Weaviate service.
+	// When the value contains a scheme ("://"), the SAIA v1 pipeline uses it
+	// as-is (bypassing the cloud ML-Platform "/weaviate" path convention).
+	weaviatePlatformURL := fmt.Sprintf("http://%s:80", ai.Spec.VectorDbUrl)
 	env := []corev1.EnvVar{
 		{Name: "PLATFORM_URL", Value: ai.Spec.AIPlatformUrl},
+		{Name: "WEAVIATE_PLATFORM_URL", Value: weaviatePlatformURL},
 		{Name: "VECTOR_DB_URL", Value: ai.Spec.VectorDbUrl},
 		{Name: "S3_BUCKET", Value: bucketName},
 	}
@@ -678,6 +683,13 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 // v2 uses different env var names: VECTOR_DB_HOST (not VECTOR_DB_URL),
 // ML_PLATFORM_URL (not PLATFORM_URL), and needs vector DB TLS/auth disabled.
 //
+// This also switches the conversation store from the ephemeral filesystem
+// default to the S3 backend added in saia-service commit 3d3756f3 (Tony,
+// merged into ai-tier-v2.0 via 9efe1fce on 2026-04-20, shipped in image
+// build-v2-002). See the CONVERSATION_STORE block below for the full
+// rationale; without this the v2 API returns 404 on GET /conversations/<id>
+// /items after every pod restart.
+//
 // SAIA V2 FieldDescription backend selection (required by both v2 API and v2
 // worker, else FieldDescriptionRepositoryFactory.get() raises ValueError at
 // startup and the worker enters a restart loop).
@@ -706,6 +718,7 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 // Sourcing them from the same secret keys as the S3-compat creds keeps a
 // single source of truth for object-store auth.
 func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
+	bucketName := extractBucketName(ai.Spec.TaskVolume.Path)
 	env := []corev1.EnvVar{
 		{Name: "ML_PLATFORM_URL", Value: ai.Spec.AIPlatformUrl},
 		{Name: "VECTOR_DB_AUTH_ENABLED", Value: "false"},
@@ -717,6 +730,41 @@ func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
 		// FieldDescription S3 backend (see doc-comment above).
 		{Name: "FIELD_DESCRIPTION_BACKEND", Value: "s3"},
 		{Name: "FIELD_DESCRIPTION_S3_KEY", Value: "field-descriptions/global-field-descriptions.json"},
+	}
+	// Conversation persistence backend.
+	//
+	// SAIA v2 defaults conversation_store to "filesystem" which writes to
+	// /home/splunk/.local_storage/conversations on the pod's ephemeral
+	// container overlay. Every v2 pod restart (worker crash-loop, operator
+	// reconfigure, Kuberay zero-downtime upgrade, node drain) wipes the full
+	// chat history and produces user-visible "Conversation ... not found"
+	// 404s on GET /conversations/<id>/items whenever the Splunk UI tries to
+	// re-hydrate a chat (incl. the saia_v2_audit_index_log_proxy flow).
+	//
+	// Tony's saia-service commits 3d3756f3 + 8e2a9f40 (merged into
+	// ai-tier-v2.0 via 9efe1fce on 2026-04-20, and present in image
+	// build-v2-002) added an S3ConversationStore that reuses the same
+	// S3-compatible object store already configured for TaskVolume
+	// (SeaweedFS / MinIO / CVFS / real AWS S3). Turning it on for the SAIA
+	// v2 API and v2 worker makes chat history survive pod restarts.
+	//
+	// Activation contract (saia-v2/app/core/config.py::Settings):
+	//   - CONVERSATION_STORE=s3
+	//   - CONVERSATION_S3_BUCKET=<bucket>  (validator raises ValueError at
+	//     startup if CONVERSATION_STORE=s3 and this is empty)
+	//   - AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY:
+	//     already wired below for the FieldDescription S3 adapter and
+	//     transparently reused by S3ConversationStore via boto3.
+	//
+	// We only emit these when we can derive a bucket name from
+	// TaskVolume.Path (the canonical source of truth for SAIA object
+	// storage). Leaving the defaults alone in the pathological "no path"
+	// case avoids a v2 pod startup crash-loop on misconfigured CRs.
+	if bucketName != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "CONVERSATION_STORE", Value: "s3"},
+			corev1.EnvVar{Name: "CONVERSATION_S3_BUCKET", Value: bucketName},
+		)
 	}
 	// Only expose AWS_ENDPOINT_URL when the operator was configured with an
 	// explicit S3-compatible endpoint (SeaweedFS/MinIO). Omitting it lets the
@@ -863,9 +911,11 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	}
 
 	// Base env: keep ONLY dynamic values here.
+	weaviatePlatformURL := fmt.Sprintf("http://%s:80", ai.Spec.VectorDbUrl)
 	env := []corev1.EnvVar{
 		// Dynamic or runtime-derived values:
 		{Name: "PLATFORM_URL", Value: ai.Spec.AIPlatformUrl},
+		{Name: "WEAVIATE_PLATFORM_URL", Value: weaviatePlatformURL},
 		{Name: "VECTOR_DB_URL", Value: ai.Spec.VectorDbUrl},
 		// SAIA uses /tasks subdirectory within its feature path
 		// Extract just the bucket name from the full path (e.g., "s3://bucket-name" -> "bucket-name")

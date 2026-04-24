@@ -622,10 +622,7 @@ EOF
 
   # Create instances (arrays already declared globally at top of script)
   CONTROLLER_IPS=()
-  CONTROLLER_PRIVATE_IPS=()
-  CONTROLLER_PUBLIC_IPS=()
   WORKER_IPS=()
-  WORKER_PRIVATE_IPS=()
   ALL_INSTANCE_IDS=()
 
   # Add existing instances to tracking arrays
@@ -746,33 +743,22 @@ EOF
   log "Waiting additional time for SSH to be fully ready..."
   sleep 60
 
-  # Get IPs - collect BOTH public and private IPs
-  # Use public IPs for SSH from local machine, private IPs for k0s internal communication
+  # Get public IPs for all instances
   for id in "${ALL_INSTANCE_IDS[@]}"; do
     local role
     role=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
       --query 'Reservations[0].Instances[0].Tags[?Key==`Role`].Value' --output text)
 
-    # Get public IP for SSH access from local machine
     local public_ip
     public_ip=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
       --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 
-    # Get private IP for k0s internal communication
-    local private_ip
-    private_ip=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
-      --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
-
-    # Use public IP for SSH, but store private IP for k0s config
     if [[ "${role}" == "controller" ]]; then
-      CONTROLLER_IPS+=("${public_ip}")  # For SSH from local machine
-      CONTROLLER_PRIVATE_IPS+=("${private_ip}")  # For k0s internal communication
-      CONTROLLER_PUBLIC_IPS+=("${public_ip}")  # For kubectl access and certificates
-      log "Controller - Public IP: ${public_ip}, Private IP: ${private_ip}"
+      CONTROLLER_IPS+=("${public_ip}")
+      log "Controller - Public IP: ${public_ip}"
     else
-      WORKER_IPS+=("${public_ip}")  # For SSH from local machine
-      WORKER_PRIVATE_IPS+=("${private_ip}")  # For k0s internal communication
-      log "Worker - Public IP: ${public_ip}, Private IP: ${private_ip} (${role})"
+      WORKER_IPS+=("${public_ip}")
+      log "Worker - Public IP: ${public_ip} (${role})"
     fi
   done
 
@@ -786,7 +772,9 @@ prepare_nodes_for_k0s() {
   log "Preparing ${#node_ips[@]} node(s) for k0s (OS compatibility + binary)..."
   for node_ip in "${node_ips[@]}"; do
     log "  Preparing node ${node_ip}..."
-    ssh_exec "${node_ip}" "
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
+      bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
       # Disable firewalld if active (blocks k0s ports: 6443, 10250, 8472, etc.)
       if systemctl is-active firewalld >/dev/null 2>&1; then
         echo 'Disabling firewalld...'
@@ -794,11 +782,53 @@ prepare_nodes_for_k0s() {
         sudo systemctl disable firewalld
       fi
 
-      # Ensure iptables is available (RHEL 10+ ships only nftables)
-      if ! command -v iptables >/dev/null 2>&1; then
-        if command -v dnf >/dev/null 2>&1 && dnf list available iptables-nft 2>/dev/null | grep -q iptables-nft; then
+      # Load kernel modules required by Calico and kube-proxy.
+      # On RHEL 10 the legacy xtables extension modules (xt_conntrack, xt_comment,
+      # br_netfilter) are not built into the kernel at all, so they cannot be
+      # modprobed. However nf_conntrack (the core conntrack module) is built as a
+      # module (=m) and must be loaded — Calico's VXLAN dataplane and kube-proxy
+      # nftables mode both require it.
+      # overlay is needed by containerd for container overlay filesystems.
+      for mod in nf_conntrack overlay; do
+        if ! lsmod | grep -q "^${mod} "; then
+          sudo modprobe "${mod}" 2>/dev/null || echo "WARN: could not load kernel module ${mod}"
+        fi
+      done
+      # Persist across reboots
+      sudo mkdir -p /etc/modules-load.d
+      printf 'nf_conntrack\noverlay\n' | sudo tee /etc/modules-load.d/k0s.conf >/dev/null
+
+      # Ensure iptables is available (RHEL 10+ ships only nftables).
+      # Do NOT use 'command -v iptables' or 'iptables --version' as the guard:
+      # on RHEL 10 both can return exit 0 even when no binary exists (shell PATH
+      # edge case). Use rpm -q as the ground truth on RPM-based systems; fall
+      # back to testing whether the binary actually produces output.
+      _iptables_ok=false
+      if rpm -q iptables-nft >/dev/null 2>&1 || rpm -q iptables >/dev/null 2>&1; then
+        _iptables_ok=true
+      elif [ -n "$(iptables --version 2>/dev/null)" ]; then
+        _iptables_ok=true
+      fi
+      if ! $_iptables_ok; then
+        if command -v dnf >/dev/null 2>&1; then
           echo 'Installing iptables-nft...'
-          sudo dnf install -y iptables-nft >/dev/null 2>&1
+          if sudo dnf install -y iptables-nft; then
+            echo 'iptables-nft installed successfully'
+          else
+            echo 'ERROR: dnf install iptables-nft failed — kube-proxy will fail to program ClusterIP NAT rules. Ensure AppStream repo is enabled.' >&2
+            exit 1
+          fi
+        elif command -v apt-get >/dev/null 2>&1; then
+          echo 'Installing iptables...'
+          if sudo apt-get install -y iptables; then
+            echo 'iptables installed successfully'
+          else
+            echo 'ERROR: apt-get install iptables failed — cannot proceed.' >&2
+            exit 1
+          fi
+        else
+          echo 'ERROR: No package manager found to install iptables — cannot proceed.' >&2
+          exit 1
         fi
       fi
 
@@ -821,8 +851,112 @@ prepare_nodes_for_k0s() {
       if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then
         sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s
       fi
-    " || warn "  Preparation had issues on ${node_ip}"
+REMOTE_SCRIPT
   done
+}
+
+# ====== FIX KUBE-PROXY MODE (iptables → nftables) IF NEEDED ======
+# RHEL 10 kernel 6.12.0-124.38+ removed the legacy xtables extension modules
+# (xt_conntrack, xt_comment, xt_nat, nft_compat). kube-proxy in "iptables"
+# mode cannot program NAT rules without them, even with iptables-nft installed.
+# Older RHEL 10 kernels (6.12.0-124.21) still ship xt_* modules so iptables
+# mode works fine there — we only patch when the modules are truly absent.
+#
+# k0s manages kube-proxy via a stack manifest at
+#   /var/lib/k0s/manifests/kubeproxy/kube-proxy.yaml
+# and continuously reconciles the ConfigMap from it. Patching the ConfigMap
+# alone is overwritten within seconds. We must patch the on-disk manifest
+# FIRST, then the ConfigMap, then bounce the pods.
+fix_kube_proxy_mode_if_needed() {
+  local controller_ip="$1"
+
+  # Check current mode from ConfigMap
+  local current_mode
+  current_mode=$(kubectl get cm kube-proxy -n kube-system \
+    -o jsonpath='{.data.config\.conf}' 2>/dev/null \
+    | grep '^mode:' | awk '{print $2}' | tr -d '"')
+
+  if [[ "${current_mode}" != "iptables" ]]; then
+    log "kube-proxy mode is '${current_mode}' — no patch needed"
+    return 0
+  fi
+
+  # Check if the controller kernel actually has xt_conntrack
+  local has_xt
+  has_xt=$(ssh_exec "${controller_ip}" \
+    "modprobe -n xt_conntrack 2>/dev/null && echo yes || echo no") || has_xt="no"
+  has_xt=$(echo "${has_xt}" | tr -d '[:space:]')
+
+  if [[ "${has_xt}" == "yes" ]]; then
+    log "kube-proxy mode is iptables and kernel has xt_conntrack — no patch needed"
+    return 0
+  fi
+
+  log "kube-proxy is in iptables mode but kernel lacks xt_conntrack — patching to nftables..."
+
+  # 1. Patch the on-disk manifest so k0s reconciliation preserves the change
+  ssh_exec "${controller_ip}" \
+    "sudo sed -i 's/mode: \"iptables\"/mode: \"nftables\"/' /var/lib/k0s/manifests/kubeproxy/kube-proxy.yaml" \
+    || warn "  Could not patch on-disk kube-proxy manifest"
+
+  # 2. Patch the ConfigMap for immediate effect
+  kubectl get cm kube-proxy -n kube-system -o json 2>/dev/null \
+    | python3 -c "
+import json, sys
+cm = json.load(sys.stdin)
+cm['data']['config.conf'] = cm['data']['config.conf'].replace('mode: \"iptables\"', 'mode: \"nftables\"')
+print(json.dumps(cm))
+" | kubectl apply -f - 2>/dev/null
+
+  # 3. Force-kill kube-proxy pods so replacements start with the new ConfigMap.
+  #    --wait=false is not enough: the old pods keep running with the stale
+  #    iptables-mode config until graceful shutdown completes, and the new pods
+  #    may mount the ConfigMap volume before k8s propagates the update.
+  log "  Force-restarting kube-proxy pods to pick up nftables mode..."
+  kubectl delete pods -n kube-system -l k8s-app=kube-proxy \
+    --force --grace-period=0 2>/dev/null || true
+  sleep 5  # give DaemonSet controller time to schedule replacements
+
+  local deadline=$(( $(date +%s) + 90 ))
+  while true; do
+    local not_ready
+    not_ready=$(kubectl get pods -n kube-system -l k8s-app=kube-proxy \
+      --no-headers 2>/dev/null | grep -cv '1/1.*Running') || not_ready=99
+    [[ "${not_ready}" -eq 0 ]] && { log "  ✓ kube-proxy pods Running in nftables mode"; break; }
+    [[ $(date +%s) -ge ${deadline} ]] && { warn "  Timed out waiting for kube-proxy pods"; break; }
+    sleep 3
+  done
+}
+
+bounce_calico_if_needed() {
+  log "Checking if calico-node pods need a restart (install-cni CrashLoop)..."
+  local crashing
+  crashing=$(kubectl get pods -n kube-system -l k8s-app=calico-node \
+    --no-headers 2>/dev/null | grep -cE 'Init:Error|CrashLoopBackOff|Init:CrashLoopBackOff') || crashing=0
+  if [[ "${crashing}" -gt 0 ]]; then
+    log "  Found ${crashing} crashing calico-node pod(s) — deleting so they restart with working kube-proxy..."
+    kubectl delete pods -n kube-system -l k8s-app=calico-node --wait=false 2>/dev/null || true
+
+    local deadline=$(( $(date +%s) + 120 ))
+    log "  Waiting up to 120s for calico-node pods to become Running..."
+    while true; do
+      local not_running
+      not_running=$(kubectl get pods -n kube-system -l k8s-app=calico-node \
+        --no-headers 2>/dev/null | grep -cv 'Running') || not_running=99
+      if [[ "${not_running}" -eq 0 ]]; then
+        log "  ✓ All calico-node pods are Running"
+        break
+      fi
+      if [[ $(date +%s) -ge ${deadline} ]]; then
+        warn "  Timed out waiting for calico-node pods — current state:"
+        kubectl get pods -n kube-system -l k8s-app=calico-node 2>/dev/null || true
+        break
+      fi
+      sleep 5
+    done
+  else
+    log "  calico-node pods look healthy, no restart needed"
+  fi
 }
 
 # ====== MOUNT NVMe INSTANCE STORE FOR EPHEMERAL STORAGE ======
@@ -1191,6 +1325,11 @@ PYSCRIPT"
   log "k0s cluster installed successfully!"
   kubectl get nodes
 
+  # On newer RHEL 10 kernels (6.12.0-124.38+) the xt_conntrack module is gone,
+  # so kube-proxy in iptables mode can't program NAT rules. Detect and fix.
+  fix_kube_proxy_mode_if_needed "${controller_ip}"
+  bounce_calico_if_needed
+
   # Label nodes for proper workload scheduling
   label_nodes
 }
@@ -1211,20 +1350,62 @@ resolve_node_name() {
 label_nodes() {
   log "Labeling nodes for AI workload scheduling..."
 
-  # Wait for all nodes to be ready
+  # Wait for all nodes to be ready.
+  #
+  # NOTE: we count nodes whose "Ready" condition is exactly "True" via a
+  # structured JSON query — NOT by grepping for the string "Ready" in the
+  # plain-text `kubectl get nodes` output. That string match is a trap
+  # because the STATUS column of a not-yet-ready node prints the substring
+  # "NotReady" which ALSO matches a naive `grep -c Ready`, causing the loop
+  # to exit prematurely. Downstream labeling then silently skips any worker
+  # that joined the API server late with "Node not found in cluster".
   local node_count=$((${#CONTROLLER_IPS[@]} + ${#WORKER_IPS[@]}))
-  log "Waiting for ${node_count} nodes to be ready..."
+  log "Waiting for ${node_count} node(s) to be Ready..."
 
   local timeout=300
   local elapsed=0
-  while [[ $(kubectl get nodes --no-headers | grep -c "Ready") -lt ${node_count} ]]; do
+  local ready_count
+  while :; do
+    ready_count=$(kubectl get nodes -o json 2>/dev/null \
+      | jq '[.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True"))] | length' 2>/dev/null \
+      || echo 0)
+    if [[ "${ready_count}" -ge "${node_count}" ]]; then
+      log "  ✓ All ${ready_count}/${node_count} nodes Ready"
+      break
+    fi
     sleep 5
     elapsed=$((elapsed + 5))
     if [[ ${elapsed} -ge ${timeout} ]]; then
-      warn "Timeout waiting for all nodes to be ready, proceeding anyway..."
+      warn "Timeout (${timeout}s) waiting for all nodes to be Ready (have ${ready_count}/${node_count}); proceeding anyway..."
       break
     fi
+    if (( elapsed % 30 == 0 )); then
+      log "  ${ready_count}/${node_count} nodes Ready (${elapsed}/${timeout}s)"
+    fi
   done
+
+  # Helper: wait up to 60s for a given node name to appear in the API server.
+  # This guards against the race where a worker joined the cluster just after
+  # the top-of-function readiness check returned but its Node object is still
+  # propagating to the API server we're talking to.
+  _wait_for_node_visible() {
+    local node_name="$1"
+    local ip="$2"
+    local tries=0
+    local max_tries=12  # 12 * 5s = 60s
+    while (( tries < max_tries )); do
+      if kubectl get node "${node_name}" &>/dev/null; then
+        return 0
+      fi
+      sleep 5
+      tries=$((tries + 1))
+    done
+    warn "  Node '${node_name}' (from ${ip}) did not become visible in API server after 60s"
+    return 1
+  }
+
+  # Track labeling outcomes so we can fail loud if any node ends up unlabeled.
+  local labeling_failures=()
 
   # Label controller nodes
   for controller_ip in "${CONTROLLER_IPS[@]}"; do
@@ -1233,12 +1414,12 @@ label_nodes() {
 
     if [[ -z "${node_name}" ]]; then
       warn "  Could not resolve hostname for controller ${controller_ip}, skipping..."
+      labeling_failures+=("${controller_ip} (hostname unresolved)")
       continue
     fi
 
-    # Verify this node exists in the cluster
-    if ! kubectl get node "${node_name}" &>/dev/null; then
-      warn "  Node '${node_name}' (from ${controller_ip}) not found in cluster, skipping..."
+    if ! _wait_for_node_visible "${node_name}" "${controller_ip}"; then
+      labeling_failures+=("${controller_ip} / ${node_name} (never visible)")
       continue
     fi
 
@@ -1269,12 +1450,13 @@ label_nodes() {
 
     if [[ -z "${node_name}" ]]; then
       warn "  Could not resolve hostname for worker ${worker_ip}, skipping..."
+      labeling_failures+=("${worker_ip} (hostname unresolved)")
       worker_index=$((worker_index + 1))
       continue
     fi
 
-    if ! kubectl get node "${node_name}" &>/dev/null; then
-      warn "  Node '${node_name}' (from ${worker_ip}) not found in cluster, skipping..."
+    if ! _wait_for_node_visible "${node_name}" "${worker_ip}"; then
+      labeling_failures+=("${worker_ip} / ${node_name} (never visible)")
       worker_index=$((worker_index + 1))
       continue
     fi
@@ -1307,6 +1489,91 @@ label_nodes() {
   kubectl get nodes -l splunk.ai/workload-type=gpu -o name | while read -r node; do
     kubectl taint nodes "${node#node/}" nvidia.com/gpu=true:NoSchedule --overwrite || true
   done
+
+  # --- Final verification: every node must have splunk.ai/workload-type set ---
+  # Without this, downstream scheduling silently breaks: weaviate / ray-head /
+  # many operator-created workloads use nodeSelector: splunk.ai/workload-type=cpu
+  # and will sit in Pending forever on a node that only has default labels.
+  log "Verifying every node has splunk.ai/workload-type set..."
+  local unlabeled
+  unlabeled=$(kubectl get nodes -o json 2>/dev/null \
+    | jq -r '.items[] | select(.metadata.labels["splunk.ai/workload-type"] == null) | .metadata.name' 2>/dev/null \
+    || echo "")
+  if [[ -n "${unlabeled}" ]]; then
+    # Last-chance recovery: re-iterate config IPs and label whichever matches.
+    # This catches the case where resolve_node_name raced earlier in the run.
+    warn "Found unlabeled node(s), attempting recovery:"
+    echo "${unlabeled}" | while IFS= read -r nn; do
+      warn "  - ${nn}"
+    done
+    for ip in "${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}"; do
+      local nn
+      nn=$(resolve_node_name "${ip}")
+      [[ -z "${nn}" ]] && continue
+      if echo "${unlabeled}" | grep -qx "${nn}"; then
+        # Best-effort: apply CPU labels to the controller, CPU labels to
+        # any worker whose index is < CPU_WORKER_COUNT, else GPU labels.
+        # This duplicates a small amount of logic but keeps the recovery
+        # path fully self-contained.
+        local is_controller=false
+        for cip in "${CONTROLLER_IPS[@]}"; do
+          [[ "${cip}" == "${ip}" ]] && is_controller=true && break
+        done
+        if ${is_controller}; then
+          log "  Recovery: labeling controller ${nn} (${ip})"
+          kubectl label nodes "${nn}" \
+            splunk.ai/node-role=controller \
+            splunk.ai/workload-type=control-plane \
+            node.kubernetes.io/role=controller \
+            --overwrite || true
+        else
+          local wi=0
+          for wip in "${WORKER_IPS[@]}"; do
+            [[ "${wip}" == "${ip}" ]] && break
+            wi=$((wi + 1))
+          done
+          if [[ ${wi} -lt ${CPU_WORKER_COUNT} ]]; then
+            log "  Recovery: labeling CPU worker ${nn} (${ip})"
+            kubectl label nodes "${nn}" \
+              splunk.ai/node-role=worker \
+              splunk.ai/workload-type=cpu \
+              node.kubernetes.io/workload=ai-cpu \
+              splunk.ai/instance-type=cpu-worker \
+              --overwrite || true
+          else
+            log "  Recovery: labeling GPU worker ${nn} (${ip})"
+            kubectl label nodes "${nn}" \
+              splunk.ai/node-role=worker \
+              splunk.ai/workload-type=gpu \
+              node.kubernetes.io/workload=ai-gpu \
+              splunk.ai/instance-type=gpu-worker \
+              nvidia.com/gpu=true \
+              --overwrite || true
+          fi
+        fi
+      fi
+    done
+
+    # Re-check after recovery attempt.
+    unlabeled=$(kubectl get nodes -o json 2>/dev/null \
+      | jq -r '.items[] | select(.metadata.labels["splunk.ai/workload-type"] == null) | .metadata.name' 2>/dev/null \
+      || echo "")
+    if [[ -n "${unlabeled}" ]]; then
+      err "Nodes still unlabeled after recovery pass:
+$(echo "${unlabeled}" | sed 's/^/  /')
+
+Workloads that select splunk.ai/workload-type=cpu (weaviate, ray-head,
+most operator-managed pods) will stay Pending. Aborting."
+    fi
+    log "  ✓ Recovery successful — all nodes now have workload-type set"
+  else
+    log "  ✓ All nodes have splunk.ai/workload-type set"
+  fi
+
+  if [[ ${#labeling_failures[@]} -gt 0 ]]; then
+    warn "label_nodes encountered ${#labeling_failures[@]} non-fatal issue(s):"
+    for f in "${labeling_failures[@]}"; do warn "  - ${f}"; done
+  fi
 
   log "Node labeling complete!"
   log "Nodes with labels:"
@@ -1678,120 +1945,443 @@ EOF
 
 # ====== INSTALL NVIDIA DRIVERS ON GPU NODES (bare-metal / EC2) ======
 # Per-node NVIDIA driver + container toolkit install (called in parallel).
+#
+# Error handling philosophy:
+#   - `set -euo pipefail` inside every remote block so the first real failure
+#     aborts the node install immediately.
+#   - NO blanket `|| true` / `2>/dev/null` on installer commands — failures
+#     are loud and caught.
+#   - After install, strict verification gates hard-fail if the artifacts
+#     aren't where they should be (nvidia-smi works, libnvidia-ml.so exists,
+#     nvidia-ctk present, CDI spec populated).
+#   - RHEL 9 and RHEL 10 paths are deliberately symmetric: both install EPEL,
+#     both install DKMS, both clean stale cross-major CUDA repos.
+#
+# Returns 0 on fully-successful install, non-zero on any verification failure.
 _install_nvidia_on_node() {
   local gpu_ip="$1"
 
-  # Check if driver is already installed
-  if ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" &>/dev/null; then
-    local driver_ver
-    driver_ver=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null" || echo "unknown")
+  # ---- Phase A: detect if driver is already installed ---------------------
+  local driver_ver=""
+  if ssh_exec "${gpu_ip}" "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=driver_version --format=csv,noheader" 2>/dev/null; then
+    driver_ver=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1") || driver_ver=""
+  fi
+
+  if [[ -n "${driver_ver}" ]]; then
     echo "✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
   else
     echo "Installing NVIDIA driver on ${gpu_ip}..."
-    ssh_exec "${gpu_ip}" "
-      set -e
-      # Install kernel headers (needed for DKMS driver build)
-      sudo dnf install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
-        sudo yum install -y kernel-devel-\$(uname -r) kernel-headers-\$(uname -r) 2>/dev/null || \
-        sudo apt-get install -y linux-headers-\$(uname -r) 2>/dev/null || true
 
-      # Detect OS and add appropriate NVIDIA repo
-      if [ -f /etc/amzn-release ] || grep -qi 'amzn' /etc/os-release 2>/dev/null; then
-        sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo 2>/dev/null || true
-        sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
-          sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || true
+    # ---- Phase B: install driver + supporting packages --------------------
+    # `set -euo pipefail` means ANY failure aborts the block. Each step below
+    # must either succeed or have an explicit fallback branch that succeeds.
+    if ! ssh_exec "${gpu_ip}" "
+      set -euo pipefail
+
+      # --- OS detection (RHEL 9, RHEL 10, Amazon Linux 2023, Debian/Ubuntu) ---
+      # OS_VERSION holds the numeric major we use to build the CUDA+EPEL URLs.
+      # For RHEL we read %{rhel}; for Amazon Linux 2023 we hardcode 9 because
+      # AL2023 is binary-compatible with RHEL/Fedora 9's nvidia-driver RPMs
+      # and the Fedora EPEL9 repo is the standard 3rd-party source.
+      echo '--- OS detection ---'
+      OS_FAMILY=
+      OS_VERSION=
+      if grep -qiE '^ID=\"?amzn\"?' /etc/os-release 2>/dev/null; then
+        OS_FAMILY=amzn
+        OS_VERSION=\$(. /etc/os-release; echo \"\${VERSION_ID%%.*}\")
       elif [ -f /etc/redhat-release ]; then
-        RHEL_MAJOR=\$(rpm -E %{rhel} 2>/dev/null || echo 9)
-        if [ \"\${RHEL_MAJOR}\" -ge 10 ]; then
-          # Add RHEL 10 CUDA repo only; remove any stale rhel9 repo to prevent GPG conflicts
-          sudo rm -f /etc/yum.repos.d/cuda-rhel9.repo 2>/dev/null || true
-          sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/cuda-rhel10.repo 2>/dev/null || true
-
-          # RHEL 10 removed DNF modularity; DKMS kmod requires EPEL
-          if ! rpm -q epel-release >/dev/null 2>&1; then
-            echo 'Installing EPEL for dkms...'
-            sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm 2>/dev/null || true
-          fi
-          sudo dnf install -y dkms 2>/dev/null || true
-
-          sudo dnf install -y nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
-            sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || \
-            sudo dnf install -y --nobest nvidia-open 2>/dev/null || true
-        else
-          sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo 2>/dev/null || true
-          sudo dnf module install -y nvidia-driver:latest-dkms 2>/dev/null || \
-            sudo dnf install -y --nobest nvidia-driver nvidia-driver-cuda nvidia-driver-libs 2>/dev/null || true
-        fi
+        OS_FAMILY=rhel
+        OS_VERSION=\$(rpm -E %{rhel})
       elif [ -f /etc/debian_version ]; then
-        curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
-        sudo dpkg -i /tmp/cuda-keyring.deb
-        sudo apt-get update && sudo apt-get install -y nvidia-driver-550 2>/dev/null || true
+        OS_FAMILY=debian
+      fi
+      if [ -z \"\${OS_FAMILY}\" ]; then
+        echo 'ERROR: unsupported OS (not amzn/rhel/debian)' >&2
+        cat /etc/os-release >&2 || true
+        exit 1
+      fi
+      echo \"OS_FAMILY=\${OS_FAMILY}  OS_VERSION=\${OS_VERSION:-n/a}\"
+
+      # --- Step 1: kernel headers (required for DKMS to build nvidia kmod) ---
+      KREL=\$(uname -r)
+      echo \"--- Installing kernel headers for kernel \${KREL} ---\"
+      if [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        sudo apt-get update -qq
+        sudo apt-get install -y \"linux-headers-\${KREL}\"
+      else
+        # Exact-match: every historical kernel-devel is usually in RHUI for
+        # RHEL 9/10. Fall back to the latest only when absent (rare).
+        if ! sudo dnf install -y \"kernel-devel-\${KREL}\" \"kernel-headers-\${KREL}\"; then
+          echo \"WARN: Exact kernel-devel-\${KREL} not found; installing latest kernel-devel/headers.\"
+          echo \"      DKMS will build against the latest headers — if they don't match the running kernel,\"
+          echo \"      modprobe will fail below and you'll need to reboot into the updated kernel.\"
+          sudo dnf install -y kernel-devel kernel-headers
+        fi
       fi
 
-      # Load nvidia kernel module immediately (avoids needing a reboot)
-      sudo modprobe nvidia 2>/dev/null || true
-    " || { echo "Driver install on ${gpu_ip} had issues"; return 1; }
+      # --- Step 2: EPEL + DKMS + build toolchain ----------------------------
+      # DKMS builds the nvidia kernel module from source on every kernel
+      # update. It needs: dkms (from EPEL), gcc, make, elfutils-libelf-devel.
+      # On a BARE RHEL minimal install, NONE of these are pre-installed.
+      # On AWS AMIs they may be partially pre-installed but we should not
+      # rely on that — be explicit.
+      if [ \"\${OS_FAMILY}\" = 'rhel' ] || [ \"\${OS_FAMILY}\" = 'amzn' ]; then
+        # EPEL: AL2023 = EPEL9 (binary-compat). RHEL: matching major.
+        if [ \"\${OS_FAMILY}\" = 'amzn' ]; then
+          EPEL_MAJOR=9
+        else
+          EPEL_MAJOR=\${OS_VERSION}
+        fi
 
-    # Verify
-    if ssh_exec "${gpu_ip}" "nvidia-smi 2>/dev/null" &>/dev/null; then
-      echo "✓ NVIDIA driver installed successfully on ${gpu_ip}"
-    else
-      echo "⚠ NVIDIA driver may need a reboot on ${gpu_ip} to take effect"
+        # dnf-plugins-core provides 'dnf config-manager'. Pre-installed on
+        # most AMIs; install explicitly for minimal images.
+        sudo dnf install -y dnf-plugins-core
+
+        # EPEL: provides DKMS on RHEL (RHEL's own repos don't ship DKMS).
+        if ! rpm -q epel-release >/dev/null 2>&1; then
+          echo \"--- Installing EPEL for DKMS (major \${EPEL_MAJOR}) ---\"
+          sudo dnf install -y \"https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm\"
+        fi
+        # CRB (formerly PowerTools on RHEL 8) hosts a few EPEL build deps on
+        # RHEL. AL2023 doesn't have a CRB repo (its core packages are in
+        # 'amazonlinux' directly), so this whole chain is best-effort — the
+        # trailing '|| true' only runs when ALL three names fail to match
+        # any known repo, which is the expected state on AL2023.
+        sudo dnf config-manager --set-enabled crb 2>/dev/null \\
+          || sudo dnf config-manager --set-enabled PowerTools 2>/dev/null \\
+          || sudo dnf config-manager --set-enabled powertools 2>/dev/null \\
+          || true
+
+        # DKMS + the build toolchain. Being explicit means a minimal / bare
+        # RHEL install works out-of-the-box and future driver versions
+        # with different weak-deps don't silently miss a needed package.
+        echo '--- Installing DKMS + build toolchain (gcc, make, elfutils-libelf-devel) ---'
+        sudo dnf install -y dkms gcc make elfutils-libelf-devel
+      fi
+
+      # --- Step 3: CUDA repo for the right OS family + version --------------
+      # Clean cross-major repos so dnf doesn't try to install from the wrong
+      # CUDA metadata (common failure mode on in-place RHEL 9 → 10 upgrades,
+      # and on re-runs of this script where the target OS may have changed).
+      if [ \"\${OS_FAMILY}\" = 'amzn' ]; then
+        sudo rm -f /etc/yum.repos.d/cuda-amzn*.repo
+        sudo dnf config-manager --add-repo \\
+          \"https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo\"
+      elif [ \"\${OS_FAMILY}\" = 'rhel' ]; then
+        sudo rm -f /etc/yum.repos.d/cuda-rhel*.repo
+        sudo dnf config-manager --add-repo \\
+          \"https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo\"
+      elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        curl -fsSL \\
+          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \\
+          -o /tmp/cuda-keyring.deb
+        sudo dpkg -i /tmp/cuda-keyring.deb
+        sudo apt-get update -qq
+      fi
+
+      # --- Step 4: install the driver -------------------------------------
+      # Follows NVIDIA's official RHEL install guidance:
+      # https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/
+      #
+      # Package names in the CUDA repo (rhel9/rhel10/amzn2023):
+      #   - cuda-drivers                -> meta-pkg for proprietary driver
+      #                                    (pulls nvidia-driver, kmod-nvidia-latest-dkms,
+      #                                    nvidia-driver-cuda, nvidia-driver-libs,
+      #                                    libnvidia-ml, etc.)
+      #   - nvidia-open                 -> meta-pkg for open-source kernel driver
+      #   - nvidia-driver:latest-dkms   -> RHEL 9 only (dnf modular stream).
+      #                                    Removed in RHEL 10 (modularity deprecated).
+      #
+      # There is NO package called 'nvidia-driver-dkms' in either repo —
+      # previous attempts at it failed on every fresh install.
+      # 
+      # Strategy: single meta-package install. RHEL 10 requires --allowerasing
+      # because it has to remove conflicting nouveau packages. The flag is
+      # a no-op on RHEL 9/AL2023 where there's nothing to erase.
+      echo '--- Installing NVIDIA driver (meta package: cuda-drivers) ---'
+      if [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        sudo apt-get install -y nvidia-driver-550
+      else
+        # Blacklist nouveau so the new nvidia driver can load without fighting it.
+        # Harmless if nouveau isn't loaded (grep returns nothing).
+        if lsmod | grep -q '^nouveau'; then
+          echo '--- Blacklisting nouveau + unloading ---'
+          echo -e 'blacklist nouveau\\noptions nouveau modeset=0' \\
+            | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
+          sudo rmmod nouveau 2>/dev/null || true
+          # Regenerate initramfs so nouveau doesn't come back on reboot.
+          sudo dracut --force 2>/dev/null || true
+        fi
+
+        # Primary strategy: cuda-drivers meta-package (works on RHEL 9, RHEL 10,
+        # AL2023 — the CUDA repo ships the same package name everywhere).
+        if sudo dnf install -y --allowerasing cuda-drivers; then
+          echo '✓ Installed cuda-drivers meta-package'
+        elif [ \"\${OS_VERSION}\" = '9' ] && sudo dnf module install -y nvidia-driver:latest-dkms; then
+          # RHEL 9 fallback: classic dnf module stream (RHEL 10 dropped modularity).
+          # Kept as a safety net — cuda-drivers should always work above.
+          echo '✓ Installed nvidia-driver:latest-dkms via dnf module (RHEL 9 legacy path)'
+        elif sudo dnf install -y --allowerasing nvidia-open; then
+          # Last-resort fallback: open-source kernel driver.
+          echo '✓ Installed nvidia-open (open-kernel fallback)'
+        else
+          echo 'ERROR: all NVIDIA driver install strategies failed' >&2
+          echo '  Tried: cuda-drivers, nvidia-driver:latest-dkms (module), nvidia-open' >&2
+          echo '  Possible causes:' >&2
+          echo '    - CUDA repo URL incorrect for OS version \${OS_VERSION}' >&2
+          echo '    - EPEL/DKMS not available' >&2
+          echo '    - Network blocked to developer.download.nvidia.com' >&2
+          exit 1
+        fi
+      fi
+
+      # --- Step 5: verify DKMS built + load kmod ---------------------------
+      # Before modprobe: check dkms status so we catch kernel-mismatch cases
+      # early with a clear error instead of the cryptic 'Module not found'.
+      echo '--- Verifying DKMS status + loading nvidia kmod ---'
+      if [ \"\${OS_FAMILY}\" != 'debian' ]; then
+        DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
+        if [ -z \"\${DKMS_OUT}\" ]; then
+          echo 'ERROR: dkms status shows no nvidia entry — driver install did not register with DKMS' >&2
+          exit 1
+        fi
+        echo \"DKMS: \${DKMS_OUT}\"
+        if ! echo \"\${DKMS_OUT}\" | grep -qE 'installed|built'; then
+          echo 'ERROR: nvidia DKMS module is not installed/built. See: sudo dkms status; dmesg | grep nvidia' >&2
+          exit 1
+        fi
+        # Check the built-for kernel matches the running kernel. If not,
+        # a reboot into the newer installed kernel is required — DO NOT pretend
+        # modprobe will work. This is exactly what prevents false-positive
+        # 'install succeeded' on nodes that had a pending kernel update.
+        if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
+          echo \"ERROR: DKMS built nvidia module for a different kernel than \${KREL}.\" >&2
+          echo \"       'sudo dkms status' shows: \${DKMS_OUT}\" >&2
+          echo \"       Action: reboot the node into the kernel DKMS built for, then re-run.\" >&2
+          exit 1
+        fi
+      fi
+      sudo modprobe nvidia || {
+        echo 'ERROR: modprobe nvidia failed after DKMS build succeeded.' >&2
+        echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
+        exit 1
+      }
+    "; then
+      echo "❌ NVIDIA driver install failed on ${gpu_ip}" >&2
+      return 1
     fi
+
+    # ---- Phase C: hard-verify driver actually works -----------------------
+    local ver_check
+    ver_check=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1" || echo "")
+    if [[ -z "${ver_check}" ]] || ! [[ "${ver_check}" =~ ^[0-9]+\.[0-9]+ ]]; then
+      echo "❌ nvidia-smi verification failed on ${gpu_ip} (got: '${ver_check}')" >&2
+      return 1
+    fi
+    echo "✓ NVIDIA driver v${ver_check} running on ${gpu_ip}"
   fi
 
-  # Install NVIDIA Container Toolkit
-  echo "Ensuring NVIDIA Container Toolkit on ${gpu_ip}..."
-  ssh_exec "${gpu_ip}" "
-    if command -v nvidia-ctk &>/dev/null; then
-      echo 'nvidia-ctk already installed'
+  # ---- Phase D: NVIDIA Container Toolkit install ------------------------
+  echo "Installing NVIDIA Container Toolkit on ${gpu_ip}..."
+  if ! ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+    if command -v nvidia-ctk >/dev/null 2>&1; then
+      echo '✓ nvidia-ctk already installed (version: '\"\$(nvidia-ctk --version 2>/dev/null | head -1)\"')'
     else
-      # Add NVIDIA Container Toolkit repo
-      curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
-        sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null 2>/dev/null || true
-      curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-        sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
-
-      # Install
-      sudo dnf install -y nvidia-container-toolkit 2>/dev/null || \
-        sudo yum install -y nvidia-container-toolkit 2>/dev/null || \
-        sudo apt-get install -y nvidia-container-toolkit 2>/dev/null || true
+      echo '--- Adding NVIDIA container-toolkit repo ---'
+      if [ -f /etc/debian_version ]; then
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+          sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+          sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+          sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+        sudo apt-get update -qq
+        sudo apt-get install -y nvidia-container-toolkit
+      else
+        # RHEL 9 and 10 both use the same libnvidia-container stable RPM repo.
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+          sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
+        sudo dnf install -y nvidia-container-toolkit
+      fi
     fi
 
-    # Configure for k0s containerd (k0s uses /run/k0s/containerd.sock)
+    # --- Configure k0s containerd (k0s uses /run/k0s/containerd.sock) ----
+    # Strategy (compatible with nvidia-ctk >= 1.14, validated against 1.19):
+    #
+    #   1. Run \`nvidia-ctk runtime configure --runtime=containerd
+    #      --nvidia-set-as-default\` with NO --config= flag. This makes
+    #      nvidia-ctk emit a complete, correct drop-in at its known-good
+    #      default path /etc/containerd/conf.d/99-nvidia.toml, containing:
+    #
+    #        - version = 2
+    #        - plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.nvidia
+    #        - default_runtime_name = \"nvidia\"
+    #
+    #   2. On k0s nodes, we cannot leave that file at its default path
+    #      because k0s's managed /etc/k0s/containerd.toml only imports
+    #      /etc/k0s/containerd.d/*.toml — anything under
+    #      /etc/containerd/conf.d/ is ignored. So we move it.
+    #
+    # We deliberately avoid passing --config= pointing at the k0s drop-in,
+    # because nvidia-ctk 1.19 treats the --config target as a \"main\"
+    # containerd config and only writes a two-line stub (imports + version)
+    # into it, emitting the actual runtime config to /etc/containerd/conf.d/
+    # regardless. That silent behavior caused the 'containerd-nvidia-runtime:
+    # FAIL' verification error that reaching here used to surface.
+    echo '--- Configuring containerd runtime for nvidia ---'
     if [ -d /etc/k0s/containerd.d ]; then
-      sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
+      sudo mkdir -p /etc/k0s/containerd.d
 
-      if [ -f /etc/containerd/conf.d/99-nvidia.toml ]; then
-        sudo cp /etc/containerd/conf.d/99-nvidia.toml /etc/k0s/containerd.d/nvidia.toml
-        sudo rm -f /etc/containerd/conf.d/99-nvidia.toml
-      elif [ ! -s /etc/k0s/containerd.d/nvidia.toml ]; then
-        sudo nvidia-ctk runtime configure --runtime=containerd \
-          --config=/etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+      # Preserve any existing drop-in so idempotent re-runs don't lose
+      # hand-tuned configuration.
+      if [ -s /etc/k0s/containerd.d/nvidia.toml ]; then
+        sudo cp -a /etc/k0s/containerd.d/nvidia.toml /etc/k0s/containerd.d/nvidia.toml.bak
       fi
 
-      sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \
-        /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+      # Wipe any previous output so we can tell whether this invocation
+      # actually produced a file.
+      sudo rm -f /etc/containerd/conf.d/99-nvidia.toml
 
-      if ! grep -q 'default_runtime_name' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null; then
-        sudo sed -i '/\[plugins\.\"io\.containerd\.grpc\.v1\.cri\"\.containerd\]$/{
-          a\      default_runtime_name = \"nvidia\"
-        }' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null || true
+      # Generate the canonical drop-in at nvidia-ctk's default path. We
+      # rely on --nvidia-set-as-default to inject default_runtime_name.
+      sudo nvidia-ctk runtime configure \\
+        --runtime=containerd \\
+        --nvidia-set-as-default
+
+      # Hard-fail if the file is missing or empty.
+      if [ ! -s /etc/containerd/conf.d/99-nvidia.toml ]; then
+        echo 'ERROR: nvidia-ctk did not produce /etc/containerd/conf.d/99-nvidia.toml' >&2
+        echo 'nvidia-ctk --version:' >&2
+        nvidia-ctk --version 2>&1 | head -3 >&2
+        exit 1
+      fi
+
+      # Verify the generated drop-in actually names nvidia as the default
+      # runtime. Earlier nvidia-ctk versions (< 1.14) ignored
+      # --nvidia-set-as-default silently.
+      if ! sudo grep -q 'default_runtime_name = \"nvidia\"' /etc/containerd/conf.d/99-nvidia.toml; then
+        echo 'ERROR: nvidia-ctk drop-in does not set default_runtime_name = \"nvidia\".' >&2
+        echo 'nvidia-ctk --version:' >&2
+        nvidia-ctk --version 2>&1 | head -3 >&2
+        echo '--- generated drop-in (first 30 lines) ---' >&2
+        sudo head -30 /etc/containerd/conf.d/99-nvidia.toml >&2
+        exit 1
+      fi
+
+      # Relocate the drop-in from nvidia-ctk's default path to the path
+      # that k0s's managed containerd.toml imports. We strip keys that
+      # would duplicate declarations already made by k0s's top-level
+      # config (version / imports / disabled_plugins / required_plugins);
+      # leaving them in place causes containerd to refuse to start with
+      # duplicate top-level-key errors.
+      sudo mv /etc/containerd/conf.d/99-nvidia.toml /etc/k0s/containerd.d/nvidia.toml
+      sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \\
+        /etc/k0s/containerd.d/nvidia.toml
+
+      # Final sanity: the k0s drop-in must still carry default_runtime_name
+      # after the key-strip above (it lives under a nested table, not at
+      # top level, so the sed above never touches it — but verify anyway
+      # so failure is loud instead of silently broken).
+      if ! sudo grep -q 'default_runtime_name = \"nvidia\"' /etc/k0s/containerd.d/nvidia.toml; then
+        echo 'ERROR: /etc/k0s/containerd.d/nvidia.toml lost default_runtime_name after relocation.' >&2
+        echo '--- file contents ---' >&2
+        sudo cat /etc/k0s/containerd.d/nvidia.toml >&2
+        exit 1
       fi
     elif [ -f /etc/containerd/config.toml ]; then
-      sudo nvidia-ctk runtime configure --runtime=containerd 2>/dev/null || true
+      # Non-k0s containerd (standalone) — safe to let nvidia-ctk edit in place.
+      sudo nvidia-ctk runtime configure --runtime=containerd --nvidia-set-as-default
+    else
+      echo 'ERROR: no containerd config dir found at /etc/k0s/containerd.d or /etc/containerd/config.toml' >&2
+      exit 1
     fi
 
+    # --- Generate the CDI spec so k8s device plugin can find the GPUs ---
+    echo '--- Generating CDI spec ---'
     sudo mkdir -p /etc/cdi
-    sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml 2>/dev/null || true
+    sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+    if [ ! -s /etc/cdi/nvidia.yaml ]; then
+      echo 'ERROR: /etc/cdi/nvidia.yaml empty after generation' >&2
+      exit 1
+    fi
+    # Sanity-check that NVML could enumerate at least one device (without
+    # this, the spec contains no devices and the device plugin crash-loops).
+    if ! grep -q 'name: ' /etc/cdi/nvidia.yaml; then
+      echo 'ERROR: /etc/cdi/nvidia.yaml contains no device entries' >&2
+      cat /etc/cdi/nvidia.yaml | head -40 >&2
+      exit 1
+    fi
 
-    sudo systemctl stop k0sworker 2>/dev/null || true
+    # --- Restart k0sworker to pick up new runtime + CDI spec -----------
+    echo '--- Restarting k0sworker to pick up runtime changes ---'
+    sudo systemctl stop k0sworker || true
     sleep 3
-    sudo pkill -9 containerd-shim 2>/dev/null || true
-    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+    sudo pkill -9 containerd-shim || true
+    sudo rm -f /run/k0s/containerd.sock || true
+    sudo systemctl start k0sworker
 
-    sudo systemctl start k0sworker 2>/dev/null || true
-  " || { echo "Container toolkit setup on ${gpu_ip} had issues"; return 1; }
+    # Quick sanity: confirm nvidia-ctk + libnvidia-ml.so exist where expected.
+    # Search all known paths (distributions differ): RHEL/Fedora use
+    # /usr/lib64, Debian/Ubuntu use /usr/lib/x86_64-linux-gnu, and
+    # some distros also expose it via ldconfig.
+    echo '--- Post-install sanity ---'
+    nvidia-ctk --version | head -1
+    LIBNVML_PATH=\$(ldconfig -p 2>/dev/null | awk '/libnvidia-ml\\.so\\.1/ {print \$NF; exit}')
+    if [ -z \"\${LIBNVML_PATH}\" ]; then
+      for so in /usr/lib64/libnvidia-ml.so.1 \\
+                /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 \\
+                /usr/lib/libnvidia-ml.so.1; do
+        if [ -e \"\${so}\" ]; then LIBNVML_PATH=\"\${so}\"; break; fi
+      done
+    fi
+    if [ -n \"\${LIBNVML_PATH}\" ]; then
+      echo \"✓ libnvidia-ml.so.1 found: \${LIBNVML_PATH}\"
+    else
+      echo 'ERROR: libnvidia-ml.so.1 not found on any standard path.' >&2
+      exit 1
+    fi
+  "; then
+    echo "❌ Container toolkit setup failed on ${gpu_ip}" >&2
+    return 1
+  fi
+
+  # ---- Phase E: post-install strict verification -----------------------
+  # These checks are what the device plugin will actually need at runtime.
+  local checks_out
+  checks_out=$(ssh_exec "${gpu_ip}" "
+    set +e
+    echo -n 'nvidia-smi: '
+    nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1 && echo OK || echo FAIL
+    echo -n 'libnvidia-ml.so: '
+    # Check ldconfig cache first (most reliable), then fall back to the
+    # common per-distribution install paths.
+    if ldconfig -p 2>/dev/null | grep -q 'libnvidia-ml\.so\.1'; then
+      echo OK
+    elif ls /usr/lib64/libnvidia-ml.so.1 \\
+           /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 \\
+           /usr/lib/libnvidia-ml.so.1 2>/dev/null | head -1 | grep -q .; then
+      echo OK
+    else
+      echo FAIL
+    fi
+    echo -n 'nvidia-ctk: '
+    command -v nvidia-ctk >/dev/null 2>&1 && echo OK || echo FAIL
+    echo -n 'cdi-spec: '
+    [ -s /etc/cdi/nvidia.yaml ] && grep -q 'name: ' /etc/cdi/nvidia.yaml && echo OK || echo FAIL
+    echo -n 'nvidia-kmod: '
+    lsmod | grep -q '^nvidia ' && echo OK || echo FAIL
+    echo -n 'containerd-nvidia-runtime: '
+    grep -q 'default_runtime_name = \"nvidia\"' /etc/k0s/containerd.d/nvidia.toml 2>/dev/null && echo OK || echo FAIL
+  ")
+
+  echo "Strict verification on ${gpu_ip}:"
+  echo "${checks_out}" | sed 's/^/    /'
+  if echo "${checks_out}" | grep -q FAIL; then
+    echo "❌ Strict verification failed on ${gpu_ip} — device plugin will crash-loop with ERROR_LIBRARY_NOT_FOUND" >&2
+    return 1
+  fi
+  echo "✓ Strict verification passed on ${gpu_ip}"
+  return 0
 }
 
 # EKS GPU AMIs ship with NVIDIA drivers pre-installed.
@@ -1866,7 +2456,21 @@ install_nvidia_host_drivers() {
   rm -rf "${logdir}"
 
   if [[ ${failed} -gt 0 ]]; then
-    warn "${failed} GPU node(s) had NVIDIA install issues — check logs above"
+    err "${failed}/${#gpu_ips[@]} GPU node(s) had NVIDIA install failures. Aborting install.
+    
+    What to check on a failing node:
+      ssh <node> 'dkms status | grep nvidia'             # must show 'installed'
+      ssh <node> 'lsmod | grep nvidia'                   # must list nvidia kmod
+      ssh <node> 'ls /usr/lib64/libnvidia-ml.so.1'       # must exist
+      ssh <node> 'nvidia-ctk --version'                  # must work
+      ssh <node> 'cat /etc/cdi/nvidia.yaml | head -40'   # must list GPU devices
+      ssh <node> 'sudo dmesg | grep -i nvidia | tail -30'# kernel-level errors
+    
+    Common causes:
+      - kernel-devel for running kernel not available (exact match too new);
+        reboot to match a released kernel, then re-run
+      - EPEL/DKMS didn't install (check 'rpm -q epel-release dkms')
+      - Stale /etc/yum.repos.d/cuda-rhel*.repo from a prior OS upgrade"
   else
     log "NVIDIA drivers installed successfully on all ${#gpu_ips[@]} GPU node(s)"
   fi
@@ -1909,20 +2513,41 @@ install_nvidia_host_drivers() {
   done
 
   if [[ "${all_gpu_ready}" != "true" ]]; then
-    warn "Some GPU nodes may not be Ready yet. Check with: kubectl get nodes"
-    warn "GPU nodes may need a reboot if NVIDIA drivers were freshly installed."
+    err "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s. Check: kubectl get nodes"
   fi
 
-  # Verify GPUs are visible to Kubernetes
+  # Verify GPUs are visible to Kubernetes. If the device-plugin DaemonSet
+  # isn't installed yet (expected during the initial install — it's created
+  # by install_nvidia_device_plugin() in Phase 2), short-circuit immediately
+  # instead of waiting a fruitless 120s. For idempotent re-runs where the
+  # DS is already present we poll up to 120s.
+  if ! kubectl -n kube-system get ds nvidia-device-plugin-daemonset &>/dev/null; then
+    log "  (device plugin DaemonSet not yet installed; capacity will appear after install_nvidia_device_plugin runs)"
+    log "NVIDIA host driver installation complete"
+    return 0
+  fi
+
   log "Checking if GPUs are visible to Kubernetes..."
-  local gpu_capacity
-  gpu_capacity=$(kubectl get nodes -l splunk.ai/workload-type=gpu -o json 2>/dev/null | \
-    jq '[.items[].status.capacity["nvidia.com/gpu"] // "0" | tonumber] | add' 2>/dev/null || echo "0")
-  if [[ "${gpu_capacity}" -gt 0 ]]; then
-    log "✓ Total GPUs visible to Kubernetes: ${gpu_capacity}"
-  else
-    warn "No GPUs visible to Kubernetes yet — the NVIDIA device plugin may still be starting"
-    warn "Check with: kubectl get nodes -o json | jq '.items[].status.capacity'"
+  local gpu_capacity="0"
+  local cap_wait=0
+  local cap_timeout=120
+  while [[ ${cap_wait} -lt ${cap_timeout} ]]; do
+    gpu_capacity=$(kubectl get nodes -l splunk.ai/workload-type=gpu -o json 2>/dev/null | \
+      jq '[.items[].status.capacity["nvidia.com/gpu"] // "0" | tonumber] | add' 2>/dev/null || echo "0")
+    if [[ "${gpu_capacity}" -gt 0 ]]; then
+      log "✓ Total GPUs visible to Kubernetes: ${gpu_capacity}"
+      break
+    fi
+    sleep 10
+    cap_wait=$((cap_wait + 10))
+    log "  Waiting for GPU capacity to be reported... ${cap_wait}/${cap_timeout}s"
+  done
+
+  if [[ "${gpu_capacity}" -le 0 ]]; then
+    err "Device plugin DaemonSet is installed but no GPUs are visible after ${cap_timeout}s.
+    Investigate with:
+      kubectl -n kube-system logs ds/nvidia-device-plugin-daemonset --tail 40
+      kubectl -n kube-system describe pod -l name=nvidia-device-plugin-ds"
   fi
 
   log "NVIDIA host driver installation complete"
@@ -1940,8 +2565,10 @@ install_nvidia_device_plugin() {
   local ver="${NVIDIA_VERSION:-v0.17.3}"
   log "Installing NVIDIA device plugin DaemonSet (${ver})..."
 
-  # Create the nvidia RuntimeClass so pods (including the device plugin
-  # itself) can use the NVIDIA container runtime for GPU access.
+  # Create the nvidia RuntimeClass FIRST. The device-plugin DaemonSet we
+  # apply below references this RuntimeClass via runtimeClassName=nvidia, so
+  # it must exist before any DS pod is scheduled — otherwise kubelet will
+  # reject the pod with 'RuntimeClass "nvidia" not found'.
   log "  Creating nvidia RuntimeClass..."
   cat <<'RTEOF' | kubectl apply -f -
 apiVersion: node.k8s.io/v1
@@ -1951,17 +2578,55 @@ metadata:
 handler: nvidia
 RTEOF
 
-  kubectl apply -n kube-system \
-    -f "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml"
+  # Fetch the upstream manifest into a temp file, inject our required
+  # pod-spec fields (nodeSelector + runtimeClassName) BEFORE applying.
+  # Doing this in one shot — instead of apply-then-patch — avoids the
+  # race where the initial DS pods start under the default runtime
+  # (runc), hit 'ERROR_LIBRARY_NOT_FOUND' because they have no access to
+  # libnvidia-ml.so or /dev/nvidia*, and land in CrashLoopBackOff before
+  # the patch ever reaches them.
+  local manifest
+  manifest=$(mktemp)
+  if ! curl -fsSL \
+      "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml" \
+      -o "${manifest}"; then
+    rm -f "${manifest}"
+    err "Failed to fetch NVIDIA device-plugin manifest from GitHub (version ${ver}).
+    Check network connectivity and that version ${ver} exists upstream."
+  fi
 
-  # Constrain the device plugin to GPU-labeled nodes only — non-GPU nodes
-  # don't have the NVIDIA drivers and the plugin pods would fail there.
-  log "  Patching device plugin: GPU nodeSelector..."
-  kubectl patch daemonset nvidia-device-plugin-daemonset -n kube-system --type='json' \
-    -p='[
-      {"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {"splunk.ai/workload-type": "gpu"}}
-    ]' 2>/dev/null || true
+  log "  Patching manifest in place: GPU nodeSelector + nvidia runtimeClassName..."
+  # Use yq when available (cleanest, structure-aware); fall back to kubectl
+  # patch --local on stdout — both produce the same patched manifest on
+  # stdout which we then `apply -f -`.
+  local patched
+  patched=$(mktemp)
+  if command -v yq >/dev/null 2>&1; then
+    yq eval '
+      (select(.kind == "DaemonSet") | .spec.template.spec.nodeSelector."splunk.ai/workload-type") = "gpu"
+      | (select(.kind == "DaemonSet") | .spec.template.spec.runtimeClassName) = "nvidia"
+    ' "${manifest}" > "${patched}"
+  else
+    # Fallback: use kubectl patch --local. This requires reading from the
+    # manifest and piping through patch; multi-document files complicate
+    # things, but this upstream manifest is a single DaemonSet.
+    kubectl patch -f "${manifest}" --local -o yaml \
+      --type='json' \
+      -p='[
+        {"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {"splunk.ai/workload-type": "gpu"}},
+        {"op": "add", "path": "/spec/template/spec/runtimeClassName", "value": "nvidia"}
+      ]' > "${patched}"
+  fi
 
+  if ! kubectl apply -n kube-system -f "${patched}"; then
+    rm -f "${manifest}" "${patched}"
+    err "Failed to apply patched NVIDIA device-plugin manifest. Check kubectl connectivity."
+  fi
+  rm -f "${manifest}" "${patched}"
+
+  # Wait for the DS to roll out so the caller observes GPU capacity as
+  # soon as possible. Non-fatal: we verify capacity explicitly upstream
+  # via the strict-verification loop.
   kubectl -n kube-system rollout status ds/nvidia-device-plugin-daemonset --timeout=3m || true
 
   log "NVIDIA device plugin installed successfully"
@@ -3186,17 +3851,30 @@ install_ai_platform_stack() {
   install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("nvidia-drivers")
 
+  # Track which phase-1 tasks failed. nvidia-drivers failures are fatal:
+  # without them the device-plugin crash-loops and the whole GPU stack
+  # silently fails. Every other phase-1 task is merely warned on failure.
+  local phase1_fatal_failures=0
   for i in "${!phase1_pids[@]}"; do
     if wait "${phase1_pids[$i]}"; then
       log "  ✓ ${phase1_names[$i]} completed"
     else
       warn "  ✗ ${phase1_names[$i]} had issues"
+      if [[ "${phase1_names[$i]}" == "nvidia-drivers" ]]; then
+        phase1_fatal_failures=$((phase1_fatal_failures + 1))
+      fi
     fi
     while IFS= read -r line; do
       log "    [${phase1_names[$i]}] ${line}"
     done < "${phase1_logdir}/${phase1_names[$i]}.log"
   done
   rm -rf "${phase1_logdir}"
+
+  if [[ ${phase1_fatal_failures} -gt 0 ]]; then
+    err "NVIDIA driver install failed on at least one GPU node; aborting install.
+    Device-plugin pods would otherwise crash-loop with NVML: ERROR_LIBRARY_NOT_FOUND
+    and model pods would stay Pending forever. Fix the errors above and re-run."
+  fi
 
   ensure_s3compat_credentials
 
@@ -3593,6 +4271,8 @@ main_install() {
           all_node_ips+=("${WORKER_IPS[@]}")
         fi
         prepare_nodes_for_k0s "${all_node_ips[@]}"
+        fix_kube_proxy_mode_if_needed "${controller_ip}"
+        bounce_calico_if_needed
 
         # Ensure all expected workers are joined
         if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
@@ -3660,6 +4340,8 @@ main_install() {
           all_node_ips2+=("${WORKER_IPS[@]}")
         fi
         prepare_nodes_for_k0s "${all_node_ips2[@]}"
+        fix_kube_proxy_mode_if_needed "${controller_ip}"
+        bounce_calico_if_needed
 
         # Ensure all expected workers are joined
         if [[ -n "${EXISTING_WORKER_IPS}" ]]; then

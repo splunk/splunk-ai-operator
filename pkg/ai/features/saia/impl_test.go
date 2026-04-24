@@ -205,7 +205,7 @@ func newTestAIService() *aiv1.AIService {
 		},
 		Spec: aiv1.AIServiceSpec{
 			AIPlatformUrl:      "http://platform:8000",
-			VectorDbUrl:        "weaviate:80",
+			VectorDbUrl:        "weaviate.ai-platform.svc.cluster.local",
 			Replicas:           1,
 			ServiceAccountName: "test-sa",
 			TaskVolume: aiv1.ObjectStorageSpec{
@@ -577,8 +577,8 @@ func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
 	ai.Annotations = map[string]string{
-		"operator.splunk.com/example":              "v1",
-		"kubectl.kubernetes.io/restartedAt":        "should-be-skipped",
+		"operator.splunk.com/example":                      "v1",
+		"kubectl.kubernetes.io/restartedAt":                "should-be-skipped",
 		"kubectl.kubernetes.io/last-applied-configuration": "should-be-skipped",
 	}
 
@@ -837,13 +837,80 @@ func Test_buildV2ExtraEnv_FieldDescriptionBackend(t *testing.T) {
 	})
 }
 
+// Test_buildV2ExtraEnv_ConversationStore verifies the switch from the
+// ephemeral "filesystem" default (which lives on the pod's container overlay
+// and loses all chat history on restart) to the "s3" backend introduced in
+// saia-service by Tony's commits 3d3756f3 / 8e2a9f40 (merged into
+// ai-tier-v2.0 via 9efe1fce on 2026-04-20, shipped in image build-v2-002).
+//
+// Contract (from saia-v2/app/core/config.py::Settings and
+// app/repositories/conversation/store_factory.py):
+//   - CONVERSATION_STORE=s3 selects S3ConversationStore
+//   - CONVERSATION_S3_BUCKET must be non-empty (validator raises
+//     ValueError at startup otherwise, crash-looping the v2 pod)
+//   - AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are
+//     reused from the FieldDescription S3 wiring below
+func Test_buildV2ExtraEnv_ConversationStore(t *testing.T) {
+	t.Run("enables s3 backend with bucket extracted from TaskVolume.Path", func(t *testing.T) {
+		ai := newTestAIService() // TaskVolume.Path = "s3://test-bucket/saia"
+		envMap := envToMap(buildV2ExtraEnv(ai))
+
+		assert.Equal(t, "s3", envMap["CONVERSATION_STORE"],
+			"CONVERSATION_STORE must be 's3' so S3ConversationStore is selected over the ephemeral filesystem default")
+		assert.Equal(t, "test-bucket", envMap["CONVERSATION_S3_BUCKET"],
+			"CONVERSATION_S3_BUCKET must be the extracted bucket name so SAIA v2's Settings validator passes at startup")
+	})
+
+	t.Run("handles all supported TaskVolume.Path prefixes", func(t *testing.T) {
+		cases := []struct {
+			path       string
+			wantBucket string
+		}{
+			{"s3://my-bucket/path", "my-bucket"},
+			{"s3compat://bucket-name", "bucket-name"},
+			{"minio://minio-bucket", "minio-bucket"},
+			{"seaweedfs://sw-bucket/prefix", "sw-bucket"},
+			{"gs://gcs-bucket", "gcs-bucket"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.path, func(t *testing.T) {
+				ai := newTestAIService()
+				ai.Spec.TaskVolume.Path = tc.path
+				envMap := envToMap(buildV2ExtraEnv(ai))
+
+				assert.Equal(t, "s3", envMap["CONVERSATION_STORE"])
+				assert.Equal(t, tc.wantBucket, envMap["CONVERSATION_S3_BUCKET"])
+			})
+		}
+	})
+
+	// An empty TaskVolume.Path indicates a misconfigured CR. We must NOT
+	// emit CONVERSATION_STORE=s3 in that case, because CONVERSATION_S3_BUCKET
+	// would be empty and the v2 pod would crash-loop on the Pydantic
+	// validator. Leaving the defaults in place gives a clearer failure mode
+	// (ephemeral filesystem store) than a startup crash.
+	t.Run("omits conversation-store envs when TaskVolume.Path is empty", func(t *testing.T) {
+		ai := newTestAIService()
+		ai.Spec.TaskVolume.Path = ""
+		envMap := envToMap(buildV2ExtraEnv(ai))
+
+		_, hasStore := envMap["CONVERSATION_STORE"]
+		_, hasBucket := envMap["CONVERSATION_S3_BUCKET"]
+		assert.False(t, hasStore,
+			"CONVERSATION_STORE must be omitted when no bucket can be derived, to avoid the SAIA v2 startup validator crashing the pod")
+		assert.False(t, hasBucket,
+			"CONVERSATION_S3_BUCKET must be omitted when no bucket can be derived")
+	})
+}
+
 func Test_buildSAIABaseEnv(t *testing.T) {
 	ai := newTestAIService()
 	env := buildSAIABaseEnv(ai)
 	envMap := envToMap(env)
 
 	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])
-	assert.Equal(t, "weaviate:80", envMap["VECTOR_DB_URL"])
+	assert.Equal(t, "http://weaviate.ai-platform.svc.cluster.local:80", envMap["WEAVIATE_PLATFORM_URL"])
+	assert.Equal(t, "weaviate.ai-platform.svc.cluster.local", envMap["VECTOR_DB_URL"])
 	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
 	assert.Equal(t, "http://seaweedfs:8333", envMap["S3COMPAT_OBJECT_STORE_ENDPOINT_URL"])
 	assert.Equal(t, "test-bucket", envMap["S3COMPAT_OBJECT_STORE_BUCKET"])
