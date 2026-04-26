@@ -3675,6 +3675,96 @@ YAML
   log "AIPlatform CR installed successfully"
 }
 
+saia_service_template_enabled_k0s() {
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -n "${svc_type}" && "${svc_type}" != "null" && "${svc_type}" != "ClusterIP" ]]
+}
+
+wait_for_k0s_aiservice_exists() {
+  local name="$1" timeout="${2:-600}" waited=0
+  while ! kubectl -n "${AI_NS}" get aiservice "${name}" >/dev/null 2>&1; do
+    [[ $waited -ge $timeout ]] && err "Timed out waiting for AIService ${AI_NS}/${name}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+apply_k0s_saia_service_annotations() {
+  local aiservice_name="$1"
+  local annotation_keys key value
+
+  annotation_keys="$(yq eval '.aiPlatform.serviceTemplate.annotations // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+  [[ -z "${annotation_keys}" ]] && return 0
+
+  local annotate_args=()
+  while IFS= read -r key; do
+    [[ -z "${key}" || "${key}" == "null" ]] && continue
+    value="$(yq eval ".aiPlatform.serviceTemplate.annotations.\"${key}\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -z "${value}" || "${value}" == "null" ]] && continue
+    annotate_args+=("${key}=${value}")
+  done <<< "${annotation_keys}"
+
+  if [[ ${#annotate_args[@]} -gt 0 ]]; then
+    log "Applying SAIA Service annotations to AIService/${aiservice_name}..."
+    kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" "${annotate_args[@]}" --overwrite
+  fi
+}
+
+patch_k0s_saia_public_service_workaround() {
+  local platform_name="${CLUSTER_NAME}-ai-platform"
+  local aiservice_name="${platform_name}-saia"
+  local public_svc_name="${aiservice_name}-saia-service"
+  local svc_type svc_node_port
+
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+
+  wait_for_k0s_aiservice_exists "${aiservice_name}"
+
+  if saia_service_template_enabled_k0s; then
+    log "Patching AIService/${aiservice_name} with SAIA public exposure settings..."
+    if [[ "${svc_type}" == "NodePort" && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${svc_node_port}
+          }
+        ]
+      }
+    }
+  }
+}"
+    else
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"${svc_type}\"
+      }
+    }
+  }
+}"
+    fi
+  fi
+
+  apply_k0s_saia_service_annotations "${aiservice_name}"
+
+  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
+
+  if saia_service_template_enabled_k0s; then
+    log "Recreating SAIA public Service to ensure patched settings take effect..."
+    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+  fi
+}
+
 # ====== INSTALL FULL STACK ======
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
@@ -3770,6 +3860,7 @@ install_ai_platform_stack() {
   # Install AI Platform operator and CR while Splunk Standalone boots
   install_splunk_ai_operator
   install_ai_platform_cr
+  patch_k0s_saia_public_service_workaround
 
   # Now wait for Splunk Standalone to be ready (likely already done by now)
   wait_for_splunk_standalone

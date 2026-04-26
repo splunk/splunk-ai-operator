@@ -91,6 +91,14 @@ load_config() {
     SAIA_SERVICE_SA="$(yq eval '.aiPlatform.serviceAccounts.saiaService' "$cfg")"
     DEFAULT_ACCELERATOR="$(yq eval '.aiPlatform.defaultAcceleratorType' "$cfg")"
     WORKER_IMAGE_REGISTRY="$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry' "$cfg")"
+    SAIA_SERVICE_TYPE="$(yq eval '.aiPlatform.serviceTemplate.type // ""' "$cfg")"
+    SAIA_SERVICE_NODE_PORT="$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "$cfg")"
+    # AWS Load Balancer Controller (LBC) install toggle. Default: false — the
+    # script assumes customers bring their own LB and point it at NodePort
+    # (Path A). Set to true only when you want operator-managed NLB/ALB
+    # provisioning via the `aws-load-balancer-type: external` annotation or
+    # dynamic target registration via TargetGroupBinding CRs (Path B).
+    INSTALL_LBC="$(yq eval '.aiPlatform.awsLoadBalancerController.install // false' "$cfg")"
     INGRESS_HOST="$(yq eval '.aiPlatform.ingress.host' "$cfg")"
     INGRESS_CLASS="$(yq eval '.aiPlatform.ingress.className' "$cfg")"
     INGRESS_TLS_SECRET="$(yq eval '.aiPlatform.ingress.tlsSecretName' "$cfg")"
@@ -120,9 +128,11 @@ load_config() {
     RAY_WORKER_IMAGE="$(yq eval '.images.ray.workerImage' "$cfg")"
     WEAVIATE_IMAGE="$(yq eval '.images.weaviate.image' "$cfg")"
     SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$cfg")"
+    SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image // ""' "$cfg")"
     SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$cfg")"
     FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$cfg")"
     OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$cfg")"
+    NGINX_IMAGE="$(yq eval '.images.nginx.image // "docker.io/library/nginx:1.27-alpine"' "$cfg")"
 
     # Subnets - read as arrays (support both cluster.subnets and top-level subnets)
     PRIVATE_SUBNETS=()
@@ -172,6 +182,9 @@ load_config() {
     SAIA_SERVICE_SA="saia-service-sa"
     DEFAULT_ACCELERATOR="L40S"
     WORKER_IMAGE_REGISTRY=""
+    SAIA_SERVICE_TYPE=""
+    SAIA_SERVICE_NODE_PORT=""
+    INSTALL_LBC="false"
     INGRESS_HOST="ai.example.com"
     INGRESS_CLASS="nginx"
     INGRESS_TLS_SECRET="ai-platform-tls"
@@ -179,6 +192,8 @@ load_config() {
     SPLUNK_OPERATOR_FILE="./splunk-operator-cluster.yaml"
     SPLUNK_AI_FILE="./artifacts.yaml"
     SPLUNK_IMAGE="splunk/splunk:10.2.0-dev1"
+    SAIA_API_V2_IMAGE=""
+    NGINX_IMAGE="docker.io/library/nginx:1.27-alpine"
     RAY_VERSION="v1.2.2"
     NVIDIA_VERSION="v0.17.3"
     ENABLE_CPU=true
@@ -229,6 +244,19 @@ load_config() {
 
   # Splunk operators
   SPLUNK_AI_NS="splunk-ai-operator-system"
+
+  # AWS Load Balancer Controller (LBC) — required when a Service of type=LoadBalancer
+  # uses the "service.beta.kubernetes.io/aws-load-balancer-type: external" annotation
+  # (the in-tree EKS cloud controller intentionally skips those Services). Pinned
+  # chart and policy versions keep installs reproducible against a vetted upstream
+  # release (supply-chain hygiene: codeguard-0-supply-chain-security).
+  LBC_NS="kube-system"
+  LBC_SA="aws-load-balancer-controller"
+  LBC_RELEASE="aws-load-balancer-controller"
+  LBC_ROLE_NAME="AWSLoadBalancerControllerRole-${CLUSTER_NAME}"
+  LBC_POLICY_NAME="AWSLoadBalancerControllerIAMPolicy-${CLUSTER_NAME}"
+  LBC_CHART_VERSION="1.8.2"   # helm chart version (appVersion v2.8.2)
+  LBC_POLICY_VERSION="v2.8.2" # upstream tag used to fetch iam_policy.json
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, region=${REGION}, namespace=${AI_NS}"
 }
@@ -386,47 +414,67 @@ configure_images() {
   local ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
   local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
+  local saia_api_v2_full=""
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
+  local nginx_full=$(build_image_url "$IMAGE_REGISTRY" "$NGINX_IMAGE")
+  if [[ -n "${SAIA_API_V2_IMAGE}" && "${SAIA_API_V2_IMAGE}" != "null" ]]; then
+    saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
+  fi
 
   # Escape special characters for sed
   local ray_head_escaped=$(echo "$ray_head_full" | sed 's/[\/&]/\\&/g')
   local ray_worker_escaped=$(echo "$ray_worker_full" | sed 's/[\/&]/\\&/g')
   local weaviate_escaped=$(echo "$weaviate_full" | sed 's/[\/&]/\\&/g')
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
+  local saia_api_v2_escaped=""
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
   local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
+  local nginx_escaped=$(echo "$nginx_full" | sed 's/[\/&]/\\&/g')
   local operator_escaped=$(echo "$operator_full" | sed 's/[\/&]/\\&/g')
+  if [[ -n "${saia_api_v2_full}" ]]; then
+    saia_api_v2_escaped=$(echo "$saia_api_v2_full" | sed 's/[\/&]/\\&/g')
+  fi
 
-  SEDOPTION="-i"
+  local SED_INPLACE
   if [[ "$OSTYPE" == "darwin"* ]]; then
-    SEDOPTION="-i ''"
+    SED_INPLACE=(sed -i "")
+  else
+    SED_INPLACE=(sed -i)
   fi
   # Replace RELATED_IMAGE_ env vars by matching the env var name (not the value pattern)
   # This works regardless of what registry/image was there before
-  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_SAIA_API/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
-  sed $SEDOPTION "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
+  if [[ -n "${saia_api_v2_escaped}" ]]; then
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_escaped}|" "$SPLUNK_AI_FILE"
+  fi
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
 
   # Replace operator image (the container image itself, not env var)
   # Find the line with "image:" that's near "splunk-ai-operator" and replace it
-  sed $SEDOPTION "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
+  "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
 
   log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
   log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
   log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
+  if [[ -n "${saia_api_v2_full}" ]]; then
+    log "  ✓ Updated RELATED_IMAGE_SAIA_API_V2: $saia_api_v2_full"
+  fi
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
+  log "  ✓ Updated RELATED_IMAGE_NGINX: $nginx_full"
   log "  ✓ Updated operator image: $operator_full"
   log "  ✓ Updated MODEL_VERSION: $MODEL_VERSION"
   log "  ✓ Updated RAY_VERSION: $RAY_RUNTIME_VERSION"
@@ -441,10 +489,10 @@ configure_images() {
   local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
   # Replace RELATED_IMAGE_SPLUNK_ENTERPRISE env var
-  sed $SEDOPTION "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
+  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
 
   # Replace splunk-operator image (the container image itself)
-  sed $SEDOPTION "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+  "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
 
   log "  ✓ Updated Splunk Enterprise image: $splunk_full"
   log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
@@ -1365,6 +1413,139 @@ install_cert_manager() {
   check_ready cert-manager "app.kubernetes.io/instance=cert-manager,app.kubernetes.io/component=controller"
 }
 
+# ---------- AWS Load Balancer Controller (LBC) ----------
+# LBC watches Services with the "aws-load-balancer-type: external" annotation
+# (the in-tree cloud controller skips those Services on purpose) and drives
+# NLB/ALB provisioning through the AWS ELBv2 API. Without LBC installed, such
+# Services stay in EXTERNAL-IP=<pending> forever. LBC also gives us IP-mode
+# targeting, ACM-backed TLS termination, and modern NLB attributes — all
+# features the in-tree controller does not support.
+
+# Fetches the upstream-recommended IAM policy for LBC from a pinned git tag and
+# creates a customer-managed policy in the account (idempotent). Emits the ARN
+# on stdout so the caller can attach it via eksctl. Uses a cluster-scoped name
+# so teardown of one cluster won't remove a policy shared with other clusters.
+ensure_lbc_iam_policy() {
+  # Resolve the caller's account ID; construct the canonical policy ARN
+  # deterministically (IAM policy names are unique per account). This avoids
+  # parsing AWS CLI text output -- some CLI/JMESPath combinations have been
+  # observed to emit multi-line "None\nNone" for `Policies[?...].Arn | [0]`
+  # when no match exists, which would otherwise slip past a "!= None" guard.
+  local acct policy_arn
+  acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "$acct" || ! "$acct" =~ ^[0-9]{12}$ ]]; then
+    err "Could not resolve a valid AWS account ID via STS (got: '${acct}')"
+  fi
+  policy_arn="arn:aws:iam::${acct}:policy/${LBC_POLICY_NAME}"
+
+  if aws iam get-policy --policy-arn "$policy_arn" >/dev/null 2>&1; then
+    log "✓ LBC IAM policy already exists: ${policy_arn}" >&2
+    printf "%s" "$policy_arn"
+    return 0
+  fi
+
+  local tmp; tmp="$(mktemp)"; TMP_FILES+=("$tmp")
+  local url="https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/${LBC_POLICY_VERSION}/docs/install/iam_policy.json"
+  log "Fetching LBC IAM policy ${LBC_POLICY_VERSION} from ${url}" >&2
+  if ! curl -fsSL --max-time 60 "$url" -o "$tmp"; then
+    err "Failed to download AWS LBC IAM policy from ${url}. Check network access or bump LBC_POLICY_VERSION."
+  fi
+  if ! jq -e . "$tmp" >/dev/null 2>&1; then
+    err "Downloaded LBC IAM policy is not valid JSON. Refusing to proceed."
+  fi
+
+  local created
+  created="$(aws iam create-policy \
+    --policy-name "${LBC_POLICY_NAME}" \
+    --policy-document "file://${tmp}" \
+    --description "AWS Load Balancer Controller policy for ${CLUSTER_NAME} (${LBC_POLICY_VERSION})" \
+    --query 'Policy.Arn' --output text 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "$created" || "$created" != arn:aws:iam::* ]]; then
+    err "create-policy did not return a valid ARN for ${LBC_POLICY_NAME} (got: '${created}')"
+  fi
+  log "✓ Created LBC IAM policy ${LBC_POLICY_NAME}: ${created}" >&2
+  printf "%s" "$created"
+}
+
+# Creates the IRSA-bound ServiceAccount used by the LBC deployment. Uses eksctl
+# so the trust policy is pinned to this cluster's OIDC provider and SA subject.
+ensure_lbc_irsa() {
+  log "Ensuring IRSA for AWS Load Balancer Controller (${LBC_NS}/${LBC_SA})..."
+  local policy_arn; policy_arn="$(ensure_lbc_iam_policy)"
+  if [[ -z "$policy_arn" || "$policy_arn" != arn:aws:iam::* ]]; then
+    err "LBC IAM policy ARN is empty/invalid ('${policy_arn}'); cannot configure IRSA"
+  fi
+
+  eksctl create iamserviceaccount \
+    --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
+    --namespace "${LBC_NS}" \
+    --name "${LBC_SA}" \
+    --role-name "${LBC_ROLE_NAME}" \
+    --attach-policy-arn "${policy_arn}" \
+    --approve \
+    --override-existing-serviceaccounts
+
+  wait_resource_exists "${LBC_NS}" sa "${LBC_SA}" 180
+  log "✓ LBC IRSA role and service account configured"
+}
+
+# Tags user-provided subnets so LBC can auto-discover where to place LBs.
+# eksctl already tags subnets it creates, so this is a no-op when the cluster
+# was created without explicit cluster.subnets.
+tag_lbc_subnets() {
+  if [[ ${#PUBLIC_SUBNETS[@]} -eq 0 && ${#PRIVATE_SUBNETS[@]} -eq 0 ]]; then
+    log "No user-provided subnets; eksctl-created subnets are already tagged for LBC discovery."
+    return 0
+  fi
+  log "Tagging user-provided subnets for AWS Load Balancer Controller discovery..."
+  if [[ ${#PUBLIC_SUBNETS[@]} -gt 0 ]]; then
+    log "  Public subnets (${#PUBLIC_SUBNETS[@]}): kubernetes.io/role/elb=1"
+    aws ec2 create-tags --region "${REGION}" \
+      --resources "${PUBLIC_SUBNETS[@]}" \
+      --tags Key=kubernetes.io/role/elb,Value=1 \
+             "Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=shared"
+  fi
+  if [[ ${#PRIVATE_SUBNETS[@]} -gt 0 ]]; then
+    log "  Private subnets (${#PRIVATE_SUBNETS[@]}): kubernetes.io/role/internal-elb=1"
+    aws ec2 create-tags --region "${REGION}" \
+      --resources "${PRIVATE_SUBNETS[@]}" \
+      --tags Key=kubernetes.io/role/internal-elb,Value=1 \
+             "Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=shared"
+  fi
+  log "✓ Subnets tagged for LBC auto-discovery"
+}
+
+install_aws_load_balancer_controller() {
+  log "Installing AWS Load Balancer Controller (helm chart ${LBC_CHART_VERSION})..."
+
+  local vpc_id
+  vpc_id="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" \
+    --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null || true)"
+  if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
+    err "Could not determine VPC ID for cluster ${CLUSTER_NAME}. LBC install requires vpcId."
+  fi
+
+  if ! aws iam get-role --role-name "${LBC_ROLE_NAME}" >/dev/null 2>&1; then
+    err "IRSA role ${LBC_ROLE_NAME} not found. ensure_lbc_irsa must run first."
+  fi
+
+  helm repo add eks https://aws.github.io/eks-charts >/dev/null
+  helm repo update >/dev/null
+  helm_retry 5 upgrade --install "${LBC_RELEASE}" eks/aws-load-balancer-controller \
+    --namespace "${LBC_NS}" \
+    --version "${LBC_CHART_VERSION}" \
+    --set clusterName="${CLUSTER_NAME}" \
+    --set region="${REGION}" \
+    --set vpcId="${vpc_id}" \
+    --set serviceAccount.create=false \
+    --set serviceAccount.name="${LBC_SA}" \
+    --wait --timeout 10m
+
+  check_ready "${LBC_NS}" "app.kubernetes.io/name=aws-load-balancer-controller"
+  log "✓ AWS Load Balancer Controller ${LBC_CHART_VERSION} installed and ready"
+}
+
 # ---------- External S3-compatible object storage (credentials only; no in-cluster install) ----------
 ensure_s3compat_credentials() {
   # Only create credentials secret when using external S3-compatible storage (s3compat, minio, seaweedfs).
@@ -1534,6 +1715,39 @@ ensure_s3_upload_splunk_app() {
     aws s3 cp "${SPLUNK_APP_LOCAL_PATH}" "s3://${S3_BUCKET}/${key}"
     log "Uploaded ${base} to s3://${S3_BUCKET}/${key}"
   fi
+}
+
+ensure_external_objstore_upload_splunk_app() {
+  if [[ -z "${SPLUNK_APP_LOCAL_PATH}" ]]; then
+    log "SPLUNK_APP_LOCAL_PATH not set; skipping app upload to ${OBJ_STORE_TYPE}://${OBJ_STORE_BUCKET}/apps/"
+    return 0
+  fi
+  if [[ ! -f "${SPLUNK_APP_LOCAL_PATH}" ]]; then
+    warn "SPLUNK_APP_LOCAL_PATH='${SPLUNK_APP_LOCAL_PATH}' not found; skipping upload"
+    return 0
+  fi
+  if [[ -z "${OBJ_STORE_ENDPOINT}" ]]; then
+    warn "OBJ_STORE_ENDPOINT not set; cannot upload Splunk app to external object store"
+    return 0
+  fi
+
+  local base key
+  base="$(basename "${SPLUNK_APP_LOCAL_PATH}")"
+  key="apps/${base}"
+  log "Ensuring Splunk app '${base}' exists at ${OBJ_STORE_TYPE}://${OBJ_STORE_BUCKET}/${key}"
+
+  if AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+    aws --endpoint-url "${OBJ_STORE_ENDPOINT}" s3api head-object --bucket "${OBJ_STORE_BUCKET}" --key "${key}" >/dev/null 2>&1; then
+    log "App already present at ${OBJ_STORE_TYPE}://${OBJ_STORE_BUCKET}/${key}; skipping upload"
+  else
+    AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+      aws --endpoint-url "${OBJ_STORE_ENDPOINT}" s3 cp "${SPLUNK_APP_LOCAL_PATH}" "s3://${OBJ_STORE_BUCKET}/${key}"
+    log "Uploaded ${base} to ${OBJ_STORE_TYPE}://${OBJ_STORE_BUCKET}/${key}"
+  fi
+}
+
+should_wait_for_splunk_app_install() {
+  [[ -n "${SPLUNK_APP_LOCAL_PATH:-}" && -f "${SPLUNK_APP_LOCAL_PATH}" ]]
 }
 
 ensure_namespace() { kubectl get ns "$1" >/dev/null 2>&1 || kubectl create ns "$1"; }
@@ -2112,6 +2326,119 @@ show_platform_access_info() {
   log ""
 }
 
+saia_service_template_enabled() {
+  [[ -n "${SAIA_SERVICE_TYPE:-}" && "${SAIA_SERVICE_TYPE}" != "null" && "${SAIA_SERVICE_TYPE}" != "ClusterIP" ]]
+}
+
+saia_aiservice_name() {
+  local platform_name="${1:-${AI_PLATFORM_NAME}}"
+  printf "%s-saia" "${platform_name}"
+}
+
+wait_for_aiservice_exists() {
+  local name="$1" timeout="${2:-600}" waited=0
+  while ! kubectl -n "${AI_NS}" get aiservice "${name}" >/dev/null 2>&1; do
+    [[ $waited -ge $timeout ]] && err "Timed out waiting for AIService ${AI_NS}/${name}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+apply_saia_service_annotations() {
+  local aiservice_name="$1"
+  local annotation_keys key value
+
+  annotation_keys="$(yq eval '.aiPlatform.serviceTemplate.annotations // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+  [[ -z "${annotation_keys}" ]] && return 0
+
+  local annotate_args=()
+  while IFS= read -r key; do
+    [[ -z "${key}" || "${key}" == "null" ]] && continue
+    value="$(yq eval ".aiPlatform.serviceTemplate.annotations.\"${key}\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -z "${value}" || "${value}" == "null" ]] && continue
+    annotate_args+=("${key}=${value}")
+  done <<< "${annotation_keys}"
+
+  if [[ ${#annotate_args[@]} -gt 0 ]]; then
+    log "Applying SAIA Service annotations to AIService/${aiservice_name}..."
+    kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" "${annotate_args[@]}" --overwrite
+  fi
+}
+
+patch_saia_public_service_workaround() {
+  local platform_name="${1:-${AI_PLATFORM_NAME}}"
+  local aiservice_name public_svc_name
+
+  aiservice_name="$(saia_aiservice_name "${platform_name}")"
+  public_svc_name="${aiservice_name}-saia-service"
+
+  wait_for_aiservice_exists "${aiservice_name}"
+
+  if saia_service_template_enabled; then
+    log "Patching AIService/${aiservice_name} with SAIA public exposure settings..."
+    if [[ "${SAIA_SERVICE_TYPE}" == "NodePort" && -n "${SAIA_SERVICE_NODE_PORT:-}" && "${SAIA_SERVICE_NODE_PORT}" != "null" ]]; then
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${SAIA_SERVICE_NODE_PORT}
+          }
+        ]
+      }
+    }
+  }
+}"
+    else
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"${SAIA_SERVICE_TYPE}\"
+      }
+    }
+  }
+}"
+    fi
+  fi
+
+  apply_saia_service_annotations "${aiservice_name}"
+
+  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
+
+  if saia_service_template_enabled; then
+    log "Recreating SAIA public Service to ensure patched settings take effect..."
+    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+    wait_resource_exists "${AI_NS}" service "${public_svc_name}" 300
+  fi
+}
+
+wait_for_saia_load_balancer() {
+  local platform_name="${1:-${AI_PLATFORM_NAME}}" timeout="${2:-1200}" waited=0
+  local svc_name hostname=""
+  svc_name="$(saia_aiservice_name "${platform_name}")-saia-service"
+
+  [[ "${SAIA_SERVICE_TYPE:-}" == "LoadBalancer" ]] || return 0
+
+  log "Waiting for SAIA LoadBalancer Service ${AI_NS}/${svc_name} to receive an external hostname..."
+  while true; do
+    hostname="$(kubectl -n "${AI_NS}" get svc "${svc_name}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+    [[ -z "${hostname}" ]] && hostname="$(kubectl -n "${AI_NS}" get svc "${svc_name}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+    if [[ -n "${hostname}" ]]; then
+      log "✓ SAIA external endpoint: ${hostname}"
+      return 0
+    fi
+    [[ $waited -ge $timeout ]] && err "Timed out waiting for SAIA LoadBalancer Service ${AI_NS}/${svc_name}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
 # Quick status check function - can be called standalone
 check_aiplatform_status() {
   local platform_name="${1:-${AI_PLATFORM_NAME}}"
@@ -2262,6 +2589,14 @@ YAML
       ;;
   esac
 
+  local svc_template_yaml=""
+  if saia_service_template_enabled; then
+    svc_template_yaml="  serviceTemplate:"$'\n'"    spec:"$'\n'"      type: ${SAIA_SERVICE_TYPE}"$'\n'
+    if [[ "${SAIA_SERVICE_TYPE}" == "NodePort" && -n "${SAIA_SERVICE_NODE_PORT:-}" && "${SAIA_SERVICE_NODE_PORT}" != "null" ]]; then
+      svc_template_yaml+="      ports:"$'\n'"      - name: http"$'\n'"        port: 8080"$'\n'"        targetPort: 8080"$'\n'"        nodePort: ${SAIA_SERVICE_NODE_PORT}"$'\n'
+    fi
+  fi
+
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -2279,6 +2614,7 @@ spec:
     - name: saia
       version: "1.1.0"
       serviceAccountName: ${SAIA_SERVICE_SA}
+${svc_template_yaml}
   storage:
     vectorDB:
       size: ${VECTORDB_SIZE}
@@ -2314,6 +2650,8 @@ spec:
 YAML
 
   wait_aiplatform_ready
+  patch_saia_public_service_workaround "${AI_PLATFORM_NAME}"
+  wait_for_saia_load_balancer "${AI_PLATFORM_NAME}" 1200
 }
 
 # Wait until Splunk AI Assistant app shows as installed in Standalone status
@@ -2616,6 +2954,7 @@ delete_cluster_minimal() {
   delete_iamserviceaccount_if_exists "${AI_NS}" "${RAY_WORKER_SA}"
   delete_iamserviceaccount_if_exists "${AI_NS}" "${SAIA_SERVICE_SA}"
   delete_iamserviceaccount_if_exists "${EBS_NS}" "${EBS_SA}"
+  delete_iamserviceaccount_if_exists "${LBC_NS}" "${LBC_SA}"
   echo ""
 
   log "Step 2: Deleting IAM roles..."
@@ -2624,6 +2963,7 @@ delete_cluster_minimal() {
   delete_role_if_exists "IRSA-${CLUSTER_NAME}-${RAY_WORKER_SA}"
   delete_role_if_exists "IRSA-${CLUSTER_NAME}-${SAIA_SERVICE_SA}"
   delete_role_if_exists "${EBS_IRSA_ROLE_NAME}"
+  delete_role_if_exists "${LBC_ROLE_NAME}"
   echo ""
 
   log "Step 3: Cleaning up any eksctl-created EBS CSI addon roles..."
@@ -2720,6 +3060,7 @@ delete_cluster_minimal() {
   else
     delete_policy_if_exists "${AI_BUCKET_POLICY_NAME}"
   fi
+  delete_policy_if_exists "${LBC_POLICY_NAME}"
   echo ""
 
   log "Step 8: Purging all IRSA roles associated with this cluster's OIDC provider..."
@@ -2779,6 +3120,7 @@ delete_everything() {
   helm uninstall "${AUTOSCALER_RELEASE}" -n "${AUTOSCALER_NS}" || true
   kubectl delete -f https://github.com/splunk/splunk-operator/releases/download/2.8.1/splunk-operator-cluster.yaml --ignore-not-found
   kubectl delete -k "github.com/ray-project/kuberay/ray-operator/config/default?ref=v1.2.2" --ignore-not-found
+  helm uninstall "${LBC_RELEASE}" -n "${LBC_NS}" || true
   helm uninstall kube-prometheus -n monitoring || true
   helm uninstall cert-manager -n cert-manager || true
   kubectl delete storageclass gp3 --ignore-not-found
@@ -2856,7 +3198,7 @@ preflight_env() {
   fi
 
   pf_header "Tools"
-  for t in aws eksctl kubectl helm git jq yq; do
+  for t in aws eksctl kubectl helm git jq yq curl; do
     if command -v "$t" >/dev/null 2>&1; then pf_ok "$t found ($(command -v $t))"; else pf_fail "$t not found in PATH"; fi
   done
 
@@ -3102,6 +3444,7 @@ install_ai_platform_stack() {
   log "=== Setting up Splunk AI Platform stack ==="
   if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
     log "Using external S3-compatible object storage (${OBJ_STORE_TYPE}); skipping S3 bucket creation; using ECR-only policy for IRSA."
+    ensure_external_objstore_upload_splunk_app
   else
     ensure_s3_bucket_and_prefixes
     ensure_s3_upload_splunk_app
@@ -3169,19 +3512,36 @@ reconcile_flow() {
   fi
   install_kube_prometheus
   install_cert_manager
+  # AWS Load Balancer Controller (LBC) — only install when the operator itself
+  # needs to provision NLBs/ALBs (Service type=LoadBalancer with the
+  # `aws-load-balancer-type: external` annotation) or when binding k8s Services
+  # to customer-managed target groups via TargetGroupBinding CRs. Customers who
+  # bring their own LB and point it at NodePort (Path A) should leave this off.
+  if [[ "${INSTALL_LBC}" == "true" ]]; then
+    log "aiPlatform.awsLoadBalancerController.install=true — installing AWS Load Balancer Controller"
+    tag_lbc_subnets
+    ensure_lbc_irsa
+    install_aws_load_balancer_controller
+  else
+    log "aiPlatform.awsLoadBalancerController.install=false — skipping LBC install (bring-your-own-LB / NodePort path)"
+  fi
   ensure_s3compat_credentials
   install_otel_operator_and_contrib_collector
   install_ray_operator
   install_splunk_operator
   install_splunk_ai_operator
   install_ai_platform_stack
-  wait_splunk_ai_assistant_installed "Splunk_AI_Assistant_Cloud.tgz" 1200
+  if should_wait_for_splunk_app_install; then
+    wait_splunk_ai_assistant_installed "Splunk_AI_Assistant_Cloud.tgz" 1200
+  else
+    log "Skipping Splunk AI Assistant app wait because no local app archive is configured"
+  fi
   # push_saia_conf_into_pod
 }
 
 # ---------- MAIN ----------
 main_install() {
-  for t in aws eksctl kubectl helm git jq yq; do need "$t"; done
+  for t in aws eksctl kubectl helm git jq yq curl; do need "$t"; done
 
   # Load configuration from YAML file
   load_config

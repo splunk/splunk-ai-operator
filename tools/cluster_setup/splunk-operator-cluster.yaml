@@ -55325,7 +55325,6 @@ subjects:
 apiVersion: v1
 data:
   OPERATOR_NAME: '"splunk-operator"'
-  # TODO identify whats this ??
   RELATED_IMAGE_SPLUNK_ENTERPRISE: 667741767953.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:splunk-redhat-8-amd64-10.2.0-ef65e8205e4d-6d943f7-28228924
   WATCH_NAMESPACE: ""
 kind: ConfigMap

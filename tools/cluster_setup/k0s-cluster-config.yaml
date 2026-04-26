@@ -15,7 +15,7 @@ cluster:
   name: airgap-cluster
   # region: us-east-2                    # Ignored for on-prem, but required in config
   sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
-  sshKeyPath: /Users/mohaari2/.ssh/ai-key-arif.pem  # CHANGE THIS: Path to SSH private key
+  sshKeyPath: /Users/kiran/.ssh/ai-key-arif.pem  # CHANGE THIS: Path to SSH private key
 
 # ---------- Node Configuration ----------
 nodes:
@@ -25,12 +25,11 @@ nodes:
 
   existingIPs:
     controllers:
-      - 3.144.14.96                       # CHANGE THIS: Your controller server IP
+      - 3.149.241.167
     workers:
-      - 3.14.134.16                       # CHANGE THIS: CPU worker 1
-      - 13.59.78.115                      # CHANGE THIS: GPU worker 1
-      - 3.15.20.136                       # CHANGE THIS: GPU worker 2
-
+      - 18.221.244.241
+      - 18.191.19.128
+      - 3.137.209.219
 # ---------- Storage Configuration ----------
 # Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).
 # Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
@@ -103,7 +102,7 @@ images:
     # Build & push with:
     #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.26 \
     #     make docker-build-amd64 docker-push
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.28"
+    image: "docker.io/kbhos698/splunk-ai-operator:ai-tier"
 
   splunk:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom" #TODO this update
@@ -175,8 +174,8 @@ kubernetes:
 
 # ---------- File Paths ----------
 files:
-  splunkOperator: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/splunk-operator-cluster.yaml"
-  aiPlatform: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/artifacts.yaml"
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"
 
 # ---------- Splunk Configuration ----------
 splunk:
@@ -213,7 +212,12 @@ aiPlatform:
   # To ENABLE external exposure for on-prem / airgap customers, NodePort is the
   # recommended default: any k8s node IP + the configured nodePort yields a
   # reachable endpoint from VPN-connected users. No cloud LB / cert-manager
-  # needed. Use LoadBalancer only if the customer runs MetalLB or a cloud LB.
+  # needed. Use LoadBalancer only if the cluster has MetalLB/cloud LB support.
+  #
+  # Note: the current operator image preserves serviceTemplate.spec.type, but
+  # not nested serviceTemplate.metadata.annotations. The k0s installer applies
+  # any annotations below directly to the generated AIService after creation,
+  # which the current operator already copies onto the rendered Service.
   serviceTemplate:
     type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
     nodePort: 30080         # Fixed NodePort (30000-32767). Required for stable DNS.
