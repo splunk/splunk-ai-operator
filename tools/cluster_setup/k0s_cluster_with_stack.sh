@@ -644,6 +644,14 @@ PYSCRIPT"
   # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
   ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
 
+  # Safety gate: refuse to wipe if a live cluster with Ready nodes exists.
+  # This prevents accidental data loss when the existing-cluster detection
+  # (useExisting) flakes due to an SSH timeout or transient k0s status error.
+  if ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null" 2>/dev/null | grep -q ' Ready'; then
+    err "k0s cluster on ${controller_ip} has Ready nodes — refusing to wipe.
+    Use 'delete' or 'clean-all' to tear down first, or set useExisting=auto in config."
+  fi
+
   # Clean stale k0s state from any previous run
   ssh_exec "${controller_ip}" "
     sudo systemctl stop k0scontroller 2>/dev/null || true
