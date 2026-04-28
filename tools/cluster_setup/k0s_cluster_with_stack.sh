@@ -27,6 +27,13 @@ export LANG=C LC_ALL=C
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
 
+# ====== SESSION LOG ======
+LOG_DIR="${LOG_DIR:-$(dirname "$0")/logs}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/k0s-install-$(date '+%Y-%m-%d_%H-%M-%S').log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "[LOG] Session log: ${LOG_FILE}"
+
 # ====== COLORS & LOGGING ======
 log()   { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
