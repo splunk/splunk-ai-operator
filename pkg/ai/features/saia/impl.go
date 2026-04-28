@@ -175,14 +175,16 @@ func (r *SaiaReconciler) validateAIService(
 	// Default resources — SAIA API needs headroom beyond 2Gi or the kubelet OOMKills during startup.
 	if ai.Spec.Resources.Requests == nil {
 		ai.Spec.Resources.Requests = corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("500m"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+			corev1.ResourceCPU:              resource.MustParse("2"),
+			corev1.ResourceMemory:           resource.MustParse("4Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
 		}
 	}
 	if ai.Spec.Resources.Limits == nil {
 		ai.Spec.Resources.Limits = corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("2"),
-			corev1.ResourceMemory: resource.MustParse("4Gi"),
+			corev1.ResourceCPU:              resource.MustParse("2"),
+			corev1.ResourceMemory:           resource.MustParse("4Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
 		}
 	}
 	if ai.Spec.TaskVolume.Path == "" {
@@ -1125,7 +1127,18 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	v2Resources := ai.Spec.V2.Resources
 	if v2Resources.Requests == nil {
-		v2Resources = ai.Spec.Resources
+		v2Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("2"),
+				corev1.ResourceMemory:           resource.MustParse("4Gi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("2"),
+				corev1.ResourceMemory:           resource.MustParse("4Gi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+		}
 	}
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
@@ -1213,12 +1226,12 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	// IngestionWorker.run() when the queue is empty OR the tenant lock is busy.
 	// The heartbeat is written only at the top of process_next(), so this sleep
 	// directly controls heartbeat cadence. The liveness probe rejects heartbeats
-	// older than 120s, so we MUST keep this well under that threshold — 10s
-	// matches the saia-v2 default (see Settings.run_tasks_delay_s). Do NOT
+	// older than 1200s, so we MUST keep this well under that threshold — 600s
+	// matches the saia-v2 helm default (see Settings.run_tasks_delay_s). Do NOT
 	// conflate with the v1 worker APScheduler cron (which uses 600s for weekly
 	// jobs); v2 reuses the same env name for a different purpose.
 	env = append(env,
-		corev1.EnvVar{Name: "RUN_TASKS_DELAY_S", Value: "10"},
+		corev1.EnvVar{Name: "RUN_TASKS_DELAY_S", Value: "600"},
 		corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"},
 		corev1.EnvVar{Name: "WORKER_HEARTBEAT_PATH", Value: "/tmp/ingestion_worker_heartbeat"},
 	)
@@ -1241,7 +1254,18 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 
 	v2WorkerResources := ai.Spec.V2Worker.Resources
 	if v2WorkerResources.Requests == nil {
-		v2WorkerResources = ai.Spec.Resources
+		v2WorkerResources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("2"),
+				corev1.ResourceMemory:           resource.MustParse("16Gi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("25Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("2"),
+				corev1.ResourceMemory:           resource.MustParse("16Gi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("25Gi"),
+			},
+		}
 	}
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
@@ -1284,7 +1308,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 									"python3", "-c",
 									"import os,sys,time\n" +
 										"p=os.environ.get('WORKER_HEARTBEAT_PATH','/tmp/ingestion_worker_heartbeat')\n" +
-										"sys.exit(0 if os.path.exists(p) and (time.time()-float(open(p).read().strip()))<120 else 1)",
+										"sys.exit(0 if os.path.exists(p) and (time.time()-float(open(p).read().strip()))<1200 else 1)",
 								},
 							},
 						},
