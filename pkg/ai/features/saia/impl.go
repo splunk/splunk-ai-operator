@@ -579,15 +579,43 @@ func (r *SaiaReconciler) reconcilePostInstallHook(
 		}
 	}
 	uri := fmt.Sprintf("http://%s:80", ai.Spec.VectorDbUrl)
+	backoffLimit := int32(1)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ai.Name + "-vector-db-setup-posthook",
 			Namespace: ai.Namespace,
 		},
 		Spec: batchv1.JobSpec{
+			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
+					// Wait for Weaviate to accept connections before running
+					// the schema setup container. This eliminates the
+					// error-pod churn that occurred when the Job was created
+					// before Weaviate was fully serving (the operator-level
+					// condition check can race with actual endpoint readiness).
+					InitContainers: []corev1.Container{
+						{
+							Name:            "wait-for-weaviate",
+							Image:           hookImage,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Command: []string{"python3", "-c", fmt.Sprintf(
+								`import urllib.request, time, sys
+url = "http://%s:80/v1/.well-known/ready"
+for i in range(120):
+    try:
+        r = urllib.request.urlopen(url, timeout=5)
+        if r.status == 200:
+            print("weaviate ready"); sys.exit(0)
+    except Exception as e:
+        print(f"attempt {i+1}/120: {e}")
+    time.sleep(5)
+print("timed out waiting for weaviate"); sys.exit(1)`,
+								ai.Spec.VectorDbUrl,
+							)},
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:            "vector-db-setup-container",

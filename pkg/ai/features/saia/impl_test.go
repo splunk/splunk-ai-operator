@@ -270,6 +270,20 @@ func Test_reconcilePostInstallHook_SetsGRPCEnvForV2DataLoader(t *testing.T) {
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "test-vector-db-setup-posthook", Namespace: "default"}, job))
 
+	// BackoffLimit must be 1 to avoid error-pod churn.
+	require.NotNil(t, job.Spec.BackoffLimit)
+	assert.Equal(t, int32(1), *job.Spec.BackoffLimit)
+
+	// InitContainer must poll Weaviate readiness before the main container runs.
+	require.Len(t, job.Spec.Template.Spec.InitContainers, 1)
+	initC := job.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, "wait-for-weaviate", initC.Name)
+	assert.Equal(t, "dummy-hook-image:latest", initC.Image)
+	require.NotEmpty(t, initC.Command)
+	assert.Equal(t, "python3", initC.Command[0])
+	assert.Contains(t, initC.Command[2], "weaviate.ai-platform.svc.cluster.local")
+	assert.Contains(t, initC.Command[2], "/v1/.well-known/ready")
+
 	// Collect env var names/values.
 	envMap := envToMap(job.Spec.Template.Spec.Containers[0].Env)
 
