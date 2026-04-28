@@ -32,12 +32,26 @@ nodes:
       - 3.15.20.136                       # CHANGE THIS: GPU worker 2
 
 # ---------- Storage Configuration ----------
+# Prerequisites (must be provisioned BEFORE running the installer):
+#   - /var/lib/k0s must have at least 500 GB free on GPU workers
+#   - /var/lib/k0s must have at least 200 GB free on CPU workers
+#   - /var/lib/k0s must have at least 100 GB free on controllers
+#   If using a dedicated disk, mount it at /var/lib/k0s before running this script.
+#
 # Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).
 # Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
 storage:
   s3Bucket: "ai-platform-bucket-minio-us-east-2"  # Used when objectStore.type is aws
   storageClass: "local-path"                 # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
+
+  # Minimum available disk space (GB) on /var/lib/k0s per node role.
+  # The installer checks these thresholds at preflight and fails if not met.
+  # Override to lower values only if you know your workload footprint is smaller.
+  # minimumDiskSpace:
+  #   controller: 100    # k0s control plane, kine/etcd, container images
+  #   cpuWorker: 200     # weaviate, saia-api, data-loader, fluent-bit
+  #   gpuWorker: 500     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
 
   objectStore:
     # 2026-04-21: switched from seaweedfs to minio because SeaweedFS returns
