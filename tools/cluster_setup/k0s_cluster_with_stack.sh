@@ -4,10 +4,8 @@ set -euo pipefail
 # =============================================================================
 # k0s Cluster Setup Script for Splunk AI Platform
 # =============================================================================
-# Mirrors eks_cluster_with_stack.sh functionality but for k0s clusters
-# Supports:
-#   1. On-prem/baremetal: Use customer-provided IP addresses
-#   2. AWS EC2: Automatically create EC2 instances for testing
+# Deploys a k0s cluster on customer-provided (on-prem / baremetal) nodes.
+# Requires existingIPs in the config YAML (controller + worker IPs).
 # =============================================================================
 
 # --- AWS credentials handling ---
@@ -110,18 +108,14 @@ load_config() {
   SSH_USER=$(yq eval '.cluster.sshUser' "${CONFIG_FILE}" 2>/dev/null || echo "ubuntu")
   SSH_KEY_PATH=$(yq eval '.cluster.sshKeyPath' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
-  # EC2 configuration (if creating instances)
-  VPC_ID=$(yq eval '.ec2.vpcId' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  SUBNET_ID=$(yq eval '.ec2.subnetId' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  KEY_NAME=$(yq eval '.ec2.keyName' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  # Validate existingIPs are provided (mandatory for on-prem)
+  if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
+    err "nodes.existingIPs.controllers must be set in config YAML — this script requires pre-provisioned nodes"
+  fi
 
   CONTROLLER_COUNT=$(yq eval '.nodes.controllers' "${CONFIG_FILE}" 2>/dev/null || echo "1")
   CPU_WORKER_COUNT=$(yq eval '.nodes.cpuWorkers' "${CONFIG_FILE}" 2>/dev/null || echo "2")
   GPU_WORKER_COUNT=$(yq eval '.nodes.gpuWorkers' "${CONFIG_FILE}" 2>/dev/null || echo "1")
-
-  CONTROLLER_INSTANCE_TYPE=$(yq eval '.instanceTypes.controller' "${CONFIG_FILE}" 2>/dev/null || echo "t3.xlarge")
-  CPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.cpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "m5.4xlarge")
-  GPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.gpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "g5.2xlarge")
 
   # Storage configuration
   STORAGE_CLASS=$(yq eval '.storage.storageClass // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
@@ -178,11 +172,6 @@ load_config() {
   # ECR configuration (for private image repositories)
   ECR_ACCOUNT=$(yq eval '.ecr.account' "${CONFIG_FILE}" 2>/dev/null || echo "")
   ECR_REGION=$(yq eval '.ecr.region // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-
-  # Get AWS account if using EC2
-  if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-  fi
 
   # Auto-detect ECR account from AWS if not specified
   if [[ -z "${ECR_ACCOUNT}" ]] && aws sts get-caller-identity &>/dev/null; then
@@ -432,22 +421,10 @@ preflight_checks() {
   fi
 
   pf_header "Infrastructure mode"
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    pf_ok "Using existing infrastructure (on-prem/baremetal)"
-    pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
-    pf_ok "Worker IPs: ${EXISTING_WORKER_IPS}"
-    [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]] && pf_ok "SSH key: ${SSH_KEY_PATH}" || pf_fail "SSH key not found: ${SSH_KEY_PATH}"
-  else
-    pf_ok "Creating EC2 instances"
-    if command -v aws >/dev/null 2>&1; then
-      pf_ok "AWS CLI found"
-      [[ -n "${ACCOUNT_ID}" ]] && pf_ok "AWS Account: ${ACCOUNT_ID}" || pf_fail "Cannot get AWS account ID"
-      [[ -n "${VPC_ID}" ]] && pf_ok "VPC ID: ${VPC_ID}" || pf_fail "VPC ID not set"
-      [[ -n "${KEY_NAME}" ]] && pf_ok "EC2 Key name: ${KEY_NAME}" || pf_fail "EC2 key name not set"
-    else
-      pf_fail "AWS CLI not found - required for EC2 instance creation"
-    fi
-  fi
+  pf_ok "Using existing infrastructure (on-prem/baremetal)"
+  pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
+  pf_ok "Worker IPs: ${EXISTING_WORKER_IPS}"
+  [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]] && pf_ok "SSH key: ${SSH_KEY_PATH}" || pf_fail "SSH key not found: ${SSH_KEY_PATH}"
 
   pf_summary
 }
@@ -475,295 +452,6 @@ scp_file() {
   else
     scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${file}" "${SSH_USER}@${host}:${dest}"
   fi
-}
-
-# ====== EC2 INSTANCE CREATION ======
-create_security_group() {
-  log "Creating security group for k0s cluster..."
-
-  local sg_name="${CLUSTER_NAME}-k0s-sg"
-  local sg_id
-
-  sg_id=$(aws ec2 describe-security-groups \
-    --region "${REGION}" \
-    --filters "Name=group-name,Values=${sg_name}" "Name=vpc-id,Values=${VPC_ID}" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
-
-  if [[ "${sg_id}" != "None" && -n "${sg_id}" ]]; then
-    log "Security group already exists: ${sg_id}"
-    echo "${sg_id}"
-    return 0
-  fi
-
-  sg_id=$(aws ec2 create-security-group \
-    --region "${REGION}" \
-    --group-name "${sg_name}" \
-    --description "Security group for ${CLUSTER_NAME} k0s cluster" \
-    --vpc-id "${VPC_ID}" \
-    --query 'GroupId' --output text)
-
-  # Tag the security group
-  aws ec2 create-tags --region "${REGION}" --resources "${sg_id}" \
-    --tags "Key=Cluster,Value=${CLUSTER_NAME}" "Key=ManagedBy,Value=k0s-script" "Key=Name,Value=${sg_name}"
-
-  log "Created security group: ${sg_id}"
-
-  # Add ingress rules (redirect output to avoid pollution)
-  log "Configuring security group rules (restricted to your IP)..."
-
-  # Detect current public IP address
-  MY_IP="${ALLOWED_CIDR:-}"
-  if [[ -z "$MY_IP" ]]; then
-    log "Auto-detecting your public IP address..."
-    MY_IP=$(curl -s https://checkip.amazonaws.com || curl -s https://ipinfo.io/ip || curl -s https://api.ipify.org)
-    if [[ -z "$MY_IP" ]]; then
-      warn "Could not auto-detect IP. Set ALLOWED_CIDR environment variable."
-      warn "Example: export ALLOWED_CIDR=\"1.2.3.4/32\""
-      err "Failed to determine your IP address"
-    fi
-    # Add /32 for single IP
-    MY_IP="${MY_IP}/32"
-    log "  Detected IP: ${MY_IP}"
-  else
-    log "  Using provided CIDR: ${MY_IP}"
-  fi
-
-  # === EXTERNAL ACCESS (restricted to your IP) ===
-  # API server - allow ONLY from your IP for kubectl access
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 6443 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Port 6443 (Kubernetes API): RESTRICTED to ${MY_IP}"
-
-  # SSH - allow ONLY from your IP for management
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 22 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Port 22 (SSH): RESTRICTED to ${MY_IP}"
-
-  # NodePort services - allow ONLY from your IP for accessing deployed services
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 30000-32767 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Ports 30000-32767 (NodePort): RESTRICTED to ${MY_IP}"
-
-  # Konnectivity agent port - allow ONLY from your IP
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 8132 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Port 8132 (Konnectivity): RESTRICTED to ${MY_IP}"
-
-  # === INTERNAL CLUSTER COMMUNICATION (within security group only) ===
-  # All internal traffic - etcd (2380), kubelet (10250), CNI, pod networking, etc.
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol -1 --source-group "${sg_id}" >/dev/null 2>&1 || true
-  log "  ✓ All ports: INTERNAL ONLY - for cluster communication via private IPs"
-
-  log "Security group rules configured"
-  echo "${sg_id}"
-}
-
-find_existing_instances() {
-  local role="$1"
-  aws ec2 describe-instances \
-    --region "${REGION}" \
-    --filters \
-      "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-      "Name=tag:Role,Values=${role}" \
-      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
-    --query 'Reservations[].Instances[].InstanceId' \
-    --output text
-}
-
-create_ec2_instances() {
-  log "Creating EC2 instances for k0s cluster..."
-
-  # Check for existing instances
-  local existing_controllers existing_cpu_workers existing_gpu_workers
-  existing_controllers=$(find_existing_instances "controller")
-  existing_cpu_workers=$(find_existing_instances "cpu-worker")
-  existing_gpu_workers=$(find_existing_instances "gpu-worker")
-
-  local existing_controller_count=$(echo "${existing_controllers}" | wc -w)
-  local existing_cpu_worker_count=$(echo "${existing_cpu_workers}" | wc -w)
-  local existing_gpu_worker_count=$(echo "${existing_gpu_workers}" | wc -w)
-
-  log "Found existing instances: ${existing_controller_count} controllers, ${existing_cpu_worker_count} CPU workers, ${existing_gpu_worker_count} GPU workers"
-
-  local sg_id
-  sg_id=$(create_security_group)
-
-  # Get subnet if not provided
-  if [[ -z "${SUBNET_ID}" ]]; then
-    SUBNET_ID=$(aws ec2 describe-subnets \
-      --region "${REGION}" \
-      --filters "Name=vpc-id,Values=${VPC_ID}" \
-      --query 'Subnets[0].SubnetId' --output text)
-  fi
-
-  [[ -n "${SUBNET_ID}" && "${SUBNET_ID}" != "None" ]] || err "No subnets found in VPC ${VPC_ID}"
-
-  # Get latest Ubuntu 22.04 AMI
-  local ami_id
-  ami_id=$(aws ec2 describe-images \
-    --region "${REGION}" \
-    --owners 099720109477 \
-    --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
-    --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
-
-  log "Using AMI: ${ami_id}"
-
-  # User data for k0s installation - write to temp file
-  local user_data_file="/tmp/k0s-userdata-$$.sh"
-  cat > "${user_data_file}" <<'EOF'
-#!/bin/bash
-set -ex
-apt-get update
-apt-get install -y curl wget jq
-curl -sSLf https://get.k0s.sh | sh
-EOF
-  TMP_FILES+=("${user_data_file}")
-
-  # Create instances (arrays already declared globally at top of script)
-  CONTROLLER_IPS=()
-  WORKER_IPS=()
-  ALL_INSTANCE_IDS=()
-
-  # Add existing instances to tracking arrays
-  if [[ -n "${existing_controllers}" ]]; then
-    for id in ${existing_controllers}; do
-      ALL_INSTANCE_IDS+=("${id}")
-    done
-  fi
-  if [[ -n "${existing_cpu_workers}" ]]; then
-    for id in ${existing_cpu_workers}; do
-      ALL_INSTANCE_IDS+=("${id}")
-    done
-  fi
-  if [[ -n "${existing_gpu_workers}" ]]; then
-    for id in ${existing_gpu_workers}; do
-      ALL_INSTANCE_IDS+=("${id}")
-    done
-  fi
-
-  # Controllers - only create if needed
-  local controllers_to_create=$((CONTROLLER_COUNT - existing_controller_count))
-  if [[ ${controllers_to_create} -gt 0 ]]; then
-    log "Creating ${controllers_to_create} additional controller(s)..."
-    for ((i=existing_controller_count; i<CONTROLLER_COUNT; i++)); do
-      local instance_id
-      instance_id=$(aws ec2 run-instances \
-        --region "${REGION}" \
-        --image-id "${ami_id}" \
-        --instance-type "${CONTROLLER_INSTANCE_TYPE}" \
-        --key-name "${KEY_NAME}" \
-        --security-group-ids "${sg_id}" \
-        --subnet-id "${SUBNET_ID}" \
-        --associate-public-ip-address \
-        --user-data "file://${user_data_file}" \
-        --tag-specifications \
-          "ResourceType=instance,Tags=[{Key=Name,Value=${CLUSTER_NAME}-controller-${i}},{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=controller},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=volume,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=controller},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=network-interface,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=controller},{Key=ManagedBy,Value=k0s-script}]" \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
-        --query 'Instances[0].InstanceId' \
-        --output text)
-
-      ALL_INSTANCE_IDS+=("${instance_id}")
-      log "Created controller: ${instance_id}"
-    done
-  else
-    log "All ${CONTROLLER_COUNT} controller(s) already exist, skipping creation"
-  fi
-
-  # CPU Workers - only create if needed
-  local cpu_workers_to_create=$((CPU_WORKER_COUNT - existing_cpu_worker_count))
-  if [[ ${cpu_workers_to_create} -gt 0 ]]; then
-    log "Creating ${cpu_workers_to_create} additional CPU worker(s)..."
-    for ((i=existing_cpu_worker_count; i<CPU_WORKER_COUNT; i++)); do
-      local instance_id
-      instance_id=$(aws ec2 run-instances \
-        --region "${REGION}" \
-        --image-id "${ami_id}" \
-        --instance-type "${CPU_WORKER_INSTANCE_TYPE}" \
-        --key-name "${KEY_NAME}" \
-        --security-group-ids "${sg_id}" \
-        --subnet-id "${SUBNET_ID}" \
-        --associate-public-ip-address \
-        --user-data "file://${user_data_file}" \
-        --tag-specifications \
-          "ResourceType=instance,Tags=[{Key=Name,Value=${CLUSTER_NAME}-cpu-worker-${i}},{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=cpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=volume,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=cpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=network-interface,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=cpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
-        --query 'Instances[0].InstanceId' \
-        --output text)
-
-      ALL_INSTANCE_IDS+=("${instance_id}")
-      log "Created CPU worker: ${instance_id}"
-    done
-  else
-    log "All ${CPU_WORKER_COUNT} CPU worker(s) already exist, skipping creation"
-  fi
-
-  # GPU Workers - only create if needed
-  if [[ ${GPU_WORKER_COUNT} -gt 0 ]]; then
-    local gpu_workers_to_create=$((GPU_WORKER_COUNT - existing_gpu_worker_count))
-    if [[ ${gpu_workers_to_create} -gt 0 ]]; then
-      log "Creating ${gpu_workers_to_create} additional GPU worker(s)..."
-      for ((i=existing_gpu_worker_count; i<GPU_WORKER_COUNT; i++)); do
-        local instance_id
-        instance_id=$(aws ec2 run-instances \
-          --region "${REGION}" \
-          --image-id "${ami_id}" \
-          --instance-type "${GPU_WORKER_INSTANCE_TYPE}" \
-          --key-name "${KEY_NAME}" \
-          --security-group-ids "${sg_id}" \
-          --subnet-id "${SUBNET_ID}" \
-          --associate-public-ip-address \
-          --user-data "file://${user_data_file}" \
-          --tag-specifications \
-            "ResourceType=instance,Tags=[{Key=Name,Value=${CLUSTER_NAME}-gpu-worker-${i}},{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=gpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-            "ResourceType=volume,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=gpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-            "ResourceType=network-interface,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=gpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-          --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":300,"VolumeType":"gp3"}}]' \
-          --query 'Instances[0].InstanceId' \
-          --output text)
-
-        ALL_INSTANCE_IDS+=("${instance_id}")
-        log "Created GPU worker: ${instance_id}"
-      done
-    else
-      log "All ${GPU_WORKER_COUNT} GPU worker(s) already exist, skipping creation"
-    fi
-  fi
-
-  log "Waiting for instances to be running..."
-  aws ec2 wait instance-running --region "${REGION}" --instance-ids "${ALL_INSTANCE_IDS[@]}"
-
-  log "Waiting for instance status checks (this may take 3-5 minutes)..."
-  aws ec2 wait instance-status-ok --region "${REGION}" --instance-ids "${ALL_INSTANCE_IDS[@]}" || true
-
-  log "Waiting additional time for SSH to be fully ready..."
-  sleep 60
-
-  # Get public IPs for all instances
-  for id in "${ALL_INSTANCE_IDS[@]}"; do
-    local role
-    role=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
-      --query 'Reservations[0].Instances[0].Tags[?Key==`Role`].Value' --output text)
-
-    local public_ip
-    public_ip=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
-      --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-
-    if [[ "${role}" == "controller" ]]; then
-      CONTROLLER_IPS+=("${public_ip}")
-      log "Controller - Public IP: ${public_ip}"
-    else
-      WORKER_IPS+=("${public_ip}")
-      log "Worker - Public IP: ${public_ip} (${role})"
-    fi
-  done
-
-  # Set SSH key path from EC2 key
-  SSH_KEY_PATH="${HOME}/.ssh/${KEY_NAME}.pem"
 }
 
 # ====== PREPARE NODES (RHEL/Fedora compatibility + k0s binary) ======
@@ -4148,19 +3836,9 @@ main_install() {
   if [[ "${use_existing_cluster}" == "false" ]]; then
     log "No existing cluster found, starting k0s cluster installation..."
 
-    # Setup infrastructure
-    if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-      log "Using existing infrastructure..."
-    else
-      log "Creating EC2 instances..."
-      create_ec2_instances
-    fi
-
-    # After getting IPs (from config or EC2), check if k0s is already installed
-    # Parse IPs if from config
-    if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-      IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
-    fi
+    # Parse IPs from config
+    log "Using existing infrastructure..."
+    IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
 
     # Check if k0s is already running on the controller node
     if [[ "${#CONTROLLER_IPS[@]}" -gt 0 ]]; then
@@ -4169,7 +3847,7 @@ main_install() {
 
       if ssh_exec "${controller_ip}" "command -v k0s >/dev/null 2>&1 && sudo k0s status >/dev/null 2>&1"; then
         log "============================================"
-        log "✓ k0s cluster already running on EC2 instances!"
+        log "✓ k0s cluster already running on existing nodes!"
         log "============================================"
         log "Retrieving kubeconfig from existing k0s cluster..."
         mkdir -p "${HOME}/.kube"
@@ -4235,208 +3913,38 @@ main_delete() {
   log "Starting cleanup of k0s cluster: ${CLUSTER_NAME}"
   log "============================================"
 
-  # For EC2 mode: Just delete AWS resources (instances, security groups)
-  # Kubernetes resources will be destroyed when instances are terminated
-  # This is much faster and avoids stuck namespace deletion issues
+  # Graceful Kubernetes cleanup, then stop k0s on all nodes
+  log "Performing graceful Kubernetes cleanup..."
 
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    # On-prem mode: Need to clean Kubernetes resources gracefully
-    log "On-prem mode detected - performing graceful Kubernetes cleanup..."
+  export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
 
-    export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
-
-    if [[ -f "${KUBECONFIG}" ]] && timeout 10 kubectl cluster-info &>/dev/null; then
-      log "Deleting Kubernetes resources..."
-      kubectl delete aiplatform --all -n "${AI_NS}" --timeout=60s || true
-      kubectl delete namespace "${AI_NS}" --timeout=120s || true
-      kubectl delete namespace splunk-ai-operator-system --timeout=60s || true
-      kubectl delete namespace monitoring --timeout=60s || true
-    fi
-    # On-prem: Stop k0s on existing infrastructure
-    IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
-    IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
-
-    log "Stopping k0s on controller nodes..."
-    for ip in "${CONTROLLER_IPS[@]}"; do
-      log "  Stopping k0s on controller: ${ip}..."
-      ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
-    done
-
-    log "Stopping k0s on worker nodes..."
-    for ip in "${WORKER_IPS[@]}"; do
-      log "  Stopping k0s on worker: ${ip}..."
-      ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
-    done
-
-    log "k0s stopped on all on-prem nodes"
-    log "NOTE: Node machines are still running. To clean up completely:"
-    log "  - Remove k0s binaries: sudo rm -f /usr/local/bin/k0s"
-    log "  - Clean up data: sudo rm -rf /var/lib/k0s /etc/k0s"
-
-  else
-    # EC2: Terminate instances
-    log "============================================"
-    log "Scanning for resources to delete..."
-    log "============================================"
-
-    # First, preview what will be deleted
-    local instance_ids instance_count=0
-    instance_ids=$(aws ec2 describe-instances \
-      --region "${REGION}" \
-      --filters \
-        "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-        "Name=instance-state-name,Values=running,stopped,stopping" \
-      --query 'Reservations[].Instances[].InstanceId' --output text)
-
-    if [[ -n "${instance_ids}" ]]; then
-      instance_count=$(echo "${instance_ids}" | wc -w)
-      log "EC2 Instances to terminate: ${instance_count}"
-      # Show instance details
-      aws ec2 describe-instances --region "${REGION}" --instance-ids ${instance_ids} \
-        --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`].Value|[0],InstanceType,State.Name]' \
-        --output table 2>/dev/null || echo "  ${instance_ids}"
-    else
-      log "EC2 Instances: None found"
-    fi
-
-    # Check other resources
-    local enis=$(aws ec2 describe-network-interfaces --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'NetworkInterfaces[?Status==`available`].NetworkInterfaceId' --output text 2>/dev/null || echo "")
-    local eni_count=$(echo "${enis}" | wc -w)
-    log "Network Interfaces: ${eni_count:-0}"
-
-    local sg_id=$(aws ec2 describe-security-groups --region "${REGION}" \
-      --filters "Name=group-name,Values=${CLUSTER_NAME}-k0s-sg" "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
-    if [[ -n "${sg_id}" && "${sg_id}" != "None" ]]; then
-      log "Security Groups: 1 (${sg_id})"
-    else
-      log "Security Groups: 0"
-    fi
-
-    local volumes=$(aws ec2 describe-volumes --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" "Name=tag:ManagedBy,Values=k0s-script" "Name=status,Values=available" \
-      --query 'Volumes[].VolumeId' --output text 2>/dev/null || echo "")
-    local vol_count=$(echo "${volumes}" | wc -w)
-    log "EBS Volumes: ${vol_count:-0}"
-
-    log ""
-    log "All resources are tagged with:"
-    log "  - Cluster: ${CLUSTER_NAME}"
-    log "  - ManagedBy: k0s-script"
-    log ""
-
-    # Confirmation prompt (skip if AUTO_APPROVE is set)
-    if [[ "${AUTO_APPROVE:-false}" != "true" ]]; then
-      warn "This will permanently delete the above AWS resources!"
-      read -p "Type 'yes' to confirm deletion: " -r
-      if [[ ! $REPLY =~ ^[Yy]es$ ]]; then
-        log "Deletion cancelled by user"
-        exit 0
-      fi
-    fi
-
-    log ""
-    log "============================================"
-    log "Starting resource deletion..."
-    log "============================================"
-    log ""
-
-    # Now proceed with deletion
-    if [[ -n "${instance_ids}" ]]; then
-      log "Terminating ${instance_count} EC2 instance(s)..."
-      aws ec2 terminate-instances --region "${REGION}" --instance-ids ${instance_ids}
-
-      log "Waiting for instances to terminate..."
-      aws ec2 wait instance-terminated --region "${REGION}" --instance-ids ${instance_ids} || warn "Timeout waiting for instances to terminate"
-
-      log "EC2 instances terminated successfully"
-    else
-      log "No EC2 instances to terminate"
-    fi
-
-    # Clean up network interfaces that may be stuck
-    log "Checking for orphaned network interfaces..."
-    local enis eni_count=0
-    enis=$(aws ec2 describe-network-interfaces \
-      --region "${REGION}" \
-      --filters \
-        "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'NetworkInterfaces[?Status==`available`].NetworkInterfaceId' --output text 2>/dev/null || echo "")
-
-    if [[ -n "${enis}" ]]; then
-      eni_count=$(echo "${enis}" | wc -w)
-      log "Found ${eni_count} orphaned network interface(s), deleting..."
-      for eni in ${enis}; do
-        log "  Deleting network interface: ${eni}"
-        aws ec2 delete-network-interface --region "${REGION}" --network-interface-id "${eni}" 2>/dev/null || warn "Could not delete ENI ${eni}"
-      done
-    else
-      log "No orphaned network interfaces found"
-    fi
-
-    # Delete security group (with retries for ENI detachment)
-    log "Deleting security group..."
-    local sg_id sg_deleted=false
-    sg_id=$(aws ec2 describe-security-groups \
-      --region "${REGION}" \
-      --filters \
-        "Name=group-name,Values=${CLUSTER_NAME}-k0s-sg" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
-
-    if [[ -n "${sg_id}" && "${sg_id}" != "None" ]]; then
-      log "Found security group: ${sg_id}"
-
-      # Try multiple times with increasing wait periods
-      for attempt in 1 2 3 4 5; do
-        log "  Attempt ${attempt}/5 to delete security group..."
-        if aws ec2 delete-security-group --region "${REGION}" --group-id "${sg_id}" 2>/dev/null; then
-          log "Security group deleted successfully"
-          sg_deleted=true
-          break
-        else
-          if [[ ${attempt} -lt 5 ]]; then
-            local wait_time=$((attempt * 15))
-            log "  Security group still has dependencies, waiting ${wait_time}s for ENIs to detach..."
-            sleep ${wait_time}
-          fi
-        fi
-      done
-
-      if [[ "${sg_deleted}" == "false" ]]; then
-        warn "Could not delete security group after 5 attempts (may have dependencies)"
-        warn "AWS will auto-clean it when dependencies are removed"
-      fi
-    else
-      log "Security group not found or already deleted"
-    fi
-
-    # Delete any EBS volumes that were created
-    log "Checking for orphaned EBS volumes..."
-    local volumes vol_count=0
-    volumes=$(aws ec2 describe-volumes \
-      --region "${REGION}" \
-      --filters \
-        "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-        "Name=status,Values=available" \
-      --query 'Volumes[].VolumeId' --output text)
-
-    if [[ -n "${volumes}" ]]; then
-      vol_count=$(echo "${volumes}" | wc -w)
-      log "Found ${vol_count} orphaned EBS volume(s), deleting..."
-      for vol in ${volumes}; do
-        log "  Deleting volume: ${vol}"
-        aws ec2 delete-volume --region "${REGION}" --volume-id "${vol}" && log "    Volume ${vol} deleted" || warn "    Could not delete volume ${vol}"
-      done
-    else
-      log "No orphaned EBS volumes found"
-    fi
+  if [[ -f "${KUBECONFIG}" ]] && timeout 10 kubectl cluster-info &>/dev/null; then
+    log "Deleting Kubernetes resources..."
+    kubectl delete aiplatform --all -n "${AI_NS}" --timeout=60s || true
+    kubectl delete namespace "${AI_NS}" --timeout=120s || true
+    kubectl delete namespace splunk-ai-operator-system --timeout=60s || true
+    kubectl delete namespace monitoring --timeout=60s || true
   fi
+
+  IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
+  IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+
+  log "Stopping k0s on controller nodes..."
+  for ip in "${CONTROLLER_IPS[@]}"; do
+    log "  Stopping k0s on controller: ${ip}..."
+    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
+  done
+
+  log "Stopping k0s on worker nodes..."
+  for ip in "${WORKER_IPS[@]}"; do
+    log "  Stopping k0s on worker: ${ip}..."
+    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
+  done
+
+  log "k0s stopped on all nodes"
+  log "NOTE: Node machines are still running. To clean up completely:"
+  log "  - Remove k0s binaries: sudo rm -f /usr/local/bin/k0s"
+  log "  - Clean up data: sudo rm -rf /var/lib/k0s /etc/k0s"
 
   # Clean up local files
   log "Cleaning up local files..."
@@ -4453,17 +3961,9 @@ main_delete() {
   log "Cleanup Summary"
   log "============================================"
 
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    log "Infrastructure: On-premises"
-    log "  - k0s stopped and reset on all nodes"
-    log "  - NOTE: Nodes are still running, k0s binaries remain"
-  else
-    log "Infrastructure: AWS EC2"
-    log "  - EC2 Instances: ${instance_count:-0} terminated"
-    log "  - Network Interfaces: ${eni_count:-0} cleaned up"
-    log "  - Security Groups: $([ "${sg_deleted}" == "true" ] && echo "1 deleted" || echo "pending cleanup")"
-    log "  - EBS Volumes: ${vol_count:-0} deleted"
-  fi
+  log "Infrastructure: On-premises"
+  log "  - k0s stopped and reset on all nodes"
+  log "  - NOTE: Nodes are still running, k0s binaries remain"
 
   log ""
   log "Kubernetes Resources:"
@@ -4483,21 +3983,11 @@ main_delete() {
   log ""
   log "Cluster '${CLUSTER_NAME}' has been deleted."
 
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    log ""
-    log "On-prem nodes are still running with k0s stopped."
-    log "To fully clean up each node, run:"
-    log "  sudo rm -f /usr/local/bin/k0s"
-    log "  sudo rm -rf /var/lib/k0s /etc/k0s"
-  else
-    # Check if any resources failed to delete
-    if [[ "${sg_deleted}" == "false" ]]; then
-      log ""
-      warn "Some resources may require manual cleanup:"
-      warn "  - Security group ${sg_id} may have lingering dependencies"
-      warn "  - Check AWS console for any remaining resources tagged with Cluster=${CLUSTER_NAME}"
-    fi
-  fi
+  log ""
+  log "Nodes are still running with k0s stopped."
+  log "To fully clean up each node, run:"
+  log "  sudo rm -f /usr/local/bin/k0s"
+  log "  sudo rm -rf /var/lib/k0s /etc/k0s"
 }
 
 # ====== CLEAN ALL (AGGRESSIVE CLEANUP) ======
@@ -4545,36 +4035,34 @@ usage() {
   cat <<EOF
 Usage: $0 [install|delete|clean-all|join-workers]
 
-Deploys Splunk AI Platform on k0s cluster (on-prem or EC2)
+Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
+Requires nodes.existingIPs in the config YAML.
 
 Commands:
   install       - Install k0s cluster and AI Platform stack
   join-workers  - Join/rejoin worker nodes to existing cluster (resume after failure)
   delete        - Delete cluster and all resources (graceful)
-  clean-all     - Aggressive cleanup including node-level cleanup (on-prem)
+  clean-all     - Aggressive cleanup including node-level cleanup
 
 Environment:
   CONFIG_FILE  - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
   AUTO_APPROVE - Skip confirmation prompt for delete (default: false)
 
 Examples:
-  # On-prem with existing IPs
-  CONFIG_FILE=./on-prem-config.yaml $0 install
-
-  # EC2 simulation
-  CONFIG_FILE=./ec2-config.yaml $0 install
+  # Install with existing IPs
+  CONFIG_FILE=./my-config.yaml $0 install
 
   # Join worker nodes (if install failed or was interrupted)
-  CONFIG_FILE=./ec2-config.yaml $0 join-workers
+  CONFIG_FILE=./my-config.yaml $0 join-workers
 
   # Delete cluster (with confirmation prompt)
-  CONFIG_FILE=./config.yaml $0 delete
+  CONFIG_FILE=./my-config.yaml $0 delete
 
   # Delete cluster (auto-approve, no prompt)
-  AUTO_APPROVE=true CONFIG_FILE=./config.yaml $0 delete
+  AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml $0 delete
 
-  # Deep cleanup (aggressive, on-prem only)
-  CONFIG_FILE=./config.yaml $0 clean-all
+  # Deep cleanup (aggressive)
+  CONFIG_FILE=./my-config.yaml $0 clean-all
 
 Notes:
   - 'install' performs full cluster setup including worker joins
@@ -4584,19 +4072,14 @@ Notes:
     * Adding workers to existing cluster
     * Fixing missing node labels
   - 'delete' performs comprehensive cleanup:
-    * Shows preview of all resources to be deleted
-    * Requires confirmation (type 'yes') unless AUTO_APPROVE=true
-    * Only deletes resources tagged with ManagedBy=k0s-script
     * All Kubernetes resources (CRs, operators, namespaces)
-    * All AWS resources (EC2, ENIs, security groups, EBS volumes)
-    * Includes retry logic for ENI detachment
+    * Stops and resets k0s on all nodes
+    * Machines remain running but k0s is stopped and reset
     * Provides detailed cleanup summary
-  - 'clean-all' adds aggressive node-level cleanup (on-prem only):
+  - 'clean-all' adds aggressive node-level cleanup:
     * Removes k0s data directories (preserves k0s binary)
     * Cleans kubelet, CNI, and Calico files
     * Flushes iptables rules
-  - For EC2 mode, 'delete' terminates all instances and cleans AWS resources
-  - For on-prem mode, machines remain running but k0s is stopped and reset
   - All commands are idempotent and safe to run multiple times
 EOF
 }
@@ -4664,53 +4147,15 @@ join_workers() {
     err "Kubeconfig not found at ${KUBECONFIG}. Please run 'install' first."
   fi
 
-  # Get controller IP from existing cluster
+  # Get IPs from config
   log "Detecting cluster configuration..."
+  IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
+  IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
 
-  # Option 1: Get from EC2 instances
-  if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
-    log "Discovering EC2 instances for cluster: ${CLUSTER_NAME}..."
-
-    # Get controller IPs
-    local controller_ips
-    controller_ips=$(aws ec2 describe-instances --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-                "Name=tag:Role,Values=controller" \
-                "Name=instance-state-name,Values=running" \
-      --query 'Reservations[*].Instances[*].PublicIpAddress' \
-      --output text)
-
-    if [[ -z "${controller_ips}" ]]; then
-      err "No running controller instances found for cluster ${CLUSTER_NAME}"
-    fi
-
-    # Convert newlines and tabs to spaces, then split into array
-    controller_ips=$(echo "${controller_ips}" | tr '\n\t' ' ')
-    IFS=' ' read -ra CONTROLLER_IPS <<< "${controller_ips}"
-
-    # Get worker IPs
-    local worker_ips
-    worker_ips=$(aws ec2 describe-instances --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-                "Name=tag:Role,Values=cpu-worker,gpu-worker" \
-                "Name=instance-state-name,Values=running" \
-      --query 'Reservations[*].Instances[*].PublicIpAddress' \
-      --output text)
-
-    if [[ -z "${worker_ips}" ]]; then
-      warn "No worker instances found for cluster ${CLUSTER_NAME}"
-      log "Nothing to join, exiting."
-      return 0
-    fi
-
-    # Convert newlines and tabs to spaces, then split into array
-    worker_ips=$(echo "${worker_ips}" | tr '\n\t' ' ')
-    IFS=' ' read -ra WORKER_IPS <<< "${worker_ips}"
-    SSH_KEY_PATH="${HOME}/.ssh/${KEY_NAME}.pem"
-  else
-    # Option 2: Use existing IPs from config
-    IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
-    IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+  if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
+    warn "No worker IPs found in config"
+    log "Nothing to join, exiting."
+    return 0
   fi
 
   local controller_ip="${CONTROLLER_IPS[0]}"
