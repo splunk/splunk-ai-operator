@@ -313,6 +313,9 @@ aiPlatform:
 # Required when aiPlatform.serviceTemplate.type=LoadBalancer on a bare-metal
 # / k0s cluster. Pinned chart version for supply-chain reproducibility
 # (codeguard-0-supply-chain-security).
+#
+# If serviceTemplate.type=NodePort, the installer skips MetalLB entirely even
+# when metallb.install=true (NodePort does not use a LoadBalancer provider).
 metallb:
   install: true                    # set false if MetalLB is already installed or not needed
   chartVersion: "0.14.8"           # metallb/metallb Helm chart (matches MetalLB v0.14.8)

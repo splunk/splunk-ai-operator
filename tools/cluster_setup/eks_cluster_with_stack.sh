@@ -947,6 +947,11 @@ ${public_subnets}"
     fi
   else
     log "No subnets specified - eksctl will create new subnets automatically"
+    # One NAT gateway => one Elastic IP. HighlyAvailable uses one NAT per AZ
+    # (often 3 EIPs) and commonly trips the default regional EIP quota (5).
+    vpc_config="vpc:
+  nat:
+    gateway: Single"
   fi
 
   cat <<EOF > eks-cluster-config.yaml
@@ -956,6 +961,8 @@ metadata:
   name: ${CLUSTER_NAME}
   region: ${REGION}
   version: "${K8S_VERSION}"
+autoModeConfig:
+  enabled: false
 iam:
   withOIDC: true
 addons:
@@ -3343,7 +3350,18 @@ preflight_env() {
     fi
   fi
   if [[ $subnet_count -eq 0 ]]; then
-    pf_ok "No subnets specified - eksctl will create new VPC and subnets automatically"
+    pf_ok "No subnets specified - eksctl will create new VPC and subnets automatically (NAT mode: Single = 1 Elastic IP)"
+    pf_header "Elastic IP headroom (new VPC)"
+    local eip_cnt
+    eip_cnt="$(aws ec2 describe-addresses --region "${REGION}" --query 'length(Addresses)' --output text 2>/dev/null || true)"
+    if [[ -n "${eip_cnt}" && "${eip_cnt}" =~ ^[0-9]+$ ]]; then
+      pf_ok "Allocated Elastic IPs in ${REGION}: ${eip_cnt}"
+      if (( eip_cnt >= 5 )); then
+        pf_warn "Typical default EIP quota is 5 per region. At ${eip_cnt}+ addresses, NAT gateway EIP allocation may fail (you saw: maximum number of addresses). Release unused EIPs in EC2 → Elastic IPs or request a quota increase before create cluster."
+      fi
+    else
+      pf_warn "Could not list Elastic IPs (aws ec2 describe-addresses). If create fails on NAT/EIP, check quotas and unused addresses."
+    fi
   else
     local all_subnets=("${PRIVATE_SUBNETS[@]}" "${PUBLIC_SUBNETS[@]}")
     local vpc_id=""

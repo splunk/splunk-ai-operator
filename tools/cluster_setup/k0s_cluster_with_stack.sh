@@ -388,6 +388,17 @@ configure_images() {
   log "✓ All images configured successfully"
 }
 
+# True if objectStore.auth values are still obvious template text. Non-empty
+# placeholders otherwise pass the length preflight and get applied into
+# minio-credentials, which makes SAIA fail at startup with InvalidAccessKeyId.
+object_store_auth_looks_like_placeholder() {
+  case "${MINIO_ROOT_USER}${MINIO_ROOT_PASSWORD}" in
+    *\<*|*\>*) return 0 ;;
+    *CHANGEME*|*changeme*) return 0 ;;
+  esac
+  return 1
+}
+
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
@@ -423,6 +434,9 @@ preflight_checks() {
     [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
   fi
   [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required (objectStore.auth.rootPassword)"
+  if object_store_auth_looks_like_placeholder; then
+    pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with a real access key and secret in your config (keep secrets in a Git-ignored file such as tools/cluster_setup/k0s-config.local.yaml)."
+  fi
 
   pf_header "Infrastructure mode"
   pf_ok "Using existing infrastructure (on-prem/baremetal)"
@@ -1118,6 +1132,10 @@ ensure_namespace() {
 # the Kubernetes credentials secret so the operator and workloads can auth.
 ensure_s3compat_credentials() {
   log "Creating credentials secret for S3-compatible object storage (${OBJ_STORE_TYPE})..."
+  if object_store_auth_looks_like_placeholder; then
+    err "Refusing to create minio-credentials: objectStore.auth contains template placeholders; fix ${CONFIG_FILE}"
+    return 1
+  fi
   if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
     err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
     return 1
@@ -2637,15 +2655,23 @@ install_ai_platform_cr() {
 
   # Ensure object storage credentials secret exists in AI namespace
   log "Creating/updating S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
-  kubectl -n "${AI_NS}" create secret generic minio-credentials \
-    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-  log "✓ Object storage credentials secret ready"
+  if object_store_auth_looks_like_placeholder; then
+    if kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
+      warn "Skipping minio-credentials apply: auth in ${CONFIG_FILE} still looks like a template (e.g. contains '<'). Preserving existing secret."
+    else
+      err "minio-credentials missing and cannot be created: fix objectStore.auth in ${CONFIG_FILE} (remove <...> placeholders)."
+    fi
+  else
+    kubectl -n "${AI_NS}" create secret generic minio-credentials \
+      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    log "✓ Object storage credentials secret ready"
+  fi
 
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
@@ -2825,6 +2851,14 @@ saia_service_template_enabled_k0s() {
   [[ -n "${svc_type}" && "${svc_type}" != "null" && "${svc_type}" != "ClusterIP" ]]
 }
 
+# True when SAIA public Service is explicitly NodePort. MetalLB is not used in
+# that mode, so install_metallb skips the Helm install even if metallb.install=true.
+k0s_saia_service_template_is_nodeport() {
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${svc_type}" == "NodePort" ]]
+}
+
 wait_for_k0s_aiservice_exists() {
   local name="$1" timeout="${2:-600}" waited=0
   while ! kubectl -n "${AI_NS}" get aiservice "${name}" >/dev/null 2>&1; do
@@ -2869,6 +2903,12 @@ metallb_enabled_k0s() {
 
 install_metallb() {
   metallb_enabled_k0s || { log "metallb.install != true — skipping MetalLB install"; return 0; }
+
+  if k0s_saia_service_template_is_nodeport; then
+    log "Skipping MetalLB install: aiPlatform.serviceTemplate.type=NodePort (LoadBalancer provider not used for SAIA)."
+    log "NOTE: metallb.install=true has no effect while SAIA uses NodePort. Set metallb.install=false to match config, or use type=LoadBalancer to install MetalLB."
+    return 0
+  fi
 
   local ns chart_version pool_name addr_count mode
   ns="$(yq eval '.metallb.namespace // "metallb-system"' "${CONFIG_FILE}" 2>/dev/null)"
@@ -3018,7 +3058,7 @@ patch_k0s_saia_public_service_workaround() {
   if saia_service_template_enabled_k0s; then
     log "Patching AIService/${aiservice_name} with SAIA public exposure settings (type=${svc_type})..."
     if [[ "${svc_type}" == "NodePort" && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
-      log "WARNING: NodePort exposure is discouraged on k0s. Prefer type=LoadBalancer with metallb.install=true." >&2
+      log "WARNING: NodePort exposure is discouraged on k0s. Prefer type=LoadBalancer with metallb.install=true (MetalLB install is skipped automatically when type=NodePort)." >&2
       kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
   \"spec\": {
     \"serviceTemplate\": {
