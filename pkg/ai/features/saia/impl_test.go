@@ -116,8 +116,12 @@ func Test_validateAIService_defaults(t *testing.T) {
 	err := r.validateAIService(context.Background(), ai)
 	assert.NoError(t, err)
 	assert.Equal(t, int32(1), ai.Spec.Replicas)
-	assert.NotNil(t, ai.Spec.Resources.Requests)
-	assert.NotNil(t, ai.Spec.Resources.Limits)
+	assert.Equal(t, resource.MustParse("2"), ai.Spec.Resources.Requests[corev1.ResourceCPU])
+	assert.Equal(t, resource.MustParse("4Gi"), ai.Spec.Resources.Requests[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("10Gi"), ai.Spec.Resources.Requests[corev1.ResourceEphemeralStorage])
+	assert.Equal(t, resource.MustParse("2"), ai.Spec.Resources.Limits[corev1.ResourceCPU])
+	assert.Equal(t, resource.MustParse("4Gi"), ai.Spec.Resources.Limits[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("10Gi"), ai.Spec.Resources.Limits[corev1.ResourceEphemeralStorage])
 	// AIPlatformUrl is built as "<scheme>://<ray-svc>.<ns>.svc.<cluster-domain>:8000".
 	// When AIPlatformScheme is unset, the operator defaults to "http" (see
 	// validateAIService). This makes the URL usable directly by httpx/openai
@@ -220,8 +224,14 @@ func newTestAIService() *aiv1.AIService {
 			V2Worker: aiv1.SAIAWorkerConfig{Replicas: 1},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    *mustParseQuantity("500m"),
-					corev1.ResourceMemory: *mustParseQuantity("2Gi"),
+					corev1.ResourceCPU:              *mustParseQuantity("2"),
+					corev1.ResourceMemory:           *mustParseQuantity("4Gi"),
+					corev1.ResourceEphemeralStorage: *mustParseQuantity("10Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:              *mustParseQuantity("2"),
+					corev1.ResourceMemory:           *mustParseQuantity("4Gi"),
+					corev1.ResourceEphemeralStorage: *mustParseQuantity("10Gi"),
 				},
 			},
 		},
@@ -259,6 +269,20 @@ func Test_reconcilePostInstallHook_SetsGRPCEnvForV2DataLoader(t *testing.T) {
 	job := &batchv1.Job{}
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "test-vector-db-setup-posthook", Namespace: "default"}, job))
+
+	// BackoffLimit must be 1 to avoid error-pod churn.
+	require.NotNil(t, job.Spec.BackoffLimit)
+	assert.Equal(t, int32(1), *job.Spec.BackoffLimit)
+
+	// InitContainer must poll Weaviate readiness before the main container runs.
+	require.Len(t, job.Spec.Template.Spec.InitContainers, 1)
+	initC := job.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, "wait-for-weaviate", initC.Name)
+	assert.Equal(t, "dummy-hook-image:latest", initC.Image)
+	require.NotEmpty(t, initC.Command)
+	assert.Equal(t, "python3", initC.Command[0])
+	assert.Contains(t, initC.Command[2], "weaviate.ai-platform.svc.cluster.local")
+	assert.Contains(t, initC.Command[2], "/v1/.well-known/ready")
 
 	// Collect env var names/values.
 	envMap := envToMap(job.Spec.Template.Spec.Containers[0].Env)
@@ -393,9 +417,9 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	envMap := envToMap(container.Env)
 	// RUN_TASKS_DELAY_S controls the v2 worker's poll sleep (saia-v2
 	// IngestionWorker.run). The value MUST stay well under the liveness probe
-	// threshold (120s) because the heartbeat file is only refreshed at the top
-	// of each iteration. 10s matches saia-v2's own Settings default.
-	assert.Equal(t, "10", envMap["RUN_TASKS_DELAY_S"])
+	// threshold (1200s) because the heartbeat file is only refreshed at the top
+	// of each iteration. 600s matches saia-v2's helm default.
+	assert.Equal(t, "600", envMap["RUN_TASKS_DELAY_S"])
 	// Heartbeat path must match saia-v2's default (app/core/config.py).
 	assert.Equal(t, "/tmp/ingestion_worker_heartbeat", envMap["WORKER_HEARTBEAT_PATH"])
 	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])

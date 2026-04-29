@@ -4,10 +4,8 @@ set -euo pipefail
 # =============================================================================
 # k0s Cluster Setup Script for Splunk AI Platform
 # =============================================================================
-# Mirrors eks_cluster_with_stack.sh functionality but for k0s clusters
-# Supports:
-#   1. On-prem/baremetal: Use customer-provided IP addresses
-#   2. AWS EC2: Automatically create EC2 instances for testing
+# Deploys a k0s cluster on customer-provided (on-prem / baremetal) nodes.
+# Requires existingIPs in the config YAML (controller + worker IPs).
 # =============================================================================
 
 # --- AWS credentials handling ---
@@ -28,6 +26,13 @@ export LANG=C LC_ALL=C
 
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
+
+# ====== SESSION LOG ======
+LOG_DIR="${LOG_DIR:-$(dirname "$0")/logs}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/k0s-install-$(date '+%Y-%m-%d_%H-%M-%S').log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "[LOG] Session log: ${LOG_FILE}"
 
 # ====== COLORS & LOGGING ======
 log()   { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
@@ -110,22 +115,28 @@ load_config() {
   SSH_USER=$(yq eval '.cluster.sshUser' "${CONFIG_FILE}" 2>/dev/null || echo "ubuntu")
   SSH_KEY_PATH=$(yq eval '.cluster.sshKeyPath' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
-  # EC2 configuration (if creating instances)
-  VPC_ID=$(yq eval '.ec2.vpcId' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  SUBNET_ID=$(yq eval '.ec2.subnetId' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  KEY_NAME=$(yq eval '.ec2.keyName' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  # Validate existingIPs are provided (mandatory for on-prem)
+  if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
+    err "nodes.existingIPs.controllers must be set in config YAML — this script requires pre-provisioned nodes"
+  fi
 
   CONTROLLER_COUNT=$(yq eval '.nodes.controllers' "${CONFIG_FILE}" 2>/dev/null || echo "1")
   CPU_WORKER_COUNT=$(yq eval '.nodes.cpuWorkers' "${CONFIG_FILE}" 2>/dev/null || echo "2")
   GPU_WORKER_COUNT=$(yq eval '.nodes.gpuWorkers' "${CONFIG_FILE}" 2>/dev/null || echo "1")
 
-  CONTROLLER_INSTANCE_TYPE=$(yq eval '.instanceTypes.controller' "${CONFIG_FILE}" 2>/dev/null || echo "t3.xlarge")
-  CPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.cpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "m5.4xlarge")
-  GPU_WORKER_INSTANCE_TYPE=$(yq eval '.instanceTypes.gpuWorker' "${CONFIG_FILE}" 2>/dev/null || echo "g5.2xlarge")
-
   # Storage configuration
   STORAGE_CLASS=$(yq eval '.storage.storageClass // "local-path"' "${CONFIG_FILE}" 2>/dev/null || echo "local-path")
   VECTORDB_SIZE=$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
+
+  # Minimum disk space thresholds (GB) for preflight validation.
+  # Customers must ensure /var/lib/k0s has at least this much space before install.
+  MIN_DISK_CONTROLLER=$(yq eval '.storage.minimumDiskSpace.controller // "100"' "${CONFIG_FILE}" 2>/dev/null || echo "100")
+  MIN_DISK_CPU_WORKER=$(yq eval '.storage.minimumDiskSpace.cpuWorker // "200"' "${CONFIG_FILE}" 2>/dev/null || echo "200")
+  MIN_DISK_GPU_WORKER=$(yq eval '.storage.minimumDiskSpace.gpuWorker // "500"' "${CONFIG_FILE}" 2>/dev/null || echo "500")
+  # Strip non-numeric suffixes (e.g. "30Gi" -> "30") so arithmetic comparisons work
+  MIN_DISK_CONTROLLER="${MIN_DISK_CONTROLLER//[!0-9]/}"
+  MIN_DISK_CPU_WORKER="${MIN_DISK_CPU_WORKER//[!0-9]/}"
+  MIN_DISK_GPU_WORKER="${MIN_DISK_GPU_WORKER//[!0-9]/}"
 
   # Object storage: objectStore.type (aws | s3compat | minio | seaweedfs); default minio when unset
   OBJ_STORE_TYPE="$(yq eval '.storage.objectStore.type // "minio"' "$CONFIG_FILE" 2>/dev/null || echo "minio")"
@@ -133,15 +144,10 @@ load_config() {
   OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   _obj_user="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "$CONFIG_FILE" 2>/dev/null || echo "minioadmin")"
   _obj_pw="$(yq eval '.storage.objectStore.auth.rootPassword // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
-  USE_EXTERNAL_OBJ_STORE="false"
-  case "${OBJ_STORE_TYPE}" in s3compat|minio|seaweedfs) USE_EXTERNAL_OBJ_STORE="true"; esac
   MINIO_ENDPOINT="${OBJ_STORE_ENDPOINT}"
   MINIO_BUCKET="${OBJ_STORE_BUCKET}"
   MINIO_ROOT_USER="${MINIO_ROOT_USER:-$_obj_user}"
   MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$_obj_pw}"
-
-  # Legacy compat: MINIO_NS for in-cluster MinIO (unused when external)
-  MINIO_NS="minio-system"
 
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
@@ -179,11 +185,6 @@ load_config() {
   ECR_ACCOUNT=$(yq eval '.ecr.account' "${CONFIG_FILE}" 2>/dev/null || echo "")
   ECR_REGION=$(yq eval '.ecr.region // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
-  # Get AWS account if using EC2
-  if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-  fi
-
   # Auto-detect ECR account from AWS if not specified
   if [[ -z "${ECR_ACCOUNT}" ]] && aws sts get-caller-identity &>/dev/null; then
     ECR_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
@@ -201,11 +202,7 @@ load_config() {
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "Object storage: external S3-compatible (${OBJ_STORE_TYPE}), endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
-  else
-    log "Object storage: AWS S3, bucket=${OBJ_STORE_BUCKET}"
-  fi
+  log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -414,40 +411,27 @@ preflight_checks() {
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
   [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "AI platform file: ${SPLUNK_AI_FILE}" || pf_warn "AI platform file not found: ${SPLUNK_AI_FILE}"
 
-  pf_header "Object storage"
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    pf_ok "Object storage: external S3-compatible (${OBJ_STORE_TYPE})"
-    if [[ "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
-      if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
-        pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
-      else
-        pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}"
-      fi
+  pf_header "Object storage (customer-managed)"
+  pf_ok "Object storage type: ${OBJ_STORE_TYPE} (bucket=${OBJ_STORE_BUCKET})"
+  if [[ "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+    if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
+      pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
     else
-      [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "External object store requires endpoint"
+      [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
     fi
-    [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required"
   else
-    pf_ok "Object storage: in-cluster MinIO or AWS S3 (bucket=${OBJ_STORE_BUCKET})"
+    [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
   fi
+  [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required (objectStore.auth.rootPassword)"
 
   pf_header "Infrastructure mode"
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    pf_ok "Using existing infrastructure (on-prem/baremetal)"
-    pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
-    pf_ok "Worker IPs: ${EXISTING_WORKER_IPS}"
-    [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]] && pf_ok "SSH key: ${SSH_KEY_PATH}" || pf_fail "SSH key not found: ${SSH_KEY_PATH}"
-  else
-    pf_ok "Creating EC2 instances"
-    if command -v aws >/dev/null 2>&1; then
-      pf_ok "AWS CLI found"
-      [[ -n "${ACCOUNT_ID}" ]] && pf_ok "AWS Account: ${ACCOUNT_ID}" || pf_fail "Cannot get AWS account ID"
-      [[ -n "${VPC_ID}" ]] && pf_ok "VPC ID: ${VPC_ID}" || pf_fail "VPC ID not set"
-      [[ -n "${KEY_NAME}" ]] && pf_ok "EC2 Key name: ${KEY_NAME}" || pf_fail "EC2 key name not set"
-    else
-      pf_fail "AWS CLI not found - required for EC2 instance creation"
-    fi
-  fi
+  pf_ok "Using existing infrastructure (on-prem/baremetal)"
+  pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
+  pf_ok "Worker IPs: ${EXISTING_WORKER_IPS}"
+  [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]] && pf_ok "SSH key: ${SSH_KEY_PATH}" || pf_fail "SSH key not found: ${SSH_KEY_PATH}"
+
+  # Validate disk space on every node (requires SSH access)
+  preflight_check_node_storage
 
   pf_summary
 }
@@ -475,295 +459,6 @@ scp_file() {
   else
     scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${file}" "${SSH_USER}@${host}:${dest}"
   fi
-}
-
-# ====== EC2 INSTANCE CREATION ======
-create_security_group() {
-  log "Creating security group for k0s cluster..."
-
-  local sg_name="${CLUSTER_NAME}-k0s-sg"
-  local sg_id
-
-  sg_id=$(aws ec2 describe-security-groups \
-    --region "${REGION}" \
-    --filters "Name=group-name,Values=${sg_name}" "Name=vpc-id,Values=${VPC_ID}" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
-
-  if [[ "${sg_id}" != "None" && -n "${sg_id}" ]]; then
-    log "Security group already exists: ${sg_id}"
-    echo "${sg_id}"
-    return 0
-  fi
-
-  sg_id=$(aws ec2 create-security-group \
-    --region "${REGION}" \
-    --group-name "${sg_name}" \
-    --description "Security group for ${CLUSTER_NAME} k0s cluster" \
-    --vpc-id "${VPC_ID}" \
-    --query 'GroupId' --output text)
-
-  # Tag the security group
-  aws ec2 create-tags --region "${REGION}" --resources "${sg_id}" \
-    --tags "Key=Cluster,Value=${CLUSTER_NAME}" "Key=ManagedBy,Value=k0s-script" "Key=Name,Value=${sg_name}"
-
-  log "Created security group: ${sg_id}"
-
-  # Add ingress rules (redirect output to avoid pollution)
-  log "Configuring security group rules (restricted to your IP)..."
-
-  # Detect current public IP address
-  MY_IP="${ALLOWED_CIDR:-}"
-  if [[ -z "$MY_IP" ]]; then
-    log "Auto-detecting your public IP address..."
-    MY_IP=$(curl -s https://checkip.amazonaws.com || curl -s https://ipinfo.io/ip || curl -s https://api.ipify.org)
-    if [[ -z "$MY_IP" ]]; then
-      warn "Could not auto-detect IP. Set ALLOWED_CIDR environment variable."
-      warn "Example: export ALLOWED_CIDR=\"1.2.3.4/32\""
-      err "Failed to determine your IP address"
-    fi
-    # Add /32 for single IP
-    MY_IP="${MY_IP}/32"
-    log "  Detected IP: ${MY_IP}"
-  else
-    log "  Using provided CIDR: ${MY_IP}"
-  fi
-
-  # === EXTERNAL ACCESS (restricted to your IP) ===
-  # API server - allow ONLY from your IP for kubectl access
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 6443 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Port 6443 (Kubernetes API): RESTRICTED to ${MY_IP}"
-
-  # SSH - allow ONLY from your IP for management
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 22 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Port 22 (SSH): RESTRICTED to ${MY_IP}"
-
-  # NodePort services - allow ONLY from your IP for accessing deployed services
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 30000-32767 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Ports 30000-32767 (NodePort): RESTRICTED to ${MY_IP}"
-
-  # Konnectivity agent port - allow ONLY from your IP
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol tcp --port 8132 --cidr "${MY_IP}" >/dev/null 2>&1 || true
-  log "  ✓ Port 8132 (Konnectivity): RESTRICTED to ${MY_IP}"
-
-  # === INTERNAL CLUSTER COMMUNICATION (within security group only) ===
-  # All internal traffic - etcd (2380), kubelet (10250), CNI, pod networking, etc.
-  aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${sg_id}" \
-    --protocol -1 --source-group "${sg_id}" >/dev/null 2>&1 || true
-  log "  ✓ All ports: INTERNAL ONLY - for cluster communication via private IPs"
-
-  log "Security group rules configured"
-  echo "${sg_id}"
-}
-
-find_existing_instances() {
-  local role="$1"
-  aws ec2 describe-instances \
-    --region "${REGION}" \
-    --filters \
-      "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-      "Name=tag:Role,Values=${role}" \
-      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
-    --query 'Reservations[].Instances[].InstanceId' \
-    --output text
-}
-
-create_ec2_instances() {
-  log "Creating EC2 instances for k0s cluster..."
-
-  # Check for existing instances
-  local existing_controllers existing_cpu_workers existing_gpu_workers
-  existing_controllers=$(find_existing_instances "controller")
-  existing_cpu_workers=$(find_existing_instances "cpu-worker")
-  existing_gpu_workers=$(find_existing_instances "gpu-worker")
-
-  local existing_controller_count=$(echo "${existing_controllers}" | wc -w)
-  local existing_cpu_worker_count=$(echo "${existing_cpu_workers}" | wc -w)
-  local existing_gpu_worker_count=$(echo "${existing_gpu_workers}" | wc -w)
-
-  log "Found existing instances: ${existing_controller_count} controllers, ${existing_cpu_worker_count} CPU workers, ${existing_gpu_worker_count} GPU workers"
-
-  local sg_id
-  sg_id=$(create_security_group)
-
-  # Get subnet if not provided
-  if [[ -z "${SUBNET_ID}" ]]; then
-    SUBNET_ID=$(aws ec2 describe-subnets \
-      --region "${REGION}" \
-      --filters "Name=vpc-id,Values=${VPC_ID}" \
-      --query 'Subnets[0].SubnetId' --output text)
-  fi
-
-  [[ -n "${SUBNET_ID}" && "${SUBNET_ID}" != "None" ]] || err "No subnets found in VPC ${VPC_ID}"
-
-  # Get latest Ubuntu 22.04 AMI
-  local ami_id
-  ami_id=$(aws ec2 describe-images \
-    --region "${REGION}" \
-    --owners 099720109477 \
-    --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
-    --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
-
-  log "Using AMI: ${ami_id}"
-
-  # User data for k0s installation - write to temp file
-  local user_data_file="/tmp/k0s-userdata-$$.sh"
-  cat > "${user_data_file}" <<'EOF'
-#!/bin/bash
-set -ex
-apt-get update
-apt-get install -y curl wget jq
-curl -sSLf https://get.k0s.sh | sh
-EOF
-  TMP_FILES+=("${user_data_file}")
-
-  # Create instances (arrays already declared globally at top of script)
-  CONTROLLER_IPS=()
-  WORKER_IPS=()
-  ALL_INSTANCE_IDS=()
-
-  # Add existing instances to tracking arrays
-  if [[ -n "${existing_controllers}" ]]; then
-    for id in ${existing_controllers}; do
-      ALL_INSTANCE_IDS+=("${id}")
-    done
-  fi
-  if [[ -n "${existing_cpu_workers}" ]]; then
-    for id in ${existing_cpu_workers}; do
-      ALL_INSTANCE_IDS+=("${id}")
-    done
-  fi
-  if [[ -n "${existing_gpu_workers}" ]]; then
-    for id in ${existing_gpu_workers}; do
-      ALL_INSTANCE_IDS+=("${id}")
-    done
-  fi
-
-  # Controllers - only create if needed
-  local controllers_to_create=$((CONTROLLER_COUNT - existing_controller_count))
-  if [[ ${controllers_to_create} -gt 0 ]]; then
-    log "Creating ${controllers_to_create} additional controller(s)..."
-    for ((i=existing_controller_count; i<CONTROLLER_COUNT; i++)); do
-      local instance_id
-      instance_id=$(aws ec2 run-instances \
-        --region "${REGION}" \
-        --image-id "${ami_id}" \
-        --instance-type "${CONTROLLER_INSTANCE_TYPE}" \
-        --key-name "${KEY_NAME}" \
-        --security-group-ids "${sg_id}" \
-        --subnet-id "${SUBNET_ID}" \
-        --associate-public-ip-address \
-        --user-data "file://${user_data_file}" \
-        --tag-specifications \
-          "ResourceType=instance,Tags=[{Key=Name,Value=${CLUSTER_NAME}-controller-${i}},{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=controller},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=volume,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=controller},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=network-interface,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=controller},{Key=ManagedBy,Value=k0s-script}]" \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
-        --query 'Instances[0].InstanceId' \
-        --output text)
-
-      ALL_INSTANCE_IDS+=("${instance_id}")
-      log "Created controller: ${instance_id}"
-    done
-  else
-    log "All ${CONTROLLER_COUNT} controller(s) already exist, skipping creation"
-  fi
-
-  # CPU Workers - only create if needed
-  local cpu_workers_to_create=$((CPU_WORKER_COUNT - existing_cpu_worker_count))
-  if [[ ${cpu_workers_to_create} -gt 0 ]]; then
-    log "Creating ${cpu_workers_to_create} additional CPU worker(s)..."
-    for ((i=existing_cpu_worker_count; i<CPU_WORKER_COUNT; i++)); do
-      local instance_id
-      instance_id=$(aws ec2 run-instances \
-        --region "${REGION}" \
-        --image-id "${ami_id}" \
-        --instance-type "${CPU_WORKER_INSTANCE_TYPE}" \
-        --key-name "${KEY_NAME}" \
-        --security-group-ids "${sg_id}" \
-        --subnet-id "${SUBNET_ID}" \
-        --associate-public-ip-address \
-        --user-data "file://${user_data_file}" \
-        --tag-specifications \
-          "ResourceType=instance,Tags=[{Key=Name,Value=${CLUSTER_NAME}-cpu-worker-${i}},{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=cpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=volume,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=cpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-          "ResourceType=network-interface,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=cpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
-        --query 'Instances[0].InstanceId' \
-        --output text)
-
-      ALL_INSTANCE_IDS+=("${instance_id}")
-      log "Created CPU worker: ${instance_id}"
-    done
-  else
-    log "All ${CPU_WORKER_COUNT} CPU worker(s) already exist, skipping creation"
-  fi
-
-  # GPU Workers - only create if needed
-  if [[ ${GPU_WORKER_COUNT} -gt 0 ]]; then
-    local gpu_workers_to_create=$((GPU_WORKER_COUNT - existing_gpu_worker_count))
-    if [[ ${gpu_workers_to_create} -gt 0 ]]; then
-      log "Creating ${gpu_workers_to_create} additional GPU worker(s)..."
-      for ((i=existing_gpu_worker_count; i<GPU_WORKER_COUNT; i++)); do
-        local instance_id
-        instance_id=$(aws ec2 run-instances \
-          --region "${REGION}" \
-          --image-id "${ami_id}" \
-          --instance-type "${GPU_WORKER_INSTANCE_TYPE}" \
-          --key-name "${KEY_NAME}" \
-          --security-group-ids "${sg_id}" \
-          --subnet-id "${SUBNET_ID}" \
-          --associate-public-ip-address \
-          --user-data "file://${user_data_file}" \
-          --tag-specifications \
-            "ResourceType=instance,Tags=[{Key=Name,Value=${CLUSTER_NAME}-gpu-worker-${i}},{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=gpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-            "ResourceType=volume,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=gpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-            "ResourceType=network-interface,Tags=[{Key=Cluster,Value=${CLUSTER_NAME}},{Key=Role,Value=gpu-worker},{Key=ManagedBy,Value=k0s-script}]" \
-          --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":300,"VolumeType":"gp3"}}]' \
-          --query 'Instances[0].InstanceId' \
-          --output text)
-
-        ALL_INSTANCE_IDS+=("${instance_id}")
-        log "Created GPU worker: ${instance_id}"
-      done
-    else
-      log "All ${GPU_WORKER_COUNT} GPU worker(s) already exist, skipping creation"
-    fi
-  fi
-
-  log "Waiting for instances to be running..."
-  aws ec2 wait instance-running --region "${REGION}" --instance-ids "${ALL_INSTANCE_IDS[@]}"
-
-  log "Waiting for instance status checks (this may take 3-5 minutes)..."
-  aws ec2 wait instance-status-ok --region "${REGION}" --instance-ids "${ALL_INSTANCE_IDS[@]}" || true
-
-  log "Waiting additional time for SSH to be fully ready..."
-  sleep 60
-
-  # Get public IPs for all instances
-  for id in "${ALL_INSTANCE_IDS[@]}"; do
-    local role
-    role=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
-      --query 'Reservations[0].Instances[0].Tags[?Key==`Role`].Value' --output text)
-
-    local public_ip
-    public_ip=$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${id}" \
-      --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-
-    if [[ "${role}" == "controller" ]]; then
-      CONTROLLER_IPS+=("${public_ip}")
-      log "Controller - Public IP: ${public_ip}"
-    else
-      WORKER_IPS+=("${public_ip}")
-      log "Worker - Public IP: ${public_ip} (${role})"
-    fi
-  done
-
-  # Set SSH key path from EC2 key
-  SSH_KEY_PATH="${HOME}/.ssh/${KEY_NAME}.pem"
 }
 
 # ====== PREPARE NODES (RHEL/Fedora compatibility + k0s binary) ======
@@ -815,117 +510,70 @@ REMOTE_SCRIPT
   done
 }
 
-# ====== MOUNT NVMe INSTANCE STORE FOR EPHEMERAL STORAGE ======
-# GPU instance types (g5, g6, p4, p5) typically come with large NVMe instance
-# store drives but tiny 10 GB EBS root volumes. Kubernetes counts ephemeral
-# storage from the filesystem backing /var/lib/k0s/kubelet, so we mount an
-# unused NVMe drive there to prevent "Insufficient ephemeral-storage" errors.
-mount_nvme_instance_store() {
-  if [[ ${GPU_WORKER_COUNT} -eq 0 ]]; then
-    return 0
-  fi
+# ====== PREFLIGHT: NODE STORAGE VALIDATION ======
+# On-prem / baremetal nodes must have sufficient disk space BEFORE running the
+# installer. This function SSHs to every node and verifies the filesystem
+# backing /var/lib/k0s (or / on first install) meets the minimum threshold.
+#
+# Thresholds (configurable via storage.minimumDiskSpace in config YAML):
+#   Controller : 100 GB (k0s control plane, kine/etcd, container images)
+#   CPU worker : 200 GB (weaviate, saia-api, data-loader, fluent-bit, etc.)
+#   GPU worker : 500 GB (model weights 60-240 GB each, ray-worker-gpu image ~30 GB)
+#
+# If a dedicated disk is available, the customer should mount it at
+# /var/lib/k0s before running this script.
+preflight_check_node_storage() {
+  pf_header "Node storage"
 
-  # Ensure WORKER_IPS is populated
-  if [[ -z "${WORKER_IPS+x}" || ${#WORKER_IPS[@]} -eq 0 ]]; then
-    if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
-      IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+  IFS=' ' read -ra _ctrl_ips <<< "${EXISTING_CONTROLLER_IPS}"
+  IFS=' ' read -ra _worker_ips <<< "${EXISTING_WORKER_IPS}"
+
+  # Helper: SSH to a node and return available GB on the filesystem backing
+  # /var/lib/k0s (falls back to / if k0s hasn't been installed yet).
+  _get_avail_gb() {
+    local ip="$1"
+    ssh_exec "${ip}" "
+      avail_kb=\$(df --output=avail /var/lib/k0s 2>/dev/null | tail -1 | tr -d ' ')
+      if [ -z \"\${avail_kb}\" ] || [ \"\${avail_kb}\" = \"Avail\" ]; then
+        avail_kb=\$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
+      fi
+      echo \$(( \${avail_kb:-0} / 1048576 ))
+    " 2>/dev/null || echo "0"
+  }
+
+  # Check controller nodes
+  for ip in "${_ctrl_ips[@]}"; do
+    local avail
+    avail=$(_get_avail_gb "${ip}")
+    avail=$(echo "${avail}" | tr -d '[:space:]')
+    if [[ "${avail}" -ge "${MIN_DISK_CONTROLLER}" ]]; then
+      pf_ok "Controller ${ip}: ${avail} GB available (minimum: ${MIN_DISK_CONTROLLER} GB)"
     else
-      return 0
+      pf_fail "Controller ${ip}: ${avail} GB available — need at least ${MIN_DISK_CONTROLLER} GB on /var/lib/k0s"
     fi
-  fi
-
-  local gpu_ips=()
-  local idx=0
-  for ip in "${WORKER_IPS[@]}"; do
-    if [[ ${idx} -ge ${CPU_WORKER_COUNT} ]]; then
-      gpu_ips+=("${ip}")
-    fi
-    idx=$((idx + 1))
   done
 
-  if [[ ${#gpu_ips[@]} -eq 0 ]]; then
-    return 0
-  fi
+  # Check worker nodes (distinguish CPU vs GPU by index)
+  local widx=0
+  for ip in "${_worker_ips[@]}"; do
+    local avail role min_required
+    avail=$(_get_avail_gb "${ip}")
+    avail=$(echo "${avail}" | tr -d '[:space:]')
 
-  log "Checking NVMe instance store volumes on GPU workers..."
+    if [[ ${widx} -lt ${CPU_WORKER_COUNT} ]]; then
+      role="CPU worker"
+      min_required="${MIN_DISK_CPU_WORKER}"
+    else
+      role="GPU worker"
+      min_required="${MIN_DISK_GPU_WORKER}"
+    fi
 
-  for gpu_ip in "${gpu_ips[@]}"; do
-    ssh_exec "${gpu_ip}" "
-      # Skip if /var/lib/k0s is already on a large filesystem (>50 GB)
-      k0s_avail_gb=\$(df --output=avail /var/lib/k0s 2>/dev/null | tail -1 | awk '{print int(\$1/1048576)}')
-      if [ \"\${k0s_avail_gb:-0}\" -ge 50 ]; then
-        echo 'NVMe mount: /var/lib/k0s already has >=50 GB, skipping'
-        exit 0
-      fi
-
-      # Find the first NVMe device that is NOT the root disk and has no partitions
-      ROOT_DEV=\$(lsblk -no PKNAME \$(findmnt -n -o SOURCE /) 2>/dev/null | head -1)
-      NVME_DEV=''
-      for dev in /dev/nvme*n1; do
-        [ -b \"\$dev\" ] || continue
-        dev_name=\$(basename \"\$dev\")
-        # Skip the root device
-        [ \"\$dev_name\" = \"\$ROOT_DEV\" ] && continue
-        # Skip devices that already have partitions (they are in use)
-        if lsblk -n \"\$dev\" 2>/dev/null | grep -q part; then continue; fi
-        # Skip devices already mounted
-        if mount | grep -q \"\$dev\"; then continue; fi
-        NVME_DEV=\"\$dev\"
-        break
-      done
-
-      if [ -z \"\$NVME_DEV\" ]; then
-        echo 'NVMe mount: no unused NVMe instance store found, skipping'
-        exit 0
-      fi
-
-      echo \"NVMe mount: formatting \$NVME_DEV and mounting to /var/lib/k0s\"
-
-      # Format
-      sudo mkfs.xfs -f \"\$NVME_DEV\" >/dev/null 2>&1
-
-      # If k0s is running, stop it and preserve existing data
-      if systemctl is-active k0sworker >/dev/null 2>&1; then
-        sudo systemctl stop k0sworker 2>/dev/null || true
-        sleep 3
-        sudo pkill -9 k0s 2>/dev/null || true
-        sudo pkill -9 containerd 2>/dev/null || true
-        sudo pkill -9 containerd-shim 2>/dev/null || true
-        sleep 2
-      fi
-
-      # Lazy unmount anything stuck under /var/lib/k0s
-      for mp in \$(mount | grep '/var/lib/k0s' | awk '{print \$3}' | sort -r); do
-        sudo umount -l \"\$mp\" 2>/dev/null || true
-      done
-
-      # Copy existing data if present
-      if [ -d /var/lib/k0s ] && [ \"\$(ls -A /var/lib/k0s 2>/dev/null)\" ]; then
-        sudo mkdir -p /mnt/nvme-staging
-        sudo mount \"\$NVME_DEV\" /mnt/nvme-staging
-        sudo cp -a /var/lib/k0s/. /mnt/nvme-staging/ 2>/dev/null || true
-        sudo umount /mnt/nvme-staging
-        sudo rmdir /mnt/nvme-staging
-      fi
-
-      # Mount
-      sudo rm -rf /var/lib/k0s 2>/dev/null || true
-      sudo mkdir -p /var/lib/k0s
-      sudo mount \"\$NVME_DEV\" /var/lib/k0s
-
-      # Persist in fstab
-      NVME_UUID=\$(sudo blkid -s UUID -o value \"\$NVME_DEV\")
-      if ! grep -q \"\$NVME_UUID\" /etc/fstab 2>/dev/null; then
-        echo \"UUID=\$NVME_UUID /var/lib/k0s xfs defaults,nofail 0 2\" | sudo tee -a /etc/fstab >/dev/null
-      fi
-
-      # Restart k0s if it was running
-      if systemctl is-enabled k0sworker >/dev/null 2>&1; then
-        sudo systemctl start k0sworker 2>/dev/null || true
-      fi
-
-      echo \"NVMe mount: done — \$(df -h \$NVME_DEV | tail -1 | awk '{print \$2}') available on /var/lib/k0s\"
-    " 2>/dev/null || warn "  NVMe mount on ${gpu_ip} had issues — may need manual setup"
+    if [[ "${avail}" -ge "${min_required}" ]]; then
+      pf_ok "${role} ${ip}: ${avail} GB available (minimum: ${min_required} GB)"
+    else
+      pf_fail "${role} ${ip}: ${avail} GB available — need at least ${min_required} GB on /var/lib/k0s"
+    fi
+    widx=$((widx + 1))
   done
 }
 
@@ -1002,6 +650,14 @@ PYSCRIPT"
 
   # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
   ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
+
+  # Safety gate: refuse to wipe if a live cluster with Ready nodes exists.
+  # This prevents accidental data loss when the existing-cluster detection
+  # (useExisting) flakes due to an SSH timeout or transient k0s status error.
+  if ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null" 2>/dev/null | grep -q ' Ready'; then
+    err "k0s cluster on ${controller_ip} has Ready nodes — refusing to wipe.
+    Use 'delete' or 'clean-all' to tear down first, or set useExisting=auto in config."
+  fi
 
   # Clean stale k0s state from any previous run
   ssh_exec "${controller_ip}" "
@@ -1457,273 +1113,17 @@ ensure_namespace() {
   fi
 }
 
-# ====== INSTALL MINIO ======
-# TODO remove
-install_minio() {
-  # When using external S3-compatible storage, skip in-cluster MinIO; credentials
-  # are created by ensure_s3compat_credentials() instead.
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "Using external S3-compatible storage (${OBJ_STORE_TYPE}); skipping in-cluster MinIO install."
-    return 0
-  fi
-
-  # Auto-generate root password if not set
-  if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
-    MINIO_ROOT_PASSWORD="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
-    log "Generated MinIO root password (saved for secret creation)"
-  fi
-
-  # In-cluster MinIO installation
-  log "Installing MinIO in ${MINIO_NS}..."
-  ensure_namespace "${MINIO_NS}"
-
-  # Create MinIO secret
-  kubectl create secret generic minio-creds \
-    --namespace="${MINIO_NS}" \
-    --from-literal=accesskey="${MINIO_ROOT_USER}" \
-    --from-literal=secretkey="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-  # Deploy MinIO
-  cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: minio-pvc
-  namespace: ${MINIO_NS}
-spec:
-  storageClassName: ${STORAGE_CLASS}
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 200Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: minio
-  namespace: ${MINIO_NS}
-spec:
-  type: ClusterIP
-  ports:
-    - port: 9000
-      targetPort: 9000
-      name: api
-    - port: 9001
-      targetPort: 9001
-      name: console
-  selector:
-    app: minio
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: minio
-  namespace: ${MINIO_NS}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: minio
-  template:
-    metadata:
-      labels:
-        app: minio
-    spec:
-      containers:
-      - name: minio
-        image: minio/minio:latest
-        args:
-        - server
-        - /data
-        - --console-address
-        - ":9001"
-        env:
-        - name: MINIO_ROOT_USER
-          valueFrom:
-            secretKeyRef:
-              name: minio-creds
-              key: accesskey
-        - name: MINIO_ROOT_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: minio-creds
-              key: secretkey
-        ports:
-        - containerPort: 9000
-          name: api
-        - containerPort: 9001
-          name: console
-        volumeMounts:
-        - name: data
-          mountPath: /data
-        resources:
-          requests:
-            cpu: "500m"
-            memory: "2Gi"
-          limits:
-            cpu: "2"
-            memory: "4Gi"
-      volumes:
-      - name: data
-        persistentVolumeClaim:
-          claimName: minio-pvc
-EOF
-
-  log "Waiting for MinIO to be ready..."
-  kubectl wait --for=condition=ready pod -l app=minio -n "${MINIO_NS}" --timeout=300s
-
-  # Create credentials secret in AI platform namespace
-  # SAIA and pkg/storage expect s3_access_key/s3_secret_key; models/SAIA expect MINIO_ACCESS_KEY/MINIO_SECRET_KEY.
-  ensure_namespace "${AI_NS}"
-  local secret_name="minio-credentials"
-  kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
-    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-
-  # Create bucket and directories using a job
-  log "Verifying MinIO bucket: ${MINIO_BUCKET}..."
-
-  # Delete existing job if it exists (Jobs are immutable, can't be updated)
-  kubectl delete job minio-create-bucket -n "${MINIO_NS}" --ignore-not-found=true 2>/dev/null || true
-  sleep 2
-
-  cat <<EOF | kubectl apply -f -
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-create-bucket
-  namespace: ${MINIO_NS}
-spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 60
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-      - name: mc
-        image: minio/mc:latest
-        command:
-        - /bin/sh
-        - -c
-        - |
-          set -e
-          echo "Configuring MinIO client..."
-          mc alias set myminio http://minio.${MINIO_NS}.svc.cluster.local:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
-
-          echo ""
-          echo "Checking if bucket exists..."
-          if mc ls myminio/${MINIO_BUCKET} >/dev/null 2>&1; then
-            echo "✓ Bucket '${MINIO_BUCKET}' already exists"
-          else
-            echo "Creating bucket: ${MINIO_BUCKET}"
-            mc mb myminio/${MINIO_BUCKET}
-            echo "Setting anonymous read policy for bucket..."
-            mc anonymous set download myminio/${MINIO_BUCKET} || true
-          fi
-
-          echo ""
-          echo "Verifying required directories..."
-          DIRS_TO_CREATE=""
-
-          # Check each directory
-          for dir in apps artifacts model_artifacts tasks; do
-            if mc ls myminio/${MINIO_BUCKET}/\$dir/ >/dev/null 2>&1; then
-              echo "  ✓ \$dir/ exists"
-            else
-              echo "  → \$dir/ missing, will create"
-              DIRS_TO_CREATE="\$DIRS_TO_CREATE \$dir"
-            fi
-          done
-
-          # Create missing directories only
-          if [ -n "\$DIRS_TO_CREATE" ]; then
-            echo ""
-            echo "Creating missing directories..."
-            for dir in \$DIRS_TO_CREATE; do
-              case \$dir in
-                apps)
-                  echo "  - apps/ (for Splunk apps and add-ons)"
-                  echo "placeholder" | mc pipe myminio/${MINIO_BUCKET}/apps/.keep
-                  ;;
-                artifacts)
-                  echo "  - artifacts/ (for AI Platform artifacts)"
-                  echo "placeholder" | mc pipe myminio/${MINIO_BUCKET}/artifacts/.keep
-                  ;;
-                model_artifacts)
-                  echo "  - model_artifacts/ (for AI model artifacts)"
-                  echo "placeholder" | mc pipe myminio/${MINIO_BUCKET}/model_artifacts/.keep
-                  ;;
-                tasks)
-                  echo "  - tasks/ (for AI Platform tasks)"
-                  echo "placeholder" | mc pipe myminio/${MINIO_BUCKET}/tasks/.keep
-                  ;;
-              esac
-            done
-          else
-            echo ""
-            echo "✓ All directories already exist, nothing to create"
-          fi
-
-          echo ""
-          echo "Final verification:"
-          ALL_OK=true
-          for dir in apps artifacts model_artifacts tasks; do
-            if mc ls myminio/${MINIO_BUCKET}/\$dir/ >/dev/null 2>&1; then
-              echo "  ✓ \$dir/ verified"
-            else
-              echo "  ✗ \$dir/ missing"
-              ALL_OK=false
-            fi
-          done
-
-          if [ "\$ALL_OK" = "true" ]; then
-            echo ""
-            echo "✓ Bucket structure ready!"
-            echo ""
-            echo "Bucket contents:"
-            mc ls myminio/${MINIO_BUCKET}/
-          else
-            echo ""
-            echo "✗ Some directories are missing"
-            exit 1
-          fi
-EOF
-
-  log "Waiting for bucket verification job to complete..."
-  if kubectl wait --for=condition=complete job/minio-create-bucket -n "${MINIO_NS}" --timeout=120s; then
-    log "✓ MinIO bucket structure verified"
-
-    # Show job logs for verification
-    kubectl logs -n "${MINIO_NS}" job/minio-create-bucket --tail=20 2>/dev/null || true
-  else
-    warn "Bucket verification job did not complete in time, checking status..."
-    kubectl describe job/minio-create-bucket -n "${MINIO_NS}" || true
-    kubectl logs -n "${MINIO_NS}" job/minio-create-bucket --tail=50 || true
-  fi
-
-  log "✓ MinIO installed; bucket=${MINIO_BUCKET}; credentials secret ${AI_NS}/${secret_name}"
-}
-
-# ====== External S3-compatible object storage (credentials only; no in-cluster install) ======
+# ====== S3-COMPATIBLE OBJECT STORAGE CREDENTIALS ======
+# Object storage is always customer-managed (external). This function creates
+# the Kubernetes credentials secret so the operator and workloads can auth.
 ensure_s3compat_credentials() {
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
-    return 0
-  fi
-
-  log "Object store type is ${OBJ_STORE_TYPE}; creating credentials secret for external S3-compatible storage."
+  log "Creating credentials secret for S3-compatible object storage (${OBJ_STORE_TYPE})..."
   if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
     err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
     return 1
   fi
   if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
-    err "External S3-compatible storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
+    err "S3-compatible storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
     return 1
   fi
   ensure_namespace "${AI_NS}"
@@ -1736,7 +1136,7 @@ ensure_s3compat_credentials() {
     --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
     --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
     --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-  log "✓ External S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
+  log "✓ S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
 }
 
 # ====== INSTALL CERT-MANAGER ======
@@ -2488,8 +1888,7 @@ install_kube_prometheus() {
   log "Installing kube-prometheus-stack..."
 
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-  # TODO uncomment
-  # helm repo update prometheus-community  # Only update the specific repo we need
+  helm repo update prometheus-community  # Only update the specific repo we need
 
   helm_retry 3 upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
@@ -2508,8 +1907,7 @@ install_otel_operator_and_contrib_collector() {
   wait_for_cert_manager_webhook 30 10
 
   helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
-  # TODO uncomment
-  # helm repo update open-telemetry  # Only update the specific repo we need
+  helm repo update open-telemetry  # Only update the specific repo we need
 
   # Use cert-manager for webhook certificates (now that konnectivity is fixed)
   helm_retry 3 upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
@@ -2528,8 +1926,7 @@ install_ray_operator() {
   log "Installing KubeRay Operator..."
 
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  # TODO uncomment
-  # helm repo update kuberay  # Only update the specific repo we need
+  helm repo update kuberay  # Only update the specific repo we need
 
   helm_retry 3 upgrade --install kuberay-operator kuberay/kuberay-operator \
     --namespace ray-system --create-namespace \
@@ -3116,201 +2513,6 @@ create_ecr_secret() {
   log "✓ Secret will be referenced in AIPlatform CR spec.imagePullSecrets"
 }
 
-# ====== ECR CREDENTIAL REFRESHER CRONJOB ======
-# ECR tokens expire every 12 hours. This CronJob refreshes the ecr-registry-secret
-# in all relevant namespaces every 6 hours so image pulls never break.
-install_ecr_credential_refresher() {
-  if [[ "${IMAGE_PULL_SECRETS_ECR_ENABLED}" != "true" ]]; then
-    log "ECR not enabled — skipping credential refresher"
-    return 0
-  fi
-
-  local ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
-  local ecr_account="${ECR_ACCOUNT}"
-
-  if [[ -z "${ecr_account}" ]]; then
-    warn "ECR account not configured — skipping credential refresher"
-    return 0
-  fi
-
-  local ecr_server="${ecr_account}.dkr.ecr.${ecr_region}.amazonaws.com"
-  local refresher_ns="${AI_NS}"
-  local target_namespaces="${AI_NS} splunk-ai-operator-system"
-
-  # Resolve AWS credentials (env > aws configure)
-  local aws_key="${AWS_ACCESS_KEY_ID:-}"
-  local aws_secret="${AWS_SECRET_ACCESS_KEY:-}"
-  local aws_session="${AWS_SESSION_TOKEN:-}"
-
-  if [[ -z "$aws_key" ]]; then
-    aws_key=$(aws configure get aws_access_key_id 2>/dev/null || echo "")
-  fi
-  if [[ -z "$aws_secret" ]]; then
-    aws_secret=$(aws configure get aws_secret_access_key 2>/dev/null || echo "")
-  fi
-
-  if [[ -z "$aws_key" ]] || [[ -z "$aws_secret" ]]; then
-    warn "AWS credentials not available — skipping ECR credential refresher CronJob"
-    warn "ECR tokens will expire after 12 hours. Refresh ecr-registry-secret manually."
-    return 0
-  fi
-
-  if [[ -n "$aws_session" ]]; then
-    warn "Detected temporary AWS credentials (session token present)"
-    warn "ECR refresher CronJob will work until these session credentials expire"
-    warn "For long-term use, configure an IAM user with ecr:GetAuthorizationToken permission"
-  fi
-
-  log "Installing ECR credential refresher CronJob..."
-
-  # Store AWS credentials in a secret for the CronJob to use
-  local secret_args=(
-    --from-literal=AWS_ACCESS_KEY_ID="${aws_key}"
-    --from-literal=AWS_SECRET_ACCESS_KEY="${aws_secret}"
-  )
-  [[ -n "$aws_session" ]] && secret_args+=(--from-literal=AWS_SESSION_TOKEN="${aws_session}")
-
-  kubectl -n "${refresher_ns}" create secret generic aws-ecr-credentials \
-    "${secret_args[@]}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-  # Pre-build the optional SESSION_TOKEN env block
-  local session_token_env=""
-  if [[ -n "$aws_session" ]]; then
-    session_token_env="
-            - name: AWS_SESSION_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: aws-ecr-credentials
-                  key: AWS_SESSION_TOKEN
-                  optional: true"
-  fi
-
-  # Deploy ServiceAccount, RBAC, and CronJob
-  cat <<CRONEOF | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ecr-credential-refresher
-  namespace: ${refresher_ns}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ecr-credential-refresher
-rules:
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "create", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ecr-credential-refresher
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: ecr-credential-refresher
-subjects:
-- kind: ServiceAccount
-  name: ecr-credential-refresher
-  namespace: ${refresher_ns}
----
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: ecr-credential-refresher
-  namespace: ${refresher_ns}
-spec:
-  schedule: "0 */6 * * *"
-  successfulJobsHistoryLimit: 2
-  failedJobsHistoryLimit: 3
-  concurrencyPolicy: Replace
-  jobTemplate:
-    spec:
-      backoffLimit: 3
-      template:
-        spec:
-          serviceAccountName: ecr-credential-refresher
-          restartPolicy: OnFailure
-          containers:
-          - name: refresher
-            image: amazon/aws-cli:latest
-            command:
-            - /bin/bash
-            - -ec
-            - |
-              echo "Refreshing ECR credentials..."
-              ECR_TOKEN=\$(aws ecr get-login-password --region "\${ECR_REGION}")
-              AUTH=\$(echo -n "AWS:\${ECR_TOKEN}" | base64 -w0)
-              DOCKERCFG=\$(printf '{"auths":{"%s":{"username":"AWS","password":"%s","auth":"%s"}}}' "\${ECR_SERVER}" "\${ECR_TOKEN}" "\${AUTH}" | base64 -w0)
-
-              K8S_TOKEN=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-              K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              K8S_API="https://kubernetes.default.svc"
-
-              for NS in \${TARGET_NAMESPACES}; do
-                echo "  Updating ecr-registry-secret in \${NS}..."
-                SECRET_JSON=\$(printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"ecr-registry-secret","namespace":"%s"},"type":"kubernetes.io/dockerconfigjson","data":{".dockerconfigjson":"%s"}}' "\${NS}" "\${DOCKERCFG}")
-
-                HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" \
-                  -H "Authorization: Bearer \${K8S_TOKEN}" \
-                  --cacert \${K8S_CA} \
-                  "\${K8S_API}/api/v1/namespaces/\${NS}/secrets/ecr-registry-secret")
-
-                if [ "\${HTTP_CODE}" = "200" ]; then
-                  curl -sf -X PUT \
-                    -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer \${K8S_TOKEN}" \
-                    --cacert \${K8S_CA} \
-                    "\${K8S_API}/api/v1/namespaces/\${NS}/secrets/ecr-registry-secret" \
-                    -d "\${SECRET_JSON}" > /dev/null
-                  echo "    Updated existing secret"
-                else
-                  curl -sf -X POST \
-                    -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer \${K8S_TOKEN}" \
-                    --cacert \${K8S_CA} \
-                    "\${K8S_API}/api/v1/namespaces/\${NS}/secrets" \
-                    -d "\${SECRET_JSON}" > /dev/null
-                  echo "    Created new secret"
-                fi
-              done
-              echo "ECR credential refresh complete"
-            env:
-            - name: ECR_REGION
-              value: "${ecr_region}"
-            - name: ECR_SERVER
-              value: "${ecr_server}"
-            - name: TARGET_NAMESPACES
-              value: "${target_namespaces}"
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: aws-ecr-credentials
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aws-ecr-credentials
-                  key: AWS_SECRET_ACCESS_KEY${session_token_env}
-CRONEOF
-
-  log "✓ ECR credential refresher CronJob installed (schedule: every 6 hours)"
-
-  # Trigger an immediate run to ensure fresh credentials right now
-  log "Running initial credential refresh..."
-  kubectl -n "${refresher_ns}" delete job ecr-initial-refresh --ignore-not-found=true 2>/dev/null || true
-  kubectl -n "${refresher_ns}" create job --from=cronjob/ecr-credential-refresher ecr-initial-refresh 2>/dev/null || true
-
-  # Wait for the initial job to complete (up to 2 minutes)
-  if kubectl -n "${refresher_ns}" wait --for=condition=complete job/ecr-initial-refresh --timeout=120s 2>/dev/null; then
-    log "✓ Initial ECR credential refresh completed successfully"
-  else
-    warn "Initial ECR refresh may still be running — pods should recover once it completes"
-  fi
-}
-
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
@@ -3318,26 +2520,17 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
-  # Create credentials secret for Splunk App Framework
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "Using external S3-compatible credentials for Splunk App Framework..."
-    if ! kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
-      log "Creating minio-credentials secret in ${AI_NS}..."
-      kubectl -n "${AI_NS}" create secret generic minio-credentials \
-        --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-        --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-        --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-        --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-        --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-        --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-    fi
-  else
-    log "Creating S3-compatible secret for Splunk App Framework..."
-    kubectl -n "${AI_NS}" create secret generic s3-secret \
+  # Ensure credentials secret exists for Splunk App Framework
+  if ! kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
+    log "Creating minio-credentials secret in ${AI_NS}..."
+    kubectl -n "${AI_NS}" create secret generic minio-credentials \
+      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
       --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
       --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl apply -f -
+      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
   fi
 
   # Create splunk-defaults ConfigMap (optional but recommended)
@@ -3368,10 +2561,9 @@ YAML
       warn "Could not patch default ServiceAccount"
   fi
 
-  # Standalone app repo: external S3-compatible when objectStore.type is s3compat/minio/seaweedfs, else S3
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    local minio_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
-    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  # Standalone app repo: uses customer-managed S3-compatible object storage
+  local minio_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
+  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
@@ -3407,45 +2599,6 @@ spec:
         path: ${MINIO_BUCKET}
         secretRef: minio-credentials
 YAML
-  else
-    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
-apiVersion: enterprise.splunk.com/v4
-kind: Standalone
-metadata:
-  name: ${AI_STANDALONE_NAME}
-  namespace: ${AI_NS}
-spec:
-  replicas: 1
-  etcVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  varVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  volumes:
-    - name: defaults
-      configMap:
-        name: splunk-defaults
-  defaultsUrl: /mnt/defaults/default.yml
-  appRepo:
-    appInstallPeriodSeconds: 90
-    appSources:
-      - name: apps
-        scope: local
-        location: apps
-    appsRepoPollIntervalSeconds: 60
-    defaults:
-      scope: local
-      volumeName: volume_app_repo
-    installMaxRetries: 2
-    volumes:
-      - name: volume_app_repo
-        provider: aws
-        storageType: s3
-        endpoint: http://minio.${MINIO_NS}.svc.cluster.local:9000
-        region: us-east-1
-        path: ${MINIO_BUCKET}
-        secretRef: s3-secret
-YAML
-  fi
 
   log "Splunk Standalone CR applied (pod starts in background)"
 }
@@ -3483,25 +2636,16 @@ install_ai_platform_cr() {
   log "Using Splunk secret: ${splunk_secret}"
 
   # Ensure object storage credentials secret exists in AI namespace
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "Creating/updating external S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
-    kubectl -n "${AI_NS}" create secret generic minio-credentials \
-      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-    log "✓ Object storage credentials secret ready"
-  else
-    log "Creating/updating S3 credentials secret (s3-secret) in ${AI_NS}..."
-    kubectl -n "${AI_NS}" create secret generic s3-secret \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl apply -f -
-    log "✓ S3 credentials secret ready"
-  fi
+  log "Creating/updating S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
+  kubectl -n "${AI_NS}" create secret generic minio-credentials \
+    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+  log "✓ Object storage credentials secret ready"
 
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
@@ -3527,26 +2671,26 @@ EOF
 
   # objectStorage: path/endpoint/secret by object store type (aws | s3compat | minio | seaweedfs)
   local obj_path obj_endpoint obj_secret
+  obj_secret="minio-credentials"
   case "${OBJ_STORE_TYPE}" in
     s3compat)
       obj_path="s3compat://${OBJ_STORE_BUCKET}"
       obj_endpoint="${OBJ_STORE_ENDPOINT}"
-      obj_secret="minio-credentials"
       ;;
     minio)
       obj_path="minio://${MINIO_BUCKET}"
       obj_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
-      obj_secret="minio-credentials"
       ;;
     seaweedfs)
       obj_path="seaweedfs://${OBJ_STORE_BUCKET}"
       obj_endpoint="${OBJ_STORE_ENDPOINT}"
-      obj_secret="minio-credentials"
       ;;
-    aws|*)
+    aws)
       obj_path="s3://${OBJ_STORE_BUCKET}"
-      obj_endpoint="http://minio.${MINIO_NS}.svc.cluster.local:9000"
-      obj_secret="s3-secret"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      ;;
+    *)
+      err "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, s3compat, minio, seaweedfs"
       ;;
   esac
 
@@ -3936,18 +3080,11 @@ install_ai_platform_stack() {
   local phase1_pids=() phase1_names=() phase1_logdir
   phase1_logdir=$(mktemp -d)
 
-  install_minio > "${phase1_logdir}/minio.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("minio")
-
   install_cert_manager > "${phase1_logdir}/cert-manager.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("cert-manager")
 
   install_kube_prometheus > "${phase1_logdir}/kube-prometheus.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("kube-prometheus")
-
-  # These don't need cert-manager — run in parallel too
-  mount_nvme_instance_store > "${phase1_logdir}/nvme.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("nvme-mount")
 
   install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("nvidia-drivers")
@@ -4011,9 +3148,6 @@ install_ai_platform_stack() {
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
 
-  # Deploy CronJob that auto-refreshes ECR credentials every 6 hours (tokens expire at 12h)
-  install_ecr_credential_refresher
-
   # Apply Splunk Standalone CR (non-blocking — pod boots in background)
   install_splunk_standalone
 
@@ -4074,15 +3208,12 @@ check_platform_health() {
   fi
   log ""
 
-  # Check 3: MinIO / Object Storage
-  log "Checking object storage..."
-  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
-    log "⏭️  External S3-compatible storage (${OBJ_STORE_TYPE}); skipping in-cluster check"
-  elif kubectl get pod -n "${MINIO_NS}" -l app=minio 2>/dev/null | grep -q "Running"; then
-    log "✅ MinIO is running"
+  # Check 3: Object Storage
+  log "Checking object storage configuration..."
+  if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
+    log "✅ Object storage configured: ${OBJ_STORE_TYPE} at ${OBJ_STORE_ENDPOINT} (customer-managed)"
   else
-    warn "MinIO pod not in Running state"
-    kubectl get pods -n "${MINIO_NS}"
+    warn "Object storage endpoint not configured"
     ((health_issues++))
   fi
   log ""
@@ -4212,18 +3343,11 @@ show_platform_access_info() {
   kubectl get nodes -o wide 2>/dev/null || warn "Could not retrieve node information"
   log ""
 
-  # MinIO information
-  log "🗄️  MinIO (Object Storage):"
-  log "  Console URL: http://localhost:9001"
-  log "  API URL: http://localhost:9000"
-  log "  "
-  log "  💡 Access MinIO Console:"
-  log "     kubectl port-forward svc/minio -n ${MINIO_NS} 9001:9001"
-  log "     Open: http://localhost:9001"
-  log "  "
-  log "  🔑 Credentials:"
-  log "     Username: ${MINIO_ROOT_USER}"
-  log "     Password: ${MINIO_ROOT_PASSWORD}"
+  # Object storage information
+  log "🗄️  Object Storage (customer-managed):"
+  log "  Type: ${OBJ_STORE_TYPE}"
+  log "  Endpoint: ${OBJ_STORE_ENDPOINT}"
+  log "  Bucket: ${OBJ_STORE_BUCKET}"
   log ""
 
   # AI Platform information
@@ -4412,19 +3536,9 @@ main_install() {
   if [[ "${use_existing_cluster}" == "false" ]]; then
     log "No existing cluster found, starting k0s cluster installation..."
 
-    # Setup infrastructure
-    if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-      log "Using existing infrastructure..."
-    else
-      log "Creating EC2 instances..."
-      create_ec2_instances
-    fi
-
-    # After getting IPs (from config or EC2), check if k0s is already installed
-    # Parse IPs if from config
-    if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-      IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
-    fi
+    # Parse IPs from config
+    log "Using existing infrastructure..."
+    IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
 
     # Check if k0s is already running on the controller node
     if [[ "${#CONTROLLER_IPS[@]}" -gt 0 ]]; then
@@ -4433,7 +3547,7 @@ main_install() {
 
       if ssh_exec "${controller_ip}" "command -v k0s >/dev/null 2>&1 && sudo k0s status >/dev/null 2>&1"; then
         log "============================================"
-        log "✓ k0s cluster already running on EC2 instances!"
+        log "✓ k0s cluster already running on existing nodes!"
         log "============================================"
         log "Retrieving kubeconfig from existing k0s cluster..."
         mkdir -p "${HOME}/.kube"
@@ -4499,208 +3613,38 @@ main_delete() {
   log "Starting cleanup of k0s cluster: ${CLUSTER_NAME}"
   log "============================================"
 
-  # For EC2 mode: Just delete AWS resources (instances, security groups)
-  # Kubernetes resources will be destroyed when instances are terminated
-  # This is much faster and avoids stuck namespace deletion issues
+  # Graceful Kubernetes cleanup, then stop k0s on all nodes
+  log "Performing graceful Kubernetes cleanup..."
 
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    # On-prem mode: Need to clean Kubernetes resources gracefully
-    log "On-prem mode detected - performing graceful Kubernetes cleanup..."
+  export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
 
-    export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
-
-    if [[ -f "${KUBECONFIG}" ]] && timeout 10 kubectl cluster-info &>/dev/null; then
-      log "Deleting Kubernetes resources..."
-      kubectl delete aiplatform --all -n "${AI_NS}" --timeout=60s || true
-      kubectl delete namespace "${AI_NS}" --timeout=120s || true
-      kubectl delete namespace splunk-ai-operator-system --timeout=60s || true
-      kubectl delete namespace monitoring --timeout=60s || true
-    fi
-    # On-prem: Stop k0s on existing infrastructure
-    IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
-    IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
-
-    log "Stopping k0s on controller nodes..."
-    for ip in "${CONTROLLER_IPS[@]}"; do
-      log "  Stopping k0s on controller: ${ip}..."
-      ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
-    done
-
-    log "Stopping k0s on worker nodes..."
-    for ip in "${WORKER_IPS[@]}"; do
-      log "  Stopping k0s on worker: ${ip}..."
-      ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
-    done
-
-    log "k0s stopped on all on-prem nodes"
-    log "NOTE: Node machines are still running. To clean up completely:"
-    log "  - Remove k0s binaries: sudo rm -f /usr/local/bin/k0s"
-    log "  - Clean up data: sudo rm -rf /var/lib/k0s /etc/k0s"
-
-  else
-    # EC2: Terminate instances
-    log "============================================"
-    log "Scanning for resources to delete..."
-    log "============================================"
-
-    # First, preview what will be deleted
-    local instance_ids instance_count=0
-    instance_ids=$(aws ec2 describe-instances \
-      --region "${REGION}" \
-      --filters \
-        "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-        "Name=instance-state-name,Values=running,stopped,stopping" \
-      --query 'Reservations[].Instances[].InstanceId' --output text)
-
-    if [[ -n "${instance_ids}" ]]; then
-      instance_count=$(echo "${instance_ids}" | wc -w)
-      log "EC2 Instances to terminate: ${instance_count}"
-      # Show instance details
-      aws ec2 describe-instances --region "${REGION}" --instance-ids ${instance_ids} \
-        --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`].Value|[0],InstanceType,State.Name]' \
-        --output table 2>/dev/null || echo "  ${instance_ids}"
-    else
-      log "EC2 Instances: None found"
-    fi
-
-    # Check other resources
-    local enis=$(aws ec2 describe-network-interfaces --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'NetworkInterfaces[?Status==`available`].NetworkInterfaceId' --output text 2>/dev/null || echo "")
-    local eni_count=$(echo "${enis}" | wc -w)
-    log "Network Interfaces: ${eni_count:-0}"
-
-    local sg_id=$(aws ec2 describe-security-groups --region "${REGION}" \
-      --filters "Name=group-name,Values=${CLUSTER_NAME}-k0s-sg" "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
-    if [[ -n "${sg_id}" && "${sg_id}" != "None" ]]; then
-      log "Security Groups: 1 (${sg_id})"
-    else
-      log "Security Groups: 0"
-    fi
-
-    local volumes=$(aws ec2 describe-volumes --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" "Name=tag:ManagedBy,Values=k0s-script" "Name=status,Values=available" \
-      --query 'Volumes[].VolumeId' --output text 2>/dev/null || echo "")
-    local vol_count=$(echo "${volumes}" | wc -w)
-    log "EBS Volumes: ${vol_count:-0}"
-
-    log ""
-    log "All resources are tagged with:"
-    log "  - Cluster: ${CLUSTER_NAME}"
-    log "  - ManagedBy: k0s-script"
-    log ""
-
-    # Confirmation prompt (skip if AUTO_APPROVE is set)
-    if [[ "${AUTO_APPROVE:-false}" != "true" ]]; then
-      warn "This will permanently delete the above AWS resources!"
-      read -p "Type 'yes' to confirm deletion: " -r
-      if [[ ! $REPLY =~ ^[Yy]es$ ]]; then
-        log "Deletion cancelled by user"
-        exit 0
-      fi
-    fi
-
-    log ""
-    log "============================================"
-    log "Starting resource deletion..."
-    log "============================================"
-    log ""
-
-    # Now proceed with deletion
-    if [[ -n "${instance_ids}" ]]; then
-      log "Terminating ${instance_count} EC2 instance(s)..."
-      aws ec2 terminate-instances --region "${REGION}" --instance-ids ${instance_ids}
-
-      log "Waiting for instances to terminate..."
-      aws ec2 wait instance-terminated --region "${REGION}" --instance-ids ${instance_ids} || warn "Timeout waiting for instances to terminate"
-
-      log "EC2 instances terminated successfully"
-    else
-      log "No EC2 instances to terminate"
-    fi
-
-    # Clean up network interfaces that may be stuck
-    log "Checking for orphaned network interfaces..."
-    local enis eni_count=0
-    enis=$(aws ec2 describe-network-interfaces \
-      --region "${REGION}" \
-      --filters \
-        "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'NetworkInterfaces[?Status==`available`].NetworkInterfaceId' --output text 2>/dev/null || echo "")
-
-    if [[ -n "${enis}" ]]; then
-      eni_count=$(echo "${enis}" | wc -w)
-      log "Found ${eni_count} orphaned network interface(s), deleting..."
-      for eni in ${enis}; do
-        log "  Deleting network interface: ${eni}"
-        aws ec2 delete-network-interface --region "${REGION}" --network-interface-id "${eni}" 2>/dev/null || warn "Could not delete ENI ${eni}"
-      done
-    else
-      log "No orphaned network interfaces found"
-    fi
-
-    # Delete security group (with retries for ENI detachment)
-    log "Deleting security group..."
-    local sg_id sg_deleted=false
-    sg_id=$(aws ec2 describe-security-groups \
-      --region "${REGION}" \
-      --filters \
-        "Name=group-name,Values=${CLUSTER_NAME}-k0s-sg" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-      --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
-
-    if [[ -n "${sg_id}" && "${sg_id}" != "None" ]]; then
-      log "Found security group: ${sg_id}"
-
-      # Try multiple times with increasing wait periods
-      for attempt in 1 2 3 4 5; do
-        log "  Attempt ${attempt}/5 to delete security group..."
-        if aws ec2 delete-security-group --region "${REGION}" --group-id "${sg_id}" 2>/dev/null; then
-          log "Security group deleted successfully"
-          sg_deleted=true
-          break
-        else
-          if [[ ${attempt} -lt 5 ]]; then
-            local wait_time=$((attempt * 15))
-            log "  Security group still has dependencies, waiting ${wait_time}s for ENIs to detach..."
-            sleep ${wait_time}
-          fi
-        fi
-      done
-
-      if [[ "${sg_deleted}" == "false" ]]; then
-        warn "Could not delete security group after 5 attempts (may have dependencies)"
-        warn "AWS will auto-clean it when dependencies are removed"
-      fi
-    else
-      log "Security group not found or already deleted"
-    fi
-
-    # Delete any EBS volumes that were created
-    log "Checking for orphaned EBS volumes..."
-    local volumes vol_count=0
-    volumes=$(aws ec2 describe-volumes \
-      --region "${REGION}" \
-      --filters \
-        "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-        "Name=tag:ManagedBy,Values=k0s-script" \
-        "Name=status,Values=available" \
-      --query 'Volumes[].VolumeId' --output text)
-
-    if [[ -n "${volumes}" ]]; then
-      vol_count=$(echo "${volumes}" | wc -w)
-      log "Found ${vol_count} orphaned EBS volume(s), deleting..."
-      for vol in ${volumes}; do
-        log "  Deleting volume: ${vol}"
-        aws ec2 delete-volume --region "${REGION}" --volume-id "${vol}" && log "    Volume ${vol} deleted" || warn "    Could not delete volume ${vol}"
-      done
-    else
-      log "No orphaned EBS volumes found"
-    fi
+  if [[ -f "${KUBECONFIG}" ]] && timeout 10 kubectl cluster-info &>/dev/null; then
+    log "Deleting Kubernetes resources..."
+    kubectl delete aiplatform --all -n "${AI_NS}" --timeout=60s || true
+    kubectl delete namespace "${AI_NS}" --timeout=120s || true
+    kubectl delete namespace splunk-ai-operator-system --timeout=60s || true
+    kubectl delete namespace monitoring --timeout=60s || true
   fi
+
+  IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
+  IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+
+  log "Stopping k0s on controller nodes..."
+  for ip in "${CONTROLLER_IPS[@]}"; do
+    log "  Stopping k0s on controller: ${ip}..."
+    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
+  done
+
+  log "Stopping k0s on worker nodes..."
+  for ip in "${WORKER_IPS[@]}"; do
+    log "  Stopping k0s on worker: ${ip}..."
+    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
+  done
+
+  log "k0s stopped on all nodes"
+  log "NOTE: Node machines are still running. To clean up completely:"
+  log "  - Remove k0s binaries: sudo rm -f /usr/local/bin/k0s"
+  log "  - Clean up data: sudo rm -rf /var/lib/k0s /etc/k0s"
 
   # Clean up local files
   log "Cleaning up local files..."
@@ -4717,17 +3661,9 @@ main_delete() {
   log "Cleanup Summary"
   log "============================================"
 
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    log "Infrastructure: On-premises"
-    log "  - k0s stopped and reset on all nodes"
-    log "  - NOTE: Nodes are still running, k0s binaries remain"
-  else
-    log "Infrastructure: AWS EC2"
-    log "  - EC2 Instances: ${instance_count:-0} terminated"
-    log "  - Network Interfaces: ${eni_count:-0} cleaned up"
-    log "  - Security Groups: $([ "${sg_deleted}" == "true" ] && echo "1 deleted" || echo "pending cleanup")"
-    log "  - EBS Volumes: ${vol_count:-0} deleted"
-  fi
+  log "Infrastructure: On-premises"
+  log "  - k0s stopped and reset on all nodes"
+  log "  - NOTE: Nodes are still running, k0s binaries remain"
 
   log ""
   log "Kubernetes Resources:"
@@ -4747,21 +3683,11 @@ main_delete() {
   log ""
   log "Cluster '${CLUSTER_NAME}' has been deleted."
 
-  if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
-    log ""
-    log "On-prem nodes are still running with k0s stopped."
-    log "To fully clean up each node, run:"
-    log "  sudo rm -f /usr/local/bin/k0s"
-    log "  sudo rm -rf /var/lib/k0s /etc/k0s"
-  else
-    # Check if any resources failed to delete
-    if [[ "${sg_deleted}" == "false" ]]; then
-      log ""
-      warn "Some resources may require manual cleanup:"
-      warn "  - Security group ${sg_id} may have lingering dependencies"
-      warn "  - Check AWS console for any remaining resources tagged with Cluster=${CLUSTER_NAME}"
-    fi
-  fi
+  log ""
+  log "Nodes are still running with k0s stopped."
+  log "To fully clean up each node, run:"
+  log "  sudo rm -f /usr/local/bin/k0s"
+  log "  sudo rm -rf /var/lib/k0s /etc/k0s"
 }
 
 # ====== CLEAN ALL (AGGRESSIVE CLEANUP) ======
@@ -4809,36 +3735,34 @@ usage() {
   cat <<EOF
 Usage: $0 [install|delete|clean-all|join-workers]
 
-Deploys Splunk AI Platform on k0s cluster (on-prem or EC2)
+Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
+Requires nodes.existingIPs in the config YAML.
 
 Commands:
   install       - Install k0s cluster and AI Platform stack
   join-workers  - Join/rejoin worker nodes to existing cluster (resume after failure)
   delete        - Delete cluster and all resources (graceful)
-  clean-all     - Aggressive cleanup including node-level cleanup (on-prem)
+  clean-all     - Aggressive cleanup including node-level cleanup
 
 Environment:
   CONFIG_FILE  - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
   AUTO_APPROVE - Skip confirmation prompt for delete (default: false)
 
 Examples:
-  # On-prem with existing IPs
-  CONFIG_FILE=./on-prem-config.yaml $0 install
-
-  # EC2 simulation
-  CONFIG_FILE=./ec2-config.yaml $0 install
+  # Install with existing IPs
+  CONFIG_FILE=./my-config.yaml $0 install
 
   # Join worker nodes (if install failed or was interrupted)
-  CONFIG_FILE=./ec2-config.yaml $0 join-workers
+  CONFIG_FILE=./my-config.yaml $0 join-workers
 
   # Delete cluster (with confirmation prompt)
-  CONFIG_FILE=./config.yaml $0 delete
+  CONFIG_FILE=./my-config.yaml $0 delete
 
   # Delete cluster (auto-approve, no prompt)
-  AUTO_APPROVE=true CONFIG_FILE=./config.yaml $0 delete
+  AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml $0 delete
 
-  # Deep cleanup (aggressive, on-prem only)
-  CONFIG_FILE=./config.yaml $0 clean-all
+  # Deep cleanup (aggressive)
+  CONFIG_FILE=./my-config.yaml $0 clean-all
 
 Notes:
   - 'install' performs full cluster setup including worker joins
@@ -4848,19 +3772,14 @@ Notes:
     * Adding workers to existing cluster
     * Fixing missing node labels
   - 'delete' performs comprehensive cleanup:
-    * Shows preview of all resources to be deleted
-    * Requires confirmation (type 'yes') unless AUTO_APPROVE=true
-    * Only deletes resources tagged with ManagedBy=k0s-script
     * All Kubernetes resources (CRs, operators, namespaces)
-    * All AWS resources (EC2, ENIs, security groups, EBS volumes)
-    * Includes retry logic for ENI detachment
+    * Stops and resets k0s on all nodes
+    * Machines remain running but k0s is stopped and reset
     * Provides detailed cleanup summary
-  - 'clean-all' adds aggressive node-level cleanup (on-prem only):
+  - 'clean-all' adds aggressive node-level cleanup:
     * Removes k0s data directories (preserves k0s binary)
     * Cleans kubelet, CNI, and Calico files
     * Flushes iptables rules
-  - For EC2 mode, 'delete' terminates all instances and cleans AWS resources
-  - For on-prem mode, machines remain running but k0s is stopped and reset
   - All commands are idempotent and safe to run multiple times
 EOF
 }
@@ -4928,53 +3847,15 @@ join_workers() {
     err "Kubeconfig not found at ${KUBECONFIG}. Please run 'install' first."
   fi
 
-  # Get controller IP from existing cluster
+  # Get IPs from config
   log "Detecting cluster configuration..."
+  IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
+  IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
 
-  # Option 1: Get from EC2 instances
-  if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
-    log "Discovering EC2 instances for cluster: ${CLUSTER_NAME}..."
-
-    # Get controller IPs
-    local controller_ips
-    controller_ips=$(aws ec2 describe-instances --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-                "Name=tag:Role,Values=controller" \
-                "Name=instance-state-name,Values=running" \
-      --query 'Reservations[*].Instances[*].PublicIpAddress' \
-      --output text)
-
-    if [[ -z "${controller_ips}" ]]; then
-      err "No running controller instances found for cluster ${CLUSTER_NAME}"
-    fi
-
-    # Convert newlines and tabs to spaces, then split into array
-    controller_ips=$(echo "${controller_ips}" | tr '\n\t' ' ')
-    IFS=' ' read -ra CONTROLLER_IPS <<< "${controller_ips}"
-
-    # Get worker IPs
-    local worker_ips
-    worker_ips=$(aws ec2 describe-instances --region "${REGION}" \
-      --filters "Name=tag:Cluster,Values=${CLUSTER_NAME}" \
-                "Name=tag:Role,Values=cpu-worker,gpu-worker" \
-                "Name=instance-state-name,Values=running" \
-      --query 'Reservations[*].Instances[*].PublicIpAddress' \
-      --output text)
-
-    if [[ -z "${worker_ips}" ]]; then
-      warn "No worker instances found for cluster ${CLUSTER_NAME}"
-      log "Nothing to join, exiting."
-      return 0
-    fi
-
-    # Convert newlines and tabs to spaces, then split into array
-    worker_ips=$(echo "${worker_ips}" | tr '\n\t' ' ')
-    IFS=' ' read -ra WORKER_IPS <<< "${worker_ips}"
-    SSH_KEY_PATH="${HOME}/.ssh/${KEY_NAME}.pem"
-  else
-    # Option 2: Use existing IPs from config
-    IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
-    IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+  if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
+    warn "No worker IPs found in config"
+    log "Nothing to join, exiting."
+    return 0
   fi
 
   local controller_ip="${CONTROLLER_IPS[0]}"
@@ -5189,7 +4070,6 @@ case "${1:-install}" in
     clean_all
     ;;
   join-workers)
-  # TODO fix this flow
     join_workers
     ;;
   *)

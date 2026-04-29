@@ -639,7 +639,7 @@ storage:
       rootUser: "admin"
       rootPassword: "Change-This-Strong-Password-123!"
 
-images: # TODO update images with released versions (from docker.io / how ?)
+images:
   registry: "registry.corp.com"
   operator:
     image: "registry.corp.com/splunk/splunk-ai-operator:v0.1.5"

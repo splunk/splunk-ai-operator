@@ -61,15 +61,24 @@ func NewStorageClient(
 		if u.Host == "" {
 			return nil, fmt.Errorf("invalid volume URI %q: S3-compatible path must include bucket name (e.g. s3compat://bucket-name/prefix)", vs.Path)
 		}
+		if vs.Endpoint == "" {
+			return nil, fmt.Errorf("s3compat:// scheme requires spec.objectStorage.endpoint to be set (otherwise the AWS SDK targets real AWS S3)")
+		}
 		return NewS3CompatibleClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "minio":
 		if u.Host == "" {
 			return nil, fmt.Errorf("invalid volume URI %q: MinIO path must include bucket name (e.g. minio://bucket-name/prefix)", vs.Path)
 		}
+		if vs.Endpoint == "" {
+			return nil, fmt.Errorf("minio:// scheme requires spec.objectStorage.endpoint to be set (otherwise the AWS SDK targets real AWS S3)")
+		}
 		return NewS3CompatibleClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "seaweedfs":
 		if u.Host == "" {
 			return nil, fmt.Errorf("invalid volume URI %q: SeaweedFS path must include bucket name (e.g. seaweedfs://bucket-name/prefix)", vs.Path)
+		}
+		if vs.Endpoint == "" {
+			return nil, fmt.Errorf("seaweedfs:// scheme requires spec.objectStorage.endpoint to be set (otherwise the AWS SDK targets real AWS S3)")
 		}
 		return NewS3CompatibleClient(ctx, k8sClient, namespace, u.Host, prefix, vs)
 	case "fixture":

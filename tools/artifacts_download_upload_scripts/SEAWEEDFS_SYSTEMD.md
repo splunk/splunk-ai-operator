@@ -12,7 +12,7 @@ Run SeaweedFS as a systemd service so it **restarts on failure** and **starts on
 On the host where SeaweedFS should run:
 
 ```bash
-cd /path/to/splunk-ai-operator/tools/cluster_setup
+cd /path/to/splunk-ai-operator/tools/artifacts_download_upload_scripts
 sudo ./install_seaweedfs_systemd.sh
 ```
 
@@ -22,7 +22,7 @@ This copies `seaweedfs.service` to `/etc/systemd/system/`, enables and starts th
 
 1. Copy the unit file:
    ```bash
-   sudo cp tools/cluster_setup/seaweedfs.service /etc/systemd/system/
+   sudo cp tools/artifacts_download_upload_scripts/seaweedfs.service /etc/systemd/system/
    sudo systemctl daemon-reload
    ```
 

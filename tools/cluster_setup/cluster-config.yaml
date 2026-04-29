@@ -21,7 +21,7 @@ cluster:
   #        ./eks_cluster_with_stack.sh install
   #
   #   2. AFTER first install succeeds, flip this one line:
-  #        useExisting: true             # subsequent `install` only reconciles
+  #        useExisting: false            # subsequent `install` only reconciles
   #                                      # operators/CRs on the existing cluster.
   #      Re-running `install` is now safe and does NOT create new VPCs/IGWs.
   #
@@ -32,8 +32,8 @@ cluster:
   #        leaving orphan VPCs behind and eating your per-region quota.
   #        ./eks_cluster_with_stack.sh delete-full
   # ------------------------------------------------------------------------
-  useExisting: true   # true = do not create cluster; use existing one (script fails if cluster not found)
-  name: "ai-tier-sok-test-east2"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  useExisting: false  # true = do not create cluster; use existing one (script fails if cluster not found)
+  name: "my-ai-cluster"                             # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
   region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
   # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).

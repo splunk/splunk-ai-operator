@@ -98,12 +98,12 @@ Preferred generic names; `MINIO_*` are accepted for backward compatibility.
 
 | Preferred (generic) | Fallback | Description |
 |---------------------|----------|-------------|
-| `S3COMPAT_OBJECT_STORE_ENDPOINT` | `MINIO_ENDPOINT` | S3 API endpoint URL (e.g. http://host:9000 for MinIO, http://host:8333 for SeaweedFS) |
-| `S3COMPAT_OBJECT_STORE_BUCKET` | `MINIO_BUCKET` | Bucket name |
-| `S3COMPAT_OBJECT_STORE_ACCESS_KEY` | `MINIO_ROOT_USER` or `MINIO_ACCESS_KEY` | Access key |
-| `S3COMPAT_OBJECT_STORE_SECRET_KEY` | `MINIO_ROOT_PASSWORD` or `MINIO_SECRET_KEY` | Secret key |
+| `OBJECT_STORE_ENDPOINT` | `MINIO_ENDPOINT` | S3 API endpoint URL (e.g. http://host:9000 for MinIO, http://host:8333 for SeaweedFS) |
+| `OBJECT_STORE_BUCKET` | `MINIO_BUCKET` | Bucket name |
+| `OBJECT_STORE_ACCESS_KEY` | `MINIO_ROOT_USER` or `MINIO_ACCESS_KEY` | Access key |
+| `OBJECT_STORE_SECRET_KEY` | `MINIO_ROOT_PASSWORD` or `MINIO_SECRET_KEY` | Secret key |
 
-Example for SeaweedFS: `S3COMPAT_OBJECT_STORE_ENDPOINT=http://seaweedfs:8333 S3COMPAT_OBJECT_STORE_BUCKET=my-bucket ./upload_to_minio.sh`
+Example for SeaweedFS: `OBJECT_STORE_ENDPOINT=http://seaweedfs:8333 OBJECT_STORE_BUCKET=my-bucket ./upload_to_minio.sh`
 
 **Prerequisites:**
 - Run `download_from_huggingface.sh` first to download artifacts

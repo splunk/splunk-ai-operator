@@ -50,9 +50,8 @@ type ApplicationParams struct {
 	S3CompatObjectStoreEndpointUrl string           `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
 	S3CompatObjectStoreAccessKey   string           `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
 	S3CompatObjectStoreSecretKey   string           `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
-	Replicas                       map[string]int32 `yaml:"REPLICAS"`
-	WorkingDirBase                 string           `yaml:"WORKING_DIR_BASE"`
-	ModelVersion                   string           `yaml:"MODEL_VERSION"`
+	Replicas        map[string]int32 `yaml:"REPLICAS"`
+	ModelVersion    string           `yaml:"MODEL_VERSION"`
 	AcceleratorType                string           `yaml:"ACCELERATOR_TYPE"`
 }
 
@@ -86,26 +85,6 @@ func (b *Builder) effectiveAcceleratorType() string {
 		return s
 	}
 	return "L40S"
-}
-
-// rayWorkingDirBase builds the base URI for runtime_env.working_dir application zips.
-//
-// Ray's Serve config rejects plain http:// for remote working_dir URIs; allowed schemes include
-// s3 and https. We always use s3:// for S3 and S3-compatible backends (AWS, MinIO, SeaweedFS, etc.).
-// Ray pods receive AWS_ENDPOINT_URL plus AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (when applicable)
-// from rayS3DownloadEnv; modern boto3/botocore honor AWS_ENDPOINT_URL for the S3 client used to
-// fetch runtime_env packages.
-//
-// For GCS we use gs:// (scheme may be gs or gcs in objectStorage.path).
-func rayWorkingDirBase(scheme, bucket string) string {
-	switch strings.ToLower(scheme) {
-	case "s3", "s3compat", "minio", "seaweedfs":
-		return fmt.Sprintf("s3://%s/ray-services/ai-platform/applications", bucket)
-	case "gs", "gcs":
-		return fmt.Sprintf("gs://%s/ray-services/ai-platform/applications", bucket)
-	default:
-		return fmt.Sprintf("%s://%s/ray-services/ai-platform/applications", scheme, bucket)
-	}
 }
 
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
@@ -208,9 +187,6 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
-	// Build working_dir base (s3:// or gs://; see rayWorkingDirBase).
-	workingDirBase := rayWorkingDirBase(u.Scheme, u.Host)
-
 	param := ApplicationParams{
 		ArtifactBucketName:             u.Host,
 		ArtifactsProvider:              artifactsProvider,
@@ -219,7 +195,6 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		S3CompatObjectStoreAccessKey:   s3CompatObjectStoreAccessKey,
 		S3CompatObjectStoreSecretKey:   s3CompatObjectStoreSecretKey,
 		Replicas:                       replicasMap,
-		WorkingDirBase:                 workingDirBase,
 		ModelVersion:                   os.Getenv("MODEL_VERSION"),
 		AcceleratorType:                b.effectiveAcceleratorType(),
 	}

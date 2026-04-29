@@ -25,5 +25,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: docker.com/splunk/splunk-ai-operator
+  newName: docker.io/splunk/splunk-ai-operator
   newTag: v0.0.1
