@@ -13,7 +13,7 @@
 # ---------- Cluster Configuration ----------
 cluster:
   name: airgap-cluster
-  # region: us-east-2                    # Ignored for on-prem, but required in config
+  region: us-east-2                       # CHANGE THIS — required when storage.objectStore.type=aws (region of the S3 bucket); ignored for true on-prem
   sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
   sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
 
@@ -38,7 +38,7 @@ nodes:
 #   - /var/lib/k0s must have at least 100 GB free on controllers
 #   If using a dedicated disk, mount it at /var/lib/k0s before running this script.
 #
-# Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).
+# Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install).
 # Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
 storage:
   storageClass: "local-path"                 # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
@@ -58,8 +58,8 @@ storage:
     # endpoint: "http://3.144.157.201:8333"      # SeaweedFS (deprecated — see comment above)
     endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS S3 API endpoint
     auth:
-      rootUser: "minioadmin"
-      rootPassword: "minioadmin"
+      rootUser: "<paste-AWS_ACCESS_KEY_ID-here>"          # CHANGE THIS — AWS_ACCESS_KEY_ID (AKIA…) or MinIO root user
+      rootPassword: "<paste-AWS_SECRET_ACCESS_KEY-here>"  # CHANGE THIS — AWS secret OR MinIO root password; NEVER commit real keys
 
 # ---------- Container Images Configuration ----------
 images:
@@ -132,32 +132,36 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
 
-  # ---------- SAIA public exposure (OPTIONAL) ----------
-  # The SAIA "public" Service (nginx reverse proxy in front of v1+v2 API pods)
-  # defaults to ClusterIP, meaning it is only reachable from inside the cluster.
-  #
-  # Two call patterns hit this Service:
-  #   (A) Splunk Enterprise pod      → saia-service   (works with ClusterIP)
-  #   (B) End user's browser         → saia-service   (needs external exposure)
+  # ---------- SAIA public exposure (NodePort-free) ----------
+  # The SAIA "public" Service (nginx reverse proxy in front of v1 + v2 API
+  # pods) defaults to ClusterIP — only reachable from inside the cluster. Two
+  # call patterns hit it:
+  #   (A) Splunk Enterprise pod   → saia-service   (works with ClusterIP)
+  #   (B) End user's browser      → saia-service   (needs external exposure)
   #
   # Pattern B is used by the v2 chat UI (/query streaming, conversations,
   # feedback, admin endpoints). Without external exposure the v2 chat UI
-  # breaks for users, even though v1 one-shot SPL features still work.
+  # breaks for users; v1 one-shot SPL still works.
   #
-  # To DISABLE external exposure (use ClusterIP only), either:
-  #   * Delete / comment-out the entire `serviceTemplate:` block below, OR
-  #   * Set `type: ClusterIP` explicitly.
-  # Either is treated identically — the installer skips emitting serviceTemplate
-  # into the AIPlatform CR and the operator falls through to the ClusterIP
-  # default in reconcileSAIAService().
+  # The supported on-prem path is `type: LoadBalancer` backed by MetalLB
+  # (allocates a routable VIP from a pool you provide; ARP / BGP-announces it
+  # on your network). NodePort is intentionally avoided so we never open
+  # 30000-32767 on every worker node.
   #
-  # To ENABLE external exposure for on-prem / airgap customers, NodePort is the
-  # recommended default: any k8s node IP + the configured nodePort yields a
-  # reachable endpoint from VPN-connected users. No cloud LB / cert-manager
-  # needed. Use LoadBalancer only if the customer runs MetalLB or a cloud LB.
+  # The installer:
+  #   * Installs MetalLB (set metallb.install: true below).
+  #   * Applies an IPAddressPool + L2Advertisement (or BGPAdvertisement) from
+  #     the metallb config below.
+  #   * Renders the SAIA Service as type: LoadBalancer; MetalLB allocates a
+  #     VIP from the pool and announces it.
+  #   * Patches the Service with `allocateLoadBalancerNodePorts: false` and
+  #     `externalTrafficPolicy: Local` so kube-proxy does not open a NodePort.
+  #
+  # To DISABLE external exposure (ClusterIP only), comment out the whole
+  # serviceTemplate block AND set metallb.install: false.
   serviceTemplate:
-    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
-    nodePort: 30080         # Fixed NodePort (30000-32767). Required for stable DNS.
+    type: LoadBalancer      # ClusterIP | LoadBalancer (NodePort is not used on k0s)
+    # No nodePort field — explicitly NodePort-free.
 
   features:
     - name: "saia"
@@ -174,6 +178,38 @@ aiPlatform:
         operator: "Equal"
         value: "true"
         effect: "NoSchedule"
+
+# ---------- MetalLB (k0s LoadBalancer provider) ----------
+# Required when aiPlatform.serviceTemplate.type=LoadBalancer on a bare-metal
+# / k0s cluster. Pinned chart version for supply-chain reproducibility
+# (codeguard-0-supply-chain-security).
+#
+# If serviceTemplate.type=NodePort, the installer skips MetalLB entirely even
+# when metallb.install=true (NodePort does not use a LoadBalancer provider).
+metallb:
+  install: true                    # set false if MetalLB is already installed or not needed
+  chartVersion: "0.14.8"           # metallb/metallb Helm chart (matches MetalLB v0.14.8)
+  namespace: "metallb-system"
+
+  # Address pool — a range of IPs MetalLB can hand out to LoadBalancer
+  # Services. Must be routable from clients (VPN-connected users) to your k0s
+  # workers. Use IPs that are NOT used elsewhere on the LAN.
+  pool:
+    name: "saia-pool"
+    addresses:
+      - "10.20.30.100-10.20.30.110"   # CHANGE THIS to a free range on your network
+
+  # Advertisement mode: "layer2" works on most LANs without network gear
+  # changes (one elected node answers ARP for the VIP at a time; failover ~
+  # seconds). Use "bgp" only if your fabric supports BGP peering — then also
+  # populate metallb.bgpPeers below.
+  mode: "layer2"                  # layer2 | bgp
+
+  # Required only when mode=bgp. Leave empty for layer2.
+  bgpPeers: []
+    # - peerAddress: "10.0.0.1"
+    #   peerASN: 65001
+    #   myASN: 65000
 
 # ---------- Image Pull Secrets ----------
 imagePullSecrets:

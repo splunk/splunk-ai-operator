@@ -13,8 +13,27 @@
 
 # ---------- Cluster Configuration ----------
 cluster:
-  useExisting: false   # true = do not create cluster; use existing one (script fails if cluster not found)
-  name: "my-ai-cluster"                     # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  # ------------------------------------------------------------------------
+  # LIFECYCLE WORKFLOW (to avoid VPC/IGW quota churn and DELETE_FAILED loops)
+  # ------------------------------------------------------------------------
+  #   1. FIRST install (cluster does not exist yet):
+  #        useExisting: false            # eksctl creates the cluster + VPC
+  #        ./eks_cluster_with_stack.sh install
+  #
+  #   2. AFTER first install succeeds, flip this one line:
+  #        useExisting: false            # subsequent `install` only reconciles
+  #                                      # operators/CRs on the existing cluster.
+  #      Re-running `install` is now safe and does NOT create new VPCs/IGWs.
+  #
+  #   3. When you genuinely want to tear down:
+  #        ALWAYS use `delete-full` (NOT `delete`). It uninstalls CRs/operators
+  #        first so the AWS Load Balancer Controller removes its NLBs + SGs
+  #        before CFN deletes the VPC -- this prevents DELETE_FAILED stacks
+  #        leaving orphan VPCs behind and eating your per-region quota.
+  #        ./eks_cluster_with_stack.sh delete-full
+  # ------------------------------------------------------------------------
+  useExisting: false  # true = do not create cluster; use existing one (script fails if cluster not found)
+  name: "my-ai-cluster"                             # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
   region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
   # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).
@@ -73,7 +92,7 @@ nodeGroups:
     desiredCapacity: 2                    # Initial number of GPU nodes
     minSize: 2                            # Minimum GPU nodes
     maxSize: 4                            # Maximum GPU nodes (set equal to desiredCapacity for H100)
-    volumeSize: 1000                      # EBS volume size per GPU node (GB) - larger for model storage
+    volumeSize: 500                      # EBS volume size per GPU node (GB) - larger for model storage
     volumeType: "gp3"                     # EBS volume type
 
     # ── H100 ONLY ──────────────────────────────────────────────────────────────
@@ -93,7 +112,7 @@ nodeGroups:
 # Object storage: only AWS S3 or external S3-compatible (no in-cluster MinIO install).
 # Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
 storage:
-  s3Bucket: "ai-platform-bucket-minio-us-east-2"  # Used when objectStore.type is aws
+  s3Bucket: "ai-platform-bucket-us-east-2"  # Used when objectStore.type is aws
   storageClass: "gp3"                        # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
 
@@ -102,12 +121,8 @@ storage:
   # - minio: same wiring as s3compat but path uses minio:// (use if an older operator webhook rejects s3compat://)
   # - seaweedfs: path uses seaweedfs:// (requires operator webhook that allows that scheme)
   objectStore:
-    type: "minio"                         # aws | s3compat | minio | seaweedfs (external only for non-aws)
-    bucket: "ai-platform-bucket-minio-us-east-2"
-    endpoint: "http://10.0.0.5:9000"         # CHANGE THIS: MinIO API (9000) or SeaweedFS S3 gateway (8333)
-    auth:
-      rootUser: ""                            # CHANGE THIS: S3-compatible access key (or MinIO root user)
-      rootPassword: ""                        # CHANGE THIS: S3-compatible secret key (or MinIO root password)
+    type: "aws"                         # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-us-east-2"            # Must match SeaweedFS env (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) or MinIO root
 
 # ---------- Container Images Configuration ----------
 images:
@@ -147,7 +162,7 @@ images:
     #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     # Bump tag after building fixed operator (SAIA 8Gi default, SchemaJobId persist, feature config)
     #image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
-    image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.31"
+    image: "docker.io/kbhos698/splunk-ai-operator:ai-tier"
 
   # Splunk Enterprise Images
   splunk:
@@ -170,8 +185,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "ml-platform/ray/ray-head:build-008"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-008"
+    headImage: "ml-platform/ray/ray-head:build-v2-008"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-008"
 
   # Weaviate Vector Database
   weaviate:
@@ -183,9 +198,14 @@ images:
   # SAIA (Splunk AI Assistant) Images
   saia:
     # Relative paths - registry prefix auto-applied
-    apiImage: "ml-platform/saia/saia-api:build-005"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003"
-
+    # NOTE: keep dataLoaderImage in sync with apiImage/apiV2Image. Tags older than
+    # v2-008 (specifically pre v2.0.4-13-g3b677604) ship a broken URL-compat shim
+    # that ignores VECTOR_DB_GRPC_* env vars and falls back to grpc.<host>:443 TLS,
+    # causing the vector-db-setup posthook Job to fail with a Weaviate gRPC health
+    # check error. See pkg/ai/features/saia/impl.go (reconcilePostInstallHook).
+    apiImage: "ml-platform/saia/saia-api:build-v2-009"
+    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-009"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-009"
   # Supporting Images
   fluentBit:
     # Docker Hub public image (has full path, registry prefix ignored)
@@ -197,6 +217,14 @@ images:
   otelCollector:
     # Public image - full path so registry prefix is NOT applied; validation checks this URL
     image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+  # NGINX reverse proxy used by the SAIA reconciler to route v1 / v2 requests
+  # by path. OPTIONAL: omit this block to use the script default
+  # (docker.io/library/nginx:1.27-alpine). Add it only to pin a specific tag
+  # or point at an internal mirror in airgapped clusters.
+  #
+  # nginx:
+  #   image: "harbor.internal/library/nginx:1.27-alpine"
 
 # ---------- Operator Versions ----------
 operators:
@@ -238,6 +266,124 @@ aiPlatform:
   workerGroupConfig:
     serviceAccountName: "ray-worker-sa"
     imageRegistry: ""                     # Leave empty for default
+
+  # ---------------------------------------------------------------------------
+  # Public SAIA exposure (NodePort-free)
+  # ---------------------------------------------------------------------------
+  # The operator renders a public Kubernetes Service named
+  # `<aiService.name>-saia-service`; because the AIService is typically named
+  # `<aiPlatform.name>-saia`, the resulting Service is usually
+  # `<aiPlatform.name>-saia-saia-service`. Its endpoints are the in-cluster
+  # nginx pods (nginx terminates path routing to saia v1 / v2). The install
+  # script then configures HOW that Service is reached from outside the cluster.
+  #
+  # IMPORTANT: this template intentionally does NOT use Service.type=NodePort.
+  # Many enterprise security policies prohibit opening 30000-32767 on every
+  # worker. All three modes below are NodePort-free — the script sets
+  # `allocateLoadBalancerNodePorts: false` on LoadBalancer Services so
+  # kube-proxy never opens a node port; for the BYO mode the Service stays
+  # ClusterIP and AWS LBC registers pod IPs into the customer's target group.
+  #
+  # Pick ONE of the modes below by editing the active block at the bottom of
+  # this section. Each mode shows: the YAML to use, what the script does, and
+  # what you must provision outside the cluster.
+  #
+  # ---------------------------------------------------------------------------
+  # MODE 1 — Operator-managed AWS NLB, IP-target mode (DEFAULT)
+  # ---------------------------------------------------------------------------
+  #   serviceTemplate:
+  #     type: LoadBalancer
+  #     annotations:
+  #       service.beta.kubernetes.io/aws-load-balancer-type:             "external"
+  #       service.beta.kubernetes.io/aws-load-balancer-scheme:           "internet-facing"   # or "internal"
+  #       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type:  "ip"                # ← pods, not nodes
+  #       service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+  #     # Optional TLS termination at the NLB:
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:..."
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-negotiation-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  #   awsLoadBalancerController:
+  #     install: true
+  #   byoTargetGroup:
+  #     enabled: false
+  #
+  # Script does:
+  #   * Installs AWS Load Balancer Controller (LBC) with IRSA, tags subnets.
+  #   * Creates the LoadBalancer Service; LBC provisions an NLB whose targets
+  #     are pod IPs (no NodePort, no kube-proxy hop, real client IP preserved).
+  #   * Patches the rendered Service to set `allocateLoadBalancerNodePorts:
+  #     false` and `externalTrafficPolicy: Local`.
+  # You must do: nothing on the AWS side. DNS appears in
+  # `.status.loadBalancer.ingress[0].hostname` after ~2-3 min.
+  #
+  # ---------------------------------------------------------------------------
+  # MODE 2 — Bring-your-own AWS LB (TargetGroupBinding, IP-target)
+  # ---------------------------------------------------------------------------
+  # Customer already owns the NLB / ALB / target group. LBC is installed only
+  # to manage target-group membership; it does NOT create LBs in this mode.
+  #
+  #   serviceTemplate:
+  #     type: ClusterIP                # LB is owned by the customer
+  #   awsLoadBalancerController:
+  #     install: true                  # required for TargetGroupBinding
+  #   byoTargetGroup:
+  #     enabled: true
+  #     targetGroupArn: "arn:aws:elasticloadbalancing:<region>:<account>:targetgroup/<your-tg>/<id>"
+  #     securityGroupId: "sg-xxxxxxxxxxxxxxxxx"   # the customer's LB security group
+  #
+  # Script does:
+  #   * Installs LBC.
+  #   * Leaves the public Service as ClusterIP.
+  #   * Applies a TargetGroupBinding CR with `targetType: ip` so LBC registers
+  #     nginx pod IPs into the customer's target group as endpoints change.
+  # You must do (outside the cluster):
+  #   1. Pre-create the target group in the EKS VPC with:
+  #        - Target type:   ip
+  #        - Protocol/Port: TCP/8080 (NLB) or HTTP/8080 (ALB)  ← pod port, not 30080
+  #        - Health check:  HTTP /nginx_health on traffic-port, 200 OK
+  #   2. Attach the target group to your existing LB listener.
+  #   3. Worker pod SG ingress 8080 from the LB SG only — the
+  #      TargetGroupBinding `networking.ingress.from.securityGroup` block
+  #      configured by the script does this for you.
+  #
+  # ---------------------------------------------------------------------------
+  # MODE 3 — On-prem / k0s / airgap (NOT applicable to this EKS template)
+  # ---------------------------------------------------------------------------
+  # Use the dedicated `k0s-cluster-config.yaml` template, which configures
+  # MetalLB to allocate a routable VIP. The user-facing contract there is
+  # identical (`type: LoadBalancer`) — only the LB provider changes.
+  #
+  # ---------------------------------------------------------------------------
+  # SECURITY NOTES (apply to all modes)
+  # ---------------------------------------------------------------------------
+  #   * Always terminate TLS at the LB (ACM cert on AWS) and place an auth
+  #     layer in front (oauth2-proxy, Cognito on the ALB, API Gateway, …)
+  #     before exposing on the public internet.
+  #   * Restrict the LB listener to trusted source CIDRs / SGs (never
+  #     0.0.0.0/0 to a sensitive endpoint).
+  #   * Pod SG ingress should allow 8080 only from the LB SG.
+  # ---------------------------------------------------------------------------
+
+  # Active mode below — EDIT to switch. Default is MODE 1.
+  serviceTemplate:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: "external"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+      service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+  awsLoadBalancerController:
+    install: true
+
+  # Bring-your-own AWS target group (Mode 2). Set enabled: true and provide
+  # both targetGroupArn and securityGroupId; the script will then leave the
+  # SAIA Service as ClusterIP and apply a TargetGroupBinding (LBC manages
+  # target registration into your existing target group).
+  byoTargetGroup:
+    enabled: false
+    # targetGroupArn: "arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/my-saia-tg/abc123"
+    # securityGroupId: "sg-0123456789abcdef0"
 
   # CPU Scheduling
   cpuScheduling:

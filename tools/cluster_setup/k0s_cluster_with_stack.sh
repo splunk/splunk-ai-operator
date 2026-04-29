@@ -388,6 +388,17 @@ configure_images() {
   log "✓ All images configured successfully"
 }
 
+# True if objectStore.auth values are still obvious template text. Non-empty
+# placeholders otherwise pass the length preflight and get applied into
+# minio-credentials, which makes SAIA fail at startup with InvalidAccessKeyId.
+object_store_auth_looks_like_placeholder() {
+  case "${MINIO_ROOT_USER}${MINIO_ROOT_PASSWORD}" in
+    *\<*|*\>*) return 0 ;;
+    *CHANGEME*|*changeme*) return 0 ;;
+  esac
+  return 1
+}
+
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
@@ -423,6 +434,9 @@ preflight_checks() {
     [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
   fi
   [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required (objectStore.auth.rootPassword)"
+  if object_store_auth_looks_like_placeholder; then
+    pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with a real access key and secret in your config (keep secrets in a Git-ignored file such as tools/cluster_setup/k0s-config.local.yaml)."
+  fi
 
   pf_header "Infrastructure mode"
   pf_ok "Using existing infrastructure (on-prem/baremetal)"
@@ -1118,6 +1132,10 @@ ensure_namespace() {
 # the Kubernetes credentials secret so the operator and workloads can auth.
 ensure_s3compat_credentials() {
   log "Creating credentials secret for S3-compatible object storage (${OBJ_STORE_TYPE})..."
+  if object_store_auth_looks_like_placeholder; then
+    err "Refusing to create minio-credentials: objectStore.auth contains template placeholders; fix ${CONFIG_FILE}"
+    return 1
+  fi
   if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
     err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
     return 1
@@ -2637,15 +2655,23 @@ install_ai_platform_cr() {
 
   # Ensure object storage credentials secret exists in AI namespace
   log "Creating/updating S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
-  kubectl -n "${AI_NS}" create secret generic minio-credentials \
-    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
-  log "✓ Object storage credentials secret ready"
+  if object_store_auth_looks_like_placeholder; then
+    if kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
+      warn "Skipping minio-credentials apply: auth in ${CONFIG_FILE} still looks like a template (e.g. contains '<'). Preserving existing secret."
+    else
+      err "minio-credentials missing and cannot be created: fix objectStore.auth in ${CONFIG_FILE} (remove <...> placeholders)."
+    fi
+  else
+    kubectl -n "${AI_NS}" create secret generic minio-credentials \
+      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    log "✓ Object storage credentials secret ready"
+  fi
 
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
@@ -2819,6 +2845,270 @@ YAML
   log "AIPlatform CR installed successfully"
 }
 
+saia_service_template_enabled_k0s() {
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -n "${svc_type}" && "${svc_type}" != "null" && "${svc_type}" != "ClusterIP" ]]
+}
+
+# True when SAIA public Service is explicitly NodePort. MetalLB is not used in
+# that mode, so install_metallb skips the Helm install even if metallb.install=true.
+k0s_saia_service_template_is_nodeport() {
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${svc_type}" == "NodePort" ]]
+}
+
+wait_for_k0s_aiservice_exists() {
+  local name="$1" timeout="${2:-600}" waited=0
+  while ! kubectl -n "${AI_NS}" get aiservice "${name}" >/dev/null 2>&1; do
+    [[ $waited -ge $timeout ]] && err "Timed out waiting for AIService ${AI_NS}/${name}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+apply_k0s_saia_service_annotations() {
+  local aiservice_name="$1"
+  local annotation_keys key value
+
+  annotation_keys="$(yq eval '.aiPlatform.serviceTemplate.annotations // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+  [[ -z "${annotation_keys}" ]] && return 0
+
+  local annotate_args=()
+  while IFS= read -r key; do
+    [[ -z "${key}" || "${key}" == "null" ]] && continue
+    value="$(yq eval ".aiPlatform.serviceTemplate.annotations.\"${key}\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -z "${value}" || "${value}" == "null" ]] && continue
+    annotate_args+=("${key}=${value}")
+  done <<< "${annotation_keys}"
+
+  if [[ ${#annotate_args[@]} -gt 0 ]]; then
+    log "Applying SAIA Service annotations to AIService/${aiservice_name}..."
+    kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" "${annotate_args[@]}" --overwrite
+  fi
+}
+
+# ---------- MetalLB (k0s LoadBalancer provider) ----------
+# k0s ships without a Service.type=LoadBalancer provider. MetalLB fills that
+# gap by allocating a VIP from a customer-provided pool and announcing it via
+# Layer-2 (ARP/NDP) or BGP. We pin the chart version for supply-chain
+# reproducibility (codeguard-0-supply-chain-security).
+
+metallb_enabled_k0s() {
+  local v
+  v="$(yq eval '.metallb.install // false' "${CONFIG_FILE}" 2>/dev/null || echo false)"
+  [[ "${v}" == "true" ]]
+}
+
+install_metallb() {
+  metallb_enabled_k0s || { log "metallb.install != true — skipping MetalLB install"; return 0; }
+
+  if k0s_saia_service_template_is_nodeport; then
+    log "Skipping MetalLB install: aiPlatform.serviceTemplate.type=NodePort (LoadBalancer provider not used for SAIA)."
+    log "NOTE: metallb.install=true has no effect while SAIA uses NodePort. Set metallb.install=false to match config, or use type=LoadBalancer to install MetalLB."
+    return 0
+  fi
+
+  local ns chart_version pool_name addr_count mode
+  ns="$(yq eval '.metallb.namespace // "metallb-system"' "${CONFIG_FILE}" 2>/dev/null)"
+  chart_version="$(yq eval '.metallb.chartVersion // "0.14.8"' "${CONFIG_FILE}" 2>/dev/null)"
+  pool_name="$(yq eval '.metallb.pool.name // "saia-pool"' "${CONFIG_FILE}" 2>/dev/null)"
+  addr_count="$(yq eval '.metallb.pool.addresses // [] | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+  mode="$(yq eval '.metallb.mode // "layer2"' "${CONFIG_FILE}" 2>/dev/null)"
+
+  if [[ "${addr_count}" == "0" ]]; then
+    err "metallb.install=true but metallb.pool.addresses is empty. Provide at least one IP range routable on your network."
+  fi
+  if [[ "${mode}" != "layer2" && "${mode}" != "bgp" ]]; then
+    err "metallb.mode must be 'layer2' or 'bgp' (got: ${mode})."
+  fi
+
+  log "Installing MetalLB ${chart_version} into namespace ${ns}..."
+  helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1 || true
+  helm repo update >/dev/null 2>&1 || true
+
+  kubectl get ns "${ns}" >/dev/null 2>&1 || kubectl create ns "${ns}"
+
+  helm upgrade --install metallb metallb/metallb \
+    --namespace "${ns}" \
+    --version "${chart_version}" \
+    --wait --timeout 5m
+
+  # Wait for the controller webhook to be Ready before applying CRs, otherwise
+  # the IPAddressPool / L2Advertisement applies race the validating webhook.
+  log "Waiting for MetalLB controller to be ready..."
+  kubectl -n "${ns}" rollout status deploy/metallb-controller --timeout=180s
+
+  # Render IPAddressPool with the configured address ranges.
+  local addresses_yaml=""
+  local i
+  local pool_count
+  pool_count="$(yq eval '.metallb.pool.addresses | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+  for ((i=0; i<pool_count; i++)); do
+    local addr
+    addr="$(yq eval ".metallb.pool.addresses[${i}]" "${CONFIG_FILE}" 2>/dev/null)"
+    [[ -z "${addr}" || "${addr}" == "null" ]] && continue
+    addresses_yaml+="    - ${addr}"$'\n'
+  done
+
+  log "Applying MetalLB IPAddressPool '${pool_name}' (${addr_count} range(s))..."
+  cat <<YAML | kubectl -n "${ns}" apply -f -
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: ${pool_name}
+  namespace: ${ns}
+spec:
+  addresses:
+${addresses_yaml}
+YAML
+
+  if [[ "${mode}" == "layer2" ]]; then
+    log "Applying MetalLB L2Advertisement for pool '${pool_name}'..."
+    cat <<YAML | kubectl -n "${ns}" apply -f -
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: ${pool_name}-l2
+  namespace: ${ns}
+spec:
+  ipAddressPools:
+    - ${pool_name}
+YAML
+  else
+    # BGP mode — render BGPPeers from config and attach a BGPAdvertisement.
+    local peer_count
+    peer_count="$(yq eval '.metallb.bgpPeers // [] | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+    if [[ "${peer_count}" == "0" ]]; then
+      err "metallb.mode=bgp requires metallb.bgpPeers to be non-empty (peerAddress, peerASN, myASN per peer)."
+    fi
+    local p
+    for ((p=0; p<peer_count; p++)); do
+      local peer_addr peer_asn my_asn
+      peer_addr="$(yq eval ".metallb.bgpPeers[${p}].peerAddress" "${CONFIG_FILE}" 2>/dev/null)"
+      peer_asn="$(yq eval ".metallb.bgpPeers[${p}].peerASN" "${CONFIG_FILE}" 2>/dev/null)"
+      my_asn="$(yq eval ".metallb.bgpPeers[${p}].myASN" "${CONFIG_FILE}" 2>/dev/null)"
+      [[ -z "${peer_addr}" || -z "${peer_asn}" || -z "${my_asn}" ]] && \
+        err "metallb.bgpPeers[${p}] missing peerAddress / peerASN / myASN."
+      cat <<YAML | kubectl -n "${ns}" apply -f -
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: bgp-peer-${p}
+  namespace: ${ns}
+spec:
+  peerAddress: ${peer_addr}
+  peerASN: ${peer_asn}
+  myASN: ${my_asn}
+YAML
+    done
+    cat <<YAML | kubectl -n "${ns}" apply -f -
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: ${pool_name}-bgp
+  namespace: ${ns}
+spec:
+  ipAddressPools:
+    - ${pool_name}
+YAML
+  fi
+
+  log "✓ MetalLB ${chart_version} installed (${mode}, pool=${pool_name})"
+}
+
+# Disable kube-proxy NodePort allocation on the rendered SAIA Service so
+# kube-proxy never opens 30000-32767 on workers. The operator's
+# reconcileSAIAService only mutates Selector/Ports on existing Services
+# (pkg/ai/features/saia/impl.go), so this patch survives subsequent
+# reconciles. externalTrafficPolicy=Local preserves the real client IP for
+# MetalLB-style L4 providers (the announcing node forwards directly to a
+# local pod with no SNAT).
+patch_k0s_saia_service_disable_nodeport() {
+  local platform_name="${CLUSTER_NAME}-ai-platform"
+  local aiservice_name="${platform_name}-saia"
+  local svc_name="${aiservice_name}-saia-service"
+
+  local svc_type
+  svc_type="$(kubectl -n "${AI_NS}" get svc "${svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || true)"
+  [[ "${svc_type}" != "LoadBalancer" ]] && return 0
+
+  log "Patching Service ${AI_NS}/${svc_name} to disable NodePort allocation..."
+  kubectl -n "${AI_NS}" patch svc "${svc_name}" --type=merge -p '{
+  "spec": {
+    "allocateLoadBalancerNodePorts": false,
+    "externalTrafficPolicy": "Local"
+  }
+}' >/dev/null
+  log "✓ Service ${AI_NS}/${svc_name}: allocateLoadBalancerNodePorts=false, externalTrafficPolicy=Local"
+}
+
+patch_k0s_saia_public_service_workaround() {
+  local platform_name="${CLUSTER_NAME}-ai-platform"
+  local aiservice_name="${platform_name}-saia"
+  local public_svc_name="${aiservice_name}-saia-service"
+  local svc_type svc_node_port
+
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+
+  wait_for_k0s_aiservice_exists "${aiservice_name}"
+
+  if saia_service_template_enabled_k0s; then
+    log "Patching AIService/${aiservice_name} with SAIA public exposure settings (type=${svc_type})..."
+    if [[ "${svc_type}" == "NodePort" && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
+      log "WARNING: NodePort exposure is discouraged on k0s. Prefer type=LoadBalancer with metallb.install=true (MetalLB install is skipped automatically when type=NodePort)." >&2
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${svc_node_port}
+          }
+        ]
+      }
+    }
+  }
+}"
+    else
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"${svc_type}\"
+      }
+    }
+  }
+}"
+    fi
+  fi
+
+  apply_k0s_saia_service_annotations "${aiservice_name}"
+
+  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
+
+  if saia_service_template_enabled_k0s; then
+    log "Recreating SAIA public Service to ensure patched settings take effect..."
+    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+    # Wait briefly for the operator to recreate it before patching NodePort
+    # allocation off; if it doesn't come back the patch will be a no-op.
+    local waited=0
+    while ! kubectl -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
+      [[ ${waited} -ge 300 ]] && break
+      sleep 5
+      waited=$((waited + 5))
+    done
+  fi
+
+  patch_k0s_saia_service_disable_nodeport
+}
+
 # ====== INSTALL FULL STACK ======
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
@@ -2901,9 +3191,18 @@ install_ai_platform_stack() {
   # Apply Splunk Standalone CR (non-blocking — pod boots in background)
   install_splunk_standalone
 
+  # MetalLB must be installed BEFORE the AIPlatform CR is reconciled — the
+  # operator renders a Service.type=LoadBalancer for SAIA and we need a
+  # provider in the cluster to allocate a VIP, otherwise the Service is
+  # stuck in EXTERNAL-IP=<pending> indefinitely. No-op when
+  # metallb.install=false (e.g., user is bringing their own MetalLB or wants
+  # ClusterIP only).
+  install_metallb
+
   # Install AI Platform operator and CR while Splunk Standalone boots
   install_splunk_ai_operator
   install_ai_platform_cr
+  patch_k0s_saia_public_service_workaround
 
   # Now wait for Splunk Standalone to be ready (likely already done by now)
   wait_for_splunk_standalone
@@ -2923,7 +3222,10 @@ check_platform_health() {
   # Check 1: Cluster nodes
   log "Checking cluster nodes..."
   local not_ready
-  not_ready=$(kubectl get nodes --no-headers 2>/dev/null | grep -v " Ready " | wc -l || echo "0")
+  # Count nodes whose status is not Ready without relying on grep exit codes.
+  # This avoids `set -euo pipefail` aborting the script when all nodes are
+  # Ready, while still producing a whitespace-free numeric result.
+  not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk 'index($0, " Ready ") == 0 { count++ } END { print count+0 }')
   if [[ "${not_ready}" -gt 0 ]]; then
     warn "Found ${not_ready} node(s) not in Ready state"
     kubectl get nodes
