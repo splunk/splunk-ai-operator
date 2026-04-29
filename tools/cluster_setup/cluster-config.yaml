@@ -275,90 +275,98 @@ aiPlatform:
     imageRegistry: ""                     # Leave empty for default
 
   # ---------------------------------------------------------------------------
-  # Public SAIA exposure
+  # Public SAIA exposure (NodePort-free)
   # ---------------------------------------------------------------------------
-  # The operator always renders a public Kubernetes Service named
+  # The operator renders a public Kubernetes Service named
   # `<aiPlatform.name>-saia-service` whose endpoints are the in-cluster nginx
-  # pods (nginx terminates path routing to saia v1 / v2). HOW that Service is
-  # reached from outside the cluster depends on two settings below:
+  # pods (nginx terminates path routing to saia v1 / v2). The install script
+  # then configures HOW that Service is reached from outside the cluster.
   #
-  #   - aiPlatform.serviceTemplate.{type, nodePort, annotations}
-  #   - aiPlatform.awsLoadBalancerController.install
+  # IMPORTANT: this template intentionally does NOT use Service.type=NodePort.
+  # Many enterprise security policies prohibit opening 30000-32767 on every
+  # worker. All three modes below are NodePort-free — the script sets
+  # `allocateLoadBalancerNodePorts: false` on LoadBalancer Services so
+  # kube-proxy never opens a node port; for the BYO mode the Service stays
+  # ClusterIP and AWS LBC registers pod IPs into the customer's target group.
   #
-  # Pick ONE of the three modes below. Each row shows: what you put in this
-  # file, what the install script does, and what you (the customer) must
-  # provision outside the cluster.
+  # Pick ONE of the modes below by editing the active block at the bottom of
+  # this section. Each mode shows: the YAML to use, what the script does, and
+  # what you must provision outside the cluster.
   #
   # ---------------------------------------------------------------------------
-  # MODE 1 — Operator-managed AWS NLB (default, simplest on EKS)
+  # MODE 1 — Operator-managed AWS NLB, IP-target mode (DEFAULT)
   # ---------------------------------------------------------------------------
   #   serviceTemplate:
   #     type: LoadBalancer
   #     annotations:
   #       service.beta.kubernetes.io/aws-load-balancer-type:             "external"
-  #       service.beta.kubernetes.io/aws-load-balancer-scheme:           "internet-facing"  # or "internal"
-  #       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type:  "instance"
+  #       service.beta.kubernetes.io/aws-load-balancer-scheme:           "internet-facing"   # or "internal"
+  #       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type:  "ip"                # ← pods, not nodes
+  #       service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+  #     # Optional TLS termination at the NLB:
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:..."
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-negotiation-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
   #   awsLoadBalancerController:
   #     install: true
+  #   byoTargetGroup:
+  #     enabled: false
   #
   # Script does:
-  #   * Installs AWS Load Balancer Controller (LBC) with IRSA and tags
-  #     public/private subnets for auto-discovery.
-  #   * Creates the LoadBalancer-typed Service; LBC reads the annotations and
-  #     provisions an internet-facing AWS NLB (~2-3 min). Public DNS appears
-  #     in `.status.loadBalancer.ingress[0].hostname`.
-  # You must do:
-  #   * Nothing on the AWS side — fully automated.
-  #   * (Optional) Add an ACM cert listener annotation if you want TLS
-  #     termination at the NLB.
+  #   * Installs AWS Load Balancer Controller (LBC) with IRSA, tags subnets.
+  #   * Creates the LoadBalancer Service; LBC provisions an NLB whose targets
+  #     are pod IPs (no NodePort, no kube-proxy hop, real client IP preserved).
+  #   * Patches the rendered Service to set `allocateLoadBalancerNodePorts:
+  #     false` and `externalTrafficPolicy: Local`.
+  # You must do: nothing on the AWS side. DNS appears in
+  # `.status.loadBalancer.ingress[0].hostname` after ~2-3 min.
   #
   # ---------------------------------------------------------------------------
-  # MODE 2 — Bring-your-own AWS LB (you already have an NLB / ALB)
+  # MODE 2 — Bring-your-own AWS LB (TargetGroupBinding, IP-target)
   # ---------------------------------------------------------------------------
+  # Customer already owns the NLB / ALB / target group. LBC is installed only
+  # to manage target-group membership; it does NOT create LBs in this mode.
+  #
   #   serviceTemplate:
-  #     type: NodePort
-  #     nodePort: 30080            # any free port in 30000-32767
+  #     type: ClusterIP                # LB is owned by the customer
   #   awsLoadBalancerController:
-  #     install: false             # no LBC, no operator-created LB
+  #     install: true                  # required for TargetGroupBinding
+  #   byoTargetGroup:
+  #     enabled: true
+  #     targetGroupArn: "arn:aws:elasticloadbalancing:<region>:<account>:targetgroup/<your-tg>/<id>"
+  #     securityGroupId: "sg-xxxxxxxxxxxxxxxxx"   # the customer's LB security group
   #
   # Script does:
-  #   * Creates the public Service as NodePort 30080 on every worker.
-  #   * Skips LBC install entirely.
-  # You must do (in AWS, outside the script):
-  #   1. Pre-create an NLB or ALB (any scheme).
-  #   2. Create a target group:
-  #        - Target type:    instance
-  #        - Protocol/Port:  TCP/30080 (NLB) or HTTP/30080 (ALB)
-  #        - Health check:   HTTP /nginx_health on port "traffic-port", 200 OK
-  #   3. Attach the EKS managed-nodegroup ASG to the target group so
-  #      membership tracks node scale-in/out, e.g. via Terraform:
-  #        resource "aws_autoscaling_attachment" "saia" {
-  #          autoscaling_group_name = "eks-<cluster>-<nodegroup>-NodeGroup-XXXX"
-  #          lb_target_group_arn    = "arn:aws:elasticloadbalancing:...:targetgroup/my-saia-tg/..."
-  #        }
-  #   4. Worker node SG: allow ingress TCP/30080 from the NLB subnet CIDRs
-  #      (NLB) or from the ALB's security group (ALB).
-  #
-  # ---------------------------------------------------------------------------
-  # MODE 3 — On-prem / k0s / airgap (HAProxy, F5, MetalLB, hardware LB, …)
-  # ---------------------------------------------------------------------------
-  #   serviceTemplate:
-  #     type: NodePort
-  #     nodePort: 30080
-  #   awsLoadBalancerController:
-  #     install: false             # has no effect off-AWS, leave false
-  #
-  # Script does:
-  #   * Same as Mode 2 — creates the public Service as NodePort 30080.
+  #   * Installs LBC.
+  #   * Leaves the public Service as ClusterIP.
+  #   * Applies a TargetGroupBinding CR with `targetType: ip` so LBC registers
+  #     nginx pod IPs into the customer's target group as endpoints change.
   # You must do (outside the cluster):
-  #   * Point your existing L4 LB (HAProxy / F5 / MetalLB / hardware) at every
-  #     worker node IP on TCP/30080, with HTTP health-check /nginx_health.
-  #     Sample HAProxy backend:
-  #         backend saia_be
-  #             option httpchk GET /nginx_health
-  #             server worker1 10.0.1.11:30080 check
-  #             server worker2 10.0.1.12:30080 check
+  #   1. Pre-create the target group in the EKS VPC with:
+  #        - Target type:   ip
+  #        - Protocol/Port: TCP/8080 (NLB) or HTTP/8080 (ALB)  ← pod port, not 30080
+  #        - Health check:  HTTP /nginx_health on traffic-port, 200 OK
+  #   2. Attach the target group to your existing LB listener.
+  #   3. Worker pod SG ingress 8080 from the LB SG only — the
+  #      TargetGroupBinding `networking.ingress.from.securityGroup` block
+  #      configured by the script does this for you.
   #
+  # ---------------------------------------------------------------------------
+  # MODE 3 — On-prem / k0s / airgap (NOT applicable to this EKS template)
+  # ---------------------------------------------------------------------------
+  # Use the dedicated `k0s-cluster-config.yaml` template, which configures
+  # MetalLB to allocate a routable VIP. The user-facing contract there is
+  # identical (`type: LoadBalancer`) — only the LB provider changes.
+  #
+  # ---------------------------------------------------------------------------
+  # SECURITY NOTES (apply to all modes)
+  # ---------------------------------------------------------------------------
+  #   * Always terminate TLS at the LB (ACM cert on AWS) and place an auth
+  #     layer in front (oauth2-proxy, Cognito on the ALB, API Gateway, …)
+  #     before exposing on the public internet.
+  #   * Restrict the LB listener to trusted source CIDRs / SGs (never
+  #     0.0.0.0/0 to a sensitive endpoint).
+  #   * Pod SG ingress should allow 8080 only from the LB SG.
   # ---------------------------------------------------------------------------
 
   # Active mode below — EDIT to switch. Default is MODE 1.
@@ -367,10 +375,20 @@ aiPlatform:
     annotations:
       service.beta.kubernetes.io/aws-load-balancer-type: "external"
       service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
-      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "instance"
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+      service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
 
   awsLoadBalancerController:
     install: true
+
+  # Bring-your-own AWS target group (Mode 2). Set enabled: true and provide
+  # both targetGroupArn and securityGroupId; the script will then leave the
+  # SAIA Service as ClusterIP and apply a TargetGroupBinding (LBC manages
+  # target registration into your existing target group).
+  byoTargetGroup:
+    enabled: false
+    # targetGroupArn: "arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/my-saia-tg/abc123"
+    # securityGroupId: "sg-0123456789abcdef0"
 
   # CPU Scheduling
   cpuScheduling:

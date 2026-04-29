@@ -93,12 +93,18 @@ load_config() {
     WORKER_IMAGE_REGISTRY="$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry' "$cfg")"
     SAIA_SERVICE_TYPE="$(yq eval '.aiPlatform.serviceTemplate.type // ""' "$cfg")"
     SAIA_SERVICE_NODE_PORT="$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "$cfg")"
-    # AWS Load Balancer Controller (LBC) install toggle. Default: false — the
-    # script assumes customers bring their own LB and point it at NodePort
-    # (Path A). Set to true only when you want operator-managed NLB/ALB
-    # provisioning via the `aws-load-balancer-type: external` annotation or
-    # dynamic target registration via TargetGroupBinding CRs (Path B).
+    # AWS Load Balancer Controller (LBC) install toggle. Required for both
+    # operator-managed NLB provisioning (Mode 1) and customer-owned LB
+    # registration via TargetGroupBinding (Mode 2). Off-AWS users (k0s) leave
+    # this false.
     INSTALL_LBC="$(yq eval '.aiPlatform.awsLoadBalancerController.install // false' "$cfg")"
+    # Bring-your-own AWS target group (Mode 2). When enabled the script keeps
+    # the public Service as ClusterIP and applies a TargetGroupBinding so LBC
+    # registers nginx pod IPs into the customer's pre-existing target group.
+    # Requires INSTALL_LBC=true.
+    BYO_TG_ENABLED="$(yq eval '.aiPlatform.byoTargetGroup.enabled // false' "$cfg")"
+    BYO_TG_ARN="$(yq eval '.aiPlatform.byoTargetGroup.targetGroupArn // ""' "$cfg")"
+    BYO_TG_SG_ID="$(yq eval '.aiPlatform.byoTargetGroup.securityGroupId // ""' "$cfg")"
     INGRESS_HOST="$(yq eval '.aiPlatform.ingress.host' "$cfg")"
     INGRESS_CLASS="$(yq eval '.aiPlatform.ingress.className' "$cfg")"
     INGRESS_TLS_SECRET="$(yq eval '.aiPlatform.ingress.tlsSecretName' "$cfg")"
@@ -185,6 +191,9 @@ load_config() {
     SAIA_SERVICE_TYPE=""
     SAIA_SERVICE_NODE_PORT=""
     INSTALL_LBC="false"
+    BYO_TG_ENABLED="false"
+    BYO_TG_ARN=""
+    BYO_TG_SG_ID=""
     INGRESS_HOST="ai.example.com"
     INGRESS_CLASS="nginx"
     INGRESS_TLS_SECRET="ai-platform-tls"
@@ -2365,18 +2374,120 @@ apply_saia_service_annotations() {
   fi
 }
 
+byo_target_group_enabled() {
+  [[ "${BYO_TG_ENABLED:-false}" == "true" ]]
+}
+
+# Validates BYO target-group configuration and warns about misconfigurations
+# before any kubectl/aws calls are issued. Caller decides whether to err or
+# return on warnings — we treat missing required fields as fatal because the
+# rest of the install would silently misroute traffic.
+validate_byo_target_group_config() {
+  byo_target_group_enabled || return 0
+
+  if [[ "${INSTALL_LBC:-false}" != "true" ]]; then
+    err "byoTargetGroup.enabled=true requires awsLoadBalancerController.install=true (LBC manages the TargetGroupBinding)."
+  fi
+  if [[ -z "${BYO_TG_ARN:-}" || "${BYO_TG_ARN}" == "null" ]]; then
+    err "byoTargetGroup.enabled=true requires byoTargetGroup.targetGroupArn to be set."
+  fi
+  if [[ "${BYO_TG_ARN}" != arn:aws:elasticloadbalancing:* ]]; then
+    err "byoTargetGroup.targetGroupArn must look like 'arn:aws:elasticloadbalancing:<region>:<account>:targetgroup/<name>/<id>' (got: ${BYO_TG_ARN})."
+  fi
+  if [[ -z "${BYO_TG_SG_ID:-}" || "${BYO_TG_SG_ID}" == "null" ]]; then
+    err "byoTargetGroup.enabled=true requires byoTargetGroup.securityGroupId (the customer LB's SG) so LBC opens pod-SG ingress correctly."
+  fi
+  if [[ "${SAIA_SERVICE_TYPE:-}" == "LoadBalancer" ]]; then
+    log "WARNING: byoTargetGroup.enabled=true with serviceTemplate.type=LoadBalancer creates BOTH an operator-managed LB AND a TargetGroupBinding. Set serviceTemplate.type=ClusterIP for pure BYO." >&2
+  fi
+}
+
+# Apply a TargetGroupBinding CR pointing at the customer's pre-provisioned
+# target group. AWS LBC reads this CR and registers the SAIA Service's pod
+# IPs (targetType: ip) into the customer's TG, then deregisters them on pod
+# rotation. The networking.ingress block has LBC open the pod SG to the LB's
+# SG only — never 0.0.0.0/0 (codeguard-0-iac-security).
+apply_byo_target_group_binding() {
+  local platform_name="${1:-${AI_PLATFORM_NAME}}"
+  local svc_name
+  svc_name="$(saia_aiservice_name "${platform_name}")-saia-service"
+
+  byo_target_group_enabled || return 0
+
+  log "Applying TargetGroupBinding for BYO target group ${BYO_TG_ARN}..."
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: ${svc_name}-tgb
+  namespace: ${AI_NS}
+spec:
+  serviceRef:
+    name: ${svc_name}
+    port: 8080
+  targetGroupARN: ${BYO_TG_ARN}
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - securityGroup:
+              groupID: ${BYO_TG_SG_ID}
+        ports:
+          - protocol: TCP
+            port: 8080
+YAML
+  log "✓ TargetGroupBinding ${AI_NS}/${svc_name}-tgb applied"
+}
+
+# Disable kube-proxy NodePort allocation on the rendered SAIA Service. The
+# operator's reconcileSAIAService only touches Selector/Ports on existing
+# Services (pkg/ai/features/saia/impl.go), so this patch survives subsequent
+# reconciles. externalTrafficPolicy=Local preserves real client IP for
+# MetalLB-style providers; for AWS NLB ip-target mode it is a no-op since
+# LBC bypasses kube-proxy entirely.
+patch_saia_service_disable_nodeport() {
+  local platform_name="${1:-${AI_PLATFORM_NAME}}"
+  local svc_name
+  svc_name="$(saia_aiservice_name "${platform_name}")-saia-service"
+
+  # Only meaningful when the Service is type=LoadBalancer; ClusterIP services
+  # don't allocate NodePorts.
+  local svc_type
+  svc_type="$(kubectl -n "${AI_NS}" get svc "${svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || true)"
+  [[ "${svc_type}" != "LoadBalancer" ]] && return 0
+
+  log "Patching Service ${AI_NS}/${svc_name} to disable NodePort allocation..."
+  kubectl -n "${AI_NS}" patch svc "${svc_name}" --type=merge -p '{
+  "spec": {
+    "allocateLoadBalancerNodePorts": false,
+    "externalTrafficPolicy": "Local"
+  }
+}' >/dev/null
+  log "✓ Service ${AI_NS}/${svc_name}: allocateLoadBalancerNodePorts=false, externalTrafficPolicy=Local"
+}
+
 patch_saia_public_service_workaround() {
   local platform_name="${1:-${AI_PLATFORM_NAME}}"
-  local aiservice_name public_svc_name
+  local aiservice_name public_svc_name effective_type
 
   aiservice_name="$(saia_aiservice_name "${platform_name}")"
   public_svc_name="${aiservice_name}-saia-service"
 
   wait_for_aiservice_exists "${aiservice_name}"
 
-  if saia_service_template_enabled; then
-    log "Patching AIService/${aiservice_name} with SAIA public exposure settings..."
-    if [[ "${SAIA_SERVICE_TYPE}" == "NodePort" && -n "${SAIA_SERVICE_NODE_PORT:-}" && "${SAIA_SERVICE_NODE_PORT}" != "null" ]]; then
+  # In BYO mode the customer owns the LB; force the SAIA Service to ClusterIP
+  # regardless of what serviceTemplate.type says — TargetGroupBinding wires
+  # everything else.
+  if byo_target_group_enabled; then
+    effective_type="ClusterIP"
+  else
+    effective_type="${SAIA_SERVICE_TYPE}"
+  fi
+
+  if [[ -n "${effective_type:-}" && "${effective_type}" != "null" ]]; then
+    log "Patching AIService/${aiservice_name} with SAIA public exposure settings (type=${effective_type})..."
+    if [[ "${effective_type}" == "NodePort" && -n "${SAIA_SERVICE_NODE_PORT:-}" && "${SAIA_SERVICE_NODE_PORT}" != "null" ]]; then
+      log "WARNING: NodePort exposure is discouraged; consider Mode 1 (LoadBalancer + LBC) or Mode 2 (BYO target group) instead." >&2
       kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
   \"spec\": {
     \"serviceTemplate\": {
@@ -2399,7 +2510,7 @@ patch_saia_public_service_workaround() {
   \"spec\": {
     \"serviceTemplate\": {
       \"spec\": {
-        \"type\": \"${SAIA_SERVICE_TYPE}\"
+        \"type\": \"${effective_type}\"
       }
     }
   }
@@ -2411,11 +2522,16 @@ patch_saia_public_service_workaround() {
 
   kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
 
-  if saia_service_template_enabled; then
+  if [[ -n "${effective_type:-}" && "${effective_type}" != "null" && "${effective_type}" != "ClusterIP" ]]; then
     log "Recreating SAIA public Service to ensure patched settings take effect..."
     kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
     wait_resource_exists "${AI_NS}" service "${public_svc_name}" 300
   fi
+
+  # NodePort-free hardening: disable kube-proxy NodePort allocation on
+  # LoadBalancer Services and apply BYO TargetGroupBinding if configured.
+  patch_saia_service_disable_nodeport "${platform_name}"
+  apply_byo_target_group_binding "${platform_name}"
 }
 
 wait_for_saia_load_balancer() {
@@ -2423,6 +2539,13 @@ wait_for_saia_load_balancer() {
   local svc_name hostname=""
   svc_name="$(saia_aiservice_name "${platform_name}")-saia-service"
 
+  # In BYO mode the Service is ClusterIP and the customer's LB DNS is not
+  # surfaced via .status.loadBalancer; skip the wait. Mode 1 (operator-
+  # managed NLB) still gates on SAIA_SERVICE_TYPE=LoadBalancer.
+  if byo_target_group_enabled; then
+    log "byoTargetGroup.enabled=true — skipping wait for operator-managed LB hostname (LB is customer-managed)."
+    return 0
+  fi
   [[ "${SAIA_SERVICE_TYPE:-}" == "LoadBalancer" ]] || return 0
 
   log "Waiting for SAIA LoadBalancer Service ${AI_NS}/${svc_name} to receive an external hostname..."
@@ -3512,18 +3635,23 @@ reconcile_flow() {
   fi
   install_kube_prometheus
   install_cert_manager
-  # AWS Load Balancer Controller (LBC) — only install when the operator itself
-  # needs to provision NLBs/ALBs (Service type=LoadBalancer with the
-  # `aws-load-balancer-type: external` annotation) or when binding k8s Services
-  # to customer-managed target groups via TargetGroupBinding CRs. Customers who
-  # bring their own LB and point it at NodePort (Path A) should leave this off.
+  # Validate BYO target-group config before any side-effecting calls. Fail
+  # fast if the customer set byoTargetGroup.enabled=true without LBC or
+  # required ARN/SG fields — better an early error than a silently-broken
+  # data path.
+  validate_byo_target_group_config
+  # AWS Load Balancer Controller (LBC) — required when the operator provisions
+  # NLBs/ALBs (Mode 1: Service type=LoadBalancer + `aws-load-balancer-type:
+  # external` annotation) or when binding the SAIA Service to a customer-
+  # managed target group via TargetGroupBinding (Mode 2: byoTargetGroup
+  # enabled). Off-AWS deployments leave this false.
   if [[ "${INSTALL_LBC}" == "true" ]]; then
     log "aiPlatform.awsLoadBalancerController.install=true — installing AWS Load Balancer Controller"
     tag_lbc_subnets
     ensure_lbc_irsa
     install_aws_load_balancer_controller
   else
-    log "aiPlatform.awsLoadBalancerController.install=false — skipping LBC install (bring-your-own-LB / NodePort path)"
+    log "aiPlatform.awsLoadBalancerController.install=false — skipping LBC install"
   fi
   ensure_s3compat_credentials
   install_otel_operator_and_contrib_collector
