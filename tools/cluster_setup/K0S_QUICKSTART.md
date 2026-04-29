@@ -8,13 +8,13 @@ Deploys the complete Splunk AI Platform stack on k0s Kubernetes using pre-provis
 
 **Admin workstation:** `kubectl`, `helm`, `git`, `jq`, `yq`
 
-**Nodes (all):** RHEL 9/10, AL2023, or Debian/Ubuntu · passwordless SSH + sudo · Python 3.8+
+**Nodes (all):** RHEL 9 · passwordless SSH + sudo · Python 3.8+
 
 | Node Type | Min CPU | Min RAM | Min Disk | Notes |
 |-----------|---------|---------|----------|-------|
 | Controller | 4 | 8 GB | 100 GB | API server, etcd, scheduler |
 | CPU Worker | 8 | 32 GB | 200 GB | Weaviate, Ray head, Splunk |
-| GPU Worker | 8 | 32 GB | 500 GB | NVIDIA GPU required |
+| GPU Worker | 8 | 32 GB | 500 GB | NVIDIA GPU required (3 * H100, 3 * L40S) |
 
 **Ports between nodes:** 22 (SSH), 6443 (API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN), 179 (Calico BGP)
 
@@ -92,9 +92,9 @@ The config template is `k0s-cluster-config.yaml`. Copy it and edit. Key sections
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `controllers` | No | `1` | Controller count (1 or 3 for HA) |
-| `cpuWorkers` | No | `2` | First N workers labeled CPU |
-| `gpuWorkers` | No | `1` | Remaining workers labeled GPU |
+| `controllers` | **Yes** | `1` | Controller count (1 or 3 for HA) |
+| `cpuWorkers` | **Yes** | `2` | First N workers labeled CPU |
+| `gpuWorkers` | **Yes** | `1` | Remaining workers labeled GPU |
 | `existingIPs.controllers` | **Yes** | — | Controller IP list |
 | `existingIPs.workers` | **Yes** | — | Worker IP list |
 
@@ -102,14 +102,14 @@ The config template is `k0s-cluster-config.yaml`. Copy it and edit. Key sections
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `storageClass` | No | `local-path` | StorageClass for PVCs |
-| `vectorDbSize` | No | `50Gi` | Weaviate PV size |
+| `storageClass` | **Yes** | `local-path` | StorageClass for PVCs |
+| `vectorDbSize` | **Yes** | `50Gi` | Weaviate PV size |
 | `minimumDiskSpace.controller` | No | `100` | Preflight disk check (GB) |
 | `minimumDiskSpace.cpuWorker` | No | `200` | Preflight disk check (GB) |
 | `minimumDiskSpace.gpuWorker` | No | `500` | Preflight disk check (GB) |
-| `objectStore.type` | No | `minio` | `aws` / `s3compat` / `minio` / `seaweedfs` |
-| `objectStore.bucket` | No | `ai-platform-data` | Bucket name |
-| `objectStore.endpoint` | **Yes*** | — | S3 endpoint (*required for non-AWS) |
+| `objectStore.type` | **Yes** | `minio` | `aws` / `s3compat` / `minio` / `seaweedfs` |
+| `objectStore.bucket` | **Yes** | `ai-platform-data` | Bucket name |
+| `objectStore.endpoint` | **Yes** | — | S3 endpoint (*required for non-AWS) |
 | `objectStore.auth.rootUser` | Yes | — | Access key |
 | `objectStore.auth.rootPassword` | Yes | — | Secret key |
 
@@ -137,15 +137,15 @@ Short paths auto-prefixed with `images.registry`. All marked **Yes** are require
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `name` | No | `${CLUSTER_NAME}-ai-platform` | CR name |
-| `defaultAcceleratorType` | No | `""` | `L40S` / `H100` / empty |
+| `name` | **Yes** | `${CLUSTER_NAME}-ai-platform` | CR name |
+| `defaultAcceleratorType` | **Yes** | `""` | `L40S` / `H100` / empty |
 | `workerGroupConfig.imageRegistry` | No | `""` | Ray worker image override |
 | `features[].name` | Yes | — | Feature name (e.g., `saia`) |
 | `features[].version` | Yes | — | Feature version |
 | `cpuScheduling` | No | auto | `nodeSelector` + `tolerations` for CPU pods |
 | `gpuScheduling` | No | auto | `nodeSelector` + `tolerations` for GPU pods |
-| `serviceTemplate.type` | No | — | `NodePort` / `LoadBalancer` for SAIA exposure |
-| `serviceTemplate.nodePort` | No | — | Port number (NodePort only) |
+| `serviceTemplate.type` | **Yes** | — | `NodePort` / `LoadBalancer` for SAIA exposure |
+| `serviceTemplate.nodePort` | **Yes** | — | Port number (NodePort only) |
 
 ### imagePullSecrets
 
@@ -178,7 +178,7 @@ The script auto-labels nodes:
 | CPU Worker | `splunk.ai/workload-type: cpu`, `splunk.ai/instance-type: cpu-worker` |
 | GPU Worker | `splunk.ai/workload-type: gpu`, `nvidia.com/gpu: "true"`, taint `nvidia.com/gpu=true:NoSchedule` |
 
-**NVIDIA drivers** are installed directly on GPU nodes (not GPU Operator). Supported: RHEL 9/10, AL2023, Debian/Ubuntu. The script installs kernel headers, CUDA repo, `cuda-drivers`, NVIDIA Container Toolkit, then verifies with `nvidia-smi`.
+**NVIDIA drivers** are installed directly on GPU nodes (not GPU Operator). Supported: RHEL 9 currently. The script installs kernel headers, CUDA repo, `cuda-drivers`, NVIDIA Container Toolkit, then verifies with `nvidia-smi`.
 
 ## 7. Troubleshooting
 
@@ -254,7 +254,7 @@ tail -f tools/cluster_setup/logs/k0s-install-*.log
 | KubeRay Operator | `quay.io/kuberay/operator:v1.2.2` |
 | Prometheus, Grafana, cert-manager, NVIDIA plugin, local-path | Pulled by their respective Helm charts/manifests |
 
-**NVIDIA packages on GPU nodes (RHEL/AL2023/Ubuntu):**
+**NVIDIA packages on GPU nodes (RHEL 9):**
 
 | Package | Source |
 |---------|--------|
