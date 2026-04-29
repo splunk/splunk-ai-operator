@@ -57,12 +57,6 @@ cluster:
 #     availabilityZones:   required — must match capacityReservation.az
 #     maxSize:             must equal desiredCapacity (capacity reservations are fixed-size)
 #
-#   H100_NVL:
-#     instanceType:        p4de.24xlarge   (8x H100 NVL GPUs, 94 GB VRAM each)
-#     defaultAcceleratorType: H100_NVL
-#     capacityReservation: not required
-#     availabilityZones:   not required
-#
 nodeGroups:
   cpu:
     enabled: true                         # Set to false to skip CPU node group
@@ -232,7 +226,6 @@ aiPlatform:
   # Must be changed in sync with nodeGroups.gpu.instanceType (see GPU TYPE QUICK REFERENCE above).
   #   L40S     → instanceType: g6e.12xlarge
   #   H100     → instanceType: p5.4xlarge    (also uncomment capacityReservation + availabilityZones)
-  #   H100_NVL → instanceType: p4de.24xlarge
   defaultAcceleratorType: "L40S"
 
   # Features to enable

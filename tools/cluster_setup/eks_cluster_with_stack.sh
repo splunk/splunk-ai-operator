@@ -810,7 +810,7 @@ generate_node_groups() {
       k8s.io/cluster-autoscaler/${CLUSTER_NAME}: owned"
   fi
   # H100 with capacity reservation: node group created separately via CloudFormation
-  # All other GPU types (L40S, H100_NVL): standard eksctl managed node group
+  # All other GPU types (L40S): standard eksctl managed node group
   if [[ "$ENABLE_GPU" == "true" && "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
     log "GPU nodes will be created separately with capacity reservation ${GPU_CAPACITY_RESERVATION_ID}"
   elif [[ "$ENABLE_GPU" == "true" ]]; then
@@ -822,7 +822,7 @@ generate_node_groups() {
     maxSize: ${GPU_MAX}
     volumeSize: ${GPU_VOLUME_SIZE}
     volumeType: ${GPU_VOLUME_TYPE}"
-    # Lock to specific AZ when availabilityZones are specified (e.g. for H100_NVL)
+    # Lock to specific AZ when availabilityZones are specified
     if [[ ${#GPU_AVAILABILITY_ZONES[@]} -gt 0 ]]; then
       nodes+="
     availabilityZones:"
