@@ -271,9 +271,11 @@ aiPlatform:
   # Public SAIA exposure (NodePort-free)
   # ---------------------------------------------------------------------------
   # The operator renders a public Kubernetes Service named
-  # `<aiPlatform.name>-saia-service` whose endpoints are the in-cluster nginx
-  # pods (nginx terminates path routing to saia v1 / v2). The install script
-  # then configures HOW that Service is reached from outside the cluster.
+  # `<aiService.name>-saia-service`; because the AIService is typically named
+  # `<aiPlatform.name>-saia`, the resulting Service is usually
+  # `<aiPlatform.name>-saia-saia-service`. Its endpoints are the in-cluster
+  # nginx pods (nginx terminates path routing to saia v1 / v2). The install
+  # script then configures HOW that Service is reached from outside the cluster.
   #
   # IMPORTANT: this template intentionally does NOT use Service.type=NodePort.
   # Many enterprise security policies prohibit opening 30000-32767 on every
