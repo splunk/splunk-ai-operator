@@ -3222,12 +3222,10 @@ check_platform_health() {
   # Check 1: Cluster nodes
   log "Checking cluster nodes..."
   local not_ready
-  # `wc -l` on macOS returns "       N" with leading whitespace and the `||
-  # echo` fallback can append a second value, so the resulting string was
-  # tripping the `[[ -gt 0 ]]` test ("[[: 0\n0: syntax error"). Strip
-  # whitespace and default to 0 if grep returns 1 (no matches).
-  not_ready=$(kubectl get nodes --no-headers 2>/dev/null | grep -v " Ready " | wc -l | tr -d '[:space:]')
-  not_ready="${not_ready:-0}"
+  # Count nodes whose status is not Ready without relying on grep exit codes.
+  # This avoids `set -euo pipefail` aborting the script when all nodes are
+  # Ready, while still producing a whitespace-free numeric result.
+  not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk 'index($0, " Ready ") == 0 { count++ } END { print count+0 }')
   if [[ "${not_ready}" -gt 0 ]]; then
     warn "Found ${not_ready} node(s) not in Ready state"
     kubectl get nodes
