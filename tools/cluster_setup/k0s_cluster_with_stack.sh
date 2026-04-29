@@ -2783,7 +2783,7 @@ spec:
   images:
 ${image_pull_secrets}
 
-  # GPU accelerator type (determines Ray worker tiers: L40S, H100_NVL, or empty for no workers)
+  # GPU accelerator type (determines Ray worker tiers: L40S, H100, or empty for no workers)
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
   # Features from config (aiPlatform.features)

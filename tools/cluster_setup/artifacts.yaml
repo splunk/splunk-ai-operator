@@ -5688,11 +5688,11 @@ spec:
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v2-010
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v2-012
         - name: RELATED_IMAGE_SAIA_API_V2
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-010
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-012
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-010
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-012
         - name: SPLUNK_METRICS_INDEX_NAME
           value: _metrics
         - name: RELATED_IMAGE_FLUENT_BIT
@@ -5705,7 +5705,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.53.0
-        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.28
+        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.29
         livenessProbe:
           httpGet:
             path: /healthz

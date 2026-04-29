@@ -50,8 +50,8 @@ The script installs everything needed for the AI Platform:
 1. **EKS Cluster** (Kubernetes 1.31-1.34) - AWS-managed control plane
 2. **VPC CNI** - Native AWS VPC networking for pods
 3. **S3 Bucket** - Object storage for AI artifacts and models
-4. **EBS CSI Driver** - Persistent volumes backed by AWS EBS
-5. **Cluster Autoscaler** - Automatic node scaling based on demand
+4. **EBS CSI Driver** - Persistent volumes backed by AWS EBS (IRSA-based IAM)
+5. **Cluster Autoscaler** - Automatic node scaling based on demand (IRSA-based IAM)
 6. **Cert-Manager** - Automated certificate management
 7. **Object storage** - AWS S3 or external S3-compatible only (MinIO, SeaweedFS, etc.; no in-cluster MinIO install)
 8. **Kube-Prometheus Stack** - Monitoring with Prometheus + Grafana
@@ -390,13 +390,14 @@ You must configure these images in `cluster-config.yaml`:
 |-------|--------------|-------------|
 | Splunk AI Operator | `operator.image` | Main operator controller |
 | Splunk Enterprise | `splunk.image` | Splunk instance for observability |
-| Splunk Operator | `splunk.operatorImage` | Splunk CRD controller (optional, has default) |
+| Splunk Operator | `splunk.operatorImage` | Splunk CRD controller (optional, default: `docker.io/splunk/splunk-operator:3.0.0`) |
 | Ray Head | `ray.headImage` | Ray cluster head node |
 | Ray Worker | `ray.workerImage` | Ray worker nodes (GPU) |
 | Weaviate | `weaviate.image` | Vector database |
 | SAIA API | `saia.apiImage` | Splunk AI Assistant API |
 | SAIA Data Loader | `saia.dataLoaderImage` | SAIA initialization |
-| Fluent Bit | `fluentBit.image` | Logging (optional, has default) |
+| Fluent Bit | `fluentBit.image` | Logging (optional, default: `fluent/fluent-bit:1.9.6`) |
+| OpenTelemetry Collector | `otelCollector.image` | Telemetry collection (optional, default: `otel/opentelemetry-collector-contrib:0.122.1`) |
 
 **No manual YAML editing required!** The script handles everything.
 
@@ -519,7 +520,7 @@ vi my-cluster-config.yaml
 cluster:
   name: "my-ai-cluster"           # ← CHANGE: Your unique cluster name (DNS-1123 compliant)
   region: "us-west-2"             # ← CHANGE: Your AWS region
-  k8sVersion: "1.31"              # Kubernetes version (1.29, 1.30, 1.31)
+  k8sVersion: "1.31"              # Kubernetes version (1.31, 1.32, 1.33, 1.34)
 
   # Option A: Leave subnets empty to create new VPC automatically
   # Option B: Provide existing subnet IDs (eksctl auto-detects VPC from subnets)
@@ -579,9 +580,11 @@ export MINIO_ROOT_PASSWORD='your-secure-password'
 CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
 ```
 
-**Idempotency and existing VPC**  
-- The install is **idempotent**: if the EKS cluster already exists, the script skips cluster creation and only runs reconcile (addons, operators, AIPlatform). Set `cluster.useExisting: true` to require an existing cluster (script fails if the cluster is not found).
+**Idempotency and existing clusters**
+- The install is **idempotent**: if the EKS cluster already exists, the script skips cluster creation and only runs reconcile (addons, operators, AIPlatform). You can safely re-run `install` to update images, fix issues, or add components.
+- **Require existing cluster:** Set `cluster.useExisting: true` to skip cluster creation entirely. The script will fail with a clear error if the cluster is not found. This is useful when you created the cluster separately or want to guard against accidentally creating a new cluster.
 - **Use an existing VPC:** Provide `cluster.subnets` (private and public subnet IDs and AZs). eksctl will use that VPC and will not create a new one.
+- **Preserve VPC on delete:** Set `cluster.preserveVpcOnDelete: true` when using an existing VPC to prevent the `delete` command from removing it. Requires at least 2 private subnets to be specified.
 
 **Important Notes:**
 - **Cluster Name**: Must be DNS-1123 compliant (lowercase letters, numbers, hyphens; start/end with alphanumeric)
@@ -595,15 +598,22 @@ CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
 |---------|--------------|------------------|
 | `cluster.name` | EKS cluster name | ✅ **REQUIRED:** Change to your cluster name |
 | `cluster.region` | AWS region | ✅ **REQUIRED:** Change to your region |
+| `cluster.k8sVersion` | Kubernetes version (1.31-1.34) | ⚙️ Optional: default 1.31 |
 | `cluster.useExisting` | Use existing cluster only (do not create) | ⚙️ Set `true` to skip cluster creation; script fails if cluster not found |
+| `cluster.preserveVpcOnDelete` | Keep VPC when running `delete` | ⚙️ Set `true` when using an existing VPC you don't want deleted |
 | `cluster.subnets` | VPC subnets for nodes | ⚙️ **OPTIONAL:** Leave empty for new VPC or provide existing subnet IDs to use existing VPC |
 | `storage.s3Bucket` | S3 bucket for AI artifacts (used when `objectStore.type` is aws) | ✅ **REQUIRED** if not using MinIO/SeaweedFS |
 | `storage.objectStore` | Object store: `type` (aws \| s3compat \| minio \| seaweedfs), `bucket`, `endpoint`, `auth`. Default type is `aws` when unset. External only (no in-cluster install). | ⚙️ Required for s3compat/minio/seaweedfs: set `endpoint` and credentials. See [Object Storage Selection](../../docs/configuration/object-storage.md). |
 | `images.registry` | Container registry URL | ✅ **REQUIRED:** Your ECR/Docker registry |
 | `images.*` | All container images | ✅ **REQUIRED:** Configure all image paths |
 | `nodeGroups.cpu` | CPU node group settings | ⚙️ Optional: adjust size/type |
-| `nodeGroups.gpu` | GPU node group settings | ⚙️ Optional: adjust size/type |
+| `nodeGroups.gpu` | GPU node group settings | ⚙️ Optional: adjust size/type/AZ/capacity reservation |
+| `nodeGroups.gpu.availabilityZones` | Lock GPU nodes to specific AZs | ⚙️ Optional: for capacity-constrained GPU types |
+| `nodeGroups.gpu.capacityReservation` | H100 Capacity Block reservation | ⚙️ Optional: for H100 with Capacity Blocks |
+| `operators.ray.modelVersion` | Model version for AI serving | ⚙️ Optional: default `v0.3.14-36-g1549f5a` |
+| `operators.ray.rayVersion` | Ray runtime version | ⚙️ Optional: default `2.44.0` |
 | `aiPlatform` | AI Platform configuration | ⚙️ Optional: customize features |
+| `aiPlatform.defaultAcceleratorType` | GPU type: `L40S`, `H100` | ⚙️ Optional: default `L40S` |
 
 ### 5. Configure Container Images ⚠️ CRITICAL
 
@@ -636,6 +646,9 @@ images:
 
   fluentBit:
     image: "fluent/fluent-bit:1.9.6"  # ← OPTIONAL (has default)
+
+  otelCollector:
+    image: "otel/opentelemetry-collector-contrib:0.122.1"  # ← OPTIONAL (has default)
 ```
 
 **Tips:**
@@ -646,6 +659,12 @@ images:
   - Example: `"docker.io/splunk/splunk:10.2.0"` stays as-is
 
 **The script will validate ALL images exist before deployment!**
+
+**Additional Version Configuration:**
+
+The script also configures these versions in `artifacts.yaml`:
+- `operators.ray.modelVersion` - Sets `MODEL_VERSION` env var (default: `v0.3.14-36-g1549f5a`)
+- `operators.ray.rayVersion` - Sets `RAY_VERSION` env var (default: `2.44.0`)
 
 ### 6. Login to Container Registries
 
@@ -720,52 +739,66 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
    - ✓ Creates backups
 
 2. **Preflight Checks** (1 min)
-   - ✓ Checks AWS credentials
+   - ✓ Checks AWS credentials and identity
+   - ✓ Validates cluster name (DNS-1123), S3 bucket name
    - ✓ Verifies subnets exist (if provided)
-   - ✓ Validates NAT Gateway & Internet Gateway
-   - ✓ Checks required tools
+   - ✓ Validates NAT Gateway, Internet Gateway, route tables
+   - ✓ Checks required tools (aws, eksctl, kubectl, helm, git, jq, yq)
 
-3. **Create EKS Cluster** (10-15 min)
-   - ✓ Creates managed control plane
+3. **Create EKS Cluster** (10-15 min) - skipped if cluster already exists
+   - ✓ Creates managed control plane with OIDC
    - ✓ Sets up node groups (CPU + GPU)
+   - ✓ Creates H100 node group via CloudFormation (if using Capacity Block)
 
 4. **Install Infrastructure** (10-15 min)
-   - ✓ EBS CSI Driver (for persistent volumes)
-   - ✓ Cluster Autoscaler (for node scaling)
-   - ✓ VPC CNI (for pod networking)
+   - ✓ OIDC provider for IRSA
+   - ✓ EBS CSI Driver with IRSA role
+   - ✓ gp3 StorageClass (set as default)
+   - ✓ Cluster Autoscaler with IRSA role
+   - ✓ NVIDIA device plugin
 
 5. **Install Platform Components** (15-20 min)
+   - ✓ Kube-Prometheus Stack (Prometheus + Grafana)
    - ✓ Cert Manager (certificates)
-   - ✓ Prometheus + Grafana (monitoring)
-   - ✓ OpenTelemetry (tracing)
-   - ✓ NVIDIA GPU Operator (GPU support)
+   - ✓ S3-compatible credentials secret (if external object store)
+   - ✓ OpenTelemetry Operator + collector
    - ✓ KubeRay Operator (Ray clusters)
    - ✓ Splunk Operator (Splunk management)
+   - ✓ Splunk AI Platform Operator (with your images!)
 
 6. **Deploy AI Platform** (5-10 min)
-   - ✓ Creates S3 bucket
-   - ✓ Sets up IAM roles (IRSA)
-   - ✓ Installs Splunk AI Operator (with your images!)
-   - ✓ Creates AIPlatform CR
-   - ✓ Deploys AI services
+   - ✓ Creates S3 bucket and prefixes (artifacts/, apps/, tasks/)
+   - ✓ Uploads Splunk app to S3 (if localAppPath configured)
+   - ✓ Sets up IRSA roles for Ray head, Ray worker, SAIA service
+   - ✓ Adds ECR permissions to IRSA roles
+   - ✓ Creates Splunk Standalone instance
+   - ✓ Creates AIPlatform CR and monitors until Ready
+   - ✓ Waits for Splunk AI Assistant app installation on Standalone
 
 **What Happens During Installation:**
-1. ✓ Creates EKS cluster with control plane (5-10 minutes)
-2. ✓ Creates managed node groups (CPU and GPU) (5-10 minutes)
-3. ✓ Installs AWS Load Balancer Controller
-4. ✓ Installs EBS CSI driver
-5. ✓ Installs Cluster Autoscaler
-6. ✓ Installs cert-manager
-7. ✓ Installs monitoring stack (Prometheus, Grafana)
-8. ✓ Installs OpenTelemetry
-9. ✓ Installs NVIDIA GPU support
-10. ✓ Installs Ray operator
-11. ✓ Installs Splunk operator
-12. ✓ Creates Splunk Standalone instance
-13. ✓ Installs Splunk AI Platform operator
-14. ✓ Creates S3 bucket and IAM roles
-15. ✓ Creates ECR image pull secrets
-16. ✓ Deploys AIPlatform CR
+1. ✓ Validates configuration and container images (fails fast if images missing)
+2. ✓ Runs preflight checks (AWS credentials, subnets, VPC networking, tools)
+3. ✓ Creates EKS cluster with control plane (or skips if already exists)
+4. ✓ Creates managed node groups (CPU and GPU)
+5. ✓ Creates H100 GPU node group via CloudFormation (if using Capacity Block)
+6. ✓ Ensures OIDC provider for IRSA
+7. ✓ Installs EBS CSI driver (with IRSA role)
+8. ✓ Creates gp3 StorageClass (set as default)
+9. ✓ Installs Cluster Autoscaler (with IRSA role)
+10. ✓ Installs NVIDIA device plugin
+11. ✓ Installs kube-prometheus-stack (monitoring)
+12. ✓ Installs cert-manager
+13. ✓ Creates S3-compatible credentials secret (if using external object store)
+14. ✓ Installs OpenTelemetry Operator + collector
+15. ✓ Installs KubeRay Operator
+16. ✓ Installs Splunk Operator
+17. ✓ Installs Splunk AI Platform Operator
+18. ✓ Creates S3 bucket and IAM roles (IRSA for Ray head/worker/SAIA)
+19. ✓ Adds ECR permissions to IRSA roles
+20. ✓ Creates Splunk Standalone instance
+21. ✓ Deploys AIPlatform CR
+22. ✓ Monitors AIPlatform status until Ready
+23. ✓ Waits for Splunk AI Assistant app to be installed on Standalone
 
 ### 4. Verify Installation
 
@@ -874,7 +907,9 @@ The script uses a YAML configuration file (`cluster-config.yaml`) for all settin
 cluster:
   name: "my-ai-cluster"              # EKS cluster name (DNS-1123 compliant)
   region: "us-west-2"                # AWS region
-  k8sVersion: "1.31"                 # Kubernetes version (1.29, 1.30, 1.31)
+  k8sVersion: "1.31"                 # Kubernetes version (1.31, 1.32, 1.33, 1.34)
+  useExisting: false                 # Set true to require existing cluster (fails if not found)
+  preserveVpcOnDelete: false         # Set true to keep VPC when running delete (existing VPC only)
 
   subnets:                           # Optional - leave empty for auto VPC creation
     private:                         # Private subnets (at least 2, different AZs)
@@ -906,19 +941,51 @@ nodeGroups:
     maxSize: 4                       # Maximum nodes
     volumeSize: 1000                 # EBS volume size in GB
     volumeType: "gp3"                # EBS volume type
+    availabilityZones: []            # Optional: lock GPU nodes to specific AZs
+    capacityReservation:             # Optional: for H100 Capacity Blocks (CloudFormation-based)
+      id: ""                         # EC2 Capacity Reservation ID
+      az: ""                         # AZ of the reservation
 
 storage:
-  s3Bucket: "my-ai-platform-bucket"  # S3 bucket for artifacts/apps/tasks
+  s3Bucket: "my-ai-platform-bucket"  # S3 bucket for artifacts/apps/tasks (used when objectStore.type is aws)
   storageClass: "gp3"                # Default storage class for PVCs
   vectorDbSize: "50Gi"               # VectorDB PVC size
+  objectStore:                       # External S3-compatible storage (optional)
+    type: "aws"                      # aws | s3compat | minio | seaweedfs (default: aws)
+    bucket: ""                       # Bucket name (defaults to s3Bucket)
+    endpoint: ""                     # S3-compatible endpoint (required for s3compat/minio/seaweedfs)
+    namespace: "minio"               # Namespace hint (for credential secret placement)
+    auth:
+      rootUser: "minioadmin"         # S3-compatible access key (env MINIO_ROOT_USER takes precedence)
+      rootPassword: ""               # S3-compatible secret key (env MINIO_ROOT_PASSWORD takes precedence)
+
+images:
+  registry: ""                       # Container registry URL (prepended to relative image paths)
+  operator:
+    image: ""                        # Splunk AI Operator image
+  splunk:
+    image: ""                        # Splunk Enterprise image
+    operatorImage: ""                # Splunk Operator image (default: docker.io/splunk/splunk-operator:3.0.0)
+  ray:
+    headImage: ""                    # Ray head node image
+    workerImage: ""                  # Ray worker node image
+  weaviate:
+    image: ""                        # Weaviate vector database image
+  saia:
+    apiImage: ""                     # SAIA API image
+    dataLoaderImage: ""              # SAIA data loader / post-install hook image
+  fluentBit:
+    image: ""                        # Fluent Bit image (default: fluent/fluent-bit:1.9.6)
+  otelCollector:
+    image: ""                        # OpenTelemetry Collector image (default: otel/opentelemetry-collector-contrib:0.122.1)
 
 operators:
-  splunk:
-    image: "splunk/splunk:10.2.0-dev1"  # Splunk Enterprise image
   ray:
-    version: "v1.2.2"                          # Ray operator version
+    version: "v1.2.2"               # KubeRay operator version
+    modelVersion: ""                 # Model version (default: v0.3.14-36-g1549f5a)
+    rayVersion: ""                   # Ray runtime version (default: 2.44.0)
   nvidia:
-    devicePluginVersion: "v0.17.3"             # NVIDIA device plugin version
+    devicePluginVersion: "v0.17.3"   # NVIDIA device plugin version
 
 aiPlatform:
   namespace: "ai-platform"           # Kubernetes namespace
@@ -927,7 +994,7 @@ aiPlatform:
     rayHead: "ray-head-sa"
     rayWorker: "ray-worker-sa"
     saiaService: "saia-service-sa"
-  defaultAcceleratorType: "L40S"     # Default GPU type
+  defaultAcceleratorType: "L40S"     # Default GPU type (L40S, H100)
   workerGroupConfig:
     serviceAccountName: "ray-worker-sa"
     imageRegistry: ""                # Leave empty for default
@@ -936,11 +1003,13 @@ aiPlatform:
     className: "nginx"
     host: "ai.example.com"
     tlsSecretName: "ai-platform-tls"
+  certificate:
+    issuerName: "platform-issuer"    # Cert-manager issuer name
 
 splunkStandalone:
   name: "splunk-standalone"          # Splunk Standalone CR name
   serviceAccount: "saia-service-sa"  # Service account for S3 access
-  localAppPath: ""                   # Optional: local path to Splunk app to upload
+  localAppPath: ""                   # Optional: local path to Splunk app to upload to S3
 
 files:
   splunkOperatorManifest: "./splunk-operator-cluster.yaml"
@@ -990,8 +1059,6 @@ storage:
   vectorDbSize: "20Gi"               # Smaller vector DB
 
 operators:
-  splunk:
-    image: "splunk/splunk:10.2.0-dev1"
   ray:
     version: "v1.2.2"
 
@@ -1014,6 +1081,7 @@ cluster:
   name: "prod-ai-platform"
   region: "us-west-2"
   k8sVersion: "1.31"
+  preserveVpcOnDelete: true          # Don't delete VPC on cleanup
   subnets:
     private:                         # 3 AZs for high availability
       - id: "subnet-private-2a"
@@ -1055,8 +1123,6 @@ storage:
   vectorDbSize: "200Gi"              # Large vector DB
 
 operators:
-  splunk:
-    image: "splunk/splunk:10.2.0-dev1"
   ray:
     version: "v1.2.2"
 
@@ -1107,8 +1173,6 @@ storage:
   vectorDbSize: "100Gi"
 
 operators:
-  splunk:
-    image: "splunk/splunk:10.2.0-dev1"
   ray:
     version: "v1.2.2"
 
@@ -1116,6 +1180,53 @@ aiPlatform:
   namespace: "ai-platform"
   name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
+```
+
+#### Example 4: H100 GPU Cluster with Capacity Block
+
+```yaml
+# h100-cluster-config.yaml - H100 instances with EC2 Capacity Blocks
+
+cluster:
+  name: "h100-ai-cluster"
+  region: "us-east-2"
+  k8sVersion: "1.31"
+
+nodeGroups:
+  cpu:
+    enabled: true
+    instanceType: "m5.xlarge"
+    desiredCapacity: 3
+    minSize: 2
+    maxSize: 6
+    volumeSize: 300
+    volumeType: "gp3"
+
+  gpu:
+    enabled: true
+    instanceType: "p5.48xlarge"      # 8x H100 GPUs
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    volumeSize: 2000
+    volumeType: "gp3"
+    capacityReservation:             # H100 Capacity Block
+      id: "cr-0abcdef1234567890"     # Your Capacity Reservation ID
+      az: "us-east-2b"              # AZ of the reservation
+
+storage:
+  s3Bucket: "h100-ai-platform-data"
+  storageClass: "gp3"
+  vectorDbSize: "100Gi"
+
+operators:
+  ray:
+    version: "v1.2.2"
+
+aiPlatform:
+  namespace: "ai-platform"
+  name: "splunk-ai-stack"
+  defaultAcceleratorType: "H100"     # Must be H100 for capacity block
 ```
 
 ### Instance Type Selection Guide
@@ -1136,11 +1247,13 @@ aiPlatform:
 | Instance Type | GPUs | GPU Memory | vCPU | Memory | Use Case | Approx Cost/hr |
 |---------------|------|------------|------|--------|----------|----------------|
 | g5.xlarge | 1x A10G | 24 GB | 4 | 16 GB | Dev/Small Models | $1.01 |
-| g5.2xlarge | 1x A10G | 24 GB | 8 | 32 GB | **Recommended** | $1.21 |
+| g5.2xlarge | 1x A10G | 24 GB | 8 | 32 GB | Small Production | $1.21 |
 | g5.4xlarge | 1x A10G | 24 GB | 16 | 64 GB | Large Single-GPU | $1.62 |
 | g5.12xlarge | 4x A10G | 96 GB | 48 | 192 GB | Multi-GPU Training | $5.67 |
+| g6e.12xlarge | 4x L40S | 192 GB | 48 | 384 GB | **Recommended (L40S)** | $7.77 |
 | p3.2xlarge | 1x V100 | 16 GB | 8 | 61 GB | ML Training | $3.06 |
 | p4d.24xlarge | 8x A100 | 320 GB | 96 | 1152 GB | Large-Scale Training | $32.77 |
+| p5.48xlarge | 8x H100 | 640 GB | 192 | 2048 GB | H100 (Capacity Block) | $98.32 |
 
 **Note:** Prices are approximate for US East/West regions and may vary. Check [AWS Pricing](https://aws.amazon.com/ec2/pricing/on-demand/) for current rates.
 
@@ -1151,18 +1264,52 @@ aiPlatform:
 ### Basic Commands
 
 ```bash
-# Install EKS cluster and AI Platform
+# Install EKS cluster and AI Platform (idempotent - safe to re-run)
 ./eks_cluster_with_stack.sh install
 
-# Delete entire cluster and all AWS resources
+# Delete cluster and ALL AWS resources/roles/policies created by this script
 ./eks_cluster_with_stack.sh delete
 
-# Full cleanup (including S3 buckets, IAM roles)
+# Full cleanup: uninstall CRs/operators then run comprehensive AWS cleanup
 ./eks_cluster_with_stack.sh delete-full
-
-# Check AIPlatform status
-./eks_cluster_with_stack.sh status
 ```
+
+#### What `delete` Does (10-Step Cleanup)
+
+The `delete` command performs a comprehensive, ordered cleanup of all AWS resources created by the script:
+
+| Step | Action | Details |
+|------|--------|---------|
+| 1 | Delete IRSA Service Accounts | Removes SA CloudFormation stacks for Cluster Autoscaler, Ray head/worker, SAIA, EBS CSI |
+| 2 | Delete IAM Roles | Removes IRSA roles for all service accounts |
+| 3 | Clean up EBS CSI addon roles | Finds and deletes any `eksctl-<cluster>-addon-aws-ebs-csi-driver-*` roles |
+| 4 | Delete EKS Addons | Removes `aws-ebs-csi-driver` addon |
+| 5 | Delete EKS Cluster | Runs `eksctl delete cluster --wait` and waits for CloudFormation stack deletion |
+| 6 | Clean up CloudFormation stacks | Deletes lingering nodegroup, IAMServiceAccount, and addon stacks |
+| 7 | Delete IAM Policies | Removes S3 bucket policy (or ECR-only policy if using external object store) |
+| 8 | Purge IRSA roles by OIDC | Finds and removes any remaining roles associated with the cluster's OIDC provider |
+| 9 | Delete OIDC Provider | Removes the IAM OIDC identity provider |
+| 10 | Delete EBS Volumes | Removes all EBS volumes tagged with the cluster name |
+
+**VPC Preservation:** If `cluster.preserveVpcOnDelete: true` is set, the VPC and subnets are preserved; only EKS and related resources are deleted.
+
+**Verification after delete:**
+```bash
+# Check for remaining IAM roles
+aws iam list-roles --query "Roles[?contains(RoleName, '${CLUSTER_NAME}')].RoleName"
+
+# Check for remaining CloudFormation stacks
+aws cloudformation list-stacks --query "StackSummaries[?contains(StackName, 'eksctl-${CLUSTER_NAME}')].StackName"
+
+# Check for remaining EBS volumes
+aws ec2 describe-volumes --region ${REGION} \
+  --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
+  --query 'Volumes[].VolumeId'
+```
+
+#### What `delete-full` Does
+
+The `delete-full` command runs a full teardown: it first uninstalls all Kubernetes CRs and operators (AIPlatform, Splunk Standalone, Splunk Operator, OpenTelemetry, Cluster Autoscaler, KubeRay, kube-prometheus-stack, cert-manager, gp3 StorageClass), then runs the same 10-step `delete` cleanup above.
 
 ### Post-Installation Tasks
 
@@ -1282,7 +1429,7 @@ aws eks update-nodegroup-config \
 aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.version
 
 # Update control plane
-aws eks update-cluster-version --name ${CLUSTER_NAME} --kubernetes-version 1.29
+aws eks update-cluster-version --name ${CLUSTER_NAME} --kubernetes-version 1.32
 
 # Wait for update to complete (check status)
 aws eks describe-update --name ${CLUSTER_NAME} --update-id <update-id>
@@ -2001,6 +2148,43 @@ aws ecr describe-images --repository-name ray --region us-west-2
 ---
 
 ## Advanced Topics
+
+### H100 GPU Nodes with Capacity Blocks
+
+For H100 instances, the script supports AWS EC2 Capacity Blocks, which guarantee GPU capacity for a reserved time period. When `defaultAcceleratorType: "H100"` and a `capacityReservation.id` is set, GPU nodes are created separately via CloudFormation instead of eksctl managed node groups.
+
+**How It Works:**
+1. CPU node group is created first via eksctl (standard managed node group)
+2. The script then creates a CloudFormation stack with a Launch Template that references the Capacity Block reservation
+3. Nodes auto-join the cluster with `nvidia.com/gpu=true` label and taint
+4. The CloudFormation stack is idempotent (skipped if already healthy)
+
+**Configuration:**
+```yaml
+nodeGroups:
+  gpu:
+    enabled: true
+    instanceType: "p5.48xlarge"         # H100 instance type
+    desiredCapacity: 2
+    volumeSize: 2000
+    volumeType: "gp3"
+    capacityReservation:
+      id: "cr-0abcdef1234567890"        # Your Capacity Reservation ID
+      az: "us-east-2b"                 # AZ of the reservation
+
+aiPlatform:
+  defaultAcceleratorType: "H100"        # Must be H100 for capacity block path
+```
+
+**Requirements:**
+- You must have a valid EC2 Capacity Reservation (Capacity Block) purchased in your region
+- The AZ of the reservation must match a subnet in your VPC
+- `defaultAcceleratorType` must be set to `H100`
+
+**Cleanup:**
+The `delete` and `delete-full` commands automatically clean up the CloudFormation stack (`<cluster-name>-gpu-capacity-block`).
+
+---
 
 ### Auto Scaling
 

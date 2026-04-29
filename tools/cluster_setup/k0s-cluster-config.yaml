@@ -41,54 +41,8 @@ nodes:
 # Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install).
 # Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
 storage:
-  # ---------------------------------------------------------------------
-  # Real AWS S3 on k0s — via s3compat with AWS S3 endpoint
-  # ---------------------------------------------------------------------
-  # WHY NOT type=aws?
-  #   The k0s install script and operator do NOT actually support
-  #   objectStore.type=aws today. When set, the script silently:
-  #     * installs an in-cluster MinIO into the minio-system namespace,
-  #     * points SAIA's S3COMPAT_OBJECT_STORE_ENDPOINT_URL at that MinIO
-  #       (http://minio.minio-system.svc.cluster.local:9000),
-  #     * ignores AIPlatform.spec.objectStorage.path = s3://...
-  #   Result: SAIA always uses the in-cluster MinIO regardless of the
-  #   objectStore.type setting. This was verified by inspecting pod env
-  #   vars after a clean install with type=aws — see operator bug filed
-  #   for proper k0s AWS S3 support.
-  #
-  # WORKAROUND — use type=s3compat with the AWS S3 regional endpoint:
-  #   The s3compat adapter is just boto3 with explicit endpoint_url +
-  #   credentials. AWS S3 IS S3-compatible, so the same code path works
-  #   when pointed at https://s3.<region>.amazonaws.com with a real AWS
-  #   access-key/secret pair. SAIA pods authenticate with the static
-  #   AWS keys you put in auth.rootUser / auth.rootPassword, the
-  #   installer creates a Kubernetes Secret named "minio-credentials"
-  #   with those keys, and SAIA's storage_adapters/factory.py uses them
-  #   to sign SigV4 requests to AWS S3 — which AWS accepts as valid.
-  #
-  # SECURITY NOTES (codeguard-1-hardcoded-credentials,
-  # codeguard-0-additional-cryptography):
-  #   * The AWS access key below MUST come from a dedicated IAM USER (not
-  #     a root account) with a least-privilege policy scoped to the
-  #     bucket only:
-  #         s3:GetObject, s3:PutObject, s3:DeleteObject,
-  #         s3:GetObjectTagging, s3:PutObjectTagging
-  #         on arn:aws:s3:::<bucket>/*
-  #         s3:ListBucket, s3:GetBucketLocation
-  #         on arn:aws:s3:::<bucket>
-  #   * Rotate the access key every 90 days at most; deactivate the
-  #     prior key after rollout.
-  #   * Do NOT commit these values to source control — populate from a
-  #     real secrets manager (Vault / AWS Secrets Manager / sops) at
-  #     deploy time, not from this YAML file.
-  #   * `endpoint` MUST be HTTPS — never use plaintext for S3 traffic.
-  #
-  # When the operator is fixed to support k0s+IRSA-style or k0s+IMDS
-  # auth properly, switch back to type=aws and remove the auth block.
-  # ---------------------------------------------------------------------
-  s3Bucket: "ai-platform-bucket-us-east-2"      # CHANGE THIS — must match objectStore.bucket below
-  storageClass: "local-path"                     # k0s default storage class (NOT "gp3" — gp3 is EKS-only)
-  vectorDbSize: "50Gi"                           # VectorDB persistent volume size
+  storageClass: "local-path"                 # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
+  vectorDbSize: "50Gi"                       # VectorDB persistent volume size
 
   # Minimum available disk space (GB) on /var/lib/k0s per node role.
   # The installer checks these thresholds at preflight and fails if not met.
@@ -99,32 +53,10 @@ storage:
   #   gpuWorker: 500     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
 
   objectStore:
-    # type=minio (NOT s3compat) is required: the AIPlatform CRD pattern
-    # only accepts ^(s3|gs|azure|minio)://... — `s3compat://` and
-    # `seaweedfs://` are rejected by the API server. The path scheme is
-    # purely a label for the CRD; the runtime endpoint below decides which
-    # backend SAIA actually talks to.
-    #
-    # Two supported scenarios for this template:
-    #   (a) Real AWS S3 (recommended on EC2): point endpoint at AWS regional
-    #       S3 (https://s3.<region>.amazonaws.com) and put real AWS access
-    #       keys in auth.* — SAIA's adapter is boto3 with explicit
-    #       endpoint_url, so AWS S3 accepts the SigV4-signed requests
-    #       normally despite the "minio" type label.
-    #   (b) External MinIO (true on-prem / airgap): point endpoint at your
-    #       MinIO API URL (e.g. http://<host>:9000) with MinIO root
-    #       credentials. Note: the in-cluster MinIO install was removed in
-    #       refactor 4146385 — you must provide MinIO yourself.
-    #
-    # SeaweedFS note: SAIA v2's S3ConversationStore calls GetObjectTagging
-    # on the conversation key *before* the first PutObject. SeaweedFS
-    # returns S3 InternalError/500 (instead of NoSuchKey/404) for that,
-    # which the boto3 SDK retries 5x and then surfaces as 502 to the UI on
-    # every brand-new chat. MinIO and AWS S3 are both spec-compliant
-    # (return NoSuchKey/404), so prefer those.
-    type: "minio"
-    bucket: "ai-platform-bucket-us-east-2"          # CHANGE THIS — must match storage.s3Bucket above
-    endpoint: "https://s3.us-east-2.amazonaws.com"  # CHANGE THIS — AWS S3 regional URL OR your MinIO http://<host>:9000
+    type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-minio-us-east-2"
+    # endpoint: "http://3.144.157.201:8333"      # SeaweedFS (deprecated — see comment above)
+    endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS S3 API endpoint
     auth:
       rootUser: "<paste-AWS_ACCESS_KEY_ID-here>"          # CHANGE THIS — AWS_ACCESS_KEY_ID (AKIA…) or MinIO root user
       rootPassword: "<paste-AWS_SECRET_ACCESS_KEY-here>"  # CHANGE THIS — AWS secret OR MinIO root password; NEVER commit real keys
@@ -135,45 +67,6 @@ images:
   registry: ""                                    # CHANGE THIS: Your ECR/Docker/Harbor registry (e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com)
 
   operator:
-    # image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.29"
-    # v0.1.21 added ServiceTemplate propagation (AIPlatform → AIService) so the
-    # aiPlatform.serviceTemplate block in this config actually takes effect.
-    # v0.1.21 also sets FIELD_DESCRIPTION_BACKEND=s3 + FIELD_DESCRIPTION_S3_KEY +
-    # AWS_ENDPOINT_URL on the v2 API and v2 worker pods (Confluence ERD 3.8.1.2)
-    # and wires AWS_ACCESS_KEY_ID/SECRET from TaskVolume.SecretRef so boto3 can
-    # actually auth to the S3-compatible endpoint (otherwise field-description
-    # lookups silently return empty and sourcetype metadata is degraded).
-    # v0.1.24 lowers RUN_TASKS_DELAY_S from 600s to 10s on the v2 worker.
-    # The saia-v2 IngestionWorker only refreshes its heartbeat at the top of
-    # each poll iteration, and the liveness probe kills the pod at 120s stale.
-    # At 600s (the v1 scheduler cadence) the worker got SIGKILLed every time
-    # the tenant lock was busy or the queue was empty.
-    # v0.1.25 adds the nginx CORS preflight short-circuit (SAIA v2's
-    # TenantConversationKeyMiddleware rejects unauthenticated OPTIONS with
-    # 400 before CORSMiddleware can respond, so nginx has to answer the
-    # preflight itself with 204 + CORS headers) AND sets
-    # DISABLE_RESPONSES_API_REDIS=True on the GptOss120b and GptOss20b Ray
-    # Serve apps (pair with ray-head/ray-worker-gpu:build-v2-001 which
-    # includes the NoOpOpenAIServingResponses implementation — see
-    # ai-platform-models commits c1f9aef3, da7628ea, b6ff101e). Without the
-    # env var the vLLM RedisOpenAIServingResponses constructor raises
-    # RuntimeError('Responses Redis URL not set') on every /v1/responses
-    # call and the SAIA v2 /query path fails with SearchStreamError.
-    # v0.1.26 switches the SAIA v2 conversation store from the ephemeral
-    # "filesystem" default to "s3" (S3ConversationStore) by setting
-    # CONVERSATION_STORE=s3 and CONVERSATION_S3_BUCKET=<bucket> on both the
-    # v2 API and v2 worker pods. Before this, chat history lived on the
-    # pod's container overlay and every pod restart produced spurious
-    # "Conversation <id> not found" 404s on GET /conversations/<id>/items
-    # (the Splunk UI's saia_v2_audit_index_log_proxy flow surfaced them as
-    # "Failed to fetch SAIA V2 conversation items"). Reuses the same
-    # AWS_ENDPOINT_URL + AWS_ACCESS_KEY_ID/SECRET that v0.1.21 wired for
-    # the FieldDescription S3 adapter. Pairs with saia-service image
-    # build-v2-002 which ships Tony's S3ConversationStore (commits
-    # 3d3756f3, 8e2a9f40, merged via 9efe1fce into ai-tier-v2.0).
-    # Build & push with:
-    #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.26 \
-    #     make docker-build-amd64 docker-push
     image: "splunk-ai-operator:latest"              # CHANGE THIS: Your operator image
 
   splunk:
@@ -181,39 +74,16 @@ images:
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   ray:
-    # headImage: "ml-platform/ray/ray-head:build-v1alpha1"
-    # headImage: "ml-platform/ray/ray-head:087e40e"
-    # headImage: "ml-platform/ray/ray-head:build-010"
-    # headImage: "ml-platform/ray/ray-head:9a24502-ai-tier" # arif rebase to main
-    # headImage: "ml-platform/ray/ray-head:build-v2-001" # tony redis changes
-    headImage: "ml-platform/ray/ray-head:build-v2-010" # tony redis changes + fixes
-
-    # workerImage: "ml-platform/ray/ray-worker-gpu:build-v1alpha1"
-    # workerImage: "ml-platform/ray/ray-worker-gpu:087e40e"
-    # workerImage: "ml-platform/ray/ray-worker-gpu:build-010"
-    # workerImage: "ml-platform/ray/ray-worker-gpu:9a24502-ai-tier" # arif rebase to main
-    # workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-001" # tony redis changes
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-010" # tony redis changes + fixes
+    headImage: "ml-platform/ray/ray-head:build-v2-010"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-010"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
   saia:
-    # apiImage: "ml-platform/saia/saia-api:build-v1alpha1"
-    # apiImage: "ml-platform/saia/saia-api:build-006" #saia v1.5
-    # apiImage: "ml-platform/saia/saia-api:v2.0.4-23-g2fc91e9" #saia v2
-    # apiImage: "ml-platform/saia/saia-api:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
-    apiImage: "ml-platform/saia/saia-api:build-v2-010" #saia v2 + tony changes
-
-    # apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-23-g2fc91e9" #saia v2
-    # apiV2Image: "ml-platform/saia/saia-api-v2:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
-    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-010" #saia v2 + tony changes
-
-    # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v1alpha1"
-    # dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003" #saia v1.5
-    # dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-23-g2fc91e9" #saia v2
-    # dataLoaderImage: "ml-platform/saia/saia-data-loader:v2.0.4-31-g9efe1fc" #saia v2 + tony changes
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-010" #saia v2 + tony changes + personalization fix
+    apiImage: "ml-platform/saia/saia-api:build-v2-012"
+    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-012"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-012"
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
