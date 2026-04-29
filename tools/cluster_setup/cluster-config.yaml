@@ -14,7 +14,7 @@
 # ---------- Cluster Configuration ----------
 cluster:
   useExisting: false   # true = do not create cluster; use existing one (script fails if cluster not found)
-  name: "ai-tier-sok-test-east2"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  name: "my-ai-cluster"                     # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
   region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
   # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).
@@ -110,10 +110,10 @@ storage:
   objectStore:
     type: "minio"                         # aws | s3compat | minio | seaweedfs (external only for non-aws)
     bucket: "ai-platform-bucket-minio-us-east-2"
-    endpoint: "http://13.59.216.105:9000"    # MinIO API (9000) or SeaweedFS S3 gateway (8333)
+    endpoint: "http://10.0.0.5:9000"         # CHANGE THIS: MinIO API (9000) or SeaweedFS S3 gateway (8333)
     auth:
-      rootUser: "minioadmin"
-      rootPassword: "minioadmin"              # Must match SeaweedFS env (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) or MinIO root
+      rootUser: ""                            # CHANGE THIS: S3-compatible access key (or MinIO root user)
+      rootPassword: ""                        # CHANGE THIS: S3-compatible secret key (or MinIO root password)
 
 # ---------- Container Images Configuration ----------
 images:

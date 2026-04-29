@@ -1888,8 +1888,7 @@ install_kube_prometheus() {
   log "Installing kube-prometheus-stack..."
 
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-  # TODO uncomment
-  # helm repo update prometheus-community  # Only update the specific repo we need
+  helm repo update prometheus-community  # Only update the specific repo we need
 
   helm_retry 3 upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --namespace monitoring --create-namespace \
@@ -1908,8 +1907,7 @@ install_otel_operator_and_contrib_collector() {
   wait_for_cert_manager_webhook 30 10
 
   helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
-  # TODO uncomment
-  # helm repo update open-telemetry  # Only update the specific repo we need
+  helm repo update open-telemetry  # Only update the specific repo we need
 
   # Use cert-manager for webhook certificates (now that konnectivity is fixed)
   helm_retry 3 upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
@@ -1928,8 +1926,7 @@ install_ray_operator() {
   log "Installing KubeRay Operator..."
 
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  # TODO uncomment
-  # helm repo update kuberay  # Only update the specific repo we need
+  helm repo update kuberay  # Only update the specific repo we need
 
   helm_retry 3 upgrade --install kuberay-operator kuberay/kuberay-operator \
     --namespace ray-system --create-namespace \
@@ -3809,7 +3806,6 @@ case "${1:-install}" in
     clean_all
     ;;
   join-workers)
-  # TODO fix this flow
     join_workers
     ;;
   *)

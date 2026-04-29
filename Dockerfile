@@ -44,8 +44,10 @@ COPY LICENSE LICENSE-2.0.txt
 COPY --from=builder /certs/tls.crt /certs/tls.crt
 COPY --from=builder /certs/tls.key /certs/tls.key
 
-# USER 65532:65532
-# GID 0 required for Red Hat / OpenShift SCC compatibility on k0s nodes
+# Run as non-root UID with GID 0 (root group). GID 0 is required on
+# RHEL / OpenShift / k0s nodes: the container runtime assigns a random
+# UID at launch and only grants group-read/write to GID 0. Without it
+# the process cannot read /manager or the config files copied above.
 USER 1001:0
 ENV INSTANCE_FILE=/instance.yaml
 ENV APPLICATION_FILE=/applications.yaml

@@ -15,7 +15,7 @@ cluster:
   name: airgap-cluster
   # region: us-east-2                    # Ignored for on-prem, but required in config
   sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
-  sshKeyPath: /Users/mohaari2/.ssh/ai-key-arif.pem  # CHANGE THIS: Path to SSH private key
+  sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
 
 # ---------- Node Configuration ----------
 nodes:
@@ -25,11 +25,11 @@ nodes:
 
   existingIPs:
     controllers:
-      - 3.144.14.96                       # CHANGE THIS: Your controller server IP
+      - 10.0.0.1                          # CHANGE THIS: Your controller server IP
     workers:
-      - 3.14.134.16                       # CHANGE THIS: CPU worker 1
-      - 13.59.78.115                      # CHANGE THIS: GPU worker 1
-      - 3.15.20.136                       # CHANGE THIS: GPU worker 2
+      - 10.0.0.2                          # CHANGE THIS: CPU worker 1
+      - 10.0.0.3                          # CHANGE THIS: GPU worker 1
+      - 10.0.0.4                          # CHANGE THIS: GPU worker 2
 
 # ---------- Storage Configuration ----------
 # Prerequisites (must be provisioned BEFORE running the installer):
@@ -67,7 +67,7 @@ storage:
     type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
     bucket: "ai-platform-bucket-minio-us-east-2"
     # endpoint: "http://3.144.157.201:8333"      # SeaweedFS (deprecated — see comment above)
-    endpoint: "http://13.59.216.105:9000"        # MinIO (AWS-spec compliant GetObjectTagging semantics)
+    endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS S3 API endpoint
     auth:
       rootUser: "minioadmin"
       rootPassword: "minioadmin"
@@ -75,7 +75,7 @@ storage:
 # ---------- Container Images Configuration ----------
 images:
   # Registry prefix - applied to images without a full registry path
-  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+  registry: ""                                    # CHANGE THIS: Your ECR/Docker/Harbor registry (e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com)
 
   operator:
     # image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.29"
@@ -117,10 +117,10 @@ images:
     # Build & push with:
     #   IMG=658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.26 \
     #     make docker-build-amd64 docker-push
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.28"
+    image: "splunk-ai-operator:latest"              # CHANGE THIS: Your operator image
 
   splunk:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom" #TODO this update
+    image: "splunk/splunk:10.2.0"                   # CHANGE THIS: Your Splunk Enterprise image
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   ray:
@@ -189,8 +189,8 @@ kubernetes:
 
 # ---------- File Paths ----------
 files:
-  splunkOperator: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/splunk-operator-cluster.yaml"
-  aiPlatform: "/Users/mohaari2/Files/repos/AI/splunk-ai-operator/tools/cluster_setup/artifacts.yaml"
+  splunkOperator: "./splunk-operator-cluster.yaml"  # CHANGE THIS: Path to Splunk Operator manifest
+  aiPlatform: "./artifacts.yaml"                     # CHANGE THIS: Path to AI Platform artifacts
 
 # ---------- Splunk Configuration ----------
 splunk:
@@ -255,5 +255,5 @@ imagePullSecrets:
   autoCreateECR: true
 
 ecr:
-  account: "658391232643"
-  region: us-east-2
+  account: ""                                        # CHANGE THIS: Your AWS account ID (e.g. 123456789012)
+  region: us-east-2                                  # CHANGE THIS: Your AWS region

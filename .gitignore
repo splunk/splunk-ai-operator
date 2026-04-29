@@ -31,6 +31,9 @@ tmp/*
 skaffold.env.local
 .skaffold/
 
+# Logs
+tools/cluster_setup/logs/
+
 # Helm build artifacts
 *.tgz
 helm-chart/**/charts/
