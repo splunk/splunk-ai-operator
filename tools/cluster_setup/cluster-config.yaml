@@ -13,29 +13,50 @@
 
 # ---------- Cluster Configuration ----------
 cluster:
-  useExisting: false
-  name: "my-ai-cluster"                   # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
-  region: "us-west-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
+  useExisting: false   # true = do not create cluster; use existing one (script fails if cluster not found)
+  name: "my-ai-cluster"                     # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
+  # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).
+  preserveVpcOnDelete: false              # Set true to keep VPC on delete and redeploy without recreating VPC
 
-  # If you donot provide any subnet information, eksctl will create a new VPC with public and private subnets automatically.
+  # To use an EXISTING VPC: provide subnets below; eksctl will not create a new VPC. Idempotent: cluster is only created if it does not exist.
+  # If you do not provide subnets, eksctl creates a new VPC and subnets automatically.
   # VPC Subnets - CHANGE ALL OF THESE to your actual subnet IDs
   # Find your subnets: aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxxxx" --region us-west-2
-  #subnets:
-  #  private:                              # Private subnets (at least 2 in different AZs)
-  #    - id: "subnet-1a2b3c4d5e6f7g8h"    # CHANGE THIS: Your private subnet 1
-  #      az: "us-west-2a"                  # CHANGE THIS: Availability zone for subnet 1
-  #    - id: "subnet-9h8g7f6e5d4c3b2a"    # CHANGE THIS: Your private subnet 2
-  #      az: "us-west-2b"                  # CHANGE THIS: Availability zone for subnet 2
-  #  public:                               # Public subnets (at least 2 in different AZs)
-  #    - id: "subnet-a1b2c3d4e5f6g7h8"    # CHANGE THIS: Your public subnet 1
-  #      az: "us-west-2a"                  # CHANGE THIS: Availability zone for subnet 1
-  #    - id: "subnet-h8g7f6e5d4c3b2a1"    # CHANGE THIS: Your public subnet 2
-  #      az: "us-west-2b"                  # CHANGE THIS: Availability zone for subnet 2
-  #    - id: "subnet-1h2g3f4e5d6c7b8a"    # OPTIONAL: Additional public subnet for HA
-  #      az: "us-west-2c"                  # OPTIONAL: Third availability zone
+# subnets:
+#    private:                              # Private subnets (at least 2 in different AZs)
+#      - id: "subnet-02734905b10e7ad5a"    # CHANGE THIS: Your private subnet 1
+#        az: "us-east-2b"                  # CHANGE THIS: Availability zone for subnet 1
+#      - id: "subnet-0c1d7dc49788d11dc"    # CHANGE THIS: Your private subnet 2
+#        az: "us-east-2c"                  # CHANGE THIS: Availability zone for subnet 2
+#      - id: "subnet-0f8f94998d65dfcd2"    # CHANGE THIS: Your private subnet 2
+#        az: "us-east-2a"   
+#    public:                               # Public subnets (at least 2 in different AZs)
+#      - id: "subnet-0f0ea3b190a618540"    # CHANGE THIS: Your public subnet 1
+#        az: "us-east-2c"                  # CHANGE THIS: Availability zone for subnet 1
+#      - id: "subnet-02b736130e7c2a787"    # CHANGE THIS: Your public subnet 2
+#        az: "us-east-2a"                  # CHANGE THIS: Availability zone for subnet 2
+#      - id: "subnet-02c35a8cd0b5d90a5"    # OPTIONAL: Additional public subnet for HA
+#        az: "us-east-2b"                  # OPTIONAL: Third availability zone
 
 # ---------- Node Groups ----------
+#
+# GPU TYPE QUICK REFERENCE — set instanceType and defaultAcceleratorType (under aiPlatform) together:
+#
+#   L40S  (default):
+#     instanceType:        g6e.12xlarge    (4x L40S GPUs, 48 GB VRAM each)
+#     defaultAcceleratorType: L40S
+#     capacityReservation: not required
+#     availabilityZones:   not required
+#
+#   H100:
+#     instanceType:        p5.4xlarge      (8x H100 GPUs, 80 GB VRAM each; capacity reservation required)
+#     defaultAcceleratorType: H100
+#     capacityReservation: required — uncomment block below and set id + az
+#     availabilityZones:   required — must match capacityReservation.az
+#     maxSize:             must equal desiredCapacity (capacity reservations are fixed-size)
+#
 nodeGroups:
   cpu:
     enabled: true                         # Set to false to skip CPU node group
@@ -48,18 +69,45 @@ nodeGroups:
 
   gpu:
     enabled: true                         # Set to false to skip GPU nodes (saves cost)
-    instanceType: "g6e.12xlarge"          # GPU instance type (g6e.12xlarge=4xL40S GPUs, g5.xlarge=1xA10G)
+    instanceType: "g6e.12xlarge"          # CHANGE THIS: see GPU TYPE QUICK REFERENCE above
     desiredCapacity: 2                    # Initial number of GPU nodes
     minSize: 2                            # Minimum GPU nodes
-    maxSize: 4                            # Maximum GPU nodes
+    maxSize: 4                            # Maximum GPU nodes (set equal to desiredCapacity for H100)
     volumeSize: 1000                      # EBS volume size per GPU node (GB) - larger for model storage
     volumeType: "gp3"                     # EBS volume type
 
+    # ── H100 ONLY ──────────────────────────────────────────────────────────────
+    # Capacity Reservation: required for P5/H100 instances (scarce capacity).
+    # Uncomment and fill in when defaultAcceleratorType is H100.
+    # capacityReservation:
+    #   id: "cr-xxxxxxxxxxxxxxxxx"        # CHANGE THIS: your capacity reservation ID
+    #   az: "us-east-2c"                  # CHANGE THIS: AZ where the reservation exists
+
+    # Availability Zones: lock GPU nodes to the AZ matching the capacity reservation.
+    # Uncomment and fill in when defaultAcceleratorType is H100.
+    # availabilityZones:
+    #   - "us-east-2c"                    # CHANGE THIS: must match capacityReservation.az
+    # ───────────────────────────────────────────────────────────────────────────
+
 # ---------- Storage Configuration ----------
+# Object storage: only AWS S3 or external S3-compatible (no in-cluster MinIO install).
+# Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
 storage:
-  s3Bucket: "my-company-ai-platform-bucket"  # CHANGE THIS: Globally unique S3 bucket name
+  s3Bucket: "ai-platform-bucket-minio-us-east-2"  # Used when objectStore.type is aws
   storageClass: "gp3"                        # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
   vectorDbSize: "50Gi"                       # VectorDB persistent volume size
+
+  # Object store: aws (S3) or external S3-compatible (s3compat, minio, seaweedfs). No in-cluster install.
+  # - s3compat: generic S3 API (MinIO :9000, SeaweedFS S3 :8333, etc.) — AIPlatform path uses s3compat://bucket
+  # - minio: same wiring as s3compat but path uses minio:// (use if an older operator webhook rejects s3compat://)
+  # - seaweedfs: path uses seaweedfs:// (requires operator webhook that allows that scheme)
+  objectStore:
+    type: "minio"                         # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-minio-us-east-2"
+    endpoint: "http://10.0.0.5:9000"         # CHANGE THIS: MinIO API (9000) or SeaweedFS S3 gateway (8333)
+    auth:
+      rootUser: ""                            # CHANGE THIS: S3-compatible access key (or MinIO root user)
+      rootPassword: ""                        # CHANGE THIS: S3-compatible secret key (or MinIO root password)
 
 # ---------- Container Images Configuration ----------
 images:
@@ -82,7 +130,7 @@ images:
   #
   # REQUIRED: Specify your private registry URL for custom images
   # Leave empty to use Docker Hub defaults for all images
-  registry: "1234567890.dkr.ecr.us-west-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
   # ==================================================================================
   # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
@@ -97,18 +145,17 @@ images:
     # Option 2: Full path (ignores registry prefix)
     #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
-    image: "docker.io/splunk/splunk-ai-operator:0.1.0"
+    # Bump tag after building fixed operator (SAIA 8Gi default, SchemaJobId persist, feature config)
+    #image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v0.1.31"
 
   # Splunk Enterprise Images
   splunk:
-    # Option 1: Relative path (uses registry prefix)
-    #   image: "splunk/splunk:10.2.0"
-    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0"
-    #
-    # Option 2: Full path (ignores registry prefix)
-    #   image: "docker.io/myorg/splunk:10.2.0"
-    #   Result: "docker.io/myorg/splunk:10.2.0"
-    image: "splunk/splunk:10-2-ai-custom"
+    # Splunk Enterprise image
+    # Default behavior: If no registry in path, uses Docker Hub
+    #   "splunk/splunk:10.2.0" → Docker Hub
+    #   "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0" → ECR
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
 
     # Splunk Operator image (optional - has default)
     # Default: "docker.io/splunk/splunk-operator:3.0.0"
@@ -123,8 +170,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "ml-platform/ray/ray-head:build-17"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-17"
+    headImage: "ml-platform/ray/ray-head:build-008"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-008"
 
   # Weaviate Vector Database
   weaviate:
@@ -136,8 +183,8 @@ images:
   # SAIA (Splunk AI Assistant) Images
   saia:
     # Relative paths - registry prefix auto-applied
-    apiImage: "ml-platform/saia/saia-api:build-1"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-1"
+    apiImage: "ml-platform/saia/saia-api:build-005"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-003"
 
   # Supporting Images
   fluentBit:
@@ -145,6 +192,11 @@ images:
     # OR specify your mirrored image:
     #   image: "fluent-bit:1.9.6"  → uses registry prefix
     image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  # OpenTelemetry Collector (use full URL so it is not rewritten to ECR)
+  otelCollector:
+    # Public image - full path so registry prefix is NOT applied; validation checks this URL
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
 
 # ---------- Operator Versions ----------
 operators:
@@ -170,8 +222,11 @@ aiPlatform:
     rayWorker: "ray-worker-sa" # no change
     saiaService: "saia-service-sa" # no change
 
-  # Default accelerator type
-  defaultAcceleratorType: "L40S" 
+  # Default accelerator type — must match a top-level key in instance.yaml.
+  # Must be changed in sync with nodeGroups.gpu.instanceType (see GPU TYPE QUICK REFERENCE above).
+  #   L40S     → instanceType: g6e.12xlarge
+  #   H100     → instanceType: p5.4xlarge    (also uncomment capacityReservation + availabilityZones)
+  defaultAcceleratorType: "L40S"
 
   # Features to enable
   features: # no change

@@ -65,6 +65,9 @@ endif
 # tools. (i.e. podman)
 CONTAINER_TOOL ?= docker
 
+# GO_VERSION is read from .env if not already set, and passed as a build-arg to docker builds.
+GO_VERSION ?= $(shell grep '^GO_VERSION=' .env | cut -d= -f2)
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -215,7 +218,11 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg GO_VERSION=$(GO_VERSION) -t ${IMG} .
+
+.PHONY: docker-build-amd64
+docker-build-amd64: ## Build docker image for linux/amd64 (e.g. for x86_64 servers/EC2).
+	$(CONTAINER_TOOL) build --platform=linux/amd64 --build-arg GO_VERSION=$(GO_VERSION) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -234,7 +241,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name splunk-ai-operator-builder
 	$(CONTAINER_TOOL) buildx use splunk-ai-operator-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg GO_VERSION=$(GO_VERSION) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm splunk-ai-operator-builder
 	rm Dockerfile.cross
 

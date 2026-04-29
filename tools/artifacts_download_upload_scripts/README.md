@@ -70,13 +70,14 @@ sudo ./download_from_huggingface.sh
 - Script returns non-zero exit code on failure (suitable for CI/CD pipelines)
 
 ### 2. `upload_to_minio.sh`
-Uploads downloaded artifacts to MinIO storage.
+Uploads downloaded artifacts to MinIO or any S3-compatible storage (e.g. SeaweedFS).
 
 **Features:**
 - Automatically uploads **all artifacts** from `./model_artifacts/` directory
 - No config file needed - just uploads everything found
 - **Auto-creates bucket** if it doesn't exist
 - Uses native MinIO Client (mc) for optimal performance
+- Works with **MinIO, SeaweedFS, or any S3-compatible** backend; set endpoint and credentials to match your store.
 - Comprehensive dependency installation:
   - MinIO Client via **Homebrew on macOS** or **direct download on Linux**
   - Supports macOS (Intel & Apple Silicon) and Linux (amd64 & arm64)
@@ -92,16 +93,109 @@ Or with sudo if dependency installation fails:
 sudo ./upload_to_minio.sh
 ```
 
+**Environment variables (S3-compatible target):**  
+Preferred generic names; `MINIO_*` are accepted for backward compatibility.
+
+| Preferred (generic) | Fallback | Description |
+|---------------------|----------|-------------|
+| `OBJECT_STORE_ENDPOINT` | `MINIO_ENDPOINT` | S3 API endpoint URL (e.g. http://host:9000 for MinIO, http://host:8333 for SeaweedFS) |
+| `OBJECT_STORE_BUCKET` | `MINIO_BUCKET` | Bucket name |
+| `OBJECT_STORE_ACCESS_KEY` | `MINIO_ROOT_USER` or `MINIO_ACCESS_KEY` | Access key |
+| `OBJECT_STORE_SECRET_KEY` | `MINIO_ROOT_PASSWORD` or `MINIO_SECRET_KEY` | Secret key |
+
+Example for SeaweedFS: `OBJECT_STORE_ENDPOINT=http://seaweedfs:8333 OBJECT_STORE_BUCKET=my-bucket ./upload_to_minio.sh`
+
 **Prerequisites:**
 - Run `download_from_huggingface.sh` first to download artifacts
 - May require sudo for installing MinIO Client (mc)
-- Configure MinIO settings in the script or use environment variables:
-  - `MINIO_ENDPOINT` (default: http://127.0.0.1:9000)
-  - `MINIO_BUCKET` (default: personal)
-  - `MINIO_ROOT_USER` (default: minioadmin)
-  - `MINIO_ROOT_PASSWORD` (default: minioadmin)
+- Set endpoint, bucket, and credentials via the env vars above (defaults point to a local MinIO).
 
-### 3. `upload_to_minio_aws.sh`
+### 3. `upload_to_seaweedfs.sh`
+Uploads downloaded artifacts to SeaweedFS (S3-compatible). If SeaweedFS is not running at the endpoint, the script can **install and start it** (downloads the `weed` binary from GitHub releases, no Docker). If you run SeaweedFS via **systemd** (see **§4 `install_seaweedfs_systemd.sh`** below), ensure the service is up (`sudo systemctl start seaweedfs`) before running the upload script so the script doesn’t start a second instance.
+
+**Features:**
+- **Auto-install SeaweedFS** when not reachable: downloads latest `weed` for Linux/macOS (amd64/arm64), installs to `/usr/local/bin` or `~/.local/bin`, and starts `weed server -s3` in the background (S3 gateway on port 8333).
+- Auto-install only runs when the endpoint is local (`127.0.0.1` or `localhost`). For remote endpoints, SeaweedFS must already be running.
+- Creates configured buckets (from `SEAWEEDFS_BUCKETS` or primary bucket), then uploads all of `./model_artifacts/` to the primary bucket.
+- Uses MinIO Client (mc); installs mc if missing.
+
+**Usage:**
+```bash
+./upload_to_seaweedfs.sh
+```
+
+With a remote SeaweedFS:
+```bash
+S3COMPAT_OBJECT_STORE_ENDPOINT=http://seaweedfs-host:8333 S3COMPAT_OBJECT_STORE_BUCKET=my-bucket ./upload_to_seaweedfs.sh
+```
+
+To skip auto-install and only fail if unreachable:
+```bash
+SEAWEEDFS_SKIP_INSTALL=1 ./upload_to_seaweedfs.sh
+```
+
+**Volume limit:** When the script starts SeaweedFS it uses `-volume.max=100` (set `SEAWEEDFS_VOLUME_MAX`; use `0` for auto). The default (~7) can cause "0 node candidates" once the volume server is "full."
+
+**Environment variables:** `S3COMPAT_OBJECT_STORE_ENDPOINT` (default: http://127.0.0.1:8333), `S3COMPAT_OBJECT_STORE_BUCKET`, `S3COMPAT_OBJECT_STORE_ACCESS_KEY`, `S3COMPAT_OBJECT_STORE_SECRET_KEY`, `SEAWEEDFS_BUCKETS`, `SEAWEEDFS_SKIP_INSTALL`, `SEAWEEDFS_UPLOAD_RETRIES`, `SEAWEEDFS_UPLOAD_RETRY_DELAY`, `SEAWEEDFS_PARALLEL_JOBS`, `SEAWEEDFS_ERROR_LOG`, `SEAWEEDFS_SKIP_EXISTING`, `SEAWEEDFS_WAIT_VOLUME_SERVER`, `SEAWEEDFS_MASTER`, `SEAWEEDFS_VOLUME_MAX` (default 100).
+
+**SeaweedFS credentials:** SeaweedFS S3 has no built-in users (unlike MinIO’s default `minioadmin`). If you start SeaweedFS yourself, it must be configured to accept the same access key/secret the script uses (defaults: `minioadmin`/`minioadmin`). Options: (1) Start with env vars: `AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin weed server -s3`; (2) Use a JSON config file with `weed s3 -config=/path/to/s3.json` (see [SeaweedFS S3 Credentials](https://github.com/seaweedfs/seaweedfs/wiki/S3-Credentials)). If you see *"The access key ID you provided does not exist in our records"*, restart SeaweedFS with the same credentials as `S3COMPAT_OBJECT_STORE_ACCESS_KEY`/`S3COMPAT_OBJECT_STORE_SECRET_KEY` (or set those env vars to match your SeaweedFS config).
+
+**Volume server readiness:** After SeaweedFS has just started (or restarted), the master may not see a volume server yet, so uploads can fail with "Not enough data nodes found". The script can **wait for a volume server** (when endpoint is local and `weed` is available): it polls `weed shell -master=... cluster.ps` for up to `SEAWEEDFS_WAIT_VOLUME_SERVER` seconds (default 60) before starting uploads. Set `SEAWEEDFS_WAIT_VOLUME_SERVER=0` to skip.
+
+**Parallel uploads and error log:** Uploads run in parallel (up to `SEAWEEDFS_PARALLEL_JOBS` at a time, default 3). Directory artifacts are uploaded **file-by-file** with per-file retries, so one failed file (e.g. a single `.safetensors` shard) only retries that file, not the whole artifact. Failed files/artifacts are appended to `SEAWEEDFS_ERROR_LOG` (default `./seaweedfs_upload_errors.log`) with artifact id and relative path; at the end the script prints that file and exits with code 1 if any failed.
+
+**Large artifacts (e.g. LLaMA 70B):** Uploads of very large files (multi-GB `.safetensors` shards) can fail with *"We encountered an internal error, please try again"*. The script retries each artifact up to `SEAWEEDFS_UPLOAD_RETRIES` (default 3) with `SEAWEEDFS_UPLOAD_RETRY_DELAY` seconds between attempts. If failures persist, check SeaweedFS host memory and disk (`/tmp/seaweedfs.log` or volume server logs), ensure enough free space for the full object, and consider increasing retries: `SEAWEEDFS_UPLOAD_RETRIES=5 SEAWEEDFS_UPLOAD_RETRY_DELAY=30 ./upload_to_seaweedfs.sh`.
+
+**"0 node candidates" / "Not enough data nodes":** Usually the volume server hit its max volume count (default ~7), disk is near full (read-only), heartbeat timeouts, or OOM. The script and systemd unit use `-volume.max=100` by default. When the error happens: `curl -s http://localhost:9333/cluster/status | jq` (master view); `curl -s http://127.0.0.1:8080/status | jq` (volume server; if Max==Count, increase `SEAWEEDFS_VOLUME_MAX`). See `tools/artifacts_download_upload_scripts/SEAWEEDFS_SYSTEMD.md` for full troubleshooting.
+
+**Prerequisites:**
+- Run `download_from_huggingface.sh` first to download artifacts
+- For auto-install: curl, tar; optional sudo for `/usr/local/bin`
+- No Docker required
+
+**Create standard folders:** To create the platform folders (`apps/`, `artifacts/`, `config/`, `job_groups/`, `model_artifacts/`, `tasks/`) in SeaweedFS, run `./create_seaweedfs_folders.sh` after SeaweedFS is up. It uses the same endpoint and credentials as `upload_to_seaweedfs.sh`.
+
+**Upload Splunk AI Assistant app:** To upload `Splunk_AI_Assistant_Cloud.tgz` to `bucket/apps/`, run `./upload_splunk_app_to_seaweedfs.sh`. Put the .tgz in the current directory or set `SPLUNK_APP_LOCAL_PATH=/path/to/Splunk_AI_Assistant_Cloud.tgz`. Same endpoint/credentials as above.
+
+### 4. `install_seaweedfs_systemd.sh`
+Installs SeaweedFS as a **systemd service** so it starts on boot and restarts on failure. Run this on the host where SeaweedFS should run (e.g. EC2), after the `weed` binary is installed.
+
+**Features:**
+- Copies `seaweedfs.service` from this directory into `/etc/systemd/system/`
+- Enables and starts the `seaweedfs` service (master, volume, filer, S3 gateway)
+- Service runs as `ec2-user` (configurable in the unit file); data directory is `/home/ec2-user/data` by default
+- Handles SELinux: on Enforcing systems, labels `/usr/local/bin/weed` so the service can execute it
+- Requires the `weed` binary at `/usr/local/bin/weed` (install it first via `upload_to_seaweedfs.sh` or manually from [SeaweedFS releases](https://github.com/seaweedfs/seaweedfs/releases))
+
+**Usage:**
+```bash
+# 1. Install weed first (e.g. run upload_to_seaweedfs.sh once, or download weed and put it in /usr/local/bin)
+# 2. Then install the systemd service (requires sudo)
+sudo ./install_seaweedfs_systemd.sh
+```
+
+**Prerequisites:**
+- `weed` at `/usr/local/bin/weed` (run `./upload_to_seaweedfs.sh` once to auto-install it, or download and extract from GitHub releases)
+- Run the script as root: `sudo ./install_seaweedfs_systemd.sh`
+- The `seaweedfs.service` unit file must be in the same directory as the script
+
+**After install:**
+- **Status:** `sudo systemctl status seaweedfs`
+- **Logs:** `journalctl -u seaweedfs -f`
+- **Stop:** `sudo systemctl stop seaweedfs`
+- **Restart:** `sudo systemctl restart seaweedfs`
+- **S3 endpoint:** http://127.0.0.1:8333 (default credentials: minioadmin/minioadmin)
+- **Data directory:** `/home/ec2-user/data` (edit the unit file or use a drop-in to change)
+
+**Unit file details (`seaweedfs.service`):**
+- `ExecStart`: `/usr/local/bin/weed server -s3 -ip.bind=0.0.0.0 -dir=/home/ec2-user/data -volume.max=100`
+- `Restart=on-failure`, `RestartSec=5`
+- S3 credentials are set via `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the unit (default minioadmin/minioadmin); override with `/etc/default/seaweedfs` or a systemd drop-in if needed
+- To use a different user or data dir, copy the unit to a drop-in or edit `/etc/systemd/system/seaweedfs.service` after install
+
+**Troubleshooting:** If the service fails to start, check `sudo systemctl status seaweedfs` and `journalctl -u seaweedfs -n 50`. Ensure `/home/ec2-user/data` exists and is writable by `ec2-user`, and that `/usr/local/bin/weed` is executable. On SELinux systems, the script runs `chcon -t bin_t /usr/local/bin/weed` to allow execution.
+
+### 5. `upload_to_minio_aws.sh`
 Uploads downloaded artifacts to MinIO using AWS CLI (S3-compatible API).
 
 **Features:**
@@ -128,18 +222,18 @@ sudo ./upload_to_minio_aws.sh
 **Prerequisites:**
 - Run `download_from_huggingface.sh` first to download artifacts
 - May require sudo for installing AWS CLI
-- Configure MinIO settings in the script:
-  - `MINIO_ENDPOINT` (default: http://127.0.0.1:9000)
-  - `MINIO_BUCKET` (default: ml-platform-artifacts)
-  - `MINIO_ACCESS_KEY` (default: minioadmin)
-  - `MINIO_SECRET_KEY` (default: minioadmin)
+- Use generic env vars (MINIO_* accepted for backward compatibility):
+  - `S3COMPAT_OBJECT_STORE_ENDPOINT` (default: http://127.0.0.1:9000)
+  - `S3COMPAT_OBJECT_STORE_BUCKET` (default: ai-platform-artifacts-bucket)
+  - `S3COMPAT_OBJECT_STORE_ACCESS_KEY` (default: minioadmin)
+  - `S3COMPAT_OBJECT_STORE_SECRET_KEY` (default: minioadmin)
 
 **When to use this vs `upload_to_minio.sh`:**
 - Use this if you prefer AWS CLI over MinIO Client (mc)
 - Use this if you already have AWS CLI installed
 - Use `upload_to_minio.sh` for better MinIO native support
 
-### 4. `upload_to_s3.sh`
+### 6. `upload_to_s3.sh`
 Uploads downloaded artifacts to AWS S3 storage.
 
 **Features:**
@@ -181,12 +275,12 @@ sudo S3_BUCKET=your-bucket-name ./upload_to_s3.sh
 - Set `S3_BUCKET` environment variable
 - Optional: Set `S3_REGION` (default: us-east-1) and `S3_PREFIX` (default: model_artifacts)
 
-### 5. `test_minio_connection.sh`
-Diagnostic script to test MinIO connectivity and troubleshoot issues.
+### 7. `test_minio_connection.sh`
+Diagnostic script to test S3-compatible object store connectivity (MinIO, SeaweedFS, etc.) and troubleshoot issues.
 
 **Features:**
 - Tests MinIO Client (mc) installation
-- Verifies MinIO endpoint connectivity
+- Verifies endpoint connectivity
 - Tests authentication with credentials
 - Lists all existing buckets
 - Tests bucket creation permissions
@@ -197,9 +291,9 @@ Diagnostic script to test MinIO connectivity and troubleshoot issues.
 ./test_minio_connection.sh
 ```
 
-Or with custom settings:
+Or with custom settings (use generic names; MINIO_* also accepted):
 ```bash
-MINIO_ENDPOINT=http://localhost:9000 MINIO_BUCKET=nexus ./test_minio_connection.sh
+S3COMPAT_OBJECT_STORE_ENDPOINT=http://localhost:9000 S3COMPAT_OBJECT_STORE_BUCKET=nexus ./test_minio_connection.sh
 ```
 
 Or with sudo if dependency installation fails:
@@ -213,7 +307,7 @@ sudo ./test_minio_connection.sh
 **When to use:**
 - Before running upload scripts for the first time
 - When bucket creation fails
-- To diagnose MinIO connectivity issues
+- To diagnose object store connectivity issues
 - To verify credentials and permissions
 
 ## Configuration
@@ -333,19 +427,18 @@ All artifacts in the list will be downloaded and uploaded automatically.
 ### For Download Script:
 - No additional environment variables needed (reads from `model_artifacts_configs.yaml`)
 
-### For MinIO Upload Script (using mc):
+### For MinIO / S3-compatible Upload Script (using mc, `upload_to_minio.sh`):
 - No config file needed - automatically uploads all artifacts from `./model_artifacts/`
-- `MINIO_ENDPOINT`: MinIO server endpoint (default: http://127.0.0.1:9000)
-- `MINIO_BUCKET`: Target bucket name (default: personal)
-- `MINIO_ROOT_USER`: MinIO access key (default: minioadmin)
-- `MINIO_ROOT_PASSWORD`: MinIO secret key (default: minioadmin)
+- Works with MinIO, SeaweedFS, or any S3-compatible backend.
+- **Preferred (generic):** `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, `S3COMPAT_OBJECT_STORE_ACCESS_KEY`, `S3COMPAT_OBJECT_STORE_SECRET_KEY`
+- **Backward compatibility:** `MINIO_ENDPOINT`, `MINIO_BUCKET`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` (or `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`)
+- Defaults: endpoint http://127.0.0.1:9000, bucket ai-platform-bucket, minioadmin/minioadmin
 
-### For MinIO Upload Script (using AWS CLI):
+### For S3-compatible Upload Script (using AWS CLI, `upload_to_minio_aws.sh`):
 - No config file needed - automatically uploads all artifacts from `./model_artifacts/`
-- `MINIO_ENDPOINT`: MinIO server endpoint (default: http://127.0.0.1:9000)
-- `MINIO_BUCKET`: Target bucket name (default: ml-platform-artifacts)
-- `MINIO_ACCESS_KEY`: MinIO access key (default: minioadmin)
-- `MINIO_SECRET_KEY`: MinIO secret key (default: minioadmin)
+- **Preferred (generic):** `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, `S3COMPAT_OBJECT_STORE_ACCESS_KEY`, `S3COMPAT_OBJECT_STORE_SECRET_KEY`
+- **Backward compatibility:** `MINIO_ENDPOINT`, `MINIO_BUCKET`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` (or `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`)
+- Defaults: endpoint http://127.0.0.1:9000, bucket ai-platform-artifacts-bucket, minioadmin/minioadmin
 
 ### For S3 Upload Script:
 - No config file needed - automatically uploads all artifacts from `./model_artifacts/`

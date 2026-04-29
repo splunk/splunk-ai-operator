@@ -498,3 +498,4 @@ func TestSetImageRegistry(t *testing.T) {
 		})
 	}
 }
+

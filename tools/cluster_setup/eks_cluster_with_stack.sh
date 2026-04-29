@@ -29,6 +29,7 @@ load_config() {
     CLUSTER_NAME="$(yq eval '.cluster.name' "$cfg")"
     REGION="$(yq eval '.cluster.region' "$cfg")"
     K8S_VERSION="$(yq eval '.cluster.k8sVersion' "$cfg")"
+    USE_EXISTING_CLUSTER="$(yq eval '.cluster.useExisting // false' "$cfg")"
 
     # Node groups
     ENABLE_CPU="$(yq eval '.nodeGroups.cpu.enabled' "$cfg")"
@@ -47,10 +48,40 @@ load_config() {
     GPU_VOLUME_SIZE="$(yq eval '.nodeGroups.gpu.volumeSize' "$cfg")"
     GPU_VOLUME_TYPE="$(yq eval '.nodeGroups.gpu.volumeType' "$cfg")"
 
+    # GPU Availability Zones (optional - for capacity-constrained instance types like P5/H100)
+    GPU_AVAILABILITY_ZONES=()
+    while IFS= read -r az; do
+      [[ -n "$az" ]] && GPU_AVAILABILITY_ZONES+=("$az")
+    done < <(yq eval '.nodeGroups.gpu.availabilityZones[]' "$cfg" 2>/dev/null)
+
+    # Capacity Reservation (optional - for H100/P5 instances)
+    GPU_CAPACITY_RESERVATION_ID="$(yq eval '.nodeGroups.gpu.capacityReservation.id' "$cfg" 2>/dev/null)"
+    GPU_CAPACITY_RESERVATION_AZ="$(yq eval '.nodeGroups.gpu.capacityReservation.az' "$cfg" 2>/dev/null)"
+    [[ "$GPU_CAPACITY_RESERVATION_ID" == "null" ]] && GPU_CAPACITY_RESERVATION_ID=""
+    [[ "$GPU_CAPACITY_RESERVATION_AZ" == "null" ]] && GPU_CAPACITY_RESERVATION_AZ=""
+
+    # Cluster options
+    PRESERVE_VPC_ON_DELETE="$(yq eval '.cluster.preserveVpcOnDelete // false' "$cfg")"
+
     # Storage
     S3_BUCKET="$(yq eval '.storage.s3Bucket' "$cfg")"
     STORAGE_CLASS="$(yq eval '.storage.storageClass' "$cfg")"
     VECTORDB_SIZE="$(yq eval '.storage.vectorDbSize' "$cfg")"
+    # Object storage: objectStore.type (aws | s3compat | minio | seaweedfs); default aws when unset
+    OBJ_STORE_TYPE="$(yq eval '.storage.objectStore.type // "aws"' "$cfg")"
+    OBJ_STORE_BUCKET="$(yq eval '.storage.objectStore.bucket // .storage.s3Bucket // "ai-platform"' "$cfg")"
+    OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "$cfg")"
+    OBJ_STORE_NS="$(yq eval '.storage.objectStore.namespace // "minio"' "$cfg")"
+    _obj_user="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "$cfg")"
+    _obj_pw="$(yq eval '.storage.objectStore.auth.rootPassword // ""' "$cfg")"
+    # External S3-compatible only (no in-cluster MinIO install). True when type is s3compat, minio, or seaweedfs.
+    USE_EXTERNAL_OBJ_STORE="false"
+    case "${OBJ_STORE_TYPE}" in s3compat|minio|seaweedfs) USE_EXTERNAL_OBJ_STORE="true"; esac
+    MINIO_ENDPOINT="${OBJ_STORE_ENDPOINT}"
+    MINIO_NS="${OBJ_STORE_NS}"
+    MINIO_BUCKET="${OBJ_STORE_BUCKET}"
+    MINIO_ROOT_USER="${MINIO_ROOT_USER:-$_obj_user}"
+    MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$_obj_pw}"
 
     # AI Platform
     AI_NS="$(yq eval '.aiPlatform.namespace' "$cfg")"
@@ -93,32 +124,44 @@ load_config() {
     FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$cfg")"
     OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$cfg")"
 
-    # Subnets - read as arrays (Bash 3.2 compatible)
+    # Subnets - read as arrays (support both cluster.subnets and top-level subnets)
     PRIVATE_SUBNETS=()
     while IFS= read -r subnet; do
       [[ -n "$subnet" ]] && PRIVATE_SUBNETS+=("$subnet")
-    done < <(yq eval '.cluster.subnets.private[].id' "$cfg")
+    done < <(yq eval '.cluster.subnets.private[].id // .subnets.private[].id' "$cfg")
 
     PRIVATE_SUBNETS_AZ=()
     while IFS= read -r az; do
       [[ -n "$az" ]] && PRIVATE_SUBNETS_AZ+=("$az")
-    done < <(yq eval '.cluster.subnets.private[].az' "$cfg")
+    done < <(yq eval '.cluster.subnets.private[].az // .subnets.private[].az' "$cfg")
 
     PUBLIC_SUBNETS=()
     while IFS= read -r subnet; do
       [[ -n "$subnet" ]] && PUBLIC_SUBNETS+=("$subnet")
-    done < <(yq eval '.cluster.subnets.public[].id' "$cfg")
+    done < <(yq eval '.cluster.subnets.public[].id // .subnets.public[].id' "$cfg")
 
     PUBLIC_SUBNETS_AZ=()
     while IFS= read -r az; do
       [[ -n "$az" ]] && PUBLIC_SUBNETS_AZ+=("$az")
-    done < <(yq eval '.cluster.subnets.public[].az' "$cfg")
+    done < <(yq eval '.cluster.subnets.public[].az // .subnets.public[].az' "$cfg")
   else
     # Fallback: simple grep-based parsing (less robust but works without yq)
     CLUSTER_NAME="$(grep 'name:' "$cfg" | head -1 | sed 's/.*name: *"\(.*\)".*/\1/')"
     REGION="$(grep 'region:' "$cfg" | head -1 | sed 's/.*region: *"\(.*\)".*/\1/')"
     K8S_VERSION="$(grep 'k8sVersion:' "$cfg" | sed 's/.*k8sVersion: *"\(.*\)".*/\1/')"
+    USE_EXISTING_CLUSTER="false"
+    PRESERVE_VPC_ON_DELETE="false"
     S3_BUCKET="$(grep 's3Bucket:' "$cfg" | sed 's/.*s3Bucket: *"\(.*\)".*/\1/')"
+    OBJ_STORE_TYPE=""
+    OBJ_STORE_BUCKET="${S3_BUCKET}"
+    OBJ_STORE_ENDPOINT=""
+    OBJ_STORE_NS="minio"
+    USE_EXTERNAL_OBJ_STORE="false"
+    MINIO_ENDPOINT=""
+    MINIO_NS="minio"
+    MINIO_BUCKET="ai-platform"
+    MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
+    MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-}"
     AI_NS="$(grep 'namespace:' "$cfg" | grep -A2 'aiPlatform:' | tail -1 | sed 's/.*namespace: *"\(.*\)".*/\1/')"
     AI_PLATFORM_NAME="splunk-ai-stack"
     AI_STANDALONE_NAME="splunk-standalone"
@@ -152,6 +195,9 @@ load_config() {
     GPU_MAX=4
     GPU_VOLUME_SIZE=1000
     GPU_VOLUME_TYPE="gp3"
+    GPU_AVAILABILITY_ZONES=()
+    GPU_CAPACITY_RESERVATION_ID=""
+    GPU_CAPACITY_RESERVATION_AZ=""
     SPLUNK_APP_LOCAL_PATH=""
 
     # Hardcoded subnets for fallback
@@ -163,6 +209,7 @@ load_config() {
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
   S3_PREFIXES=("artifacts/" "apps/" "tasks/")
   AI_BUCKET_POLICY_NAME="S3Access-${CLUSTER_NAME}-ai-platform"
+  AI_ECR_ONLY_POLICY_NAME="ECRAccess-${CLUSTER_NAME}-ai-platform"
 
   # IRSA for EBS CSI
   EBS_IRSA_ROLE_NAME="EBSCSIDriverRole-${CLUSTER_NAME}"
@@ -762,7 +809,11 @@ generate_node_groups() {
       k8s.io/cluster-autoscaler/enabled: \"true\"
       k8s.io/cluster-autoscaler/${CLUSTER_NAME}: owned"
   fi
-  if [[ "$ENABLE_GPU" == "true" ]]; then
+  # H100 with capacity reservation: node group created separately via CloudFormation
+  # All other GPU types (L40S): standard eksctl managed node group
+  if [[ "$ENABLE_GPU" == "true" && "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    log "GPU nodes will be created separately with capacity reservation ${GPU_CAPACITY_RESERVATION_ID}"
+  elif [[ "$ENABLE_GPU" == "true" ]]; then
     nodes+="
   - name: gpu-nodes
     instanceType: ${GPU_INSTANCE_TYPE}
@@ -770,7 +821,17 @@ generate_node_groups() {
     minSize: ${GPU_MIN}
     maxSize: ${GPU_MAX}
     volumeSize: ${GPU_VOLUME_SIZE}
-    volumeType: ${GPU_VOLUME_TYPE}
+    volumeType: ${GPU_VOLUME_TYPE}"
+    # Lock to specific AZ when availabilityZones are specified
+    if [[ ${#GPU_AVAILABILITY_ZONES[@]} -gt 0 ]]; then
+      nodes+="
+    availabilityZones:"
+      for az in "${GPU_AVAILABILITY_ZONES[@]}"; do
+        nodes+="
+      - ${az}"
+      done
+    fi
+    nodes+="
     tags:
       Name: ${CLUSTER_NAME}-gpu
       Environment: prod
@@ -852,6 +913,174 @@ EOF
 }
 
 create_cluster() { log "Creating EKS cluster..."; eksctl create cluster -f eks-cluster-config.yaml; ensure_kubeconfig; }
+
+# Create GPU node group with Capacity Block using CloudFormation.
+# Only called when DEFAULT_ACCELERATOR=H100 and GPU_CAPACITY_RESERVATION_ID is set.
+create_gpu_nodegroup_with_capacity_block() {
+  if [[ "$DEFAULT_ACCELERATOR" != "H100" || -z "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    return 0
+  fi
+
+  log "Creating GPU node group with Capacity Block (H100)..."
+  log "  Reservation: ${GPU_CAPACITY_RESERVATION_ID} in ${GPU_CAPACITY_RESERVATION_AZ}"
+
+  local stack_name="${CLUSTER_NAME}-gpu-capacity-block"
+  local cfn_template_file="/tmp/${stack_name}-template.yaml"
+
+  # Get cluster info
+  local cluster_info vpc_id cluster_sg
+  cluster_info=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" --query 'cluster')
+  vpc_id=$(echo "$cluster_info" | jq -r '.resourcesVpcConfig.vpcId')
+  cluster_sg=$(echo "$cluster_info" | jq -r '.resourcesVpcConfig.clusterSecurityGroupId')
+  log "  VPC: ${vpc_id}, Security Group: ${cluster_sg}"
+
+  # Get EKS GPU AMI
+  local ami_id
+  ami_id=$(aws ssm get-parameter \
+    --name "/aws/service/eks/optimized-ami/${K8S_VERSION}/amazon-linux-2-gpu/recommended/image_id" \
+    --region "${REGION}" --query 'Parameter.Value' --output text)
+  log "  AMI: ${ami_id}"
+
+  # Get node IAM role created by eksctl for the CPU node group
+  local node_role_arn
+  node_role_arn=$(aws iam list-roles \
+    --query "Roles[?contains(RoleName, '${CLUSTER_NAME}') && contains(RoleName, 'NodeInstanceRole')].Arn" \
+    --output text | head -1)
+  log "  Node Role: ${node_role_arn}"
+
+  if [[ -z "$node_role_arn" || "$node_role_arn" == "None" ]]; then
+    err "Node role not found — ensure CPU node group was created first."
+  fi
+
+  # Find subnet in the capacity reservation AZ
+  local subnet_id
+  subnet_id=$(aws ec2 describe-subnets --region "${REGION}" \
+    --filters "Name=availability-zone,Values=${GPU_CAPACITY_RESERVATION_AZ}" \
+              "Name=vpc-id,Values=${vpc_id}" \
+              "Name=tag:Name,Values=*eksctl-${CLUSTER_NAME}*Private*" \
+    --query 'Subnets[0].SubnetId' --output text)
+  if [[ -z "$subnet_id" || "$subnet_id" == "None" ]]; then
+    subnet_id=$(aws ec2 describe-subnets --region "${REGION}" \
+      --filters "Name=availability-zone,Values=${GPU_CAPACITY_RESERVATION_AZ}" \
+                "Name=vpc-id,Values=${vpc_id}" \
+      --query 'Subnets[0].SubnetId' --output text)
+  fi
+  if [[ -z "$subnet_id" || "$subnet_id" == "None" ]]; then
+    err "Subnet not found in ${GPU_CAPACITY_RESERVATION_AZ} for VPC ${vpc_id}"
+  fi
+  log "  Subnet: ${subnet_id}"
+
+  # Generate CloudFormation template
+  cat > "${cfn_template_file}" <<CFEOF
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS GPU Node Group with Capacity Block for H100'
+Parameters:
+  ClusterName:    { Type: String }
+  ReservationId:  { Type: String }
+  SubnetId:       { Type: String }
+  NodeRoleArn:    { Type: String }
+  SecurityGroupId:{ Type: String }
+  AmiId:          { Type: String }
+  InstanceType:   { Type: String }
+  VolumeSize:     { Type: Number }
+  DesiredCapacity:{ Type: Number }
+Resources:
+  GPULaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '\${ClusterName}-capacity-block-gpu'
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref AmiId
+        InstanceMarketOptions:
+          MarketType: capacity-block
+        CapacityReservationSpecification:
+          CapacityReservationTarget:
+            CapacityReservationId: !Ref ReservationId
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            /etc/eks/bootstrap.sh \${ClusterName} --kubelet-extra-args '--node-labels=eks.amazonaws.com/nodegroup=gpu-nodes,nvidia.com/gpu=true --register-with-taints=nvidia.com/gpu=true:NoSchedule'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '\${ClusterName}-gpu-node' }
+  GPUNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: gpu-nodes
+      NodeRole: !Ref NodeRoleArn
+      Subnets:
+        - !Ref SubnetId
+      CapacityType: CAPACITY_BLOCK
+      ScalingConfig:
+        MinSize: !Ref DesiredCapacity
+        MaxSize: !Ref DesiredCapacity
+        DesiredSize: !Ref DesiredCapacity
+      Labels:
+        nvidia.com/gpu: "true"
+      Taints:
+        - { Key: nvidia.com/gpu, Value: "true", Effect: NO_SCHEDULE }
+      LaunchTemplate:
+        Id: !Ref GPULaunchTemplate
+        Version: !GetAtt GPULaunchTemplate.LatestVersionNumber
+CFEOF
+
+  # Delete failed/rolled-back stack if present
+  local stack_status
+  stack_status=$(aws cloudformation describe-stacks --stack-name "${stack_name}" --region "${REGION}" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_EXISTS")
+
+  if [[ "$stack_status" == "CREATE_COMPLETE" || "$stack_status" == "UPDATE_COMPLETE" ]]; then
+    log "GPU node group already exists and is healthy — skipping."
+    rm -f "${cfn_template_file}"; return 0
+  elif [[ "$stack_status" != "NOT_EXISTS" ]]; then
+    log "Deleting ${stack_status} stack before retry..."
+    aws cloudformation delete-stack --stack-name "${stack_name}" --region "${REGION}"
+    aws cloudformation wait stack-delete-complete --stack-name "${stack_name}" --region "${REGION}" || true
+  fi
+
+  aws cloudformation deploy \
+    --template-file "${cfn_template_file}" \
+    --stack-name "${stack_name}" \
+    --region "${REGION}" \
+    --parameter-overrides \
+      ClusterName="${CLUSTER_NAME}" \
+      ReservationId="${GPU_CAPACITY_RESERVATION_ID}" \
+      SubnetId="${subnet_id}" \
+      NodeRoleArn="${node_role_arn}" \
+      SecurityGroupId="${cluster_sg}" \
+      AmiId="${ami_id}" \
+      InstanceType="${GPU_INSTANCE_TYPE}" \
+      VolumeSize="${GPU_VOLUME_SIZE}" \
+      DesiredCapacity="${GPU_DESIRED}" \
+    --capabilities CAPABILITY_IAM \
+    --no-fail-on-empty-changeset
+
+  rm -f "${cfn_template_file}"
+
+  local final_status
+  final_status=$(aws cloudformation describe-stacks --stack-name "${stack_name}" --region "${REGION}" \
+    --query 'Stacks[0].StackStatus' --output text)
+  if [[ "$final_status" != "CREATE_COMPLETE" && "$final_status" != "UPDATE_COMPLETE" ]]; then
+    err "CloudFormation stack failed: ${final_status}. Check: aws cloudformation describe-stack-events --stack-name ${stack_name} --region ${REGION}"
+  fi
+
+  log "GPU node group with Capacity Block created successfully."
+  log "Waiting for nodes to join cluster..."
+  sleep 30
+  kubectl get nodes -l nvidia.com/gpu=true 2>/dev/null || log "(Nodes may still be joining...)"
+}
 
 ensure_oidc() {
   log "Ensuring IAM OIDC provider is associated..."
@@ -1002,6 +1231,7 @@ ensure_ebs_irsa_role() {
   # Create IRSA for EBS CSI using eksctl (handles role creation, trust policy, and SA annotation)
   eksctl create iamserviceaccount \
     --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
     --namespace "${EBS_NS}" \
     --name "${EBS_SA}" \
     --role-name "${EBS_IRSA_ROLE_NAME}" \
@@ -1086,6 +1316,7 @@ install_cluster_autoscaler() {
   log "Installing Cluster Autoscaler with IRSA..."
   eksctl create iamserviceaccount \
     --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
     --name "${AUTOSCALER_SA}" \
     --namespace "${AUTOSCALER_NS}" \
     --role-name "${AUTOSCALER_ROLE_NAME}" \
@@ -1132,6 +1363,35 @@ install_cert_manager() {
     --namespace cert-manager --create-namespace --set installCRDs=true \
     --wait --timeout 15m
   check_ready cert-manager "app.kubernetes.io/instance=cert-manager,app.kubernetes.io/component=controller"
+}
+
+# ---------- External S3-compatible object storage (credentials only; no in-cluster install) ----------
+ensure_s3compat_credentials() {
+  # Only create credentials secret when using external S3-compatible storage (s3compat, minio, seaweedfs).
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
+    return 0
+  fi
+
+  log "Object store type is ${OBJ_STORE_TYPE}; creating credentials secret for external S3-compatible storage."
+  if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
+    err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
+    return 1
+  fi
+  if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
+    err "External S3-compatible storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
+    return 1
+  fi
+  ensure_namespace "${AI_NS}"
+  local secret_name="minio-credentials"
+  kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
+    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
+    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
+    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
+    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+  log "✓ External S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
 }
 
 # ---------- OTEL Operator + contrib collector (idempotent) ----------
@@ -1328,6 +1588,62 @@ EOF
   printf "%s" "$arn"
 }
 
+# ECR-only policy for IRSA when using MinIO (no S3) - allows pulling images from ECR
+ensure_ecr_only_policy() {
+  local name="${AI_ECR_ONLY_POLICY_NAME}"
+  local expected_arn="arn:aws:iam::${ACCOUNT_ID}:policy/${name}"
+  if aws iam get-policy --policy-arn "$expected_arn" >/dev/null 2>&1; then
+    printf "%s" "$expected_arn"
+    return 0
+  fi
+  local arn
+  arn="$(get_policy_arn_by_name "$name")"
+  if [[ -z "$arn" ]]; then
+    log "Creating IAM policy ${name} (ECR read-only, for MinIO-only mode)"
+    local pd; pd="$(mktemp)"; TMP_FILES+=("$pd")
+    cat > "$pd" <<'ECRPOL'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage"
+      ],
+      "Resource": "arn:aws:ecr:*:*:repository/*"
+    }
+  ]
+}
+ECRPOL
+    local create_out rc
+    set +e
+    create_out="$(aws iam create-policy --policy-name "${name}" --policy-document "file://${pd}" --query 'Policy.Arn' --output text 2>&1)"
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+      arn="$(normalize_arn "$create_out")"
+    else
+      if grep -qi 'EntityAlreadyExists' <<<"$create_out"; then
+        arn="$(get_policy_arn_by_name "$name")"
+      else
+        err "Failed to create IAM policy ${name}: $create_out"
+      fi
+    fi
+  fi
+  arn="$(normalize_arn "$arn")"
+  [[ -z "$arn" ]] && err "Failed to resolve ARN for policy ${name}"
+  printf "%s" "$arn"
+}
+
 # ------- IRSA helpers: ensure & validate -------
 generate_irsa_trust_policy() {
   local ns="$1" sa="$2"
@@ -1386,6 +1702,18 @@ ensure_irsa_for_sa() {
   local sa="$1" ns="$2" policy_arn_raw="${3:-}"
   local role="IRSA-${CLUSTER_NAME}-${sa}"
 
+  # Fail fast if kubectl cannot reach the cluster (e.g. wrong KUBECONFIG or context)
+  local kerr
+  kerr="$(kubectl get ns "${ns}" 2>&1)" || true
+  if echo "${kerr}" | grep -q "connection refused\|localhost:8080\|dial tcp.*8080"; then
+    err "kubectl cannot reach the cluster (API server connection refused). \
+Fix: run 'aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${REGION}' and ensure KUBECONFIG (if set) points to that file. \
+Then re-run this script."
+  fi
+  if ! kubectl get ns "${ns}" >/dev/null 2>&1; then
+    err "Cannot access namespace ${ns} (kubectl get ns failed). Ensure the cluster is reachable and the namespace exists."
+  fi
+
   # Resolve/repair policy ARN if invalid
   local policy_arn; policy_arn="$(normalize_arn "$policy_arn_raw")"
   if [[ -z "$policy_arn" || $policy_arn != arn:aws:iam::* ]]; then
@@ -1401,6 +1729,7 @@ ensure_irsa_for_sa() {
   log "Ensuring IRSA (role ${role}) for ${ns}/${sa} with policy ${policy_arn}"
   eksctl create iamserviceaccount \
     --cluster "${CLUSTER_NAME}" \
+    --region "${REGION}" \
     --namespace "${ns}" \
     --name "${sa}" \
     --role-name "${role}" \
@@ -1454,28 +1783,34 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
-  # Create IRSA for Splunk Standalone (recommended approach)
+  # IRSA for Splunk Standalone: S3 bucket policy when using AWS S3, ECR-only when using external S3-compatible
   log "Setting up IRSA for Splunk Standalone service account..."
-  local policy_arn; policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  local policy_arn
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    policy_arn="$(ensure_ecr_only_policy)"
+  else
+    policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  fi
   ensure_irsa_for_sa "${STANDALONE_SA}" "${AI_NS}" "${policy_arn}"
 
-  # DEPRECATED: Create s3-secret using AWS credentials
-  # This is legacy approach - IRSA above is preferred, but Splunk Operator may still require the secret
-  log "Creating s3-secret for Splunk Standalone (fallback if IRSA not fully supported)..."
-  if resolve_aws_creds_for_secret 2>/dev/null; then
-    local ak="${AWS_ACCESS_KEY_ID:-}"; local sk="${AWS_SECRET_ACCESS_KEY:-}"; local st="${AWS_SESSION_TOKEN:-}"
-    if [[ -n "$ak" && -n "$sk" ]]; then
-      kubectl -n "${AI_NS}" create secret generic s3-secret \
-        --from-literal=s3_access_key="${ak}" \
-        --from-literal=s3_secret_key="${sk}" \
-        $( [[ -n "$st" ]] && printf -- "--from-literal=s3_session_token=%s" "$st" ) \
-        --dry-run=client -o yaml | kubectl apply -f -
-      log "✓ Created s3-secret with explicit credentials"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" != "true" ]]; then
+    # Create s3-secret for Standalone when using S3 (fallback if IRSA not fully supported)
+    log "Creating s3-secret for Splunk Standalone (S3 mode)..."
+    if resolve_aws_creds_for_secret 2>/dev/null; then
+      local ak="${AWS_ACCESS_KEY_ID:-}"; local sk="${AWS_SECRET_ACCESS_KEY:-}"; local st="${AWS_SESSION_TOKEN:-}"
+      if [[ -n "$ak" && -n "$sk" ]]; then
+        kubectl -n "${AI_NS}" create secret generic s3-secret \
+          --from-literal=s3_access_key="${ak}" \
+          --from-literal=s3_secret_key="${sk}" \
+          $( [[ -n "$st" ]] && printf -- "--from-literal=s3_session_token=%s" "$st" ) \
+          --dry-run=client -o yaml | kubectl apply -f -
+        log "✓ Created s3-secret with explicit credentials"
+      else
+        warn "No AWS credentials available - s3-secret not created. Splunk Standalone will use IRSA."
+      fi
     else
-      warn "No AWS credentials available - s3-secret not created. Splunk Standalone will use IRSA."
+      warn "AWS credentials not available - s3-secret not created. Splunk Standalone will use IRSA via ${STANDALONE_SA}."
     fi
-  else
-    warn "AWS credentials not available - s3-secret not created. Splunk Standalone will use IRSA via ${STANDALONE_SA}."
   fi
 
   cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
@@ -1497,7 +1832,47 @@ data:
                 sslPassword: password
 YAML
 
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  # Standalone app repo: external S3-compatible when objectStore.type is s3compat/minio/seaweedfs, else S3
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    local minio_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
+    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: ${AI_STANDALONE_NAME}
+  namespace: ${AI_NS}
+spec:
+  serviceAccount: ${STANDALONE_SA}
+  etcVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  varVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  volumes:
+    - name: defaults
+      configMap:
+        name: splunk-defaults
+  defaultsUrl: /mnt/defaults/default.yml
+  appRepo:
+    appInstallPeriodSeconds: 90
+    appSources:
+      - name: apps
+        scope: local
+        location: apps
+    appsRepoPollIntervalSeconds: 60
+    defaults:
+      scope: local
+      volumeName: volume_app_repo
+    installMaxRetries: 2
+    volumes:
+      - name: volume_app_repo
+        provider: aws
+        storageType: s3
+        endpoint: ${minio_endpoint}
+        path: ${MINIO_BUCKET}
+        secretRef: minio-credentials
+YAML
+  else
+    cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
@@ -1534,6 +1909,7 @@ spec:
         path: ${S3_BUCKET}
         secretRef: s3-secret
 YAML
+  fi
 
   local sts="splunk-${AI_STANDALONE_NAME}-standalone"
   wait_resource_exists "${AI_NS}" statefulset "${sts}" 600
@@ -1861,6 +2237,31 @@ spec:
   ca: { secretName: root-secret }
 YAML
 
+  # objectStorage: path/endpoint/secret by object store type (aws | s3compat | minio | seaweedfs)
+  local obj_path obj_endpoint obj_secret
+  case "${OBJ_STORE_TYPE}" in
+    s3compat)
+      obj_path="s3compat://${OBJ_STORE_BUCKET}"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      obj_secret="minio-credentials"
+      ;;
+    minio)
+      obj_path="minio://${MINIO_BUCKET}"
+      obj_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
+      obj_secret="minio-credentials"
+      ;;
+    seaweedfs)
+      obj_path="seaweedfs://${OBJ_STORE_BUCKET}"
+      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      obj_secret="minio-credentials"
+      ;;
+    aws|*)
+      obj_path="s3://${S3_BUCKET}"
+      obj_endpoint=""
+      obj_secret=""
+      ;;
+  esac
+
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -1868,8 +2269,10 @@ metadata:
   name: ${AI_PLATFORM_NAME}
 spec:
   objectStorage:
-    path: s3://${S3_BUCKET}
+    path: ${obj_path}
     region: ${REGION}
+    $( [[ -n "$obj_endpoint" ]] && echo "endpoint: \"${obj_endpoint}\"" )
+    $( [[ -n "$obj_secret" ]] && echo "secretRef: ${obj_secret}" )
   serviceAccountName: ${RAY_HEAD_SA}
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
   features:
@@ -2199,6 +2602,9 @@ delete_cluster_minimal() {
   log "===================================================================="
   log "  Starting comprehensive cleanup for cluster ${CLUSTER_NAME}"
   log "===================================================================="
+  if [[ "${PRESERVE_VPC_ON_DELETE}" == "true" && ( ${#PRIVATE_SUBNETS[@]} -gt 0 || ${#PUBLIC_SUBNETS[@]} -gt 0 ) ]]; then
+    log "  (VPC preserved: cluster was created in existing VPC; only EKS and related resources will be deleted)"
+  fi
   echo ""
 
   # Store OIDC ARN before deleting cluster
@@ -2309,7 +2715,11 @@ delete_cluster_minimal() {
   echo ""
 
   log "Step 7: Deleting IAM policies..."
-  delete_policy_if_exists "${AI_BUCKET_POLICY_NAME}"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    delete_policy_if_exists "${AI_ECR_ONLY_POLICY_NAME}"
+  else
+    delete_policy_if_exists "${AI_BUCKET_POLICY_NAME}"
+  fi
   echo ""
 
   log "Step 8: Purging all IRSA roles associated with this cluster's OIDC provider..."
@@ -2330,7 +2740,11 @@ delete_cluster_minimal() {
   echo ""
   log "Summary of deleted resources:"
   log "  ✓ IAM Roles: Cluster Autoscaler, Ray (head/worker), SAIA, EBS Pod Identity"
-  log "  ✓ IAM Policies: S3 access policy for AI platform"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "  ✓ IAM Policies: ECR-only policy for AI platform (external S3-compatible mode)"
+  else
+    log "  ✓ IAM Policies: S3 access policy for AI platform"
+  fi
   log "  ✓ Pod Identity: EBS CSI driver association"
   log "  ✓ EKS Addons: EBS CSI driver, Pod Identity agent"
   log "  ✓ CloudFormation Stacks: All eksctl-created stacks"
@@ -2419,7 +2833,18 @@ preflight_env() {
   [[ -n "$CLUSTER_NAME" ]] && pf_ok "CLUSTER_NAME=${CLUSTER_NAME}" || pf_fail "CLUSTER_NAME is empty"
   dns1123_ok "$CLUSTER_NAME" || pf_fail "CLUSTER_NAME must be DNS-1123 compliant"
   [[ "$K8S_VERSION" =~ ^1\.[0-9]+$ ]] && pf_ok "K8S_VERSION=${K8S_VERSION}" || pf_fail "K8S_VERSION format invalid"
-  s3_name_ok "$S3_BUCKET" && pf_ok "S3 bucket name valid: ${S3_BUCKET}" || pf_fail "S3 bucket name invalid: ${S3_BUCKET}"
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    pf_ok "Object storage: external S3-compatible (${OBJ_STORE_TYPE}); endpoint required"
+    if [[ "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+      if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
+        pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
+      else
+        pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}"
+      fi
+    fi
+  else
+    s3_name_ok "$S3_BUCKET" && pf_ok "S3 bucket name valid: ${S3_BUCKET}" || pf_fail "S3 bucket name invalid: ${S3_BUCKET}"
+  fi
 
   pf_header "Required files"
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "SPLUNK_OPERATOR_FILE present: ${SPLUNK_OPERATOR_FILE}" || pf_fail "SPLUNK_OPERATOR_FILE missing: ${SPLUNK_OPERATOR_FILE}"
@@ -2431,7 +2856,7 @@ preflight_env() {
   fi
 
   pf_header "Tools"
-  for t in aws eksctl kubectl helm git jq; do
+  for t in aws eksctl kubectl helm git jq yq; do
     if command -v "$t" >/dev/null 2>&1; then pf_ok "$t found ($(command -v $t))"; else pf_fail "$t not found in PATH"; fi
   done
 
@@ -2445,6 +2870,13 @@ preflight_env() {
   pf_header "Subnets exist"
   # Check if subnets are provided (arrays may be empty)
   local subnet_count=$((${#PRIVATE_SUBNETS[@]} + ${#PUBLIC_SUBNETS[@]}))
+  if [[ "${PRESERVE_VPC_ON_DELETE}" == "true" ]]; then
+    if [[ ${#PRIVATE_SUBNETS[@]} -lt 2 ]]; then
+      pf_fail "cluster.preserveVpcOnDelete is true: you must specify at least 2 private subnets under cluster.subnets.private so the cluster uses an existing VPC (VPC will not be deleted on 'delete')."
+    else
+      pf_ok "Preserve VPC on delete: using existing VPC (subnets specified); VPC will not be deleted when you run delete."
+    fi
+  fi
   if [[ $subnet_count -eq 0 ]]; then
     pf_ok "No subnets specified - eksctl will create new VPC and subnets automatically"
   else
@@ -2668,11 +3100,20 @@ add_ecr_permissions_to_role() {
 # ---------- Orchestrator for AI Platform setup ----------
 install_ai_platform_stack() {
   log "=== Setting up Splunk AI Platform stack ==="
-  ensure_s3_bucket_and_prefixes
-  ensure_s3_upload_splunk_app
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    log "Using external S3-compatible object storage (${OBJ_STORE_TYPE}); skipping S3 bucket creation; using ECR-only policy for IRSA."
+  else
+    ensure_s3_bucket_and_prefixes
+    ensure_s3_upload_splunk_app
+  fi
   ensure_namespace "${AI_NS}"
 
-  local policy_arn; policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  local policy_arn
+  if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
+    policy_arn="$(ensure_ecr_only_policy)"
+  else
+    policy_arn="$(ensure_bucket_policy "${AI_BUCKET_POLICY_NAME}" "${S3_BUCKET}")"
+  fi
 
   ensure_irsa_for_sa "${RAY_HEAD_SA}"      "${AI_NS}" "${policy_arn}"
   ensure_irsa_for_sa "${RAY_WORKER_SA}"    "${AI_NS}" "${policy_arn}"
@@ -2698,7 +3139,14 @@ install_ai_platform_stack() {
 }
 
 # ---------- CREATE / RECONCILE / DELETE FLOWS ----------
-create_cluster_flow() { create_cluster_config; create_cluster; }
+create_cluster_flow() {
+  create_cluster_config
+  create_cluster
+  # H100 with capacity reservation: eksctl cannot manage these nodes — create via CloudFormation
+  if [[ "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    create_gpu_nodegroup_with_capacity_block
+  fi
+}
 
 reconcile_flow() {
   ensure_oidc
@@ -2709,8 +3157,19 @@ reconcile_flow() {
   install_cluster_autoscaler
   install_nvidia_device_plugin
   uncordon_ready_nodes
+  # H100 with capacity reservation: create GPU node group if not already present
+  if [[ "$DEFAULT_ACCELERATOR" == "H100" && -n "$GPU_CAPACITY_RESERVATION_ID" ]]; then
+    local gpu_node_count
+    gpu_node_count=$(kubectl get nodes -l nvidia.com/gpu=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$gpu_node_count" -lt 1 ]]; then
+      create_gpu_nodegroup_with_capacity_block
+    else
+      log "Found ${gpu_node_count} H100 GPU node(s) — skipping capacity block creation."
+    fi
+  fi
   install_kube_prometheus
   install_cert_manager
+  ensure_s3compat_credentials
   install_otel_operator_and_contrib_collector
   install_ray_operator
   install_splunk_operator
@@ -2722,10 +3181,15 @@ reconcile_flow() {
 
 # ---------- MAIN ----------
 main_install() {
-  for t in aws eksctl kubectl helm git jq; do need "$t"; done
+  for t in aws eksctl kubectl helm git jq yq; do need "$t"; done
 
   # Load configuration from YAML file
   load_config
+
+  # Force region for all AWS CLI and eksctl commands
+  export AWS_DEFAULT_REGION="${REGION}"
+  export AWS_REGION="${REGION}"
+  log "Using AWS Region: ${REGION}"
 
   # Validate and configure container images
   validate_image_config
@@ -2750,9 +3214,16 @@ main_install() {
     pf_summary
   fi
 
+  # Idempotent: create cluster only if it does not exist. When cluster.useExisting is true, fail if cluster is missing.
   if ! cluster_exists; then
+    if [[ "${USE_EXISTING_CLUSTER}" == "true" ]]; then
+      err "cluster.useExisting is true but cluster '${CLUSTER_NAME}' was not found in ${REGION}. Create the cluster first or set useExisting: false."
+      exit 1
+    fi
     create_cluster_flow
     ensure_kubeconfig
+  else
+    log "Cluster ${CLUSTER_NAME} already exists; skipping cluster creation (idempotent)."
   fi
 
   preflight_api_connectivity

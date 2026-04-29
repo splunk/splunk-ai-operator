@@ -1,0 +1,186 @@
+# ===================================================================
+# k0s Cluster Configuration for Splunk AI Platform
+# ===================================================================
+# Mirrors cluster-config.yaml (EKS) but adapted for k0s on bare-metal / EC2.
+#
+# Quick Start:
+#   1. Copy: cp k0s-cluster-config.yaml my-k0s-config.yaml
+#   2. Edit: vi my-k0s-config.yaml
+#   3. Replace all values marked with "CHANGE THIS"
+#   4. Run: CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
+# ===================================================================
+
+# ---------- Cluster Configuration ----------
+cluster:
+  name: airgap-cluster
+  # region: us-east-2                    # Ignored for on-prem, but required in config
+  sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
+  sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
+
+# ---------- Node Configuration ----------
+nodes:
+  controllers: 1
+  cpuWorkers: 1                           # Not used with existingIPs
+  gpuWorkers: 2                           # Not used with existingIPs
+
+  existingIPs:
+    controllers:
+      - 10.0.0.1                          # CHANGE THIS: Your controller server IP
+    workers:
+      - 10.0.0.2                          # CHANGE THIS: CPU worker 1
+      - 10.0.0.3                          # CHANGE THIS: GPU worker 1
+      - 10.0.0.4                          # CHANGE THIS: GPU worker 2
+
+# ---------- Storage Configuration ----------
+# Prerequisites (must be provisioned BEFORE running the installer):
+#   - /var/lib/k0s must have at least 500 GB free on GPU workers
+#   - /var/lib/k0s must have at least 200 GB free on CPU workers
+#   - /var/lib/k0s must have at least 100 GB free on controllers
+#   If using a dedicated disk, mount it at /var/lib/k0s before running this script.
+#
+# Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install for external).
+# Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
+storage:
+  storageClass: "local-path"                 # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
+  vectorDbSize: "50Gi"                       # VectorDB persistent volume size
+
+  # Minimum available disk space (GB) on /var/lib/k0s per node role.
+  # The installer checks these thresholds at preflight and fails if not met.
+  # Override to lower values only if you know your workload footprint is smaller.
+  # minimumDiskSpace:
+  #   controller: 100    # k0s control plane, kine/etcd, container images
+  #   cpuWorker: 200     # weaviate, saia-api, data-loader, fluent-bit
+  #   gpuWorker: 500     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
+
+  objectStore:
+    type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-minio-us-east-2"
+    # endpoint: "http://3.144.157.201:8333"      # SeaweedFS (deprecated — see comment above)
+    endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS S3 API endpoint
+    auth:
+      rootUser: "minioadmin"
+      rootPassword: "minioadmin"
+
+# ---------- Container Images Configuration ----------
+images:
+  # Registry prefix - applied to images without a full registry path
+  registry: ""                                    # CHANGE THIS: Your ECR/Docker/Harbor registry (e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com)
+
+  operator:
+    image: "splunk-ai-operator:latest"              # CHANGE THIS: Your operator image
+
+  splunk:
+    image: "splunk/splunk:10.2.0"                   # CHANGE THIS: Your Splunk Enterprise image
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+
+  ray:
+    headImage: "ml-platform/ray/ray-head:build-v2-010"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-010"
+
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+
+  saia:
+    apiImage: "ml-platform/saia/saia-api:build-v2-012"
+    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-012"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-012"
+
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+  # Reverse proxy used by the SAIA reconciler to route v1 / v2 requests by
+  # path. Consumed via RELATED_IMAGE_NGINX. Point this at an internal mirror
+  # for airgapped clusters.
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+
+# ---------- Operator Versions ----------
+operators:
+  ray:
+    version: "v1.2.2"
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.53.0"
+
+  certManager:
+    installCRDs: true
+
+  nvidia:
+    devicePluginVersion: "v0.17.3"
+
+# ---------- Kubernetes ----------
+kubernetes:
+  namespace: ai-platform
+
+# ---------- File Paths ----------
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"  # CHANGE THIS: Path to Splunk Operator manifest
+  aiPlatform: "./artifacts.yaml"                     # CHANGE THIS: Path to AI Platform artifacts
+
+# ---------- Splunk Configuration ----------
+splunk:
+  standaloneName: splunk-standalone
+
+# ---------- AI Platform Configuration ----------
+aiPlatform:
+  name: "splunk-ai-stack"
+  defaultAcceleratorType: "L40S"
+  # defaultAcceleratorType: "H100"
+
+  workerGroupConfig:
+    imageRegistry: ""
+
+  # ---------- SAIA public exposure (OPTIONAL) ----------
+  # The SAIA "public" Service (nginx reverse proxy in front of v1+v2 API pods)
+  # defaults to ClusterIP, meaning it is only reachable from inside the cluster.
+  #
+  # Two call patterns hit this Service:
+  #   (A) Splunk Enterprise pod      → saia-service   (works with ClusterIP)
+  #   (B) End user's browser         → saia-service   (needs external exposure)
+  #
+  # Pattern B is used by the v2 chat UI (/query streaming, conversations,
+  # feedback, admin endpoints). Without external exposure the v2 chat UI
+  # breaks for users, even though v1 one-shot SPL features still work.
+  #
+  # To DISABLE external exposure (use ClusterIP only), either:
+  #   * Delete / comment-out the entire `serviceTemplate:` block below, OR
+  #   * Set `type: ClusterIP` explicitly.
+  # Either is treated identically — the installer skips emitting serviceTemplate
+  # into the AIPlatform CR and the operator falls through to the ClusterIP
+  # default in reconcileSAIAService().
+  #
+  # To ENABLE external exposure for on-prem / airgap customers, NodePort is the
+  # recommended default: any k8s node IP + the configured nodePort yields a
+  # reachable endpoint from VPN-connected users. No cloud LB / cert-manager
+  # needed. Use LoadBalancer only if the customer runs MetalLB or a cloud LB.
+  serviceTemplate:
+    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
+    nodePort: 30080         # Fixed NodePort (30000-32767). Required for stable DNS.
+
+  features:
+    - name: "saia"
+      version: "1.1.0"
+
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+# ---------- Image Pull Secrets ----------
+imagePullSecrets:
+  secrets:
+    - ecr-registry-secret
+  autoCreateECR: true
+
+ecr:
+  account: ""                                        # CHANGE THIS: Your AWS account ID (e.g. 123456789012)
+  region: us-east-2                                  # CHANGE THIS: Your AWS region

@@ -1,12 +1,18 @@
 #!/bin/bash
-# Script to upload model artifacts to MinIO
+# Script to upload model artifacts to MinIO or any S3-compatible storage (e.g. SeaweedFS).
+# Prefer generic env vars; MINIO_* are accepted for backward compatibility.
 
 SOURCE_DIR="./model_artifacts"
-MINIO_ENDPOINT="http://127.0.0.1:9000"
-# Change the bucket name to the one you want to use. It will be created if it doesn't exist.
-MINIO_BUCKET="ai-platform-artifacts-bucket"
-MINIO_ROOT_USER="minioadmin"
-MINIO_ROOT_PASSWORD="minioadmin"
+# Generic names (preferred); fallback to MINIO_* for backward compatibility
+OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-${MINIO_ENDPOINT:-http://127.0.0.1:9000}}"
+OBJECT_STORE_BUCKET="${OBJECT_STORE_BUCKET:-${MINIO_BUCKET:-ai-platform-bucket-minio-us-east-2}}"
+OBJECT_STORE_ACCESS_KEY="${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-minioadmin}}}"
+OBJECT_STORE_SECRET_KEY="${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY:-minioadmin}}}"
+# Internal use (script uses one set)
+MINIO_ENDPOINT="${OBJECT_STORE_ENDPOINT}"
+MINIO_BUCKET="${OBJECT_STORE_BUCKET}"
+MINIO_ROOT_USER="${OBJECT_STORE_ACCESS_KEY}"
+MINIO_ROOT_PASSWORD="${OBJECT_STORE_SECRET_KEY}"
 
 # Convert bucket name to lowercase (S3/MinIO requirement)
 ORIGINAL_BUCKET="$MINIO_BUCKET"
@@ -176,7 +182,7 @@ if [ $CONNECTION_STATUS -ne 0 ]; then
     echo ""
     
     # Check for specific error types
-    if echo "$CONNECTION_TEST" | grep -q "Access Denied\|InvalidAccessKeyId\|SignatureDoesNotMatch"; then
+    if echo "$CONNECTION_TEST" | grep -qi "Access Denied\|InvalidAccessKeyId\|SignatureDoesNotMatch\|signature.*does not match"; then
         echo "Error: Authentication failed - Invalid credentials"
         echo ""
         echo "Current configuration:"
@@ -189,7 +195,8 @@ if [ $CONNECTION_STATUS -ne 0 ]; then
         echo "  3. Default MinIO credentials are usually:"
         echo "     - Username: minioadmin"
         echo "     - Password: minioadmin"
-        echo "  4. If you changed MinIO credentials, update them in this script"
+        echo "  4. If you installed MinIO with a custom password (e.g. install_minio_ec2.sh --password 'xxx'), run:"
+        echo "     MINIO_ROOT_PASSWORD='your-password' ./upload_to_minio.sh"
     elif echo "$CONNECTION_TEST" | grep -q "dial tcp\|connection refused\|no such host"; then
         echo "Error: Cannot reach MinIO endpoint"
         echo ""
@@ -252,10 +259,10 @@ for artifact_path in "$SOURCE_DIR"/*; do
         echo "Processing: $id"
         
         if [[ -d "$artifact_path" ]]; then
-            # It's a directory - upload recursively
+            # It's a directory - upload recursively (trailing slash on source = copy contents, not directory as single object)
             echo "Uploading directory to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id/"
             
-            mc cp --recursive "$artifact_path" "$MINIO_ALIAS/$MINIO_BUCKET/model_artifacts/$id/"
+            mc cp --recursive "$artifact_path/" "$MINIO_ALIAS/$MINIO_BUCKET/model_artifacts/$id/"
         else
             # It's a file - upload directly
             echo "Uploading file to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id"

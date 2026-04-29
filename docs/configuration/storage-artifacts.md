@@ -6,9 +6,16 @@ The Splunk AI team has provided global artifact storage in a publicly readable S
 ## Prerequisites
 
 Utilizing the AI Platform requires one of the following remote storage providers:
-   * An Amazon S3 or S3-API-compliant remote object storage location
+   * **AWS S3** – Native Amazon S3 (use path scheme `s3://`)
+   * **MinIO** – S3-compatible, in-cluster or external (use path scheme `s3compat://` or `minio://` with endpoint and credentials)
+   * **SeaweedFS** – S3-compatible (use path scheme `s3compat://` or `seaweedfs://` with endpoint and credentials)
+   * Any other **S3-API-compatible** storage (use `s3compat://` with endpoint and secretRef; `minio://` and `seaweedfs://` are optional aliases)
    * Azure blob storage
    * GCP Cloud Storage
+
+### Object storage selection
+
+The operator chooses the backend **by the path scheme** in `spec.objectStorage.path`. Use `s3://` for AWS S3 only; use `s3compat://` (or `minio://` / `seaweedfs://` as aliases) with `endpoint` and `secretRef` for MinIO, SeaweedFS, or any S3-compatible backend. See [Object Storage Selection](object-storage.md) for the full decision table, path schemes, and YAML examples.
 
 ### Prerequisites common to all remote storage providers
 * Read-write access to the path used to host the files.

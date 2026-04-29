@@ -75,6 +75,48 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	assert.Equal(t, "feature1", service.Labels["feature"])
 }
 
+func TestBuildAIService_PropagatesServiceTemplate(t *testing.T) {
+	// Customers configure public exposure (NodePort / LoadBalancer) at the
+	// AIPlatform level. Without propagation, the setting is silently dropped
+	// and SAIA is never reachable outside the cluster. This test locks in the
+	// contract that AIPlatform.spec.serviceTemplate flows into AIService.
+	scheme := buildTestScheme(t)
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				Endpoint: "splunk-endpoint",
+			},
+			ServiceTemplate: corev1.Service{
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeNodePort,
+					Ports: []corev1.ServicePort{
+						{Name: "http", NodePort: 30080},
+					},
+				},
+			},
+		},
+	}
+	feature := aiApi.FeatureSpec{Name: "saia", Version: "v1"}
+	r := &AIPlatformReconciler{Scheme: scheme}
+
+	service := r.buildAIService(context.Background(), platform, feature, "my-ai-saia")
+
+	assert.Equal(t, corev1.ServiceTypeNodePort, service.Spec.ServiceTemplate.Spec.Type,
+		"NodePort selection must propagate so customers can expose SAIA")
+	if assert.Len(t, service.Spec.ServiceTemplate.Spec.Ports, 1) {
+		assert.Equal(t, int32(30080), service.Spec.ServiceTemplate.Spec.Ports[0].NodePort,
+			"explicit NodePort must propagate")
+	}
+
+	// Mutating the child spec must not affect the parent (deep-copy check).
+	service.Spec.ServiceTemplate.Spec.Ports[0].NodePort = 31234
+	assert.Equal(t, int32(30080), platform.Spec.ServiceTemplate.Spec.Ports[0].NodePort,
+		"buildAIService must deep-copy ServiceTemplate to avoid shared state")
+}
+
 func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 	ctx := context.Background()
 	scheme := buildTestScheme(t)

@@ -1818,15 +1818,27 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Optional override endpoint (only needed for S3-compatible services like MinIO)
-                      Must be a valid HTTP/HTTPS URL
+                      Optional override endpoint (only needed for S3-compatible services like MinIO, SeaweedFS)
+                      Must be a valid HTTP/HTTPS URL. When set with s3:// path, backend is treated as S3-compatible (MinIO, SeaweedFS, etc.)
                     pattern: ^https?://.*$
                     type: string
                   path:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-                      azure://containername/<path prefix>, or minio://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
+                      azure://containername/<path prefix>, s3compat://bucketname/<path prefix> (generic S3-compatible), minio://, or seaweedfs://
+                    pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    type: string
+                  provider:
+                    description: |-
+                      Provider is an optional hint for documentation and tooling. Operator derives behavior from path scheme and endpoint.
+                      Values: aws, minio, seaweedfs, s3compat, gcs, azure
+                    enum:
+                    - aws
+                    - minio
+                    - seaweedfs
+                    - s3compat
+                    - gcs
+                    - azure
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -1834,7 +1846,8 @@ spec:
                     minLength: 1
                     type: string
                   secretRef:
-                    description: Secret name containing storage credentials
+                    description: Secret name containing storage credentials (e.g.
+                      s3_access_key, s3_secret_key for S3-compatible backends)
                     maxLength: 253
                     minLength: 1
                     type: string
@@ -1882,6 +1895,152 @@ spec:
                       type: string
                   type: object
                 type: array
+              v2:
+                description: |-
+                  V2 configures the SAIA v2 deployment. v2 is always deployed alongside v1 behind nginx.
+                  Users toggle Agent Mode (v1 vs v2) from the Splunk Settings UI.
+                properties:
+                  image:
+                    description: Image is the container image for the v2 API pod
+                    type: string
+                  replicas:
+                    default: 1
+                    description: Replicas is the number of v2 API replicas
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  resources:
+                    description: Resources defines the compute resources for the v2
+                      API pods
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This is an alpha field and requires enabling the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                type: object
+              v2Worker:
+                description: V2Worker configures the v2 SAIA worker deployment (same
+                  v2 image, command=run-worker.sh).
+                properties:
+                  replicas:
+                    default: 1
+                    description: Replicas is the number of worker replicas
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  resources:
+                    description: Resources defines the compute resources for the worker
+                      pods
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This is an alpha field and requires enabling the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                type: object
               vectorDbUrl:
                 description: VectorDbUrl specifies the URL or service name for the
                   vector database

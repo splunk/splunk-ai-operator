@@ -44,9 +44,15 @@ type Builder struct {
 }
 
 type ApplicationParams struct {
-	ArtifactBucketName string           `yaml:"ARTIFACTS_S3_BUCKET"`
-	CloudProvider      string           `yaml:"CLOUD_PROVIDER"`
-	Replicas           map[string]int32 `yaml:"REPLICAS"`
+	ArtifactBucketName             string           `yaml:"ARTIFACTS_S3_BUCKET"`
+	ArtifactsProvider              string           `yaml:"ARTIFACTS_PROVIDER"`
+	CloudProvider                  string           `yaml:"CLOUD_PROVIDER"`
+	S3CompatObjectStoreEndpointUrl string           `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
+	S3CompatObjectStoreAccessKey   string           `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
+	S3CompatObjectStoreSecretKey   string           `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
+	Replicas        map[string]int32 `yaml:"REPLICAS"`
+	ModelVersion    string           `yaml:"MODEL_VERSION"`
+	AcceleratorType                string           `yaml:"ACCELERATOR_TYPE"`
 }
 
 type WorkerConfigs map[string][]InstanceDetail
@@ -73,6 +79,14 @@ func New(ai *enterpriseApi.AIPlatform, client client.Client, scheme *runtime.Sch
 	}
 }
 
+// effectiveAcceleratorType returns spec.defaultAcceleratorType or L40S when unset, matching instance.yaml keys (L40S, H100_NVL).
+func (b *Builder) effectiveAcceleratorType() string {
+	if s := strings.TrimSpace(b.ai.Spec.DefaultAcceleratorType); s != "" {
+		return s
+	}
+	return "L40S"
+}
+
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
 func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPlatform) error {
 	logger := log.FromContext(ctx) // Define logger
@@ -89,15 +103,30 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		return err
 	}
 
-	// Set CloudProvider based on URL scheme
-	var cloudProvider string
+	// Set CloudProvider and artifacts provider/bucket from URL scheme (for SDK model loaders).
+	// ARTIFACTS_PROVIDER matches storage client GetProvider(): s3/minio/seaweedfs/s3compat -> "s3", gs/gcs -> "gcs", azure -> "azure".
+	// S3 (AWS) uses cloudProvider "aws" when no custom endpoint; s3compat/minio/seaweedfs use "s3compat".
+	var cloudProvider, artifactsProvider string
 	switch u.Scheme {
 	case "s3":
-		cloudProvider = "aws"
-	case "gs":
+		if p.Spec.ObjectStorage.Endpoint != "" {
+			cloudProvider = "s3compat"
+		} else {
+			cloudProvider = "aws"
+		}
+		artifactsProvider = "s3"
+	case "s3compat", "minio", "seaweedfs":
+		cloudProvider = "s3compat"
+		artifactsProvider = "s3"
+	case "gs", "gcs":
 		cloudProvider = "gcp"
+		artifactsProvider = "gcs"
+	case "azure":
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
 	default:
-		cloudProvider = "azure" // TODO: FIX THIS, need to support minio
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
 	}
 
 	// Initialize the replicas map by iterating through features
@@ -135,10 +164,39 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
+	// S3-compatible backends (s3compat, minio, seaweedfs) need custom endpoint and credentials. S3 (AWS) uses region/IRSA only.
+	s3CompatScheme := (u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs")
+	s3CompatObjectStoreEndpoint := ""
+	if s3CompatScheme && p.Spec.ObjectStorage.Endpoint != "" {
+		s3CompatObjectStoreEndpoint = p.Spec.ObjectStorage.Endpoint
+	}
+
+	var s3CompatObjectStoreAccessKey, s3CompatObjectStoreSecretKey string
+	if p.Spec.ObjectStorage.SecretRef != "" && s3CompatScheme {
+		var secret corev1.Secret
+		secretRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Spec.ObjectStorage.SecretRef}
+		if err := b.Get(ctx, secretRef, &secret); err != nil {
+			logger.Error(err, "Failed to get object storage secret for S3-compatible credentials", "secret", p.Spec.ObjectStorage.SecretRef)
+			return err
+		}
+		if raw, ok := secret.Data["s3_access_key"]; ok {
+			s3CompatObjectStoreAccessKey = string(raw)
+		}
+		if raw, ok := secret.Data["s3_secret_key"]; ok {
+			s3CompatObjectStoreSecretKey = string(raw)
+		}
+	}
+
 	param := ApplicationParams{
-		ArtifactBucketName: u.Host,
-		CloudProvider:      cloudProvider,
-		Replicas:           replicasMap,
+		ArtifactBucketName:             u.Host,
+		ArtifactsProvider:              artifactsProvider,
+		CloudProvider:                  cloudProvider,
+		S3CompatObjectStoreEndpointUrl: s3CompatObjectStoreEndpoint,
+		S3CompatObjectStoreAccessKey:   s3CompatObjectStoreAccessKey,
+		S3CompatObjectStoreSecretKey:   s3CompatObjectStoreSecretKey,
+		Replicas:                       replicasMap,
+		ModelVersion:                   os.Getenv("MODEL_VERSION"),
+		AcceleratorType:                b.effectiveAcceleratorType(),
 	}
 
 	// Use embedded applications.yaml content
@@ -578,6 +636,7 @@ func (b *Builder) Build(ctx context.Context) (*rayv1.RayService, error) {
 }
 
 func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec, error) {
+	acceleratorType := b.effectiveAcceleratorType()
 	annotations, labels := buildHeadAnnotationsAndLabels(b.ai)
 	head := rayv1.HeadGroupSpec{
 		RayStartParams: map[string]string{
@@ -628,7 +687,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse feature YAML file %s: %v", fileName, err)
 		}
-		for k, val := range featureConfig.InstanceScale[b.ai.Spec.DefaultAcceleratorType] {
+		for k, val := range featureConfig.InstanceScale[acceleratorType] {
 			old_val, ok := instanceScale[k]
 			if ok {
 				instanceScale[k] = old_val + val
@@ -639,17 +698,29 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	}
 
 	var workers []rayv1.WorkerGroupSpec
-	var gpuConfigs = instanceMap[b.ai.Spec.DefaultAcceleratorType]
+	gpuConfigs := instanceMap[acceleratorType]
+	if len(gpuConfigs) == 0 {
+		return nil, fmt.Errorf("instance.yaml has no worker tiers for defaultAcceleratorType %q; keys must match exactly (e.g. L40S, H100_NVL)", acceleratorType)
+	}
 	for _, cfg := range gpuConfigs {
 		annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
 
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
+		replicas := instanceScale[cfg.Tier]
+
+		maxReplicas := replicas + 5
+		if cfg.GPUsPerPod > 0 {
+			maxReplicas = replicas
+		}
+
 		wg := rayv1.WorkerGroupSpec{
-			GroupName: cfg.Tier,
-			Replicas:  int32Ptr(instanceScale[cfg.Tier]),
+			GroupName:   cfg.Tier,
+			Replicas:    int32Ptr(replicas),
+			MinReplicas: int32Ptr(replicas),
+			MaxReplicas: int32Ptr(maxReplicas),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
-				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, b.ai.Spec.DefaultAcceleratorType, cfg.GPUsPerPod),
+				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -662,20 +733,105 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		workers = append(workers, wg)
 	}
 
+	idleTimeout := int32Ptr(600)
 	return &rayv1.RayClusterSpec{
 		RayVersion:              os.Getenv("RAY_VERSION"),
 		EnableInTreeAutoscaling: boolPtr(true),
+		AutoscalerOptions:       &rayv1.AutoscalerOptions{IdleTimeoutSeconds: idleTimeout},
 		HeadGroupSpec:           head,
 		WorkerGroupSpecs:        workers,
 	}, nil
 }
 
+// objectStorageSecretEnv returns env vars for S3COMPAT_OBJECT_STORE_ACCESS_KEY and S3COMPAT_OBJECT_STORE_SECRET_KEY from
+// the objectStorage secret (s3_access_key/s3_secret_key) for S3-compatible object storage.
+func (b *Builder) objectStorageSecretEnv() []corev1.EnvVar {
+	if b.ai.Spec.ObjectStorage.SecretRef == "" {
+		return nil
+	}
+	secretName := b.ai.Spec.ObjectStorage.SecretRef
+	return []corev1.EnvVar{
+		{
+			Name: "S3COMPAT_OBJECT_STORE_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "s3_access_key",
+				},
+			},
+		},
+		{
+			Name: "S3COMPAT_OBJECT_STORE_SECRET_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "s3_secret_key",
+				},
+			},
+		},
+	}
+}
+
+// rayS3DownloadEnv sets AWS_* variables so application code and Ray's runtime_env S3 fetch use the
+// configured S3-compatible endpoint (via AWS_ENDPOINT_URL) and credentials when present.
+func (b *Builder) rayS3DownloadEnv() []corev1.EnvVar {
+	u, err := url.Parse(b.ai.Spec.ObjectStorage.Path)
+	if err != nil {
+		return nil
+	}
+	endpoint := strings.TrimSpace(b.ai.Spec.ObjectStorage.Endpoint)
+	s3CompatScheme := u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs"
+	s3WithCustomEndpoint := u.Scheme == "s3" && endpoint != ""
+	if (!s3CompatScheme && !s3WithCustomEndpoint) || endpoint == "" {
+		return nil
+	}
+	var out []corev1.EnvVar
+	out = append(out, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
+	if r := strings.TrimSpace(b.ai.Spec.ObjectStorage.Region); r != "" {
+		out = append(out,
+			corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: r},
+			corev1.EnvVar{Name: "AWS_REGION", Value: r},
+		)
+	}
+	if b.ai.Spec.ObjectStorage.SecretRef == "" {
+		return out
+	}
+	sn := b.ai.Spec.ObjectStorage.SecretRef
+	out = append(out,
+		corev1.EnvVar{
+			Name: "AWS_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: sn},
+					Key:                  "s3_access_key",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: sn},
+					Key:                  "s3_secret_key",
+				},
+			},
+		},
+	)
+	return out
+}
+
 func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
+	headEnv := []corev1.EnvVar{
+		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
+		{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
+	}
+	headEnv = append(headEnv, b.rayS3DownloadEnv()...)
+	headEnv = append(headEnv, b.objectStorageSecretEnv()...)
 	spec := corev1.PodSpec{
 		Containers: []corev1.Container{{
 			Name:            "ray-head",
 			Image:           SetImageRegistry("RELATED_IMAGE_RAY_HEAD", b.ai.Spec.Images.RayHeadGroupImage),
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Args: []string{
 				"ulimit -n 65536; echo head; $KUBERAY_GEN_RAY_START_CMD",
 			},
@@ -684,10 +840,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 				"-lc",
 				"--",
 			},
-			Env: []corev1.EnvVar{
-				{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
-				{Name: "CLUSTER_NAME", Value: "ai-platform-models"}, // FIXME
-			},
+			Env: headEnv,
 			Lifecycle: &corev1.Lifecycle{
 				PreStop: &corev1.LifecycleHandler{
 					Exec: &corev1.ExecAction{
@@ -756,13 +909,13 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 
 func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec {
 	defaultEnv := []corev1.EnvVar{
-		{Name: "DEFAULT_GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},
+		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
 		{Name: "RAY_HEAD_SERVICE_HOST", Value: fmt.Sprintf("%s.%s.svc.%s", b.ai.Name+"-head-svc", b.ai.Namespace, os.Getenv("CLUSTER_DOMAIN"))},
 		{Name: "SERVICE_NAME", Value: b.ai.Name},
 		{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
 		{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
 		{Name: "GPG_PUBLICKEY_PATH", Value: "kv-splunk/al-platform.ray-worker-sa/gpgkey"}, // FIXME
-		{Name: "GPU_TYPE", Value: b.ai.Spec.DefaultAcceleratorType},                       // FIXME
+		{Name: "GPU_TYPE", Value: b.effectiveAcceleratorType()},                           // FIXME
 	}
 
 	// Combine defaultEnv with cfg.Env to create combinedEnv
@@ -783,11 +936,14 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 			combinedEnv = append(combinedEnv, corev1.EnvVar{Name: key, Value: value})
 		}
 	}
+	// S3-compatible: boto3 for Ray runtime_env working_dir + app-level S3COMPAT_* keys
+	combinedEnv = append(combinedEnv, b.rayS3DownloadEnv()...)
+	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
 	rayCommand := fmt.Sprintf(`echo %s worker;
         ulimit -n 65536;
     	export PATH="/home/ray/anaconda3/bin:$PATH";
         KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
-        $KUBERAY_GEN_RAY_START_CMD;`, cfg.Tier)
+        $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
 		Affinity:           b.ai.Spec.GPUSchedulingSpec.Affinity,
 		Tolerations:        b.ai.Spec.GPUSchedulingSpec.Tolerations,
@@ -796,7 +952,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 		Containers: []corev1.Container{{
 			Name:            "ray-worker",
 			Image:           SetImageRegistry("RELATED_IMAGE_RAY_WORKER", b.ai.Spec.WorkerGroupConfig.ImageRegistry),
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Command: []string{
 				"/bin/bash",
 				"-lc",

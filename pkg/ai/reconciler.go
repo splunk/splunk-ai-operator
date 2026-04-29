@@ -3,6 +3,7 @@ package ai_platform
 import (
 	"context"
 	"fmt"
+	"os"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
@@ -131,6 +132,15 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 		svc.Namespace = platform.Namespace
 
 		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &svc, func() error {
+			// After client Get, svc holds the live AIService (empty on first create).
+			preservedResources := svc.Spec.Resources
+			// Preserve any direct `kubectl patch aiservice` edit of ServiceTemplate.
+			// Without this, an admin who patches the public SAIA Service type
+			// (e.g. to NodePort for browser-direct v2 traffic) would see their
+			// change revert on the next AIPlatform reconcile, same footgun as
+			// Resources above.
+			preservedServiceTemplate := svc.Spec.ServiceTemplate
+
 			// Ensure ownership
 			if err := controllerutil.SetControllerReference(platform, &svc, r.Scheme); err != nil {
 				return err
@@ -141,6 +151,18 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 
 			// Copy desired spec
 			svc.Spec = built.Spec
+
+			// buildAIService does not set Resources; without this, every AIPlatform reconcile
+			// wipes kubectl patches / user-set limits (e.g. SAIA memory) back to empty → 2Gi defaults.
+			if resourceRequirementsNonEmpty(preservedResources) {
+				svc.Spec.Resources = preservedResources
+			}
+			// If the admin already patched serviceTemplate (non-empty
+			// spec.type), keep that override. Otherwise fall through to the
+			// value buildAIService() just set from AIPlatform.spec.
+			if preservedServiceTemplate.Spec.Type != "" {
+				svc.Spec.ServiceTemplate = preservedServiceTemplate
+			}
 
 			// Merge labels
 			if svc.Labels == nil {
@@ -189,6 +211,10 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 	return nil
 }
 
+func resourceRequirementsNonEmpty(r corev1.ResourceRequirements) bool {
+	return len(r.Requests) > 0 || len(r.Limits) > 0
+}
+
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {
 	vectorDbUrl := platform.Status.VectorDbServiceName
 
@@ -198,7 +224,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	taskObjectStorage := platform.Spec.ObjectStorage
 	// Don't append feature name - just pass the bucket path directly
 	// taskObjectStorage.Path is already set from platform.Spec.ObjectStorage
-	return &aiApi.AIService{
+	svc := &aiApi.AIService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: platform.Namespace,
@@ -227,10 +253,24 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				Path:    "/metrics",
 			},
 			MTLS: platform.Spec.MTLS,
-			// Propagate imagePullSecrets from AIPlatform to AIService
+			// Propagate public-exposure preference from AIPlatform. Customers deploy
+			// the higher-level AIPlatform CR, so any NodePort / LoadBalancer setting
+			// they configure at that level must flow down to the AIService. Without
+			// this copy, the spec lands on AIPlatform and is silently ignored.
+			// Deep-copy because corev1.Service is a value type with nested
+			// slices/maps; a shallow copy would share state across children.
+			ServiceTemplate:  *platform.Spec.ServiceTemplate.DeepCopy(),
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
 		},
 	}
+
+	// SAIA v2: populate from operator env var if set
+	if v2Image := os.Getenv("RELATED_IMAGE_SAIA_API_V2"); v2Image != "" {
+		svc.Spec.V2 = aiApi.SAIAv2Config{Image: v2Image, Replicas: 1}
+		svc.Spec.V2Worker = aiApi.SAIAWorkerConfig{Replicas: 1}
+	}
+
+	return svc
 }
 
 // CheckAIServiceStatus verifies that all AIService children have successful conditions.
