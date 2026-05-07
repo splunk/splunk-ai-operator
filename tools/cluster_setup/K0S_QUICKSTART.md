@@ -277,7 +277,7 @@ Short paths auto-prefixed with `images.registry`. All marked **Yes** are require
 | `cpuScheduling`                   | No       | auto                          | `nodeSelector` + `tolerations` for CPU pods   |
 | `gpuScheduling`                   | No       | auto                          | `nodeSelector` + `tolerations` for GPU pods   |
 | `serviceTemplate.type`            | **Yes**  | —                             | `NodePort` / `LoadBalancer` for SAIA exposure |
-| `serviceTemplate.nodePort`        | **Yes**  | —                             | Port number (NodePort only)                   |
+| `serviceTemplate.nodePort`        | No       | —                             | Port number (when serviceTemplate.type as NodePort only)                   |
 
 
 ### imagePullSecrets
@@ -294,7 +294,7 @@ The `secrets[]` list is **not consumed**. The script auto-detects secrets by che
 | `custom.enabled`    | Create custom registry secret    |
 
 
-ECR tokens expire after 12 hours. Re-run install or set up a CronJob to refresh.
+ECR tokens usually expire after 12 hours. Re-run install or set up a CronJob to refresh.
 
 ### ecr
 
@@ -303,6 +303,47 @@ ECR tokens expire after 12 hours. Re-run install or set up a CronJob to refresh.
 | --------- | -------------- |
 | `account` | AWS account ID |
 | `region`  | ECR region     |
+
+
+### metallb
+
+k0s has no built-in `LoadBalancer` provider. When `aiPlatform.serviceTemplate.type=LoadBalancer` (the recommended SAIA exposure path), the installer deploys MetalLB to allocate a VIP from a pool you provide. Skipped automatically when `type=NodePort`.
+
+
+| Field            | Required                | Default          | Description                                              |
+| ---------------- | ----------------------- | ---------------- | -------------------------------------------------------- |
+| `install`        | **Yes**                 | `false`          | Set `true` to install MetalLB                            |
+| `chartVersion`   | No                      | `0.14.8`         | `metallb/metallb` Helm chart version                     |
+| `namespace`      | No                      | `metallb-system` | MetalLB install namespace                                |
+| `pool.name`      | No                      | `saia-pool`      | Name of the `IPAddressPool`                              |
+| `pool.addresses` | **Yes**                 | —                | Free, routable IP range(s) on your LAN                   |
+| `mode`           | No                      | `layer2`         | `layer2` (most LANs) or `bgp` (data-center fabric)       |
+| `bgpPeers`       | **Yes when `mode=bgp`** | `[]`             | List of `{peerAddress, peerASN, myASN}` for BGP upstream |
+
+
+**Minimal config (Layer-2):**
+
+```yaml
+metallb:
+  install: true
+  pool:
+    addresses:
+      - "10.20.30.100-10.20.30.110"   # free range on the worker LAN
+  mode: "layer2"
+```
+
+**Verify MetalLB after install:**
+
+```bash
+# MetalLB controller and speakers
+kubectl -n metallb-system get deploy,ds
+
+# Address pool and advertisement
+kubectl -n metallb-system get ipaddresspool,l2advertisement,bgppeer,bgpadvertisement
+
+# SAIA service should have an EXTERNAL-IP from the pool
+kubectl -n ai-platform get svc -l app.kubernetes.io/component=saia
+```
 
 
 ## 6. Node Labels & GPU
