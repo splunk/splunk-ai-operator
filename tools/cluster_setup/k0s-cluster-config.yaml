@@ -14,8 +14,8 @@
 cluster:
   name: airgap-cluster
   region: us-east-2                       # CHANGE THIS — required when storage.objectStore.type=aws (region of the S3 bucket); ignored for true on-prem
-  sshUser: ec2-user                       # CHANGE THIS: SSH user for remote nodes
   sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
+  sshUser: root                       # CHANGE THIS: SSH user for remote nodes
 
 # ---------- Node Configuration ----------
 nodes:
