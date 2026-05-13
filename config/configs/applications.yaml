@@ -35,62 +35,80 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
   - args:
-      application_name: GptOss120b
+      application_name: Gemma431bIt
       deployment_configs:
         LLMDeployment:
           gpu_type_options_override:
             H100:
+              autoscaling_config:
+                max_replicas: {{.Replicas.Gemma431bIt}}
+                min_replicas: {{.Replicas.Gemma431bIt}}
+                target_ongoing_requests: 6
+              max_ongoing_requests: 8
               ray_actor_options:
                 num_gpus: 1
             L40S:
+              autoscaling_config:
+                max_replicas: {{.Replicas.Gemma431bIt}}
+                min_replicas: {{.Replicas.Gemma431bIt}}
+                target_ongoing_requests: 4
+              max_ongoing_requests: 6
               ray_actor_options:
-                num_gpus: 2
+                num_gpus: 4
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.GptOss120b}}
-              min_replicas: {{.Replicas.GptOss120b}}
+              max_replicas: {{.Replicas.Gemma431bIt}}
+              min_replicas: {{.Replicas.Gemma431bIt}}
       deployment_type: text_gen_model_deployment
       gpu_types: '["{{.AcceleratorType}}"]'
       model_definition:
         gpu_type_model_config_override:
           H100:
             engine_args:
-              gpu_memory_utilization: 0.90
+              dtype: bfloat16
+              gpu_memory_utilization: 0.9
+              max_model_len: 32768
+              max_num_batched_tokens: 4096
               tensor_parallel_size: 1
           L40S:
             engine_args:
-              gpu_memory_utilization: 0.90
-              tensor_parallel_size: 2
+              dtype: bfloat16
+              gpu_memory_utilization: 0.85
+              max_model_len: 240000
+              max_num_batched_tokens: 4096
+              max_num_seqs: 2
+              tensor_parallel_size: 4
         model_config:
           openai_serving_config:
             chat:
               enable_auto_tools: true
-              tool_parser: openai
+              tool_parser: gemma4
             responses:
               enable_auto_tools: true
-              tool_parser: openai
-        model_id: gpt_oss_120b
+              tool_parser: gemma4
+        model_id: gemma4_31b_it
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/gpt-oss-120b
+            blob_prefix: model_artifacts/gemma-4-31b-it
       tokenizer_definition:
-        model_id: gpt_oss_120b
+        model_id: gemma4_31b_it
         model_loader:
           blob_storage:
             artifacts_list:
               - chat_template.jinja
               - config.json
+              - processor_config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/gpt-oss-120b
-    name: GptOss120b
+            blob_prefix: model_artifacts/gemma-4-31b-it
+    name: Gemma431bIt
     import_path: main:create_serve_app
-    route_prefix: /gpt_oss_120b
+    route_prefix: /gemma4_31b_it
     runtime_env:
       working_dir: "file:///home/ray/ray/applications/generic_application.zip"
       env_vars:
         API_VERSION: "v1"
-        APPLICATION_NAME: gpt_oss_120b
+        APPLICATION_NAME: gemma4_31b_it
         VLLM_ATTENTION_BACKEND: TRITON_ATTN
         ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
         S3_BUCKET: "{{.ArtifactBucketName}}"
@@ -217,7 +235,7 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
         VLLM_WORKER_MULTIPROC_METHOD: spawn
-        # See GptOss120b above for rationale. Must be "True" in airgap (no
+        # See Gemma431bIt above for rationale. Must be "True" in airgap (no
         # Redis) so vLLM uses NoOpOpenAIServingResponses.
         DISABLE_RESPONSES_API_REDIS: "True"
   - args:

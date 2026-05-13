@@ -34,7 +34,7 @@ The S3 bucket must be pre-populated with the following directories before instal
 
 | Model                             | Purpose                                         |
 | --------------------------------- | ----------------------------------------------- |
-| `gpt-oss-120b`                    | Primary LLM for chat, SPL generation, reasoning |
+| `gemma-4-31b-it`                  | Primary LLM for chat, SPL generation, reasoning |
 | `gpt-oss-20b`                     | Field descriptions, conversation titles         |
 | `all-minilm-l6-v2`                | Sentence embeddings (data loader, SAIA)         |
 | `bi-encoder`                      | Semantic search ranking                         |
