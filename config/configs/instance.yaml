@@ -31,6 +31,16 @@ L40S:
         memory: "48Gi"
         ephemeral-storage: "100Gi"
         nvidia.com/gpu: "2"
+  - tier: l40s-4-gpu
+    gpusPerPod: 4
+    resources:
+      requests:
+        cpu: "1"
+      limits:
+        cpu: "8"
+        memory: "96Gi"
+        ephemeral-storage: "200Gi"
+        nvidia.com/gpu: "4"
 H100:
   - tier: h100-0-gpu
     gpusPerPod: 0

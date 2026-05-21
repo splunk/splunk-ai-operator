@@ -54,7 +54,7 @@ applications:
                 target_ongoing_requests: 4
               max_ongoing_requests: 6
               ray_actor_options:
-                num_gpus: 4
+                num_gpus: 2
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.Gemma431bIt}}
@@ -74,10 +74,10 @@ applications:
             engine_args:
               dtype: bfloat16
               gpu_memory_utilization: 0.85
-              max_model_len: 240000
+              max_model_len: 120000
               max_num_batched_tokens: 4096
               max_num_seqs: 2
-              tensor_parallel_size: 4
+              tensor_parallel_size: 2
         model_config:
           openai_serving_config:
             chat:
@@ -89,7 +89,7 @@ applications:
         model_id: gemma4_31b_it
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/gemma-4-31b-it
+            blob_prefix: model_artifacts/gemma-4-31B-it
       tokenizer_definition:
         model_id: gemma4_31b_it
         model_loader:
@@ -100,7 +100,7 @@ applications:
               - processor_config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/gemma-4-31b-it
+            blob_prefix: model_artifacts/gemma-4-31B-it
     name: Gemma431bIt
     import_path: main:create_serve_app
     route_prefix: /gemma4_31b_it

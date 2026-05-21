@@ -17,6 +17,7 @@ instanceScale:
     l40s-0-gpu: 1
     l40s-1-gpu: 2
     l40s-2-gpu: 1
+    l40s-4-gpu: 0
   H100:
     h100-0-gpu: 1
     h100-1-gpu: 2
