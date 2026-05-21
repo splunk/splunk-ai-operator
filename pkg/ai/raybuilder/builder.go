@@ -47,12 +47,101 @@ type ApplicationParams struct {
 	ArtifactBucketName             string           `yaml:"ARTIFACTS_S3_BUCKET"`
 	ArtifactsProvider              string           `yaml:"ARTIFACTS_PROVIDER"`
 	CloudProvider                  string           `yaml:"CLOUD_PROVIDER"`
+	Region                         string           `yaml:"AWS_REGION"`
 	S3CompatObjectStoreEndpointUrl string           `yaml:"S3COMPAT_OBJECT_STORE_ENDPOINT_URL"`
 	S3CompatObjectStoreAccessKey   string           `yaml:"S3COMPAT_OBJECT_STORE_ACCESS_KEY"`
 	S3CompatObjectStoreSecretKey   string           `yaml:"S3COMPAT_OBJECT_STORE_SECRET_KEY"`
-	Replicas        map[string]int32 `yaml:"REPLICAS"`
-	ModelVersion    string           `yaml:"MODEL_VERSION"`
+	Replicas                       map[string]int32 `yaml:"REPLICAS"`
+	ModelVersion                   string           `yaml:"MODEL_VERSION"`
 	AcceleratorType                string           `yaml:"ACCELERATOR_TYPE"`
+}
+
+// classifyObjectStorage maps an AIPlatform objectStorage URL scheme + endpoint
+// pair to the (cloudProvider, artifactsProvider, needsS3CompatCreds) tuple
+// expected by the SAIA / ML-platform SDK that runs inside Ray Serve replicas.
+//
+// SDK contract (see /home/ray/sdk/storage/factory.py in the ai-platform-models
+// image): CLOUD_PROVIDER MUST be one of "aws", "gcp", "azure" — any other
+// value (notably "s3compat") raises "RuntimeError: Unsupported CLOUD_PROVIDER".
+// The s3compat flavour is plumbed into the SDK via S3COMPAT_OBJECT_STORE_*
+// env vars while CLOUD_PROVIDER stays "aws" — boto3 then signs SigV4 against
+// the explicit endpoint URL and AWS accepts the requests.
+//
+// Decision table:
+//
+//	scheme=s3, endpoint empty            → ("aws",      "s3",    needsCreds=true)   ← AWS S3 default URL
+//	scheme=s3, endpoint matches AWS host → ("aws",      "s3",    needsCreds=true)   ← installer-set regional URL
+//	scheme=s3, endpoint set to non-AWS   → ("s3compat", "s3",    needsCreds=true)   ← MinIO/SeaweedFS behind s3://
+//	scheme=s3compat|minio|seaweedfs      → ("s3compat", "s3",    needsCreds=true)
+//	scheme=gs|gcs                        → ("gcp",      "gcs",   needsCreds=false)
+//	scheme=azure                         → ("azure",    "azure", needsCreds=false)
+//	other / unknown                      → ("azure",    "azure", needsCreds=false)
+//
+// `needsS3CompatCreds` is true whenever the resolved provider can use the
+// S3COMPAT_*/AWS_* credential set in the ObjectStorage Secret. Callers gate
+// secret loading on it AND on a non-empty SecretRef.
+func classifyObjectStorage(scheme, endpoint string) (cloudProvider, artifactsProvider string, needsS3CompatCreds bool) {
+	switch scheme {
+	case "s3":
+		artifactsProvider = "s3"
+		ep := strings.TrimSpace(endpoint)
+		if ep == "" || isAWSRegionalEndpoint(ep) {
+			// Real AWS S3 — either no endpoint (boto3 derives from region) or an
+			// AWS regional URL (e.g. https://s3.us-east-2.amazonaws.com, which
+			// the k0s installer requires non-empty even for type=aws).
+			cloudProvider = "aws"
+		} else {
+			// s3:// against a non-AWS endpoint = S3-compatible store (MinIO,
+			// SeaweedFS, etc.). Keep the s3compat code path so the SDK reads
+			// S3COMPAT_* env vars.
+			cloudProvider = "s3compat"
+		}
+		needsS3CompatCreds = true
+	case "s3compat", "minio", "seaweedfs":
+		cloudProvider = "s3compat"
+		artifactsProvider = "s3"
+		needsS3CompatCreds = true
+	case "gs", "gcs":
+		cloudProvider = "gcp"
+		artifactsProvider = "gcs"
+	case "azure":
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
+	default:
+		// Unknown scheme: preserve the legacy default (azure) rather than
+		// failing — the operator hasn't validated this scheme until now and a
+		// hard error here would break running clusters during upgrade.
+		cloudProvider = "azure"
+		artifactsProvider = "azure"
+	}
+	return
+}
+
+// isAWSRegionalEndpoint returns true for AWS S3 regional endpoints such as:
+//
+//	https://s3.us-east-2.amazonaws.com
+//	https://s3-fips.us-east-1.amazonaws.com
+//	https://bucket-name.s3.us-east-2.amazonaws.com  (virtual-hosted-style)
+//	https://s3.dualstack.us-east-1.amazonaws.com
+//
+// We need this because the k0s installer requires a non-empty
+// objectStore.endpoint even for type=aws (see preflight in
+// tools/cluster_setup/k0s_cluster_with_stack.sh:434), so an empty-endpoint
+// check alone is not sufficient to identify real AWS S3.
+//
+// The match is intentionally narrow: host must end in `.amazonaws.com` AND
+// contain `s3` somewhere in the host (case-insensitive). This catches every
+// AWS S3 endpoint pattern documented by AWS but rejects unrelated AWS hosts
+// (e.g. `lambda.us-east-1.amazonaws.com`) and any third-party impostor whose
+// host doesn't end in `.amazonaws.com`. Returns false on parse error or empty
+// host (caller already handles the empty-endpoint case).
+func isAWSRegionalEndpoint(endpoint string) bool {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	return strings.HasSuffix(host, ".amazonaws.com") && strings.Contains(host, "s3")
 }
 
 type WorkerConfigs map[string][]InstanceDetail
@@ -103,31 +192,11 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		return err
 	}
 
-	// Set CloudProvider and artifacts provider/bucket from URL scheme (for SDK model loaders).
-	// ARTIFACTS_PROVIDER matches storage client GetProvider(): s3/minio/seaweedfs/s3compat -> "s3", gs/gcs -> "gcs", azure -> "azure".
-	// S3 (AWS) uses cloudProvider "aws" when no custom endpoint; s3compat/minio/seaweedfs use "s3compat".
-	var cloudProvider, artifactsProvider string
-	switch u.Scheme {
-	case "s3":
-		if p.Spec.ObjectStorage.Endpoint != "" {
-			cloudProvider = "s3compat"
-		} else {
-			cloudProvider = "aws"
-		}
-		artifactsProvider = "s3"
-	case "s3compat", "minio", "seaweedfs":
-		cloudProvider = "s3compat"
-		artifactsProvider = "s3"
-	case "gs", "gcs":
-		cloudProvider = "gcp"
-		artifactsProvider = "gcs"
-	case "azure":
-		cloudProvider = "azure"
-		artifactsProvider = "azure"
-	default:
-		cloudProvider = "azure"
-		artifactsProvider = "azure"
-	}
+	// Classify object-storage URL into the (CLOUD_PROVIDER, ARTIFACTS_PROVIDER,
+	// needsCreds) tuple the SAIA / ai-platform SDK consumes via runtime_env
+	// env vars. See classifyObjectStorage doc-comment for the full decision
+	// table, including AWS regional-endpoint detection.
+	cloudProvider, artifactsProvider, needsS3CompatCreds := classifyObjectStorage(u.Scheme, p.Spec.ObjectStorage.Endpoint)
 
 	// Initialize the replicas map by iterating through features
 	replicasMap := make(map[string]int32)
@@ -164,19 +233,34 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		}
 	}
 
-	// S3-compatible backends (s3compat, minio, seaweedfs) need custom endpoint and credentials. S3 (AWS) uses region/IRSA only.
-	s3CompatScheme := (u.Scheme == "s3compat" || u.Scheme == "minio" || u.Scheme == "seaweedfs")
+	// S3-compatible endpoint is only meaningful when the classifier picked the
+	// s3compat code path. For real AWS (cloudProvider=aws) we leave it empty so
+	// boto3 falls through to the default regional URL derived from AWS_REGION.
 	s3CompatObjectStoreEndpoint := ""
-	if s3CompatScheme && p.Spec.ObjectStorage.Endpoint != "" {
+	if cloudProvider == "s3compat" && p.Spec.ObjectStorage.Endpoint != "" {
 		s3CompatObjectStoreEndpoint = p.Spec.ObjectStorage.Endpoint
 	}
 
+	// Load S3 credentials from the operator-managed Secret whenever the chosen
+	// provider can use them (aws OR s3compat). The Secret is the single
+	// source of truth — `s3_access_key`/`s3_secret_key` populate both the
+	// boto3-standard AWS_* env vars (consumed by the AWS code path) and the
+	// S3COMPAT_* env vars (consumed by the s3compat shim). Templating both
+	// pairs is safe because each code path only reads its own set.
+	//
+	// Previously this block was gated behind s3CompatScheme, which silently
+	// skipped credential injection for real-AWS deployments and produced
+	// `botocore.exceptions.NoCredentialsError` inside every Serve replica
+	// when the cluster lacked IRSA / EC2 instance-profile credentials (true
+	// for k0s on bare-metal / non-EKS deployments).
 	var s3CompatObjectStoreAccessKey, s3CompatObjectStoreSecretKey string
-	if p.Spec.ObjectStorage.SecretRef != "" && s3CompatScheme {
+	if p.Spec.ObjectStorage.SecretRef != "" && needsS3CompatCreds {
 		var secret corev1.Secret
 		secretRef := types.NamespacedName{Namespace: p.Namespace, Name: p.Spec.ObjectStorage.SecretRef}
 		if err := b.Get(ctx, secretRef, &secret); err != nil {
-			logger.Error(err, "Failed to get object storage secret for S3-compatible credentials", "secret", p.Spec.ObjectStorage.SecretRef)
+			logger.Error(err, "Failed to get object storage credentials Secret",
+				"secret", p.Spec.ObjectStorage.SecretRef,
+				"cloudProvider", cloudProvider)
 			return err
 		}
 		if raw, ok := secret.Data["s3_access_key"]; ok {
@@ -191,6 +275,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		ArtifactBucketName:             u.Host,
 		ArtifactsProvider:              artifactsProvider,
 		CloudProvider:                  cloudProvider,
+		Region:                         p.Spec.ObjectStorage.Region,
 		S3CompatObjectStoreEndpointUrl: s3CompatObjectStoreEndpoint,
 		S3CompatObjectStoreAccessKey:   s3CompatObjectStoreAccessKey,
 		S3CompatObjectStoreSecretKey:   s3CompatObjectStoreSecretKey,

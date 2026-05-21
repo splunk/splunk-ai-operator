@@ -14,6 +14,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -86,6 +99,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -170,6 +196,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -230,6 +269,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -280,6 +332,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -330,6 +395,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -371,6 +449,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -427,6 +518,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -453,6 +557,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -504,6 +621,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -560,6 +690,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -606,6 +749,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
@@ -638,6 +794,19 @@ applications:
         S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
         S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
         S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
         ENABLE_AUTHN: "false"
         ENABLE_AUTHZ: "false"
         SERVICE_EXTERNAL_NAME: "ai-platform-models"
