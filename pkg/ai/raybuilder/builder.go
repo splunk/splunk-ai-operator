@@ -61,11 +61,11 @@ type ApplicationParams struct {
 // expected by the SAIA / ML-platform SDK that runs inside Ray Serve replicas.
 //
 // SDK contract (see /home/ray/sdk/storage/factory.py in the ai-platform-models
-// image): CLOUD_PROVIDER MUST be one of "aws", "gcp", "azure" — any other
-// value (notably "s3compat") raises "RuntimeError: Unsupported CLOUD_PROVIDER".
-// The s3compat flavour is plumbed into the SDK via S3COMPAT_OBJECT_STORE_*
-// env vars while CLOUD_PROVIDER stays "aws" — boto3 then signs SigV4 against
-// the explicit endpoint URL and AWS accepts the requests.
+// image): CLOUD_PROVIDER accepts the values emitted below, including
+// "s3compat" for S3-compatible backends such as MinIO and SeaweedFS. When
+// CLOUD_PROVIDER is "s3compat", the SDK uses the S3COMPAT_OBJECT_STORE_*
+// env vars for endpoint and credentials while still speaking the S3 API with
+// SigV4-compatible request signing.
 //
 // Decision table:
 //
