@@ -789,19 +789,17 @@ func sanitize(s string) string {
 }
 
 func Test_buildV2ExtraEnv_FieldDescriptionBackend(t *testing.T) {
-	// Explicit AIService with seaweedfs-style endpoint → AWS_ENDPOINT_URL is set.
 	t.Run("with S3-compatible endpoint", func(t *testing.T) {
 		ai := newTestAIService() // already sets TaskVolume.Endpoint = "http://seaweedfs:8333"
 		envMap := envToMap(buildV2ExtraEnv(ai))
+		baseMap := envToMap(buildSAIABaseEnv(ai))
 
 		assert.Equal(t, "s3", envMap["FIELD_DESCRIPTION_BACKEND"])
 		assert.Equal(t, "field-descriptions/global-field-descriptions.json",
 			envMap["FIELD_DESCRIPTION_S3_KEY"])
-		assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
+		assert.Equal(t, "http://seaweedfs:8333", baseMap["AWS_ENDPOINT_URL"])
 	})
 
-	// No explicit endpoint (= real AWS S3 deployment) → AWS_ENDPOINT_URL must
-	// be omitted so boto3 falls back to the default AWS regional endpoint.
 	t.Run("without S3-compatible endpoint", func(t *testing.T) {
 		ai := newTestAIService()
 		ai.Spec.TaskVolume.Endpoint = ""
@@ -810,54 +808,6 @@ func Test_buildV2ExtraEnv_FieldDescriptionBackend(t *testing.T) {
 		assert.Equal(t, "s3", envMap["FIELD_DESCRIPTION_BACKEND"])
 		assert.Equal(t, "field-descriptions/global-field-descriptions.json",
 			envMap["FIELD_DESCRIPTION_S3_KEY"])
-		_, has := envMap["AWS_ENDPOINT_URL"]
-		assert.False(t, has,
-			"AWS_ENDPOINT_URL must be omitted when TaskVolume.Endpoint is empty (cloud S3 case)")
-	})
-
-	// SecretRef present → AWS_ACCESS_KEY_ID/SECRET sourced from same keys as
-	// the S3COMPAT_* envs in buildSAIABaseEnv. Required so that the v2
-	// S3StorageAdapter (used by S3FieldDescriptionRepository) can authenticate
-	// to SeaweedFS / MinIO.
-	t.Run("AWS credentials sourced from SecretRef", func(t *testing.T) {
-		ai := newTestAIService() // already sets SecretRef = "s3-creds"
-		env := buildV2ExtraEnv(ai)
-
-		var foundID, foundSecret bool
-		for _, e := range env {
-			if e.Name == "AWS_ACCESS_KEY_ID" {
-				foundID = true
-				if assert.NotNil(t, e.ValueFrom) && assert.NotNil(t, e.ValueFrom.SecretKeyRef) {
-					assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
-					assert.Equal(t, "s3_access_key", e.ValueFrom.SecretKeyRef.Key)
-				}
-			}
-			if e.Name == "AWS_SECRET_ACCESS_KEY" {
-				foundSecret = true
-				if assert.NotNil(t, e.ValueFrom) && assert.NotNil(t, e.ValueFrom.SecretKeyRef) {
-					assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
-					assert.Equal(t, "s3_secret_key", e.ValueFrom.SecretKeyRef.Key)
-				}
-			}
-		}
-		assert.True(t, foundID, "AWS_ACCESS_KEY_ID must be present so boto3 can auth to S3-compat endpoint")
-		assert.True(t, foundSecret, "AWS_SECRET_ACCESS_KEY must be present so boto3 can auth to S3-compat endpoint")
-	})
-
-	// No SecretRef → AWS_* must be omitted (cloud deployments use IAM role,
-	// not env-var creds; setting empty values would otherwise mask the IAM
-	// chain inside boto3).
-	t.Run("AWS credentials omitted when SecretRef empty", func(t *testing.T) {
-		ai := newTestAIService()
-		ai.Spec.TaskVolume.SecretRef = ""
-		env := buildV2ExtraEnv(ai)
-
-		for _, e := range env {
-			assert.NotEqual(t, "AWS_ACCESS_KEY_ID", e.Name,
-				"AWS_ACCESS_KEY_ID must be omitted in cloud (IAM-role) case")
-			assert.NotEqual(t, "AWS_SECRET_ACCESS_KEY", e.Name,
-				"AWS_SECRET_ACCESS_KEY must be omitted in cloud (IAM-role) case")
-		}
 	})
 }
 
@@ -938,6 +888,7 @@ func Test_buildSAIABaseEnv(t *testing.T) {
 	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
 	assert.Equal(t, "http://seaweedfs:8333", envMap["S3COMPAT_OBJECT_STORE_ENDPOINT_URL"])
 	assert.Equal(t, "test-bucket", envMap["S3COMPAT_OBJECT_STORE_BUCKET"])
+	assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
 
 	// S3 creds come from secretRef
 	found := false
@@ -949,6 +900,54 @@ func Test_buildSAIABaseEnv(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "S3COMPAT_OBJECT_STORE_ACCESS_KEY should be present")
+
+	t.Run("AWS credentials sourced from SecretRef", func(t *testing.T) {
+		var foundID, foundSecret bool
+		for _, e := range env {
+			if e.Name == "AWS_ACCESS_KEY_ID" {
+				foundID = true
+				if assert.NotNil(t, e.ValueFrom) && assert.NotNil(t, e.ValueFrom.SecretKeyRef) {
+					assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
+					assert.Equal(t, "s3_access_key", e.ValueFrom.SecretKeyRef.Key)
+				}
+			}
+			if e.Name == "AWS_SECRET_ACCESS_KEY" {
+				foundSecret = true
+				if assert.NotNil(t, e.ValueFrom) && assert.NotNil(t, e.ValueFrom.SecretKeyRef) {
+					assert.Equal(t, "s3-creds", e.ValueFrom.SecretKeyRef.Name)
+					assert.Equal(t, "s3_secret_key", e.ValueFrom.SecretKeyRef.Key)
+				}
+			}
+		}
+		assert.True(t, foundID, "AWS_ACCESS_KEY_ID must be present for boto3 (v1 and v2)")
+		assert.True(t, foundSecret, "AWS_SECRET_ACCESS_KEY must be present for boto3 (v1 and v2)")
+	})
+
+	t.Run("AWS region from TaskVolume.Region", func(t *testing.T) {
+		ai := newTestAIService()
+		ai.Spec.TaskVolume.Region = "ap-southeast-2"
+		envMap := envToMap(buildSAIABaseEnv(ai))
+		assert.Equal(t, "ap-southeast-2", envMap["AWS_REGION"])
+		assert.Equal(t, "ap-southeast-2", envMap["AWS_DEFAULT_REGION"])
+	})
+
+	t.Run("without S3-compatible endpoint", func(t *testing.T) {
+		ai := newTestAIService()
+		ai.Spec.TaskVolume.Endpoint = ""
+		envMap := envToMap(buildSAIABaseEnv(ai))
+		_, has := envMap["AWS_ENDPOINT_URL"]
+		assert.False(t, has,
+			"AWS_ENDPOINT_URL must be omitted when TaskVolume.Endpoint is empty (cloud S3 case)")
+	})
+
+	t.Run("AWS credentials omitted when SecretRef empty", func(t *testing.T) {
+		ai := newTestAIService()
+		ai.Spec.TaskVolume.SecretRef = ""
+		for _, e := range buildSAIABaseEnv(ai) {
+			assert.NotEqual(t, "AWS_ACCESS_KEY_ID", e.Name)
+			assert.NotEqual(t, "AWS_SECRET_ACCESS_KEY", e.Name)
+		}
+	})
 }
 
 func Test_extractBucketName(t *testing.T) {

@@ -104,6 +104,21 @@ load_config() {
   log "Loading configuration from: ${CONFIG_FILE}"
   [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
 
+  # Validate the WHOLE file parses cleanly before pulling individual fields.
+  # Every yq lookup below uses `2>/dev/null` to fall through to a default, which
+  # silently swallows YAML syntax errors and makes them look like missing
+  # fields downstream (e.g. "nodes.existingIPs.controllers must be set" when
+  # the real problem is a corrupted comment 90 lines later in the file).
+  # Surface parse errors with their actual line number and content instead.
+  if command -v yq >/dev/null 2>&1; then
+    local yq_err
+    if ! yq_err=$(yq eval '.' "${CONFIG_FILE}" 2>&1 >/dev/null); then
+      err "Config file ${CONFIG_FILE} has YAML syntax errors:
+${yq_err}
+Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
+    fi
+  fi
+
   # Parse YAML configuration
   CLUSTER_NAME=$(yq eval '.cluster.name' "${CONFIG_FILE}" 2>/dev/null || grep '^  name:' "${CONFIG_FILE}" | awk '{print $2}')
   USE_EXISTING=$(yq eval '.cluster.useExisting' "${CONFIG_FILE}" 2>/dev/null || echo "never")
@@ -424,19 +439,47 @@ preflight_checks() {
 
   pf_header "Object storage (customer-managed)"
   pf_ok "Object storage type: ${OBJ_STORE_TYPE} (bucket=${OBJ_STORE_BUCKET})"
-  if [[ "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
-    if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
-      pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
-    else
-      [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
-    fi
-  else
-    [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
-  fi
+  case "${OBJ_STORE_TYPE}" in
+    seaweedfs)
+      if echo "${OBJ_STORE_ENDPOINT}" | grep -q ':9000'; then
+        pf_warn "SeaweedFS uses port 8333 (not 9000). Endpoint has :9000 (MinIO); use http://host:8333 for SeaweedFS."
+      else
+        [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
+      fi
+      ;;
+    s3compat|minio)
+      [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
+      ;;
+    aws)
+      # type=aws does NOT require endpoint — boto3 derives the regional URL
+      # from AWS_REGION. If a user does pass one (e.g. for VPC endpoint pinning
+      # or testing), warn that the installer will ignore it for the AIPlatform
+      # CR. Only AWS regional hosts are sane here; anything else means the
+      # user likely meant type=s3compat.
+      if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
+        case "${OBJ_STORE_ENDPOINT}" in
+          *.amazonaws.com|*amazonaws.com*) pf_warn "type=aws: ignoring objectStore.endpoint='${OBJ_STORE_ENDPOINT}' (boto3 will derive the regional URL from AWS_REGION)." ;;
+          *) pf_warn "type=aws but endpoint '${OBJ_STORE_ENDPOINT}' is not an AWS host. If you meant to point at MinIO/SeaweedFS, change objectStore.type to s3compat. The endpoint will be dropped for type=aws." ;;
+        esac
+      else
+        pf_ok "Endpoint: (using default AWS S3 regional URL from AWS_REGION)"
+      fi
+      ;;
+    *)
+      pf_fail "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, s3compat, minio, seaweedfs"
+      ;;
+  esac
   [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required (objectStore.auth.rootPassword)"
   if object_store_auth_looks_like_placeholder; then
     pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with a real access key and secret in your config (keep secrets in a Git-ignored file such as tools/cluster_setup/k0s-config.local.yaml)."
   fi
+  # Reject STS temporary credentials early — the minio-credentials Secret schema
+  # has no AWS_SESSION_TOKEN field, so ASIA* keys silently fail at SAIA startup
+  # with InvalidToken. Permanent IAM keys (AKIA*) are required. See
+  # codeguard-1-hardcoded-credentials for IAM user setup guidance.
+  case "${MINIO_ROOT_USER}" in
+    ASIA*) pf_fail "objectStore.auth.rootUser '${MINIO_ROOT_USER}' is an STS temporary key (ASIA…). The k0s installer does not propagate AWS_SESSION_TOKEN; use a permanent IAM access key (AKIA…) instead. To mint one: aws iam create-access-key --user-name <iam-user>." ;;
+  esac
 
   pf_header "Infrastructure mode"
   pf_ok "Using existing infrastructure (on-prem/baremetal)"
@@ -544,36 +587,98 @@ preflight_check_node_storage() {
 
   # Helper: SSH to a node and return available GB on the filesystem backing
   # /var/lib/k0s (falls back to / if k0s hasn't been installed yet).
+  #
+  # Resilience notes:
+  #   - Uses POSIX `df -Pk` instead of `df --output=avail` so it works on
+  #     BusyBox / non-GNU coreutils. The 4th awk column (`$4`) is the avail
+  #     count in 1024-byte blocks across POSIX-compliant df implementations.
+  #   - Distinguishes SSH failure (rc=255) from "df returned no data" so the
+  #     caller can show a helpful error instead of a misleading "0 GB" that
+  #     looks like an actual disk-pressure problem.
+  #   - 10s SSH timeout so a bad host doesn't stall the whole preflight.
   _get_avail_gb() {
-    local ip="$1"
-    ssh_exec "${ip}" "
-      avail_kb=\$(df --output=avail /var/lib/k0s 2>/dev/null | tail -1 | tr -d ' ')
-      if [ -z \"\${avail_kb}\" ] || [ \"\${avail_kb}\" = \"Avail\" ]; then
-        avail_kb=\$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
-      fi
-      echo \$(( \${avail_kb:-0} / 1048576 ))
-    " 2>/dev/null || echo "0"
+    local ip="$1" out rc
+    local -a ssh_cmd=(
+      ssh
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=10
+      -o BatchMode=yes
+    )
+    if [ -n "${SSH_KEY_PATH:-}" ]; then
+      ssh_cmd+=(-i "$SSH_KEY_PATH")
+    fi
+    out=$(
+      "${ssh_cmd[@]}" "${SSH_USER}@${ip}" \
+        "avail_kb=\$(df -Pk /var/lib/k0s 2>/dev/null | awk 'NR==2 {print \$4}')
+         [ -z \"\$avail_kb\" ] && avail_kb=\$(df -Pk / 2>/dev/null | awk 'NR==2 {print \$4}')
+         echo \"\${avail_kb:-0}\"" 2>/dev/null
+    )
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      # SSH itself failed (wrong user, host unreachable, key rejected, etc.).
+      # Return a sentinel value the caller can recognise — preserve old "0"
+      # behaviour for back-compat but stamp the SSH error so pf_fail messages
+      # are actionable.
+      echo "SSH_ERROR_RC=${rc}" >&2
+      echo "0"
+      return
+    fi
+    out=$(echo "${out}" | tr -d '[:space:]')
+    # KB → GB (integer truncation; close enough for a preflight threshold)
+    echo "$(( ${out:-0} / 1048576 ))"
+  }
+
+  # Helper that runs _get_avail_gb and turns its sentinel stderr (SSH_ERROR_RC=...)
+  # into a human-readable failure message. SSH errors look very different from
+  # genuine disk-pressure problems and should not be reported as "0 GB available".
+  _check_node_disk() {
+    local ip="$1" role="$2" min_required="$3"
+    local stdout stderr_file stderr avail ssh_err
+    # Capture stdout and stderr separately via a temp file (avoids the fd-3
+    # redirection trick that leaked stdout "0" lines to the terminal).
+    stderr_file=$(mktemp)
+    stdout=$(_get_avail_gb "${ip}" 2>"${stderr_file}")
+    stderr=$(cat "${stderr_file}"); rm -f "${stderr_file}"
+
+    if printf '%s' "${stderr}" | grep -q 'SSH_ERROR_RC='; then
+      ssh_err=$(printf '%s' "${stderr}" | sed -n 's/.*SSH_ERROR_RC=\([0-9]*\).*/\1/p')
+      local hint
+      case "${ssh_err}" in
+        255)
+          # Most common rc=255 cause on a fresh Mac+EC2 setup is a too-permissive
+          # key file; SSH then silently refuses to use it. Probe perms first so
+          # users don't waste time on SG/user rotations.
+          if [[ -f "${SSH_KEY_PATH}" ]]; then
+            local perms
+            perms=$(stat -f '%Lp' "${SSH_KEY_PATH}" 2>/dev/null || stat -c '%a' "${SSH_KEY_PATH}" 2>/dev/null)
+            if [[ "${perms}" != "400" && "${perms}" != "600" ]]; then
+              hint=" — SSH key ${SSH_KEY_PATH} has permissions ${perms} (must be 400 or 600). Run: chmod 400 ${SSH_KEY_PATH}"
+            fi
+          fi
+          ;;
+      esac
+      pf_fail "${role} ${ip}: SSH failed (rc=${ssh_err:-?})${hint:-}. Verify cluster.sshUser='${SSH_USER}' matches the AMI default (ec2-user/ubuntu/rocky/admin), the security group allows port 22 from your IP, and the SSH key at ${SSH_KEY_PATH:-default} is authorised on the node."
+      return
+    fi
+
+    avail=$(printf '%s' "${stdout}" | tr -d '[:space:]')
+    if [[ "${avail:-0}" -ge "${min_required}" ]]; then
+      pf_ok "${role} ${ip}: ${avail} GB available (minimum: ${min_required} GB)"
+    else
+      pf_fail "${role} ${ip}: ${avail:-0} GB available — need at least ${min_required} GB on /var/lib/k0s"
+    fi
   }
 
   # Check controller nodes
   for ip in "${_ctrl_ips[@]}"; do
-    local avail
-    avail=$(_get_avail_gb "${ip}")
-    avail=$(echo "${avail}" | tr -d '[:space:]')
-    if [[ "${avail}" -ge "${MIN_DISK_CONTROLLER}" ]]; then
-      pf_ok "Controller ${ip}: ${avail} GB available (minimum: ${MIN_DISK_CONTROLLER} GB)"
-    else
-      pf_fail "Controller ${ip}: ${avail} GB available — need at least ${MIN_DISK_CONTROLLER} GB on /var/lib/k0s"
-    fi
+    _check_node_disk "${ip}" "Controller" "${MIN_DISK_CONTROLLER}"
   done
 
   # Check worker nodes (distinguish CPU vs GPU by index)
   local widx=0
   for ip in "${_worker_ips[@]}"; do
-    local avail role min_required
-    avail=$(_get_avail_gb "${ip}")
-    avail=$(echo "${avail}" | tr -d '[:space:]')
-
+    local role min_required
     if [[ ${widx} -lt ${CPU_WORKER_COUNT} ]]; then
       role="CPU worker"
       min_required="${MIN_DISK_CPU_WORKER}"
@@ -581,12 +686,7 @@ preflight_check_node_storage() {
       role="GPU worker"
       min_required="${MIN_DISK_GPU_WORKER}"
     fi
-
-    if [[ "${avail}" -ge "${min_required}" ]]; then
-      pf_ok "${role} ${ip}: ${avail} GB available (minimum: ${min_required} GB)"
-    else
-      pf_fail "${role} ${ip}: ${avail} GB available — need at least ${min_required} GB on /var/lib/k0s"
-    fi
+    _check_node_disk "${ip}" "${role}" "${min_required}"
     widx=$((widx + 1))
   done
 }
@@ -1131,17 +1231,27 @@ ensure_namespace() {
 # Object storage is always customer-managed (external). This function creates
 # the Kubernetes credentials secret so the operator and workloads can auth.
 ensure_s3compat_credentials() {
-  log "Creating credentials secret for S3-compatible object storage (${OBJ_STORE_TYPE})..."
+  log "Creating credentials secret for object storage (type=${OBJ_STORE_TYPE})..."
   if object_store_auth_looks_like_placeholder; then
     err "Refusing to create minio-credentials: objectStore.auth contains template placeholders; fix ${CONFIG_FILE}"
     return 1
   fi
-  if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
-    err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
-    return 1
-  fi
+  # Endpoint is only required for S3-compatible backends (MinIO/SeaweedFS/
+  # generic s3compat). For type=aws boto3 derives the regional URL from
+  # AWS_REGION on the consuming pods, and the installer intentionally renders
+  # the AIPlatform CR without an endpoint field (see setup_ai_platform case
+  # "aws" — endpoint dropped to mirror the EKS installer's behaviour and to
+  # match the operator's classifyObjectStorage() helper).
+  case "${OBJ_STORE_TYPE}" in
+    s3compat|minio|seaweedfs)
+      if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
+        err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
+        return 1
+      fi
+      ;;
+  esac
   if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
-    err "S3-compatible storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
+    err "Object storage requires credentials (objectStore.auth.rootPassword or MINIO_ROOT_PASSWORD)"
     return 1
   fi
   ensure_namespace "${AI_NS}"
@@ -2579,8 +2689,39 @@ YAML
       warn "Could not patch default ServiceAccount"
   fi
 
-  # Standalone app repo: uses customer-managed S3-compatible object storage
+  # Standalone app repo: uses customer-managed S3-compatible object storage.
+  #
+  # IMPORTANT — unlike the AIPlatform CR (which lets boto3 derive the AWS
+  # regional URL from AWS_REGION when endpoint is empty), the Splunk Operator's
+  # validateStandaloneSpec hard-requires `endpoint` on every appRepo volume.
+  # An empty/missing value yields:
+  #     Error  validateStandaloneSpec  validate standalone spec failed
+  #            volume Endpoint URI is missing
+  # ...and the Standalone goes into PHASE=Error indefinitely (the operator's
+  # secret never gets created, breaking the downstream AIPlatform reconcile).
+  #
+  # For type=aws we therefore synthesise https://s3.<region>.amazonaws.com
+  # from cluster.region (which boto3 inside SAIA would have computed anyway).
+  # For s3compat/minio/seaweedfs we use the user-provided endpoint as-is —
+  # preflight already enforces it's non-empty for those types.
+  #
+  # NOTE on `provider: aws` vs `storageType: s3`:
+  #   These are the Splunk Operator CRD field names; both apply for any
+  #   S3-compatible store (MinIO/SeaweedFS/CVFS/real AWS S3) — `aws` is the
+  #   provider taxonomy in the Splunk Operator's bucket abstraction, not the
+  #   cloud provider. Do not change this even when objectStore.type != aws.
   local minio_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
+  if [[ -z "${minio_endpoint}" && "${OBJ_STORE_TYPE}" == "aws" ]]; then
+    local aws_region="${REGION:-${ECR_REGION:-us-east-1}}"
+    minio_endpoint="https://s3.${aws_region}.amazonaws.com"
+    log "type=aws: synthesised Splunk Standalone S3 endpoint = ${minio_endpoint}"
+  fi
+  if [[ -z "${minio_endpoint}" ]]; then
+    err "Splunk Standalone needs a non-empty S3 endpoint; check storage.objectStore.endpoint (or storage.objectStore.type)."
+    return 1
+  fi
+  local endpoint_line="        endpoint: ${minio_endpoint}"
+
   cat <<YAML | kubectl apply --server-side --force-conflicts -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
@@ -2613,7 +2754,7 @@ spec:
       - name: volume_app_repo
         provider: aws
         storageType: s3
-        endpoint: ${minio_endpoint}
+${endpoint_line}
         path: ${MINIO_BUCKET}
         secretRef: minio-credentials
 YAML
@@ -2713,7 +2854,16 @@ EOF
       ;;
     aws)
       obj_path="s3://${OBJ_STORE_BUCKET}"
-      obj_endpoint="${OBJ_STORE_ENDPOINT}"
+      # Intentionally leave obj_endpoint empty for real AWS S3 — boto3 derives
+      # the regional URL (s3.<region>.amazonaws.com) from AWS_REGION. Passing
+      # the endpoint through into the AIPlatform CR would (a) duplicate the
+      # default and risk region drift, (b) trigger the operator's legacy
+      # "endpoint non-empty ⇒ s3compat" classification on older operator
+      # builds, and (c) prevent later migration to IRSA / EC2 instance-profile
+      # credentials (which fail when an explicit endpoint is set without
+      # matching AWS_ENDPOINT_URL plumbing). Matches the EKS installer
+      # behaviour in eks_cluster_with_stack.sh:2715-2719.
+      obj_endpoint=""
       ;;
     *)
       err "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, s3compat, minio, seaweedfs"
@@ -2775,7 +2925,7 @@ metadata:
 spec:
   objectStorage:
     path: ${obj_path}
-    region: us-east-1
+    region: ${REGION:-${ECR_REGION:-us-east-1}}
     $( [[ -n "$obj_endpoint" ]] && echo "endpoint: \"${obj_endpoint}\"" )
     $( [[ -n "$obj_secret" ]] && echo "secretRef: ${obj_secret}" )
 

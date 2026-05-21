@@ -706,6 +706,49 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 		)
 	}
 
+	return appendSAIABoto3Env(ai, env)
+}
+
+// appendSAIABoto3Env adds boto3-canonical AWS_* env vars for all SAIA pods (v1 and v2).
+// SAIA v1 calls boto3 directly and does not read S3COMPAT_OBJECT_STORE_*; without
+// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY k0s deployments with static keys fail with
+// NoCredentialsError at startup.
+func appendSAIABoto3Env(ai *aiv1.AIService, env []corev1.EnvVar) []corev1.EnvVar {
+	if ai.Spec.TaskVolume.Endpoint != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "AWS_ENDPOINT_URL",
+			Value: ai.Spec.TaskVolume.Endpoint,
+		})
+	}
+	if r := strings.TrimSpace(ai.Spec.TaskVolume.Region); r != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "AWS_REGION", Value: r},
+			corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: r},
+		)
+	}
+	if ai.Spec.TaskVolume.SecretRef != "" {
+		sn := ai.Spec.TaskVolume.SecretRef
+		env = append(env,
+			corev1.EnvVar{
+				Name: "AWS_ACCESS_KEY_ID",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: sn},
+						Key:                  "s3_access_key",
+					},
+				},
+			},
+			corev1.EnvVar{
+				Name: "AWS_SECRET_ACCESS_KEY",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: sn},
+						Key:                  "s3_secret_key",
+					},
+				},
+			},
+		)
+	}
 	return env
 }
 
@@ -794,41 +837,6 @@ func buildV2ExtraEnv(ai *aiv1.AIService) []corev1.EnvVar {
 		env = append(env,
 			corev1.EnvVar{Name: "CONVERSATION_STORE", Value: "s3"},
 			corev1.EnvVar{Name: "CONVERSATION_S3_BUCKET", Value: bucketName},
-		)
-	}
-	// Only expose AWS_ENDPOINT_URL when the operator was configured with an
-	// explicit S3-compatible endpoint (SeaweedFS/MinIO). Omitting it lets the
-	// v2 adapter use the default AWS S3 endpoint when running in a real cloud
-	// deployment.
-	if ai.Spec.TaskVolume.Endpoint != "" {
-		env = append(env, corev1.EnvVar{
-			Name:  "AWS_ENDPOINT_URL",
-			Value: ai.Spec.TaskVolume.Endpoint,
-		})
-	}
-	// boto3-canonical credentials for the v2 S3StorageAdapter. Mirrors the
-	// S3COMPAT_OBJECT_STORE_ACCESS_KEY/_SECRET_KEY plumbing in buildSAIABaseEnv;
-	// see s3compat secret schema in raybuilder/builder.go and ai.Spec.TaskVolume.SecretRef.
-	if ai.Spec.TaskVolume.SecretRef != "" {
-		env = append(env,
-			corev1.EnvVar{
-				Name: "AWS_ACCESS_KEY_ID",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
-						Key:                  "s3_access_key",
-					},
-				},
-			},
-			corev1.EnvVar{
-				Name: "AWS_SECRET_ACCESS_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
-						Key:                  "s3_secret_key",
-					},
-				},
-			},
 		)
 	}
 	return env
@@ -940,49 +948,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		{Name: "config-volume", MountPath: "/etc/config"},
 	}
 
-	// Base env: keep ONLY dynamic values here.
-	weaviatePlatformURL := fmt.Sprintf("http://%s:80", ai.Spec.VectorDbUrl)
-	env := []corev1.EnvVar{
-		// Dynamic or runtime-derived values:
-		{Name: "PLATFORM_URL", Value: ai.Spec.AIPlatformUrl},
-		{Name: "WEAVIATE_PLATFORM_URL", Value: weaviatePlatformURL},
-		{Name: "VECTOR_DB_URL", Value: ai.Spec.VectorDbUrl},
-		// SAIA uses /tasks subdirectory within its feature path
-		// Extract just the bucket name from the full path (e.g., "s3://bucket-name" -> "bucket-name")
-		{Name: "S3_BUCKET", Value: extractBucketName(ai.Spec.TaskVolume.Path)},
-	}
-
-	// S3-compatible object store: set S3COMPAT_OBJECT_STORE_ENDPOINT_URL and S3COMPAT_OBJECT_STORE_BUCKET for custom endpoint (MinIO, SeaweedFS, etc.).
-	if ai.Spec.TaskVolume.Endpoint != "" {
-		env = append(env,
-			corev1.EnvVar{Name: "S3COMPAT_OBJECT_STORE_ENDPOINT_URL", Value: ai.Spec.TaskVolume.Endpoint},
-			corev1.EnvVar{Name: "S3COMPAT_OBJECT_STORE_BUCKET", Value: extractBucketName(ai.Spec.TaskVolume.Path)},
-		)
-	}
-
-	// S3-compatible object store credentials from secretRef (S3COMPAT_OBJECT_STORE_ACCESS_KEY, S3COMPAT_OBJECT_STORE_SECRET_KEY).
-	if ai.Spec.TaskVolume.SecretRef != "" {
-		env = append(env,
-			corev1.EnvVar{
-				Name: "S3COMPAT_OBJECT_STORE_ACCESS_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
-						Key:                  "s3_access_key",
-					},
-				},
-			},
-			corev1.EnvVar{
-				Name: "S3COMPAT_OBJECT_STORE_SECRET_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.TaskVolume.SecretRef},
-						Key:                  "s3_secret_key",
-					},
-				},
-			},
-		)
-	}
+	env := buildSAIABaseEnv(ai)
 
 	// mTLS handling (dynamic)
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
