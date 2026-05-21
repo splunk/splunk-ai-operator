@@ -113,9 +113,9 @@ load_config() {
   if command -v yq >/dev/null 2>&1; then
     local yq_err
     if ! yq_err=$(yq eval '.' "${CONFIG_FILE}" 2>&1 >/dev/null); then
-      err "Config file ${CONFIG_FILE} has YAML syntax errors:"
-      err "${yq_err}"
-      err "Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
+      err "Config file ${CONFIG_FILE} has YAML syntax errors:
+${yq_err}
+Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
     fi
   fi
 
@@ -598,10 +598,18 @@ preflight_check_node_storage() {
   #   - 10s SSH timeout so a bad host doesn't stall the whole preflight.
   _get_avail_gb() {
     local ip="$1" out rc
+    local -a ssh_cmd=(
+      ssh
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=10
+      -o BatchMode=yes
+    )
+    if [ -n "${SSH_KEY_PATH:-}" ]; then
+      ssh_cmd+=(-i "$SSH_KEY_PATH")
+    fi
     out=$(
-      ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          -o ConnectTimeout=10 -o BatchMode=yes \
-          ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${ip}" \
+      "${ssh_cmd[@]}" "${SSH_USER}@${ip}" \
         "avail_kb=\$(df -Pk /var/lib/k0s 2>/dev/null | awk 'NR==2 {print \$4}')
          [ -z \"\$avail_kb\" ] && avail_kb=\$(df -Pk / 2>/dev/null | awk 'NR==2 {print \$4}')
          echo \"\${avail_kb:-0}\"" 2>/dev/null

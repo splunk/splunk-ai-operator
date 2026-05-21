@@ -137,10 +137,10 @@ func classifyObjectStorage(scheme, endpoint string) (cloudProvider, artifactsPro
 // host (caller already handles the empty-endpoint case).
 func isAWSRegionalEndpoint(endpoint string) bool {
 	u, err := url.Parse(strings.TrimSpace(endpoint))
-	if err != nil || u.Host == "" {
+	if err != nil || u.Hostname() == "" {
 		return false
 	}
-	host := strings.ToLower(u.Host)
+	host := strings.ToLower(u.Hostname())
 	return strings.HasSuffix(host, ".amazonaws.com") && strings.Contains(host, "s3")
 }
 
