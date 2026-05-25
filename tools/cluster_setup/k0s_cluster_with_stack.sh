@@ -3539,7 +3539,7 @@ check_platform_health() {
 #     after Job-level retries succeed.
 #
 # Tunables (env vars):
-#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 900).
+#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 600).
 #   POD_HEALTH_PENDING_GRACE  How long Pending pods are tolerated (default 300).
 #   POD_HEALTH_POLL_INTERVAL  Re-check interval while waiting (default 15).
 #
@@ -3552,12 +3552,13 @@ verify_all_pods_healthy() {
   log "============================================"
   log ""
 
-  # The default budget (15 minutes) is sized for the slowest realistic
-  # scenario: KubeRay creates worker pods only AFTER the head pod becomes
-  # Running+Ready, and each worker then has to pull a multi-GB image and
-  # register with the head. Splunk Standalone has a similar 2–5 min init.
-  # Operators on fast networks can shrink this with POD_HEALTH_STABLE_WAIT.
-  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-900}"
+  # The default budget (10 minutes) is sized for the typical case: KubeRay
+  # creates worker pods only AFTER the head pod becomes Running+Ready, and
+  # each worker then has to pull a multi-GB image and register with the
+  # head. Splunk Standalone has a similar 2–5 min init.
+  # On slow networks or fresh clusters where Ray Serve has lots to download,
+  # bump this with POD_HEALTH_STABLE_WAIT (e.g. 1200 for 20 minutes).
+  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-600}"
   local pending_grace_secs="${POD_HEALTH_PENDING_GRACE:-300}"
   local poll_interval="${POD_HEALTH_POLL_INTERVAL:-15}"
   local elapsed=0
@@ -4202,10 +4203,128 @@ _collect_pod_summary() {
   return 0
 }
 
+# Print a short, human-friendly summary of unhealthy pods. Designed to be
+# called from the post-install banner so the user gets actionable context
+# without scrolling back through the full diagnostic output. Reads from the
+# global POD_LINES populated during verify_all_pods_healthy; if it's empty
+# (e.g. verify ran a long time ago, or kubectl was unavailable) we fall back
+# to a single-line `kubectl get pods -A` query so the banner is never silent.
+#
+# Output format:
+#   ⚠️  3 unhealthy pod(s) across 2 namespace(s):
+#         ai-platform        (1) airgap-cluster-l40s-…-l-worker-w957f [Running 1/2]
+#         kube-system        (2) calico-node-f5qk7 [Pending 0/1, BackOff]
+#                                konnectivity-agent-nkgrs [Pending 0/1]
+#
+# We deliberately do NOT re-run kubectl by default: the diagnostics above
+# the banner already exhausted the freshest information; re-querying here
+# would add latency and risk a different snapshot, confusing the operator.
+_print_unhealthy_pod_summary() {
+  local total=0
+  local line ns name phase ready reason message owner_kind owner_name waiting terminated restarts created
+  local -a unhealthy_lines=()
+
+  # Use cached POD_LINES if available; otherwise refresh once.
+  if (( ${#POD_LINES[@]} == 0 )); then
+    _collect_pod_summary || {
+      warn "Unable to summarise unhealthy pods: pod listing failed."
+      return 0
+    }
+  fi
+
+  for line in "${POD_LINES[@]}"; do
+    [[ -z "${line}" ]] && continue
+    IFS="${_POD_FS}" read -r ns name phase ready reason message owner_kind owner_name waiting terminated restarts created <<<"${line}"
+    if ! _pod_is_healthy "${phase}" "${ready}" "${waiting}" "${terminated}" "${reason}"; then
+      # Build a compact "[Phase ready/total, reason]" suffix. We omit empty
+      # reason fields rather than printing literal "[Pending 0/1, ]".
+      local suffix="[${phase} ${ready}"
+      if [[ -n "${reason}" ]]; then
+        suffix+=", ${reason}"
+      elif [[ -n "${waiting}" ]]; then
+        suffix+=", ${waiting}"
+      elif [[ -n "${terminated}" ]]; then
+        suffix+=", ${terminated}"
+      fi
+      suffix+="]"
+      unhealthy_lines+=("${ns}${_POD_FS}${name}${_POD_FS}${suffix}")
+      total=$((total + 1))
+    fi
+  done
+
+  if (( total == 0 )); then
+    log "✅ All pods are healthy at banner time."
+    return 0
+  fi
+
+  # Bucket by namespace so the banner is easy to skim. We stick to plain
+  # arrays (bash 3.2 has no associative arrays) by collecting unique
+  # namespaces in encounter order and counting occurrences in a parallel
+  # array.
+  local -a ns_keys=() ns_counts=()
+  local i found_idx
+  for line in "${unhealthy_lines[@]}"; do
+    IFS="${_POD_FS}" read -r ns _name _suffix <<<"${line}"
+    found_idx=-1
+    for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+      if [[ "${ns_keys[$i]}" == "${ns}" ]]; then
+        found_idx="$i"
+        break
+      fi
+    done
+    if (( found_idx == -1 )); then
+      ns_keys+=("${ns}")
+      ns_counts+=(1)
+    else
+      ns_counts[$found_idx]=$(( ns_counts[found_idx] + 1 ))
+    fi
+  done
+
+  warn "${total} unhealthy pod(s) across ${#ns_keys[@]} namespace(s):"
+  for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+    warn "  • ${ns_keys[$i]} (${ns_counts[$i]}):"
+    local printed=0
+    local max_per_ns=5  # avoid 200-line banners on truly broken clusters
+    local pn _pname _psuffix
+    for line in "${unhealthy_lines[@]}"; do
+      IFS="${_POD_FS}" read -r pn _pname _psuffix <<<"${line}"
+      [[ "${pn}" != "${ns_keys[$i]}" ]] && continue
+      warn "      - ${_pname} ${_psuffix}"
+      printed=$(( printed + 1 ))
+      if (( printed >= max_per_ns )); then
+        local remaining=$(( ns_counts[i] - printed ))
+        if (( remaining > 0 )); then
+          warn "      … and ${remaining} more in ${ns_keys[$i]} (run: kubectl get pods -n ${ns_keys[$i]})"
+        fi
+        break
+      fi
+    done
+  done
+  warn ""
+  warn "Tip: scroll up to see per-pod logs, events, and recommended fixes."
+}
+
 # ====== SHOW PLATFORM ACCESS INFORMATION ======
 show_platform_access_info() {
+  # Read VERIFY_RC set by main_install (contract documented there). Use a safe
+  # default so this function still works when invoked from contexts that did
+  # not run verify_all_pods_healthy (e.g. someone calling
+  # `show_platform_access_info` directly from a debug shell).
+  local verify_rc="${VERIFY_RC:-0}"
+  local banner_status banner_emoji
+  if (( verify_rc == 0 )); then
+    banner_emoji="🎉"
+    banner_status="Installation Complete!"
+  elif (( verify_rc == 255 )); then
+    banner_emoji="⚠️"
+    banner_status="Installation Complete — Workloads Still Initializing"
+  else
+    banner_emoji="⚠️"
+    banner_status="Installation Complete — ${verify_rc} Pod(s) Unhealthy"
+  fi
+
   log "============================================"
-  log "🎉 Installation Complete!"
+  log "${banner_emoji} ${banner_status}"
   log "============================================"
   log ""
 
@@ -4302,13 +4421,49 @@ show_platform_access_info() {
 
   log "============================================"
   log "📚 Documentation:"
-  log "  Setup Guide: ./tools/cluster_setup/README.md"
+  log "  Setup Guide: ./tools/cluster_setup/K0S_README.md"
+  log "  Setup Guide (Concise version): ./tools/cluster_setup/K0S_QUICKSTART.md"
   log "  Custom Resources: ./docs/CustomResources.md"
   log "  Troubleshooting: Check operator logs and events above"
   log "============================================"
   log ""
-  log "✅ Your AI Platform is ready to use!"
+
+  # Final status line. We tell the truth: "ready to use" only when every pod
+  # AND every workload CR reports healthy. Anything else gets an explicit
+  # warning banner with a per-namespace summary so the operator immediately
+  # sees what failed without scrolling back through tens of pages of
+  # diagnostics.
+  if (( verify_rc == 0 )); then
+    log "✅ Your AI Platform is ready to use!"
+  elif (( verify_rc == 255 )); then
+    warn "⚠️  Your AI Platform is partially ready: pods look healthy but one or"
+    warn "    more workload-level Custom Resources (RayCluster/RayService/"
+    warn "    Splunk Standalone/AIPlatform/AIService) have not yet reported"
+    warn "    Ready. This usually clears within a few minutes — re-check with:"
+    warn "       kubectl get aiplatform,aiservice,raycluster,rayservice -n ${AI_NS}"
+    warn "       kubectl get standalone -n ${AI_NS}"
+    warn "    Or re-run just the verifier (no install steps):"
+    warn "       CONFIG_FILE=${CONFIG_FILE:-<your-config>} ${0} verify-pods"
+  else
+    warn "⚠️  Your AI Platform is NOT ready to use yet: ${verify_rc} pod(s)"
+    warn "    are unhealthy. Summary:"
+    log ""
+    _print_unhealthy_pod_summary
+    warn "    Re-run the verifier after fixing the issues above:"
+    warn "       CONFIG_FILE=${CONFIG_FILE:-<your-config>} ${0} verify-pods"
+  fi
   log ""
+
+  # Propagate the verifier's status to callers (sourced contexts) without
+  # changing the function-call style. main_install ignores this return; CI
+  # wrappers that source the script can read it. We deliberately use 0 vs
+  # non-zero here rather than re-encoding the count — the count is already
+  # in the banner.
+  if (( verify_rc == 0 )); then
+    return 0
+  else
+    return 1
+  fi
 }
 
 # ====== MAIN INSTALL FLOW ======
@@ -4484,10 +4639,31 @@ main_install() {
   # Verify every pod across every namespace, capture diagnostics for failures,
   # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
   # errors as ignorable when the newest posthook pod has Succeeded.
-  verify_all_pods_healthy || warn "Some pods are unhealthy — see diagnostics above for remediation steps."
+  #
+  # The exit code conveys structured information that the post-install banner
+  # consumes via VERIFY_RC (see show_platform_access_info):
+  #   0       all pods healthy AND all workload CRs Ready
+  #   1..254  N pods unhealthy (count is clamped to this range)
+  #   255     pods healthy but workload CRs not Ready (e.g. RayService still
+  #           initialising). Distinct from "0 unhealthy" so the banner can
+  #           remain honest even when no individual pod is failing.
+  VERIFY_RC=0
+  verify_all_pods_healthy || VERIFY_RC=$?
+  if (( VERIFY_RC != 0 )); then
+    warn "Some components are not fully ready — see diagnostics above for remediation steps."
+  fi
 
-  # Show platform access information
-  show_platform_access_info
+  # Show platform access information. Reads VERIFY_RC to choose between a
+  # success banner and a "partially ready" banner with an inline summary.
+  #
+  # show_platform_access_info itself returns nonzero when VERIFY_RC != 0,
+  # which is useful for sourced contexts (CI wrappers can branch on the
+  # function's return). But for the install CLI command we deliberately
+  # swallow that return — install completing with an actionable warning
+  # banner should NOT cause callers chaining via `&&` to silently abort.
+  # The banner already tells the operator what's wrong; failing the exit
+  # code on top of that just breaks automation.
+  show_platform_access_info || true
 }
 
 # ====== MAIN DELETE FLOW ======
@@ -4641,10 +4817,9 @@ Environment:
   AUTO_APPROVE             - Skip confirmation prompt for delete (default: false)
   POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
                              RayService, Splunk Standalone, AIPlatform/AIService) to
-                             reach Ready during verify (default: 900 = 15 minutes).
-                             Sized for the slowest realistic case: KubeRay creates
-                             worker pods only after the head pod is Ready, then each
-                             worker has to pull a multi-GB image.
+                             reach Ready during verify (default: 600 = 10 minutes).
+                             Bump to 1200 (20 min) on slow networks or fresh clusters
+                             where Ray Serve has lots of model artifacts to download.
   POD_HEALTH_PENDING_GRACE - Seconds to ignore Pending pods younger than this
                              (default: 300)
   POD_HEALTH_POLL_INTERVAL - Seconds between checks while waiting (default: 15)
