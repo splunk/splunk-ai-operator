@@ -24,6 +24,25 @@ export EDITOR=cat
 export KUBE_EDITOR=cat
 export LANG=C LC_ALL=C
 
+# --- Cross-function shared state ---
+# We run under `set -euo pipefail`, where ${#ARR[@]} on a never-set array
+# aborts with "unbound variable". The verifier helpers (_collect_pod_summary,
+# _check_workload_readiness) and the post-install banner
+# (_print_unhealthy_pod_summary, show_platform_access_info) all share state
+# through these globals — declare them up-front so the script is safe to
+# source and to invoke any helper out-of-order.
+#
+# - POD_LINES               populated by _collect_pod_summary; one delimited
+#                            row per pod (see field layout in that helper).
+# - WORKLOAD_PENDING_REASON  populated by _check_workload_readiness; multiline
+#                            human-readable list of CRs that aren't Ready.
+# - VERIFY_RC                set by main_install from verify_all_pods_healthy;
+#                            read by show_platform_access_info to choose
+#                            between success / partial-readiness banners.
+declare -a POD_LINES=()
+WORKLOAD_PENDING_REASON=""
+VERIFY_RC=0
+
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
 
@@ -3561,6 +3580,15 @@ verify_all_pods_healthy() {
   local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-600}"
   local pending_grace_secs="${POD_HEALTH_PENDING_GRACE:-300}"
   local poll_interval="${POD_HEALTH_POLL_INTERVAL:-15}"
+  # Clamp grace ≤ wait. Without this, configuring a short STABLE_WAIT (e.g.
+  # 120s for fast feedback during script iteration) while leaving the default
+  # 300s grace would silently skip Pending pods at the post-budget walk —
+  # producing a false "0 unhealthy" return after the loop timed out. Cap
+  # grace so any Pending pod still around when the budget expires is always
+  # counted and diagnosed.
+  if (( pending_grace_secs > stable_wait_secs )); then
+    pending_grace_secs="${stable_wait_secs}"
+  fi
   local elapsed=0
   local unhealthy_count=0
 
@@ -3702,7 +3730,12 @@ verify_all_pods_healthy() {
       fi
     fi
 
-    # Pending pods get a grace window before being flagged
+    # Pending pods get a grace window before we emit the verbose
+    # diagnostics block (events + logs + recommendation). We DO still count
+    # them in unhealthy_count so the return code stays honest — earlier
+    # versions of this code skipped both, which under a short STABLE_WAIT
+    # could mask genuinely-stuck Pending pods as "0 unhealthy" and produce
+    # a false-success return.
     local now_unix created_unix age_secs
     now_unix=$(date -u +%s)
     if [[ -n "${created}" ]]; then
@@ -3711,12 +3744,21 @@ verify_all_pods_healthy() {
     else
       age_secs=0
     fi
+    local in_pending_grace=0
     if [[ "${phase}" == "Pending" && ${age_secs} -lt ${pending_grace_secs} ]]; then
-      log "↪︎ Pod ${ns}/${name} is Pending (${age_secs}s, < grace ${pending_grace_secs}s) — skipping."
-      continue
+      in_pending_grace=1
     fi
 
     unhealthy_count=$((unhealthy_count + 1))
+
+    if (( in_pending_grace == 1 )); then
+      # Quiet path: count it, log a one-liner, but skip events/logs/recommendation
+      # so the operator isn't drowned in transient "ContainerCreating" noise
+      # for pods that just started.
+      warn "❌ Unhealthy pod (in grace window): ${ns}/${name} — phase=${phase} age=${age_secs}s (< grace ${pending_grace_secs}s)"
+      warn ""
+      continue
+    fi
 
     local classification
     classification=$(_classify_pod_failure "${phase}" "${reason}" "${waiting}" "${terminated}" "${message}")
