@@ -24,6 +24,25 @@ export EDITOR=cat
 export KUBE_EDITOR=cat
 export LANG=C LC_ALL=C
 
+# --- Cross-function shared state ---
+# We run under `set -euo pipefail`, where ${#ARR[@]} on a never-set array
+# aborts with "unbound variable". The verifier helpers (_collect_pod_summary,
+# _check_workload_readiness) and the post-install banner
+# (_print_unhealthy_pod_summary, show_platform_access_info) all share state
+# through these globals — declare them up-front so the script is safe to
+# source and to invoke any helper out-of-order.
+#
+# - POD_LINES               populated by _collect_pod_summary; one delimited
+#                            row per pod (see field layout in that helper).
+# - WORKLOAD_PENDING_REASON  populated by _check_workload_readiness; multiline
+#                            human-readable list of CRs that aren't Ready.
+# - VERIFY_RC                set by main_install from verify_all_pods_healthy;
+#                            read by show_platform_access_info to choose
+#                            between success / partial-readiness banners.
+declare -a POD_LINES=()
+WORKLOAD_PENDING_REASON=""
+VERIFY_RC=0
+
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
 
@@ -120,9 +139,17 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   fi
 
   # Parse YAML configuration
-  CLUSTER_NAME=$(yq eval '.cluster.name' "${CONFIG_FILE}" 2>/dev/null || grep '^  name:' "${CONFIG_FILE}" | awk '{print $2}')
-  USE_EXISTING=$(yq eval '.cluster.useExisting' "${CONFIG_FILE}" 2>/dev/null || echo "never")
-  REGION=$(yq eval '.cluster.region' "${CONFIG_FILE}" 2>/dev/null || grep '^  region:' "${CONFIG_FILE}" | awk '{print $2}')
+  # NOTE: `yq eval '.foo'` on a missing key prints the literal string "null"
+  # (not empty), which silently breaks any `${VAR:-fallback}` defaulting later
+  # in the script (the var is "set" to the 4-character string "null"). Use
+  # `// ""` in the jq-style yq expression so missing/null values become empty
+  # strings, then `${VAR:-fallback}` works as intended.
+  CLUSTER_NAME=$(yq eval '.cluster.name // ""' "${CONFIG_FILE}" 2>/dev/null || grep '^  name:' "${CONFIG_FILE}" | awk '{print $2}')
+  [[ "${CLUSTER_NAME}" == "null" ]] && CLUSTER_NAME=""
+  USE_EXISTING=$(yq eval '.cluster.useExisting // "never"' "${CONFIG_FILE}" 2>/dev/null || echo "never")
+  [[ "${USE_EXISTING}" == "null" ]] && USE_EXISTING="never"
+  REGION=$(yq eval '.cluster.region // ""' "${CONFIG_FILE}" 2>/dev/null || grep '^  region:' "${CONFIG_FILE}" | awk '{print $2}')
+  [[ "${REGION}" == "null" ]] && REGION=""
 
   # Node IPs (for existing infrastructure)
   EXISTING_CONTROLLER_IPS=$(yq eval '.nodes.existingIPs.controllers[]' "${CONFIG_FILE}" 2>/dev/null | tr '\n' ' ' || echo "")
@@ -3510,10 +3537,836 @@ check_platform_health() {
   return "${health_issues}"
 }
 
+# ====== VERIFY ALL PODS ARE HEALTHY ======
+# Walks every pod in every namespace AND every workload CR (RayCluster,
+# RayService, Splunk Standalone, AIPlatform, AIService) and waits until both
+# levels are healthy or the budget expires. For unhealthy pods it captures the
+# most recent logs (current and previous container) and emits a tailored
+# remediation hint based on the failure mode.
+#
+# Why CR-level checks: KubeRay creates worker pods only AFTER the head pod
+# becomes Running+Ready. Looking only at "current pods" can return success
+# in the gap between "head Ready" and "workers created/pulled". The workload
+# readiness gate ensures we keep waiting until RayCluster reports
+# readyWorkerReplicas >= desiredWorkerReplicas (or RayClusterProvisioned=True
+# with all workers up).
+#
+# Special cases handled:
+#   - saia-vector-db-setup-posthook-* pods: ignored if there is at least one
+#     newest pod for that owner (Job) in Succeeded/Completed state. These are
+#     one-shot setup Jobs that frequently leave older Errored attempts behind
+#     after Job-level retries succeed.
+#
+# Tunables (env vars):
+#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 600).
+#   POD_HEALTH_PENDING_GRACE  How long Pending pods are tolerated (default 300).
+#   POD_HEALTH_POLL_INTERVAL  Re-check interval while waiting (default 15).
+#
+# Returns:
+#   0 if all pods AND all workload CRs are healthy/Ready; non-zero count of
+#   unhealthy pods otherwise.
+verify_all_pods_healthy() {
+  log "============================================"
+  log "🩺 Verifying pod health across all namespaces..."
+  log "============================================"
+  log ""
+
+  # The default budget (10 minutes) is sized for the typical case: KubeRay
+  # creates worker pods only AFTER the head pod becomes Running+Ready, and
+  # each worker then has to pull a multi-GB image and register with the
+  # head. Splunk Standalone has a similar 2–5 min init.
+  # On slow networks or fresh clusters where Ray Serve has lots to download,
+  # bump this with POD_HEALTH_STABLE_WAIT (e.g. 1200 for 20 minutes).
+  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-600}"
+  local pending_grace_secs="${POD_HEALTH_PENDING_GRACE:-300}"
+  local poll_interval="${POD_HEALTH_POLL_INTERVAL:-15}"
+  # Clamp grace ≤ wait. Without this, configuring a short STABLE_WAIT (e.g.
+  # 120s for fast feedback during script iteration) while leaving the default
+  # 300s grace would silently skip Pending pods at the post-budget walk —
+  # producing a false "0 unhealthy" return after the loop timed out. Cap
+  # grace so any Pending pod still around when the budget expires is always
+  # counted and diagnosed.
+  if (( pending_grace_secs > stable_wait_secs )); then
+    pending_grace_secs="${stable_wait_secs}"
+  fi
+  local elapsed=0
+  local unhealthy_count=0
+
+  # Globals populated by the pod-summary / workload-readiness helpers below
+  # (bash 3.2 has no `local -n`, so we use convention-named globals instead).
+  POD_LINES=()
+  WORKLOAD_PENDING_REASON=""
+
+  # Allow the platform a stabilisation window before we start failing on pods
+  # that are still mid-rollout. The loop exits early on success and only
+  # reports failures once the budget is exhausted. We wait for BOTH:
+  #   1. No pod is in an unhealthy state, AND
+  #   2. CR-level workloads (RayCluster, RayService, Splunk Standalone) report
+  #      themselves Ready and have all their expected children present.
+  # This is what catches the "head Ray pod is up but workers have not been
+  # created/pulled yet" case.
+  while (( elapsed <= stable_wait_secs )); do
+    if ! _collect_pod_summary; then
+      warn "Failed to list pods from cluster"
+      return 1
+    fi
+
+    local has_unhealthy=0
+    local first_unhealthy=""
+    local line ns name phase ready reason message owner_kind owner_name waiting terminated restarts created
+    for line in "${POD_LINES[@]}"; do
+      [[ -z "${line}" ]] && continue
+      IFS="${_POD_FS}" read -r ns name phase ready reason message owner_kind owner_name waiting terminated restarts created <<<"${line}"
+      if ! _pod_is_healthy "${phase}" "${ready}" "${waiting}" "${terminated}" "${reason}"; then
+        if [[ -z "${first_unhealthy}" ]]; then
+          first_unhealthy="${ns}/${name} (phase=${phase} ready=${ready} reason=${reason}${waiting:+ waiting=${waiting}}${terminated:+ terminated=${terminated}})"
+        fi
+        has_unhealthy=1
+      fi
+    done
+
+    # CR readiness check: returns 0 if every workload CR is Ready and has all
+    # expected children, non-zero with a human-readable reason otherwise. The
+    # human-readable reason is written to the global WORKLOAD_PENDING_REASON.
+    WORKLOAD_PENDING_REASON=""
+    local cr_ready=0
+    _check_workload_readiness || cr_ready=$?
+    local pending_reason="${WORKLOAD_PENDING_REASON}"
+
+    if (( has_unhealthy == 0 )) && (( cr_ready == 0 )); then
+      log "✅ All pods are in a healthy state and all workloads (Ray, Splunk, AI Platform) are Ready."
+      log "============================================"
+      log ""
+      return 0
+    fi
+
+    if (( elapsed < stable_wait_secs )); then
+      local status_msg=""
+      if (( has_unhealthy != 0 )); then
+        status_msg="${first_unhealthy}"
+      fi
+      if [[ -n "${pending_reason}" ]]; then
+        status_msg="${status_msg:+${status_msg}; }${pending_reason}"
+      fi
+      log "Still settling (elapsed=${elapsed}s/${stable_wait_secs}s): ${status_msg:-pods/CRs not yet Ready}"
+      log "  Re-checking in ${poll_interval}s..."
+      sleep "${poll_interval}"
+      elapsed=$(( elapsed + poll_interval ))
+      continue
+    fi
+    break
+  done
+
+  # Budget exhausted — surface CR-level pending reason once before listing
+  # individual pod failures so operators see "RayCluster X has 1/3 workers
+  # ready" before the per-pod error dump.
+  if [[ -n "${pending_reason}" ]]; then
+    warn "⚠️  Workload readiness still incomplete after ${stable_wait_secs}s:"
+    while IFS= read -r _r; do
+      [[ -z "${_r}" ]] && continue
+      warn "    • ${_r}"
+    done <<<"${pending_reason}"
+    warn ""
+  fi
+
+  # ---- Identify "newest Completed posthook" so we can ignore stale errors ----
+  # A vector-db setup posthook owner is considered healthy if its newest pod
+  # is in Succeeded/Completed phase, even if older retry attempts errored.
+  local healthy_posthook_owners=()
+  local owner_key
+  for line in "${POD_LINES[@]}"; do
+    [[ -z "${line}" ]] && continue
+    IFS="${_POD_FS}" read -r ns name phase ready reason message owner_kind owner_name waiting terminated restarts created <<<"${line}"
+    if [[ "${name}" == saia-vector-db-setup-posthook-* && "${phase}" == "Succeeded" ]]; then
+      owner_key="${ns}|${owner_kind}|${owner_name}"
+      # Confirm this is the newest pod for this owner. We only need the
+      # namespace, name, owner identity, and creation timestamp here — the
+      # remaining fields are deliberately read into a single discard variable
+      # to keep `read -r` aligned without unused locals.
+      local is_newest=1
+      local other_line other_ns other_name other_ok other_on other_c _discard
+      for other_line in "${POD_LINES[@]}"; do
+        [[ -z "${other_line}" ]] && continue
+        # Field order matches the jq projection earlier:
+        # ns | name | phase | ready | reason | message | owner_kind | owner_name | waiting | terminated | restarts | created
+        IFS="${_POD_FS}" read -r other_ns other_name _discard _discard _discard _discard other_ok other_on _discard _discard _discard other_c <<<"${other_line}"
+        if [[ "${other_ns}" == "${ns}" && "${other_ok}" == "${owner_kind}" && "${other_on}" == "${owner_name}" && "${other_name}" != "${name}" ]]; then
+          if [[ "${other_c}" > "${created}" ]]; then
+            is_newest=0
+            break
+          fi
+        fi
+      done
+      if (( is_newest == 1 )); then
+        healthy_posthook_owners+=("${owner_key}")
+      fi
+    fi
+  done
+
+  # ---- Walk unhealthy pods, capture diagnostics, and emit recommendations ----
+  for line in "${POD_LINES[@]}"; do
+    [[ -z "${line}" ]] && continue
+    IFS="${_POD_FS}" read -r ns name phase ready reason message owner_kind owner_name waiting terminated restarts created <<<"${line}"
+
+    if _pod_is_healthy "${phase}" "${ready}" "${waiting}" "${terminated}" "${reason}"; then
+      continue
+    fi
+
+    # Skip vector-db posthook errors when the newest pod for the same owner
+    # already completed successfully (the Job retried and won).
+    if [[ "${name}" == saia-vector-db-setup-posthook-* ]]; then
+      owner_key="${ns}|${owner_kind}|${owner_name}"
+      local is_ignored=0
+      local healthy
+      for healthy in "${healthy_posthook_owners[@]}"; do
+        if [[ "${healthy}" == "${owner_key}" ]]; then
+          is_ignored=1
+          break
+        fi
+      done
+      if (( is_ignored == 1 )); then
+        log "↪︎ Ignoring stale failure on ${ns}/${name} — newest posthook pod for ${owner_kind}/${owner_name} succeeded."
+        continue
+      fi
+    fi
+
+    # Pending pods get a grace window before we emit the verbose
+    # diagnostics block (events + logs + recommendation). We DO still count
+    # them in unhealthy_count so the return code stays honest — earlier
+    # versions of this code skipped both, which under a short STABLE_WAIT
+    # could mask genuinely-stuck Pending pods as "0 unhealthy" and produce
+    # a false-success return.
+    local now_unix created_unix age_secs
+    now_unix=$(date -u +%s)
+    if [[ -n "${created}" ]]; then
+      created_unix=$(_iso_to_unix "${created}")
+      age_secs=$(( now_unix - created_unix ))
+    else
+      age_secs=0
+    fi
+    local in_pending_grace=0
+    if [[ "${phase}" == "Pending" && ${age_secs} -lt ${pending_grace_secs} ]]; then
+      in_pending_grace=1
+    fi
+
+    unhealthy_count=$((unhealthy_count + 1))
+
+    if (( in_pending_grace == 1 )); then
+      # Quiet path: count it, log a one-liner, but skip events/logs/recommendation
+      # so the operator isn't drowned in transient "ContainerCreating" noise
+      # for pods that just started.
+      warn "❌ Unhealthy pod (in grace window): ${ns}/${name} — phase=${phase} age=${age_secs}s (< grace ${pending_grace_secs}s)"
+      warn ""
+      continue
+    fi
+
+    local classification
+    classification=$(_classify_pod_failure "${phase}" "${reason}" "${waiting}" "${terminated}" "${message}")
+
+    warn "❌ Unhealthy pod: ${ns}/${name}"
+    warn "   Phase=${phase} Ready=${ready} Restarts=${restarts}"
+    [[ -n "${reason}" ]]     && warn "   Reason: ${reason}"
+    [[ -n "${waiting}" ]]    && warn "   Waiting: ${waiting}"
+    [[ -n "${terminated}" ]] && warn "   Terminated: ${terminated}"
+    if [[ -n "${message}" ]]; then
+      # Keep messages bounded
+      warn "   Message: ${message:0:500}"
+    fi
+
+    # Recent events for this pod (most actionable signal for scheduling/image issues)
+    local events
+    events=$(kubectl get events -n "${ns}" --field-selector "involvedObject.name=${name}" \
+              --sort-by='.lastTimestamp' -o jsonpath='{range .items[-5:]}{.lastTimestamp} {.type} {.reason}: {.message}{"\n"}{end}' 2>/dev/null || true)
+    if [[ -n "${events}" ]]; then
+      warn "   Recent events:"
+      while IFS= read -r ev_line; do
+        [[ -z "${ev_line}" ]] && continue
+        warn "     • ${ev_line}"
+      done <<<"${events}"
+    fi
+
+    # Recent logs — try previous instance first (post-crash), then current
+    local logs
+    if [[ "${phase}" == "Pending" ]]; then
+      logs=""  # No containers started yet
+    else
+      logs=$(kubectl logs -n "${ns}" "${name}" --all-containers=true --previous --tail=40 2>/dev/null || true)
+      if [[ -z "${logs}" ]]; then
+        logs=$(kubectl logs -n "${ns}" "${name}" --all-containers=true --tail=40 2>/dev/null || true)
+      fi
+    fi
+    if [[ -n "${logs}" ]]; then
+      warn "   Recent logs (tail):"
+      while IFS= read -r log_line; do
+        [[ -z "${log_line}" ]] && continue
+        warn "     | ${log_line}"
+      done <<<"${logs}"
+    fi
+
+    # Tailored recommendation
+    warn "   💡 Recommendation: $(_recommend_for_classification "${classification}" "${ns}" "${name}")"
+    warn ""
+  done
+
+  log "============================================"
+  if (( unhealthy_count == 0 )) && [[ -z "${pending_reason}" ]]; then
+    log "✅ Pod Verification Summary: All pods are healthy."
+  elif (( unhealthy_count == 0 )); then
+    warn "⚠️  Pod Verification Summary: All pods look healthy, but workload CRs above did not report Ready within ${stable_wait_secs}s."
+  else
+    warn "⚠️  Pod Verification Summary: ${unhealthy_count} pod(s) are unhealthy. See details above."
+  fi
+  log "============================================"
+  log ""
+
+  # Return code rules:
+  #   0  → Everything healthy AND every CR Ready.
+  #   N  → N unhealthy pods (clamped to 1..254).
+  #   255 → Pods look fine but workload CRs (RayCluster/RayService/Splunk/AI)
+  #         never reached Ready within the budget — this catches the "Ray head
+  #         is up but workers never materialised" case the user asked about.
+  if (( unhealthy_count == 0 )) && [[ -z "${pending_reason}" ]]; then
+    return 0
+  fi
+  if (( unhealthy_count == 0 )); then
+    return 255  # CR-level not Ready
+  fi
+  if (( unhealthy_count >= 255 )); then
+    return 254  # leave 255 reserved for the CR-only case
+  fi
+  return "${unhealthy_count}"
+}
+
+# Helper: returns 0 if a pod is in a healthy state, 1 otherwise.
+_pod_is_healthy() {
+  local phase="$1" ready="$2" waiting="$3" terminated="$4" reason="$5"
+
+  # Succeeded Jobs are healthy
+  [[ "${phase}" == "Succeeded" ]] && return 0
+
+  # Pending and Failed/Unknown are unhealthy
+  case "${phase}" in
+    Failed|Unknown|Pending) return 1 ;;
+  esac
+
+  # Running but containers stuck waiting/terminated abnormally
+  if [[ -n "${waiting}" ]]; then
+    case "${waiting}" in
+      *CrashLoopBackOff*|*ImagePullBackOff*|*ErrImagePull*|*CreateContainerConfigError*|*CreateContainerError*|*InvalidImageName*|*RegistryUnavailable*|*ErrImageNeverPull*) return 1 ;;
+    esac
+  fi
+  if [[ -n "${terminated}" ]]; then
+    case "${terminated}" in
+      *Error*|*OOMKilled*|*ContainerCannotRun*|*DeadlineExceeded*) return 1 ;;
+    esac
+  fi
+  if [[ "${reason}" == "NodeLost" || "${reason}" == "Evicted" ]]; then
+    return 1
+  fi
+
+  # Running with not-all-containers ready
+  if [[ "${phase}" == "Running" ]]; then
+    local r1="${ready%%/*}"
+    local r2="${ready##*/}"
+    if [[ -n "${r1}" && -n "${r2}" && "${r1}" != "${r2}" ]]; then
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# Helper: classifies a pod failure into a small set of buckets that map to
+# remediation hints. Output is a single token consumed by _recommend_for_classification.
+_classify_pod_failure() {
+  local phase="$1" reason="$2" waiting="$3" terminated="$4" message="$5"
+  local haystack="${reason} ${waiting} ${terminated} ${message}"
+
+  # Most-specific container-state signals win. Check these first so e.g. a
+  # Pending pod with ImagePullBackOff is classified as "image-pull", not the
+  # generic "pending-long" bucket below.
+  case "${haystack}" in
+    *ImagePullBackOff*|*ErrImagePull*|*InvalidImageName*|*ErrImageNeverPull*|*RegistryUnavailable*) echo "image-pull"; return ;;
+    *CrashLoopBackOff*)                                                                              echo "crashloop"; return ;;
+    *CreateContainerConfigError*|*CreateContainerError*)                                             echo "config-error"; return ;;
+    *OOMKilled*)                                                                                     echo "oom"; return ;;
+    *Evicted*)                                                                                       echo "evicted"; return ;;
+    *NodeLost*)                                                                                      echo "node-lost"; return ;;
+    *DeadlineExceeded*)                                                                              echo "deadline"; return ;;
+  esac
+
+  # Phase-specific buckets for cases the container-state signal didn't catch.
+  case "${phase}:${reason}" in
+    Pending:*Unschedulable*|Pending:*FailedScheduling*) echo "unschedulable"; return ;;
+  esac
+
+  if [[ "${phase}" == "Pending" ]]; then
+    echo "pending-long"; return
+  fi
+  if [[ "${phase}" == "Failed" ]]; then
+    echo "failed"; return
+  fi
+  echo "not-ready"
+}
+
+# Helper: emits a remediation hint for a classification bucket.
+_recommend_for_classification() {
+  local cls="$1" ns="$2" name="$3"
+  case "${cls}" in
+    image-pull)
+      echo "Image pull failed. Verify the image tag exists and the cluster can reach the registry. \
+Check pull secrets ('kubectl get sa default -n ${ns} -o yaml' and 'imagePullSecrets'); for ECR re-run \
+the registry login + secret refresh; for air-gapped clusters confirm the image is mirrored. \
+Then: kubectl describe pod -n ${ns} ${name}"
+      ;;
+    crashloop)
+      echo "Container is crashing on startup. Inspect the previous-instance logs above for the \
+real exception, then check ConfigMap/Secret values, env vars, command/args, missing dependencies, \
+or unreachable dependencies (DB, MinIO, Splunk). Run: kubectl logs -n ${ns} ${name} --previous"
+      ;;
+    config-error)
+      echo "Container config is invalid. Most often a missing/renamed Secret or ConfigMap, or a \
+key referenced in env/volumeMounts that doesn't exist. Run: kubectl describe pod -n ${ns} ${name} \
+and reconcile referenced Secrets/ConfigMaps."
+      ;;
+    oom)
+      echo "Container was OOMKilled. Increase 'resources.limits.memory' on the workload, check for \
+memory leaks, and verify node has sufficient capacity. Run: kubectl top pod -n ${ns} ${name}"
+      ;;
+    evicted)
+      echo "Pod was Evicted (node pressure). Free disk/memory on the node, raise pod resource \
+requests so it lands on a less-loaded node, and inspect: kubectl describe node <node>"
+      ;;
+    node-lost)
+      echo "Node hosting this pod went away. Check kubelet/k0sworker on that node and re-join if \
+needed. Run: kubectl get nodes; sudo systemctl status k0sworker (on the affected host)"
+      ;;
+    deadline)
+      echo "Job/Pod deadline exceeded. Increase 'activeDeadlineSeconds' or fix the underlying \
+slow-startup cause; check downstream dependency readiness and retries."
+      ;;
+    unschedulable)
+      echo "Pod cannot be scheduled. Common causes: missing node labels (e.g. nvidia.com/gpu=true), \
+taints without matching tolerations, insufficient CPU/memory/GPU, or PVC binding failure. Run: \
+kubectl describe pod -n ${ns} ${name} and review the Events at the bottom."
+      ;;
+    pending-long)
+      echo "Pod has been Pending for a long time. Likely PVC not bound (check 'kubectl get pvc -n \
+${ns}'), no available node matches scheduling constraints, or image is still pulling. Run: \
+kubectl describe pod -n ${ns} ${name}"
+      ;;
+    failed)
+      echo "Pod terminated as Failed. Inspect logs and exit code; for Jobs, raise backoffLimit only \
+after fixing the root cause. Run: kubectl logs -n ${ns} ${name} --previous"
+      ;;
+    not-ready|*)
+      echo "Pod is Running but not all containers are Ready. Check readiness probe configuration \
+and dependency health. Run: kubectl describe pod -n ${ns} ${name}"
+      ;;
+  esac
+}
+
+# Helper: convert RFC3339/ISO timestamp to unix epoch (Linux + macOS portable).
+_iso_to_unix() {
+  local ts="$1"
+  local out
+  if out=$(date -u -d "${ts}" +%s 2>/dev/null); then
+    printf '%s' "${out}"; return 0
+  fi
+  if out=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "${ts}" +%s 2>/dev/null); then
+    printf '%s' "${out}"; return 0
+  fi
+  printf '0'
+}
+
+# Field separator used between columns in the per-pod summary line. We use
+# the ASCII Unit Separator (0x1f) because bash's `read -r` collapses
+# consecutive empty fields when IFS is whitespace (including tab), which
+# would shift columns whenever a pod has e.g. an empty reason+message.
+# Unit Separator is non-whitespace, so empties are preserved.
+_POD_FS=$'\x1f'
+
+# Helper: check that every workload-level Custom Resource (RayCluster,
+# RayService, Splunk Standalone, AIPlatform, AIService) is Ready and has all
+# its expected child pods present.
+#
+# This catches the case where verify_all_pods_healthy would otherwise return
+# success too early — for example, the Ray head pod is Running+Ready but the
+# Ray operator has not yet created (or the cluster has not yet pulled images
+# for) the worker pods. In that window there are no unhealthy pods, but the
+# cluster is decidedly not ready.
+#
+# Output: writes a newline-separated list of human-readable "still pending"
+# reasons to the global `WORKLOAD_PENDING_REASON`. Returns 0 iff the list is
+# empty.
+#
+# Why a global instead of a nameref? bash 3.2 (still shipped on macOS as
+# /bin/bash) doesn't support `local -n`, and this script's shebang is
+# `#!/bin/bash`. Using a fixed global name avoids both the nameref dependency
+# AND the subshell scoping issue that would arise from `var=$(_helper ...)`.
+_check_workload_readiness() {
+  WORKLOAD_PENDING_REASON=""
+  local missing=()
+
+  # Project CR rows for one CRD into a delimited string via jq. On kubectl or
+  # jq failure, append a "Could not query …" entry to `missing` so we never
+  # silently treat a transient API error as "all good".
+  #
+  # NOTE: We deliberately avoid `var=$(_helper ...)` style here because that
+  # spawns a subshell — the inner function's modifications to the parent's
+  # `missing` array would be invisible back in the parent. Instead, helper
+  # writes to two outer locals: `_wl_rows` (delimited rows for the caller to
+  # parse) and `_wl_err` (set to non-empty if the query failed; appended into
+  # `missing` directly).
+  _wl_query_crd() {
+    local crd="$1" resource="$2" jq_proj="$3"
+    _wl_rows=""
+    if ! kubectl get crd "${crd}" >/dev/null 2>&1; then
+      return 0  # CRD not installed → nothing to check.
+    fi
+    local raw json_rc jq_rc out
+    set +e
+    raw=$(kubectl get "${resource}" --all-namespaces -o json 2>&1); json_rc=$?
+    set -e
+    if (( json_rc != 0 )); then
+      missing+=("Could not query ${resource} (kubectl rc=${json_rc}): ${raw:0:200}")
+      return 0
+    fi
+    set +e
+    out=$(printf '%s' "${raw}" | jq -r --arg FS "${_POD_FS}" "${jq_proj}" 2>&1); jq_rc=$?
+    set -e
+    if (( jq_rc != 0 )); then
+      missing+=("Could not parse ${resource} status (jq rc=${jq_rc}): ${out:0:200}")
+      return 0
+    fi
+    _wl_rows="${out}"
+  }
+
+  # Scrub a string to a non-negative integer for safe arithmetic under
+  # `set -euo pipefail`. Anything non-numeric becomes 0.
+  _wl_int() {
+    local v="${1:-0}"
+    [[ "${v}" =~ ^[0-9]+$ ]] || v=0
+    printf '%s' "${v}"
+  }
+
+  local _wl_rows=""
+
+  # ---- KubeRay: RayClusters ---------------------------------------------------
+  # Each RayCluster is considered ready when:
+  #   - It exposes a 'ready' state OR a 'RayClusterProvisioned'=True condition.
+  #   - readyWorkerReplicas >= desiredWorkerReplicas (so all workers are up).
+  # We use jq to project the relevant fields with `// 0` for back-compat with
+  # older KubeRay versions that don't surface every field.
+  _wl_query_crd rayclusters.ray.io rayclusters '
+      .items[]
+      | [
+          .metadata.namespace,
+          .metadata.name,
+          (.status.state // ""),
+          (.status.desiredWorkerReplicas // 0 | tostring),
+          (.status.readyWorkerReplicas // 0 | tostring),
+          ([(.status.conditions // [])[] | select(.type=="RayClusterProvisioned") | .status] | first // ""),
+          ([(.status.conditions // [])[] | select(.type=="HeadPodReady") | .status] | first // "")
+        ]
+      | join($FS)
+    '
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    local rc_ns rc_name rc_state rc_desired rc_ready rc_provisioned rc_head_ready
+    IFS="${_POD_FS}" read -r rc_ns rc_name rc_state rc_desired rc_ready rc_provisioned rc_head_ready <<<"${line}"
+    rc_desired=$(_wl_int "${rc_desired}")
+    rc_ready=$(_wl_int "${rc_ready}")
+    local is_ready=0
+    if [[ "${rc_state}" == "ready" || "${rc_provisioned}" == "True" ]]; then
+      is_ready=1
+    fi
+    if (( is_ready == 1 )) && (( rc_desired > 0 )) && (( rc_ready >= rc_desired )); then
+      :  # Fully Ready.
+    elif (( is_ready == 1 )) && (( rc_desired == 0 )); then
+      :  # Head-only cluster, no workers expected.
+    else
+      local why="RayCluster ${rc_ns}/${rc_name}: state=${rc_state:-unknown}"
+      [[ -n "${rc_head_ready}" ]] && why+=" headReady=${rc_head_ready}"
+      why+=" workers=${rc_ready}/${rc_desired}"
+      missing+=("${why}")
+    fi
+  done <<<"${_wl_rows}"
+
+  # ---- KubeRay: RayServices ---------------------------------------------------
+  # A RayService is Ready when its 'Ready' condition is True. KubeRay also
+  # reports 'numServeEndpoints' once the serve apps are reachable.
+  _wl_query_crd rayservices.ray.io rayservices '
+      .items[]
+      | [
+          .metadata.namespace,
+          .metadata.name,
+          ([(.status.conditions // [])[] | select(.type=="Ready") | .status] | first // ""),
+          ([(.status.conditions // [])[] | select(.type=="UpgradeInProgress") | .status] | first // ""),
+          (.status.numServeEndpoints // 0 | tostring)
+        ]
+      | join($FS)
+    '
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    local rs_ns rs_name rs_ready rs_upgrading rs_endpoints
+    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_upgrading rs_endpoints <<<"${line}"
+    if [[ "${rs_ready}" != "True" ]]; then
+      local why="RayService ${rs_ns}/${rs_name}: Ready=${rs_ready:-Unknown}"
+      [[ "${rs_upgrading}" == "True" ]] && why+=" (upgrade in progress)"
+      why+=" serveEndpoints=${rs_endpoints}"
+      missing+=("${why}")
+    fi
+  done <<<"${_wl_rows}"
+
+  # ---- Splunk Operator: Standalone -------------------------------------------
+  # Splunk Operator surfaces .status.phase = "Ready" once the StatefulSet pod
+  # has finished its Splunk init container chain. Other phases include
+  # 'Pending', 'Updating', 'ScalingUp'.
+  _wl_query_crd standalones.enterprise.splunk.com standalones '
+      .items[]
+      | [
+          .metadata.namespace,
+          .metadata.name,
+          (.status.phase // ""),
+          (.spec.replicas // 1 | tostring),
+          (.status.readyReplicas // 0 | tostring)
+        ]
+      | join($FS)
+    '
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    local sp_ns sp_name sp_phase sp_desired sp_ready
+    IFS="${_POD_FS}" read -r sp_ns sp_name sp_phase sp_desired sp_ready <<<"${line}"
+    sp_desired=$(_wl_int "${sp_desired}")
+    sp_ready=$(_wl_int "${sp_ready}")
+    if [[ "${sp_phase}" != "Ready" ]] || (( sp_ready < sp_desired )); then
+      missing+=("Splunk Standalone ${sp_ns}/${sp_name}: phase=${sp_phase:-unknown} replicas=${sp_ready}/${sp_desired}")
+    fi
+  done <<<"${_wl_rows}"
+
+  # ---- AI Platform: AIPlatform / AIService ------------------------------------
+  # The Splunk AI Operator surfaces .status.phase = "Ready" or a structured
+  # conditions list. We accept either.
+  local crd_kind ai_resource
+  for crd_kind in aiplatforms.ai.splunk.com aiservices.ai.splunk.com; do
+    ai_resource="${crd_kind%%.*}"
+    _wl_query_crd "${crd_kind}" "${ai_resource}" '
+        .items[]
+        | [
+            .metadata.namespace,
+            .metadata.name,
+            (.status.phase // ""),
+            ([(.status.conditions // [])[] | select(.type=="Ready") | .status] | first // "")
+          ]
+        | join($FS)
+      '
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      local ai_ns ai_name ai_phase ai_ready
+      IFS="${_POD_FS}" read -r ai_ns ai_name ai_phase ai_ready <<<"${line}"
+      # If neither phase nor a Ready condition surfaces success, treat as pending.
+      if [[ "${ai_phase}" != "Ready" && "${ai_ready}" != "True" ]]; then
+        missing+=("${ai_resource} ${ai_ns}/${ai_name}: phase=${ai_phase:-unknown} Ready=${ai_ready:-Unknown}")
+      fi
+    done <<<"${_wl_rows}"
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    # local-scoped IFS so the join doesn't leak out of this function.
+    local IFS=$'\n'
+    WORKLOAD_PENDING_REASON="${missing[*]}"
+    return 1
+  fi
+  return 0
+}
+
+# Helper: populate the global POD_LINES array with one delimited line per pod.
+# Layout (matches readers in verify_all_pods_healthy):
+#   ns, name, phase, ready/total, reason, message,
+#   owner_kind, owner_name, waiting_reasons, terminated_reasons, restarts, created
+#
+# We use kubectl's JSON output piped through jq (already required by the
+# script's preflight) rather than kubectl's go-template engine because:
+#   - kubectl's text/template lacks `add`/`replace` helpers we need for
+#     restart-count summation and message scrubbing.
+#   - jq lets us emit a single, well-formed delimited line per pod.
+#
+# We write to the global POD_LINES (rather than using `local -n`) because the
+# script's shebang is `#!/bin/bash` and macOS still ships bash 3.2 (no
+# nameref). Using a fixed global keeps the helper bash-3.2 safe.
+_collect_pod_summary() {
+  local raw rc
+
+  # We run under `set -euo pipefail`, where a failed command substitution
+  # aborts BEFORE the next statement (`rc=$?`) can run. Disable `errexit`
+  # for just the kubectl/jq pipeline so we can capture and report the error
+  # instead of dying mid-loop. Embedded newlines/tabs/separators in
+  # status.message are scrubbed to spaces so each pod stays on one line and
+  # never injects our chosen field separator.
+  set +e
+  raw=$(kubectl get pods --all-namespaces -o json 2>&1 \
+        | jq -r --arg FS "${_POD_FS}" '
+            .items[]
+            | (.status.containerStatuses // []) as $cs
+            | [
+                .metadata.namespace,
+                .metadata.name,
+                (.status.phase // "Unknown"),
+                (
+                  (([$cs[] | select(.ready == true)] | length) | tostring)
+                  + "/"
+                  + (($cs | length) | tostring)
+                ),
+                (.status.reason // ""),
+                ((.status.message // "") | gsub("[\\n\\t\\u001f]"; " ")),
+                ((.metadata.ownerReferences // [])[0].kind // ""),
+                ((.metadata.ownerReferences // [])[0].name // ""),
+                ([$cs[] | .state.waiting.reason // empty] | join(",")),
+                ([$cs[] | .state.terminated.reason // empty] | join(",")),
+                ([$cs[] | .restartCount // 0] | add // 0 | tostring),
+                (.metadata.creationTimestamp // "")
+              ]
+            | join($FS)
+          ' 2>&1); rc=$?
+  set -e
+  if (( rc != 0 )); then
+    warn "kubectl/jq pod summary failed (rc=${rc}): ${raw:0:300}"
+    return 1
+  fi
+
+  # Reset and populate the global. Bash 3.2 lacks `local -n`, so we use a
+  # fixed global name (POD_LINES) by convention.
+  POD_LINES=()
+  while IFS= read -r _line; do
+    [[ -z "${_line}" ]] && continue
+    POD_LINES+=("${_line}")
+  done <<<"${raw}"
+  return 0
+}
+
+# Print a short, human-friendly summary of unhealthy pods. Designed to be
+# called from the post-install banner so the user gets actionable context
+# without scrolling back through the full diagnostic output. Reads from the
+# global POD_LINES populated during verify_all_pods_healthy; if it's empty
+# (e.g. verify ran a long time ago, or kubectl was unavailable) we fall back
+# to a single-line `kubectl get pods -A` query so the banner is never silent.
+#
+# Output format:
+#   ⚠️  3 unhealthy pod(s) across 2 namespace(s):
+#         ai-platform        (1) airgap-cluster-l40s-…-l-worker-w957f [Running 1/2]
+#         kube-system        (2) calico-node-f5qk7 [Pending 0/1, BackOff]
+#                                konnectivity-agent-nkgrs [Pending 0/1]
+#
+# We deliberately do NOT re-run kubectl by default: the diagnostics above
+# the banner already exhausted the freshest information; re-querying here
+# would add latency and risk a different snapshot, confusing the operator.
+_print_unhealthy_pod_summary() {
+  local total=0
+  local line ns name phase ready reason message owner_kind owner_name waiting terminated restarts created
+  local -a unhealthy_lines=()
+
+  # Use cached POD_LINES if available; otherwise refresh once.
+  if (( ${#POD_LINES[@]} == 0 )); then
+    _collect_pod_summary || {
+      warn "Unable to summarise unhealthy pods: pod listing failed."
+      return 0
+    }
+  fi
+
+  for line in "${POD_LINES[@]}"; do
+    [[ -z "${line}" ]] && continue
+    IFS="${_POD_FS}" read -r ns name phase ready reason message owner_kind owner_name waiting terminated restarts created <<<"${line}"
+    if ! _pod_is_healthy "${phase}" "${ready}" "${waiting}" "${terminated}" "${reason}"; then
+      # Build a compact "[Phase ready/total, reason]" suffix. We omit empty
+      # reason fields rather than printing literal "[Pending 0/1, ]".
+      local suffix="[${phase} ${ready}"
+      if [[ -n "${reason}" ]]; then
+        suffix+=", ${reason}"
+      elif [[ -n "${waiting}" ]]; then
+        suffix+=", ${waiting}"
+      elif [[ -n "${terminated}" ]]; then
+        suffix+=", ${terminated}"
+      fi
+      suffix+="]"
+      unhealthy_lines+=("${ns}${_POD_FS}${name}${_POD_FS}${suffix}")
+      total=$((total + 1))
+    fi
+  done
+
+  if (( total == 0 )); then
+    log "✅ All pods are healthy at banner time."
+    return 0
+  fi
+
+  # Bucket by namespace so the banner is easy to skim. We stick to plain
+  # arrays (bash 3.2 has no associative arrays) by collecting unique
+  # namespaces in encounter order and counting occurrences in a parallel
+  # array.
+  local -a ns_keys=() ns_counts=()
+  local i found_idx
+  for line in "${unhealthy_lines[@]}"; do
+    IFS="${_POD_FS}" read -r ns _name _suffix <<<"${line}"
+    found_idx=-1
+    for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+      if [[ "${ns_keys[$i]}" == "${ns}" ]]; then
+        found_idx="$i"
+        break
+      fi
+    done
+    if (( found_idx == -1 )); then
+      ns_keys+=("${ns}")
+      ns_counts+=(1)
+    else
+      ns_counts[$found_idx]=$(( ns_counts[found_idx] + 1 ))
+    fi
+  done
+
+  warn "${total} unhealthy pod(s) across ${#ns_keys[@]} namespace(s):"
+  for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+    warn "  • ${ns_keys[$i]} (${ns_counts[$i]}):"
+    local printed=0
+    local max_per_ns=5  # avoid 200-line banners on truly broken clusters
+    local pn _pname _psuffix
+    for line in "${unhealthy_lines[@]}"; do
+      IFS="${_POD_FS}" read -r pn _pname _psuffix <<<"${line}"
+      [[ "${pn}" != "${ns_keys[$i]}" ]] && continue
+      warn "      - ${_pname} ${_psuffix}"
+      printed=$(( printed + 1 ))
+      if (( printed >= max_per_ns )); then
+        local remaining=$(( ns_counts[i] - printed ))
+        if (( remaining > 0 )); then
+          warn "      … and ${remaining} more in ${ns_keys[$i]} (run: kubectl get pods -n ${ns_keys[$i]})"
+        fi
+        break
+      fi
+    done
+  done
+  warn ""
+  warn "Tip: scroll up to see per-pod logs, events, and recommended fixes."
+}
+
 # ====== SHOW PLATFORM ACCESS INFORMATION ======
 show_platform_access_info() {
+  # Read VERIFY_RC set by main_install (contract documented there). Use a safe
+  # default so this function still works when invoked from contexts that did
+  # not run verify_all_pods_healthy (e.g. someone calling
+  # `show_platform_access_info` directly from a debug shell).
+  local verify_rc="${VERIFY_RC:-0}"
+  local banner_status banner_emoji
+  if (( verify_rc == 0 )); then
+    banner_emoji="🎉"
+    banner_status="Installation Complete!"
+  elif (( verify_rc == 255 )); then
+    banner_emoji="⚠️"
+    banner_status="Installation Complete — Workloads Still Initializing"
+  else
+    banner_emoji="⚠️"
+    banner_status="Installation Complete — ${verify_rc} Pod(s) Unhealthy"
+  fi
+
   log "============================================"
-  log "🎉 Installation Complete!"
+  log "${banner_emoji} ${banner_status}"
   log "============================================"
   log ""
 
@@ -3610,13 +4463,49 @@ show_platform_access_info() {
 
   log "============================================"
   log "📚 Documentation:"
-  log "  Setup Guide: ./tools/cluster_setup/README.md"
+  log "  Setup Guide: ./tools/cluster_setup/K0S_README.md"
+  log "  Setup Guide (Concise version): ./tools/cluster_setup/K0S_QUICKSTART.md"
   log "  Custom Resources: ./docs/CustomResources.md"
   log "  Troubleshooting: Check operator logs and events above"
   log "============================================"
   log ""
-  log "✅ Your AI Platform is ready to use!"
+
+  # Final status line. We tell the truth: "ready to use" only when every pod
+  # AND every workload CR reports healthy. Anything else gets an explicit
+  # warning banner with a per-namespace summary so the operator immediately
+  # sees what failed without scrolling back through tens of pages of
+  # diagnostics.
+  if (( verify_rc == 0 )); then
+    log "✅ Your AI Platform is ready to use!"
+  elif (( verify_rc == 255 )); then
+    warn "⚠️  Your AI Platform is partially ready: pods look healthy but one or"
+    warn "    more workload-level Custom Resources (RayCluster/RayService/"
+    warn "    Splunk Standalone/AIPlatform/AIService) have not yet reported"
+    warn "    Ready. This usually clears within a few minutes — re-check with:"
+    warn "       kubectl get aiplatform,aiservice,raycluster,rayservice -n ${AI_NS}"
+    warn "       kubectl get standalone -n ${AI_NS}"
+    warn "    Or re-run just the verifier (no install steps):"
+    warn "       CONFIG_FILE=${CONFIG_FILE:-<your-config>} ${0} verify-pods"
+  else
+    warn "⚠️  Your AI Platform is NOT ready to use yet: ${verify_rc} pod(s)"
+    warn "    are unhealthy. Summary:"
+    log ""
+    _print_unhealthy_pod_summary
+    warn "    Re-run the verifier after fixing the issues above:"
+    warn "       CONFIG_FILE=${CONFIG_FILE:-<your-config>} ${0} verify-pods"
+  fi
   log ""
+
+  # Propagate the verifier's status to callers (sourced contexts) without
+  # changing the function-call style. main_install ignores this return; CI
+  # wrappers that source the script can read it. We deliberately use 0 vs
+  # non-zero here rather than re-encoding the count — the count is already
+  # in the banner.
+  if (( verify_rc == 0 )); then
+    return 0
+  else
+    return 1
+  fi
 }
 
 # ====== MAIN INSTALL FLOW ======
@@ -3789,8 +4678,34 @@ main_install() {
   # Run health checks
   check_platform_health || warn "Some components may still be initializing"
 
-  # Show platform access information
-  show_platform_access_info
+  # Verify every pod across every namespace, capture diagnostics for failures,
+  # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
+  # errors as ignorable when the newest posthook pod has Succeeded.
+  #
+  # The exit code conveys structured information that the post-install banner
+  # consumes via VERIFY_RC (see show_platform_access_info):
+  #   0       all pods healthy AND all workload CRs Ready
+  #   1..254  N pods unhealthy (count is clamped to this range)
+  #   255     pods healthy but workload CRs not Ready (e.g. RayService still
+  #           initialising). Distinct from "0 unhealthy" so the banner can
+  #           remain honest even when no individual pod is failing.
+  VERIFY_RC=0
+  verify_all_pods_healthy || VERIFY_RC=$?
+  if (( VERIFY_RC != 0 )); then
+    warn "Some components are not fully ready — see diagnostics above for remediation steps."
+  fi
+
+  # Show platform access information. Reads VERIFY_RC to choose between a
+  # success banner and a "partially ready" banner with an inline summary.
+  #
+  # show_platform_access_info itself returns nonzero when VERIFY_RC != 0,
+  # which is useful for sourced contexts (CI wrappers can branch on the
+  # function's return). But for the install CLI command we deliberately
+  # swallow that return — install completing with an actionable warning
+  # banner should NOT cause callers chaining via `&&` to silently abort.
+  # The banner already tells the operator what's wrong; failing the exit
+  # code on top of that just breaks automation.
+  show_platform_access_info || true
 }
 
 # ====== MAIN DELETE FLOW ======
@@ -3921,7 +4836,7 @@ clean_all() {
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $0 [install|delete|clean-all|join-workers]
+Usage: $0 [install|delete|clean-all|join-workers|verify-pods]
 
 Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
@@ -3931,10 +4846,25 @@ Commands:
   join-workers  - Join/rejoin worker nodes to existing cluster (resume after failure)
   delete        - Delete cluster and all resources (graceful)
   clean-all     - Aggressive cleanup including node-level cleanup
+  verify-pods   - Verify every pod across every namespace AND every workload CR
+                  (RayCluster/RayService, Splunk Standalone, AIPlatform/AIService).
+                  Waits for Ray workers to be created/pulled by the head, captures
+                  diagnostics (events + recent logs) for unhealthy pods, and emits
+                  targeted remediation recommendations. Stale
+                  'saia-vector-db-setup-posthook' errors are ignored when the newest
+                  posthook pod has Succeeded.
 
 Environment:
-  CONFIG_FILE  - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
-  AUTO_APPROVE - Skip confirmation prompt for delete (default: false)
+  CONFIG_FILE              - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
+  AUTO_APPROVE             - Skip confirmation prompt for delete (default: false)
+  POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
+                             RayService, Splunk Standalone, AIPlatform/AIService) to
+                             reach Ready during verify (default: 600 = 10 minutes).
+                             Bump to 1200 (20 min) on slow networks or fresh clusters
+                             where Ray Serve has lots of model artifacts to download.
+  POD_HEALTH_PENDING_GRACE - Seconds to ignore Pending pods younger than this
+                             (default: 300)
+  POD_HEALTH_POLL_INTERVAL - Seconds between checks while waiting (default: 15)
 
 Examples:
   # Install with existing IPs
@@ -3952,6 +4882,9 @@ Examples:
   # Deep cleanup (aggressive)
   CONFIG_FILE=./my-config.yaml $0 clean-all
 
+  # Verify all pods are healthy (re-runs diagnostics any time)
+  CONFIG_FILE=./my-config.yaml $0 verify-pods
+
 Notes:
   - 'install' performs full cluster setup including worker joins
   - 'join-workers' is useful for:
@@ -3968,6 +4901,9 @@ Notes:
     * Removes k0s data directories (preserves k0s binary)
     * Cleans kubelet, CNI, and Calico files
     * Flushes iptables rules
+  - 'verify-pods' runs the same pod-health audit that 'install' triggers at
+    the end. Useful for re-checking a cluster, gathering remediation hints
+    after a partial failure, or verifying a manual fix.
   - All commands are idempotent and safe to run multiple times
 EOF
 }
@@ -4259,6 +5195,14 @@ case "${1:-install}" in
     ;;
   join-workers)
     join_workers
+    ;;
+  verify-pods)
+    load_config
+    # Reuse the same kubeconfig path the install path writes to, when present
+    if [[ -z "${KUBECONFIG:-}" ]] && [[ -f "${HOME}/.kube/k0s-${CLUSTER_NAME}" ]]; then
+      export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
+    fi
+    verify_all_pods_healthy
     ;;
   *)
     usage
