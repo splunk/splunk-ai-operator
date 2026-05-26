@@ -86,12 +86,15 @@ func Test_ApplicationsYAML_DisableResponsesRedis(t *testing.T) {
 		}
 	}
 
-	// We expect exactly two text-gen apps today (GptOss120b, GptOss20b). If
-	// this count changes, someone added a new text-gen model; they MUST also
-	// add DISABLE_RESPONSES_API_REDIS to the new app.
-	require.Len(t, textGenApps, 2,
-		"expected exactly 2 text_gen_model_deployment apps (GptOss120b, GptOss20b); "+
+	expectedTextGenApps := []string{"Gemma431bIt", "GptOss20b"}
+
+	// We expect exactly two text-gen apps today (Gemma431bIt, GptOss20b).
+	// If this count changes, someone added a new text-gen model; they MUST
+	// also add DISABLE_RESPONSES_API_REDIS to the new app.
+	require.Len(t, textGenApps, len(expectedTextGenApps),
+		"expected exactly %d text_gen_model_deployment app(s) (%s); "+
 			"found %d. New text-gen apps MUST set DISABLE_RESPONSES_API_REDIS.",
+		len(expectedTextGenApps), strings.Join(expectedTextGenApps, ", "),
 		len(textGenApps))
 
 	for _, a := range textGenApps {
@@ -110,7 +113,7 @@ func Test_ApplicationsYAML_DisableResponsesRedis(t *testing.T) {
 	for _, a := range textGenApps {
 		names = append(names, a.Name)
 	}
-	assert.ElementsMatch(t, []string{"GptOss120b", "GptOss20b"}, names,
+	assert.ElementsMatch(t, expectedTextGenApps, names,
 		"unexpected set of text_gen_model_deployment apps: %v", names)
 
 	// Hygiene check: non-text-gen apps should NOT carry this env (it's a

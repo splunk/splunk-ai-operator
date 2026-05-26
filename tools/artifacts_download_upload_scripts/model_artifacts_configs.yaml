@@ -22,16 +22,16 @@ artifact-configs:
     hf-url: https://huggingface.co/Mike0307/multilingual-e5-language-detection
     is-a-gated-model: false
 
-  - artifact-id: llama31-70b-instruct-awq
-    hf-url: https://huggingface.co/hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4
+  - artifact-id: gpt-oss-20b
+    hf-url: https://huggingface.co/openai/gpt-oss-20b
     is-a-gated-model: false
 
   - artifact-id: mbart-translator
     hf-url: https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt
     is-a-gated-model: false
 
-  - artifact-id: llama31-8b-instruct
-    hf-url: https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+  - artifact-id: gemma-4-31b-it
+    hf-url: https://huggingface.co/google/gemma-4-31B-it
     is-a-gated-model: true
 
   - artifact-id: pii-classifier

@@ -349,6 +349,8 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 		"LOG_LEVEL":                       "info",
 		"USE_GPT_OSS":                     "true",
 		"SCS_TOKEN":                       "no-auth-required",
+		"LLM_PROVIDER":                    "ml-platform",
+		"LLM_MODEL":                       "gemma4_31b_it",
 	}
 
 	found := &corev1.ConfigMap{}

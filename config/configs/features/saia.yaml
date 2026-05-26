@@ -4,8 +4,8 @@ applicationScale:
   CrossEncoder: 1
   E5LanguageClassifier: 1
   Entrypoint: 1
+  Gemma431bIt: 1
   GptOss20b: 1
-  GptOss120b: 1
   MbartTranslator: 1
   PromptInjectionClassifier: 1
   PromptInjectionCrossEncoder: 1
@@ -17,6 +17,7 @@ instanceScale:
     l40s-0-gpu: 1
     l40s-1-gpu: 2
     l40s-2-gpu: 1
+    l40s-4-gpu: 0
   H100:
     h100-0-gpu: 1
     h100-1-gpu: 2
