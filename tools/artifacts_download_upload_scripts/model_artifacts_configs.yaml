@@ -30,7 +30,7 @@ artifact-configs:
     hf-url: https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt
     is-a-gated-model: false
 
-  - artifact-id: gemma-4-31B-it
+  - artifact-id: gemma-4-31b-it
     hf-url: https://huggingface.co/google/gemma-4-31B-it
     is-a-gated-model: true
 
