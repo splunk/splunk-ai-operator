@@ -2,11 +2,11 @@
 # Script to upload model artifacts to MinIO using AWS CLI (S3-compatible API)
 
 SOURCE_DIR="./model_artifacts"
-MINIO_ENDPOINT="http://127.0.0.1:9000"
+MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
 # Change the bucket name to the one you want to use. It will be created if it doesn't exist.
-MINIO_BUCKET="ai-platform-artifacts-bucket"
-MINIO_ACCESS_KEY="minioadmin"
-MINIO_SECRET_KEY="minioadmin"
+MINIO_BUCKET="${MINIO_BUCKET:-ai-platform-artifacts-bucket}"
+MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
+MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
 
 # Convert bucket name to lowercase (S3/MinIO requirement)
 ORIGINAL_BUCKET="$MINIO_BUCKET"
