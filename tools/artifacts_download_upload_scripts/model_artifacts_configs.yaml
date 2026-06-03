@@ -25,6 +25,9 @@ artifact-configs:
   - artifact-id: gpt-oss-20b
     hf-url: https://huggingface.co/openai/gpt-oss-20b
     is-a-gated-model: false
+    files-to-exclude:
+      - metal/
+      - original/
 
   - artifact-id: mbart-translator
     hf-url: https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt
@@ -32,7 +35,7 @@ artifact-configs:
 
   - artifact-id: gemma-4-31b-it
     hf-url: https://huggingface.co/google/gemma-4-31B-it
-    is-a-gated-model: true
+    is-a-gated-model: false
 
   - artifact-id: pii-classifier
     hf-url: https://huggingface.co/StanfordAIMI/stanford-deidentifier-base

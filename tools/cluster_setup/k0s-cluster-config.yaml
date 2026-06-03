@@ -8,6 +8,31 @@
 #   2. Edit: vi my-k0s-config.yaml
 #   3. Replace all values marked with "CHANGE THIS"
 #   4. Run: CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
+#
+# Prerequisites (must be satisfied BEFORE running the installer):
+#
+# Local machine:
+#   ssh, kubectl, helm, git, jq, yq — install via brew or your package manager
+#   Example (macOS):  brew install kubectl helm git jq yq
+#   Example (Linux):  apt-get install -y kubectl helm git jq && \
+#                     wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && \
+#                     chmod +x /usr/local/bin/yq
+#
+# All remote nodes (controllers + workers):
+#   - SSH access using the key at cluster.sshKeyPath as cluster.sshUser
+#   - Passwordless sudo: add to /etc/sudoers:
+#       <sshUser> ALL=(ALL) NOPASSWD:ALL
+#   - curl (used to download the k0s binary if not pre-installed)
+#   - Internet access to https://get.k0s.sh and NVIDIA package repos
+#     For airgapped clusters: pre-install k0s on all nodes and install
+#     NVIDIA drivers manually before running this script
+#   - python3 (pyyaml is installed automatically by the script via dnf/apt)
+#   - Supported OS: RHEL/CentOS/Amazon Linux (dnf) or Ubuntu/Debian (apt)
+#
+# GPU worker nodes additionally require:
+#   - Minimum 500 GB free on /var/lib/k0s (model weights are large)
+#     Mount a dedicated disk at /var/lib/k0s before running if needed
+#   - kernel-devel matching the running kernel (installer attempts this via dnf/apt)
 # ===================================================================
 
 # ---------- Cluster Configuration ----------
