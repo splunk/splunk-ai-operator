@@ -25,6 +25,9 @@ artifact-configs:
   - artifact-id: gpt-oss-20b
     hf-url: https://huggingface.co/openai/gpt-oss-20b
     is-a-gated-model: false
+    files-to-exclude:
+      - metal/
+      - original/
 
   - artifact-id: mbart-translator
     hf-url: https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt
