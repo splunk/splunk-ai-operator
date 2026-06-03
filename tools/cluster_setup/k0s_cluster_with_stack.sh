@@ -444,13 +444,21 @@ object_store_auth_looks_like_placeholder() {
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
-  for tool in ssh kubectl helm git jq yq; do
+  for tool in ssh kubectl helm git jq; do
     if command -v "$tool" >/dev/null 2>&1; then
       pf_ok "$tool found"
     else
       pf_fail "$tool not found in PATH"
     fi
   done
+
+  # yq is strongly recommended — without it, config parsing falls back to
+  # grep/awk which cannot handle arrays or nested structures reliably.
+  if command -v yq >/dev/null 2>&1; then
+    pf_ok "yq found"
+  else
+    pf_warn "yq not found — install it for reliable config parsing (brew install yq / snap install yq). Falling back to grep/awk which may miss complex config values."
+  fi
 
   pf_header "Configuration"
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"
@@ -538,9 +546,13 @@ ssh_exec() {
   local cmd="$*"
 
   if [[ -n "${SSH_KEY_PATH}" ]]; then
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "${SSH_KEY_PATH}" "${SSH_USER}@${host}" "${cmd}"
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 -o BatchMode=yes \
+        -i "${SSH_KEY_PATH}" "${SSH_USER}@${host}" "${cmd}"
   else
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${SSH_USER}@${host}" "${cmd}"
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 -o BatchMode=yes \
+        "${SSH_USER}@${host}" "${cmd}"
   fi
 }
 
