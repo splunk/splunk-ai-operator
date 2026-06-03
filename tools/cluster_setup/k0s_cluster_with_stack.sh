@@ -600,8 +600,10 @@ preflight_check_remote_deps() {
       pf_warn "${ip}: curl not found — k0s binary download will fail (pre-install k0s or install curl)"
     fi
 
-    # internet access to k0s install endpoint
-    if ssh_exec "${ip}" "curl -sf --connect-timeout 5 https://get.k0s.sh >/dev/null 2>&1"; then
+    # internet access to k0s install endpoint — only meaningful if curl is present
+    if ! ssh_exec "${ip}" "command -v curl >/dev/null 2>&1"; then
+      pf_warn "${ip}: skipping get.k0s.sh reachability check — curl is not installed"
+    elif ssh_exec "${ip}" "curl -sf --connect-timeout 5 https://get.k0s.sh >/dev/null 2>&1"; then
       pf_ok "${ip}: internet access OK (get.k0s.sh reachable)"
     else
       pf_warn "${ip}: cannot reach get.k0s.sh — airgapped cluster requires k0s pre-installed on nodes"
