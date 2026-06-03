@@ -444,20 +444,13 @@ object_store_auth_looks_like_placeholder() {
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
-  for tool in ssh kubectl helm git jq; do
+  for tool in ssh kubectl helm git jq yq; do
     if command -v "$tool" >/dev/null 2>&1; then
       pf_ok "$tool found"
     else
       pf_fail "$tool not found in PATH"
     fi
   done
-
-  # Check for yq
-  if command -v yq >/dev/null 2>&1; then
-    pf_ok "yq found"
-  else
-    pf_warn "yq not found - using fallback parsing (install yq for better results)"
-  fi
 
   pf_header "Configuration"
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"
@@ -514,8 +507,26 @@ preflight_checks() {
   pf_ok "Worker IPs: ${EXISTING_WORKER_IPS}"
   [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]] && pf_ok "SSH key: ${SSH_KEY_PATH}" || pf_fail "SSH key not found: ${SSH_KEY_PATH}"
 
+  # Validate SSH reachability for all nodes before any install begins
+  pf_header "Remote node SSH access"
+  local _all_ips=()
+  IFS=' ' read -ra _all_ips <<< "${EXISTING_CONTROLLER_IPS} ${EXISTING_WORKER_IPS}"
+  for ip in "${_all_ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+    if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 -o BatchMode=yes \
+        ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${ip}" "echo ok" >/dev/null 2>&1; then
+      pf_ok "SSH reachable: ${ip}"
+    else
+      pf_fail "Cannot SSH to ${ip} — check SSH key (${SSH_KEY_PATH}), user (${SSH_USER}), and network"
+    fi
+  done
+
   # Validate disk space on every node (requires SSH access)
   preflight_check_node_storage
+
+  # Validate remote node software prerequisites
+  preflight_check_remote_deps
 
   pf_summary
 }
@@ -545,6 +556,47 @@ scp_file() {
   fi
 }
 
+# ====== PREFLIGHT: REMOTE NODE DEPENDENCY CHECK ======
+# SSHs to every node and reports what is present vs missing BEFORE install.
+# Does not install anything — surfaces gaps so the operator can fix them
+# upfront rather than hitting a silent failure mid-run.
+preflight_check_remote_deps() {
+  pf_header "Remote node dependencies"
+  local _all_ips=()
+  IFS=' ' read -ra _all_ips <<< "${EXISTING_CONTROLLER_IPS} ${EXISTING_WORKER_IPS}"
+  for ip in "${_all_ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+
+    # python3
+    if ssh_exec "${ip}" "command -v python3 >/dev/null 2>&1"; then
+      pf_ok "${ip}: python3 found"
+    else
+      pf_warn "${ip}: python3 not found — installer will attempt install via dnf/apt"
+    fi
+
+    # passwordless sudo
+    if ssh_exec "${ip}" "sudo -n true 2>/dev/null"; then
+      pf_ok "${ip}: passwordless sudo available"
+    else
+      pf_fail "${ip}: passwordless sudo required — add '${SSH_USER} ALL=(ALL) NOPASSWD:ALL' to /etc/sudoers"
+    fi
+
+    # curl (needed to download k0s binary if not pre-installed)
+    if ssh_exec "${ip}" "command -v curl >/dev/null 2>&1"; then
+      pf_ok "${ip}: curl found"
+    else
+      pf_warn "${ip}: curl not found — k0s binary download will fail (pre-install k0s or install curl)"
+    fi
+
+    # internet access to k0s install endpoint
+    if ssh_exec "${ip}" "curl -sf --connect-timeout 5 https://get.k0s.sh >/dev/null 2>&1"; then
+      pf_ok "${ip}: internet access OK (get.k0s.sh reachable)"
+    else
+      pf_warn "${ip}: cannot reach get.k0s.sh — airgapped cluster requires k0s pre-installed on nodes"
+    fi
+  done
+}
+
 # ====== PREPARE NODES (RHEL/Fedora compatibility + k0s binary) ======
 prepare_nodes_for_k0s() {
   local node_ips=("$@")
@@ -572,17 +624,24 @@ prepare_nodes_for_k0s() {
       printf 'br_netfilter\noverlay\nnf_conntrack\n' | sudo tee /etc/modules-load.d/k0s.conf >/dev/null
 
       # Ensure python3 + PyYAML are available (used for k0s config generation)
-      if ! python3 -c 'import yaml' 2>/dev/null; then
+      if python3 -c 'import yaml' 2>/dev/null; then
+        echo "python3+pyyaml already present"
+      else
+        echo "Installing python3-pyyaml..."
         if command -v dnf >/dev/null 2>&1; then
           sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
         elif command -v apt-get >/dev/null 2>&1; then
           sudo apt-get install -y python3-yaml 2>/dev/null || true
+        else
+          echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
         fi
       fi
 
       # Install k0s binary if not present
-      if ! command -v k0s >/dev/null 2>&1; then
-        echo 'Installing k0s binary...'
+      if command -v k0s >/dev/null 2>&1; then
+        echo "k0s binary already present ($(k0s version 2>/dev/null || echo unknown))"
+      else
+        echo "Installing k0s binary..."
         curl -sSLf https://get.k0s.sh | sudo sh
       fi
 
