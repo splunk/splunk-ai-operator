@@ -262,7 +262,13 @@ if [ -f "$CONFIG_FILE" ]; then
             cd "$DOWNLOAD_DIR/$id"
             if [ -f .gitattributes ] && grep -q "filter=lfs" .gitattributes; then
                 echo "Downloading LFS files for $id..."
-                if ! git lfs pull; then
+                lfs_pull_cmd="git lfs pull"
+                if [[ -n "$files_to_exclude" ]]; then
+                    lfs_exclude_arg=$(echo "$files_to_exclude" | tr '\n' ',' | sed 's/,$//')
+                    echo "Excluding from LFS download: $lfs_exclude_arg"
+                    lfs_pull_cmd="git lfs pull --exclude=\"$lfs_exclude_arg\""
+                fi
+                if ! eval "$lfs_pull_cmd"; then
                     echo "WARNING: Failed to download some LFS files for $id"
                 fi
             fi
