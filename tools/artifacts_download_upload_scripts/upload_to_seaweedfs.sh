@@ -147,6 +147,8 @@ fi
 echo ""
 
 # ---- Install mc if needed (same pattern as upload_to_minio.sh) ----
+# sudo on Amazon Linux uses a restricted PATH that excludes /usr/local/bin
+export PATH="$PATH:/usr/local/bin"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 if ! command -v mc &>/dev/null; then
@@ -156,11 +158,13 @@ if ! command -v mc &>/dev/null; then
       brew install minio/stable/mc
     else
       if [[ "$ARCH" == "arm64" ]]; then MC_URL="https://dl.min.io/client/mc/release/darwin-arm64/mc"; else MC_URL="https://dl.min.io/client/mc/release/darwin-amd64/mc"; fi
-      curl -o /tmp/mc "$MC_URL" && chmod +x /tmp/mc && sudo mv /tmp/mc /usr/local/bin/mc
+      curl -fsSL -o /tmp/mc "$MC_URL" || { echo "Error: Failed to download mc from $MC_URL"; exit 1; }
+      chmod +x /tmp/mc && sudo mv /tmp/mc /usr/local/bin/mc
     fi
   elif [[ "$OS" == "Linux" ]]; then
     if [[ "$ARCH" == "x86_64" ]]; then MC_URL="https://dl.min.io/client/mc/release/linux-amd64/mc"; elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then MC_URL="https://dl.min.io/client/mc/release/linux-arm64/mc"; else echo "Unsupported arch: $ARCH"; exit 1; fi
-    curl -o /tmp/mc "$MC_URL" && chmod +x /tmp/mc
+    curl -fsSL -o /tmp/mc "$MC_URL" || { echo "Error: Failed to download mc from $MC_URL"; exit 1; }
+    chmod +x /tmp/mc
     sudo mv /tmp/mc /usr/local/bin/mc 2>/dev/null || { mkdir -p ~/.local/bin; mv /tmp/mc ~/.local/bin/mc; export PATH="$PATH:$HOME/.local/bin"; }
   else
     echo "Unsupported OS: $OS"; exit 1

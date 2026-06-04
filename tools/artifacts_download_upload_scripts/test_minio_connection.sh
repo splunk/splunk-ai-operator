@@ -17,6 +17,9 @@ echo "  Password: ${MINIO_ROOT_PASSWORD:0:3}***"
 echo "  Bucket:   $MINIO_BUCKET"
 echo ""
 
+# sudo on Amazon Linux uses a restricted PATH that excludes /usr/local/bin
+export PATH="$PATH:/usr/local/bin"
+
 # Check if mc is installed
 echo "[1/6] Checking if MinIO Client (mc) is installed..."
 if command -v mc &> /dev/null; then
@@ -41,14 +44,14 @@ else
             else
                 MC_URL="https://dl.min.io/client/mc/release/darwin-amd64/mc"
             fi
-            curl -o /tmp/mc "$MC_URL"
+            curl -fsSL -o /tmp/mc "$MC_URL" || { echo "Error: Failed to download mc from $MC_URL"; exit 1; }
             chmod +x /tmp/mc
             sudo mv /tmp/mc /usr/local/bin/mc
         fi
     elif [[ "$OS" == "Linux" ]]; then
         # Linux installation
         echo "Installing MinIO Client for Linux..."
-        
+
         if [[ "$ARCH" == "x86_64" ]]; then
             MC_URL="https://dl.min.io/client/mc/release/linux-amd64/mc"
         elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
@@ -57,8 +60,8 @@ else
             echo "Error: Unsupported architecture: $ARCH"
             exit 1
         fi
-        
-        curl -o /tmp/mc "$MC_URL"
+
+        curl -fsSL -o /tmp/mc "$MC_URL" || { echo "Error: Failed to download mc from $MC_URL"; exit 1; }
         chmod +x /tmp/mc
         
         # Try to move to /usr/local/bin
