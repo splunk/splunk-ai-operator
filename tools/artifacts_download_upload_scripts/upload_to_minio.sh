@@ -25,6 +25,9 @@ fi
 echo "Checking and installing dependencies..."
 echo ""
 
+# sudo on Amazon Linux uses a restricted PATH that excludes /usr/local/bin
+export PATH="$PATH:/usr/local/bin"
+
 # Detect OS and Architecture
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -48,7 +51,7 @@ if ! command -v mc &> /dev/null; then
                 MC_URL="https://dl.min.io/client/mc/release/darwin-amd64/mc"
             fi
             
-            curl -o /tmp/mc "$MC_URL"
+            curl -fsSL -o /tmp/mc "$MC_URL"
             chmod +x /tmp/mc
             sudo mv /tmp/mc /usr/local/bin/mc
         fi
@@ -67,7 +70,7 @@ if ! command -v mc &> /dev/null; then
         fi
         
         # Download mc
-        curl -o /tmp/mc "$MC_URL"
+        curl -fsSL -o /tmp/mc "$MC_URL"
         chmod +x /tmp/mc
         
         # Try to move to /usr/local/bin
