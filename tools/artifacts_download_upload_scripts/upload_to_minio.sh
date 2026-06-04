@@ -51,14 +51,14 @@ if ! command -v mc &> /dev/null; then
                 MC_URL="https://dl.min.io/client/mc/release/darwin-amd64/mc"
             fi
             
-            curl -fsSL -o /tmp/mc "$MC_URL"
+            curl -fsSL -o /tmp/mc "$MC_URL" || { echo "Error: Failed to download mc from $MC_URL"; exit 1; }
             chmod +x /tmp/mc
             sudo mv /tmp/mc /usr/local/bin/mc
         fi
     elif [[ "$OS" == "Linux" ]]; then
         # Linux installation
         echo "Installing MinIO Client for Linux..."
-        
+
         # Determine architecture
         if [[ "$ARCH" == "x86_64" ]]; then
             MC_URL="https://dl.min.io/client/mc/release/linux-amd64/mc"
@@ -68,9 +68,9 @@ if ! command -v mc &> /dev/null; then
             echo "Error: Unsupported architecture: $ARCH"
             exit 1
         fi
-        
+
         # Download mc
-        curl -fsSL -o /tmp/mc "$MC_URL"
+        curl -fsSL -o /tmp/mc "$MC_URL" || { echo "Error: Failed to download mc from $MC_URL"; exit 1; }
         chmod +x /tmp/mc
         
         # Try to move to /usr/local/bin
