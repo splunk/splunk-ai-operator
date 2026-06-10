@@ -7,6 +7,9 @@ set -o pipefail
 
 CONFIG_FILE="./model_artifacts_configs.yaml"
 DOWNLOAD_DIR="./model_artifacts"
+# Set SKIP_IF_EXISTS=1 to skip downloading a model that already exists locally.
+# Useful for re-running the upload step without re-downloading everything.
+SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}"
 
 # Ensure download directory exists
 mkdir -p "$DOWNLOAD_DIR"
@@ -212,6 +215,11 @@ if [ -f "$CONFIG_FILE" ]; then
         echo "is-a-gated-model: $is_a_gated_model"
         
         if [[ -n "$hf_url" && "$hf_url" != "null" ]]; then
+            if [[ "$SKIP_IF_EXISTS" == "1" && -d "$DOWNLOAD_DIR/$id" ]]; then
+                echo "Skipping $id — already exists at $DOWNLOAD_DIR/$id (SKIP_IF_EXISTS=1)"
+                echo "-----------------------------"
+                continue
+            fi
             # Remove existing directory if it exists to force re-download
             if [ -d "$DOWNLOAD_DIR/$id" ]; then
                 echo "Model $id already exists at $DOWNLOAD_DIR/$id, removing for fresh download..."

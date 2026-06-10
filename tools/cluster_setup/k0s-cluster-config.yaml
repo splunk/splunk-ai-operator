@@ -77,6 +77,13 @@ storage:
   #   cpuWorker: 200     # weaviate, saia-api, data-loader, fluent-bit
   #   gpuWorker: 500     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
 
+  # Model staging: download model artifacts from Hugging Face and upload them to
+  # the object store during 'install' (before the cluster pulls them). Set false
+  # to skip — e.g. if models are already staged or you want to run separately via
+  # the 'stage-artifacts' subcommand.
+  modelStaging:
+    enabled: true
+
   objectStore:
     type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
     bucket: "ai-platform-bucket-minio-us-east-2"

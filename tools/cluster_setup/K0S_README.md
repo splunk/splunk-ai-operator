@@ -245,6 +245,8 @@ storage:
     auth:
       rootUser: "admin"
       rootPassword: "Change-This-Strong-Password!"
+  modelStaging:
+    enabled: true                 # Download from HF + upload to object store before install
 
 images:
   registry: "registry.corp.com"
@@ -374,6 +376,7 @@ ecr:
 | `storage.objectStore.endpoint` | **Yes*** | — | S3-compatible endpoint URL (*required for s3compat/minio/seaweedfs) |
 | `storage.objectStore.auth.rootUser` | Yes | — | Access key / root user |
 | `storage.objectStore.auth.rootPassword` | Yes | — | Secret key / root password |
+| `storage.modelStaging.enabled` | No | `true` | Download models from Hugging Face and upload to the object store before cluster install. Set `false` to skip (e.g. models already staged). |
 
 #### Images Section
 
@@ -476,6 +479,12 @@ imagePullSecrets:
 # Install cluster and full AI Platform stack
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
 
+# Stage model artifacts only (download from HF + upload to object store)
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+
+# Re-stage without re-downloading models already present locally
+SKIP_IF_EXISTS=1 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+
 # Delete entire cluster (stop k0s, remove services)
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh delete
 
@@ -494,6 +503,7 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 | `AUTO_APPROVE` | `false` | Skip confirmation prompts |
 | `USE_EXISTING` | (from config) | Override `cluster.useExisting` (`auto`/`force`/`never`) |
 | `LOG_DIR` | `./logs` | Directory for session log files |
+| `SKIP_IF_EXISTS` | `0` | Set to `1` to skip re-downloading models already present in `model_artifacts/` (used with `stage-artifacts` or during `install`) |
 
 ### Session Logging
 
@@ -516,14 +526,15 @@ The `install` command executes these steps in order:
 2. **Validate images** — Ensure all required image fields are set
 3. **Configure images** — Patch `RELATED_IMAGE_*` env vars in manifest files
 4. **Preflight checks** — Validate tools, SSH connectivity, disk space, config
-5. **Install k0s cluster** — Safety gate check → clean state → install controller → join workers → label nodes
-6. **Install AI Platform stack** (two-phase parallel):
+5. **Model staging** *(when `storage.modelStaging.enabled: true`, the default)* — Download models from Hugging Face and upload them to the configured object store. Set `SKIP_IF_EXISTS=1` to skip re-downloading models already present locally. Skipped entirely when `enabled: false`.
+6. **Install k0s cluster** — Safety gate check → clean state → install controller → join workers → label nodes
+7. **Install AI Platform stack** (two-phase parallel):
    - Phase 1 (parallel): cert-manager, kube-prometheus, NVIDIA host drivers
    - Between phases: Ensure S3 credentials secret
    - Phase 2 (parallel): OTel operator, Ray operator, Splunk operator, NVIDIA device plugin
    - Sequential: Image pull secrets → Splunk standalone → AI operator → AIPlatform CR
-7. **Health checks** — Verify all components are running
-8. **Access info** — Display kubeconfig path and service endpoints
+8. **Health checks** — Verify all components are running
+9. **Access info** — Display kubeconfig path and service endpoints
 
 ### join-workers Command
 

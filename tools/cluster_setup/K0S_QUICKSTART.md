@@ -21,12 +21,11 @@ Deploys the complete Splunk AI Platform stack on k0s Kubernetes using pre-provis
 
 **External S3-compatible storage:** Any S3-compatible endpoint (SeaweedFS, MinIO, AWS S3). Must be provisioned **before** running the installer. Customer managed.
 
-The S3 bucket must be pre-populated with the following directories before installation:
-
+The S3 bucket must contain the following directory before AI inference services start. The installer populates it automatically when `storage.modelStaging.enabled: true` (the default). If you manage staging separately, ensure it is in place before running `install` with staging disabled:
 
 | Directory          | Required | Description                                                                                                                                                   |
 | ------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model_artifacts/` | **Yes**  | Pre-trained model weights. Must be uploaded before install; Ray workers download models from here at startup. Without these, AI inference services will fail. |
+| `model_artifacts/` | **Yes**  | Pre-trained model weights. Ray workers download models from here at startup. Without these, AI inference services will fail. Auto-populated by `install` when `storage.modelStaging.enabled: true`. |
 
 
 **Required models in `model_artifacts/`:**
@@ -48,20 +47,40 @@ The S3 bucket must be pre-populated with the following directories before instal
 
 ### Downloading and Uploading Model Artifacts
 
-Helper scripts in `tools/artifacts_download_upload_scripts/` automate downloading models from Hugging Face and uploading them to S3-compatible storage.
+The installer handles this automatically when `storage.modelStaging.enabled: true` (the default). It downloads models from Hugging Face and uploads them to your configured object store as part of the `install` flow, before the k0s cluster is created.
 
-**Step 1 — Download models from Hugging Face:**
+**To run staging standalone** (without a cluster install):
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+**To skip re-downloading models already present locally:**
+
+```bash
+SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+**To skip staging entirely** (models already in object store — set in YAML):
+
+```yaml
+storage:
+  modelStaging:
+    enabled: false
+```
+
+The staging step reads HF credentials and model list from `tools/artifacts_download_upload_scripts/model_artifacts_configs.yaml`. Edit that file to add/remove models or set `hf-token` / `hf-username` for gated models.
+
+**Manual staging** (running the scripts directly):
+
+Helper scripts in `tools/artifacts_download_upload_scripts/` can also be run independently:
 
 ```bash
 cd tools/artifacts_download_upload_scripts
-# Edit model_artifacts_configs.yaml if you need to add/remove models or set HF credentials for gated models
-./download_from_huggingface.sh
+./download_from_huggingface.sh   # downloads into ./model_artifacts/
 ```
 
-Downloads all configured models into `./model_artifacts/`. Auto-installs dependencies (`wget`, `yq`, `git-lfs`). Supports gated models via `hf-token` / `hf-username` in `model_artifacts_configs.yaml`.
-
-**Step 2 — Upload to your object store:**
-
+Then upload:
 
 | Storage Type          | Script                   | Key Environment Variables                                                                                                                |
 | --------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
@@ -70,19 +89,7 @@ Downloads all configured models into `./model_artifacts/`. Auto-installs depende
 | AWS S3                | `upload_to_s3.sh`        | `S3_BUCKET`, `S3_REGION` (requires AWS CLI credentials)                                                                                  |
 | MinIO via AWS CLI     | `upload_to_minio_aws.sh` | `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, `S3COMPAT_OBJECT_STORE_ACCESS_KEY`, `S3COMPAT_OBJECT_STORE_SECRET_KEY` |
 
-
-Example (SeaweedFS):
-
-```bash
-S3COMPAT_OBJECT_STORE_ENDPOINT=http://seaweedfs-host:8333 \
-S3COMPAT_OBJECT_STORE_BUCKET=ai-platform-bucket \
-S3COMPAT_OBJECT_STORE_ACCESS_KEY=minioadmin \
-S3COMPAT_OBJECT_STORE_SECRET_KEY=minioadmin \
-./upload_to_seaweedfs.sh
-```
-
 **Additional utilities:**
-
 
 | Script                         | Purpose                                      |
 | ------------------------------ | -------------------------------------------- |
@@ -90,7 +97,6 @@ S3COMPAT_OBJECT_STORE_SECRET_KEY=minioadmin \
 | `create_seaweedfs_folders.sh`  | Create standard bucket folder structure      |
 | `install_seaweedfs_systemd.sh` | Install SeaweedFS as a systemd service       |
 | `install_minio_ec2.sh`         | Install MinIO on an EC2 instance             |
-
 
 > See `tools/artifacts_download_upload_scripts/README.md` for full usage details.
 
@@ -112,24 +118,33 @@ kubectl get aiplatform -n ai-platform
 
 ## 3. Commands
 
-| Command        | Description                                        |
-| -------------- | -------------------------------------------------- |
-| `install`      | Create k0s cluster + deploy full AI Platform stack |
-| `clean-all`    | Stop + reset + wipe all k0s state from every node  |
-| `join-workers` | Add or rejoin worker nodes to an existing cluster  |
+| Command           | Description                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| `install`         | Create k0s cluster + deploy full AI Platform stack (auto-stages models if enabled)  |
+| `stage-artifacts` | Download models from Hugging Face and upload to object store (standalone, no cluster required) |
+| `clean-all`       | Stop + reset + wipe all k0s state from every node                                   |
+| `join-workers`    | Add or rejoin worker nodes to an existing cluster                                    |
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh <command>
+
+# Stage models without re-downloading ones already present locally
+SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+
+# Install but skip model staging (models already in object store)
+# Set storage.modelStaging.enabled: false in your config, then:
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 **Environment variables:**
 
 
-| Variable       | Default                     | Description                    |
-| -------------- | --------------------------- | ------------------------------ |
-| `CONFIG_FILE`  | `./k0s-cluster-config.yaml` | Config file path               |
-| `USE_EXISTING` | from config                 | Override `cluster.useExisting` |
-| `LOG_DIR`      | `./logs`                    | Session log directory          |
+| Variable         | Default                     | Description                                                                          |
+| ---------------- | --------------------------- | ------------------------------------------------------------------------------------ |
+| `CONFIG_FILE`    | `./k0s-cluster-config.yaml` | Config file path                                                                     |
+| `USE_EXISTING`   | from config                 | Override `cluster.useExisting`                                                       |
+| `LOG_DIR`        | `./logs`                    | Session log directory                                                                |
+| `SKIP_IF_EXISTS` | `0`                         | Set to `1` to skip re-downloading models already present in `model_artifacts/`      |
 
 
 ## 4. What `install` Does
@@ -137,12 +152,16 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh <command>
 ```
 1. Load config → validate images → patch RELATED_IMAGE_* in manifests
 2. Preflight checks (tools, SSH, disk space)
-3. Install k0s cluster (safety gate → clean state → controller → workers → labels)
-4. Phase 1 (parallel): cert-manager, kube-prometheus, NVIDIA host drivers
-5. Ensure S3 credentials secret
-6. Phase 2 (parallel): OTel operator, Ray operator, Splunk operator, NVIDIA device plugin
-7. Sequential: image pull secrets → Splunk standalone → AI operator → AIPlatform CR
-8. Health checks → access info
+3. Model staging (when storage.modelStaging.enabled: true):
+   - Download models from Hugging Face → upload to object store
+   - Set SKIP_IF_EXISTS=1 to skip models already downloaded locally
+   - Set storage.modelStaging.enabled: false to skip entirely
+4. Install k0s cluster (safety gate → clean state → controller → workers → labels)
+5. Phase 1 (parallel): cert-manager, kube-prometheus, NVIDIA host drivers
+6. Ensure S3 credentials secret
+7. Phase 2 (parallel): OTel operator, Ray operator, Splunk operator, NVIDIA device plugin
+8. Sequential: image pull secrets → Splunk standalone → AI operator → AIPlatform CR
+9. Health checks → access info
 ```
 
 **Safety gate:** If the controller already has Ready nodes, `install` refuses to wipe. Use `useExisting: auto` or run `clean-all` first.
@@ -191,6 +210,7 @@ The config template is `k0s-cluster-config.yaml`. Copy it and edit. Key sections
 | `objectStore.endpoint`          | **Yes**  | —                  | S3 endpoint (*required for non-AWS)        |
 | `objectStore.auth.rootUser`     | Yes      | —                  | Access key                                 |
 | `objectStore.auth.rootPassword` | Yes      | —                  | Secret key                                 |
+| `modelStaging.enabled`          | No       | `true`             | Download models from HF + upload to object store before install. Set `false` to skip. |
 
 
 #### S3 Bucket Directory Layout
