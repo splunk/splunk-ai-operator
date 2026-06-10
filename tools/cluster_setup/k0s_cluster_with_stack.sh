@@ -119,7 +119,54 @@ cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/n
 trap cleanup_tmp EXIT
 
 # ====== LOAD CONFIGURATION ======
+
+ensure_yq() {
+  command -v yq >/dev/null 2>&1 && return 0
+  local os arch url
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64|amd64)   arch="amd64" ;;
+    aarch64|arm64)  arch="arm64" ;;
+    *) warn "yq auto-install: unsupported arch ${arch}, skipping"; return 1 ;;
+  esac
+  case "${os}" in
+    Linux)
+      url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}"
+      log "Installing yq (linux-${arch})..."
+      if curl -fsSL -o /tmp/yq "${url}"; then
+        chmod +x /tmp/yq
+        if [[ "$(id -u)" -eq 0 ]]; then
+          mv /tmp/yq /usr/local/bin/yq
+        else
+          sudo mv /tmp/yq /usr/local/bin/yq 2>/dev/null || { mkdir -p ~/.local/bin; mv /tmp/yq ~/.local/bin/yq; export PATH="$PATH:$HOME/.local/bin"; }
+        fi
+      else
+        warn "yq download failed — config parsing may be unreliable"; return 1
+      fi
+      ;;
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then
+        log "Installing yq via brew..."
+        brew install yq
+      else
+        url="https://github.com/mikefarah/yq/releases/latest/download/yq_darwin_${arch}"
+        log "Installing yq (darwin-${arch})..."
+        if curl -fsSL -o /tmp/yq "${url}"; then
+          chmod +x /tmp/yq
+          sudo mv /tmp/yq /usr/local/bin/yq 2>/dev/null || { mkdir -p ~/.local/bin; mv /tmp/yq ~/.local/bin/yq; export PATH="$PATH:$HOME/.local/bin"; }
+        else
+          warn "yq download failed — config parsing may be unreliable"; return 1
+        fi
+      fi
+      ;;
+    *) warn "yq auto-install: unsupported OS ${os}, skipping"; return 1 ;;
+  esac
+  command -v yq >/dev/null 2>&1 && log "yq installed: $(yq --version 2>/dev/null)" || warn "yq install succeeded but binary not found in PATH"
+}
+
 load_config() {
+  ensure_yq
   log "Loading configuration from: ${CONFIG_FILE}"
   [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
 
@@ -180,8 +227,10 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   MIN_DISK_CPU_WORKER="${MIN_DISK_CPU_WORKER//[!0-9]/}"
   MIN_DISK_GPU_WORKER="${MIN_DISK_GPU_WORKER//[!0-9]/}"
 
-  # Object storage: objectStore.type (aws | s3compat | minio | seaweedfs); default minio when unset
+  # Object storage: objectStore.type (aws | minio | seaweedfs); s3compat accepted as a legacy alias for minio.
   OBJ_STORE_TYPE="$(yq eval '.storage.objectStore.type // "minio"' "$CONFIG_FILE" 2>/dev/null || echo "minio")"
+  # Normalise s3compat → minio so all downstream logic only sees aws | minio | seaweedfs.
+  [[ "${OBJ_STORE_TYPE}" == "s3compat" ]] && OBJ_STORE_TYPE="minio"
   OBJ_STORE_BUCKET="$(yq eval '.storage.objectStore.bucket // "ai-platform-data"' "$CONFIG_FILE" 2>/dev/null || echo "ai-platform-data")"
   OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   _obj_user="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "$CONFIG_FILE" 2>/dev/null || echo "minioadmin")"
@@ -190,6 +239,10 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   MINIO_BUCKET="${OBJ_STORE_BUCKET}"
   MINIO_ROOT_USER="${MINIO_ROOT_USER:-$_obj_user}"
   MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$_obj_pw}"
+
+  # Model staging: download from HF + upload to object store before cluster install.
+  MODEL_STAGING_ENABLED="$(yq eval '.storage.modelStaging.enabled // "true"' "$CONFIG_FILE" 2>/dev/null || echo "true")"
+  [[ "${MODEL_STAGING_ENABLED}" == "null" ]] && MODEL_STAGING_ENABLED="true"
 
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
@@ -245,6 +298,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
+  log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -475,7 +529,7 @@ preflight_checks() {
         [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
       fi
       ;;
-    s3compat|minio)
+    minio)
       [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "Endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "objectStore.endpoint is required"
       ;;
     aws)
@@ -494,7 +548,7 @@ preflight_checks() {
       fi
       ;;
     *)
-      pf_fail "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, s3compat, minio, seaweedfs"
+      pf_fail "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, minio, seaweedfs (s3compat is accepted as a legacy alias for minio)"
       ;;
   esac
   [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required (objectStore.auth.rootPassword)"
@@ -1343,7 +1397,7 @@ ensure_s3compat_credentials() {
   # "aws" — endpoint dropped to mirror the EKS installer's behaviour and to
   # match the operator's classifyObjectStorage() helper).
   case "${OBJ_STORE_TYPE}" in
-    s3compat|minio|seaweedfs)
+    minio|seaweedfs)
       if [[ -z "${OBJ_STORE_ENDPOINT}" && -z "${MINIO_ENDPOINT}" ]]; then
         err "storage.objectStore.type=${OBJ_STORE_TYPE} requires storage.objectStore.endpoint"
         return 1
@@ -1365,6 +1419,67 @@ ensure_s3compat_credentials() {
     --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
     --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
   log "✓ S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
+}
+
+# ====== MODEL ARTIFACT STAGING ======
+# Downloads model artifacts from Hugging Face and uploads them to the configured
+# object store. Runs before k0s cluster work so models are available when Ray
+# workers start. Reads HF credentials from model_artifacts_configs.yaml (in the
+# same directory as the upload/download scripts — no extra env vars needed for HF).
+stage_model_artifacts() {
+  local staging_dir
+  staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
+    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of cluster_setup/)"; return 1; }
+
+  log "Model staging directory: ${staging_dir}"
+
+  if object_store_auth_looks_like_placeholder; then
+    err "Refusing to stage artifacts: objectStore.auth still contains template placeholders; fix ${CONFIG_FILE}"
+    return 1
+  fi
+
+  # ---- Download from Hugging Face ----
+  log "Downloading model artifacts from Hugging Face..."
+  ( cd "${staging_dir}" && SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" bash ./download_from_huggingface.sh ) \
+    || { err "Hugging Face download failed — see output above"; return 1; }
+
+  # ---- Upload to object store (dispatch by type) ----
+  log "Uploading model artifacts to object store (type=${OBJ_STORE_TYPE})..."
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      ( cd "${staging_dir}" && \
+        S3_BUCKET="${OBJ_STORE_BUCKET}" \
+        S3_REGION="${REGION:-us-east-2}" \
+        AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+        AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+        bash ./upload_to_s3.sh ) \
+        || { err "Upload to S3 failed"; return 1; }
+      ;;
+    minio)
+      ( cd "${staging_dir}" && \
+        OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+        OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        bash ./upload_to_minio.sh ) \
+        || { err "Upload to MinIO failed"; return 1; }
+      ;;
+    seaweedfs)
+      ( cd "${staging_dir}" && \
+        OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+        OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        bash ./upload_to_seaweedfs_upload_only.sh ) \
+        || { err "Upload to SeaweedFS failed"; return 1; }
+      ;;
+    *)
+      err "Unsupported objectStore.type for model staging: '${OBJ_STORE_TYPE}' (expected: aws | minio | seaweedfs)"
+      return 1
+      ;;
+  esac
+
+  log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
 }
 
 # ====== INSTALL CERT-MANAGER ======
@@ -2936,21 +3051,17 @@ EOF
     log "No imagePullSecrets found, using public images only"
   fi
 
-  # objectStorage: path/endpoint/secret by object store type (aws | s3compat | minio | seaweedfs)
+  # objectStorage: path/endpoint/secret by object store type (aws | minio | seaweedfs).
+  # minio and seaweedfs both render as s3compat:// in the CR — classifyObjectStorage()
+  # in the operator maps s3compat/minio/seaweedfs schemes identically to cloudProvider=s3compat,
+  # and storageclient.go routes all three to NewS3CompatibleClient. Using s3compat:// here
+  # keeps the CR uniform regardless of which S3-compatible backend is behind the endpoint.
   local obj_path obj_endpoint obj_secret
   obj_secret="minio-credentials"
   case "${OBJ_STORE_TYPE}" in
-    s3compat)
+    minio|seaweedfs)
       obj_path="s3compat://${OBJ_STORE_BUCKET}"
-      obj_endpoint="${OBJ_STORE_ENDPOINT}"
-      ;;
-    minio)
-      obj_path="minio://${MINIO_BUCKET}"
       obj_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
-      ;;
-    seaweedfs)
-      obj_path="seaweedfs://${OBJ_STORE_BUCKET}"
-      obj_endpoint="${OBJ_STORE_ENDPOINT}"
       ;;
     aws)
       obj_path="s3://${OBJ_STORE_BUCKET}"
@@ -2966,7 +3077,7 @@ EOF
       obj_endpoint=""
       ;;
     *)
-      err "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, s3compat, minio, seaweedfs"
+      err "Unsupported objectStore.type: ${OBJ_STORE_TYPE}. Supported: aws, minio, seaweedfs"
       ;;
   esac
 
@@ -4590,6 +4701,13 @@ main_install() {
 
   preflight_checks
 
+  if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
+    log "Model staging enabled — downloading from Hugging Face and uploading to object store…"
+    stage_model_artifacts
+  else
+    log "Model staging disabled (storage.modelStaging.enabled=false) — skipping HF download + upload"
+  fi
+
   # Check if existing Kubernetes cluster should be used
   local use_existing_cluster=false
 
@@ -4909,23 +5027,28 @@ clean_all() {
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $0 [install|delete|clean-all|join-workers|verify-pods]
+Usage: $0 [install|stage-artifacts|delete|clean-all|join-workers|verify-pods]
 
 Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
 
 Commands:
-  install       - Install k0s cluster and AI Platform stack
-  join-workers  - Join/rejoin worker nodes to existing cluster (resume after failure)
-  delete        - Delete cluster and all resources (graceful)
-  clean-all     - Aggressive cleanup including node-level cleanup
-  verify-pods   - Verify every pod across every namespace AND every workload CR
-                  (RayCluster/RayService, Splunk Standalone, AIPlatform/AIService).
-                  Waits for Ray workers to be created/pulled by the head, captures
-                  diagnostics (events + recent logs) for unhealthy pods, and emits
-                  targeted remediation recommendations. Stale
-                  'saia-vector-db-setup-posthook' errors are ignored when the newest
-                  posthook pod has Succeeded.
+  install          - Install k0s cluster and AI Platform stack (auto-stages model
+                     artifacts first when storage.modelStaging.enabled=true)
+  stage-artifacts  - Download model artifacts from Hugging Face and upload them to
+                     the configured object store. Runs standalone — no cluster
+                     required. Useful to re-stage or to pre-load before install.
+                     Always runs regardless of storage.modelStaging.enabled.
+  join-workers     - Join/rejoin worker nodes to existing cluster (resume after failure)
+  delete           - Delete cluster and all resources (graceful)
+  clean-all        - Aggressive cleanup including node-level cleanup
+  verify-pods      - Verify every pod across every namespace AND every workload CR
+                     (RayCluster/RayService, Splunk Standalone, AIPlatform/AIService).
+                     Waits for Ray workers to be created/pulled by the head, captures
+                     diagnostics (events + recent logs) for unhealthy pods, and emits
+                     targeted remediation recommendations. Stale
+                     'saia-vector-db-setup-posthook' errors are ignored when the newest
+                     posthook pod has Succeeded.
 
 Environment:
   CONFIG_FILE              - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
@@ -4940,7 +5063,14 @@ Environment:
   POD_HEALTH_POLL_INTERVAL - Seconds between checks while waiting (default: 15)
 
 Examples:
-  # Install with existing IPs
+  # Install with existing IPs (auto-stages models if storage.modelStaging.enabled=true)
+  CONFIG_FILE=./my-config.yaml $0 install
+
+  # Stage model artifacts only (no cluster install; skips staging gate in YAML)
+  CONFIG_FILE=./my-config.yaml $0 stage-artifacts
+
+  # Skip model staging during install (models already in object store)
+  # Set storage.modelStaging.enabled: false in your config YAML, then:
   CONFIG_FILE=./my-config.yaml $0 install
 
   # Join worker nodes (if install failed or was interrupted)
@@ -4974,6 +5104,11 @@ Notes:
     * Removes k0s data directories (preserves k0s binary)
     * Cleans kubelet, CNI, and Calico files
     * Flushes iptables rules
+  - 'stage-artifacts' runs independently of the YAML gate; set
+    storage.modelStaging.enabled: false to skip auto-staging during 'install'
+    while still being able to run it manually via this subcommand.
+    HF credentials (hf-token, hf-username) are read from
+    ../artifacts_download_upload_scripts/model_artifacts_configs.yaml.
   - 'verify-pods' runs the same pod-health audit that 'install' triggers at
     the end. Useful for re-checking a cluster, gathering remediation hints
     after a partial failure, or verifying a manual fix.
@@ -5259,6 +5394,10 @@ join_workers() {
 case "${1:-install}" in
   install)
     main_install
+    ;;
+  stage-artifacts)
+    load_config
+    stage_model_artifacts
     ;;
   delete)
     main_delete

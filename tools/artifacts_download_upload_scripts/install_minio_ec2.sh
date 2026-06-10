@@ -192,7 +192,9 @@ install_minio_binary() {
   fi
   chmod +x "$tmp"
   mv "$tmp" /usr/local/bin/minio
-  minio --version
+  # Restore SELinux context — binary moved from /tmp inherits user_tmp_t which systemd cannot exec.
+  command -v restorecon &>/dev/null && restorecon /usr/local/bin/minio || true
+  /usr/local/bin/minio --version
 }
 
 install_mc() {
@@ -217,7 +219,8 @@ install_mc() {
   fi
   chmod +x "$tmp"
   mv "$tmp" /usr/local/bin/mc
-  mc --version
+  command -v restorecon &>/dev/null && restorecon /usr/local/bin/mc || true
+  /usr/local/bin/mc --version
 }
 
 # Stop MinIO so we can replace the binary without restart loop (e.g. after wrong-arch fix).
@@ -225,6 +228,7 @@ systemctl stop minio 2>/dev/null || true
 # Always (re)install MinIO binary so we get the correct architecture for this host.
 # A wrong-arch binary (e.g. amd64 on arm64 EC2) causes "Exec format error" and crash-loop.
 install_minio_binary
+export PATH="$PATH:/usr/local/bin"
 if ! command -v mc &>/dev/null; then
   install_mc
 else
