@@ -123,6 +123,8 @@ trap cleanup_tmp EXIT
 ensure_yq() {
   command -v yq >/dev/null 2>&1 && return 0
   local os arch url
+  # Pinned version — matches download_from_huggingface.sh; update both together.
+  local YQ_VERSION="v4.44.1"
   os="$(uname -s)"
   arch="$(uname -m)"
   case "${arch}" in
@@ -132,8 +134,8 @@ ensure_yq() {
   esac
   case "${os}" in
     Linux)
-      url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}"
-      log "Installing yq (linux-${arch})..."
+      url="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}"
+      log "Installing yq ${YQ_VERSION} (linux-${arch})..."
       if curl -fsSL -o /tmp/yq "${url}"; then
         chmod +x /tmp/yq
         if [[ "$(id -u)" -eq 0 ]]; then
@@ -150,8 +152,8 @@ ensure_yq() {
         log "Installing yq via brew..."
         brew install yq
       else
-        url="https://github.com/mikefarah/yq/releases/latest/download/yq_darwin_${arch}"
-        log "Installing yq (darwin-${arch})..."
+        url="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_darwin_${arch}"
+        log "Installing yq ${YQ_VERSION} (darwin-${arch})..."
         if curl -fsSL -o /tmp/yq "${url}"; then
           chmod +x /tmp/yq
           sudo mv /tmp/yq /usr/local/bin/yq 2>/dev/null || { mkdir -p ~/.local/bin; mv /tmp/yq ~/.local/bin/yq; export PATH="$PATH:$HOME/.local/bin"; }
@@ -166,7 +168,8 @@ ensure_yq() {
 }
 
 load_config() {
-  ensure_yq
+  ensure_yq || true
+  command -v yq >/dev/null 2>&1 || err "yq is required to parse ${CONFIG_FILE}. Install it (brew install yq / snap install yq) and retry."
   log "Loading configuration from: ${CONFIG_FILE}"
   [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
 
@@ -1445,6 +1448,9 @@ stage_model_artifacts() {
 
   # ---- Upload to object store (dispatch by type) ----
   log "Uploading model artifacts to object store (type=${OBJ_STORE_TYPE})..."
+  if [[ "${OBJ_STORE_TYPE}" == "minio" || "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+    [[ -n "${OBJ_STORE_ENDPOINT}" ]] || { err "storage.objectStore.endpoint is required for ${OBJ_STORE_TYPE} model staging"; return 1; }
+  fi
   case "${OBJ_STORE_TYPE}" in
     aws)
       ( cd "${staging_dir}" && \
@@ -5036,9 +5042,10 @@ Commands:
   install          - Install k0s cluster and AI Platform stack (auto-stages model
                      artifacts first when storage.modelStaging.enabled=true)
   stage-artifacts  - Download model artifacts from Hugging Face and upload them to
-                     the configured object store. Runs standalone — no cluster
-                     required. Useful to re-stage or to pre-load before install.
-                     Always runs regardless of storage.modelStaging.enabled.
+                     the configured object store. Useful to re-stage or to
+                     pre-load before install. Requires nodes.existingIPs in the
+                     config (same as install). Always runs regardless of
+                     storage.modelStaging.enabled.
   join-workers     - Join/rejoin worker nodes to existing cluster (resume after failure)
   delete           - Delete cluster and all resources (graceful)
   clean-all        - Aggressive cleanup including node-level cleanup
