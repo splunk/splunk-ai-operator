@@ -51,7 +51,7 @@ OPTIONS
   --installer SCRIPT    Path to k0s_cluster_with_stack.sh.
                         Default: same directory as this script.
 
-  --subcommand CMD      Installer subcommand to run: install | upgrade | join-workers
+  --subcommand CMD      Installer subcommand to run: install | join-workers
                         Default: install
                         Env: SUBCOMMAND
 
@@ -115,11 +115,11 @@ EXAMPLES
     --config /etc/splunk-ai/my-cluster-config.yaml \
     --extract-dir /opt/airgap
 
-  # Run upgrade instead of fresh install
+  # Re-join workers after a failed or partial install
   ./install_from_airgap_bundle.sh \
     --bundle airgap-bundle-20260612-103000.tar.gz \
     --config my-cluster-config.yaml \
-    --subcommand upgrade
+    --subcommand join-workers
 
 MANUAL USE (advanced)
   If you extracted the bundle yourself and want to run the installer directly,
@@ -269,17 +269,23 @@ export CERT_MANAGER_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/cert-manager.ya
 export LOCAL_PATH_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/local-path-storage.yaml"
 export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
 
-# Helm chart paths — installer uses these instead of remote repos
-PROM_TGZ="${LOCAL_CHARTS_DIR}/kube-prometheus-stack-${PROMETHEUS_CHART_VERSION}.tgz"
-OTEL_TGZ="${LOCAL_CHARTS_DIR}/opentelemetry-operator-${OTEL_CHART_VERSION}.tgz"
-KUBERAY_TGZ="${LOCAL_CHARTS_DIR}/kuberay-operator-${KUBERAY_CHART_VERSION}.tgz"
-METALLB_TGZ="${LOCAL_CHARTS_DIR}/metallb-${METALLB_CHART_VERSION}.tgz"
+# Helm chart paths — installer uses these instead of remote repos.
+# helm pull sometimes produces underscores instead of dashes in the filename,
+# so resolve via glob; fail fast if the chart is genuinely missing.
+_resolve_chart() {
+  local pattern="$1" label="$2"
+  # shellcheck disable=SC2206
+  local matches=( ${pattern} )
+  if [[ ${#matches[@]} -eq 0 || ! -f "${matches[0]}" ]]; then
+    err "Chart not found for ${label} (expected: ${pattern}). Bundle may be corrupt or version-mismatched."
+  fi
+  echo "${matches[0]}"
+}
 
-# Warn if expected chart files are missing (bundle may be from a different version)
-for tgz in "${PROM_TGZ}" "${OTEL_TGZ}" "${KUBERAY_TGZ}" "${METALLB_TGZ}"; do
-  # helm pull sometimes adds underscores vs dashes in filenames — find flexibly
-  [[ -f "${tgz}" ]] || warn "Expected chart not found (name mismatch?): ${tgz}"
-done
+PROM_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/kube-prometheus-stack-${PROMETHEUS_CHART_VERSION}*.tgz" "kube-prometheus-stack")"
+OTEL_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/opentelemetry-operator-${OTEL_CHART_VERSION}*.tgz" "opentelemetry-operator")"
+KUBERAY_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/kuberay-operator-${KUBERAY_CHART_VERSION}*.tgz" "kuberay-operator")"
+METALLB_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/metallb-${METALLB_CHART_VERSION}*.tgz" "metallb")"
 
 export PROMETHEUS_CHART_PATH="${PROM_TGZ}"
 export OTEL_CHART_PATH="${OTEL_TGZ}"

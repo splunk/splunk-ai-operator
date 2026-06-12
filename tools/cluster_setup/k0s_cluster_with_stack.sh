@@ -57,7 +57,7 @@ echo "[LOG] Session log: ${LOG_FILE}"
 _rotate_logs() {
   local keep=10
   local logs
-  # Sort oldest-first; delete everything beyond the last $keep files.
+  # Newest-first; tail of the array is the oldest — delete those.
   mapfile -t logs < <(ls -1t "${LOG_DIR}"/k0s-install-*.log 2>/dev/null)
   local excess=$(( ${#logs[@]} - keep ))
   if (( excess > 0 )); then
@@ -1671,7 +1671,7 @@ ensure_s3compat_credentials() {
   if [[ -n "${_endpoint}" ]]; then
     wait_for_dependency \
       "object store (${OBJ_STORE_TYPE}) at ${_endpoint}" \
-      "curl -sf --connect-timeout 5 --max-time 10 '${_endpoint}' >/dev/null 2>&1 || curl -sf --connect-timeout 5 --max-time 10 '${_endpoint}' -o /dev/null -w '%{http_code}' 2>/dev/null | grep -qE '^[0-9]'" \
+      "curl -sL --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' '${_endpoint}' 2>/dev/null | grep -qE '^[0-9]'" \
       300
   fi
   # Endpoint is only required for S3-compatible backends (MinIO/SeaweedFS/
@@ -5245,8 +5245,12 @@ main_install() {
   # Run health checks
   phase_start "Health Verification"
   step_start "Platform health checks"
-  check_platform_health || { step_fail "some components still initializing"; warn "Some components may still be initializing"; }
-  step_ok 2>/dev/null || true  # step_fail already called on error path above
+  if check_platform_health; then
+    step_ok
+  else
+    step_fail "some components still initializing"
+    warn "Some components may still be initializing"
+  fi
 
   # Verify every pod across every namespace, capture diagnostics for failures,
   # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
@@ -5863,25 +5867,11 @@ join_workers() {
     log "Joining worker: ${worker_ip}"
     log "============================================"
 
-    # Check if k0s is installed
-    log "  Checking if k0s is installed..."
-    if ! ssh_exec "${worker_ip}" "command -v k0s >/dev/null 2>&1"; then
-      log "  Installing k0s..."
-      if ! ssh_exec "${worker_ip}" "curl -sSLf '${K0S_INSTALL_URL:-https://get.k0s.sh}' | sudo sh"; then
-        warn "  Failed to install k0s on ${worker_ip}, skipping..."
-        continue
-      fi
-    else
-      log "  ✓ k0s already installed"
-    fi
-
-    # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
-    ssh_exec "${worker_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
-
     # Thorough cleanup before rejoining (handles stale configurations)
     cleanup_worker_k0s "${worker_ip}"
 
-    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary)
+    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary).
+    # Handles both online (curl get.k0s.sh) and air-gap (file:// scp) install paths.
     prepare_nodes_for_k0s "${worker_ip}"
 
     # Install worker with fresh token

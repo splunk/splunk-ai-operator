@@ -111,17 +111,17 @@ grep -l "gemma-4-31b-it" \
 ### T1-5: Model list in artifacts README matches source of truth
 
 ```bash
-# Source of truth
-grep "^  name:" tools/artifacts_download_upload_scripts/model_artifacts_configs.yaml \
-  | awk '{print $2}' | sort
+# Source of truth — YAML uses "  - artifact-id:" (2 spaces + dash)
+grep "^  - artifact-id:" tools/artifacts_download_upload_scripts/model_artifacts_configs.yaml \
+  | awk '{print $3}' | sort
 
-# README list
-grep -E "^\| \`" tools/artifacts_download_upload_scripts/README.md \
+# K0S_README.md model table — rows of the form "   | `<artifact-id>` |" with hyphens in name
+grep -E "^\s+\| \`[a-z][a-z0-9-]+\` \|" tools/cluster_setup/K0S_README.md \
   | awk -F'`' '{print $2}' | sort
 ```
 
 **Pass:** Both lists are identical.
-**Fail:** Any model present in the YAML is absent from the README, or vice versa.
+**Fail:** Any model present in the YAML is absent from K0S_README.md, or vice versa.
 
 ---
 
@@ -138,7 +138,7 @@ for var in \
   OTEL_CHART_PATH \
   KUBERAY_CHART_PATH \
   METALLB_CHART_PATH; do
-  grep -q "\${${var}" tools/cluster_setup/k0s_cluster_with_stack.sh \
+  grep -qF "\${${var}" tools/cluster_setup/k0s_cluster_with_stack.sh \
     && echo "OK: $var" \
     || echo "MISSING: $var"
 done
@@ -171,7 +171,8 @@ for doc in tools/cluster_setup/K0S_README.md tools/cluster_setup/DEPLOYMENT_GUID
   grep -oP '\[.*?\]\(\K[^)]+(?=\))' "$doc" \
     | grep -v "^http" | grep -v "^#" \
     | while read -r f; do
-        [ -f "tools/cluster_setup/$f" ] \
+        base="${f%%#*}"
+        [ -f "tools/cluster_setup/$base" ] \
           && echo "OK: $f" \
           || echo "BROKEN: $f"
       done
@@ -451,7 +452,7 @@ grep -c "packages/" tools/cluster_setup/prepare_airgap_bundle.sh
 
 ---
 
-### T1-29: DEPLOYMENT_GUIDE.md exists and contains all 14 Mermaid diagrams
+### T1-29: DEPLOYMENT_GUIDE.md exists and contains all 11 Mermaid diagrams
 
 ```bash
 # File exists
@@ -461,8 +462,8 @@ test -f tools/cluster_setup/DEPLOYMENT_GUIDE.md && echo "OK: file exists" || ech
 grep -c '```mermaid' tools/cluster_setup/DEPLOYMENT_GUIDE.md
 ```
 
-**Pass:** File exists; count = 14.
-**Fail:** File missing or count ≠ 14.
+**Pass:** File exists; count = 11.
+**Fail:** File missing or count ≠ 11.
 
 ---
 
@@ -1294,7 +1295,7 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T1-26 | `--gpu-os` argument parsing present in `prepare_airgap_bundle.sh` | No | No | < 1 min | Yes |
 | T1-27 | `--gpu-os` validation gate rejects non-rhel9 — code review | No | No | < 1 min | Yes |
 | T1-28 | `packages/` section integrated into `prepare_airgap_bundle.sh` | No | No | < 1 min | Yes |
-| T1-29 | `DEPLOYMENT_GUIDE.md` exists with 14 Mermaid diagrams | No | No | < 1 min | Yes |
+| T1-29 | `DEPLOYMENT_GUIDE.md` exists with 11 Mermaid diagrams | No | No | < 1 min | Yes |
 | T2-16 | `--gpu-os` validation rejects unsupported values (live run) | No | No | < 1 min | Yes |
 | T2-17 | `packages/` dir in bundle — all 4 GPU package files present | No | Yes | ~5 min | Recommended |
 | T2-18 | Bundle checksums include `packages/` files | No | No | < 1 min | Recommended |

@@ -135,8 +135,7 @@ again at the start of every `install` invocation.
 
 The node is not running RHEL 9.
 
-**Supported:** RHEL 9 only. RHEL 10, Amazon Linux 2023, Rocky Linux,
-AlmaLinux, and Debian/Ubuntu are not tested or supported for cluster nodes.
+**Supported:** RHEL 9 only. Other Linux distributions are not tested or supported for cluster nodes.
 
 **Options:**
 

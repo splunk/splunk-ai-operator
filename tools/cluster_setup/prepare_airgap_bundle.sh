@@ -139,7 +139,7 @@ GPU NODE PACKAGES (packages/ directory)
   developer.download.nvidia.com. For a truly offline install you still need
   either a local RPM mirror or to pre-install the NVIDIA driver and
   nvidia-container-toolkit before running this script.
-  See AIRGAP.md → 'GPU Node OS Packages — Strategies' for full options.
+  See K0S_README.md — 'GPU Nodes in Air-Gapped Environments' for full options.
 
 HELP
       exit 0
@@ -480,7 +480,7 @@ VEOF
 log "--- Computing checksums ---"
 (
   cd "${STAGE_DIR}"
-  find binaries manifests charts packages -type f | sort | while read -r f; do
+  find . -type f ! -name "checksums.sha256" | sed 's|^\./||' | sort | while read -r f; do
     printf "%s  %s\n" "$(sha256 "$f")" "$f"
   done
 ) > "${STAGE_DIR}/checksums.sha256"
