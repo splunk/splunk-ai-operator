@@ -244,8 +244,11 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$_obj_pw}"
 
   # Model staging: download from HF + upload to object store before cluster install.
-  MODEL_STAGING_ENABLED="$(yq eval '.storage.modelStaging.enabled // "true"' "$CONFIG_FILE" 2>/dev/null || echo "true")"
-  [[ "${MODEL_STAGING_ENABLED}" == "null" ]] && MODEL_STAGING_ENABLED="true"
+  # Read the raw value without a `// default` — the `// "true"` fallback treats
+  # boolean false as falsy and incorrectly returns "true" when enabled: false.
+  # Default to "true" only when the key is absent (yq returns "null").
+  MODEL_STAGING_ENABLED="$(yq eval '.storage.modelStaging.enabled' "$CONFIG_FILE" 2>/dev/null || echo "null")"
+  [[ "${MODEL_STAGING_ENABLED}" == "null" || -z "${MODEL_STAGING_ENABLED}" ]] && MODEL_STAGING_ENABLED="true"
 
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
@@ -3528,16 +3531,16 @@ install_ai_platform_stack() {
   local phase2_pids=() phase2_names=() phase2_logdir
   phase2_logdir=$(mktemp -d)
 
-  install_otel_operator_and_contrib_collector > "${phase2_logdir}/otel.log" 2>&1 &
+  install_otel_operator_and_contrib_collector > "${phase2_logdir}/otel-operator.log" 2>&1 &
   phase2_pids+=($!); phase2_names+=("otel-operator")
 
-  install_ray_operator > "${phase2_logdir}/ray.log" 2>&1 &
+  install_ray_operator > "${phase2_logdir}/ray-operator.log" 2>&1 &
   phase2_pids+=($!); phase2_names+=("ray-operator")
 
   install_splunk_operator > "${phase2_logdir}/splunk-operator.log" 2>&1 &
   phase2_pids+=($!); phase2_names+=("splunk-operator")
 
-  install_nvidia_device_plugin > "${phase2_logdir}/nvidia-plugin.log" 2>&1 &
+  install_nvidia_device_plugin > "${phase2_logdir}/nvidia-device-plugin.log" 2>&1 &
   phase2_pids+=($!); phase2_names+=("nvidia-device-plugin")
 
   for i in "${!phase2_pids[@]}"; do
