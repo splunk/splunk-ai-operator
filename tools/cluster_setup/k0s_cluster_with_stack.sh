@@ -59,6 +59,27 @@ warn()  { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 need()  { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
 
+# ====== DESTRUCTIVE-ACTION CONFIRMATION ======
+# Gate irreversible operations (cluster wipe, node-level rm -rf, iptables flush)
+# behind an explicit confirmation. Set AUTO_APPROVE=true to skip the prompt
+# (CI / automation). On a non-interactive stdin with AUTO_APPROVE unset we
+# refuse rather than silently proceeding — destroying a cluster should never be
+# the default when nobody is at the keyboard.
+confirm_destructive() {
+  local action="$1"
+  if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
+    warn "${action}: AUTO_APPROVE=true — skipping confirmation."
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    err "${action}: stdin is not a TTY and AUTO_APPROVE is not set. Re-run with AUTO_APPROVE=true to proceed non-interactively."
+  fi
+  warn "${action}"
+  local ans
+  read -r -p "Type the cluster name '${CLUSTER_NAME}' to confirm: " ans
+  [[ "${ans}" == "${CLUSTER_NAME}" ]] || err "Confirmation did not match — aborting."
+}
+
 # ====== HELM RETRY LOGIC ======
 # Retries helm commands with exponential backoff on transient errors
 # Usage: helm_retry <max_tries> <helm_command_and_args>
@@ -85,15 +106,6 @@ helm_retry() {
 }
 
 # ====== WAIT FOR RESOURCE HELPERS ======
-# Wait for a specific resource to exist
-wait_resource_exists() {
-  local ns="$1" kind="$2" name="$3" timeout="${4:-300}"
-  log "Waiting for ${kind}/${name} to exist in ${ns} (timeout: ${timeout}s)..."
-  kubectl wait --for=condition=Established --timeout="${timeout}s" "crd/${name}" 2>/dev/null || \
-  timeout "${timeout}s" bash -c "until kubectl get ${kind} ${name} -n ${ns} >/dev/null 2>&1; do sleep 2; done" || \
-  warn "Timeout waiting for ${kind}/${name} in ${ns}"
-}
-
 # Wait for a deployment rollout
 wait_rollout() {
   local ns="$1" kind="$2" name="$3" timeout="${4:-300}"
@@ -570,6 +582,23 @@ preflight_checks() {
   pf_ok "Using existing infrastructure (on-prem/baremetal)"
   pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
   pf_ok "Worker IPs: ${EXISTING_WORKER_IPS}"
+
+  # Worker role classification is positional: the first CPU_WORKER_COUNT worker
+  # IPs are treated as CPU nodes, the rest as GPU. That inference drives disk
+  # thresholds, node labels, AND which hosts get NVIDIA drivers — so if the
+  # configured counts don't sum to the actual worker-IP count, nodes get
+  # silently mislabeled and pods sit Pending. Validate the arithmetic up front.
+  local _pf_worker_ips=()
+  IFS=' ' read -ra _pf_worker_ips <<< "${EXISTING_WORKER_IPS}"
+  local _pf_worker_n=0 _ip
+  for _ip in "${_pf_worker_ips[@]}"; do [[ -n "${_ip}" ]] && _pf_worker_n=$((_pf_worker_n + 1)); done
+  local _pf_cpu="${CPU_WORKER_COUNT//[!0-9]/}"; _pf_cpu="${_pf_cpu:-0}"
+  local _pf_gpu="${GPU_WORKER_COUNT//[!0-9]/}"; _pf_gpu="${_pf_gpu:-0}"
+  if (( _pf_cpu + _pf_gpu == _pf_worker_n )); then
+    pf_ok "Worker counts consistent: ${_pf_cpu} CPU + ${_pf_gpu} GPU = ${_pf_worker_n} worker IP(s)"
+  else
+    pf_fail "Worker count mismatch: nodes.cpuWorkers (${_pf_cpu}) + nodes.gpuWorkers (${_pf_gpu}) = $((_pf_cpu + _pf_gpu)), but ${_pf_worker_n} worker IP(s) are listed in nodes.existingIPs.workers. The first ${_pf_cpu} worker IP(s) are labeled CPU and the rest GPU — fix the counts or the IP list so they agree, or GPU drivers/labels will land on the wrong nodes."
+  fi
   [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]] && pf_ok "SSH key: ${SSH_KEY_PATH}" || pf_fail "SSH key not found: ${SSH_KEY_PATH}"
 
   # Validate SSH reachability for all nodes before any install begins
@@ -1043,7 +1072,13 @@ PYSCRIPT"
   log "Verifying worker nodes joined the cluster..."
   local expected_nodes=$((${#CONTROLLER_IPS[@]} + ${#WORKER_IPS[@]}))
   local actual_nodes
-  actual_nodes=$(ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers | wc -l")
+  actual_nodes=$(ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+  # Scrub to a bare integer — SSH/wc can emit surrounding whitespace or a
+  # multi-line payload, which would make the `-lt` comparison below abort with
+  # "integer expression expected" under `set -euo pipefail`. Mirror the
+  # join-wait loop above, which already does this.
+  actual_nodes=$(echo "${actual_nodes}" | tr -d '[:space:]')
+  [[ "${actual_nodes}" =~ ^[0-9]+$ ]] || actual_nodes=0
 
   log "Expected nodes: ${expected_nodes}, Actual nodes: ${actual_nodes}"
 
@@ -1577,6 +1612,18 @@ _install_nvidia_on_node() {
     # must either succeed or have an explicit fallback branch that succeeds.
     if ! ssh_exec "${gpu_ip}" "
       set -euo pipefail
+
+      # --- Arch guard ---
+      # The CUDA repo URLs built below are hardcoded to .../x86_64/... (and the
+      # Debian path to ubuntu2204 x86_64). On an arm64 GPU host (Grace-Hopper /
+      # GH200) those URLs fetch the wrong repo and fail with a confusing dnf/apt
+      # error much later. Fail fast with an actionable message instead.
+      ARCH=\$(uname -m)
+      if [ \"\${ARCH}\" != 'x86_64' ] && [ \"\${ARCH}\" != 'amd64' ]; then
+        echo \"ERROR: NVIDIA driver install in this script only supports x86_64 (got: \${ARCH}).\" >&2
+        echo '       For arm64 GPU nodes, pre-install the NVIDIA driver + container toolkit out-of-band and re-run.' >&2
+        exit 1
+      fi
 
       # --- OS detection (RHEL 9, RHEL 10, Amazon Linux 2023, Debian/Ubuntu) ---
       # OS_VERSION holds the numeric major we use to build the CUDA+EPEL URLs.
@@ -2553,108 +2600,6 @@ install_splunk_ai_operator() {
   log "Splunk AI Operator ready (ns=${ai_operator_ns}, deploy=${dep:-unknown})"
 }
 
-# ====== CREATE MINIO SECRET FOR AI PLATFORM ======
-create_minio_secret() {
-  local ns="$1"
-  ensure_namespace "${ns}"
-
-  log "Creating MinIO credentials secret in ${ns}..."
-
-  kubectl create secret generic minio-credentials \
-    --namespace="${ns}" \
-    --from-literal=accessKey="${MINIO_ROOT_USER}" \
-    --from-literal=secretKey="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-  log "MinIO credentials secret created"
-  echo "minio-credentials"
-}
-
-# ====== SETUP ECR REPOSITORY PERMISSIONS ======
-setup_ecr_permissions() {
-  local repo_prefix="${1:-ml-platform}"
-  # Use ECR_REGION from config, fallback to REGION, then us-east-2
-  local ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
-
-  log "Checking ECR repository permissions for: ${repo_prefix} in region ${ecr_region}..."
-
-  # Check if AWS credentials are available
-  if ! aws sts get-caller-identity &>/dev/null; then
-    warn "AWS credentials not available - skipping ECR setup"
-    return 0
-  fi
-
-  local current_account
-  current_account=$(aws sts get-caller-identity --query Account --output text)
-  log "Current AWS Account: ${current_account}"
-
-  # List repositories matching prefix
-  local repos
-  repos=$(aws ecr describe-repositories --region "${ecr_region}" 2>/dev/null | \
-    jq -r --arg prefix "${repo_prefix}" '.repositories[] | select(.repositoryName | startswith($prefix)) | .repositoryName' || echo "")
-
-  if [[ -z "${repos}" ]]; then
-    warn "No ECR repositories found with prefix: ${repo_prefix}"
-    log "You may need to:"
-    log "  1. Create ECR repositories for AI Platform images"
-    log "  2. Push images to ECR"
-    log "  3. Grant pull permissions to this account (${current_account})"
-    return 0
-  fi
-
-  log "Found ECR repositories:"
-  echo "${repos}" | sed 's/^/  - /'
-
-  # For each repository, ensure pull permissions are granted
-  for repo in ${repos}; do
-    log "Checking permissions for repository: ${repo}"
-
-    # Get current policy
-    local policy
-    policy=$(aws ecr get-repository-policy --repository-name "${repo}" --region "${ecr_region}" 2>/dev/null | jq -r '.policyText' || echo "")
-
-    if [[ -z "${policy}" ]]; then
-      log "  No policy found, creating one to allow pull access..."
-
-      # Create policy allowing pull from this account
-      cat > "/tmp/ecr-policy-${repo//\//-}.json" <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowPull",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::${current_account}:root"
-      },
-      "Action": [
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability"
-      ]
-    }
-  ]
-}
-EOF
-
-      if aws ecr set-repository-policy \
-        --repository-name "${repo}" \
-        --region "${ecr_region}" \
-        --policy-text "file:///tmp/ecr-policy-${repo//\//-}.json" &>/dev/null; then
-        log "  ✓ Pull permissions granted for repository: ${repo}"
-      else
-        warn "  Could not set policy for repository: ${repo}"
-      fi
-
-      rm -f "/tmp/ecr-policy-${repo//\//-}.json"
-    else
-      log "  ✓ Repository policy already exists"
-    fi
-  done
-
-  log "ECR repository permissions configured"
-}
-
 # ====== CREATE IMAGE PULL SECRETS FROM CONFIG ======
 create_image_pull_secrets() {
   local ns="$1"
@@ -2803,63 +2748,6 @@ create_image_pull_secrets() {
   if [[ ${#secrets_created[@]} -gt 0 ]]; then
     echo "${secrets_created[@]}"
   fi
-}
-
-# ====== CREATE ECR IMAGE PULL SECRET (Legacy - kept for compatibility) ======
-create_ecr_secret() {
-  local ns="$1"
-  # Use ECR_REGION from config, fallback to REGION, then us-east-2
-  local region="${ECR_REGION:-${REGION:-us-east-2}}"
-  local ecr_account="${ECR_ACCOUNT:-}"
-
-  ensure_namespace "${ns}"
-
-  log "Creating ECR image pull secret in ${ns}..."
-
-  # Check if AWS credentials are available
-  if ! aws sts get-caller-identity &>/dev/null; then
-    warn "=========================================="
-    warn "AWS credentials not available!"
-    warn "=========================================="
-    warn "Skipping ECR secret creation."
-    warn "If AI Platform uses private ECR images, pods will fail to pull images."
-    warn ""
-    warn "To fix:"
-    warn "  1. Configure AWS credentials: aws configure"
-    warn "  2. Ensure ECR repository permissions are granted (run setup_ecr_permissions.sh)"
-    warn "  3. Re-run the installation"
-    warn "=========================================="
-    return 0
-  fi
-
-  # Auto-detect ECR account if not provided
-  if [[ -z "${ecr_account}" ]]; then
-    ecr_account=$(aws sts get-caller-identity --query Account --output text)
-    log "Auto-detected ECR account: ${ecr_account}"
-  fi
-
-  log "Prerequisite: ECR repository permissions must be configured beforehand"
-  log "  Run: ./setup_ecr_permissions.sh to set up ECR access"
-
-  # Get ECR authorization token
-  log "Getting ECR authorization token for region ${region}..."
-  local ecr_password
-  if ! ecr_password=$(aws ecr get-login-password --region "${region}" 2>/dev/null); then
-    warn "Failed to get ECR token - skipping secret creation"
-    warn "Check AWS credentials and permissions"
-    return 0
-  fi
-
-  # Create docker-registry secret
-  kubectl create secret docker-registry ecr-registry-secret \
-    --docker-server="${ecr_account}.dkr.ecr.${region}.amazonaws.com" \
-    --docker-username=AWS \
-    --docker-password="${ecr_password}" \
-    --namespace="${ns}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-  log "✓ ECR secret created: ecr-registry-secret"
-  log "✓ Secret will be referenced in AIPlatform CR spec.imagePullSecrets"
 }
 
 # ====== INSTALL SPLUNK STANDALONE ======
@@ -4909,6 +4797,11 @@ main_install() {
 main_delete() {
   load_config
 
+  # Guard the wipe unless a caller already confirmed (clean_all confirms first).
+  if [[ "${_DELETE_CONFIRMED:-false}" != "true" ]]; then
+    confirm_destructive "This will DELETE cluster '${CLUSTER_NAME}': all Kubernetes resources will be removed and k0s will be stopped + reset on every node."
+  fi
+
   log "============================================"
   log "Starting cleanup of k0s cluster: ${CLUSTER_NAME}"
   log "============================================"
@@ -4998,6 +4891,12 @@ clean_all() {
   warn "This will forcefully remove all resources and data!"
 
   load_config
+
+  # Confirm once here (the extra node-level rm -rf + iptables flush below make
+  # this strictly more destructive than main_delete), then suppress the prompt
+  # inside main_delete so the operator isn't asked twice.
+  confirm_destructive "AGGRESSIVE CLEANUP of cluster '${CLUSTER_NAME}': in addition to a full delete, this removes k0s data dirs, kubelet/CNI/Calico files, and FLUSHES all iptables rules on every node."
+  export _DELETE_CONFIRMED=true
 
   # Run normal delete first
   main_delete
