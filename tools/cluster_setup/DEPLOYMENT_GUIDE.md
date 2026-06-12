@@ -58,7 +58,6 @@ flowchart TD
 | Typical cloud / on-prem | ✅ | ✅ | Standard deployment |
 | Install machine online, cluster isolated | ✅ | ❌ | Air-gapped deployment |
 | Everything offline | ❌ | ❌ | Air-gapped deployment (prepare bundle on a third machine) |
-| Only GPU nodes blocked | ✅ | ✅ (non-GPU) / ❌ (GPU) | Standard + pre-install GPU drivers |
 
 ---
 
