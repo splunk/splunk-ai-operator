@@ -24,6 +24,18 @@
 | **wait_for_dependency() — object store** | ~20 lines in `ensure_s3compat_credentials` | `ensure_s3compat_credentials` | **Low** — adds a wait before secret creation; worst case adds ≤5 min if store is briefly unreachable | **Partial** — guard logic reviewable; wait behaviour needs live test |
 | **wait_for_dependency() — HuggingFace** | ~8 lines in `stage_model_artifacts` | `stage_model_artifacts` | **Low** — skipped when `AIRGAP_MODE=true`; adds pause before download | **Partial** — AIRGAP_MODE guard reviewable; wait needs live test |
 | **wait_for_dependency() — NVIDIA repos** | ~10 lines in `install_nvidia_host_drivers` | `install_nvidia_host_drivers` | **Low** — skipped when `AIRGAP_MODE=true`; per-node check before toolkit install | **Partial** — AIRGAP_MODE guard reviewable; wait needs live test |
+| **`_check_node_os()` helper + wiring** | ~45 lines (new helper) + 2 wiring sites | `prepare_nodes_for_k0s`, `_install_nvidia_on_node` | **Medium** — gates all node work; wrong regex exits prematurely | **Partial** — guard logic reviewable; must run against real node to verify OS string parsing |
+| **AIRGAP_MODE hard-fail on missing nvidia-smi** | ~8 lines in `_install_nvidia_on_node` | `_install_nvidia_on_node` | **Low** — new branch between existing detection and install phases | **Yes** — grep code path |
+| **GPU package URL overrides (EPEL, CUDA, CTK)** | ~20 lines (`${VAR:-url}` patterns in `_install_nvidia_on_node`) | `_install_nvidia_on_node` | **Low** — original URLs preserved as defaults | **Yes** — grep |
+| **`AIRGAP_PYYAML_WHEEL_PATH` support (all nodes)** | ~15 lines in `prepare_nodes_for_k0s` + ~10 lines in `install_from_airgap_bundle.sh` | `prepare_nodes_for_k0s` | **Low** — new branch; falls through to `dnf install` if var unset | **Yes** — grep |
+| **`prepare_airgap_bundle.sh` packages/ section** | ~80 lines (new section 5) | None (new code in existing script) | **Low** — additive; does not touch existing sections | **Yes** — `bash -n` + grep |
+| **`--gpu-os` argument + validation gate** | ~30 lines in `prepare_airgap_bundle.sh` | Argument-parsing block | **None** — new argument; existing behaviour unchanged if not passed | **Yes** — grep |
+| **RHEL 10 / AL2023 removal from docs** | ~50 lines changed across 4 docs | K0S_README, K0S_QUICKSTART, AIRGAP, k0s_cluster_with_stack.sh comments | **None** — documentation | **Yes** — grep |
+| **DEPLOYMENT_GUIDE.md (new file)** | 829 lines (new file, 14 Mermaid diagrams) | None | **None** — new file, no code change | **Partial** — file parseable locally; diagram rendering needs GitHub preview |
+| **Staging machine requirements** | ~20 lines across AIRGAP.md, K0S_QUICKSTART.md, DEPLOYMENT_GUIDE.md | None | **None** — documentation | **Yes** — grep |
+| **GPU spec update (8 × L40S, g6e.12xlarge)** | ~15 lines across K0S_QUICKSTART, K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
+| **VOC Portal removal from k0s docs** | ~5 lines changed in K0S_QUICKSTART, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
+| **`defaultAcceleratorType` description (L40S only)** | ~3 lines across K0S_QUICKSTART, K0S_README | None | **None** — documentation | **Yes** — grep |
 
 ---
 
@@ -231,6 +243,229 @@ grep -c 'AUTO_APPROVE.*true' tools/cluster_setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Count ≥ 2 (install plan gate + delete prompt gate).
+
+---
+
+### T1-14: `_check_node_os()` helper is defined and wired at both call sites
+
+```bash
+# Helper definition present
+grep -c "^_check_node_os()" tools/cluster_setup/k0s_cluster_with_stack.sh
+
+# Wired into prepare_nodes_for_k0s
+grep -A60 "^prepare_nodes_for_k0s()" tools/cluster_setup/k0s_cluster_with_stack.sh \
+  | grep "_check_node_os"
+
+# Wired into _install_nvidia_on_node
+grep -A20 "^_install_nvidia_on_node()" tools/cluster_setup/k0s_cluster_with_stack.sh \
+  | grep "_check_node_os"
+```
+
+**Pass:** Definition count = 1; both function bodies show a `_check_node_os` call.
+**Fail:** Any output missing — helper not defined or not wired.
+
+---
+
+### T1-15: `FORCE_UNSUPPORTED_OS` escape hatch is present
+
+```bash
+grep "FORCE_UNSUPPORTED_OS" tools/cluster_setup/k0s_cluster_with_stack.sh
+```
+
+**Pass:** At least one line with `FORCE_UNSUPPORTED_OS:-0` guard in `_check_node_os`.
+**Fail:** No match — internal testing escape hatch missing.
+
+---
+
+### T1-16: AIRGAP_MODE hard-fail code path is present in `_install_nvidia_on_node`
+
+```bash
+grep -A8 'AIRGAP_MODE.*true' tools/cluster_setup/k0s_cluster_with_stack.sh \
+  | grep -E "ERROR.*AIRGAP_MODE|nvidia-smi.*not found"
+```
+
+**Pass:** At least one error message mentioning `AIRGAP_MODE` and missing nvidia-smi.
+**Fail:** No match — AIRGAP hard-fail was not added.
+
+---
+
+### T1-17: GPU package URL override variables are wired into `_install_nvidia_on_node`
+
+```bash
+for var in EPEL_RPM_URL_OVERRIDE CUDA_REPO_URL_OVERRIDE NVIDIA_CTK_REPO_URL_OVERRIDE; do
+  grep -q "\${${var}" tools/cluster_setup/k0s_cluster_with_stack.sh \
+    && echo "OK: $var" \
+    || echo "MISSING: $var"
+done
+```
+
+**Pass:** All 3 print `OK`.
+**Fail:** Any `MISSING` — override env var not wired in.
+
+---
+
+### T1-18: Original GPU package URLs still present as defaults
+
+```bash
+grep "dl.fedoraproject.org/pub/epel"        tools/cluster_setup/k0s_cluster_with_stack.sh
+grep "developer.download.nvidia.com/compute" tools/cluster_setup/k0s_cluster_with_stack.sh
+grep "nvidia.github.io/libnvidia-container"  tools/cluster_setup/k0s_cluster_with_stack.sh
+```
+
+**Pass:** All 3 match — original URLs preserved as `${VAR:-<url>}` defaults.
+**Fail:** Any grep finds nothing — URL was removed rather than made overridable.
+
+---
+
+### T1-19: `AIRGAP_PYYAML_WHEEL_PATH` branch is present in installer
+
+```bash
+grep "AIRGAP_PYYAML_WHEEL_PATH" tools/cluster_setup/k0s_cluster_with_stack.sh
+grep "AIRGAP_PYYAML_WHEEL_PATH" tools/cluster_setup/install_from_airgap_bundle.sh
+```
+
+**Pass:** At least one match in each file.
+**Fail:** Missing from either file — offline pyyaml install not wired.
+
+---
+
+### T1-20: RHEL 10 and Amazon Linux 2023 removed from all k0s docs
+
+```bash
+grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
+  tools/cluster_setup/K0S_README.md \
+  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/AIRGAP.md \
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md
+```
+
+**Pass:** Zero matches.
+**Fail:** Any match — removed OS still mentioned in docs.
+
+---
+
+### T1-21: Supported OS stated consistently as RHEL 9 family
+
+```bash
+grep -c "Rocky.*9\|AlmaLinux.*9\|CentOS.*Stream.*9" \
+  tools/cluster_setup/K0S_README.md \
+  tools/cluster_setup/K0S_QUICKSTART.md
+```
+
+**Pass:** Count > 0 in each file — compatible distros listed.
+**Fail:** 0 — only "RHEL 9" listed without mentioning compatible alternatives.
+
+---
+
+### T1-22: VOC Portal removed from all k0s docs
+
+```bash
+grep -rni "VOC.Portal\|voc portal" \
+  tools/cluster_setup/K0S_README.md \
+  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/AIRGAP.md \
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md
+```
+
+**Pass:** Zero matches.
+**Fail:** Any match — VOC Portal reference still present.
+
+---
+
+### T1-23: `defaultAcceleratorType` described as required, L40S only
+
+```bash
+grep -A2 "defaultAcceleratorType" tools/cluster_setup/K0S_README.md \
+  | grep -i "L40S\|only"
+grep -i "defaultAcceleratorType" tools/cluster_setup/K0S_QUICKSTART.md \
+  | grep -i "L40S"
+```
+
+**Pass:** Both return a match confirming L40S is the required/only value.
+**Fail:** No match — description may still say "e.g." or omit the constraint.
+
+---
+
+### T1-24: GPU spec is consistently 8 × L40S across docs
+
+```bash
+grep -c "8.*L40S\|L40S.*8" \
+  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md
+```
+
+**Pass:** Count ≥ 1 in each file.
+**Fail:** 0 in any file — 8-GPU total not explicitly called out.
+
+---
+
+### T1-25: Staging machine requirements (250 GB / 16 GB) present in all three docs
+
+```bash
+for f in \
+  tools/cluster_setup/AIRGAP.md \
+  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md; do
+  grep -qiE "250.?GB|250 GB" "$f" \
+    && echo "OK (250 GB): $f" \
+    || echo "MISSING (250 GB): $f"
+  grep -qiE "16.?GB|16 GB" "$f" \
+    && echo "OK (16 GB): $f" \
+    || echo "MISSING (16 GB): $f"
+done
+```
+
+**Pass:** All 6 lines print `OK`.
+**Fail:** Any `MISSING` — staging requirements inconsistent across docs.
+
+---
+
+### T1-26: `prepare_airgap_bundle.sh` — `--gpu-os` argument parsing present
+
+```bash
+grep "gpu.os\|gpu_os\|GPU_NODE_OS" tools/cluster_setup/prepare_airgap_bundle.sh
+```
+
+**Pass:** At least 3 matches (variable declaration, argument parsing, validation gate).
+**Fail:** Fewer than 3 — argument or validation not fully wired.
+
+---
+
+### T1-27: `prepare_airgap_bundle.sh` validation gate rejects non-rhel9 values — code review
+
+```bash
+grep -A5 "gpu_node_os.*not supported\|GPU_NODE_OS.*!=.*rhel9\|Only.*rhel9" \
+  tools/cluster_setup/prepare_airgap_bundle.sh
+```
+
+**Pass:** Error message and exit 1 present.
+**Fail:** No match — non-rhel9 values would silently proceed.
+
+---
+
+### T1-28: `prepare_airgap_bundle.sh` packages/ section present
+
+```bash
+grep -c "packages/" tools/cluster_setup/prepare_airgap_bundle.sh
+```
+
+**Pass:** Count ≥ 3 (mkdir, download lines, checksums find).
+**Fail:** Count < 3 — packages directory not fully integrated.
+
+---
+
+### T1-29: DEPLOYMENT_GUIDE.md exists and contains all 14 Mermaid diagrams
+
+```bash
+# File exists
+test -f tools/cluster_setup/DEPLOYMENT_GUIDE.md && echo "OK: file exists" || echo "MISSING"
+
+# Count Mermaid blocks
+grep -c '```mermaid' tools/cluster_setup/DEPLOYMENT_GUIDE.md
+```
+
+**Pass:** File exists; count = 14.
+**Fail:** File missing or count ≠ 14.
 
 ---
 
@@ -469,6 +704,110 @@ grep -A5 "AIRGAP_MODE.*true.*skip.*NVIDIA\|skipping NVIDIA repo" \
 
 ---
 
+### T2-16: `prepare_airgap_bundle.sh --gpu-os` validation rejects unsupported values
+
+```bash
+./tools/cluster_setup/prepare_airgap_bundle.sh --gpu-os rhel10 --output-dir /tmp/dummy 2>&1
+echo "exit: $?"
+
+./tools/cluster_setup/prepare_airgap_bundle.sh --gpu-os amzn2023 --output-dir /tmp/dummy 2>&1
+echo "exit: $?"
+```
+
+**Pass:** Both print an "ERROR: ... not supported" message and exit 1 immediately without downloading anything.
+**Fail:** Either proceeds past the validation gate or exits 0.
+
+---
+
+### T2-17: `prepare_airgap_bundle.sh --gpu-os rhel9` downloads all 4 GPU package files
+
+```bash
+./tools/cluster_setup/prepare_airgap_bundle.sh \
+  --output-dir /tmp/test-bundle-gpu \
+  --gpu-os rhel9 \
+  --k0s-version v1.31.2+k0s.0
+```
+
+Verify the packages/ directory:
+
+```bash
+BUNDLE_DIR=$(tar -tzf /tmp/test-bundle-gpu/airgap-bundle-*.tar.gz | head -1 | cut -d/ -f1)
+tar -tzf /tmp/test-bundle-gpu/airgap-bundle-*.tar.gz | grep "packages/"
+```
+
+Expected:
+```
+airgap-bundle-.../packages/epel-release-latest-9.noarch.rpm
+airgap-bundle-.../packages/cuda-rhel9.repo
+airgap-bundle-.../packages/nvidia-container-toolkit.repo
+airgap-bundle-.../packages/PyYAML-*.whl
+airgap-bundle-.../packages/pyyaml.filename
+```
+
+**Pass:** All 5 paths present and files non-empty; script exits 0.
+**Fail:** Any path missing or empty file.
+
+---
+
+### T2-18: Bundle checksums include packages/ files
+
+```bash
+BUNDLE_DIR=$(tar -tzf /tmp/test-bundle-gpu/airgap-bundle-*.tar.gz | head -1 | cut -d/ -f1)
+tar -xzf /tmp/test-bundle-gpu/airgap-bundle-*.tar.gz -C /tmp/test-bundle-gpu
+grep "packages/" "/tmp/test-bundle-gpu/${BUNDLE_DIR}/checksums.sha256"
+```
+
+**Pass:** At least 4 lines — each GPU package file checksummed.
+**Fail:** 0 lines — packages/ not included in checksums.sha256.
+
+---
+
+### T2-19: `install_from_airgap_bundle.sh` exports `AIRGAP_PYYAML_WHEEL_PATH` from bundle
+
+```bash
+# Use the bundle created in T2-17
+BUNDLE=/tmp/test-bundle-gpu/airgap-bundle-*.tar.gz
+
+# Dry-run: source the env setup portion and check the variable
+bash -c "
+  BUNDLE_DIR=\$(tar -tzf ${BUNDLE} | head -1 | cut -d/ -f1)
+  tar -xzf ${BUNDLE} -C /tmp/pyyaml-test 2>/dev/null
+  PYYAML_FNAME=\$(cat /tmp/pyyaml-test/\${BUNDLE_DIR}/packages/pyyaml.filename 2>/dev/null)
+  echo \"PYYAML_FNAME: \${PYYAML_FNAME}\"
+  [[ -f \"/tmp/pyyaml-test/\${BUNDLE_DIR}/packages/\${PYYAML_FNAME}\" ]] \
+    && echo 'WHEEL: found' \
+    || echo 'WHEEL: missing'
+"
+```
+
+**Pass:** Both `PYYAML_FNAME` (non-empty) and `WHEEL: found` printed.
+**Fail:** Either empty or `WHEEL: missing` — pointer file or wheel absent.
+
+---
+
+### T2-20: `bundle-versions.txt` includes gpu_node_os field
+
+```bash
+BUNDLE_DIR=$(tar -tzf /tmp/test-bundle-gpu/airgap-bundle-*.tar.gz | head -1 | cut -d/ -f1)
+grep "gpu_node_os" "/tmp/test-bundle-gpu/${BUNDLE_DIR}/bundle-versions.txt"
+```
+
+**Pass:** Line `gpu_node_os=rhel9` present.
+**Fail:** Missing — consumers cannot verify what GPU OS the bundle targets.
+
+---
+
+### T2-21: `--help` output of `prepare_airgap_bundle.sh` references `--gpu-os` and package strategy notes
+
+```bash
+./tools/cluster_setup/prepare_airgap_bundle.sh --help | grep -E "gpu.os|GPU_NODE_OS|EPEL|CUDA|NVIDIA_CTK|PyYAML|rhel9"
+```
+
+**Pass:** At least 4 matching lines covering the new options and package notes.
+**Fail:** Fewer — new options not documented in help output.
+
+---
+
 ## Tier 3 — Live cluster (real machines or EC2)
 
 ### T3-1: Normal (online) install still works — regression test
@@ -652,6 +991,123 @@ grep "Waiting for external dependency.*object store" logs/k0s-install-*.log | ta
 
 ---
 
+### T3-12: `_check_node_os()` passes on RHEL 9 (and compatible) nodes
+
+Run the installer against a RHEL 9 (or Rocky 9 / AlmaLinux 9) cluster:
+
+```bash
+grep "OS check passed" logs/k0s-install-*.log
+```
+
+**Pass:** One `OS check passed` line per node (controller + workers + GPU workers).
+**Fail:** Any `Unsupported OS` error — RHEL 9 incorrectly rejected.
+
+Repeat with Rocky Linux 9 and AlmaLinux 9 if available. Both should pass.
+
+---
+
+### T3-13: `_check_node_os()` blocks install on unsupported OS
+
+Attempt an install against a node running an unsupported OS (e.g. Ubuntu 22.04 or RHEL 8):
+
+```bash
+# Run installer — expect failure at OS gate, before any k0s components are touched
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 | grep -E "Unsupported OS|Only RHEL 9"
+echo "exit: $?"
+```
+
+**Pass:** Error message names the detected OS and mentions `FORCE_UNSUPPORTED_OS=1`; installer exits non-zero before touching k0s.
+**Fail:** Install proceeds on unsupported OS, or error message is unhelpful.
+
+---
+
+### T3-14: `FORCE_UNSUPPORTED_OS=1` downgrades error to warning and continues
+
+```bash
+FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 \
+  | grep -E "Unsupported OS|WARN"
+```
+
+**Pass:** Warning message (not error) is printed; install continues past the OS check.
+**Fail:** Install still exits — `FORCE_UNSUPPORTED_OS=1` guard not working.
+
+---
+
+### T3-15: AIRGAP_MODE=true hard-fails when nvidia-smi absent on GPU node
+
+Set up a GPU node with no NVIDIA drivers pre-installed and run the installer with `AIRGAP_MODE=true`:
+
+```bash
+AIRGAP_MODE=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 \
+  | grep -E "AIRGAP_MODE.*nvidia-smi|Pre-install the NVIDIA driver"
+echo "exit: $?"
+```
+
+**Pass:** Error message references `AIRGAP_MODE=true`, missing `nvidia-smi`, and points to `AIRGAP.md`; exit non-zero.
+**Fail:** Installer attempts package downloads (which timeout) or exits with an unhelpful message.
+
+---
+
+### T3-16: GPU package URL overrides redirect install to local mirror
+
+Set up a local HTTP server serving the EPEL RPM, CUDA repo, and CTK repo files. Export the overrides and run the installer:
+
+```bash
+export EPEL_RPM_URL_OVERRIDE="http://mirror.test.internal/epel-release-latest-9.noarch.rpm"
+export CUDA_REPO_URL_OVERRIDE="http://mirror.test.internal/cuda-rhel9.repo"
+export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.test.internal/nvidia-container-toolkit.repo"
+
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+Verify in the install log that the overridden URLs (not the default NVIDIA/Fedora CDN URLs) were fetched:
+
+```bash
+grep "mirror.test.internal" logs/k0s-install-*.log
+```
+
+**Pass:** All 3 override URLs appear in the log; no `dl.fedoraproject.org` or `developer.download.nvidia.com` requests on the GPU node.
+**Fail:** Default URLs still used — `${VAR:-default}` substitution not taking effect.
+
+---
+
+### T3-17: `AIRGAP_PYYAML_WHEEL_PATH` installs pyyaml offline on all nodes
+
+Set `AIRGAP_PYYAML_WHEEL_PATH` to the bundled `.whl` file and run the installer. On each node after install:
+
+```bash
+python3 -c "import yaml; print(yaml.__version__)"
+```
+
+And in the install log:
+
+```bash
+grep "pip3.*no-index\|AIRGAP_PYYAML_WHEEL_PATH\|pyyaml.*wheel" logs/k0s-install-*.log
+```
+
+**Pass:** `yaml` imports successfully on each node; log shows offline pip3 install path (not `dnf install python3-pyyaml`).
+**Fail:** `dnf install` called for pyyaml when wheel path was set, or import fails.
+
+---
+
+### T3-18: Full air-gap install with bundled GPU packages (end-to-end)
+
+Use the bundle from T2-17 (which includes the `packages/` directory). Pre-configure nodes with no NVIDIA drivers. Run the installer with `install_from_airgap_bundle.sh`:
+
+1. `install_from_airgap_bundle.sh` should automatically set `AIRGAP_PYYAML_WHEEL_PATH`
+2. On GPU nodes, follow Strategy 1 from AIRGAP.md using the bundled package files before running the installer
+3. Run the installer — it should detect `nvidia-smi` and skip driver install
+
+```bash
+grep "nvidia-smi.*found\|skipping.*driver" logs/k0s-install-*.log
+grep "pip3.*no-index\|pyyaml.*offline" logs/k0s-install-*.log
+```
+
+**Pass:** Log shows nvidia-smi detected on GPU nodes (skipping install), and pyyaml installed from wheel on all nodes.
+**Fail:** Either driver install attempted in air-gap, or pyyaml falls back to dnf.
+
+---
+
 ## Tier 4 — EC2-based testing
 
 ### Why EC2
@@ -735,6 +1191,43 @@ images:
 
 Use Spot instances to cut cost by ~70%. Terminate all instances immediately after each run.
 
+### Visual review — DEPLOYMENT_GUIDE.md diagrams
+
+Open the file on GitHub (or in a Mermaid-aware viewer) and confirm all 14 diagrams render without syntax errors:
+
+```bash
+# Quick local check — count mermaid blocks to catch accidental deletions
+grep -c '```mermaid' tools/cluster_setup/DEPLOYMENT_GUIDE.md
+# Expected: 14
+```
+
+For each diagram verify:
+- No "Syntax error" overlay in the GitHub renderer
+- Node labels are legible (no truncation)
+- Arrows point in the correct direction
+- Air-gap and non-air-gap paths are visually distinct
+
+The 14 diagrams to review (in order):
+1. Non-air-gap deployment overview (flowchart)
+2. Non-air-gap install sequence (sequenceDiagram)
+3. Network requirements (flowchart)
+4. Air-gap deployment overview (flowchart)
+5. Air-gap install sequence (sequenceDiagram)
+6. Air-gap network architecture (flowchart)
+7. Bundle contents (graph)
+8. GPU node strategy selection (flowchart)
+9. Strategy 1 — pre-install steps (flowchart)
+10. Strategy 2 — local mirror setup (flowchart)
+11. Full cluster architecture (graph)
+12. Install state machine (stateDiagram-v2)
+13. Troubleshooting decision tree (flowchart)
+14. Component dependency graph (graph)
+
+**Pass:** All 14 render cleanly on GitHub with correct labels and flow directions.
+**Fail:** Any diagram shows a syntax error or visually broken layout.
+
+---
+
 ### Teardown
 
 ```bash
@@ -791,3 +1284,32 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T3-9 | Object store wait fires and resolves | Yes | Yes | Part of T3-1 | Yes (for air-gap customers) |
 | T3-10 | Object store wait pauses when store is down | Yes | Yes | ~5 min interactive | Recommended |
 | T3-11 | Air-gap skips HuggingFace + NVIDIA waits, keeps object store wait | Yes | No (blocked) | Part of T3-2 | Yes (for air-gap customers) |
+| T1-14 | `_check_node_os()` defined + wired at both call sites | No | No | < 1 min | Yes |
+| T1-15 | `FORCE_UNSUPPORTED_OS` escape hatch present | No | No | < 1 min | Yes |
+| T1-16 | AIRGAP hard-fail code path in `_install_nvidia_on_node` | No | No | < 1 min | Yes |
+| T1-17 | GPU package URL override vars wired in | No | No | < 1 min | Yes |
+| T1-18 | Original GPU package URLs still present as defaults | No | No | < 1 min | Yes |
+| T1-19 | `AIRGAP_PYYAML_WHEEL_PATH` branch present in installer + bundle script | No | No | < 1 min | Yes |
+| T1-20 | RHEL 10 / AL2023 removed from all k0s docs | No | No | < 1 min | Yes |
+| T1-21 | Supported OS stated consistently (RHEL 9 + compatible) | No | No | < 1 min | Yes |
+| T1-22 | VOC Portal removed from all k0s docs | No | No | < 1 min | Yes |
+| T1-23 | `defaultAcceleratorType` — L40S required, no "e.g." | No | No | < 1 min | Yes |
+| T1-24 | 8 × L40S total called out in K0S_QUICKSTART + DEPLOYMENT_GUIDE | No | No | < 1 min | Yes |
+| T1-25 | Staging requirements (250 GB / 16 GB) in all 3 docs | No | No | < 1 min | Yes |
+| T1-26 | `--gpu-os` argument parsing present in `prepare_airgap_bundle.sh` | No | No | < 1 min | Yes |
+| T1-27 | `--gpu-os` validation gate rejects non-rhel9 — code review | No | No | < 1 min | Yes |
+| T1-28 | `packages/` section integrated into `prepare_airgap_bundle.sh` | No | No | < 1 min | Yes |
+| T1-29 | `DEPLOYMENT_GUIDE.md` exists with 14 Mermaid diagrams | No | No | < 1 min | Yes |
+| T2-16 | `--gpu-os` validation rejects unsupported values (live run) | No | No | < 1 min | Yes |
+| T2-17 | `packages/` dir in bundle — all 4 GPU package files present | No | Yes | ~5 min | Recommended |
+| T2-18 | Bundle checksums include `packages/` files | No | No | < 1 min | Recommended |
+| T2-19 | `AIRGAP_PYYAML_WHEEL_PATH` exported correctly from bundle | No | No | < 1 min | Recommended |
+| T2-20 | `bundle-versions.txt` includes `gpu_node_os` field | No | No | < 1 min | Recommended |
+| T2-21 | `prepare_airgap_bundle.sh --help` documents new GPU options | No | No | < 1 min | Yes |
+| T3-12 | `_check_node_os()` passes on RHEL 9 / Rocky 9 / AlmaLinux 9 | Yes | Yes | Part of T3-1 | Yes (before shipping) |
+| T3-13 | `_check_node_os()` blocks install on unsupported OS | Yes | Yes | ~5 min | Yes (before shipping) |
+| T3-14 | `FORCE_UNSUPPORTED_OS=1` downgrades error to warning | Yes | Yes | ~5 min | Recommended |
+| T3-15 | AIRGAP_MODE hard-fails when nvidia-smi absent on GPU node | Yes | No | ~5 min | Yes (for air-gap customers) |
+| T3-16 | GPU package URL overrides redirect to local mirror | Yes | Yes | ~30 min | Recommended |
+| T3-17 | `AIRGAP_PYYAML_WHEEL_PATH` installs pyyaml offline on all nodes | Yes | No | Part of T3-2 | Yes (for air-gap customers) |
+| T3-18 | Full air-gap install with bundled GPU packages end-to-end | Yes | No (blocked) | ~60 min | Yes (for air-gap customers) |

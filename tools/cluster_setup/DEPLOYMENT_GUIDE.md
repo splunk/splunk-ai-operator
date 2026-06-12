@@ -47,9 +47,9 @@ flowchart TD
     AIRGAP --> ADOC[📄 See Air-Gapped Deployment section]
     FULLAIR --> ADOC
 
-    style STANDARD fill:#22543d,color:#fff
-    style AIRGAP fill:#744210,color:#fff
-    style FULLAIR fill:#63171b,color:#fff
+    style STANDARD fill:#276749,color:#fff
+    style AIRGAP fill:#c05621,color:#fff
+    style FULLAIR fill:#c53030,color:#fff
 ```
 
 | Scenario | Install machine has internet | Cluster nodes have internet | Use |
@@ -147,55 +147,60 @@ flowchart LR
 ### Install Flow
 
 ```mermaid
-sequenceDiagram
-    actor Admin
-    participant WS as Admin Workstation
-    participant HF as HuggingFace
-    participant OBJ as Object Store
-    participant CTRL as Controller Node
-    participant WKRS as Worker Nodes
+flowchart TD
+    START(["Admin: ./k0s_cluster_with_stack.sh install"])
 
-    Admin->>WS: Edit k0s-cluster-config.yaml
-    Admin->>WS: ./k0s_cluster_with_stack.sh install
-
-    rect rgb(30, 60, 30)
-        note over WS: Phase 0 — Preflight
-        WS->>WS: Validate config + tools
-        WS->>CTRL: SSH connectivity check
-        WS->>WKRS: Disk space preflight
-        WS->>OBJ: Object store reachability
+    subgraph P0["🔍 Phase 0 — Preflight"]
+        direction LR
+        V1["Validate config + tools"] --> V2["SSH connectivity check\nall nodes"]
+        V2 --> V3["Disk space preflight\nObject store reachability"]
     end
 
-    rect rgb(30, 50, 80)
-        note over WS,OBJ: Phase 1 — Model Staging (if enabled)
-        WS->>HF: Download model weights (~60 GB)
-        HF-->>WS: gemma-4-31b-it, gpt-oss-20b, + 8 models
-        WS->>OBJ: Upload model_artifacts/
+    subgraph P1["📦 Phase 1 — Model Staging  (if enabled)"]
+        direction LR
+        M1["Download ~60 GB\nfrom HuggingFace"] --> M2["gemma-4-31b-it · gpt-oss-20b\n+ 8 more models"]
+        M2 --> M3["Upload model_artifacts/\nto Object Store"]
     end
 
-    rect rgb(60, 30, 60)
-        note over WS,WKRS: Phase 2 — Cluster Bootstrap
-        WS->>CTRL: Install k0s controller
-        WS->>WKRS: Install k0s workers
-        WS->>WKRS: Label nodes (cpu/gpu roles)
-        WS->>WKRS: Install NVIDIA drivers (GPU nodes)
+    subgraph P2["⚙️ Phase 2 — Cluster Bootstrap"]
+        direction LR
+        C1["Install k0s\ncontroller"] --> C2["Install k0s\nworkers"]
+        C2 --> C3["Label nodes\ncpu / gpu roles"]
+        C3 --> C4["Install NVIDIA drivers\nGPU nodes only"]
     end
 
-    rect rgb(60, 50, 20)
-        note over WS,CTRL: Phase 3 — Platform Stack
-        WS->>CTRL: cert-manager + Prometheus (parallel)
-        WS->>CTRL: OTel + KubeRay + Splunk operators
-        WS->>CTRL: NVIDIA device plugin
-        WS->>CTRL: MetalLB (if LoadBalancer)
-        WS->>CTRL: Splunk Enterprise CR
-        WS->>CTRL: AIPlatform CR
+    subgraph P3["🚀 Phase 3 — Platform Stack"]
+        direction LR
+        H1["cert-manager +\nPrometheus (parallel)"] --> H2["OTel · KubeRay\nSplunk operators"]
+        H2 --> H3["NVIDIA device plugin\nMetalLB"]
+        H3 --> H4["Splunk Enterprise CR\nAIPlatform CR"]
     end
 
-    rect rgb(20, 40, 60)
-        note over WS,CTRL: Phase 4 — Verify
-        WS->>CTRL: Wait for all pods Ready
-        WS->>Admin: Print access URLs + credentials
+    subgraph P4["✅ Phase 4 — Verify"]
+        direction LR
+        R1["Wait for all pods Ready"] --> R2["Print access URLs\n+ credentials"]
     end
+
+    START --> P0 --> P1 --> P2 --> P3 --> P4
+
+    classDef preflight  fill:#d4edda,color:#155724,stroke:#28a745
+    classDef staging    fill:#d1ecf1,color:#0c5460,stroke:#17a2b8
+    classDef bootstrap  fill:#e2d9f3,color:#3d2b6e,stroke:#6f42c1
+    classDef platform   fill:#fff3cd,color:#7d5a00,stroke:#ffc107
+    classDef verify     fill:#d6f5f0,color:#0d4a45,stroke:#20c997
+
+    class V1,V2,V3 preflight
+    class M1,M2,M3 staging
+    class C1,C2,C3,C4 bootstrap
+    class H1,H2,H3,H4 platform
+    class R1,R2 verify
+
+    style START fill:#343a40,color:#ffffff,stroke:#212529
+    style P0 fill:#f0fff4,color:#155724,stroke:#28a745
+    style P1 fill:#e8f8fb,color:#0c5460,stroke:#17a2b8
+    style P2 fill:#f3eeff,color:#3d2b6e,stroke:#6f42c1
+    style P3 fill:#fffdf0,color:#7d5a00,stroke:#ffc107
+    style P4 fill:#eafaf7,color:#0d4a45,stroke:#20c997
 ```
 
 ### Step-by-Step (Standard)
@@ -506,8 +511,8 @@ flowchart TD
     F --> G["6. Export env-var overrides\nall 13 URL + path variables"]
     G --> H["7. Run k0s_cluster_with_stack.sh install\nwith all overrides in effect"]
 
-    style C fill:#1a3a1a
-    style G fill:#1a2a3a
+    style C fill:#c6f6d5,color:#1a202c
+    style G fill:#bee3f8,color:#1a202c
 ```
 
 The install plan shown before any changes are made will display:
