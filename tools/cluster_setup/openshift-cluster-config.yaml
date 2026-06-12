@@ -1,0 +1,105 @@
+# =============================================================================
+# OpenShift Cluster Config for Splunk AI Platform
+# =============================================================================
+# Used by openshift_with_stack.sh
+# =============================================================================
+
+kubernetes:
+  namespace: ai-platform
+
+# OpenShift-specific settings
+openshift:
+  # Grant privileged SCC to Ray worker and operator service accounts.
+  # Required when running GPU workloads (nvidia.com/gpu requests).
+  # Set to "false" only if your cluster policy already covers this.
+  grantPrivilegedSCC: "true"
+
+  # Node labeling for splunk.ai/* workload selectors.
+  # The operator schedules weaviate/ray-head on cpu nodes and Ray workers on gpu nodes.
+  # Use "auto" to detect by nvidia.com/gpu.present label (works when GPU Operator is installed).
+  # Use "manual" to specify node names explicitly below.
+  nodeLabelStrategy: "manual"
+
+  # L40S nodes handle CPU workloads (weaviate, ray-head, saia-api).
+  # RTX 6000 Blackwell node is dedicated to GPU model pods (ray-worker).
+  nodes:
+    cpu:
+      - 00-25-b5-b5-00-31
+      - 00-25-b5-b5-00-33
+    gpu:
+      - cc-40-f3-9f-e2-3c
+
+images:
+  # Registry prefix applied to images that are not fully qualified
+  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
+
+  operator:
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.1"
+
+  ray:
+    headImage: "ml-platform/ray/ray-head:build-953"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-953"
+
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+
+  saia:
+    apiImage: "ml-platform/saia/saia-api:build-v2-main-c3b489d"
+    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
+
+  splunk:
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "50Gi"
+  objectStore:
+    type: "minio"           # aws | s3compat | minio | seaweedfs
+    bucket: "ai-platform-bucket"
+    endpoint: "http://18.116.39.79:8333"
+    auth:
+      rootUser: "minioadmin"
+      rootPassword: "minioadmin"
+
+splunk:
+  standaloneName: splunk-standalone
+
+aiPlatform:
+  name: "openshift-ai-platform"
+  defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
+  workerGroupConfig:
+    imageRegistry: ""
+  serviceTemplate:
+    type: NodePort
+    nodePort: 30080
+  features:
+    - name: "saia"
+      version: "1.1.0"
+
+operators:
+  ray:
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.53.0"
+
+files:
+  aiPlatform: "./artifacts.yaml"
+  splunkOperator: "./splunk-operator-cluster.yaml"
+
+# ECR pull secret — created automatically in all relevant namespaces during install.
+# Requires AWS credentials in the environment (e.g. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# or an instance profile). Set enabled: false for non-ECR registries.
+ecr:
+  enabled: true
+  account: "658391232643"
+  region: "us-east-2"

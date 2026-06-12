@@ -1061,11 +1061,18 @@ spec:
                 items:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
+                    env:
+                      additionalProperties:
+                        type: string
+                      description: Env specifies environment variables to propagate
+                        to the child AIService.
+                      type: object
                     name:
                       description: Name of the feature, e.g. "saia" or "seca"
                       enum:
                       - saia
                       - seca
+                      - weaviate-service
                       type: string
                     scaleFactor:
                       description: ScaleFactor is the desired fixed number of replicas
@@ -2085,6 +2092,11 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                     type: array
+                  otelImage:
+                    default: otel/opentelemetry-collector-contrib:0.122.1
+                    description: OTelImage is the OpenTelemetry Collector sidecar
+                      image
+                    type: string
                   rayHeadGroupImage:
                     description: Ray head group image, e.g. "rayproject/ray-head:latest"
                     type: string
@@ -2225,7 +2237,8 @@ spec:
                 type: object
               objectStorage:
                 description: |-
-                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
+                  ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models.
+                  It is optional for platforms that only enable features that do not require object storage.
                   Supported providers: S3, GCS, Azure Blob Storage, MinIO
                 properties:
                   endpoint:
@@ -2237,8 +2250,8 @@ spec:
                   path:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-                      azure://containername/<path prefix>, minio://bucketname/<path prefix>, seaweedfs://bucketname/<path prefix>, or s3compat://bucketname/<path prefix>
-                    pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
+                      azure://containername/<path prefix>, or minio://bucketname/<path prefix>
+                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -2908,8 +2921,6 @@ spec:
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                 type: object
-            required:
-            - objectStorage
             type: object
           status:
             description: AIPlatformStatus defines observed state
@@ -4084,11 +4095,18 @@ spec:
               features:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
+                  env:
+                    additionalProperties:
+                      type: string
+                    description: Env specifies environment variables to propagate
+                      to the child AIService.
+                    type: object
                   name:
                     description: Name of the feature, e.g. "saia" or "seca"
                     enum:
                     - saia
                     - seca
+                    - weaviate-service
                     type: string
                   scaleFactor:
                     description: ScaleFactor is the desired fixed number of replicas
@@ -4866,27 +4884,15 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Optional override endpoint (only needed for S3-compatible services like MinIO, SeaweedFS)
-                      Must be a valid HTTP/HTTPS URL. When set with s3:// path, backend is treated as S3-compatible (MinIO, SeaweedFS, etc.)
+                      Optional override endpoint (only needed for S3-compatible services like MinIO)
+                      Must be a valid HTTP/HTTPS URL
                     pattern: ^https?://.*$
                     type: string
                   path:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-                      azure://containername/<path prefix>, s3compat://bucketname/<path prefix> (generic S3-compatible), minio://, or seaweedfs://
-                    pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
-                    type: string
-                  provider:
-                    description: |-
-                      Provider is an optional hint for documentation and tooling. Operator derives behavior from path scheme and endpoint.
-                      Values: aws, minio, seaweedfs, s3compat, gcs, azure
-                    enum:
-                    - aws
-                    - minio
-                    - seaweedfs
-                    - s3compat
-                    - gcs
-                    - azure
+                      azure://containername/<path prefix>, or minio://bucketname/<path prefix>
+                    pattern: ^(s3|gs|azure|minio)://[a-zA-Z0-9.\-_]+(/.*)?$
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -4894,8 +4900,7 @@ spec:
                     minLength: 1
                     type: string
                   secretRef:
-                    description: Secret name containing storage credentials (e.g.
-                      s3_access_key, s3_secret_key for S3-compatible backends)
+                    description: Secret name containing storage credentials
                     maxLength: 253
                     minLength: 1
                     type: string
@@ -5682,19 +5687,19 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:build-v2-010
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:build-953
         - name: RELATED_IMAGE_RAY_WORKER
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-v2-010
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-953
         - name: RELATED_IMAGE_WEAVIATE
           value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
+        - name: RELATED_IMAGE_WEAVIATE_SERVICE
+          value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v2-012
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v2-main-c3b489d
         - name: RELATED_IMAGE_SAIA_API_V2
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-012
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-main-c3b489d
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-012
-        - name: SPLUNK_METRICS_INDEX_NAME
-          value: _metrics
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-main-c3b489d
         - name: RELATED_IMAGE_FLUENT_BIT
           value: docker.io/fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR
@@ -5705,7 +5710,7 @@ spec:
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
           value: 2.53.0
-        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.29
+        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.1
         livenessProbe:
           httpGet:
             path: /healthz

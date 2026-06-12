@@ -4,7 +4,6 @@ applicationScale:
   CrossEncoder: 1
   E5LanguageClassifier: 1
   Entrypoint: 1
-  Gemma431bIt: 1
   GptOss20b: 1
   MbartTranslator: 1
   PromptInjectionClassifier: 1
@@ -24,3 +23,7 @@ instanceScale:
   H100_NVL:
     h100-nvl-0-gpu: 1
     h100-nvl-1-gpu: 2
+  RTX_PRO_6000_BLACKWELL:
+    rtx-pro-6000-blackwell-0-gpu: 1
+    rtx-pro-6000-blackwell-1-gpu: 1
+    rtx-pro-6000-blackwell-2-gpu: 0
