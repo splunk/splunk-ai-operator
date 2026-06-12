@@ -64,6 +64,8 @@ flowchart TD
 
 The installer deploys the complete Splunk AI Platform stack onto your k0s cluster.
 
+> **SAIA** = Splunk AI Assistant — the AI chat and SPL-generation application that runs on top of the platform.
+
 ```mermaid
 graph TB
     subgraph CTRL["🖥️  Controller Node"]
@@ -114,6 +116,19 @@ graph TB
 | OTel Operator | latest | Observability |
 | NVIDIA Device Plugin | v0.17.3 | Exposes GPUs to Kubernetes |
 
+### Version Compatibility
+
+| Component | Supported version | Notes |
+|---|---|---|
+| k0s (Kubernetes) | v1.31.x | Installed automatically by the installer |
+| RHEL | 9 | Only supported OS for cluster nodes |
+| NVIDIA CUDA driver | 12.x (cuda-drivers) | Installed via CUDA repo on GPU nodes |
+| NVIDIA Container Toolkit | latest stable | Installed alongside CUDA drivers |
+| GPU hardware | NVIDIA L40S | Only `defaultAcceleratorType: L40S` is supported |
+| Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
+
+> **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are access-controlled through your private registry. Contact your Splunk account team to confirm entitlements before deployment.
+
 ---
 
 ## Standard Deployment (Internet-Connected)
@@ -141,9 +156,30 @@ flowchart LR
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ |
 | GPU Worker | 48 vCPUs | 384 GiB | 500 GB | **2 nodes required** · 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **8 × L40S total, 384 GB total GPU memory** · 100 Gbps · equivalent to g6e.12xlarge |
 
+> **Minimum viable topology:** The platform requires at least 1 controller + 1 CPU worker + 2 GPU workers. The controller and CPU worker roles can coexist on a single machine for lab/testing use, but this is not supported for production. A single GPU worker is not sufficient — the AI inference stack distributes work across both nodes.
+
 **Ports to open between nodes:** 22 (SSH), 6443 (k8s API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN/Calico), 179 (Calico BGP).
 
+**Object storage sizing:**
+
+| Data | Minimum size | Notes |
+|---|---|---|
+| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 10 models + headroom for re-staging |
+| Runtime data (conversations, queues, config) | 100 GB | Grows with usage; monitor and expand as needed |
+| **Total recommended bucket** | **500 GB+** | Plan for growth if running multiple tenants |
+
 ### Install Flow
+
+**Estimated time:**
+
+| Phase | Typical duration | Notes |
+|---|---|---|
+| Preflight | 1–2 min | Config validation and SSH checks |
+| Model staging | 2–6 hours | Depends on internet speed — >120 GB download. Skip with `modelStaging.enabled: false` if already staged. |
+| Cluster bootstrap | 10–20 min | k0s install + NVIDIA driver install on GPU nodes |
+| Platform stack | 15–30 min | Helm chart deploys + operator reconciliation |
+| **Total (first install with staging)** | **~3–7 hours** | Mostly model download time |
+| **Total (staging already done)** | **~30–60 min** | |
 
 ```mermaid
 flowchart TD
@@ -585,6 +621,21 @@ EOF
 
 ## Post-Install Verification
 
+**Component namespaces — quick reference:**
+
+| Namespace | Components |
+|---|---|
+| `ai-platform` | AIPlatform CR, SAIA API v1/v2, Ray Head/Workers, Weaviate, Splunk Enterprise, Data Loader, Nginx |
+| `splunk-ai-operator-system` | Splunk AI Operator controller |
+| `splunk-operator` | Splunk Operator controller |
+| `ray-system` | KubeRay Operator |
+| `cert-manager` | cert-manager controller, webhook, cainjector |
+| `kube-prometheus-stack` | Prometheus, Grafana, Alertmanager |
+| `opentelemetry-operator-system` | OTel Operator |
+| `kube-system` | NVIDIA device plugin DaemonSet, Calico, local-path-provisioner |
+| `metallb-system` | MetalLB controller and speakers (if LoadBalancer enabled) |
+| `local-path-storage` | local-path-provisioner |
+
 ```bash
 # Set kubeconfig
 export KUBECONFIG=~/.kube/k0s-<cluster-name>
@@ -619,6 +670,23 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 | SAIA service | `EXTERNAL-IP` assigned |
 | GPU nodes | `nvidia.com/gpu: N` in allocatable |
 
+**Sample output — healthy cluster:**
+
+```
+# kubectl get nodes
+NAME          STATUS   ROLES    AGE   VERSION
+controller    Ready    master   12m   v1.31.2+k0s
+cpu-worker-1  Ready    <none>   10m   v1.31.2+k0s
+gpu-worker-1  Ready    <none>   10m   v1.31.2+k0s
+gpu-worker-2  Ready    <none>   10m   v1.31.2+k0s
+
+# kubectl get aiplatform -n ai-platform
+NAME                  STATUS   AGE
+my-cluster-ai-platform  Ready    8m
+```
+
+If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 10 minutes, check the session log and see [Troubleshooting](#troubleshooting).
+
 ---
 
 ## Install the Splunk AI Assistant App
@@ -626,6 +694,8 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 After the cluster is healthy, install the **Splunk AI Assistant** app
 (`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance to enable
 the AI chat UI.
+
+> **Obtaining the app:** `Splunk_AI_Assistant_Cloud.tgz` is provided by your Splunk account team as part of your Splunk AI Platform entitlement. Contact your Splunk representative if you do not have it.
 
 ### 1. Find your Splunk Web URL
 
@@ -681,13 +751,19 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 
 ### Re-run after a partial failure
 
-The installer is idempotent for most steps. If install fails partway:
+The installer is safe to re-run for most steps — Helm releases are upgraded if they already exist, and k0s join is skipped for nodes that are already Ready.
+
+**Steps that are NOT idempotent:**
+- **Model staging** — re-downloads files already on disk unless you set `SKIP_IF_EXISTS=1`
+- **`clean-all`** — destructive; wipes all k0s state from every node with no recovery
+
+If install fails partway, re-run directly:
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
-The safety gate prevents wiping a cluster with Ready nodes. If you need to start clean:
+The safety gate prevents wiping a cluster with Ready nodes. If you need to start completely clean:
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all
@@ -709,12 +785,41 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
+### Upgrade the platform
+
+Update your config YAML with new image tags, then re-run install. The installer upgrades existing Helm releases in place:
+
+```bash
+# 1. Update image tags in your config
+vi my-cluster.yaml   # bump operator, ray, saia, splunk image versions
+
+# 2. Run install — Helm upgrades existing releases, does not wipe the cluster
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+```
+
+> The safety gate prevents `install` from wiping a cluster with Ready nodes — it upgrades the stack only. If you also need to upgrade k0s itself, run `clean-all` + `install` (destructive — back up etcd first).
+
+**Air-gap upgrade:**
+
+```bash
+# Build a new bundle on a connected machine
+./prepare_airgap_bundle.sh --output-dir /mnt/transfer
+
+# Then on the install machine
+./install_from_airgap_bundle.sh \
+  --bundle /opt/airgap-bundle-<new-timestamp>.tar.gz \
+  --config my-cluster-config.yaml \
+  --subcommand upgrade
+```
+
 ### Collect a support bundle
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
-# Outputs a redacted tar.gz in logs/ with pod logs, events, node state
+ls tools/cluster_setup/logs/k0s-diagnose-*.tar.gz
 ```
+
+The tar.gz contains: pod logs from all namespaces, Kubernetes events, node descriptions, AIPlatform CR status, and the install session log — with secrets and credentials redacted. **Attach this file when opening a Splunk support case.**
 
 ---
 
@@ -722,8 +827,21 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
 
 ### Diagnose first
 
+**Step 1 — validate config** (catches ~40% of issues before touching any node):
+
 ```bash
-# Collect all cluster state into a support bundle
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+```
+
+**Step 2 — check the session log** (search for `ERROR`):
+
+```bash
+tail -100 tools/cluster_setup/logs/k0s-install-*.log | grep -i error
+```
+
+**Step 3 — collect a support bundle**:
+
+```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
 ls tools/cluster_setup/logs/k0s-diagnose-*.tar.gz
 ```
@@ -747,7 +865,7 @@ flowchart TD
 
     PRE --> FIX_PRE["ssh -i key user@node\ndf -h /var/lib/k0s"]
     MODELS --> FIX_MODELS["./k0s_cluster_with_stack.sh validate\ncheck objectStore.endpoint + credentials"]
-    K0S_FAIL --> FIX_K0S["ssh user@ctrl 'sudo k0s status'\nssl user@ctrl 'sudo journalctl -u k0scontroller -n 50'"]
+    K0S_FAIL --> FIX_K0S["ssh user@ctrl 'sudo k0s status'\nssh user@ctrl 'sudo journalctl -u k0scontroller -n 50'"]
     GPU_FAIL --> FIX_GPU["ssh user@gpu-node nvidia-smi\nkubectl get pods -n kube-system | grep nvidia"]
     HELM_FAIL --> FIX_HELM["kubectl get pods -A | grep -v Running\nkubectl describe pod <failing-pod> -n <ns>"]
     CR_FAIL --> FIX_CR["kubectl describe aiplatform -n ai-platform\nkubectl logs -n splunk-ai-operator-system deploy/splunk-ai-operator-controller-manager"]
@@ -766,6 +884,8 @@ flowchart TD
 | Pod stuck in `ImagePullBackOff` | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists |
 | SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
+
+> For the full symptom list — Ray workers not starting, models not loading, Splunk stuck initializing, and more — see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.
 
 ---
 
