@@ -267,14 +267,14 @@ Short paths auto-prefixed with `images.registry`. All marked **Yes** are require
 **Image sources:**
 
 
-| Source      | Images                                                                                                                     |
+| Source | Images |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
-| VOC Portal  | `operator`, `ray.headImage`, `ray.workerImage`, `saia.apiImage`, `saia.apiV2Image`, `saia.dataLoaderImage`, `splunk.image` |
+| Your registry | `operator`, `ray.headImage`, `ray.workerImage`, `saia.apiImage`, `saia.apiV2Image`, `saia.dataLoaderImage`, `splunk.image` |
 | `docker.io` | `splunk.operatorImage`, `weaviate.image`, `nginx.image`, `fluentBit.image`, `otelCollector.image`                          |
 | `quay.io`   | KubeRay Operator (deployed via Helm, not in this config)                                                                   |
 
 
-> **Note:** VOC Portal images must be pushed to a registry (e.g., ECR, ACR, GCR, private registry) accessible by the cluster. Set `images.registry` to that registry; short paths like `ml-platform/ray/ray-head:tag` are auto-prefixed with it.
+> **Note:** Internal images must be pushed to a registry accessible by the cluster (e.g., ECR, ACR, GCR, or a private registry). Set `images.registry` to that registry; short paths like `ml-platform/ray/ray-head:tag` are auto-prefixed with it.
 
 
 | Field                  | Req     | Default                                        |
@@ -300,7 +300,7 @@ Short paths auto-prefixed with `images.registry`. All marked **Yes** are require
 | Field                             | Required | Default                       | Description                                   |
 | --------------------------------- | -------- | ----------------------------- | --------------------------------------------- |
 | `name`                            | **Yes**  | `${CLUSTER_NAME}-ai-platform` | CR name                                       |
-| `defaultAcceleratorType`          | **Yes**  | `""`                          | `L40S`                                        |
+| `defaultAcceleratorType`          | **Yes**  | `""`                          | Set to `L40S`                                 |
 | `workerGroupConfig.imageRegistry` | No       | `""`                          | Ray worker image override                     |
 | `features[].name`                 | Yes      | —                             | Feature name (e.g., `saia`)                   |
 | `features[].version`              | Yes      | —                             | Feature version                               |

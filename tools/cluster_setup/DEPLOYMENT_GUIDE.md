@@ -215,8 +215,8 @@ The config sections to fill in:
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
 | `nodes.existingIPs` | IP addresses of your controller and worker nodes |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
-| `images` | Your registry URL + all image tags (from ECR / VOC Portal) |
-| `aiPlatform` | `defaultAcceleratorType` (e.g. `L40S`) |
+| `images` | Your registry URL + all image tags |
+| `aiPlatform` | `defaultAcceleratorType` — set to `L40S` |
 | `metallb.pool.addresses` | A free IP range on your LAN (for LoadBalancer VIP) |
 
 **2. Validate your config before installing**

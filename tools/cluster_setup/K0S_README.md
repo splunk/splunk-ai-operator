@@ -291,7 +291,7 @@ splunk:
 
 aiPlatform:
   name: "prod-ai-stack"
-  defaultAcceleratorType: "L40S"        # GPU tier: L40S or ""
+  defaultAcceleratorType: "L40S"        # Only supported value: L40S
   workerGroupConfig:
     imageRegistry: ""                   # Override registry for Ray worker images
   features:
@@ -424,7 +424,7 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `aiPlatform.name` | No | `${CLUSTER_NAME}-ai-platform` | Base name for the AIPlatform CR |
-| `aiPlatform.defaultAcceleratorType` | No | `""` | GPU tier label: `L40S` or empty |
+| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | Must be set to `L40S` |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
