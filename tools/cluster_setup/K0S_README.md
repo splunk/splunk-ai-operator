@@ -13,6 +13,7 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
 - [Architecture](#architecture)
 - [Image Pull Secrets](#image-pull-secrets)
 - [Advanced Topics](#advanced-topics)
+- [Splunk AI Assistant App](#splunk-ai-assistant-app)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
 - [Internet Dependencies](#internet-dependencies)
@@ -1034,6 +1035,226 @@ scp ubuntu@controller-ip:/tmp/etcd-backup.db ./backup/
 scp ./backup/etcd-backup.db ubuntu@controller-ip:/tmp/
 ssh ubuntu@controller-ip
 sudo k0s etcd snapshot restore /tmp/etcd-backup.db
+```
+
+---
+
+## Splunk AI Assistant App
+
+The **Splunk AI Assistant** app (`Splunk_AI_Assistant_Cloud.tgz`) is a Splunk
+application that provides the AI chat UI. It must be installed on the Splunk
+Enterprise instance after the cluster is fully healthy.
+
+### Prerequisites
+
+- All pods are Running: `kubectl get pods -A | grep -v "Running\|Completed"`
+- `AIPlatform` CR is Ready: `kubectl get aiplatform -n ai-platform`
+- You have the `Splunk_AI_Assistant_Cloud.tgz` archive (obtain from your Splunk account team)
+- Splunk Web is reachable from your browser (see [Finding the Splunk Web URL](#finding-the-splunk-web-url))
+
+---
+
+### Finding the Splunk Web URL
+
+Splunk Enterprise listens on port **8000**. How you reach it depends on your
+service configuration.
+
+**NodePort (default)**
+
+```bash
+# Discover the assigned NodePort
+kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
+```
+
+Access URL: `http://<any-worker-node-ip>:<nodePort>`
+
+**LoadBalancer (MetalLB)**
+
+```bash
+kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia \
+  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}'
+```
+
+Access URL: `http://<EXTERNAL-IP>`
+
+**kubectl port-forward (quick access, no external exposure)**
+
+```bash
+kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
+```
+
+Open `http://localhost:8000` in your browser.
+
+**Retrieve the admin password**
+
+```bash
+kubectl get secret splunk-standalone-secret -n ai-platform \
+  -o jsonpath='{.data.password}' | base64 --decode && echo
+```
+
+---
+
+### Install via Splunk UI
+
+1. Open the Splunk Web URL in your browser and log in as `admin`
+2. Click the **Apps** menu in the top navigation bar → **Manage Apps**
+3. Click **Install app from file**
+4. Click **Choose File** and select `Splunk_AI_Assistant_Cloud.tgz`
+5. Check **Upgrade app** if a previous version is already installed
+6. Click **Upload**
+7. If Splunk prompts for a restart, click **Restart Splunk** and wait ~60 seconds
+
+After restart, the **Splunk AI Assistant** app appears in the Apps list.
+
+---
+
+### Install in an Air-Gapped Environment
+
+When the browser machine cannot reach Splunk Web directly, copy the app into
+the pod using `kubectl`:
+
+```bash
+APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
+NAMESPACE="ai-platform"
+POD="splunk-standalone-0"
+
+# 1. Copy the archive into the pod
+kubectl cp "${APP_TGZ}" "${NAMESPACE}/${POD}:/tmp/${APP_TGZ}"
+
+# 2. Extract into the Splunk apps directory
+kubectl exec -n "${NAMESPACE}" "${POD}" -- bash -c "
+  tar -xzf /tmp/${APP_TGZ} -C /opt/splunk/etc/apps
+  rm /tmp/${APP_TGZ}
+  echo 'Extracted to /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud'"
+
+# 3. Restart Splunk to pick up the new app
+kubectl exec -n "${NAMESPACE}" "${POD}" -- /opt/splunk/bin/splunk restart
+```
+
+Wait ~60 seconds, then verify (see [Verifying the Installation](#verifying-the-installation)).
+
+---
+
+### Verifying the Installation
+
+**Via Kubernetes Standalone status**
+
+```bash
+kubectl get standalone splunk-standalone -n ai-platform -o json \
+  | jq '.status.appContext.appSrcDeployStatus'
+```
+
+`deployStatus: 3` with `isDeploymentInProgress: false` means the app is installed.
+
+| `deployStatus` | Meaning |
+|---|---|
+| `0` | Pending |
+| `1` | Downloading |
+| `2` | Deploying |
+| `3` | ✅ Installed |
+| `-1` | Error |
+
+**Via Splunk REST API (from inside the pod)**
+
+```bash
+kubectl exec -n ai-platform splunk-standalone-0 -- \
+  curl -sku admin:"$(kubectl get secret splunk-standalone-secret \
+    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)" \
+  https://localhost:8089/services/apps/local/Splunk_AI_Assistant_Cloud \
+  | grep -E "<title>|disabled|version"
+```
+
+**End-to-end smoke test**
+
+Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm
+a response is returned from the AI backend.
+
+---
+
+### Configuring the App
+
+The app needs to know the SAIA API endpoint to route prompts to the AI backend.
+
+**Find the SAIA API endpoint**
+
+```bash
+# NodePort
+kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia \
+  -o jsonpath='{.items[0].spec.ports[0].nodePort}'
+# URL: http://<any-worker-ip>:<nodePort>
+
+# LoadBalancer
+kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia \
+  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}'
+# URL: http://<EXTERNAL-IP>
+```
+
+**Set via Splunk UI**
+
+In Splunk Web: **Settings → Splunk AI Assistant → Configuration** (or navigate
+to `/en-US/app/Splunk_AI_Assistant_Cloud/setup`), enter the SAIA API URL and
+save.
+
+**Set via `splunkaiassistant.conf` (scripted / air-gapped)**
+
+```bash
+kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
+  mkdir -p /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local
+  cat > /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf <<'EOF'
+[splunk_ai_assistant]
+feedback_enabled = true
+
+[saia_sok_configurations]
+saia_endpoint = http://<worker-node-ip>:<nodePort>
+EOF"
+
+# Reload app config without full restart
+kubectl exec -n ai-platform splunk-standalone-0 -- \
+  /opt/splunk/bin/splunk _internal call \
+  /apps/local/Splunk_AI_Assistant_Cloud/_reload \
+  -auth admin:"$(kubectl get secret splunk-standalone-secret \
+    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)"
+```
+
+---
+
+### Troubleshooting the App
+
+**App does not appear after upload**
+
+```bash
+kubectl exec -n ai-platform splunk-standalone-0 -- \
+  tail -50 /opt/splunk/var/log/splunk/splunkd.log | grep -iE "install|app|error"
+```
+
+**Chat returns no response — SAIA API unreachable**
+
+```bash
+# Check SAIA service and pods are running
+kubectl get pods,svc -n ai-platform | grep saia
+
+# Test API reachability from inside the Splunk pod
+kubectl exec -n ai-platform splunk-standalone-0 -- \
+  curl -sv http://<worker-ip>:<nodePort>/health
+# Expected: HTTP 200
+```
+
+**`deployStatus: -1` — app deployment error**
+
+```bash
+kubectl logs -n splunk-operator deploy/splunk-operator-controller-manager \
+  --tail=100 | grep -iE "app|error"
+```
+
+**Restart loop after app install**
+
+A malformed `splunkaiassistant.conf` is the most common cause. Remove and restart:
+
+```bash
+kubectl exec -n ai-platform splunk-standalone-0 -- \
+  rm -f /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf
+kubectl exec -n ai-platform splunk-standalone-0 -- \
+  /opt/splunk/bin/splunk restart
 ```
 
 ---

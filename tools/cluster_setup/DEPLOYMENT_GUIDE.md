@@ -24,6 +24,7 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
 - [Cluster Architecture](#cluster-architecture)
 - [Post-Install Verification](#post-install-verification)
+- [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
 - [Common Operations](#common-operations)
 - [Troubleshooting](#troubleshooting)
 
@@ -743,6 +744,62 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 | `aiplatform/<name>` | `Ready` |
 | SAIA service | `EXTERNAL-IP` assigned |
 | GPU nodes | `nvidia.com/gpu: N` in allocatable |
+
+---
+
+## Install the Splunk AI Assistant App
+
+After the cluster is healthy, install the **Splunk AI Assistant** app
+(`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance to enable
+the AI chat UI.
+
+### 1. Find your Splunk Web URL
+
+```bash
+# Retrieve the admin password
+kubectl get secret splunk-standalone-secret -n ai-platform \
+  -o jsonpath='{.data.password}' | base64 --decode && echo
+
+# NodePort (default) — open on any worker node IP
+kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
+
+# LoadBalancer — if MetalLB is configured
+kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
+
+# Quick access without external exposure
+kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
+# → http://localhost:8000
+```
+
+### 2. Install via Splunk UI
+
+1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`, default port **8000**)
+2. Click **Apps → Manage Apps**
+3. Click **Install app from file**, select `Splunk_AI_Assistant_Cloud.tgz`
+4. Check **Upgrade app** if updating an existing installation, then click **Upload**
+5. Restart Splunk if prompted
+
+### 3. Air-gapped install (no browser access to cluster)
+
+```bash
+APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
+kubectl cp "${APP_TGZ}" ai-platform/splunk-standalone-0:/tmp/${APP_TGZ}
+kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
+  tar -xzf /tmp/${APP_TGZ} -C /opt/splunk/etc/apps && rm /tmp/${APP_TGZ}"
+kubectl exec -n ai-platform splunk-standalone-0 -- /opt/splunk/bin/splunk restart
+```
+
+### 4. Verify
+
+```bash
+kubectl get standalone splunk-standalone -n ai-platform -o json \
+  | jq '.status.appContext.appSrcDeployStatus'
+# deployStatus: 3 = installed
+```
+
+> **Full details** — app configuration, `splunkaiassistant.conf`, air-gapped
+> install steps, and troubleshooting are in
+> [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
 
 ---
 
