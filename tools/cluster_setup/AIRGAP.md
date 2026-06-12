@@ -175,6 +175,16 @@ imagePullSecrets:
 Model weights (~60 GB total) are not included in the binary bundle. They must
 be staged separately into your object store.
 
+**System requirements for the staging machine:**
+
+| Resource | Minimum | Notes |
+|---|---|---|
+| Disk (free) | 250 GB | ~60 GB for 10 model weight files + 200 GB working buffer |
+| RAM | 16 GB | Needed to stream and process large files without swapping |
+| Internet | Stable broadband | Downloads ~60 GB from HuggingFace; resume with `SKIP_IF_EXISTS=1` |
+
+This can be the same machine used to build the airgap bundle.
+
 On the internet-connected machine:
 
 ```bash

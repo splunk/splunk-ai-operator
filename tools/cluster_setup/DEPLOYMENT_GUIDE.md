@@ -410,6 +410,19 @@ imagePullSecrets:
 
 Model weights (~60 GB) must be staged to your object store. Do this on the connected machine.
 
+**System requirements for the staging machine**
+
+This can be the same machine you use to run the installer, or any machine with internet access and SSH/S3 connectivity to your environment.
+
+| Resource | Minimum | Notes |
+|---|---|---|
+| Disk (free) | 250 GB | ~60 GB for 10 models + 200 GB working buffer for download staging and upload temp files |
+| RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
+| Internet | Stable broadband | Downloads ~60 GB from HuggingFace; a flaky connection will require re-running with `SKIP_IF_EXISTS=1` |
+| CPU | 4 cores | Recommended for parallel upload scripts; not a hard blocker |
+
+> **Same machine as the installer?** The installer machine already runs `kubectl`, `helm`, and `ssh` — it can also run model staging. Just ensure the **disk requirement** is met on that machine. `/tmp` or the working directory must have 250 GB free.
+
 ```bash
 cd tools/artifacts_download_upload_scripts
 

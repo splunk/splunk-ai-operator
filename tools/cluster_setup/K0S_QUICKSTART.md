@@ -49,6 +49,16 @@ The S3 bucket must contain the following directory before AI inference services 
 
 The installer handles this automatically when `storage.modelStaging.enabled: true` (the default). It downloads models from Hugging Face and uploads them to your configured object store as part of the `install` flow, before the k0s cluster is created.
 
+**System requirements for the staging machine** (the machine running the installer or staging scripts):
+
+| Resource | Minimum | Notes |
+|---|---|---|
+| Disk (free) | 250 GB | ~60 GB for 10 model weight files + 200 GB buffer for download staging and upload temp files |
+| RAM | 16 GB | Needed to stream large files without swapping |
+| Internet | Stable broadband | Downloads ~60 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
+
+This can be the same machine used to run the installer script.
+
 **To run staging standalone** (without a cluster install):
 
 ```bash
