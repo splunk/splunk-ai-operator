@@ -158,7 +158,7 @@ flowchart TD
 
     subgraph P1["📦 Phase 1 — Model Staging  (if enabled)"]
         direction LR
-        M1["Download ~60 GB\nfrom HuggingFace"] --> M2["gemma-4-31b-it · gpt-oss-20b\n+ 8 more models"]
+        M1["Download >120 GB\nfrom HuggingFace"] --> M2["gemma-4-31b-it · gpt-oss-20b\n+ 8 more models"]
         M2 --> M3["Upload model_artifacts/\nto Object Store"]
     end
 
@@ -272,7 +272,7 @@ flowchart LR
     end
 
     subgraph TRANSFER["📦 Transfer Mechanism"]
-        TARBALL["airgap-bundle.tar.gz\n~500 MB\n+\nmodel weights\n~60 GB\n+\ncontainer images"]
+        TARBALL["airgap-bundle.tar.gz\n~500 MB\n+\nmodel weights\n>120 GB\n+\ncontainer images"]
     end
 
     subgraph AIRGAP["🔒 Air-Gapped Zone"]
@@ -407,7 +407,7 @@ imagePullSecrets:
 
 ### Phase 3 — Stage Model Weights
 
-Model weights (~60 GB) must be staged to your object store. Do this on the connected machine.
+Model weights (>120 GB) must be staged to your object store. Do this on the connected machine.
 
 **System requirements for the staging machine**
 
@@ -415,9 +415,9 @@ This can be the same machine you use to run the installer, or any machine with i
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | ~60 GB for 10 models + 200 GB working buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
-| Internet | Stable broadband | Downloads ~60 GB from HuggingFace; a flaky connection will require re-running with `SKIP_IF_EXISTS=1` |
+| Internet | Stable broadband | Downloads >120 GB from HuggingFace; a flaky connection will require re-running with `SKIP_IF_EXISTS=1` |
 | CPU | 4 cores | Recommended for parallel upload scripts; not a hard blocker |
 
 > **Same machine as the installer?** The installer machine already runs `kubectl`, `helm`, and `ssh` — it can also run model staging. Just ensure the **disk requirement** is met on that machine. `/tmp` or the working directory must have 250 GB free.

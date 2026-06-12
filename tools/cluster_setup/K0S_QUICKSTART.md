@@ -53,9 +53,9 @@ The installer handles this automatically when `storage.modelStaging.enabled: tru
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | ~60 GB for 10 model weight files + 200 GB buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 model weight files + buffer for download staging and upload temp files |
 | RAM | 16 GB | Needed to stream large files without swapping |
-| Internet | Stable broadband | Downloads ~60 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
+| Internet | Stable broadband | Downloads >120 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
 
 This can be the same machine used to run the installer script.
 
