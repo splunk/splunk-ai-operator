@@ -14,7 +14,7 @@ Deploys the complete Splunk AI Platform stack on k0s Kubernetes using pre-provis
 | ---------- | ------- | ------------------ | -------- | -------------------------------------------------------- |
 | Controller | 4       | 8 GB               | 100 GB   | API server, etcd, scheduler                              |
 | CPU Worker | 8       | 32 GB              | 200 GB   | Weaviate, Ray head, Splunk, SAIA API/v2, Data Loader     |
-| GPU Worker | 16      | 384 GB             | 500 GB   | NVIDIA GPU required (6 × L40S 48GB)                       |
+| GPU Worker | 48 vCPUs | 384 GiB            | 500 GB   | 4 × NVIDIA L40S (48 GB GDDR6 each, 192 GB total GPU memory) · 100 Gbps · equivalent to g6e.12xlarge |
 
 
 **Ports between nodes:** 22 (SSH), 6443 (API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN), 179 (Calico BGP). Best practice is to allow all ports between nodes.

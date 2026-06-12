@@ -140,7 +140,7 @@ flowchart LR
 |---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 (or 3 for HA) |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ |
-| GPU Worker | 16 cores | 384 GB | 500 GB | 1+ (NVIDIA GPU required) |
+| GPU Worker | 48 vCPUs | 384 GiB | 500 GB | 2× required · 4 × NVIDIA L40S per node (48 GB GDDR6 each, 192 GB GPU memory per node, 384 GB total across 2 nodes) · 100 Gbps · equivalent to g6e.12xlarge |
 
 **Ports to open between nodes:** 22 (SSH), 6443 (k8s API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN/Calico), 179 (Calico BGP).
 
