@@ -8,7 +8,7 @@ Deploys the complete Splunk AI Platform stack on k0s Kubernetes using pre-provis
 
 **Admin workstation:** `kubectl`, `helm`, `git`, `jq`, `yq`
 
-**Nodes (all):** RHEL 9 · passwordless SSH + sudo · Python 3.8+
+**Nodes (all):** RHEL 9 (or compatible: Rocky 9, AlmaLinux 9, CentOS Stream 9) · passwordless SSH + sudo · Python 3.8+
 
 | Node Type  | Min CPU | Min RAM (per node) | Min Disk | Notes                                                    |
 | ---------- | ------- | ------------------ | -------- | -------------------------------------------------------- |
@@ -477,11 +477,11 @@ tail -f tools/cluster_setup/logs/k0s-install-*.log
 **NVIDIA packages on GPU nodes (RHEL 9):**
 
 
-| Package             | Source                                              |
-| ------------------- | --------------------------------------------------- |
-| CUDA drivers        | `developer.download.nvidia.com/compute/cuda/repos/` |
-| Container Toolkit   | `nvidia.github.io/libnvidia-container/`             |
-| EPEL (RHEL 10 only) | `dl.fedoraproject.org/pub/epel/`                    |
+| Package           | Source                                                      |
+| ----------------- | ----------------------------------------------------------- |
+| CUDA drivers      | `developer.download.nvidia.com/compute/cuda/repos/rhel9/`  |
+| EPEL (for DKMS)   | `dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm` |
+| Container Toolkit | `nvidia.github.io/libnvidia-container/`                     |
 
 
 ## 9. Architecture

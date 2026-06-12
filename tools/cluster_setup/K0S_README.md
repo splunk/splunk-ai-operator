@@ -56,7 +56,7 @@ The script installs everything needed for the AI Platform:
 4. **Cert-Manager v1.13.0** — Automated certificate management
 5. **Kube-Prometheus Stack** — Monitoring with Prometheus + Grafana
 6. **OpenTelemetry Operator** — Distributed tracing and telemetry
-7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9/10, AL2023, Debian/Ubuntu)
+7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9)
 8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI
 9. **Splunk Operator** — Splunk Enterprise management
 10. **Splunk AI Platform Operator** — AI platform orchestration (SAIA feature)
@@ -119,7 +119,7 @@ yq --version
 
 ### Software Requirements (on All Nodes)
 
-- RHEL 9/10, Amazon Linux 2023, or Debian/Ubuntu
+- RHEL 9 (and compatible: Rocky Linux 9, AlmaLinux 9, CentOS Stream 9)
 - Passwordless SSH access from admin workstation
 - Sudo privileges without password
 - Python 3.8+ installed
@@ -940,15 +940,12 @@ kubectl get nodes -l splunk.ai/workload-type=cpu
 The script installs NVIDIA host drivers directly on GPU nodes (not the GPU Operator).
 
 **Supported distributions:**
-- RHEL 9
-- RHEL 10
-- Amazon Linux 2023
-- Debian/Ubuntu
+- RHEL 9 (and compatible: Rocky Linux 9, AlmaLinux 9, CentOS Stream 9)
 
 **What happens on GPU nodes:**
 1. Kernel headers installed
 2. NVIDIA CUDA repository configured
-3. `cuda-drivers` package installed (falls back to `nvidia-driver-550` on Debian)
+3. `cuda-drivers` package installed
 4. NVIDIA Container Toolkit installed and configured
 5. `nvidia-smi` verification run
 6. NVIDIA device plugin DaemonSet applied cluster-wide with RuntimeClass
@@ -1288,12 +1285,10 @@ The script downloads various binaries, manifests, Helm charts, OS packages, and 
 
 | What | URL / Source |
 |------|-------------|
-| Kernel headers | `dnf/yum install kernel-devel-$(uname -r) kernel-headers-$(uname -r)` or `apt-get install linux-headers-$(uname -r)` |
-| NVIDIA GPU driver (AL2023) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo` |
-| NVIDIA GPU driver (RHEL 9/10) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/rhel{9,10}/x86_64/...` |
-| NVIDIA GPU driver (Ubuntu) | `https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb` + `nvidia-driver-550` |
-| EPEL for dkms (RHEL 10) | `https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm` |
-| NVIDIA Container Toolkit | Repo: `https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo`, GPG: `https://nvidia.github.io/libnvidia-container/gpgkey` |
+| Kernel headers | `dnf install kernel-devel-$(uname -r) kernel-headers-$(uname -r)` |
+| NVIDIA GPU driver (RHEL 9) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo` |
+| EPEL for DKMS | `https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm` |
+| NVIDIA Container Toolkit | Repo: `https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo` |
 
 ### Container Images Pulled by Kubernetes at Runtime
 

@@ -254,6 +254,43 @@ wait_for_dependency() {
   Resolve the issue, then re-run the installer."
 }
 
+# ====== NODE OS GATE ======
+# Only RHEL 9 is tested and supported. All other OS families (RHEL 10,
+# Amazon Linux, Debian/Ubuntu) stop the script with a clear error.
+# Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
+# continue at your own risk (useful for internal testing).
+_check_node_os() {
+  local node_ip="$1" role="${2:-node}"
+  local os_id="" os_version_id="" os_pretty=""
+
+  os_id=$(ssh_exec "${node_ip}" \
+    ". /etc/os-release 2>/dev/null && echo \"\${ID}\"" 2>/dev/null || echo "")
+  os_version_id=$(ssh_exec "${node_ip}" \
+    ". /etc/os-release 2>/dev/null && echo \"\${VERSION_ID%%.*}\"" 2>/dev/null || echo "")
+  os_pretty=$(ssh_exec "${node_ip}" \
+    ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
+
+  # Supported: RHEL / CentOS / Rocky / AlmaLinux family, major version 9
+  if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
+    log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+    return 0
+  fi
+
+  local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
+  Only RHEL 9 (and compatible: Rocky 9, AlmaLinux 9, CentOS Stream 9) is
+  tested and supported. Installation on other OS versions is not validated
+  and may fail in unexpected ways.
+  To skip this check and continue at your own risk, set:
+    FORCE_UNSUPPORTED_OS=1"
+
+  if [[ "${FORCE_UNSUPPORTED_OS:-0}" == "1" ]]; then
+    warn "${msg}"
+    warn "  FORCE_UNSUPPORTED_OS=1 — continuing anyway (unsupported, use for testing only)"
+  else
+    err "${msg}"
+  fi
+}
+
 # ====== SHOW INSTALL PLAN ======
 # Called before install starts; prints what will be done so customers can
 # validate the config before a 40-minute run.
@@ -884,6 +921,7 @@ prepare_nodes_for_k0s() {
   log "Preparing ${#node_ips[@]} node(s) for k0s (OS compatibility + binary)..."
   for node_ip in "${node_ips[@]}"; do
     log "  Preparing node ${node_ip}..."
+    _check_node_os "${node_ip}" "node"
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
       bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
@@ -1808,12 +1846,15 @@ EOF
 #   - After install, strict verification gates hard-fail if the artifacts
 #     aren't where they should be (nvidia-smi works, libnvidia-ml.so exists,
 #     nvidia-ctk present, CDI spec populated).
-#   - RHEL 9 and RHEL 10 paths are deliberately symmetric: both install EPEL,
-#     both install DKMS, both clean stale cross-major CUDA repos.
+#   - Tested on RHEL 9 only. Code paths for other OS families are kept for
+#     internal testing but are not supported (blocked by _check_node_os).
 #
 # Returns 0 on fully-successful install, non-zero on any verification failure.
 _install_nvidia_on_node() {
   local gpu_ip="$1"
+
+  # ---- OS gate: only RHEL 9 is supported for GPU driver install -----------
+  _check_node_os "${gpu_ip}" "GPU worker"
 
   # ---- Phase A: detect if driver is already installed ---------------------
   local driver_ver=""
@@ -1842,11 +1883,10 @@ _install_nvidia_on_node() {
     if ! ssh_exec "${gpu_ip}" "
       set -euo pipefail
 
-      # --- OS detection (RHEL 9, RHEL 10, Amazon Linux 2023, Debian/Ubuntu) ---
-      # OS_VERSION holds the numeric major we use to build the CUDA+EPEL URLs.
-      # For RHEL we read %{rhel}; for Amazon Linux 2023 we hardcode 9 because
-      # AL2023 is binary-compatible with RHEL/Fedora 9's nvidia-driver RPMs
-      # and the Fedora EPEL9 repo is the standard 3rd-party source.
+      # --- OS detection (RHEL 9 is the only supported path) ---
+      # Code paths for other OS families are kept for internal testing.
+      # _check_node_os() already gated unsupported OS before this block runs.
+      # OS_VERSION holds the numeric major used to build CUDA/EPEL URLs.
       echo '--- OS detection ---'
       OS_FAMILY=
       OS_VERSION=

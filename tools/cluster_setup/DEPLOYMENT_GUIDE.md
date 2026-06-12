@@ -294,14 +294,8 @@ Run this on any machine with internet access. You do not need the cluster nodes 
 ```bash
 cd tools/cluster_setup
 
-# Default: targets RHEL 9 GPU nodes
+# Build the bundle (RHEL 9 GPU nodes — only supported target)
 ./prepare_airgap_bundle.sh --output-dir /mnt/transfer
-
-# For RHEL 10 GPU nodes
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer --gpu-os rhel10
-
-# For Amazon Linux 2023 GPU nodes
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer --gpu-os amzn2023
 
 # Pin a specific k0s version
 ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
@@ -332,8 +326,8 @@ graph TD
     end
 
     subgraph PKGS["📁 packages/  (GPU nodes)"]
-        EPEL["epel-release-latest-N.noarch.rpm"]
-        CUDA["cuda-rhel9.repo\n(or rhel10 / amzn2023)"]
+        EPEL["epel-release-latest-9.noarch.rpm"]
+        CUDA["cuda-rhel9.repo"]
         CTK["nvidia-container-toolkit.repo"]
         PYYAML["PyYAML wheel\n(all nodes)"]
     end

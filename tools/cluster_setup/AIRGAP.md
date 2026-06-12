@@ -296,13 +296,13 @@ pre-installed.
 
 | Package | Node type | Repo source |
 |---|---|---|
-| `python3-pyyaml` / `python3-yaml` | All nodes | Default OS repo (dnf/apt) |
+| `python3-pyyaml` | All nodes (RHEL 9) | Default OS repo (`dnf`) |
 | `kernel-devel`, `kernel-headers` | GPU workers | Default OS repo / RHUI |
-| `dnf-plugins-core` | GPU workers (RHEL/AL2023) | Default OS repo |
-| `epel-release` RPM | GPU workers (RHEL/AL2023) | `dl.fedoraproject.org/pub/epel/` |
+| `dnf-plugins-core` | GPU workers | Default OS repo |
+| `epel-release` RPM | GPU workers | `dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm` |
 | `dkms`, `gcc`, `make`, `elfutils-libelf-devel` | GPU workers | EPEL repo |
-| CUDA repo `.repo` file | GPU workers | `developer.download.nvidia.com` |
-| `cuda-drivers` / `nvidia-open` | GPU workers | CUDA repo |
+| CUDA repo `.repo` file | GPU workers | `developer.download.nvidia.com/compute/cuda/repos/rhel9/` |
+| `cuda-drivers` | GPU workers | CUDA repo |
 | `nvidia-container-toolkit` | GPU workers | `nvidia.github.io/libnvidia-container` |
 
 ### Strategies
@@ -319,7 +319,7 @@ The bundle includes package files to assist:
 # On each GPU node (copy from the bundle machine first):
 BUNDLE_PKGS=/opt/airgap/airgap-bundle-<date>/packages
 
-# 1. Install EPEL (RHEL/AL2023 only — provides DKMS)
+# 1. Install EPEL (provides DKMS)
 sudo dnf install -y "${BUNDLE_PKGS}/epel-release-latest-9.noarch.rpm"
 
 # 2. Enable EPEL and install the build toolchain + DKMS
@@ -348,7 +348,7 @@ driver installation:
 > file. `install_from_airgap_bundle.sh` sets `AIRGAP_PYYAML_WHEEL_PATH` automatically
 > so the installer uses it instead of calling `dnf install python3-pyyaml`.
 
-**Strategy 2 — Local RPM/DEB mirror (for organizations with many nodes)**
+**Strategy 2 — Local RPM mirror (for organizations with many nodes)**
 
 Set up an internal mirror of the OS repos and redirect the installer to it via
 environment variables. This is the most robust option for large fleets.
@@ -364,9 +364,6 @@ export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-co
 
 ./install_from_airgap_bundle.sh --bundle ... --config ...
 ```
-
-For Debian/Ubuntu GPU nodes the CUDA and CTK overrides accept a URL to the `.list`
-file or keyring `.deb` used during apt setup (same `${VAR:-default}` pattern).
 
 **Strategy 3 — Partial air-gap: GPU nodes have controlled internet access**
 

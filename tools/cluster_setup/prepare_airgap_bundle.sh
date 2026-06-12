@@ -25,9 +25,8 @@ KUBERAY_CHART_VERSION="1.2.2"
 # Override with --k0s-version if you need a specific release.
 K0S_VERSION="${K0S_VERSION:-latest}"
 
-# Target OS for GPU node RPM packages: rhel9 | rhel10 | amzn2023
-# Only affects which EPEL and CUDA .repo files are downloaded; the pyyaml
-# wheel is pure Python and works on all supported OS versions.
+# Target OS for GPU node RPM packages. Only rhel9 is tested and supported.
+# rhel10 and amzn2023 code paths are kept for internal testing only.
 GPU_NODE_OS="${GPU_NODE_OS:-rhel9}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
@@ -56,11 +55,10 @@ OPTIONS
                         Env: K0S_VERSION
 
   --gpu-os OS           Target OS for GPU node package files.
-                        Choices: rhel9 | rhel10 | amzn2023
-                        Default: rhel9
+                        Supported: rhel9 (default — only tested/supported value)
                         Env: GPU_NODE_OS
-                        Affects which EPEL RPM and CUDA .repo file are downloaded.
-                        The pyyaml wheel is pure Python and works on all OS versions.
+                        Only RHEL 9 (and compatible: Rocky 9, AlmaLinux 9) is
+                        tested and supported. Any other value will error.
 
   -h, --help            Show this help text.
 
@@ -110,17 +108,14 @@ ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   AIRGAP_PYYAML_WHEEL_PATH          Path to PyYAML .whl file (all nodes, optional)
 
 EXAMPLES
-  # Basic bundle in current directory (RHEL 9 GPU nodes)
+  # Basic bundle (RHEL 9 GPU nodes — only supported target)
   ./prepare_airgap_bundle.sh
 
-  # RHEL 10 GPU nodes with custom output directory
-  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --gpu-os rhel10
-
-  # Amazon Linux 2023 GPU nodes, pinned k0s version
-  ./prepare_airgap_bundle.sh --gpu-os amzn2023 --k0s-version v1.31.2+k0s.0
+  # Custom output directory and pinned k0s version
+  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
 
   # Using env vars instead of flags
-  OUTPUT_DIR=/mnt/transfer GPU_NODE_OS=rhel9 ./prepare_airgap_bundle.sh
+  OUTPUT_DIR=/mnt/transfer ./prepare_airgap_bundle.sh
 
 NEXT STEPS AFTER BUNDLING
   1. Mirror container images listed in container-images.txt to your internal registry.
@@ -134,7 +129,7 @@ GPU NODE PACKAGES (packages/ directory)
   copies these to each GPU node via scp before the main installer runs, so the
   installer can use them without internet access.
 
-  For RHEL/AL2023 GPU nodes the bundle provides:
+  For RHEL 9 GPU nodes the bundle provides:
     - EPEL release RPM (installs EPEL repo for DKMS)
     - CUDA .repo file (redirects dnf to the bundled content if served via HTTP)
     - nvidia-container-toolkit .repo file
@@ -156,6 +151,17 @@ done
 BUNDLE_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BUNDLE_NAME="airgap-bundle-${BUNDLE_TIMESTAMP}"
 STAGE_DIR="${OUTPUT_DIR}/${BUNDLE_NAME}"
+
+# ── OS validation ─────────────────────────────────────────────────────────────
+if [[ "${GPU_NODE_OS}" != "rhel9" ]]; then
+  echo "ERROR: --gpu-os '${GPU_NODE_OS}' is not supported." >&2
+  echo "  Only 'rhel9' is tested and supported for GPU node packages." >&2
+  echo "  rhel10 and amzn2023 paths exist in the code for internal testing" >&2
+  echo "  but are not validated for production use." >&2
+  echo "  To use an untested OS path, set GPU_NODE_OS directly and accept the risk:" >&2
+  echo "    GPU_NODE_OS=rhel10 ./prepare_airgap_bundle.sh ..." >&2
+  exit 1
+fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO  $*"; }
