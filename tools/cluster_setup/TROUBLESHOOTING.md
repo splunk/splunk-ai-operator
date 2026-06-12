@@ -284,7 +284,7 @@ kubectl label node <node-name> splunk.ai/workload-type=<cpu|gpu> --overwrite
 In air-gap mode, the installer cannot download GPU packages from the internet.
 You must pre-install NVIDIA drivers on GPU nodes before running the installer.
 
-See [AIRGAP.md — GPU Node OS Packages](AIRGAP.md#gpu-node-os-packages) for
+See [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments) for
 step-by-step instructions and bundled package files.
 
 ---
@@ -421,14 +421,16 @@ kubectl logs -n <operator-namespace> deploy/<operator-name> --tail=50
 ```bash
 # Re-run with verbose output
 cd tools/artifacts_download_upload_scripts
-HF_TOKEN=<your-token> bash -x ./download_from_huggingface.sh 2>&1 | tee /tmp/hf-download.log
+bash -x ./download_from_huggingface.sh 2>&1 | tee /tmp/hf-download.log
 ```
+
+> `HF_TOKEN` is not required for the current release. If you see authentication errors on gated models in a future release, set it via `HF_TOKEN=hf_... ./download_from_huggingface.sh`.
 
 **Common causes:**
 
 | Cause | Fix |
 |---|---|
-| Missing or expired `HF_TOKEN` | Generate a new token at huggingface.co/settings/tokens. Must have `read` scope for gated models. |
+| Disk full on staging machine | Minimum 250 GB free. `df -h .` to check. |
 | Disk full on staging machine | Minimum 250 GB free. `df -h .` to check. |
 | Interrupted download | Set `SKIP_IF_EXISTS=1` to resume without re-downloading completed files. |
 | Network timeout on large files | Use a stable wired connection. The script is restartable — re-run with `SKIP_IF_EXISTS=1`. |
@@ -689,7 +691,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 ### GPU driver install fails in air-gap mode
 
-See [AIRGAP.md — GPU Node OS Packages](AIRGAP.md#gpu-node-os-packages).
+See [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments).
 Pre-install drivers on GPU nodes using the bundle's `packages/` directory
 before running the main installer. The installer detects `nvidia-smi` and
 skips the driver install entirely.

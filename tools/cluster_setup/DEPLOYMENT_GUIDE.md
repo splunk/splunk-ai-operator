@@ -22,7 +22,6 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [Phase 4 — Transfer to Air-Gapped Environment](#phase-4--transfer-to-air-gapped-environment)
   - [Phase 5 — Install from the Bundle](#phase-5--install-from-the-bundle)
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
-- [Cluster Architecture](#cluster-architecture)
 - [Post-Install Verification](#post-install-verification)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
 - [Common Operations](#common-operations)
@@ -213,16 +212,7 @@ cp k0s-cluster-config.yaml my-cluster.yaml
 # Open my-cluster.yaml and fill in ALL fields marked CHANGE THIS
 ```
 
-The config sections to fill in:
-
-| Section | What to set |
-|---|---|
-| `cluster` | `name`, `sshKeyPath`, `sshUser` |
-| `nodes.existingIPs` | IP addresses of your controller and worker nodes |
-| `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
-| `images` | Your registry URL + all image tags |
-| `aiPlatform` | `defaultAcceleratorType` — set to `L40S` |
-| `metallb.pool.addresses` | A free IP range on your LAN (for LoadBalancer VIP) |
+See the [Configuration Reference in K0S_README.md](K0S_README.md#configuration) for all config fields and descriptions.
 
 **2. Validate your config before installing**
 
@@ -268,7 +258,7 @@ kubectl get aiplatform -n ai-platform      # AIPlatform Ready
 flowchart LR
     subgraph CONNECTED["🌐 Internet-Connected Zone"]
         BNDMACHINE["Bundle Machine\n(laptop / jump host)"]
-        INTERNET[("Internet\nGitHub · NVIDIA\nHuggingFace\nHelm repos\nPyPI")]
+        INTERNET[("Internet\nGitHub · NVIDIA\nHuggingFace\nHelm repos")]
     end
 
     subgraph TRANSFER["📦 Transfer Mechanism"]
@@ -382,7 +372,6 @@ flowchart LR
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
 
-# From the bundle (after extracting or before packing it)
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
   [[ -z "$img" ]] && continue
@@ -411,22 +400,20 @@ Model weights (>120 GB) must be staged to your object store. Do this on the conn
 
 **System requirements for the staging machine**
 
-This can be the same machine you use to run the installer, or any machine with internet access and SSH/S3 connectivity to your environment.
-
 | Resource | Minimum | Notes |
 |---|---|---|
 | Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; a flaky connection will require re-running with `SKIP_IF_EXISTS=1` |
-| CPU | 4 cores | Recommended for parallel upload scripts; not a hard blocker |
+| CPU | 4 cores | Recommended for parallel upload scripts |
 
-> **Same machine as the installer?** The installer machine already runs `kubectl`, `helm`, and `ssh` — it can also run model staging. Just ensure the **disk requirement** is met on that machine. `/tmp` or the working directory must have 250 GB free.
+> **Same machine as the installer?** The installer machine already runs `kubectl`, `helm`, and `ssh` — it can also run model staging. Just ensure the **disk requirement** is met. `/tmp` or the working directory must have 250 GB free.
 
 ```bash
 cd tools/artifacts_download_upload_scripts
 
-# Download from HuggingFace (set HF_TOKEN for gated models)
-HF_TOKEN=hf_... ./download_from_huggingface.sh
+# Download from HuggingFace (HF_TOKEN is optional for the current release)
+./download_from_huggingface.sh
 
 # Upload to your object store (endpoint must be reachable from this machine)
 ./upload_to_minio.sh    # or upload_to_s3.sh, upload_to_seaweedfs.sh
@@ -442,26 +429,9 @@ storage:
 
 ### Phase 4 — Transfer to Air-Gapped Environment
 
-```mermaid
-sequenceDiagram
-    actor Admin
-    participant CONN as Connected Machine
-    participant MEDIA as Transfer Medium
-    participant INSTALL as Air-Gapped\nInstall Machine
-
-    Admin->>CONN: ./prepare_airgap_bundle.sh
-
-    Note over CONN: Bundle ready:\nairgap-bundle-<date>.tar.gz
-
-    CONN->>MEDIA: scp / USB drive / secure courier
-    MEDIA->>INSTALL: Copy bundle
-
-    Note over INSTALL: Also copy:\ninstall_from_airgap_bundle.sh\nk0s_cluster_with_stack.sh\nmy-cluster-config.yaml
-```
-
 ```bash
 # Copy bundle
-scp /mnt/transfer/airgap-bundle-20260612-103000.tar.gz \
+scp /mnt/transfer/airgap-bundle-<timestamp>.tar.gz \
     admin@install-machine:/opt/splunk-ai/
 
 # Copy installer scripts (if not already on the machine)
@@ -493,7 +463,7 @@ cd /opt/splunk-ai
 chmod +x install_from_airgap_bundle.sh k0s_cluster_with_stack.sh
 
 ./install_from_airgap_bundle.sh \
-  --bundle /opt/splunk-ai/airgap-bundle-20260612-103000.tar.gz \
+  --bundle /opt/splunk-ai/airgap-bundle-<timestamp>.tar.gz \
   --config /opt/splunk-ai/my-cluster-config.yaml
 ```
 
@@ -528,7 +498,7 @@ Confirm to proceed.
 
 ### GPU Nodes in Air-Gapped Environments
 
-GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that normally download from the internet. In air-gap mode the installer detects this and fails clearly rather than timing out.
+GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that normally download from the internet. In air-gap mode the installer detects missing `nvidia-smi` and fails clearly rather than timing out.
 
 ```mermaid
 flowchart TD
@@ -536,7 +506,7 @@ flowchart TD
     CHECK{"nvidia-smi\nalready present?"}
     SKIP["✅ Skip driver install\nDriver already installed"]
     AIRGAP_CHECK{"AIRGAP_MODE\n= true?"}
-    FAIL["❌ Clear error message:\nnvidia-smi not found\nin AIRGAP_MODE\n→ see AIRGAP.md"]
+    FAIL["❌ Clear error message:\nnvidia-smi not found\nin AIRGAP_MODE\n→ see K0S_README.md"]
     INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nCUDA repo → cuda-drivers\nnvidia-container-toolkit"]
     CTK["Install nvidia-container-toolkit"]
     VERIFY["Verify: nvidia-smi returns\ndriver version number"]
@@ -579,132 +549,26 @@ flowchart LR
 The bundle's `packages/` directory contains the files needed to pre-install drivers:
 
 ```bash
-# Copy packages from the bundle to each GPU node
 GPU_NODE="10.0.0.3"
 BUNDLE_PKGS="/opt/airgap/airgap-bundle-<date>/packages"
 
 scp -r "${BUNDLE_PKGS}" "${GPU_NODE}:/tmp/airgap-packages"
 
-# On each GPU node — install the driver before running the main installer
 ssh "${GPU_NODE}" bash <<'EOF'
   PKG=/tmp/airgap-packages
-
-  # 1. Install EPEL (provides DKMS)
   sudo dnf install -y "${PKG}/epel-release-latest-9.noarch.rpm"
-
-  # 2. Install DKMS + build toolchain
   sudo dnf install -y dkms gcc make elfutils-libelf-devel "kernel-devel-$(uname -r)"
-
-  # 3. Add CUDA repo and install driver
   sudo cp "${PKG}/cuda-rhel9.repo" /etc/yum.repos.d/
   sudo dnf install -y cuda-drivers
-
-  # 4. Install nvidia-container-toolkit
   sudo cp "${PKG}/nvidia-container-toolkit.repo" /etc/yum.repos.d/
   sudo dnf install -y nvidia-container-toolkit
-
-  # 5. Verify
   nvidia-smi
 EOF
 ```
 
 > After pre-installing drivers, run `install_from_airgap_bundle.sh` normally. The installer will detect `nvidia-smi` and skip driver installation entirely.
 
----
-
-## Cluster Architecture
-
-```mermaid
-graph TB
-    subgraph USERS["👥 Users"]
-        BROWSER["Browser\nSAIA v2 Chat UI"]
-        SPLUNK_UI["Splunk Web\nSPL + AI Assist"]
-    end
-
-    subgraph ADMIN["🔧 Admin Workstation"]
-        KUBECTL["kubectl"]
-        INSTALLER["k0s_cluster_with_stack.sh"]
-    end
-
-    subgraph NETWORK["🌐 Network (your LAN)"]
-        VIP["MetalLB VIP\n10.20.30.100\n(LoadBalancer)"]
-    end
-
-    subgraph CTRL["🖥️  Controller Node(s)"]
-        APISERVER["k0s API Server :6443"]
-        ETCD["kine/etcd"]
-        SCHEDULER["Scheduler\nController Manager"]
-    end
-
-    subgraph CPU["💻  CPU Worker(s)"]
-        subgraph AI_SVC["AI Services"]
-            SAIA_SVC["SAIA API v1/v2\n(nginx reverse proxy)"]
-            DATA_LOADER["Data Loader"]
-        end
-        subgraph RAY_CTRL["Ray Control"]
-            RAY_HEAD_POD["Ray Head Pod"]
-            RAY_OPERATOR["KubeRay Operator"]
-        end
-        subgraph DATA_SVC["Data Services"]
-            WEAVIATE_POD["Weaviate\nVector DB"]
-            SPLUNK_POD["Splunk Enterprise"]
-        end
-        subgraph OBS["Observability"]
-            PROM_POD["Prometheus\nGrafana"]
-            OTEL_POD["OTel Collector"]
-        end
-    end
-
-    subgraph GPU["🔥  GPU Worker(s)"]
-        RAY_WORKER["Ray GPU Workers\n(AI Inference)"]
-        MODEL_CACHE["Model Cache\n/var/lib/k0s"]
-    end
-
-    subgraph STORAGE["🗄️  External Storage (customer-managed)"]
-        OBJ_STORE["Object Store\n(MinIO / SeaweedFS / S3)\nmodel_artifacts/ · conversations/\nconfig/ · storage_queue/"]
-    end
-
-    BROWSER -->|HTTPS| VIP
-    SPLUNK_UI -->|internal| SAIA_SVC
-    VIP --> SAIA_SVC
-
-    KUBECTL -->|kubectl| APISERVER
-    INSTALLER -->|SSH + k0s API| CTRL
-
-    APISERVER --- ETCD
-    APISERVER --> CPU
-    APISERVER --> GPU
-
-    SAIA_SVC --> WEAVIATE_POD
-    SAIA_SVC --> RAY_HEAD_POD
-    RAY_HEAD_POD <-->|Ray protocol| RAY_WORKER
-    RAY_WORKER <--> MODEL_CACHE
-    DATA_LOADER --> OBJ_STORE
-    RAY_WORKER <--> OBJ_STORE
-    SPLUNK_POD --> SAIA_SVC
-```
-
-### Network Ports
-
-```mermaid
-graph LR
-    subgraph EXTERNAL["External Access"]
-        USER["User browser\nor Splunk"]
-    end
-    subgraph K8S["k0s Cluster"]
-        METALLB_PORT["MetalLB VIP\n:80 / :443"]
-        K8S_API[":6443\nkubectl"]
-        ETCD_PORT[":2380\netcd peer"]
-        KUBELET_PORT[":10250\nkubelet"]
-        KONNECT_PORT[":8132\nkonnectivity"]
-        CALICO_PORT["4789/UDP\nVXLAN"]
-        BGP_PORT[":179\nCalico BGP"]
-        SSH_PORT[":22\nSSH"]
-    end
-
-    USER --> METALLB_PORT
-    USER --> K8S_API
-```
+> **Environment variable reference and advanced options** — see [K0S_README.md — Air-Gapped Deployment](K0S_README.md#air-gapped-deployment).
 
 ---
 
@@ -885,7 +749,7 @@ flowchart TD
 | "SSH connection refused" | `ssh -i key user@node-ip hostname` | Check firewall / security groups on port 22 |
 | "Refusing to wipe — Ready nodes" | `kubectl get nodes` | Set `useExisting: auto` in config or run `clean-all` first |
 | "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
-| "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments) |
+| "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | Re-transfer the bundle | `sha256sum airgap-bundle-<date>.tar.gz` and compare |
 | "Expected chart not found" | `ls /opt/airgap/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists |

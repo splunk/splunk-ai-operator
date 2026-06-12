@@ -18,8 +18,8 @@
 | **Air-gap env-var overrides** | ~80 lines (all `${VAR:-url}` patterns) | 5 install functions | **Low** — original URLs preserved as defaults | **Yes** |
 | **prepare_airgap_bundle.sh** | 384 lines (new script) | None | **None** — new file | **Yes** — `bash -n` |
 | **install_from_airgap_bundle.sh** | 283 lines (new script) | None | **None** — new file | **Yes** — `bash -n` |
-| **AIRGAP.md** | 381 lines (new doc) | None | **None** — documentation | **Yes** |
-| **H100 removal from k0s docs** | ~10 lines removed/changed | K0S_README, K0S_QUICKSTART, k0s-cluster-config.yaml, k0s_cluster_with_stack.sh | **None** — documentation + comment | **Yes** — grep |
+| **Air-gap content in K0S_README** | ~350 lines added to K0S_README | None | **None** — documentation | **Yes** |
+| **H100 removal from k0s docs** | ~10 lines removed/changed | K0S_README, K0S_README (was QUICKSTART), k0s-cluster-config.yaml, k0s_cluster_with_stack.sh | **None** — documentation + comment | **Yes** — grep |
 | **Gemma model list additions** | ~30 lines added | K0S_README, EKS_README, artifacts/README | **None** — documentation | **Yes** — grep |
 | **wait_for_dependency() — object store** | ~20 lines in `ensure_s3compat_credentials` | `ensure_s3compat_credentials` | **Low** — adds a wait before secret creation; worst case adds ≤5 min if store is briefly unreachable | **Partial** — guard logic reviewable; wait behaviour needs live test |
 | **wait_for_dependency() — HuggingFace** | ~8 lines in `stage_model_artifacts` | `stage_model_artifacts` | **Low** — skipped when `AIRGAP_MODE=true`; adds pause before download | **Partial** — AIRGAP_MODE guard reviewable; wait needs live test |
@@ -30,12 +30,12 @@
 | **`AIRGAP_PYYAML_WHEEL_PATH` support (all nodes)** | ~15 lines in `prepare_nodes_for_k0s` + ~10 lines in `install_from_airgap_bundle.sh` | `prepare_nodes_for_k0s` | **Low** — new branch; falls through to `dnf install` if var unset | **Yes** — grep |
 | **`prepare_airgap_bundle.sh` packages/ section** | ~80 lines (new section 5) | None (new code in existing script) | **Low** — additive; does not touch existing sections | **Yes** — `bash -n` + grep |
 | **`--gpu-os` argument + validation gate** | ~30 lines in `prepare_airgap_bundle.sh` | Argument-parsing block | **None** — new argument; existing behaviour unchanged if not passed | **Yes** — grep |
-| **RHEL 10 / AL2023 removal from docs** | ~50 lines changed across 4 docs | K0S_README, K0S_QUICKSTART, AIRGAP, k0s_cluster_with_stack.sh comments | **None** — documentation | **Yes** — grep |
-| **DEPLOYMENT_GUIDE.md (new file)** | 829 lines (new file, 14 Mermaid diagrams) | None | **None** — new file, no code change | **Partial** — file parseable locally; diagram rendering needs GitHub preview |
-| **Staging machine requirements** | ~20 lines across AIRGAP.md, K0S_QUICKSTART.md, DEPLOYMENT_GUIDE.md | None | **None** — documentation | **Yes** — grep |
-| **GPU spec update (8 × L40S, g6e.12xlarge)** | ~15 lines across K0S_QUICKSTART, K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
-| **VOC Portal removal from k0s docs** | ~5 lines changed in K0S_QUICKSTART, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
-| **`defaultAcceleratorType` description (L40S only)** | ~3 lines across K0S_QUICKSTART, K0S_README | None | **None** — documentation | **Yes** — grep |
+| **RHEL 10 / AL2023 removal from docs** | ~50 lines changed across 3 docs | K0S_README, DEPLOYMENT_GUIDE, k0s_cluster_with_stack.sh comments | **None** — documentation | **Yes** — grep |
+| **DEPLOYMENT_GUIDE.md (restructured)** | Steps + diagrams focused, detail in K0S_README | None | **None** — documentation only | **Partial** — file parseable locally; diagram rendering needs GitHub preview |
+| **Staging machine requirements** | ~20 lines across K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
+| **GPU spec update (8 × L40S, g6e.12xlarge)** | ~15 lines across K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
+| **VOC Portal removal from k0s docs** | ~5 lines changed in K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
+| **`defaultAcceleratorType` description (L40S only)** | ~3 lines across K0S_README | None | **None** — documentation | **Yes** — grep |
 
 ---
 
@@ -76,7 +76,6 @@ echo "exit: $?"
 ```bash
 grep -rn "H100" \
   tools/cluster_setup/K0S_README.md \
-  tools/cluster_setup/K0S_QUICKSTART.md \
   tools/cluster_setup/k0s-cluster-config.yaml \
   tools/cluster_setup/k0s_cluster_with_stack.sh
 ```
@@ -168,25 +167,27 @@ grep "mikefarah/yq/releases"          tools/cluster_setup/k0s_cluster_with_stack
 ### T1-8: Internal doc links resolve
 
 ```bash
-grep -oP '\[.*?\]\(\K[^)]+(?=\))' tools/cluster_setup/AIRGAP.md \
-  | grep -v "^http" \
-  | while read -r f; do
-      [ -f "tools/cluster_setup/$f" ] \
-        && echo "OK: $f" \
-        || echo "BROKEN: $f"
-    done
+for doc in tools/cluster_setup/K0S_README.md tools/cluster_setup/DEPLOYMENT_GUIDE.md tools/cluster_setup/TROUBLESHOOTING.md; do
+  grep -oP '\[.*?\]\(\K[^)]+(?=\))' "$doc" \
+    | grep -v "^http" | grep -v "^#" \
+    | while read -r f; do
+        [ -f "tools/cluster_setup/$f" ] \
+          && echo "OK: $f" \
+          || echo "BROKEN: $f"
+      done
+done
 ```
 
 **Pass:** All print `OK`.
 **Fail:** Any `BROKEN`.
 
-AIRGAP.md referenced from K0S_README:
+Air-gap content referenced from DEPLOYMENT_GUIDE:
 
 ```bash
-grep -c "AIRGAP.md" tools/cluster_setup/K0S_README.md
+grep -c "K0S_README.md.*air" tools/cluster_setup/DEPLOYMENT_GUIDE.md
 ```
 
-**Pass:** Count ≥ 2 (ToC callout + Air-Gapped Deployment section).
+**Pass:** Count ≥ 1 (reference link to K0S_README air-gap section).
 
 ---
 
@@ -334,9 +335,8 @@ grep "AIRGAP_PYYAML_WHEEL_PATH" tools/cluster_setup/install_from_airgap_bundle.s
 ```bash
 grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
   tools/cluster_setup/K0S_README.md \
-  tools/cluster_setup/K0S_QUICKSTART.md \
-  tools/cluster_setup/AIRGAP.md \
-  tools/cluster_setup/DEPLOYMENT_GUIDE.md
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md \
+  tools/cluster_setup/TROUBLESHOOTING.md
 ```
 
 **Pass:** Zero matches.
@@ -349,9 +349,8 @@ grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
 ```bash
 grep -rni "Rocky\|AlmaLinux\|CentOS" \
   tools/cluster_setup/K0S_README.md \
-  tools/cluster_setup/K0S_QUICKSTART.md \
   tools/cluster_setup/DEPLOYMENT_GUIDE.md \
-  tools/cluster_setup/AIRGAP.md
+  tools/cluster_setup/TROUBLESHOOTING.md
 ```
 
 **Pass:** Zero matches — only RHEL 9 is mentioned as supported.
@@ -364,9 +363,8 @@ grep -rni "Rocky\|AlmaLinux\|CentOS" \
 ```bash
 grep -rni "VOC.Portal\|voc portal" \
   tools/cluster_setup/K0S_README.md \
-  tools/cluster_setup/K0S_QUICKSTART.md \
-  tools/cluster_setup/AIRGAP.md \
-  tools/cluster_setup/DEPLOYMENT_GUIDE.md
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md \
+  tools/cluster_setup/TROUBLESHOOTING.md
 ```
 
 **Pass:** Zero matches.
@@ -379,11 +377,9 @@ grep -rni "VOC.Portal\|voc portal" \
 ```bash
 grep -A2 "defaultAcceleratorType" tools/cluster_setup/K0S_README.md \
   | grep -i "L40S\|only"
-grep -i "defaultAcceleratorType" tools/cluster_setup/K0S_QUICKSTART.md \
-  | grep -i "L40S"
 ```
 
-**Pass:** Both return a match confirming L40S is the required/only value.
+**Pass:** Returns a match confirming L40S is the required/only value.
 **Fail:** No match — description may still say "e.g." or omit the constraint.
 
 ---
@@ -392,7 +388,7 @@ grep -i "defaultAcceleratorType" tools/cluster_setup/K0S_QUICKSTART.md \
 
 ```bash
 grep -c "8.*L40S\|L40S.*8" \
-  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/K0S_README.md \
   tools/cluster_setup/DEPLOYMENT_GUIDE.md
 ```
 
@@ -401,12 +397,11 @@ grep -c "8.*L40S\|L40S.*8" \
 
 ---
 
-### T1-25: Staging machine requirements (250 GB / 16 GB) present in all three docs
+### T1-25: Staging machine requirements (250 GB / 16 GB) present in docs
 
 ```bash
 for f in \
-  tools/cluster_setup/AIRGAP.md \
-  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/K0S_README.md \
   tools/cluster_setup/DEPLOYMENT_GUIDE.md; do
   grep -qiE "250.?GB|250 GB" "$f" \
     && echo "OK (250 GB): $f" \
@@ -417,7 +412,7 @@ for f in \
 done
 ```
 
-**Pass:** All 6 lines print `OK`.
+**Pass:** All 4 lines print `OK`.
 **Fail:** Any `MISSING` — staging requirements inconsistent across docs.
 
 ---
@@ -1043,7 +1038,7 @@ AIRGAP_MODE=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh instal
 echo "exit: $?"
 ```
 
-**Pass:** Error message references `AIRGAP_MODE=true`, missing `nvidia-smi`, and points to `AIRGAP.md`; exit non-zero.
+**Pass:** Error message references `AIRGAP_MODE=true` and missing `nvidia-smi`; exit non-zero.
 **Fail:** Installer attempts package downloads (which timeout) or exits with an unhelpful message.
 
 ---
@@ -1095,7 +1090,7 @@ grep "pip3.*no-index\|AIRGAP_PYYAML_WHEEL_PATH\|pyyaml.*wheel" logs/k0s-install-
 Use the bundle from T2-17 (which includes the `packages/` directory). Pre-configure nodes with no NVIDIA drivers. Run the installer with `install_from_airgap_bundle.sh`:
 
 1. `install_from_airgap_bundle.sh` should automatically set `AIRGAP_PYYAML_WHEEL_PATH`
-2. On GPU nodes, follow Strategy 1 from AIRGAP.md using the bundled package files before running the installer
+2. On GPU nodes, follow Strategy 1 from K0S_README.md (GPU Nodes in Air-Gapped Environments) using the bundled package files before running the installer
 3. Run the installer — it should detect `nvidia-smi` and skip driver install
 
 ```bash
@@ -1294,7 +1289,7 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T1-21 | Supported OS stated consistently (RHEL 9 + compatible) | No | No | < 1 min | Yes |
 | T1-22 | VOC Portal removed from all k0s docs | No | No | < 1 min | Yes |
 | T1-23 | `defaultAcceleratorType` — L40S required, no "e.g." | No | No | < 1 min | Yes |
-| T1-24 | 8 × L40S total called out in K0S_QUICKSTART + DEPLOYMENT_GUIDE | No | No | < 1 min | Yes |
+| T1-24 | 8 × L40S total called out in K0S_README + DEPLOYMENT_GUIDE | No | No | < 1 min | Yes |
 | T1-25 | Staging requirements (250 GB / 16 GB) in all 3 docs | No | No | < 1 min | Yes |
 | T1-26 | `--gpu-os` argument parsing present in `prepare_airgap_bundle.sh` | No | No | < 1 min | Yes |
 | T1-27 | `--gpu-os` validation gate rejects non-rhel9 — code review | No | No | < 1 min | Yes |
