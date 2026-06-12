@@ -32,7 +32,81 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
     --k0s-version) K0S_VERSION="$2"; shift 2 ;;
-    *) echo "Unknown option: $1" >&2; exit 1 ;;
+    -h|--help)
+      cat <<'HELP'
+prepare_airgap_bundle.sh — download all Splunk AI Platform install artifacts
+into a self-contained tar.gz bundle for air-gapped deployments.
+
+USAGE
+  ./prepare_airgap_bundle.sh [OPTIONS]
+
+OPTIONS
+  --output-dir DIR      Directory where the bundle is written.
+                        Default: ./airgap-bundle
+                        Env: OUTPUT_DIR
+
+  --k0s-version VER     Specific k0s release to download (e.g. v1.31.2+k0s.0).
+                        Default: latest stable release
+                        Env: K0S_VERSION
+
+  -h, --help            Show this help text.
+
+WHAT IS BUNDLED
+  binaries/
+    k0s          — k0s Kubernetes binary (linux/amd64)
+    yq           — YAML processor used by the installer
+
+  manifests/
+    cert-manager.yaml          — cert-manager CRDs + controller
+    local-path-storage.yaml    — Rancher local-path provisioner
+    nvidia-device-plugin.yml   — NVIDIA GPU device plugin DaemonSet
+
+  charts/
+    kube-prometheus-stack-*.tgz   — Prometheus + Grafana (version resolved at bundle time)
+    opentelemetry-operator-*.tgz  — OTel operator (version resolved at bundle time)
+    kuberay-operator-1.2.2.tgz    — KubeRay operator (pinned)
+    metallb-0.14.8.tgz            — MetalLB load-balancer (pinned)
+
+  airgap-env.sh         — Source this to set env-var overrides before a manual install
+  container-images.txt  — List of container images to mirror to your internal registry
+  bundle-versions.txt   — Records all component versions for reproducibility
+  checksums.sha256      — SHA-256 checksums for every file in the bundle
+
+ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
+  These are exported automatically by install_from_airgap_bundle.sh.
+  You only need to set them manually if you extract the bundle yourself.
+
+  K0S_INSTALL_URL                   URL/path to k0s binary (file:// or https://)
+  YQ_DOWNLOAD_URL                   URL/path to yq binary
+  CERT_MANAGER_MANIFEST_URL         URL/path to cert-manager.yaml
+  LOCAL_PATH_MANIFEST_URL           URL/path to local-path-storage.yaml
+  NVIDIA_DEVICE_PLUGIN_MANIFEST_URL URL/path to nvidia-device-plugin.yml
+  PROMETHEUS_CHART_PATH             Local path to kube-prometheus-stack .tgz
+  OTEL_CHART_PATH                   Local path to opentelemetry-operator .tgz
+  KUBERAY_CHART_PATH                Local path to kuberay-operator .tgz
+  METALLB_CHART_PATH                Local path to metallb .tgz
+
+EXAMPLES
+  # Basic bundle in current directory
+  ./prepare_airgap_bundle.sh
+
+  # Custom output directory and pinned k0s version
+  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
+
+  # Using env vars instead of flags
+  OUTPUT_DIR=/mnt/transfer K0S_VERSION=v1.31.2+k0s.0 ./prepare_airgap_bundle.sh
+
+NEXT STEPS AFTER BUNDLING
+  1. Mirror container images listed in container-images.txt to your internal registry.
+  2. Stage model weights via tools/artifacts_download_upload_scripts/ (separate step).
+  3. Copy the .tar.gz to the air-gapped install machine.
+  4. Run: ./install_from_airgap_bundle.sh --bundle airgap-bundle-<date>.tar.gz \
+                                          --config my-cluster-config.yaml
+
+HELP
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; echo "Run with --help for usage." >&2; exit 1 ;;
   esac
 done
 

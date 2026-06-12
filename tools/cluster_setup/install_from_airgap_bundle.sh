@@ -23,13 +23,95 @@ SUBCOMMAND="${SUBCOMMAND:-install}"
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bundle)    BUNDLE_TARBALL="$2"; shift 2 ;;
-    --config)    CONFIG_FILE="$2"; shift 2 ;;
+    --bundle)      BUNDLE_TARBALL="$2"; shift 2 ;;
+    --config)      CONFIG_FILE="$2"; shift 2 ;;
     --extract-dir) EXTRACT_DIR="$2"; shift 2 ;;
-    --installer) INSTALLER_SCRIPT="$2"; shift 2 ;;
-    --subcommand) SUBCOMMAND="$2"; shift 2 ;;
+    --installer)   INSTALLER_SCRIPT="$2"; shift 2 ;;
+    --subcommand)  SUBCOMMAND="$2"; shift 2 ;;
+    -h|--help)
+      cat <<'HELP'
+install_from_airgap_bundle.sh — extract an air-gap bundle and run the
+Splunk AI Platform installer with no outbound internet required.
+
+USAGE
+  ./install_from_airgap_bundle.sh --bundle BUNDLE.tar.gz [OPTIONS]
+
+REQUIRED
+  --bundle FILE         Path to the tar.gz produced by prepare_airgap_bundle.sh.
+
+OPTIONS
+  --config FILE         Path to your k0s-cluster-config.yaml.
+                        If omitted, the installer looks for CONFIG_FILE in the
+                        environment or its default location.
+
+  --extract-dir DIR     Directory where the bundle is extracted.
+                        Default: /opt/airgap
+                        Env: EXTRACT_DIR
+
+  --installer SCRIPT    Path to k0s_cluster_with_stack.sh.
+                        Default: same directory as this script.
+
+  --subcommand CMD      Installer subcommand to run: install | upgrade | join-workers
+                        Default: install
+                        Env: SUBCOMMAND
+
+  -h, --help            Show this help text.
+
+WHAT THIS SCRIPT DOES
+  1. Extracts the bundle into --extract-dir.
+  2. Verifies SHA-256 checksums of all bundled files.
+  3. Installs the bundled k0s binary to /usr/local/bin/k0s (if not already present).
+  4. Installs the bundled yq binary to /usr/local/bin/yq (if not already present).
+  5. Registers a local Helm chart repository pointing at the bundled .tgz files.
+  6. Exports the following environment variables so k0s_cluster_with_stack.sh
+     uses local files instead of downloading from the internet:
+
+     K0S_INSTALL_URL                   → file://<bundle>/binaries/k0s
+     YQ_DOWNLOAD_URL                   → file://<bundle>/binaries/yq
+     CERT_MANAGER_MANIFEST_URL         → file://<bundle>/manifests/cert-manager.yaml
+     LOCAL_PATH_MANIFEST_URL           → file://<bundle>/manifests/local-path-storage.yaml
+     NVIDIA_DEVICE_PLUGIN_MANIFEST_URL → file://<bundle>/manifests/nvidia-device-plugin.yml
+     PROMETHEUS_CHART_PATH             → <bundle>/charts/kube-prometheus-stack-*.tgz
+     OTEL_CHART_PATH                   → <bundle>/charts/opentelemetry-operator-*.tgz
+     KUBERAY_CHART_PATH                → <bundle>/charts/kuberay-operator-*.tgz
+     METALLB_CHART_PATH                → <bundle>/charts/metallb-*.tgz
+     AIRGAP_MODE                       → true
+
+  7. Invokes k0s_cluster_with_stack.sh <subcommand>.
+
+PREREQUISITES ON THIS MACHINE (no internet needed)
+  kubectl, helm, tar, ssh — must be pre-installed.
+  The installer will use the bundled k0s and yq binaries.
+
+EXAMPLES
+  # Minimal — config in current directory
+  ./install_from_airgap_bundle.sh --bundle airgap-bundle-20260612-103000.tar.gz
+
+  # Explicit config and extract path
+  ./install_from_airgap_bundle.sh \
+    --bundle /mnt/transfer/airgap-bundle-20260612-103000.tar.gz \
+    --config /etc/splunk-ai/my-cluster-config.yaml \
+    --extract-dir /opt/airgap
+
+  # Run upgrade instead of fresh install
+  ./install_from_airgap_bundle.sh \
+    --bundle airgap-bundle-20260612-103000.tar.gz \
+    --config my-cluster-config.yaml \
+    --subcommand upgrade
+
+MANUAL USE (advanced)
+  If you extracted the bundle yourself and want to run the installer directly,
+  source the env-var file from the bundle then call the installer:
+
+    export AIRGAP_BUNDLE_DIR=/opt/airgap/airgap-bundle-20260612-103000
+    source "${AIRGAP_BUNDLE_DIR}/airgap-env.sh"
+    CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+
+HELP
+      exit 0
+      ;;
     *) echo "Unknown option: $1" >&2
-       echo "Usage: $0 --bundle BUNDLE.tar.gz [--config CONFIG.yaml] [--extract-dir DIR] [--installer SCRIPT] [--subcommand install|upgrade]" >&2
+       echo "Run with --help for usage." >&2
        exit 1 ;;
   esac
 done

@@ -18,6 +18,8 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
 - [Internet Dependencies](#internet-dependencies)
 - [Migration Guide](#migration-guide)
 
+> **Air-Gap Installation:** See [AIRGAP.md](AIRGAP.md) for the complete guide to deploying in disconnected environments.
+
 ---
 
 ## Overview
@@ -497,6 +499,8 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 
 ### Environment Variables
 
+#### General
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONFIG_FILE` | `./k0s-cluster-config.yaml` | Path to configuration file |
@@ -504,6 +508,27 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 | `USE_EXISTING` | (from config) | Override `cluster.useExisting` (`auto`/`force`/`never`) |
 | `LOG_DIR` | `./logs` | Directory for session log files |
 | `SKIP_IF_EXISTS` | `0` | Set to `1` to skip re-downloading models already present in `model_artifacts/` (used with `stage-artifacts` or during `install`) |
+
+#### Air-Gap URL Overrides
+
+Every internet URL in the installer can be redirected to a local file or
+internal mirror by setting the corresponding variable. Unset variables fall
+back to the default public URL. These are set automatically by
+`install_from_airgap_bundle.sh`; set them manually only for partial overrides.
+
+| Variable | Replaces | Example value |
+|----------|----------|---------------|
+| `K0S_INSTALL_URL` | `https://get.k0s.sh` | `file:///opt/airgap/bundle/binaries/k0s` |
+| `YQ_DOWNLOAD_URL` | GitHub yq release URL | `file:///opt/airgap/bundle/binaries/yq` |
+| `CERT_MANAGER_MANIFEST_URL` | GitHub cert-manager release URL | `file:///opt/airgap/bundle/manifests/cert-manager.yaml` |
+| `LOCAL_PATH_MANIFEST_URL` | GitHub local-path-provisioner URL | `file:///opt/airgap/bundle/manifests/local-path-storage.yaml` |
+| `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA device plugin URL | `file:///opt/airgap/bundle/manifests/nvidia-device-plugin.yml` |
+| `PROMETHEUS_CHART_PATH` | `prometheus-community/kube-prometheus-stack` | `/opt/airgap/bundle/charts/kube-prometheus-stack-72.3.0.tgz` |
+| `OTEL_CHART_PATH` | `open-telemetry/opentelemetry-operator` | `/opt/airgap/bundle/charts/opentelemetry-operator-0.80.0.tgz` |
+| `KUBERAY_CHART_PATH` | `kuberay/kuberay-operator` | `/opt/airgap/bundle/charts/kuberay-operator-1.2.2.tgz` |
+| `METALLB_CHART_PATH` | `metallb/metallb` | `/opt/airgap/bundle/charts/metallb-0.14.8.tgz` |
+
+See [AIRGAP.md](AIRGAP.md) for the full air-gap workflow.
 
 ### Session Logging
 
@@ -936,31 +961,37 @@ This generates a Kubernetes Service exposing port 8080 on the specified NodePort
 
 ### Air-Gapped Deployment
 
-For completely disconnected environments:
+For completely disconnected environments, use the dedicated helper scripts.
+See [AIRGAP.md](AIRGAP.md) for the complete guide.
 
-1. **Pre-stage on a connected system:**
-   - Download k0s binary
-   - Pull all required container images
-   - Download Helm charts
+**Quick start:**
 
-2. **Transfer to air-gapped environment:**
-   - Copy k0s binary to all nodes
-   - Load images into local registry
-   - Copy Helm charts and manifests
+```bash
+# 1. On an internet-connected machine — build the bundle
+./prepare_airgap_bundle.sh --output-dir /mnt/transfer
 
-3. **Configure to use local resources:**
-   ```yaml
-   images:
-     registry: "registry.airgap.local"
-     operator:
-       image: "registry.airgap.local/splunk-ai-operator:v0.1.5"
-   imagePullSecrets:
-     secrets:
-       - private-registry-secret
-     autoCreateECR: false
-   ```
+# 2. Mirror container images from container-images.txt to your internal registry
 
-4. **Run installation pointing to local registry**
+# 3. Copy the .tar.gz to the air-gapped install machine
+
+# 4. On the install machine — install from the bundle
+./install_from_airgap_bundle.sh \
+  --bundle airgap-bundle-<timestamp>.tar.gz \
+  --config my-cluster-config.yaml
+```
+
+Point all image references at your internal registry in the config:
+
+```yaml
+images:
+  registry: "registry.airgap.local"
+  operator:
+    image: "registry.airgap.local/splunk-ai-operator:latest"
+imagePullSecrets:
+  secrets:
+    - internal-registry-secret
+  autoCreateECR: false
+```
 
 ### Backup and Restore
 
