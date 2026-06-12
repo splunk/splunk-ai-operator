@@ -21,6 +21,9 @@
 | **AIRGAP.md** | 381 lines (new doc) | None | **None** — documentation | **Yes** |
 | **H100 removal from k0s docs** | ~10 lines removed/changed | K0S_README, K0S_QUICKSTART, k0s-cluster-config.yaml, k0s_cluster_with_stack.sh | **None** — documentation + comment | **Yes** — grep |
 | **Gemma model list additions** | ~30 lines added | K0S_README, EKS_README, artifacts/README | **None** — documentation | **Yes** — grep |
+| **wait_for_dependency() — object store** | ~20 lines in `ensure_s3compat_credentials` | `ensure_s3compat_credentials` | **Low** — adds a wait before secret creation; worst case adds ≤5 min if store is briefly unreachable | **Partial** — guard logic reviewable; wait behaviour needs live test |
+| **wait_for_dependency() — HuggingFace** | ~8 lines in `stage_model_artifacts` | `stage_model_artifacts` | **Low** — skipped when `AIRGAP_MODE=true`; adds pause before download | **Partial** — AIRGAP_MODE guard reviewable; wait needs live test |
+| **wait_for_dependency() — NVIDIA repos** | ~10 lines in `install_nvidia_host_drivers` | `install_nvidia_host_drivers` | **Low** — skipped when `AIRGAP_MODE=true`; per-node check before toolkit install | **Partial** — AIRGAP_MODE guard reviewable; wait needs live test |
 
 ---
 
@@ -429,6 +432,43 @@ echo "exit: $?"
 
 ---
 
+### T2-13: `wait_for_dependency()` wired into `ensure_s3compat_credentials` — code review
+
+```bash
+grep -A25 "^ensure_s3compat_credentials" \
+  tools/cluster_setup/k0s_cluster_with_stack.sh \
+  | grep "wait_for_dependency"
+```
+
+**Pass:** `wait_for_dependency` call is present in the function body.
+**Fail:** No match — the wait was not wired in.
+
+---
+
+### T2-14: HuggingFace wait is skipped in air-gap mode — code review
+
+```bash
+grep -A5 "AIRGAP_MODE.*true.*skip.*HuggingFace\|skipping HuggingFace" \
+  tools/cluster_setup/k0s_cluster_with_stack.sh
+```
+
+**Pass:** Log line confirming skip is present.
+**Fail:** No guard — air-gap installs would attempt HuggingFace connectivity check unnecessarily.
+
+---
+
+### T2-15: NVIDIA repo wait is skipped in air-gap mode — code review
+
+```bash
+grep -A5 "AIRGAP_MODE.*true.*skip.*NVIDIA\|skipping NVIDIA repo" \
+  tools/cluster_setup/k0s_cluster_with_stack.sh
+```
+
+**Pass:** Log line confirming skip is present.
+**Fail:** No guard — air-gap GPU installs would fail the connectivity check instead of proceeding with pre-installed drivers.
+
+---
+
 ## Tier 3 — Live cluster (real machines or EC2)
 
 ### T3-1: Normal (online) install still works — regression test
@@ -547,6 +587,68 @@ grep "run.*diagnose"               logs/k0s-install-*.log | tail -3
 
 **Pass:** Both "Log file:" and "run diagnose" appear near the error.
 **Fail:** Not present.
+
+---
+
+### T3-9: Object store wait fires and resolves during online install
+
+During T3-1 (online install), check the log for the wait message:
+
+```bash
+grep "Waiting for external dependency.*object store" logs/k0s-install-*.log | tail -3
+grep "object store.*ready"                           logs/k0s-install-*.log | tail -3
+```
+
+**Pass:** Both lines present — wait fired and resolved immediately because the store was already up.
+**Fail:** Neither line present — `wait_for_dependency` was not called.
+
+---
+
+### T3-10: Object store wait pauses when store is not yet up (interactive test)
+
+Start an install where the MinIO endpoint is unreachable at install time (e.g. stop MinIO, let install start, restart MinIO within 30 s):
+
+```bash
+# Stop MinIO on its host
+ssh minio-host "sudo systemctl stop minio"
+
+# Start install
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install &
+INSTALL_PID=$!
+
+# Wait ~15s then restart MinIO
+sleep 15
+ssh minio-host "sudo systemctl start minio"
+
+# Install should continue automatically
+wait $INSTALL_PID
+```
+
+**Pass:** Log shows "not ready yet. Retrying...", then "ready" after MinIO comes back — install continues without operator intervention.
+**Fail:** Install immediately errors with "connection refused" before MinIO started.
+
+---
+
+### T3-11: Air-gap install skips HuggingFace and NVIDIA repo waits
+
+During T3-2 (full air-gap install):
+
+```bash
+# HuggingFace wait must NOT appear (AIRGAP_MODE=true, modelStaging irrelevant)
+grep "Waiting for external dependency.*HuggingFace" logs/k0s-install-*.log | tail -3
+# Expected: no output
+
+# NVIDIA skip message must appear for each GPU node
+grep "AIRGAP_MODE=true.*NVIDIA\|skipping NVIDIA repo" logs/k0s-install-*.log | tail -3
+# Expected: one line per GPU worker
+
+# Object store wait must still appear (store is always external, even in air-gap)
+grep "Waiting for external dependency.*object store" logs/k0s-install-*.log | tail -3
+# Expected: present
+```
+
+**Pass:** HuggingFace wait absent, NVIDIA skip present per GPU node, object store wait present.
+**Fail:** HuggingFace wait fires in air-gap mode (wastes time on an unreachable host), or object store wait is missing.
 
 ---
 
@@ -675,6 +777,9 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T2-10 | `wait_for_dependency` timeout | No | No | ~10 s | Recommended |
 | T2-11 | Install plan abort on non-yes | No | No | < 1 min | Recommended |
 | T2-12 | Delete aborts on wrong name | No | No | < 1 min | Recommended |
+| T2-13 | Object store wait wired into credentials function | No | No | < 1 min | Yes |
+| T2-14 | HuggingFace wait skipped in air-gap mode | No | No | < 1 min | Yes |
+| T2-15 | NVIDIA repo wait skipped in air-gap mode | No | No | < 1 min | Yes |
 | T3-1 | Online install regression | Yes | Yes | ~45 min | Yes (before shipping) |
 | T3-2 | Full air-gap install | Yes | No (blocked) | ~60 min | Yes (for air-gap customers) |
 | T3-3 | Partial env-var override | Yes | Yes | ~45 min | Recommended |
@@ -683,3 +788,6 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T3-6 | Phase markers grep-able | Yes | Yes | Part of T3-1 | Yes |
 | T3-7 | `diagnose` full bundle | Yes | Yes | ~2 min | Recommended |
 | T3-8 | err() shows log path | Yes | Yes | Part of T3-1 | Yes |
+| T3-9 | Object store wait fires and resolves | Yes | Yes | Part of T3-1 | Yes (for air-gap customers) |
+| T3-10 | Object store wait pauses when store is down | Yes | Yes | ~5 min interactive | Recommended |
+| T3-11 | Air-gap skips HuggingFace + NVIDIA waits, keeps object store wait | Yes | No (blocked) | Part of T3-2 | Yes (for air-gap customers) |

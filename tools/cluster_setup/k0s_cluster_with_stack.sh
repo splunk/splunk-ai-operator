@@ -279,9 +279,15 @@ show_install_plan() {
   echo "" >&2
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
   echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
-  [[ "${MODEL_STAGING_ENABLED}" == "true" ]] && \
-    echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2 || \
+  if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+      echo -e "    2. Model artifact staging  [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
+    else
+      echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2
+    fi
+  else
     echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
+  fi
   echo -e "    3. k0s cluster installation" >&2
   echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
   echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
@@ -1586,6 +1592,27 @@ ensure_s3compat_credentials() {
     err "Refusing to create minio-credentials: objectStore.auth contains template placeholders; fix ${CONFIG_FILE}"
     return 1
   fi
+
+  # Wait for the object store endpoint to be reachable before creating the
+  # Kubernetes secret. In air-gapped environments the store (MinIO/SeaweedFS)
+  # may still be starting up, or its VIP may not be routable yet.
+  local _endpoint=""
+  case "${OBJ_STORE_TYPE}" in
+    minio|seaweedfs)
+      _endpoint="${OBJ_STORE_ENDPOINT:-${MINIO_ENDPOINT:-}}"
+      ;;
+    aws)
+      # For AWS S3, validate connectivity to the regional endpoint.
+      _endpoint="https://s3.${REGION:-us-east-2}.amazonaws.com"
+      ;;
+  esac
+
+  if [[ -n "${_endpoint}" ]]; then
+    wait_for_dependency \
+      "object store (${OBJ_STORE_TYPE}) at ${_endpoint}" \
+      "curl -sf --connect-timeout 5 --max-time 10 '${_endpoint}' >/dev/null 2>&1 || curl -sf --connect-timeout 5 --max-time 10 '${_endpoint}' -o /dev/null -w '%{http_code}' 2>/dev/null | grep -qE '^[0-9]'" \
+      300
+  fi
   # Endpoint is only required for S3-compatible backends (MinIO/SeaweedFS/
   # generic s3compat). For type=aws boto3 derives the regional URL from
   # AWS_REGION on the consuming pods, and the installer intentionally renders
@@ -1632,6 +1659,16 @@ stage_model_artifacts() {
   if object_store_auth_looks_like_placeholder; then
     err "Refusing to stage artifacts: objectStore.auth still contains template placeholders; fix ${CONFIG_FILE}"
     return 1
+  fi
+
+  # ---- Check HuggingFace reachability (skip in air-gap mode) ----
+  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+    wait_for_dependency \
+      "HuggingFace (huggingface.co) — required for model weight download" \
+      "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+      300
+  else
+    log "AIRGAP_MODE=true — skipping HuggingFace connectivity check (models must be pre-staged in object store)"
   fi
 
   # ---- Download from Hugging Face ----
@@ -1975,6 +2012,17 @@ _install_nvidia_on_node() {
   fi
 
   # ---- Phase D: NVIDIA Container Toolkit install ------------------------
+  # Check NVIDIA repo reachability from this GPU node before attempting install.
+  # Skip in air-gap mode — drivers must be pre-installed on the node.
+  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+    wait_for_dependency \
+      "NVIDIA package repo (nvidia.github.io) — required for container-toolkit install on ${gpu_ip}" \
+      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io >/dev/null 2>&1'" \
+      180
+  else
+    log "AIRGAP_MODE=true — skipping NVIDIA repo check for ${gpu_ip}; drivers must be pre-installed on the node"
+  fi
+
   echo "Installing NVIDIA Container Toolkit on ${gpu_ip}..."
   if ! ssh_exec "${gpu_ip}" "
     set -euo pipefail
