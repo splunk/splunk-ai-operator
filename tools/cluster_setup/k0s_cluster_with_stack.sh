@@ -134,7 +134,7 @@ ensure_yq() {
   esac
   case "${os}" in
     Linux)
-      url="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}"
+      url="${YQ_DOWNLOAD_URL:-https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}}"
       log "Installing yq ${YQ_VERSION} (linux-${arch})..."
       if curl -fsSL -o /tmp/yq "${url}"; then
         chmod +x /tmp/yq
@@ -716,7 +716,11 @@ prepare_nodes_for_k0s() {
         echo "k0s binary already present ($(k0s version 2>/dev/null || echo unknown))"
       else
         echo "Installing k0s binary..."
-        curl -sSLf https://get.k0s.sh | sudo sh
+        if [[ -n "${K0S_INSTALL_URL:-}" && "${K0S_INSTALL_URL}" == file://* ]]; then
+          sudo cp "${K0S_INSTALL_URL#file://}" /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
+        else
+          curl -sSLf "${K0S_INSTALL_URL:-https://get.k0s.sh}" | sudo sh
+        fi
       fi
 
       # Ensure k0s is in sudo secure_path
@@ -1080,7 +1084,7 @@ PYSCRIPT"
 
   # Install local-path storage provisioner for persistent volumes
   log "Installing local-path storage provisioner..."
-  ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml"
+  ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f '${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}'"
 
   log "Waiting for storage provisioner to be ready..."
   sleep 10
@@ -1495,7 +1499,7 @@ stage_model_artifacts() {
 install_cert_manager() {
   log "Installing cert-manager..."
 
-  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+  kubectl apply -f "${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
 
   wait_for_crd certificates.cert-manager.io 300
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
@@ -2190,12 +2194,12 @@ RTEOF
   # the patch ever reaches them.
   local manifest
   manifest=$(mktemp)
-  if ! curl -fsSL \
-      "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml" \
-      -o "${manifest}"; then
+  local nvidia_manifest_url="${NVIDIA_DEVICE_PLUGIN_MANIFEST_URL:-https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml}"
+  if ! curl -fsSL "${nvidia_manifest_url}" -o "${manifest}"; then
     rm -f "${manifest}"
-    err "Failed to fetch NVIDIA device-plugin manifest from GitHub (version ${ver}).
-    Check network connectivity and that version ${ver} exists upstream."
+    err "Failed to fetch NVIDIA device-plugin manifest (version ${ver}).
+    URL: ${nvidia_manifest_url}
+    For air-gapped installs set NVIDIA_DEVICE_PLUGIN_MANIFEST_URL=file:///path/to/nvidia-device-plugin.yml"
   fi
 
   log "  Patching manifest in place: GPU nodeSelector + nvidia runtimeClassName..."
@@ -2239,10 +2243,17 @@ RTEOF
 install_kube_prometheus() {
   log "Installing kube-prometheus-stack..."
 
-  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-  helm repo update prometheus-community  # Only update the specific repo we need
+  local chart_ref
+  if [[ -n "${PROMETHEUS_CHART_PATH:-}" && -f "${PROMETHEUS_CHART_PATH}" ]]; then
+    chart_ref="${PROMETHEUS_CHART_PATH}"
+    log "  Using local chart: ${chart_ref}"
+  else
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+    helm repo update prometheus-community
+    chart_ref="prometheus-community/kube-prometheus-stack"
+  fi
 
-  helm_retry 3 upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  helm_retry 3 upgrade --install kube-prometheus-stack "${chart_ref}" \
     --namespace monitoring --create-namespace \
     --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
     --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
@@ -2258,11 +2269,18 @@ install_otel_operator_and_contrib_collector() {
   # OTEL operator uses cert-manager for webhook certs — ensure webhook is ready
   wait_for_cert_manager_webhook 30 10
 
-  helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
-  helm repo update open-telemetry  # Only update the specific repo we need
+  local chart_ref
+  if [[ -n "${OTEL_CHART_PATH:-}" && -f "${OTEL_CHART_PATH}" ]]; then
+    chart_ref="${OTEL_CHART_PATH}"
+    log "  Using local chart: ${chart_ref}"
+  else
+    helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
+    helm repo update open-telemetry
+    chart_ref="open-telemetry/opentelemetry-operator"
+  fi
 
   # Use cert-manager for webhook certificates (now that konnectivity is fixed)
-  helm_retry 3 upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+  helm_retry 3 upgrade --install opentelemetry-operator "${chart_ref}" \
     --namespace opentelemetry-operator-system --create-namespace \
     --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
     --set admissionWebhooks.certManager.enabled=true \
@@ -2277,12 +2295,20 @@ install_otel_operator_and_contrib_collector() {
 install_ray_operator() {
   log "Installing KubeRay Operator..."
 
-  helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  helm repo update kuberay  # Only update the specific repo we need
+  local chart_ref version_flag=()
+  if [[ -n "${KUBERAY_CHART_PATH:-}" && -f "${KUBERAY_CHART_PATH}" ]]; then
+    chart_ref="${KUBERAY_CHART_PATH}"
+    log "  Using local chart: ${chart_ref}"
+  else
+    helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
+    helm repo update kuberay
+    chart_ref="kuberay/kuberay-operator"
+    version_flag=(--version 1.2.2)
+  fi
 
-  helm_retry 3 upgrade --install kuberay-operator kuberay/kuberay-operator \
+  helm_retry 3 upgrade --install kuberay-operator "${chart_ref}" \
     --namespace ray-system --create-namespace \
-    --version 1.2.2 \
+    "${version_flag[@]+"${version_flag[@]}"}" \
     --set image.repository=quay.io/kuberay/operator \
     --set image.tag=v1.2.2 \
     --wait --timeout=10m
@@ -3295,12 +3321,19 @@ install_metallb() {
   fi
 
   log "Installing MetalLB ${chart_version} into namespace ${ns}..."
-  helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1 || true
-  helm repo update >/dev/null 2>&1 || true
+  local metallb_chart_ref
+  if [[ -n "${METALLB_CHART_PATH:-}" && -f "${METALLB_CHART_PATH}" ]]; then
+    metallb_chart_ref="${METALLB_CHART_PATH}"
+    log "  Using local chart: ${metallb_chart_ref}"
+  else
+    helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1 || true
+    helm repo update >/dev/null 2>&1 || true
+    metallb_chart_ref="metallb/metallb"
+  fi
 
   kubectl get ns "${ns}" >/dev/null 2>&1 || kubectl create ns "${ns}"
 
-  helm upgrade --install metallb metallb/metallb \
+  helm upgrade --install metallb "${metallb_chart_ref}" \
     --namespace "${ns}" \
     --version "${chart_version}" \
     --wait --timeout 5m
@@ -5314,7 +5347,7 @@ join_workers() {
     log "  Checking if k0s is installed..."
     if ! ssh_exec "${worker_ip}" "command -v k0s >/dev/null 2>&1"; then
       log "  Installing k0s..."
-      if ! ssh_exec "${worker_ip}" "curl -sSLf https://get.k0s.sh | sudo sh"; then
+      if ! ssh_exec "${worker_ip}" "curl -sSLf '${K0S_INSTALL_URL:-https://get.k0s.sh}' | sudo sh"; then
         warn "  Failed to install k0s on ${worker_ip}, skipping..."
         continue
       fi
