@@ -509,6 +509,32 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 | `LOG_DIR` | `./logs` | Directory for session log files |
 | `SKIP_IF_EXISTS` | `0` | Set to `1` to skip re-downloading models already present in `model_artifacts/` (used with `stage-artifacts` or during `install`) |
 
+#### Air-Gap Mode
+
+Use `cluster.airgap: true` in your config YAML to tell the installer the cluster has no outbound internet:
+
+```yaml
+cluster:
+  name: my-cluster
+  airgap: true   # disconnected environment — skips HuggingFace + NVIDIA repo checks
+  sshKeyPath: ~/.ssh/id_rsa
+  sshUser: ec2-user
+```
+
+**What `airgap: true` does:**
+- Skips the HuggingFace connectivity check before model staging (models must be pre-staged in object store)
+- Skips the NVIDIA package repo connectivity check on GPU workers (drivers must be pre-installed)
+- Object store connectivity is still checked — it lives on your local network and must be reachable
+- The install plan banner shows `Air-gap mode: true` so customers can confirm it was picked up
+
+**Precedence:** `AIRGAP_MODE=true` env var overrides the YAML value — useful for a one-off run without editing the file. `install_from_airgap_bundle.sh` sets `AIRGAP_MODE=true` automatically; no manual config change needed when using the bundle workflow.
+
+| Setting | How to set | When to use |
+|---|---|---|
+| `cluster.airgap: true` in YAML | Edit `k0s-cluster-config.yaml` | Permanent air-gap environment — commit it with your config |
+| `AIRGAP_MODE=true` env var | `AIRGAP_MODE=true ./k0s_cluster_with_stack.sh install` | One-off run without editing YAML, or CI override |
+| Neither (default) | Do nothing | Internet-connected environment |
+
 #### Air-Gap URL Overrides
 
 Every internet URL in the installer can be redirected to a local file or

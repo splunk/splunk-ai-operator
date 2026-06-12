@@ -220,6 +220,24 @@ scp my-cluster-config.yaml admin@install-machine:/opt/splunk-ai/
 
 ## Step 5 — Install from the Bundle
 
+### Configure air-gap mode in your cluster config
+
+Add `cluster.airgap: true` to your `k0s-cluster-config.yaml`. This is the recommended way to configure air-gap mode — it is version-controlled alongside your cluster config and requires no additional env vars each run.
+
+```yaml
+cluster:
+  name: my-cluster
+  airgap: true        # tells the installer this environment has no outbound internet
+  sshKeyPath: ~/.ssh/id_rsa
+  sshUser: ec2-user
+```
+
+> **Why this matters:** without `airgap: true`, the installer will attempt connectivity checks to HuggingFace and NVIDIA package repos before skipping them. Those checks will pause for up to 5 minutes waiting for unreachable hosts before timing out. Setting `airgap: true` skips them immediately.
+
+> **`install_from_airgap_bundle.sh` sets `AIRGAP_MODE=true` automatically** via environment variable. You only need `cluster.airgap: true` in your YAML if you ever run `k0s_cluster_with_stack.sh` directly (without going through the bundle installer).
+
+### Run the installer
+
 On the air-gapped install machine:
 
 ```bash
@@ -236,8 +254,10 @@ The script:
 2. Verifies SHA-256 checksums
 3. Installs `k0s` and `yq` from the bundle
 4. Registers a local Helm repository from the bundled `.tgz` files
-5. Sets all env-var overrides (see [Environment Variable Reference](#environment-variable-reference))
+5. Sets all env-var overrides including `AIRGAP_MODE=true` (see [Environment Variable Reference](#environment-variable-reference))
 6. Runs `k0s_cluster_with_stack.sh install`
+
+The install plan displayed before install starts will show `Air-gap mode: true` — confirm this before proceeding.
 
 Run `./install_from_airgap_bundle.sh --help` for full flag reference.
 
@@ -290,7 +310,7 @@ When set to a local `.tgz` path, the installer skips `helm repo add` /
 | Variable | Default | Description |
 |---|---|---|
 | `AIRGAP_BUNDLE_DIR` | _(not set)_ | Set to the extracted bundle directory. Used by `airgap-env.sh` for manual installs. |
-| `AIRGAP_MODE` | _(not set)_ | Set to `true` by `install_from_airgap_bundle.sh`. Reserved for future use. |
+| `AIRGAP_MODE` | `false` | Set to `true` by `install_from_airgap_bundle.sh`, or loaded from `cluster.airgap` in the config YAML. Skips HuggingFace and NVIDIA repo connectivity checks; object store check is preserved. Env var takes precedence over YAML. |
 
 ### Manual override example
 

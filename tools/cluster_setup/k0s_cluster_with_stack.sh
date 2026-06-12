@@ -393,6 +393,21 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   REGION=$(yq eval '.cluster.region // ""' "${CONFIG_FILE}" 2>/dev/null || grep '^  region:' "${CONFIG_FILE}" | awk '{print $2}')
   [[ "${REGION}" == "null" ]] && REGION=""
 
+  # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
+  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically; customers
+  # running the installer directly should set cluster.airgap: true in their config.
+  local _yaml_airgap
+  _yaml_airgap=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  [[ "${_yaml_airgap}" == "null" ]] && _yaml_airgap="false"
+  # Env var takes precedence over YAML (allows override without editing the file).
+  if [[ "${AIRGAP_MODE:-}" == "true" ]]; then
+    : # already set — env var wins
+  elif [[ "${_yaml_airgap}" == "true" ]]; then
+    export AIRGAP_MODE="true"
+  else
+    export AIRGAP_MODE="false"
+  fi
+
   # Node IPs (for existing infrastructure)
   EXISTING_CONTROLLER_IPS=$(yq eval '.nodes.existingIPs.controllers[]' "${CONFIG_FILE}" 2>/dev/null | tr '\n' ' ' || echo "")
   EXISTING_WORKER_IPS=$(yq eval '.nodes.existingIPs.workers[]' "${CONFIG_FILE}" 2>/dev/null | tr '\n' ' ' || echo "")
