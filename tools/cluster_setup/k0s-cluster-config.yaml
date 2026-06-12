@@ -159,7 +159,6 @@ splunk:
 aiPlatform:
   name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
-  # defaultAcceleratorType: "H100"
 
   workerGroupConfig:
     imageRegistry: ""

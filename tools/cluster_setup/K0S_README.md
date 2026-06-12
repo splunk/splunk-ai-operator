@@ -289,7 +289,7 @@ splunk:
 
 aiPlatform:
   name: "prod-ai-stack"
-  defaultAcceleratorType: "L40S"        # GPU tier: L40S, H100, or ""
+  defaultAcceleratorType: "L40S"        # GPU tier: L40S or ""
   workerGroupConfig:
     imageRegistry: ""                   # Override registry for Ray worker images
   features:
@@ -422,7 +422,7 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `aiPlatform.name` | No | `${CLUSTER_NAME}-ai-platform` | Base name for the AIPlatform CR |
-| `aiPlatform.defaultAcceleratorType` | No | `""` | GPU tier label: `L40S`, `H100`, or empty |
+| `aiPlatform.defaultAcceleratorType` | No | `""` | GPU tier label: `L40S` or empty |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
@@ -527,6 +527,21 @@ The `install` command executes these steps in order:
 3. **Configure images** — Patch `RELATED_IMAGE_*` env vars in manifest files
 4. **Preflight checks** — Validate tools, SSH connectivity, disk space, config
 5. **Model staging** *(when `storage.modelStaging.enabled: true`, the default)* — Download models from Hugging Face and upload them to the configured object store. Set `SKIP_IF_EXISTS=1` to skip re-downloading models already present locally. Skipped entirely when `enabled: false`.
+
+   **Models staged (from `model_artifacts_configs.yaml`):**
+
+   | Model artifact ID | Purpose |
+   |---|---|
+   | `gemma-4-31b-it` | Primary LLM for chat, SPL generation, reasoning |
+   | `gpt-oss-20b` | Secondary LLM |
+   | `all-minilm-l6-v2` | Sentence transformer / semantic search |
+   | `bi-encoder` | BGE small encoder |
+   | `cross-encoder` | MS MARCO cross-encoder |
+   | `e5-language-classifier` | Multilingual language detection |
+   | `mbart-translator` | Multilingual translation |
+   | `pii-classifier` | PII detection |
+   | `uae-large` | Embedding model |
+   | `xlm-roberta-language-classifier` | Language classifier |
 6. **Install k0s cluster** — Safety gate check → clean state → install controller → join workers → label nodes
 7. **Install AI Platform stack** (two-phase parallel):
    - Phase 1 (parallel): cert-manager, kube-prometheus, NVIDIA host drivers
