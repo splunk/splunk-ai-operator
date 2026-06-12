@@ -270,16 +270,15 @@ _check_node_os() {
   os_pretty=$(ssh_exec "${node_ip}" \
     ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
 
-  # Supported: RHEL / CentOS / Rocky / AlmaLinux family, major version 9
+  # Supported: RHEL 9 only. Other family members kept for internal testing.
   if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
   fi
 
   local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
-  Only RHEL 9 (and compatible: Rocky 9, AlmaLinux 9, CentOS Stream 9) is
-  tested and supported. Installation on other OS versions is not validated
-  and may fail in unexpected ways.
+  Only RHEL 9 is tested and supported. Installation on other OS versions
+  is not validated and may fail in unexpected ways.
   To skip this check and continue at your own risk, set:
     FORCE_UNSUPPORTED_OS=1"
 

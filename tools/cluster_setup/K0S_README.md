@@ -119,7 +119,7 @@ yq --version
 
 ### Software Requirements (on All Nodes)
 
-- RHEL 9 (and compatible: Rocky Linux 9, AlmaLinux 9, CentOS Stream 9)
+- RHEL 9
 - Passwordless SSH access from admin workstation
 - Sudo privileges without password
 - Python 3.8+ installed
@@ -940,7 +940,7 @@ kubectl get nodes -l splunk.ai/workload-type=cpu
 The script installs NVIDIA host drivers directly on GPU nodes (not the GPU Operator).
 
 **Supported distributions:**
-- RHEL 9 (and compatible: Rocky Linux 9, AlmaLinux 9, CentOS Stream 9)
+- RHEL 9
 
 **What happens on GPU nodes:**
 1. Kernel headers installed

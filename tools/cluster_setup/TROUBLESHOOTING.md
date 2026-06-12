@@ -133,15 +133,14 @@ again at the start of every `install` invocation.
 
 ### "Unsupported OS on \<role\> \<ip\>: \<pretty-name\>"
 
-The node is not running RHEL 9 (or a compatible distro: Rocky Linux 9,
-AlmaLinux 9, CentOS Stream 9).
+The node is not running RHEL 9.
 
-**Supported:** RHEL 9 family only. RHEL 10, Amazon Linux 2023, and
-Debian/Ubuntu are not tested or supported for cluster nodes.
+**Supported:** RHEL 9 only. RHEL 10, Amazon Linux 2023, Rocky Linux,
+AlmaLinux, and Debian/Ubuntu are not tested or supported for cluster nodes.
 
 **Options:**
 
-1. Re-provision the node with RHEL 9, Rocky Linux 9, or AlmaLinux 9.
+1. Re-provision the node with RHEL 9.
 2. For internal testing only — bypass the check at your own risk:
    ```bash
    FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install

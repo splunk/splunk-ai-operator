@@ -8,7 +8,7 @@ Deploys the complete Splunk AI Platform stack on k0s Kubernetes using pre-provis
 
 **Admin workstation:** `kubectl`, `helm`, `git`, `jq`, `yq`
 
-**Nodes (all):** RHEL 9 (or compatible: Rocky 9, AlmaLinux 9, CentOS Stream 9) · passwordless SSH + sudo · Python 3.8+
+**Nodes (all):** RHEL 9 · passwordless SSH + sudo · Python 3.8+
 
 | Node Type  | Min CPU | Min RAM (per node) | Min Disk | Notes                                                    |
 | ---------- | ------- | ------------------ | -------- | -------------------------------------------------------- |

@@ -57,8 +57,8 @@ OPTIONS
   --gpu-os OS           Target OS for GPU node package files.
                         Supported: rhel9 (default — only tested/supported value)
                         Env: GPU_NODE_OS
-                        Only RHEL 9 (and compatible: Rocky 9, AlmaLinux 9) is
-                        tested and supported. Any other value will error.
+                        Only RHEL 9 is tested and supported.
+                        Any other value will error.
 
   -h, --help            Show this help text.
 

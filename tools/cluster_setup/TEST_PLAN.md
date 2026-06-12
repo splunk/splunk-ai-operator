@@ -344,16 +344,18 @@ grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
 
 ---
 
-### T1-21: Supported OS stated consistently as RHEL 9 family
+### T1-21: Supported OS is RHEL 9 only — no compatible alternatives listed
 
 ```bash
-grep -c "Rocky.*9\|AlmaLinux.*9\|CentOS.*Stream.*9" \
+grep -rni "Rocky\|AlmaLinux\|CentOS" \
   tools/cluster_setup/K0S_README.md \
-  tools/cluster_setup/K0S_QUICKSTART.md
+  tools/cluster_setup/K0S_QUICKSTART.md \
+  tools/cluster_setup/DEPLOYMENT_GUIDE.md \
+  tools/cluster_setup/AIRGAP.md
 ```
 
-**Pass:** Count > 0 in each file — compatible distros listed.
-**Fail:** 0 — only "RHEL 9" listed without mentioning compatible alternatives.
+**Pass:** Zero matches — only RHEL 9 is mentioned as supported.
+**Fail:** Any match — removed distros still present in docs.
 
 ---
 
@@ -991,9 +993,9 @@ grep "Waiting for external dependency.*object store" logs/k0s-install-*.log | ta
 
 ---
 
-### T3-12: `_check_node_os()` passes on RHEL 9 (and compatible) nodes
+### T3-12: `_check_node_os()` passes on RHEL 9 nodes
 
-Run the installer against a RHEL 9 (or Rocky 9 / AlmaLinux 9) cluster:
+Run the installer against a RHEL 9 cluster:
 
 ```bash
 grep "OS check passed" logs/k0s-install-*.log
@@ -1001,8 +1003,6 @@ grep "OS check passed" logs/k0s-install-*.log
 
 **Pass:** One `OS check passed` line per node (controller + workers + GPU workers).
 **Fail:** Any `Unsupported OS` error — RHEL 9 incorrectly rejected.
-
-Repeat with Rocky Linux 9 and AlmaLinux 9 if available. Both should pass.
 
 ---
 
@@ -1306,7 +1306,7 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T2-19 | `AIRGAP_PYYAML_WHEEL_PATH` exported correctly from bundle | No | No | < 1 min | Recommended |
 | T2-20 | `bundle-versions.txt` includes `gpu_node_os` field | No | No | < 1 min | Recommended |
 | T2-21 | `prepare_airgap_bundle.sh --help` documents new GPU options | No | No | < 1 min | Yes |
-| T3-12 | `_check_node_os()` passes on RHEL 9 / Rocky 9 / AlmaLinux 9 | Yes | Yes | Part of T3-1 | Yes (before shipping) |
+| T3-12 | `_check_node_os()` passes on RHEL 9 | Yes | Yes | Part of T3-1 | Yes (before shipping) |
 | T3-13 | `_check_node_os()` blocks install on unsupported OS | Yes | Yes | ~5 min | Yes (before shipping) |
 | T3-14 | `FORCE_UNSUPPORTED_OS=1` downgrades error to warning | Yes | Yes | ~5 min | Recommended |
 | T3-15 | AIRGAP_MODE hard-fails when nvidia-smi absent on GPU node | Yes | No | ~5 min | Yes (for air-gap customers) |
