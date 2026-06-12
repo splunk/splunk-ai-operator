@@ -212,7 +212,18 @@ cp k0s-cluster-config.yaml my-cluster.yaml
 # Open my-cluster.yaml and fill in ALL fields marked CHANGE THIS
 ```
 
-See the [Configuration Reference in K0S_README.md](K0S_README.md#configuration) for all config fields and descriptions.
+The config sections to fill in:
+
+| Section | What to set |
+|---|---|
+| `cluster` | `name`, `sshKeyPath`, `sshUser` |
+| `nodes.existingIPs` | IP addresses of your controller and worker nodes |
+| `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
+| `images` | Your registry URL + all image tags |
+| `aiPlatform` | `defaultAcceleratorType` — set to `L40S` |
+| `metallb.pool.addresses` | A free IP range on your LAN (for LoadBalancer VIP) |
+
+> For full field descriptions, defaults, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#configuration).
 
 **2. Validate your config before installing**
 
