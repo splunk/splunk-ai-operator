@@ -53,11 +53,51 @@ LOG_FILE="${LOG_DIR}/k0s-install-$(date '+%Y-%m-%d_%H-%M-%S').log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[LOG] Session log: ${LOG_FILE}"
 
+# ====== LOG ROTATION (keep last 10 logs) ======
+_rotate_logs() {
+  local keep=10
+  local logs
+  # Sort oldest-first; delete everything beyond the last $keep files.
+  mapfile -t logs < <(ls -1t "${LOG_DIR}"/k0s-install-*.log 2>/dev/null)
+  local excess=$(( ${#logs[@]} - keep ))
+  if (( excess > 0 )); then
+    for (( i=${#logs[@]}-1; i>=${#logs[@]}-excess; i-- )); do
+      rm -f "${logs[$i]}"
+    done
+  fi
+}
+_rotate_logs
+
 # ====== COLORS & LOGGING ======
-log()   { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
-warn()  { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
-err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
-need()  { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
+_ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+log()   { echo -e "\033[1;36m[$(_ts) INFO]\033[0m $*" >&2; }
+warn()  { echo -e "\033[1;33m[$(_ts) WARN]\033[0m $*" >&2; }
+err()   {
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m $*" >&2
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Log file: ${LOG_FILE}" >&2
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Run '$0 diagnose' to collect a full support bundle." >&2
+  exit 1
+}
+
+# ====== TOOL CHECKER ======
+# Provides install instructions instead of a bare "missing in PATH" message.
+need() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  local install_hint=""
+  case "$1" in
+    kubectl) install_hint="brew install kubectl  OR  https://kubernetes.io/docs/tasks/tools/" ;;
+    helm)    install_hint="brew install helm  OR  https://helm.sh/docs/intro/install/" ;;
+    yq)      install_hint="brew install yq  OR  wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq" ;;
+    jq)      install_hint="brew install jq  OR  apt-get install jq  OR  dnf install jq" ;;
+    ssh)     install_hint="apt-get install openssh-client  OR  brew install openssh" ;;
+    curl)    install_hint="apt-get install curl  OR  brew install curl" ;;
+    aws)     install_hint="https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" ;;
+    git)     install_hint="brew install git  OR  apt-get install git" ;;
+    *)       install_hint="install '$1' via your system package manager" ;;
+  esac
+  err "Required tool not found: $1
+  Install: ${install_hint}"
+}
 
 # ====== HELM RETRY LOGIC ======
 # Retries helm commands with exponential backoff on transient errors
@@ -117,6 +157,152 @@ pf_summary(){
 TMP_FILES=()
 cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/null || true; }
 trap cleanup_tmp EXIT
+
+# ====== STEP PROGRESS TRACKER ======
+# Usage: step_start "Install cert-manager"   → prints [STEP N/TOTAL] banner
+#        step_ok                             → marks it done
+#        step_fail "reason"                  → marks it failed (does not exit)
+# show_step_summary                          → final table printed at end of install
+declare -a _STEP_NAMES=()
+declare -a _STEP_STATUS=()  # "ok" | "fail" | "skip"
+_STEP_CURRENT=""
+
+step_start() {
+  _STEP_CURRENT="$1"
+  _STEP_NAMES+=("$1")
+  _STEP_STATUS+=("running")
+  local n=${#_STEP_NAMES[@]}
+  echo -e "\n\033[1;34m[$(_ts) ── STEP ${n}: $1 ──]\033[0m" >&2
+}
+
+step_ok() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="ok"
+}
+
+step_fail() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="fail:${1:-unknown error}"
+}
+
+step_skip() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="skip:${1:-}"
+}
+
+show_step_summary() {
+  echo -e "\n\033[1;34m[$(_ts) ════ INSTALL SUMMARY ════]\033[0m" >&2
+  local total=${#_STEP_NAMES[@]} ok=0 fail=0 skip=0
+  for i in "${!_STEP_NAMES[@]}"; do
+    local s="${_STEP_STATUS[$i]}"
+    local icon color label
+    case "${s%%:*}" in
+      ok)      icon="✔"; color="\033[1;32m"; label="OK";           ok=$((ok+1)) ;;
+      fail)    icon="✖"; color="\033[1;31m"; label="${s#fail:}";   fail=$((fail+1)) ;;
+      skip)    icon="–"; color="\033[1;33m"; label="${s#skip:}";   skip=$((skip+1)) ;;
+      running) icon="?"; color="\033[1;33m"; label="interrupted";  fail=$((fail+1)) ;;
+      *)       icon="?"; color="\033[0m";    label="${s}" ;;
+    esac
+    printf "  ${color}${icon}\033[0m  %-45s %s\n" "${_STEP_NAMES[$i]}" "${label}" >&2
+  done
+  echo "" >&2
+  if (( fail == 0 )); then
+    echo -e "  \033[1;32mAll ${total} steps completed successfully.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped.\033[0m" >&2
+    echo -e "  \033[1;31mSee log: ${LOG_FILE}\033[0m" >&2
+  fi
+  echo "" >&2
+}
+
+# ====== PHASE SECTION MARKERS ======
+# Emit a grep-friendly section header so production support can isolate phases.
+phase_start() { echo -e "\n\033[1;35m[$(_ts) ════════ PHASE: $* ════════]\033[0m" >&2; }
+phase_end()   { echo -e "\033[1;35m[$(_ts) ════════ END: $* ════════]\033[0m\n" >&2; }
+
+# ====== WAIT FOR DEPENDENCY (interactive pause-and-retry) ======
+# Usage: wait_for_dependency "check description" CHECK_COMMAND [max_wait_seconds]
+# The check command is re-run every 30 s. On each failure the customer is
+# prompted to press Enter to retry immediately, or the loop continues after
+# 30 s automatically. The function returns 0 once the check passes, or
+# exits with a clear message after max_wait_seconds.
+wait_for_dependency() {
+  local description="$1"
+  local check_cmd="$2"
+  local max_wait="${3:-600}"
+  local elapsed=0 interval=30
+
+  log "Waiting for external dependency: ${description}"
+  log "  Max wait: ${max_wait}s. Press Enter at any time to retry immediately."
+
+  while (( elapsed < max_wait )); do
+    if eval "${check_cmd}" >/dev/null 2>&1; then
+      log "  ✔ ${description} — ready"
+      return 0
+    fi
+    local remaining=$(( max_wait - elapsed ))
+    warn "  ${description} not ready yet. Retrying in ${interval}s (${remaining}s remaining)."
+    warn "  Press Enter to retry now, or wait..."
+    # Wait up to interval seconds for a keypress; non-interactive shells skip.
+    if read -t "${interval}" -r 2>/dev/null; then
+      log "  Retrying immediately..."
+    fi
+    elapsed=$(( elapsed + interval ))
+  done
+
+  err "Timed out after ${max_wait}s waiting for: ${description}
+  Resolve the issue, then re-run the installer."
+}
+
+# ====== SHOW INSTALL PLAN ======
+# Called before install starts; prints what will be done so customers can
+# validate the config before a 40-minute run.
+show_install_plan() {
+  echo -e "\n\033[1;34m╔══════════════════════════════════════════════════════════╗\033[0m" >&2
+  echo -e "\033[1;34m║           SPLUNK AI PLATFORM — INSTALL PLAN               ║\033[0m" >&2
+  echo -e "\033[1;34m╚══════════════════════════════════════════════════════════╝\033[0m" >&2
+  echo "" >&2
+  echo -e "  \033[1mCluster name     :\033[0m ${CLUSTER_NAME}" >&2
+  echo -e "  \033[1mNamespace        :\033[0m ${AI_NS}" >&2
+  echo -e "  \033[1mConfig file      :\033[0m ${CONFIG_FILE}" >&2
+  echo -e "  \033[1mLog file         :\033[0m ${LOG_FILE}" >&2
+  echo "" >&2
+  echo -e "  \033[1mController nodes :\033[0m ${EXISTING_CONTROLLER_IPS}" >&2
+  echo -e "  \033[1mWorker nodes     :\033[0m ${EXISTING_WORKER_IPS:-none configured}" >&2
+  echo -e "  \033[1mAccelerator type :\033[0m ${DEFAULT_ACCELERATOR:-<none — CPU only>}" >&2
+  echo "" >&2
+  echo -e "  \033[1mObject store     :\033[0m type=$(yq eval '.storage.objectStore.type // "?"' "${CONFIG_FILE}" 2>/dev/null)  bucket=$(yq eval '.storage.objectStore.bucket // "?"' "${CONFIG_FILE}" 2>/dev/null)" >&2
+  echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
+  echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
+  echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
+  echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
+  echo "" >&2
+  echo -e "  \033[1mSteps that will run:\033[0m" >&2
+  echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
+  [[ "${MODEL_STAGING_ENABLED}" == "true" ]] && \
+    echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2 || \
+    echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
+  echo -e "    3. k0s cluster installation" >&2
+  echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
+  echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  echo -e "    6. MetalLB load-balancer" >&2
+  echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+  echo -e "    8. Health check + pod verification" >&2
+  echo "" >&2
+
+  if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
+    log "AUTO_APPROVE=true — skipping confirmation."
+    return 0
+  fi
+
+  echo -e "  \033[1mReview the plan above. Type 'yes' to proceed, anything else to abort:\033[0m" >&2
+  local answer
+  read -r answer
+  if [[ "${answer}" != "yes" ]]; then
+    echo "Aborted by user." >&2
+    exit 0
+  fi
+}
 
 # ====== LOAD CONFIGURATION ======
 
@@ -4741,14 +4927,26 @@ main_install() {
   validate_image_config
   configure_images
 
-  preflight_checks
+  show_install_plan
 
+  phase_start "Preflight"
+  step_start "Preflight checks"
+  preflight_checks
+  step_ok
+  phase_end "Preflight"
+
+  phase_start "Model Staging"
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
+    step_start "Model artifact staging (HuggingFace → object store)"
     log "Model staging enabled — downloading from Hugging Face and uploading to object store…"
     stage_model_artifacts
+    step_ok
   else
+    step_start "Model artifact staging"
     log "Model staging disabled (storage.modelStaging.enabled=false) — skipping HF download + upload"
+    step_skip "modelStaging.enabled=false"
   fi
+  phase_end "Model Staging"
 
   # Check if existing Kubernetes cluster should be used
   local use_existing_cluster=false
@@ -4906,10 +5104,17 @@ main_install() {
   fi
 
   # Install AI Platform stack
+  phase_start "AI Platform Stack"
+  step_start "Install AI Platform stack"
   install_ai_platform_stack
+  step_ok
+  phase_end "AI Platform Stack"
 
   # Run health checks
-  check_platform_health || warn "Some components may still be initializing"
+  phase_start "Health Verification"
+  step_start "Platform health checks"
+  check_platform_health || { step_fail "some components still initializing"; warn "Some components may still be initializing"; }
+  step_ok 2>/dev/null || true  # step_fail already called on error path above
 
   # Verify every pod across every namespace, capture diagnostics for failures,
   # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
@@ -4922,11 +5127,18 @@ main_install() {
   #   255     pods healthy but workload CRs not Ready (e.g. RayService still
   #           initialising). Distinct from "0 unhealthy" so the banner can
   #           remain honest even when no individual pod is failing.
+  step_start "Pod health verification"
   VERIFY_RC=0
   verify_all_pods_healthy || VERIFY_RC=$?
   if (( VERIFY_RC != 0 )); then
+    step_fail "${VERIFY_RC} pod(s)/CR(s) not ready — see diagnostics above"
     warn "Some components are not fully ready — see diagnostics above for remediation steps."
+  else
+    step_ok
   fi
+  phase_end "Health Verification"
+
+  show_step_summary
 
   # Show platform access information. Reads VERIFY_RC to choose between a
   # success banner and a "partially ready" banner with an inline summary.
@@ -4948,6 +5160,28 @@ main_delete() {
   log "============================================"
   log "Starting cleanup of k0s cluster: ${CLUSTER_NAME}"
   log "============================================"
+  log "  Controllers : ${EXISTING_CONTROLLER_IPS}"
+  log "  Workers     : ${EXISTING_WORKER_IPS:-none}"
+  log "  Namespace   : ${AI_NS}"
+  log "============================================"
+  log ""
+  warn "This will DELETE the AI Platform stack and stop k0s on all nodes."
+  warn "Node machines will remain running but all Kubernetes data will be removed."
+  warn "This action CANNOT be undone."
+  log ""
+
+  if [[ "${AUTO_APPROVE:-false}" != "true" ]]; then
+    echo -e "  \033[1;31mType the cluster name '${CLUSTER_NAME}' to confirm deletion, or Ctrl-C to abort:\033[0m" >&2
+    local confirm_input
+    read -r confirm_input
+    if [[ "${confirm_input}" != "${CLUSTER_NAME}" ]]; then
+      echo "Aborted — input did not match cluster name." >&2
+      exit 0
+    fi
+    log "Confirmed. Proceeding with deletion..."
+  else
+    log "AUTO_APPROVE=true — skipping confirmation prompt."
+  fi
 
   # Graceful Kubernetes cleanup, then stop k0s on all nodes
   log "Performing graceful Kubernetes cleanup..."
@@ -5066,25 +5300,177 @@ clean_all() {
   log "Aggressive cleanup complete!"
 }
 
+# ====== DIAGNOSE SUBCOMMAND ======
+# Collects a support bundle: cluster state, pod logs, events, installer logs.
+# Produces a single tar.gz that can be attached to a support ticket.
+diagnose() {
+  load_config 2>/dev/null || true
+
+  local bundle_dir
+  bundle_dir="$(mktemp -d)/splunk-ai-diagnose-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "${bundle_dir}"
+
+  log "=== Collecting support bundle into ${bundle_dir} ==="
+
+  # 1. Installer logs
+  log "Collecting installer logs..."
+  cp "${LOG_DIR}"/k0s-install-*.log "${bundle_dir}/" 2>/dev/null || true
+
+  # 2. Cluster state (best-effort — cluster may be unreachable)
+  if timeout 10 kubectl cluster-info &>/dev/null 2>&1; then
+    log "Collecting cluster state..."
+    kubectl get nodes -o wide                          > "${bundle_dir}/nodes.txt"       2>&1 || true
+    kubectl get pods --all-namespaces -o wide          > "${bundle_dir}/pods.txt"        2>&1 || true
+    kubectl get events --all-namespaces --sort-by='.lastTimestamp' \
+                                                       > "${bundle_dir}/events.txt"      2>&1 || true
+    kubectl get pvc --all-namespaces                   > "${bundle_dir}/pvcs.txt"        2>&1 || true
+    kubectl get svc --all-namespaces                   > "${bundle_dir}/services.txt"    2>&1 || true
+    kubectl describe nodes                             > "${bundle_dir}/node-details.txt" 2>&1 || true
+
+    # Per-namespace pod logs for failing pods
+    log "Collecting logs from non-Running pods..."
+    local ns pod
+    while IFS= read -r line; do
+      ns=$(echo "${line}" | awk '{print $1}')
+      pod=$(echo "${line}" | awk '{print $2}')
+      mkdir -p "${bundle_dir}/pod-logs/${ns}"
+      kubectl logs "${pod}" -n "${ns}" --tail=200 \
+        > "${bundle_dir}/pod-logs/${ns}/${pod}.log" 2>&1 || true
+      kubectl logs "${pod}" -n "${ns}" --previous --tail=100 \
+        > "${bundle_dir}/pod-logs/${ns}/${pod}.previous.log" 2>&1 || true
+    done < <(kubectl get pods --all-namespaces --no-headers 2>/dev/null \
+             | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}')
+
+    # AI Platform specific resources
+    kubectl describe aiplatform --all -n "${AI_NS}" > "${bundle_dir}/aiplatform-cr.txt" 2>&1 || true
+    kubectl describe aiservice  --all -n "${AI_NS}" > "${bundle_dir}/aiservice-cr.txt"  2>&1 || true
+  else
+    warn "Cluster not reachable — skipping kubectl diagnostics."
+    echo "Cluster unreachable at time of diagnose run." > "${bundle_dir}/CLUSTER_UNREACHABLE.txt"
+  fi
+
+  # 3. Config file (redact credentials)
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    log "Including config file (credentials redacted)..."
+    sed 's/\(rootUser\|rootPassword\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\):.*/\1: <REDACTED>/g' \
+      "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
+  fi
+
+  # 4. Tool versions
+  {
+    echo "=== Tool versions ==="
+    kubectl version --client 2>/dev/null || true
+    helm version 2>/dev/null || true
+    yq --version 2>/dev/null || true
+    ssh -V 2>&1 || true
+    echo "=== OS ==="
+    uname -a
+  } > "${bundle_dir}/tool-versions.txt"
+
+  # 5. Pack bundle
+  local bundle_tar="${LOG_DIR}/splunk-ai-diagnose-$(date '+%Y%m%d-%H%M%S').tar.gz"
+  tar -czf "${bundle_tar}" -C "$(dirname "${bundle_dir}")" "$(basename "${bundle_dir}")"
+  rm -rf "${bundle_dir}"
+
+  log ""
+  log "=== Support bundle ready ==="
+  log "  File: ${bundle_tar}"
+  log "  Attach this file to your support ticket."
+}
+
+# ====== VALIDATE SUBCOMMAND ======
+# Config completeness check — catches problems before a 40-min install run.
+validate_config() {
+  load_config
+
+  echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
+  local errors=0 warnings=0
+
+  _vcheck() {
+    local label="$1" val="$2" severity="${3:-error}" hint="${4:-}"
+    if [[ -z "${val}" || "${val}" == "null" || "${val}" == "<paste"* ]]; then
+      if [[ "${severity}" == "warn" ]]; then
+        echo -e "  \033[1;33m!\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        warnings=$(( warnings + 1 ))
+      else
+        echo -e "  \033[1;31m✖\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        errors=$(( errors + 1 ))
+      fi
+    else
+      echo -e "  \033[1;32m✔\033[0m ${label}" >&2
+    fi
+  }
+
+  _vcheck "cluster.name"                "${CLUSTER_NAME}"
+  _vcheck "cluster.sshKeyPath"          "$(yq eval '.cluster.sshKeyPath' "${CONFIG_FILE}" 2>/dev/null)" "" "set path to your SSH private key"
+  _vcheck "cluster.sshUser"             "$(yq eval '.cluster.sshUser'    "${CONFIG_FILE}" 2>/dev/null)" "" "set SSH login user on nodes"
+  _vcheck "nodes.existingIPs.controllers[0]" "$(yq eval '.nodes.existingIPs.controllers[0]' "${CONFIG_FILE}" 2>/dev/null)"  "" "at least one controller IP required"
+
+  local obj_type obj_bucket obj_user obj_pass
+  obj_type=$(yq eval '.storage.objectStore.type    // ""' "${CONFIG_FILE}" 2>/dev/null)
+  obj_bucket=$(yq eval '.storage.objectStore.bucket  // ""' "${CONFIG_FILE}" 2>/dev/null)
+  obj_user=$(yq eval '.storage.objectStore.auth.rootUser     // ""' "${CONFIG_FILE}" 2>/dev/null)
+  obj_pass=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null)
+  _vcheck "storage.objectStore.type"   "${obj_type}"   "" "aws | s3compat | minio | seaweedfs"
+  _vcheck "storage.objectStore.bucket" "${obj_bucket}" "" "name of the bucket"
+  _vcheck "storage.objectStore.auth.rootUser"     "${obj_user}"  "" "AWS_ACCESS_KEY_ID or MinIO root user"
+  _vcheck "storage.objectStore.auth.rootPassword" "${obj_pass}"  "" "AWS secret or MinIO root password"
+
+  local img_reg img_op
+  img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
+  img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
+  _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  if [[ -z "${img_reg}" ]]; then
+    echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
+    warnings=$(( warnings + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m images.registry = ${img_reg}" >&2
+  fi
+
+  local splunk_file ai_file
+  splunk_file=$(yq eval '.files.splunkOperator // ""' "${CONFIG_FILE}" 2>/dev/null)
+  ai_file=$(yq eval     '.files.aiPlatform     // ""' "${CONFIG_FILE}" 2>/dev/null)
+  [[ -f "${splunk_file}" ]] && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${splunk_file}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${splunk_file}" >&2; errors=$(( errors+1 )); }
+  [[ -f "${ai_file}" ]]     && echo -e "  \033[1;32m✔\033[0m files.aiPlatform exists: ${ai_file}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.aiPlatform not found: ${ai_file}" >&2; errors=$(( errors+1 )); }
+
+  echo "" >&2
+  if (( errors == 0 && warnings == 0 )); then
+    echo -e "  \033[1;32mConfiguration looks complete. Ready to run install.\033[0m" >&2
+  elif (( errors == 0 )); then
+    echo -e "  \033[1;33m${warnings} warning(s). Configuration is usable but review the items above.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${errors} error(s), ${warnings} warning(s). Fix the errors above before running install.\033[0m" >&2
+    exit 1
+  fi
+}
+
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $0 [install|stage-artifacts|delete|clean-all|join-workers|verify-pods]
+Usage: $0 [install|validate|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
 
 Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
 
 Commands:
   install          - Install k0s cluster and AI Platform stack (auto-stages model
-                     artifacts first when storage.modelStaging.enabled=true)
+                     artifacts first when storage.modelStaging.enabled=true).
+                     Displays an install plan and asks for confirmation before starting.
+  validate         - Check config file completeness before a full install.
+                     Catches missing IPs, unset credentials, missing manifest files.
+                     Safe to run any time — makes no changes.
   stage-artifacts  - Download model artifacts from Hugging Face and upload them to
                      the configured object store. Useful to re-stage or to
                      pre-load before install. Requires nodes.existingIPs in the
                      config (same as install). Always runs regardless of
                      storage.modelStaging.enabled.
   join-workers     - Join/rejoin worker nodes to existing cluster (resume after failure)
-  delete           - Delete cluster and all resources (graceful)
-  clean-all        - Aggressive cleanup including node-level cleanup
+  delete           - Delete cluster and all resources (graceful).
+                     Prompts for cluster name confirmation unless AUTO_APPROVE=true.
+  clean-all        - Aggressive cleanup including node-level cleanup.
+                     Prompts for cluster name confirmation unless AUTO_APPROVE=true.
   verify-pods      - Verify every pod across every namespace AND every workload CR
                      (RayCluster/RayService, Splunk Standalone, AIPlatform/AIService).
                      Waits for Ray workers to be created/pulled by the head, captures
@@ -5092,6 +5478,8 @@ Commands:
                      targeted remediation recommendations. Stale
                      'saia-vector-db-setup-posthook' errors are ignored when the newest
                      posthook pod has Succeeded.
+  diagnose         - Collect a support bundle (cluster state, pod logs, events,
+                     installer logs) into a tar.gz file. Attach to support tickets.
 
 Environment:
   CONFIG_FILE              - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
@@ -5438,6 +5826,9 @@ case "${1:-install}" in
   install)
     main_install
     ;;
+  validate)
+    validate_config
+    ;;
   stage-artifacts)
     load_config
     stage_model_artifacts
@@ -5458,6 +5849,9 @@ case "${1:-install}" in
       export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
     fi
     verify_all_pods_healthy
+    ;;
+  diagnose)
+    diagnose
     ;;
   *)
     usage
