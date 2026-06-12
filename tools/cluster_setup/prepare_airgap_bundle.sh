@@ -25,6 +25,11 @@ KUBERAY_CHART_VERSION="1.2.2"
 # Override with --k0s-version if you need a specific release.
 K0S_VERSION="${K0S_VERSION:-latest}"
 
+# Target OS for GPU node RPM packages: rhel9 | rhel10 | amzn2023
+# Only affects which EPEL and CUDA .repo files are downloaded; the pyyaml
+# wheel is pure Python and works on all supported OS versions.
+GPU_NODE_OS="${GPU_NODE_OS:-rhel9}"
+
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -32,6 +37,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
     --k0s-version) K0S_VERSION="$2"; shift 2 ;;
+    --gpu-os)      GPU_NODE_OS="$2"; shift 2 ;;
     -h|--help)
       cat <<'HELP'
 prepare_airgap_bundle.sh — download all Splunk AI Platform install artifacts
@@ -48,6 +54,13 @@ OPTIONS
   --k0s-version VER     Specific k0s release to download (e.g. v1.31.2+k0s.0).
                         Default: latest stable release
                         Env: K0S_VERSION
+
+  --gpu-os OS           Target OS for GPU node package files.
+                        Choices: rhel9 | rhel10 | amzn2023
+                        Default: rhel9
+                        Env: GPU_NODE_OS
+                        Affects which EPEL RPM and CUDA .repo file are downloaded.
+                        The pyyaml wheel is pure Python and works on all OS versions.
 
   -h, --help            Show this help text.
 
@@ -67,6 +80,12 @@ WHAT IS BUNDLED
     kuberay-operator-1.2.2.tgz    — KubeRay operator (pinned)
     metallb-0.14.8.tgz            — MetalLB load-balancer (pinned)
 
+  packages/  (GPU node OS packages — for fully offline GPU worker setup)
+    epel-release-latest-<N>.noarch.rpm  — EPEL RPM for RHEL/AL2023
+    cuda-<os>.repo                      — CUDA package repository definition
+    nvidia-container-toolkit.repo       — nvidia-container-toolkit RPM repo definition
+    pyyaml-*.whl                        — PyYAML pure-Python wheel (all nodes)
+
   airgap-env.sh         — Source this to set env-var overrides before a manual install
   container-images.txt  — List of container images to mirror to your internal registry
   bundle-versions.txt   — Records all component versions for reproducibility
@@ -85,16 +104,23 @@ ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   OTEL_CHART_PATH                   Local path to opentelemetry-operator .tgz
   KUBERAY_CHART_PATH                Local path to kuberay-operator .tgz
   METALLB_CHART_PATH                Local path to metallb .tgz
+  EPEL_RPM_URL_OVERRIDE             URL/path to EPEL release RPM (GPU nodes)
+  CUDA_REPO_URL_OVERRIDE            URL/path to CUDA .repo file (GPU nodes)
+  NVIDIA_CTK_REPO_URL_OVERRIDE      URL/path to nvidia-container-toolkit .repo (GPU nodes)
+  AIRGAP_PYYAML_WHEEL_PATH          Path to PyYAML .whl file (all nodes, optional)
 
 EXAMPLES
-  # Basic bundle in current directory
+  # Basic bundle in current directory (RHEL 9 GPU nodes)
   ./prepare_airgap_bundle.sh
 
-  # Custom output directory and pinned k0s version
-  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
+  # RHEL 10 GPU nodes with custom output directory
+  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --gpu-os rhel10
+
+  # Amazon Linux 2023 GPU nodes, pinned k0s version
+  ./prepare_airgap_bundle.sh --gpu-os amzn2023 --k0s-version v1.31.2+k0s.0
 
   # Using env vars instead of flags
-  OUTPUT_DIR=/mnt/transfer K0S_VERSION=v1.31.2+k0s.0 ./prepare_airgap_bundle.sh
+  OUTPUT_DIR=/mnt/transfer GPU_NODE_OS=rhel9 ./prepare_airgap_bundle.sh
 
 NEXT STEPS AFTER BUNDLING
   1. Mirror container images listed in container-images.txt to your internal registry.
@@ -102,6 +128,23 @@ NEXT STEPS AFTER BUNDLING
   3. Copy the .tar.gz to the air-gapped install machine.
   4. Run: ./install_from_airgap_bundle.sh --bundle airgap-bundle-<date>.tar.gz \
                                           --config my-cluster-config.yaml
+
+GPU NODE PACKAGES (packages/ directory)
+  The bundle includes OS package files for GPU workers. install_from_airgap_bundle.sh
+  copies these to each GPU node via scp before the main installer runs, so the
+  installer can use them without internet access.
+
+  For RHEL/AL2023 GPU nodes the bundle provides:
+    - EPEL release RPM (installs EPEL repo for DKMS)
+    - CUDA .repo file (redirects dnf to the bundled content if served via HTTP)
+    - nvidia-container-toolkit .repo file
+    - PyYAML wheel (pure Python, installed via pip3 --no-index)
+
+  NOTE: The CUDA and nvidia-container-toolkit .repo files redirect dnf to
+  developer.download.nvidia.com. For a truly offline install you still need
+  either a local RPM mirror or to pre-install the NVIDIA driver and
+  nvidia-container-toolkit before running this script.
+  See AIRGAP.md → 'GPU Node OS Packages — Strategies' for full options.
 
 HELP
       exit 0
@@ -156,12 +199,14 @@ log "  local-path-provisioner: ${LOCAL_PATH_PROVISIONER_VERSION}"
 log "  nvidia-device-plugin  : ${NVIDIA_DEVICE_PLUGIN_VERSION}"
 log "  metallb chart         : ${METALLB_CHART_VERSION}"
 log "  kuberay chart         : ${KUBERAY_CHART_VERSION}"
+log "  gpu node OS           : ${GPU_NODE_OS}"
 log ""
 
 mkdir -p \
   "${STAGE_DIR}/binaries" \
   "${STAGE_DIR}/manifests" \
-  "${STAGE_DIR}/charts"
+  "${STAGE_DIR}/charts" \
+  "${STAGE_DIR}/packages"
 
 # ── 1. k0s binary ─────────────────────────────────────────────────────────────
 log "--- Downloading k0s binary ---"
@@ -237,7 +282,75 @@ helm pull metallb/metallb \
   --version "${METALLB_CHART_VERSION}" \
   --destination "${STAGE_DIR}/charts"
 
-# ── 5. Write manifest: env var overrides for k0s_cluster_with_stack.sh ────────
+# ── 5. GPU node OS packages ───────────────────────────────────────────────────
+# These files are SCPed to GPU nodes by install_from_airgap_bundle.sh before
+# the main installer runs so the nodes can install dependencies without internet.
+#
+# Strategy:
+#  - EPEL RPM: installs the EPEL repo (provides DKMS on RHEL/AL2023).
+#  - CUDA .repo file: tells dnf/apt where the CUDA packages live.
+#    For a fully offline setup the customer must serve the CUDA RPMs from a
+#    local HTTP mirror and redirect CUDA_REPO_URL_OVERRIDE to it.
+#    Without a local mirror, the .repo file still points at NVIDIA's servers.
+#  - nvidia-container-toolkit .repo: same pattern.
+#  - PyYAML wheel: pure-Python, installed offline via pip3 --no-index.
+log "--- Downloading GPU node OS packages (target OS: ${GPU_NODE_OS}) ---"
+
+# Resolve EPEL major from GPU_NODE_OS
+case "${GPU_NODE_OS}" in
+  rhel9|amzn2023) EPEL_MAJOR=9 ;;
+  rhel10)         EPEL_MAJOR=10 ;;
+  *)
+    warn "Unknown GPU_NODE_OS '${GPU_NODE_OS}'; defaulting EPEL major to 9"
+    EPEL_MAJOR=9 ;;
+esac
+
+# EPEL release RPM
+EPEL_RPM_URL="https://dl.fedoraproject.org/pub/epel/epel-release-latest-${EPEL_MAJOR}.noarch.rpm"
+download "${EPEL_RPM_URL}" "${STAGE_DIR}/packages/epel-release-latest-${EPEL_MAJOR}.noarch.rpm"
+echo "${EPEL_RPM_URL}" > "${STAGE_DIR}/packages/epel-release-latest-${EPEL_MAJOR}.noarch.rpm.url"
+
+# CUDA repo definition file (text file — not the full RPM package set)
+case "${GPU_NODE_OS}" in
+  amzn2023)
+    CUDA_REPO_FILE_URL="https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo"
+    CUDA_REPO_FILENAME="cuda-amzn2023.repo" ;;
+  rhel10)
+    CUDA_REPO_FILE_URL="https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/cuda-rhel10.repo"
+    CUDA_REPO_FILENAME="cuda-rhel10.repo" ;;
+  *)
+    CUDA_REPO_FILE_URL="https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo"
+    CUDA_REPO_FILENAME="cuda-rhel9.repo" ;;
+esac
+download "${CUDA_REPO_FILE_URL}" "${STAGE_DIR}/packages/${CUDA_REPO_FILENAME}"
+
+# nvidia-container-toolkit RPM repo definition (text file)
+CTK_REPO_URL="https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo"
+download "${CTK_REPO_URL}" "${STAGE_DIR}/packages/nvidia-container-toolkit.repo"
+
+# PyYAML wheel — pure Python, works on all supported OS versions.
+# We fetch the latest wheel from PyPI's simple index rather than pip-downloading
+# (avoid requiring pip on the bundle machine).
+log "Downloading PyYAML wheel from PyPI..."
+PYYAML_WHEEL_URL="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
+  | grep -o '"url":"[^"]*none-any\.whl"' | head -1 | cut -d'"' -f4)"
+if [[ -z "${PYYAML_WHEEL_URL}" ]]; then
+  # PyYAML ships platform wheels; fall back to a known-good URL pattern.
+  PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
+    | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  warn "Pure-Python PyYAML wheel not found; fetching source distribution for version ${PYYAML_VERSION}."
+  # The source tarball also works: pip3 install pyyaml-X.Y.tar.gz (builds in-place).
+  PYYAML_WHEEL_URL="https://files.pythonhosted.org/packages/source/P/PyYAML/PyYAML-${PYYAML_VERSION}.tar.gz"
+  PYYAML_FILENAME="PyYAML-${PYYAML_VERSION}.tar.gz"
+else
+  PYYAML_FILENAME="$(basename "${PYYAML_WHEEL_URL}")"
+fi
+download "${PYYAML_WHEEL_URL}" "${STAGE_DIR}/packages/${PYYAML_FILENAME}"
+echo "${PYYAML_FILENAME}" > "${STAGE_DIR}/packages/pyyaml.filename"
+
+log "GPU node packages downloaded to ${STAGE_DIR}/packages/"
+
+# ── 6. Env-var override manifest ──────────────────────────────────────────────
 log "--- Writing env-var override manifest ---"
 
 cat > "${STAGE_DIR}/airgap-env.sh" <<'ENVEOF'
@@ -264,9 +377,20 @@ export PROMETHEUS_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack-
 export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-$(cat "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version").tgz"
 export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION:-1.2.2}.tgz"
 export METALLB_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/metallb-${METALLB_CHART_VERSION:-0.14.8}.tgz"
+
+# GPU node OS packages — used by install_from_airgap_bundle.sh to SCP packages
+# to each GPU node before the main installer runs.
+# The installer reads AIRGAP_PYYAML_WHEEL_PATH to install pyyaml without internet.
+# EPEL, CUDA, and CTK packages are distributed as files on the node, then the
+# installer uses EPEL_RPM_URL_OVERRIDE / CUDA_REPO_URL_OVERRIDE /
+# NVIDIA_CTK_REPO_URL_OVERRIDE to reference those local copies.
+PYYAML_FNAME="$(cat "${AIRGAP_BUNDLE_DIR}/packages/pyyaml.filename" 2>/dev/null || echo "")"
+if [[ -n "${PYYAML_FNAME}" ]]; then
+  export AIRGAP_PYYAML_WHEEL_PATH="${AIRGAP_BUNDLE_DIR}/packages/${PYYAML_FNAME}"
+fi
 ENVEOF
 
-# ── 6. Container image list ───────────────────────────────────────────────────
+# ── 7. Container image list ───────────────────────────────────────────────────
 log "--- Generating container image list ---"
 
 cat > "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
@@ -330,7 +454,7 @@ docker.io/library/nginx:1.27-alpine
 #         pii-classifier, uae-large, xlm-roberta-language-classifier
 IMGEOF
 
-# ── 7. Write version manifest ─────────────────────────────────────────────────
+# ── 8. Write version manifest ─────────────────────────────────────────────────
 cat > "${STAGE_DIR}/bundle-versions.txt" <<VEOF
 k0s_version=${K0S_VERSION}
 yq_version=${YQ_VERSION}
@@ -341,20 +465,22 @@ metallb_chart_version=${METALLB_CHART_VERSION}
 kuberay_chart_version=${KUBERAY_CHART_VERSION}
 prometheus_chart_version=${PROMETHEUS_CHART_VERSION}
 otel_chart_version=${OTEL_CHART_VERSION}
+gpu_node_os=${GPU_NODE_OS}
+epel_major=${EPEL_MAJOR}
 bundle_timestamp=${BUNDLE_TIMESTAMP}
 VEOF
 
-# ── 8. Checksums ──────────────────────────────────────────────────────────────
+# ── 9. Checksums ──────────────────────────────────────────────────────────────
 log "--- Computing checksums ---"
 (
   cd "${STAGE_DIR}"
-  find binaries manifests charts -type f | sort | while read -r f; do
+  find binaries manifests charts packages -type f | sort | while read -r f; do
     printf "%s  %s\n" "$(sha256 "$f")" "$f"
   done
 ) > "${STAGE_DIR}/checksums.sha256"
 log "Checksums written to ${STAGE_DIR}/checksums.sha256"
 
-# ── 9. Pack the bundle ────────────────────────────────────────────────────────
+# ── 10. Pack the bundle ───────────────────────────────────────────────────────
 log "--- Creating tar.gz bundle ---"
 BUNDLE_TARBALL="${OUTPUT_DIR}/${BUNDLE_NAME}.tar.gz"
 tar -czf "${BUNDLE_TARBALL}" -C "${OUTPUT_DIR}" "${BUNDLE_NAME}"

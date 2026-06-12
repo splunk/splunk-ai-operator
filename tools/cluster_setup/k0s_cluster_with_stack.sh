@@ -909,7 +909,16 @@ prepare_nodes_for_k0s() {
         echo "python3+pyyaml already present"
       else
         echo "Installing python3-pyyaml..."
-        if command -v dnf >/dev/null 2>&1; then
+        # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
+        # back to the OS package manager (which will succeed if a local repo
+        # mirror is configured on the node).  Internet-only paths are guarded
+        # by the AIRGAP_PYYAML_WHEEL_PATH check so we never silently skip them.
+        if [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
+          echo "Installing pyyaml from bundled wheel ${AIRGAP_PYYAML_WHEEL_PATH}..."
+          sudo pip3 install --no-index --find-links="$(dirname "${AIRGAP_PYYAML_WHEEL_PATH}")" pyyaml 2>/dev/null \
+            || sudo pip3 install "${AIRGAP_PYYAML_WHEEL_PATH}" 2>/dev/null \
+            || echo "WARN: pip3 wheel install failed — python3-pyyaml may be missing"
+        elif command -v dnf >/dev/null 2>&1; then
           sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
         elif command -v apt-get >/dev/null 2>&1; then
           sudo apt-get install -y python3-yaml 2>/dev/null || true
@@ -1814,6 +1823,16 @@ _install_nvidia_on_node() {
 
   if [[ -n "${driver_ver}" ]]; then
     echo "✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    # In air-gap mode the node must have NVIDIA drivers pre-installed.
+    # The Phase A check above already looked for nvidia-smi; if we reach
+    # here it wasn't found.  Fail clearly rather than attempting internet
+    # package downloads that will time out or silently fail.
+    echo "ERROR: AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found on ${gpu_ip}." >&2
+    echo "  Pre-install the NVIDIA driver on this node using a local RPM/DEB mirror" >&2
+    echo "  or the bundled package directory, then re-run the installer." >&2
+    echo "  See AIRGAP.md → 'GPU Node OS Packages' for step-by-step instructions." >&2
+    return 1
   else
     echo "Installing NVIDIA driver on ${gpu_ip}..."
 
@@ -1883,9 +1902,12 @@ _install_nvidia_on_node() {
         sudo dnf install -y dnf-plugins-core
 
         # EPEL: provides DKMS on RHEL (RHEL's own repos don't ship DKMS).
+        # EPEL_RPM_URL_OVERRIDE lets air-gap customers redirect to a local mirror:
+        #   export EPEL_RPM_URL_OVERRIDE="http://mirror.internal/epel/epel-release-latest-9.noarch.rpm"
         if ! rpm -q epel-release >/dev/null 2>&1; then
           echo \"--- Installing EPEL for DKMS (major \${EPEL_MAJOR}) ---\"
-          sudo dnf install -y \"https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm\"
+          _EPEL_URL=\"\${EPEL_RPM_URL_OVERRIDE:-https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm}\"
+          sudo dnf install -y \"\${_EPEL_URL}\"
         fi
         # CRB (formerly PowerTools on RHEL 8) hosts a few EPEL build deps on
         # RHEL. AL2023 doesn't have a CRB repo (its core packages are in
@@ -1908,18 +1930,21 @@ _install_nvidia_on_node() {
       # Clean cross-major repos so dnf doesn't try to install from the wrong
       # CUDA metadata (common failure mode on in-place RHEL 9 → 10 upgrades,
       # and on re-runs of this script where the target OS may have changed).
+      #
+      # CUDA_REPO_URL_OVERRIDE: set to a local mirror .repo/.deb URL to redirect
+      # away from developer.download.nvidia.com:
+      #   export CUDA_REPO_URL_OVERRIDE="http://mirror.internal/cuda/cuda-rhel9.repo"
       if [ \"\${OS_FAMILY}\" = 'amzn' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-amzn*.repo
-        sudo dnf config-manager --add-repo \\
-          \"https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo\"
+        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo}\"
+        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
       elif [ \"\${OS_FAMILY}\" = 'rhel' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-rhel*.repo
-        sudo dnf config-manager --add-repo \\
-          \"https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo\"
+        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo}\"
+        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
       elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        curl -fsSL \\
-          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \\
-          -o /tmp/cuda-keyring.deb
+        _CUDA_DEB=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb}\"
+        curl -fsSL \"\${_CUDA_DEB}\" -o /tmp/cuda-keyring.deb
         sudo dpkg -i /tmp/cuda-keyring.deb
         sudo apt-get update -qq
       fi
@@ -2045,17 +2070,22 @@ _install_nvidia_on_node() {
       echo '✓ nvidia-ctk already installed (version: '\"\$(nvidia-ctk --version 2>/dev/null | head -1)\"')'
     else
       echo '--- Adding NVIDIA container-toolkit repo ---'
+      # NVIDIA_CTK_REPO_URL_OVERRIDE: set to a local mirror repo URL to redirect
+      # away from nvidia.github.io (partial air-gap or local mirror scenario):
+      #   export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-container-toolkit.repo"
       if [ -f /etc/debian_version ]; then
-        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+        _CTK_BASE=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container}\"
+        curl -fsSL \"\${_CTK_BASE}/gpgkey\" | \
           sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        curl -fsSL \"\${_CTK_BASE}/stable/deb/nvidia-container-toolkit.list\" | \
           sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
         sudo apt-get update -qq
         sudo apt-get install -y nvidia-container-toolkit
       else
         # RHEL 9 and 10 both use the same libnvidia-container stable RPM repo.
-        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+        _CTK_REPO=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo}\"
+        curl -fsSL \"\${_CTK_REPO}\" | \
           sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
         sudo dnf install -y nvidia-container-toolkit
       fi

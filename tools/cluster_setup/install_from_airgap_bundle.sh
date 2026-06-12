@@ -75,9 +75,31 @@ WHAT THIS SCRIPT DOES
      OTEL_CHART_PATH                   → <bundle>/charts/opentelemetry-operator-*.tgz
      KUBERAY_CHART_PATH                → <bundle>/charts/kuberay-operator-*.tgz
      METALLB_CHART_PATH                → <bundle>/charts/metallb-*.tgz
+     AIRGAP_PYYAML_WHEEL_PATH          → <bundle>/packages/PyYAML-*.whl (or .tar.gz)
      AIRGAP_MODE                       → true
 
   7. Invokes k0s_cluster_with_stack.sh <subcommand>.
+
+NOTE ON GPU NODE PACKAGES
+  The bundle contains OS package files under packages/:
+    - epel-release-latest-<N>.noarch.rpm
+    - cuda-<os>.repo
+    - nvidia-container-toolkit.repo
+    - PyYAML-*.whl (or .tar.gz)
+
+  install_from_airgap_bundle.sh does NOT automatically SCP these to GPU nodes
+  because the GPU node IPs and SSH credentials are defined in the cluster config,
+  which is loaded by k0s_cluster_with_stack.sh itself. Instead:
+
+  Option A (recommended): pre-install NVIDIA drivers + nvidia-container-toolkit
+    on GPU nodes before running this script.  The installer detects and skips
+    driver installation if nvidia-smi is already present.
+
+  Option B: use the packages/ files to set up a local RPM mirror, then set
+    EPEL_RPM_URL_OVERRIDE / CUDA_REPO_URL_OVERRIDE / NVIDIA_CTK_REPO_URL_OVERRIDE
+    to point at that mirror before running this script.
+
+  See AIRGAP.md → 'GPU Node OS Packages' for full step-by-step instructions.
 
 PREREQUISITES ON THIS MACHINE (no internet needed)
   kubectl, helm, tar, ssh — must be pre-installed.
@@ -263,6 +285,17 @@ export PROMETHEUS_CHART_PATH="${PROM_TGZ}"
 export OTEL_CHART_PATH="${OTEL_TGZ}"
 export KUBERAY_CHART_PATH="${KUBERAY_TGZ}"
 export METALLB_CHART_PATH="${METALLB_TGZ}"
+
+# GPU node OS packages — pyyaml wheel path for offline pip3 install on all nodes
+PYYAML_FNAME=""
+[[ -f "${BUNDLE_DIR}/packages/pyyaml.filename" ]] && \
+  PYYAML_FNAME="$(cat "${BUNDLE_DIR}/packages/pyyaml.filename")"
+if [[ -n "${PYYAML_FNAME}" && -f "${BUNDLE_DIR}/packages/${PYYAML_FNAME}" ]]; then
+  export AIRGAP_PYYAML_WHEEL_PATH="${BUNDLE_DIR}/packages/${PYYAML_FNAME}"
+  log "PyYAML wheel found: ${AIRGAP_PYYAML_WHEEL_PATH}"
+else
+  log "No PyYAML wheel in bundle — nodes will fall back to OS package manager for pyyaml."
+fi
 
 # Disable helm repo add/update calls inside the installer — all charts are local
 export AIRGAP_MODE="true"

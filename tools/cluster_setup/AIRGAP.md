@@ -12,6 +12,7 @@ outbound internet access from the cluster nodes or the install machine.
 - [Step 3 — Stage Model Weights](#step-3--stage-model-weights)
 - [Step 4 — Transfer Files to the Air-Gapped Environment](#step-4--transfer-files-to-the-air-gapped-environment)
 - [Step 5 — Install from the Bundle](#step-5--install-from-the-bundle)
+- [GPU Node OS Packages](#gpu-node-os-packages)
 - [Environment Variable Reference](#environment-variable-reference)
 - [Partial Air-Gap (Mirror One Component)](#partial-air-gap-mirror-one-component)
 - [Troubleshooting](#troubleshooting)
@@ -272,6 +273,110 @@ Run `./install_from_airgap_bundle.sh --help` for full flag reference.
 
 ---
 
+---
+
+## GPU Node OS Packages
+
+The main installer SSHes into cluster nodes and installs OS packages at runtime.
+In an air-gapped environment those package downloads will fail unless the nodes
+have internet access, a local package mirror is configured, or the packages are
+pre-installed.
+
+### Which packages are internet-dependent
+
+| Package | Node type | Repo source |
+|---|---|---|
+| `python3-pyyaml` / `python3-yaml` | All nodes | Default OS repo (dnf/apt) |
+| `kernel-devel`, `kernel-headers` | GPU workers | Default OS repo / RHUI |
+| `dnf-plugins-core` | GPU workers (RHEL/AL2023) | Default OS repo |
+| `epel-release` RPM | GPU workers (RHEL/AL2023) | `dl.fedoraproject.org/pub/epel/` |
+| `dkms`, `gcc`, `make`, `elfutils-libelf-devel` | GPU workers | EPEL repo |
+| CUDA repo `.repo` file | GPU workers | `developer.download.nvidia.com` |
+| `cuda-drivers` / `nvidia-open` | GPU workers | CUDA repo |
+| `nvidia-container-toolkit` | GPU workers | `nvidia.github.io/libnvidia-container` |
+
+### Strategies
+
+**Strategy 1 — Pre-install before running the installer (simplest)**
+
+Pre-install NVIDIA drivers and nvidia-container-toolkit on GPU nodes before
+running `install_from_airgap_bundle.sh`. The installer detects `nvidia-smi` at
+runtime and skips the driver installation entirely.
+
+The bundle includes package files to assist:
+
+```bash
+# On each GPU node (copy from the bundle machine first):
+BUNDLE_PKGS=/opt/airgap/airgap-bundle-<date>/packages
+
+# 1. Install EPEL (RHEL/AL2023 only — provides DKMS)
+sudo dnf install -y "${BUNDLE_PKGS}/epel-release-latest-9.noarch.rpm"
+
+# 2. Enable EPEL and install the build toolchain + DKMS
+sudo dnf install -y dkms gcc make elfutils-libelf-devel kernel-devel-$(uname -r)
+
+# 3. Add the CUDA repo (repo file only — still fetches RPMs from NVIDIA CDN
+#    unless you set up a local mirror; see Strategy 2 below)
+sudo cp "${BUNDLE_PKGS}/cuda-rhel9.repo" /etc/yum.repos.d/
+sudo dnf install -y cuda-drivers
+
+# 4. Add the nvidia-container-toolkit repo and install
+sudo cp "${BUNDLE_PKGS}/nvidia-container-toolkit.repo" /etc/yum.repos.d/
+sudo dnf install -y nvidia-container-toolkit
+```
+
+After this, run the installer normally — it will detect `nvidia-smi` and skip
+driver installation:
+
+```bash
+./install_from_airgap_bundle.sh \
+  --bundle /opt/airgap-bundle-<date>.tar.gz \
+  --config my-cluster-config.yaml
+```
+
+> **For python3-pyyaml on all nodes:** The bundle includes a `packages/PyYAML-*.whl`
+> file. `install_from_airgap_bundle.sh` sets `AIRGAP_PYYAML_WHEEL_PATH` automatically
+> so the installer uses it instead of calling `dnf install python3-pyyaml`.
+
+**Strategy 2 — Local RPM/DEB mirror (for organizations with many nodes)**
+
+Set up an internal mirror of the OS repos and redirect the installer to it via
+environment variables. This is the most robust option for large fleets.
+
+```bash
+# Example: reposync CUDA repo to an internal HTTP server
+reposync --repoid cuda-rhel9-x86_64 --download-path /var/www/html/cuda/
+
+# Then export before running the installer:
+export CUDA_REPO_URL_OVERRIDE="http://mirror.internal/cuda/cuda-rhel9.repo"
+export EPEL_RPM_URL_OVERRIDE="http://mirror.internal/epel/epel-release-latest-9.noarch.rpm"
+export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-container-toolkit.repo"
+
+./install_from_airgap_bundle.sh --bundle ... --config ...
+```
+
+For Debian/Ubuntu GPU nodes the CUDA and CTK overrides accept a URL to the `.list`
+file or keyring `.deb` used during apt setup (same `${VAR:-default}` pattern).
+
+**Strategy 3 — Partial air-gap: GPU nodes have controlled internet access**
+
+If the GPU nodes can reach NVIDIA's package servers but the control plane /
+install machine cannot, set `AIRGAP_MODE=true` in your config (to skip
+HuggingFace checks) while leaving the GPU node driver install unblocked. The
+`wait_for_dependency()` check in the installer will pause for you to confirm
+connectivity before each GPU node install.
+
+### Environment variables for package URL overrides
+
+| Variable | Default URL | What it controls |
+|---|---|---|
+| `EPEL_RPM_URL_OVERRIDE` | `dl.fedoraproject.org/pub/epel/epel-release-latest-N.noarch.rpm` | EPEL release RPM for DKMS |
+| `CUDA_REPO_URL_OVERRIDE` | NVIDIA CUDA repo URL for the detected OS | CUDA package repo definition |
+| `NVIDIA_CTK_REPO_URL_OVERRIDE` | `nvidia.github.io/.../nvidia-container-toolkit.repo` | nvidia-container-toolkit repo |
+| `AIRGAP_PYYAML_WHEEL_PATH` | _(not set)_ | Path to PyYAML `.whl` for offline pip3 install |
+
+---
+
 ## Environment Variable Reference
 
 These variables are set automatically by `install_from_airgap_bundle.sh`.
@@ -304,6 +409,18 @@ When set to a local `.tgz` path, the installer skips `helm repo add` /
 | `OTEL_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/opentelemetry-operator-<ver>.tgz` |
 | `KUBERAY_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/kuberay-operator-1.2.2.tgz` |
 | `METALLB_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/metallb-0.14.8.tgz` |
+
+### GPU Node OS Package URLs
+
+These override the internet URLs used when the installer installs OS packages
+on GPU worker nodes. Set them to point at a local HTTP mirror or a `file://` path.
+
+| Variable | Default URL | Package |
+|---|---|---|
+| `EPEL_RPM_URL_OVERRIDE` | `dl.fedoraproject.org/pub/epel/epel-release-latest-N.noarch.rpm` | EPEL RPM (provides DKMS) |
+| `CUDA_REPO_URL_OVERRIDE` | NVIDIA CUDA repo for detected OS | CUDA repository definition |
+| `NVIDIA_CTK_REPO_URL_OVERRIDE` | `nvidia.github.io/.../nvidia-container-toolkit.repo` | nvidia-container-toolkit repo |
+| `AIRGAP_PYYAML_WHEEL_PATH` | _(not set)_ | Path to PyYAML `.whl` for offline pip3 (all nodes) |
 
 ### Other
 
