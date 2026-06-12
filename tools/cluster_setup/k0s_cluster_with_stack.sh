@@ -3069,7 +3069,7 @@ EOF
   obj_secret="minio-credentials"
   case "${OBJ_STORE_TYPE}" in
     minio|seaweedfs)
-      obj_path="s3compat://${OBJ_STORE_BUCKET}"
+      obj_path="minio://${OBJ_STORE_BUCKET}"
       obj_endpoint="${MINIO_ENDPOINT:-${OBJ_STORE_ENDPOINT}}"
       ;;
     aws)
