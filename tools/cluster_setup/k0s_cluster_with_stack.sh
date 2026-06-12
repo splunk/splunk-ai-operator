@@ -580,8 +580,11 @@ preflight_checks() {
   IFS=' ' read -ra _pf_worker_ips <<< "${EXISTING_WORKER_IPS}"
   local _pf_worker_n=0 _ip
   for _ip in "${_pf_worker_ips[@]}"; do [[ -n "${_ip}" ]] && _pf_worker_n=$((_pf_worker_n + 1)); done
-  local _pf_cpu="${CPU_WORKER_COUNT//[!0-9]/}"; _pf_cpu="${_pf_cpu:-0}"
-  local _pf_gpu="${GPU_WORKER_COUNT//[!0-9]/}"; _pf_gpu="${_pf_gpu:-0}"
+  local _pf_cpu_raw="${CPU_WORKER_COUNT:-}" _pf_gpu_raw="${GPU_WORKER_COUNT:-}"
+  local _pf_cpu="${_pf_cpu_raw//[!0-9]/}"; _pf_cpu="${_pf_cpu:-0}"
+  local _pf_gpu="${_pf_gpu_raw//[!0-9]/}"; _pf_gpu="${_pf_gpu:-0}"
+  [[ "${_pf_cpu_raw}" =~ ^[0-9]+$ ]] || pf_fail "nodes.cpuWorkers must be an integer (got: '${_pf_cpu_raw}')"
+  [[ "${_pf_gpu_raw}" =~ ^[0-9]+$ ]] || pf_fail "nodes.gpuWorkers must be an integer (got: '${_pf_gpu_raw}')"
   if (( _pf_cpu + _pf_gpu == _pf_worker_n )); then
     pf_ok "Worker counts consistent: ${_pf_cpu} CPU + ${_pf_gpu} GPU = ${_pf_worker_n} worker IP(s)"
   else
