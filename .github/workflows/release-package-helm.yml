@@ -166,8 +166,9 @@ jobs:
             # Extract from git tag (remove 'v' prefix)
             VERSION=${GITHUB_REF_NAME#v}
           elif [ -n "${{ inputs.new_operator_version }}" ]; then
-            # Use input version (for workflow_call)
+            # Use input version (for workflow_call / workflow_dispatch), strip leading v
             VERSION="${{ inputs.new_operator_version }}"
+            VERSION="${VERSION#v}"
           else
             # Fallback to Chart.yaml version
             VERSION=$(grep '^version:' helm-chart/splunk-ai-operator/Chart.yaml | awk '{print $2}' | tr -d '"')
