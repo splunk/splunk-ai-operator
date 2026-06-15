@@ -650,13 +650,13 @@ flowchart LR
 
 **Pre-installing the driver offline (Strategy 1):**
 
-A fully air-gapped GPU node can't reach NVIDIA's RPM repos, so the bundle's bare
-`cuda-rhel9.repo` isn't enough on its own — `dnf install` against it would still
-try to fetch packages over the blocked link. The reliable approach is to build a
-self-contained RPM **closure** on a connected RHEL 9 host, copy it to the node,
-and install from it as a local repo. The driver flavor that works on RHEL 9 is
-the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`); the old
-`cuda-drivers` meta-package no longer resolves.
+A fully air-gapped GPU node can't reach NVIDIA's RPM repos. The bundle's
+`cuda-rhel9.repo` only points `dnf` at NVIDIA's servers, so on a disconnected
+node you supply the packages yourself: build a self-contained RPM **closure** on
+a connected RHEL 9 host, copy it to the node, and install from it as a local
+repo. Use the DKMS driver flavor `nvidia-driver:latest-dkms`
+(`kmod-nvidia-latest-dkms`) — the older `cuda-drivers` meta-package is no longer
+published.
 
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the
 > same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only

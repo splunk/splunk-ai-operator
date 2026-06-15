@@ -332,15 +332,24 @@ ADDON_LIST="${STAGE_DIR}/images/addon-images.list"
   # extension, so a bare *.yaml glob silently skipped it and its image
   # (nvcr.io/nvidia/k8s-device-plugin) never made it into the bundle, leaving
   # the device-plugin DaemonSet in ImagePullBackOff on air-gapped GPU nodes.
+  # `|| true` on each grep pipeline: a no-match returns exit 1, which under
+  # `set -euo pipefail` would otherwise abort the whole bundle build before the
+  # `[[ -s "${ADDON_LIST}" ]] ... else warn` best-effort fallback below could
+  # run. Same guard the PyYAML URL resolution above already uses.
   grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
     "${STAGE_DIR}"/manifests/*.yaml "${STAGE_DIR}"/manifests/*.yml 2>/dev/null \
-    | sed -E 's/image:[[:space:]]*["'"'"']?//'
-  # Helm charts: render with default values and grep image: refs.
-  for _tgz in "${STAGE_DIR}"/charts/*.tgz; do
-    helm template "${_tgz}" 2>/dev/null \
-      | grep -oE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
-      | sed -E 's/image:[[:space:]]*["'"'"']?//'
-  done
+    | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
+  # Helm charts: render with default values and grep image: refs. Guard the glob
+  # with compgen so an empty charts/ dir doesn't run the loop once with a literal
+  # unexpanded "*.tgz" path (which makes `helm template` fail and, under set -e,
+  # abort the build).
+  if compgen -G "${STAGE_DIR}/charts/*.tgz" >/dev/null 2>&1; then
+    for _tgz in "${STAGE_DIR}"/charts/*.tgz; do
+      helm template "${_tgz}" 2>/dev/null \
+        | grep -oE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
+        | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
+    done
+  fi
   # busybox:latest (otel init) — pin a concrete tag so it resolves offline.
   echo "busybox:latest"
 } | grep -E '[:/]' | grep -vE '^busybox$' | sort -u > "${ADDON_LIST}"
