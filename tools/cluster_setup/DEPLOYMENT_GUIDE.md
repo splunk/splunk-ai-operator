@@ -308,7 +308,7 @@ flowchart LR
     end
 
     subgraph TRANSFER["📦 Transfer Mechanism"]
-        TARBALL["airgap-bundle.tar.gz\n~500 MB\n+\nmodel weights\n>120 GB\n+\ncontainer images"]
+        TARBALL["airgap-bundle.tar.gz\n~2–4 GB\n(binaries · charts · manifests\n+ k0s & add-on image bundles)\n+\nmodel weights\n>120 GB\n+\nplatform images\nmirrored to your registry"]
     end
 
     subgraph AIRGAP["🔒 Air-Gapped Zone"]
@@ -353,6 +353,11 @@ graph TD
         YQ["yq v4.44.1\nYAML processor"]
     end
 
+    subgraph IMG["📁 images/  ⭐ pre-loaded OCI image bundles"]
+        K0SIMG["k0s-images.tar\nk0s control-plane images:\npause · calico · kube-proxy\ncoredns · metrics-server"]
+        ADDIMG["addon-images.tar\nadd-on component images:\ncert-manager · prometheus\nkuberay · metallb · otel\nnvidia-device-plugin · busybox"]
+    end
+
     subgraph MAN["📁 manifests/"]
         CERT["cert-manager v1.13.0"]
         LP["local-path-provisioner v0.0.24"]
@@ -380,14 +385,52 @@ graph TD
         SUMS["checksums.sha256"]
     end
 
-    SCRIPT --> BIN & MAN & CHARTS & PKGS & META
+    SCRIPT --> BIN & IMG & MAN & CHARTS & PKGS & META
 ```
+
+> **⭐ The `images/` bundles are the part customers most often miss.** A single
+> `prepare_airgap_bundle.sh` run produces **both** image tarballs automatically —
+> you do **not** run a separate command for them. They are essential: without
+> them, an air-gapped cluster's own infrastructure pods (Calico, CoreDNS,
+> cert-manager, the NVIDIA device plugin, …) try to pull from quay.io / ghcr.io /
+> registry.k8s.io over the blocked link and the cluster never becomes Ready.
+> See [Why two image bundles?](#why-two-image-bundles) below.
 
 Output: a single timestamped `.tar.gz`:
 
 ```
-/mnt/transfer/airgap-bundle-20260612-103000.tar.gz   (~500 MB)
+/mnt/transfer/airgap-bundle-20260612-103000.tar.gz   (~2–4 GB)
 ```
+
+> **Bundle size:** the image tarballs are the bulk of the bundle — expect a few
+> GB (the binaries, charts, and manifests alone are ~500 MB; the k0s and add-on
+> images add the rest). Size scales with the resolved image set.
+
+#### Why two image bundles?
+
+The bundle carries container images in two separate OCI tarballs under `images/`
+because two *different* sets of images would otherwise be pulled from the
+internet at cluster-bring-up time — and neither set is covered by the
+`images.registry` rewrite you configure for the platform's own images:
+
+| Tarball | Built by (in `prepare_airgap_bundle.sh`) | Covers | Why it can't come from your registry |
+|---|---|---|---|
+| `k0s-images.tar` | `k0s airgap list-images --all` → `k0s airgap bundle-artifacts` | k0s control-plane images: `pause`, Calico, kube-proxy, CoreDNS, metrics-server | k0s pulls these itself at kubelet startup (from quay.io/k0sproject) — they never pass through the installer's config |
+| `addon-images.tar` | renders every Helm chart + static manifest, collects each `image:` ref, then `bundle-artifacts` | add-on components: cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, **NVIDIA device plugin**, busybox | their image refs live *inside* the charts/manifests (quay.io, ghcr.io, registry.k8s.io, nvcr.io, docker.io) — the `images.registry` rewrite only touches the platform CR images, not these |
+
+**How they get used (fully automatic):** `install_from_airgap_bundle.sh` detects
+`images/*.tar` and the installer copies **every** tarball to
+`/var/lib/k0s/images/` on each node — *after* `k0s install` (which recreates
+`/var/lib/k0s`) and *before* `k0s start`. k0s auto-imports every tarball in that
+directory into containerd at kubelet startup, so the infra pods start with
+`IfNotPresent` and never reach for the internet. Workers added later with
+`join-workers` get the same treatment.
+
+> **This is distinct from [Phase 2 — Mirror Container Images](#phase-2--mirror-container-images).**
+> The `images/` bundles cover **infrastructure** images (k0s + add-ons) and are
+> built for you. Phase 2 covers the **Splunk AI Platform application** images
+> (Splunk Enterprise, SAIA, Ray, Weaviate, the operator …), which you mirror to
+> your own registry and point `images.registry` at. Both are required.
 
 ### Phase 2 — Mirror Container Images
 
@@ -523,12 +566,14 @@ flowchart TD
     B --> C["2. Verify SHA-256 checksums\nof every bundled file"]
     C --> D["3. Install k0s binary\nto /usr/local/bin/k0s"]
     D --> E["4. Install yq binary\nto /usr/local/bin/yq"]
-    E --> F["5. Register local Helm repo\nfile:///opt/airgap/.../charts/"]
-    F --> G["6. Export env-var overrides\nall 13 URL + path variables"]
-    G --> H["7. Run k0s_cluster_with_stack.sh install\nwith all overrides in effect"]
+    E --> F["5. Register local Helm repo\n(best-effort; charts install by path)"]
+    F --> G["6. Export env-var overrides\nincl. AIRGAP_K0S_IMAGE_DIR\n→ points at images/*.tar"]
+    G --> H["7. Run k0s_cluster_with_stack.sh install"]
+    H --> I["During install: copy k0s-images.tar\n+ addon-images.tar to each node's\n/var/lib/k0s/images/ (after k0s install,\nbefore k0s start) → auto-imported\ninto containerd"]
 
     style C fill:#c6f6d5,color:#1a202c
     style G fill:#bee3f8,color:#1a202c
+    style I fill:#fef3c7,color:#1a202c
 ```
 
 The install plan shown before any changes are made will display:
@@ -537,8 +582,21 @@ The install plan shown before any changes are made will display:
 Air-gap mode    : true
 k0s install URL : file:///opt/airgap/.../binaries/k0s
 Helm charts     : local (file:///opt/airgap/.../charts/)
+Image bundles   : k0s-images.tar, addon-images.tar  → staged to /var/lib/k0s/images/
 ...
 ```
+
+During install, watch the log for lines confirming the bundles reached each node:
+
+```
+Staging image bundle k0s-images.tar on <node-ip> (/var/lib/k0s/images/)...
+Staging image bundle addon-images.tar on <node-ip> (/var/lib/k0s/images/)...
+```
+
+> If you instead see `No pre-loaded image bundles in air-gap bundle (images/*.tar)`,
+> your bundle was built before this feature — rebuild it with the current
+> `prepare_airgap_bundle.sh`. Without the bundles, infra pods will sit in
+> `ImagePullBackOff` and nodes will stay `NotReady`.
 
 Confirm to proceed.
 
@@ -915,7 +973,8 @@ flowchart TD
 | "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | Re-transfer the bundle | `sha256sum airgap-bundle-<date>.tar.gz` and compare |
 | "Expected chart not found" | `ls /opt/airgap/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
-| Pod stuck in `ImagePullBackOff` | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists |
+| Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
+| Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in your bundle (rebuild with current `prepare_airgap_bundle.sh` if not); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
 | SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
 
@@ -923,4 +982,4 @@ flowchart TD
 
 ---
 
-*Splunk AI Platform · k0s Deployment Guide · Last updated 2026-06-12*
+*Splunk AI Platform · k0s Deployment Guide · Last updated 2026-06-15*

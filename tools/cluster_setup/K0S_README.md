@@ -1141,14 +1141,22 @@ cd tools/cluster_setup
 | Category | Contents |
 |---|---|
 | Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at bundle time), `opentelemetry-operator` (version captured at bundle time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
 | GPU packages | `epel-release-latest-9.noarch.rpm`, `cuda-rhel9.repo`, `nvidia-container-toolkit.repo`, PyYAML wheel (all nodes) |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
-Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~500 MB)
+Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB)
 
 > `kube-prometheus-stack` and `opentelemetry-operator` are not pinned in the installer — the bundle script resolves and records those versions at download time so the air-gapped install uses exactly the charts that were tested.
+
+> **Two image bundles, built for you.** `k0s-images.tar` and `addon-images.tar`
+> cover the *infrastructure* images that k0s and the add-on charts/manifests pull
+> from quay.io / ghcr.io / registry.k8s.io / nvcr.io — refs the `images.registry`
+> rewrite never touches. They are **separate** from the platform application
+> images you mirror in [Step 2](#step-2--mirror-container-images). Both are
+> required for a working air-gapped cluster.
 
 ---
 
