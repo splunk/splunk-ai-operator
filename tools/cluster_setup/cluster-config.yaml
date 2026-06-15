@@ -141,7 +141,7 @@ images:
     #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     # Bump tag after building fixed operator (SAIA 8Gi default, SchemaJobId persist, feature config)
-    #image: "1234567890.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
+    #image: "123456789012.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
     image: "docker.io/splunk/splunk-ai-operator:0.2.0"
 
   # Splunk Enterprise Images
