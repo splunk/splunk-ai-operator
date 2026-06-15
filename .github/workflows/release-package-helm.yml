@@ -13,6 +13,16 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      old_operator_version:
+        description: 'OLD OPERATOR VERSION'
+        required: false
+        type: string
+      new_operator_version:
+        description: 'NEW OPERATOR VERSION (e.g. 0.2.0)'
+        required: true
+        type: string
 
 jobs:
   build-and-push-images:
