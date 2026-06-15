@@ -282,6 +282,17 @@ jobs:
         run: |
           mkdir -p .helm-releases
 
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Fetch declared chart dependencies before packaging
+          helm dependency update helm-chart/splunk-ai-operator
+
+          if [ -f helm-chart/splunk-ai-platform/Chart.yaml ]; then
+            # Keep the platform chart's local operator dependency version in sync with the release version
+            sed -i '/- name: splunk-ai-operator/{n;s/^\(\s*version:\).*/\1 "'"$VERSION"'"/;}' helm-chart/splunk-ai-platform/Chart.yaml
+            helm dependency update helm-chart/splunk-ai-platform
+          fi
+
           # Package operator chart
           helm package helm-chart/splunk-ai-operator --destination .helm-releases
 
