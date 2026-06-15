@@ -98,9 +98,9 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             splunk/splunk-ai-operator
           tags: |
-            type=semver,pattern=v{{version}},value=v${{ steps.version.outputs.version }}
-            type=semver,pattern={{version}},value=v${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern=v{{version}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker images
