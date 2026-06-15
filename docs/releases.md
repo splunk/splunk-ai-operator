@@ -10,7 +10,7 @@ Releases are fully automated via GitHub Actions. You create releases from the Gi
 
 1. Go to: [Create Release Tag Workflow](https://github.com/splunk/splunk-ai-operator/actions/workflows/create-release-tag.yml)
 2. Click **"Run workflow"**
-3. Enter version (e.g., `0.1.0` for first release, `0.2.0` for next)
+3. Enter version (e.g., `0.2.0` for first release, `0.2.0` for next)
 4. Click **"Run workflow"**
 5. Wait ~10 minutes - Release created automatically!
 
@@ -32,7 +32,7 @@ Releases are fully automated via GitHub Actions. You create releases from the Gi
 2. Click **"Run workflow"** button (top right)
 3. Fill in:
    - **Use workflow from**: `main` (default)
-   - **Release version**: `0.1.0` (without 'v' prefix, it's added automatically)
+   - **Release version**: `0.2.0` (without 'v' prefix, it's added automatically)
    - **Mark as pre-release**: Check for beta/rc releases
 4. Click **"Run workflow"**
 
@@ -42,7 +42,7 @@ Two workflows run automatically:
 
 **1. Create Release Tag** (~30 seconds)
 - Validates version format
-- Creates git tag `v0.1.0`
+- Creates git tag `v0.2.0`
 - Pushes tag to GitHub
 
 **2. Release Package** (~5-10 minutes)
@@ -66,15 +66,15 @@ https://github.com/splunk/splunk-ai-operator/releases
 ```
 
 Verify assets:
-- `install-v0.1.0.yaml` - Kubernetes manifests
-- `splunk-ai-operator-0.1.0.tgz` - Helm chart
-- `splunk-ai-platform-0.1.0.tgz` - Platform chart
+- `install-v0.2.0.yaml` - Kubernetes manifests
+- `splunk-ai-operator-0.2.0.tgz` - Helm chart
+- `splunk-ai-platform-0.2.0.tgz` - Platform chart
 - `index.yaml` - Helm repository index
 
 **2. Check OCI Registry:**
 ```bash
 # Verify chart is available
-helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
+helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.2.0
 ```
 
 **3. Check Docker Images:**
@@ -84,13 +84,13 @@ helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
 **4. Test Installation:**
 ```bash
 # Test kubectl
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/install-v0.1.0.yaml
+kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
 
 # Test Helm OCI
-helm install test-release oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
+helm install test-release oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.2.0
 
 # Test Docker
-docker pull ghcr.io/splunk/splunk-ai-operator:v0.1.0
+docker pull ghcr.io/splunk/splunk-ai-operator:v0.2.0
 ```
 
 ---
@@ -102,7 +102,7 @@ We follow [Semantic Versioning 2.0.0](https://semver.org/):
 ### Format: `MAJOR.MINOR.PATCH[-PRERELEASE]`
 
 **Examples:**
-- `0.1.0` - First release
+- `0.2.0` - First release
 - `0.2.0` - Second release with new features
 - `0.1.1` - Patch release
 - `1.0.0` - GA release (when ready)
@@ -137,11 +137,11 @@ We follow [Semantic Versioning 2.0.0](https://semver.org/):
 
 ### Artifacts Published
 
-When you release `v0.1.0`, the automation creates:
+When you release `v0.2.0`, the automation creates:
 
 #### 1. Kubernetes Manifests
 ```
-install-v0.1.0.yaml
+install-v0.2.0.yaml
 ```
 Contains:
 - All CRDs (AIPlatform, AIService)
@@ -152,25 +152,25 @@ Contains:
 
 #### 2. Helm Charts (OCI Registry)
 ```
-oci://ghcr.io/splunk/charts/splunk-ai-operator:0.1.0
-oci://ghcr.io/splunk/charts/splunk-ai-platform:0.1.0
+oci://ghcr.io/splunk/charts/splunk-ai-operator:0.2.0
+oci://ghcr.io/splunk/charts/splunk-ai-platform:0.2.0
 ```
 
 #### 3. Helm Charts (GitHub Release)
 ```
-splunk-ai-operator-0.1.0.tgz
-splunk-ai-platform-0.1.0.tgz
+splunk-ai-operator-0.2.0.tgz
+splunk-ai-platform-0.2.0.tgz
 index.yaml
 ```
 
 #### 4. Docker Images
 ```
-ghcr.io/splunk/splunk-ai-operator:v0.1.0
-ghcr.io/splunk/splunk-ai-operator:0.1.0
+ghcr.io/splunk/splunk-ai-operator:v0.2.0
+ghcr.io/splunk/splunk-ai-operator:0.2.0
 ghcr.io/splunk/splunk-ai-operator:latest  (if on main)
 
-splunk/splunk-ai-operator:v0.1.0
-splunk/splunk-ai-operator:0.1.0
+splunk/splunk-ai-operator:v0.2.0
+splunk/splunk-ai-operator:0.2.0
 splunk/splunk-ai-operator:latest  (if on main)
 ```
 
@@ -180,20 +180,20 @@ Users can install via:
 
 **1. kubectl (Manifests):**
 ```bash
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/install-v0.1.0.yaml
+kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
 ```
 
 **2. Helm OCI (Recommended):**
 ```bash
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0
+  --version 0.2.0
 ```
 
 **3. Helm (GitHub Release):**
 ```bash
 helm install splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/splunk-ai-operator-0.1.0.tgz
+  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz
 ```
 
 ---
@@ -211,7 +211,7 @@ For critical bug fixes:
 
 ### Example
 
-If `v0.1.0` has a critical bug:
+If `v0.2.0` has a critical bug:
 - Fix merged to `main`
 - Create release: `0.1.1`
 - Release notes should highlight:
@@ -257,14 +257,14 @@ Pre-release: ✅ (checked)
 
 **Error:**
 ```
-❌ Tag v0.1.0 already exists
+❌ Tag v0.2.0 already exists
 ```
 
 **Solution:**
 1. Choose different version, or
 2. Delete existing tag (requires admin):
    ```bash
-   git push --delete origin v0.1.0
+   git push --delete origin v0.2.0
    ```
 3. Delete GitHub Release if it exists
 
@@ -293,7 +293,7 @@ Pre-release: ✅ (checked)
 **Verify:**
 ```bash
 # This should work
-helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
+helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.2.0
 ```
 
 **If not:**
@@ -324,7 +324,7 @@ After release is published:
 
 ### First Release Setup (One-Time)
 
-For the very first release (`v0.1.0`):
+For the very first release (`v0.2.0`):
 
 1. **Make GHCR packages public:**
    - Go to: https://github.com/orgs/splunk/packages

@@ -35,12 +35,12 @@ The Splunk AI Operator is a Kubernetes operator that enables customers to manage
 # Install using Helm OCI registry (Recommended - Helm 3.8+)
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace
 
 # Or install using kubectl
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/install-v0.1.0.yaml
+kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
 ```
 
 See [Installation Guide](docs/installation.md) for detailed instructions and all installation methods.
@@ -59,7 +59,7 @@ See [Installation Guide](docs/installation.md) for detailed instructions and all
 # Requires Helm 3.8+
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace
 ```
@@ -67,14 +67,14 @@ helm install splunk-ai-operator \
 **Option 2: kubectl (Manifests)**
 ```bash
 # Install operator with all dependencies
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/install-v0.1.0.yaml
+kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
 ```
 
 **Option 3: Helm (GitHub Release)**
 ```bash
 # For compatibility with older Helm versions
 helm install splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/splunk-ai-operator-0.1.0.tgz \
+  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz \
   --namespace splunk-ai-operator-system \
   --create-namespace
 ```
@@ -100,7 +100,7 @@ Charts are published to OCI registry and GitHub Releases:
 # Install from OCI registry
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0
+  --version 0.2.0
 
 # View available versions
 # Visit: https://github.com/splunk/splunk-ai-operator/pkgs/container/charts%2Fsplunk-ai-operator
@@ -110,15 +110,15 @@ helm install splunk-ai-operator \
 
 Images are published to multiple registries:
 
-- **GHCR**: `ghcr.io/splunk/splunk-ai-operator:v0.1.0`
-- **Docker Hub**: `splunk/splunk-ai-operator:v0.1.0`
+- **GHCR**: `ghcr.io/splunk/splunk-ai-operator:v0.2.0`
+- **Docker Hub**: `splunk/splunk-ai-operator:v0.2.0`
 
 ```bash
 # Pull from GHCR (recommended)
-docker pull ghcr.io/splunk/splunk-ai-operator:v0.1.0
+docker pull ghcr.io/splunk/splunk-ai-operator:v0.2.0
 
 # Pull from Docker Hub
-docker pull splunk/splunk-ai-operator:v0.1.0
+docker pull splunk/splunk-ai-operator:v0.2.0
 ```
 
 ### Deploy AI Platform

@@ -3,7 +3,7 @@ apiVersion: v2
 name: splunk-ai-platform
 description: A Helm chart for deploying Splunk AIPlatform custom resources with observability stack
 type: application
-version: "0.1.0"
+version: "0.2.0"
 appVersion: "v4.0.0"
 icon: https://example.com/icon.png
 keywords:
@@ -51,6 +51,6 @@ annotations:
 # (cert-manager, kuberay, opentelemetry, prometheus, splunk-operator)
 dependencies:
   - name: splunk-ai-operator
-    version: "0.1.0"
+    version: "0.2.0"
     repository: "file://../splunk-ai-operator"
     condition: splunk-ai-operator.enabled

@@ -101,7 +101,7 @@ Azure Managed Identities can be used to provide IAM access to the blobs. With ma
       "id": "/subscriptions/<subscription-id>/resourceGroups/MC_splunkAIOperatorResourceGroup_splunkAIOperatorCluster_westus2/providers/Microsoft.ManagedIdentity/userAssignedIdentities/splunkAIOperatorCluster-agentpool",
       "location": "westus2",
       "name": "splunkAIOperatorCluster-agentpool",
-      "principalId": "f0f04120-6a36-49bc--**************",
+      "principalId": "f0f0.2.0-6a36-49bc--**************",
       "resourceGroup": "MC_splunkAIOperatorResourceGroup_splunkAIOperatorCluster_westus2",
       "tags": {},
       "tenantId": "8add7810-b62a--**************",
@@ -125,7 +125,7 @@ Azure Managed Identities can be used to provide IAM access to the blobs. With ma
     Output:
 
     ```
-    f0f04120-6a36-49bc--**************
+    f0f0.2.0-6a36-49bc--**************
     ```
 
 5. **Assign Read-Write Access for Kubelet User Managed Identity to the Storage Account**
@@ -141,7 +141,7 @@ Azure Managed Identities can be used to provide IAM access to the blobs. With ma
     If `<storageAccountResourceGroup>` is `splunkAIOperatorResourceGroup` and `<storageAccountName>` is `mystorageaccount`, the command would be:
 
     ```bash
-    az role assignment create --assignee "f0f04120-6a36-49bc--**************" --role 'Storage Blob Data Contributor' --scope /subscriptions/f428689e-c379-4712--**************/resourceGroups/splunkAIOperatorResourceGroup/providers/Microsoft.Storage/storageAccounts/mystorageaccount
+    az role assignment create --assignee "f0f0.2.0-6a36-49bc--**************" --role 'Storage Blob Data Contributor' --scope /subscriptions/f428689e-c379-4712--**************/resourceGroups/splunkAIOperatorResourceGroup/providers/Microsoft.Storage/storageAccounts/mystorageaccount
     ```
 
     After this command, you can connect to Azure Blob without secrets.

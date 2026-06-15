@@ -96,7 +96,7 @@ EOF
 # Install the complete platform
 helm install my-ai-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace ai-platform \
   --create-namespace \
   --values my-platform-values.yaml
@@ -112,7 +112,7 @@ Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.htm
 ```bash
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -132,7 +132,7 @@ Requires Helm 3.8+:
 # NOTE: Requires Splunk General Terms acceptance
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -141,7 +141,7 @@ helm install splunk-ai-operator \
 # Install platform
 helm install my-ai-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace ai-platform \
   --create-namespace \
   --values values.yaml
@@ -157,7 +157,7 @@ Compatible with Helm 3.0+:
 # Install operator
 # NOTE: Requires Splunk General Terms acceptance
 helm install splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/splunk-ai-operator-0.1.0.tgz \
+  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -165,7 +165,7 @@ helm install splunk-ai-operator \
 
 # Install platform
 helm install my-ai-platform \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/splunk-ai-platform-0.1.0.tgz \
+  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-platform-0.2.0.tgz \
   --namespace ai-platform \
   --create-namespace \
   --values values.yaml
@@ -178,7 +178,7 @@ helm install my-ai-platform \
 For environments where Helm is not available:
 
 ```bash
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/install-v0.1.0.yaml
+kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
 ```
 
 ## Deploying the Operator Only
@@ -193,7 +193,7 @@ Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.htm
 ```bash
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -216,7 +216,7 @@ splunk-operator:
 # Operator image configuration
 image:
   repository: ghcr.io/splunk/splunk-ai-operator
-  tag: "v0.1.0"
+  tag: "v0.2.0"
   pullPolicy: IfNotPresent
 
 # Container images used by the operator
@@ -257,7 +257,7 @@ Install with custom values:
 ```bash
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --values operator-values.yaml
@@ -269,13 +269,13 @@ helm install splunk-ai-operator \
 
 ```bash
 # Show all configurable values
-helm show values oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
+helm show values oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.2.0
 
 # Show chart information
-helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
+helm show chart oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.2.0
 
 # Show complete details
-helm show all oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.1.0
+helm show all oci://ghcr.io/splunk/charts/splunk-ai-operator --version 0.2.0
 ```
 
 ## Deploying Complete AI Platform
@@ -324,7 +324,7 @@ Install:
 ```bash
 helm install my-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace ai-platform \
   --create-namespace \
   --values platform-values.yaml
@@ -344,7 +344,7 @@ splunk-ai-operator:
   enabled: true
   image:
     repository: ghcr.io/splunk/splunk-ai-operator
-    tag: "v0.1.0"
+    tag: "v0.2.0"
 
 # KubeRay Operator
 kuberay-operator:
@@ -507,7 +507,7 @@ Install with complete configuration:
 ```bash
 helm install my-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace ai-platform \
   --create-namespace \
   --values complete-platform-values.yaml
@@ -529,7 +529,7 @@ Or via command line:
 ```bash
 helm install my-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace ai-platform \
   --create-namespace \
   --set splunk-ai-operator.enabled=false \
@@ -551,7 +551,7 @@ splunk-ai-operator:
   # Use images from AWS ECR
   image:
     repository: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk-ai-operator"
-    tag: "v0.1.0"
+    tag: "v0.2.0"
 
   rayHeadImage: "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-head:v2.44.0"
   rayWorkerImage: "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-worker-gpu:v2.44.0"
@@ -822,7 +822,7 @@ kubectl create secret generic splunk-secret \
 # Render templates without installing
 helm template test-release \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --values platform-values.yaml \
   --debug
 ```

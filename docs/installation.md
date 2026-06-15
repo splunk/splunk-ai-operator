@@ -23,7 +23,7 @@ Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.htm
 # and splunkGeneralTerms configures the splunk-operator environment
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -55,7 +55,7 @@ EOF
 # Install with custom values
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --values my-values.yaml
@@ -98,7 +98,7 @@ Review the terms at: https://www.splunk.com/en_us/legal/splunk-general-terms.htm
 ```bash
 # Install from GitHub Release
 helm install splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/splunk-ai-operator-0.1.0.tgz \
+  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -144,7 +144,7 @@ By default, the operator is installed cluster-scoped and watches all namespaces:
 # Helm installation is cluster-scoped by default
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace splunk-ai-operator-system \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \
@@ -161,7 +161,7 @@ To restrict the operator to a single namespace:
 # Install with namespace scope
 helm install splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace my-app-namespace \
   --create-namespace \
   --set splunk-operator.acceptGeneralTerms=true \

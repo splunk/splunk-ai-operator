@@ -530,7 +530,7 @@ metallb:
   mode: layer2
   pool:
     addresses:
-      - "10.20.30.100-10.20.30.110"   # free IPs on your network
+      - "10.20.30.2.0-10.20.30.2.0"   # free IPs on your network
 ```
 
 ---

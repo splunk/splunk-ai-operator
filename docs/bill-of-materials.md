@@ -44,13 +44,13 @@ The BOM includes:
 ```text
 ================================================================================
 Bill of Materials (BOM)
-Splunk AI Operator v0.1.0
+Splunk AI Operator v0.2.0
 Generated: 2025-11-18T19:34:23Z
 ================================================================================
 
 OPERATOR IMAGE
 --------------
-ghcr.io/splunk/splunk-ai-operator:v0.1.0
+ghcr.io/splunk/splunk-ai-operator:v0.2.0
 
 MANAGED CONTAINER IMAGES
 ------------------------
@@ -95,10 +95,10 @@ SBOMs can be used with security scanning tools:
 
 ```bash
 # Grype (vulnerability scanning)
-grype sbom:./sbom-operator-v0.1.0.cyclonedx.json
+grype sbom:./sbom-operator-v0.2.0.cyclonedx.json
 
 # Trivy (security scanning)
-trivy sbom --scanners vuln sbom-operator-v0.1.0.spdx.json
+trivy sbom --scanners vuln sbom-operator-v0.2.0.spdx.json
 
 # Dependency-Track (component analysis platform)
 # Upload the CycloneDX file to Dependency-Track
@@ -111,7 +111,7 @@ trivy sbom --scanners vuln sbom-operator-v0.1.0.spdx.json
 All BOM and SBOM files are attached to each GitHub release:
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 BASE_URL="https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}"
 
 # Download custom BOM (human-readable)
@@ -130,7 +130,7 @@ You can generate the custom BOM locally:
 
 ```bash
 # Generate BOM for current version
-make generate-bom VERSION=0.1.0
+make generate-bom VERSION=0.2.0
 
 # Output files created in dist/
 ls -l dist/bom-*
@@ -144,8 +144,8 @@ To verify the exact images used in a release:
 
 ```bash
 # Pull image and get digest
-docker pull ghcr.io/splunk/splunk-ai-operator:v0.1.0 --platform linux/amd64
-docker inspect ghcr.io/splunk/splunk-ai-operator:v0.1.0 --format='{{.RepoDigests}}'
+docker pull ghcr.io/splunk/splunk-ai-operator:v0.2.0 --platform linux/amd64
+docker inspect ghcr.io/splunk/splunk-ai-operator:v0.2.0 --format='{{.RepoDigests}}'
 ```
 
 ### Verify Build Attestations
@@ -154,7 +154,7 @@ Each operator image includes cryptographic attestations:
 
 ```bash
 # View attestation using GitHub CLI
-gh attestation verify oci://ghcr.io/splunk/splunk-ai-operator:v0.1.0 \
+gh attestation verify oci://ghcr.io/splunk/splunk-ai-operator:v0.2.0 \
   --owner splunk
 
 # Verify with cosign (SLSA provenance)
@@ -162,7 +162,7 @@ cosign verify-attestation \
   --type slsaprovenance \
   --certificate-identity-regexp="^https://github.com/splunk/splunk-ai-operator" \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-  ghcr.io/splunk/splunk-ai-operator:v0.1.0
+  ghcr.io/splunk/splunk-ai-operator:v0.2.0
 ```
 
 ### Security Scanning
@@ -171,10 +171,10 @@ Scan operator image for vulnerabilities:
 
 ```bash
 # Using Trivy
-trivy image ghcr.io/splunk/splunk-ai-operator:v0.1.0
+trivy image ghcr.io/splunk/splunk-ai-operator:v0.2.0
 
 # Using Grype
-grype ghcr.io/splunk/splunk-ai-operator:v0.1.0
+grype ghcr.io/splunk/splunk-ai-operator:v0.2.0
 
 # Scan all managed images from BOM
 while read -r line; do
@@ -183,7 +183,7 @@ while read -r line; do
     echo "Scanning: $image"
     trivy image "$image"
   fi
-done < bom-v0.1.0.txt
+done < bom-v0.2.0.txt
 ```
 
 ## Compliance Use Cases
@@ -212,7 +212,7 @@ Extract license information from SBOM:
 ```bash
 # Using jq to extract licenses from CycloneDX SBOM
 jq -r '.components[] | select(.licenses) | "\(.name): \(.licenses[].license.id // .licenses[].license.name)"' \
-  sbom-operator-v0.1.0.cyclonedx.json | sort -u
+  sbom-operator-v0.2.0.cyclonedx.json | sort -u
 ```
 
 ### Audit Trail
@@ -234,13 +234,13 @@ Integrate BOM/SBOM into your CI/CD pipeline:
 # Example GitHub Actions workflow
 - name: Download SBOM
   run: |
-    VERSION="0.1.0"
+    VERSION="0.2.0"
     curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/sbom-operator-v${VERSION}.cyclonedx.json"
 
 - name: Scan for vulnerabilities
   uses: anchore/scan-action@v3
   with:
-    sbom: "sbom-operator-v0.1.0.cyclonedx.json"
+    sbom: "sbom-operator-v0.2.0.cyclonedx.json"
     fail-build: true
     severity-cutoff: high
 ```
@@ -277,7 +277,7 @@ while read -r line; do
       exit 1
     fi
   fi
-done < bom-v0.1.0.yaml
+done < bom-v0.2.0.yaml
 
 echo "✅ All images from approved registries"
 ```

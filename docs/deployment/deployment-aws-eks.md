@@ -238,7 +238,7 @@ helm version               # Minimum: v3.12+
 git --version             # Minimum: v2.30+
 jq --version              # Minimum: v1.6+
 yq --version              # Minimum: v4.30+ (mikefarah/yq, NOT Python yq)
-eksctl version            # Minimum: v0.150+
+eksctl version            # Minimum: v0.2.0+
 aws --version             # Minimum: AWS CLI v2.13+
 ```
 
