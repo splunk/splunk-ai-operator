@@ -1020,7 +1020,7 @@ The script installs NVIDIA host drivers directly on GPU nodes (not the GPU Opera
 **What happens on GPU nodes:**
 1. Kernel headers installed
 2. NVIDIA CUDA repository configured
-3. `cuda-drivers` package installed
+3. NVIDIA driver installed — the `nvidia-driver:latest-dkms` DKMS module (`kmod-nvidia-latest-dkms`); the older `cuda-drivers` meta-package is no longer published in NVIDIA's rhel9 repo
 4. NVIDIA Container Toolkit installed and configured
 5. `nvidia-smi` verification run
 6. NVIDIA device plugin DaemonSet applied cluster-wide with RuntimeClass
@@ -1122,7 +1122,7 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
-> **NVIDIA drivers:** The installer detects and skips driver installation if `nvidia-smi` is already present. For air-gapped GPU nodes, pre-install NVIDIA drivers and `nvidia-container-toolkit` using a local package mirror or RPM files before running the installer. See [NVIDIA GPU Support](#nvidia-gpu-support).
+> **NVIDIA drivers:** The installer detects and skips driver installation if `nvidia-smi` is already present. For air-gapped GPU nodes, pre-install the NVIDIA driver and `nvidia-container-toolkit` from an offline RPM closure before running the installer — see [Strategy 1 — Pre-install before running the installer](#gpu-nodes-in-air-gapped-environments) for the full recipe.
 
 ---
 
@@ -1141,14 +1141,22 @@ cd tools/cluster_setup
 | Category | Contents |
 |---|---|
 | Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at bundle time), `opentelemetry-operator` (version captured at bundle time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
 | GPU packages | `epel-release-latest-9.noarch.rpm`, `cuda-rhel9.repo`, `nvidia-container-toolkit.repo`, PyYAML wheel (all nodes) |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
-Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~500 MB)
+Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB)
 
 > `kube-prometheus-stack` and `opentelemetry-operator` are not pinned in the installer — the bundle script resolves and records those versions at download time so the air-gapped install uses exactly the charts that were tested.
+
+> **Two image bundles, built for you.** `k0s-images.tar` and `addon-images.tar`
+> cover the *infrastructure* images that k0s and the add-on charts/manifests pull
+> from quay.io / ghcr.io / registry.k8s.io / nvcr.io — refs the `images.registry`
+> rewrite never touches. They are **separate** from the platform application
+> images you mirror in [Step 2](#step-2--mirror-container-images). Both are
+> required for a working air-gapped cluster.
 
 ---
 
@@ -1309,39 +1317,100 @@ GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that 
 
 **Strategy 1 — Pre-install before running the installer (recommended)**
 
-Pre-install NVIDIA drivers and nvidia-container-toolkit on GPU nodes before running `install_from_airgap_bundle.sh`. The installer detects `nvidia-smi` and skips driver installation entirely.
+Pre-install the NVIDIA driver and nvidia-container-toolkit on each GPU node before running `install_from_airgap_bundle.sh`. The installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips Container Toolkit install), then configures the containerd runtime offline.
+
+A fully air-gapped GPU node cannot reach NVIDIA's RPM repos, so the bundle's bare `cuda-rhel9.repo` is not enough on its own — `dnf install` against it would still try to fetch packages and their dependencies over the blocked link. Instead, build a self-contained RPM **closure** on a connected RHEL 9 host, copy it to the node, and install from it as a local repo.
+
+The driver flavor that succeeds on RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
+
+> **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
+
+**Step 1 — build the closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the bundle-prep machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
 
 ```bash
-# Copy packages from the bundle to each GPU node
-GPU_NODE="10.0.0.3"
-BUNDLE_PKGS="/opt/airgap/airgap-bundle-<date>/packages"
+DEST=~/nvidia-offline
+NODE_KREL="5.14.0-687.10.1.el9_8"   # GPU node's `uname -r`
+NODE_MINOR="9.8"                     # GPU node's RHEL minor (cat /etc/os-release)
 
-scp -r "${BUNDLE_PKGS}" "${GPU_NODE}:/tmp/airgap-packages"
+# Repos on the BUILD host (one-time): EPEL + NVIDIA CUDA + container-toolkit
+sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+sudo dnf config-manager --add-repo \
+  https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+  | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+sudo dnf module enable -y nvidia-driver:latest-dkms
 
-# On each GPU node — install the driver before running the main installer
+mkdir -p "$DEST"
+sudo dnf download --resolve --alldeps --releasever="$NODE_MINOR" \
+  --setopt=install_weak_deps=False --destdir="$DEST" \
+  -x 'kernel-core*' -x 'kernel-modules-core*' -x 'kernel-5.14*' \
+  kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
+  nvidia-kmod-common nvidia-modprobe nvidia-persistenced \
+  dkms gcc make elfutils-libelf-devel \
+  "kernel-devel-${NODE_KREL}" "kernel-headers-${NODE_KREL}"
+
+# Container Toolkit into the same dir
+sudo dnf download --resolve --alldeps --releasever="$NODE_MINOR" \
+  --setopt=install_weak_deps=False --destdir="$DEST" \
+  nvidia-container-toolkit
+```
+
+**Step 2 — fix three traps before publishing the repo** (redo each on every rebuild):
+
+1. **glibc skew.** `--alldeps` always pulls the *latest* `glibc` (e.g. `-270`), but the node runs an older minor (e.g. `-266`) and you **cannot** upgrade a core lib offline. Delete the too-new glibc RPMs and re-pull only the two `gcc` actually needs, at the node's installed version:
+   ```bash
+   rm -f "$DEST"/glibc-2.34-270*.rpm
+   sudo dnf download --releasever="$NODE_MINOR" --destdir="$DEST" \
+     glibc-devel-2.34-266 glibc-headers-2.34-266   # match the node's glibc
+   ```
+2. **dkms kernel-devel-matched.** `dkms` has a rich dependency `(kernel-devel-matched if kernel-core)`; the node has `kernel-core`, so the closure must contain `kernel-devel-matched-<KREL>`:
+   ```bash
+   sudo dnf download --releasever="$NODE_MINOR" --destdir="$DEST" \
+     "kernel-devel-matched-${NODE_KREL}"
+   ```
+3. **repo metadata.** Build the repo index, then transfer to the node:
+   ```bash
+   createrepo_c "$DEST"
+   GPU_NODE="10.0.0.3"
+   scp -r "$DEST" "${GPU_NODE}:/tmp/nvidia-offline"
+   ```
+
+**Step 3 — install on the GPU node from the local repo.** Use **named packages against a local `--repofrompath`** (not `dnf install *.rpm`, which force-installs every file and conflicts). The `dnf clean all` + `--refresh` is mandatory — dnf caches repodata by repo name+path and will otherwise replay stale-metadata errors:
+
+```bash
 ssh "${GPU_NODE}" bash <<'EOF'
-  PKG=/tmp/airgap-packages
+  PKGDIR=/tmp/nvidia-offline
+  sudo dnf clean all
+  sudo dnf install -y --refresh --disablerepo='*' \
+    --repofrompath="airgap-nvidia,${PKGDIR}" \
+    --setopt=airgap-nvidia.gpgcheck=0 --setopt=install_weak_deps=False \
+    kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
+    nvidia-kmod-common nvidia-modprobe nvidia-persistenced \
+    dkms gcc make elfutils-libelf-devel "kernel-devel-$(uname -r)"
 
-  # 1. Install EPEL (provides DKMS)
-  sudo dnf install -y "${PKG}/epel-release-latest-9.noarch.rpm"
+  sudo dnf install -y --refresh --disablerepo='*' \
+    --repofrompath="airgap-nvidia,${PKGDIR}" \
+    --setopt=airgap-nvidia.gpgcheck=0 nvidia-container-toolkit
 
-  # 2. Install DKMS + build toolchain
-  sudo dnf install -y dkms gcc make elfutils-libelf-devel "kernel-devel-$(uname -r)"
-
-  # 3. Add CUDA repo and install driver
-  sudo cp "${PKG}/cuda-rhel9.repo" /etc/yum.repos.d/
-  sudo dnf install -y cuda-drivers
-
-  # 4. Install nvidia-container-toolkit
-  sudo cp "${PKG}/nvidia-container-toolkit.repo" /etc/yum.repos.d/
-  sudo dnf install -y nvidia-container-toolkit
-
-  # 5. Verify
-  nvidia-smi
+  # DKMS builds the kmod in %post — verify the whole stack before continuing:
+  dkms status | grep -i nvidia      # → ...: installed
+  nvidia-smi                        # → lists the GPU
+  nvidia-ctk --version              # → NVIDIA Container Toolkit CLI version ...
+  ls -l /lib64/libnvidia-ml.so.1    # → present
 EOF
 ```
 
-> `install_from_airgap_bundle.sh` also sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the bundle's `packages/PyYAML-*.whl` so the installer uses it instead of calling `dnf install python3-pyyaml`.
+> **Do not reboot into a different kernel** after this. The kmod is DKMS-built against the running kernel only; pin/exclude kernel updates on air-gapped GPU nodes (`exclude=kernel*` in `/etc/dnf/dnf.conf`) so a reboot can't land on a kernel with no matching module.
+
+After this succeeds on every GPU node, run `install_from_airgap_bundle.sh` normally. The installer skips driver + toolkit install, then configures the containerd runtime, generates the CDI spec, and applies the device-plugin DaemonSet — all offline.
+
+**What the installer handles for you (k0s ≥ 1.33 / containerd 2.x):**
+
+- **containerd 2.x runtime config.** `nvidia-ctk runtime configure` still emits the legacy `io.containerd.grpc.v1.cri` plugin key, which containerd 2.x rejects (crash-looping the worker). The installer rewrites the drop-in to the new `io.containerd.cri.v1.runtime` key automatically when the node's k0s base config uses it — no manual edit needed.
+- **device-plugin image.** The bundle includes `nvcr.io/nvidia/k8s-device-plugin` in `addon-images.tar`, staged to `/var/lib/k0s/images/` on every worker, so the DaemonSet starts without pulling from `nvcr.io`.
+- **worker image staging on rejoin.** Workers joined into an existing cluster also receive the image tarballs, so a GPU node added later still comes up Ready offline.
+
+> `install_from_airgap_bundle.sh` also sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the PyYAML artifact in the bundle's `packages/` directory so the installer uses it instead of calling `dnf install python3-pyyaml`. PyYAML does not publish a pure-Python (`none-any`) wheel, so this is normally the source sdist (`PyYAML-*.tar.gz`), which `pip3 install` builds on the node; if a pure-Python wheel is ever published the bundle prefers it. Either way the path is wired up for you — don't expect a specific `.whl` filename.
 
 **Strategy 2 — Local RPM mirror (for organizations with many nodes)**
 
@@ -1396,7 +1465,7 @@ These variables are set automatically by `install_from_airgap_bundle.sh`. Set th
 | `EPEL_RPM_URL_OVERRIDE` | `dl.fedoraproject.org/pub/epel/epel-release-latest-N.noarch.rpm` | EPEL release RPM for DKMS |
 | `CUDA_REPO_URL_OVERRIDE` | NVIDIA CUDA repo URL for the detected OS | CUDA package repo definition |
 | `NVIDIA_CTK_REPO_URL_OVERRIDE` | `nvidia.github.io/.../nvidia-container-toolkit.repo` | nvidia-container-toolkit repo |
-| `AIRGAP_PYYAML_WHEEL_PATH` | _(not set)_ | Path to PyYAML `.whl` for offline pip3 install |
+| `AIRGAP_PYYAML_WHEEL_PATH` | _(not set)_ | Path to the bundled PyYAML artifact (`.whl` if a pure-Python wheel exists, otherwise the `.tar.gz` sdist) for offline pip3 install |
 
 **Other:**
 

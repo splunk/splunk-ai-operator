@@ -871,6 +871,37 @@ scp_file() {
   fi
 }
 
+# Stage pre-loaded container-image bundles onto a node so k0s auto-imports them
+# from disk at startup instead of pulling over a (blocked) internet link. Copies
+# EVERY *.tar from the bundle's images/ dir into the node's /var/lib/k0s/images/,
+# covering both k0s control-plane images (k0s-images.tar: pause/calico/kube-proxy/
+# coredns/…) and add-on component images (addon-images.tar: cert-manager/
+# prometheus/metallb/…). k0s imports all tarballs in that directory at startup.
+#
+# MUST be called AFTER `k0s install` (which, together with the stale-state cleanup,
+# recreates /var/lib/k0s) and BEFORE `k0s start` (k0s scans /var/lib/k0s/images/
+# only at kubelet startup). No-op unless AIRGAP_K0S_IMAGE_DIR points at a dir with
+# at least one *.tar (set only by install_from_airgap_bundle.sh).
+stage_k0s_image_bundle() {
+  local node_ip="$1"
+  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 0
+  local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  [[ -f "${_tars[0]}" ]] || return 0
+  ssh_exec "${node_ip}" "sudo mkdir -p /var/lib/k0s/images" \
+    || { warn "    Could not create /var/lib/k0s/images on ${node_ip} — images may fail to pull"; return 0; }
+  local _tar _name
+  for _tar in "${_tars[@]}"; do
+    _name="$(basename "${_tar}")"
+    log "    Staging image bundle ${_name} on ${node_ip} (/var/lib/k0s/images/)..."
+    if scp_file "${_tar}" "${node_ip}" "/tmp/${_name}"; then
+      ssh_exec "${node_ip}" "sudo mv -f /tmp/${_name} /var/lib/k0s/images/${_name}" \
+        || warn "    Failed to place ${_name} on ${node_ip} — some images may fail to pull"
+    else
+      warn "    Failed to copy ${_name} to ${node_ip} — some images may fail to pull"
+    fi
+  done
+}
+
 # ====== PREFLIGHT: REMOTE NODE DEPENDENCY CHECK ======
 # SSHs to every node and reports what is present vs missing BEFORE install.
 # Does not install anything — surfaces gaps so the operator can fix them
@@ -921,6 +952,24 @@ prepare_nodes_for_k0s() {
   for node_ip in "${node_ips[@]}"; do
     log "  Preparing node ${node_ip}..."
     _check_node_os "${node_ip}" "node"
+
+    # Air-gap: push the bundled k0s binary from THIS host (the installer machine)
+    # to the node. K0S_INSTALL_URL=file://... points at a path on the installer
+    # host, NOT the node, and the env var does not cross the SSH boundary into the
+    # heredoc below — so the node can neither read that path nor reach the internet
+    # to curl get.k0s.sh. We copy the binary to /tmp/k0s-airgap (writable by the
+    # SSH user) and the remote script installs it from there.
+    if [[ "${AIRGAP_MODE}" == "true" && -n "${K0S_INSTALL_URL:-}" && "${K0S_INSTALL_URL}" == file://* ]]; then
+      local _k0s_src="${K0S_INSTALL_URL#file://}"
+      if [[ -f "${_k0s_src}" ]]; then
+        log "    Copying bundled k0s binary to ${node_ip}:/tmp/k0s-airgap ..."
+        scp_file "${_k0s_src}" "${node_ip}" "/tmp/k0s-airgap" \
+          || warn "    Failed to copy k0s binary to ${node_ip} — node install may fail"
+      else
+        warn "    Bundled k0s binary not found at ${_k0s_src} — node will fall back to other install paths"
+      fi
+    fi
+
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
       bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
@@ -967,6 +1016,13 @@ prepare_nodes_for_k0s() {
       # Install k0s binary if not present
       if command -v k0s >/dev/null 2>&1; then
         echo "k0s binary already present ($(k0s version 2>/dev/null || echo unknown))"
+      elif [ -f /tmp/k0s-airgap ]; then
+        # Air-gap: the installer host scp'd the bundled binary here before this
+        # heredoc ran. Prefer it over any network path so an air-gapped node
+        # never tries to reach the internet.
+        echo "Installing k0s binary from air-gap bundle (/tmp/k0s-airgap)..."
+        sudo cp /tmp/k0s-airgap /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
+        rm -f /tmp/k0s-airgap
       else
         echo "Installing k0s binary..."
         if [[ -n "${K0S_INSTALL_URL:-}" && "${K0S_INSTALL_URL}" == file://* ]]; then
@@ -1207,6 +1263,9 @@ PYSCRIPT"
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."
   ssh_exec "${controller_ip}" "sudo k0s install controller --config /tmp/k0s.yaml --enable-worker"
+  # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
+  # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
+  stage_k0s_image_bundle "${controller_ip}"
   ssh_exec "${controller_ip}" "sudo k0s start"
 
   log "Waiting for controller API server to be ready..."
@@ -1247,6 +1306,9 @@ PYSCRIPT"
     # Write token to temp file first (stdin pipe doesn't work reliably over SSH)
     if ssh_exec "${worker_ip}" "echo '${worker_token}' | sudo tee /tmp/k0s-token >/dev/null && sudo k0s install worker --token-file=/tmp/k0s-token"; then
       log "  ✓ k0s installed on ${worker_ip}"
+      # Air-gap: stage k0s system images now — after install (recreated
+      # /var/lib/k0s), before this worker is started in the loop below.
+      stage_k0s_image_bundle "${worker_ip}"
     else
       warn "  ✗ Failed to install k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
@@ -1335,9 +1397,19 @@ PYSCRIPT"
     log "✓ All ${expected_nodes} nodes joined successfully!"
   fi
 
-  # Install local-path storage provisioner for persistent volumes
+  # Install local-path storage provisioner for persistent volumes.
+  # NOTE: kubectl runs on the CONTROLLER here (M2's local kubeconfig is not
+  # retrieved until a few lines below). kubectl's `apply -f` does not understand
+  # the file:// scheme, and an air-gap bundle path is local to M2 (the installer
+  # host), not the controller. So in air-gap mode we stream the manifest's bytes
+  # from M2 into the controller's kubectl over ssh stdin (`apply -f -`).
   log "Installing local-path storage provisioner..."
-  ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f '${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}'"
+  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}"
+  if [[ "${_lp_url}" == file://* ]]; then
+    ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f -" < "${_lp_url#file://}"
+  else
+    ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f '${_lp_url}'"
+  fi
 
   log "Waiting for storage provisioner to be ready..."
   sleep 10
@@ -1783,7 +1855,12 @@ stage_model_artifacts() {
 install_cert_manager() {
   log "Installing cert-manager..."
 
-  kubectl apply -f "${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+  # kubectl runs locally on this (installer) host here, with KUBECONFIG already
+  # set. `apply -f` accepts a local path or an http(s) URL but NOT the file://
+  # scheme, so strip it to a bare path for air-gap bundle manifests.
+  local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+  [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
+  kubectl apply -f "${_cm_url}"
 
   wait_for_crd certificates.cert-manager.io 300
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
@@ -2091,13 +2168,19 @@ _install_nvidia_on_node() {
   fi
 
   # ---- Phase D: NVIDIA Container Toolkit install ------------------------
-  # Check NVIDIA repo reachability from this GPU node before attempting install.
-  # Skip in air-gap mode — drivers must be pre-installed on the node.
-  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+  # Short-circuit the repo reachability check if nvidia-ctk is already present.
+  # Only check reachability (and only in non-air-gap mode) when we actually need
+  # to download the CTK. Use the repo file URL — the bare nvidia.github.io root
+  # times out from some regions despite the repo itself being reachable.
+  local _ctk_present
+  _ctk_present=$(ssh_exec "${gpu_ip}" "command -v nvidia-ctk >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo no)
+  if [[ "${_ctk_present}" != "yes" ]] && [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
     wait_for_dependency \
       "NVIDIA package repo (nvidia.github.io) — required for container-toolkit install on ${gpu_ip}" \
-      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io >/dev/null 2>&1'" \
+      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo >/dev/null 2>&1'" \
       180
+  elif [[ "${_ctk_present}" == "yes" ]]; then
+    log "nvidia-ctk already installed on ${gpu_ip} — skipping repo check"
   else
     log "AIRGAP_MODE=true — skipping NVIDIA repo check for ${gpu_ip}; drivers must be pre-installed on the node"
   fi
@@ -2202,6 +2285,23 @@ _install_nvidia_on_node() {
       sudo mv /etc/containerd/conf.d/99-nvidia.toml /etc/k0s/containerd.d/nvidia.toml
       sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \\
         /etc/k0s/containerd.d/nvidia.toml
+
+      # containerd 2.x (shipped by k0s >= 1.33) renamed the CRI plugin: the
+      # legacy v1 table plugins.io.containerd.grpc.v1.cri was split into
+      # plugins.io.containerd.cri.v1.runtime (runtime config) and
+      # plugins.io.containerd.cri.v1.images (image config), and the config
+      # loader now REJECTS the legacy key in a pre-flight check, crash-looping
+      # k0sworker (so the GPU node never becomes Ready and the install aborts).
+      # nvidia-ctk (through at least 1.19) still emits the legacy key, so when
+      # this k0s's own managed base config uses the new runtime plugin name we
+      # rewrite the drop-in plugin key to match. On older containerd-1.x k0s the
+      # base config still uses the legacy key, the grep fails, and the drop-in
+      # is left untouched.
+      if sudo grep -q 'io\\.containerd\\.cri\\.v1\\.runtime' /etc/k0s/containerd.toml 2>/dev/null; then
+        echo '--- Rewriting nvidia drop-in to containerd 2.x CRI plugin key (io.containerd.cri.v1.runtime) ---'
+        sudo sed -i 's/io\\.containerd\\.grpc\\.v1\\.cri/io.containerd.cri.v1.runtime/g' \\
+          /etc/k0s/containerd.d/nvidia.toml
+      fi
 
       # Final sanity: the k0s drop-in must still carry default_runtime_name
       # after the key-strip above (it lives under a nested table, not at
@@ -5882,6 +5982,14 @@ join_workers() {
       warn "  Failed to install worker configuration on ${worker_ip}"
       continue
     fi
+
+    # Air-gap: stage k0s system + add-on images now — after `k0s install`
+    # (which recreated /var/lib/k0s) and BEFORE the worker is started below.
+    # Without this a worker joined via this subcommand starts with an empty
+    # /var/lib/k0s/images/, so its calico/kube-proxy pods try to pull from the
+    # (blocked) internet and the node never becomes Ready. No-op when
+    # AIRGAP_K0S_IMAGE_DIR is unset (i.e. not an air-gap install).
+    stage_k0s_image_bundle "${worker_ip}"
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."

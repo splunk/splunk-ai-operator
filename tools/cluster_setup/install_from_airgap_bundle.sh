@@ -245,16 +245,23 @@ if ! command -v yq >/dev/null 2>&1; then
   log "yq installed to /usr/local/bin/yq"
 fi
 
-# ── Set up local Helm chart repository ───────────────────────────────────────
-log "Registering local Helm chart repository..."
+# ── Set up local Helm chart repository (best-effort convenience only) ─────────
+# NOTE: The main installer (k0s_cluster_with_stack.sh) installs every chart by
+# ABSOLUTE PATH via the *_CHART_PATH env vars exported below — it never references
+# this "airgap-charts" repo. Registration is therefore purely optional convenience.
+#
+# Modern Helm (v3.7+) dropped support for "file://" as a `helm repo add` protocol
+# ("Error: could not find protocol handler for: file"). Since the repo is unused,
+# we make the whole block strictly non-fatal so it cannot abort the install under
+# `set -euo pipefail` on a host with a newer Helm.
+log "Registering local Helm chart repository (optional; charts install by path)..."
 LOCAL_CHARTS_DIR="${BUNDLE_DIR}/charts"
-helm repo add airgap-charts "file://${LOCAL_CHARTS_DIR}" 2>/dev/null || \
-  helm repo add airgap-charts "file://${LOCAL_CHARTS_DIR}"
-
-# Helm needs an index file for the local repo to work with `helm install REPO/chart`.
-# Build one from the .tgz files present.
-helm repo index "${LOCAL_CHARTS_DIR}" --url "file://${LOCAL_CHARTS_DIR}" 2>/dev/null || true
-helm repo update airgap-charts 2>/dev/null || true
+helm repo index "${LOCAL_CHARTS_DIR}" --url "file://${LOCAL_CHARTS_DIR}" >/dev/null 2>&1 || true
+if helm repo add airgap-charts "file://${LOCAL_CHARTS_DIR}" >/dev/null 2>&1; then
+  helm repo update airgap-charts >/dev/null 2>&1 || true
+else
+  log "  Helm rejected file:// repo (expected on Helm 3.7+); charts will install by path — no action needed."
+fi
 
 # ── Export env-var overrides read by k0s_cluster_with_stack.sh ───────────────
 # The main installer respects these vars via ${VAR:-default} patterns.
@@ -263,6 +270,20 @@ export AIRGAP_BUNDLE_DIR="${BUNDLE_DIR}"
 # Binaries
 export K0S_INSTALL_URL="file://${BUNDLE_DIR}/binaries/k0s"
 export YQ_DOWNLOAD_URL="file://${BUNDLE_DIR}/binaries/yq"
+
+# Pre-loaded container-image bundles (OCI tarballs). The installer scp's EVERY
+# *.tar in this directory to each node's /var/lib/k0s/images/, where k0s
+# auto-imports all of them into containerd at startup — covering both k0s
+# control-plane images (k0s-images.tar: pause/calico/kube-proxy/coredns/…) AND
+# add-on component images (addon-images.tar: cert-manager/prometheus/metallb/…).
+# This removes the need to pull from quay.io/ghcr.io/etc. over a blocked link.
+if compgen -G "${BUNDLE_DIR}/images/*.tar" >/dev/null 2>&1; then
+  export AIRGAP_K0S_IMAGE_DIR="${BUNDLE_DIR}/images"
+  log "Pre-loaded image bundles found in: ${AIRGAP_K0S_IMAGE_DIR}"
+  for _t in "${BUNDLE_DIR}/images"/*.tar; do log "  - $(basename "${_t}") ($(du -h "${_t}" | cut -f1))"; done
+else
+  warn "No pre-loaded image bundles in air-gap bundle (images/*.tar) — k0s control-plane AND add-on images may fail to pull on air-gapped nodes."
+fi
 
 # Static manifests
 export CERT_MANAGER_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/cert-manager.yaml"
