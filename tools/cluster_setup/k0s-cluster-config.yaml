@@ -37,7 +37,7 @@
 
 # ---------- Cluster Configuration ----------
 cluster:
-  name: airgap-cluster
+  name: ai-cluster
   region: us-east-2                       # CHANGE THIS — required when storage.objectStore.type=aws (region of the S3 bucket); ignored for true on-prem
   sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
   sshUser: root                       # CHANGE THIS: SSH user for remote nodes
@@ -89,13 +89,12 @@ storage:
   # to skip — e.g. if models are already staged or you want to run separately via
   # the 'stage-artifacts' subcommand.
   modelStaging:
-    enabled: true
+    enabled: false
 
   objectStore:
     type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
     bucket: "ai-platform-bucket-minio-us-east-2"
-    # endpoint: "http://3.144.157.201:8333"      # SeaweedFS (deprecated — see comment above)
-    endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS S3 API endpoint
+    endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS/S3 API endpoint
     auth:
       rootUser: "<paste-AWS_ACCESS_KEY_ID-here>"          # CHANGE THIS — AWS_ACCESS_KEY_ID (AKIA…) or MinIO root user
       rootPassword: "<paste-AWS_SECRET_ACCESS_KEY-here>"  # CHANGE THIS — AWS secret OR MinIO root password; NEVER commit real keys
@@ -106,23 +105,23 @@ images:
   registry: ""                                    # CHANGE THIS: Your ECR/Docker/Harbor registry (e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com)
 
   operator:
-    image: "splunk-ai-operator:latest"              # CHANGE THIS: Your operator image
+    image: "docker.io/splunk/splunk-ai-operator:0.2.0"
 
   splunk:
-    image: "splunk/splunk:10.2.0"                   # CHANGE THIS: Your Splunk Enterprise image
+    image: "docker.io/splunk/splunk:10.2-rhel9"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   ray:
-    headImage: "ml-platform/ray/ray-head:build-v2-010"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-010"
+    headImage: "splunk/ray-head-build-preview:latest"
+    workerImage: "splunk/ray-worker-gpu-build-preview:latest"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
   saia:
-    apiImage: "ml-platform/saia/saia-api:build-v2-012"
-    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-012"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-012"
+    apiImage: "splunk/saia-api-build-preview:latest"
+    apiV2Image: "splunk/saia-api-v2-build-preview:latest"
+    dataLoaderImage: "splunk/saia-data-loader-build-preview:latest"
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
