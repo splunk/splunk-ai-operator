@@ -125,7 +125,7 @@ images:
   #
   # REQUIRED: Specify your private registry URL for custom images
   # Leave empty to use Docker Hub defaults for all images
-  registry: "1234567890.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+  registry: "123456789012.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
   # ==================================================================================
   # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
