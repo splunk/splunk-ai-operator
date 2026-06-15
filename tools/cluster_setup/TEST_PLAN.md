@@ -1046,23 +1046,55 @@ echo "exit: $?"
 
 ### T3-16: GPU package URL overrides redirect install to local mirror
 
-Set up a local HTTP server serving the EPEL RPM, CUDA repo, and CTK repo files. Export the overrides and run the installer:
+**No internet required.** This test exercises only the `install_nvidia_host_drivers` phase
+against a single GPU node. A minimal local HTTP server stands in for the package mirrors.
+
+**Setup — local mirror (run on the test/staging machine):**
 
 ```bash
-export EPEL_RPM_URL_OVERRIDE="http://mirror.test.internal/epel-release-latest-9.noarch.rpm"
-export CUDA_REPO_URL_OVERRIDE="http://mirror.test.internal/cuda-rhel9.repo"
-export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.test.internal/nvidia-container-toolkit.repo"
+# Serve placeholder repo files from a temp directory on the staging machine
+MIRROR_DIR=$(mktemp -d)
+echo "[epel]"   > "${MIRROR_DIR}/epel-release-latest-9.noarch.rpm"  # dummy RPM placeholder
+echo "[cuda]"   > "${MIRROR_DIR}/cuda-rhel9.repo"
+echo "[nvidia]" > "${MIRROR_DIR}/nvidia-container-toolkit.repo"
 
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+python3 -m http.server 8090 --directory "${MIRROR_DIR}" &
+MIRROR_PID=$!
 ```
 
-Verify in the install log that the overridden URLs (not the default NVIDIA/Fedora CDN URLs) were fetched:
+**Trigger only the GPU driver install phase on a single GPU node:**
 
 ```bash
-grep "mirror.test.internal" logs/k0s-install-*.log
+export EPEL_RPM_URL_OVERRIDE="http://<staging-machine-ip>:8090/epel-release-latest-9.noarch.rpm"
+export CUDA_REPO_URL_OVERRIDE="http://<staging-machine-ip>:8090/cuda-rhel9.repo"
+export NVIDIA_CTK_REPO_URL_OVERRIDE="http://<staging-machine-ip>:8090/nvidia-container-toolkit.repo"
+
+# Source the config so the script can resolve GPU node IPs, then call the
+# driver-install function directly — no full cluster install needed.
+CONFIG_FILE=./my-config.yaml bash -c '
+  source ./k0s_cluster_with_stack.sh
+  load_config
+  install_nvidia_host_drivers
+' 2>&1 | tee /tmp/t3-16-driver-install.log
 ```
 
-**Pass:** All 3 override URLs appear in the log; no `dl.fedoraproject.org` or `developer.download.nvidia.com` requests on the GPU node.
+**Verify the overridden URLs were used (not the default CDN URLs):**
+
+```bash
+grep "mirror.test.internal\|<staging-machine-ip>:8090" /tmp/t3-16-driver-install.log
+
+# Confirm default CDN URLs were NOT contacted
+grep -c "dl.fedoraproject.org\|developer.download.nvidia.com" /tmp/t3-16-driver-install.log
+# expected: 0
+```
+
+**Cleanup:**
+
+```bash
+kill "${MIRROR_PID}"; rm -rf "${MIRROR_DIR}"
+```
+
+**Pass:** All 3 override URLs appear in the log; no `dl.fedoraproject.org` or `developer.download.nvidia.com` fetches observed.
 **Fail:** Default URLs still used — `${VAR:-default}` substitution not taking effect.
 
 ---

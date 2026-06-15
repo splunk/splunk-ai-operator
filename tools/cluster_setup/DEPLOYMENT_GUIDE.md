@@ -54,9 +54,9 @@ flowchart TD
 
 | Scenario | Install machine has internet | Cluster nodes have internet | Use |
 |---|---|---|---|
-| Typical cloud / on-prem | ✅ | ✅ | Standard deployment |
-| Install machine online, cluster isolated | ✅ | ❌ | Air-gapped deployment |
-| Everything offline | ❌ | ❌ | Air-gapped deployment (prepare bundle on a third machine) |
+| Typical cloud / on-prem | ✅ | ✅ | [Standard deployment](#standard-deployment-internet-connected) |
+| Install machine online, cluster isolated | ✅ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) |
+| Everything offline | ❌ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) (prepare bundle on a third machine) |
 
 ---
 
