@@ -34,7 +34,7 @@ images:
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
 
   operator:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.1"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.2"
 
   ray:
     headImage: "ml-platform/ray/ray-head:build-953"
