@@ -1461,7 +1461,7 @@ aws eks update-nodegroup-version \
 ```bash
 # Update operator image
 kubectl set image deployment/splunk-ai-operator-controller-manager \
-  manager=docker.io/splunk/splunk-ai-operator:0.1.0 \
+  manager=docker.io/splunk/splunk-ai-operator:0.2.0 \
   -n splunk-ai-operator-system
 
 # Restart operator
@@ -1523,7 +1523,7 @@ kubectl get deployment splunk-ai-operator-controller-manager \
 **VPC Layout:**
 ```
 VPC (10.0.0.0/16)
-├── Public Subnet A (10.0.1.0/24) - AZ us-west-2a
+├── Public Subnet A (10.0.2.0/24) - AZ us-west-2a
 │   ├── Internet Gateway
 │   ├── NAT Gateway A
 │   └── Application Load Balancer (if using ingress)
@@ -2302,7 +2302,7 @@ aws ec2 accept-vpc-peering-connection \
 
 # Update route tables
 aws ec2 create-route --route-table-id rtb-xxxxx \
-  --destination-cidr-block 10.1.0.0/16 \
+  --destination-cidr-block 10.2.0.0/16 \
   --vpc-peering-connection-id pcx-xxxxx
 ```
 

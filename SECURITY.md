@@ -73,7 +73,7 @@ When deploying the Splunk AI Operator:
 
 ```yaml
 # Good
-image: ghcr.io/splunk/splunk-ai-operator:v0.1.0
+image: ghcr.io/splunk/splunk-ai-operator:v0.2.0
 
 # Avoid
 image: ghcr.io/splunk/splunk-ai-operator:latest
@@ -176,10 +176,10 @@ Refer to each component's security documentation for specific guidance.
 ### Container Scanning
 ```bash
 # Scan operator image with Trivy
-trivy image ghcr.io/splunk/splunk-ai-operator:v0.1.0
+trivy image ghcr.io/splunk/splunk-ai-operator:v0.2.0
 
 # Scan with Grype
-grype ghcr.io/splunk/splunk-ai-operator:v0.1.0
+grype ghcr.io/splunk/splunk-ai-operator:v0.2.0
 ```
 
 ### Kubernetes Security Scanning

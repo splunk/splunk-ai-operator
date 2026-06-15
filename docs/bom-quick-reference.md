@@ -3,7 +3,7 @@
 ## 📥 Download Files
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 BASE_URL="https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}"
 
 # Essential files
@@ -59,9 +59,9 @@ done
 | File | Contains | Use For |
 |------|----------|---------|
 | `compatibility-matrix.yaml` | K8s versions, required services, component versions | Pre-deployment checks |
-| `bom-v0.1.0.txt` | All images + dependency versions | Quick review |
-| `bom-v0.1.0.yaml` | Machine-readable BOM | Automation, scripts |
-| `sbom-operator-v0.1.0.cyclonedx.json` | Software dependencies | Vulnerability scanning |
+| `bom-v0.2.0.txt` | All images + dependency versions | Quick review |
+| `bom-v0.2.0.yaml` | Machine-readable BOM | Automation, scripts |
+| `sbom-operator-v0.2.0.cyclonedx.json` | Software dependencies | Vulnerability scanning |
 
 ## 🎯 Common Tasks
 

@@ -12,7 +12,7 @@ A clear and concise description of what the bug is.
 
 ## Environment
 
-- **Operator Version**: [e.g., v0.1.0]
+- **Operator Version**: [e.g., v0.2.0]
 - **Kubernetes Version**: [e.g., v1.31.13]
 - **Cloud Provider**: [e.g., AWS EKS, GKE, AKS, k0s]
 - **OS**: [e.g., Ubuntu 22.04]

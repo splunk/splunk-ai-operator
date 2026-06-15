@@ -50,7 +50,7 @@ metadata:
   labels:
     app.kubernetes.io/name: splunk-ai-platform-example
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 0.1.0
+    app.kubernetes.io/version: 0.2.0
 spec:
   objectStorage:
     path: "s3://my-ai-bucket"
@@ -60,7 +60,7 @@ spec:
   features:
     - name: "saia"
       serviceAccountName: "saia-sa"
-      version: "0.1.0"
+      version: "0.2.0"
   workerGroupConfig:
     serviceAccountName: "ray-worker-sa"
     imageRegistry: "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-worker-gpu"  

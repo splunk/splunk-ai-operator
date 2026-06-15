@@ -16,13 +16,13 @@ This guide shows you how to practically use the Bill of Materials (BOM) and Comp
 
 ### 1. Pre-Deployment: Check Compatibility
 
-**Scenario:** You want to deploy Splunk AI Operator v0.1.0 on your Kubernetes cluster.
+**Scenario:** You want to deploy Splunk AI Operator v0.2.0 on your Kubernetes cluster.
 
 **Steps:**
 
 ```bash
 # Download the compatibility matrix
-VERSION="0.1.0"
+VERSION="0.2.0"
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/compatibility-matrix.yaml"
 
 # Check Kubernetes compatibility
@@ -79,7 +79,7 @@ kubectl get deployment -n cert-manager cert-manager -o jsonpath='{.metadata.labe
 #### Option A: Scan Operator Image
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Download SBOM
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/sbom-operator-v${VERSION}.cyclonedx.json"
@@ -106,7 +106,7 @@ done
 
 **Example Output:**
 ```
-Scanning: ghcr.io/splunk/splunk-ai-operator:v0.1.0
+Scanning: ghcr.io/splunk/splunk-ai-operator:v0.2.0
 ✅ No HIGH or CRITICAL vulnerabilities
 
 Scanning: splunk/splunk:10.2.0
@@ -116,19 +116,19 @@ Scanning: splunk/splunk:10.2.0
 
 ### 3. Upgrade Planning: Compare Versions
 
-**Scenario:** You're on v0.0.5 and want to upgrade to v0.1.0. What changed?
+**Scenario:** You're on v0.0.5 and want to upgrade to v0.2.0. What changed?
 
 ```bash
 # Download both BOMs
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v0.0.5/bom-v0.0.5.yaml"
-curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v0.1.0/bom-v0.1.0.yaml"
+curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/bom-v0.2.0.yaml"
 
 # Compare Splunk Enterprise versions
 echo "Old version:"
 yq '.spec.dependencies.splunkEnterpriseVersion' bom-v0.0.5.yaml
 
 echo "New version:"
-yq '.spec.dependencies.splunkEnterpriseVersion' bom-v0.1.0.yaml
+yq '.spec.dependencies.splunkEnterpriseVersion' bom-v0.2.0.yaml
 
 # Check if upgrade is safe
 yq '.upgradePaths[] | select(.from == "0.0.x" and .to == "0.1.x")' compatibility-matrix.yaml
@@ -150,7 +150,7 @@ notes: "Initial pre-GA release"
 **Scenario:** Audit team needs a complete list of all software dependencies.
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Download all compliance files
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/bom-v${VERSION}.txt"
@@ -173,7 +173,7 @@ Create a validation script:
 #!/bin/bash
 # check-registry-policy.sh
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 APPROVED_REGISTRIES=(
   "ghcr.io/splunk"
   "splunk"
@@ -230,7 +230,7 @@ on:
       operator_version:
         description: 'Operator version to deploy'
         required: true
-        default: '0.1.0'
+        default: '0.2.0'
 
 jobs:
   validate:
@@ -308,7 +308,7 @@ jobs:
 #### Using Dependency-Track
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Download CycloneDX SBOM
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/sbom-operator-v${VERSION}.cyclonedx.json"
@@ -337,7 +337,7 @@ Dependency-Track will:
 **Scenario:** You need to mirror all images to a private registry for air-gapped deployment.
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 PRIVATE_REGISTRY="registry.internal.company.com"
 
 # Download BOM
@@ -346,7 +346,7 @@ curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERS
 # Create mirror script
 cat > mirror-images.sh <<'EOF'
 #!/bin/bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 PRIVATE_REGISTRY="registry.internal.company.com"
 BOM_FILE="bom-v${VERSION}.yaml"
 
@@ -383,7 +383,7 @@ chmod +x mirror-images.sh
 **Scenario:** Deployment failing, need to verify actual vs expected versions.
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 NAMESPACE="splunk-ai-operator-system"
 
 # Download expected BOM
@@ -416,7 +416,7 @@ kubectl get deployment -n splunk-ai ray-head -o jsonpath='{.spec.template.spec.c
 **Scenario:** Create an executive summary for stakeholders.
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Download files
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/bom-v${VERSION}.yaml"
@@ -475,7 +475,7 @@ cat executive-summary.md
 
 ```bash
 # Set your version
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Download compatibility matrix
 curl -LO "https://github.com/splunk/splunk-ai-operator/releases/download/v${VERSION}/compatibility-matrix.yaml"
