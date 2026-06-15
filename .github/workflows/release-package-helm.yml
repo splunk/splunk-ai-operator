@@ -282,6 +282,13 @@ jobs:
         run: |
           mkdir -p .helm-releases
 
+          # Fetch declared chart dependencies before packaging
+          helm dependency update helm-chart/splunk-ai-operator
+
+          if [ -f helm-chart/splunk-ai-platform/Chart.yaml ]; then
+            helm dependency update helm-chart/splunk-ai-platform
+          fi
+
           # Package operator chart
           helm package helm-chart/splunk-ai-operator --destination .helm-releases
 
