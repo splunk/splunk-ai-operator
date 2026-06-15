@@ -2168,13 +2168,19 @@ _install_nvidia_on_node() {
   fi
 
   # ---- Phase D: NVIDIA Container Toolkit install ------------------------
-  # Check NVIDIA repo reachability from this GPU node before attempting install.
-  # Skip in air-gap mode — drivers must be pre-installed on the node.
-  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+  # Short-circuit the repo reachability check if nvidia-ctk is already present.
+  # Only check reachability (and only in non-air-gap mode) when we actually need
+  # to download the CTK. Use the repo file URL — the bare nvidia.github.io root
+  # times out from some regions despite the repo itself being reachable.
+  local _ctk_present
+  _ctk_present=$(ssh_exec "${gpu_ip}" "command -v nvidia-ctk >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo no)
+  if [[ "${_ctk_present}" != "yes" ]] && [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
     wait_for_dependency \
       "NVIDIA package repo (nvidia.github.io) — required for container-toolkit install on ${gpu_ip}" \
-      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io >/dev/null 2>&1'" \
+      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo >/dev/null 2>&1'" \
       180
+  elif [[ "${_ctk_present}" == "yes" ]]; then
+    log "nvidia-ctk already installed on ${gpu_ip} — skipping repo check"
   else
     log "AIRGAP_MODE=true — skipping NVIDIA repo check for ${gpu_ip}; drivers must be pre-installed on the node"
   fi
