@@ -160,6 +160,9 @@ aiPlatform:
   name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
   # defaultAcceleratorType: "H100"
+  # defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"   # RTX PRO 6000 Blackwell (g7e-class) nodes.
+  #   Must exactly match an instance.yaml tier key AND the gpu_type_options_override
+  #   keys in applications.yaml — builder.go errors if no matching worker tier exists.
 
   workerGroupConfig:
     imageRegistry: ""
