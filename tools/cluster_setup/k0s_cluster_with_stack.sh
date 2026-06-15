@@ -2280,6 +2280,23 @@ _install_nvidia_on_node() {
       sudo sed -i '/^version/d; /^imports/d; /^disabled_plugins/d; /^required_plugins/d' \\
         /etc/k0s/containerd.d/nvidia.toml
 
+      # containerd 2.x (shipped by k0s >= 1.33) renamed the CRI plugin: the
+      # legacy v1 table plugins.io.containerd.grpc.v1.cri was split into
+      # plugins.io.containerd.cri.v1.runtime (runtime config) and
+      # plugins.io.containerd.cri.v1.images (image config), and the config
+      # loader now REJECTS the legacy key in a pre-flight check, crash-looping
+      # k0sworker (so the GPU node never becomes Ready and the install aborts).
+      # nvidia-ctk (through at least 1.19) still emits the legacy key, so when
+      # this k0s's own managed base config uses the new runtime plugin name we
+      # rewrite the drop-in plugin key to match. On older containerd-1.x k0s the
+      # base config still uses the legacy key, the grep fails, and the drop-in
+      # is left untouched.
+      if sudo grep -q 'io\\.containerd\\.cri\\.v1\\.runtime' /etc/k0s/containerd.toml 2>/dev/null; then
+        echo '--- Rewriting nvidia drop-in to containerd 2.x CRI plugin key (io.containerd.cri.v1.runtime) ---'
+        sudo sed -i 's/io\\.containerd\\.grpc\\.v1\\.cri/io.containerd.cri.v1.runtime/g' \\
+          /etc/k0s/containerd.d/nvidia.toml
+      fi
+
       # Final sanity: the k0s drop-in must still carry default_runtime_name
       # after the key-strip above (it lives under a nested table, not at
       # top level, so the sed above never touches it — but verify anyway
@@ -5959,6 +5976,14 @@ join_workers() {
       warn "  Failed to install worker configuration on ${worker_ip}"
       continue
     fi
+
+    # Air-gap: stage k0s system + add-on images now — after `k0s install`
+    # (which recreated /var/lib/k0s) and BEFORE the worker is started below.
+    # Without this a worker joined via this subcommand starts with an empty
+    # /var/lib/k0s/images/, so its calico/kube-proxy pods try to pull from the
+    # (blocked) internet and the node never becomes Ready. No-op when
+    # AIRGAP_K0S_IMAGE_DIR is unset (i.e. not an air-gap install).
+    stage_k0s_image_bundle "${worker_ip}"
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."

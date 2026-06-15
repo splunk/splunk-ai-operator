@@ -119,10 +119,10 @@ graph TB
 
 | Component | Supported version | Notes |
 |---|---|---|
-| k0s (Kubernetes) | v1.31.x | Installed automatically by the installer |
+| k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
 | RHEL | 9 | Only supported OS for cluster nodes |
-| NVIDIA CUDA driver | 12.x (cuda-drivers) | Installed via CUDA repo on GPU nodes |
-| NVIDIA Container Toolkit | latest stable | Installed alongside CUDA drivers |
+| NVIDIA driver | `nvidia-driver:latest-dkms` (DKMS module) | Installed via NVIDIA repo on GPU nodes; the older `cuda-drivers` meta-package is no longer published |
+| NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S | Only `defaultAcceleratorType: L40S` is supported |
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
 
@@ -553,7 +553,7 @@ flowchart TD
     SKIP["✅ Skip driver install\nDriver already installed"]
     AIRGAP_CHECK{"AIRGAP_MODE\n= true?"}
     FAIL["❌ Clear error message:\nnvidia-smi not found\nin AIRGAP_MODE\n→ see K0S_README.md"]
-    INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nCUDA repo → cuda-drivers\nnvidia-container-toolkit"]
+    INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nNVIDIA repo → nvidia-driver:latest-dkms\nnvidia-container-toolkit"]
     CTK["Install nvidia-container-toolkit"]
     VERIFY["Verify: nvidia-smi returns\ndriver version number"]
 
@@ -590,29 +590,128 @@ flowchart LR
     end
 ```
 
-**Using bundled package files (Strategy 1):**
+**Pre-installing the driver offline (Strategy 1 — full recipe):**
 
-The bundle's `packages/` directory contains the files needed to pre-install drivers:
+A fully air-gapped GPU node has no access to NVIDIA's RPM repos, so you must
+build a self-contained RPM **closure** on a connected RHEL 9 host (the bundle
+machine works — its repos serve the GPU node's minor version), copy it to the
+node, and install from it as a local repo. The driver flavor that succeeds on
+RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`);
+the older `cuda-drivers` meta-package has been removed from NVIDIA's current
+rhel9 repo and no longer resolves.
+
+> **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the
+> same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only
+> `kernel-devel` / `kernel-headers` are node-specific (pinned to `uname -r`).
+
+**Step 1 — build the closure on a connected RHEL 9 host.** Pin every
+node-specific value to the *GPU node's* running kernel and OS minor, not the
+build host's:
 
 ```bash
-GPU_NODE="10.0.0.3"
-BUNDLE_PKGS="/opt/airgap/airgap-bundle-<date>/packages"
+DEST=~/nvidia-offline
+NODE_KREL="5.14.0-687.10.1.el9_8"   # GPU node's `uname -r`
+NODE_MINOR="9.8"                     # GPU node's RHEL minor (cat /etc/os-release)
 
-scp -r "${BUNDLE_PKGS}" "${GPU_NODE}:/tmp/airgap-packages"
+# Enable the DKMS driver module + EPEL (dkms) + CUDA + container-toolkit repos
+# on the BUILD host first (see K0S_README.md for the repo/GPG-key setup).
+sudo dnf module enable -y nvidia-driver:latest-dkms
 
+mkdir -p "$DEST"
+sudo dnf download --resolve --alldeps --releasever="$NODE_MINOR" \
+  --setopt=install_weak_deps=False --destdir="$DEST" \
+  -x 'kernel-core*' -x 'kernel-modules-core*' -x 'kernel-5.14*' \
+  kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
+  nvidia-kmod-common nvidia-modprobe nvidia-persistenced \
+  dkms gcc make elfutils-libelf-devel \
+  "kernel-devel-${NODE_KREL}" "kernel-headers-${NODE_KREL}"
+
+# Container Toolkit into the same dir
+sudo dnf download --resolve --alldeps --releasever="$NODE_MINOR" \
+  --setopt=install_weak_deps=False --destdir="$DEST" \
+  nvidia-container-toolkit
+```
+
+**Step 2 — fix three traps before publishing the repo** (each must be redone on
+every rebuild):
+
+1. **glibc skew.** `--alldeps` always pulls the *latest* `glibc` (e.g. `-270`),
+   but the node runs an older minor (e.g. `-266`) and you **cannot** upgrade a
+   core lib offline. Delete the too-new glibc RPMs and add only the two new
+   glibc packages `gcc` actually needs, at the node's installed version:
+   ```bash
+   rm -f "$DEST"/glibc-2.34-270*.rpm
+   sudo dnf download --releasever="$NODE_MINOR" --destdir="$DEST" \
+     glibc-devel-2.34-266 glibc-headers-2.34-266   # match the node's glibc
+   ```
+2. **dkms kernel-devel-matched.** `dkms` has a rich dependency
+   `(kernel-devel-matched if kernel-core)`; the node has `kernel-core`, so the
+   closure must contain `kernel-devel-matched-<KREL>`:
+   ```bash
+   sudo dnf download --releasever="$NODE_MINOR" --destdir="$DEST" \
+     "kernel-devel-matched-${NODE_KREL}"
+   ```
+3. **repo metadata.** Build the repo index, then transfer:
+   ```bash
+   createrepo_c "$DEST"
+   scp -r "$DEST" "${GPU_NODE}:/tmp/nvidia-offline"
+   ```
+
+**Step 3 — install on the GPU node from the local repo.** Use **named packages
+against a local repofrompath** (not `dnf install *.rpm`, which force-installs
+every file and conflicts). The `dnf clean all` + `--refresh` is mandatory — dnf
+caches repodata by repo name+path and will otherwise replay stale-metadata
+errors:
+
+```bash
 ssh "${GPU_NODE}" bash <<'EOF'
-  PKG=/tmp/airgap-packages
-  sudo dnf install -y "${PKG}/epel-release-latest-9.noarch.rpm"
-  sudo dnf install -y dkms gcc make elfutils-libelf-devel "kernel-devel-$(uname -r)"
-  sudo cp "${PKG}/cuda-rhel9.repo" /etc/yum.repos.d/
-  sudo dnf install -y cuda-drivers
-  sudo cp "${PKG}/nvidia-container-toolkit.repo" /etc/yum.repos.d/
-  sudo dnf install -y nvidia-container-toolkit
-  nvidia-smi
+  PKGDIR=/tmp/nvidia-offline
+  sudo dnf clean all
+  sudo dnf install -y --refresh --disablerepo='*' \
+    --repofrompath="airgap-nvidia,${PKGDIR}" \
+    --setopt=airgap-nvidia.gpgcheck=0 --setopt=install_weak_deps=False \
+    kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
+    nvidia-kmod-common nvidia-modprobe nvidia-persistenced \
+    dkms gcc make elfutils-libelf-devel "kernel-devel-$(uname -r)"
+
+  sudo dnf install -y --refresh --disablerepo='*' \
+    --repofrompath="airgap-nvidia,${PKGDIR}" \
+    --setopt=airgap-nvidia.gpgcheck=0 nvidia-container-toolkit
+
+  # DKMS builds the kmod in %post — verify the whole stack before continuing:
+  dkms status | grep -i nvidia      # → ...: installed
+  nvidia-smi                        # → lists the GPU
+  nvidia-ctk --version              # → NVIDIA Container Toolkit CLI version ...
+  ls -l /lib64/libnvidia-ml.so.1    # → present
 EOF
 ```
 
-> After pre-installing drivers, run `install_from_airgap_bundle.sh` normally. The installer will detect `nvidia-smi` and skip driver installation entirely.
+> **Do not reboot into a different kernel** after this. The kmod is DKMS-built
+> against the running kernel only; pin/exclude kernel updates on air-gapped GPU
+> nodes (`exclude=kernel*` in `/etc/dnf/dnf.conf`) so a reboot can't land on a
+> kernel with no matching module.
+
+> After this succeeds, run `install_from_airgap_bundle.sh` normally. The
+> installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips
+> Container Toolkit install), then configures the containerd runtime, generates
+> the CDI spec, and applies the device-plugin DaemonSet — all offline.
+
+**What the installer handles for you (k0s ≥ 1.33 / containerd 2.x):**
+
+- **containerd 2.x runtime config.** `nvidia-ctk runtime configure` still emits
+  the legacy `io.containerd.grpc.v1.cri` plugin key, which containerd 2.x
+  rejects (crash-looping the worker). The installer rewrites the drop-in to the
+  new `io.containerd.cri.v1.runtime` key automatically when the node's k0s base
+  config uses it — no manual edit needed.
+- **device-plugin image.** The bundle includes
+  `nvcr.io/nvidia/k8s-device-plugin` in `addon-images.tar`, staged to
+  `/var/lib/k0s/images/` on every worker, so the DaemonSet starts without
+  pulling from `nvcr.io`. (If you see the device-plugin in `ImagePullBackOff`,
+  you are on a bundle built before this fix — rebuild with the current
+  `prepare_airgap_bundle.sh`.)
+- **worker image staging on rejoin.** Workers joined into an existing cluster
+  also receive the image tarballs, so a GPU node added later still comes up
+  Ready offline.
 
 > **Environment variable reference and advanced options** — see [K0S_README.md — Air-Gapped Deployment](K0S_README.md#air-gapped-deployment).
 

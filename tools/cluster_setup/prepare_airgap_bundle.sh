@@ -328,7 +328,12 @@ ADDON_LIST="${STAGE_DIR}/images/addon-images.list"
 {
   # Static manifests: grep image: refs (skip the bare 'busybox' with no tag — we
   # pin busybox:latest explicitly below so containerd has a concrete ref).
-  grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' "${STAGE_DIR}"/manifests/*.yaml 2>/dev/null \
+  # Match BOTH *.yaml and *.yml — nvidia-device-plugin.yml uses the .yml
+  # extension, so a bare *.yaml glob silently skipped it and its image
+  # (nvcr.io/nvidia/k8s-device-plugin) never made it into the bundle, leaving
+  # the device-plugin DaemonSet in ImagePullBackOff on air-gapped GPU nodes.
+  grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
+    "${STAGE_DIR}"/manifests/*.yaml "${STAGE_DIR}"/manifests/*.yml 2>/dev/null \
     | sed -E 's/image:[[:space:]]*["'"'"']?//'
   # Helm charts: render with default values and grep image: refs.
   for _tgz in "${STAGE_DIR}"/charts/*.tgz; do
