@@ -80,8 +80,13 @@ jobs:
       - name: Extract version from tag
         id: version
         run: |
-          # Extract version from tag (remove 'v' prefix)
-          VERSION=${GITHUB_REF_NAME#v}
+          # Prefer explicit input (workflow_dispatch / workflow_call), fall back to tag ref
+          INPUT_VERSION="${{ inputs.new_operator_version }}"
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
 
@@ -93,9 +98,9 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             splunk/splunk-ai-operator
           tags: |
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=v{{version}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{version}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.version.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker images
