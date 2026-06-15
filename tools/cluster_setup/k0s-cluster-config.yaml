@@ -41,6 +41,13 @@ cluster:
   region: us-east-2                       # CHANGE THIS — required when storage.objectStore.type=aws (region of the S3 bucket); ignored for true on-prem
   sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
   sshUser: root                       # CHANGE THIS: SSH user for remote nodes
+  # airgap: false                         # Set to true for fully disconnected environments.
+  #                                       # When true, the installer skips internet connectivity
+  #                                       # checks for HuggingFace and NVIDIA package repos, and
+  #                                       # assumes k0s + NVIDIA drivers are pre-installed on nodes.
+  #                                       # Object store connectivity is still checked (it is local).
+  #                                       # Can also be set via: AIRGAP_MODE=true (env var override).
+  #                                       # install_from_airgap_bundle.sh sets this automatically.
 
 # ---------- Node Configuration ----------
 nodes:
@@ -159,7 +166,6 @@ splunk:
 aiPlatform:
   name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
-  # defaultAcceleratorType: "H100"
 
   workerGroupConfig:
     imageRegistry: ""

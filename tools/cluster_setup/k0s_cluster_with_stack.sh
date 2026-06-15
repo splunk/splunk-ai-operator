@@ -53,11 +53,51 @@ LOG_FILE="${LOG_DIR}/k0s-install-$(date '+%Y-%m-%d_%H-%M-%S').log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[LOG] Session log: ${LOG_FILE}"
 
+# ====== LOG ROTATION (keep last 10 logs) ======
+_rotate_logs() {
+  local keep=10
+  local logs
+  # Newest-first; tail of the array is the oldest — delete those.
+  mapfile -t logs < <(ls -1t "${LOG_DIR}"/k0s-install-*.log 2>/dev/null)
+  local excess=$(( ${#logs[@]} - keep ))
+  if (( excess > 0 )); then
+    for (( i=${#logs[@]}-1; i>=${#logs[@]}-excess; i-- )); do
+      rm -f "${logs[$i]}"
+    done
+  fi
+}
+_rotate_logs
+
 # ====== COLORS & LOGGING ======
-log()   { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
-warn()  { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
-err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
-need()  { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
+_ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+log()   { echo -e "\033[1;36m[$(_ts) INFO]\033[0m $*" >&2; }
+warn()  { echo -e "\033[1;33m[$(_ts) WARN]\033[0m $*" >&2; }
+err()   {
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m $*" >&2
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Log file: ${LOG_FILE}" >&2
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Run '$0 diagnose' to collect a full support bundle." >&2
+  exit 1
+}
+
+# ====== TOOL CHECKER ======
+# Provides install instructions instead of a bare "missing in PATH" message.
+need() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  local install_hint=""
+  case "$1" in
+    kubectl) install_hint="brew install kubectl  OR  https://kubernetes.io/docs/tasks/tools/" ;;
+    helm)    install_hint="brew install helm  OR  https://helm.sh/docs/intro/install/" ;;
+    yq)      install_hint="brew install yq  OR  wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq" ;;
+    jq)      install_hint="brew install jq  OR  apt-get install jq  OR  dnf install jq" ;;
+    ssh)     install_hint="apt-get install openssh-client  OR  brew install openssh" ;;
+    curl)    install_hint="apt-get install curl  OR  brew install curl" ;;
+    aws)     install_hint="https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" ;;
+    git)     install_hint="brew install git  OR  apt-get install git" ;;
+    *)       install_hint="install '$1' via your system package manager" ;;
+  esac
+  err "Required tool not found: $1
+  Install: ${install_hint}"
+}
 
 # ====== HELM RETRY LOGIC ======
 # Retries helm commands with exponential backoff on transient errors
@@ -118,6 +158,194 @@ TMP_FILES=()
 cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/null || true; }
 trap cleanup_tmp EXIT
 
+# ====== STEP PROGRESS TRACKER ======
+# Usage: step_start "Install cert-manager"   → prints [STEP N/TOTAL] banner
+#        step_ok                             → marks it done
+#        step_fail "reason"                  → marks it failed (does not exit)
+# show_step_summary                          → final table printed at end of install
+declare -a _STEP_NAMES=()
+declare -a _STEP_STATUS=()  # "ok" | "fail" | "skip"
+_STEP_CURRENT=""
+
+step_start() {
+  _STEP_CURRENT="$1"
+  _STEP_NAMES+=("$1")
+  _STEP_STATUS+=("running")
+  local n=${#_STEP_NAMES[@]}
+  echo -e "\n\033[1;34m[$(_ts) ── STEP ${n}: $1 ──]\033[0m" >&2
+}
+
+step_ok() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="ok"
+}
+
+step_fail() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="fail:${1:-unknown error}"
+}
+
+step_skip() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="skip:${1:-}"
+}
+
+show_step_summary() {
+  echo -e "\n\033[1;34m[$(_ts) ════ INSTALL SUMMARY ════]\033[0m" >&2
+  local total=${#_STEP_NAMES[@]} ok=0 fail=0 skip=0
+  for i in "${!_STEP_NAMES[@]}"; do
+    local s="${_STEP_STATUS[$i]}"
+    local icon color label
+    case "${s%%:*}" in
+      ok)      icon="✔"; color="\033[1;32m"; label="OK";           ok=$((ok+1)) ;;
+      fail)    icon="✖"; color="\033[1;31m"; label="${s#fail:}";   fail=$((fail+1)) ;;
+      skip)    icon="–"; color="\033[1;33m"; label="${s#skip:}";   skip=$((skip+1)) ;;
+      running) icon="?"; color="\033[1;33m"; label="interrupted";  fail=$((fail+1)) ;;
+      *)       icon="?"; color="\033[0m";    label="${s}" ;;
+    esac
+    printf "  ${color}${icon}\033[0m  %-45s %s\n" "${_STEP_NAMES[$i]}" "${label}" >&2
+  done
+  echo "" >&2
+  if (( fail == 0 )); then
+    echo -e "  \033[1;32mAll ${total} steps completed successfully.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped.\033[0m" >&2
+    echo -e "  \033[1;31mSee log: ${LOG_FILE}\033[0m" >&2
+  fi
+  echo "" >&2
+}
+
+# ====== PHASE SECTION MARKERS ======
+# Emit a grep-friendly section header so production support can isolate phases.
+phase_start() { echo -e "\n\033[1;35m[$(_ts) ════════ PHASE: $* ════════]\033[0m" >&2; }
+phase_end()   { echo -e "\033[1;35m[$(_ts) ════════ END: $* ════════]\033[0m\n" >&2; }
+
+# ====== WAIT FOR DEPENDENCY (interactive pause-and-retry) ======
+# Usage: wait_for_dependency "check description" CHECK_COMMAND [max_wait_seconds]
+# The check command is re-run every 30 s. On each failure the customer is
+# prompted to press Enter to retry immediately, or the loop continues after
+# 30 s automatically. The function returns 0 once the check passes, or
+# exits with a clear message after max_wait_seconds.
+wait_for_dependency() {
+  local description="$1"
+  local check_cmd="$2"
+  local max_wait="${3:-600}"
+  local elapsed=0 interval=30
+
+  log "Waiting for external dependency: ${description}"
+  log "  Max wait: ${max_wait}s. Press Enter at any time to retry immediately."
+
+  while (( elapsed < max_wait )); do
+    if eval "${check_cmd}" >/dev/null 2>&1; then
+      log "  ✔ ${description} — ready"
+      return 0
+    fi
+    local remaining=$(( max_wait - elapsed ))
+    warn "  ${description} not ready yet. Retrying in ${interval}s (${remaining}s remaining)."
+    warn "  Press Enter to retry now, or wait..."
+    # Wait up to interval seconds for a keypress; non-interactive shells skip.
+    if read -t "${interval}" -r 2>/dev/null; then
+      log "  Retrying immediately..."
+    fi
+    elapsed=$(( elapsed + interval ))
+  done
+
+  err "Timed out after ${max_wait}s waiting for: ${description}
+  Resolve the issue, then re-run the installer."
+}
+
+# ====== NODE OS GATE ======
+# Only RHEL 9 is tested and supported. All other OS families (RHEL 10,
+# Amazon Linux, Debian/Ubuntu) stop the script with a clear error.
+# Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
+# continue at your own risk (useful for internal testing).
+_check_node_os() {
+  local node_ip="$1" role="${2:-node}"
+  local os_id="" os_version_id="" os_pretty=""
+
+  os_id=$(ssh_exec "${node_ip}" \
+    ". /etc/os-release 2>/dev/null && echo \"\${ID}\"" 2>/dev/null || echo "")
+  os_version_id=$(ssh_exec "${node_ip}" \
+    ". /etc/os-release 2>/dev/null && echo \"\${VERSION_ID%%.*}\"" 2>/dev/null || echo "")
+  os_pretty=$(ssh_exec "${node_ip}" \
+    ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
+
+  # Supported: RHEL 9 only. Other family members kept for internal testing.
+  if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
+    log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+    return 0
+  fi
+
+  local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
+  Only RHEL 9 is tested and supported. Installation on other OS versions
+  is not validated and may fail in unexpected ways.
+  To skip this check and continue at your own risk, set:
+    FORCE_UNSUPPORTED_OS=1"
+
+  if [[ "${FORCE_UNSUPPORTED_OS:-0}" == "1" ]]; then
+    warn "${msg}"
+    warn "  FORCE_UNSUPPORTED_OS=1 — continuing anyway (unsupported, use for testing only)"
+  else
+    err "${msg}"
+  fi
+}
+
+# ====== SHOW INSTALL PLAN ======
+# Called before install starts; prints what will be done so customers can
+# validate the config before a 40-minute run.
+show_install_plan() {
+  echo -e "\n\033[1;34m╔══════════════════════════════════════════════════════════╗\033[0m" >&2
+  echo -e "\033[1;34m║           SPLUNK AI PLATFORM — INSTALL PLAN               ║\033[0m" >&2
+  echo -e "\033[1;34m╚══════════════════════════════════════════════════════════╝\033[0m" >&2
+  echo "" >&2
+  echo -e "  \033[1mCluster name     :\033[0m ${CLUSTER_NAME}" >&2
+  echo -e "  \033[1mNamespace        :\033[0m ${AI_NS}" >&2
+  echo -e "  \033[1mConfig file      :\033[0m ${CONFIG_FILE}" >&2
+  echo -e "  \033[1mLog file         :\033[0m ${LOG_FILE}" >&2
+  echo "" >&2
+  echo -e "  \033[1mController nodes :\033[0m ${EXISTING_CONTROLLER_IPS}" >&2
+  echo -e "  \033[1mWorker nodes     :\033[0m ${EXISTING_WORKER_IPS:-none configured}" >&2
+  echo -e "  \033[1mAccelerator type :\033[0m ${DEFAULT_ACCELERATOR:-<none — CPU only>}" >&2
+  echo "" >&2
+  echo -e "  \033[1mObject store     :\033[0m type=$(yq eval '.storage.objectStore.type // "?"' "${CONFIG_FILE}" 2>/dev/null)  bucket=$(yq eval '.storage.objectStore.bucket // "?"' "${CONFIG_FILE}" 2>/dev/null)" >&2
+  echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
+  echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
+  echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
+  echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
+  echo "" >&2
+  echo -e "  \033[1mSteps that will run:\033[0m" >&2
+  echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
+  if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+      echo -e "    2. Model artifact staging  [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
+    else
+      echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2
+    fi
+  else
+    echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
+  fi
+  echo -e "    3. k0s cluster installation" >&2
+  echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
+  echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  echo -e "    6. MetalLB load-balancer" >&2
+  echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+  echo -e "    8. Health check + pod verification" >&2
+  echo "" >&2
+
+  if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
+    log "AUTO_APPROVE=true — skipping confirmation."
+    return 0
+  fi
+
+  echo -e "  \033[1mReview the plan above. Type 'yes' to proceed, anything else to abort:\033[0m" >&2
+  local answer
+  read -r answer
+  if [[ "${answer}" != "yes" ]]; then
+    echo "Aborted by user." >&2
+    exit 0
+  fi
+}
+
 # ====== LOAD CONFIGURATION ======
 
 ensure_yq() {
@@ -134,7 +362,7 @@ ensure_yq() {
   esac
   case "${os}" in
     Linux)
-      url="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}"
+      url="${YQ_DOWNLOAD_URL:-https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}}"
       log "Installing yq ${YQ_VERSION} (linux-${arch})..."
       if curl -fsSL -o /tmp/yq "${url}"; then
         chmod +x /tmp/yq
@@ -200,6 +428,21 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   [[ "${USE_EXISTING}" == "null" ]] && USE_EXISTING="never"
   REGION=$(yq eval '.cluster.region // ""' "${CONFIG_FILE}" 2>/dev/null || grep '^  region:' "${CONFIG_FILE}" | awk '{print $2}')
   [[ "${REGION}" == "null" ]] && REGION=""
+
+  # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
+  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically; customers
+  # running the installer directly should set cluster.airgap: true in their config.
+  local _yaml_airgap
+  _yaml_airgap=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  [[ "${_yaml_airgap}" == "null" ]] && _yaml_airgap="false"
+  # Env var takes precedence over YAML (allows override without editing the file).
+  if [[ "${AIRGAP_MODE:-}" == "true" ]]; then
+    : # already set — env var wins
+  elif [[ "${_yaml_airgap}" == "true" ]]; then
+    export AIRGAP_MODE="true"
+  else
+    export AIRGAP_MODE="false"
+  fi
 
   # Node IPs (for existing infrastructure)
   EXISTING_CONTROLLER_IPS=$(yq eval '.nodes.existingIPs.controllers[]' "${CONFIG_FILE}" 2>/dev/null | tr '\n' ' ' || echo "")
@@ -677,6 +920,7 @@ prepare_nodes_for_k0s() {
   log "Preparing ${#node_ips[@]} node(s) for k0s (OS compatibility + binary)..."
   for node_ip in "${node_ips[@]}"; do
     log "  Preparing node ${node_ip}..."
+    _check_node_os "${node_ip}" "node"
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
       bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
@@ -702,7 +946,16 @@ prepare_nodes_for_k0s() {
         echo "python3+pyyaml already present"
       else
         echo "Installing python3-pyyaml..."
-        if command -v dnf >/dev/null 2>&1; then
+        # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
+        # back to the OS package manager (which will succeed if a local repo
+        # mirror is configured on the node).  Internet-only paths are guarded
+        # by the AIRGAP_PYYAML_WHEEL_PATH check so we never silently skip them.
+        if [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
+          echo "Installing pyyaml from bundled wheel ${AIRGAP_PYYAML_WHEEL_PATH}..."
+          sudo pip3 install --no-index --find-links="$(dirname "${AIRGAP_PYYAML_WHEEL_PATH}")" pyyaml 2>/dev/null \
+            || sudo pip3 install "${AIRGAP_PYYAML_WHEEL_PATH}" 2>/dev/null \
+            || echo "WARN: pip3 wheel install failed — python3-pyyaml may be missing"
+        elif command -v dnf >/dev/null 2>&1; then
           sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
         elif command -v apt-get >/dev/null 2>&1; then
           sudo apt-get install -y python3-yaml 2>/dev/null || true
@@ -716,7 +969,11 @@ prepare_nodes_for_k0s() {
         echo "k0s binary already present ($(k0s version 2>/dev/null || echo unknown))"
       else
         echo "Installing k0s binary..."
-        curl -sSLf https://get.k0s.sh | sudo sh
+        if [[ -n "${K0S_INSTALL_URL:-}" && "${K0S_INSTALL_URL}" == file://* ]]; then
+          sudo cp "${K0S_INSTALL_URL#file://}" /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
+        else
+          curl -sSLf "${K0S_INSTALL_URL:-https://get.k0s.sh}" | sudo sh
+        fi
       fi
 
       # Ensure k0s is in sudo secure_path
@@ -1080,7 +1337,7 @@ PYSCRIPT"
 
   # Install local-path storage provisioner for persistent volumes
   log "Installing local-path storage provisioner..."
-  ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml"
+  ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f '${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}'"
 
   log "Waiting for storage provisioner to be ready..."
   sleep 10
@@ -1396,6 +1653,27 @@ ensure_s3compat_credentials() {
     err "Refusing to create minio-credentials: objectStore.auth contains template placeholders; fix ${CONFIG_FILE}"
     return 1
   fi
+
+  # Wait for the object store endpoint to be reachable before creating the
+  # Kubernetes secret. In air-gapped environments the store (MinIO/SeaweedFS)
+  # may still be starting up, or its VIP may not be routable yet.
+  local _endpoint=""
+  case "${OBJ_STORE_TYPE}" in
+    minio|seaweedfs)
+      _endpoint="${OBJ_STORE_ENDPOINT:-${MINIO_ENDPOINT:-}}"
+      ;;
+    aws)
+      # For AWS S3, validate connectivity to the regional endpoint.
+      _endpoint="https://s3.${REGION:-us-east-2}.amazonaws.com"
+      ;;
+  esac
+
+  if [[ -n "${_endpoint}" ]]; then
+    wait_for_dependency \
+      "object store (${OBJ_STORE_TYPE}) at ${_endpoint}" \
+      "curl -sL --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' '${_endpoint}' 2>/dev/null | grep -qE '^[0-9]'" \
+      300
+  fi
   # Endpoint is only required for S3-compatible backends (MinIO/SeaweedFS/
   # generic s3compat). For type=aws boto3 derives the regional URL from
   # AWS_REGION on the consuming pods, and the installer intentionally renders
@@ -1442,6 +1720,16 @@ stage_model_artifacts() {
   if object_store_auth_looks_like_placeholder; then
     err "Refusing to stage artifacts: objectStore.auth still contains template placeholders; fix ${CONFIG_FILE}"
     return 1
+  fi
+
+  # ---- Check HuggingFace reachability (skip in air-gap mode) ----
+  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+    wait_for_dependency \
+      "HuggingFace (huggingface.co) — required for model weight download" \
+      "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+      300
+  else
+    log "AIRGAP_MODE=true — skipping HuggingFace connectivity check (models must be pre-staged in object store)"
   fi
 
   # ---- Download from Hugging Face ----
@@ -1495,7 +1783,7 @@ stage_model_artifacts() {
 install_cert_manager() {
   log "Installing cert-manager..."
 
-  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+  kubectl apply -f "${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
 
   wait_for_crd certificates.cert-manager.io 300
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
@@ -1557,12 +1845,15 @@ EOF
 #   - After install, strict verification gates hard-fail if the artifacts
 #     aren't where they should be (nvidia-smi works, libnvidia-ml.so exists,
 #     nvidia-ctk present, CDI spec populated).
-#   - RHEL 9 and RHEL 10 paths are deliberately symmetric: both install EPEL,
-#     both install DKMS, both clean stale cross-major CUDA repos.
+#   - Tested on RHEL 9 only. Code paths for other OS families are kept for
+#     internal testing but are not supported (blocked by _check_node_os).
 #
 # Returns 0 on fully-successful install, non-zero on any verification failure.
 _install_nvidia_on_node() {
   local gpu_ip="$1"
+
+  # ---- OS gate: only RHEL 9 is supported for GPU driver install -----------
+  _check_node_os "${gpu_ip}" "GPU worker"
 
   # ---- Phase A: detect if driver is already installed ---------------------
   local driver_ver=""
@@ -1572,6 +1863,16 @@ _install_nvidia_on_node() {
 
   if [[ -n "${driver_ver}" ]]; then
     echo "✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    # In air-gap mode the node must have NVIDIA drivers pre-installed.
+    # The Phase A check above already looked for nvidia-smi; if we reach
+    # here it wasn't found.  Fail clearly rather than attempting internet
+    # package downloads that will time out or silently fail.
+    echo "ERROR: AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found on ${gpu_ip}." >&2
+    echo "  Pre-install the NVIDIA driver on this node using a local RPM/DEB mirror" >&2
+    echo "  or the bundled package directory, then re-run the installer." >&2
+    echo "  See AIRGAP.md → 'GPU Node OS Packages' for step-by-step instructions." >&2
+    return 1
   else
     echo "Installing NVIDIA driver on ${gpu_ip}..."
 
@@ -1581,11 +1882,10 @@ _install_nvidia_on_node() {
     if ! ssh_exec "${gpu_ip}" "
       set -euo pipefail
 
-      # --- OS detection (RHEL 9, RHEL 10, Amazon Linux 2023, Debian/Ubuntu) ---
-      # OS_VERSION holds the numeric major we use to build the CUDA+EPEL URLs.
-      # For RHEL we read %{rhel}; for Amazon Linux 2023 we hardcode 9 because
-      # AL2023 is binary-compatible with RHEL/Fedora 9's nvidia-driver RPMs
-      # and the Fedora EPEL9 repo is the standard 3rd-party source.
+      # --- OS detection (RHEL 9 is the only supported path) ---
+      # Code paths for other OS families are kept for internal testing.
+      # _check_node_os() already gated unsupported OS before this block runs.
+      # OS_VERSION holds the numeric major used to build CUDA/EPEL URLs.
       echo '--- OS detection ---'
       OS_FAMILY=
       OS_VERSION=
@@ -1641,9 +1941,12 @@ _install_nvidia_on_node() {
         sudo dnf install -y dnf-plugins-core
 
         # EPEL: provides DKMS on RHEL (RHEL's own repos don't ship DKMS).
+        # EPEL_RPM_URL_OVERRIDE lets air-gap customers redirect to a local mirror:
+        #   export EPEL_RPM_URL_OVERRIDE="http://mirror.internal/epel/epel-release-latest-9.noarch.rpm"
         if ! rpm -q epel-release >/dev/null 2>&1; then
           echo \"--- Installing EPEL for DKMS (major \${EPEL_MAJOR}) ---\"
-          sudo dnf install -y \"https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm\"
+          _EPEL_URL=\"\${EPEL_RPM_URL_OVERRIDE:-https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm}\"
+          sudo dnf install -y \"\${_EPEL_URL}\"
         fi
         # CRB (formerly PowerTools on RHEL 8) hosts a few EPEL build deps on
         # RHEL. AL2023 doesn't have a CRB repo (its core packages are in
@@ -1666,18 +1969,21 @@ _install_nvidia_on_node() {
       # Clean cross-major repos so dnf doesn't try to install from the wrong
       # CUDA metadata (common failure mode on in-place RHEL 9 → 10 upgrades,
       # and on re-runs of this script where the target OS may have changed).
+      #
+      # CUDA_REPO_URL_OVERRIDE: set to a local mirror .repo/.deb URL to redirect
+      # away from developer.download.nvidia.com:
+      #   export CUDA_REPO_URL_OVERRIDE="http://mirror.internal/cuda/cuda-rhel9.repo"
       if [ \"\${OS_FAMILY}\" = 'amzn' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-amzn*.repo
-        sudo dnf config-manager --add-repo \\
-          \"https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo\"
+        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo}\"
+        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
       elif [ \"\${OS_FAMILY}\" = 'rhel' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-rhel*.repo
-        sudo dnf config-manager --add-repo \\
-          \"https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo\"
+        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo}\"
+        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
       elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        curl -fsSL \\
-          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \\
-          -o /tmp/cuda-keyring.deb
+        _CUDA_DEB=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb}\"
+        curl -fsSL \"\${_CUDA_DEB}\" -o /tmp/cuda-keyring.deb
         sudo dpkg -i /tmp/cuda-keyring.deb
         sudo apt-get update -qq
       fi
@@ -1785,6 +2091,17 @@ _install_nvidia_on_node() {
   fi
 
   # ---- Phase D: NVIDIA Container Toolkit install ------------------------
+  # Check NVIDIA repo reachability from this GPU node before attempting install.
+  # Skip in air-gap mode — drivers must be pre-installed on the node.
+  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+    wait_for_dependency \
+      "NVIDIA package repo (nvidia.github.io) — required for container-toolkit install on ${gpu_ip}" \
+      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io >/dev/null 2>&1'" \
+      180
+  else
+    log "AIRGAP_MODE=true — skipping NVIDIA repo check for ${gpu_ip}; drivers must be pre-installed on the node"
+  fi
+
   echo "Installing NVIDIA Container Toolkit on ${gpu_ip}..."
   if ! ssh_exec "${gpu_ip}" "
     set -euo pipefail
@@ -1792,17 +2109,22 @@ _install_nvidia_on_node() {
       echo '✓ nvidia-ctk already installed (version: '\"\$(nvidia-ctk --version 2>/dev/null | head -1)\"')'
     else
       echo '--- Adding NVIDIA container-toolkit repo ---'
+      # NVIDIA_CTK_REPO_URL_OVERRIDE: set to a local mirror repo URL to redirect
+      # away from nvidia.github.io (partial air-gap or local mirror scenario):
+      #   export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-container-toolkit.repo"
       if [ -f /etc/debian_version ]; then
-        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+        _CTK_BASE=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container}\"
+        curl -fsSL \"\${_CTK_BASE}/gpgkey\" | \
           sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        curl -fsSL \"\${_CTK_BASE}/stable/deb/nvidia-container-toolkit.list\" | \
           sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
         sudo apt-get update -qq
         sudo apt-get install -y nvidia-container-toolkit
       else
         # RHEL 9 and 10 both use the same libnvidia-container stable RPM repo.
-        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+        _CTK_REPO=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo}\"
+        curl -fsSL \"\${_CTK_REPO}\" | \
           sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
         sudo dnf install -y nvidia-container-toolkit
       fi
@@ -2190,12 +2512,12 @@ RTEOF
   # the patch ever reaches them.
   local manifest
   manifest=$(mktemp)
-  if ! curl -fsSL \
-      "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml" \
-      -o "${manifest}"; then
+  local nvidia_manifest_url="${NVIDIA_DEVICE_PLUGIN_MANIFEST_URL:-https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml}"
+  if ! curl -fsSL "${nvidia_manifest_url}" -o "${manifest}"; then
     rm -f "${manifest}"
-    err "Failed to fetch NVIDIA device-plugin manifest from GitHub (version ${ver}).
-    Check network connectivity and that version ${ver} exists upstream."
+    err "Failed to fetch NVIDIA device-plugin manifest (version ${ver}).
+    URL: ${nvidia_manifest_url}
+    For air-gapped installs set NVIDIA_DEVICE_PLUGIN_MANIFEST_URL=file:///path/to/nvidia-device-plugin.yml"
   fi
 
   log "  Patching manifest in place: GPU nodeSelector + nvidia runtimeClassName..."
@@ -2239,10 +2561,17 @@ RTEOF
 install_kube_prometheus() {
   log "Installing kube-prometheus-stack..."
 
-  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-  helm repo update prometheus-community  # Only update the specific repo we need
+  local chart_ref
+  if [[ -n "${PROMETHEUS_CHART_PATH:-}" && -f "${PROMETHEUS_CHART_PATH}" ]]; then
+    chart_ref="${PROMETHEUS_CHART_PATH}"
+    log "  Using local chart: ${chart_ref}"
+  else
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+    helm repo update prometheus-community
+    chart_ref="prometheus-community/kube-prometheus-stack"
+  fi
 
-  helm_retry 3 upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  helm_retry 3 upgrade --install kube-prometheus-stack "${chart_ref}" \
     --namespace monitoring --create-namespace \
     --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
     --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
@@ -2258,11 +2587,18 @@ install_otel_operator_and_contrib_collector() {
   # OTEL operator uses cert-manager for webhook certs — ensure webhook is ready
   wait_for_cert_manager_webhook 30 10
 
-  helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
-  helm repo update open-telemetry  # Only update the specific repo we need
+  local chart_ref
+  if [[ -n "${OTEL_CHART_PATH:-}" && -f "${OTEL_CHART_PATH}" ]]; then
+    chart_ref="${OTEL_CHART_PATH}"
+    log "  Using local chart: ${chart_ref}"
+  else
+    helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
+    helm repo update open-telemetry
+    chart_ref="open-telemetry/opentelemetry-operator"
+  fi
 
   # Use cert-manager for webhook certificates (now that konnectivity is fixed)
-  helm_retry 3 upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+  helm_retry 3 upgrade --install opentelemetry-operator "${chart_ref}" \
     --namespace opentelemetry-operator-system --create-namespace \
     --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
     --set admissionWebhooks.certManager.enabled=true \
@@ -2277,12 +2613,20 @@ install_otel_operator_and_contrib_collector() {
 install_ray_operator() {
   log "Installing KubeRay Operator..."
 
-  helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  helm repo update kuberay  # Only update the specific repo we need
+  local chart_ref version_flag=()
+  if [[ -n "${KUBERAY_CHART_PATH:-}" && -f "${KUBERAY_CHART_PATH}" ]]; then
+    chart_ref="${KUBERAY_CHART_PATH}"
+    log "  Using local chart: ${chart_ref}"
+  else
+    helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
+    helm repo update kuberay
+    chart_ref="kuberay/kuberay-operator"
+    version_flag=(--version 1.2.2)
+  fi
 
-  helm_retry 3 upgrade --install kuberay-operator kuberay/kuberay-operator \
+  helm_retry 3 upgrade --install kuberay-operator "${chart_ref}" \
     --namespace ray-system --create-namespace \
-    --version 1.2.2 \
+    "${version_flag[@]+"${version_flag[@]}"}" \
     --set image.repository=quay.io/kuberay/operator \
     --set image.tag=v1.2.2 \
     --wait --timeout=10m
@@ -3153,7 +3497,7 @@ spec:
   images:
 ${image_pull_secrets}
 
-  # GPU accelerator type (determines Ray worker tiers: L40S, H100, or empty for no workers)
+  # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
   # Features from config (aiPlatform.features)
@@ -3295,12 +3639,19 @@ install_metallb() {
   fi
 
   log "Installing MetalLB ${chart_version} into namespace ${ns}..."
-  helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1 || true
-  helm repo update >/dev/null 2>&1 || true
+  local metallb_chart_ref
+  if [[ -n "${METALLB_CHART_PATH:-}" && -f "${METALLB_CHART_PATH}" ]]; then
+    metallb_chart_ref="${METALLB_CHART_PATH}"
+    log "  Using local chart: ${metallb_chart_ref}"
+  else
+    helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1 || true
+    helm repo update >/dev/null 2>&1 || true
+    metallb_chart_ref="metallb/metallb"
+  fi
 
   kubectl get ns "${ns}" >/dev/null 2>&1 || kubectl create ns "${ns}"
 
-  helm upgrade --install metallb metallb/metallb \
+  helm upgrade --install metallb "${metallb_chart_ref}" \
     --namespace "${ns}" \
     --version "${chart_version}" \
     --wait --timeout 5m
@@ -4708,14 +5059,26 @@ main_install() {
   validate_image_config
   configure_images
 
-  preflight_checks
+  show_install_plan
 
+  phase_start "Preflight"
+  step_start "Preflight checks"
+  preflight_checks
+  step_ok
+  phase_end "Preflight"
+
+  phase_start "Model Staging"
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
+    step_start "Model artifact staging (HuggingFace → object store)"
     log "Model staging enabled — downloading from Hugging Face and uploading to object store…"
     stage_model_artifacts
+    step_ok
   else
+    step_start "Model artifact staging"
     log "Model staging disabled (storage.modelStaging.enabled=false) — skipping HF download + upload"
+    step_skip "modelStaging.enabled=false"
   fi
+  phase_end "Model Staging"
 
   # Check if existing Kubernetes cluster should be used
   local use_existing_cluster=false
@@ -4873,10 +5236,21 @@ main_install() {
   fi
 
   # Install AI Platform stack
+  phase_start "AI Platform Stack"
+  step_start "Install AI Platform stack"
   install_ai_platform_stack
+  step_ok
+  phase_end "AI Platform Stack"
 
   # Run health checks
-  check_platform_health || warn "Some components may still be initializing"
+  phase_start "Health Verification"
+  step_start "Platform health checks"
+  if check_platform_health; then
+    step_ok
+  else
+    step_fail "some components still initializing"
+    warn "Some components may still be initializing"
+  fi
 
   # Verify every pod across every namespace, capture diagnostics for failures,
   # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
@@ -4889,11 +5263,18 @@ main_install() {
   #   255     pods healthy but workload CRs not Ready (e.g. RayService still
   #           initialising). Distinct from "0 unhealthy" so the banner can
   #           remain honest even when no individual pod is failing.
+  step_start "Pod health verification"
   VERIFY_RC=0
   verify_all_pods_healthy || VERIFY_RC=$?
   if (( VERIFY_RC != 0 )); then
+    step_fail "${VERIFY_RC} pod(s)/CR(s) not ready — see diagnostics above"
     warn "Some components are not fully ready — see diagnostics above for remediation steps."
+  else
+    step_ok
   fi
+  phase_end "Health Verification"
+
+  show_step_summary
 
   # Show platform access information. Reads VERIFY_RC to choose between a
   # success banner and a "partially ready" banner with an inline summary.
@@ -4915,6 +5296,28 @@ main_delete() {
   log "============================================"
   log "Starting cleanup of k0s cluster: ${CLUSTER_NAME}"
   log "============================================"
+  log "  Controllers : ${EXISTING_CONTROLLER_IPS}"
+  log "  Workers     : ${EXISTING_WORKER_IPS:-none}"
+  log "  Namespace   : ${AI_NS}"
+  log "============================================"
+  log ""
+  warn "This will DELETE the AI Platform stack and stop k0s on all nodes."
+  warn "Node machines will remain running but all Kubernetes data will be removed."
+  warn "This action CANNOT be undone."
+  log ""
+
+  if [[ "${AUTO_APPROVE:-false}" != "true" ]]; then
+    echo -e "  \033[1;31mType the cluster name '${CLUSTER_NAME}' to confirm deletion, or Ctrl-C to abort:\033[0m" >&2
+    local confirm_input
+    read -r confirm_input
+    if [[ "${confirm_input}" != "${CLUSTER_NAME}" ]]; then
+      echo "Aborted — input did not match cluster name." >&2
+      exit 0
+    fi
+    log "Confirmed. Proceeding with deletion..."
+  else
+    log "AUTO_APPROVE=true — skipping confirmation prompt."
+  fi
 
   # Graceful Kubernetes cleanup, then stop k0s on all nodes
   log "Performing graceful Kubernetes cleanup..."
@@ -5033,25 +5436,177 @@ clean_all() {
   log "Aggressive cleanup complete!"
 }
 
+# ====== DIAGNOSE SUBCOMMAND ======
+# Collects a support bundle: cluster state, pod logs, events, installer logs.
+# Produces a single tar.gz that can be attached to a support ticket.
+diagnose() {
+  load_config 2>/dev/null || true
+
+  local bundle_dir
+  bundle_dir="$(mktemp -d)/splunk-ai-diagnose-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "${bundle_dir}"
+
+  log "=== Collecting support bundle into ${bundle_dir} ==="
+
+  # 1. Installer logs
+  log "Collecting installer logs..."
+  cp "${LOG_DIR}"/k0s-install-*.log "${bundle_dir}/" 2>/dev/null || true
+
+  # 2. Cluster state (best-effort — cluster may be unreachable)
+  if timeout 10 kubectl cluster-info &>/dev/null 2>&1; then
+    log "Collecting cluster state..."
+    kubectl get nodes -o wide                          > "${bundle_dir}/nodes.txt"       2>&1 || true
+    kubectl get pods --all-namespaces -o wide          > "${bundle_dir}/pods.txt"        2>&1 || true
+    kubectl get events --all-namespaces --sort-by='.lastTimestamp' \
+                                                       > "${bundle_dir}/events.txt"      2>&1 || true
+    kubectl get pvc --all-namespaces                   > "${bundle_dir}/pvcs.txt"        2>&1 || true
+    kubectl get svc --all-namespaces                   > "${bundle_dir}/services.txt"    2>&1 || true
+    kubectl describe nodes                             > "${bundle_dir}/node-details.txt" 2>&1 || true
+
+    # Per-namespace pod logs for failing pods
+    log "Collecting logs from non-Running pods..."
+    local ns pod
+    while IFS= read -r line; do
+      ns=$(echo "${line}" | awk '{print $1}')
+      pod=$(echo "${line}" | awk '{print $2}')
+      mkdir -p "${bundle_dir}/pod-logs/${ns}"
+      kubectl logs "${pod}" -n "${ns}" --tail=200 \
+        > "${bundle_dir}/pod-logs/${ns}/${pod}.log" 2>&1 || true
+      kubectl logs "${pod}" -n "${ns}" --previous --tail=100 \
+        > "${bundle_dir}/pod-logs/${ns}/${pod}.previous.log" 2>&1 || true
+    done < <(kubectl get pods --all-namespaces --no-headers 2>/dev/null \
+             | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}')
+
+    # AI Platform specific resources
+    kubectl describe aiplatform --all -n "${AI_NS}" > "${bundle_dir}/aiplatform-cr.txt" 2>&1 || true
+    kubectl describe aiservice  --all -n "${AI_NS}" > "${bundle_dir}/aiservice-cr.txt"  2>&1 || true
+  else
+    warn "Cluster not reachable — skipping kubectl diagnostics."
+    echo "Cluster unreachable at time of diagnose run." > "${bundle_dir}/CLUSTER_UNREACHABLE.txt"
+  fi
+
+  # 3. Config file (redact credentials)
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    log "Including config file (credentials redacted)..."
+    sed 's/\(rootUser\|rootPassword\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\):.*/\1: <REDACTED>/g' \
+      "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
+  fi
+
+  # 4. Tool versions
+  {
+    echo "=== Tool versions ==="
+    kubectl version --client 2>/dev/null || true
+    helm version 2>/dev/null || true
+    yq --version 2>/dev/null || true
+    ssh -V 2>&1 || true
+    echo "=== OS ==="
+    uname -a
+  } > "${bundle_dir}/tool-versions.txt"
+
+  # 5. Pack bundle
+  local bundle_tar="${LOG_DIR}/splunk-ai-diagnose-$(date '+%Y%m%d-%H%M%S').tar.gz"
+  tar -czf "${bundle_tar}" -C "$(dirname "${bundle_dir}")" "$(basename "${bundle_dir}")"
+  rm -rf "${bundle_dir}"
+
+  log ""
+  log "=== Support bundle ready ==="
+  log "  File: ${bundle_tar}"
+  log "  Attach this file to your support ticket."
+}
+
+# ====== VALIDATE SUBCOMMAND ======
+# Config completeness check — catches problems before a 40-min install run.
+validate_config() {
+  load_config
+
+  echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
+  local errors=0 warnings=0
+
+  _vcheck() {
+    local label="$1" val="$2" severity="${3:-error}" hint="${4:-}"
+    if [[ -z "${val}" || "${val}" == "null" || "${val}" == "<paste"* ]]; then
+      if [[ "${severity}" == "warn" ]]; then
+        echo -e "  \033[1;33m!\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        warnings=$(( warnings + 1 ))
+      else
+        echo -e "  \033[1;31m✖\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        errors=$(( errors + 1 ))
+      fi
+    else
+      echo -e "  \033[1;32m✔\033[0m ${label}" >&2
+    fi
+  }
+
+  _vcheck "cluster.name"                "${CLUSTER_NAME}"
+  _vcheck "cluster.sshKeyPath"          "$(yq eval '.cluster.sshKeyPath' "${CONFIG_FILE}" 2>/dev/null)" "" "set path to your SSH private key"
+  _vcheck "cluster.sshUser"             "$(yq eval '.cluster.sshUser'    "${CONFIG_FILE}" 2>/dev/null)" "" "set SSH login user on nodes"
+  _vcheck "nodes.existingIPs.controllers[0]" "$(yq eval '.nodes.existingIPs.controllers[0]' "${CONFIG_FILE}" 2>/dev/null)"  "" "at least one controller IP required"
+
+  local obj_type obj_bucket obj_user obj_pass
+  obj_type=$(yq eval '.storage.objectStore.type    // ""' "${CONFIG_FILE}" 2>/dev/null)
+  obj_bucket=$(yq eval '.storage.objectStore.bucket  // ""' "${CONFIG_FILE}" 2>/dev/null)
+  obj_user=$(yq eval '.storage.objectStore.auth.rootUser     // ""' "${CONFIG_FILE}" 2>/dev/null)
+  obj_pass=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null)
+  _vcheck "storage.objectStore.type"   "${obj_type}"   "" "aws | s3compat | minio | seaweedfs"
+  _vcheck "storage.objectStore.bucket" "${obj_bucket}" "" "name of the bucket"
+  _vcheck "storage.objectStore.auth.rootUser"     "${obj_user}"  "" "AWS_ACCESS_KEY_ID or MinIO root user"
+  _vcheck "storage.objectStore.auth.rootPassword" "${obj_pass}"  "" "AWS secret or MinIO root password"
+
+  local img_reg img_op
+  img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
+  img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
+  _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  if [[ -z "${img_reg}" ]]; then
+    echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
+    warnings=$(( warnings + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m images.registry = ${img_reg}" >&2
+  fi
+
+  local splunk_file ai_file
+  splunk_file=$(yq eval '.files.splunkOperator // ""' "${CONFIG_FILE}" 2>/dev/null)
+  ai_file=$(yq eval     '.files.aiPlatform     // ""' "${CONFIG_FILE}" 2>/dev/null)
+  [[ -f "${splunk_file}" ]] && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${splunk_file}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${splunk_file}" >&2; errors=$(( errors+1 )); }
+  [[ -f "${ai_file}" ]]     && echo -e "  \033[1;32m✔\033[0m files.aiPlatform exists: ${ai_file}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.aiPlatform not found: ${ai_file}" >&2; errors=$(( errors+1 )); }
+
+  echo "" >&2
+  if (( errors == 0 && warnings == 0 )); then
+    echo -e "  \033[1;32mConfiguration looks complete. Ready to run install.\033[0m" >&2
+  elif (( errors == 0 )); then
+    echo -e "  \033[1;33m${warnings} warning(s). Configuration is usable but review the items above.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${errors} error(s), ${warnings} warning(s). Fix the errors above before running install.\033[0m" >&2
+    exit 1
+  fi
+}
+
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $0 [install|stage-artifacts|delete|clean-all|join-workers|verify-pods]
+Usage: $0 [install|validate|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
 
 Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
 
 Commands:
   install          - Install k0s cluster and AI Platform stack (auto-stages model
-                     artifacts first when storage.modelStaging.enabled=true)
+                     artifacts first when storage.modelStaging.enabled=true).
+                     Displays an install plan and asks for confirmation before starting.
+  validate         - Check config file completeness before a full install.
+                     Catches missing IPs, unset credentials, missing manifest files.
+                     Safe to run any time — makes no changes.
   stage-artifacts  - Download model artifacts from Hugging Face and upload them to
                      the configured object store. Useful to re-stage or to
                      pre-load before install. Requires nodes.existingIPs in the
                      config (same as install). Always runs regardless of
                      storage.modelStaging.enabled.
   join-workers     - Join/rejoin worker nodes to existing cluster (resume after failure)
-  delete           - Delete cluster and all resources (graceful)
-  clean-all        - Aggressive cleanup including node-level cleanup
+  delete           - Delete cluster and all resources (graceful).
+                     Prompts for cluster name confirmation unless AUTO_APPROVE=true.
+  clean-all        - Aggressive cleanup including node-level cleanup.
+                     Prompts for cluster name confirmation unless AUTO_APPROVE=true.
   verify-pods      - Verify every pod across every namespace AND every workload CR
                      (RayCluster/RayService, Splunk Standalone, AIPlatform/AIService).
                      Waits for Ray workers to be created/pulled by the head, captures
@@ -5059,6 +5614,8 @@ Commands:
                      targeted remediation recommendations. Stale
                      'saia-vector-db-setup-posthook' errors are ignored when the newest
                      posthook pod has Succeeded.
+  diagnose         - Collect a support bundle (cluster state, pod logs, events,
+                     installer logs) into a tar.gz file. Attach to support tickets.
 
 Environment:
   CONFIG_FILE              - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
@@ -5310,25 +5867,11 @@ join_workers() {
     log "Joining worker: ${worker_ip}"
     log "============================================"
 
-    # Check if k0s is installed
-    log "  Checking if k0s is installed..."
-    if ! ssh_exec "${worker_ip}" "command -v k0s >/dev/null 2>&1"; then
-      log "  Installing k0s..."
-      if ! ssh_exec "${worker_ip}" "curl -sSLf https://get.k0s.sh | sudo sh"; then
-        warn "  Failed to install k0s on ${worker_ip}, skipping..."
-        continue
-      fi
-    else
-      log "  ✓ k0s already installed"
-    fi
-
-    # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
-    ssh_exec "${worker_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
-
     # Thorough cleanup before rejoining (handles stale configurations)
     cleanup_worker_k0s "${worker_ip}"
 
-    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary)
+    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary).
+    # Handles both online (curl get.k0s.sh) and air-gap (file:// scp) install paths.
     prepare_nodes_for_k0s "${worker_ip}"
 
     # Install worker with fresh token
@@ -5405,6 +5948,9 @@ case "${1:-install}" in
   install)
     main_install
     ;;
+  validate)
+    validate_config
+    ;;
   stage-artifacts)
     load_config
     stage_model_artifacts
@@ -5425,6 +5971,9 @@ case "${1:-install}" in
       export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
     fi
     verify_all_pods_healthy
+    ;;
+  diagnose)
+    diagnose
     ;;
   *)
     usage

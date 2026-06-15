@@ -769,7 +769,23 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
 6. **Deploy AI Platform** (5-10 min)
    - ✓ Creates S3 bucket and prefixes (artifacts/, apps/, tasks/)
    - ✓ Uploads Splunk app to S3 (if localAppPath configured)
+   - ✓ Stages model artifacts to S3 (when `storage.modelStaging.enabled: true`, the default)
    - ✓ Sets up IRSA roles for Ray head, Ray worker, SAIA service
+
+   **Models staged (from `model_artifacts_configs.yaml`):**
+
+   | Model artifact ID | Purpose |
+   |---|---|
+   | `gemma-4-31b-it` | Primary LLM for chat, SPL generation, reasoning |
+   | `gpt-oss-20b` | Secondary LLM |
+   | `all-minilm-l6-v2` | Sentence transformer / semantic search |
+   | `bi-encoder` | BGE small encoder |
+   | `cross-encoder` | MS MARCO cross-encoder |
+   | `e5-language-classifier` | Multilingual language detection |
+   | `mbart-translator` | Multilingual translation |
+   | `pii-classifier` | PII detection |
+   | `uae-large` | Embedding model |
+   | `xlm-roberta-language-classifier` | Language classifier |
    - ✓ Adds ECR permissions to IRSA roles
    - ✓ Creates Splunk Standalone instance
    - ✓ Creates AIPlatform CR and monitors until Ready

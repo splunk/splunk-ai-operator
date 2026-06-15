@@ -335,14 +335,14 @@ The download script uses the `model_artifacts_configs.yaml` configuration file.
 
 **Artifact Configuration (`artifact-configs`):**
 
-The following 10 models are pre-configured and ready to download:
+The following models are pre-configured and ready to download:
+- `gemma-4-31b-it` - Primary LLM for chat, SPL generation, reasoning
+- `gpt-oss-20b` - Secondary LLM
 - `all-minilm-l6-v2` - Sentence transformer model
 - `bi-encoder` - BGE small encoder
 - `cross-encoder` - MS MARCO cross-encoder
 - `e5-language-classifier` - Multilingual language detection
-- `llama31-70b-instruct-awq` - Llama 3.1 70B quantized
 - `mbart-translator` - Multilingual translation
-- `llama31-8b-instruct` - Llama 3.1 8B
 - `pii-classifier` - PII detection model
 - `uae-large` - UAE embedding model
 - `xlm-roberta-language-classifier` - Language classifier
