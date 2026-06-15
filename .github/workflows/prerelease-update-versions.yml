@@ -1,6 +1,23 @@
 name: Update Versions
 on:
   workflow_call:
+    inputs:
+      old_operator_version:
+        description: 'Current version (e.g. 0.1.0)'
+        required: true
+        type: string
+      new_operator_version:
+        description: 'Next version (e.g. 0.2.0)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      old_operator_version:
+        description: 'Current version (e.g. 0.1.0)'
+        required: true
+      new_operator_version:
+        description: 'Next version (e.g. 0.2.0)'
+        required: true
 
 jobs:
   package:
@@ -41,26 +58,26 @@ jobs:
           go-version: ${{ steps.dotenv.outputs.GO_VERSION }}
           cache: true
       - name: Update Helm Version
-        if: github.event.inputs.old_operator_version != github.event.inputs.new_operator_version
+        if: inputs.old_operator_version != inputs.new_operator_version
         uses: jacobtomlinson/gha-find-replace@2ff30f644d2e0078fc028beb9193f5ff0dcad39e # v3
         with:
-          find: "${{ github.event.inputs.old_operator_version }}"
-          replace: "${{ github.event.inputs.new_operator_version }}"
+          find: "${{ inputs.old_operator_version }}"
+          replace: "${{ inputs.new_operator_version }}"
           include: "helm-chart/**.yaml"
       - name: Update Operator Version in DOCS
-        if: github.event.inputs.old_operator_version != github.event.inputs.new_operator_version
+        if: inputs.old_operator_version != inputs.new_operator_version
         uses: jacobtomlinson/gha-find-replace@2ff30f644d2e0078fc028beb9193f5ff0dcad39e # v3
         with:
-          find: "${{ github.event.inputs.old_operator_version }}"
-          replace: "${{ github.event.inputs.new_operator_version }}"
+          find: "${{ inputs.old_operator_version }}"
+          replace: "${{ inputs.new_operator_version }}"
           include: "**.md"
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@7380612b49221684fefa025244f2ef4008ae50ad # v3.10.1
         with:
-          branch: "release/${{ github.event.inputs.new_operator_version }}"
-          title: "Splunk AI Operator ${{ github.event.inputs.new_operator_version }} release"
+          branch: "release/${{ inputs.new_operator_version }}"
+          title: "Splunk AI Operator ${{ inputs.new_operator_version }} release"
           reviewers: "${{ steps.dotenv.outputs.REVIEWERS }}"
           body: |
-            ### Automated Pull Request for Splunk AI Operator Release ${{ github.event.inputs.new_operator_version }}
+            ### Automated Pull Request for Splunk AI Operator Release ${{ inputs.new_operator_version }}
             * Changes added to docs/ChangeLog-NEW.md. Please filter and update ChangeLog.md
             * Delete ChangeLog-New.md
