@@ -41,22 +41,21 @@ flowchart TD
 
     Q2{Does your install\nmachine have internet?}
     Q2 -->|Yes| AIRGAP[Air-Gapped Deployment\nBundle on connected machine,\ninstall offline]
-    Q2 -->|No| FULLAIR[Fully Disconnected\nPrepare bundle on any\nconnected machine,\ntransfer physically]
+    Q2 -->|No| AIRGAP2[Air-Gapped Deployment\nPrepare bundle on any\nconnected machine,\ntransfer physically]
 
     STANDARD --> SDOC[📄 See Standard Deployment section]
     AIRGAP --> ADOC[📄 See Air-Gapped Deployment section]
-    FULLAIR --> ADOC
+    AIRGAP2 --> ADOC
 
     style STANDARD fill:#276749,color:#fff
     style AIRGAP fill:#c05621,color:#fff
-    style FULLAIR fill:#c53030,color:#fff
+    style AIRGAP2 fill:#c05621,color:#fff
 ```
 
 | Scenario | Install machine has internet | Cluster nodes have internet | Use |
 |---|---|---|---|
 | Typical cloud / on-prem | ✅ | ✅ | [Standard deployment](#standard-deployment-internet-connected) |
-| Install machine online, cluster isolated | ✅ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) |
-| Everything offline | ❌ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) (prepare bundle on a third machine) |
+| Cluster isolated (with or without internet on install machine) | ✅ / ❌ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) — run `prepare_airgap_bundle.sh` on any connected machine, then transfer the bundle |
 
 ---
 
