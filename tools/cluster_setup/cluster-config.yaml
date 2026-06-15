@@ -33,7 +33,7 @@ cluster:
   #        ./eks_cluster_with_stack.sh delete-full
   # ------------------------------------------------------------------------
   useExisting: false  # true = do not create cluster; use existing one (script fails if cluster not found)
-  name: "my-ai-cluster"                             # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  name: "ai-cluster"                             # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
   region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
   k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
   # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).
@@ -68,14 +68,7 @@ cluster:
 #     defaultAcceleratorType: L40S
 #     capacityReservation: not required
 #     availabilityZones:   not required
-#
-#   H100:
-#     instanceType:        p5.4xlarge      (8x H100 GPUs, 80 GB VRAM each; capacity reservation required)
-#     defaultAcceleratorType: H100
-#     capacityReservation: required — uncomment block below and set id + az
-#     availabilityZones:   required — must match capacityReservation.az
-#     maxSize:             must equal desiredCapacity (capacity reservations are fixed-size)
-#
+
 nodeGroups:
   cpu:
     enabled: true                         # Set to false to skip CPU node group
@@ -91,22 +84,9 @@ nodeGroups:
     instanceType: "g6e.12xlarge"          # CHANGE THIS: see GPU TYPE QUICK REFERENCE above
     desiredCapacity: 2                    # Initial number of GPU nodes
     minSize: 2                            # Minimum GPU nodes
-    maxSize: 4                            # Maximum GPU nodes (set equal to desiredCapacity for H100)
+    maxSize: 4                            # Maximum GPU nodes
     volumeSize: 500                      # EBS volume size per GPU node (GB) - larger for model storage
     volumeType: "gp3"                     # EBS volume type
-
-    # ── H100 ONLY ──────────────────────────────────────────────────────────────
-    # Capacity Reservation: required for P5/H100 instances (scarce capacity).
-    # Uncomment and fill in when defaultAcceleratorType is H100.
-    # capacityReservation:
-    #   id: "cr-xxxxxxxxxxxxxxxxx"        # CHANGE THIS: your capacity reservation ID
-    #   az: "us-east-2c"                  # CHANGE THIS: AZ where the reservation exists
-
-    # Availability Zones: lock GPU nodes to the AZ matching the capacity reservation.
-    # Uncomment and fill in when defaultAcceleratorType is H100.
-    # availabilityZones:
-    #   - "us-east-2c"                    # CHANGE THIS: must match capacityReservation.az
-    # ───────────────────────────────────────────────────────────────────────────
 
 # ---------- Storage Configuration ----------
 # Object storage: only AWS S3 or external S3-compatible (no in-cluster MinIO install).
@@ -185,8 +165,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "splunk/ray-head-build-preview"
-    workerImage: "splunk/ray-worker-gpu-build-preview"
+    headImage: "splunk/ray-head-build-preview:latest"
+    workerImage: "splunk/ray-worker-gpu-build-preview:latest"
 
   # Weaviate Vector Database
   weaviate:
@@ -203,9 +183,9 @@ images:
     # that ignores VECTOR_DB_GRPC_* env vars and falls back to grpc.<host>:443 TLS,
     # causing the vector-db-setup posthook Job to fail with a Weaviate gRPC health
     # check error. See pkg/ai/features/saia/impl.go (reconcilePostInstallHook).
-    apiImage: "splunk/saia-api-build-preview"
-    apiV2Image: "splunk/saia-api-v2-build-preview"
-    dataLoaderImage: "splunk/saia-data-loader-build-preview"
+    apiImage: "splunk/saia-api-build-preview:latest"
+    apiV2Image: "splunk/saia-api-v2-build-preview:latest"
+    dataLoaderImage: "splunk/saia-data-loader-build-preview:latest"
   # Supporting Images
   fluentBit:
     # Docker Hub public image (has full path, registry prefix ignored)
@@ -231,7 +211,7 @@ operators:
   ray:
     version: "v1.2.2"                     # do not change Ray operator version
     modelVersion: "v0.3.14-36-g1549f5a"   # Model version for Ray
-    rayVersion: "2.44.0"                  # Ray runtime version
+    rayVersion: "2.53.0"                  # Ray runtime version
 
   certManager:
     installCRDs: true              # no change
@@ -253,7 +233,6 @@ aiPlatform:
   # Default accelerator type — must match a top-level key in instance.yaml.
   # Must be changed in sync with nodeGroups.gpu.instanceType (see GPU TYPE QUICK REFERENCE above).
   #   L40S     → instanceType: g6e.12xlarge
-  #   H100     → instanceType: p5.4xlarge    (also uncomment capacityReservation + availabilityZones)
   defaultAcceleratorType: "L40S"
 
   # Features to enable
