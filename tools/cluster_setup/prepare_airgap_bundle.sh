@@ -227,6 +227,31 @@ download "${K0S_URL}" "${STAGE_DIR}/binaries/k0s"
 chmod +x "${STAGE_DIR}/binaries/k0s"
 echo "${K0S_VERSION}" > "${STAGE_DIR}/binaries/k0s.version"
 
+# ── 1b. k0s system-image bundle (pause, calico, kube-proxy, coredns, etc.) ─────
+# k0s pulls its OWN control-plane images (quay.io/k0sproject/*) at startup; in an
+# air-gapped cluster those pulls time out. k0s solves this natively: any OCI image
+# bundle dropped at /var/lib/k0s/images/ is auto-imported into containerd before
+# the kubelet starts. We build that bundle here (M1 has internet) using the exact
+# k0s binary we just downloaded, and stage it for the installer to scp to every
+# node. --all includes images for every bundled component (both calico AND
+# kube-router network providers, metrics-server, etc.) so the bundle is correct
+# regardless of which provider the cluster config selects.
+log "--- Building k0s system-image bundle (this pulls ~8 images, may take a few minutes) ---"
+mkdir -p "${STAGE_DIR}/images"
+if "${STAGE_DIR}/binaries/k0s" airgap list-images --all > "${STAGE_DIR}/images/k0s-images.list" 2>/dev/null \
+   && [[ -s "${STAGE_DIR}/images/k0s-images.list" ]]; then
+  log "k0s system images to bundle:"
+  while IFS= read -r _img; do log "    ${_img}"; done < "${STAGE_DIR}/images/k0s-images.list"
+  # --concurrency=1 makes the tarball reproducible (deterministic image order).
+  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    -o "${STAGE_DIR}/images/k0s-images.tar" \
+    < "${STAGE_DIR}/images/k0s-images.list" \
+    || err "Failed to build k0s system-image bundle (k0s airgap bundle-artifacts)."
+  log "k0s system-image bundle written: ${STAGE_DIR}/images/k0s-images.tar ($(du -h "${STAGE_DIR}/images/k0s-images.tar" | cut -f1))"
+else
+  err "Could not enumerate k0s system images (k0s airgap list-images --all). k0s ${K0S_VERSION} binary may be incompatible."
+fi
+
 # ── 2. yq binary ──────────────────────────────────────────────────────────────
 log "--- Downloading yq binary ---"
 YQ_URL="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
@@ -288,6 +313,46 @@ helm pull metallb/metallb \
   --version "${METALLB_CHART_VERSION}" \
   --destination "${STAGE_DIR}/charts"
 
+# ── 4b. Add-on component image bundle ──────────────────────────────────────────
+# The add-on components (cert-manager, local-path, kube-prometheus-stack, otel,
+# kuberay, metallb) reference their images inside their HELM CHARTS and STATIC
+# MANIFESTS — NOT in the cluster config — so the installer's registry-rewrite
+# never touches them, and on an air-gapped node those pulls (quay.io, ghcr.io,
+# rancher, registry.k8s.io, docker.io) time out. We enumerate every image those
+# charts+manifests render to, then build a SECOND k0s image bundle (addon-images
+# .tar) that the installer drops at /var/lib/k0s/images/ alongside k0s-images.tar.
+# k0s imports every tarball in that dir at startup, so containerd already has the
+# exact image refs and pods pull them with IfNotPresent — no registry needed.
+log "--- Enumerating add-on component images (rendering charts + manifests) ---"
+ADDON_LIST="${STAGE_DIR}/images/addon-images.list"
+{
+  # Static manifests: grep image: refs (skip the bare 'busybox' with no tag — we
+  # pin busybox:latest explicitly below so containerd has a concrete ref).
+  grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' "${STAGE_DIR}"/manifests/*.yaml 2>/dev/null \
+    | sed -E 's/image:[[:space:]]*["'"'"']?//'
+  # Helm charts: render with default values and grep image: refs.
+  for _tgz in "${STAGE_DIR}"/charts/*.tgz; do
+    helm template "${_tgz}" 2>/dev/null \
+      | grep -oE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
+      | sed -E 's/image:[[:space:]]*["'"'"']?//'
+  done
+  # busybox:latest (otel init) — pin a concrete tag so it resolves offline.
+  echo "busybox:latest"
+} | grep -E '[:/]' | grep -vE '^busybox$' | sort -u > "${ADDON_LIST}"
+
+if [[ -s "${ADDON_LIST}" ]]; then
+  log "Add-on images to bundle ($(wc -l < "${ADDON_LIST}")):"
+  while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
+  log "Building add-on image bundle (pulls the images above, may take several minutes)..."
+  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    -o "${STAGE_DIR}/images/addon-images.tar" \
+    < "${ADDON_LIST}" \
+    || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
+  log "Add-on image bundle written: ${STAGE_DIR}/images/addon-images.tar ($(du -h "${STAGE_DIR}/images/addon-images.tar" | cut -f1))"
+else
+  warn "Could not enumerate any add-on images from charts/manifests — add-on pods may fail to pull on air-gapped nodes."
+fi
+
 # ── 5. GPU node OS packages ───────────────────────────────────────────────────
 # These files are SCPed to GPU nodes by install_from_airgap_bundle.sh before
 # the main installer runs so the nodes can install dependencies without internet.
@@ -334,23 +399,38 @@ download "${CUDA_REPO_FILE_URL}" "${STAGE_DIR}/packages/${CUDA_REPO_FILENAME}"
 CTK_REPO_URL="https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo"
 download "${CTK_REPO_URL}" "${STAGE_DIR}/packages/nvidia-container-toolkit.repo"
 
-# PyYAML wheel — pure Python, works on all supported OS versions.
-# We fetch the latest wheel from PyPI's simple index rather than pip-downloading
-# (avoid requiring pip on the bundle machine).
-log "Downloading PyYAML wheel from PyPI..."
-PYYAML_WHEEL_URL="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
-  | grep -o '"url":"[^"]*none-any\.whl"' | head -1 | cut -d'"' -f4)"
+# PyYAML — fetched from PyPI so the nodes can install it without pip's network
+# access (avoids requiring pip on the bundle machine). PyYAML does NOT publish a
+# pure-Python (none-any) wheel — every wheel is platform-specific (cp3x, manylinux,
+# win) — so we resolve the real download URL from PyPI's per-version JSON metadata
+# rather than guessing a path. The per-version endpoint (.../PyYAML/<ver>/json)
+# lists only that release's files in `urls[]`, so the source sdist is matched
+# reliably and the modern hash-based pythonhosted URL is used verbatim.
+#
+# Each grep is guarded with `|| true`: a no-match returns exit 1, which under
+# `set -euo pipefail` would otherwise abort the whole script mid-resolution.
+log "Resolving PyYAML download URL from PyPI..."
+PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
+  | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+[[ -z "${PYYAML_VERSION}" ]] && err "Could not resolve latest PyYAML version from PyPI."
+
+PYYAML_META="$(curl -fsSL "https://pypi.org/pypi/PyYAML/${PYYAML_VERSION}/json")" \
+  || err "Could not fetch PyPI metadata for PyYAML ${PYYAML_VERSION}."
+
+# Prefer a pure-Python wheel if one is ever published (future-proofing); the
+# urls[] array here contains only this version's artifacts.
+PYYAML_WHEEL_URL="$(echo "${PYYAML_META}" \
+  | grep -o '"url":"[^"]*none-any\.whl"' | head -1 | cut -d'"' -f4 || true)"
 if [[ -z "${PYYAML_WHEEL_URL}" ]]; then
-  # PyYAML ships platform wheels; fall back to a known-good URL pattern.
-  PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
-    | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
-  warn "Pure-Python PyYAML wheel not found; fetching source distribution for version ${PYYAML_VERSION}."
-  # The source tarball also works: pip3 install pyyaml-X.Y.tar.gz (builds in-place).
-  PYYAML_WHEEL_URL="https://files.pythonhosted.org/packages/source/P/PyYAML/PyYAML-${PYYAML_VERSION}.tar.gz"
-  PYYAML_FILENAME="PyYAML-${PYYAML_VERSION}.tar.gz"
-else
-  PYYAML_FILENAME="$(basename "${PYYAML_WHEEL_URL}")"
+  # No pure-Python wheel: fall back to the source sdist (pip3 install builds it
+  # in-place on the node — the on-node installer already handles this).
+  PYYAML_WHEEL_URL="$(echo "${PYYAML_META}" \
+    | grep -o '"url":"[^"]*\.tar\.gz"' | head -1 | cut -d'"' -f4 || true)"
+  warn "No pure-Python PyYAML wheel published; using source sdist for ${PYYAML_VERSION}."
 fi
+[[ -z "${PYYAML_WHEEL_URL}" ]] && err "Could not resolve a PyYAML download URL for ${PYYAML_VERSION}."
+PYYAML_FILENAME="$(basename "${PYYAML_WHEEL_URL}")"
+
 download "${PYYAML_WHEEL_URL}" "${STAGE_DIR}/packages/${PYYAML_FILENAME}"
 echo "${PYYAML_FILENAME}" > "${STAGE_DIR}/packages/pyyaml.filename"
 
