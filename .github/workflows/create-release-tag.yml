@@ -20,6 +20,16 @@ jobs:
   create-tag:
     runs-on: ubuntu-latest
     steps:
+      - name: Check RELEASE_PAT is configured
+        run: |
+          if [[ -z "${{ secrets.RELEASE_PAT }}" ]]; then
+            echo "❌ RELEASE_PAT secret is not set."
+            echo "This workflow requires a PAT with 'repo' scope to push the tag and trigger release-package-helm.yml."
+            echo "Add it under: Settings → Secrets and variables → Actions → New repository secret → RELEASE_PAT"
+            exit 1
+          fi
+          echo "✅ RELEASE_PAT is configured"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
