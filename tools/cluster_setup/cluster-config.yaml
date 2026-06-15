@@ -145,7 +145,7 @@ images:
   #
   # REQUIRED: Specify your private registry URL for custom images
   # Leave empty to use Docker Hub defaults for all images
-  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+  registry: "1234567890.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
   # ==================================================================================
   # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
@@ -161,8 +161,8 @@ images:
     #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
     # Bump tag after building fixed operator (SAIA 8Gi default, SchemaJobId persist, feature config)
-    #image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
-    image: "docker.io/kbhos698/splunk-ai-operator:ai-tier"
+    #image: "1234567890.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
+    image: "docker.io/splunk/splunk-ai-operator:0.2.0"
 
   # Splunk Enterprise Images
   splunk:
@@ -170,7 +170,7 @@ images:
     # Default behavior: If no registry in path, uses Docker Hub
     #   "splunk/splunk:10.2.0" → Docker Hub
     #   "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0" → ECR
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
+    image: "docker.io/splunk/splunk:10.2-rhel9"
 
     # Splunk Operator image (optional - has default)
     # Default: "docker.io/splunk/splunk-operator:3.0.0"
@@ -185,8 +185,8 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "ml-platform/ray/ray-head:build-v2-008"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-v2-008"
+    headImage: "splunk/ray-head-build-preview"
+    workerImage: "splunk/ray-worker-gpu-build-preview"
 
   # Weaviate Vector Database
   weaviate:
@@ -203,9 +203,9 @@ images:
     # that ignores VECTOR_DB_GRPC_* env vars and falls back to grpc.<host>:443 TLS,
     # causing the vector-db-setup posthook Job to fail with a Weaviate gRPC health
     # check error. See pkg/ai/features/saia/impl.go (reconcilePostInstallHook).
-    apiImage: "ml-platform/saia/saia-api:build-v2-009"
-    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-009"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-009"
+    apiImage: "splunk/saia-api-build-preview"
+    apiV2Image: "splunk/saia-api-v2-build-preview"
+    dataLoaderImage: "splunk/saia-data-loader-build-preview"
   # Supporting Images
   fluentBit:
     # Docker Hub public image (has full path, registry prefix ignored)
