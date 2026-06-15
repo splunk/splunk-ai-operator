@@ -1,6 +1,14 @@
 name: Update Versions
 on:
   workflow_call:
+  workflow_dispatch:
+    inputs:
+      old_operator_version:
+        description: 'Current version (e.g. 0.1.0)'
+        required: true
+      new_operator_version:
+        description: 'Next version (e.g. 0.2.0)'
+        required: true
 
 jobs:
   package:
