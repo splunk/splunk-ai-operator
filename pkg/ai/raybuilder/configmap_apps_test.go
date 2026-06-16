@@ -86,11 +86,9 @@ func Test_ApplicationsYAML_DisableResponsesRedis(t *testing.T) {
 		}
 	}
 
-	expectedTextGenApps := []string{"GptOss20b"}
+	expectedTextGenApps := []string{"Gemma431bIt", "GptOss20b"}
 
-	// We expect exactly one text-gen app today (GptOss20b). Gemma431bIt was
-	// removed — it requires 2× RTX PRO 6000 GPUs and cannot run alongside
-	// GptOss20b on a single 2-GPU node.
+	// We expect exactly two text-gen apps today (Gemma431bIt, GptOss20b).
 	// If this count changes, someone added a new text-gen model; they MUST
 	// also add DISABLE_RESPONSES_API_REDIS to the new app.
 	require.Len(t, textGenApps, len(expectedTextGenApps),
