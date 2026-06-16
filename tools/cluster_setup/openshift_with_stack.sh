@@ -1198,6 +1198,30 @@ install_splunk_standalone() {
   fi
   [[ -z "${minio_endpoint}" ]] && err "storage.objectStore.endpoint must be set for type=${OBJ_STORE_TYPE}"
 
+  # Configure Splunk to use the service URL as the token issuer so that JWT
+  # tokens have iss=https://splunk-splunk-standalone-standalone-service:8089,
+  # matching SAIA's SPLUNK_ISSUERS. Without this, Splunk uses the pod hostname
+  # as issuer (e.g. splunk-splunk-standalone-standalone-0) and SAIA rejects
+  # tokens with "Issuer not allowed".
+  cat <<'YAML' | oc -n "${AI_NS}" apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-defaults
+data:
+  default.yml: |
+    splunk:
+      conf:
+        - key: authentication
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              oauth2_settings:
+                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
+                certFile: $SPLUNK_HOME/etc/auth/server.pem
+                sslPassword: password
+YAML
+
   oc apply --server-side --force-conflicts -f - <<YAML
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
@@ -1206,6 +1230,11 @@ metadata:
   namespace: ${AI_NS}
 spec:
   replicas: 1
+  volumes:
+    - name: defaults
+      configMap:
+        name: splunk-defaults
+  defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appSources:
       - name: apps
