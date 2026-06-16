@@ -25,5 +25,5 @@ instanceScale:
     h100-nvl-1-gpu: 2
   RTX_PRO_6000_BLACKWELL:
     rtx-pro-6000-blackwell-0-gpu: 1
-    rtx-pro-6000-blackwell-1-gpu: 2
-    rtx-pro-6000-blackwell-2-gpu: 0
+    rtx-pro-6000-blackwell-1-gpu: 0
+    rtx-pro-6000-blackwell-2-gpu: 1

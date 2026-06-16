@@ -28,11 +28,182 @@ LOG_FILE="${LOG_DIR}/openshift-install-$(date '+%Y-%m-%d_%H-%M-%S').log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[LOG] Session log: ${LOG_FILE}"
 
+# ====== LOG ROTATION (keep last 10 logs) ======
+_rotate_logs() {
+  local keep=10
+  local logs=()
+  while IFS= read -r f; do logs+=("$f"); done < <(ls -1t "${LOG_DIR}"/openshift-install-*.log 2>/dev/null)
+  local excess=$(( ${#logs[@]} - keep ))
+  if (( excess > 0 )); then
+    for (( i=${#logs[@]}-1; i>=${#logs[@]}-excess; i-- )); do
+      rm -f "${logs[$i]}"
+    done
+  fi
+}
+_rotate_logs
+
 # ====== COLORS & LOGGING ======
-log()  { echo -e "\033[1;36m[INFO]\033[0m $*" >&2; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
-err()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
+_ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+log()  { echo -e "\033[1;36m[$(_ts) INFO]\033[0m $*" >&2; }
+warn() { echo -e "\033[1;33m[$(_ts) WARN]\033[0m $*" >&2; }
+err()  {
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m $*" >&2
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Log file: ${LOG_FILE}" >&2
+  echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Run '$0 diagnose' to collect a full support bundle." >&2
+  exit 1
+}
+
+# ====== TOOL CHECKER ======
+need() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  local install_hint=""
+  case "$1" in
+    oc)      install_hint="https://docs.openshift.com/container-platform/latest/cli_reference/openshift_cli/getting-started-cli.html" ;;
+    helm)    install_hint="brew install helm  OR  https://helm.sh/docs/intro/install/" ;;
+    yq)      install_hint="brew install yq  OR  wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq" ;;
+    jq)      install_hint="brew install jq  OR  apt-get install jq  OR  dnf install jq" ;;
+    curl)    install_hint="apt-get install curl  OR  brew install curl" ;;
+    aws)     install_hint="https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" ;;
+    git)     install_hint="brew install git  OR  apt-get install git" ;;
+    *)       install_hint="install '$1' via your system package manager" ;;
+  esac
+  err "Required tool not found: $1
+  Install: ${install_hint}"
+}
+
+# ====== STEP PROGRESS TRACKER ======
+declare -a _STEP_NAMES=()
+declare -a _STEP_STATUS=()
+_STEP_CURRENT=""
+
+step_start() {
+  _STEP_CURRENT="$1"
+  _STEP_NAMES+=("$1")
+  _STEP_STATUS+=("running")
+  local n=${#_STEP_NAMES[@]}
+  echo -e "\n\033[1;34m[$(_ts) ── STEP ${n}: $1 ──]\033[0m" >&2
+}
+
+step_ok() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="ok"
+}
+
+step_fail() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="fail:${1:-unknown error}"
+}
+
+step_skip() {
+  local last=$(( ${#_STEP_STATUS[@]} - 1 ))
+  _STEP_STATUS[$last]="skip:${1:-}"
+}
+
+show_step_summary() {
+  echo -e "\n\033[1;34m[$(_ts) ════ INSTALL SUMMARY ════]\033[0m" >&2
+  local total=${#_STEP_NAMES[@]} ok=0 fail=0 skip=0
+  for i in "${!_STEP_NAMES[@]}"; do
+    local s="${_STEP_STATUS[$i]}"
+    local icon color label
+    case "${s%%:*}" in
+      ok)      icon="✔"; color="\033[1;32m"; label="OK";           ok=$((ok+1)) ;;
+      fail)    icon="✖"; color="\033[1;31m"; label="${s#fail:}";   fail=$((fail+1)) ;;
+      skip)    icon="–"; color="\033[1;33m"; label="${s#skip:}";   skip=$((skip+1)) ;;
+      running) icon="?"; color="\033[1;33m"; label="interrupted";  fail=$((fail+1)) ;;
+      *)       icon="?"; color="\033[0m";    label="${s}" ;;
+    esac
+    printf "  ${color}${icon}\033[0m  %-45s %s\n" "${_STEP_NAMES[$i]}" "${label}" >&2
+  done
+  echo "" >&2
+  if (( fail == 0 )); then
+    echo -e "  \033[1;32mAll ${total} steps completed successfully.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped.\033[0m" >&2
+    echo -e "  \033[1;31mSee log: ${LOG_FILE}\033[0m" >&2
+  fi
+  echo "" >&2
+}
+
+# ====== PHASE SECTION MARKERS ======
+phase_start() { echo -e "\n\033[1;35m[$(_ts) ════════ PHASE: $* ════════]\033[0m" >&2; }
+phase_end()   { echo -e "\033[1;35m[$(_ts) ════════ END: $* ════════]\033[0m\n" >&2; }
+
+# ====== WAIT FOR DEPENDENCY (interactive pause-and-retry) ======
+wait_for_dependency() {
+  local description="$1"
+  local check_cmd="$2"
+  local max_wait="${3:-600}"
+  local elapsed=0 interval=30
+
+  log "Waiting for external dependency: ${description}"
+  log "  Max wait: ${max_wait}s. Press Enter at any time to retry immediately."
+
+  while (( elapsed < max_wait )); do
+    if eval "${check_cmd}" >/dev/null 2>&1; then
+      log "  ✔ ${description} — ready"
+      return 0
+    fi
+    local remaining=$(( max_wait - elapsed ))
+    warn "  ${description} not ready yet. Retrying in ${interval}s (${remaining}s remaining)."
+    warn "  Press Enter to retry now, or wait..."
+    if read -t "${interval}" -r 2>/dev/null; then
+      log "  Retrying immediately..."
+    fi
+    elapsed=$(( elapsed + interval ))
+  done
+
+  err "Timed out after ${max_wait}s waiting for: ${description}
+  Resolve the issue, then re-run the installer."
+}
+
+# ====== SHOW INSTALL PLAN ======
+show_install_plan() {
+  echo -e "\n\033[1;34m╔══════════════════════════════════════════════════════════╗\033[0m" >&2
+  echo -e "\033[1;34m║       SPLUNK AI PLATFORM — OPENSHIFT INSTALL PLAN         ║\033[0m" >&2
+  echo -e "\033[1;34m╚══════════════════════════════════════════════════════════╝\033[0m" >&2
+  echo "" >&2
+  echo -e "  \033[1mNamespace        :\033[0m ${AI_NS}" >&2
+  echo -e "  \033[1mConfig file      :\033[0m ${CONFIG_FILE}" >&2
+  echo -e "  \033[1mLog file         :\033[0m ${LOG_FILE}" >&2
+  echo "" >&2
+  echo -e "  \033[1mAccelerator type :\033[0m ${DEFAULT_ACCELERATOR:-<none>}" >&2
+  echo -e "  \033[1mNode label strat :\033[0m ${NODE_LABEL_STRATEGY}" >&2
+  echo -e "  \033[1mOperator image   :\033[0m ${OPERATOR_IMAGE}" >&2
+  echo -e "  \033[1mImage registry   :\033[0m ${IMAGE_REGISTRY:-<none>}" >&2
+  echo -e "  \033[1mECR enabled      :\033[0m ${ECR_ENABLED}" >&2
+  echo "" >&2
+  echo -e "  \033[1mObject store     :\033[0m type=${OBJ_STORE_TYPE}  bucket=${OBJ_STORE_BUCKET:-<unset>}" >&2
+  echo -e "  \033[1mObject endpoint  :\033[0m ${OBJ_STORE_ENDPOINT:-<default>}" >&2
+  echo "" >&2
+  echo -e "  \033[1mSteps that will run:\033[0m" >&2
+  echo -e "    1.  Preflight checks (oc login, tools, manifest files)" >&2
+  echo -e "    2.  NFD Operator (OLM)" >&2
+  echo -e "    3.  NVIDIA GPU Operator (OLM)" >&2
+  echo -e "    4.  Node labeling (splunk.ai/workload-type)" >&2
+  echo -e "    5.  local-path-provisioner + SELinux relabeling" >&2
+  echo -e "    6.  cert-manager (Helm)" >&2
+  echo -e "    7.  OpenTelemetry Operator (Helm)" >&2
+  echo -e "    8.  KubeRay Operator (Helm)" >&2
+  echo -e "    9.  ECR pull secrets" >&2
+  echo -e "    10. Splunk AI Operator" >&2
+  echo -e "    11. Splunk Operator" >&2
+  echo -e "    12. Splunk Standalone CR" >&2
+  echo -e "    13. AIPlatform CR" >&2
+  echo "" >&2
+
+  if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
+    log "AUTO_APPROVE=true — skipping confirmation."
+    return 0
+  fi
+
+  echo -e "  \033[1mReview the plan above. Type 'yes' to proceed, anything else to abort:\033[0m" >&2
+  local answer
+  read -r answer
+  if [[ "${answer}" != "yes" ]]; then
+    echo "Aborted by user." >&2
+    exit 0
+  fi
+}
 
 # ====== LOAD CONFIGURATION ======
 load_config() {
@@ -1001,6 +1172,14 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
+  # Wait for object store endpoint to be reachable before creating credentials secret
+  if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
+    wait_for_dependency \
+      "object store (${OBJ_STORE_TYPE}) at ${OBJ_STORE_ENDPOINT}" \
+      "curl -sL --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' '${OBJ_STORE_ENDPOINT}' 2>/dev/null | grep -qE '^[0-9]'" \
+      300
+  fi
+
   # Object storage credentials secret
   oc -n "${AI_NS}" create secret generic minio-credentials \
     --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
@@ -1073,7 +1252,7 @@ install_ai_platform_cr() {
     aws)       obj_path="s3://${OBJ_STORE_BUCKET}";       obj_endpoint="" ;;
     s3compat)  obj_path="s3compat://${OBJ_STORE_BUCKET}"; obj_endpoint="${OBJ_STORE_ENDPOINT}" ;;
     minio)     obj_path="minio://${OBJ_STORE_BUCKET}";    obj_endpoint="${OBJ_STORE_ENDPOINT}" ;;
-    seaweedfs) obj_path="seaweedfs://${OBJ_STORE_BUCKET}";obj_endpoint="${OBJ_STORE_ENDPOINT}" ;;
+    seaweedfs) obj_path="minio://${OBJ_STORE_BUCKET}";    obj_endpoint="${OBJ_STORE_ENDPOINT}" ;;
     *) err "Unsupported objectStore.type: ${OBJ_STORE_TYPE}" ;;
   esac
 
@@ -1230,22 +1409,73 @@ main_install() {
   log "============================================"
 
   load_config
-  preflight_checks
   validate_image_config
   configure_images
+
+  show_install_plan
+
+  phase_start "Preflight"
+  step_start "Preflight checks"
+  preflight_checks
+  step_ok
+  phase_end "Preflight"
+
+  phase_start "Infrastructure"
+  step_start "NFD Operator"
   install_nfd
+  step_ok
+
+  step_start "NVIDIA GPU Operator"
   install_nvidia_gpu_operator
+  step_ok
+
+  step_start "Node labeling"
   label_nodes
+  step_ok
+
+  step_start "local-path-provisioner + SELinux"
   install_local_path_provisioner
   relabel_worker_nodes_for_selinux
+  step_ok
+  phase_end "Infrastructure"
+
+  phase_start "Operators"
+  step_start "cert-manager"
   install_cert_manager
+  step_ok
+
+  step_start "OpenTelemetry Operator"
   install_otel_operator
+  step_ok
+
+  step_start "KubeRay Operator"
   install_ray_operator
+  step_ok
+
+  step_start "ECR pull secrets"
   ensure_ecr_pull_secret
+  step_ok
+
+  step_start "Splunk AI Operator"
   install_splunk_ai_operator
+  step_ok
+
+  step_start "Splunk Operator"
   install_splunk_operator
+  step_ok
+  phase_end "Operators"
+
+  phase_start "AI Platform Stack"
+  step_start "Splunk Standalone CR"
   install_splunk_standalone
+  step_ok
+
+  step_start "AIPlatform CR"
   install_ai_platform_cr
+  step_ok
+  phase_end "AI Platform Stack"
+
+  show_step_summary
 
   log "============================================"
   log " Install complete"
@@ -1271,6 +1501,28 @@ main_delete() {
 
   if ! oc whoami &>/dev/null; then
     err "Not logged in to OpenShift. Run: oc login <cluster-url>"
+  fi
+
+  log "  Namespace   : ${AI_NS}"
+  log "  Cluster     : $(oc whoami --show-server 2>/dev/null || echo '<unknown>')"
+  log "============================================"
+  log ""
+  warn "This will DELETE the AI Platform stack from the OpenShift cluster."
+  warn "The cluster nodes themselves will remain running."
+  warn "This action CANNOT be undone."
+  log ""
+
+  if [[ "${AUTO_APPROVE:-false}" != "true" ]]; then
+    echo -e "  \033[1;31mType 'yes' to confirm deletion, or Ctrl-C to abort:\033[0m" >&2
+    local confirm_input
+    read -r confirm_input
+    if [[ "${confirm_input}" != "yes" ]]; then
+      echo "Aborted — confirmation not given." >&2
+      exit 0
+    fi
+    log "Confirmed. Proceeding with deletion..."
+  else
+    log "AUTO_APPROVE=true — skipping confirmation prompt."
   fi
 
   local ai_operator_ns="splunk-ai-operator-system"
@@ -1384,20 +1636,100 @@ main_delete() {
   log "Log file: ${LOG_FILE}"
 }
 
+# ====== DIAGNOSE SUBCOMMAND ======
+diagnose() {
+  load_config 2>/dev/null || true
+
+  local bundle_dir
+  bundle_dir="$(mktemp -d)/splunk-ai-diagnose-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "${bundle_dir}"
+
+  log "=== Collecting support bundle into ${bundle_dir} ==="
+
+  # 1. Installer logs
+  log "Collecting installer logs..."
+  cp "${LOG_DIR}"/openshift-install-*.log "${bundle_dir}/" 2>/dev/null || true
+
+  # 2. Cluster state (best-effort — cluster may be unreachable)
+  if timeout 10 oc cluster-info &>/dev/null 2>&1; then
+    log "Collecting cluster state..."
+    oc get nodes -o wide                                         > "${bundle_dir}/nodes.txt"        2>&1 || true
+    oc get pods --all-namespaces -o wide                         > "${bundle_dir}/pods.txt"         2>&1 || true
+    oc get events --all-namespaces --sort-by='.lastTimestamp'    > "${bundle_dir}/events.txt"       2>&1 || true
+    oc get pvc --all-namespaces                                  > "${bundle_dir}/pvcs.txt"         2>&1 || true
+    oc get svc --all-namespaces                                  > "${bundle_dir}/services.txt"     2>&1 || true
+    oc describe nodes                                            > "${bundle_dir}/node-details.txt" 2>&1 || true
+
+    # Per-namespace pod logs for failing pods
+    log "Collecting logs from non-Running pods..."
+    local ns pod
+    while IFS= read -r line; do
+      ns=$(echo "${line}" | awk '{print $1}')
+      pod=$(echo "${line}" | awk '{print $2}')
+      mkdir -p "${bundle_dir}/pod-logs/${ns}"
+      oc logs "${pod}" -n "${ns}" --tail=200 \
+        > "${bundle_dir}/pod-logs/${ns}/${pod}.log" 2>&1 || true
+      oc logs "${pod}" -n "${ns}" --previous --tail=100 \
+        > "${bundle_dir}/pod-logs/${ns}/${pod}.previous.log" 2>&1 || true
+    done < <(oc get pods --all-namespaces --no-headers 2>/dev/null \
+             | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}')
+
+    # AI Platform specific resources
+    oc describe aiplatform --all -n "${AI_NS:-ai-platform}" > "${bundle_dir}/aiplatform-cr.txt" 2>&1 || true
+    oc describe aiservice  --all -n "${AI_NS:-ai-platform}" > "${bundle_dir}/aiservice-cr.txt"  2>&1 || true
+
+    # Operator logs
+    oc logs -n splunk-ai-operator-system -l control-plane=controller-manager --tail=500 \
+      > "${bundle_dir}/operator-logs.txt" 2>&1 || true
+  else
+    warn "Cluster not reachable — skipping oc diagnostics."
+    echo "Cluster unreachable at time of diagnose run." > "${bundle_dir}/CLUSTER_UNREACHABLE.txt"
+  fi
+
+  # 3. Config file (redact credentials)
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    log "Including config file (credentials redacted)..."
+    sed 's/\(rootUser\|rootPassword\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\|accessKey\|secretKey\):.*/\1: <REDACTED>/g' \
+      "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
+  fi
+
+  # 4. Tool versions
+  {
+    echo "=== Tool versions ==="
+    oc version 2>/dev/null || true
+    helm version 2>/dev/null || true
+    yq --version 2>/dev/null || true
+    echo "=== OS ==="
+    uname -a
+  } > "${bundle_dir}/versions.txt" 2>&1
+
+  # 5. Pack into tar.gz
+  local bundle_tar="${bundle_dir}.tar.gz"
+  tar -czf "${bundle_tar}" -C "$(dirname "${bundle_dir}")" "$(basename "${bundle_dir}")" 2>/dev/null
+  rm -rf "${bundle_dir}"
+
+  log "=== Support bundle ready: ${bundle_tar} ==="
+  log "Attach this file to your support ticket or share with the team."
+}
+
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [install|delete]
+Usage: $(basename "$0") [install|delete|diagnose]
 
-  install  Deploy the Splunk AI Platform stack onto an existing OpenShift cluster.
-  delete   Remove the Splunk AI Platform stack (leaves the cluster intact).
+  install   Deploy the Splunk AI Platform stack onto an existing OpenShift cluster.
+  delete    Remove the Splunk AI Platform stack (leaves the cluster intact).
+  diagnose  Collect a support bundle (logs, cluster state, config) into a tar.gz.
 
 Config file: ${CONFIG_FILE}
   Override with: CONFIG_FILE=/path/to/config.yaml $(basename "$0")
 
+Environment:
+  AUTO_APPROVE=true  Skip confirmation prompts (for CI/CD use)
+
 Prerequisites:
   - Logged in to OpenShift: oc login <cluster-url>
-  - oc, yq in PATH
+  - oc, yq, helm in PATH
   - artifacts.yaml (operator manifests) in the same directory, or set files.aiPlatform in config
 EOF
 }
@@ -1409,6 +1741,9 @@ case "${1:-install}" in
     ;;
   delete)
     main_delete
+    ;;
+  diagnose)
+    diagnose
     ;;
   *)
     usage

@@ -34,7 +34,7 @@ images:
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
 
   operator:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.2"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.5"
 
   ray:
     headImage: "ml-platform/ray/ray-head:build-953"
@@ -65,7 +65,7 @@ storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
   objectStore:
-    type: "minio"           # aws | s3compat | minio | seaweedfs
+    type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
     endpoint: "http://18.116.39.79:8333"
     auth:
