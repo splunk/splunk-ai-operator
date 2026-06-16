@@ -5008,9 +5008,9 @@ show_platform_access_info() {
   log "============================================"
   log "📚 Documentation:"
   log "  Setup Guide: ./tools/cluster_setup/K0S_README.md"
-  log "  Setup Guide (Concise version): ./tools/cluster_setup/K0S_QUICKSTART.md"
+  log "  Deployment Guide: ./tools/cluster_setup/DEPLOYMENT_GUIDE.md"
+  log "  Troubleshooting: ./tools/cluster_setup/TROUBLESHOOTING.md"
   log "  Custom Resources: ./docs/CustomResources.md"
-  log "  Troubleshooting: Check operator logs and events above"
   log "============================================"
   log ""
 
