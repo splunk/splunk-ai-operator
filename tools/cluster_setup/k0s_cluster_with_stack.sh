@@ -3879,7 +3879,7 @@ patch_k0s_saia_public_service_workaround() {
   if saia_service_template_enabled_k0s; then
     log "Patching AIService/${aiservice_name} with SAIA public exposure settings (type=${svc_type})..."
     if [[ "${svc_type}" == "NodePort" && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
-      log "WARNING: NodePort exposure is discouraged on k0s. Prefer type=LoadBalancer with metallb.install=true (MetalLB install is skipped automatically when type=NodePort)." >&2
+      log "SAIA exposed via NodePort ${svc_node_port} — reach it at http://<worker-ip>:${svc_node_port} (front with a cloud LB on cloud VMs). For bare-metal L2 LANs you may alternatively use type=LoadBalancer with metallb.install=true; MetalLB is skipped automatically under NodePort." >&2
       kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
   \"spec\": {
     \"serviceTemplate\": {

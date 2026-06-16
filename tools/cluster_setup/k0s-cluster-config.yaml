@@ -182,13 +182,15 @@ aiPlatform:
   #
   # Choose the exposure type based on WHERE k0s runs:
   #
-  #   NodePort   — works everywhere (bare-metal, on-prem, AND cloud VMs like
-  #                EC2). Opens a fixed port (default 30080) on every worker
-  #                node; reach SAIA at http://<any-worker-ip>:<nodePort>. On a
-  #                cloud VM, point an external load balancer (AWS NLB, GCP LB)
-  #                at the worker nodes on this port to get a public DNS name.
-  #                This is the recommended default — it has no L2 network
-  #                assumptions and is the only option that works on a cloud VPC.
+  #   NodePort   — the default/portable option; works everywhere (bare-metal,
+  #                on-prem, AND cloud VMs like EC2). Opens a fixed port
+  #                (default 30080) on every worker node; reach SAIA at
+  #                http://<any-worker-ip>:<nodePort>. On a cloud VM, point an
+  #                external load balancer (AWS NLB, GCP LB) at the worker nodes
+  #                on this port to get a public DNS name. Use this whenever
+  #                MetalLB/LoadBalancer is unavailable (i.e. any cloud VPC),
+  #                since it has no L2 network assumptions. On bare-metal L2 you
+  #                may instead prefer LoadBalancer below for a stable VIP.
   #
   #   LoadBalancer — only for TRUE bare-metal / on-prem k0s on a real L2 LAN,
   #                backed by MetalLB (see the metallb block below). MetalLB
