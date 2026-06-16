@@ -4796,11 +4796,15 @@ _collect_pod_summary() {
 # (e.g. verify ran a long time ago, or kubectl was unavailable) we fall back
 # to a single-line `kubectl get pods -A` query so the banner is never silent.
 #
-# Output format:
-#   ⚠️  3 unhealthy pod(s) across 2 namespace(s):
-#         ai-platform        (1) airgap-cluster-l40s-…-l-worker-w957f [Running 1/2]
-#         kube-system        (2) calico-node-f5qk7 [Pending 0/1, BackOff]
-#                                konnectivity-agent-nkgrs [Pending 0/1]
+# Output format (root-cause pods listed first, transient PodInitializing second):
+#   1 root-cause pod(s) need attention:
+#     • ai-platform (1):
+#         - head-pod [Pending 0/2, ImagePullBackOff]
+#
+#   5 pod(s) are still initializing (will recover once root-cause pod(s) above are healthy):
+#     • ai-platform (5):
+#         - gpu-worker-1 [Pending 0/1, PodInitializing]
+#         … and 4 more in ai-platform (run: kubectl get pods -n ai-platform)
 #
 # We deliberately do NOT re-run kubectl by default: the diagnostics above
 # the banner already exhausted the freshest information; re-querying here
@@ -4845,7 +4849,6 @@ _print_pod_section() {
 _print_unhealthy_pod_summary() {
   local total=0
   local line ns name phase ready reason message owner_kind owner_name waiting terminated restarts created
-  local -a unhealthy_lines=()
 
   # Use cached POD_LINES if available; otherwise refresh once.
   if (( ${#POD_LINES[@]} == 0 )); then
