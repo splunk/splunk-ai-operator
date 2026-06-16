@@ -4892,12 +4892,20 @@ _print_unhealthy_pod_summary() {
   fi
 
   if (( downstream_count > 0 )); then
-    warn "${downstream_count} pod(s) are still initializing (waiting on root-cause pod(s) above to become ready):"
+    if (( total > 0 )); then
+      warn "${downstream_count} pod(s) are still initializing (will recover once root-cause pod(s) above are healthy):"
+    else
+      warn "${downstream_count} pod(s) are still initializing:"
+    fi
     _print_pod_section "${downstream_lines[@]}"
     warn ""
   fi
 
-  warn "Tip: fix the root-cause pod(s) first — initializing pods will recover automatically."
+  if (( total > 0 )); then
+    warn "Tip: fix the root-cause pod(s) first — initializing pods will recover automatically."
+  else
+    warn "Tip: pods are still starting up — re-run the verifier in a few minutes."
+  fi
   warn "     Scroll up to see per-pod logs, events, and recommended fixes."
 }
 
