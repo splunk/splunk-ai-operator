@@ -4818,12 +4818,11 @@ _print_unhealthy_pod_summary() {
     }
   fi
 
+  local -a root_cause_lines=() downstream_lines=()
   for line in "${POD_LINES[@]}"; do
     [[ -z "${line}" ]] && continue
     IFS="${_POD_FS}" read -r ns name phase ready reason message owner_kind owner_name waiting terminated restarts created <<<"${line}"
     if ! _pod_is_healthy "${phase}" "${ready}" "${waiting}" "${terminated}" "${reason}"; then
-      # Build a compact "[Phase ready/total, reason]" suffix. We omit empty
-      # reason fields rather than printing literal "[Pending 0/1, ]".
       local suffix="[${phase} ${ready}"
       if [[ -n "${reason}" ]]; then
         suffix+=", ${reason}"
@@ -4833,61 +4832,73 @@ _print_unhealthy_pod_summary() {
         suffix+=", ${terminated}"
       fi
       suffix+="]"
-      unhealthy_lines+=("${ns}${_POD_FS}${name}${_POD_FS}${suffix}")
-      total=$((total + 1))
+      # PodInitializing is a transient downstream effect — another pod's failure
+      # is blocking this one. Separate it so the operator focuses on root causes.
+      if [[ "${waiting}" == "PodInitializing" || "${reason}" == "PodInitializing" ]]; then
+        downstream_lines+=("${ns}${_POD_FS}${name}${_POD_FS}${suffix}")
+      else
+        root_cause_lines+=("${ns}${_POD_FS}${name}${_POD_FS}${suffix}")
+        total=$((total + 1))
+      fi
     fi
   done
 
-  if (( total == 0 )); then
+  local downstream_count=${#downstream_lines[@]}
+  total=$(( total ))  # root-cause count only
+
+  if (( total == 0 && downstream_count == 0 )); then
     log "✅ All pods are healthy at banner time."
     return 0
   fi
 
-  # Bucket by namespace so the banner is easy to skim. We stick to plain
-  # arrays (bash 3.2 has no associative arrays) by collecting unique
-  # namespaces in encounter order and counting occurrences in a parallel
-  # array.
-  local -a ns_keys=() ns_counts=()
-  local i found_idx
-  for line in "${unhealthy_lines[@]}"; do
-    IFS="${_POD_FS}" read -r ns _name _suffix <<<"${line}"
-    found_idx=-1
+  # Helper: print namespace-bucketed pod list from an array
+  _print_pod_section() {
+    local -a lines=("$@")
+    local -a ns_keys=() ns_counts=()
+    local i found_idx line ns _name _suffix pn _pname _psuffix
+    for line in "${lines[@]}"; do
+      IFS="${_POD_FS}" read -r ns _name _suffix <<<"${line}"
+      found_idx=-1
+      for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+        [[ "${ns_keys[$i]}" == "${ns}" ]] && { found_idx=$i; break; }
+      done
+      if (( found_idx == -1 )); then
+        ns_keys+=("${ns}"); ns_counts+=(1)
+      else
+        ns_counts[$found_idx]=$(( ns_counts[found_idx] + 1 ))
+      fi
+    done
     for (( i=0; i < ${#ns_keys[@]}; i++ )); do
-      if [[ "${ns_keys[$i]}" == "${ns}" ]]; then
-        found_idx="$i"
-        break
-      fi
-    done
-    if (( found_idx == -1 )); then
-      ns_keys+=("${ns}")
-      ns_counts+=(1)
-    else
-      ns_counts[$found_idx]=$(( ns_counts[found_idx] + 1 ))
-    fi
-  done
-
-  warn "${total} unhealthy pod(s) across ${#ns_keys[@]} namespace(s):"
-  for (( i=0; i < ${#ns_keys[@]}; i++ )); do
-    warn "  • ${ns_keys[$i]} (${ns_counts[$i]}):"
-    local printed=0
-    local max_per_ns=5  # avoid 200-line banners on truly broken clusters
-    local pn _pname _psuffix
-    for line in "${unhealthy_lines[@]}"; do
-      IFS="${_POD_FS}" read -r pn _pname _psuffix <<<"${line}"
-      [[ "${pn}" != "${ns_keys[$i]}" ]] && continue
-      warn "      - ${_pname} ${_psuffix}"
-      printed=$(( printed + 1 ))
-      if (( printed >= max_per_ns )); then
-        local remaining=$(( ns_counts[i] - printed ))
-        if (( remaining > 0 )); then
-          warn "      … and ${remaining} more in ${ns_keys[$i]} (run: kubectl get pods -n ${ns_keys[$i]})"
+      warn "  • ${ns_keys[$i]} (${ns_counts[$i]}):"
+      local printed=0
+      for line in "${lines[@]}"; do
+        IFS="${_POD_FS}" read -r pn _pname _psuffix <<<"${line}"
+        [[ "${pn}" != "${ns_keys[$i]}" ]] && continue
+        warn "      - ${_pname} ${_psuffix}"
+        printed=$(( printed + 1 ))
+        if (( printed >= 5 )); then
+          local remaining=$(( ns_counts[i] - printed ))
+          (( remaining > 0 )) && warn "      … and ${remaining} more in ${ns_keys[$i]} (run: kubectl get pods -n ${ns_keys[$i]})"
+          break
         fi
-        break
-      fi
+      done
     done
-  done
-  warn ""
-  warn "Tip: scroll up to see per-pod logs, events, and recommended fixes."
+  }
+
+  if (( total > 0 )); then
+    warn "${total} root-cause pod(s) need attention:"
+    _print_pod_section "${root_cause_lines[@]}"
+    warn ""
+  fi
+
+  if (( downstream_count > 0 )); then
+    warn "${downstream_count} pod(s) are still initializing (waiting on root-cause pod(s) above to become ready):"
+    _print_pod_section "${downstream_lines[@]}"
+    warn ""
+  fi
+
+  warn "Tip: fix the root-cause pod(s) first — initializing pods will recover automatically."
+  warn "     Scroll up to see per-pod logs, events, and recommended fixes."
 }
 
 # ====== SHOW PLATFORM ACCESS INFORMATION ======
@@ -5031,8 +5042,7 @@ show_platform_access_info() {
     warn "    Or re-run just the verifier (no install steps):"
     warn "       CONFIG_FILE=${CONFIG_FILE:-<your-config>} ${0} verify-pods"
   else
-    warn "⚠️  Your AI Platform is NOT ready to use yet: ${verify_rc} pod(s)"
-    warn "    are unhealthy. Summary:"
+    warn "⚠️  Your AI Platform is NOT ready to use yet. Summary:"
     log ""
     _print_unhealthy_pod_summary
     warn "    Re-run the verifier after fixing the issues above:"
