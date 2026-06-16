@@ -67,10 +67,10 @@ storage:
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
-    endpoint: "http://18.116.39.79:8333"
+    endpoint: "<S3_ENDPOINT_URL>"
     auth:
-      rootUser: "minioadmin"
-      rootPassword: "minioadmin"
+      rootUser: "<S3_ACCESS_KEY_ID>"
+      rootPassword: "<S3_SECRET_ACCESS_KEY>"
 
 splunk:
   standaloneName: splunk-standalone

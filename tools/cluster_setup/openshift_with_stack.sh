@@ -371,8 +371,8 @@ configure_images() {
 preflight_checks() {
   log "Running preflight checks..."
 
-  for tool in oc yq; do
-    command -v "$tool" >/dev/null 2>&1 && log "  ✓ $tool found" || err "Missing $tool in PATH"
+  for tool in oc yq helm aws curl jq base64 tar; do
+    command -v "$tool" >/dev/null 2>&1 && log "  ✓ $tool found" || err "Missing required tool: $tool"
   done
 
   # Verify we are connected to the cluster
@@ -988,9 +988,14 @@ ensure_ecr_pull_secret() {
       --namespace="${ns}" \
       --dry-run=client -o yaml | oc apply -f -
 
-    # Patch the default SA so pods without explicit imagePullSecrets also pull correctly
-    oc patch serviceaccount default -n "${ns}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+    # Append ecr-registry-secret to the default SA only if not already present.
+    # Using JSON patch add rather than a merge patch to avoid overwriting existing pull secrets.
+    if ! oc get serviceaccount default -n "${ns}" -o jsonpath='{.imagePullSecrets[*].name}' 2>/dev/null | grep -qw ecr-registry-secret; then
+      oc patch serviceaccount default -n "${ns}" --type=json \
+        -p='[{"op":"add","path":"/imagePullSecrets","value":[]}]' 2>/dev/null || true
+      oc patch serviceaccount default -n "${ns}" --type=json \
+        -p='[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"ecr-registry-secret"}}]' 2>/dev/null || true
+    fi
 
     log "  ✓ ecr-registry-secret created in ${ns}"
   done
@@ -1511,11 +1516,12 @@ main_install() {
   log "============================================"
   log ""
   log "Next steps:"
-  log "  1. Create an AIPlatform CR in namespace '${AI_NS}'"
+  log "  1. Verify resources:"
+  log "     oc get aiplatform,aiservice,raycluster,rayservice -n ${AI_NS}"
   log "  2. Check operator logs:"
   log "     oc logs -n splunk-ai-operator-system -l control-plane=controller-manager -f"
-  log "  3. Watch resources:"
-  log "     oc get aiplatform,raycluster,rayservice -n ${AI_NS}"
+  log "  3. Watch Ray cluster:"
+  log "     oc get raycluster,rayservice -n ${AI_NS} -w"
   log ""
   log "Log file: ${LOG_FILE}"
 }

@@ -89,6 +89,8 @@ H100_NVL:
 RTX_PRO_6000_BLACKWELL:
   - tier: rtx-pro-6000-blackwell-0-gpu
     gpusPerPod: 0
+    env:
+      NVIDIA_VISIBLE_DEVICES: void
     resources:
       limits:
         cpu: "16"
