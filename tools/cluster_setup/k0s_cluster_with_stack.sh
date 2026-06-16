@@ -4805,6 +4805,43 @@ _collect_pod_summary() {
 # We deliberately do NOT re-run kubectl by default: the diagnostics above
 # the banner already exhausted the freshest information; re-querying here
 # would add latency and risk a different snapshot, confusing the operator.
+
+# Helper: print a namespace-bucketed pod list from a delimited-line array.
+# Called by _print_unhealthy_pod_summary for both root-cause and downstream sections.
+_print_pod_section() {
+  local -a lines=("$@")
+  local -a ns_keys=() ns_counts=()
+  local i found_idx line ns _name _suffix pn _pname _psuffix
+  for line in "${lines[@]}"; do
+    IFS="${_POD_FS}" read -r ns _name _suffix <<<"${line}"
+    found_idx=-1
+    for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+      [[ "${ns_keys[$i]}" == "${ns}" ]] && { found_idx=$i; break; }
+    done
+    if (( found_idx == -1 )); then
+      ns_keys+=("${ns}"); ns_counts+=(1)
+    else
+      ns_counts[$found_idx]=$(( ns_counts[found_idx] + 1 ))
+    fi
+  done
+  for (( i=0; i < ${#ns_keys[@]}; i++ )); do
+    warn "  • ${ns_keys[$i]} (${ns_counts[$i]}):"
+    local printed=0
+    local max_per_ns=5  # avoid 200-line banners on truly broken clusters
+    for line in "${lines[@]}"; do
+      IFS="${_POD_FS}" read -r pn _pname _psuffix <<<"${line}"
+      [[ "${pn}" != "${ns_keys[$i]}" ]] && continue
+      warn "      - ${_pname} ${_psuffix}"
+      printed=$(( printed + 1 ))
+      if (( printed >= max_per_ns )); then
+        local remaining=$(( ns_counts[i] - printed ))
+        (( remaining > 0 )) && warn "      … and ${remaining} more in ${ns_keys[$i]} (run: kubectl get pods -n ${ns_keys[$i]})"
+        break
+      fi
+    done
+  done
+}
+
 _print_unhealthy_pod_summary() {
   local total=0
   local line ns name phase ready reason message owner_kind owner_name waiting terminated restarts created
@@ -4844,46 +4881,11 @@ _print_unhealthy_pod_summary() {
   done
 
   local downstream_count=${#downstream_lines[@]}
-  total=$(( total ))  # root-cause count only
 
   if (( total == 0 && downstream_count == 0 )); then
     log "✅ All pods are healthy at banner time."
     return 0
   fi
-
-  # Helper: print namespace-bucketed pod list from an array
-  _print_pod_section() {
-    local -a lines=("$@")
-    local -a ns_keys=() ns_counts=()
-    local i found_idx line ns _name _suffix pn _pname _psuffix
-    for line in "${lines[@]}"; do
-      IFS="${_POD_FS}" read -r ns _name _suffix <<<"${line}"
-      found_idx=-1
-      for (( i=0; i < ${#ns_keys[@]}; i++ )); do
-        [[ "${ns_keys[$i]}" == "${ns}" ]] && { found_idx=$i; break; }
-      done
-      if (( found_idx == -1 )); then
-        ns_keys+=("${ns}"); ns_counts+=(1)
-      else
-        ns_counts[$found_idx]=$(( ns_counts[found_idx] + 1 ))
-      fi
-    done
-    for (( i=0; i < ${#ns_keys[@]}; i++ )); do
-      warn "  • ${ns_keys[$i]} (${ns_counts[$i]}):"
-      local printed=0
-      for line in "${lines[@]}"; do
-        IFS="${_POD_FS}" read -r pn _pname _psuffix <<<"${line}"
-        [[ "${pn}" != "${ns_keys[$i]}" ]] && continue
-        warn "      - ${_pname} ${_psuffix}"
-        printed=$(( printed + 1 ))
-        if (( printed >= 5 )); then
-          local remaining=$(( ns_counts[i] - printed ))
-          (( remaining > 0 )) && warn "      … and ${remaining} more in ${ns_keys[$i]} (run: kubectl get pods -n ${ns_keys[$i]})"
-          break
-        fi
-      done
-    done
-  }
 
   if (( total > 0 )); then
     warn "${total} root-cause pod(s) need attention:"
