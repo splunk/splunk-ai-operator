@@ -145,6 +145,7 @@ applications:
         # share the same source-of-truth Secret keys (s3_access_key /
         # s3_secret_key) so emitting both pairs is safe — each provider only
         # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
         # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
         AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
         AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
@@ -158,6 +159,16 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
         VLLM_WORKER_MULTIPROC_METHOD: spawn
+        # Disable the Redis-backed Responses API store (see ai-platform-models
+        # commit c1f9aef3: "feat: add a no-op store"). When True, the vLLM
+        # TextGen deployment constructs NoOpOpenAIServingResponses instead of
+        # RedisOpenAIServingResponses, so /v1/responses works without a Redis
+        # infra. Without this flag the deployment raises
+        #   RuntimeError: Responses Redis URL not set
+        # on every request, which surfaces as an empty SSE stream and the SAIA
+        # v2 /query path fails with "An error occurred processing your request".
+        # Airgap k0s has no Redis; cloud sets this to "False" and wires
+        # RESPONSES_REDIS_ADDRESS to its in-namespace Redis StatefulSet.
         DISABLE_RESPONSES_API_REDIS: "True"
   - args:
       application_name: GptOss20b
@@ -256,7 +267,8 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
         VLLM_WORKER_MULTIPROC_METHOD: spawn
-        # Must be "True" in airgap (no Redis) so vLLM uses NoOpOpenAIServingResponses.
+        # See Gemma431bIt above for rationale. Must be "True" in airgap (no
+        # Redis) so vLLM uses NoOpOpenAIServingResponses.
         DISABLE_RESPONSES_API_REDIS: "True"
   - args:
       application_name: UaeLarge
