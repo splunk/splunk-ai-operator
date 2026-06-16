@@ -5045,36 +5045,6 @@ show_platform_access_info() {
   log "     kubectl get aiservice -n ${AI_NS}"
   log ""
 
-  # LoadBalancer endpoint (only shown when svc type is LoadBalancer)
-  local _svc_type
-  _svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  if [[ "${_svc_type}" == "LoadBalancer" ]]; then
-    log "🌐 AI Platform LoadBalancer URL:"
-    local _lb_ip="" _retries=0 _lb_svc_name=""
-    # Find the saia nginx service name (ends with -saia-service and is type LoadBalancer)
-    _lb_svc_name=$(kubectl get svc -n "${AI_NS}" \
-      -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-      | grep -m1 "saia-service" || echo "")
-    while [[ -z "${_lb_ip}" || "${_lb_ip}" == "<pending>" ]] && (( _retries < 12 )); do
-      if [[ -n "${_lb_svc_name}" ]]; then
-        _lb_ip=$(kubectl get svc "${_lb_svc_name}" -n "${AI_NS}" \
-          -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-      fi
-      [[ -z "${_lb_ip}" || "${_lb_ip}" == "<pending>" ]] && { sleep 5; _retries=$(( _retries + 1 )); }
-    done
-    if [[ -n "${_lb_ip}" && "${_lb_ip}" != "<pending>" ]]; then
-      local _lb_port
-      _lb_port=$(kubectl get svc "${_lb_svc_name}" -n "${AI_NS}" \
-        -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "8080")
-      log "  ✅ Endpoint: http://${_lb_ip}:${_lb_port}"
-      log "  👉 Use this URL in the UI configuration."
-    else
-      log "  ⚠️  LoadBalancer IP still pending. Run to check:"
-      log "     kubectl get svc -n ${AI_NS} -o wide"
-    fi
-    log ""
-  fi
-
   # Splunk information
   log "📊 Splunk Enterprise:"
   log "  Check Status:"
