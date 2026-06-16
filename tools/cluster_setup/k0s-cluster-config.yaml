@@ -169,7 +169,7 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
 
-  # ---------- SAIA public exposure (NodePort-free) ----------
+  # ---------- SAIA public exposure ----------
   # The SAIA "public" Service (nginx reverse proxy in front of v1 + v2 API
   # pods) defaults to ClusterIP — only reachable from inside the cluster. Two
   # call patterns hit it:
@@ -180,25 +180,29 @@ aiPlatform:
   # feedback, admin endpoints). Without external exposure the v2 chat UI
   # breaks for users; v1 one-shot SPL still works.
   #
-  # The supported on-prem path is `type: LoadBalancer` backed by MetalLB
-  # (allocates a routable VIP from a pool you provide; ARP / BGP-announces it
-  # on your network). NodePort is intentionally avoided so we never open
-  # 30000-32767 on every worker node.
+  # Choose the exposure type based on WHERE k0s runs:
   #
-  # The installer:
-  #   * Installs MetalLB (set metallb.install: true below).
-  #   * Applies an IPAddressPool + L2Advertisement (or BGPAdvertisement) from
-  #     the metallb config below.
-  #   * Renders the SAIA Service as type: LoadBalancer; MetalLB allocates a
-  #     VIP from the pool and announces it.
-  #   * Patches the Service with `allocateLoadBalancerNodePorts: false` and
-  #     `externalTrafficPolicy: Local` so kube-proxy does not open a NodePort.
+  #   NodePort   — works everywhere (bare-metal, on-prem, AND cloud VMs like
+  #                EC2). Opens a fixed port (default 30080) on every worker
+  #                node; reach SAIA at http://<any-worker-ip>:<nodePort>. On a
+  #                cloud VM, point an external load balancer (AWS NLB, GCP LB)
+  #                at the worker nodes on this port to get a public DNS name.
+  #                This is the recommended default — it has no L2 network
+  #                assumptions and is the only option that works on a cloud VPC.
+  #
+  #   LoadBalancer — only for TRUE bare-metal / on-prem k0s on a real L2 LAN,
+  #                backed by MetalLB (see the metallb block below). MetalLB
+  #                allocates a routable VIP and announces it via ARP (layer2)
+  #                or BGP. This does NOT work on AWS/GCP/Azure VPCs: cloud
+  #                fabrics drop the gratuitous ARP MetalLB relies on and only
+  #                route to real ENI addresses, so the VIP is unreachable. On a
+  #                cloud VM use NodePort + a cloud load balancer instead.
   #
   # To DISABLE external exposure (ClusterIP only), comment out the whole
   # serviceTemplate block AND set metallb.install: false.
   serviceTemplate:
-    type: LoadBalancer      # ClusterIP | LoadBalancer (NodePort is not used on k0s)
-    # No nodePort field — explicitly NodePort-free.
+    type: NodePort          # ClusterIP | NodePort | LoadBalancer
+    nodePort: 30080         # Fixed NodePort (30000-32767). Required only for NodePort.
 
   features:
     - name: "saia"
@@ -217,14 +221,17 @@ aiPlatform:
         effect: "NoSchedule"
 
 # ---------- MetalLB (k0s LoadBalancer provider) ----------
-# Required when aiPlatform.serviceTemplate.type=LoadBalancer on a bare-metal
-# / k0s cluster. Pinned chart version for supply-chain reproducibility
-# (codeguard-0-supply-chain-security).
+# ONLY for true bare-metal / on-prem k0s on a real L2 LAN, and ONLY when
+# aiPlatform.serviceTemplate.type=LoadBalancer. Does NOT work on cloud VPCs
+# (AWS/GCP/Azure) — see the SAIA public exposure notes above. Pinned chart
+# version for supply-chain reproducibility (codeguard-0-supply-chain-security).
 #
-# If serviceTemplate.type=NodePort, the installer skips MetalLB entirely even
-# when metallb.install=true (NodePort does not use a LoadBalancer provider).
+# If serviceTemplate.type=NodePort (the default), the installer skips MetalLB
+# entirely even when metallb.install=true (NodePort does not use a
+# LoadBalancer provider). Leave install: false unless you switch to
+# LoadBalancer on bare-metal.
 metallb:
-  install: true                    # set false if MetalLB is already installed or not needed
+  install: false                   # true only for bare-metal LoadBalancer; ignored under NodePort
   chartVersion: "0.14.8"           # metallb/metallb Helm chart (matches MetalLB v0.14.8)
   namespace: "metallb-system"
 
