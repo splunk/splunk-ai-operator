@@ -1032,30 +1032,6 @@ install_splunk_ai_operator() {
     oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1 || true
   fi
 
-  # Inject the local instance.yaml so the operator knows about RTX_PRO_6000_BLACKWELL
-  # and other accelerators that may not be baked into the operator image.
-  local instance_src
-  instance_src="$(dirname "${SPLUNK_AI_FILE}")/../../config/configs/instance.yaml"
-  if [[ ! -f "${instance_src}" ]]; then
-    instance_src="$(cd "$(dirname "$0")/../.." && pwd)/config/configs/instance.yaml"
-  fi
-  if [[ -f "${instance_src}" ]]; then
-    oc create configmap splunk-ai-operator-instance-yaml \
-      -n "${ai_operator_ns}" \
-      --from-file=instance.yaml="${instance_src}" \
-      --dry-run=client -o yaml | oc -n "${ai_operator_ns}" apply -f -
-    # Mount the ConfigMap and set INSTANCE_FILE so the operator uses it
-    oc patch deployment splunk-ai-operator-controller-manager \
-      -n "${ai_operator_ns}" --type=json -p='[
-        {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"instance-yaml","configMap":{"name":"splunk-ai-operator-instance-yaml"}}},
-        {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"instance-yaml","mountPath":"/etc/instance","readOnly":true}},
-        {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"INSTANCE_FILE","value":"/etc/instance/instance.yaml"}}
-      ]' 2>/dev/null || true
-    log "  ✓ instance.yaml ConfigMap injected into operator"
-  else
-    warn "instance.yaml not found at ${instance_src} — defaultAcceleratorType may not resolve"
-  fi
-
   # Patch the operator SA and deployment with ECR pull secret AFTER the manifest apply
   # (the SA is created by the manifest; patching before apply silently does nothing).
   if [[ "${ECR_ENABLED}" == "true" ]]; then
@@ -1069,7 +1045,7 @@ install_splunk_ai_operator() {
     log "  ✓ ECR pull secret patched into operator SA and deployment"
   fi
 
-  # Rollout restart so the deployment picks up pull secrets and instance.yaml.
+  # Rollout restart so the deployment picks up the updated pull secrets.
   oc rollout restart deployment splunk-ai-operator-controller-manager \
     -n "${ai_operator_ns}" 2>/dev/null || true
 
