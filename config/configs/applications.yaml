@@ -65,10 +65,10 @@ applications:
         gpu_type_model_config_override:
           H100:
             engine_args:
-              dtype: bfloat16
               gpu_memory_utilization: 0.9
-              max_model_len: 32768
-              max_num_batched_tokens: 4096
+              enable_chunked_prefill: true
+              async_scheduling: true
+              max_num_batched_tokens: 8192
               tensor_parallel_size: 1
           L40S:
             engine_args:
@@ -91,7 +91,7 @@ applications:
         model_id: gemma4_31b_it
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/gemma-4-31b-it
+            blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
       tokenizer_definition:
         model_id: gemma4_31b_it
         model_loader:
@@ -102,7 +102,7 @@ applications:
               - processor_config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/gemma-4-31b-it
+            blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
     name: Gemma431bIt
     import_path: main:create_serve_app
     route_prefix: /gemma4_31b_it

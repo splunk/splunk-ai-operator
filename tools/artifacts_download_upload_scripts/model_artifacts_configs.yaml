@@ -37,6 +37,10 @@ artifact-configs:
     hf-url: https://huggingface.co/google/gemma-4-31B-it
     is-a-gated-model: false
 
+  - artifact-id: gemma-4-31b-it-qat-w4a16-ct
+    hf-url: https://huggingface.co/google/gemma-4-31B-it-qat-w4a16-ct
+    is-a-gated-model: false
+
   - artifact-id: pii-classifier
     hf-url: https://huggingface.co/StanfordAIMI/stanford-deidentifier-base
     is-a-gated-model: false
