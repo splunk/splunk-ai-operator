@@ -62,7 +62,7 @@ applications:
                 target_ongoing_requests: 4
               max_ongoing_requests: 10
               ray_actor_options:
-                num_gpus: 2
+                num_gpus: 1
                 resources:
                   "gpu_count:2": 0.001
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
@@ -92,11 +92,11 @@ applications:
           RTX_PRO_6000_BLACKWELL:
             engine_args:
               dtype: bfloat16
-              gpu_memory_utilization: 0.85
-              max_model_len: 240000
+              gpu_memory_utilization: 0.9
+              max_model_len: 120000
               max_num_batched_tokens: 4096
               max_num_seqs: 1
-              tensor_parallel_size: 2
+              tensor_parallel_size: 1
         model_config:
           openai_serving_config:
             chat:
@@ -110,7 +110,7 @@ applications:
         model_id: gemma4_31b_it
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/gemma-4-31b-it
+            blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
       tokenizer_definition:
         model_id: gemma4_31b_it
         model_loader:
@@ -121,7 +121,7 @@ applications:
               - processor_config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/gemma-4-31b-it
+            blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
     name: Gemma431bIt
     import_path: main:create_serve_app
     route_prefix: /gemma4_31b_it
@@ -188,7 +188,7 @@ applications:
                 target_ongoing_requests: 4
               max_ongoing_requests: 8
               ray_actor_options:
-                num_gpus: 1
+                num_gpus: 0.5
                 resources:
                   "gpu_count:2": 0.001
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
@@ -207,6 +207,10 @@ applications:
           L40S:
             engine_args:
               gpu_memory_utilization: 0.95
+              tensor_parallel_size: 1
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.5
               tensor_parallel_size: 1
         model_config:
           openai_serving_config:
