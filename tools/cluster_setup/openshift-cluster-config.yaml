@@ -65,18 +65,12 @@ storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
   objectStore:
-    # type: "seaweedfs"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
-    # bucket: "ai-platform-bucket"
-    # endpoint: "http://18.116.39.79:8333"
-    # auth:
-    #   rootUser: "minioadmin"
-    #   rootPassword: "minioadmin"
-    type: "minio"                                      # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
-    endpoint: "http://54.253.238.99:9000"
+    endpoint: "<S3_ENDPOINT_URL>"
     auth:
-      rootUser: "minioadmin"
-      rootPassword: "minioadmin"    
+      rootUser: "<S3_ACCESS_KEY_ID>"
+      rootPassword: "<S3_SECRET_ACCESS_KEY>"  
 
 splunk:
   standaloneName: splunk-standalone
