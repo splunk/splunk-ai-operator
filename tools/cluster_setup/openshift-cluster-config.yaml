@@ -70,7 +70,7 @@ storage:
     endpoint: "<S3_ENDPOINT_URL>"
     auth:
       rootUser: "<S3_ACCESS_KEY_ID>"
-      rootPassword: "<S3_SECRET_ACCESS_KEY>"  
+      rootPassword: "<S3_SECRET_ACCESS_KEY>"
 
 splunk:
   standaloneName: splunk-standalone

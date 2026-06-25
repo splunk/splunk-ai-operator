@@ -870,9 +870,7 @@ install_local_path_provisioner() {
   oc patch configmap local-path-config -n local-path-storage --type=merge -p "$(cat <<'PATCH'
 {
   "data": {
-    "helperPod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: registry.access.redhat.com/ubi8/ubi-minimal\n    imagePullPolicy: IfNotPresent\n    securityContext:\n      privileged: true\n",
-    "setup": "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nchcon -Rt container_file_t \"$VOL_DIR\"\n"
-  }
+    "setup": "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nif command -v chcon >/dev/null 2>&1; then\n  chcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\nfi\n"
 }
 PATCH
   )"
@@ -1449,7 +1447,7 @@ YAML
 create_saia_route() {
   if [[ -z "$INGRESS_DOMAIN" ]]; then
     warn "Could not determine ingress domain — skipping SAIA Route creation"
-    warn "Create it manually: oc expose svc/openshift-ai-platform-saia-saia-service -n ${AI_NS}"
+    warn "Create it manually: oc expose svc/${AI_PLATFORM_NAME}-saia-saia-service -n ${AI_NS}"
     return 0
   fi
 
