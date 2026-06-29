@@ -1,17 +1,15 @@
 from __future__ import print_function
 import os
-import shlex
 import sys, getopt
 import subprocess
 
-def executeKubectlCommand(command):
-   stream = subprocess.Popen(["kubectl", command]).wait()
-   output = stream.read()
-   return output
+def executeKubectlCommand(args):
+    result = subprocess.run(["kubectl"] + args, shell=False, capture_output=True, text=True)
+    return result.stdout
 
 
 def runAndCollectDiag(collectDir, podDiagsDir, pod):
-    output = executeKubectlCommand("exec --stdin %s -- /opt/splunk/bin/splunk diag;" % pod)
+    output = executeKubectlCommand(["exec", "--stdin", pod, "--", "/opt/splunk/bin/splunk", "diag"])
     for line in output.splitlines():
         words = line.split()
         if len(words) > 4 and "Splunk diagnosis file created:" in line:
@@ -23,10 +21,11 @@ def runAndCollectDiag(collectDir, podDiagsDir, pod):
                 diagFile = dirs[3]
 
             #Copy the diag over
-            executeKubectlCommand("cp %s:%s %s/%s/%s" % (pod, diagFileFullPath, collectDir, podDiagsDir, diagFile))
+            dest = os.path.join(collectDir, podDiagsDir, diagFile)
+            executeKubectlCommand(["cp", "%s:%s" % (pod, diagFileFullPath), dest])
 
             #Delete the diag
-            executeKubectlCommand("exec --stdin %s -- rm -rf %s" % (pod, diagFileFullPath))
+            executeKubectlCommand(["exec", "--stdin", pod, "--", "rm", "-rf", diagFileFullPath])
 
 def main(argv):
     #Define required variables
@@ -50,10 +49,15 @@ def main(argv):
             collectDir = arg
 
     # Collect logs from the operator
-    output = executeKubectlCommand("logs deployment/splunk-ai-operator-controller-manager manager > %s/%s/operator.log" % (collectDir, podLogsDir))
-    output = executeKubectlCommand("logs -l app.kubernetes.io/managed-by=splunk-operator --tail -1 > %s/%s/splunkEnterprisePods.log" % (collectDir, podLogsDir))
+    operator_log = os.path.join(collectDir, podLogsDir, "operator.log")
+    with open(operator_log, "w") as f:
+        f.write(executeKubectlCommand(["logs", "deployment/splunk-ai-operator-controller-manager", "manager"]))
 
-    output = executeKubectlCommand("kubectl get pods")
+    splunk_log = os.path.join(collectDir, podLogsDir, "splunkEnterprisePods.log")
+    with open(splunk_log, "w") as f:
+        f.write(executeKubectlCommand(["logs", "-l", "app.kubernetes.io/managed-by=splunk-operator", "--tail", "-1"]))
+
+    output = executeKubectlCommand(["get", "pods"])
     for line in output.splitlines():
         words = line.split()
         if "splunk" in words[0]:
@@ -61,12 +65,15 @@ def main(argv):
 
             #ensure container is specified for the operator
             if "operator" in pod:
-                opPod = pod + " -c manager"
-                executeKubectlCommand("logs %s > %s/%s/%s.log" % (opPod, collectDir, podLogsDir, pod))
+                pod_log = os.path.join(collectDir, podLogsDir, pod + ".log")
+                with open(pod_log, "w") as f:
+                    f.write(executeKubectlCommand(["logs", pod, "-c", "manager"]))
                 continue
 
             # Collect logs from pod
-            executeKubectlCommand("logs %s > %s/%s/%s.log" % (pod, collectDir, podLogsDir, pod))
+            pod_log = os.path.join(collectDir, podLogsDir, pod + ".log")
+            with open(pod_log, "w") as f:
+                f.write(executeKubectlCommand(["logs", pod]))
 
             # Collect diag and save diag from all Splunk Instances
             if collectDiag == "true":
