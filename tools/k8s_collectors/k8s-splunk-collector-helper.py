@@ -49,14 +49,17 @@ def main(argv):
     podLogsDir = "pod_data/logs"
     podDiagsDir = "pod_data/diags"
 
+    script = os.path.basename(__file__)
+    usage = "Usage: %s -f <collectFolder> [-d true]" % script
+
     try:
-        opts, args = getopt.getopt(argv, "d:f:", ["diag=", "folder="])
+        opts, args = getopt.getopt(argv, "hd:f:", ["help", "diag=", "folder="])
     except getopt.GetoptError:
-        print("Use the format collect_logs_and_diags.py -d <diag> -f <collectFolder>")
+        print(usage)
         sys.exit(2)
     for opt, arg in opts:
-        if opt == '-h':
-            print("Use the format collect_logs_and_diags.py -d <diag> -f <collectFolder>")
+        if opt in ("-h", "--help"):
+            print(usage)
             sys.exit()
         elif opt in ("-d", "--diag"):
             collectDiag = arg
