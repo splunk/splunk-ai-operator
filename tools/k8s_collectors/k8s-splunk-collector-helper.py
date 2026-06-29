@@ -3,9 +3,28 @@ import os
 import sys, getopt
 import subprocess
 
-def executeKubectlCommand(args):
-    result = subprocess.run(["kubectl"] + args, shell=False, capture_output=True, text=True)
-    return result.stdout
+
+def executeKubectlCommand(args, stdout=None):
+    """Run kubectl with an argv list. Raises RuntimeError on non-zero exit.
+
+    If stdout is an open file handle, kubectl's output is streamed directly
+    into it (no in-memory buffering). Otherwise returns captured output as str.
+    """
+    cmd = ["kubectl"] + args
+    if stdout is not None:
+        proc = subprocess.Popen(cmd, shell=False, stdout=stdout,
+                                stderr=subprocess.PIPE, universal_newlines=True)
+        _, stderr = proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError("kubectl %s failed (rc=%d): %s" % (" ".join(args), proc.returncode, stderr.strip()))
+        return ""
+    else:
+        proc = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, universal_newlines=True)
+        stdout_data, stderr = proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError("kubectl %s failed (rc=%d): %s" % (" ".join(args), proc.returncode, stderr.strip()))
+        return stdout_data
 
 
 def runAndCollectDiag(collectDir, podDiagsDir, pod):
@@ -13,71 +32,64 @@ def runAndCollectDiag(collectDir, podDiagsDir, pod):
     for line in output.splitlines():
         words = line.split()
         if len(words) > 4 and "Splunk diagnosis file created:" in line:
-            #Extract diag file name and full path
             diagFileFullPath = words[4]
-            diagFile = ""
-            dirs = diagFileFullPath.split('/')
-            if len(dirs) >= 2 and len(dirs[3]) > 0:
-                diagFile = dirs[3]
+            diagFile = os.path.basename(diagFileFullPath)
+            if not diagFile:
+                print("WARNING: could not extract diag filename from path: %s" % diagFileFullPath)
+                continue
 
-            #Copy the diag over
             dest = os.path.join(collectDir, podDiagsDir, diagFile)
             executeKubectlCommand(["cp", "%s:%s" % (pod, diagFileFullPath), dest])
-
-            #Delete the diag
             executeKubectlCommand(["exec", "--stdin", pod, "--", "rm", "-rf", diagFileFullPath])
 
+
 def main(argv):
-    #Define required variables
     collectDiag = ''
     collectDir = ''
     podLogsDir = "pod_data/logs"
     podDiagsDir = "pod_data/diags"
 
     try:
-        opts, args = getopt.getopt(argv,"d:f:",["diag=","folder="])
+        opts, args = getopt.getopt(argv, "d:f:", ["diag=", "folder="])
     except getopt.GetoptError:
-        print ("Use the format collect_logs_and_diags.py -d <diag> -f <collectFolder>")
+        print("Use the format collect_logs_and_diags.py -d <diag> -f <collectFolder>")
         sys.exit(2)
     for opt, arg in opts:
         if opt == '-h':
-            print ("Use the format collect_logs_and_diags.py -d <diag> -f <collectFolder>")
+            print("Use the format collect_logs_and_diags.py -d <diag> -f <collectFolder>")
             sys.exit()
         elif opt in ("-d", "--diag"):
             collectDiag = arg
         elif opt in ("-f", "--folder"):
             collectDir = arg
 
-    # Collect logs from the operator
     operator_log = os.path.join(collectDir, podLogsDir, "operator.log")
     with open(operator_log, "w") as f:
-        f.write(executeKubectlCommand(["logs", "deployment/splunk-ai-operator-controller-manager", "manager"]))
+        executeKubectlCommand(["logs", "deployment/splunk-ai-operator-controller-manager", "manager"], stdout=f)
 
     splunk_log = os.path.join(collectDir, podLogsDir, "splunkEnterprisePods.log")
     with open(splunk_log, "w") as f:
-        f.write(executeKubectlCommand(["logs", "-l", "app.kubernetes.io/managed-by=splunk-operator", "--tail", "-1"]))
+        executeKubectlCommand(["logs", "-l", "app.kubernetes.io/managed-by=splunk-operator", "--tail", "-1"], stdout=f)
 
     output = executeKubectlCommand(["get", "pods"])
     for line in output.splitlines():
         words = line.split()
-        if "splunk" in words[0]:
+        if words and "splunk" in words[0]:
             pod = words[0]
 
-            #ensure container is specified for the operator
             if "operator" in pod:
                 pod_log = os.path.join(collectDir, podLogsDir, pod + ".log")
                 with open(pod_log, "w") as f:
-                    f.write(executeKubectlCommand(["logs", pod, "-c", "manager"]))
+                    executeKubectlCommand(["logs", pod, "-c", "manager"], stdout=f)
                 continue
 
-            # Collect logs from pod
             pod_log = os.path.join(collectDir, podLogsDir, pod + ".log")
             with open(pod_log, "w") as f:
-                f.write(executeKubectlCommand(["logs", pod]))
+                executeKubectlCommand(["logs", pod], stdout=f)
 
-            # Collect diag and save diag from all Splunk Instances
             if collectDiag == "true":
                 runAndCollectDiag(collectDir, podDiagsDir, pod)
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
