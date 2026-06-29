@@ -24,8 +24,8 @@ openshift:
   # RTX 6000 Blackwell node is dedicated to GPU model pods (ray-worker).
   nodes:
     cpu:
-      - 00-25-b5-b5-00-31
-      - 00-25-b5-b5-00-33
+      - 00-25-b5-b5-00-35
+      - 00-25-b5-b5-00-37
     gpu:
       - cc-40-f3-9f-e2-3c
 
@@ -34,7 +34,7 @@ images:
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
 
   operator:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.5"
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.10"
 
   ray:
     headImage: "ml-platform/ray/ray-head:build-953"
@@ -86,6 +86,11 @@ aiPlatform:
   features:
     - name: "saia"
       version: "1.1.0"
+  cpuScheduling:
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
 
 operators:
   ray:

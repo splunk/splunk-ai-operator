@@ -260,6 +260,18 @@ ${yq_err}"
   MINIO_ROOT_PASSWORD=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName // "splunk-standalone"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
+  # Ingress domain: read from config if set, otherwise auto-detect from the cluster.
+  # Used to create an OpenShift Route for SAIA so both browsers and in-cluster services
+  # can reach it via a stable hostname.
+  local cfg_ingress_domain
+  cfg_ingress_domain=$(yq eval '.openshift.ingressDomain // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "$cfg_ingress_domain" ]]; then
+    INGRESS_DOMAIN="$cfg_ingress_domain"
+  else
+    INGRESS_DOMAIN=$(oc get ingresscontroller default -n openshift-ingress-operator \
+      -o jsonpath='{.status.domain}' 2>/dev/null || echo "")
+  fi
+
   log "Configuration loaded: namespace=${AI_NS}, accelerator=${DEFAULT_ACCELERATOR}"
 }
 
@@ -723,16 +735,25 @@ label_nodes() {
     oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule --overwrite 2>/dev/null || true
   done
 
-  # Verify no worker node is left unlabeled — unlabeled workers cause silent Pending forever
-  local unlabeled
-  unlabeled=$(oc get nodes -l node-role.kubernetes.io/worker -o json 2>/dev/null \
-    | python3 -c "
+  # Verify labeled nodes have the label — scope check to listed nodes in manual mode
+  # (auto mode checks all workers; manual mode only checks what the user explicitly listed)
+  local unlabeled=""
+  if [[ "${NODE_LABEL_STRATEGY}" == "manual" ]]; then
+    for node in "${cpu_nodes[@]}" "${gpu_nodes[@]}"; do
+      local val
+      val=$(oc get node "${node}" -o jsonpath='{.metadata.labels.splunk\.ai/workload-type}' 2>/dev/null || echo "")
+      [[ -z "${val}" ]] && unlabeled+="${node}"$'\n'
+    done
+  else
+    unlabeled=$(oc get nodes -l node-role.kubernetes.io/worker -o json 2>/dev/null \
+      | python3 -c "
 import json,sys
 data=json.load(sys.stdin)
 for n in data['items']:
     if 'splunk.ai/workload-type' not in n['metadata']['labels']:
         print(n['metadata']['name'])
 " 2>/dev/null || echo "")
+  fi
 
   if [[ -n "${unlabeled}" ]]; then
     err "Worker node(s) still missing splunk.ai/workload-type after labeling:
@@ -843,14 +864,13 @@ install_local_path_provisioner() {
     2>/dev/null || true
 
   # Patch the helper pod template to run privileged and relabel the created directory
-  # with svirt_sandbox_file_t so containers can read/write it (SELinux on OpenShift).
-  # Without the chcon, directories get var_t which containers cannot access.
+  # busybox lacks chcon; use ubi-minimal which ships selinux-utils so chcon runs.
+  # container_file_t allows any container to read/write regardless of MCS categories.
+  # Without this, local-path-provisioner creates dirs with var_t which blocks all containers.
   oc patch configmap local-path-config -n local-path-storage --type=merge -p "$(cat <<'PATCH'
 {
   "data": {
-    "helperPod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: busybox\n    imagePullPolicy: IfNotPresent\n    securityContext:\n      privileged: true\n",
-    "setup": "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nchcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\n"
-  }
+    "setup": "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nif command -v chcon >/dev/null 2>&1; then\n  chcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\nfi\n"
 }
 PATCH
   )"
@@ -1329,6 +1349,13 @@ install_ai_platform_cr() {
     storage_yaml="  storage:"$'\n'"    vectorDB:"$'\n'"      size: ${VECTORDB_SIZE}"$'\n'"      storageClassName: ${STORAGE_CLASS}"$'\n'
   fi
 
+  # CPU scheduling tolerations — read from config, default to empty list
+  local cpu_tols cpu_tolerations_inline="[]"
+  cpu_tols=$(yq eval '.aiPlatform.cpuScheduling.tolerations // []' "${CONFIG_FILE}" 2>/dev/null || echo "[]")
+  if [[ "${cpu_tols}" != "[]" && "${cpu_tols}" != "null" && -n "${cpu_tols}" ]]; then
+    cpu_tolerations_inline=$'\n'"$(echo "${cpu_tols}" | sed 's/^/      /')"
+  fi
+
   # Probe the AIPlatform webhook TLS cert immediately before applying.
   # cert-manager issues certs with notBefore ~30-60s in the future (clock skew);
   # retry until the x509 error clears. Using --dry-run=server hits the exact
@@ -1384,7 +1411,7 @@ ${svc_template_yaml}${storage_yaml}
   cpuScheduler:
     nodeSelector:
       splunk.ai/workload-type: cpu
-    tolerations: []
+    tolerations: ${cpu_tolerations_inline}
   gpuScheduler:
     nodeSelector:
       splunk.ai/workload-type: gpu
@@ -1410,6 +1437,53 @@ YAML
 
   oc get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" -o wide || true
   log "  ✓ AIPlatform CR installed"
+}
+
+# ====== CREATE SAIA ROUTE ======
+# Creates an OpenShift Route so SAIA is reachable via a stable external hostname.
+# The URL must be reachable from both the browser and from within the cluster
+# (Splunk's setup page validates connectivity from the server side).
+# NodePort alone doesn't work when node IPs are not externally routable.
+create_saia_route() {
+  if [[ -z "$INGRESS_DOMAIN" ]]; then
+    warn "Could not determine ingress domain — skipping SAIA Route creation"
+    warn "Create it manually: oc expose svc/${AI_PLATFORM_NAME}-saia-saia-service -n ${AI_NS}"
+    return 0
+  fi
+
+  local route_host="saia.${INGRESS_DOMAIN}"
+  local svc_name="${AI_PLATFORM_NAME}-saia-saia-service"
+
+  log "Creating SAIA Route: http://${route_host} ..."
+
+  # Wait for the SAIA service to exist (created by the operator after posthook)
+  local elapsed=0 timeout=300
+  while ! oc get svc "${svc_name}" -n "${AI_NS}" >/dev/null 2>&1; do
+    sleep 10; elapsed=$((elapsed + 10))
+    [[ ${elapsed} -ge ${timeout} ]] && { warn "Timed out waiting for SAIA service — Route not created"; return 0; }
+    log "  Waiting for SAIA service... (${elapsed}s)"
+  done
+
+  oc apply -f - <<EOF
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: saia
+  namespace: ${AI_NS}
+  annotations:
+    haproxy.router.openshift.io/timeout: "600s"
+    haproxy.router.openshift.io/response-buffering: "disabled"
+spec:
+  host: ${route_host}
+  to:
+    kind: Service
+    name: ${svc_name}
+  port:
+    targetPort: 8080
+EOF
+
+  log "  ✓ SAIA Route created: http://${route_host}"
+  log "    Use this URL in Splunk AI setup: http://${route_host}"
 }
 
 # ====== MAIN INSTALL ======
@@ -1483,9 +1557,16 @@ main_install() {
   step_start "AIPlatform CR"
   install_ai_platform_cr
   step_ok
+
+  step_start "SAIA Route"
+  create_saia_route
+  step_ok
   phase_end "AI Platform Stack"
 
   show_step_summary
+
+  local saia_url=""
+  [[ -n "$INGRESS_DOMAIN" ]] && saia_url="http://saia.${INGRESS_DOMAIN}"
 
   log "============================================"
   log " Install complete"
@@ -1498,6 +1579,11 @@ main_install() {
   log "     oc logs -n splunk-ai-operator-system -l control-plane=controller-manager -f"
   log "  3. Watch Ray cluster:"
   log "     oc get raycluster,rayservice -n ${AI_NS} -w"
+  if [[ -n "$saia_url" ]]; then
+  log ""
+  log "  SAIA app URL (use this in Splunk AI setup):"
+  log "     ${saia_url}"
+  fi
   log ""
   log "Log file: ${LOG_FILE}"
 }
@@ -1540,6 +1626,9 @@ main_delete() {
   local splunk_operator_ns="splunk-operator"
 
   # ── 1. AI Platform CRs (trigger operator finalizers before namespace delete) ──
+  log "Removing SAIA Route..."
+  oc delete route saia -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+
   log "Removing AIPlatform CR and waiting for finalizers..."
   oc delete aiplatform --all -n "${AI_NS}" --timeout=120s 2>/dev/null || true
   oc delete standalone --all -n "${AI_NS}" --timeout=60s 2>/dev/null || true

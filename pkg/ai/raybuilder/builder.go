@@ -962,13 +962,13 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:              resource.MustParse("1"),
-					corev1.ResourceMemory:           resource.MustParse("2Gi"),
+					corev1.ResourceMemory:           resource.MustParse("4Gi"),
 					corev1.ResourceEphemeralStorage: resource.MustParse("5Gi"),
 					"nvidia.com/gpu":                resource.MustParse("0"),
 				},
 				Limits: corev1.ResourceList{
 					corev1.ResourceCPU:              resource.MustParse("4"),
-					corev1.ResourceMemory:           resource.MustParse("8Gi"),
+					corev1.ResourceMemory:           resource.MustParse("16Gi"),
 					corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
 					"nvidia.com/gpu":                resource.MustParse("0"),
 				},
