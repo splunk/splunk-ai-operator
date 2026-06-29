@@ -66,6 +66,11 @@ def main(argv):
         elif opt in ("-f", "--folder"):
             collectDir = arg
 
+    if not collectDir:
+        print("Error: -f <collectFolder> is required")
+        print(usage)
+        sys.exit(2)
+
     operator_log = os.path.join(collectDir, podLogsDir, "operator.log")
     with open(operator_log, "w") as f:
         executeKubectlCommand(["logs", "deployment/splunk-ai-operator-controller-manager", "manager"], stdout=f)
