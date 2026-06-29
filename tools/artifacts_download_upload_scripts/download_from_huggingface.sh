@@ -5,7 +5,55 @@
 set -e
 set -o pipefail
 
-CONFIG_FILE="./model_artifacts_configs.yaml"
+# ---------- Accelerator / config-file selection ----------
+# Precedence: --accelerator/-a flag > ACCELERATOR env var > default (l40s)
+# Passing ACCELERATOR=<type> is also how k0s_cluster_with_stack.sh forwards
+# the aiPlatform.defaultAcceleratorType value from the cluster config.
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--accelerator <type>] [--help]
+
+Options:
+  -a, --accelerator <type>  GPU accelerator type for which to download models.
+                            Supported: l40s (default), h100
+  -h, --help                Show this help message
+
+Environment:
+  ACCELERATOR     Fallback when --accelerator is not given (used by the k0s installer).
+  SKIP_IF_EXISTS  Set to 1 to skip models already downloaded locally.
+EOF
+}
+
+ACCEL_FLAG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--accelerator) ACCEL_FLAG="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+# Resolve: CLI flag > env var > default
+ACCEL="${ACCEL_FLAG:-${ACCELERATOR:-l40s}}"
+ACCEL="${ACCEL,,}"  # lowercase
+
+case "${ACCEL}" in
+  l40s|"") CONFIG_FILE="./model_artifacts_configs.yaml" ;;
+  h100)    CONFIG_FILE="./model_artifacts_configs_h100.yaml" ;;
+  *)
+    echo "Error: unsupported accelerator '${ACCEL}'. Supported values: l40s, h100" >&2
+    exit 1
+    ;;
+esac
+
+echo "Accelerator: ${ACCEL} → config: ${CONFIG_FILE}"
+
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  echo "Error: config file '${CONFIG_FILE}' not found in $(pwd)" >&2
+  exit 1
+fi
+
 DOWNLOAD_DIR="./model_artifacts"
 # Set SKIP_IF_EXISTS=1 to skip downloading a model that already exists locally.
 # Useful for re-running the upload step without re-downloading everything.

@@ -1805,8 +1805,11 @@ stage_model_artifacts() {
   fi
 
   # ---- Download from Hugging Face ----
-  log "Downloading model artifacts from Hugging Face..."
-  ( cd "${staging_dir}" && SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" bash ./download_from_huggingface.sh ) \
+  log "Downloading model artifacts from Hugging Face (accelerator: ${DEFAULT_ACCELERATOR:-l40s})..."
+  ( cd "${staging_dir}" && \
+      ACCELERATOR="${DEFAULT_ACCELERATOR:-}" \
+      SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" \
+      bash ./download_from_huggingface.sh ) \
     || { err "Hugging Face download failed — see output above"; return 1; }
 
   # ---- Upload to object store (dispatch by type) ----
