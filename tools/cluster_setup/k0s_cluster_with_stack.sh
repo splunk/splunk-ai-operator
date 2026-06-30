@@ -1164,6 +1164,34 @@ preflight_check_node_storage() {
   done
 }
 
+# Write a containerd drop-in that configures IMAGE_REGISTRY as a plain-HTTP
+# (insecure) mirror. Required when the registry serves HTTP instead of HTTPS,
+# which causes containerd to fail with "http: server gave HTTP response to
+# HTTPS client". Must be called after `k0s install` (creates /etc/k0s) and
+# before `k0s start` (containerd reads the drop-in only at startup).
+configure_insecure_registry_on_node() {
+  local node_ip="$1"
+  local registry="${IMAGE_REGISTRY:-}"
+
+  # Only needed for private registries; skip for empty / public registries.
+  [[ -z "${registry}" ]] && return 0
+
+  log "  Configuring insecure registry ${registry} on ${node_ip}..."
+  ssh_exec "${node_ip}" "
+    sudo mkdir -p /etc/k0s/containerd.d
+    sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null <<'TOML'
+[plugins.\"io.containerd.grpc.v1.cri\".registry]
+  [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]
+    [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"${registry}\"]
+      endpoint = [\"http://${registry}\"]
+  [plugins.\"io.containerd.grpc.v1.cri\".registry.configs]
+    [plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"${registry}\".tls]
+      insecure_skip_verify = true
+TOML
+  "
+  log "  ✓ Insecure registry drop-in written on ${node_ip}"
+}
+
 # ====== K0S CLUSTER INSTALLATION ======
 install_k0s_cluster() {
   log "Installing k0s cluster..."
@@ -1266,6 +1294,7 @@ PYSCRIPT"
   # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
   # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
   stage_k0s_image_bundle "${controller_ip}"
+  configure_insecure_registry_on_node "${controller_ip}"
   ssh_exec "${controller_ip}" "sudo k0s start"
 
   log "Waiting for controller API server to be ready..."
@@ -1333,6 +1362,7 @@ PYSCRIPT"
     fi
 
     log "  Starting k0s worker on ${worker_ip}..."
+    configure_insecure_registry_on_node "${worker_ip}"
     if ssh_exec "${worker_ip}" "sudo k0s start"; then
       log "  ✓ k0s started on ${worker_ip}"
     else
@@ -6013,6 +6043,7 @@ join_workers() {
     # (blocked) internet and the node never becomes Ready. No-op when
     # AIRGAP_K0S_IMAGE_DIR is unset (i.e. not an air-gap install).
     stage_k0s_image_bundle "${worker_ip}"
+    configure_insecure_registry_on_node "${worker_ip}"
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."
