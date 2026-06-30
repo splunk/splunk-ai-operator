@@ -90,20 +90,28 @@ fix_node() {
 
   log "  ── ${ip} (${role}) ──"
 
-  # Write drop-in
+  # Write registry config — use hosts.toml for containerd v2, drop-in TOML for v1.
+  # containerd v2 (k0s >= 1.33) rejects io.containerd.grpc.v1.cri in a pre-flight
+  # check and crash-loops. Detect by checking the k0s managed base config.
   ssh_exec "${ip}" bash -s -- "${registry}" <<'REMOTE'
     REGISTRY="$1"
-    sudo mkdir -p /etc/k0s/containerd.d
-    sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null <<TOML
-[plugins."io.containerd.grpc.v1.cri".registry]
-  [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${REGISTRY}"]
-      endpoint = ["http://${REGISTRY}"]
-  [plugins."io.containerd.grpc.v1.cri".registry.configs]
-    [plugins."io.containerd.grpc.v1.cri".registry.configs."${REGISTRY}".tls]
-      insecure_skip_verify = true
-TOML
-    echo "Drop-in written to /etc/k0s/containerd.d/insecure-registry.toml"
+    if sudo grep -q 'io\.containerd\.cri\.v1' /etc/k0s/containerd.toml 2>/dev/null; then
+      echo "--- containerd v2 detected: writing hosts.toml ---"
+      sudo mkdir -p "/etc/k0s/containerd/certs.d/${REGISTRY}"
+      printf 'server = "http://%s"\n\n[host."http://%s"]\n  capabilities = ["pull", "resolve", "push"]\n  skip_verify = true\n' \
+        "${REGISTRY}" "${REGISTRY}" \
+        | sudo tee "/etc/k0s/containerd/certs.d/${REGISTRY}/hosts.toml" >/dev/null
+      echo "Written: /etc/k0s/containerd/certs.d/${REGISTRY}/hosts.toml"
+    else
+      echo "--- containerd v1 detected: writing drop-in TOML ---"
+      sudo mkdir -p /etc/k0s/containerd.d
+      # Remove the broken v1 drop-in if it was previously written
+      sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml
+      printf '[plugins."io.containerd.grpc.v1.cri".registry]\n  [plugins."io.containerd.grpc.v1.cri".registry.mirrors]\n    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."%s"]\n      endpoint = ["http://%s"]\n  [plugins."io.containerd.grpc.v1.cri".registry.configs]\n    [plugins."io.containerd.grpc.v1.cri".registry.configs."%s".tls]\n      insecure_skip_verify = true\n' \
+        "${REGISTRY}" "${REGISTRY}" "${REGISTRY}" \
+        | sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null
+      echo "Written: /etc/k0s/containerd.d/insecure-registry.toml"
+    fi
 REMOTE
 
   # Restart the right service
@@ -172,6 +180,8 @@ fi
 # ── fix controller ────────────────────────────────────────────────────────────
 log ""
 log "── Fixing controller (${CONTROLLER_IP}) ──"
+# Remove any previously written v1 drop-in that is crash-looping the controller
+ssh_exec "${CONTROLLER_IP}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
 fix_node "${CONTROLLER_IP}" "${REGISTRY}" "controller"
 
 # Wait for API server to come back

@@ -1164,32 +1164,33 @@ preflight_check_node_storage() {
   done
 }
 
-# Write a containerd drop-in that configures IMAGE_REGISTRY as a plain-HTTP
-# (insecure) mirror. Required when the registry serves HTTP instead of HTTPS,
-# which causes containerd to fail with "http: server gave HTTP response to
-# HTTPS client". Must be called after `k0s install` (creates /etc/k0s) and
-# before `k0s start` (containerd reads the drop-in only at startup).
+# Write an insecure registry config for a plain-HTTP private registry.
+# Supports both containerd v1 (drop-in TOML) and containerd v2 (hosts.toml).
+# containerd v2 (k0s >= 1.33) rejects the legacy io.containerd.grpc.v1.cri
+# plugin key with a pre-flight failure; it uses hosts.toml under
+# /etc/k0s/containerd/certs.d/<registry>/ instead.
+# Must be called after `k0s install` and before `k0s start`.
 configure_insecure_registry_on_node() {
   local node_ip="$1"
   local registry="${IMAGE_REGISTRY:-}"
 
-  # Only needed for private registries; skip for empty / public registries.
   [[ -z "${registry}" ]] && return 0
 
   log "  Configuring insecure registry ${registry} on ${node_ip}..."
   ssh_exec "${node_ip}" "
-    sudo mkdir -p /etc/k0s/containerd.d
-    sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null <<'TOML'
-[plugins.\"io.containerd.grpc.v1.cri\".registry]
-  [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]
-    [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"${registry}\"]
-      endpoint = [\"http://${registry}\"]
-  [plugins.\"io.containerd.grpc.v1.cri\".registry.configs]
-    [plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"${registry}\".tls]
-      insecure_skip_verify = true
-TOML
+    if sudo grep -q 'io\\.containerd\\.cri\\.v1' /etc/k0s/containerd.toml 2>/dev/null; then
+      echo '--- containerd v2: writing hosts.toml ---'
+      sudo mkdir -p \"/etc/k0s/containerd/certs.d/${registry}\"
+      printf 'server = \"http://${registry}\"\n\n[host.\"http://${registry}\"]\n  capabilities = [\"pull\", \"resolve\", \"push\"]\n  skip_verify = true\n' \
+        | sudo tee \"/etc/k0s/containerd/certs.d/${registry}/hosts.toml\" >/dev/null
+    else
+      echo '--- containerd v1: writing drop-in TOML ---'
+      sudo mkdir -p /etc/k0s/containerd.d
+      printf '[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]\n    [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"${registry}\"]\n      endpoint = [\"http://${registry}\"]\n  [plugins.\"io.containerd.grpc.v1.cri\".registry.configs]\n    [plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"${registry}\".tls]\n      insecure_skip_verify = true\n' \
+        | sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null
+    fi
   "
-  log "  ✓ Insecure registry drop-in written on ${node_ip}"
+  log "  ✓ Insecure registry configured on ${node_ip}"
 }
 
 # ====== K0S CLUSTER INSTALLATION ======
