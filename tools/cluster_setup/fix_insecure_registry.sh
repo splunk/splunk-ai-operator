@@ -201,8 +201,16 @@ fi
 log ""
 log "── Controller (localhost) ──"
 write_dropin_local "${REGISTRY}"
-log "Drop-in written. Restarting k0s..."
-sudo systemctl restart k0s
+log "Drop-in written. Restarting k0s controller service..."
+if sudo systemctl restart k0scontroller 2>/dev/null; then
+  log "✓ k0scontroller restarted"
+elif sudo systemctl restart k0s 2>/dev/null; then
+  log "✓ k0s restarted"
+else
+  err "Could not restart controller service — tried k0scontroller and k0s."
+  err "Check: sudo systemctl list-units 'k0s*'"
+  exit 1
+fi
 
 log "Waiting for API server..."
 for i in $(seq 1 30); do
