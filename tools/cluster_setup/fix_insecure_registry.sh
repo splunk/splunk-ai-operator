@@ -175,15 +175,15 @@ log "── Fixing controller (${CONTROLLER_IP}) ──"
 fix_node "${CONTROLLER_IP}" "${REGISTRY}" "controller"
 
 # Wait for API server to come back
-log "Waiting for API server..."
-for i in $(seq 1 30); do
+log "Waiting for API server (up to 180s)..."
+for i in $(seq 1 90); do
   if ssh_exec "${CONTROLLER_IP}" "sudo k0s kubectl get --raw /healthz" >/dev/null 2>&1; then
-    log "✓ API server ready (${i}s)"
+    log "✓ API server ready ($((i * 2))s)"
     break
   fi
   sleep 2
-  if [[ ${i} -eq 30 ]]; then
-    err "API server not ready after 60s — check: ssh ${SSH_USER}@${CONTROLLER_IP} 'sudo journalctl -u k0scontroller -n 50'"
+  if [[ ${i} -eq 90 ]]; then
+    err "API server not ready after 180s — check: ssh ${SSH_USER}@${CONTROLLER_IP} 'sudo journalctl -u k0scontroller -n 50'"
     exit 1
   fi
 done
