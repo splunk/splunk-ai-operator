@@ -34,9 +34,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Resolve: CLI flag > env var > default
-ACCEL="${ACCEL_FLAG:-${ACCELERATOR:-l40s}}"
-ACCEL="${ACCEL,,}"  # lowercase
+# Resolve: CLI flag > env var > default (tr used for Bash 3 compat on macOS)
+ACCEL="$(printf '%s' "${ACCEL_FLAG:-${ACCELERATOR:-l40s}}" | tr '[:upper:]' '[:lower:]')"
 
 case "${ACCEL}" in
   l40s|"") CONFIG_FILE="./model_artifacts_configs.yaml" ;;

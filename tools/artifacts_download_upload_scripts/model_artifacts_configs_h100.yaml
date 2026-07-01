@@ -1,4 +1,8 @@
 ---
+# NOTE: If switching from L40S to H100 staging on an existing staging directory,
+# do NOT use SKIP_IF_EXISTS=1 — gemma-4-31b-it shares the same artifact-id across
+# both configs. Delete ./model_artifacts/gemma-4-31b-it/ before re-running with this param.
+#
 # Hugging Face credentials for gated models. Not required if there are no gated models
 hf-username: <CHANGE ME>
 hf-token: <CHANGE ME>
