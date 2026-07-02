@@ -27,6 +27,8 @@ SEAWEEDFS_PARALLEL_JOBS="${SEAWEEDFS_PARALLEL_JOBS:-1}"
 SEAWEEDFS_ERROR_LOG="${SEAWEEDFS_ERROR_LOG:-./seaweedfs_upload_errors.log}"
 # Set to 1 to skip uploading a file if it already exists at destination (avoids re-uploading on script re-runs).
 SEAWEEDFS_SKIP_EXISTING="${SEAWEEDFS_SKIP_EXISTING:-0}"
+# Set to 1 to skip artifacts whose .staging_complete marker already exists in SeaweedFS.
+SKIP_IF_STAGED="${SKIP_IF_STAGED:-0}"
 
 # Normalize primary bucket to lowercase
 OBJECT_STORE_BUCKET=$(echo "$OBJECT_STORE_BUCKET" | tr '[:upper:]' '[:lower:]')
@@ -115,15 +117,29 @@ do_upload_file() {
 }
 
 # Upload a directory artifact file-by-file (per-file retries; one failed file doesn't re-upload the rest).
+# .staging_complete is excluded from the main loop and uploaded last so its presence proves completeness.
 upload_artifact_dir() {
   local artifact_path="$1" dest_base="$2" id="$3" failed=0 f rel
+  local marker_local="${artifact_path}/.staging_complete"
+  # Marker lives in staging_state/ — separate from model_artifacts/ —
+  # so model loaders never encounter it at inference time.
+  local marker_dest="${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete"
   while IFS= read -r -d '' f; do
     rel="${f#${artifact_path}/}"
+    # Skip local marker — not uploaded into model_artifacts/
+    [[ "$rel" == ".staging_complete" ]] && continue
     if ! do_upload_file "$f" "${dest_base}/${rel}"; then
       echo "$(date -Iseconds 2>/dev/null || date) FAILED: $id $rel" >> "$SEAWEEDFS_ERROR_LOG"
       failed=1
     fi
   done < <(find "$artifact_path" -type f -print0)
+  # Upload marker to staging_state/ last — its presence proves upload is complete
+  if [[ $failed -eq 0 && -f "$marker_local" ]]; then
+    if ! do_upload_file "$marker_local" "$marker_dest"; then
+      echo "$(date -Iseconds 2>/dev/null || date) FAILED: $id .staging_complete" >> "$SEAWEEDFS_ERROR_LOG"
+      failed=1
+    fi
+  fi
   return $failed
 }
 
@@ -151,6 +167,16 @@ while [[ $idx -lt $total ]]; do
     artifact_path="${artifact_paths[$idx]}"
     id=$(basename "$artifact_path")
     dest_base="${MC_ALIAS}/${OBJECT_STORE_BUCKET}/model_artifacts/$id"
+
+    # Skip entirely if already fully staged (marker in staging_state/ prefix)
+    if [[ "$SKIP_IF_STAGED" == "1" ]]; then
+      if mc stat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" &>/dev/null; then
+        echo "✓ $id already staged (.staging_complete present) — skipping."
+        idx=$((idx + 1))
+        continue
+      fi
+    fi
+
     (
       if [[ -d "$artifact_path" ]]; then
         upload_artifact_dir "$artifact_path" "$dest_base" "$id" || exit 1

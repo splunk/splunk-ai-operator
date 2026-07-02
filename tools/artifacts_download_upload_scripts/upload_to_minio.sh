@@ -13,6 +13,8 @@ MINIO_ENDPOINT="${OBJECT_STORE_ENDPOINT}"
 MINIO_BUCKET="${OBJECT_STORE_BUCKET}"
 MINIO_ROOT_USER="${OBJECT_STORE_ACCESS_KEY}"
 MINIO_ROOT_PASSWORD="${OBJECT_STORE_SECRET_KEY}"
+# Set to 1 to skip artifacts whose .staging_complete marker already exists in MinIO.
+SKIP_IF_STAGED="${SKIP_IF_STAGED:-0}"
 
 # Convert bucket name to lowercase (S3/MinIO requirement)
 ORIGINAL_BUCKET="$MINIO_BUCKET"
@@ -260,20 +262,43 @@ for artifact_path in "$SOURCE_DIR"/*; do
     if [[ -e "$artifact_path" ]]; then
         id=$(basename "$artifact_path")
         echo "Processing: $id"
-        
-        if [[ -d "$artifact_path" ]]; then
-            # It's a directory - upload recursively (trailing slash on source = copy contents, not directory as single object)
-            echo "Uploading directory to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id/"
-            
-            mc cp --recursive "$artifact_path/" "$MINIO_ALIAS/$MINIO_BUCKET/model_artifacts/$id/"
-        else
-            # It's a file - upload directly
-            echo "Uploading file to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id"
-            
-            mc cp "$artifact_path" "$MINIO_ALIAS/$MINIO_BUCKET/model_artifacts/$id"
+
+        dest_base="$MINIO_ALIAS/$MINIO_BUCKET/model_artifacts/$id"
+        # Marker lives in staging_state/ — separate from model_artifacts/ —
+        # so model loaders never encounter it at inference time.
+        marker_dest="$MINIO_ALIAS/$MINIO_BUCKET/staging_state/$id/.staging_complete"
+        marker_local="$artifact_path/.staging_complete"
+
+        # Skip entirely if already fully staged in MinIO
+        if [[ "$SKIP_IF_STAGED" == "1" ]]; then
+            if mc stat "$marker_dest" &>/dev/null; then
+                echo "✓ $id already staged in MinIO (.staging_complete present) — skipping."
+                echo "-----------------------------"
+                continue
+            fi
         fi
-        
-        if [ $? -eq 0 ]; then
+
+        upload_ok=0
+        if [[ -d "$artifact_path" ]]; then
+            # Mirror directory — only syncs missing/changed objects (idempotent).
+            # Exclude local marker from mirror; store marker goes to staging_state/ below.
+            echo "Mirroring directory to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id/"
+            if mc mirror --overwrite --exclude ".staging_complete" \
+                    "$artifact_path/" "${dest_base}/"; then
+                # Upload marker to staging_state/ last — its presence proves upload is complete
+                if [[ -f "$marker_local" ]]; then
+                    mc cp "$marker_local" "$marker_dest" && upload_ok=1
+                else
+                    upload_ok=1
+                fi
+            fi
+        else
+            # Single-file artifact — upload directly
+            echo "Uploading file to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id"
+            mc cp "$artifact_path" "$dest_base" && upload_ok=1
+        fi
+
+        if [[ "$upload_ok" == "1" ]]; then
             echo "✓ Uploaded $id to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id"
         else
             echo "✗ Failed to upload $id"

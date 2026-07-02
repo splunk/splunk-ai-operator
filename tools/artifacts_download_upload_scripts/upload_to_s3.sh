@@ -5,6 +5,8 @@ SOURCE_DIR="./model_artifacts"
 S3_BUCKET="${S3_BUCKET:-ai-platform-artifacts-bucket}"
 S3_REGION="${S3_REGION:-us-east-2}"
 S3_PREFIX="${S3_PREFIX:-model_artifacts}"
+# Set to 1 to skip artifacts whose .staging_complete marker already exists in S3.
+SKIP_IF_STAGED="${SKIP_IF_STAGED:-0}"
 
 # Convert bucket name to lowercase (S3 requirement)
 if [[ -n "$S3_BUCKET" ]]; then
@@ -229,26 +231,45 @@ for artifact_path in "$SOURCE_DIR"/*; do
     if [[ -e "$artifact_path" ]]; then
         id=$(basename "$artifact_path")
         echo "Processing: $id"
-        
-        if [[ -d "$artifact_path" ]]; then
-            # It's a directory - upload recursively
-            s3_path="s3://$S3_BUCKET/$S3_PREFIX/$id/"
-            echo "Uploading directory to: $s3_path"
-            
-            aws s3 cp "$artifact_path" "$s3_path" \
-                --recursive \
-                --region "$S3_REGION"
-        else
-            # It's a file - upload directly
-            s3_path="s3://$S3_BUCKET/$S3_PREFIX/$id"
-            echo "Uploading file to: $s3_path"
-            
-            aws s3 cp "$artifact_path" "$s3_path" \
-                --region "$S3_REGION"
+
+        s3_base="s3://$S3_BUCKET/$S3_PREFIX/$id"
+        # Marker lives in staging_state/ — separate from model_artifacts/ —
+        # so model loaders never encounter it at inference time.
+        marker_s3="s3://$S3_BUCKET/staging_state/$id/.staging_complete"
+
+        # Skip entirely if already fully staged in S3
+        if [[ "$SKIP_IF_STAGED" == "1" ]]; then
+            if aws s3 ls "$marker_s3" --region "$S3_REGION" &>/dev/null; then
+                echo "✓ $id already staged in S3 (.staging_complete present) — skipping."
+                echo "-----------------------------"
+                continue
+            fi
         fi
-        
-        if [ $? -eq 0 ]; then
-            echo "✓ Uploaded $id to $s3_path"
+
+        upload_ok=0
+        if [[ -d "$artifact_path" ]]; then
+            # Sync directory — only pushes missing/changed files (idempotent).
+            # Exclude local marker from sync; store marker goes to staging_state/ below.
+            echo "Syncing directory to: ${s3_base}/"
+            if aws s3 sync "$artifact_path" "${s3_base}/" \
+                    --exclude ".staging_complete" \
+                    --region "$S3_REGION"; then
+                # Upload marker to staging_state/ last — its presence proves upload is complete
+                if [[ -f "$artifact_path/.staging_complete" ]]; then
+                    aws s3 cp "$artifact_path/.staging_complete" "$marker_s3" \
+                        --region "$S3_REGION" && upload_ok=1
+                else
+                    upload_ok=1
+                fi
+            fi
+        else
+            # Single-file artifact — upload directly
+            echo "Uploading file to: $s3_base"
+            aws s3 cp "$artifact_path" "$s3_base" --region "$S3_REGION" && upload_ok=1
+        fi
+
+        if [[ "$upload_ok" == "1" ]]; then
+            echo "✓ Uploaded $id to $s3_base"
         else
             echo "✗ Failed to upload $id"
         fi

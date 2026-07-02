@@ -290,6 +290,35 @@ _check_node_os() {
   fi
 }
 
+# ====== RESOLVE MODEL STAGING DECISION ======
+# Called after load_config, before show_install_plan.
+# In Full (interactive) mode: always prompts; answer overrides storage.modelStaging.enabled.
+# In Silent mode: honours the config value with no prompt.
+resolve_model_staging() {
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
+    return 0
+  fi
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    log "Air-gap mode: model staging skipped (models must be pre-staged in object store); no prompt."
+    MODEL_STAGING_ENABLED=false
+    return 0
+  fi
+  # Full/interactive: prompt always overrides config value
+  echo "" >&2
+  echo -e "  \033[1mModel Download\033[0m" >&2
+  echo "  Do you want to download and stage model artifacts from HuggingFace now?" >&2
+  echo "  (Required for a first install unless models are already in your object store.)" >&2
+  local ans
+  read -rp "  Download & stage models? [y/N]: " ans
+  case "${ans}" in
+    [Yy]|[Yy][Ee][Ss]) MODEL_STAGING_ENABLED=true ;;
+    *)                  MODEL_STAGING_ENABLED=false ;;
+  esac
+  echo "" >&2
+  log "Model staging set to '${MODEL_STAGING_ENABLED}' by interactive prompt (overrides config value)."
+}
+
 # ====== SHOW INSTALL PLAN ======
 # Called before install starts; prints what will be done so customers can
 # validate the config before a 40-minute run.
@@ -332,8 +361,11 @@ show_install_plan() {
   echo -e "    8. Health check + pod verification" >&2
   echo "" >&2
 
-  if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
-    log "AUTO_APPROVE=true — skipping confirmation."
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    echo -e "  \033[1;33m⚠  SILENT INSTALL — no interactive prompts.\033[0m" >&2
+    echo -e "  The config file is assumed to have been reviewed and is correct." >&2
+    echo -e "  The steps listed above will run automatically. Press Ctrl-C within 5 s to abort." >&2
+    sleep 5
     return 0
   fi
 
@@ -1873,10 +1905,27 @@ stage_model_artifacts() {
   fi
 
   # ---- Download from Hugging Face ----
-  log "Downloading model artifacts from Hugging Face (accelerator: ${DEFAULT_ACCELERATOR:-l40s})..."
+  local _accel="${DEFAULT_ACCELERATOR:-}"
+  if [[ -z "${_accel}" ]]; then
+    warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
+    _accel="l40s"
+  fi
+  # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
+  # re-runs skip models that are already fully staged (no re-download, no re-upload).
+  # Set SKIP_IF_STAGED=0 to force a full re-download regardless of store state.
+  local _skip_staged="${SKIP_IF_STAGED:-1}"
+  log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
   ( cd "${staging_dir}" && \
-      ACCELERATOR="${DEFAULT_ACCELERATOR:-}" \
+      ACCELERATOR="${_accel}" \
       SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" \
+      SKIP_IF_STAGED="${_skip_staged}" \
+      OBJ_STORE_TYPE="${OBJ_STORE_TYPE}" \
+      OBJ_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+      OBJ_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+      OBJ_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      OBJ_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      S3_REGION="${REGION:-us-east-2}" \
+      S3_PREFIX="model_artifacts" \
       bash ./download_from_huggingface.sh ) \
     || { err "Hugging Face download failed — see output above"; return 1; }
 
@@ -1892,6 +1941,7 @@ stage_model_artifacts() {
         S3_REGION="${REGION:-us-east-2}" \
         AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
         AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+        SKIP_IF_STAGED="${_skip_staged}" \
         bash ./upload_to_s3.sh ) \
         || { err "Upload to S3 failed"; return 1; }
       ;;
@@ -1901,6 +1951,7 @@ stage_model_artifacts() {
         OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
         OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
         OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        SKIP_IF_STAGED="${_skip_staged}" \
         bash ./upload_to_minio.sh ) \
         || { err "Upload to MinIO failed"; return 1; }
       ;;
@@ -1910,6 +1961,7 @@ stage_model_artifacts() {
         OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
         OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
         OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        SKIP_IF_STAGED="${_skip_staged}" \
         bash ./upload_to_seaweedfs_upload_only.sh ) \
         || { err "Upload to SeaweedFS failed"; return 1; }
       ;;
@@ -5248,10 +5300,19 @@ show_platform_access_info() {
 
 # ====== MAIN INSTALL FLOW ======
 main_install() {
+  # Sync SILENT_INSTALL ↔ AUTO_APPROVE so both paths are consistent.
+  # AUTO_APPROVE=true (legacy CI env var) implies silent; --silent flag sets AUTO_APPROVE
+  # so the existing delete/clean-all confirmation gates keep working unchanged.
+  [[ "${AUTO_APPROVE:-false}" == "true" ]] && SILENT_INSTALL=true
+  SILENT_INSTALL="${SILENT_INSTALL:-false}"
+  [[ "${SILENT_INSTALL}" == "true" ]] && AUTO_APPROVE=true
+
   load_config
 
   validate_image_config
   configure_images
+
+  resolve_model_staging
 
   show_install_plan
 
@@ -5785,9 +5846,19 @@ Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
 
 Commands:
-  install          - Install k0s cluster and AI Platform stack (auto-stages model
-                     artifacts first when storage.modelStaging.enabled=true).
-                     Displays an install plan and asks for confirmation before starting.
+  install [--silent|-s]
+                   - Install k0s cluster and AI Platform stack.
+                     Two flows are supported:
+
+                     Full install (default, no flag):
+                       Interactive. Prompts whether to download & stage model
+                       artifacts — the answer overrides storage.modelStaging.enabled.
+                       Displays the install plan and asks for 'yes' before starting.
+
+                     Silent install (--silent / -s / AUTO_APPROVE=true):
+                       Non-interactive. Uses config values as-is. Assumes the config
+                       has been reviewed. Displays the install plan, waits 5 s, then
+                       proceeds automatically without any prompts.
   validate         - Check config file completeness before a full install.
                      Catches missing IPs, unset credentials, missing manifest files.
                      Safe to run any time — makes no changes.
@@ -5813,7 +5884,9 @@ Commands:
 
 Environment:
   CONFIG_FILE              - Path to k0s config YAML (default: ./k0s-cluster-config.yaml)
-  AUTO_APPROVE             - Skip confirmation prompt for delete (default: false)
+  SILENT_INSTALL           - Set to true to run install non-interactively (same as --silent).
+  AUTO_APPROVE             - Set to true to skip all confirmation prompts (implies SILENT_INSTALL
+                             for install; also skips delete/clean-all confirmations).
   POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
                              RayService, Splunk Standalone, AIPlatform/AIService) to
                              reach Ready during verify (default: 600 = 10 minutes).
@@ -5824,15 +5897,16 @@ Environment:
   POD_HEALTH_POLL_INTERVAL - Seconds between checks while waiting (default: 15)
 
 Examples:
-  # Install with existing IPs (auto-stages models if storage.modelStaging.enabled=true)
+  # Full install (interactive): prompts for model download, then asks 'yes' to proceed
   CONFIG_FILE=./my-config.yaml $0 install
 
-  # Stage model artifacts only (no cluster install; skips staging gate in YAML)
+  # Silent install (non-interactive, CI/CD): uses config values, no prompts, 5-second abort window
+  CONFIG_FILE=./my-config.yaml $0 install --silent
+  # Equivalent:
+  AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml $0 install
+
+  # Stage model artifacts only (no cluster install; always runs regardless of config)
   CONFIG_FILE=./my-config.yaml $0 stage-artifacts
-
-  # Skip model staging during install (models already in object store)
-  # Set storage.modelStaging.enabled: false in your config YAML, then:
-  CONFIG_FILE=./my-config.yaml $0 install
 
   # Join worker nodes (if install failed or was interrupted)
   CONFIG_FILE=./my-config.yaml $0 join-workers
@@ -6146,8 +6220,17 @@ join_workers() {
 }
 
 # ====== MAIN ======
-case "${1:-install}" in
+# Parse install-specific flags before handing off to subcommands.
+_CMD="${1:-install}"
+shift 2>/dev/null || true
+case "${_CMD}" in
   install)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --silent|-s) SILENT_INSTALL=true; shift ;;
+        *) echo "Unknown install option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+    done
     main_install
     ;;
   validate)
