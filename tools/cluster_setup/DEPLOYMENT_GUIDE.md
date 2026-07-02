@@ -24,10 +24,6 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
 - [Post-Install Verification](#post-install-verification)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
-  - [Find your Splunk Web URL](#1-find-your-splunk-web-url)
-  - [Install via Splunk UI](#2-install-via-splunk-ui)
-  - [Onboard to the AI Tier (SAIA Endpoint)](#3-onboard-to-the-ai-tier-saia-endpoint)
-  - [Air-gapped install](#4-air-gapped-install-no-browser-access-to-cluster)
 - [Common Operations](#common-operations)
 - [Troubleshooting](#troubleshooting)
 
@@ -129,14 +125,6 @@ graph TB
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
-
-### k0s Runtime Behaviour
-
-| Behaviour | Detail |
-|---|---|
-| k0s config persistence | The installer writes k0s config to `/etc/k0s/k0s.yaml` before starting the controller so the config survives node reboots |
-| Kine compaction | `compact-interval: 5m` is set in the kine `extraArgs` to prevent unbounded SQLite DB growth on single-node clusters |
-| containerd v2 insecure registry | On containerd ≥ 2.x (k0s ≥ 1.33) the installer writes both a `config_path` drop-in and a per-registry `hosts.toml` — the legacy `io.containerd.grpc.v1.cri` plugin key is silently ignored by containerd 2.x |
 
 > **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are access-controlled through your private registry. Contact your Splunk account team to confirm entitlements before deployment.
 
@@ -513,15 +501,8 @@ Model weights (>120 GB) must be staged to your object store. Do this on the conn
 ```bash
 cd tools/artifacts_download_upload_scripts
 
-# Download from HuggingFace — pass GPU type explicitly or get prompted interactively
+# Download from HuggingFace — pass GPU type or select interactively when prompted
 ./download_from_huggingface.sh --accelerator l40s   # or --accelerator h100
-
-# When called without --accelerator and no ACCELERATOR env var, the script
-# asks interactively:
-#   Select GPU type:
-#     1) l40s
-#     2) h100
-#   Enter 1 or 2:
 
 # Upload to your object store (endpoint must be reachable from this machine)
 ./upload_to_minio.sh    # or upload_to_s3.sh, upload_to_seaweedfs.sh
@@ -803,11 +784,10 @@ If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 
 ## Install the Splunk AI Assistant App
 
 After the cluster is healthy, install the **Splunk AI Assistant** app
-(`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance to enable
-the AI chat UI, then onboard it to the AI tier so prompts are routed to the
-inference backend.
+(`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance, then
+onboard it to the AI tier.
 
-> **Obtaining the app:** `Splunk_AI_Assistant_Cloud.tgz` is provided by your Splunk account team as part of your Splunk AI Platform entitlement. Contact your Splunk representative if you do not have it.
+> **Obtaining the app:** `Splunk_AI_Assistant_Cloud.tgz` is provided by your Splunk account team. Contact your Splunk representative if you do not have it.
 
 ### 1. Find your Splunk Web URL
 
@@ -818,87 +798,31 @@ kubectl get secret splunk-standalone-secret -n ai-platform \
 
 # NodePort (default) — open on any worker node IP
 kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
+# → http://<node-ip>:<nodePort>
+```
 
-# LoadBalancer — if MetalLB is configured
+### 2. Install the app
+
+1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`)
+2. **Apps → Manage Apps → Install app from file**
+3. Select `Splunk_AI_Assistant_Cloud.tgz`, check **Upgrade app** if updating, click **Upload**
+4. Restart Splunk if prompted
+
+### 3. Onboard to the AI tier
+
+The app needs the SAIA API URL (`http://<node-ip>:<nodePort>`) to route prompts to the AI backend.
+
+```bash
+# Find the SAIA NodePort
 kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-
-# Quick access without external exposure
-kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
-# → http://localhost:8000
+# PORT(S) column shows  8080:<nodePort>/TCP  — use that nodePort
 ```
 
-### 2. Install via Splunk UI
+In Splunk Web: **Splunk AI Assistant → Configuration** → enter `http://<worker-node-ip>:<nodePort>` as the AI Tier Endpoint and save.
 
-1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`, default port **8000**)
-2. Click **Apps → Manage Apps**
-3. Click **Install app from file**, select `Splunk_AI_Assistant_Cloud.tgz`
-4. Check **Upgrade app** if updating an existing installation, then click **Upload**
-5. Restart Splunk if prompted
+> **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
 
-### 3. Onboard to the AI Tier (SAIA Endpoint)
-
-After installing the app, you must point it at the SAIA API so prompts reach the AI backend. The SAIA API is exposed as a **NodePort** service — you need `http://<node-ip>:<nodePort>`.
-
-**Step 1 — find the SAIA NodePort**
-
-```bash
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-# NAME          TYPE       CLUSTER-IP    EXTERNAL-IP  PORT(S)         AGE
-# saia-service  NodePort   10.96.x.x     <none>       8080:30080/TCP  5m
-#                                                            ^^^^^^^^
-#                                                            nodePort
-```
-
-The SAIA API URL is `http://<any-worker-node-ip>:<nodePort>` (e.g. `http://10.0.0.21:30080`).
-
-**Step 2 — configure the app via Splunk UI**
-
-In Splunk Web, navigate to:
-**Splunk AI Assistant → Configuration** (or go to `/en-US/app/Splunk_AI_Assistant_Cloud/setup`)
-
-Enter the SAIA API URL in the **AI Tier Endpoint** field and save.
-
-**Step 3 — or configure via `splunkaiassistant.conf` (scripted / air-gapped)**
-
-```bash
-# Replace <worker-node-ip> and <nodePort> with values from Step 1
-SAIA_URL="http://<worker-node-ip>:<nodePort>"
-
-kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
-  mkdir -p /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local
-  cat > /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf <<EOF
-[splunk_ai_assistant]
-feedback_enabled = true
-
-[saia_sok_configurations]
-saia_endpoint = ${SAIA_URL}
-EOF"
-
-# Reload without full restart
-kubectl exec -n ai-platform splunk-standalone-0 -- \
-  /opt/splunk/bin/splunk _internal call \
-  /apps/local/Splunk_AI_Assistant_Cloud/_reload \
-  -auth admin:"\$(kubectl get secret splunk-standalone-secret \
-    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)"
-```
-
-**Step 4 — smoke test**
-
-Open the Splunk AI Assistant app in Splunk Web, type a prompt, and confirm a response is returned from the AI backend. A working response means Splunk → SAIA API → Ray inference is end-to-end healthy.
-
-### 4. Air-gapped install (no browser access to cluster)
-
-```bash
-APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
-kubectl cp "${APP_TGZ}" ai-platform/splunk-standalone-0:/tmp/${APP_TGZ}
-kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
-  tar -xzf /tmp/${APP_TGZ} -C /opt/splunk/etc/apps && rm /tmp/${APP_TGZ}"
-kubectl exec -n ai-platform splunk-standalone-0 -- /opt/splunk/bin/splunk restart
-```
-
-Then follow Step 3 above to configure the SAIA endpoint.
-
-### 5. Verify
+### 4. Verify
 
 ```bash
 kubectl get standalone splunk-standalone -n ai-platform -o json \
@@ -906,9 +830,7 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 # deployStatus: 3 = installed
 ```
 
-> **Full details** — app configuration, `splunkaiassistant.conf`, air-gapped
-> install steps, and troubleshooting are in
-> [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
+Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end connectivity.
 
 ---
 
@@ -950,23 +872,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
-The GPU accelerator type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`) and forwarded automatically to the download script. If unset it defaults to `l40s` with a warning.
-
-When running the download script directly (outside the installer):
-
-```bash
-cd tools/artifacts_download_upload_scripts
-
-# Explicit — pass flag
-./download_from_huggingface.sh --accelerator l40s   # or h100
-
-# Interactive — prompted when no flag and no ACCELERATOR env var
-./download_from_huggingface.sh
-#   Select GPU type:
-#     1) l40s
-#     2) h100
-#   Enter 1 or 2:
-```
+The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for direct script usage and `--accelerator` flag details.
 
 ### Upgrade the platform
 
