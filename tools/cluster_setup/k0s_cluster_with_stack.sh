@@ -809,20 +809,22 @@ preflight_checks() {
     pf_warn "python3 not found — image registry auth check will be skipped (install python3 to enable it)."
   fi
 
-  # Object-store CLI tools — required only for the configured backend.
+  # Object-store CLI tools — used for the model staging pre-check.
+  # If absent, the pre-check is skipped and staging proceeds unconditionally
+  # (fail-open); install will still succeed but staged-model validation is bypassed.
   case "${OBJ_STORE_TYPE:-}" in
     aws)
       if command -v aws >/dev/null 2>&1; then
-        pf_ok "aws CLI found (required for OBJ_STORE_TYPE=aws)"
+        pf_ok "aws CLI found"
       else
-        pf_fail "aws CLI not found — required for objectStore.type=aws. Install: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+        pf_warn "aws CLI not found — model staging pre-check will be skipped. Install aws CLI to enable it: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
       fi
       ;;
     minio|seaweedfs|s3compat)
       if command -v mc >/dev/null 2>&1; then
-        pf_ok "mc (MinIO client) found (required for OBJ_STORE_TYPE=${OBJ_STORE_TYPE})"
+        pf_ok "mc (MinIO client) found"
       else
-        pf_fail "mc (MinIO client) not found — required for objectStore.type=${OBJ_STORE_TYPE}. Install: https://min.io/docs/minio/linux/reference/minio-mc.html"
+        pf_warn "mc (MinIO client) not found — model staging pre-check will be skipped. Install mc to enable it: https://min.io/docs/minio/linux/reference/minio-mc.html"
       fi
       ;;
   esac
