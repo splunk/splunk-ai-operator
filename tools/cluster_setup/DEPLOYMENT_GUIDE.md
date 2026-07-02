@@ -254,11 +254,13 @@ The config sections to fill in:
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
 | `nodes.existingIPs` | IP addresses of your controller and worker nodes |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
-| `images` | Your registry URL + all image tags |
-| `aiPlatform` | `defaultAcceleratorType` — set to `L40S` |
+| `images.registry` | Your registry hostname, e.g. `123456789.dkr.ecr.us-east-2.amazonaws.com` or `registry.internal:5000` |
+| `images.registryInsecure` | `true` only for plain-HTTP (no-TLS) registries; leave `false` (default) for ECR, Harbor, or any HTTPS registry |
+| `images` (tags) | All image tags pointing at your registry |
+| `aiPlatform` | `defaultAcceleratorType` — `L40S` or `H100` |
 | `metallb.pool.addresses` | A free IP range on your LAN (for LoadBalancer VIP) |
 
-> For full field descriptions, defaults, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#configuration).
+> For full field descriptions, secure vs insecure registry guidance, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#images-section).
 
 **2. Validate your config before installing**
 
@@ -493,7 +495,7 @@ Model weights (>120 GB) must be staged to your object store. Do this on the conn
 |---|---|---|
 | Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
-| Internet | Stable broadband | Downloads >120 GB from HuggingFace; a flaky connection will require re-running with `SKIP_IF_EXISTS=1` |
+| Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run on a flaky connection — already-staged models are skipped automatically |
 | CPU | 4 cores | Recommended for parallel upload scripts |
 
 > **Same machine as the installer?** The installer machine already runs `kubectl`, `helm`, and `ssh` — it can also run model staging. Just ensure the **disk requirement** is met. `/tmp` or the working directory must have 250 GB free.
@@ -841,8 +843,9 @@ Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end co
 The installer is safe to re-run for most steps — Helm releases are upgraded if they already exist, and k0s join is skipped for nodes that are already Ready.
 
 **Steps that are NOT idempotent:**
-- **Model staging** — re-downloads files already on disk unless you set `SKIP_IF_EXISTS=1`
 - **`clean-all`** — destructive; wipes all k0s state from every node with no recovery
+
+Model staging is now **resumable** — re-runs skip already-staged models automatically. No flags needed.
 
 If install fails partway, re-run directly:
 
@@ -867,12 +870,9 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
-
-# Skip models already downloaded locally
-SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
-The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for direct script usage and `--accelerator` flag details.
+The command is resumable — it checks which models are already staged in the object store and only downloads/uploads what is missing. The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for details on the pre-check, per-model logging, and direct script usage.
 
 ### Upgrade the platform
 
@@ -971,6 +971,9 @@ flowchart TD
 | "Checksum verification failed" | Re-transfer the bundle | `sha256sum airgap-bundle-<date>.tar.gz` and compare |
 | "Expected chart not found" | `ls /opt/airgap/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
+| `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](K0S_README.md#insecure-registry-support-containerd-v2) |
+| All models reported MISSING after a successful upload | `mc ls myminio/<bucket>/staging_state/` | Bucket name has uppercase letters — the upload scripts normalize to lowercase; use a lowercase `storage.objectStore.bucket` value. See [Model Staging Issues](K0S_README.md#model-staging-issues) |
+| All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](K0S_README.md#switching-defaultacceleratortype-from-l40s-to-h100-shows-models-as-missing) |
 | Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in your bundle (rebuild with current `prepare_airgap_bundle.sh` if not); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
 | SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
