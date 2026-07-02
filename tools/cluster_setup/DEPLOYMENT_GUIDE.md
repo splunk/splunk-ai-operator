@@ -254,11 +254,13 @@ The config sections to fill in:
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
 | `nodes.existingIPs` | IP addresses of your controller and worker nodes |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
-| `images` | Your registry URL + all image tags |
-| `aiPlatform` | `defaultAcceleratorType` — set to `L40S` |
+| `images.registry` | Your registry hostname, e.g. `123456789.dkr.ecr.us-east-2.amazonaws.com` or `registry.internal:5000` |
+| `images.registryInsecure` | `true` only for plain-HTTP (no-TLS) registries; leave `false` (default) for ECR, Harbor, or any HTTPS registry |
+| `images` (tags) | All image tags pointing at your registry |
+| `aiPlatform` | `defaultAcceleratorType` — `L40S` or `H100` |
 | `metallb.pool.addresses` | A free IP range on your LAN (for LoadBalancer VIP) |
 
-> For full field descriptions, defaults, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#configuration).
+> For full field descriptions, secure vs insecure registry guidance, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#images-section).
 
 **2. Validate your config before installing**
 
@@ -969,6 +971,7 @@ flowchart TD
 | "Checksum verification failed" | Re-transfer the bundle | `sha256sum airgap-bundle-<date>.tar.gz` and compare |
 | "Expected chart not found" | `ls /opt/airgap/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
+| `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](K0S_README.md#insecure-registry-support-containerd-v2) |
 | Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in your bundle (rebuild with current `prepare_airgap_bundle.sh` if not); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
 | SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |

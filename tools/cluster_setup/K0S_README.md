@@ -423,7 +423,8 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `images.registry` | No | `""` | Registry prefix for short image paths |
+| `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
+| `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
 | `images.operator.image` | **Yes** | — | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
@@ -436,6 +437,17 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
+
+**Secure vs insecure registry — which to use:**
+
+| Registry type | `images.registry` | `images.registryInsecure` | Notes |
+|---|---|---|---|
+| AWS ECR | `<account>.dkr.ecr.<region>.amazonaws.com` | `false` (default) | HTTPS; use `imagePullSecrets.autoCreateECR: true` for token refresh |
+| Harbor / internal HTTPS | `registry.internal:443` | `false` (default) | HTTPS with valid TLS cert — no extra config needed |
+| Plain-HTTP internal mirror | `10.0.0.5:5000` or `registry.internal:5000` | **`true`** | Installer writes containerd config for HTTP pulls on every node; see [Insecure Registry Support](#insecure-registry-support-containerd-v2) |
+| Docker Hub | `docker.io` | `false` (default) | Public HTTPS — no `images.registry` needed unless mirroring |
+
+> **Do not set `registryInsecure: true` for HTTPS registries.** It has no effect on TLS registries and may cause unexpected behaviour.
 
 **Image patching chain:** The script reads these config values, resolves them via `build_image_url()` (prepends registry if needed), then uses `sed` to patch the corresponding `RELATED_IMAGE_*` env vars in manifest files:
 
