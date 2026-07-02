@@ -784,7 +784,7 @@ object_store_auth_looks_like_placeholder() {
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
-  for tool in ssh kubectl helm git jq; do
+  for tool in ssh curl kubectl helm git jq; do
     if command -v "$tool" >/dev/null 2>&1; then
       pf_ok "$tool found"
     else
@@ -799,6 +799,33 @@ preflight_checks() {
   else
     pf_warn "yq not found — install it for reliable config parsing (brew install yq / snap install yq). Falling back to grep/awk which may miss complex config values."
   fi
+
+  # python3 is used by preflight_check_registry() to parse Bearer token JSON.
+  # Without it the auth check degrades gracefully (skips manifest probe) but
+  # it is good to surface the gap early.
+  if command -v python3 >/dev/null 2>&1; then
+    pf_ok "python3 found"
+  else
+    pf_warn "python3 not found — image registry auth check will be skipped (install python3 to enable it)."
+  fi
+
+  # Object-store CLI tools — required only for the configured backend.
+  case "${OBJ_STORE_TYPE:-}" in
+    aws)
+      if command -v aws >/dev/null 2>&1; then
+        pf_ok "aws CLI found (required for OBJ_STORE_TYPE=aws)"
+      else
+        pf_fail "aws CLI not found — required for objectStore.type=aws. Install: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+      fi
+      ;;
+    minio|seaweedfs|s3compat)
+      if command -v mc >/dev/null 2>&1; then
+        pf_ok "mc (MinIO client) found (required for OBJ_STORE_TYPE=${OBJ_STORE_TYPE})"
+      else
+        pf_fail "mc (MinIO client) not found — required for objectStore.type=${OBJ_STORE_TYPE}. Install: https://min.io/docs/minio/linux/reference/minio-mc.html"
+      fi
+      ;;
+  esac
 
   pf_header "Configuration"
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"
