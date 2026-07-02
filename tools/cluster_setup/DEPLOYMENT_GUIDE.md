@@ -123,7 +123,7 @@ graph TB
 | RHEL | 9 | Only supported OS for cluster nodes |
 | NVIDIA driver | `nvidia-driver:latest-dkms` (DKMS module) | Installed via NVIDIA repo on GPU nodes; the older `cuda-drivers` meta-package is no longer published |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
-| GPU hardware | NVIDIA L40S | Only `defaultAcceleratorType: L40S` is supported |
+| GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
 
 > **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are access-controlled through your private registry. Contact your Splunk account team to confirm entitlements before deployment.
@@ -501,8 +501,8 @@ Model weights (>120 GB) must be staged to your object store. Do this on the conn
 ```bash
 cd tools/artifacts_download_upload_scripts
 
-# Download from HuggingFace (HF_TOKEN is optional for the current release)
-./download_from_huggingface.sh
+# Download from HuggingFace — pass GPU type or select interactively when prompted
+./download_from_huggingface.sh --accelerator l40s   # or --accelerator h100
 
 # Upload to your object store (endpoint must be reachable from this machine)
 ./upload_to_minio.sh    # or upload_to_s3.sh, upload_to_seaweedfs.sh
@@ -784,10 +784,10 @@ If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 
 ## Install the Splunk AI Assistant App
 
 After the cluster is healthy, install the **Splunk AI Assistant** app
-(`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance to enable
-the AI chat UI.
+(`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance, then
+onboard it to the AI tier.
 
-> **Obtaining the app:** `Splunk_AI_Assistant_Cloud.tgz` is provided by your Splunk account team as part of your Splunk AI Platform entitlement. Contact your Splunk representative if you do not have it.
+> **Obtaining the app:** `Splunk_AI_Assistant_Cloud.tgz` is provided by your Splunk account team. Contact your Splunk representative if you do not have it.
 
 ### 1. Find your Splunk Web URL
 
@@ -798,32 +798,29 @@ kubectl get secret splunk-standalone-secret -n ai-platform \
 
 # NodePort (default) — open on any worker node IP
 kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
-
-# LoadBalancer — if MetalLB is configured
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-
-# Quick access without external exposure
-kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
-# → http://localhost:8000
+# → http://<node-ip>:<nodePort>
 ```
 
-### 2. Install via Splunk UI
+### 2. Install the app
 
-1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`, default port **8000**)
-2. Click **Apps → Manage Apps**
-3. Click **Install app from file**, select `Splunk_AI_Assistant_Cloud.tgz`
-4. Check **Upgrade app** if updating an existing installation, then click **Upload**
-5. Restart Splunk if prompted
+1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`)
+2. **Apps → Manage Apps → Install app from file**
+3. Select `Splunk_AI_Assistant_Cloud.tgz`, check **Upgrade app** if updating, click **Upload**
+4. Restart Splunk if prompted
 
-### 3. Air-gapped install (no browser access to cluster)
+### 3. Onboard to the AI tier
+
+The app needs the SAIA API URL (`http://<node-ip>:<nodePort>`) to route prompts to the AI backend.
 
 ```bash
-APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
-kubectl cp "${APP_TGZ}" ai-platform/splunk-standalone-0:/tmp/${APP_TGZ}
-kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
-  tar -xzf /tmp/${APP_TGZ} -C /opt/splunk/etc/apps && rm /tmp/${APP_TGZ}"
-kubectl exec -n ai-platform splunk-standalone-0 -- /opt/splunk/bin/splunk restart
+# Find the SAIA NodePort
+kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
+# PORT(S) column shows  8080:<nodePort>/TCP  — use that nodePort
 ```
+
+In Splunk Web: **Splunk AI Assistant → Configuration** → enter `http://<worker-node-ip>:<nodePort>` as the AI Tier Endpoint and save.
+
+> **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
 
 ### 4. Verify
 
@@ -833,9 +830,7 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 # deployStatus: 3 = installed
 ```
 
-> **Full details** — app configuration, `splunkaiassistant.conf`, air-gapped
-> install steps, and troubleshooting are in
-> [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
+Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end connectivity.
 
 ---
 
@@ -876,6 +871,8 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 # Skip models already downloaded locally
 SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
+
+The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for direct script usage and `--accelerator` flag details.
 
 ### Upgrade the platform
 
@@ -982,4 +979,4 @@ flowchart TD
 
 ---
 
-*Splunk AI Platform · k0s Deployment Guide · Last updated 2026-06-15*
+*Splunk AI Platform · k0s Deployment Guide · Last updated 2026-07-02*

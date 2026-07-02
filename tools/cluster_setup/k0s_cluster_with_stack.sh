@@ -501,6 +501,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
+  # Leave false (default) for ECR, Docker Hub, Harbor, or any HTTPS registry.
+  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "false"' "$CONFIG_FILE" 2>/dev/null || echo "false")"
   OPERATOR_IMAGE="$(yq eval '.images.operator.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_IMAGE="$(yq eval '.images.splunk.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_OPERATOR_IMAGE="$(yq eval '.images.splunk.operatorImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -1164,6 +1167,53 @@ preflight_check_node_storage() {
   done
 }
 
+# ====== INSECURE REGISTRY CONFIGURATION ======
+# Configures the IMAGE_REGISTRY (read from config) as an insecure (plain-HTTP)
+# registry on a node. Must be called AFTER k0s start so containerd has written
+# /etc/k0s/containerd.toml and the v1/v2 detection is reliable.
+#
+# containerd v2 (k0s >= 1.33, containerd >= 2.x) uses per-registry hosts.toml
+# under /etc/k0s/containerd/certs.d/<registry>/. The legacy v1 drop-in TOML
+# (io.containerd.grpc.v1.cri) is silently ignored by containerd 2.x.
+#
+# Detection: check the containerd binary version directly — more reliable than
+# inspecting the toml file, which may not exist at call time on first install.
+configure_insecure_registry_on_node() {
+  local node_ip="$1"
+  local registry="${IMAGE_REGISTRY:-}"
+
+  # Only configure plain-HTTP (insecure) access when explicitly opted in.
+  # TLS registries (ECR, Docker Hub, Harbor) must not be redirected to HTTP.
+  [[ -z "${registry}" ]] && return 0
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" != "true" ]] && return 0
+
+  log "  Configuring insecure registry ${registry} on ${node_ip}..."
+  ssh_exec "${node_ip}" "
+    # Detect containerd major version from the binary k0s bundles
+    containerd_version=\$(sudo /var/lib/k0s/bin/containerd --version 2>/dev/null | grep -oP 'v\K[0-9]+' | head -1)
+    echo \"--- containerd major version: \${containerd_version:-unknown} ---\"
+
+    if [[ \"\${containerd_version:-1}\" -ge 2 ]]; then
+      echo '--- containerd v2: writing config_path drop-in + hosts.toml ---'
+      # Drop-in that sets config_path so containerd reads the certs.d directory.
+      # Without this, the per-registry hosts.toml is silently ignored by containerd 2.x.
+      sudo mkdir -p /etc/k0s/containerd.d
+      printf '[plugins.\"io.containerd.cri.v1.images\".registry]\n  config_path = \"/etc/k0s/containerd/certs.d\"\n' \
+        | sudo tee /etc/k0s/containerd.d/registry-config-path.toml >/dev/null
+      # Per-registry hosts.toml for plain-HTTP access
+      sudo mkdir -p \"/etc/k0s/containerd/certs.d/${registry}\"
+      printf 'server = \"http://${registry}\"\n\n[host.\"http://${registry}\"]\n  capabilities = [\"pull\", \"resolve\", \"push\"]\n  skip_verify = true\n' \
+        | sudo tee \"/etc/k0s/containerd/certs.d/${registry}/hosts.toml\" >/dev/null
+    else
+      echo '--- containerd v1: writing drop-in TOML ---'
+      sudo mkdir -p /etc/k0s/containerd.d
+      printf '[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]\n    [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"${registry}\"]\n      endpoint = [\"http://${registry}\"]\n  [plugins.\"io.containerd.grpc.v1.cri\".registry.configs]\n    [plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"${registry}\".tls]\n      insecure_skip_verify = true\n' \
+        | sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null
+    fi
+  "
+  log "  ✓ Insecure registry configured on ${node_ip}"
+}
+
 # ====== K0S CLUSTER INSTALLATION ======
 install_k0s_cluster() {
   log "Installing k0s cluster..."
@@ -1186,9 +1236,38 @@ install_k0s_cluster() {
   fi
   prepare_nodes_for_k0s "${all_ips[@]}"
 
-  # Generate k0s config
+  # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
+  ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
+
+  # Safety gate: refuse to wipe if a live cluster with Ready nodes exists.
+  # This prevents accidental data loss when the existing-cluster detection
+  # (useExisting) flakes due to an SSH timeout or transient k0s status error.
+  if ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null" 2>/dev/null | grep -q ' Ready'; then
+    err "k0s cluster on ${controller_ip} has Ready nodes — refusing to wipe.
+    Use 'delete' or 'clean-all' to tear down first, or set useExisting=auto in config."
+  fi
+
+  # Clean stale k0s state from any previous run.
+  # Must run BEFORE config generation: rm -rf /etc/k0s would otherwise delete
+  # the /etc/k0s/k0s.yaml we are about to write, causing k0s install to fail.
+  ssh_exec "${controller_ip}" "
+    sudo systemctl stop k0scontroller 2>/dev/null || true
+    sudo systemctl reset-failed k0scontroller 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0scontroller.service 2>/dev/null || true
+    sudo systemctl stop k0sworker 2>/dev/null || true
+    sudo systemctl reset-failed k0sworker 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0sworker.service 2>/dev/null || true
+    sudo pkill -9 containerd-shim 2>/dev/null || true
+    sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s 2>/dev/null || true
+    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+    sudo systemctl daemon-reload
+  " 2>/dev/null || true
+
+  # Generate k0s config into a persistent location so it survives reboots.
+  # /tmp is cleared on reboot which caused k0s to fall back to defaults
+  # (including --compact-interval=0) after a node restart.
   log "Generating k0s configuration..."
-  ssh_exec "${controller_ip}" "k0s config create > /tmp/k0s.yaml"
+  ssh_exec "${controller_ip}" "sudo mkdir -p /etc/k0s && k0s config create | sudo tee /etc/k0s/k0s.yaml >/dev/null"
 
   # Configure k0s API with the controller IP for SANs and externalAddress
   log "Configuring k0s with controller IP ${controller_ip}..."
@@ -1196,7 +1275,7 @@ install_k0s_cluster() {
 import yaml
 
 # Read the k0s config
-with open('/tmp/k0s.yaml', 'r') as f:
+with open('/etc/k0s/k0s.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
 # Add the controller IP to SANs (for kubectl access and cluster communication)
@@ -1220,49 +1299,31 @@ if 'calico' not in config['spec']['network']:
     config['spec']['network']['calico'] = {}
 config['spec']['network']['calico']['mode'] = 'vxlan'
 
-# Set kine for storage
+# Set kine for storage with compaction enabled to prevent unbounded DB growth.
+# k0s KineConfig exposes extraArgs (map) and rawArgs (slice) — there is no
+# compactInterval field; the flag must be passed via extraArgs.
 if 'storage' not in config['spec']:
     config['spec']['storage'] = {}
 config['spec']['storage']['type'] = 'kine'
+if 'kine' not in config['spec']['storage']:
+    config['spec']['storage']['kine'] = {}
+if 'extraArgs' not in config['spec']['storage']['kine']:
+    config['spec']['storage']['kine']['extraArgs'] = {}
+config['spec']['storage']['kine']['extraArgs']['compact-interval'] = '5m'
 
 # Write back
-with open('/tmp/k0s.yaml', 'w') as f:
+with open('/etc/k0s/k0s.yaml', 'w') as f:
     yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 PYSCRIPT"
 
-  ssh_exec "${controller_ip}" "python3 /tmp/k0s-config-update.py"
+  ssh_exec "${controller_ip}" "sudo python3 /tmp/k0s-config-update.py"
 
   log "Verifying k0s configuration includes controller IP..."
-  ssh_exec "${controller_ip}" "grep -A3 'api:' /tmp/k0s.yaml | head -5"
-
-  # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
-  ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
-
-  # Safety gate: refuse to wipe if a live cluster with Ready nodes exists.
-  # This prevents accidental data loss when the existing-cluster detection
-  # (useExisting) flakes due to an SSH timeout or transient k0s status error.
-  if ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null" 2>/dev/null | grep -q ' Ready'; then
-    err "k0s cluster on ${controller_ip} has Ready nodes — refusing to wipe.
-    Use 'delete' or 'clean-all' to tear down first, or set useExisting=auto in config."
-  fi
-
-  # Clean stale k0s state from any previous run
-  ssh_exec "${controller_ip}" "
-    sudo systemctl stop k0scontroller 2>/dev/null || true
-    sudo systemctl reset-failed k0scontroller 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/k0scontroller.service 2>/dev/null || true
-    sudo systemctl stop k0sworker 2>/dev/null || true
-    sudo systemctl reset-failed k0sworker 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/k0sworker.service 2>/dev/null || true
-    sudo pkill -9 containerd-shim 2>/dev/null || true
-    sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s 2>/dev/null || true
-    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
-    sudo systemctl daemon-reload
-  " 2>/dev/null || true
+  ssh_exec "${controller_ip}" "sudo grep -A3 'api:' /etc/k0s/k0s.yaml | head -5"
 
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."
-  ssh_exec "${controller_ip}" "sudo k0s install controller --config /tmp/k0s.yaml --enable-worker"
+  ssh_exec "${controller_ip}" "sudo k0s install controller --config /etc/k0s/k0s.yaml --enable-worker"
   # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
   # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
   stage_k0s_image_bundle "${controller_ip}"
@@ -1279,6 +1340,10 @@ PYSCRIPT"
     ctrl_retries=$((ctrl_retries + 5))
     log "  Waiting... ${ctrl_retries}/300s"
   done
+
+  # Configure insecure registry after k0s start so that containerd has written
+  # /etc/k0s/containerd.toml — required for correct containerd v1/v2 detection.
+  configure_insecure_registry_on_node "${controller_ip}"
 
   # Generate worker token
   log "Generating worker join token..."
@@ -1335,6 +1400,9 @@ PYSCRIPT"
     log "  Starting k0s worker on ${worker_ip}..."
     if ssh_exec "${worker_ip}" "sudo k0s start"; then
       log "  ✓ k0s started on ${worker_ip}"
+      # Configure insecure registry after k0s start so containerd is running
+      # and the v1/v2 detection against the containerd binary is reliable.
+      configure_insecure_registry_on_node "${worker_ip}"
     else
       warn "  ✗ Failed to start k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
