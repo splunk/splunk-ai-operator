@@ -258,6 +258,75 @@ _print_unhealthy_pod_summary
 assert_eq "scenario 4: truncation ellipsis shown for downstream" \
   "1" "$(echo "${_captured}" | grep -c "… and" || true)"
 
+# ── Tests: k0s config path ────────────────────────────────────────────────────
+# Verify that the install script uses /etc/k0s/k0s.yaml (not /tmp/k0s.yaml)
+# everywhere — config generation, python update script, install command, verify.
+
+suite "k0s config path"
+
+assert_eq "config create writes to /etc/k0s/k0s.yaml" \
+  "0" "$(grep -c '/tmp/k0s\.yaml' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "k0s install controller uses /etc/k0s/k0s.yaml" \
+  "1" "$(grep -c 'k0s install controller.*--config /etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "python update script reads /etc/k0s/k0s.yaml" \
+  "1" "$(grep -c "open('/etc/k0s/k0s.yaml', 'r')" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "python update script writes /etc/k0s/k0s.yaml" \
+  "1" "$(grep -c "open('/etc/k0s/k0s.yaml', 'w')" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "verify step uses /etc/k0s/k0s.yaml" \
+  "1" "$(grep -c 'grep.*api.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
+
+# ── Tests: kine compaction ─────────────────────────────────────────────────────
+# Verify that the generated k0s config sets kine compactInterval to prevent
+# unbounded SQLite DB growth (the 16GB DB bug we fixed).
+
+suite "kine compaction"
+
+assert_eq "kine compactInterval is set in config update script" \
+  "1" "$(grep -c "compactInterval.*5m\|5m.*compactInterval" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "kine dict is initialised before setting compactInterval" \
+  "1" "$(grep -c "'kine' not in config\['spec'\]\['storage'\]" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "storage type is still set to kine" \
+  "1" "$(grep -c "config\['spec'\]\['storage'\]\['type'\] = 'kine'" "${SCRIPT}" | tr -d '[:space:]')"
+
+# ── Tests: configure_insecure_registry_on_node ────────────────────────────────
+# Verify the function exists, uses IMAGE_REGISTRY (not a hardcoded IP), detects
+# containerd version from the binary, and is called AFTER the API server wait.
+
+suite "configure_insecure_registry_on_node"
+
+assert_eq "function is defined" \
+  "1" "$(grep -c '^configure_insecure_registry_on_node()' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "uses IMAGE_REGISTRY variable not hardcoded IP" \
+  "0" "$(grep -A40 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '172\.[0-9]' | tr -d '[:space:]')"
+
+assert_eq "detects containerd version from binary path" \
+  "1" "$(grep -c '/var/lib/k0s/bin/containerd --version' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "v2 path writes hosts.toml (functional line in function body)" \
+  "1" "$(grep 'hosts\.toml' "${SCRIPT}" | grep -c 'tee\|mkdir' | tr -d '[:space:]')"
+
+assert_eq "v2 path uses /etc/k0s/containerd/certs.d (functional line in function body)" \
+  "1" "$(grep 'etc/k0s/containerd/certs\.d' "${SCRIPT}" | grep -c 'mkdir' | tr -d '[:space:]')"
+
+assert_eq "v1 path writes drop-in TOML" \
+  "1" "$(grep -c 'insecure-registry\.toml' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "controller registry config called after API server wait loop" \
+  "1" "$(awk '/ctrl_retries < 60/{found=1} found && /configure_insecure_registry_on_node.*controller_ip/{print; exit}' "${SCRIPT}" | grep -c 'configure_insecure_registry_on_node' | tr -d '[:space:]')"
+
+assert_eq "worker registry config called after k0s start succeeds" \
+  "1" "$(awk '/sudo k0s start/{found=1} found && /configure_insecure_registry_on_node.*worker_ip/{print; exit}' "${SCRIPT}" | grep -c 'configure_insecure_registry_on_node' | tr -d '[:space:]')"
+
+assert_eq "returns early when IMAGE_REGISTRY is empty" \
+  "1" "$(grep -A5 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '\[\[ -z.*registry.*\]\] && return 0' | tr -d '[:space:]')"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""

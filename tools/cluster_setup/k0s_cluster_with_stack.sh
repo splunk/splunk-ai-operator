@@ -1164,6 +1164,44 @@ preflight_check_node_storage() {
   done
 }
 
+# ====== INSECURE REGISTRY CONFIGURATION ======
+# Configures the IMAGE_REGISTRY (read from config) as an insecure (plain-HTTP)
+# registry on a node. Must be called AFTER k0s start so containerd has written
+# /etc/k0s/containerd.toml and the v1/v2 detection is reliable.
+#
+# containerd v2 (k0s >= 1.33, containerd >= 2.x) uses per-registry hosts.toml
+# under /etc/k0s/containerd/certs.d/<registry>/. The legacy v1 drop-in TOML
+# (io.containerd.grpc.v1.cri) is silently ignored by containerd 2.x.
+#
+# Detection: check the containerd binary version directly — more reliable than
+# inspecting the toml file, which may not exist at call time on first install.
+configure_insecure_registry_on_node() {
+  local node_ip="$1"
+  local registry="${IMAGE_REGISTRY:-}"
+
+  [[ -z "${registry}" ]] && return 0
+
+  log "  Configuring insecure registry ${registry} on ${node_ip}..."
+  ssh_exec "${node_ip}" "
+    # Detect containerd major version from the binary k0s bundles
+    containerd_version=\$(sudo /var/lib/k0s/bin/containerd --version 2>/dev/null | grep -oP 'v\K[0-9]+' | head -1)
+    echo \"--- containerd major version: \${containerd_version:-unknown} ---\"
+
+    if [[ \"\${containerd_version:-1}\" -ge 2 ]]; then
+      echo '--- containerd v2: writing hosts.toml ---'
+      sudo mkdir -p \"/etc/k0s/containerd/certs.d/${registry}\"
+      printf 'server = \"http://${registry}\"\n\n[host.\"http://${registry}\"]\n  capabilities = [\"pull\", \"resolve\", \"push\"]\n  skip_verify = true\n' \
+        | sudo tee \"/etc/k0s/containerd/certs.d/${registry}/hosts.toml\" >/dev/null
+    else
+      echo '--- containerd v1: writing drop-in TOML ---'
+      sudo mkdir -p /etc/k0s/containerd.d
+      printf '[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]\n    [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"${registry}\"]\n      endpoint = [\"http://${registry}\"]\n  [plugins.\"io.containerd.grpc.v1.cri\".registry.configs]\n    [plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"${registry}\".tls]\n      insecure_skip_verify = true\n' \
+        | sudo tee /etc/k0s/containerd.d/insecure-registry.toml >/dev/null
+    fi
+  "
+  log "  ✓ Insecure registry configured on ${node_ip}"
+}
+
 # ====== K0S CLUSTER INSTALLATION ======
 install_k0s_cluster() {
   log "Installing k0s cluster..."
@@ -1186,9 +1224,11 @@ install_k0s_cluster() {
   fi
   prepare_nodes_for_k0s "${all_ips[@]}"
 
-  # Generate k0s config
+  # Generate k0s config into a persistent location so it survives reboots.
+  # /tmp is cleared on reboot which caused k0s to fall back to defaults
+  # (including --compact-interval=0) after a node restart.
   log "Generating k0s configuration..."
-  ssh_exec "${controller_ip}" "k0s config create > /tmp/k0s.yaml"
+  ssh_exec "${controller_ip}" "sudo mkdir -p /etc/k0s && k0s config create | sudo tee /etc/k0s/k0s.yaml >/dev/null"
 
   # Configure k0s API with the controller IP for SANs and externalAddress
   log "Configuring k0s with controller IP ${controller_ip}..."
@@ -1196,7 +1236,7 @@ install_k0s_cluster() {
 import yaml
 
 # Read the k0s config
-with open('/tmp/k0s.yaml', 'r') as f:
+with open('/etc/k0s/k0s.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
 # Add the controller IP to SANs (for kubectl access and cluster communication)
@@ -1220,20 +1260,23 @@ if 'calico' not in config['spec']['network']:
     config['spec']['network']['calico'] = {}
 config['spec']['network']['calico']['mode'] = 'vxlan'
 
-# Set kine for storage
+# Set kine for storage with compaction enabled to prevent unbounded DB growth
 if 'storage' not in config['spec']:
     config['spec']['storage'] = {}
 config['spec']['storage']['type'] = 'kine'
+if 'kine' not in config['spec']['storage']:
+    config['spec']['storage']['kine'] = {}
+config['spec']['storage']['kine']['compactInterval'] = '5m'
 
 # Write back
-with open('/tmp/k0s.yaml', 'w') as f:
+with open('/etc/k0s/k0s.yaml', 'w') as f:
     yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 PYSCRIPT"
 
-  ssh_exec "${controller_ip}" "python3 /tmp/k0s-config-update.py"
+  ssh_exec "${controller_ip}" "sudo python3 /tmp/k0s-config-update.py"
 
   log "Verifying k0s configuration includes controller IP..."
-  ssh_exec "${controller_ip}" "grep -A3 'api:' /tmp/k0s.yaml | head -5"
+  ssh_exec "${controller_ip}" "sudo grep -A3 'api:' /etc/k0s/k0s.yaml | head -5"
 
   # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
   ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
@@ -1262,7 +1305,7 @@ PYSCRIPT"
 
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."
-  ssh_exec "${controller_ip}" "sudo k0s install controller --config /tmp/k0s.yaml --enable-worker"
+  ssh_exec "${controller_ip}" "sudo k0s install controller --config /etc/k0s/k0s.yaml --enable-worker"
   # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
   # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
   stage_k0s_image_bundle "${controller_ip}"
@@ -1279,6 +1322,10 @@ PYSCRIPT"
     ctrl_retries=$((ctrl_retries + 5))
     log "  Waiting... ${ctrl_retries}/300s"
   done
+
+  # Configure insecure registry after k0s start so that containerd has written
+  # /etc/k0s/containerd.toml — required for correct containerd v1/v2 detection.
+  configure_insecure_registry_on_node "${controller_ip}"
 
   # Generate worker token
   log "Generating worker join token..."
@@ -1335,6 +1382,9 @@ PYSCRIPT"
     log "  Starting k0s worker on ${worker_ip}..."
     if ssh_exec "${worker_ip}" "sudo k0s start"; then
       log "  ✓ k0s started on ${worker_ip}"
+      # Configure insecure registry after k0s start so containerd is running
+      # and the v1/v2 detection against the containerd binary is reliable.
+      configure_insecure_registry_on_node "${worker_ip}"
     else
       warn "  ✗ Failed to start k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
