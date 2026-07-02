@@ -501,6 +501,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
+  # Leave false (default) for ECR, Docker Hub, Harbor, or any HTTPS registry.
+  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "false"' "$CONFIG_FILE" 2>/dev/null || echo "false")"
   OPERATOR_IMAGE="$(yq eval '.images.operator.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_IMAGE="$(yq eval '.images.splunk.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_OPERATOR_IMAGE="$(yq eval '.images.splunk.operatorImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -1179,7 +1182,10 @@ configure_insecure_registry_on_node() {
   local node_ip="$1"
   local registry="${IMAGE_REGISTRY:-}"
 
+  # Only configure plain-HTTP (insecure) access when explicitly opted in.
+  # TLS registries (ECR, Docker Hub, Harbor) must not be redirected to HTTP.
   [[ -z "${registry}" ]] && return 0
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" != "true" ]] && return 0
 
   log "  Configuring insecure registry ${registry} on ${node_ip}..."
   ssh_exec "${node_ip}" "
@@ -1188,7 +1194,13 @@ configure_insecure_registry_on_node() {
     echo \"--- containerd major version: \${containerd_version:-unknown} ---\"
 
     if [[ \"\${containerd_version:-1}\" -ge 2 ]]; then
-      echo '--- containerd v2: writing hosts.toml ---'
+      echo '--- containerd v2: writing config_path drop-in + hosts.toml ---'
+      # Drop-in that sets config_path so containerd reads the certs.d directory.
+      # Without this, the per-registry hosts.toml is silently ignored by containerd 2.x.
+      sudo mkdir -p /etc/k0s/containerd.d
+      printf '[plugins.\"io.containerd.cri.v1.images\".registry]\n  config_path = \"/etc/k0s/containerd/certs.d\"\n' \
+        | sudo tee /etc/k0s/containerd.d/registry-config-path.toml >/dev/null
+      # Per-registry hosts.toml for plain-HTTP access
       sudo mkdir -p \"/etc/k0s/containerd/certs.d/${registry}\"
       printf 'server = \"http://${registry}\"\n\n[host.\"http://${registry}\"]\n  capabilities = [\"pull\", \"resolve\", \"push\"]\n  skip_verify = true\n' \
         | sudo tee \"/etc/k0s/containerd/certs.d/${registry}/hosts.toml\" >/dev/null
@@ -1223,6 +1235,33 @@ install_k0s_cluster() {
     all_ips+=("${WORKER_IPS[@]}")
   fi
   prepare_nodes_for_k0s "${all_ips[@]}"
+
+  # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
+  ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
+
+  # Safety gate: refuse to wipe if a live cluster with Ready nodes exists.
+  # This prevents accidental data loss when the existing-cluster detection
+  # (useExisting) flakes due to an SSH timeout or transient k0s status error.
+  if ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null" 2>/dev/null | grep -q ' Ready'; then
+    err "k0s cluster on ${controller_ip} has Ready nodes — refusing to wipe.
+    Use 'delete' or 'clean-all' to tear down first, or set useExisting=auto in config."
+  fi
+
+  # Clean stale k0s state from any previous run.
+  # Must run BEFORE config generation: rm -rf /etc/k0s would otherwise delete
+  # the /etc/k0s/k0s.yaml we are about to write, causing k0s install to fail.
+  ssh_exec "${controller_ip}" "
+    sudo systemctl stop k0scontroller 2>/dev/null || true
+    sudo systemctl reset-failed k0scontroller 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0scontroller.service 2>/dev/null || true
+    sudo systemctl stop k0sworker 2>/dev/null || true
+    sudo systemctl reset-failed k0sworker 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/k0sworker.service 2>/dev/null || true
+    sudo pkill -9 containerd-shim 2>/dev/null || true
+    sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s 2>/dev/null || true
+    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
+    sudo systemctl daemon-reload
+  " 2>/dev/null || true
 
   # Generate k0s config into a persistent location so it survives reboots.
   # /tmp is cleared on reboot which caused k0s to fall back to defaults
@@ -1260,13 +1299,17 @@ if 'calico' not in config['spec']['network']:
     config['spec']['network']['calico'] = {}
 config['spec']['network']['calico']['mode'] = 'vxlan'
 
-# Set kine for storage with compaction enabled to prevent unbounded DB growth
+# Set kine for storage with compaction enabled to prevent unbounded DB growth.
+# k0s KineConfig exposes extraArgs (map) and rawArgs (slice) — there is no
+# compactInterval field; the flag must be passed via extraArgs.
 if 'storage' not in config['spec']:
     config['spec']['storage'] = {}
 config['spec']['storage']['type'] = 'kine'
 if 'kine' not in config['spec']['storage']:
     config['spec']['storage']['kine'] = {}
-config['spec']['storage']['kine']['compactInterval'] = '5m'
+if 'extraArgs' not in config['spec']['storage']['kine']:
+    config['spec']['storage']['kine']['extraArgs'] = {}
+config['spec']['storage']['kine']['extraArgs']['compact-interval'] = '5m'
 
 # Write back
 with open('/etc/k0s/k0s.yaml', 'w') as f:
@@ -1277,31 +1320,6 @@ PYSCRIPT"
 
   log "Verifying k0s configuration includes controller IP..."
   ssh_exec "${controller_ip}" "sudo grep -A3 'api:' /etc/k0s/k0s.yaml | head -5"
-
-  # Ensure k0s is in sudo's secure_path (some distros exclude /usr/local/bin)
-  ssh_exec "${controller_ip}" "if [ -f /usr/local/bin/k0s ] && [ ! -f /usr/bin/k0s ]; then sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s; fi" || true
-
-  # Safety gate: refuse to wipe if a live cluster with Ready nodes exists.
-  # This prevents accidental data loss when the existing-cluster detection
-  # (useExisting) flakes due to an SSH timeout or transient k0s status error.
-  if ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes --no-headers 2>/dev/null" 2>/dev/null | grep -q ' Ready'; then
-    err "k0s cluster on ${controller_ip} has Ready nodes — refusing to wipe.
-    Use 'delete' or 'clean-all' to tear down first, or set useExisting=auto in config."
-  fi
-
-  # Clean stale k0s state from any previous run
-  ssh_exec "${controller_ip}" "
-    sudo systemctl stop k0scontroller 2>/dev/null || true
-    sudo systemctl reset-failed k0scontroller 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/k0scontroller.service 2>/dev/null || true
-    sudo systemctl stop k0sworker 2>/dev/null || true
-    sudo systemctl reset-failed k0sworker 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/k0sworker.service 2>/dev/null || true
-    sudo pkill -9 containerd-shim 2>/dev/null || true
-    sudo rm -rf /var/lib/k0s /run/k0s /etc/k0s 2>/dev/null || true
-    sudo rm -f /run/k0s/containerd.sock 2>/dev/null || true
-    sudo systemctl daemon-reload
-  " 2>/dev/null || true
 
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."

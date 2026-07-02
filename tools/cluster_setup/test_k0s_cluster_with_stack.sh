@@ -280,23 +280,30 @@ assert_eq "verify step uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'grep.*api.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: kine compaction ─────────────────────────────────────────────────────
-# Verify that the generated k0s config sets kine compactInterval to prevent
-# unbounded SQLite DB growth (the 16GB DB bug we fixed).
+# Verify that the generated k0s config passes --compact-interval to kine via
+# extraArgs (the only valid path — KineConfig has no compactInterval field).
 
 suite "kine compaction"
 
-assert_eq "kine compactInterval is set in config update script" \
-  "1" "$(grep -c "compactInterval.*5m\|5m.*compactInterval" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "kine compact-interval passed via extraArgs" \
+  "1" "$(grep -c "extraArgs.*compact-interval\|compact-interval.*5m" "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "kine dict is initialised before setting compactInterval" \
+assert_eq "extraArgs dict is initialised before setting compact-interval" \
+  "1" "$(grep -c "'extraArgs' not in config\['spec'\]\['storage'\]\['kine'\]" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "kine dict is initialised before setting extraArgs" \
   "1" "$(grep -c "'kine' not in config\['spec'\]\['storage'\]" "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "storage type is still set to kine" \
   "1" "$(grep -c "config\['spec'\]\['storage'\]\['type'\] = 'kine'" "${SCRIPT}" | tr -d '[:space:]')"
 
+assert_eq "no bare compactInterval field (would be silently ignored by k0s)" \
+  "0" "$(grep -c "kine\]\['compactInterval'\]" "${SCRIPT}" | tr -d '[:space:]')"
+
 # ── Tests: configure_insecure_registry_on_node ────────────────────────────────
-# Verify the function exists, uses IMAGE_REGISTRY (not a hardcoded IP), detects
-# containerd version from the binary, and is called AFTER the API server wait.
+# Verify the function exists, is gated behind IMAGE_REGISTRY_INSECURE, uses
+# IMAGE_REGISTRY (not a hardcoded IP), writes the config_path drop-in for v2,
+# and is called AFTER the API server wait.
 
 suite "configure_insecure_registry_on_node"
 
@@ -304,10 +311,19 @@ assert_eq "function is defined" \
   "1" "$(grep -c '^configure_insecure_registry_on_node()' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "uses IMAGE_REGISTRY variable not hardcoded IP" \
-  "0" "$(grep -A40 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '172\.[0-9]' | tr -d '[:space:]')"
+  "0" "$(grep -A50 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '172\.[0-9]' | tr -d '[:space:]')"
+
+assert_eq "gated behind IMAGE_REGISTRY_INSECURE flag" \
+  "1" "$(grep -A8 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c 'IMAGE_REGISTRY_INSECURE' | tr -d '[:space:]')"
+
+assert_eq "IMAGE_REGISTRY_INSECURE loaded from config" \
+  "1" "$(grep -c 'IMAGE_REGISTRY_INSECURE.*registryInsecure' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "detects containerd version from binary path" \
   "1" "$(grep -c '/var/lib/k0s/bin/containerd --version' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "v2 path writes config_path drop-in (required for certs.d to be read)" \
+  "1" "$(grep -c 'registry-config-path\.toml' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "v2 path writes hosts.toml (functional line in function body)" \
   "1" "$(grep 'hosts\.toml' "${SCRIPT}" | grep -c 'tee\|mkdir' | tr -d '[:space:]')"
@@ -325,7 +341,7 @@ assert_eq "worker registry config called after k0s start succeeds" \
   "1" "$(awk '/sudo k0s start/{found=1} found && /configure_insecure_registry_on_node.*worker_ip/{print; exit}' "${SCRIPT}" | grep -c 'configure_insecure_registry_on_node' | tr -d '[:space:]')"
 
 assert_eq "returns early when IMAGE_REGISTRY is empty" \
-  "1" "$(grep -A5 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '\[\[ -z.*registry.*\]\] && return 0' | tr -d '[:space:]')"
+  "1" "$(grep -A8 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '\[\[ -z.*registry.*\]\] && return 0' | tr -d '[:space:]')"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

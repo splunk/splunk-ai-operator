@@ -127,6 +127,11 @@ images:
   # Leave empty to use Docker Hub defaults for all images
   registry: "123456789012.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
 
+  # Set to true ONLY for plain-HTTP (no-TLS) registries, e.g. a local mirror
+  # served without a certificate (host:port with no HTTPS). Leave false for
+  # ECR, Docker Hub, Harbor, or any registry that serves over HTTPS.
+  registryInsecure: false
+
   # ==================================================================================
   # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
   # ==================================================================================
