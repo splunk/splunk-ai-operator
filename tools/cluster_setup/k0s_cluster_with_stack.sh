@@ -1878,6 +1878,101 @@ ensure_s3compat_credentials() {
 }
 
 # ====== MODEL ARTIFACT STAGING ======
+
+# all_models_staged <staging_dir> <accel>
+# Checks whether every artifact in the GPU-specific model config already has a
+# staging_state/<id>/.staging_complete marker in the object store.
+# Returns 0 (all staged) or 1 (one or more missing / check unavailable).
+# Fails open: if the store is unreachable or a required tool is missing, returns 1
+# so staging proceeds normally.
+all_models_staged() {
+  local staging_dir="$1"
+  local accel="$2"
+  local config_file
+
+  case "${accel}" in
+    h100) config_file="${staging_dir}/model_artifacts_configs_h100.yaml" ;;
+    *)    config_file="${staging_dir}/model_artifacts_configs.yaml" ;;
+  esac
+
+  if [[ ! -f "${config_file}" ]]; then
+    warn "all_models_staged: config file not found: ${config_file} — skipping pre-check."
+    return 1
+  fi
+
+  # Read artifact IDs using yq (already ensured by ensure_yq earlier in the run)
+  local ids=()
+  local raw_ids
+  raw_ids=$(yq eval '.artifact-configs[].artifact-id' "${config_file}" 2>/dev/null) || {
+    warn "all_models_staged: could not read artifact IDs from ${config_file} — skipping pre-check."
+    return 1
+  }
+  while IFS= read -r id; do
+    [[ -n "${id}" ]] && ids+=("${id}")
+  done <<< "${raw_ids}"
+
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    warn "all_models_staged: no artifact IDs found in ${config_file} — skipping pre-check."
+    return 1
+  fi
+
+  local missing=()
+
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      if ! command -v aws &>/dev/null; then
+        warn "all_models_staged: aws CLI not found — skipping pre-check."
+        return 1
+      fi
+      for id in "${ids[@]}"; do
+        local marker="s3://${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
+        if ! AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+             AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+             aws s3 ls "${marker}" --region "${REGION:-us-east-2}" &>/dev/null; then
+          missing+=("${id}")
+        fi
+      done
+      ;;
+    minio|seaweedfs)
+      if ! command -v mc &>/dev/null; then
+        warn "all_models_staged: mc not found — skipping pre-check."
+        return 1
+      fi
+      if [[ -z "${OBJ_STORE_ENDPOINT}" ]]; then
+        warn "all_models_staged: OBJ_STORE_ENDPOINT not set — skipping pre-check."
+        return 1
+      fi
+      local _alias="installer_precheck"
+      mc alias set "${_alias}" "${OBJ_STORE_ENDPOINT}" \
+          "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api S3v4 &>/dev/null || {
+        warn "all_models_staged: could not configure mc alias — skipping pre-check."
+        return 1
+      }
+      for id in "${ids[@]}"; do
+        local marker="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
+        if ! mc stat "${marker}" &>/dev/null; then
+          missing+=("${id}")
+        fi
+      done
+      ;;
+    *)
+      warn "all_models_staged: unsupported store type '${OBJ_STORE_TYPE}' — skipping pre-check."
+      return 1
+      ;;
+  esac
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    log "✓ All ${#ids[@]} models already staged in object store (${OBJ_STORE_TYPE}, accel=${accel}) — skipping download and upload."
+    return 0
+  fi
+
+  log "Model staging needed: ${#missing[@]}/${#ids[@]} model(s) not yet staged."
+  for _m in "${missing[@]}"; do
+    log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found)"
+  done
+  return 1
+}
+
 # Downloads model artifacts from Hugging Face and uploads them to the configured
 # object store. Runs before k0s cluster work so models are available when Ray
 # workers start. Reads HF credentials from model_artifacts_configs.yaml (in the
@@ -1894,6 +1989,18 @@ stage_model_artifacts() {
     return 1
   fi
 
+  # ---- Resolve accelerator ----
+  local _accel="${DEFAULT_ACCELERATOR:-}"
+  if [[ -z "${_accel}" ]]; then
+    warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
+    _accel="l40s"
+  fi
+
+  # ---- Fast-path: skip everything if all models already staged ----
+  if all_models_staged "${staging_dir}" "${_accel}"; then
+    return 0
+  fi
+
   # ---- Check HuggingFace reachability (skip in air-gap mode) ----
   if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
     wait_for_dependency \
@@ -1905,11 +2012,6 @@ stage_model_artifacts() {
   fi
 
   # ---- Download from Hugging Face ----
-  local _accel="${DEFAULT_ACCELERATOR:-}"
-  if [[ -z "${_accel}" ]]; then
-    warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
-    _accel="l40s"
-  fi
   # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
   # re-runs skip models that are already fully staged (no re-download, no re-upload).
   # Set SKIP_IF_STAGED=0 to force a full re-download regardless of store state.
@@ -1970,6 +2072,57 @@ stage_model_artifacts() {
       return 1
       ;;
   esac
+
+  # ---- Verify all models are now staged (fail early with clear list if any missing) ----
+  log "Verifying all models are present in object store after staging..."
+  local _missing_ids=()
+  local _verify_alias="installer_verify"
+  local _verify_ok=1
+
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      if command -v aws &>/dev/null; then
+        while IFS= read -r _id; do
+          [[ -z "${_id}" ]] && continue
+          local _marker="s3://${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete"
+          AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+          AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+          aws s3 ls "${_marker}" --region "${REGION:-us-east-2}" &>/dev/null \
+            || _missing_ids+=("${_id}")
+        done < <(yq eval '.artifact-configs[].artifact-id' "${staging_dir}/$(
+            [[ "${_accel}" == "h100" ]] && echo model_artifacts_configs_h100.yaml || echo model_artifacts_configs.yaml
+          )" 2>/dev/null)
+      else
+        warn "aws CLI not available — skipping post-stage verification."
+        _verify_ok=0
+      fi
+      ;;
+    minio|seaweedfs)
+      if command -v mc &>/dev/null && [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
+        mc alias set "${_verify_alias}" "${OBJ_STORE_ENDPOINT}" \
+            "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api S3v4 &>/dev/null
+        while IFS= read -r _id; do
+          [[ -z "${_id}" ]] && continue
+          mc stat "${_verify_alias}/${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete" &>/dev/null \
+            || _missing_ids+=("${_id}")
+        done < <(yq eval '.artifact-configs[].artifact-id' "${staging_dir}/$(
+            [[ "${_accel}" == "h100" ]] && echo model_artifacts_configs_h100.yaml || echo model_artifacts_configs.yaml
+          )" 2>/dev/null)
+      else
+        warn "mc / OBJ_STORE_ENDPOINT not available — skipping post-stage verification."
+        _verify_ok=0
+      fi
+      ;;
+  esac
+
+  if [[ "${_verify_ok}" == "1" && ${#_missing_ids[@]} -gt 0 ]]; then
+    err "Model staging incomplete — the following model(s) are missing from the object store:"
+    for _id in "${_missing_ids[@]}"; do
+      err "  ✗ ${_id}  (expected: ${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete)"
+    done
+    err "Re-run '$0 stage-artifacts' to retry the missing models, then run '$0 install' again."
+    return 1
+  fi
 
   log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
 }
