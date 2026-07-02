@@ -510,6 +510,8 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Normalise s3compat → minio so all downstream logic only sees aws | minio | seaweedfs.
   [[ "${OBJ_STORE_TYPE}" == "s3compat" ]] && OBJ_STORE_TYPE="minio"
   OBJ_STORE_BUCKET="$(yq eval '.storage.objectStore.bucket // "ai-platform-data"' "$CONFIG_FILE" 2>/dev/null || echo "ai-platform-data")"
+  # Normalize to lowercase — upload scripts apply the same normalization; pre-check and verifier must use the same value.
+  OBJ_STORE_BUCKET="$(printf '%s' "${OBJ_STORE_BUCKET}" | tr '[:upper:]' '[:lower:]')"
   OBJ_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   _obj_user="$(yq eval '.storage.objectStore.auth.rootUser // "minioadmin"' "$CONFIG_FILE" 2>/dev/null || echo "minioadmin")"
   _obj_pw="$(yq eval '.storage.objectStore.auth.rootPassword // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -847,6 +849,10 @@ preflight_checks() {
     ASIA*) pf_fail "objectStore.auth.rootUser '${MINIO_ROOT_USER}' is an STS temporary key (ASIA…). The k0s installer does not propagate AWS_SESSION_TOKEN; use a permanent IAM access key (AKIA…) instead. To mint one: aws iam create-access-key --user-name <iam-user>." ;;
   esac
 
+  # Verify the image registry is reachable and credentials work before committing
+  # to a multi-minute install that would fail at ImagePullBackOff otherwise.
+  preflight_check_registry
+
   pf_header "Infrastructure mode"
   pf_ok "Using existing infrastructure (on-prem/baremetal)"
   pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
@@ -935,6 +941,218 @@ stage_k0s_image_bundle() {
       warn "    Failed to copy ${_name} to ${node_ip} — some images may fail to pull"
     fi
   done
+}
+
+# ====== PREFLIGHT: REGISTRY REACHABILITY CHECK ======
+# Verifies the configured image registry is reachable and credentials work
+# BEFORE any install work begins, so a bad registry config fails fast with a
+# clear message instead of surfacing as ImagePullBackOff minutes later.
+#
+# Strategy: hit the OCI /v2/ ping endpoint (all standard registries implement it),
+# then attempt a manifest HEAD for one representative image to confirm auth works
+# end-to-end. Uses only curl — no Docker/crane/skopeo required.
+#
+# Auth dispatch:
+#   ECR        → aws ecr get-login-password  (Bearer token)
+#   DockerHub  → imagePullSecrets.dockerHub creds
+#   GCR        → imagePullSecrets.gcr.jsonKey (_json_key)
+#   ACR        → imagePullSecrets.acr creds
+#   Custom     → imagePullSecrets.custom creds (or unauthenticated if none)
+#   No registry set → public DockerHub (no auth needed)
+preflight_check_registry() {
+  pf_header "Image registry reachability"
+
+  # No registry configured → images pull from Docker Hub / public — nothing to check
+  if [[ -z "${IMAGE_REGISTRY}" || "${IMAGE_REGISTRY}" == "null" ]]; then
+    pf_ok "No private registry configured — images pull from public registries (Docker Hub etc.)"
+    return
+  fi
+
+  # Determine protocol scheme for the ping URL
+  local scheme="https"
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] && scheme="http"
+
+  local ping_url="${scheme}://${IMAGE_REGISTRY}/v2/"
+  # curl_opts: no -f so HTTP 4xx is not treated as a curl error; we read the status code ourselves.
+  local curl_opts=(--silent --connect-timeout 10 --max-time 15)
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] && curl_opts+=(--insecure)
+
+  # ---- Step 1: TCP/TLS reachability ----
+  # 200 → open registry; 401/403 → reachable but needs auth (expected); anything else → problem.
+  # Note: %{http_code} already outputs "000" on connection failure, so no || echo needed.
+  local http_code
+  http_code=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" "${ping_url}" 2>/dev/null)
+  case "${http_code}" in
+    200|401|403)
+      pf_ok "Registry reachable: ${ping_url} (HTTP ${http_code})"
+      ;;
+    000)
+      pf_fail "Registry unreachable: cannot connect to ${ping_url} (connection refused / DNS failure / firewall). Fix images.registry or ensure network path to registry is open."
+      return
+      ;;
+    *)
+      # Any other HTTP code (400, 404, 500…) means TCP + TLS succeeded — the host
+      # is reachable even if it is not an OCI-compliant registry endpoint.
+      pf_warn "Registry ${IMAGE_REGISTRY} answered HTTP ${http_code} on /v2/ ping (not a standard OCI response, but host is reachable). Proceeding to manifest check."
+      ;;
+  esac
+
+  # ---- Step 2: Auth + manifest pull for one representative image ----
+  # Pick the operator image as the probe — it's always required
+  local probe_image="${OPERATOR_IMAGE:-}"
+  if [[ -z "${probe_image}" || "${probe_image}" == "null" ]]; then
+    pf_warn "No probe image available (images.operator.image not set) — skipping auth check."
+    return
+  fi
+
+  # Strip registry prefix from probe image to get repo:tag
+  local probe_ref="${probe_image}"
+  # If build_image_url would prepend the registry, the raw config value is just repo:tag
+  # but if the user wrote the full reference, strip the registry host
+  if [[ "${probe_ref}" == ${IMAGE_REGISTRY}/* ]]; then
+    probe_ref="${probe_ref#${IMAGE_REGISTRY}/}"
+  fi
+
+  # Split repo and tag/digest
+  local probe_repo probe_tag
+  if [[ "${probe_ref}" == *"@"* ]]; then
+    probe_repo="${probe_ref%%@*}"
+    probe_tag="${probe_ref##*@}"
+    local manifest_url="${scheme}://${IMAGE_REGISTRY}/v2/${probe_repo}/manifests/${probe_tag}"
+  else
+    probe_repo="${probe_ref%%:*}"
+    probe_tag="${probe_ref##*:}"
+    [[ "${probe_tag}" == "${probe_ref}" ]] && probe_tag="latest"
+    local manifest_url="${scheme}://${IMAGE_REGISTRY}/v2/${probe_repo}/manifests/${probe_tag}"
+  fi
+
+  local auth_header=""
+
+  # Resolve auth credentials by registry type
+  if [[ "${IMAGE_REGISTRY}" == *.dkr.ecr.*.amazonaws.com ]]; then
+    # ECR: exchange AWS credentials for a short-lived token
+    local _ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
+    if ! command -v aws &>/dev/null; then
+      pf_warn "ECR registry configured but aws CLI not found — skipping auth check."
+      return
+    fi
+    local _ecr_token
+    if ! _ecr_token=$(aws ecr get-login-password --region "${_ecr_region}" 2>/dev/null); then
+      pf_fail "Cannot obtain ECR token (aws ecr get-login-password failed). Check AWS credentials and IAM permissions (ecr:GetAuthorizationToken)."
+      return
+    fi
+    auth_header="Authorization: Basic $(printf 'AWS:%s' "${_ecr_token}" | base64 | tr -d '\n')"
+
+  elif [[ "${IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED}" == "true" && "${IMAGE_REGISTRY}" == *"docker.io"* ]]; then
+    local _dh_user _dh_pass
+    _dh_user=$(yq eval '.imagePullSecrets.dockerHub.username' "${CONFIG_FILE}" 2>/dev/null)
+    _dh_pass=$(yq eval '.imagePullSecrets.dockerHub.password' "${CONFIG_FILE}" 2>/dev/null)
+    if [[ -n "${_dh_user}" && -n "${_dh_pass}" && "${_dh_user}" != "null" && "${_dh_pass}" != "null" ]]; then
+      auth_header="Authorization: Basic $(printf '%s:%s' "${_dh_user}" "${_dh_pass}" | base64 | tr -d '\n')"
+    fi
+
+  elif [[ "${IMAGE_PULL_SECRETS_ACR_ENABLED}" == "true" && "${IMAGE_REGISTRY}" == *".azurecr.io"* ]]; then
+    local _acr_user _acr_pass
+    _acr_user=$(yq eval '.imagePullSecrets.acr.username' "${CONFIG_FILE}" 2>/dev/null)
+    _acr_pass=$(yq eval '.imagePullSecrets.acr.password' "${CONFIG_FILE}" 2>/dev/null)
+    if [[ -n "${_acr_user}" && -n "${_acr_pass}" && "${_acr_user}" != "null" && "${_acr_pass}" != "null" ]]; then
+      auth_header="Authorization: Basic $(printf '%s:%s' "${_acr_user}" "${_acr_pass}" | base64 | tr -d '\n')"
+    fi
+
+  elif [[ "${IMAGE_PULL_SECRETS_CUSTOM_ENABLED}" == "true" ]]; then
+    local _custom_user _custom_pass
+    _custom_user=$(yq eval '.imagePullSecrets.custom.username' "${CONFIG_FILE}" 2>/dev/null)
+    _custom_pass=$(yq eval '.imagePullSecrets.custom.password' "${CONFIG_FILE}" 2>/dev/null)
+    if [[ -n "${_custom_user}" && -n "${_custom_pass}" && "${_custom_user}" != "null" && "${_custom_pass}" != "null" ]]; then
+      auth_header="Authorization: Basic $(printf '%s:%s' "${_custom_user}" "${_custom_pass}" | base64 | tr -d '\n')"
+    fi
+  fi
+  # GCR uses a JSON key which is awkward with curl Basic auth and is typically
+  # handled by Workload Identity in production — just check TCP reachability for GCR.
+
+  # Many registries (Harbor, ECR, JFrog) use Bearer token auth: they return a
+  # 401 with Www-Authenticate on the manifest endpoint and expect us to exchange
+  # the basic creds for a Bearer token. Handle both flows.
+  # _bearer_exchange: given a manifest URL and optional Basic auth header, tries
+  # to fetch a Bearer token from the Www-Authenticate challenge and return the
+  # final manifest HTTP code after the Bearer retry.
+  # $1 = current http_code (must be "401"), $2 = manifest_url, $3 = auth_header (may be empty)
+  _bearer_exchange() {
+    local _cur_code="$1" _murl="$2" _ahdr="${3:-}"
+    [[ "${_cur_code}" != "401" ]] && { echo "${_cur_code}"; return; }
+
+    local _www_auth _realm _service _scope _tok _tok_code
+    local _basic_opts=("${curl_opts[@]}")
+    [[ -n "${_ahdr}" ]] && _basic_opts+=(-H "${_ahdr}")
+
+    _www_auth=$(curl "${_basic_opts[@]}" -o /dev/null -D - "${_murl}" 2>/dev/null \
+                | grep -i '^Www-Authenticate:' | head -1)
+    _realm=$(echo "${_www_auth}"   | grep -oP 'realm="[^"]+"'   | cut -d'"' -f2)
+    _service=$(echo "${_www_auth}" | grep -oP 'service="[^"]+"' | cut -d'"' -f2)
+    _scope=$(echo "${_www_auth}"   | grep -oP 'scope="[^"]+"'   | cut -d'"' -f2)
+
+    [[ -z "${_realm}" ]] && { echo "401"; return; }
+
+    local _turl="${_realm}?service=${_service}&scope=${_scope}"
+    _tok=$(curl "${_basic_opts[@]}" "${_turl}" 2>/dev/null \
+           | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token') or d.get('access_token',''))" \
+           2>/dev/null || true)
+
+    [[ -z "${_tok}" ]] && { echo "401"; return; }
+
+    _tok_code=$(curl "${curl_opts[@]}" \
+      -H "Authorization: Bearer ${_tok}" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      -o /dev/null -w "%{http_code}" \
+      "${_murl}" 2>/dev/null)
+    echo "${_tok_code}"
+  }
+
+  local manifest_http_code
+  if [[ -n "${auth_header}" ]]; then
+    manifest_http_code=$(curl "${curl_opts[@]}" \
+      -H "${auth_header}" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      -o /dev/null -w "%{http_code}" \
+      "${manifest_url}" 2>/dev/null)
+
+    # If we got 401, the registry wants Bearer auth — exchange basic creds for a token
+    if [[ "${manifest_http_code}" == "401" ]]; then
+      manifest_http_code=$(_bearer_exchange "401" "${manifest_url}" "${auth_header}")
+    fi
+  else
+    # Unauthenticated probe (public registry or no matching pull-secret config).
+    # Public registries like Docker Hub still return 401 + Www-Authenticate to trigger
+    # anonymous Bearer token exchange — attempt that before reporting auth failure.
+    manifest_http_code=$(curl "${curl_opts[@]}" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      -o /dev/null -w "%{http_code}" \
+      "${manifest_url}" 2>/dev/null)
+
+    if [[ "${manifest_http_code}" == "401" ]]; then
+      manifest_http_code=$(_bearer_exchange "401" "${manifest_url}" "")
+    fi
+  fi
+
+  case "${manifest_http_code}" in
+    200|206)
+      pf_ok "Registry auth OK: manifest reachable for ${probe_repo}:${probe_tag}"
+      ;;
+    401|403)
+      pf_fail "Registry credentials rejected (HTTP ${manifest_http_code}) for ${IMAGE_REGISTRY}. Check imagePullSecrets config — images will fail to pull at deploy time."
+      ;;
+    404)
+      # 404 on the manifest means registry is reachable + auth works, but this specific
+      # tag is not present. That is a config error, not a connectivity error.
+      pf_fail "Image not found in registry (HTTP 404): ${IMAGE_REGISTRY}/${probe_repo}:${probe_tag}. Check that images.operator.image tag exists in the registry."
+      ;;
+    000)
+      pf_fail "Registry manifest check failed: no response from ${manifest_url}. Check network path and registry health."
+      ;;
+    *)
+      pf_warn "Registry manifest check returned HTTP ${manifest_http_code} for ${probe_repo}:${probe_tag} — verify registry is healthy."
+      ;;
+  esac
 }
 
 # ====== PREFLIGHT: REMOTE NODE DEPENDENCY CHECK ======
@@ -1881,7 +2099,10 @@ ensure_s3compat_credentials() {
 
 # all_models_staged <staging_dir> <accel>
 # Checks whether every artifact in the GPU-specific model config already has a
-# staging_state/<id>/.staging_complete marker in the object store.
+# staging_state/<id>/.staging_complete marker in the object store AND that the
+# marker's accel= field matches the requested accelerator. A marker with a
+# mismatched accel (e.g. l40s marker found when h100 is requested) is treated as
+# missing so the correct model weights are downloaded and uploaded.
 # Returns 0 (all staged) or 1 (one or more missing / check unavailable).
 # Fails open: if the store is unreachable or a required tool is missing, returns 1
 # so staging proceeds normally.
@@ -1916,6 +2137,14 @@ all_models_staged() {
     return 1
   fi
 
+  # _marker_matches_accel: fetch marker content and verify accel= line.
+  # Returns 0 if marker exists and accel matches, 1 otherwise.
+  _marker_matches_accel() {
+    local content="$1" expected_accel="$2"
+    # Marker written by download script contains: accel=<type>
+    echo "${content}" | grep -q "^accel=${expected_accel}$"
+  }
+
   local missing=()
 
   case "${OBJ_STORE_TYPE}" in
@@ -1925,12 +2154,12 @@ all_models_staged() {
         return 1
       fi
       for id in "${ids[@]}"; do
-        local marker="s3://${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
-        if ! AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-             AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-             aws s3 ls "${marker}" --region "${REGION:-us-east-2}" &>/dev/null; then
-          missing+=("${id}")
-        fi
+        local marker_path="s3://${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
+        local content
+        content=$(AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+                  AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+                  aws s3 cp "${marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { missing+=("${id}"); continue; }
+        _marker_matches_accel "${content}" "${accel}" || missing+=("${id}")
       done
       ;;
     minio|seaweedfs)
@@ -1949,10 +2178,10 @@ all_models_staged() {
         return 1
       }
       for id in "${ids[@]}"; do
-        local marker="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
-        if ! mc stat "${marker}" &>/dev/null; then
-          missing+=("${id}")
-        fi
+        local marker_path="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
+        local content
+        content=$(mc cat "${marker_path}" 2>/dev/null) || { missing+=("${id}"); continue; }
+        _marker_matches_accel "${content}" "${accel}" || missing+=("${id}")
       done
       ;;
     *)
@@ -1968,7 +2197,7 @@ all_models_staged() {
 
   log "Model staging needed: ${#missing[@]}/${#ids[@]} model(s) not yet staged."
   for _m in "${missing[@]}"; do
-    log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found)"
+    log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found or accel mismatch)"
   done
   return 1
 }
@@ -1996,8 +2225,14 @@ stage_model_artifacts() {
     _accel="l40s"
   fi
 
+  # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
+  # re-runs skip models that are already fully staged (no re-download, no re-upload).
+  # Set SKIP_IF_STAGED=0 to force a full re-download/re-upload regardless of store state.
+  local _skip_staged="${SKIP_IF_STAGED:-1}"
+
   # ---- Fast-path: skip everything if all models already staged ----
-  if all_models_staged "${staging_dir}" "${_accel}"; then
+  # Guarded by _skip_staged so SKIP_IF_STAGED=0 can force a full re-stage.
+  if [[ "${_skip_staged}" != "0" ]] && all_models_staged "${staging_dir}" "${_accel}"; then
     return 0
   fi
 
@@ -2012,10 +2247,6 @@ stage_model_artifacts() {
   fi
 
   # ---- Download from Hugging Face ----
-  # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
-  # re-runs skip models that are already fully staged (no re-download, no re-upload).
-  # Set SKIP_IF_STAGED=0 to force a full re-download regardless of store state.
-  local _skip_staged="${SKIP_IF_STAGED:-1}"
   log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
   ( cd "${staging_dir}" && \
       ACCELERATOR="${_accel}" \
@@ -2074,24 +2305,26 @@ stage_model_artifacts() {
   esac
 
   # ---- Verify all models are now staged (fail early with clear list if any missing) ----
+  # Also validates marker accel= field so a leftover L40S marker doesn't pass an H100 check.
   log "Verifying all models are present in object store after staging..."
   local _missing_ids=()
   local _verify_alias="installer_verify"
   local _verify_ok=1
+  local _config_for_verify
+  _config_for_verify="${staging_dir}/$( [[ "${_accel}" == "h100" ]] && echo model_artifacts_configs_h100.yaml || echo model_artifacts_configs.yaml)"
 
   case "${OBJ_STORE_TYPE}" in
     aws)
       if command -v aws &>/dev/null; then
         while IFS= read -r _id; do
           [[ -z "${_id}" ]] && continue
-          local _marker="s3://${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete"
-          AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-          AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-          aws s3 ls "${_marker}" --region "${REGION:-us-east-2}" &>/dev/null \
-            || _missing_ids+=("${_id}")
-        done < <(yq eval '.artifact-configs[].artifact-id' "${staging_dir}/$(
-            [[ "${_accel}" == "h100" ]] && echo model_artifacts_configs_h100.yaml || echo model_artifacts_configs.yaml
-          )" 2>/dev/null)
+          local _marker_path="s3://${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete"
+          local _content
+          _content=$(AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+                     AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+                     aws s3 cp "${_marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { _missing_ids+=("${_id}"); continue; }
+          echo "${_content}" | grep -q "^accel=${_accel}$" || _missing_ids+=("${_id}")
+        done < <(yq eval '.artifact-configs[].artifact-id' "${_config_for_verify}" 2>/dev/null)
       else
         warn "aws CLI not available — skipping post-stage verification."
         _verify_ok=0
@@ -2103,11 +2336,11 @@ stage_model_artifacts() {
             "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api S3v4 &>/dev/null
         while IFS= read -r _id; do
           [[ -z "${_id}" ]] && continue
-          mc stat "${_verify_alias}/${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete" &>/dev/null \
-            || _missing_ids+=("${_id}")
-        done < <(yq eval '.artifact-configs[].artifact-id' "${staging_dir}/$(
-            [[ "${_accel}" == "h100" ]] && echo model_artifacts_configs_h100.yaml || echo model_artifacts_configs.yaml
-          )" 2>/dev/null)
+          local _marker_path="${_verify_alias}/${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete"
+          local _content
+          _content=$(mc cat "${_marker_path}" 2>/dev/null) || { _missing_ids+=("${_id}"); continue; }
+          echo "${_content}" | grep -q "^accel=${_accel}$" || _missing_ids+=("${_id}")
+        done < <(yq eval '.artifact-configs[].artifact-id' "${_config_for_verify}" 2>/dev/null)
       else
         warn "mc / OBJ_STORE_ENDPOINT not available — skipping post-stage verification."
         _verify_ok=0
@@ -2116,9 +2349,9 @@ stage_model_artifacts() {
   esac
 
   if [[ "${_verify_ok}" == "1" && ${#_missing_ids[@]} -gt 0 ]]; then
-    err "Model staging incomplete — the following model(s) are missing from the object store:"
+    err "Model staging incomplete — the following model(s) are missing or have a mismatched accelerator:"
     for _id in "${_missing_ids[@]}"; do
-      err "  ✗ ${_id}  (expected: ${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete)"
+      err "  ✗ ${_id}  (expected: ${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete with accel=${_accel})"
     done
     err "Re-run '$0 stage-artifacts' to retry the missing models, then run '$0 install' again."
     return 1

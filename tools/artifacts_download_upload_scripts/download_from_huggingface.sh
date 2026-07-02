@@ -311,10 +311,13 @@ remote_model_staged() {
     local id="$1"
     local store_type="${OBJ_STORE_TYPE:-minio}"
     local bucket="${OBJ_STORE_BUCKET:-ai-platform-data}"
-    # Store marker lives in staging_state/ prefix — separate from model_artifacts/ —
-    # so it is never visible to model loaders at inference time.
+    # Marker is at staging_state/<id>/.staging_complete.
+    # Its content includes "accel=<type>" written by the download script.
+    # We validate the accel field so a staged L40S marker does not cause us to skip
+    # the H100 download for an artifact-id shared between both configs (e.g. gemma-4-31b-it).
     local marker_path="staging_state/${id}/.staging_complete"
 
+    local _marker_content
     case "$store_type" in
         aws)
             local access_key="${OBJ_STORE_ACCESS_KEY:-}"
@@ -334,18 +337,23 @@ remote_model_staged() {
                 fi
                 return 1
             fi
-            AWS_ACCESS_KEY_ID="$access_key" AWS_SECRET_ACCESS_KEY="$secret_key" \
-                aws s3 ls "s3://${bucket}/${marker_path}" --region "$region" &>/dev/null
+            _marker_content=$(AWS_ACCESS_KEY_ID="$access_key" AWS_SECRET_ACCESS_KEY="$secret_key" \
+                aws s3 cp "s3://${bucket}/${marker_path}" - --region "$region" 2>/dev/null) || return 1
             ;;
         minio|seaweedfs)
             _setup_mc_alias || return 1
-            mc stat "${_MC_ALIAS}/${bucket}/${marker_path}" &>/dev/null
+            _marker_content=$(mc cat "${_MC_ALIAS}/${bucket}/${marker_path}" 2>/dev/null) || return 1
             ;;
         *)
             echo "WARNING: Unknown OBJ_STORE_TYPE '${store_type}' — skipping pre-check for ${id}; will download from HuggingFace." >&2
             return 1
             ;;
     esac
+    # Validate that the marker was written for the same accelerator type.
+    # Both L40S and H100 configs share artifact-ids (e.g. gemma-4-31b-it) but point
+    # to different HF repos; without this check a staged L40S marker would skip the
+    # H100 download, leaving the wrong model weights in the store.
+    echo "${_marker_content}" | grep -q "^accel=${ACCEL}$"
 }
 
 # ---------- Per-model download with retry and cleanup ----------
@@ -482,7 +490,14 @@ fi
 
 echo "Reading $CONFIG_FILE"
 
-artifact_count=$("$YQ_CMD" '.artifact-configs | length' "$CONFIG_FILE")
+artifact_count=$("$YQ_CMD" '.artifact-configs | length' "$CONFIG_FILE" 2>/dev/null) || {
+    echo "ERROR: yq failed to parse '$CONFIG_FILE' — check that yq is installed and the file is valid YAML." >&2
+    exit 1
+}
+if [[ -z "$artifact_count" || "$artifact_count" == "null" || "$artifact_count" -eq 0 ]]; then
+    echo "ERROR: No artifacts found in '$CONFIG_FILE' (artifact-configs list is empty or missing)." >&2
+    exit 1
+fi
 echo "Found $artifact_count artifacts to process"
 echo ""
 

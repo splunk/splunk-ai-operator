@@ -380,7 +380,7 @@ ecr:
 | `storage.minimumDiskSpace.cpuWorker` | No | `200` | Minimum disk (GB) for CPU worker preflight check |
 | `storage.minimumDiskSpace.gpuWorker` | No | `500` | Minimum disk (GB) for GPU worker preflight check |
 | `storage.objectStore.type` | No | `minio` | `aws`, `s3compat`, `minio`, or `seaweedfs` |
-| `storage.objectStore.bucket` | No | `ai-platform-data` | S3 bucket name |
+| `storage.objectStore.bucket` | No | `ai-platform-data` | S3 bucket name. **Must be lowercase** — the installer normalizes to lowercase automatically; uppercase letters in the config value are silently converted before any store operations. |
 | `storage.objectStore.endpoint` | **Yes*** | — | S3-compatible endpoint URL (*required for s3compat/minio/seaweedfs) |
 | `storage.objectStore.auth.rootUser` | Yes | — | Access key / root user |
 | `storage.objectStore.auth.rootPassword` | Yes | — | Secret key / root password |
@@ -394,7 +394,8 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 
 | Directory | Owner | Description |
 |---|---|---|
-| `model_artifacts/` | Admin (pre-staged) | Pre-trained model weights loaded by Ray workers at startup |
+| `model_artifacts/<id>/` | Admin (pre-staged) | Pre-trained model weights loaded by Ray workers at startup |
+| `staging_state/<id>/.staging_complete` | Installer | Completion marker; its content includes `accel=<type>` written by the download script. The pre-check validates both presence and `accel=` field so switching `defaultAcceleratorType` forces re-download and re-upload of models that differ between GPU configs (e.g. `gemma-4-31b-it`). |
 
 **Created at runtime by SAIA services:**
 
@@ -666,12 +667,12 @@ The `install` command executes these steps in order:
    SKIP_IF_STAGED=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
    ```
 
-   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the GPU-specific artifact config and verifies each model's `staging_state/<id>/.staging_complete` marker in the object store. If all models are present it exits immediately (no download, no upload). If some are missing it logs each one individually:
+   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the GPU-specific artifact config, verifies each model's `staging_state/<id>/.staging_complete` marker in the object store, and validates that the marker's `accel=` field matches the configured accelerator type. If all models are present and match, it exits immediately (no download, no upload). If some are missing or have a mismatched accelerator it logs each one:
 
    ```
    [LOG] Model staging needed: 2/10 model(s) not yet staged.
-   [LOG]   MISSING: gpt-oss-20b  (bucket/staging_state/gpt-oss-20b/.staging_complete not found)
-   [LOG]   MISSING: gemma-4-31b-it  (bucket/staging_state/gemma-4-31b-it/.staging_complete not found)
+   [LOG]   MISSING: gpt-oss-20b  (bucket/staging_state/gpt-oss-20b/.staging_complete not found or accel mismatch)
+   [LOG]   MISSING: gemma-4-31b-it  (bucket/staging_state/gemma-4-31b-it/.staging_complete not found or accel mismatch)
    ```
 
    After upload completes, a post-stage verification pass re-checks all store markers and fails with a clear per-model error list if any are still absent — preventing an install from proceeding with an incomplete model set.
@@ -1887,6 +1888,52 @@ If install fails with "k0s cluster has Ready nodes — refusing to wipe":
 # Option 2: Tear down first
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh delete
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+### Model Staging Issues
+
+#### All models reported MISSING after a successful upload
+
+The most common cause is a bucket name with uppercase letters. The upload scripts normalize to lowercase before writing markers, but the config value was previously used verbatim in path checks.
+
+**Check:** Compare the bucket name in your config with the actual bucket in MinIO/S3:
+```bash
+# MinIO
+mc ls myminio/
+# S3
+aws s3 ls
+```
+
+**Fix:** Use a lowercase bucket name in `storage.objectStore.bucket`. The installer now normalizes to lowercase automatically (uppercase values are silently converted), but lowercase-only names are safest and are required by the S3 spec.
+
+#### Switching `defaultAcceleratorType` from L40S to H100 shows models as MISSING
+
+This is expected and correct. L40S and H100 share some `artifact-id` values (e.g. `gemma-4-31b-it`) but point to different HuggingFace repositories. The staging marker at `staging_state/<id>/.staging_complete` contains an `accel=<type>` field. The pre-check validates this field, so an existing L40S marker is treated as missing when H100 is requested, forcing a fresh download and upload.
+
+```bash
+# Force re-stage for H100 after changing defaultAcceleratorType to h100
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+#### `stage-artifacts` exits success with no models downloaded (`yq` failure)
+
+If `yq` is not installed or returns an error parsing `model_artifacts_configs.yaml`, the download script now exits non-zero immediately with:
+```
+ERROR: yq failed to parse 'model_artifacts_configs.yaml' — check that yq is installed and the file is valid YAML.
+```
+
+Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
+
+#### Re-stage a single model without restarting from scratch
+
+Delete the store marker for that model and re-run `stage-artifacts`:
+```bash
+# MinIO
+mc rm myminio/<bucket>/staging_state/<model-id>/.staging_complete
+# S3
+aws s3 rm s3://<bucket>/staging_state/<model-id>/.staging_complete
+
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
 ### Storage Issues
