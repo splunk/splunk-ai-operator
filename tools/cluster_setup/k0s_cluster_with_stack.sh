@@ -5939,6 +5939,12 @@ main_install() {
   if (( VERIFY_RC != 0 )); then
     step_fail "${VERIFY_RC} pod(s)/CR(s) not ready — see diagnostics above"
     warn "Some components are not fully ready — see diagnostics above for remediation steps."
+    # Auto-collect a support bundle so customers have everything in one file.
+    # Set AUTO_DIAGNOSE=false to suppress (e.g. in CI where disk space is tight).
+    if [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+      log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
+      diagnose || true
+    fi
   else
     step_ok
   fi
@@ -6125,31 +6131,47 @@ diagnose() {
   # 2. Cluster state (best-effort — cluster may be unreachable)
   if timeout 10 kubectl cluster-info &>/dev/null 2>&1; then
     log "Collecting cluster state..."
-    kubectl get nodes -o wide                          > "${bundle_dir}/nodes.txt"       2>&1 || true
-    kubectl get pods --all-namespaces -o wide          > "${bundle_dir}/pods.txt"        2>&1 || true
-    kubectl get events --all-namespaces --sort-by='.lastTimestamp' \
-                                                       > "${bundle_dir}/events.txt"      2>&1 || true
-    kubectl get pvc --all-namespaces                   > "${bundle_dir}/pvcs.txt"        2>&1 || true
-    kubectl get svc --all-namespaces                   > "${bundle_dir}/services.txt"    2>&1 || true
-    kubectl describe nodes                             > "${bundle_dir}/node-details.txt" 2>&1 || true
+    kubectl get nodes -o wide                                           > "${bundle_dir}/nodes.txt"        2>&1 || true
+    kubectl get pods --all-namespaces -o wide                           > "${bundle_dir}/pods.txt"         2>&1 || true
+    kubectl get events --all-namespaces --sort-by='.lastTimestamp'      > "${bundle_dir}/events.txt"       2>&1 || true
+    kubectl get pvc --all-namespaces                                    > "${bundle_dir}/pvcs.txt"         2>&1 || true
+    kubectl get svc --all-namespaces                                    > "${bundle_dir}/services.txt"     2>&1 || true
+    kubectl get deployment --all-namespaces -o wide                     > "${bundle_dir}/deployments.txt"  2>&1 || true
+    kubectl get statefulset --all-namespaces -o wide                    > "${bundle_dir}/statefulsets.txt" 2>&1 || true
+    kubectl get daemonset --all-namespaces -o wide                      > "${bundle_dir}/daemonsets.txt"   2>&1 || true
+    kubectl describe nodes                                              > "${bundle_dir}/node-details.txt" 2>&1 || true
+    kubectl describe deployment  --all-namespaces                       > "${bundle_dir}/deployment-details.txt"  2>&1 || true
+    kubectl describe statefulset --all-namespaces                       > "${bundle_dir}/statefulset-details.txt" 2>&1 || true
+    kubectl describe daemonset   --all-namespaces                       > "${bundle_dir}/daemonset-details.txt"   2>&1 || true
 
-    # Per-namespace pod logs for failing pods
-    log "Collecting logs from non-Running pods..."
-    local ns pod
-    while IFS= read -r line; do
-      ns=$(echo "${line}" | awk '{print $1}')
-      pod=$(echo "${line}" | awk '{print $2}')
-      mkdir -p "${bundle_dir}/pod-logs/${ns}"
-      kubectl logs "${pod}" -n "${ns}" --tail=200 \
-        > "${bundle_dir}/pod-logs/${ns}/${pod}.log" 2>&1 || true
-      kubectl logs "${pod}" -n "${ns}" --previous --tail=100 \
-        > "${bundle_dir}/pod-logs/${ns}/${pod}.previous.log" 2>&1 || true
-    done < <(kubectl get pods --all-namespaces --no-headers 2>/dev/null \
-             | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}')
+    # Pod logs — all pods (current + previous crash container)
+    # Failing pods get deeper tails; Running pods get a shorter tail for
+    # context without blowing up the bundle size.
+    log "Collecting pod logs (all pods)..."
+    local _diag_ns _diag_pod _diag_phase
+    while IFS= read -r _diag_line; do
+      _diag_ns=$(echo "${_diag_line}"    | awk '{print $1}')
+      _diag_pod=$(echo "${_diag_line}"   | awk '{print $2}')
+      _diag_phase=$(echo "${_diag_line}" | awk '{print $4}')
+      mkdir -p "${bundle_dir}/pod-logs/${_diag_ns}"
+      local _tail=100
+      [[ "${_diag_phase}" != "Running" && "${_diag_phase}" != "Completed" ]] && _tail=300
+      kubectl logs "${_diag_pod}" -n "${_diag_ns}" --all-containers=true --tail="${_tail}" \
+        > "${bundle_dir}/pod-logs/${_diag_ns}/${_diag_pod}.log"          2>&1 || true
+      kubectl logs "${_diag_pod}" -n "${_diag_ns}" --all-containers=true --previous --tail=150 \
+        > "${bundle_dir}/pod-logs/${_diag_ns}/${_diag_pod}.previous.log" 2>&1 || true
+      # Full describe for every unhealthy pod (captures init containers, volumes, resource limits)
+      if [[ "${_diag_phase}" != "Running" && "${_diag_phase}" != "Completed" ]]; then
+        kubectl describe pod "${_diag_pod}" -n "${_diag_ns}" \
+          > "${bundle_dir}/pod-logs/${_diag_ns}/${_diag_pod}.describe.txt" 2>&1 || true
+      fi
+    done < <(kubectl get pods --all-namespaces --no-headers 2>/dev/null)
 
     # AI Platform specific resources
     kubectl describe aiplatform --all -n "${AI_NS}" > "${bundle_dir}/aiplatform-cr.txt" 2>&1 || true
     kubectl describe aiservice  --all -n "${AI_NS}" > "${bundle_dir}/aiservice-cr.txt"  2>&1 || true
+    kubectl describe raycluster --all-namespaces    > "${bundle_dir}/raycluster-cr.txt" 2>&1 || true
+    kubectl describe rayservice --all-namespaces    > "${bundle_dir}/rayservice-cr.txt" 2>&1 || true
   else
     warn "Cluster not reachable — skipping kubectl diagnostics."
     echo "Cluster unreachable at time of diagnose run." > "${bundle_dir}/CLUSTER_UNREACHABLE.txt"
@@ -6158,7 +6180,7 @@ diagnose() {
   # 3. Config file (redact credentials)
   if [[ -f "${CONFIG_FILE}" ]]; then
     log "Including config file (credentials redacted)..."
-    sed 's/\(rootUser\|rootPassword\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\):.*/\1: <REDACTED>/g' \
+    sed 's/\(rootUser\|rootPassword\|hf-token\|hf-username\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\|password\):.*/\1: <REDACTED>/g' \
       "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
   fi
 
@@ -6174,14 +6196,20 @@ diagnose() {
   } > "${bundle_dir}/tool-versions.txt"
 
   # 5. Pack bundle
+  mkdir -p "${LOG_DIR}"
   local bundle_tar="${LOG_DIR}/splunk-ai-diagnose-$(date '+%Y%m%d-%H%M%S').tar.gz"
   tar -czf "${bundle_tar}" -C "$(dirname "${bundle_dir}")" "$(basename "${bundle_dir}")"
   rm -rf "${bundle_dir}"
 
   log ""
-  log "=== Support bundle ready ==="
-  log "  File: ${bundle_tar}"
-  log "  Attach this file to your support ticket."
+  log "╔══════════════════════════════════════════════════════════════╗"
+  log "║  Support bundle ready                                        ║"
+  log "╠══════════════════════════════════════════════════════════════╣"
+  log "║  File : ${bundle_tar}"
+  log "║"
+  log "║  Share this file with Splunk Support or attach it to your   ║"
+  log "║  support ticket. It contains no plaintext credentials.      ║"
+  log "╚══════════════════════════════════════════════════════════════╝"
 }
 
 # ====== VALIDATE SUBCOMMAND ======
@@ -6670,7 +6698,13 @@ case "${_CMD}" in
     if [[ -z "${KUBECONFIG:-}" ]] && [[ -f "${HOME}/.kube/k0s-${CLUSTER_NAME}" ]]; then
       export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"
     fi
-    verify_all_pods_healthy
+    _vpc_rc=0
+    verify_all_pods_healthy || _vpc_rc=$?
+    if (( _vpc_rc != 0 )) && [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+      log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
+      diagnose || true
+    fi
+    exit "${_vpc_rc}"
     ;;
   diagnose)
     diagnose
