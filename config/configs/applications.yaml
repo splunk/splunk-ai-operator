@@ -65,10 +65,10 @@ applications:
         gpu_type_model_config_override:
           H100:
             engine_args:
-              dtype: bfloat16
               gpu_memory_utilization: 0.9
-              max_model_len: 32768
-              max_num_batched_tokens: 4096
+              enable_chunked_prefill: true
+              async_scheduling: true
+              max_num_batched_tokens: 8192
               tensor_parallel_size: 1
           L40S:
             engine_args:
