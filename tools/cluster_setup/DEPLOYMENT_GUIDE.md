@@ -493,7 +493,7 @@ Model weights (>120 GB) must be staged to your object store. Do this on the conn
 |---|---|---|
 | Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
-| Internet | Stable broadband | Downloads >120 GB from HuggingFace; a flaky connection will require re-running with `SKIP_IF_EXISTS=1` |
+| Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run on a flaky connection — already-staged models are skipped automatically |
 | CPU | 4 cores | Recommended for parallel upload scripts |
 
 > **Same machine as the installer?** The installer machine already runs `kubectl`, `helm`, and `ssh` — it can also run model staging. Just ensure the **disk requirement** is met. `/tmp` or the working directory must have 250 GB free.
@@ -841,8 +841,9 @@ Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end co
 The installer is safe to re-run for most steps — Helm releases are upgraded if they already exist, and k0s join is skipped for nodes that are already Ready.
 
 **Steps that are NOT idempotent:**
-- **Model staging** — re-downloads files already on disk unless you set `SKIP_IF_EXISTS=1`
 - **`clean-all`** — destructive; wipes all k0s state from every node with no recovery
+
+Model staging is now **resumable** — re-runs skip already-staged models automatically. No flags needed.
 
 If install fails partway, re-run directly:
 
@@ -867,12 +868,9 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
-
-# Skip models already downloaded locally
-SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
-The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for direct script usage and `--accelerator` flag details.
+The command is resumable — it checks which models are already staged in the object store and only downloads/uploads what is missing. The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for details on the pre-check, per-model logging, and direct script usage.
 
 ### Upgrade the platform
 

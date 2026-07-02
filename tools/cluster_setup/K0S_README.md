@@ -544,7 +544,9 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 | `AUTO_APPROVE` | `false` | Skip confirmation prompts |
 | `USE_EXISTING` | (from config) | Override `cluster.useExisting` (`auto`/`force`/`never`) |
 | `LOG_DIR` | `./logs` | Directory for session log files |
-| `SKIP_IF_EXISTS` | `0` | Set to `1` to skip re-downloading models already present in `model_artifacts/` (used with `stage-artifacts` or during `install`) |
+| `SKIP_IF_EXISTS` | `0` | Set to `1` to skip models that have a local `.staging_complete` marker (replaced the old directory-existence check) |
+| `SKIP_IF_STAGED` | `0` | Set to `1` to also check the object store; skips models whose `staging_state/<id>/.staging_complete` marker already exists there |
+| `HF_DOWNLOAD_RETRIES` | `2` | Number of download retries per model before giving up (15s backoff; partial folder deleted between attempts) |
 
 #### Air-Gap Mode
 
@@ -614,7 +616,7 @@ The `install` command executes these steps in order:
 2. **Validate images** — Ensure all required image fields are set
 3. **Configure images** — Patch `RELATED_IMAGE_*` env vars in manifest files
 4. **Preflight checks** — Validate tools, SSH connectivity, disk space, config
-5. **Model staging** *(when `storage.modelStaging.enabled: true`, the default)* — Download models from Hugging Face for the configured GPU type (`aiPlatform.defaultAcceleratorType`) and upload them to the object store. Set `SKIP_IF_EXISTS=1` to skip re-downloading models already present locally. Skipped entirely when `enabled: false`.
+5. **Model staging** *(when `storage.modelStaging.enabled: true`, the default)* — Download models from Hugging Face for the configured GPU type (`aiPlatform.defaultAcceleratorType`) and upload them to the object store. The staging pipeline is **resumable**: each model gets a per-model completion marker; re-runs skip already-staged models and cleanly retry only incomplete ones. The installer passes `SKIP_IF_STAGED=1` by default so previously staged models are never re-downloaded or re-uploaded. Skipped entirely when `enabled: false`.
 
    **Models staged (from `model_artifacts_configs.yaml`):**
 
@@ -645,12 +647,22 @@ The `install` command executes these steps in order:
    **Manual staging** (running scripts directly without cluster install):
 
    ```bash
-   # Stage models standalone — GPU type is read from aiPlatform.defaultAcceleratorType in config
+   # Stage models — GPU type read from aiPlatform.defaultAcceleratorType in config
    CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
-   # Skip re-downloading models already present locally
-   SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+   # Resume: skip models already staged in the object store (default behaviour of the installer)
+   SKIP_IF_STAGED=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
    ```
+
+   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the GPU-specific artifact config and verifies each model's `staging_state/<id>/.staging_complete` marker in the object store. If all models are present it exits immediately (no download, no upload). If some are missing it logs each one individually:
+
+   ```
+   [LOG] Model staging needed: 2/10 model(s) not yet staged.
+   [LOG]   MISSING: gpt-oss-20b  (bucket/staging_state/gpt-oss-20b/.staging_complete not found)
+   [LOG]   MISSING: gemma-4-31b-it  (bucket/staging_state/gemma-4-31b-it/.staging_complete not found)
+   ```
+
+   After upload completes, a post-stage verification pass re-checks all store markers and fails with a clear per-model error list if any are still absent — preventing an install from proceeding with an incomplete model set.
 
    To run the download script directly, pass the GPU type via `--accelerator`. If neither flag nor `ACCELERATOR` env var is set, the script prompts interactively:
 

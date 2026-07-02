@@ -20,68 +20,73 @@ This directory contains scripts for downloading model artifacts from Hugging Fac
 ## Scripts
 
 ### 1. `download_from_huggingface.sh`
-Downloads model artifacts from Hugging Face repositories.
+Downloads model artifacts from Hugging Face repositories. Supports resumable, idempotent downloads — safe to re-run after any failure.
 
 **Features:**
-- Reads configuration from `model_artifacts_configs.yaml`
+- Reads configuration from `model_artifacts_configs.yaml` (l40s) or `model_artifacts_configs_h100.yaml` (h100)
+- **GPU type selection**: pass `--accelerator l40s` or `--accelerator h100`; if omitted and `ACCELERATOR` env var is not set, prompts interactively
 - Supports both public and gated Hugging Face models
 - Automatically installs dependencies (wget, yq, git-lfs)
-- Validates Python 3 availability (required for gated model credential encoding)
-- **Memory-optimized cloning**: Uses shallow clone and separate LFS pull to minimize memory usage
-  - Uses `--depth 1 --single-branch` to reduce clone size
-  - Downloads LFS files separately for better memory efficiency
-  - Prevents OOM (Out of Memory) kills on resource-constrained instances
-- **Force re-download**: Removes and re-downloads models if they already exist
-- **Fail-fast error handling**: Exits immediately on any download failure
-- **Detailed error messages**: Prints specific error information for troubleshooting
-- **Credential validation**: Validates HF credentials before attempting gated model downloads
-- **Security**: Redacts sensitive credentials in logs to prevent exposure
-- Cleans up git files after download
-- Excludes specified files based on configuration
-- Saves downloads to `./model_artifacts/` directory
+- **Memory-optimized cloning**: shallow clone (`--depth 1 --single-branch`) + separate `git lfs pull` to prevent OOM
+- **Resumable downloads**: per-model `.staging_complete` marker written after each successful download. On re-run:
+  - Model with local marker → skip download (already done)
+  - Model with store marker (in `staging_state/<id>/.staging_complete`) → skip download and upload entirely
+  - Partial directory without marker → deleted and re-downloaded from scratch
+- **Retry on failure**: retries up to `HF_DOWNLOAD_RETRIES` times (default 2) with 15s backoff; deletes partial folder between attempts
+- **Store pre-check** (`SKIP_IF_STAGED=1`): checks the object store for `staging_state/<id>/.staging_complete` before downloading — skips both download and upload for already-staged models; fails open (warns and proceeds) if store tools or creds are unavailable
+- **Credential validation**: validates HF credentials before attempting gated model downloads
+- **Security**: never logs `auth_hf_url` (contains credentials)
+- Cleans up git metadata after download; excludes files per config
+- Saves downloads to `./model_artifacts/`; reports all failed models at end with non-zero exit
 
 **Usage:**
 ```bash
-./download_from_huggingface.sh
-```
+# Explicit GPU type
+./download_from_huggingface.sh --accelerator l40s   # or h100
 
-Or with sudo if dependency installation fails:
-```bash
-sudo ./download_from_huggingface.sh
+# Interactive — prompted when no flag and no ACCELERATOR env var
+./download_from_huggingface.sh
+
+# Skip models already staged in the object store (resume-friendly)
+SKIP_IF_STAGED=1 ./download_from_huggingface.sh --accelerator l40s
 ```
 
 **Prerequisites:**
-- `model_artifacts_configs.yaml` must be present in the same directory
-- Python 3 must be installed (required for URL encoding credentials)
-- For gated models: HF token and username must be configured in the YAML file
+- `model_artifacts_configs.yaml` (l40s) or `model_artifacts_configs_h100.yaml` (h100) present in the same directory
+- Python 3 installed (required for URL encoding credentials)
+- For gated models: HF token and username configured in the YAML file
 - May require sudo for installing dependencies (wget, yq, git-lfs)
 
-**Error Handling:**
-- The script exits immediately if any download fails (no partial downloads)
-- Existing model directories are automatically removed before re-downloading
-- Memory-optimized to prevent OOM (Out of Memory) kills on cloud instances
-- Error messages include possible causes:
-  - Invalid or expired HF_TOKEN
-  - No access to gated models
-  - Network connectivity issues
-  - Invalid repository URLs
-  - Repository not found or private
-  - Out of memory (OOM) - see Troubleshooting section
-- Script returns non-zero exit code on failure (suitable for CI/CD pipelines)
+**Environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `ACCELERATOR` | — | GPU type (`l40s` or `h100`). Overridden by `--accelerator` flag. If unset and no flag, prompts interactively. |
+| `SKIP_IF_STAGED` | `0` | Set to `1` to check the object store first; skip models whose `staging_state/<id>/.staging_complete` marker exists |
+| `HF_DOWNLOAD_RETRIES` | `2` | Number of download retries per model before giving up |
+| `OBJ_STORE_TYPE` | — | Store type for pre-check: `aws`, `minio`, or `seaweedfs` |
+| `OBJ_STORE_BUCKET` | — | Bucket name for pre-check |
+| `OBJ_STORE_ENDPOINT` | — | Store endpoint URL for pre-check (minio/seaweedfs) |
+| `OBJ_STORE_ACCESS_KEY` / `OBJ_STORE_SECRET_KEY` | — | Store credentials for pre-check |
+
+**Error handling:**
+- Partial folders without a `.staging_complete` marker are deleted before retry
+- All failures are collected; script exits non-zero and lists every failed model at the end
+- `git lfs pull` SHA256 verification is built-in — a completed download is already checksum-verified; no separate checksum step is needed
 
 ### 2. `upload_to_minio.sh`
-Uploads downloaded artifacts to MinIO or any S3-compatible storage (e.g. SeaweedFS).
+Uploads downloaded artifacts to MinIO or any S3-compatible storage (e.g. SeaweedFS). Idempotent — safe to re-run; only missing or changed files are transferred.
 
 **Features:**
 - Automatically uploads **all artifacts** from `./model_artifacts/` directory
 - No config file needed - just uploads everything found
 - **Auto-creates bucket** if it doesn't exist
 - Uses native MinIO Client (mc) for optimal performance
-- Works with **MinIO, SeaweedFS, or any S3-compatible** backend; set endpoint and credentials to match your store.
-- Comprehensive dependency installation:
-  - MinIO Client via **Homebrew on macOS** or **direct download on Linux**
-  - Supports macOS (Intel & Apple Silicon) and Linux (amd64 & arm64)
-  - Multiple fallback installation methods
+- Works with **MinIO, SeaweedFS, or any S3-compatible** backend
+- **Idempotent uploads**: uses `mc mirror --overwrite` so re-runs only transfer missing/changed files
+- **Completion marker**: uploads `staging_state/<id>/.staging_complete` as the final step for each artifact — its presence in the store proves the upload is complete. The marker lives in a separate `staging_state/` prefix so model loaders at inference time never encounter it
+- **Resume support** (`SKIP_IF_STAGED=1`): skips artifacts whose store marker already exists
+- Comprehensive dependency installation (mc via Homebrew on macOS or direct download on Linux)
 
 **Usage:**
 ```bash
@@ -234,18 +239,18 @@ sudo ./upload_to_minio_aws.sh
 - Use `upload_to_minio.sh` for better MinIO native support
 
 ### 6. `upload_to_s3.sh`
-Uploads downloaded artifacts to AWS S3 storage.
+Uploads downloaded artifacts to AWS S3 storage. Idempotent — safe to re-run.
 
 **Features:**
 - Automatically uploads **all artifacts** from `./model_artifacts/` directory
 - No config file needed - just uploads everything found
 - **Auto-creates bucket** if it doesn't exist (with proper region configuration)
 - Uses AWS CLI with proper credential validation
-- Comprehensive dependency installation:
-  - AWS CLI via **Homebrew on macOS** or **official AWS installer on Linux**
-  - Supports macOS (Intel & Apple Silicon) and Linux (amd64 & arm64)
-  - Multiple fallback installation methods
+- **Idempotent uploads**: uses `aws s3 sync` so re-runs only transfer missing/changed files
+- **Completion marker**: uploads `staging_state/<id>/.staging_complete` last for each artifact; separate from `model_artifacts/` prefix so inference loaders are unaffected
+- **Resume support** (`SKIP_IF_STAGED=1`): skips artifacts whose store marker already exists
 - Validates AWS credentials before upload
+- Comprehensive dependency installation (AWS CLI via Homebrew or official installer)
 
 **Usage:**
 ```bash
@@ -384,53 +389,62 @@ All artifacts in the list will be downloaded and uploaded automatically.
 
 ## Workflow
 
+The staging pipeline is **resumable and idempotent**. Re-running after any failure picks up where it left off — no re-downloading or re-uploading already-completed models.
+
+**How resume works:**
+- Each model gets a `.staging_complete` marker written after its download succeeds (local) and after its upload succeeds (store: `staging_state/<id>/.staging_complete`).
+- On re-run: model with local marker → skip download; model with store marker → skip both download and upload; partial folder without marker → delete and redo.
+
 1. **Download artifacts from Hugging Face:**
    ```bash
-   ./download_from_huggingface.sh
+   # Pass GPU type (l40s or h100) or select interactively
+   ./download_from_huggingface.sh --accelerator l40s
+
+   # To also skip models already staged in the object store:
+   SKIP_IF_STAGED=1 ./download_from_huggingface.sh --accelerator l40s
    ```
-   This will download all configured artifacts to `./model_artifacts/` directory.
-   
-   **Note:** The script will:
-   - Use memory-optimized cloning to prevent OOM issues
-   - Remove existing artifacts before downloading (ensures fresh copies)
-   - Stop immediately if any download fails
-   - Display detailed error messages if issues occur
-   - Validate credentials before attempting gated model downloads
-   
-   **For large models on cloud instances:**
-   - Monitor memory usage: `watch -n 1 free -h` (in another terminal)
-   - If script gets killed (OOM), see the **Troubleshooting** section below
-   - Consider adding swap space before downloading (especially for 70B+ models)
+   Downloads all configured artifacts to `./model_artifacts/`. Failed models are retried up to `HF_DOWNLOAD_RETRIES` times; all failures are reported at the end.
 
-2. **Upload to storage** (choose one or more):
+2. **Upload to storage** (choose one):
 
-   **Option A - Upload to MinIO (using MinIO Client):**
+   **Option A — MinIO / S3-compatible (using mc):**
    ```bash
    ./upload_to_minio.sh
+   # Resume: SKIP_IF_STAGED=1 ./upload_to_minio.sh
    ```
-   
-   **Option B - Upload to MinIO (using AWS CLI):**
-   ```bash
-   ./upload_to_minio_aws.sh
-   ```
-   
-   **Option C - Upload to AWS S3:**
+
+   **Option B — AWS S3:**
    ```bash
    export S3_BUCKET=your-bucket-name
    ./upload_to_s3.sh
+   # Resume: SKIP_IF_STAGED=1 S3_BUCKET=your-bucket ./upload_to_s3.sh
    ```
-   
-   You can run multiple scripts to upload to different destinations!
+
+   **Option C — SeaweedFS (upload-only, server already running):**
+   ```bash
+   ./upload_to_seaweedfs_upload_only.sh
+   ```
 
 ## Environment Variables
 
 ### For Download Script:
-- No additional environment variables needed (reads from `model_artifacts_configs.yaml`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `ACCELERATOR` | — | GPU type: `l40s` or `h100`. Overridden by `--accelerator` flag. Interactive prompt if unset. |
+| `SKIP_IF_EXISTS` | `0` | `1` = skip models with a local `.staging_complete` marker (re-run safe) |
+| `SKIP_IF_STAGED` | `0` | `1` = also check the object store; skip models fully staged there |
+| `HF_DOWNLOAD_RETRIES` | `2` | Retries per model on failure (15s backoff, folder deleted between attempts) |
+| `OBJ_STORE_TYPE` | — | Store type for pre-check: `aws`, `minio`, or `seaweedfs` |
+| `OBJ_STORE_BUCKET` | — | Bucket for store pre-check |
+| `OBJ_STORE_ENDPOINT` | — | Endpoint for minio/seaweedfs pre-check |
+| `OBJ_STORE_ACCESS_KEY` / `OBJ_STORE_SECRET_KEY` | — | Credentials for store pre-check |
 
 ### For MinIO / S3-compatible Upload Script (using mc, `upload_to_minio.sh`):
 - No config file needed - automatically uploads all artifacts from `./model_artifacts/`
-- Works with MinIO, SeaweedFS, or any S3-compatible backend.
-- **Preferred (generic):** `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, `S3COMPAT_OBJECT_STORE_ACCESS_KEY`, `S3COMPAT_OBJECT_STORE_SECRET_KEY`
+- Works with MinIO, SeaweedFS, or any S3-compatible backend
+- `SKIP_IF_STAGED=1` — skip artifacts whose `staging_state/<id>/.staging_complete` marker exists in the store
+- **Preferred (generic):** `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`, `OBJECT_STORE_ACCESS_KEY`, `OBJECT_STORE_SECRET_KEY`
 - **Backward compatibility:** `MINIO_ENDPOINT`, `MINIO_BUCKET`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` (or `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`)
 - Defaults: endpoint http://127.0.0.1:9000, bucket ai-platform-bucket, minioadmin/minioadmin
 
@@ -442,21 +456,20 @@ All artifacts in the list will be downloaded and uploaded automatically.
 
 ### For S3 Upload Script:
 - No config file needed - automatically uploads all artifacts from `./model_artifacts/`
+- `SKIP_IF_STAGED=1` — skip artifacts whose `staging_state/<id>/.staging_complete` marker exists in S3
 - `S3_BUCKET`: (Required) Target S3 bucket name
-- `S3_REGION`: AWS region (default: us-east-1)
+- `S3_REGION`: AWS region (default: us-east-2)
 - `S3_PREFIX`: Path prefix in bucket (default: model_artifacts)
-- AWS credentials via:
-  - `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
-  - AWS CLI configuration (`~/.aws/credentials`)
-  - IAM role (for EC2/ECS/Lambda)
+- AWS credentials via `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, or IAM role
 
 ## Notes
 
-- The download script creates a `./model_artifacts/` directory and downloads artifacts based on `model_artifacts_configs.yaml`
-- **Memory optimization**: The script uses shallow cloning and separate LFS downloads to minimize memory usage, making it suitable for cloud instances with limited RAM
-- **Re-download behavior**: If an artifact already exists, it will be automatically removed and re-downloaded to ensure fresh copies
-- **Error handling**: The script fails immediately on any error and provides detailed error messages for troubleshooting
-- All upload scripts are config-free - they simply upload **everything** found in `./model_artifacts/` directory
+- The download script creates a `./model_artifacts/` directory and downloads artifacts based on `model_artifacts_configs.yaml` (l40s) or `model_artifacts_configs_h100.yaml` (h100)
+- **Memory optimization**: shallow cloning + separate LFS downloads minimizes RAM usage; suitable for cloud instances with limited memory
+- **Resumable / idempotent**: re-running after failure skips completed models (local marker) and fully-staged models (store marker). Partial folders without a marker are deleted and re-downloaded cleanly
+- **Error handling**: failures are collected; the script reports all failed models at the end and exits non-zero. Individual model failures don't abort other downloads
+- **Completion markers** are written to `staging_state/<id>/.staging_complete` in the store (separate from `model_artifacts/`) so inference-time model loaders are never affected
+- All upload scripts are config-free — they upload everything in `./model_artifacts/` using idempotent sync (`mc mirror` / `aws s3 sync`)
 - **Buckets are automatically created** if they don't exist:
   - MinIO: Creates bucket using `mc mb` command
   - S3: Creates bucket with appropriate region configuration
