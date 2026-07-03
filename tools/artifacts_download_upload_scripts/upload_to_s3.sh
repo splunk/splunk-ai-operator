@@ -253,12 +253,16 @@ for artifact_path in "$SOURCE_DIR"/*; do
 
         upload_ok=0
         if [[ -d "$artifact_path" ]]; then
-            # Sync directory — only pushes missing/changed files (idempotent).
-            # Exclude local marker from sync; store marker goes to staging_state/ below.
+            # Sync directory — add --delete when replacing a prior version (URL changed)
+            # so stale weight files from the old model are deleted from the store.
+            sync_opts=(--exclude ".staging_complete" --region "$S3_REGION")
+            if [[ -n "$remote_hf_url" && "$remote_hf_url" != "$local_hf_url" ]]; then
+                echo "↻ $id: hf_url changed — syncing with --delete to clean up stale files."
+                sync_opts+=(--delete)
+            fi
             echo "Syncing directory to: ${s3_base}/"
             if aws s3 sync "$artifact_path" "${s3_base}/" \
-                    --exclude ".staging_complete" \
-                    --region "$S3_REGION"; then
+                    "${sync_opts[@]}"; then
                 # Upload marker to staging_state/ last — its presence proves upload is complete
                 if [[ -f "$artifact_path/.staging_complete" ]]; then
                     aws s3 cp "$artifact_path/.staging_complete" "$marker_s3" \

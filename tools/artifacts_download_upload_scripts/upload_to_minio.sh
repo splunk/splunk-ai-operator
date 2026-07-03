@@ -285,10 +285,15 @@ for artifact_path in "$SOURCE_DIR"/*; do
 
         upload_ok=0
         if [[ -d "$artifact_path" ]]; then
-            # Mirror directory — only syncs missing/changed objects (idempotent).
-            # Exclude local marker from mirror; store marker goes to staging_state/ below.
+            # Mirror directory — add --remove when replacing a prior version (URL changed)
+            # so stale weight files from the old model are deleted from the store.
+            mirror_opts=(--overwrite --exclude ".staging_complete")
+            if [[ -n "$remote_hf_url" && "$remote_hf_url" != "$local_hf_url" ]]; then
+                echo "↻ $id: hf_url changed — mirroring with --remove to clean up stale files."
+                mirror_opts+=(--remove)
+            fi
             echo "Mirroring directory to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id/"
-            if mc mirror --overwrite --exclude ".staging_complete" \
+            if mc mirror "${mirror_opts[@]}" \
                     "$artifact_path/" "${dest_base}/"; then
                 # Upload marker to staging_state/ last — its presence proves upload is complete
                 if [[ -f "$marker_local" ]]; then

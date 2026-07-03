@@ -184,6 +184,12 @@ while [[ $idx -lt $total ]]; do
 
     (
       if [[ -d "$artifact_path" ]]; then
+        # Remove stale remote files when hf_url changed — SeaweedFS has no native
+        # sync-with-delete, so explicitly wipe the remote dir before re-uploading.
+        if [[ -n "$remote_hf_url" && "$remote_hf_url" != "$local_hf_url" ]]; then
+          echo "↻ $id: hf_url changed — removing stale remote files before re-upload."
+          mc rm --recursive --force "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/model_artifacts/${id}/" 2>/dev/null || true
+        fi
         upload_artifact_dir "$artifact_path" "$dest_base" "$id" || exit 1
       else
         do_upload_file "$artifact_path" "$dest_base" || { echo "$(date -Iseconds 2>/dev/null || date) FAILED: $id" >> "$SEAWEEDFS_ERROR_LOG"; exit 1; }
