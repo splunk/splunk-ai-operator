@@ -269,10 +269,15 @@ for artifact_path in "$SOURCE_DIR"/*; do
         marker_dest="$MINIO_ALIAS/$MINIO_BUCKET/staging_state/$id/.staging_complete"
         marker_local="$artifact_path/.staging_complete"
 
-        # Skip entirely if already fully staged in MinIO
+        # Skip entirely if already fully staged in MinIO with matching hf_url.
+        # Presence-only check is not enough: a marker from a prior run may lack
+        # hf_url= or have a stale URL; in that case we must re-upload so the
+        # verification step finds a current marker.
         if [[ "$SKIP_IF_STAGED" == "1" ]]; then
-            if mc stat "$marker_dest" &>/dev/null; then
-                echo "✓ $id already staged in MinIO (.staging_complete present) — skipping."
+            local_hf_url=$(grep "^hf_url=" "$marker_local" 2>/dev/null | cut -d= -f2-)
+            remote_hf_url=$(mc cat "$marker_dest" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-)
+            if [[ -n "$local_hf_url" && "$local_hf_url" == "$remote_hf_url" ]]; then
+                echo "✓ $id already staged in MinIO (hf_url matches) — skipping."
                 echo "-----------------------------"
                 continue
             fi
@@ -280,10 +285,15 @@ for artifact_path in "$SOURCE_DIR"/*; do
 
         upload_ok=0
         if [[ -d "$artifact_path" ]]; then
-            # Mirror directory — only syncs missing/changed objects (idempotent).
-            # Exclude local marker from mirror; store marker goes to staging_state/ below.
+            # Mirror directory — add --remove when replacing a prior version (URL changed)
+            # so stale weight files from the old model are deleted from the store.
+            mirror_opts=(--overwrite --exclude ".staging_complete")
+            if [[ -n "$remote_hf_url" && "$remote_hf_url" != "$local_hf_url" ]]; then
+                echo "↻ $id: hf_url changed — mirroring with --remove to clean up stale files."
+                mirror_opts+=(--remove)
+            fi
             echo "Mirroring directory to MinIO: $MINIO_ENDPOINT/$MINIO_BUCKET/model_artifacts/$id/"
-            if mc mirror --overwrite --exclude ".staging_complete" \
+            if mc mirror "${mirror_opts[@]}" \
                     "$artifact_path/" "${dest_base}/"; then
                 # Upload marker to staging_state/ last — its presence proves upload is complete
                 if [[ -f "$marker_local" ]]; then

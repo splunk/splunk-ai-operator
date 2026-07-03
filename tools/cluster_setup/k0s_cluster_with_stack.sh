@@ -606,7 +606,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 build_image_url() {
   local registry="$1"
   local image_path="$2"
-  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
+  # Treat as fully-qualified if image starts with a registry host.
+  # Recognised forms: domain.tld/... , domain.tld:port/... , IP/... , IP:port/...
+  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
     echo "$image_path"
     return 0
   fi
@@ -1027,20 +1029,48 @@ preflight_check_registry() {
   esac
 
   # ---- Step 2: Auth + manifest pull for one representative image ----
-  # Pick the operator image as the probe — it's always required
-  local probe_image="${OPERATOR_IMAGE:-}"
-  if [[ -z "${probe_image}" || "${probe_image}" == "null" ]]; then
-    pf_warn "No probe image available (images.operator.image not set) — skipping auth check."
+  # Pick the first image that actually resolves to IMAGE_REGISTRY after applying
+  # build_image_url. The operator image is often fully-qualified to docker.io while
+  # Ray/SAIA images are short refs that build_image_url prefixes with IMAGE_REGISTRY —
+  # probing only the operator image would miss auth/tag problems in the private registry.
+  # Regex: fully-qualified = starts with domain[:port]/ or IP[:port]/
+  local _fq_re='^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/'
+
+  # _image_targets_registry <raw_config_value>
+  # Returns 0 and prints the repo:tag portion if the image (after build_image_url)
+  # targets IMAGE_REGISTRY; returns 1 otherwise.
+  _image_targets_registry() {
+    local raw="$1"
+    [[ -z "${raw}" || "${raw}" == "null" ]] && return 1
+    local full
+    full=$(build_image_url "${IMAGE_REGISTRY}" "${raw}")
+    # After build_image_url, fully-qualified refs that didn't match IMAGE_REGISTRY
+    # are returned unchanged; strip IMAGE_REGISTRY/ prefix to get repo:tag.
+    if [[ "${full}" == ${IMAGE_REGISTRY}/* ]]; then
+      echo "${full#${IMAGE_REGISTRY}/}"
+      return 0
+    fi
+    return 1
+  }
+
+  local probe_ref=""
+  local probe_source=""
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
+    local _val="${!_candidate_var:-}"
+    local _ref
+    if _ref=$(_image_targets_registry "${_val}"); then
+      probe_ref="${_ref}"
+      probe_source="${_candidate_var}"
+      break
+    fi
+  done
+
+  if [[ -z "${probe_ref}" ]]; then
+    pf_warn "No images in config target IMAGE_REGISTRY (${IMAGE_REGISTRY}) — all images appear to be fully qualified to other registries. Skipping auth check."
     return
   fi
 
-  # Strip registry prefix from probe image to get repo:tag
-  local probe_ref="${probe_image}"
-  # If build_image_url would prepend the registry, the raw config value is just repo:tag
-  # but if the user wrote the full reference, strip the registry host
-  if [[ "${probe_ref}" == ${IMAGE_REGISTRY}/* ]]; then
-    probe_ref="${probe_ref#${IMAGE_REGISTRY}/}"
-  fi
+  pf_ok "Probing registry with ${probe_source} image: ${IMAGE_REGISTRY}/${probe_ref}"
 
   # Split repo and tag/digest
   local probe_repo probe_tag
@@ -2150,28 +2180,35 @@ all_models_staged() {
     return 1
   fi
 
-  # Read artifact IDs using yq (already ensured by ensure_yq earlier in the run)
-  local ids=()
-  local raw_ids
+  # Read artifact IDs and their HF URLs — skip decision is based on URL match,
+  # not GPU type, so a model staged for any accelerator is reused as long as
+  # the source URL hasn't changed.
+  local ids=() hf_urls=()
+  local raw_ids raw_urls
   raw_ids=$(yq eval '.artifact-configs[].artifact-id' "${config_file}" 2>/dev/null) || {
     warn "all_models_staged: could not read artifact IDs from ${config_file} — skipping pre-check."
+    return 1
+  }
+  raw_urls=$(yq eval '.artifact-configs[].hf-url' "${config_file}" 2>/dev/null) || {
+    warn "all_models_staged: could not read hf-url fields from ${config_file} — skipping pre-check."
     return 1
   }
   while IFS= read -r id; do
     [[ -n "${id}" ]] && ids+=("${id}")
   done <<< "${raw_ids}"
+  while IFS= read -r url; do
+    hf_urls+=("${url}")
+  done <<< "${raw_urls}"
 
   if [[ ${#ids[@]} -eq 0 ]]; then
     warn "all_models_staged: no artifact IDs found in ${config_file} — skipping pre-check."
     return 1
   fi
 
-  # _marker_matches_accel: fetch marker content and verify accel= line.
-  # Returns 0 if marker exists and accel matches, 1 otherwise.
-  _marker_matches_accel() {
-    local content="$1" expected_accel="$2"
-    # Marker written by download script contains: accel=<type>
-    echo "${content}" | grep -q "^accel=${expected_accel}$"
+  # _marker_matches_url: returns 0 if the marker's hf_url= matches the expected URL.
+  _marker_matches_url() {
+    local content="$1" expected_url="$2"
+    echo "${content}" | grep -q "^hf_url=${expected_url}$"
   }
 
   local missing=()
@@ -2182,13 +2219,14 @@ all_models_staged() {
         warn "all_models_staged: aws CLI not found — skipping pre-check."
         return 1
       fi
-      for id in "${ids[@]}"; do
+      for i in "${!ids[@]}"; do
+        local id="${ids[$i]}" hf_url="${hf_urls[$i]:-}"
         local marker_path="s3://${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
         local content
         content=$(AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
                   AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
                   aws s3 cp "${marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { missing+=("${id}"); continue; }
-        _marker_matches_accel "${content}" "${accel}" || missing+=("${id}")
+        _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
       done
       ;;
     minio|seaweedfs)
@@ -2206,11 +2244,12 @@ all_models_staged() {
         warn "all_models_staged: could not configure mc alias — skipping pre-check."
         return 1
       }
-      for id in "${ids[@]}"; do
+      for i in "${!ids[@]}"; do
+        local id="${ids[$i]}" hf_url="${hf_urls[$i]:-}"
         local marker_path="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
         local content
         content=$(mc cat "${marker_path}" 2>/dev/null) || { missing+=("${id}"); continue; }
-        _marker_matches_accel "${content}" "${accel}" || missing+=("${id}")
+        _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
       done
       ;;
     *)
@@ -2220,13 +2259,13 @@ all_models_staged() {
   esac
 
   if [[ ${#missing[@]} -eq 0 ]]; then
-    log "✓ All ${#ids[@]} models already staged in object store (${OBJ_STORE_TYPE}, accel=${accel}) — skipping download and upload."
+    log "✓ All ${#ids[@]} models already staged in object store (${OBJ_STORE_TYPE}) — skipping download and upload."
     return 0
   fi
 
   log "Model staging needed: ${#missing[@]}/${#ids[@]} model(s) not yet staged."
   for _m in "${missing[@]}"; do
-    log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found or accel mismatch)"
+    log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found or hf_url changed)"
   done
   return 1
 }
@@ -2247,8 +2286,10 @@ stage_model_artifacts() {
     return 1
   fi
 
-  # ---- Resolve accelerator ----
-  local _accel="${DEFAULT_ACCELERATOR:-}"
+  # ---- Resolve accelerator (normalize to lowercase) ----
+  # Config uses uppercase (L40S, H100) to match the sample; internal logic requires lowercase.
+  local _accel
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
   if [[ -z "${_accel}" ]]; then
     warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
     _accel="l40s"
@@ -2334,7 +2375,7 @@ stage_model_artifacts() {
   esac
 
   # ---- Verify all models are now staged (fail early with clear list if any missing) ----
-  # Also validates marker accel= field so a leftover L40S marker doesn't pass an H100 check.
+  # Validates marker hf_url= field: if the URL changed, the staged artifact is stale.
   log "Verifying all models are present in object store after staging..."
   local _missing_ids=()
   local _verify_alias="installer_verify"
@@ -2345,15 +2386,16 @@ stage_model_artifacts() {
   case "${OBJ_STORE_TYPE}" in
     aws)
       if command -v aws &>/dev/null; then
-        while IFS= read -r _id; do
-          [[ -z "${_id}" ]] && continue
+        while IFS= read -r _entry; do
+          [[ -z "${_entry}" ]] && continue
+          local _id="${_entry%%|*}" _hf_url="${_entry##*|}"
           local _marker_path="s3://${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete"
           local _content
           _content=$(AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
                      AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
                      aws s3 cp "${_marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { _missing_ids+=("${_id}"); continue; }
-          echo "${_content}" | grep -q "^accel=${_accel}$" || _missing_ids+=("${_id}")
-        done < <(yq eval '.artifact-configs[].artifact-id' "${_config_for_verify}" 2>/dev/null)
+          echo "${_content}" | grep -q "^hf_url=${_hf_url}$" || _missing_ids+=("${_id}")
+        done < <(yq eval '.artifact-configs[] | .artifact-id + "|" + .hf-url' "${_config_for_verify}" 2>/dev/null)
       else
         warn "aws CLI not available — skipping post-stage verification."
         _verify_ok=0
@@ -2363,13 +2405,14 @@ stage_model_artifacts() {
       if command -v mc &>/dev/null && [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
         mc alias set "${_verify_alias}" "${OBJ_STORE_ENDPOINT}" \
             "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api S3v4 &>/dev/null
-        while IFS= read -r _id; do
-          [[ -z "${_id}" ]] && continue
+        while IFS= read -r _entry; do
+          [[ -z "${_entry}" ]] && continue
+          local _id="${_entry%%|*}" _hf_url="${_entry##*|}"
           local _marker_path="${_verify_alias}/${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete"
           local _content
           _content=$(mc cat "${_marker_path}" 2>/dev/null) || { _missing_ids+=("${_id}"); continue; }
-          echo "${_content}" | grep -q "^accel=${_accel}$" || _missing_ids+=("${_id}")
-        done < <(yq eval '.artifact-configs[].artifact-id' "${_config_for_verify}" 2>/dev/null)
+          echo "${_content}" | grep -q "^hf_url=${_hf_url}$" || _missing_ids+=("${_id}")
+        done < <(yq eval '.artifact-configs[] | .artifact-id + "|" + .hf-url' "${_config_for_verify}" 2>/dev/null)
       else
         warn "mc / OBJ_STORE_ENDPOINT not available — skipping post-stage verification."
         _verify_ok=0
@@ -2378,9 +2421,9 @@ stage_model_artifacts() {
   esac
 
   if [[ "${_verify_ok}" == "1" && ${#_missing_ids[@]} -gt 0 ]]; then
-    err "Model staging incomplete — the following model(s) are missing or have a mismatched accelerator:"
+    err "Model staging incomplete — the following model(s) are missing or have a changed hf_url:"
     for _id in "${_missing_ids[@]}"; do
-      err "  ✗ ${_id}  (expected: ${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete with accel=${_accel})"
+      err "  ✗ ${_id}  (expected: ${OBJ_STORE_BUCKET}/staging_state/${_id}/.staging_complete with matching hf_url)"
     done
     err "Re-run '$0 stage-artifacts' to retry the missing models, then run '$0 install' again."
     return 1
@@ -3038,9 +3081,11 @@ install_nvidia_host_drivers() {
     log "NVIDIA drivers installed successfully on all ${#gpu_ips[@]} GPU node(s)"
   fi
 
-  # Wait for GPU workers to rejoin and verify they are Ready
+  # Wait for GPU workers to rejoin and verify they are Ready.
+  # Timeout is 600s: driver install may trigger a kernel module reload or reboot
+  # which can take several minutes before the node rejoins the cluster.
   log "Waiting for GPU worker nodes to rejoin cluster and become Ready..."
-  local gpu_wait_timeout=180
+  local gpu_wait_timeout=600
   local gpu_wait_elapsed=0
   local all_gpu_ready=false
 
@@ -3076,7 +3121,9 @@ install_nvidia_host_drivers() {
   done
 
   if [[ "${all_gpu_ready}" != "true" ]]; then
-    err "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s. Check: kubectl get nodes"
+    warn "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s — continuing install."
+    warn "Check node status after install: kubectl get nodes"
+    warn "If nodes are NotReady due to a pending reboot, reboot the node and re-run the installer."
   fi
 
   # Verify GPUs are visible to Kubernetes. If the device-plugin DaemonSet
@@ -3292,18 +3339,11 @@ install_splunk_operator() {
   log "Creating image pull secrets in ${splunk_operator_ns} namespace..."
   create_image_pull_secrets "${splunk_operator_ns}" >/dev/null 2>&1 || true
 
-  # Use kubectl replace --force for CRDs to avoid annotation size limits
-  # This deletes and recreates the resource, avoiding the annotation issue
+  # Use server-side apply: idempotent, handles CRDs without annotation size
+  # limits, and never deletes resources (unlike replace --force).
   log "Installing/updating Splunk Operator CRDs and resources..."
-
-  # First, try to create (for fresh install)
-  if kubectl create -f "${SPLUNK_OPERATOR_FILE}" 2>/dev/null; then
-    log "Splunk Operator resources created successfully"
-  else
-    # Resources likely already exist, use replace --force
-    log "Resources already exist, updating with replace..."
-    kubectl replace --force -f "${SPLUNK_OPERATOR_FILE}" 2>&1 | grep -v "Warning: --force is deprecated" || true
-  fi
+  kubectl apply --server-side --force-conflicts -f "${SPLUNK_OPERATOR_FILE}" \
+    2>&1 | grep -v "^Warning:" || true
 
   # Patch splunk-operator deployment with imagePullSecrets if any exist
   log "Checking for imagePullSecrets to add to Splunk Operator deployment..."

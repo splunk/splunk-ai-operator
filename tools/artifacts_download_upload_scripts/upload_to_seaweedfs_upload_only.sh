@@ -168,10 +168,15 @@ while [[ $idx -lt $total ]]; do
     id=$(basename "$artifact_path")
     dest_base="${MC_ALIAS}/${OBJECT_STORE_BUCKET}/model_artifacts/$id"
 
-    # Skip entirely if already fully staged (marker in staging_state/ prefix)
+    # Skip entirely if already fully staged with matching hf_url.
+    # Presence-only check is not enough: a marker from a prior run may lack
+    # hf_url= or have a stale URL; in that case we must re-upload so the
+    # verification step finds a current marker.
     if [[ "$SKIP_IF_STAGED" == "1" ]]; then
-      if mc stat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" &>/dev/null; then
-        echo "✓ $id already staged (.staging_complete present) — skipping."
+      local_hf_url=$(grep "^hf_url=" "${artifact_path}/.staging_complete" 2>/dev/null | cut -d= -f2-)
+      remote_hf_url=$(mc cat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-)
+      if [[ -n "$local_hf_url" && "$local_hf_url" == "$remote_hf_url" ]]; then
+        echo "✓ $id already staged (hf_url matches) — skipping."
         idx=$((idx + 1))
         continue
       fi
@@ -179,6 +184,12 @@ while [[ $idx -lt $total ]]; do
 
     (
       if [[ -d "$artifact_path" ]]; then
+        # Remove stale remote files when hf_url changed — SeaweedFS has no native
+        # sync-with-delete, so explicitly wipe the remote dir before re-uploading.
+        if [[ -n "$remote_hf_url" && "$remote_hf_url" != "$local_hf_url" ]]; then
+          echo "↻ $id: hf_url changed — removing stale remote files before re-upload."
+          mc rm --recursive --force "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/model_artifacts/${id}/" 2>/dev/null || true
+        fi
         upload_artifact_dir "$artifact_path" "$dest_base" "$id" || exit 1
       else
         do_upload_file "$artifact_path" "$dest_base" || { echo "$(date -Iseconds 2>/dev/null || date) FAILED: $id" >> "$SEAWEEDFS_ERROR_LOG"; exit 1; }
