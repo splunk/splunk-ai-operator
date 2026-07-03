@@ -285,15 +285,21 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 		}
 	*/
 
-	// If using secret, validate SecretRef is set
-	if hasEndpoint && splunkConfig.SecretRef.Name == "" {
-		allErrs = append(allErrs, field.Required(
-			fldPath.Child("secretRef").Child("name"),
-			"secretRef.name is required when using endpoint",
-		))
+	// Vault source supplies its token via a file; it does not use a k8s SecretRef.
+	// All other sources require SecretRef when an explicit endpoint is set.
+	if splunkConfig.SecretSource != aiv1.SecretSourceVault {
+		if hasEndpoint && splunkConfig.SecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(
+				fldPath.Child("secretRef").Child("name"),
+				"secretRef.name is required when using endpoint",
+			))
+		}
 	}
 
-	// Guard against path traversal: vaultFilePath must be within /vault/secrets/
+	// Guard against path traversal: vaultFilePath must be under /vault/secrets/.
+	// The admission webhook cannot call EvalSymlinks (the file need not exist yet),
+	// so we explicitly reject ".." components before filepath.Clean can erase them,
+	// then verify the cleaned path stays within the allowed root.
 	if splunkConfig.SecretSource == aiv1.SecretSourceVault {
 		if splunkConfig.VaultFilePath == "" {
 			allErrs = append(allErrs, field.Required(
@@ -301,13 +307,28 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 				"vaultFilePath is required when secretSource is vault",
 			))
 		} else {
-			cleaned := filepath.Clean(splunkConfig.VaultFilePath)
-			if !strings.HasPrefix(cleaned, "/vault/secrets/") {
+			hasTraversal := false
+			for _, component := range strings.Split(splunkConfig.VaultFilePath, "/") {
+				if component == ".." {
+					hasTraversal = true
+					break
+				}
+			}
+			if hasTraversal {
 				allErrs = append(allErrs, field.Invalid(
 					fldPath.Child("vaultFilePath"),
 					splunkConfig.VaultFilePath,
-					"vaultFilePath must be under /vault/secrets/",
+					"vaultFilePath must be under /vault/secrets/ and must not contain '..'",
 				))
+			} else {
+				cleaned := filepath.Clean(splunkConfig.VaultFilePath)
+				if !strings.HasPrefix(cleaned, "/vault/secrets/") {
+					allErrs = append(allErrs, field.Invalid(
+						fldPath.Child("vaultFilePath"),
+						splunkConfig.VaultFilePath,
+						"vaultFilePath must be under /vault/secrets/",
+					))
+				}
 			}
 		}
 	}

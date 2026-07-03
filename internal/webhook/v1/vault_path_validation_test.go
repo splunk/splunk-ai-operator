@@ -38,7 +38,7 @@ func TestVaultPathValidation_AIService(t *testing.T) {
 				VaultFilePath: "/vault/secrets/../../../etc/passwd",
 			},
 			wantErrField: "spec.splunkConfiguration.vaultFilePath",
-			wantErrMsg:   "/vault/secrets/",
+			wantErrMsg:   "..",
 		},
 		{
 			name: "blocked: prefix collision (/vault/secrets-evil/)",
@@ -143,7 +143,7 @@ func TestVaultPathValidation_AIPlatform(t *testing.T) {
 				VaultFilePath: "/vault/secrets/../../../etc/passwd",
 			},
 			wantErrField: "spec.splunkConfiguration.vaultFilePath",
-			wantErrMsg:   "/vault/secrets/",
+			wantErrMsg:   "..",
 		},
 		{
 			name: "blocked: empty vaultFilePath with vault source",

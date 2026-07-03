@@ -17,6 +17,8 @@ limitations under the License.
 package v1
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -54,6 +56,16 @@ var _ = Describe("AIPlatform Webhook", func() {
 		Describe("vaultFilePath validation", func() {
 			fldPath := field.NewPath("spec").Child("splunkConfiguration")
 
+			// findErr returns the first field.Error whose Field contains substr.
+			findErr := func(errs field.ErrorList, fieldSubstr string) *field.Error {
+				for _, e := range errs {
+					if strings.Contains(e.Field, fieldSubstr) {
+						return e
+					}
+				}
+				return nil
+			}
+
 			It("should reject secretSource=vault with no vaultFilePath", func() {
 				splunkConfig := &aiv1.SplunkConfigurationSpec{
 					Endpoint:      "http://splunk:8088",
@@ -61,9 +73,9 @@ var _ = Describe("AIPlatform Webhook", func() {
 					VaultFilePath: "",
 				}
 				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
-				Expect(errs).NotTo(BeEmpty())
-				Expect(errs[0].Field).To(ContainSubstring("vaultFilePath"))
-				Expect(errs[0].Detail).To(ContainSubstring("required"))
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring("required"))
 			})
 
 			It("should reject vaultFilePath pointing at the SA token (VULN-87311 PoC path)", func() {
@@ -73,9 +85,9 @@ var _ = Describe("AIPlatform Webhook", func() {
 					VaultFilePath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
 				}
 				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
-				Expect(errs).NotTo(BeEmpty())
-				Expect(errs[0].Field).To(ContainSubstring("vaultFilePath"))
-				Expect(errs[0].Detail).To(ContainSubstring("/vault/secrets/"))
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
 			})
 
 			It("should reject vaultFilePath with traversal sequence", func() {
@@ -85,8 +97,9 @@ var _ = Describe("AIPlatform Webhook", func() {
 					VaultFilePath: "/vault/secrets/../../../etc/passwd",
 				}
 				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
-				Expect(errs).NotTo(BeEmpty())
-				Expect(errs[0].Detail).To(ContainSubstring("/vault/secrets/"))
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring(".."))
 			})
 
 			It("should reject path that starts with /vault/secrets but is not under it", func() {
@@ -96,8 +109,9 @@ var _ = Describe("AIPlatform Webhook", func() {
 					VaultFilePath: "/vault/secrets-evil/token",
 				}
 				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
-				Expect(errs).NotTo(BeEmpty())
-				Expect(errs[0].Detail).To(ContainSubstring("/vault/secrets/"))
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
 			})
 
 			It("should accept a valid vaultFilePath under /vault/secrets/", func() {
