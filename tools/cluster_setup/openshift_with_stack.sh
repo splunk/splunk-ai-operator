@@ -260,6 +260,9 @@ ${yq_err}"
   MINIO_ROOT_PASSWORD=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName // "splunk-standalone"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
+  NFD_CATALOG_SOURCE=$(yq eval '.operators.nfd.catalogSource // "redhat-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "redhat-operators")
+  GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "certified-operators")
+
   # Ingress domain: read from config if set, otherwise auto-detect from the cluster.
   # Used to create an OpenShift Route for SAIA so both browsers and in-cluster services
   # can reach it via a stable hostname.
@@ -315,6 +318,13 @@ configure_images() {
   fi
   cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
 
+  if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
+    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
+      cp "${SPLUNK_OPERATOR_FILE}" "${SPLUNK_OPERATOR_FILE}.original"
+    fi
+    cp "${SPLUNK_OPERATOR_FILE}.original" "${SPLUNK_OPERATOR_FILE}"
+  fi
+
   local operator_full ray_head_full ray_worker_full weaviate_full
   local saia_api_full saia_api_v2_full saia_dataloader_full
   local fluent_bit_full otel_collector_full nginx_full
@@ -364,6 +374,19 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|"                     "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|"                 "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_esc}|I"                             "$SPLUNK_AI_FILE"
+
+  if [[ -f "${SPLUNK_OPERATOR_FILE}" && -n "${SPLUNK_OPERATOR_IMAGE:-}" && "${SPLUNK_OPERATOR_IMAGE}" != "null" ]]; then
+    local splunk_op_full splunk_op_esc
+    splunk_op_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
+    splunk_op_esc=$(echo "$splunk_op_full" | sed 's/[\/&]/\\&/g')
+    local splunk_ent_full splunk_ent_esc
+    splunk_ent_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
+    splunk_ent_esc=$(echo "$splunk_ent_full" | sed 's/[\/&]/\\&/g')
+    "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_esc}|I"                             "${SPLUNK_OPERATOR_FILE}"
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_ent_esc}|" "${SPLUNK_OPERATOR_FILE}"
+    log "  ✓ Splunk Operator image:           $splunk_op_full"
+    log "  ✓ RELATED_IMAGE_SPLUNK_ENTERPRISE: $splunk_ent_full"
+  fi
 
   log "  ✓ RELATED_IMAGE_RAY_HEAD:          $ray_head_full"
   log "  ✓ RELATED_IMAGE_RAY_WORKER:        $ray_worker_full"
@@ -473,7 +496,7 @@ install_nfd() {
     return 0
   fi
 
-  oc apply -f - <<'EOF'
+  oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -496,7 +519,7 @@ metadata:
 spec:
   channel: stable
   name: nfd
-  source: redhat-operators
+  source: ${NFD_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
   installPlanApproval: Automatic
 EOF
@@ -555,7 +578,7 @@ install_nvidia_gpu_operator() {
     return 0
   fi
 
-  oc apply -f - <<'EOF'
+  oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -578,7 +601,7 @@ metadata:
 spec:
   channel: v26.3
   name: gpu-operator-certified
-  source: certified-operators
+  source: ${GPU_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
   installPlanApproval: Automatic
 EOF
@@ -782,7 +805,9 @@ install_cert_manager() {
     fi
   fi
 
-  oc apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+  local cert_manager_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+  local cert_manager_apply="${cert_manager_url#file://}"
+  oc apply -f "${cert_manager_apply}"
 
   log "Waiting for cert-manager to be ready..."
   oc wait --for=condition=ready pod \
@@ -842,7 +867,9 @@ install_local_path_provisioner() {
   fi
 
   log "Installing local-path-provisioner (no default storage class found)..."
-  oc apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml
+  local local_path_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
+  local local_path_apply="${local_path_url#file://}"
+  oc apply -f "${local_path_apply}"
 
   log "Waiting for local-path-provisioner to be ready..."
   oc rollout status deployment local-path-provisioner -n local-path-storage --timeout=120s || true
@@ -914,17 +941,24 @@ install_otel_operator() {
     return 0
   fi
 
-  helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
-  helm repo update open-telemetry 2>/dev/null || true
+  local otel_chart_ref
+  if [[ -n "${OTEL_CHART_PATH:-}" && -f "${OTEL_CHART_PATH}" ]]; then
+    otel_chart_ref="${OTEL_CHART_PATH}"
+    log "  Using local chart: ${otel_chart_ref}"
+  else
+    helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
+    helm repo update open-telemetry 2>/dev/null || true
+    otel_chart_ref="open-telemetry/opentelemetry-operator"
+  fi
 
   local otel_retries=0
   while (( otel_retries < 6 )); do
     local otel_out
-    otel_out=$(helm upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+    otel_out=$(helm upgrade --install opentelemetry-operator "${otel_chart_ref}" \
       --namespace opentelemetry-operator-system --create-namespace \
       --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
       --set admissionWebhooks.certManager.enabled=true \
-      --wait=false --timeout=10m 2>&1)
+      --wait=false --timeout=10m 2>&1) || true
     if echo "${otel_out}" | grep -q "x509: certificate\|failed to call webhook\|i/o timeout"; then
       warn "cert-manager webhook not ready yet, waiting 10s (${otel_retries}/6)..."
       sleep 10
@@ -959,12 +993,20 @@ install_ray_operator() {
     return 0
   fi
 
-  helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
-  helm repo update kuberay
+  local kuberay_chart_ref kuberay_version_flag=()
+  if [[ -n "${KUBERAY_CHART_PATH:-}" && -f "${KUBERAY_CHART_PATH}" ]]; then
+    kuberay_chart_ref="${KUBERAY_CHART_PATH}"
+    log "  Using local chart: ${kuberay_chart_ref}"
+  else
+    helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
+    helm repo update kuberay
+    kuberay_chart_ref="kuberay/kuberay-operator"
+    kuberay_version_flag=(--version 1.2.2)
+  fi
 
-  helm upgrade --install kuberay-operator kuberay/kuberay-operator \
+  helm upgrade --install kuberay-operator "${kuberay_chart_ref}" \
     --namespace ray-system --create-namespace \
-    --version 1.2.2 \
+    "${kuberay_version_flag[@]+"${kuberay_version_flag[@]}"}" \
     --set image.repository=quay.io/kuberay/operator \
     --set image.tag=v1.2.2 \
     --wait --timeout=10m
