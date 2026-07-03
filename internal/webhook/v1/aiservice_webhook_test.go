@@ -17,11 +17,14 @@ limitations under the License.
 package v1
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
-	// TODO (user): Add any additional imports if needed
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 var _ = Describe("AIService Webhook", func() {
@@ -41,47 +44,102 @@ var _ = Describe("AIService Webhook", func() {
 		Expect(defaulter).NotTo(BeNil(), "Expected defaulter to be initialized")
 		Expect(oldObj).NotTo(BeNil(), "Expected oldObj to be initialized")
 		Expect(obj).NotTo(BeNil(), "Expected obj to be initialized")
-		// TODO (user): Add any setup logic common to all tests
 	})
 
-	AfterEach(func() {
-		// TODO (user): Add any teardown logic common to all tests
-	})
+	AfterEach(func() {})
 
-	Context("When creating AIService under Defaulting Webhook", func() {
-		// TODO (user): Add logic for defaulting webhooks
-		// Example:
-		// It("Should apply defaults when a required field is empty", func() {
-		//     By("simulating a scenario where defaults should be applied")
-		//     obj.SomeFieldWithDefault = ""
-		//     By("calling the Default method to apply defaults")
-		//     defaulter.Default(ctx, obj)
-		//     By("checking that the default values are set")
-		//     Expect(obj.SomeFieldWithDefault).To(Equal("default_value"))
-		// })
-	})
+	Context("When creating AIService under Defaulting Webhook", func() {})
 
 	Context("When creating or updating AIService under Validating Webhook", func() {
-		// TODO (user): Add logic for validating webhooks
-		// Example:
-		// It("Should deny creation if a required field is missing", func() {
-		//     By("simulating an invalid creation scenario")
-		//     obj.SomeRequiredField = ""
-		//     Expect(validator.ValidateCreate(ctx, obj)).Error().To(HaveOccurred())
-		// })
-		//
-		// It("Should admit creation if all required fields are present", func() {
-		//     By("simulating an invalid creation scenario")
-		//     obj.SomeRequiredField = "valid_value"
-		//     Expect(validator.ValidateCreate(ctx, obj)).To(BeNil())
-		// })
-		//
-		// It("Should validate updates correctly", func() {
-		//     By("simulating a valid update scenario")
-		//     oldObj.SomeRequiredField = "updated_value"
-		//     obj.SomeRequiredField = "updated_value"
-		//     Expect(validator.ValidateUpdate(ctx, oldObj, obj)).To(BeNil())
-		// })
-	})
+		// --- vaultFilePath security tests (VULN-87311) ---
 
+		Describe("vaultFilePath validation", func() {
+			fldPath := field.NewPath("spec").Child("splunkConfiguration")
+
+			// findErr returns the first field.Error whose Field contains substr.
+			findErr := func(errs field.ErrorList, fieldSubstr string) *field.Error {
+				for _, e := range errs {
+					if strings.Contains(e.Field, fieldSubstr) {
+						return e
+					}
+				}
+				return nil
+			}
+
+			It("should reject secretSource=vault with no vaultFilePath", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:      "http://splunk:8088",
+					SecretSource:  aiv1.SecretSourceVault,
+					VaultFilePath: "",
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring("required"))
+			})
+
+			It("should reject vaultFilePath pointing at the SA token (VULN-87311 PoC path)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:      "http://splunk:8088",
+					SecretSource:  aiv1.SecretSourceVault,
+					VaultFilePath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
+			})
+
+			It("should reject vaultFilePath with traversal sequence", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:      "http://splunk:8088",
+					SecretSource:  aiv1.SecretSourceVault,
+					VaultFilePath: "/vault/secrets/../../../etc/passwd",
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring(".."))
+			})
+
+			It("should reject path that starts with /vault/secrets but is not under it", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:      "http://splunk:8088",
+					SecretSource:  aiv1.SecretSourceVault,
+					VaultFilePath: "/vault/secrets-evil/token",
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				e := findErr(errs, "vaultFilePath")
+				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
+				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
+			})
+
+			It("should accept a valid vaultFilePath under /vault/secrets/", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:      "http://splunk:8088",
+					SecretRef:     corev1.SecretReference{Name: "my-secret"},
+					SecretSource:  aiv1.SecretSourceVault,
+					VaultFilePath: "/vault/secrets/splunk-hec-token",
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				// The only errors (if any) should NOT be about vaultFilePath
+				for _, e := range errs {
+					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
+				}
+			})
+
+			It("should not validate vaultFilePath when secretSource is not vault", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:      "http://splunk:8088",
+					SecretRef:     corev1.SecretReference{Name: "my-secret"},
+					SecretSource:  aiv1.SecretSourceKubernetes,
+					VaultFilePath: "/etc/passwd", // would be invalid if vault source
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				for _, e := range errs {
+					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
+				}
+			})
+		})
+	})
 })
