@@ -1055,7 +1055,7 @@ preflight_check_registry() {
 
   local probe_ref=""
   local probe_source=""
-  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE OPERATOR_IMAGE; do
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
     local _val="${!_candidate_var:-}"
     local _ref
     if _ref=$(_image_targets_registry "${_val}"); then
@@ -2286,8 +2286,10 @@ stage_model_artifacts() {
     return 1
   fi
 
-  # ---- Resolve accelerator ----
-  local _accel="${DEFAULT_ACCELERATOR:-}"
+  # ---- Resolve accelerator (normalize to lowercase) ----
+  # Config uses uppercase (L40S, H100) to match the sample; internal logic requires lowercase.
+  local _accel
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
   if [[ -z "${_accel}" ]]; then
     warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
     _accel="l40s"

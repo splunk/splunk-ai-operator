@@ -237,10 +237,15 @@ for artifact_path in "$SOURCE_DIR"/*; do
         # so model loaders never encounter it at inference time.
         marker_s3="s3://$S3_BUCKET/staging_state/$id/.staging_complete"
 
-        # Skip entirely if already fully staged in S3
+        # Skip entirely if already fully staged in S3 with matching hf_url.
+        # Presence-only check is not enough: a marker from a prior run may lack
+        # hf_url= or have a stale URL; in that case we must re-upload so the
+        # verification step finds a current marker.
         if [[ "$SKIP_IF_STAGED" == "1" ]]; then
-            if aws s3 ls "$marker_s3" --region "$S3_REGION" &>/dev/null; then
-                echo "✓ $id already staged in S3 (.staging_complete present) — skipping."
+            local_hf_url=$(grep "^hf_url=" "$artifact_path/.staging_complete" 2>/dev/null | cut -d= -f2-)
+            remote_hf_url=$(aws s3 cp "$marker_s3" - --region "$S3_REGION" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-)
+            if [[ -n "$local_hf_url" && "$local_hf_url" == "$remote_hf_url" ]]; then
+                echo "✓ $id already staged in S3 (hf_url matches) — skipping."
                 echo "-----------------------------"
                 continue
             fi
