@@ -3079,9 +3079,11 @@ install_nvidia_host_drivers() {
     log "NVIDIA drivers installed successfully on all ${#gpu_ips[@]} GPU node(s)"
   fi
 
-  # Wait for GPU workers to rejoin and verify they are Ready
+  # Wait for GPU workers to rejoin and verify they are Ready.
+  # Timeout is 600s: driver install may trigger a kernel module reload or reboot
+  # which can take several minutes before the node rejoins the cluster.
   log "Waiting for GPU worker nodes to rejoin cluster and become Ready..."
-  local gpu_wait_timeout=180
+  local gpu_wait_timeout=600
   local gpu_wait_elapsed=0
   local all_gpu_ready=false
 
@@ -3117,7 +3119,9 @@ install_nvidia_host_drivers() {
   done
 
   if [[ "${all_gpu_ready}" != "true" ]]; then
-    err "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s. Check: kubectl get nodes"
+    warn "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s — continuing install."
+    warn "Check node status after install: kubectl get nodes"
+    warn "If nodes are NotReady due to a pending reboot, reboot the node and re-run the installer."
   fi
 
   # Verify GPUs are visible to Kubernetes. If the device-plugin DaemonSet
