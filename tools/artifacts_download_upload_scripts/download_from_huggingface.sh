@@ -304,17 +304,15 @@ _setup_mc_alias() {
 }
 
 _AWS_WARN_DONE=0
-# remote_model_staged <artifact-id>
-# Returns 0 if the .staging_complete marker exists in the object store, 1 otherwise.
+# remote_model_staged <artifact-id> <hf_url>
+# Returns 0 if the .staging_complete marker exists in the object store AND its
+# hf_url= field matches the current config URL, 1 otherwise.
 # Fails open (returns 1) on any configuration or tool error so staging always proceeds.
 remote_model_staged() {
     local id="$1"
+    local hf_url="$2"
     local store_type="${OBJ_STORE_TYPE:-minio}"
     local bucket="${OBJ_STORE_BUCKET:-ai-platform-data}"
-    # Marker is at staging_state/<id>/.staging_complete.
-    # Its content includes "accel=<type>" written by the download script.
-    # We validate the accel field so a staged L40S marker does not cause us to skip
-    # the H100 download for an artifact-id shared between both configs (e.g. gemma-4-31b-it).
     local marker_path="staging_state/${id}/.staging_complete"
 
     local _marker_content
@@ -349,11 +347,10 @@ remote_model_staged() {
             return 1
             ;;
     esac
-    # Validate that the marker was written for the same accelerator type.
-    # Both L40S and H100 configs share artifact-ids (e.g. gemma-4-31b-it) but point
-    # to different HF repos; without this check a staged L40S marker would skip the
-    # H100 download, leaving the wrong model weights in the store.
-    echo "${_marker_content}" | grep -q "^accel=${ACCEL}$"
+    # Validate that the marker was written for the same HF URL.
+    # If the URL changed (model updated in config), the staged artifact is stale
+    # and must be re-downloaded regardless of GPU type.
+    echo "${_marker_content}" | grep -q "^hf_url=${hf_url}$"
 }
 
 # ---------- Per-model download with retry and cleanup ----------
@@ -467,8 +464,8 @@ download_one_model() {
         # Write local completion marker (written last — its presence means fully done & verified)
         local file_count
         file_count=$(find "$dest" -type f | wc -l | tr -d ' ')
-        printf 'staged=%s\naccel=%s\nfiles=%s\n' \
-            "$(date -Iseconds 2>/dev/null || date)" "$ACCEL" "$file_count" \
+        printf 'staged=%s\naccel=%s\nhf_url=%s\nfiles=%s\n' \
+            "$(date -Iseconds 2>/dev/null || date)" "$ACCEL" "$hf_url" "$file_count" \
             > "$dest/.staging_complete"
 
         ls -lR "$dest"
@@ -521,17 +518,23 @@ for ((idx=0; idx<artifact_count; idx++)); do
     fi
 
     # 1. Object-store pre-check — skip download AND upload if fully staged remotely
-    if [[ "$SKIP_IF_STAGED" == "1" ]] && remote_model_staged "$id"; then
-        echo "✓ $id already fully staged in object store (.staging_complete marker found) — skipping download and upload."
+    #    with the same HF URL (URL change means the model was updated in config).
+    if [[ "$SKIP_IF_STAGED" == "1" ]] && remote_model_staged "$id" "$hf_url"; then
+        echo "✓ $id already fully staged in object store (hf_url matches) — skipping download and upload."
         echo "-----------------------------"
         continue
     fi
 
-    # 2. Local completion marker — skip re-download (model already downloaded & verified)
+    # 2. Local completion marker — skip re-download if marker exists and URL matches.
     if [[ "$SKIP_IF_EXISTS" == "1" || "$SKIP_IF_STAGED" == "1" ]] && [[ -f "$DOWNLOAD_DIR/$id/.staging_complete" ]]; then
-        echo "✓ $id already downloaded locally (.staging_complete marker found) — skipping download."
-        echo "-----------------------------"
-        continue
+        local_url=$(grep "^hf_url=" "$DOWNLOAD_DIR/$id/.staging_complete" 2>/dev/null | cut -d= -f2-)
+        if [[ "$local_url" == "$hf_url" ]]; then
+            echo "✓ $id already downloaded locally (hf_url matches) — skipping download."
+            echo "-----------------------------"
+            continue
+        else
+            echo "↻ $id local marker exists but hf_url changed (was: ${local_url:-unknown}, now: $hf_url) — re-downloading."
+        fi
     fi
 
     # 3. Partial/stale folder without marker — wipe and start clean
