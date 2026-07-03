@@ -284,15 +284,21 @@ docker.io/fluent/fluent-bit:1.9.6
 # ── Nginx ─────────────────────────────────────────────────────────────────────
 docker.io/library/nginx:1.27-alpine
 
-# ── cert-manager (installed from manifest) ────────────────────────────────────
-# Exact image tags are embedded in the manifest. Extract them with:
-#   grep 'image:' manifests/cert-manager.yaml
+# ── cert-manager (images extracted from bundled manifest) ─────────────────────
+IMGEOF
+
+grep -oP '(?<=image: )[^\s]+' "${STAGE_DIR}/manifests/cert-manager.yaml" 2>/dev/null | sort -u >> "${STAGE_DIR}/container-images.txt" || true
+
+cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 
 # ── local-path-provisioner ────────────────────────────────────────────────────
-# Patched in openshift_with_stack.sh to use ubi9-minimal as the helper pod.
-# The provisioner itself uses the image baked into local-path-storage.yaml.
-# Extract with: grep 'image:' manifests/local-path-storage.yaml
+# The helper pod image is overridden to ubi-minimal; mirror both.
 registry.access.redhat.com/ubi9/ubi-minimal:latest
+IMGEOF
+
+grep -oP '(?<=image: )[^\s]+' "${STAGE_DIR}/manifests/local-path-storage.yaml" 2>/dev/null | sort -u >> "${STAGE_DIR}/container-images.txt" || true
+
+cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 
 # ── OLM Operators (NFD + GPU Operator) ───────────────────────────────────────
 # These are NOT direct image references — they are OLM Subscriptions backed by
