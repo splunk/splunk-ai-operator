@@ -3310,18 +3310,11 @@ install_splunk_operator() {
   log "Creating image pull secrets in ${splunk_operator_ns} namespace..."
   create_image_pull_secrets "${splunk_operator_ns}" >/dev/null 2>&1 || true
 
-  # Use kubectl replace --force for CRDs to avoid annotation size limits
-  # This deletes and recreates the resource, avoiding the annotation issue
+  # Use server-side apply: idempotent, handles CRDs without annotation size
+  # limits, and never deletes resources (unlike replace --force).
   log "Installing/updating Splunk Operator CRDs and resources..."
-
-  # First, try to create (for fresh install)
-  if kubectl create -f "${SPLUNK_OPERATOR_FILE}" 2>/dev/null; then
-    log "Splunk Operator resources created successfully"
-  else
-    # Resources likely already exist, use replace --force
-    log "Resources already exist, updating with replace..."
-    kubectl replace --force -f "${SPLUNK_OPERATOR_FILE}" 2>&1 | grep -v "Warning: --force is deprecated" || true
-  fi
+  kubectl apply --server-side --force-conflicts -f "${SPLUNK_OPERATOR_FILE}" \
+    2>&1 | grep -v "^Warning:" || true
 
   # Patch splunk-operator deployment with imagePullSecrets if any exist
   log "Checking for imagePullSecrets to add to Splunk Operator deployment..."
