@@ -606,7 +606,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 build_image_url() {
   local registry="$1"
   local image_path="$2"
-  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
+  # Treat as fully-qualified if image starts with a registry host.
+  # Recognised forms: domain.tld/... , domain.tld:port/... , IP/... , IP:port/...
+  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
     echo "$image_path"
     return 0
   fi
@@ -1027,27 +1029,48 @@ preflight_check_registry() {
   esac
 
   # ---- Step 2: Auth + manifest pull for one representative image ----
-  # Pick the operator image as the probe — it's always required
-  local probe_image="${OPERATOR_IMAGE:-}"
-  if [[ -z "${probe_image}" || "${probe_image}" == "null" ]]; then
-    pf_warn "No probe image available (images.operator.image not set) — skipping auth check."
+  # Pick the first image that actually resolves to IMAGE_REGISTRY after applying
+  # build_image_url. The operator image is often fully-qualified to docker.io while
+  # Ray/SAIA images are short refs that build_image_url prefixes with IMAGE_REGISTRY —
+  # probing only the operator image would miss auth/tag problems in the private registry.
+  # Regex: fully-qualified = starts with domain[:port]/ or IP[:port]/
+  local _fq_re='^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/'
+
+  # _image_targets_registry <raw_config_value>
+  # Returns 0 and prints the repo:tag portion if the image (after build_image_url)
+  # targets IMAGE_REGISTRY; returns 1 otherwise.
+  _image_targets_registry() {
+    local raw="$1"
+    [[ -z "${raw}" || "${raw}" == "null" ]] && return 1
+    local full
+    full=$(build_image_url "${IMAGE_REGISTRY}" "${raw}")
+    # After build_image_url, fully-qualified refs that didn't match IMAGE_REGISTRY
+    # are returned unchanged; strip IMAGE_REGISTRY/ prefix to get repo:tag.
+    if [[ "${full}" == ${IMAGE_REGISTRY}/* ]]; then
+      echo "${full#${IMAGE_REGISTRY}/}"
+      return 0
+    fi
+    return 1
+  }
+
+  local probe_ref=""
+  local probe_source=""
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE OPERATOR_IMAGE; do
+    local _val="${!_candidate_var:-}"
+    local _ref
+    if _ref=$(_image_targets_registry "${_val}"); then
+      probe_ref="${_ref}"
+      probe_source="${_candidate_var}"
+      break
+    fi
+  done
+
+  if [[ -z "${probe_ref}" ]]; then
+    pf_warn "No images in config target IMAGE_REGISTRY (${IMAGE_REGISTRY}) — all images appear to be fully qualified to other registries. Skipping auth check."
     return
   fi
 
-  # Strip registry prefix from probe image to get repo:tag.
-  # If the image already contains a different registry host (e.g. docker.io/splunk/...)
-  # it is not stored in IMAGE_REGISTRY — skip the manifest probe to avoid a bogus
-  # 404 like <private-registry>/docker.io/splunk/...:tag.
-  local probe_ref="${probe_image}"
-  if [[ "${probe_ref}" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
-    # Image has a fully-qualified registry host
-    if [[ "${probe_ref}" != ${IMAGE_REGISTRY}/* ]]; then
-      pf_ok "Operator image uses a different registry (${probe_ref%%/*}) — skipping manifest probe against ${IMAGE_REGISTRY}."
-      return
-    fi
-    # Strip the matching registry prefix so probe_ref is just repo:tag
-    probe_ref="${probe_ref#${IMAGE_REGISTRY}/}"
-  fi
+  pf_ok "Probing registry with ${probe_source} image: ${IMAGE_REGISTRY}/${probe_ref}"
 
   # Split repo and tag/digest
   local probe_repo probe_tag
