@@ -242,8 +242,15 @@ ${yq_err}"
   NGINX_IMAGE=$(yq eval '.images.nginx.image // "docker.io/library/nginx:1.27-alpine"' "${CONFIG_FILE}" 2>/dev/null || echo "docker.io/library/nginx:1.27-alpine")
   MODEL_VERSION=$(yq eval '.operators.ray.modelVersion // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   RAY_RUNTIME_VERSION=$(yq eval '.operators.ray.rayVersion // "2.44.0"' "${CONFIG_FILE}" 2>/dev/null || echo "2.44.0")
-  SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform // "./artifacts.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
-  SPLUNK_OPERATOR_FILE=$(yq eval '.files.splunkOperator // "./splunk-operator-cluster.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")
+  local _config_dir
+  _config_dir="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)"
+  _resolve_manifest() {
+    local p="$1"
+    # Absolute paths are used as-is; relative paths are anchored to the config file's directory.
+    [[ "${p}" = /* ]] && echo "${p}" || echo "${_config_dir}/${p#./}"
+  }
+  SPLUNK_AI_FILE=$(_resolve_manifest "$(yq eval '.files.aiPlatform // "./artifacts.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")")
+  SPLUNK_OPERATOR_FILE=$(_resolve_manifest "$(yq eval '.files.splunkOperator // "./splunk-operator-cluster.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")")
 
   # OpenShift-specific
   # Whether to grant the operator service account privileged SCC.
@@ -255,6 +262,9 @@ ${yq_err}"
   ECR_ENABLED=$(yq eval '.ecr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   ECR_ACCOUNT=$(yq eval '.ecr.account // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   ECR_REGION=$(yq eval '.ecr.region // "us-east-2"' "${CONFIG_FILE}" 2>/dev/null || echo "us-east-2")
+  # S3 bucket region — may differ from ECR_REGION when ECR and S3 are in different regions.
+  # Defaults to ecr.region for backwards compatibility when not explicitly set.
+  OBJ_STORE_REGION=$(yq eval ".storage.objectStore.region // \"${ECR_REGION}\"" "${CONFIG_FILE}" 2>/dev/null || echo "${ECR_REGION}")
 
   AI_PLATFORM_NAME=$(yq eval '.aiPlatform.name // "openshift-ai-platform"' "${CONFIG_FILE}" 2>/dev/null || echo "openshift-ai-platform")
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -451,9 +461,18 @@ configure_images() {
 preflight_checks() {
   log "Running preflight checks..."
 
-  for tool in oc yq helm aws curl jq base64 tar; do
+  local _aws_needed="false"
+  [[ "${ECR_ENABLED:-false}" == "true" ]] && _aws_needed="true"
+  [[ "${OBJ_STORE_TYPE:-}" == "aws" ]] && _aws_needed="true"
+
+  for tool in oc yq helm curl jq base64 tar; do
     command -v "$tool" >/dev/null 2>&1 && log "  ✓ $tool found" || err "Missing required tool: $tool"
   done
+  if [[ "${_aws_needed}" == "true" ]]; then
+    command -v aws >/dev/null 2>&1 && log "  ✓ aws found" || err "Missing required tool: aws (needed for ECR/S3 — install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)"
+  else
+    log "  – aws CLI not required (ECR disabled, object store is not AWS)"
+  fi
 
   # Verify we are connected to the cluster
   if ! oc whoami &>/dev/null; then
@@ -541,12 +560,11 @@ grant_privileged_scc() {
 install_nfd() {
   log "Installing Node Feature Discovery Operator (NFD)..."
 
+  # Step 1: Subscription + OperatorGroup — idempotent, skip only if already present.
   if oc get subscription nfd -n openshift-nfd &>/dev/null; then
-    log "  ✓ NFD subscription already exists, skipping"
-    return 0
-  fi
-
-  oc apply -f - <<'EOF'
+    log "  ✓ NFD subscription already exists, skipping OLM install"
+  else
+    oc apply -f - <<'EOF'
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -574,22 +592,28 @@ spec:
   installPlanApproval: Automatic
 EOF
 
-  log "Waiting for NFD CSV to succeed..."
-  local retries=0
-  while (( retries < 36 )); do
-    local phase
-    phase=$(oc get csv -n openshift-nfd -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-    if [[ "${phase}" == "Succeeded" ]]; then
-      log "  ✓ NFD operator ready"
-      break
-    fi
-    sleep 10
-    retries=$(( retries + 1 ))
-    log "  Waiting for NFD CSV... (${retries}/36, phase=${phase:-pending})"
-  done
+    log "Waiting for NFD CSV to succeed..."
+    local retries=0
+    while (( retries < 36 )); do
+      local phase
+      phase=$(oc get csv -n openshift-nfd -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+      if [[ "${phase}" == "Succeeded" ]]; then
+        log "  ✓ NFD operator ready"
+        break
+      fi
+      sleep 10
+      retries=$(( retries + 1 ))
+      log "  Waiting for NFD CSV... (${retries}/36, phase=${phase:-pending})"
+    done
+  fi
 
-  # Create the NodeFeatureDiscovery CR to start labeling nodes
-  if ! oc get nodefeaturediscovery nfd-instance -n openshift-nfd &>/dev/null; then
+  # Step 2: NodeFeatureDiscovery CR — always ensure it exists, regardless of whether
+  # the Subscription was just created or was already present from a prior run.
+  # Without this CR the NFD operand never starts and nodes are never labeled with
+  # nvidia.com/gpu.present, breaking GPU-node auto-detection.
+  if oc get nodefeaturediscovery nfd-instance -n openshift-nfd &>/dev/null; then
+    log "  ✓ NodeFeatureDiscovery CR already exists, skipping"
+  else
     log "Creating NodeFeatureDiscovery CR..."
     oc apply -f - <<'EOF'
 apiVersion: nfd.openshift.io/v1
@@ -623,12 +647,11 @@ EOF
 install_nvidia_gpu_operator() {
   log "Installing NVIDIA GPU Operator..."
 
+  # Step 1: Subscription + OperatorGroup — idempotent, skip only if already present.
   if oc get subscription gpu-operator-certified -n nvidia-gpu-operator &>/dev/null; then
-    log "  ✓ GPU Operator subscription already exists, skipping"
-    return 0
-  fi
-
-  oc apply -f - <<'EOF'
+    log "  ✓ GPU Operator subscription already exists, skipping OLM install"
+  else
+    oc apply -f - <<'EOF'
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -656,22 +679,28 @@ spec:
   installPlanApproval: Automatic
 EOF
 
-  log "Waiting for GPU Operator CSV to succeed..."
-  local retries=0
-  while (( retries < 36 )); do
-    local phase
-    phase=$(oc get csv -n nvidia-gpu-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-    if [[ "${phase}" == "Succeeded" ]]; then
-      log "  ✓ GPU Operator CSV ready"
-      break
-    fi
-    sleep 10
-    retries=$(( retries + 1 ))
-    log "  Waiting for GPU Operator CSV... (${retries}/36, phase=${phase:-pending})"
-  done
+    log "Waiting for GPU Operator CSV to succeed..."
+    local retries=0
+    while (( retries < 36 )); do
+      local phase
+      phase=$(oc get csv -n nvidia-gpu-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+      if [[ "${phase}" == "Succeeded" ]]; then
+        log "  ✓ GPU Operator CSV ready"
+        break
+      fi
+      sleep 10
+      retries=$(( retries + 1 ))
+      log "  Waiting for GPU Operator CSV... (${retries}/36, phase=${phase:-pending})"
+    done
+  fi
 
-  # Create ClusterPolicy to trigger driver + toolkit + device-plugin rollout
-  if ! oc get clusterpolicy gpu-cluster-policy &>/dev/null; then
+  # Step 2: ClusterPolicy — always ensure it exists, regardless of whether the
+  # Subscription was just created or pre-existing. Without this CR the driver,
+  # toolkit, and device-plugin DaemonSets are never deployed, leaving Ray worker
+  # pods requesting nvidia.com/gpu unschedulable.
+  if oc get clusterpolicy gpu-cluster-policy &>/dev/null; then
+    log "  ✓ ClusterPolicy already exists, skipping"
+  else
     log "Creating ClusterPolicy CR..."
     oc apply -f - <<'EOF'
 apiVersion: nvidia.com/v1
@@ -1275,7 +1304,7 @@ install_splunk_standalone() {
   # Derive S3 endpoint for Splunk appRepo (endpoint is required by the Splunk Operator)
   local minio_endpoint="${OBJ_STORE_ENDPOINT}"
   if [[ -z "${minio_endpoint}" && "${OBJ_STORE_TYPE}" == "aws" ]]; then
-    minio_endpoint="https://s3.${ECR_REGION}.amazonaws.com"
+    minio_endpoint="https://s3.${OBJ_STORE_REGION}.amazonaws.com"
     log "  type=aws: using S3 endpoint ${minio_endpoint}"
   fi
   [[ -z "${minio_endpoint}" ]] && err "storage.objectStore.endpoint must be set for type=${OBJ_STORE_TYPE}"
@@ -1343,12 +1372,88 @@ spec:
         provider: aws
         storageType: s3
         endpoint: ${minio_endpoint}
-        region: ${ECR_REGION}
+        region: ${OBJ_STORE_REGION}
         path: ${OBJ_STORE_BUCKET}
         secretRef: minio-credentials
 YAML
 
   log "  ✓ Splunk Standalone CR applied"
+}
+
+# ====== STAGE MODEL ARTIFACTS ======
+# Downloads model weights from HuggingFace and uploads them to the configured
+# object store. Skipped when modelStaging.enabled=false or AIRGAP_MODE=true.
+stage_model_artifacts() {
+  if [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
+    log "Model staging disabled (storage.modelStaging.enabled=false), skipping"
+    return 0
+  fi
+
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    log "AIRGAP_MODE=true — skipping model staging (models must be pre-staged in object store)"
+    return 0
+  fi
+
+  if object_store_auth_looks_like_placeholder; then
+    err "Refusing to stage artifacts: objectStore.auth still contains template placeholders; fix ${CONFIG_FILE}"
+    return 1
+  fi
+
+  local staging_dir
+  staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
+    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of cluster_setup/)"; return 1; }
+
+  log "Model staging directory: ${staging_dir}"
+
+  wait_for_dependency \
+    "HuggingFace (huggingface.co) — required for model weight download" \
+    "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+    300
+
+  log "Downloading model artifacts from HuggingFace..."
+  ( cd "${staging_dir}" && SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" bash ./download_from_huggingface.sh ) \
+    || { err "HuggingFace download failed — see output above"; return 1; }
+
+  log "Uploading model artifacts to object store (type=${OBJ_STORE_TYPE})..."
+  if [[ "${OBJ_STORE_TYPE}" == "minio" || "${OBJ_STORE_TYPE}" == "seaweedfs" || "${OBJ_STORE_TYPE}" == "s3compat" ]]; then
+    [[ -n "${OBJ_STORE_ENDPOINT}" ]] || { err "storage.objectStore.endpoint is required for ${OBJ_STORE_TYPE} model staging"; return 1; }
+  fi
+
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      ( cd "${staging_dir}" && \
+        S3_BUCKET="${OBJ_STORE_BUCKET}" \
+        S3_REGION="${OBJ_STORE_REGION:-us-east-2}" \
+        AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+        AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+        bash ./upload_to_s3.sh ) \
+        || { err "Upload to S3 failed"; return 1; }
+      ;;
+    minio|s3compat)
+      ( cd "${staging_dir}" && \
+        OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+        OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        bash ./upload_to_minio.sh ) \
+        || { err "Upload to ${OBJ_STORE_TYPE} failed"; return 1; }
+      ;;
+    seaweedfs)
+      ( cd "${staging_dir}" && \
+        OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+        OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        bash ./upload_to_seaweedfs_upload_only.sh ) \
+        || { err "Upload to SeaweedFS failed"; return 1; }
+      ;;
+    *)
+      err "Unsupported objectStore.type for model staging: '${OBJ_STORE_TYPE}' (expected: aws | minio | s3compat | seaweedfs)"
+      return 1
+      ;;
+  esac
+
+  log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
 }
 
 # ====== INSTALL AI PLATFORM CR ======
@@ -1361,12 +1466,16 @@ install_ai_platform_cr() {
   oc delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
   oc delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
 
-  # Build imagePullSecrets block
+  # Build imagePullSecrets block — include every docker-registry secret that
+  # exists in the namespace, covering ECR, DockerHub, GCR, ACR, and custom
+  # registries. This avoids hard-coding a fixed list of names.
   local secrets_yaml=""
-  for secret_name in ecr-registry-secret; do
-    oc get secret "${secret_name}" -n "${AI_NS}" &>/dev/null && \
-      secrets_yaml+="      - name: ${secret_name}"$'\n'
-  done
+  while IFS= read -r secret_name; do
+    [[ -z "${secret_name}" ]] && continue
+    secrets_yaml+="      - name: ${secret_name}"$'\n'
+  done < <(oc get secrets -n "${AI_NS}" \
+    -o jsonpath='{range .items[?(@.type=="kubernetes.io/dockerconfigjson")]}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null || true)
   local image_pull_secrets=""
   [[ -n "${secrets_yaml}" ]] && image_pull_secrets="    imagePullSecrets:"$'\n'"${secrets_yaml}"
 
@@ -1387,11 +1496,19 @@ install_ai_platform_cr() {
   if [[ "${feature_count}" -gt 0 ]]; then
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver
+      local fname fver fsa fscale
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}")
-      [[ -n "$fname" && "$fname" != "null" ]] && \
-        features_yaml+="    - name: ${fname}"$'\n'"      version: \"${fver}\""$'\n'
+      fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}")
+      fscale=$(yq eval ".aiPlatform.features[$i].scaleFactor // \"\"" "${CONFIG_FILE}")
+      if [[ -n "$fname" && "$fname" != "null" ]]; then
+        features_yaml+="    - name: ${fname}"$'\n'
+        features_yaml+="      version: \"${fver}\""$'\n'
+        [[ -n "$fsa" && "$fsa" != "null" ]] && \
+          features_yaml+="      serviceAccountName: ${fsa}"$'\n'
+        [[ -n "$fscale" && "$fscale" != "null" ]] && \
+          features_yaml+="      scaleFactor: ${fscale}"$'\n'
+      fi
       i=$((i + 1))
     done
   else
@@ -1491,7 +1608,7 @@ metadata:
 spec:
   objectStorage:
     path: ${obj_path}
-    region: ${ECR_REGION}
+    region: ${OBJ_STORE_REGION}
     $( [[ -n "${obj_endpoint}" ]] && echo "endpoint: \"${obj_endpoint}\"" )
     secretRef: minio-credentials
   images:
@@ -1515,7 +1632,7 @@ ${svc_template_yaml}${storage_yaml}
         value: "true"
         effect: "NoSchedule"
   splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_ns_secret}
       namespace: ${AI_NS}
@@ -1624,7 +1741,7 @@ stage_model_artifacts() {
     aws)
       ( cd "${staging_dir}" && \
         S3_BUCKET="${OBJ_STORE_BUCKET}" \
-        S3_REGION="${ECR_REGION:-us-east-2}" \
+        S3_REGION="${OBJ_STORE_REGION:-us-east-2}" \
         AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
         AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
         bash ./upload_to_s3.sh ) \
@@ -1803,6 +1920,10 @@ main_install() {
   phase_end "Model Staging"
 
   phase_start "Preflight"
+  step_start "Model artifact staging"
+  stage_model_artifacts
+  step_ok
+
   step_start "Preflight checks"
   preflight_checks
   step_ok
