@@ -56,7 +56,8 @@ func TestValidateAndEnrichSplunkConfig(t *testing.T) {
 		err := ValidateAndEnrichSplunkConfig(ctx, fc, ns, "", cfg, resolver)
 
 		assert.NoError(t, err)
-		assert.Equal(t, "fake-token", cfg.Token)
+		// Token must NOT be written back to the spec to prevent exfiltration via etcd.
+		assert.Empty(t, cfg.Token)
 		assert.Equal(t, "https://custom-endpoint:8089", cfg.Endpoint)
 	})
 
@@ -93,7 +94,8 @@ func TestValidateAndEnrichSplunkConfig(t *testing.T) {
 
 		assert.NoError(t, err)
 		assert.Equal(t, "https://resolved-endpoint:8089", cfg.Endpoint)
-		assert.Equal(t, "resolved-token", cfg.Token)
+		// Token must NOT be written back to the spec to prevent exfiltration via etcd.
+		assert.Empty(t, cfg.Token)
 	})
 
 	t.Run("missing endpoint but SplunkCustomResourceRef present → endpoint resolution fails", func(t *testing.T) {

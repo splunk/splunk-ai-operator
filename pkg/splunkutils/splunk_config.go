@@ -49,10 +49,12 @@ var ValidateAndEnrichSplunkConfig = func(
 }
 
 func ensureToken(ctx context.Context, namespace string, cfg *aiApi.SplunkConfigurationSpec, resolver SplunkSecretResolver) error {
-	token, err := resolver.GetHECToken(ctx, namespace, cfg)
+	_, err := resolver.GetHECToken(ctx, namespace, cfg)
 	if err != nil {
 		return err
 	}
-	cfg.Token = token
+	// Intentionally not writing the resolved token back to cfg.Token:
+	// persisting secret material to the tenant-readable spec field in etcd
+	// would allow any holder of *-editor-role to exfiltrate the token.
 	return nil
 }

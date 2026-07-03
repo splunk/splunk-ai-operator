@@ -19,6 +19,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -290,6 +291,25 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 			fldPath.Child("secretRef").Child("name"),
 			"secretRef.name is required when using endpoint",
 		))
+	}
+
+	// Guard against path traversal: vaultFilePath must be within /vault/secrets/
+	if splunkConfig.SecretSource == aiv1.SecretSourceVault {
+		if splunkConfig.VaultFilePath == "" {
+			allErrs = append(allErrs, field.Required(
+				fldPath.Child("vaultFilePath"),
+				"vaultFilePath is required when secretSource is vault",
+			))
+		} else {
+			cleaned := filepath.Clean(splunkConfig.VaultFilePath)
+			if !strings.HasPrefix(cleaned, "/vault/secrets/") {
+				allErrs = append(allErrs, field.Invalid(
+					fldPath.Child("vaultFilePath"),
+					splunkConfig.VaultFilePath,
+					"vaultFilePath must be under /vault/secrets/",
+				))
+			}
+		}
 	}
 
 	return allErrs
