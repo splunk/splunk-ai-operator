@@ -914,13 +914,20 @@ install_otel_operator() {
     return 0
   fi
 
-  helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
-  helm repo update open-telemetry 2>/dev/null || true
+  local otel_chart_ref
+  if [[ -n "${OTEL_CHART_PATH:-}" && -f "${OTEL_CHART_PATH}" ]]; then
+    otel_chart_ref="${OTEL_CHART_PATH}"
+    log "  Using local chart: ${otel_chart_ref}"
+  else
+    helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
+    helm repo update open-telemetry 2>/dev/null || true
+    otel_chart_ref="open-telemetry/opentelemetry-operator"
+  fi
 
   local otel_retries=0
   while (( otel_retries < 6 )); do
     local otel_out
-    otel_out=$(helm upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+    otel_out=$(helm upgrade --install opentelemetry-operator "${otel_chart_ref}" \
       --namespace opentelemetry-operator-system --create-namespace \
       --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
       --set admissionWebhooks.certManager.enabled=true \
@@ -959,12 +966,20 @@ install_ray_operator() {
     return 0
   fi
 
-  helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
-  helm repo update kuberay
+  local kuberay_chart_ref kuberay_version_flag=()
+  if [[ -n "${KUBERAY_CHART_PATH:-}" && -f "${KUBERAY_CHART_PATH}" ]]; then
+    kuberay_chart_ref="${KUBERAY_CHART_PATH}"
+    log "  Using local chart: ${kuberay_chart_ref}"
+  else
+    helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
+    helm repo update kuberay
+    kuberay_chart_ref="kuberay/kuberay-operator"
+    kuberay_version_flag=(--version 1.2.2)
+  fi
 
-  helm upgrade --install kuberay-operator kuberay/kuberay-operator \
+  helm upgrade --install kuberay-operator "${kuberay_chart_ref}" \
     --namespace ray-system --create-namespace \
-    --version 1.2.2 \
+    "${kuberay_version_flag[@]+"${kuberay_version_flag[@]}"}" \
     --set image.repository=quay.io/kuberay/operator \
     --set image.tag=v1.2.2 \
     --wait --timeout=10m
