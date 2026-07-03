@@ -1034,11 +1034,18 @@ preflight_check_registry() {
     return
   fi
 
-  # Strip registry prefix from probe image to get repo:tag
+  # Strip registry prefix from probe image to get repo:tag.
+  # If the image already contains a different registry host (e.g. docker.io/splunk/...)
+  # it is not stored in IMAGE_REGISTRY — skip the manifest probe to avoid a bogus
+  # 404 like <private-registry>/docker.io/splunk/...:tag.
   local probe_ref="${probe_image}"
-  # If build_image_url would prepend the registry, the raw config value is just repo:tag
-  # but if the user wrote the full reference, strip the registry host
-  if [[ "${probe_ref}" == ${IMAGE_REGISTRY}/* ]]; then
+  if [[ "${probe_ref}" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
+    # Image has a fully-qualified registry host
+    if [[ "${probe_ref}" != ${IMAGE_REGISTRY}/* ]]; then
+      pf_ok "Operator image uses a different registry (${probe_ref%%/*}) — skipping manifest probe against ${IMAGE_REGISTRY}."
+      return
+    fi
+    # Strip the matching registry prefix so probe_ref is just repo:tag
     probe_ref="${probe_ref#${IMAGE_REGISTRY}/}"
   fi
 
