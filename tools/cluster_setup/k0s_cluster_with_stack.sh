@@ -1498,6 +1498,19 @@ configure_insecure_registry_on_node() {
 
   log "  Configuring insecure registry ${registry} on ${node_ip}..."
   ssh_exec "${node_ip}" "
+    # k0s writes /etc/k0s/containerd.toml asynchronously after start; wait for
+    # it rather than defaulting to v1 on a failed probe (which would recreate
+    # the crash loop this function is meant to prevent).
+    toml_wait=0
+    until sudo test -f /etc/k0s/containerd.toml 2>/dev/null; do
+      if (( toml_wait >= 60 )); then
+        echo 'ERROR: /etc/k0s/containerd.toml not written after 60s — aborting registry config' >&2
+        exit 1
+      fi
+      sleep 2
+      toml_wait=\$((toml_wait + 2))
+    done
+
     # Detect containerd version by inspecting the managed containerd.toml that k0s
     # writes on startup. containerd v2 uses the io.containerd.cri.v1 plugin key;
     # v1 uses io.containerd.grpc.v1.cri. Grepping the toml is more reliable than
@@ -1646,6 +1659,10 @@ PYSCRIPT"
   # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
   # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
   stage_k0s_image_bundle "${controller_ip}"
+  # Remove stale v1 drop-in before start — containerd 2.x rejects the grpc.v1.cri
+  # plugin key at preflight, crashing k0s before configure_insecure_registry_on_node
+  # can execute its own cleanup.
+  ssh_exec "${controller_ip}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
   ssh_exec "${controller_ip}" "sudo k0s start"
 
   log "Waiting for controller API server to be ready..."
@@ -1717,6 +1734,10 @@ PYSCRIPT"
     fi
 
     log "  Starting k0s worker on ${worker_ip}..."
+    # Remove stale v1 drop-in before start — containerd 2.x rejects the grpc.v1.cri
+    # plugin key at preflight, crashing k0sworker before configure_insecure_registry_on_node
+    # can execute its own cleanup.
+    ssh_exec "${worker_ip}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
     if ssh_exec "${worker_ip}" "sudo k0s start"; then
       log "  ✓ k0s started on ${worker_ip}"
       # Configure insecure registry after k0s start so containerd is running
