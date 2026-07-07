@@ -319,8 +319,14 @@ assert_eq "gated behind IMAGE_REGISTRY_INSECURE flag" \
 assert_eq "IMAGE_REGISTRY_INSECURE loaded from config" \
   "1" "$(grep -c 'IMAGE_REGISTRY_INSECURE.*registryInsecure' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "detects containerd version from binary path" \
-  "1" "$(grep -c '/var/lib/k0s/bin/containerd --version' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "waits for containerd.toml before detecting version (no silent v1 fallback)" \
+  "1" "$(grep -A40 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c 'until sudo test -f /etc/k0s/containerd\.toml' | tr -d '[:space:]')"
+
+assert_eq "times out and exits non-zero if containerd.toml never appears" \
+  "1" "$(grep -A40 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c 'exit 1' | tr -d '[:space:]')"
+
+assert_eq "detects containerd version from containerd.toml (not binary — avoids race/fallback bug)" \
+  "1" "$(grep -A40 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c 'grep.*containerd.*cri.*v1.*containerd\.toml' | tr -d '[:space:]')"
 
 assert_eq "v2 path writes config_path drop-in (required for certs.d to be read)" \
   "1" "$(grep -c 'registry-config-path\.toml' "${SCRIPT}" | tr -d '[:space:]')"
@@ -331,8 +337,14 @@ assert_eq "v2 path writes hosts.toml (functional line in function body)" \
 assert_eq "v2 path uses /etc/k0s/containerd/certs.d (functional line in function body)" \
   "1" "$(grep 'etc/k0s/containerd/certs\.d' "${SCRIPT}" | grep -c 'mkdir' | tr -d '[:space:]')"
 
-assert_eq "v1 path writes drop-in TOML" \
-  "1" "$(grep -c 'insecure-registry\.toml' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "v2 path removes stale v1 drop-in and v1 path writes it (2 references in function)" \
+  "2" "$(grep -A80 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c 'insecure-registry\.toml' | tr -d '[:space:]')"
+
+assert_eq "stale v1 drop-in removed before controller k0s start" \
+  "1" "$(awk '/stage_k0s_image_bundle.*controller_ip/{found=1} found && /rm -f.*insecure-registry\.toml/{print; exit}' "${SCRIPT}" | grep -c 'insecure-registry' | tr -d '[:space:]')"
+
+assert_eq "stale v1 drop-in removed before worker k0s start" \
+  "1" "$(awk '/Starting k0s worker on/{found=1} found && /rm -f.*insecure-registry\.toml/{print; exit}' "${SCRIPT}" | grep -c 'insecure-registry' | tr -d '[:space:]')"
 
 assert_eq "controller registry config called after API server wait loop" \
   "1" "$(awk '/ctrl_retries < 60/{found=1} found && /configure_insecure_registry_on_node.*controller_ip/{print; exit}' "${SCRIPT}" | grep -c 'configure_insecure_registry_on_node' | tr -d '[:space:]')"
