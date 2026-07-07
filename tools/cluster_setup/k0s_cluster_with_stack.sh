@@ -1498,12 +1498,22 @@ configure_insecure_registry_on_node() {
 
   log "  Configuring insecure registry ${registry} on ${node_ip}..."
   ssh_exec "${node_ip}" "
-    # Detect containerd major version from the binary k0s bundles
-    containerd_version=\$(sudo /var/lib/k0s/bin/containerd --version 2>/dev/null | grep -oP 'v\K[0-9]+' | head -1)
-    echo \"--- containerd major version: \${containerd_version:-unknown} ---\"
+    # Detect containerd version by inspecting the managed containerd.toml that k0s
+    # writes on startup. containerd v2 uses the io.containerd.cri.v1 plugin key;
+    # v1 uses io.containerd.grpc.v1.cri. Grepping the toml is more reliable than
+    # parsing the binary version and avoids a wrong fallback if the binary path changes.
+    if sudo grep -q 'io\\.containerd\\.cri\\.v1' /etc/k0s/containerd.toml 2>/dev/null; then
+      containerd_major=2
+    else
+      containerd_major=1
+    fi
+    echo \"--- containerd major version: \${containerd_major} ---\"
 
-    if [[ \"\${containerd_version:-1}\" -ge 2 ]]; then
+    if [[ \"\${containerd_major}\" -ge 2 ]]; then
       echo '--- containerd v2: writing config_path drop-in + hosts.toml ---'
+      # Remove stale v1 drop-in — containerd 2.x rejects the grpc.v1.cri plugin key
+      # at preflight, crashing k0sworker if this file is left over from a prior run.
+      sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml
       # Drop-in that sets config_path so containerd reads the certs.d directory.
       # Without this, the per-registry hosts.toml is silently ignored by containerd 2.x.
       sudo mkdir -p /etc/k0s/containerd.d
