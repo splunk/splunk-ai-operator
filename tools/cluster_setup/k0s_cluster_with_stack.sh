@@ -329,7 +329,9 @@ resolve_accelerator_type() {
   fi
   if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
     err "aiPlatform.defaultAcceleratorType not set and SILENT_INSTALL=true — set it in your config."
-    return 1
+  fi
+  if [[ ! -t 0 ]]; then
+    err "aiPlatform.defaultAcceleratorType not set and stdin is not a terminal — set it in your config or run interactively."
   fi
   echo "" >&2
   echo "  Select GPU accelerator type:" >&2
@@ -340,7 +342,7 @@ resolve_accelerator_type() {
   case "${_choice}" in
     1) DEFAULT_ACCELERATOR="L40S" ;;
     2) DEFAULT_ACCELERATOR="H100" ;;
-    *) err "Invalid choice '${_choice}'. Please enter 1 or 2."; return 1 ;;
+    *) err "Invalid choice '${_choice}'. Please enter 1 or 2." ;;
   esac
   echo "" >&2
   log "Accelerator type set to '${DEFAULT_ACCELERATOR}' by interactive prompt."
@@ -5822,7 +5824,7 @@ main_install() {
   validate_image_config
   configure_images
 
-  resolve_accelerator_type || return 1
+  resolve_accelerator_type
   resolve_model_staging
 
   show_install_plan
@@ -6777,6 +6779,7 @@ case "${_CMD}" in
     ;;
   stage-artifacts)
     load_config
+    resolve_accelerator_type
     stage_model_artifacts
     ;;
   delete)
