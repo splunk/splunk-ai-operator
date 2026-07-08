@@ -319,6 +319,33 @@ resolve_model_staging() {
   log "Model staging set to '${MODEL_STAGING_ENABLED}' by interactive prompt (overrides config value)."
 }
 
+# ====== RESOLVE ACCELERATOR TYPE ======
+# Called after load_config, before show_install_plan.
+# If defaultAcceleratorType is not set in the config, always prompt — regardless
+# of whether model staging is enabled, since the CR always requires this field.
+resolve_accelerator_type() {
+  if [[ -n "${DEFAULT_ACCELERATOR}" ]]; then
+    return 0
+  fi
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    err "aiPlatform.defaultAcceleratorType not set and SILENT_INSTALL=true — set it in your config."
+    return 1
+  fi
+  echo "" >&2
+  echo "  Select GPU accelerator type:" >&2
+  echo "    1) L40S" >&2
+  echo "    2) H100" >&2
+  local _choice
+  read -rp "  Enter 1 or 2: " _choice
+  case "${_choice}" in
+    1) DEFAULT_ACCELERATOR="L40S" ;;
+    2) DEFAULT_ACCELERATOR="H100" ;;
+    *) err "Invalid choice '${_choice}'. Please enter 1 or 2."; return 1 ;;
+  esac
+  echo "" >&2
+  log "Accelerator type set to '${DEFAULT_ACCELERATOR}' by interactive prompt."
+}
+
 # ====== SHOW INSTALL PLAN ======
 # Called before install starts; prints what will be done so customers can
 # validate the config before a 40-minute run.
@@ -2318,13 +2345,10 @@ stage_model_artifacts() {
   fi
 
   # ---- Resolve accelerator (normalize to lowercase) ----
-  # Config uses uppercase (L40S, H100) to match the sample; internal logic requires lowercase.
+  # DEFAULT_ACCELERATOR is guaranteed to be set by resolve_accelerator_type()
+  # before main_install reaches this point.
   local _accel
-  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
-  if [[ -z "${_accel}" ]]; then
-    warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
-    _accel="l40s"
-  fi
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
 
   # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
   # re-runs skip models that are already fully staged (no re-download, no re-upload).
@@ -5798,6 +5822,7 @@ main_install() {
   validate_image_config
   configure_images
 
+  resolve_accelerator_type || return 1
   resolve_model_staging
 
   show_install_plan
