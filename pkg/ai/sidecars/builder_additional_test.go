@@ -122,9 +122,61 @@ func TestRenderEnvoyConf(t *testing.T) {
 	assert.Contains(t, conf, "envoy.filters.http.lua")
 }
 
-// TestReconcileOpenTelemetryCollector is skipped because it requires OpenTelemetry CRD to be registered
+// TestReconcileOpenTelemetryCollector is skipped for the Splunk-enabled path
+// because it requires the OpenTelemetry CRD to be registered. The
+// Splunk-disabled and Otel-off paths return early before any CRD access, so
+// they are covered by TestReconcileOpenTelemetryCollector_Skips below.
 func TestReconcileOpenTelemetryCollector(t *testing.T) {
 	t.Skip("Skipping reconcileOpenTelemetryCollector test - requires OpenTelemetry Operator CRDs")
+}
+
+// TestReconcileOpenTelemetryCollector_Skips verifies the early-return paths:
+// when Otel is off, or when Splunk is disabled (empty config), no collector and
+// no otel-config ConfigMap are created — and no OpenTelemetry CRD is required.
+func TestReconcileOpenTelemetryCollector_Skips(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	tests := []struct {
+		name string
+		spec aiApi.AIPlatformSpec
+	}{
+		{
+			name: "otel disabled",
+			spec: aiApi.AIPlatformSpec{
+				Sidecars: aiApi.SidecarSpec{Otel: false},
+				SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+					Endpoint: "https://splunk:8088",
+				},
+			},
+		},
+		{
+			name: "otel enabled but Splunk disabled (empty config)",
+			spec: aiApi.AIPlatformSpec{
+				Sidecars:            aiApi.SidecarSpec{Otel: true},
+				SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			platform := &aiApi.AIPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+				Spec:       tt.spec,
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			builder := New(fakeClient, scheme, record.NewFakeRecorder(100), platform)
+
+			err := builder.reconcileOpenTelemetryCollector(ctx, platform)
+			require.NoError(t, err, "skip paths must not error")
+
+			// No otel-config ConfigMap should have been seeded.
+			cm := &corev1.ConfigMap{}
+			getErr := fakeClient.Get(ctx, clientKey(platform.Namespace, platform.Name+"-otel-config"), cm)
+			assert.Error(t, getErr, "no otel-config ConfigMap should be created on the skip path")
+		})
+	}
 }
 
 func TestReconcileOtelConfigMap(t *testing.T) {

@@ -261,15 +261,14 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
-	// Must have either Endpoint or SplunkCustomResourceRef
 	hasEndpoint := splunkConfig.Endpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
 
+	// Empty Splunk configuration means "Splunk disabled" — no telemetry. This
+	// mirrors the graceful-skip the reconcilers already implement, so a platform
+	// can run without any Splunk. A partially-filled config still validates below.
 	if !hasEndpoint && !hasCRRef {
-		allErrs = append(allErrs, field.Required(
-			fldPath,
-			"SplunkConfiguration must have either Endpoint or SplunkCustomResourceRef set",
-		))
+		return allErrs
 	}
 
 	// TODO: Temporarily disabled - allow service names without http:// prefix

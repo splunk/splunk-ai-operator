@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -38,10 +39,12 @@ func restoreValidateAndEnrich() {
 	splunkutils.ValidateAndEnrichSplunkConfig = originalValidateAndEnrichSplunkConfig
 }
 
-// Create a reconciler with a controller-runtime fake client
+// Create a reconciler with a controller-runtime fake client and a fake event
+// recorder. The recorder is required because validate() now emits a
+// SplunkConfigMissing event when Splunk is disabled (empty config).
 func newFakeReconciler() *AIPlatformReconciler {
 	fakeClient := fake.NewClientBuilder().Build()
-	return &AIPlatformReconciler{Client: fakeClient}
+	return &AIPlatformReconciler{Client: fakeClient, Recorder: record.NewFakeRecorder(10)}
 }
 
 //
@@ -71,7 +74,7 @@ func TestValidate_DefaultsSchedulingSpecs(t *testing.T) {
 		Spec: aiApi.AIPlatformSpec{
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
 			// CPUSchedulingSpec and GPUSchedulingSpec are nil → should be defaulted
-			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{Endpoint: "https://splunk:8088"},
 		},
 	}
 
@@ -122,6 +125,9 @@ func TestValidate_ResolverSelection(t *testing.T) {
 				Spec: aiApi.AIPlatformSpec{
 					ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
 					SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+						// Endpoint set so we exercise the enrich path (resolver
+						// selection), not the empty-config skip branch.
+						Endpoint:     "https://splunk:8088",
 						SecretSource: tt.secretSource,
 					},
 				},
@@ -163,6 +169,8 @@ func TestValidate_PropagatesErrorFromValidateAndEnrich(t *testing.T) {
 		},
 	}
 
+	p.Spec.SplunkConfiguration.Endpoint = "https://splunk:8088"
+
 	expectedErr := assert.AnError
 	patchValidateAndEnrich(func(
 		ctx context.Context,
@@ -178,6 +186,47 @@ func TestValidate_PropagatesErrorFromValidateAndEnrich(t *testing.T) {
 	err := r.validate(context.Background(), p)
 	assert.Error(t, err)
 	assert.Equal(t, expectedErr, err, "should propagate the error from ValidateAndEnrichSplunkConfig")
+}
+
+// 5️⃣ Empty Splunk config ⇒ skip enrichment (Splunk disabled), no error.
+func TestValidate_SkipsEnrichWhenSplunkConfigEmpty(t *testing.T) {
+	r := newFakeReconciler()
+	p := &aiApi.AIPlatform{
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage:       aiApi.ObjectStorageSpec{Path: "/data"},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{}, // both empty ⇒ disabled
+		},
+	}
+
+	called := false
+	patchValidateAndEnrich(func(
+		ctx context.Context,
+		c client.Client,
+		namespace, clusterDomain string,
+		config *aiApi.SplunkConfigurationSpec,
+		resolver splunkutils.SplunkSecretResolver,
+	) error {
+		called = true
+		return nil
+	})
+	defer restoreValidateAndEnrich()
+
+	err := r.validate(context.Background(), p)
+	require.NoError(t, err, "empty Splunk config should not error")
+	assert.False(t, called, "ValidateAndEnrichSplunkConfig must not be called when Splunk is disabled")
+
+	// Scheduling defaults still applied before the skip branch.
+	require.NotNil(t, p.Spec.CPUSchedulingSpec)
+	require.NotNil(t, p.Spec.GPUSchedulingSpec)
+
+	// A SplunkConfigMissing warning event should have been emitted.
+	rec := r.Recorder.(*record.FakeRecorder)
+	select {
+	case ev := <-rec.Events:
+		assert.Contains(t, ev, "SplunkConfigMissing")
+	default:
+		t.Fatal("expected a SplunkConfigMissing event")
+	}
 }
 
 //
