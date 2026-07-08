@@ -120,6 +120,15 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		return nil
 	}
 
+	// Splunk disabled (empty config) ⇒ skip the collector entirely. The collector
+	// exports to Splunk HEC via SplunkConfiguration.SecretRef; without a configured
+	// endpoint/secret it would render a broken collector (empty secretKeyRef, failed
+	// secret Get). Mirrors the reconciler/SAIA graceful-skip so "no Splunk" means
+	// "no telemetry" rather than a crashing sidecar.
+	if p.Spec.SplunkConfiguration.Endpoint == "" && p.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name == "" {
+		return nil
+	}
+
 	// seed or update the ConfigMap
 	if err := s.reconcileOtelConfigMap(ctx, p); err != nil {
 		return fmt.Errorf("reconcile otel configmap: %w", err)

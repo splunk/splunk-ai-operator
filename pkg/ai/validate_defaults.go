@@ -35,6 +35,16 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 		}
 	}
 
+	// Empty Splunk configuration means "Splunk disabled" — skip enrichment and
+	// run with no telemetry. Mirrors the graceful-skip the SAIA reconciler already
+	// implements. Existing CRs always set Endpoint or CRRef, so they never hit
+	// this branch and their behavior is unchanged.
+	if p.Spec.SplunkConfiguration.Endpoint == "" && p.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name == "" {
+		r.Recorder.Event(p, corev1.EventTypeWarning, "SplunkConfigMissing",
+			"Splunk configuration is missing; assuming no telemetry")
+		return nil
+	}
+
 	var resolver splunkutils.SplunkSecretResolver
 	if p.Spec.SplunkConfiguration.SecretSource == aiApi.SecretSourceVault {
 		resolver = &splunkutils.VaultFileResolver{}
