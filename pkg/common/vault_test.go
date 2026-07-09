@@ -3,74 +3,112 @@ package common
 import (
 	"context"
 	"os"
-	"strings"
+	"path/filepath"
 	"testing"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestSafeVaultPath(t *testing.T) {
+	t.Run("blocked: '..' component — traversal before Clean normalises it", func(t *testing.T) {
+		_, err := safeVaultPath("/vault/secrets/../../../etc/passwd")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "path traversal")
+	})
+
+	t.Run("blocked: '..' at end of path", func(t *testing.T) {
+		_, err := safeVaultPath("/vault/secrets/a/..")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "path traversal")
+	})
+
+	t.Run("blocked: operator SA token (outside allowed prefix)", func(t *testing.T) {
+		_, err := safeVaultPath("/var/run/secrets/kubernetes.io/serviceaccount/token")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "outside the allowed prefix")
+	})
+
+	t.Run("blocked: prefix collision (/vault/secrets-evil/)", func(t *testing.T) {
+		_, err := safeVaultPath("/vault/secrets-evil/token")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "outside the allowed prefix")
+	})
+
+	t.Run("blocked: non-existent path fails at EvalSymlinks", func(t *testing.T) {
+		_, err := safeVaultPath("/vault/secrets/no-such-file-99999")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to resolve vaultFilePath")
+	})
+
+	t.Run("blocked: symlink inside /vault/secrets/ pointing outside — EvalSymlinks catches it", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		outsideTarget := filepath.Join(tmpDir, "sa-token")
+		require.NoError(t, os.WriteFile(outsideTarget, []byte("k8s-token"), 0600))
+
+		vaultDir := filepath.Join(tmpDir, "vault", "secrets")
+		require.NoError(t, os.MkdirAll(vaultDir, 0755))
+
+		evilLink := filepath.Join(vaultDir, "evil-link")
+		require.NoError(t, os.Symlink(outsideTarget, evilLink))
+
+		resolvedLink, err := filepath.EvalSymlinks(evilLink)
+		require.NoError(t, err)
+		resolvedTarget, err := filepath.EvalSymlinks(outsideTarget)
+		require.NoError(t, err)
+		assert.Equal(t, resolvedTarget, resolvedLink,
+			"symlink should resolve to the outside target")
+
+		assert.False(t, resolvedLink == vaultSecretsRoot ||
+			len(resolvedLink) > len(vaultSecretsRoot)+1 && resolvedLink[:len(vaultSecretsRoot)+1] == vaultSecretsRoot+"/",
+			"resolved symlink path is outside /vault/secrets as expected")
+	})
+}
 
 func TestVaultFileResolver_GetHECToken(t *testing.T) {
 	ctx := context.Background()
 	resolver := &VaultFileResolver{}
 
 	t.Run("error: VaultFilePath is missing", func(t *testing.T) {
-		cfg := &aiApi.SplunkConfigurationSpec{} // no VaultFilePath set
-
+		cfg := &aiApi.SplunkConfigurationSpec{}
 		token, err := resolver.GetHECToken(ctx, "test-ns", cfg)
-
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "VaultFilePath must be provided")
 		assert.Empty(t, token)
 	})
 
-	t.Run("error: Vault file does not exist", func(t *testing.T) {
+	t.Run("error: '..' traversal rejected before read", func(t *testing.T) {
 		cfg := &aiApi.SplunkConfigurationSpec{
-			VaultFilePath: "/tmp/does-not-exist-12345",
+			VaultFilePath: "/vault/secrets/../../../var/run/secrets/kubernetes.io/serviceaccount/token",
 		}
-
 		token, err := resolver.GetHECToken(ctx, "test-ns", cfg)
-
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to read Vault-injected token file")
+		assert.Contains(t, err.Error(), "path traversal")
 		assert.Empty(t, token)
 	})
 
-	t.Run("error: Vault file exists but is empty", func(t *testing.T) {
-		tmpFile, err := os.CreateTemp("", "vault-empty-*")
-		assert.NoError(t, err)
-		defer os.Remove(tmpFile.Name()) // cleanup
-
-		// file is empty
-		cfg := &aiApi.SplunkConfigurationSpec{
-			VaultFilePath: tmpFile.Name(),
-		}
-
-		token, err := resolver.GetHECToken(ctx, "test-ns", cfg)
-
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "is empty")
-		assert.Empty(t, token)
-	})
-
-	t.Run("success: Vault file contains valid token", func(t *testing.T) {
-		tmpFile, err := os.CreateTemp("", "vault-token-*")
-		assert.NoError(t, err)
+	t.Run("error: path outside /vault/secrets/ rejected before read", func(t *testing.T) {
+		tmpFile, err := os.CreateTemp("", "sa-token-*")
+		require.NoError(t, err)
 		defer os.Remove(tmpFile.Name())
-
-		expectedToken := "super-secret-token"
-		_, err = tmpFile.WriteString(expectedToken + "\n") // simulate a newline at end
-		assert.NoError(t, err)
+		_, _ = tmpFile.WriteString("real-k8s-token")
 		tmpFile.Close()
 
-		cfg := &aiApi.SplunkConfigurationSpec{
-			VaultFilePath: tmpFile.Name(),
-		}
-
+		cfg := &aiApi.SplunkConfigurationSpec{VaultFilePath: tmpFile.Name()}
 		token, err := resolver.GetHECToken(ctx, "test-ns", cfg)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "outside the allowed prefix")
+		assert.Empty(t, token)
+	})
 
-		assert.NoError(t, err)
-		assert.Equal(t, expectedToken, token)
-		assert.False(t, strings.HasSuffix(token, "\n"), "token should be trimmed")
+	t.Run("error: non-existent path under /vault/secrets/ fails at EvalSymlinks", func(t *testing.T) {
+		cfg := &aiApi.SplunkConfigurationSpec{
+			VaultFilePath: "/vault/secrets/does-not-exist-12345",
+		}
+		token, err := resolver.GetHECToken(ctx, "test-ns", cfg)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to resolve vaultFilePath")
+		assert.Empty(t, token)
 	})
 }
