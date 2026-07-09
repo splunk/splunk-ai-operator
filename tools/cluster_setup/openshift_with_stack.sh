@@ -179,7 +179,7 @@ show_install_plan() {
   echo -e "    1.  Preflight checks (oc login, tools, manifest files)" >&2
   echo -e "    2.  NFD Operator (OLM)" >&2
   echo -e "    3.  NVIDIA GPU Operator (OLM)" >&2
-  echo -e "    4.  Node labeling (splunk.ai/workload-type)" >&2
+  echo -e "    4.  Node labeling (splunk.ai/ai-tier-node)" >&2
   echo -e "    5.  local-path-provisioner + SELinux relabeling" >&2
   echo -e "    6.  cert-manager (Helm)" >&2
   echo -e "    7.  OpenTelemetry Operator (Helm)" >&2
@@ -661,7 +661,7 @@ EOF
 label_nodes() {
   log "Applying splunk.ai/* node labels (strategy: ${NODE_LABEL_STRATEGY})..."
 
-  local cpu_nodes=() gpu_nodes=() control_nodes=()
+  local ai_nodes=() control_nodes=()
 
   # Always label master/control-plane nodes
   while IFS= read -r node; do
@@ -670,31 +670,20 @@ label_nodes() {
 
   case "${NODE_LABEL_STRATEGY}" in
     auto)
-      # GPU nodes: detected by nvidia.com/gpu.present=true (set by NVIDIA GPU Operator / NFD)
+      # AI-tier nodes: all worker nodes. GPU workers are further constrained to
+      # GPU-capable nodes by their nvidia.com/gpu resource request, not by a label.
       while IFS= read -r node; do
-        [[ -n "$node" ]] && gpu_nodes+=("$node")
-      done < <(oc get nodes -l nvidia.com/gpu.present=true,node-role.kubernetes.io/worker -o name 2>/dev/null | sed 's|node/||')
-
-      # CPU nodes: worker nodes without GPU label
-      while IFS= read -r node; do
-        [[ -n "$node" ]] && cpu_nodes+=("$node")
-      done < <(oc get nodes -l '!nvidia.com/gpu.present,node-role.kubernetes.io/worker' -o name 2>/dev/null | sed 's|node/||')
+        [[ -n "$node" ]] && ai_nodes+=("$node")
+      done < <(oc get nodes -l node-role.kubernetes.io/worker -o name 2>/dev/null | sed 's|node/||')
       ;;
 
     manual)
-      local cpu_count gpu_count
-      cpu_count=$(yq eval '.openshift.nodes.cpu | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
-      gpu_count=$(yq eval '.openshift.nodes.gpu | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+      local node_count
+      node_count=$(yq eval '.openshift.nodes | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
       local i=0
-      while [[ $i -lt $cpu_count ]]; do
-        local n; n=$(yq eval ".openshift.nodes.cpu[$i]" "${CONFIG_FILE}" 2>/dev/null || echo "")
-        [[ -n "$n" && "$n" != "null" ]] && cpu_nodes+=("$n")
-        i=$((i+1))
-      done
-      i=0
-      while [[ $i -lt $gpu_count ]]; do
-        local n; n=$(yq eval ".openshift.nodes.gpu[$i]" "${CONFIG_FILE}" 2>/dev/null || echo "")
-        [[ -n "$n" && "$n" != "null" ]] && gpu_nodes+=("$n")
+      while [[ $i -lt $node_count ]]; do
+        local n; n=$(yq eval ".openshift.nodes[$i]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+        [[ -n "$n" && "$n" != "null" ]] && ai_nodes+=("$n")
         i=$((i+1))
       done
       ;;
@@ -713,35 +702,27 @@ label_nodes() {
       --overwrite
   done
 
-  # Label CPU worker nodes — all AI-tier nodes get ai-tier-node=true.
-  # Both cpuScheduler and gpuScheduler select on this label; GPU workers are
-  # further constrained to GPU-capable nodes by their nvidia.com/gpu resource request.
-  for node in "${cpu_nodes[@]:+${cpu_nodes[@]}}"; do
-    log "  Labeling CPU worker node: ${node}"
+  # Label AI-tier worker nodes — every node gets splunk.ai/ai-tier-node=true.
+  # Both cpuScheduler and gpuScheduler select on this single label; GPU workers are
+  # further constrained to GPU-capable nodes by their nvidia.com/gpu resource request,
+  # so CPU and GPU workloads share the same node pool without a cpu/gpu label split.
+  for node in "${ai_nodes[@]:+${ai_nodes[@]}}"; do
+    log "  Labeling AI-tier worker node: ${node}"
     oc label node "${node}" \
       splunk.ai/node-role=worker \
-      splunk.ai/workload-type=cpu \
       splunk.ai/ai-tier-node=true \
       --overwrite
-  done
-
-  # Label GPU worker nodes
-  for node in "${gpu_nodes[@]:+${gpu_nodes[@]}}"; do
-    log "  Labeling GPU worker node: ${node}"
-    oc label node "${node}" \
-      splunk.ai/node-role=worker \
-      splunk.ai/workload-type=gpu \
-      splunk.ai/ai-tier-node=true \
-      --overwrite
-    # Taint GPU nodes so non-GPU workloads don't land on them
-    oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule --overwrite 2>/dev/null || true
+    # Remove any lingering nvidia.com/gpu taint — a node that previously ran as a GPU
+    # worker retains the taint across in-place reinstalls; without this, CPU workloads
+    # selecting ai-tier-node would stay Pending on it.
+    oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
   done
 
   # Verify labeled nodes have the label — scope check to listed nodes in manual mode
   # (auto mode checks all workers; manual mode only checks what the user explicitly listed)
   local unlabeled=""
   if [[ "${NODE_LABEL_STRATEGY}" == "manual" ]]; then
-    for node in "${cpu_nodes[@]:+${cpu_nodes[@]}}" "${gpu_nodes[@]:+${gpu_nodes[@]}}"; do
+    for node in "${ai_nodes[@]:+${ai_nodes[@]}}"; do
       local val
       val=$(oc get node "${node}" -o jsonpath='{.metadata.labels.splunk\.ai/ai-tier-node}' 2>/dev/null || echo "")
       [[ -z "${val}" ]] && unlabeled+="${node}"$'\n'
@@ -761,14 +742,12 @@ for n in data['items']:
     err "Worker node(s) still missing splunk.ai/ai-tier-node after labeling:
 $(echo "${unlabeled}" | sed 's/^/  /')
 
-If using nodeLabelStrategy: auto, check that the NVIDIA GPU Operator is installed
-and nodes have nvidia.com/gpu.present=true, or switch to nodeLabelStrategy: manual
-and list nodes explicitly under openshift.nodes.cpu / openshift.nodes.gpu in the config."
+If using nodeLabelStrategy: auto, check that worker nodes exist, or switch to
+nodeLabelStrategy: manual and list nodes explicitly under openshift.nodes in the config."
   fi
 
   log "  ✓ Control-plane nodes: ${#control_nodes[@]}"
-  log "  ✓ CPU worker nodes:    ${#cpu_nodes[@]}"
-  log "  ✓ GPU worker nodes:    ${#gpu_nodes[@]}"
+  log "  ✓ AI-tier worker nodes: ${#ai_nodes[@]}"
   log "Node labeling complete"
 }
 
@@ -1008,18 +987,39 @@ ensure_ecr_pull_secret() {
       --namespace="${ns}" \
       --dry-run=client -o yaml | oc apply -f -
 
-    # Patch the default SA with the ECR pull secret (merge patch overwrites imagePullSecrets,
-    # which is fine since this is the only pull secret we manage on this SA).
-    oc patch serviceaccount default -n "${ns}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+    # Append the ECR pull secret to the default SA without dropping any it already has
+    # (OpenShift auto-injects default-dockercfg-* builder/pull secrets there).
+    add_ecr_pull_secret_to_sa default "${ns}"
 
     log "  ✓ ecr-registry-secret created in ${ns}"
   done
 
   # Also patch the operator SA specifically
-  oc patch serviceaccount splunk-ai-operator-controller-manager \
-    -n splunk-ai-operator-system \
-    -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+  add_ecr_pull_secret_to_sa splunk-ai-operator-controller-manager splunk-ai-operator-system
+}
+
+# Append ecr-registry-secret to a service account's imagePullSecrets, preserving
+# any existing entries. No-op if the secret is already listed, so reruns are safe.
+add_ecr_pull_secret_to_sa() {
+  local sa="$1" ns="$2"
+
+  # Already present? nothing to do.
+  if oc get serviceaccount "${sa}" -n "${ns}" \
+      -o jsonpath='{.imagePullSecrets[*].name}' 2>/dev/null \
+      | tr ' ' '\n' | grep -qx "ecr-registry-secret"; then
+    return 0
+  fi
+
+  # If the SA has no imagePullSecrets yet, a merge patch is enough. Otherwise use a
+  # JSON add patch to append to the existing array without replacing it.
+  if oc get serviceaccount "${sa}" -n "${ns}" \
+      -o jsonpath='{.imagePullSecrets}' 2>/dev/null | grep -q '\['; then
+    oc patch serviceaccount "${sa}" -n "${ns}" --type=json \
+      -p '[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"ecr-registry-secret"}}]' 2>/dev/null || true
+  else
+    oc patch serviceaccount "${sa}" -n "${ns}" \
+      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+  fi
 }
 
 # ====== INSTALL SPLUNK AI OPERATOR ======
@@ -1411,11 +1411,6 @@ ${svc_template_yaml}${storage_yaml}
   gpuScheduler:
     nodeSelector:
       splunk.ai/ai-tier-node: "true"
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
   splunkConfiguration:
     endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
     secretRef:
@@ -1690,10 +1685,15 @@ main_delete() {
   oc delete namespace openshift-nfd --timeout=60s 2>/dev/null || true
 
   # ── 11. Node labels and taints added by label_nodes() ──
+  # Match both the current ai-tier-node label and the legacy workload-type label so
+  # teardown cleans up stacks installed before the single-label refactor. Also strip
+  # the nvidia.com/gpu taint older installs applied to GPU worker nodes.
   log "Removing splunk.ai/* node labels and GPU taint..."
-  for node in $(oc get nodes -l 'splunk.ai/ai-tier-node' -o name 2>/dev/null); do
+  for node in $( { oc get nodes -l 'splunk.ai/ai-tier-node' -o name 2>/dev/null; \
+                   oc get nodes -l 'splunk.ai/workload-type' -o name 2>/dev/null; \
+                 } | sort -u ); do
     oc label "${node}" splunk.ai/ai-tier-node- splunk.ai/workload-type- 2>/dev/null || true
-    oc taint "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
+    oc adm taint "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
   done
 
   # ── 12. SCC grants added during install ──
