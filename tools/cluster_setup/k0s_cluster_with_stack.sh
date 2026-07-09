@@ -412,6 +412,11 @@ show_install_plan() {
   echo -e "  \033[1mObject store     :\033[0m type=$(yq eval '.storage.objectStore.type // "?"' "${CONFIG_FILE}" 2>/dev/null)  bucket=$(yq eval '.storage.objectStore.bucket // "?"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
+  if [[ "${SPLUNK_MODE}" == "external" ]]; then
+    echo -e "  \033[1mSplunk telemetry :\033[0m external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
+  else
+    echo -e "  \033[1mSplunk telemetry :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
+  fi
   echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
   echo "" >&2
@@ -428,9 +433,19 @@ show_install_plan() {
   fi
   echo -e "    3. k0s cluster installation" >&2
   echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
-  echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  else
+    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, NVIDIA device-plugin  [Splunk operator SKIPPED — mode=${SPLUNK_MODE}]" >&2
+  fi
   echo -e "    6. MetalLB load-balancer" >&2
-  echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+  elif [[ "${SPLUNK_MODE}" == "external" ]]; then
+    echo -e "    7. AI Platform operator + CR (external Splunk HEC)  [Splunk Standalone SKIPPED — external mode]" >&2
+  else
+    echo -e "    7. AI Platform operator + CR  [Splunk Standalone SKIPPED — mode=disabled]" >&2
+  fi
   echo -e "    8. Health check + pod verification" >&2
   echo "" >&2
 
@@ -606,6 +621,44 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
+  # Splunk telemetry is OPT-IN and defaults to DISABLED. It only turns on when
+  # splunk.enabled: true is explicitly set AND the required Splunk images are
+  # present (enforced in validate_image_config). When disabled the script skips
+  # the Splunk Operator, the Standalone CR, and omits splunkConfiguration from
+  # the AIPlatform CR — the operator treats an empty config as "no telemetry".
+  # yq returns "null" for an absent key, which we treat as false. yq also mishandles
+  # boolean false, so we normalise explicitly.
+  SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  [[ "${SPLUNK_ENABLED}" != "true" ]] && SPLUNK_ENABLED="false"
+
+  # External Splunk: point telemetry at a Splunk running OUTSIDE the cluster.
+  # When splunk.external.endpoint is set (and splunk.enabled is true), the
+  # script does NOT install the in-cluster Splunk Operator/Standalone — it only
+  # wires the AIPlatform CR at the external HEC endpoint + a Secret holding the
+  # HEC token. The token is supplied via the SPLUNK_HEC_TOKEN env var (never the
+  # config file), mirroring how MINIO_ROOT_PASSWORD works; the script creates
+  # the Secret post-cluster-bootstrap so there is no chicken-and-egg ordering.
+  SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
+  SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-hec-external")"
+  [[ -z "${SPLUNK_EXTERNAL_SECRET_NAME}" || "${SPLUNK_EXTERNAL_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
+  # HEC token: env var only (keep it out of the config file and logs).
+  SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+
+  # Derive a single mode so downstream logic is unambiguous:
+  #   disabled  — splunk.enabled=false: no Splunk, no telemetry
+  #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
+  #               in-cluster Splunk, use customer's external HEC
+  #   internal  — splunk.enabled=true, no external endpoint: install SOK +
+  #               Standalone in-cluster (legacy behavior)
+  if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
+    SPLUNK_MODE="disabled"
+  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+    SPLUNK_MODE="external"
+  else
+    SPLUNK_MODE="internal"
+  fi
+
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
@@ -658,6 +711,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
+  log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -698,8 +752,13 @@ validate_image_config() {
   if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
     err "REQUIRED: images.operator.image must be specified in k0s-cluster-config.yaml"
   fi
-  if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml"
+  # Splunk images are only required for INTERNAL mode (in-cluster SOK +
+  # Standalone). Disabled and external modes never install those workloads, so a
+  # missing images.splunk.image must not fail the whole install.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml when splunk.enabled is true (internal mode)"
+    fi
   fi
   if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
     err "REQUIRED: images.ray.headImage must be specified in k0s-cluster-config.yaml"
@@ -754,14 +813,20 @@ configure_images() {
     log "Creating backup: ${SPLUNK_AI_FILE}.original"
     cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
   fi
-  if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
-    cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
+  # Only back up / rewrite the Splunk Operator manifest when telemetry is
+  # internal mode only. External/disabled modes never apply the manifest, so
+  # touching it (which also requires the file to exist) is pointless and would
+  # break Splunk-free installs that don't ship splunk-operator-cluster.yaml.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
+      log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
+      cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
+    fi
   fi
 
   log "Restoring from clean originals to ensure idempotent updates..."
   cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
-  cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+  [[ "${SPLUNK_MODE}" == "internal" ]] && cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
 
   log "Updating $SPLUNK_AI_FILE..."
 
@@ -829,19 +894,23 @@ configure_images() {
   log "  ✓ Updated MODEL_VERSION: $MODEL_VERSION"
   log "  ✓ Updated RAY_VERSION: $RAY_RUNTIME_VERSION"
 
-  log "Updating $SPLUNK_OPERATOR_FILE..."
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    log "Updating $SPLUNK_OPERATOR_FILE..."
 
-  local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
-  local splunk_operator_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
+    local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
+    local splunk_operator_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
 
-  local splunk_escaped=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
-  local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
+    local splunk_escaped=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
+    local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
-  "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
+    "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
 
-  log "  ✓ Updated Splunk Enterprise image: $splunk_full"
-  log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
+    log "  ✓ Updated Splunk Enterprise image: $splunk_full"
+    log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
+  else
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Operator manifest rewrite (no in-cluster Splunk)"
+  fi
   log "✓ All images configured successfully"
 }
 
@@ -906,7 +975,22 @@ preflight_checks() {
 
   pf_header "Configuration"
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"
-  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
+  case "${SPLUNK_MODE}" in
+    internal)
+      [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
+      ;;
+    external)
+      pf_ok "Splunk telemetry: external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME}, in-cluster Splunk skipped)"
+      # The HEC token must be supplied via env; fail fast here rather than
+      # discovering it at CR-apply time after the cluster is already up.
+      [[ -n "${SPLUNK_HEC_TOKEN}" ]] && pf_ok "SPLUNK_HEC_TOKEN is set (external HEC token)" || pf_fail "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
+      # Endpoint should be a base HEC URL; the operator appends /services/collector.
+      [[ "${SPLUNK_EXTERNAL_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External HEC endpoint scheme OK" || pf_warn "splunk.external.endpoint should start with http:// or https:// (got: ${SPLUNK_EXTERNAL_ENDPOINT})"
+      ;;
+    *)
+      pf_ok "Splunk telemetry disabled (splunk.enabled=false) — Splunk Operator/Standalone will be skipped"
+      ;;
+  esac
   [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "AI platform file: ${SPLUNK_AI_FILE}" || pf_warn "AI platform file not found: ${SPLUNK_AI_FILE}"
 
   pf_header "Object storage (customer-managed)"
@@ -3466,6 +3550,11 @@ install_ray_operator() {
 
 # ====== INSTALL SPLUNK OPERATOR ======
 install_splunk_operator() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Operator install (no in-cluster Splunk)"
+    return 0
+  fi
+
   log "Installing Splunk Operator..."
 
   if [[ ! -f "${SPLUNK_OPERATOR_FILE}" ]]; then
@@ -4031,6 +4120,11 @@ create_ecr_secret() {
 
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Standalone install (no in-cluster Splunk)"
+    return 0
+  fi
+
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
 
   ensure_namespace "${AI_NS}"
@@ -4153,6 +4247,10 @@ YAML
 # Blocks until Splunk Standalone pod is ready. Called at the end of the
 # install flow so the operator and CR can deploy while Splunk boots.
 wait_for_splunk_standalone() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    return 0
+  fi
+
   log "Waiting for Splunk Standalone to be ready..."
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
   log "Splunk Standalone is ready"
@@ -4178,9 +4276,59 @@ install_ai_platform_cr() {
     xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
   log "✓ Cleanup complete"
 
-  # Get Splunk secret name (for HEC endpoint)
-  local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
-  log "Using Splunk secret: ${splunk_secret}"
+  # Splunk telemetry block for the AIPlatform CR. Rendered by mode:
+  #   disabled — block stays empty; the operator treats an absent
+  #              splunkConfiguration as "no telemetry" (graceful skip).
+  #   internal — point at the in-cluster Standalone HEC + operator-managed secret.
+  #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
+  #              var and point at the customer's external HEC endpoint.
+  local splunk_config_yaml=""
+  case "${SPLUNK_MODE}" in
+    internal)
+      local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
+      log "Using Splunk secret: ${splunk_secret}"
+      splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (internal — in-cluster Standalone)
+  splunkConfiguration:
+    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    secretRef:
+      name: ${splunk_secret}
+      namespace: ${AI_NS}
+EOF
+)
+      ;;
+    external)
+      # The HEC token comes from the env var only (never the config file). The
+      # namespace is guaranteed here (internal mode created it via the Standalone
+      # install; external mode skips that, so ensure it now before the Secret).
+      ensure_namespace "${AI_NS}"
+      if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
+        err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
+      fi
+      log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
+      # --dry-run|apply keeps this idempotent across re-runs. The token value is
+      # never echoed; only the secret name is logged.
+      kubectl -n "${AI_NS}" create secret generic "${SPLUNK_EXTERNAL_SECRET_NAME}" \
+        --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
+        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+      log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
+      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
+      splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (external — customer-managed Splunk)
+  splunkConfiguration:
+    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
+    secretRef:
+      name: ${SPLUNK_EXTERNAL_SECRET_NAME}
+      namespace: ${AI_NS}
+EOF
+)
+      ;;
+    *)
+      log "Splunk telemetry disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+      ;;
+  esac
 
   # Ensure object storage credentials secret exists in AI namespace
   log "Creating/updating S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
@@ -4349,13 +4497,7 @@ ${svc_template_yaml}
         operator: "Equal"
         value: "true"
         effect: "NoSchedule"
-
-  # Splunk configuration
-  splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
-    secretRef:
-      name: ${splunk_secret}
-      namespace: ${AI_NS}
+${splunk_config_yaml}
 YAML
 
   log "AIPlatform CR created successfully"

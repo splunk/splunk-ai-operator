@@ -170,7 +170,42 @@ files:
 
 # ---------- Splunk Configuration ----------
 splunk:
+  # Splunk telemetry is OPT-IN and defaults to DISABLED.
+  # When false (or absent): the Splunk Operator and Splunk Standalone are NOT
+  # installed, and the AIPlatform CR is created WITHOUT a splunkConfiguration
+  # block — the operator treats that as "no telemetry" and runs cleanly.
+  # Set to true to enable telemetry (internal or external mode below).
+  enabled: false
+
+  # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
   standaloneName: splunk-standalone
+
+  # ----- Telemetry mode is derived from whether external.endpoint is set -----
+  #
+  #   INTERNAL (enabled: true, external.endpoint unset):
+  #     The installer deploys the Splunk Operator + a Splunk Standalone inside
+  #     the cluster and wires the AIPlatform CR at it. Requires
+  #     images.splunk.image and images.splunk.operatorImage.
+  #
+  #   EXTERNAL (enabled: true, external.endpoint set):
+  #     Use a Splunk running OUTSIDE the cluster. The installer does NOT deploy
+  #     any in-cluster Splunk. It creates a Kubernetes Secret holding the HEC
+  #     token and points the AIPlatform CR at your external HEC endpoint.
+  #
+  #     The HEC token is supplied ONLY via the SPLUNK_HEC_TOKEN environment
+  #     variable (never this file), so no live credential is committed or
+  #     logged. Example:
+  #
+  #         export SPLUNK_HEC_TOKEN='<your-hec-token>'
+  #         ./k0s_cluster_with_stack.sh --config k0s-cluster-config.yaml
+  #
+  #     The script creates the Secret AFTER the cluster/namespace exist, so
+  #     there is no bootstrap ordering problem. Preflight fails fast if
+  #     SPLUNK_HEC_TOKEN is missing in external mode.
+  #
+  # external:
+  #   endpoint: https://splunk.example.com:8088   # base HEC URL (operator appends /services/collector)
+  #   secretName: splunk-hec-external             # optional; k8s Secret name the script creates (key: hec_token)
 
 # ---------- AI Platform Configuration ----------
 aiPlatform:
