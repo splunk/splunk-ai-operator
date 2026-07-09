@@ -319,6 +319,50 @@ resolve_model_staging() {
   log "Model staging set to '${MODEL_STAGING_ENABLED}' by interactive prompt (overrides config value)."
 }
 
+# Supported GPU accelerator types. Add new types here — the interactive prompt
+# and validate_config both derive their lists from this constant.
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+
+# ====== RESOLVE ACCELERATOR TYPE ======
+# Called after load_config, before show_install_plan.
+# Prompts when defaultAcceleratorType is missing OR set to an unsupported value,
+# since the CR always requires this field and stage_model_artifacts needs a valid type.
+resolve_accelerator_type() {
+  # Return early only if already set to a valid supported type (case-insensitive).
+  # Normalize to the canonical casing from SUPPORTED_ACCELERATORS so the CR value
+  # matches the Ray builder's instanceMap keys exactly (e.g. L40S, H100).
+  local _cur
+  _cur=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
+  for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+    if [[ "${_cur}" == "${_t,,}" ]]; then
+      DEFAULT_ACCELERATOR="${_t}"
+      return 0
+    fi
+  done
+
+  local _supported_list="${SUPPORTED_ACCELERATORS[*]}"
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    err "aiPlatform.defaultAcceleratorType${DEFAULT_ACCELERATOR:+ ('${DEFAULT_ACCELERATOR}') is not supported} — must be one of: ${_supported_list}. Set it in your config."
+  fi
+  if [[ ! -t 0 ]]; then
+    err "aiPlatform.defaultAcceleratorType${DEFAULT_ACCELERATOR:+ ('${DEFAULT_ACCELERATOR}') is not supported} — set it in your config to one of: ${_supported_list}."
+  fi
+  echo "" >&2
+  echo "  Select GPU accelerator type:" >&2
+  for i in "${!SUPPORTED_ACCELERATORS[@]}"; do
+    echo "    $((i+1))) ${SUPPORTED_ACCELERATORS[$i]}" >&2
+  done
+  local _choice
+  read -rp "  Enter 1-${#SUPPORTED_ACCELERATORS[@]}: " _choice
+  if [[ "${_choice}" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= ${#SUPPORTED_ACCELERATORS[@]} )); then
+    DEFAULT_ACCELERATOR="${SUPPORTED_ACCELERATORS[$((_choice-1))]}"
+  else
+    err "Invalid choice '${_choice}'. Please enter a number between 1 and ${#SUPPORTED_ACCELERATORS[@]}."
+  fi
+  echo "" >&2
+  log "Accelerator type set to '${DEFAULT_ACCELERATOR}' by interactive prompt."
+}
+
 # ====== SHOW INSTALL PLAN ======
 # Called before install starts; prints what will be done so customers can
 # validate the config before a 40-minute run.
@@ -2318,13 +2362,10 @@ stage_model_artifacts() {
   fi
 
   # ---- Resolve accelerator (normalize to lowercase) ----
-  # Config uses uppercase (L40S, H100) to match the sample; internal logic requires lowercase.
+  # DEFAULT_ACCELERATOR is guaranteed to be set by resolve_accelerator_type()
+  # before main_install reaches this point.
   local _accel
-  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
-  if [[ -z "${_accel}" ]]; then
-    warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
-    _accel="l40s"
-  fi
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
 
   # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
   # re-runs skip models that are already fully staged (no re-download, no re-upload).
@@ -5796,6 +5837,7 @@ main_install() {
   load_config
 
   validate_image_config
+  resolve_accelerator_type
   configure_images
 
   resolve_model_staging
@@ -6325,6 +6367,21 @@ validate_config() {
   img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
   img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
   _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  _vcheck "aiPlatform.defaultAcceleratorType" \
+    "$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null)" \
+    "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
+  local _accel_val
+  _accel_val=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${_accel_val}" ]]; then
+    local _valid=false
+    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+      [[ "${_accel_val}" == "${_t,,}" ]] && _valid=true && break
+    done
+    if ! ${_valid}; then
+      echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
+      errors=$(( errors + 1 ))
+    fi
+  fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
     warnings=$(( warnings + 1 ))
@@ -6752,6 +6809,7 @@ case "${_CMD}" in
     ;;
   stage-artifacts)
     load_config
+    resolve_accelerator_type
     stage_model_artifacts
     ;;
   delete)
