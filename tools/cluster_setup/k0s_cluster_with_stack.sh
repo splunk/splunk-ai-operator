@@ -328,11 +328,16 @@ readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
 # Prompts when defaultAcceleratorType is missing OR set to an unsupported value,
 # since the CR always requires this field and stage_model_artifacts needs a valid type.
 resolve_accelerator_type() {
-  # Return early only if already set to a valid supported type (case-insensitive)
+  # Return early only if already set to a valid supported type (case-insensitive).
+  # Normalize to the canonical casing from SUPPORTED_ACCELERATORS so the CR value
+  # matches the Ray builder's instanceMap keys exactly (e.g. L40S, H100).
   local _cur
   _cur=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
   for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
-    [[ "${_cur}" == "${_t,,}" ]] && return 0
+    if [[ "${_cur}" == "${_t,,}" ]]; then
+      DEFAULT_ACCELERATOR="${_t}"
+      return 0
+    fi
   done
 
   local _supported_list="${SUPPORTED_ACCELERATORS[*]}"
