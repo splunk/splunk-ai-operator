@@ -713,23 +713,25 @@ label_nodes() {
       --overwrite
   done
 
-  # Label CPU worker nodes
-  for node in "${cpu_nodes[@]}"; do
+  # Label CPU worker nodes — all AI-tier nodes get ai-tier-node=true.
+  # Both cpuScheduler and gpuScheduler select on this label; GPU workers are
+  # further constrained to GPU-capable nodes by their nvidia.com/gpu resource request.
+  for node in "${cpu_nodes[@]:+${cpu_nodes[@]}}"; do
     log "  Labeling CPU worker node: ${node}"
     oc label node "${node}" \
       splunk.ai/node-role=worker \
       splunk.ai/workload-type=cpu \
-      splunk.ai/instance-type=cpu-worker \
+      splunk.ai/ai-tier-node=true \
       --overwrite
   done
 
   # Label GPU worker nodes
-  for node in "${gpu_nodes[@]}"; do
+  for node in "${gpu_nodes[@]:+${gpu_nodes[@]}}"; do
     log "  Labeling GPU worker node: ${node}"
     oc label node "${node}" \
       splunk.ai/node-role=worker \
       splunk.ai/workload-type=gpu \
-      splunk.ai/instance-type=gpu-worker \
+      splunk.ai/ai-tier-node=true \
       --overwrite
     # Taint GPU nodes so non-GPU workloads don't land on them
     oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule --overwrite 2>/dev/null || true
@@ -739,9 +741,9 @@ label_nodes() {
   # (auto mode checks all workers; manual mode only checks what the user explicitly listed)
   local unlabeled=""
   if [[ "${NODE_LABEL_STRATEGY}" == "manual" ]]; then
-    for node in "${cpu_nodes[@]}" "${gpu_nodes[@]}"; do
+    for node in "${cpu_nodes[@]:+${cpu_nodes[@]}}" "${gpu_nodes[@]:+${gpu_nodes[@]}}"; do
       local val
-      val=$(oc get node "${node}" -o jsonpath='{.metadata.labels.splunk\.ai/workload-type}' 2>/dev/null || echo "")
+      val=$(oc get node "${node}" -o jsonpath='{.metadata.labels.splunk\.ai/ai-tier-node}' 2>/dev/null || echo "")
       [[ -z "${val}" ]] && unlabeled+="${node}"$'\n'
     done
   else
@@ -750,13 +752,13 @@ label_nodes() {
 import json,sys
 data=json.load(sys.stdin)
 for n in data['items']:
-    if 'splunk.ai/workload-type' not in n['metadata']['labels']:
+    if 'splunk.ai/ai-tier-node' not in n['metadata']['labels']:
         print(n['metadata']['name'])
 " 2>/dev/null || echo "")
   fi
 
   if [[ -n "${unlabeled}" ]]; then
-    err "Worker node(s) still missing splunk.ai/workload-type after labeling:
+    err "Worker node(s) still missing splunk.ai/ai-tier-node after labeling:
 $(echo "${unlabeled}" | sed 's/^/  /')
 
 If using nodeLabelStrategy: auto, check that the NVIDIA GPU Operator is installed
@@ -867,13 +869,11 @@ install_local_path_provisioner() {
   # busybox lacks chcon; use ubi-minimal which ships selinux-utils so chcon runs.
   # container_file_t allows any container to read/write regardless of MCS categories.
   # Without this, local-path-provisioner creates dirs with var_t which blocks all containers.
-  oc patch configmap local-path-config -n local-path-storage --type=merge -p "$(cat <<'PATCH'
-{
-  "data": {
-    "setup": "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nif command -v chcon >/dev/null 2>&1; then\n  chcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\nfi\n"
-}
-PATCH
-  )"
+  local _patch_file; _patch_file=$(mktemp /tmp/local-path-patch-XXXXXX.json)
+  printf '%s' '{"data":{"setup":"#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nif command -v chcon >/dev/null 2>&1; then\n  chcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\nfi\n"}}' \
+    > "${_patch_file}"
+  oc patch configmap local-path-config -n local-path-storage --type=merge --patch-file="${_patch_file}"
+  rm -f "${_patch_file}"
 
   # Restart the provisioner so it picks up the new helper pod template
   oc rollout restart deployment local-path-provisioner -n local-path-storage
@@ -1008,14 +1008,10 @@ ensure_ecr_pull_secret() {
       --namespace="${ns}" \
       --dry-run=client -o yaml | oc apply -f -
 
-    # Append ecr-registry-secret to the default SA only if not already present.
-    # Using JSON patch add rather than a merge patch to avoid overwriting existing pull secrets.
-    if ! oc get serviceaccount default -n "${ns}" -o jsonpath='{.imagePullSecrets[*].name}' 2>/dev/null | grep -qw ecr-registry-secret; then
-      oc patch serviceaccount default -n "${ns}" --type=json \
-        -p='[{"op":"add","path":"/imagePullSecrets","value":[]}]' 2>/dev/null || true
-      oc patch serviceaccount default -n "${ns}" --type=json \
-        -p='[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"ecr-registry-secret"}}]' 2>/dev/null || true
-    fi
+    # Patch the default SA with the ECR pull secret (merge patch overwrites imagePullSecrets,
+    # which is fine since this is the only pull secret we manage on this SA).
+    oc patch serviceaccount default -n "${ns}" \
+      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
 
     log "  ✓ ecr-registry-secret created in ${ns}"
   done
@@ -1410,11 +1406,11 @@ ${svc_template_yaml}${storage_yaml}
     imageRegistry: "${WORKER_IMAGE_REGISTRY}"
   cpuScheduler:
     nodeSelector:
-      splunk.ai/workload-type: cpu
+      splunk.ai/ai-tier-node: "true"
     tolerations: ${cpu_tolerations_inline}
   gpuScheduler:
     nodeSelector:
-      splunk.ai/workload-type: gpu
+      splunk.ai/ai-tier-node: "true"
     tolerations:
       - key: "nvidia.com/gpu"
         operator: "Equal"
@@ -1445,7 +1441,12 @@ YAML
 # (Splunk's setup page validates connectivity from the server side).
 # NodePort alone doesn't work when node IPs are not externally routable.
 create_saia_route() {
-  if [[ -z "$INGRESS_DOMAIN" ]]; then
+  # Re-attempt ingress domain detection in case it was unavailable during load_config.
+  if [[ -z "${INGRESS_DOMAIN:-}" ]]; then
+    INGRESS_DOMAIN=$(oc get ingresscontroller default -n openshift-ingress-operator \
+      -o jsonpath='{.status.domain}' 2>/dev/null || echo "")
+  fi
+  if [[ -z "${INGRESS_DOMAIN:-}" ]]; then
     warn "Could not determine ingress domain — skipping SAIA Route creation"
     warn "Create it manually: oc expose svc/${AI_PLATFORM_NAME}-saia-saia-service -n ${AI_NS}"
     return 0
@@ -1690,8 +1691,8 @@ main_delete() {
 
   # ── 11. Node labels and taints added by label_nodes() ──
   log "Removing splunk.ai/* node labels and GPU taint..."
-  for node in $(oc get nodes -l 'splunk.ai/workload-type' -o name 2>/dev/null); do
-    oc label "${node}" splunk.ai/workload-type- 2>/dev/null || true
+  for node in $(oc get nodes -l 'splunk.ai/ai-tier-node' -o name 2>/dev/null); do
+    oc label "${node}" splunk.ai/ai-tier-node- splunk.ai/workload-type- 2>/dev/null || true
     oc taint "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
   done
 
