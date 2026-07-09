@@ -319,31 +319,41 @@ resolve_model_staging() {
   log "Model staging set to '${MODEL_STAGING_ENABLED}' by interactive prompt (overrides config value)."
 }
 
+# Supported GPU accelerator types. Add new types here — the interactive prompt
+# and validate_config both derive their lists from this constant.
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+
 # ====== RESOLVE ACCELERATOR TYPE ======
 # Called after load_config, before show_install_plan.
-# If defaultAcceleratorType is not set in the config, always prompt — regardless
-# of whether model staging is enabled, since the CR always requires this field.
+# Prompts when defaultAcceleratorType is missing OR set to an unsupported value,
+# since the CR always requires this field and stage_model_artifacts needs a valid type.
 resolve_accelerator_type() {
-  if [[ -n "${DEFAULT_ACCELERATOR}" ]]; then
-    return 0
-  fi
+  # Return early only if already set to a valid supported type (case-insensitive)
+  local _cur
+  _cur=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
+  for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+    [[ "${_cur}" == "${_t,,}" ]] && return 0
+  done
+
+  local _supported_list="${SUPPORTED_ACCELERATORS[*]}"
   if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
-    err "aiPlatform.defaultAcceleratorType not set and SILENT_INSTALL=true — set it in your config."
+    err "aiPlatform.defaultAcceleratorType${DEFAULT_ACCELERATOR:+ ('${DEFAULT_ACCELERATOR}') is not supported} — must be one of: ${_supported_list}. Set it in your config."
   fi
   if [[ ! -t 0 ]]; then
-    err "aiPlatform.defaultAcceleratorType not set and stdin is not a terminal — set it in your config or run interactively."
+    err "aiPlatform.defaultAcceleratorType${DEFAULT_ACCELERATOR:+ ('${DEFAULT_ACCELERATOR}') is not supported} — set it in your config to one of: ${_supported_list}."
   fi
   echo "" >&2
   echo "  Select GPU accelerator type:" >&2
-  echo "    1) L40S" >&2
-  echo "    2) H100" >&2
+  for i in "${!SUPPORTED_ACCELERATORS[@]}"; do
+    echo "    $((i+1))) ${SUPPORTED_ACCELERATORS[$i]}" >&2
+  done
   local _choice
-  read -rp "  Enter 1 or 2: " _choice
-  case "${_choice}" in
-    1) DEFAULT_ACCELERATOR="L40S" ;;
-    2) DEFAULT_ACCELERATOR="H100" ;;
-    *) err "Invalid choice '${_choice}'. Please enter 1 or 2." ;;
-  esac
+  read -rp "  Enter 1-${#SUPPORTED_ACCELERATORS[@]}: " _choice
+  if [[ "${_choice}" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= ${#SUPPORTED_ACCELERATORS[@]} )); then
+    DEFAULT_ACCELERATOR="${SUPPORTED_ACCELERATORS[$((_choice-1))]}"
+  else
+    err "Invalid choice '${_choice}'. Please enter a number between 1 and ${#SUPPORTED_ACCELERATORS[@]}."
+  fi
   echo "" >&2
   log "Accelerator type set to '${DEFAULT_ACCELERATOR}' by interactive prompt."
 }
@@ -5822,9 +5832,9 @@ main_install() {
   load_config
 
   validate_image_config
+  resolve_accelerator_type
   configure_images
 
-  resolve_accelerator_type
   resolve_model_staging
 
   show_install_plan
@@ -6352,6 +6362,21 @@ validate_config() {
   img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
   img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
   _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  _vcheck "aiPlatform.defaultAcceleratorType" \
+    "$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null)" \
+    "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
+  local _accel_val
+  _accel_val=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${_accel_val}" ]]; then
+    local _valid=false
+    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+      [[ "${_accel_val}" == "${_t,,}" ]] && _valid=true && break
+    done
+    if ! ${_valid}; then
+      echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
+      errors=$(( errors + 1 ))
+    fi
+  fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
     warnings=$(( warnings + 1 ))
