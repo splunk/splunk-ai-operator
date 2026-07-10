@@ -276,6 +276,8 @@ docker.io/semitechnologies/weaviate:stable-v1.28-007846a
 quay.io/kuberay/operator:v1.2.2
 
 # ── OpenTelemetry ─────────────────────────────────────────────────────────────
+# Collector image (injected into OpenTelemetryCollector CRs). The operator's own
+# controller-manager + kube-rbac-proxy images are appended below from the bundled chart.
 docker.io/otel/opentelemetry-collector-contrib:0.122.1
 
 # ── Fluent Bit ────────────────────────────────────────────────────────────────
@@ -292,9 +294,29 @@ grep -oP '(?<=image: )[^\s]+' "${STAGE_DIR}/manifests/cert-manager.yaml" 2>/dev/
 cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 
 # ── local-path-provisioner ────────────────────────────────────────────────────
-# The helper pod image is overridden to ubi-minimal; mirror both.
-registry.access.redhat.com/ubi9/ubi-minimal:latest
+# The helper pod and `oc debug` relabeling image is hard-coded to ubi8/ubi-minimal
+# in openshift_with_stack.sh (no tag → :latest); mirror the exact image it pulls.
+registry.access.redhat.com/ubi8/ubi-minimal:latest
 IMGEOF
+
+# opentelemetry-operator controller images — extracted from the bundled chart so they
+# always match the version pulled above (chart version is resolved dynamically). The
+# installer only overrides manager.collectorImage; the manager (+ any rbac-proxy) image
+# comes from chart defaults, so a disconnected install that mirrors only this list would
+# otherwise ImagePullBackOff on the operator pod. Rendered images are inline-quoted, e.g.
+#   image: "ghcr.io/.../opentelemetry-operator:0.154.0"
+# Exclude helm test-hook images (busybox:latest) — they never deploy during install.
+{
+  echo ""
+  echo "# ── OpenTelemetry Operator (controller images from bundled chart) ─────────────"
+  helm template opentelemetry-operator \
+    "${STAGE_DIR}/charts/opentelemetry-operator-${OTEL_CHART_VERSION}.tgz" \
+    2>/dev/null \
+    | grep -oE 'image:[[:space:]]*"?[^[:space:]"]+' \
+    | sed -E 's/^image:[[:space:]]*"?//' \
+    | grep -v '^busybox:' \
+    | sort -u
+} >> "${STAGE_DIR}/container-images.txt" || true
 
 grep -oP '(?<=image: )[^\s]+' "${STAGE_DIR}/manifests/local-path-storage.yaml" 2>/dev/null | sort -u >> "${STAGE_DIR}/container-images.txt" || true
 
@@ -304,14 +326,22 @@ cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 # These are NOT direct image references — they are OLM Subscriptions backed by
 # OperatorHub catalog content. Mirror them with oc mirror:
 #
+#   The GPU Operator ships in the CERTIFIED catalog (certified-operators /
+#   certified-operator-index) while NFD ships in the redhat-operators catalog
+#   (redhat-operator-index). They must be mirrored from their respective catalogs,
+#   matching the installer defaults: operators.gpu.catalogSource=certified-operators,
+#   operators.nfd.catalogSource=redhat-operators.
+#
 #   imageset-config.yaml example:
 #     kind: ImageSetConfiguration
 #     apiVersion: mirror.openshift.io/v1alpha2
 #     mirror:
 #       operators:
-#         - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.14
+#         - catalog: registry.redhat.io/redhat/certified-operator-index:v4.14
 #           packages:
 #             - name: gpu-operator-certified
+#         - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.14
+#           packages:
 #             - name: nfd
 #
 #   Then apply the generated ImageContentSourcePolicy and CatalogSource.

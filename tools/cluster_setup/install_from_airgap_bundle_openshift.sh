@@ -138,9 +138,13 @@ log "Extracting bundle..."
 mkdir -p "${EXTRACT_DIR}"
 tar -xzf "${BUNDLE_TARBALL}" -C "${EXTRACT_DIR}"
 
-# Find the extracted bundle directory (named airgap-bundle-openshift-<timestamp>)
-BUNDLE_DIR="$(find "${EXTRACT_DIR}" -maxdepth 1 -mindepth 1 -type d -name 'airgap-bundle-openshift-*' | sort | tail -1)"
-[[ -n "${BUNDLE_DIR}" ]] || err "Could not find extracted bundle directory in ${EXTRACT_DIR}"
+# Resolve the bundle directory from the tarball's own top-level entry rather than
+# globbing EXTRACT_DIR — otherwise a stale airgap-bundle-openshift-* directory from a
+# previous run could be selected instead of the bundle the user just passed via --bundle.
+BUNDLE_TOP="$(tar -tzf "${BUNDLE_TARBALL}" 2>/dev/null | sed 's#/.*##' | grep -m1 '^airgap-bundle-openshift-')"
+[[ -n "${BUNDLE_TOP}" ]] || err "Could not find airgap-bundle-openshift-* directory inside ${BUNDLE_TARBALL}"
+BUNDLE_DIR="${EXTRACT_DIR}/${BUNDLE_TOP}"
+[[ -d "${BUNDLE_DIR}" ]] || err "Expected extracted bundle directory not found: ${BUNDLE_DIR}"
 log "Bundle extracted to: ${BUNDLE_DIR}"
 
 # ── Verify checksums ───────────────────────────────────────────────────────────

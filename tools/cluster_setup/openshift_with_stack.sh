@@ -921,13 +921,13 @@ grant_privileged_scc() {
 install_nfd() {
   log "Installing Node Feature Discovery Operator (NFD)..."
 
-  # Step 1: Subscription + OperatorGroup — idempotent, skip only if already present.
+  # Step 1: Subscription + OperatorGroup — idempotent, skip creation if already present.
+  # Do NOT early-return here: a prior run may have created the Subscription but never
+  # the NodeFeatureDiscovery CR below, so we must always fall through to Step 2.
   if oc get subscription nfd -n openshift-nfd &>/dev/null; then
-    log "  ✓ NFD subscription already exists, skipping"
-    return 0
-  fi
-
-  oc apply -f - <<EOF
+    log "  ✓ NFD subscription already exists, skipping creation"
+  else
+    oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -955,19 +955,20 @@ spec:
   installPlanApproval: Automatic
 EOF
 
-  log "Waiting for NFD CSV to succeed..."
-  local retries=0
-  while (( retries < 36 )); do
-    local phase
-    phase=$(oc get csv -n openshift-nfd -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-    if [[ "${phase}" == "Succeeded" ]]; then
-      log "  ✓ NFD operator ready"
-      break
-    fi
-    sleep 10
-    retries=$(( retries + 1 ))
-    log "  Waiting for NFD CSV... (${retries}/36, phase=${phase:-pending})"
-  done
+    log "Waiting for NFD CSV to succeed..."
+    local retries=0
+    while (( retries < 36 )); do
+      local phase
+      phase=$(oc get csv -n openshift-nfd -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+      if [[ "${phase}" == "Succeeded" ]]; then
+        log "  ✓ NFD operator ready"
+        break
+      fi
+      sleep 10
+      retries=$(( retries + 1 ))
+      log "  Waiting for NFD CSV... (${retries}/36, phase=${phase:-pending})"
+    done
+  fi
 
   # Step 2: NodeFeatureDiscovery CR — always ensure it exists, regardless of whether
   # the Subscription was just created or was already present from a prior run.
@@ -1283,13 +1284,30 @@ EOF
 # k0s installs this as part of cluster setup. OpenShift has no default storage
 # class on bare-metal, so we install local-path-provisioner the same way.
 install_local_path_provisioner() {
-  if oc get storageclass 2>/dev/null | grep -q "(default)"; then
+  # When the config requests a specific storage class, skip only if THAT class already
+  # exists — not merely because the cluster has some other default. The AIPlatform CR
+  # emits storageClassName: ${STORAGE_CLASS}, so skipping on an unrelated default would
+  # leave VectorDB PVCs bound to a class that was never created and stuck Pending.
+  if [[ -n "${STORAGE_CLASS}" && "${STORAGE_CLASS}" != "null" ]]; then
+    if oc get storageclass "${STORAGE_CLASS}" &>/dev/null; then
+      log "  ✓ Requested storage class '${STORAGE_CLASS}' already exists, skipping local-path install"
+      oc get storageclass
+      return 0
+    fi
+    if [[ "${STORAGE_CLASS}" != "local-path" ]]; then
+      warn "Configured storage.storageClass='${STORAGE_CLASS}' does not exist and is not 'local-path'.
+    This installer only provisions local-path; create '${STORAGE_CLASS}' manually or set storage.storageClass: local-path in the config."
+      return 0
+    fi
+    # STORAGE_CLASS is 'local-path' and missing — fall through to install it.
+  elif oc get storageclass 2>/dev/null | grep -q "(default)"; then
+    # No specific class requested: rely on the cluster default if one already exists.
     log "  ✓ Default storage class already exists, skipping local-path install"
     oc get storageclass
     return 0
   fi
 
-  log "Installing local-path-provisioner (no default storage class found)..."
+  log "Installing local-path-provisioner..."
   local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
   [[ "${_lp_url}" == file://* ]] && _lp_url="${_lp_url#file://}"
   oc apply -f "${_lp_url}"
@@ -2365,10 +2383,6 @@ main_install() {
   phase_end "Model Staging"
 
   phase_start "Preflight"
-  step_start "Model artifact staging"
-  stage_model_artifacts
-  step_ok
-
   step_start "Preflight checks"
   preflight_checks
   step_ok
