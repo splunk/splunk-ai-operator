@@ -156,6 +156,92 @@ wait_for_dependency() {
   Resolve the issue, then re-run the installer."
 }
 
+# ====== RESOLVE MODEL STAGING ======
+# Prompts the user interactively whether to download & stage models.
+# In silent/airgap mode the prompt is skipped and MODEL_STAGING_ENABLED is unchanged.
+resolve_model_staging() {
+  # Airgap: models must be pre-staged; staging via this script is not possible.
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    log "AIRGAP_MODE=true — model staging skipped (models must be pre-staged in object store)."
+    MODEL_STAGING_ENABLED="false"
+    return 0
+  fi
+
+  # Already explicitly set in config or env — honour it and skip the prompt.
+  if [[ "${MODEL_STAGING_ENABLED}" == "true" || "${MODEL_STAGING_ENABLED}" == "false" ]]; then
+    log "MODEL_STAGING_ENABLED=${MODEL_STAGING_ENABLED} (from config/env)"
+    return 0
+  fi
+
+  # Silent install: cannot prompt — default to false.
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    log "SILENT_INSTALL=true — model staging defaulting to false (set storage.modelStaging.enabled=true in config to enable)."
+    MODEL_STAGING_ENABLED="false"
+    return 0
+  fi
+
+  echo -e "\n  \033[1mModel artifact staging:\033[0m" >&2
+  echo -e "  Download model weights from HuggingFace and upload them to the object store?" >&2
+  echo -e "  (Requires HF_TOKEN and object store credentials. Type 'yes' to enable.)" >&2
+  local answer
+  read -r -p "  Enable model staging? [yes/no]: " answer
+  if [[ "${answer}" == "yes" ]]; then
+    MODEL_STAGING_ENABLED="true"
+    log "Model staging enabled by user."
+  else
+    MODEL_STAGING_ENABLED="false"
+    log "Model staging skipped by user."
+  fi
+}
+
+# ====== SUPPORTED ACCELERATOR TYPES ======
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+
+# ====== RESOLVE ACCELERATOR TYPE ======
+# Normalizes and validates DEFAULT_ACCELERATOR. Prompts interactively if missing
+# or invalid (unless SILENT_INSTALL is true, in which case it errors out).
+resolve_accelerator_type() {
+  # Normalize to uppercase for comparison, store normalized value.
+  local _raw="${DEFAULT_ACCELERATOR:-}"
+  if [[ -n "${_raw}" && "${_raw}" != "null" ]]; then
+    DEFAULT_ACCELERATOR="${_raw^^}"
+  fi
+
+  # Validate against supported list.
+  local _valid=false
+  for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+    [[ "${DEFAULT_ACCELERATOR}" == "${_t}" ]] && _valid=true && break
+  done
+
+  if ${_valid}; then
+    log "Accelerator type: ${DEFAULT_ACCELERATOR}"
+    return 0
+  fi
+
+  # Not valid — prompt interactively or error in silent mode.
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    err "aiPlatform.defaultAcceleratorType '${DEFAULT_ACCELERATOR:-<unset>}' is not supported. Must be one of: ${SUPPORTED_ACCELERATORS[*]}"
+  fi
+
+  echo -e "\n  \033[1mAccelerator type:\033[0m" >&2
+  echo -e "  Supported types: ${SUPPORTED_ACCELERATORS[*]}" >&2
+  local answer=""
+  while true; do
+    read -r -p "  Enter accelerator type [${SUPPORTED_ACCELERATORS[*]}]: " answer
+    answer="${answer^^}"
+    local _v=false
+    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+      [[ "${answer}" == "${_t}" ]] && _v=true && break
+    done
+    if ${_v}; then
+      DEFAULT_ACCELERATOR="${answer}"
+      log "Accelerator type set to: ${DEFAULT_ACCELERATOR}"
+      return 0
+    fi
+    echo -e "  \033[1;31mInvalid choice '${answer}'. Must be one of: ${SUPPORTED_ACCELERATORS[*]}\033[0m" >&2
+  done
+}
+
 # ====== SHOW INSTALL PLAN ======
 show_install_plan() {
   echo -e "\n\033[1;34m╔══════════════════════════════════════════════════════════╗\033[0m" >&2
@@ -171,28 +257,39 @@ show_install_plan() {
   echo -e "  \033[1mOperator image   :\033[0m ${OPERATOR_IMAGE}" >&2
   echo -e "  \033[1mImage registry   :\033[0m ${IMAGE_REGISTRY:-<none>}" >&2
   echo -e "  \033[1mECR enabled      :\033[0m ${ECR_ENABLED}" >&2
+  echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
   echo "" >&2
   echo -e "  \033[1mObject store     :\033[0m type=${OBJ_STORE_TYPE}  bucket=${OBJ_STORE_BUCKET:-<unset>}" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m ${OBJ_STORE_ENDPOINT:-<default>}" >&2
+  echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
   echo "" >&2
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
+  echo -e "    0.  Model artifact staging (HuggingFace → object store)" >&2
+  if [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
+    echo -e "        [SKIPPED — modelStaging.enabled=false]" >&2
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo -e "        [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
+  fi
   echo -e "    1.  Preflight checks (oc login, tools, manifest files)" >&2
   echo -e "    2.  NFD Operator (OLM)" >&2
   echo -e "    3.  NVIDIA GPU Operator (OLM)" >&2
   echo -e "    4.  Node labeling (splunk.ai/ai-tier-node)" >&2
   echo -e "    5.  local-path-provisioner + SELinux relabeling" >&2
-  echo -e "    6.  cert-manager (Helm)" >&2
+  echo -e "    6.  cert-manager" >&2
   echo -e "    7.  OpenTelemetry Operator (Helm)" >&2
   echo -e "    8.  KubeRay Operator (Helm)" >&2
-  echo -e "    9.  ECR pull secrets" >&2
+  echo -e "    9.  Image pull secrets (ECR / DockerHub / GCR / ACR / custom)" >&2
   echo -e "    10. Splunk AI Operator" >&2
   echo -e "    11. Splunk Operator" >&2
   echo -e "    12. Splunk Standalone CR" >&2
   echo -e "    13. AIPlatform CR" >&2
   echo "" >&2
 
-  if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
-    log "AUTO_APPROVE=true — skipping confirmation."
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    echo -e "  \033[1;33m⚠  SILENT INSTALL — no interactive prompts.\033[0m" >&2
+    echo -e "  The config file is assumed to have been reviewed and is correct." >&2
+    echo -e "  The steps listed above will run automatically. Press Ctrl-C within 5 s to abort." >&2
+    sleep 5
     return 0
   fi
 
@@ -220,6 +317,9 @@ ${yq_err}"
 
   AI_NS=$(yq eval '.kubernetes.namespace // "ai-platform"' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
   IMAGE_REGISTRY=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
+  # Leave false (default) for ECR, Docker Hub, Harbor, or any HTTPS registry.
+  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "false"' "$CONFIG_FILE" 2>/dev/null || echo "false")"
   OPERATOR_IMAGE=$(yq eval '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   RAY_HEAD_IMAGE=$(yq eval '.images.ray.headImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   RAY_WORKER_IMAGE=$(yq eval '.images.ray.workerImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -234,8 +334,15 @@ ${yq_err}"
   NGINX_IMAGE=$(yq eval '.images.nginx.image // "docker.io/library/nginx:1.27-alpine"' "${CONFIG_FILE}" 2>/dev/null || echo "docker.io/library/nginx:1.27-alpine")
   MODEL_VERSION=$(yq eval '.operators.ray.modelVersion // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   RAY_RUNTIME_VERSION=$(yq eval '.operators.ray.rayVersion // "2.44.0"' "${CONFIG_FILE}" 2>/dev/null || echo "2.44.0")
-  SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform // "./artifacts.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
-  SPLUNK_OPERATOR_FILE=$(yq eval '.files.splunkOperator // "./splunk-operator-cluster.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")
+  local _config_dir
+  _config_dir="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)"
+  _resolve_manifest() {
+    local p="$1"
+    # Absolute paths are used as-is; relative paths are anchored to the config file's directory.
+    [[ "${p}" = /* ]] && echo "${p}" || echo "${_config_dir}/${p#./}"
+  }
+  SPLUNK_AI_FILE=$(_resolve_manifest "$(yq eval '.files.aiPlatform // "./artifacts.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")")
+  SPLUNK_OPERATOR_FILE=$(_resolve_manifest "$(yq eval '.files.splunkOperator // "./splunk-operator-cluster.yaml"' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")")
 
   # OpenShift-specific
   # Whether to grant the operator service account privileged SCC.
@@ -247,6 +354,9 @@ ${yq_err}"
   ECR_ENABLED=$(yq eval '.ecr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   ECR_ACCOUNT=$(yq eval '.ecr.account // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   ECR_REGION=$(yq eval '.ecr.region // "us-east-2"' "${CONFIG_FILE}" 2>/dev/null || echo "us-east-2")
+  # S3 bucket region — may differ from ECR_REGION when ECR and S3 are in different regions.
+  # Defaults to ecr.region for backwards compatibility when not explicitly set.
+  OBJ_STORE_REGION=$(yq eval ".storage.objectStore.region // \"${ECR_REGION}\"" "${CONFIG_FILE}" 2>/dev/null || echo "${ECR_REGION}")
 
   AI_PLATFORM_NAME=$(yq eval '.aiPlatform.name // "openshift-ai-platform"' "${CONFIG_FILE}" 2>/dev/null || echo "openshift-ai-platform")
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -255,10 +365,34 @@ ${yq_err}"
   VECTORDB_SIZE=$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
   OBJ_STORE_TYPE=$(yq eval '.storage.objectStore.type // "minio"' "${CONFIG_FILE}" 2>/dev/null || echo "minio")
   OBJ_STORE_BUCKET=$(yq eval '.storage.objectStore.bucket // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  OBJ_STORE_BUCKET="$(printf '%s' "${OBJ_STORE_BUCKET}" | tr '[:upper:]' '[:lower:]')"
   OBJ_STORE_ENDPOINT=$(yq eval '.storage.objectStore.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   MINIO_ROOT_USER=$(yq eval '.storage.objectStore.auth.rootUser // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   MINIO_ROOT_PASSWORD=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName // "splunk-standalone"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
+
+  # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
+  local _yaml_airgap
+  _yaml_airgap=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  [[ "${_yaml_airgap}" == "null" ]] && _yaml_airgap="false"
+  if [[ "${AIRGAP_MODE:-}" == "true" ]]; then
+    : # env var wins
+  elif [[ "${_yaml_airgap}" == "true" ]]; then
+    export AIRGAP_MODE="true"
+  else
+    export AIRGAP_MODE="false"
+  fi
+
+  # Model staging
+  MODEL_STAGING_ENABLED="$(yq eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  [[ "${MODEL_STAGING_ENABLED}" == "null" || -z "${MODEL_STAGING_ENABLED}" ]] && MODEL_STAGING_ENABLED="false"
+
+  # ImagePullSecrets configuration
+  IMAGE_PULL_SECRETS_ECR_ENABLED=$(yq eval '.imagePullSecrets.autoCreateECR // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED=$(yq eval '.imagePullSecrets.dockerHub.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  IMAGE_PULL_SECRETS_GCR_ENABLED=$(yq eval '.imagePullSecrets.gcr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  IMAGE_PULL_SECRETS_ACR_ENABLED=$(yq eval '.imagePullSecrets.acr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+  IMAGE_PULL_SECRETS_CUSTOM_ENABLED=$(yq eval '.imagePullSecrets.custom.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
 
   NFD_CATALOG_SOURCE=$(yq eval '.operators.nfd.catalogSource // "redhat-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "redhat-operators")
   GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "certified-operators")
@@ -275,15 +409,28 @@ ${yq_err}"
       -o jsonpath='{.status.domain}' 2>/dev/null || echo "")
   fi
 
-  log "Configuration loaded: namespace=${AI_NS}, accelerator=${DEFAULT_ACCELERATOR}"
+  log "Configuration loaded: namespace=${AI_NS}, accelerator=${DEFAULT_ACCELERATOR}, airgap=${AIRGAP_MODE:-false}, modelStaging=${MODEL_STAGING_ENABLED}"
+}
+
+# ====== PLACEHOLDER CREDENTIAL GUARD ======
+# True if objectStore.auth values are still obvious template text. Non-empty
+# placeholders pass the length check and get applied into minio-credentials,
+# causing SAIA to crash at startup with InvalidAccessKeyId.
+object_store_auth_looks_like_placeholder() {
+  case "${MINIO_ROOT_USER}${MINIO_ROOT_PASSWORD}" in
+    *\<*|*\>*) return 0 ;;
+    *CHANGEME*|*changeme*) return 0 ;;
+  esac
+  return 1
 }
 
 # ====== IMAGE HELPERS ======
 build_image_url() {
   local registry="$1"
   local image_path="$2"
-  # If the image is already fully qualified (contains a registry host) return as-is
-  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
+  # Treat as fully-qualified if image starts with a registry host.
+  # Recognised forms: domain.tld/... , domain.tld:port/... , IP/... , IP:port/...
+  if [[ "$image_path" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
     echo "$image_path"
     return 0
   fi
@@ -400,15 +547,293 @@ configure_images() {
   log "  ✓ Operator image:                  $operator_full"
   log "  ✓ MODEL_VERSION:                   $MODEL_VERSION"
   log "  ✓ RAY_VERSION:                     $RAY_RUNTIME_VERSION"
+
+  # Patch splunk-operator-cluster.yaml with images from config.
+  # Without this, the Splunk Operator pod and all Splunk Standalone pods use the
+  # account-specific ECR URLs baked into the committed manifest file.
+  if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
+    log "Patching image references in ${SPLUNK_OPERATOR_FILE}..."
+    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
+      cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
+    fi
+    cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+
+    local splunk_full splunk_esc splunk_op_full splunk_op_esc
+    splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
+    splunk_op_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
+    splunk_esc=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
+    splunk_op_esc=$(echo "$splunk_op_full" | sed 's/[\/&]/\\&/g')
+
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_esc}|" "$SPLUNK_OPERATOR_FILE"
+    "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_esc}|I" "$SPLUNK_OPERATOR_FILE"
+
+    log "  ✓ RELATED_IMAGE_SPLUNK_ENTERPRISE: $splunk_full"
+    log "  ✓ Splunk Operator image:           $splunk_op_full"
+  else
+    warn "Splunk Operator manifest not found at ${SPLUNK_OPERATOR_FILE} — skipping image patch"
+  fi
+}
+
+# ====== PREFLIGHT HELPER PRINTERS ======
+pf_header() { echo -e "\n\033[1;34m  ── $* ──\033[0m" >&2; }
+pf_ok()     { echo -e "  \033[1;32m✔\033[0m $*" >&2; }
+pf_warn()   { echo -e "  \033[1;33m⚠\033[0m $*" >&2; }
+pf_fail()   { echo -e "  \033[1;31m✖\033[0m $*" >&2; PREFLIGHT_FAILURES=$(( ${PREFLIGHT_FAILURES:-0} + 1 )); }
+
+# ====== PREFLIGHT: REGISTRY REACHABILITY CHECK ======
+# Verifies the configured image registry is reachable and credentials work
+# BEFORE any install work begins, so a bad registry config fails fast with a
+# clear message instead of surfacing as ImagePullBackOff minutes later.
+#
+# Strategy: hit the OCI /v2/ ping endpoint (all standard registries implement it),
+# then attempt a manifest HEAD for one representative image to confirm auth works
+# end-to-end. Uses only curl — no Docker/crane/skopeo required.
+#
+# Auth dispatch:
+#   ECR        → aws ecr get-login-password  (Bearer token)
+#   DockerHub  → imagePullSecrets.dockerHub creds
+#   GCR        → imagePullSecrets.gcr.jsonKey (_json_key)
+#   ACR        → imagePullSecrets.acr creds
+#   Custom     → imagePullSecrets.custom creds (or unauthenticated if none)
+#   No registry set → public DockerHub (no auth needed)
+preflight_check_registry() {
+  pf_header "Image registry reachability"
+
+  # No registry configured → images pull from Docker Hub / public — nothing to check
+  if [[ -z "${IMAGE_REGISTRY}" || "${IMAGE_REGISTRY}" == "null" ]]; then
+    pf_ok "No private registry configured — images pull from public registries (Docker Hub etc.)"
+    return
+  fi
+
+  # Determine protocol scheme for the ping URL
+  local scheme="https"
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] && scheme="http"
+
+  local ping_url="${scheme}://${IMAGE_REGISTRY}/v2/"
+  # curl_opts: no -f so HTTP 4xx is not treated as a curl error; we read the status code ourselves.
+  local curl_opts=(--silent --connect-timeout 10 --max-time 15)
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] && curl_opts+=(--insecure)
+
+  # ---- Step 1: TCP/TLS reachability ----
+  local http_code
+  http_code=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" "${ping_url}" 2>/dev/null)
+  case "${http_code}" in
+    200|401|403)
+      pf_ok "Registry reachable: ${ping_url} (HTTP ${http_code})"
+      ;;
+    000)
+      pf_fail "Registry unreachable: cannot connect to ${ping_url} (connection refused / DNS failure / firewall). Fix images.registry or ensure network path to registry is open."
+      return
+      ;;
+    *)
+      pf_warn "Registry ${IMAGE_REGISTRY} answered HTTP ${http_code} on /v2/ ping (not a standard OCI response, but host is reachable). Proceeding to manifest check."
+      ;;
+  esac
+
+  # ---- Step 2: Auth + manifest pull for one representative image ----
+  local _fq_re='^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/'
+
+  _image_targets_registry() {
+    local raw="$1"
+    [[ -z "${raw}" || "${raw}" == "null" ]] && return 1
+    local full
+    full=$(build_image_url "${IMAGE_REGISTRY}" "${raw}")
+    if [[ "${full}" == ${IMAGE_REGISTRY}/* ]]; then
+      echo "${full#${IMAGE_REGISTRY}/}"
+      return 0
+    fi
+    return 1
+  }
+
+  local probe_ref=""
+  local probe_source=""
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
+    local _val="${!_candidate_var:-}"
+    local _ref
+    if _ref=$(_image_targets_registry "${_val}"); then
+      probe_ref="${_ref}"
+      probe_source="${_candidate_var}"
+      break
+    fi
+  done
+
+  if [[ -z "${probe_ref}" ]]; then
+    pf_warn "No images in config target IMAGE_REGISTRY (${IMAGE_REGISTRY}) — all images appear to be fully qualified to other registries. Skipping auth check."
+    return
+  fi
+
+  pf_ok "Probing registry with ${probe_source} image: ${IMAGE_REGISTRY}/${probe_ref}"
+
+  # Split repo and tag/digest
+  local probe_repo probe_tag
+  if [[ "${probe_ref}" == *"@"* ]]; then
+    probe_repo="${probe_ref%%@*}"
+    probe_tag="${probe_ref##*@}"
+    local manifest_url="${scheme}://${IMAGE_REGISTRY}/v2/${probe_repo}/manifests/${probe_tag}"
+  else
+    probe_repo="${probe_ref%%:*}"
+    probe_tag="${probe_ref##*:}"
+    [[ "${probe_tag}" == "${probe_ref}" ]] && probe_tag="latest"
+    local manifest_url="${scheme}://${IMAGE_REGISTRY}/v2/${probe_repo}/manifests/${probe_tag}"
+  fi
+
+  local auth_header=""
+
+  # Resolve auth credentials by registry type
+  if [[ "${IMAGE_REGISTRY}" == *.dkr.ecr.*.amazonaws.com ]]; then
+    local _ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
+    if ! command -v aws &>/dev/null; then
+      pf_warn "ECR registry configured but aws CLI not found — skipping auth check."
+      return
+    fi
+    local _ecr_token
+    if ! _ecr_token=$(aws ecr get-login-password --region "${_ecr_region}" 2>/dev/null); then
+      pf_fail "Cannot obtain ECR token (aws ecr get-login-password failed). Check AWS credentials and IAM permissions (ecr:GetAuthorizationToken)."
+      return
+    fi
+    auth_header="Authorization: Basic $(printf 'AWS:%s' "${_ecr_token}" | base64 | tr -d '\n')"
+
+  elif [[ "${IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED}" == "true" && "${IMAGE_REGISTRY}" == *"docker.io"* ]]; then
+    local _dh_user _dh_pass
+    _dh_user=$(yq eval '.imagePullSecrets.dockerHub.username' "${CONFIG_FILE}" 2>/dev/null)
+    _dh_pass=$(yq eval '.imagePullSecrets.dockerHub.password' "${CONFIG_FILE}" 2>/dev/null)
+    if [[ -n "${_dh_user}" && -n "${_dh_pass}" && "${_dh_user}" != "null" && "${_dh_pass}" != "null" ]]; then
+      auth_header="Authorization: Basic $(printf '%s:%s' "${_dh_user}" "${_dh_pass}" | base64 | tr -d '\n')"
+    fi
+
+  elif [[ "${IMAGE_PULL_SECRETS_ACR_ENABLED}" == "true" && "${IMAGE_REGISTRY}" == *".azurecr.io"* ]]; then
+    local _acr_user _acr_pass
+    _acr_user=$(yq eval '.imagePullSecrets.acr.username' "${CONFIG_FILE}" 2>/dev/null)
+    _acr_pass=$(yq eval '.imagePullSecrets.acr.password' "${CONFIG_FILE}" 2>/dev/null)
+    if [[ -n "${_acr_user}" && -n "${_acr_pass}" && "${_acr_user}" != "null" && "${_acr_pass}" != "null" ]]; then
+      auth_header="Authorization: Basic $(printf '%s:%s' "${_acr_user}" "${_acr_pass}" | base64 | tr -d '\n')"
+    fi
+
+  elif [[ "${IMAGE_PULL_SECRETS_CUSTOM_ENABLED}" == "true" ]]; then
+    local _custom_user _custom_pass
+    _custom_user=$(yq eval '.imagePullSecrets.custom.username' "${CONFIG_FILE}" 2>/dev/null)
+    _custom_pass=$(yq eval '.imagePullSecrets.custom.password' "${CONFIG_FILE}" 2>/dev/null)
+    if [[ -n "${_custom_user}" && -n "${_custom_pass}" && "${_custom_user}" != "null" && "${_custom_pass}" != "null" ]]; then
+      auth_header="Authorization: Basic $(printf '%s:%s' "${_custom_user}" "${_custom_pass}" | base64 | tr -d '\n')"
+    fi
+  fi
+
+  # Bearer token exchange helper
+  _bearer_exchange() {
+    local _cur_code="$1" _murl="$2" _ahdr="${3:-}"
+    [[ "${_cur_code}" != "401" ]] && { echo "${_cur_code}"; return; }
+
+    local _www_auth _realm _service _scope _tok _tok_code
+    local _basic_opts=("${curl_opts[@]}")
+    [[ -n "${_ahdr}" ]] && _basic_opts+=(-H "${_ahdr}")
+
+    _www_auth=$(curl "${_basic_opts[@]}" -o /dev/null -D - "${_murl}" 2>/dev/null \
+                | grep -i '^Www-Authenticate:' | head -1)
+    _realm=$(echo "${_www_auth}"   | grep -oP 'realm="[^"]+"'   | cut -d'"' -f2)
+    _service=$(echo "${_www_auth}" | grep -oP 'service="[^"]+"' | cut -d'"' -f2)
+    _scope=$(echo "${_www_auth}"   | grep -oP 'scope="[^"]+"'   | cut -d'"' -f2)
+
+    [[ -z "${_realm}" ]] && { echo "401"; return; }
+
+    local _turl="${_realm}?service=${_service}&scope=${_scope}"
+    _tok=$(curl "${_basic_opts[@]}" "${_turl}" 2>/dev/null \
+           | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token') or d.get('access_token',''))" \
+           2>/dev/null || true)
+
+    [[ -z "${_tok}" ]] && { echo "401"; return; }
+
+    _tok_code=$(curl "${curl_opts[@]}" \
+      -H "Authorization: Bearer ${_tok}" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      -o /dev/null -w "%{http_code}" \
+      "${_murl}" 2>/dev/null)
+    echo "${_tok_code}"
+  }
+
+  local manifest_http_code
+  if [[ -n "${auth_header}" ]]; then
+    manifest_http_code=$(curl "${curl_opts[@]}" \
+      -H "${auth_header}" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      -o /dev/null -w "%{http_code}" \
+      "${manifest_url}" 2>/dev/null)
+
+    if [[ "${manifest_http_code}" == "401" ]]; then
+      manifest_http_code=$(_bearer_exchange "401" "${manifest_url}" "${auth_header}")
+    fi
+  else
+    manifest_http_code=$(curl "${curl_opts[@]}" \
+      -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      -o /dev/null -w "%{http_code}" \
+      "${manifest_url}" 2>/dev/null)
+
+    if [[ "${manifest_http_code}" == "401" ]]; then
+      manifest_http_code=$(_bearer_exchange "401" "${manifest_url}" "")
+    fi
+  fi
+
+  case "${manifest_http_code}" in
+    200|206)
+      pf_ok "Registry auth OK: manifest reachable for ${probe_repo}:${probe_tag}"
+      ;;
+    401|403)
+      pf_fail "Registry credentials rejected (HTTP ${manifest_http_code}) for ${IMAGE_REGISTRY}. Check imagePullSecrets config — images will fail to pull at deploy time."
+      ;;
+    404)
+      pf_fail "Image not found in registry (HTTP 404): ${IMAGE_REGISTRY}/${probe_repo}:${probe_tag}. Check that images.operator.image tag exists in the registry."
+      ;;
+    000)
+      pf_fail "Registry manifest check failed: no response from ${manifest_url}. Check network path and registry health."
+      ;;
+    *)
+      pf_warn "Registry manifest check returned HTTP ${manifest_http_code} for ${probe_repo}:${probe_tag} — verify registry is healthy."
+      ;;
+  esac
 }
 
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   log "Running preflight checks..."
 
-  for tool in oc yq helm aws curl jq base64 tar; do
+  local _aws_needed="false"
+  [[ "${ECR_ENABLED:-false}" == "true" ]] && _aws_needed="true"
+  [[ "${OBJ_STORE_TYPE:-}" == "aws" ]] && _aws_needed="true"
+
+  for tool in oc yq helm curl jq base64 tar; do
     command -v "$tool" >/dev/null 2>&1 && log "  ✓ $tool found" || err "Missing required tool: $tool"
   done
+  if [[ "${_aws_needed}" == "true" ]]; then
+    command -v aws >/dev/null 2>&1 && log "  ✓ aws found" || err "Missing required tool: aws (needed for ECR/S3 — install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)"
+  else
+    log "  – aws CLI not required (ECR disabled, object store is not AWS)"
+  fi
+
+  # python3 is used by preflight_check_registry() to parse Bearer token JSON.
+  if command -v python3 >/dev/null 2>&1; then
+    log "  ✓ python3 found"
+  else
+    warn "  python3 not found — image registry auth check will be skipped (install python3 to enable it)."
+  fi
+
+  # Object-store CLI tools — used for the model staging pre-check.
+  case "${OBJ_STORE_TYPE:-}" in
+    aws)
+      if command -v aws >/dev/null 2>&1; then
+        log "  ✓ aws CLI found"
+      else
+        warn "  aws CLI not found — model staging pre-check will be skipped. Install aws CLI to enable it: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+      fi
+      ;;
+    minio|seaweedfs|s3compat)
+      if command -v mc >/dev/null 2>&1; then
+        log "  ✓ mc (MinIO client) found"
+      else
+        warn "  mc (MinIO client) not found — model staging pre-check will be skipped. Install mc to enable it: https://min.io/docs/minio/linux/reference/minio-mc.html"
+      fi
+      ;;
+  esac
+
+  preflight_check_registry
 
   # Verify we are connected to the cluster
   if ! oc whoami &>/dev/null; then
@@ -424,6 +849,11 @@ preflight_checks() {
   fi
 
   [[ -f "${SPLUNK_AI_FILE}" ]] && log "  ✓ Manifest: ${SPLUNK_AI_FILE}" || err "Manifest not found: ${SPLUNK_AI_FILE}"
+
+  if object_store_auth_looks_like_placeholder; then
+    err "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with real credentials in ${CONFIG_FILE}"
+  fi
+  log "  ✓ Object store credentials look real"
 
   log "Preflight checks passed"
 }
@@ -491,6 +921,7 @@ grant_privileged_scc() {
 install_nfd() {
   log "Installing Node Feature Discovery Operator (NFD)..."
 
+  # Step 1: Subscription + OperatorGroup — idempotent, skip only if already present.
   if oc get subscription nfd -n openshift-nfd &>/dev/null; then
     log "  ✓ NFD subscription already exists, skipping"
     return 0
@@ -538,8 +969,13 @@ EOF
     log "  Waiting for NFD CSV... (${retries}/36, phase=${phase:-pending})"
   done
 
-  # Create the NodeFeatureDiscovery CR to start labeling nodes
-  if ! oc get nodefeaturediscovery nfd-instance -n openshift-nfd &>/dev/null; then
+  # Step 2: NodeFeatureDiscovery CR — always ensure it exists, regardless of whether
+  # the Subscription was just created or was already present from a prior run.
+  # Without this CR the NFD operand never starts and nodes are never labeled with
+  # nvidia.com/gpu.present, breaking GPU-node auto-detection.
+  if oc get nodefeaturediscovery nfd-instance -n openshift-nfd &>/dev/null; then
+    log "  ✓ NodeFeatureDiscovery CR already exists, skipping"
+  else
     log "Creating NodeFeatureDiscovery CR..."
     oc apply -f - <<'EOF'
 apiVersion: nfd.openshift.io/v1
@@ -573,6 +1009,7 @@ EOF
 install_nvidia_gpu_operator() {
   log "Installing NVIDIA GPU Operator..."
 
+  # Step 1: Subscription + OperatorGroup — idempotent, skip only if already present.
   if oc get subscription gpu-operator-certified -n nvidia-gpu-operator &>/dev/null; then
     log "  ✓ GPU Operator subscription already exists, skipping"
     return 0
@@ -620,8 +1057,13 @@ EOF
     log "  Waiting for GPU Operator CSV... (${retries}/36, phase=${phase:-pending})"
   done
 
-  # Create ClusterPolicy to trigger driver + toolkit + device-plugin rollout
-  if ! oc get clusterpolicy gpu-cluster-policy &>/dev/null; then
+  # Step 2: ClusterPolicy — always ensure it exists, regardless of whether the
+  # Subscription was just created or pre-existing. Without this CR the driver,
+  # toolkit, and device-plugin DaemonSets are never deployed, leaving Ray worker
+  # pods requesting nvidia.com/gpu unschedulable.
+  if oc get clusterpolicy gpu-cluster-policy &>/dev/null; then
+    log "  ✓ ClusterPolicy already exists, skipping"
+  else
     log "Creating ClusterPolicy CR..."
     oc apply -f - <<'EOF'
 apiVersion: nvidia.com/v1
@@ -786,9 +1228,10 @@ install_cert_manager() {
     fi
   fi
 
-  local cert_manager_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
-  local cert_manager_apply="${cert_manager_url#file://}"
-  oc apply -f "${cert_manager_apply}"
+  local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+  # oc apply -f does not understand file:// — strip it to a bare path
+  [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
+  oc apply -f "${_cm_url}"
 
   log "Waiting for cert-manager to be ready..."
   oc wait --for=condition=ready pod \
@@ -848,9 +1291,9 @@ install_local_path_provisioner() {
   fi
 
   log "Installing local-path-provisioner (no default storage class found)..."
-  local local_path_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
-  local local_path_apply="${local_path_url#file://}"
-  oc apply -f "${local_path_apply}"
+  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
+  [[ "${_lp_url}" == file://* ]] && _lp_url="${_lp_url#file://}"
+  oc apply -f "${_lp_url}"
 
   log "Waiting for local-path-provisioner to be ready..."
   oc rollout status deployment local-path-provisioner -n local-path-storage --timeout=120s || true
@@ -876,7 +1319,7 @@ install_local_path_provisioner() {
   # container_file_t allows any container to read/write regardless of MCS categories.
   # Without this, local-path-provisioner creates dirs with var_t which blocks all containers.
   local _patch_file; _patch_file=$(mktemp /tmp/local-path-patch-XXXXXX.json)
-  printf '%s' '{"data":{"setup":"#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nif command -v chcon >/dev/null 2>&1; then\n  chcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\nfi\n"}}' \
+  printf '%s' '{"data":{"helperPod.yaml":"apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: registry.access.redhat.com/ubi8/ubi-minimal\n    imagePullPolicy: IfNotPresent\n    securityContext:\n      privileged: true\n","setup":"#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"\nif command -v chcon >/dev/null 2>&1; then\n  chcon -Rt container_file_t -l s0 \"$VOL_DIR\" 2>/dev/null || true\nfi\n"}}' \
     > "${_patch_file}"
   oc patch configmap local-path-config -n local-path-storage --type=merge --patch-file="${_patch_file}"
   rm -f "${_patch_file}"
@@ -895,8 +1338,9 @@ install_local_path_provisioner() {
 relabel_worker_nodes_for_selinux() {
   log "Relabeling /opt/local-path-provisioner on worker nodes for SELinux..."
   local workers
-  workers=$(oc get nodes -l '!node-role.kubernetes.io/master,!node-role.kubernetes.io/control-plane' \
-    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  # Relabel all nodes — control-plane nodes may also carry workload labels and
+  # receive PVCs via local-path-provisioner (WaitForFirstConsumer).
+  workers=$(oc get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
   for node in ${workers}; do
     log "  Relabeling node ${node}..."
     oc debug "node/${node}" --image=registry.access.redhat.com/ubi8/ubi-minimal -- \
@@ -1232,7 +1676,7 @@ install_splunk_standalone() {
   # Derive S3 endpoint for Splunk appRepo (endpoint is required by the Splunk Operator)
   local minio_endpoint="${OBJ_STORE_ENDPOINT}"
   if [[ -z "${minio_endpoint}" && "${OBJ_STORE_TYPE}" == "aws" ]]; then
-    minio_endpoint="https://s3.${ECR_REGION}.amazonaws.com"
+    minio_endpoint="https://s3.${OBJ_STORE_REGION}.amazonaws.com"
     log "  type=aws: using S3 endpoint ${minio_endpoint}"
   fi
   [[ -z "${minio_endpoint}" ]] && err "storage.objectStore.endpoint must be set for type=${OBJ_STORE_TYPE}"
@@ -1269,6 +1713,19 @@ metadata:
   namespace: ${AI_NS}
 spec:
   replicas: 1
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: splunk.ai/workload-type
+                operator: In
+                values:
+                  - cpu
+  tolerations:
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
   volumes:
     - name: defaults
       configMap:
@@ -1287,7 +1744,7 @@ spec:
         provider: aws
         storageType: s3
         endpoint: ${minio_endpoint}
-        region: ${ECR_REGION}
+        region: ${OBJ_STORE_REGION}
         path: ${OBJ_STORE_BUCKET}
         secretRef: minio-credentials
 YAML
@@ -1305,12 +1762,16 @@ install_ai_platform_cr() {
   oc delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
   oc delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
 
-  # Build imagePullSecrets block
+  # Build imagePullSecrets block — include every docker-registry secret that
+  # exists in the namespace, covering ECR, DockerHub, GCR, ACR, and custom
+  # registries. This avoids hard-coding a fixed list of names.
   local secrets_yaml=""
-  for secret_name in ecr-registry-secret; do
-    oc get secret "${secret_name}" -n "${AI_NS}" &>/dev/null && \
-      secrets_yaml+="      - name: ${secret_name}"$'\n'
-  done
+  while IFS= read -r secret_name; do
+    [[ -z "${secret_name}" ]] && continue
+    secrets_yaml+="      - name: ${secret_name}"$'\n'
+  done < <(oc get secrets -n "${AI_NS}" \
+    -o jsonpath='{range .items[?(@.type=="kubernetes.io/dockerconfigjson")]}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null || true)
   local image_pull_secrets=""
   [[ -n "${secrets_yaml}" ]] && image_pull_secrets="    imagePullSecrets:"$'\n'"${secrets_yaml}"
 
@@ -1331,11 +1792,19 @@ install_ai_platform_cr() {
   if [[ "${feature_count}" -gt 0 ]]; then
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver
+      local fname fver fsa fscale
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}")
-      [[ -n "$fname" && "$fname" != "null" ]] && \
-        features_yaml+="    - name: ${fname}"$'\n'"      version: \"${fver}\""$'\n'
+      fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}")
+      fscale=$(yq eval ".aiPlatform.features[$i].scaleFactor // \"\"" "${CONFIG_FILE}")
+      if [[ -n "$fname" && "$fname" != "null" ]]; then
+        features_yaml+="    - name: ${fname}"$'\n'
+        features_yaml+="      version: \"${fver}\""$'\n'
+        [[ -n "$fsa" && "$fsa" != "null" ]] && \
+          features_yaml+="      serviceAccountName: ${fsa}"$'\n'
+        [[ -n "$fscale" && "$fscale" != "null" ]] && \
+          features_yaml+="      scaleFactor: ${fscale}"$'\n'
+      fi
       i=$((i + 1))
     done
   else
@@ -1435,7 +1904,7 @@ metadata:
 spec:
   objectStorage:
     path: ${obj_path}
-    region: ${ECR_REGION}
+    region: ${OBJ_STORE_REGION}
     $( [[ -n "${obj_endpoint}" ]] && echo "endpoint: \"${obj_endpoint}\"" )
     secretRef: minio-credentials
   images:
@@ -1454,7 +1923,7 @@ ${svc_template_yaml}${storage_yaml}
     nodeSelector:
       splunk.ai/ai-tier-node: "true"
   splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_ns_secret}
       namespace: ${AI_NS}
@@ -1524,19 +1993,381 @@ EOF
   log "    Use this URL in Splunk AI setup: http://${route_host}"
 }
 
+# ====== ALL MODELS STAGED PRE-CHECK ======
+# all_models_staged <staging_dir> <accel>
+# Checks whether every artifact already has a staging_complete marker with matching hf_url.
+# Returns 0 (all staged) or 1 (one or more missing).
+# Fails open: returns 1 if store is unreachable or tool is missing.
+all_models_staged() {
+  local staging_dir="$1"
+  local accel="$2"
+  local config_file
+
+  case "${accel}" in
+    h100) config_file="${staging_dir}/model_artifacts_configs_h100.yaml" ;;
+    *)    config_file="${staging_dir}/model_artifacts_configs.yaml" ;;
+  esac
+
+  if [[ ! -f "${config_file}" ]]; then
+    warn "all_models_staged: config file not found: ${config_file} — skipping pre-check."
+    return 1
+  fi
+
+  local ids=() hf_urls=()
+  local raw_ids raw_urls
+  raw_ids=$(yq eval '.artifact-configs[].artifact-id' "${config_file}" 2>/dev/null) || {
+    warn "all_models_staged: could not read artifact IDs from ${config_file} — skipping pre-check."
+    return 1
+  }
+  raw_urls=$(yq eval '.artifact-configs[].hf-url' "${config_file}" 2>/dev/null) || {
+    warn "all_models_staged: could not read hf-url fields from ${config_file} — skipping pre-check."
+    return 1
+  }
+  while IFS= read -r id; do
+    [[ -n "${id}" ]] && ids+=("${id}")
+  done <<< "${raw_ids}"
+  while IFS= read -r url; do
+    hf_urls+=("${url}")
+  done <<< "${raw_urls}"
+
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    warn "all_models_staged: no artifact IDs found in ${config_file} — skipping pre-check."
+    return 1
+  fi
+
+  _marker_matches_url() {
+    local content="$1" expected_url="$2"
+    echo "${content}" | grep -q "^hf_url=${expected_url}$"
+  }
+
+  local missing=()
+
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      if ! command -v aws &>/dev/null; then
+        warn "all_models_staged: aws CLI not found — skipping pre-check."
+        return 1
+      fi
+      for i in "${!ids[@]}"; do
+        local id="${ids[$i]}" hf_url="${hf_urls[$i]:-}"
+        local marker_path="s3://${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
+        local content
+        content=$(AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+                  AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+                  aws s3 cp "${marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { missing+=("${id}"); continue; }
+        _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
+      done
+      ;;
+    minio|seaweedfs)
+      if ! command -v mc &>/dev/null; then
+        warn "all_models_staged: mc not found — skipping pre-check."
+        return 1
+      fi
+      if [[ -z "${OBJ_STORE_ENDPOINT}" ]]; then
+        warn "all_models_staged: OBJ_STORE_ENDPOINT not set — skipping pre-check."
+        return 1
+      fi
+      local _alias="installer_precheck"
+      mc alias set "${_alias}" "${OBJ_STORE_ENDPOINT}" \
+          "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api S3v4 &>/dev/null || {
+        warn "all_models_staged: could not configure mc alias — skipping pre-check."
+        return 1
+      }
+      for i in "${!ids[@]}"; do
+        local id="${ids[$i]}" hf_url="${hf_urls[$i]:-}"
+        local marker_path="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
+        local content
+        content=$(mc cat "${marker_path}" 2>/dev/null) || { missing+=("${id}"); continue; }
+        _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
+      done
+      ;;
+    *)
+      warn "all_models_staged: unsupported store type '${OBJ_STORE_TYPE}' — skipping pre-check."
+      return 1
+      ;;
+  esac
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    log "✓ All ${#ids[@]} models already staged in object store (${OBJ_STORE_TYPE}) — skipping download and upload."
+    return 0
+  fi
+
+  log "Model staging needed: ${#missing[@]}/${#ids[@]} model(s) not yet staged."
+  for _m in "${missing[@]}"; do
+    log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found or hf_url changed)"
+  done
+  return 1
+}
+
+# ====== MODEL ARTIFACT STAGING ======
+# Downloads model artifacts from HuggingFace and uploads them to the configured
+# object store. Controlled by storage.modelStaging.enabled in config (default: false).
+# Skipped when AIRGAP_MODE=true — models must be pre-staged in that case.
+stage_model_artifacts() {
+  if [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
+    log "Model staging disabled (storage.modelStaging.enabled=false), skipping"
+    return 0
+  fi
+
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    log "AIRGAP_MODE=true — skipping model staging (models must be pre-staged in object store)"
+    return 0
+  fi
+
+  if object_store_auth_looks_like_placeholder; then
+    err "Refusing to stage artifacts: objectStore.auth still contains template placeholders; fix ${CONFIG_FILE}"
+    return 1
+  fi
+
+  local staging_dir
+  staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
+    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of cluster_setup/)"; return 1; }
+
+  log "Model staging directory: ${staging_dir}"
+
+  # ---- Resolve accelerator (normalize to lowercase) ----
+  local _accel
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
+
+  local _skip_staged="${SKIP_IF_STAGED:-1}"
+
+  # ---- Fast-path: skip everything if all models already staged ----
+  if [[ "${_skip_staged}" != "0" ]] && all_models_staged "${staging_dir}" "${_accel}"; then
+    return 0
+  fi
+
+  wait_for_dependency \
+    "HuggingFace (huggingface.co) — required for model weight download" \
+    "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+    300
+
+  log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
+  ( cd "${staging_dir}" && \
+      ACCELERATOR="${_accel}" \
+      SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" \
+      SKIP_IF_STAGED="${_skip_staged}" \
+      OBJ_STORE_TYPE="${OBJ_STORE_TYPE}" \
+      OBJ_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+      OBJ_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+      OBJ_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+      OBJ_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+      S3_REGION="${REGION:-us-east-2}" \
+      S3_PREFIX="model_artifacts" \
+      bash ./download_from_huggingface.sh ) \
+    || { err "HuggingFace download failed — see output above"; return 1; }
+
+  log "Uploading model artifacts to object store (type=${OBJ_STORE_TYPE})..."
+  if [[ "${OBJ_STORE_TYPE}" == "minio" || "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+    [[ -n "${OBJ_STORE_ENDPOINT}" ]] || { err "storage.objectStore.endpoint is required for ${OBJ_STORE_TYPE} model staging"; return 1; }
+  fi
+
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      ( cd "${staging_dir}" && \
+        S3_BUCKET="${OBJ_STORE_BUCKET}" \
+        S3_REGION="${OBJ_STORE_REGION:-us-east-2}" \
+        AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
+        AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
+        SKIP_IF_STAGED="${_skip_staged}" \
+        bash ./upload_to_s3.sh ) \
+        || { err "Upload to S3 failed"; return 1; }
+      ;;
+    minio)
+      ( cd "${staging_dir}" && \
+        OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+        OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        SKIP_IF_STAGED="${_skip_staged}" \
+        bash ./upload_to_minio.sh ) \
+        || { err "Upload to MinIO failed"; return 1; }
+      ;;
+    seaweedfs)
+      ( cd "${staging_dir}" && \
+        OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
+        OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
+        OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
+        SKIP_IF_STAGED="${_skip_staged}" \
+        bash ./upload_to_seaweedfs_upload_only.sh ) \
+        || { err "Upload to SeaweedFS failed"; return 1; }
+      ;;
+    *)
+      err "Unsupported objectStore.type for model staging: '${OBJ_STORE_TYPE}' (expected: aws | minio | seaweedfs)"
+      return 1
+      ;;
+  esac
+
+  # ---- Post-stage verification ----
+  log "Verifying model staging completeness..."
+  if all_models_staged "${staging_dir}" "${_accel}"; then
+    log "✓ Post-stage verification passed — all models confirmed staged."
+  else
+    warn "Post-stage verification: some models may not have been staged successfully."
+    warn "Check the upload logs above. You can re-run with SKIP_IF_STAGED=0 to force re-upload."
+  fi
+
+  log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
+}
+
+# ====== CREATE IMAGE PULL SECRETS ======
+# Creates pull secrets for all enabled registries (ECR, DockerHub, GCR, ACR, custom)
+# in the given namespace. Uses --dry-run=client | apply so it is idempotent.
+create_image_pull_secrets() {
+  local ns="$1"
+  ensure_namespace "${ns}"
+
+  log "Creating image pull secrets in ${ns}..."
+  local secrets_created=()
+
+  # ECR
+  if [[ "${IMAGE_PULL_SECRETS_ECR_ENABLED}" == "true" ]]; then
+    local ecr_region="${ECR_REGION:-us-east-2}"
+    local ecr_account="${ECR_ACCOUNT:-}"
+    if ! aws sts get-caller-identity &>/dev/null; then
+      warn "AWS credentials not available — skipping ECR secret creation"
+    else
+      [[ -z "${ecr_account}" ]] && ecr_account=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+      local ecr_password
+      if ecr_password=$(aws ecr get-login-password --region "${ecr_region}" 2>/dev/null); then
+        oc create secret docker-registry ecr-registry-secret \
+          --docker-server="${ecr_account}.dkr.ecr.${ecr_region}.amazonaws.com" \
+          --docker-username=AWS \
+          --docker-password="${ecr_password}" \
+          --namespace="${ns}" \
+          --dry-run=client -o yaml | oc apply -f -
+        log "  ✓ ECR secret created: ecr-registry-secret"
+        secrets_created+=("ecr-registry-secret")
+      else
+        warn "Failed to get ECR token — skipping ECR secret"
+      fi
+    fi
+  fi
+
+  # DockerHub
+  if [[ "${IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED}" == "true" ]]; then
+    local dh_user dh_pass dh_email
+    dh_user=$(yq eval '.imagePullSecrets.dockerHub.username // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    dh_pass=$(yq eval '.imagePullSecrets.dockerHub.password // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    dh_email=$(yq eval '.imagePullSecrets.dockerHub.email // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${dh_user}" && -n "${dh_pass}" ]]; then
+      local email_arg=""
+      [[ -n "${dh_email}" ]] && email_arg="--docker-email=${dh_email}"
+      oc create secret docker-registry docker-hub-secret \
+        --docker-server=docker.io \
+        --docker-username="${dh_user}" \
+        --docker-password="${dh_pass}" \
+        ${email_arg} \
+        --namespace="${ns}" \
+        --dry-run=client -o yaml | oc apply -f -
+      log "  ✓ DockerHub secret created: docker-hub-secret"
+      secrets_created+=("docker-hub-secret")
+    else
+      warn "DockerHub credentials not configured — skipping"
+    fi
+  fi
+
+  # GCR
+  if [[ "${IMAGE_PULL_SECRETS_GCR_ENABLED}" == "true" ]]; then
+    local gcr_key
+    gcr_key=$(yq eval '.imagePullSecrets.gcr.jsonKey // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${gcr_key}" && "${gcr_key}" != "null" ]]; then
+      oc create secret docker-registry gcr-secret \
+        --docker-server=gcr.io \
+        --docker-username=_json_key \
+        --docker-password="${gcr_key}" \
+        --namespace="${ns}" \
+        --dry-run=client -o yaml | oc apply -f -
+      log "  ✓ GCR secret created: gcr-secret"
+      secrets_created+=("gcr-secret")
+    else
+      warn "GCR JSON key not configured — skipping"
+    fi
+  fi
+
+  # ACR
+  if [[ "${IMAGE_PULL_SECRETS_ACR_ENABLED}" == "true" ]]; then
+    local acr_reg acr_user acr_pass
+    acr_reg=$(yq eval '.imagePullSecrets.acr.registry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    acr_user=$(yq eval '.imagePullSecrets.acr.username // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    acr_pass=$(yq eval '.imagePullSecrets.acr.password // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${acr_reg}" && -n "${acr_user}" && -n "${acr_pass}" ]]; then
+      oc create secret docker-registry acr-secret \
+        --docker-server="${acr_reg}" \
+        --docker-username="${acr_user}" \
+        --docker-password="${acr_pass}" \
+        --namespace="${ns}" \
+        --dry-run=client -o yaml | oc apply -f -
+      log "  ✓ ACR secret created: acr-secret"
+      secrets_created+=("acr-secret")
+    else
+      warn "ACR credentials not configured — skipping"
+    fi
+  fi
+
+  # Custom registry
+  if [[ "${IMAGE_PULL_SECRETS_CUSTOM_ENABLED}" == "true" ]]; then
+    local c_name c_server c_user c_pass c_email
+    c_name=$(yq eval '.imagePullSecrets.custom.name // "custom-registry-secret"' "${CONFIG_FILE}" 2>/dev/null || echo "custom-registry-secret")
+    c_server=$(yq eval '.imagePullSecrets.custom.server // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    c_user=$(yq eval '.imagePullSecrets.custom.username // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    c_pass=$(yq eval '.imagePullSecrets.custom.password // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    c_email=$(yq eval '.imagePullSecrets.custom.email // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${c_server}" && -n "${c_user}" && -n "${c_pass}" ]]; then
+      local email_arg=""
+      [[ -n "${c_email}" ]] && email_arg="--docker-email=${c_email}"
+      oc create secret docker-registry "${c_name}" \
+        --docker-server="${c_server}" \
+        --docker-username="${c_user}" \
+        --docker-password="${c_pass}" \
+        ${email_arg} \
+        --namespace="${ns}" \
+        --dry-run=client -o yaml | oc apply -f -
+      log "  ✓ Custom registry secret created: ${c_name}"
+      secrets_created+=("${c_name}")
+    else
+      warn "Custom registry credentials not configured — skipping"
+    fi
+  fi
+
+  if [[ ${#secrets_created[@]} -gt 0 ]]; then
+    log "  Pull secrets created in ${ns}: ${secrets_created[*]}"
+  else
+    log "  No additional pull secrets configured"
+  fi
+}
+
 # ====== MAIN INSTALL ======
 main_install() {
   log "============================================"
   log " Splunk AI Platform — OpenShift Install"
   log "============================================"
 
+  # Sync SILENT_INSTALL ↔ AUTO_APPROVE
+  [[ "${AUTO_APPROVE:-false}" == "true" ]] && SILENT_INSTALL=true
+  SILENT_INSTALL="${SILENT_INSTALL:-false}"
+  [[ "${SILENT_INSTALL}" == "true" ]] && AUTO_APPROVE=true
+
   load_config
   validate_image_config
   configure_images
 
+  resolve_accelerator_type
+  resolve_model_staging
+
   show_install_plan
 
+  phase_start "Model Staging"
+  step_start "Model artifact staging"
+  stage_model_artifacts
+  step_ok
+  phase_end "Model Staging"
+
   phase_start "Preflight"
+  step_start "Model artifact staging"
+  stage_model_artifacts
+  step_ok
+
   step_start "Preflight checks"
   preflight_checks
   step_ok
@@ -1574,8 +2405,11 @@ main_install() {
   install_ray_operator
   step_ok
 
-  step_start "ECR pull secrets"
+  step_start "Image pull secrets"
   ensure_ecr_pull_secret
+  create_image_pull_secrets "${AI_NS}"
+  create_image_pull_secrets "splunk-ai-operator-system"
+  create_image_pull_secrets "splunk-operator"
   step_ok
 
   step_start "Splunk AI Operator"
@@ -1802,24 +2636,47 @@ diagnose() {
     oc get pvc --all-namespaces                                  > "${bundle_dir}/pvcs.txt"         2>&1 || true
     oc get svc --all-namespaces                                  > "${bundle_dir}/services.txt"     2>&1 || true
     oc describe nodes                                            > "${bundle_dir}/node-details.txt" 2>&1 || true
+    oc get deployments --all-namespaces -o wide                  > "${bundle_dir}/deployments.txt"  2>&1 || true
+    oc get statefulsets --all-namespaces -o wide                 > "${bundle_dir}/statefulsets.txt" 2>&1 || true
+    oc get daemonsets --all-namespaces -o wide                   > "${bundle_dir}/daemonsets.txt"   2>&1 || true
+    oc describe deployments --all-namespaces                     > "${bundle_dir}/deployment-details.txt"   2>&1 || true
+    oc describe statefulsets --all-namespaces                    > "${bundle_dir}/statefulset-details.txt"  2>&1 || true
+    oc describe daemonsets --all-namespaces                      > "${bundle_dir}/daemonset-details.txt"    2>&1 || true
 
-    # Per-namespace pod logs for failing pods
-    log "Collecting logs from non-Running pods..."
-    local ns pod
+    # Per-pod log collection: ALL pods, with conditional tail size (300 for failing, 100 for running)
+    log "Collecting pod logs (all pods)..."
+    local ns pod phase
     while IFS= read -r line; do
       ns=$(echo "${line}" | awk '{print $1}')
       pod=$(echo "${line}" | awk '{print $2}')
+      phase=$(echo "${line}" | awk '{print $4}')
       mkdir -p "${bundle_dir}/pod-logs/${ns}"
-      oc logs "${pod}" -n "${ns}" --tail=200 \
+      local tail_lines=100
+      if [[ "${phase}" != "Running" && "${phase}" != "Completed" ]]; then
+        tail_lines=300
+      fi
+      oc logs "${pod}" -n "${ns}" --all-containers=true --tail="${tail_lines}" \
         > "${bundle_dir}/pod-logs/${ns}/${pod}.log" 2>&1 || true
-      oc logs "${pod}" -n "${ns}" --previous --tail=100 \
+      oc logs "${pod}" -n "${ns}" --all-containers=true --previous --tail=100 \
         > "${bundle_dir}/pod-logs/${ns}/${pod}.previous.log" 2>&1 || true
+    done < <(oc get pods --all-namespaces --no-headers 2>/dev/null)
+
+    # Describe unhealthy pods
+    log "Describing unhealthy pods..."
+    while IFS= read -r line; do
+      ns=$(echo "${line}" | awk '{print $1}')
+      pod=$(echo "${line}" | awk '{print $2}')
+      mkdir -p "${bundle_dir}/pod-describe/${ns}"
+      oc describe pod "${pod}" -n "${ns}" \
+        > "${bundle_dir}/pod-describe/${ns}/${pod}.txt" 2>&1 || true
     done < <(oc get pods --all-namespaces --no-headers 2>/dev/null \
              | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}')
 
     # AI Platform specific resources
     oc describe aiplatform --all -n "${AI_NS:-ai-platform}" > "${bundle_dir}/aiplatform-cr.txt" 2>&1 || true
     oc describe aiservice  --all -n "${AI_NS:-ai-platform}" > "${bundle_dir}/aiservice-cr.txt"  2>&1 || true
+    oc describe raycluster --all-namespaces                  > "${bundle_dir}/raycluster-cr.txt" 2>&1 || true
+    oc describe rayservice --all-namespaces                  > "${bundle_dir}/rayservice-cr.txt" 2>&1 || true
 
     # Operator logs
     oc logs -n splunk-ai-operator-system -l control-plane=controller-manager --tail=500 \
@@ -1832,7 +2689,7 @@ diagnose() {
   # 3. Config file (redact credentials)
   if [[ -f "${CONFIG_FILE}" ]]; then
     log "Including config file (credentials redacted)..."
-    sed 's/\(rootUser\|rootPassword\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\|accessKey\|secretKey\):.*/\1: <REDACTED>/g' \
+    sed 's/\(rootUser\|rootPassword\|hf-token\|hf-username\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\|accessKey\|secretKey\|password\):.*/\1: <REDACTED>/g' \
       "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
   fi
 
@@ -1848,27 +2705,40 @@ diagnose() {
 
   # 5. Pack into tar.gz
   local bundle_tar="${bundle_dir}.tar.gz"
+  mkdir -p "${LOG_DIR}"
   tar -czf "${bundle_tar}" -C "$(dirname "${bundle_dir}")" "$(basename "${bundle_dir}")" 2>/dev/null
   rm -rf "${bundle_dir}"
 
-  log "=== Support bundle ready: ${bundle_tar} ==="
-  log "Attach this file to your support ticket or share with the team."
+  echo -e "\n\033[1;34m╔══════════════════════════════════════════════════════════╗\033[0m" >&2
+  echo -e "\033[1;34m║             SUPPORT BUNDLE READY                         ║\033[0m" >&2
+  echo -e "\033[1;34m╚══════════════════════════════════════════════════════════╝\033[0m" >&2
+  log "  Bundle: ${bundle_tar}"
+  log "  Attach this file to your support ticket or share with the team."
 }
 
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [install|delete|diagnose]
+Usage: $(basename "$0") [install|delete|diagnose|stage-artifacts|verify] [options]
 
-  install   Deploy the Splunk AI Platform stack onto an existing OpenShift cluster.
-  delete    Remove the Splunk AI Platform stack (leaves the cluster intact).
-  diagnose  Collect a support bundle (logs, cluster state, config) into a tar.gz.
+  install [--silent|-s]
+                Deploy the Splunk AI Platform stack onto an existing OpenShift cluster.
+                  --silent / -s  Non-interactive: skip all prompts (equivalent to SILENT_INSTALL=true).
+  delete        Remove the Splunk AI Platform stack (leaves the cluster intact).
+  diagnose      Collect a support bundle (logs, cluster state, config) into a tar.gz.
+  stage-artifacts
+                Download model weights from HuggingFace and upload to the object store.
+  verify        Check that all pods are healthy and the platform is operational.
 
 Config file: ${CONFIG_FILE}
   Override with: CONFIG_FILE=/path/to/config.yaml $(basename "$0")
 
 Environment:
-  AUTO_APPROVE=true  Skip confirmation prompts (for CI/CD use)
+  AUTO_APPROVE=true      Skip confirmation prompts (for CI/CD use)
+  SILENT_INSTALL=true    Non-interactive mode: no prompts, 5-second countdown before install.
+                         Equivalent to --silent on the install subcommand.
+  AUTO_DIAGNOSE=false    Suppress automatic support-bundle collection on verify/install failure.
+  SKIP_IF_STAGED=0       Force re-download/re-upload even if models are already staged.
 
 Prerequisites:
   - Logged in to OpenShift: oc login <cluster-url>
@@ -1877,9 +2747,35 @@ Prerequisites:
 EOF
 }
 
+# ====== VERIFY ALL PODS HEALTHY ======
+verify_all_pods_healthy() {
+  load_config 2>/dev/null || true
+  log "Verifying all pods are healthy in namespace ${AI_NS:-ai-platform}..."
+  local unhealthy
+  unhealthy=$(oc get pods --all-namespaces --no-headers 2>/dev/null \
+    | awk '$4 != "Running" && $4 != "Completed" && $4 != "Succeeded" {print $1, $2, $4}')
+  if [[ -z "${unhealthy}" ]]; then
+    log "✓ All pods are healthy"
+    return 0
+  fi
+  warn "Unhealthy pods detected:"
+  echo "${unhealthy}" | while read -r ns pod status; do
+    warn "  ${ns}/${pod} — ${status}"
+  done
+  return 1
+}
+
 # ====== MAIN ======
-case "${1:-install}" in
+_CMD="${1:-install}"
+shift 2>/dev/null || true
+case "${_CMD}" in
   install)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --silent|-s) SILENT_INSTALL=true; shift ;;
+        *) echo "Unknown install option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+    done
     main_install
     ;;
   delete)
@@ -1887,6 +2783,20 @@ case "${1:-install}" in
     ;;
   diagnose)
     diagnose
+    ;;
+  stage-artifacts)
+    load_config
+    resolve_accelerator_type
+    stage_model_artifacts
+    ;;
+  verify)
+    _vpc_rc=0
+    verify_all_pods_healthy || _vpc_rc=$?
+    if (( _vpc_rc != 0 )) && [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+      log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
+      diagnose || true
+    fi
+    exit "${_vpc_rc}"
     ;;
   *)
     usage
