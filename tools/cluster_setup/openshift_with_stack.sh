@@ -195,7 +195,7 @@ resolve_model_staging() {
 }
 
 # ====== SUPPORTED ACCELERATOR TYPES ======
-readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100" "RTX_PRO_6000_BLACKWELL")
 
 # ====== RESOLVE ACCELERATOR TYPE ======
 # Normalizes and validates DEFAULT_ACCELERATOR. Prompts interactively if missing
@@ -1009,13 +1009,13 @@ EOF
 install_nvidia_gpu_operator() {
   log "Installing NVIDIA GPU Operator..."
 
-  # Step 1: Subscription + OperatorGroup — idempotent, skip only if already present.
+  # Step 1: Subscription + OperatorGroup — idempotent, skip creation if already present.
+  # Do NOT early-return here: a prior run may have created the Subscription but never
+  # the ClusterPolicy below, so we must always fall through to Step 2.
   if oc get subscription gpu-operator-certified -n nvidia-gpu-operator &>/dev/null; then
-    log "  ✓ GPU Operator subscription already exists, skipping"
-    return 0
-  fi
-
-  oc apply -f - <<EOF
+    log "  ✓ GPU Operator subscription already exists, skipping creation"
+  else
+    oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -1043,19 +1043,20 @@ spec:
   installPlanApproval: Automatic
 EOF
 
-  log "Waiting for GPU Operator CSV to succeed..."
-  local retries=0
-  while (( retries < 36 )); do
-    local phase
-    phase=$(oc get csv -n nvidia-gpu-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-    if [[ "${phase}" == "Succeeded" ]]; then
-      log "  ✓ GPU Operator CSV ready"
-      break
-    fi
-    sleep 10
-    retries=$(( retries + 1 ))
-    log "  Waiting for GPU Operator CSV... (${retries}/36, phase=${phase:-pending})"
-  done
+    log "Waiting for GPU Operator CSV to succeed..."
+    local retries=0
+    while (( retries < 36 )); do
+      local phase
+      phase=$(oc get csv -n nvidia-gpu-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+      if [[ "${phase}" == "Succeeded" ]]; then
+        log "  ✓ GPU Operator CSV ready"
+        break
+      fi
+      sleep 10
+      retries=$(( retries + 1 ))
+      log "  Waiting for GPU Operator CSV... (${retries}/36, phase=${phase:-pending})"
+    done
+  fi
 
   # Step 2: ClusterPolicy — always ensure it exists, regardless of whether the
   # Subscription was just created or pre-existing. Without this CR the driver,
@@ -1143,14 +1144,12 @@ label_nodes() {
       ;;
 
     manual)
-      local node_count
-      node_count=$(yq eval '.openshift.nodes | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
-      local i=0
-      while [[ $i -lt $node_count ]]; do
-        local n; n=$(yq eval ".openshift.nodes[$i]" "${CONFIG_FILE}" 2>/dev/null || echo "")
-        [[ -n "$n" && "$n" != "null" ]] && ai_nodes+=("$n")
-        i=$((i+1))
-      done
+      # openshift.nodes has cpu/gpu sub-arrays. Both CPU and GPU hosts get the single
+      # splunk.ai/ai-tier-node=true label (GPU workers are further constrained by their
+      # nvidia.com/gpu resource request), so collect hosts from both lists.
+      while IFS= read -r node; do
+        [[ -n "$node" && "$node" != "null" ]] && ai_nodes+=("$node")
+      done < <(yq eval '.openshift.nodes.cpu[], .openshift.nodes.gpu[]' "${CONFIG_FILE}" 2>/dev/null)
       ;;
 
     *)
@@ -1618,16 +1617,16 @@ install_splunk_operator() {
     fi
   fi
 
-  if oc create -f "${SPLUNK_OPERATOR_FILE}" 2>/dev/null; then
-    log "  Splunk Operator resources created"
-  else
-    log "  Resources already exist, updating..."
-    oc replace --force -f "${SPLUNK_OPERATOR_FILE}" 2>&1 | grep -v "Warning: --force is deprecated" || true
-  fi
+  # Server-side apply: idempotent create-or-update that NEVER deletes existing objects.
+  # This bundle includes CRDs and the splunk-operator Namespace; `oc replace --force` is
+  # delete-then-recreate, so recreating the CRDs would cascade-delete every Splunk custom
+  # resource (Standalones, etc.). Server-side apply patches in place and preserves them.
+  oc apply --server-side --force-conflicts -f "${SPLUNK_OPERATOR_FILE}" 2>&1 || true
+  log "  Splunk Operator resources applied"
 
   # Grant privileged SCC to the whole namespace group — this is the pattern OCP SCC admission
   # actually honours. The operator pod adds NET_BIND_SERVICE which anyuid blocks; privileged
-  # covers both. group-based grant survives replace --force (which recreates the namespace).
+  # covers both. group-based grant is namespace-scoped and survives operator manifest updates.
   oc adm policy add-scc-to-group privileged \
     "system:serviceaccounts:${splunk_operator_ns}" 2>/dev/null || true
   # Force pod recreation so it picks up the new SCC grant
@@ -1718,10 +1717,10 @@ spec:
       requiredDuringSchedulingIgnoredDuringExecution:
         nodeSelectorTerms:
           - matchExpressions:
-              - key: splunk.ai/workload-type
+              - key: splunk.ai/ai-tier-node
                 operator: In
                 values:
-                  - cpu
+                  - "true"
   tolerations:
     - key: "node-role.kubernetes.io/master"
       operator: "Exists"
@@ -1772,8 +1771,11 @@ install_ai_platform_cr() {
   done < <(oc get secrets -n "${AI_NS}" \
     -o jsonpath='{range .items[?(@.type=="kubernetes.io/dockerconfigjson")]}{.metadata.name}{"\n"}{end}' \
     2>/dev/null || true)
+  # Emit the whole images: block only when secrets exist. spec.images is an object in
+  # the CRD, so a bare "images:" with no children would serialize to null and fail
+  # validation. imagePullSecrets are optional, so omit the key entirely when empty.
   local image_pull_secrets=""
-  [[ -n "${secrets_yaml}" ]] && image_pull_secrets="    imagePullSecrets:"$'\n'"${secrets_yaml}"
+  [[ -n "${secrets_yaml}" ]] && image_pull_secrets="  images:"$'\n'"    imagePullSecrets:"$'\n'"${secrets_yaml}"
 
   # Object storage path and endpoint
   local obj_path obj_endpoint
@@ -1907,7 +1909,6 @@ spec:
     region: ${OBJ_STORE_REGION}
     $( [[ -n "${obj_endpoint}" ]] && echo "endpoint: \"${obj_endpoint}\"" )
     secretRef: minio-credentials
-  images:
 ${image_pull_secrets}
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
   features:
@@ -2786,6 +2787,10 @@ case "${_CMD}" in
     ;;
   stage-artifacts)
     load_config
+    # Running this subcommand IS an explicit request to stage, so force staging on
+    # regardless of storage.modelStaging.enabled (which only gates install-time staging).
+    # The airgap guard inside stage_model_artifacts still applies.
+    MODEL_STAGING_ENABLED="true"
     resolve_accelerator_type
     stage_model_artifacts
     ;;
