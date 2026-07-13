@@ -9,8 +9,8 @@
 # to get the ready-to-paste block for k0s-cluster-config.yaml.
 # ===================================================================
 
-# CloudFormation stack name — must be unique per AWS account + region.
-# All resources are tagged with this name for easy cleanup.
+# Stack name — used to name and tag all created resources.
+# Must be unique per AWS account + region.
 stackName: my-k0s-infra              # CHANGE THIS
 
 # AWS region for all resources.
@@ -19,31 +19,44 @@ region: us-east-2                    # CHANGE THIS
 # Single availability zone for all nodes (avoids cross-AZ data transfer costs).
 availabilityZone: us-east-2a         # CHANGE THIS to a zone in your region
 
-# Set to true for air-gapped clusters. When true, k0s nodes are launched without
-# a public IP; the k0s installer is expected to run on the installer machine
-# (which does have a public IP via EIP) and reaches k0s nodes via private IP.
-# When false, k0s nodes get public IPs for internet access during k0s/NVIDIA
-# driver install.
-airgap: false
-
 # CIDR allowed to SSH to the installer machine. Use x.x.x.x/32 for your IP.
 sshAllowedCidr: "0.0.0.0/0"         # CHANGE THIS: use your-ip/32
 
-# ---------- Network (existing VPC) ----------
-# SCP requires instances be launched in the ai-platform VPC.
-# Do NOT create a new VPC — it will be blocked.
+# ---------- Network ----------
+# vpcId behaviour:
+#   - Set to an existing VPC ID  → use that VPC (subnets must pre-exist or be
+#                                   explicitly set via subnetId / installerSubnetId)
+#   - Leave empty ("")           → auto-create VPC + IGW + public subnet + private
+#                                   subnet + NAT GW.  All created resources are
+#                                   tagged and removed on 'destroy'.
+#
+# Default for us-west-2 is the shared ai-platform VPC (SCP in splunkcloud-ai-dev
+# blocks new-VPC creation, so keep this value when deploying to that account).
+# For any other account, set to "" or your own VPC ID.
 network:
-  vpcId: vpc-09b191e89c83d588e       # ai-platform-us-west-2-vpc
-  subnetId: ""                       # k0s nodes: leave empty to auto-select private subnet in AZ
-  installerSubnetId: ""              # installer: leave empty to auto-select public subnet in AZ
-  # Available subnets:
+  vpcId: vpc-09b191e89c83d588e       # us-west-2 default: ai-platform-us-west-2-vpc
+                                     # Other regions: set your VPC ID, or leave ""
+                                     # to auto-create the entire network stack.
+
+  # Leave empty to auto-select by subnet Name tag (*private* / *public*).
+  # Pin to a specific subnet when auto-selection would pick the wrong one.
+  subnetId: ""                       # k0s nodes (private subnet, NAT outbound)
+  installerSubnetId: ""              # installer (public subnet, IGW + EIP inbound)
+
+  # CIDRs used ONLY when vpcId is empty (auto-create mode).
+  # Ignored when vpcId is set.
+  vpcCidr: "10.0.0.0/16"
+  publicSubnetCidr: "10.0.1.0/24"
+  privateSubnetCidr: "10.0.2.0/24"
+
+  # Known subnets in the us-west-2 ai-platform VPC (for reference when pinning):
   #   Private (k0s nodes — NAT gateway outbound):
-  #     subnet-0f10872b190a44521  us-west-2a
+  #     subnet-0f10872b190a44521  us-west-2a  10.0.34.0/26
   #     subnet-0451eb662c568bfdf  us-west-2b
   #     subnet-0289f96100d496522  us-west-2c
   #     subnet-0a44f4ec8e746d598  us-west-2d
   #   Public (installer — IGW, EIP SSH access):
-  #     subnet-0561d78f4f4744596  us-west-2a
+  #     subnet-0561d78f4f4744596  us-west-2a  10.0.35.240/28
 
 # ---------- SSH Key Pair ----------
 keyPair:

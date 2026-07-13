@@ -15,9 +15,11 @@ region: us-west-2
 availabilityZone: us-west-2a
 sshAllowedCidr: "0.0.0.0/0"
 
-# Existing ai-platform VPC -- required by SCP (account blocks creating new VPCs for RunInstances)
+# us-west-2 default: shared ai-platform VPC (SCP blocks new-VPC creation in splunkcloud-ai-dev).
+# Subnets are pinned explicitly to avoid auto-selection ambiguity in test runs.
+# To test auto-create network mode, set vpcId: "" (use a different AWS account).
 network:
-  vpcId: vpc-09b191e89c83d588e
+  vpcId: vpc-09b191e89c83d588e              # us-west-2 default: ai-platform-us-west-2-vpc
   subnetId: subnet-0f10872b190a44521        # private us-west-2a (k0s nodes, NAT outbound)
   installerSubnetId: subnet-0561d78f4f4744596  # public us-west-2a (installer, IGW for SSH via EIP)
 

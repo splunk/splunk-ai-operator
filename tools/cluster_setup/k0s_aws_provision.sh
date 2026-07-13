@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 # k0s AWS Provisioner
-# Creates EC2 instances (with EBS) in an existing VPC/subnet for use by
-# k0s_cluster_with_stack.sh. Uses direct AWS CLI calls with required SCP flags:
+# Creates EC2 instances (with EBS) in a VPC for use by k0s_cluster_with_stack.sh.
+# Uses direct AWS CLI calls with required SCP flags:
 #   - IMDSv2 (HttpTokens=required)
 #   - EBS encryption
-#   - Existing VPC (vpc-09b191e89c83d588e, ai-platform-us-west-2-vpc)
+#
+# Network handling (network.vpcId in config):
+#   - Set to an existing VPC ID → uses it as-is (all subnets must pre-exist)
+#   - Set to "" or omit        → auto-creates VPC + IGW + public/private subnets + NAT GW
+#   - Default for us-west-2   → vpc-09b191e89c83d588e (ai-platform-us-west-2-vpc)
 #
 # The VPC has private subnets + NAT gateway. All nodes get private IPs.
 # One node (installer) also gets an EIP for SSH access from your laptop.
@@ -63,14 +67,27 @@ load_config() {
   AZ="$(cfg '.availabilityZone')"
   SSH_CIDR="$(cfg_default '.sshAllowedCidr' '0.0.0.0/0')"
 
-  # Existing VPC + subnet — required by SCP (no creating new VPCs)
-  VPC_ID="$(cfg_default '.network.vpcId' 'vpc-09b191e89c83d588e')"
+  # Network — VPC, subnets, NAT, IGW.
+  # Empty vpcId → auto-create the whole network stack.
+  # Non-empty → use existing VPC (subnets auto-selected or explicitly set).
+  # Default for us-west-2 is the shared ai-platform VPC so existing deployments are unaffected.
+  local _vpc_default=""
+  [[ "${REGION}" == "us-west-2" ]] && _vpc_default="vpc-09b191e89c83d588e"
+  VPC_ID="$(cfg_default '.network.vpcId' "${_vpc_default}")"
+  [[ "$VPC_ID" == "null" ]] && VPC_ID=""
+
+  AUTO_CREATE_NETWORK=false
+  [[ -z "$VPC_ID" ]] && AUTO_CREATE_NETWORK=true
+
   SUBNET_ID="$(cfg_default '.network.subnetId' '')"
   [[ "$SUBNET_ID" == "null" || -z "$SUBNET_ID" ]] && SUBNET_ID=""
-  # Installer goes in the public subnet (needs inbound SSH via EIP)
-  # k0s nodes go in the private subnet (outbound only via NAT)
   INSTALLER_SUBNET_ID="$(cfg_default '.network.installerSubnetId' '')"
   [[ "$INSTALLER_SUBNET_ID" == "null" || -z "$INSTALLER_SUBNET_ID" ]] && INSTALLER_SUBNET_ID=""
+
+  # CIDR blocks used when auto-creating network (only relevant when AUTO_CREATE_NETWORK=true)
+  VPC_CIDR="$(cfg_default '.network.vpcCidr' '10.0.0.0/16')"
+  PUBLIC_CIDR="$(cfg_default '.network.publicSubnetCidr' '10.0.1.0/24')"
+  PRIVATE_CIDR="$(cfg_default '.network.privateSubnetCidr' '10.0.2.0/24')"
 
   KEY_NAME="$(cfg_default '.keyPair.name' '')"
   KEY_LOCAL="$(cfg_default '.keyPair.localPath' '')"
@@ -113,6 +130,229 @@ check_aws_auth() {
     || err "AWS credentials not configured or expired.
 Run: eval \"\$(okta-aws-login -a splunkcloud-ai-dev --role-arn arn:aws:iam::658391232643:role/splunkcloud_account_admin)\""
   log "AWS identity: $(echo "$identity" | jq -r '.Arn')"
+}
+
+# -- Create VPC + IGW + public subnet + private subnet + NAT GW if they don't exist --
+# Sets VPC_ID, SUBNET_ID (private), INSTALLER_SUBNET_ID (public).
+# All created resources are tagged and saved to state for destroy cleanup.
+ensure_network() {
+  if [[ "${AUTO_CREATE_NETWORK}" != "true" ]]; then
+    return
+  fi
+
+  log "AUTO_CREATE_NETWORK=true — creating VPC and network stack..."
+
+  # ---------- VPC ----------
+  VPC_ID=$(aws ec2 create-vpc \
+    --cidr-block "${VPC_CIDR}" \
+    --region "${REGION}" \
+    --query 'Vpc.VpcId' --output text)
+  aws ec2 modify-vpc-attribute --vpc-id "${VPC_ID}" \
+    --enable-dns-support --region "${REGION}"
+  aws ec2 modify-vpc-attribute --vpc-id "${VPC_ID}" \
+    --enable-dns-hostnames --region "${REGION}"
+  aws ec2 create-tags --resources "${VPC_ID}" \
+    --tags "Key=Name,Value=${STACK_NAME}-vpc" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_VPC_ID" "${VPC_ID}"
+  log "Created VPC: ${VPC_ID} (${VPC_CIDR})"
+
+  # ---------- Internet Gateway ----------
+  local igw_id
+  igw_id=$(aws ec2 create-internet-gateway \
+    --region "${REGION}" \
+    --query 'InternetGateway.InternetGatewayId' --output text)
+  aws ec2 attach-internet-gateway \
+    --internet-gateway-id "${igw_id}" \
+    --vpc-id "${VPC_ID}" \
+    --region "${REGION}"
+  aws ec2 create-tags --resources "${igw_id}" \
+    --tags "Key=Name,Value=${STACK_NAME}-igw" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_IGW_ID" "${igw_id}"
+  log "Created and attached IGW: ${igw_id}"
+
+  # ---------- Public subnet + route table ----------
+  INSTALLER_SUBNET_ID=$(aws ec2 create-subnet \
+    --vpc-id "${VPC_ID}" \
+    --cidr-block "${PUBLIC_CIDR}" \
+    --availability-zone "${AZ}" \
+    --region "${REGION}" \
+    --query 'Subnet.SubnetId' --output text)
+  aws ec2 modify-subnet-attribute \
+    --subnet-id "${INSTALLER_SUBNET_ID}" \
+    --map-public-ip-on-launch --region "${REGION}"
+  aws ec2 create-tags --resources "${INSTALLER_SUBNET_ID}" \
+    --tags "Key=Name,Value=${STACK_NAME}-public-${AZ}" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_PUBLIC_SUBNET_ID" "${INSTALLER_SUBNET_ID}"
+  log "Created public subnet: ${INSTALLER_SUBNET_ID} (${PUBLIC_CIDR})"
+
+  local pub_rt_id
+  pub_rt_id=$(aws ec2 create-route-table \
+    --vpc-id "${VPC_ID}" \
+    --region "${REGION}" \
+    --query 'RouteTable.RouteTableId' --output text)
+  aws ec2 create-route \
+    --route-table-id "${pub_rt_id}" \
+    --destination-cidr-block 0.0.0.0/0 \
+    --gateway-id "${igw_id}" \
+    --region "${REGION}" &>/dev/null
+  aws ec2 associate-route-table \
+    --route-table-id "${pub_rt_id}" \
+    --subnet-id "${INSTALLER_SUBNET_ID}" \
+    --region "${REGION}" &>/dev/null
+  aws ec2 create-tags --resources "${pub_rt_id}" \
+    --tags "Key=Name,Value=${STACK_NAME}-public-rt" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_PUBLIC_RT_ID" "${pub_rt_id}"
+  log "Created public route table: ${pub_rt_id} (0.0.0.0/0 → ${igw_id})"
+
+  # ---------- NAT Gateway EIP ----------
+  local nat_eip_alloc
+  nat_eip_alloc=$(aws ec2 allocate-address \
+    --domain vpc \
+    --region "${REGION}" \
+    --query 'AllocationId' --output text)
+  aws ec2 create-tags --resources "${nat_eip_alloc}" \
+    --tags "Key=Name,Value=${STACK_NAME}-nat-eip" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_NAT_EIP_ALLOC" "${nat_eip_alloc}"
+
+  # ---------- NAT Gateway (in public subnet) ----------
+  local nat_gw_id
+  nat_gw_id=$(aws ec2 create-nat-gateway \
+    --subnet-id "${INSTALLER_SUBNET_ID}" \
+    --allocation-id "${nat_eip_alloc}" \
+    --region "${REGION}" \
+    --query 'NatGateway.NatGatewayId' --output text)
+  aws ec2 create-tags --resources "${nat_gw_id}" \
+    --tags "Key=Name,Value=${STACK_NAME}-nat" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_NAT_GW_ID" "${nat_gw_id}"
+  log "Creating NAT Gateway: ${nat_gw_id} (this takes ~60s)..."
+  aws ec2 wait nat-gateway-available \
+    --nat-gateway-ids "${nat_gw_id}" \
+    --region "${REGION}"
+  log "NAT Gateway ready: ${nat_gw_id}"
+
+  # ---------- Private subnet + route table ----------
+  SUBNET_ID=$(aws ec2 create-subnet \
+    --vpc-id "${VPC_ID}" \
+    --cidr-block "${PRIVATE_CIDR}" \
+    --availability-zone "${AZ}" \
+    --region "${REGION}" \
+    --query 'Subnet.SubnetId' --output text)
+  aws ec2 create-tags --resources "${SUBNET_ID}" \
+    --tags "Key=Name,Value=${STACK_NAME}-private-${AZ}" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_PRIVATE_SUBNET_ID" "${SUBNET_ID}"
+  log "Created private subnet: ${SUBNET_ID} (${PRIVATE_CIDR})"
+
+  local priv_rt_id
+  priv_rt_id=$(aws ec2 create-route-table \
+    --vpc-id "${VPC_ID}" \
+    --region "${REGION}" \
+    --query 'RouteTable.RouteTableId' --output text)
+  aws ec2 create-route \
+    --route-table-id "${priv_rt_id}" \
+    --destination-cidr-block 0.0.0.0/0 \
+    --nat-gateway-id "${nat_gw_id}" \
+    --region "${REGION}" &>/dev/null
+  aws ec2 associate-route-table \
+    --route-table-id "${priv_rt_id}" \
+    --subnet-id "${SUBNET_ID}" \
+    --region "${REGION}" &>/dev/null
+  aws ec2 create-tags --resources "${priv_rt_id}" \
+    --tags "Key=Name,Value=${STACK_NAME}-private-rt" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "AUTO_PRIVATE_RT_ID" "${priv_rt_id}"
+  log "Created private route table: ${priv_rt_id} (0.0.0.0/0 → ${nat_gw_id})"
+
+  log "Network stack ready: VPC=${VPC_ID}  public=${INSTALLER_SUBNET_ID}  private=${SUBNET_ID}"
+}
+
+# -- Tear down auto-created network resources (called from cmd_destroy) --
+destroy_network() {
+  # Only resources tagged AUTO_* in state file are cleaned up here.
+  # Executed in reverse creation order (instances already terminated by this point).
+
+  if [[ -n "${AUTO_PRIVATE_RT_ID:-}" ]]; then
+    log "Deleting private route table ${AUTO_PRIVATE_RT_ID}..."
+    aws ec2 disassociate-route-table \
+      --association-id "$(aws ec2 describe-route-tables \
+        --route-table-ids "${AUTO_PRIVATE_RT_ID}" --region "${REGION}" \
+        --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
+        --output text 2>/dev/null || echo "")" \
+      --region "${REGION}" 2>/dev/null || true
+    aws ec2 delete-route-table \
+      --route-table-id "${AUTO_PRIVATE_RT_ID}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${AUTO_PRIVATE_SUBNET_ID:-}" ]]; then
+    log "Deleting private subnet ${AUTO_PRIVATE_SUBNET_ID}..."
+    aws ec2 delete-subnet \
+      --subnet-id "${AUTO_PRIVATE_SUBNET_ID}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${AUTO_NAT_GW_ID:-}" ]]; then
+    log "Deleting NAT Gateway ${AUTO_NAT_GW_ID} (takes ~60s)..."
+    aws ec2 delete-nat-gateway \
+      --nat-gateway-id "${AUTO_NAT_GW_ID}" \
+      --region "${REGION}" &>/dev/null || true
+    aws ec2 wait nat-gateway-deleted \
+      --nat-gateway-ids "${AUTO_NAT_GW_ID}" \
+      --region "${REGION}" 2>/dev/null || \
+      warn "NAT GW deletion still in progress; EIP release may need a retry"
+  fi
+
+  if [[ -n "${AUTO_NAT_EIP_ALLOC:-}" ]]; then
+    log "Releasing NAT EIP ${AUTO_NAT_EIP_ALLOC}..."
+    aws ec2 release-address \
+      --allocation-id "${AUTO_NAT_EIP_ALLOC}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${AUTO_PUBLIC_RT_ID:-}" ]]; then
+    log "Deleting public route table ${AUTO_PUBLIC_RT_ID}..."
+    aws ec2 disassociate-route-table \
+      --association-id "$(aws ec2 describe-route-tables \
+        --route-table-ids "${AUTO_PUBLIC_RT_ID}" --region "${REGION}" \
+        --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
+        --output text 2>/dev/null || echo "")" \
+      --region "${REGION}" 2>/dev/null || true
+    aws ec2 delete-route-table \
+      --route-table-id "${AUTO_PUBLIC_RT_ID}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${AUTO_PUBLIC_SUBNET_ID:-}" ]]; then
+    log "Deleting public subnet ${AUTO_PUBLIC_SUBNET_ID}..."
+    aws ec2 delete-subnet \
+      --subnet-id "${AUTO_PUBLIC_SUBNET_ID}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${AUTO_IGW_ID:-}" ]] && [[ -n "${AUTO_VPC_ID:-}" ]]; then
+    log "Detaching and deleting IGW ${AUTO_IGW_ID}..."
+    aws ec2 detach-internet-gateway \
+      --internet-gateway-id "${AUTO_IGW_ID}" \
+      --vpc-id "${AUTO_VPC_ID}" \
+      --region "${REGION}" 2>/dev/null || true
+    aws ec2 delete-internet-gateway \
+      --internet-gateway-id "${AUTO_IGW_ID}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${AUTO_VPC_ID:-}" ]]; then
+    log "Deleting VPC ${AUTO_VPC_ID}..."
+    aws ec2 delete-vpc \
+      --vpc-id "${AUTO_VPC_ID}" \
+      --region "${REGION}" 2>/dev/null || \
+      warn "Could not delete VPC ${AUTO_VPC_ID} — may still have dependent resources"
+  fi
 }
 
 # -- Pick subnets: k0s nodes in private, installer in public --
@@ -619,9 +859,10 @@ cmd_provision() {
   : > "${STATE_FILE}"
   log "=== k0s AWS Provisioner ==="
   log "Stack: ${STACK_NAME}  Region: ${REGION}  AZ: ${AZ}"
-  log "VPC: ${VPC_ID} (existing ai-platform VPC)"
 
   AMI_ID=$(get_rhel9_ami)
+  ensure_network   # no-op when VPC_ID is already set; creates full stack otherwise
+  log "VPC: ${VPC_ID}"
   pick_subnet
   save_state "SUBNET_ID" "${SUBNET_ID}"
   save_state "INSTALLER_SUBNET_ID" "${INSTALLER_SUBNET_ID}"
@@ -918,6 +1159,9 @@ cmd_destroy() {
     fi
   fi
 
+  # Tear down auto-created network stack (only if ensure_network created it)
+  destroy_network
+
   rm -f "${STATE_FILE}"
   log "Destroy complete."
 }
@@ -932,9 +1176,16 @@ cmd_dryrun() {
   pick_subnet
   ensure_key_pair
   echo ""
-  echo "=== Dry-run: would create the following in existing VPC ${VPC_ID} ==="
-  echo "  k0s nodes subnet    : ${SUBNET_ID} (${AZ}, private)"
-  echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${AZ}, public)"
+  if [[ "${AUTO_CREATE_NETWORK}" == "true" ]]; then
+    echo "=== Dry-run: would create new network stack + instances ==="
+    echo "  VPC (new)           : ${VPC_CIDR}"
+    echo "  Public subnet (new) : ${PUBLIC_CIDR} (${AZ}) + IGW + NAT GW"
+    echo "  Private subnet (new): ${PRIVATE_CIDR} (${AZ})"
+  else
+    echo "=== Dry-run: would create instances in existing VPC ${VPC_ID} ==="
+    echo "  k0s nodes subnet    : ${SUBNET_ID} (${AZ}, private)"
+    echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${AZ}, public)"
+  fi
   echo "  Security Group: new '${STACK_NAME}-sg' (self-ref + SSH from ${SSH_CIDR})"
   echo "  1 Installer    : ${INST_TYPE}, ${INST_DISK}GB root (encrypted) + EIP"
   echo "  ${CTRL_COUNT} Controller(s) : ${CTRL_TYPE}, ${CTRL_DISK}GB root (encrypted)"
