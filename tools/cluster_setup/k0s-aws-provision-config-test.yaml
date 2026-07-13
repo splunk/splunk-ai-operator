@@ -1,0 +1,50 @@
+# ===================================================================
+# k0s AWS Provisioner — CHEAP TEST CONFIG (Level 2)
+# ===================================================================
+# Uses t3.small/medium instances instead of GPU boxes.
+# Validates the full provision/output/destroy cycle for ~$1-2.
+# Run:
+#   ./k0s_aws_provision.sh provision --config k0s-aws-provision-config-test.yaml
+#   ./k0s_aws_provision.sh output    --config k0s-aws-provision-config-test.yaml
+#   ./k0s_aws_provision.sh status    --config k0s-aws-provision-config-test.yaml
+#   ./k0s_aws_provision.sh destroy   --config k0s-aws-provision-config-test.yaml
+# ===================================================================
+
+stackName: k0s-infra-test
+region: us-east-2
+availabilityZone: us-east-2a
+airgap: false
+sshAllowedCidr: "0.0.0.0/0"
+
+keyPair:
+  name: ""
+  localPath: ""
+
+nodes:
+  controller:
+    count: 1
+    instanceType: t3.medium
+    diskGb: 8
+
+  cpuWorker:
+    count: 1
+    instanceType: t3.medium
+    diskGb: 8
+
+  gpuWorker:
+    count: 1
+    instanceType: t3.medium         # no GPU — tests provisioning + EBS mount flow only
+    diskGb: 8
+    dataDiskGb: 8                   # small, tests attach + XFS format + mount
+
+installer:
+  instanceType: t3.small
+  diskGb: 8
+
+minio:
+  enabled: true
+  dataDiskGb: 8
+  bucket: ai-platform-test
+  rootUser: minioadmin
+  rootPassword: ""
+  port: 9000
