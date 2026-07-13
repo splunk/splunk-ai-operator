@@ -15,12 +15,43 @@ The script has two network modes selected automatically from `network.vpcId`:
 
 | `network.vpcId` | Mode | What happens |
 |---|---|---|
-| Set to an existing VPC ID | **Existing VPC** | Uses that VPC; subnets auto-selected by Name tag or pinned via `subnetId`/`installerSubnetId` |
+| Set to an existing VPC ID | **Existing VPC** | Uses that VPC; subnets auto-selected by Name tag or pinned explicitly (see below) |
 | Empty (`""`) | **Auto-create** | Creates VPC + IGW + public subnet + NAT GW EIP + NAT GW + private subnet; all resources tagged and removed on `destroy` |
 | *(omitted, region=us-west-2)* | **Existing VPC** | Defaults to `vpc-09b191e89c83d588e` (ai-platform-us-west-2-vpc) |
 
 **splunkcloud-ai-dev account:** SCP blocks new-VPC creation, so keep the default VPC or pin an existing one. Auto-create mode will fail in that account.  
 **Other accounts:** Set `network.vpcId: ""` to have the script build the entire network stack from scratch.
+
+### Subnet selection in Existing VPC mode
+
+The script needs two subnets — one for k0s nodes (private, NAT outbound) and one
+for the installer (public, IGW inbound). It finds them in one of two ways:
+
+**Auto-selected by Name tag** — leave `subnetId` and `installerSubnetId` empty.
+The script calls `aws ec2 describe-subnets` and picks the first subnet in the
+configured AZ whose `Name` tag contains:
+- `private` → used for k0s nodes
+- `public` → used for installer
+
+For example, subnets named `ai-platform-private-us-west-2a` and
+`ai-platform-public-us-west-2a` are found automatically.
+
+**Pinned via config** — set the IDs explicitly when auto-selection would pick the
+wrong subnet (e.g. your naming doesn't use "private"/"public", or there are
+multiple matching subnets in the AZ):
+
+```yaml
+network:
+  vpcId: vpc-09b191e89c83d588e
+  subnetId: subnet-0f10872b190a44521           # k0s nodes  — private, NAT outbound
+  installerSubnetId: subnet-0561d78f4f4744596   # installer  — public, IGW + EIP inbound
+```
+
+When both are pinned the Name tag lookup is skipped entirely.
+
+> **Note:** The test config pins subnets explicitly because the ai-platform VPC has
+> multiple subnets per AZ and auto-selection could be ambiguous. The production
+> config leaves them empty since the VPC tags are unambiguous in that account.
 
 ### Auto-create network resources (in creation order)
 
