@@ -135,12 +135,17 @@ Run: eval \"\$(okta-aws-login -a splunkcloud-ai-dev --role-arn arn:aws:iam::6583
 # -- Create VPC + IGW + public subnet + private subnet + NAT GW if they don't exist --
 # Sets VPC_ID, SUBNET_ID (private), INSTALLER_SUBNET_ID (public).
 # All created resources are tagged and saved to state for destroy cleanup.
+#
+# WARNING: auto-create network path (AUTO_CREATE_NETWORK=true) is UNTESTED.
+# It has not been run against a real AWS account. Validate in a sandbox account
+# before using in production. The existing-VPC path is fully tested.
 ensure_network() {
   if [[ "${AUTO_CREATE_NETWORK}" != "true" ]]; then
     return
   fi
 
-  log "AUTO_CREATE_NETWORK=true — creating VPC and network stack..."
+  warn "AUTO_CREATE_NETWORK=true — this code path is UNTESTED. Validate in a sandbox account first."
+  log "Creating VPC and network stack..."
 
   # ---------- VPC ----------
   VPC_ID=$(aws ec2 create-vpc \
@@ -273,6 +278,7 @@ ensure_network() {
 }
 
 # -- Tear down auto-created network resources (called from cmd_destroy) --
+# WARNING: UNTESTED — see ensure_network warning above.
 destroy_network() {
   # Only resources tagged AUTO_* in state file are cleaned up here.
   # Executed in reverse creation order (instances already terminated by this point).
@@ -1173,8 +1179,8 @@ cmd_dryrun() {
   load_config
   check_aws_auth
   AMI_ID=$(get_rhel9_ami)
-  pick_subnet
-  ensure_key_pair
+  # In auto-create mode there is no VPC yet, so skip subnet lookup
+  [[ "${AUTO_CREATE_NETWORK}" != "true" ]] && pick_subnet
   echo ""
   if [[ "${AUTO_CREATE_NETWORK}" == "true" ]]; then
     echo "=== Dry-run: would create new network stack + instances ==="
