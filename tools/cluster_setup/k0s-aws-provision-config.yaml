@@ -27,9 +27,23 @@ availabilityZone: us-east-2a         # CHANGE THIS to a zone in your region
 airgap: false
 
 # CIDR allowed to SSH to the installer machine. Use x.x.x.x/32 for your IP.
-# k0s nodes are not directly SSH-reachable from the internet — only via the
-# installer machine or via their private IP from within the VPC.
 sshAllowedCidr: "0.0.0.0/0"         # CHANGE THIS: use your-ip/32
+
+# ---------- Network (existing VPC) ----------
+# SCP requires instances be launched in the ai-platform VPC.
+# Do NOT create a new VPC — it will be blocked.
+network:
+  vpcId: vpc-09b191e89c83d588e       # ai-platform-us-west-2-vpc
+  subnetId: ""                       # k0s nodes: leave empty to auto-select private subnet in AZ
+  installerSubnetId: ""              # installer: leave empty to auto-select public subnet in AZ
+  # Available subnets:
+  #   Private (k0s nodes — NAT gateway outbound):
+  #     subnet-0f10872b190a44521  us-west-2a
+  #     subnet-0451eb662c568bfdf  us-west-2b
+  #     subnet-0289f96100d496522  us-west-2c
+  #     subnet-0a44f4ec8e746d598  us-west-2d
+  #   Public (installer — IGW, EIP SSH access):
+  #     subnet-0561d78f4f4744596  us-west-2a
 
 # ---------- SSH Key Pair ----------
 keyPair:

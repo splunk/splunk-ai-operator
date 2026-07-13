@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
 # k0s AWS Provisioner
-# Creates EC2 infrastructure (VPC, instances, EBS, MinIO) consumed by
-# k0s_cluster_with_stack.sh. See K0S_AWS_PROVISION.md for full docs.
+# Creates EC2 instances (with EBS) in an existing VPC/subnet for use by
+# k0s_cluster_with_stack.sh. Uses direct AWS CLI calls with required SCP flags:
+#   - IMDSv2 (HttpTokens=required)
+#   - EBS encryption
+#   - Existing VPC (vpc-09b191e89c83d588e, ai-platform-us-west-2-vpc)
+#
+# The VPC has private subnets + NAT gateway. All nodes get private IPs.
+# One node (installer) also gets an EIP for SSH access from your laptop.
 #
 # Usage:
 #   ./k0s_aws_provision.sh provision [--config FILE]
 #   ./k0s_aws_provision.sh output    [--config FILE]
 #   ./k0s_aws_provision.sh status    [--config FILE]
-#   ./k0s_aws_provision.sh destroy   [--config FILE]
-#   ./k0s_aws_provision.sh validate  [--config FILE]   # template only, no deploy
-#   ./k0s_aws_provision.sh dry-run   [--config FILE]   # generate + validate, no deploy
+#   ./k0s_aws_provision.sh destroy   [--config FILE] [--yes]
+#   ./k0s_aws_provision.sh dry-run   [--config FILE]
 # =============================================================================
 set -euo pipefail
 export AWS_PAGER="" AWS_DEFAULT_OUTPUT=json PAGER=cat LANG=C LC_ALL=C
@@ -20,36 +25,52 @@ DEFAULT_CONFIG="${SCRIPT_DIR}/k0s-aws-provision-config.yaml"
 CONFIG_FILE="${DEFAULT_CONFIG}"
 MINIO_INSTALL_SCRIPT="${SCRIPT_DIR}/../artifacts_download_upload_scripts/install_minio_ec2.sh"
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# -- Logging --
 log()  { echo "[k0s-provision] $*" >&2; }
 warn() { echo "[k0s-provision] WARN: $*" >&2; }
 err()  { echo "[k0s-provision] ERROR: $*" >&2; exit 1; }
 
-# ── Arg parsing ──────────────────────────────────────────────────────────────
+# -- Arg parsing --
 COMMAND="${1:-}"
-[[ -z "$COMMAND" ]] && { echo "Usage: $0 <provision|output|status|destroy|validate|dry-run> [--config FILE]"; exit 1; }
+[[ -z "$COMMAND" ]] && { echo "Usage: $0 <provision|output|status|destroy|dry-run> [--config FILE]"; exit 1; }
 shift
+FORCE_DESTROY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_FILE="$2"; shift 2 ;;
+    --yes|-y) FORCE_DESTROY=true; shift ;;
     *) err "Unknown option: $1" ;;
   esac
 done
 [[ -f "$CONFIG_FILE" ]] || err "Config file not found: $CONFIG_FILE"
 
-# ── yq helper ────────────────────────────────────────────────────────────────
-need_yq() { command -v yq &>/dev/null || err "yq is required. Install: brew install yq  OR  wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && chmod +x /usr/local/bin/yq"; }
-cfg() { yq eval "${1}" "${CONFIG_FILE}"; }
+# -- yq helper --
+need_yq() { command -v yq &>/dev/null || err "yq is required. Install: brew install yq"; }
+cfg()         { yq eval "${1}" "${CONFIG_FILE}"; }
 cfg_default() { yq eval "${1} // \"${2}\"" "${CONFIG_FILE}"; }
 
-# ── Load config ───────────────────────────────────────────────────────────────
+# -- State file: tracks IDs of all created resources for destroy --
+STATE_FILE=""   # set in load_config
+
+save_state() { local key="$1" val="$2"; echo "${key}=${val}" >> "${STATE_FILE}"; }
+load_state()  { [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}" || true; }
+
+# -- Load config --
 load_config() {
   need_yq
   STACK_NAME="$(cfg '.stackName')"
   REGION="$(cfg '.region')"
   AZ="$(cfg '.availabilityZone')"
-  AIRGAP="$(cfg_default '.airgap' 'false')"
   SSH_CIDR="$(cfg_default '.sshAllowedCidr' '0.0.0.0/0')"
+
+  # Existing VPC + subnet — required by SCP (no creating new VPCs)
+  VPC_ID="$(cfg_default '.network.vpcId' 'vpc-09b191e89c83d588e')"
+  SUBNET_ID="$(cfg_default '.network.subnetId' '')"
+  [[ "$SUBNET_ID" == "null" || -z "$SUBNET_ID" ]] && SUBNET_ID=""
+  # Installer goes in the public subnet (needs inbound SSH via EIP)
+  # k0s nodes go in the private subnet (outbound only via NAT)
+  INSTALLER_SUBNET_ID="$(cfg_default '.network.installerSubnetId' '')"
+  [[ "$INSTALLER_SUBNET_ID" == "null" || -z "$INSTALLER_SUBNET_ID" ]] && INSTALLER_SUBNET_ID=""
 
   KEY_NAME="$(cfg_default '.keyPair.name' '')"
   KEY_LOCAL="$(cfg_default '.keyPair.localPath' '')"
@@ -57,21 +78,18 @@ load_config() {
   [[ "$KEY_LOCAL" == "null" ]] && KEY_LOCAL=""
   [[ -z "$KEY_LOCAL" ]] && KEY_LOCAL="${HOME}/.ssh/${STACK_NAME}.pem"
 
-  # Nodes
   CTRL_COUNT="$(cfg_default '.nodes.controller.count' '1')"
-  CTRL_TYPE="$(cfg_default '.nodes.controller.instanceType' 'm6i.2xlarge')"
-  CTRL_DISK="$(cfg_default '.nodes.controller.diskGb' '100')"
+  CTRL_TYPE="$(cfg_default  '.nodes.controller.instanceType' 'm6i.2xlarge')"
+  CTRL_DISK="$(cfg_default  '.nodes.controller.diskGb' '100')"
 
   CPU_COUNT="$(cfg_default '.nodes.cpuWorker.count' '1')"
-  CPU_TYPE="$(cfg_default '.nodes.cpuWorker.instanceType' 'm6i.4xlarge')"
-  CPU_DISK="$(cfg_default '.nodes.cpuWorker.diskGb' '200')"
+  CPU_TYPE="$(cfg_default  '.nodes.cpuWorker.instanceType' 'm6i.4xlarge')"
+  CPU_DISK="$(cfg_default  '.nodes.cpuWorker.diskGb' '200')"
 
   GPU_COUNT="$(cfg_default '.nodes.gpuWorker.count' '2')"
-  GPU_TYPE="$(cfg_default '.nodes.gpuWorker.instanceType' 'g6e.12xlarge')"
-  GPU_DISK="$(cfg_default '.nodes.gpuWorker.diskGb' '100')"
+  GPU_TYPE="$(cfg_default  '.nodes.gpuWorker.instanceType' 'g6e.12xlarge')"
+  GPU_DISK="$(cfg_default  '.nodes.gpuWorker.diskGb' '100')"
   GPU_DATA_DISK="$(cfg_default '.nodes.gpuWorker.dataDiskGb' '500')"
-  GPU_CAP_RES="$(cfg_default '.nodes.gpuWorker.capacityReservationId' '')"
-  [[ "$GPU_CAP_RES" == "null" ]] && GPU_CAP_RES=""
 
   INST_TYPE="$(cfg_default '.installer.instanceType' 't3.large')"
   INST_DISK="$(cfg_default '.installer.diskGb' '50')"
@@ -84,47 +102,85 @@ load_config() {
   MINIO_PORT="$(cfg_default '.minio.port' '9000')"
   [[ "$MINIO_PASS" == "null" || -z "$MINIO_PASS" ]] && MINIO_PASS=""
 
-  # Derived
-  CFN_TEMPLATE="/tmp/${STACK_NAME}-cfn.yaml"
   TAG_KEY="k0s-provision-stack"
+  STATE_FILE="${HOME}/.k0s-provision-${STACK_NAME}.state"
 }
 
-# ── AWS auth check ────────────────────────────────────────────────────────────
+# -- AWS auth check --
 check_aws_auth() {
-  if ! aws sts get-caller-identity --region "${REGION}" &>/dev/null; then
-    err "AWS credentials not configured or expired.
-Run: eval \"\$(okta-aws-login -a splunkcloud-ai-dev --role-arn arn:aws:iam::658391232643:role/splunkcloud_account_admin)\""
-  fi
   local identity
-  identity=$(aws sts get-caller-identity --region "${REGION}" --output json)
+  identity=$(aws sts get-caller-identity --region "${REGION}" --output json 2>/dev/null) \
+    || err "AWS credentials not configured or expired.
+Run: eval \"\$(okta-aws-login -a splunkcloud-ai-dev --role-arn arn:aws:iam::658391232643:role/splunkcloud_account_admin)\""
   log "AWS identity: $(echo "$identity" | jq -r '.Arn')"
 }
 
-# ── AMI lookup: RHEL 9 ────────────────────────────────────────────────────────
+# -- Pick subnets: k0s nodes in private, installer in public --
+pick_subnet() {
+  # k0s node subnet
+  if [[ -n "$SUBNET_ID" ]]; then
+    log "Using configured k0s subnet: ${SUBNET_ID}"
+  else
+    SUBNET_ID=$(aws ec2 describe-subnets --region "${REGION}" \
+      --filters "Name=vpc-id,Values=${VPC_ID}" \
+                "Name=availabilityZone,Values=${AZ}" \
+      --query 'Subnets[?Tags[?Key==`Name`] | [?contains(Value, `private`)] | [0]] | [0].SubnetId' \
+      --output text 2>/dev/null || echo "")
+    if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
+      SUBNET_ID=$(aws ec2 describe-subnets --region "${REGION}" \
+        --filters "Name=vpc-id,Values=${VPC_ID}" \
+                  "Name=availabilityZone,Values=${AZ}" \
+        --query 'Subnets[0].SubnetId' --output text)
+    fi
+    [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]] && \
+      err "No k0s subnet found in VPC ${VPC_ID} / AZ ${AZ}. Set network.subnetId in config."
+    log "Auto-selected k0s subnet: ${SUBNET_ID} (${AZ})"
+  fi
+
+  # Installer subnet — must be public (has IGW route) for inbound SSH via EIP
+  if [[ -n "$INSTALLER_SUBNET_ID" ]]; then
+    log "Using configured installer subnet: ${INSTALLER_SUBNET_ID}"
+  else
+    INSTALLER_SUBNET_ID=$(aws ec2 describe-subnets --region "${REGION}" \
+      --filters "Name=vpc-id,Values=${VPC_ID}" \
+                "Name=availabilityZone,Values=${AZ}" \
+      --query 'Subnets[?Tags[?Key==`Name`] | [?contains(Value, `public`)] | [0]] | [0].SubnetId' \
+      --output text 2>/dev/null || echo "")
+    if [[ -z "$INSTALLER_SUBNET_ID" || "$INSTALLER_SUBNET_ID" == "None" ]]; then
+      # Fallback: use same subnet as k0s nodes and warn
+      INSTALLER_SUBNET_ID="$SUBNET_ID"
+      warn "No public subnet found in ${AZ}; installer will use the same private subnet as k0s nodes."
+      warn "EIP may not be SSH-reachable. Set network.installerSubnetId to the public subnet."
+    else
+      log "Auto-selected installer subnet (public): ${INSTALLER_SUBNET_ID} (${AZ})"
+    fi
+  fi
+}
+
+# -- RHEL 9 AMI --
 get_rhel9_ami() {
   local ami
-  # Red Hat official marketplace AMIs (owner 309956199498), RHEL 9, x86_64, latest
   ami=$(aws ec2 describe-images \
     --owners 309956199498 \
-    --filters \
-      "Name=name,Values=RHEL-9.*_HVM-*-x86_64-*" \
-      "Name=state,Values=available" \
-      "Name=architecture,Values=x86_64" \
+    --filters "Name=name,Values=RHEL-9.*_HVM-*-x86_64-*" \
+              "Name=state,Values=available" \
+              "Name=architecture,Values=x86_64" \
     --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-    --output text \
-    --region "${REGION}" 2>/dev/null)
-  [[ -z "$ami" || "$ami" == "None" ]] && err "Could not find RHEL 9 AMI in region ${REGION}. Check your region or AWS account marketplace access."
+    --output text --region "${REGION}" 2>/dev/null)
+  [[ -z "$ami" || "$ami" == "None" ]] && \
+    err "Could not find RHEL 9 AMI in region ${REGION}."
   log "RHEL 9 AMI: ${ami}"
   echo "$ami"
 }
 
-# ── Key pair management ───────────────────────────────────────────────────────
+# -- Key pair --
 ensure_key_pair() {
   if [[ -z "$KEY_NAME" ]]; then
     KEY_NAME="${STACK_NAME}-key"
-    log "No key pair specified — auto-creating: ${KEY_NAME}"
-    if aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --region "${REGION}" &>/dev/null; then
-      warn "Key pair '${KEY_NAME}' already exists in AWS. If you don't have the .pem, delete it first or set keyPair.name in config."
+    if aws ec2 describe-key-pairs --key-names "${KEY_NAME}" \
+        --region "${REGION}" &>/dev/null; then
+      warn "Key pair '${KEY_NAME}' already exists in AWS — reusing."
+      if [[ ! -f "$KEY_LOCAL" ]]; then warn "Local key file not found at ${KEY_LOCAL}. You may need to set keyPair.localPath."; fi
     else
       aws ec2 create-key-pair \
         --key-name "${KEY_NAME}" \
@@ -133,576 +189,269 @@ ensure_key_pair() {
         --region "${REGION}" > "${KEY_LOCAL}"
       chmod 600 "${KEY_LOCAL}"
       log "Key pair created, saved to: ${KEY_LOCAL}"
-      # Tag for cleanup tracking
       local kp_id
-      kp_id=$(aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --region "${REGION}" \
-        --query 'KeyPairs[0].KeyPairId' --output text)
-      aws ec2 create-tags --resources "${kp_id}" \
-        --tags "Key=${TAG_KEY},Value=${STACK_NAME}" "Key=auto-created,Value=true" \
-        --region "${REGION}" 2>/dev/null || true
+      kp_id=$(aws ec2 describe-key-pairs --key-names "${KEY_NAME}" \
+        --region "${REGION}" --query 'KeyPairs[0].KeyPairId' --output text 2>/dev/null || echo "")
+      if [[ -n "$kp_id" ]]; then
+        aws ec2 create-tags \
+          --resources "${kp_id}" \
+          --tags "Key=${TAG_KEY},Value=${STACK_NAME}" "Key=auto-created,Value=true" \
+          --region "${REGION}" 2>/dev/null || true
+      fi
     fi
   else
     log "Using existing key pair: ${KEY_NAME}"
-    if [[ ! -f "$KEY_LOCAL" ]]; then
-      warn "Key file not found at ${KEY_LOCAL}. Set keyPair.localPath in config if it is elsewhere."
-    fi
+    if [[ ! -f "$KEY_LOCAL" ]]; then warn "Key file not found at ${KEY_LOCAL}. Set keyPair.localPath in config."; fi
   fi
 }
 
-# ── CloudFormation template generation ───────────────────────────────────────
-generate_cfn_template() {
-  local ami_id="$1"
-  log "Generating CloudFormation template: ${CFN_TEMPLATE}"
-
-  # Build GPU capacity reservation snippet
-  local cap_res_snippet=""
-  if [[ -n "$GPU_CAP_RES" ]]; then
-    cap_res_snippet="          CapacityReservationSpecification:
-            CapacityReservationTarget:
-              CapacityReservationId: ${GPU_CAP_RES}"
+# -- Create or reuse a security group for this stack --
+ensure_security_group() {
+  # Check if our SG already exists
+  local existing
+  existing=$(aws ec2 describe-security-groups --region "${REGION}" \
+    --filters "Name=vpc-id,Values=${VPC_ID}" \
+              "Name=group-name,Values=${STACK_NAME}-sg" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
+  if [[ -n "$existing" && "$existing" != "None" ]]; then
+    SG_ID="$existing"
+    log "Reusing existing security group: ${SG_ID}"
+    return
   fi
 
-  # Build node public IP setting (no public IP if airgap=true for k0s nodes)
-  local k0s_node_public_ip="true"
-  [[ "$AIRGAP" == "true" ]] && k0s_node_public_ip="false"
+  log "Creating security group..."
+  SG_ID=$(aws ec2 create-security-group \
+    --group-name "${STACK_NAME}-sg" \
+    --description "k0s cluster ${STACK_NAME} - all private-IP traffic + SSH" \
+    --vpc-id "${VPC_ID}" \
+    --region "${REGION}" \
+    --query 'GroupId' --output text)
 
-  # UserData: common setup for all RHEL9 nodes
-  # - passwordless sudo for ec2-user (required by k0s installer)
-  # - disable host key checking for inter-node SSH
-  local userdata_common
-  userdata_common=$(cat <<'UDEOF'
+  # Self-referencing: all intra-cluster traffic
+  aws ec2 authorize-security-group-ingress \
+    --group-id "${SG_ID}" \
+    --ip-permissions "[{\"IpProtocol\":\"-1\",\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ID}\"}]}]" \
+    --region "${REGION}" &>/dev/null
+
+  # SSH from allowed CIDR (for EIP-bound installer)
+  aws ec2 authorize-security-group-ingress \
+    --group-id "${SG_ID}" \
+    --protocol tcp --port 22 \
+    --cidr "${SSH_CIDR}" \
+    --region "${REGION}" &>/dev/null
+
+  aws ec2 create-tags --resources "${SG_ID}" \
+    --tags "Key=Name,Value=${STACK_NAME}-sg" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  log "Security group: ${SG_ID}"
+}
+
+# -- UserData builders --
+userdata_base() {
+  cat <<'UD'
 #!/bin/bash
 set -e
-# Passwordless sudo for ec2-user (required by k0s_cluster_with_stack.sh)
 echo 'ec2-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ec2-user-nopasswd
 chmod 440 /etc/sudoers.d/ec2-user-nopasswd
-# Disable strict host key checking for inter-node SSH (k0s installer uses ssh -o StrictHostKeyChecking=no)
 mkdir -p /home/ec2-user/.ssh
 printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
   >> /home/ec2-user/.ssh/config
 chown -R ec2-user:ec2-user /home/ec2-user/.ssh
 chmod 700 /home/ec2-user/.ssh
 chmod 600 /home/ec2-user/.ssh/config
-UDEOF
-)
+UD
+}
 
-  # UserData: mount data disk at a given mount point
-  # $1 = mount point (e.g. /var/lib/k0s)
-  # Device name for second disk on Nitro instances is /dev/nvme1n1
-  userdata_mount_disk() {
-    local mp="$1"
-    cat <<MDEOF
-
-# Mount secondary EBS volume at ${mp}
+userdata_mount() {
+  local mp="$1"
+  cat <<MOUNT
 mount_data_disk() {
   local dev=""
-  # On Nitro instances the attached volume appears as nvme1n1
-  for candidate in /dev/nvme1n1 /dev/xvdb /dev/sdb; do
-    if [ -b "\$candidate" ]; then dev="\$candidate"; break; fi
-  done
-  if [ -z "\$dev" ]; then
-    echo "WARNING: secondary EBS device not found; skipping ${mp} mount" >&2
-    return
-  fi
-  # Format only if no filesystem
-  if ! blkid "\$dev" &>/dev/null; then
-    mkfs.xfs -f "\$dev"
-  fi
+  for c in /dev/nvme1n1 /dev/xvdb /dev/sdb; do [ -b "\$c" ] && dev="\$c" && break; done
+  [ -z "\$dev" ] && { echo "WARNING: data disk not found, skipping ${mp} mount" >&2; return; }
+  blkid "\$dev" &>/dev/null || mkfs.xfs -f "\$dev"
   mkdir -p "${mp}"
   grep -q "\$dev" /etc/fstab || echo "\$dev ${mp} xfs defaults,nofail 0 2" >> /etc/fstab
   mountpoint -q "${mp}" || mount "${mp}"
-  echo "Mounted \$dev at ${mp}"
 }
 mount_data_disk
-MDEOF
-  }
-
-  # Base64-encode a heredoc for CFN UserData
-  encode_userdata() {
-    printf '%s' "$1" | base64 | tr -d '\n'
-  }
-
-  # k0s node UserData (controller + workers)
-  local ud_k0s_node
-  ud_k0s_node="${userdata_common}"
-
-  # GPU worker UserData (adds /var/lib/k0s mount)
-  local ud_gpu_worker
-  ud_gpu_worker="${userdata_common}$(userdata_mount_disk '/var/lib/k0s')"
-
-  # Installer UserData (adds /data/minio mount if minio enabled)
-  local ud_installer
-  ud_installer="${userdata_common}"
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
-    ud_installer="${userdata_common}$(userdata_mount_disk '/data/minio')"
-  fi
-
-  # Generate GPU worker resources
-  local gpu_instances="" gpu_data_volumes="" gpu_vol_attachments=""
-  local i
-  for ((i=0; i<GPU_COUNT; i++)); do
-    local dev_idx=$((i + 1))  # /dev/nvme1n1 (second disk)
-    gpu_instances+="
-  GpuWorker${i}:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: ${GPU_TYPE}
-      ImageId: ${ami_id}
-      KeyName: ${KEY_NAME}
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds: [!Ref ClusterSG]
-      AssociatePublicIpAddress: ${k0s_node_public_ip}
-      BlockDeviceMappings:
-        - DeviceName: /dev/sda1
-          Ebs: { VolumeSize: ${GPU_DISK}, VolumeType: gp3, DeleteOnTermination: true }
-      UserData:
-        Fn::Base64: |
-$(echo "${ud_gpu_worker}" | sed 's/^/          /')
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-gpu-worker-${i}' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-        - { Key: k0s-role, Value: gpu-worker }
-"
-    gpu_data_volumes+="
-  GpuWorker${i}DataVol:
-    Type: AWS::EC2::Volume
-    DeletionPolicy: Delete
-    Properties:
-      AvailabilityZone: ${AZ}
-      Size: ${GPU_DATA_DISK}
-      VolumeType: gp3
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-gpu-worker-${i}-data' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-"
-    gpu_vol_attachments+="
-  GpuWorker${i}DataVolAttach:
-    Type: AWS::EC2::VolumeAttachment
-    Properties:
-      InstanceId: !Ref GpuWorker${i}
-      VolumeId: !Ref GpuWorker${i}DataVol
-      Device: /dev/sdb
-"
-  done
-
-  # Generate CPU worker resources
-  local cpu_instances=""
-  for ((i=0; i<CPU_COUNT; i++)); do
-    cpu_instances+="
-  CpuWorker${i}:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: ${CPU_TYPE}
-      ImageId: ${ami_id}
-      KeyName: ${KEY_NAME}
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds: [!Ref ClusterSG]
-      AssociatePublicIpAddress: ${k0s_node_public_ip}
-      BlockDeviceMappings:
-        - DeviceName: /dev/sda1
-          Ebs: { VolumeSize: ${CPU_DISK}, VolumeType: gp3, DeleteOnTermination: true }
-      UserData:
-        Fn::Base64: |
-$(echo "${ud_k0s_node}" | sed 's/^/          /')
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-cpu-worker-${i}' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-        - { Key: k0s-role, Value: cpu-worker }
-"
-  done
-
-  # Generate controller resources
-  local ctrl_instances=""
-  for ((i=0; i<CTRL_COUNT; i++)); do
-    ctrl_instances+="
-  Controller${i}:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: ${CTRL_TYPE}
-      ImageId: ${ami_id}
-      KeyName: ${KEY_NAME}
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds: [!Ref ClusterSG]
-      AssociatePublicIpAddress: ${k0s_node_public_ip}
-      BlockDeviceMappings:
-        - DeviceName: /dev/sda1
-          Ebs: { VolumeSize: ${CTRL_DISK}, VolumeType: gp3, DeleteOnTermination: true }
-      UserData:
-        Fn::Base64: |
-$(echo "${ud_k0s_node}" | sed 's/^/          /')
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-controller-${i}' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-        - { Key: k0s-role, Value: controller }
-"
-  done
-
-  # MinIO EBS volume
-  local minio_vol_resource=""
-  local minio_vol_attach=""
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
-    minio_vol_resource="
-  MinioDataVol:
-    Type: AWS::EC2::Volume
-    DeletionPolicy: Delete
-    Properties:
-      AvailabilityZone: ${AZ}
-      Size: ${MINIO_DATA_DISK}
-      VolumeType: gp3
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-minio-data' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-"
-    minio_vol_attach="
-  MinioDataVolAttach:
-    Type: AWS::EC2::VolumeAttachment
-    Properties:
-      InstanceId: !Ref InstallerInstance
-      VolumeId: !Ref MinioDataVol
-      Device: /dev/sdb
-"
-  fi
-
-  cat > "${CFN_TEMPLATE}" <<CFEOF
-AWSTemplateFormatVersion: '2010-09-09'
-Description: 'k0s cluster EC2 infrastructure — stack ${STACK_NAME}'
-
-Resources:
-  # ── Network ──────────────────────────────────────────────────────────────────
-  VPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: 10.10.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-vpc' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-
-  IGW:
-    Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-igw' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-
-  IGWAttach:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref IGW
-
-  PublicSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.10.0.0/24
-      AvailabilityZone: ${AZ}
-      MapPublicIpOnLaunch: false
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-subnet' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-
-  RouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-rt' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-
-  DefaultRoute:
-    Type: AWS::EC2::Route
-    DependsOn: IGWAttach
-    Properties:
-      RouteTableId: !Ref RouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref IGW
-
-  SubnetRouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref RouteTable
-
-  # ── Security Group ────────────────────────────────────────────────────────────
-  ClusterSG:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: k0s cluster nodes — all private-IP traffic + SSH to installer
-      VpcId: !Ref VPC
-      # Outbound: unrestricted
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-sg' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-
-  # Allow all traffic within the security group (private-IP k0s inter-node comms)
-  SGSelfIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ClusterSG
-      IpProtocol: -1
-      SourceSecurityGroupId: !Ref ClusterSG
-      Description: All intra-cluster traffic on private IPs
-
-  # SSH from allowed CIDR to installer machine
-  SGSSHIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ClusterSG
-      IpProtocol: tcp
-      FromPort: 22
-      ToPort: 22
-      CidrIp: ${SSH_CIDR}
-      Description: SSH from sshAllowedCidr to installer
-
-  # ── Installer Machine ─────────────────────────────────────────────────────────
-  InstallerInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: ${INST_TYPE}
-      ImageId: ${ami_id}
-      KeyName: ${KEY_NAME}
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds: [!Ref ClusterSG]
-      AssociatePublicIpAddress: false
-      BlockDeviceMappings:
-        - DeviceName: /dev/sda1
-          Ebs: { VolumeSize: ${INST_DISK}, VolumeType: gp3, DeleteOnTermination: true }
-      UserData:
-        Fn::Base64: |
-$(echo "${ud_installer}" | sed 's/^/          /')
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-installer' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-        - { Key: k0s-role, Value: installer }
-
-  InstallerEIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-      Tags:
-        - { Key: Name, Value: !Sub '\${AWS::StackName}-installer-eip' }
-        - { Key: ${TAG_KEY}, Value: !Ref AWS::StackName }
-
-  InstallerEIPAssoc:
-    Type: AWS::EC2::EIPAssociation
-    Properties:
-      InstanceId: !Ref InstallerInstance
-      EIP: !Ref InstallerEIP
-
-  # ── k0s Controllers ───────────────────────────────────────────────────────────
-${ctrl_instances}
-  # ── k0s CPU Workers ───────────────────────────────────────────────────────────
-${cpu_instances}
-  # ── k0s GPU Workers + Data Volumes ────────────────────────────────────────────
-${gpu_instances}
-${gpu_data_volumes}
-${gpu_vol_attachments}
-${minio_vol_resource}
-${minio_vol_attach}
-
-Outputs:
-  InstallerPublicIP:
-    Value: !Ref InstallerEIP
-    Description: Elastic IP of the installer machine (SSH from your laptop)
-  InstallerPrivateIP:
-    Value: !GetAtt InstallerInstance.PrivateIp
-    Description: Private IP of the installer machine
-  StackName:
-    Value: !Ref AWS::StackName
-CFEOF
-  log "Template written: ${CFN_TEMPLATE}"
+MOUNT
 }
 
-# ── Deploy stack ──────────────────────────────────────────────────────────────
-deploy_stack() {
-  log "Deploying CloudFormation stack: ${STACK_NAME} in ${REGION}..."
+make_userdata() {
+  local mp="${1:-}"
+  local ud
+  ud="$(userdata_base)"
+  [[ -n "$mp" ]] && ud+=$'\n'"$(userdata_mount "$mp")"
+  printf '%s' "$ud" | base64 | tr -d '\n'
+}
 
-  # Check for failed/rolled-back stacks and clean up
-  local existing_status
-  existing_status=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_EXISTS")
-
-  if [[ "$existing_status" == "CREATE_COMPLETE" || "$existing_status" == "UPDATE_COMPLETE" ]]; then
-    log "Stack already exists and is healthy (${existing_status})."
-    log "To reprovision, run 'destroy' first."
-    return 0
-  elif [[ "$existing_status" != "NOT_EXISTS" ]]; then
-    log "Existing stack in state ${existing_status} — deleting before retry..."
-    aws cloudformation delete-stack --stack-name "${STACK_NAME}" --region "${REGION}"
-    aws cloudformation wait stack-delete-complete --stack-name "${STACK_NAME}" --region "${REGION}" \
-      || warn "Wait for stack delete timed out; proceeding anyway"
-  fi
-
-  aws cloudformation deploy \
-    --template-file "${CFN_TEMPLATE}" \
-    --stack-name "${STACK_NAME}" \
+# -- Launch one EC2 instance (SCP-compliant: IMDSv2 + encrypted EBS) --
+# Usage: launch_instance <label> <type> <diskGb> <userdata_b64> [subnet_id_override]
+launch_instance() {
+  local label="$1" itype="$2" disk="$3" userdata_b64="$4"
+  local subnet="${5:-${SUBNET_ID}}"
+  local id
+  id=$(aws ec2 run-instances \
+    --image-id "${AMI_ID}" \
+    --instance-type "${itype}" \
+    --key-name "${KEY_NAME}" \
+    --count 1 \
+    --subnet-id "${subnet}" \
+    --security-group-ids "${SG_ID}" \
+    --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+    --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${disk},\"VolumeType\":\"gp3\",\"Encrypted\":true,\"DeleteOnTermination\":true}}]" \
+    --user-data "${userdata_b64}" \
+    --tag-specifications \
+      "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-${label}},{Key=${TAG_KEY},Value=${STACK_NAME}},{Key=k0s-role,Value=${label}},{Key=project,Value=ai-platform},{Key=env,Value=dev}]" \
+      "ResourceType=volume,Tags=[{Key=Name,Value=${STACK_NAME}-${label}-root},{Key=${TAG_KEY},Value=${STACK_NAME}}]" \
     --region "${REGION}" \
-    --no-fail-on-empty-changeset \
-    --capabilities CAPABILITY_IAM \
-    2>&1 | grep -v "^$" | while IFS= read -r line; do log "$line"; done || true
-
-  local final_status
-  final_status=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "UNKNOWN")
-
-  if [[ "$final_status" != "CREATE_COMPLETE" && "$final_status" != "UPDATE_COMPLETE" ]]; then
-    log "Stack events (last 10):"
-    aws cloudformation describe-stack-events \
-      --stack-name "${STACK_NAME}" --region "${REGION}" \
-      --query 'StackEvents[0:10].[ResourceStatus,ResourceType,ResourceStatusReason]' \
-      --output table 2>/dev/null || true
-    err "CloudFormation stack failed: ${final_status}"
-  fi
-  log "Stack deployed successfully (${final_status})"
+    --query 'Instances[0].InstanceId' \
+    --output text 2>&1) || err "Failed to launch ${label}: ${id}"
+  log "Launched ${label}: ${id}"
+  echo "${id}"
 }
 
-# ── Get instance private IPs by tag ──────────────────────────────────────────
-get_private_ips_by_role() {
-  local role="$1"
-  aws ec2 describe-instances \
+# -- Wait for instance running --
+wait_running() {
+  local id="$1" label="$2"
+  log "Waiting for ${label} (${id}) to be running..."
+  aws ec2 wait instance-running --instance-ids "${id}" --region "${REGION}"
+  log "${label} is running."
+}
+
+# -- Attach a data EBS volume (encrypted) --
+attach_data_volume() {
+  local instance_id="$1" label="$2" size_gb="$3"
+  log "Creating ${size_gb}GB encrypted data volume for ${label}..."
+  local vol_id
+  vol_id=$(aws ec2 create-volume \
+    --availability-zone "${AZ}" \
+    --size "${size_gb}" \
+    --volume-type gp3 \
+    --encrypted \
+    --tag-specifications \
+      "ResourceType=volume,Tags=[{Key=Name,Value=${STACK_NAME}-${label}-data},{Key=${TAG_KEY},Value=${STACK_NAME}}]" \
     --region "${REGION}" \
-    --filters \
-      "Name=tag:${TAG_KEY},Values=${STACK_NAME}" \
-      "Name=tag:k0s-role,Values=${role}" \
-      "Name=instance-state-name,Values=running,pending" \
-    --query 'Reservations[].Instances[].PrivateIpAddress' \
-    --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' | sort
+    --query 'VolumeId' --output text)
+  log "Volume ${vol_id} created. Waiting for available..."
+  aws ec2 wait volume-available --volume-ids "${vol_id}" --region "${REGION}"
+  aws ec2 attach-volume \
+    --volume-id "${vol_id}" \
+    --instance-id "${instance_id}" \
+    --device /dev/sdb \
+    --region "${REGION}" &>/dev/null
+  log "Volume ${vol_id} attached to ${instance_id}."
+  echo "${vol_id}"
 }
 
-get_installer_eip() {
-  aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query "Stacks[0].Outputs[?OutputKey=='InstallerPublicIP'].OutputValue" \
-    --output text 2>/dev/null || echo ""
+get_private_ip() {
+  local id="$1"
+  aws ec2 describe-instances --instance-ids "${id}" --region "${REGION}" \
+    --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text
 }
 
-get_installer_private_ip() {
-  aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query "Stacks[0].Outputs[?OutputKey=='InstallerPrivateIP'].OutputValue" \
-    --output text 2>/dev/null || echo ""
+# -- Mount data disk via SSH (direct or via jump) after EBS attach --
+# Usage: mount_disk_via_ssh <host> <mount_point> [jump_host]
+mount_disk_via_ssh() {
+  local host="$1" mp="$2" jump="${3:-}"
+  local ssh_opts=(-i "${KEY_LOCAL}" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes)
+  if [[ -n "${jump}" ]]; then
+    ssh_opts+=(-o "ProxyCommand=ssh -i ${KEY_LOCAL} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 -W %h:%p ec2-user@${jump}")
+  fi
+  log "Mounting ${mp} on ${host}..."
+  ssh "${ssh_opts[@]}" "ec2-user@${host}" "sudo bash -s" <<MOUNTSCRIPT
+set -e
+dev=""
+for c in /dev/nvme1n1 /dev/xvdb /dev/sdb; do [ -b "\$c" ] && dev="\$c" && break; done
+[ -z "\$dev" ] && { echo "ERROR: data disk not found on ${host}" >&2; exit 1; }
+blkid "\$dev" &>/dev/null || mkfs.xfs -f "\$dev"
+mkdir -p "${mp}"
+grep -q "\$dev" /etc/fstab || echo "\$dev ${mp} xfs defaults,nofail 0 2" >> /etc/fstab
+mountpoint -q "${mp}" || mount "${mp}"
+echo "Mounted \$dev at ${mp}"
+MOUNTSCRIPT
+  log "${mp} mounted on ${host}"
 }
 
-# ── Wait for SSH ──────────────────────────────────────────────────────────────
-wait_for_ssh() {
+# -- Wait for SSH (via EIP for installer, via jump for k0s nodes) --
+wait_for_ssh_direct() {
   local host="$1" label="$2" timeout=600 elapsed=0
   log "Waiting for SSH on ${label} (${host})..."
   while ! ssh -i "${KEY_LOCAL}" \
-      -o StrictHostKeyChecking=no \
-      -o ConnectTimeout=5 \
-      -o BatchMode=yes \
+      -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
       "ec2-user@${host}" 'true' 2>/dev/null; do
     sleep 10; elapsed=$((elapsed+10))
     [[ $elapsed -ge $timeout ]] && err "SSH to ${label} (${host}) timed out after ${timeout}s"
     echo -n "."
   done
-  echo ""
-  log "SSH ready: ${label} (${host})"
+  echo ""; log "SSH ready: ${label} (${host})"
 }
 
-# ── Wait for all nodes ────────────────────────────────────────────────────────
-wait_all_nodes_ssh() {
-  local eip; eip=$(get_installer_eip)
-  [[ -z "$eip" || "$eip" == "None" ]] && err "Could not get installer EIP from stack outputs"
-  wait_for_ssh "${eip}" "installer"
-
-  local ctrl_ips; readarray -t ctrl_ips < <(get_private_ips_by_role controller)
-  local cpu_ips;  readarray -t cpu_ips  < <(get_private_ips_by_role cpu-worker)
-  local gpu_ips;  readarray -t gpu_ips  < <(get_private_ips_by_role gpu-worker)
-
-  # SSH to k0s nodes via installer (jump host)
-  local all_ips=("${ctrl_ips[@]:-}" "${cpu_ips[@]:-}" "${gpu_ips[@]:-}")
-  for ip in "${all_ips[@]:-}"; do
-    [[ -z "$ip" ]] && continue
-    log "Waiting for SSH on k0s node ${ip} (via installer jump host)..."
-    local elapsed=0
-    while ! ssh -i "${KEY_LOCAL}" \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=5 \
-        -o BatchMode=yes \
-        -J "ec2-user@${eip}" \
-        "ec2-user@${ip}" 'true' 2>/dev/null; do
-      sleep 10; elapsed=$((elapsed+10))
-      [[ $elapsed -ge 600 ]] && err "SSH to ${ip} timed out"
-      echo -n "."
-    done
-    echo ""
-    log "SSH ready: ${ip}"
+wait_for_ssh_via_jump() {
+  local jump="$1" host="$2" label="$3" timeout=600 elapsed=0
+  log "Waiting for SSH on ${label} (${host}) via jump ${jump}..."
+  # Use ProxyCommand so the explicit -i key is forwarded to the jump hop
+  while ! ssh -i "${KEY_LOCAL}" \
+      -o "ProxyCommand=ssh -i ${KEY_LOCAL} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 -W %h:%p ec2-user@${jump}" \
+      -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+      "ec2-user@${host}" 'true' 2>/dev/null; do
+    sleep 10; elapsed=$((elapsed+10))
+    [[ $elapsed -ge $timeout ]] && err "SSH to ${label} (${host}) via ${jump} timed out after ${timeout}s"
+    echo -n "."
   done
+  echo ""; log "SSH ready: ${label} (${host})"
 }
 
-# ── Setup installer machine ───────────────────────────────────────────────────
+# -- Setup installer machine --
 setup_installer() {
-  local eip; eip=$(get_installer_eip)
-
-  log "Copying SSH key to installer machine..."
-  scp -i "${KEY_LOCAL}" \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=10 \
+  local eip="$1"
+  log "Copying SSH key to installer..."
+  scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
     "${KEY_LOCAL}" "ec2-user@${eip}:~/.ssh/id_rsa"
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
     'chmod 600 ~/.ssh/id_rsa'
 
-  log "Copying k0s cluster scripts to installer..."
-  scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no -r \
-    "${SCRIPT_DIR}/"* "ec2-user@${eip}:~/cluster_setup/"
-
-  # Install prerequisites on installer (yq, kubectl, helm, jq)
-  log "Installing prerequisites on installer machine..."
+  log "Installing prerequisites on installer (yq, kubectl, helm, jq)..."
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'PREREQ'
 set -e
 export PATH="$PATH:/usr/local/bin"
 sudo dnf install -y git jq curl unzip 2>/dev/null || sudo yum install -y git jq curl unzip
-
-# yq
-if ! command -v yq &>/dev/null; then
+command -v yq &>/dev/null || {
   sudo curl -sSL -o /usr/local/bin/yq \
     "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
   sudo chmod +x /usr/local/bin/yq
-fi
-
-# kubectl
-if ! command -v kubectl &>/dev/null; then
+}
+command -v kubectl &>/dev/null || {
   K8S_VER=$(curl -sSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.32.0)
   sudo curl -sSL -o /usr/local/bin/kubectl \
     "https://dl.k8s.io/release/${K8S_VER}/bin/linux/amd64/kubectl"
   sudo chmod +x /usr/local/bin/kubectl
-fi
-
-# helm
-if ! command -v helm &>/dev/null; then
+}
+command -v helm &>/dev/null || \
   curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-fi
-
-echo "Prerequisites ready: yq=$(yq --version 2>/dev/null) kubectl=$(kubectl version --client -o json 2>/dev/null | jq -r '.clientVersion.gitVersion' || echo unknown)"
+echo "Prerequisites ready."
 PREREQ
+
+  log "Copying k0s cluster scripts to installer..."
+  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
+    'mkdir -p ~/cluster_setup'
+  scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
+    "${SCRIPT_DIR}/"*.sh "${SCRIPT_DIR}/"*.yaml \
+    "ec2-user@${eip}:~/cluster_setup/" 2>/dev/null || true
 }
 
-# ── MinIO install ─────────────────────────────────────────────────────────────
+# -- MinIO install --
 install_minio() {
-  local eip; eip=$(get_installer_eip)
-  local installer_priv_ip; installer_priv_ip=$(get_installer_private_ip)
-
+  local eip="$1" installer_priv_ip="$2"
   [[ ! -f "$MINIO_INSTALL_SCRIPT" ]] && err "MinIO install script not found: ${MINIO_INSTALL_SCRIPT}"
+  [[ -z "$MINIO_PASS" ]] && \
+    MINIO_PASS=$(openssl rand -base64 18 | tr -d '=+/' | head -c 24)
 
-  # Generate password if not set
-  if [[ -z "$MINIO_PASS" ]]; then
-    MINIO_PASS=$(openssl rand -base64 18 2>/dev/null | tr -d '=+/' | head -c 24)
-    log "Auto-generated MinIO password (save it): ${MINIO_PASS}"
-  fi
-
-  log "Copying MinIO install script to installer..."
+  log "Installing MinIO on installer (http://${installer_priv_ip}:${MINIO_PORT})..."
   scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
     "${MINIO_INSTALL_SCRIPT}" "ec2-user@${eip}:~/install_minio_ec2.sh"
 
-  log "Running MinIO install on installer machine..."
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
     "sudo bash ~/install_minio_ec2.sh \
       --bucket '${MINIO_BUCKET}' \
@@ -710,40 +459,38 @@ install_minio() {
       --password '${MINIO_PASS}' \
       --data-dir /data/minio \
       --port ${MINIO_PORT}"
-
-  log "MinIO install complete at http://${installer_priv_ip}:${MINIO_PORT}"
+  log "MinIO ready at http://${installer_priv_ip}:${MINIO_PORT}"
 }
 
-# ── Generate my-k0s-config.yaml on installer ─────────────────────────────────
+# -- Push auto-generated k0s config to installer --
 push_k0s_config() {
-  local eip; eip=$(get_installer_eip)
-  local installer_priv_ip; installer_priv_ip=$(get_installer_private_ip)
+  local eip="$1" installer_priv_ip="$2"
+  load_state
 
-  readarray -t ctrl_ips  < <(get_private_ips_by_role controller)
-  readarray -t cpu_ips   < <(get_private_ips_by_role cpu-worker)
-  readarray -t gpu_ips   < <(get_private_ips_by_role gpu-worker)
+  local ctrl_yaml="" worker_yaml=""
+  for v in $(compgen -v | grep '^CTRL_IP_' | sort); do
+    ctrl_yaml+="      - ${!v}"$'\n'
+  done
+  for v in $(compgen -v | grep '^CPU_IP_' | sort); do
+    worker_yaml+="      - ${!v}  # cpu-worker"$'\n'
+  done
+  for v in $(compgen -v | grep '^GPU_IP_' | sort); do
+    worker_yaml+="      - ${!v}  # gpu-worker"$'\n'
+  done
 
-  # Build existingIPs YAML
-  local ctrl_yaml=""; for ip in "${ctrl_ips[@]:-}"; do [[ -n "$ip" ]] && ctrl_yaml+="      - ${ip}"$'\n'; done
-  local worker_yaml=""
-  for ip in "${cpu_ips[@]:-}"; do  [[ -n "$ip" ]] && worker_yaml+="      - ${ip}  # cpu-worker"$'\n'; done
-  for ip in "${gpu_ips[@]:-}"; do  [[ -n "$ip" ]] && worker_yaml+="      - ${ip}  # gpu-worker"$'\n'; done
-
-  local minio_endpoint=""; local minio_block=""
+  local minio_block=""
   if [[ "$MINIO_ENABLED" == "true" ]]; then
-    minio_endpoint="http://${installer_priv_ip}:${MINIO_PORT}"
-    minio_block="    endpoint: \"${minio_endpoint}\"
+    minio_block="    endpoint: \"http://${installer_priv_ip}:${MINIO_PORT}\"
     auth:
       rootUser: \"${MINIO_USER}\"
       rootPassword: \"${MINIO_PASS}\""
   fi
 
-  # Write config to installer
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
     "cat > ~/cluster_setup/my-k0s-config.yaml" <<KCEOF
-# Auto-generated by k0s_aws_provision.sh — $(date -Iseconds 2>/dev/null || date)
+# Auto-generated by k0s_aws_provision.sh -- $(date -Iseconds 2>/dev/null || date)
 # Stack: ${STACK_NAME} / Region: ${REGION}
-# Run on installer: CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml ~/cluster_setup/k0s_cluster_with_stack.sh install
+# Run: CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml ~/cluster_setup/k0s_cluster_with_stack.sh install
 
 cluster:
   name: ${STACK_NAME}-cluster
@@ -837,7 +584,7 @@ metallb:
   pool:
     name: "saia-pool"
     addresses:
-      - "10.10.0.200-10.10.0.210"
+      - "10.0.34.200-10.0.34.210"
 
 imagePullSecrets:
   secrets:
@@ -851,26 +598,175 @@ KCEOF
   log "k0s config written to installer: ~/cluster_setup/my-k0s-config.yaml"
 }
 
-# ── Output command ────────────────────────────────────────────────────────────
+# ============================================================
+# PROVISION
+# ============================================================
+cmd_provision() {
+  load_config
+  check_aws_auth
+
+  if [[ -f "${STATE_FILE}" ]]; then
+    warn "State file exists: ${STATE_FILE}"
+    warn "Stack may already be provisioned. Run 'status' to check, or 'destroy' first."
+    if [[ -t 0 ]]; then
+      read -r -p "Continue anyway? [y/N]: " cont < /dev/tty
+      [[ "$(echo "${cont}" | tr '[:upper:]' '[:lower:]')" != "y" ]] && { log "Aborted."; return 1; }
+    else
+      err "State file exists and stdin is not a TTY. Remove ${STATE_FILE} manually if you want to re-provision."
+    fi
+  fi
+
+  : > "${STATE_FILE}"
+  log "=== k0s AWS Provisioner ==="
+  log "Stack: ${STACK_NAME}  Region: ${REGION}  AZ: ${AZ}"
+  log "VPC: ${VPC_ID} (existing ai-platform VPC)"
+
+  AMI_ID=$(get_rhel9_ami)
+  pick_subnet
+  save_state "SUBNET_ID" "${SUBNET_ID}"
+  save_state "INSTALLER_SUBNET_ID" "${INSTALLER_SUBNET_ID}"
+  ensure_key_pair
+  ensure_security_group
+  save_state "SG_ID" "${SG_ID}"
+
+  # ---------- Launch instances ----------
+  local ud_k0s ud_gpu ud_installer
+  ud_k0s=$(make_userdata "")
+  ud_gpu=$(make_userdata "/var/lib/k0s")
+  if [[ "$MINIO_ENABLED" == "true" ]]; then
+    ud_installer=$(make_userdata "/data/minio")
+  else
+    ud_installer=$(make_userdata "")
+  fi
+
+  for ((i=0; i<CTRL_COUNT; i++)); do
+    local id; id=$(launch_instance "controller-${i}" "${CTRL_TYPE}" "${CTRL_DISK}" "${ud_k0s}")
+    save_state "CTRL_INSTANCE_${i}" "${id}"
+  done
+
+  for ((i=0; i<CPU_COUNT; i++)); do
+    local id; id=$(launch_instance "cpu-worker-${i}" "${CPU_TYPE}" "${CPU_DISK}" "${ud_k0s}")
+    save_state "CPU_INSTANCE_${i}" "${id}"
+  done
+
+  for ((i=0; i<GPU_COUNT; i++)); do
+    local id; id=$(launch_instance "gpu-worker-${i}" "${GPU_TYPE}" "${GPU_DISK}" "${ud_gpu}")
+    save_state "GPU_INSTANCE_${i}" "${id}"
+  done
+
+  local inst_id
+  inst_id=$(launch_instance "installer" "${INST_TYPE}" "${INST_DISK}" "${ud_installer}" "${INSTALLER_SUBNET_ID}")
+  save_state "INSTALLER_INSTANCE" "${inst_id}"
+
+  # ---------- Wait for all running ----------
+  load_state
+  for v in $(compgen -v | grep '_INSTANCE'); do
+    [[ -n "${!v}" ]] && wait_running "${!v}" "${v}"
+  done
+
+  # ---------- Attach data volumes ----------
+  load_state
+  for ((i=0; i<GPU_COUNT; i++)); do
+    local inst_var="GPU_INSTANCE_${i}"
+    load_state
+    local vid; vid=$(attach_data_volume "${!inst_var}" "gpu-worker-${i}" "${GPU_DATA_DISK}")
+    save_state "GPU_VOL_${i}" "${vid}"
+  done
+  if [[ "$MINIO_ENABLED" == "true" ]]; then
+    load_state
+    local vid; vid=$(attach_data_volume "${INSTALLER_INSTANCE}" "minio" "${MINIO_DATA_DISK}")
+    save_state "MINIO_VOL" "${vid}"
+  fi
+
+  # ---------- Elastic IP for installer ----------
+  log "Allocating Elastic IP for installer..."
+  local eip_alloc eip
+  eip_alloc=$(aws ec2 allocate-address --domain vpc --region "${REGION}" \
+    --query 'AllocationId' --output text)
+  aws ec2 create-tags --resources "${eip_alloc}" \
+    --tags "Key=Name,Value=${STACK_NAME}-installer-eip" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+
+  load_state
+  aws ec2 associate-address \
+    --allocation-id "${eip_alloc}" \
+    --instance-id "${INSTALLER_INSTANCE}" \
+    --region "${REGION}" &>/dev/null
+  eip=$(aws ec2 describe-addresses --allocation-ids "${eip_alloc}" \
+    --region "${REGION}" --query 'Addresses[0].PublicIp' --output text)
+  save_state "EIP_ALLOC" "${eip_alloc}"
+  save_state "EIP" "${eip}"
+  log "Installer EIP: ${eip}"
+
+  # ---------- Collect private IPs ----------
+  load_state
+  for ((i=0; i<CTRL_COUNT; i++)); do
+    local v="CTRL_INSTANCE_${i}"; load_state
+    local ip; ip=$(get_private_ip "${!v}")
+    save_state "CTRL_IP_${i}" "${ip}"
+  done
+  for ((i=0; i<CPU_COUNT; i++)); do
+    local v="CPU_INSTANCE_${i}"; load_state
+    local ip; ip=$(get_private_ip "${!v}")
+    save_state "CPU_IP_${i}" "${ip}"
+  done
+  for ((i=0; i<GPU_COUNT; i++)); do
+    local v="GPU_INSTANCE_${i}"; load_state
+    local ip; ip=$(get_private_ip "${!v}")
+    save_state "GPU_IP_${i}" "${ip}"
+  done
+  load_state
+  local installer_priv_ip; installer_priv_ip=$(get_private_ip "${INSTALLER_INSTANCE}")
+  save_state "INSTALLER_PRIV_IP" "${installer_priv_ip}"
+
+  # ---------- Wait for SSH ----------
+  load_state
+  wait_for_ssh_direct "${EIP}" "installer"
+
+  for v in $(compgen -v | grep '^CTRL_IP_\|^CPU_IP_\|^GPU_IP_'); do
+    [[ -z "${!v}" ]] && continue
+    wait_for_ssh_via_jump "${EIP}" "${!v}" "${v}"
+  done
+
+  # ---------- Mount data disks via SSH (EBS is attached after boot) ----------
+  load_state
+  for ((i=0; i<GPU_COUNT; i++)); do
+    local gpu_ip_var="GPU_IP_${i}"
+    [[ -n "${!gpu_ip_var}" ]] && \
+      mount_disk_via_ssh "${!gpu_ip_var}" "/var/lib/k0s" "${EIP}"
+  done
+  if [[ "$MINIO_ENABLED" == "true" ]]; then
+    mount_disk_via_ssh "${EIP}" "/data/minio"
+  fi
+
+  # ---------- Setup installer ----------
+  setup_installer "${EIP}"
+
+  # ---------- MinIO ----------
+  if [[ "$MINIO_ENABLED" == "true" ]]; then
+    load_state
+    install_minio "${EIP}" "${INSTALLER_PRIV_IP}"
+    save_state "MINIO_PASS" "${MINIO_PASS}"
+  fi
+
+  # ---------- Push k0s config ----------
+  load_state
+  push_k0s_config "${EIP}" "${INSTALLER_PRIV_IP}"
+
+  cmd_output
+}
+
+# ============================================================
+# OUTPUT
+# ============================================================
 cmd_output() {
   load_config
-
-  local stack_status
-  stack_status=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_EXISTS")
-  [[ "$stack_status" == "NOT_EXISTS" ]] && err "Stack '${STACK_NAME}' not found. Run 'provision' first."
-
-  local eip; eip=$(get_installer_eip)
-  local installer_priv_ip; installer_priv_ip=$(get_installer_private_ip)
-
-  readarray -t ctrl_ips  < <(get_private_ips_by_role controller)
-  readarray -t cpu_ips   < <(get_private_ips_by_role cpu-worker)
-  readarray -t gpu_ips   < <(get_private_ips_by_role gpu-worker)
+  [[ ! -f "${STATE_FILE}" ]] && err "No state file found. Run 'provision' first."
+  load_state
 
   echo ""
   echo "================================================================"
-  echo "  k0s AWS Provision — Output"
+  echo "  k0s AWS Provision -- Output"
   echo "  Stack: ${STACK_NAME}  Region: ${REGION}"
   echo "================================================================"
   echo ""
@@ -883,222 +779,182 @@ cmd_output() {
   echo "  nodes:"
   echo "    existingIPs:"
   echo "      controllers:"
-  for ip in "${ctrl_ips[@]:-}"; do [[ -n "$ip" ]] && echo "        - ${ip}"; done
+  for v in $(compgen -v | grep '^CTRL_IP_' | sort); do echo "        - ${!v}"; done
   echo "      workers:"
-  for ip in "${cpu_ips[@]:-}";  do [[ -n "$ip" ]] && echo "        - ${ip}  # cpu-worker"; done
-  for ip in "${gpu_ips[@]:-}";  do [[ -n "$ip" ]] && echo "        - ${ip}  # gpu-worker"; done
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
+  for v in $(compgen -v | grep '^CPU_IP_'  | sort); do echo "        - ${!v}  # cpu-worker"; done
+  for v in $(compgen -v | grep '^GPU_IP_'  | sort); do echo "        - ${!v}  # gpu-worker"; done
+  if [[ "${MINIO_ENABLED}" == "true" ]]; then
     echo ""
     echo "  storage:"
     echo "    objectStore:"
     echo "      type: minio"
     echo "      bucket: ${MINIO_BUCKET}"
-    echo "      endpoint: \"http://${installer_priv_ip}:${MINIO_PORT}\""
+    echo "      endpoint: \"http://${INSTALLER_PRIV_IP}:${MINIO_PORT}\""
     echo "      auth:"
     echo "        rootUser: ${MINIO_USER}"
-    echo "        rootPassword: ${MINIO_PASS}"
+    echo "        rootPassword: ${MINIO_PASS:-<check state file>}"
   fi
   echo ""
   echo "================================================================"
-  echo "  SSH to installer (run k0s install from here):"
-  echo "    ssh -i ${KEY_LOCAL} ec2-user@${eip}"
+  echo "  SSH to installer:"
+  echo "    ssh -i ${KEY_LOCAL} ec2-user@${EIP}"
   echo ""
   echo "  Auto-generated k0s config on installer:"
   echo "    ~/cluster_setup/my-k0s-config.yaml"
   echo ""
-  echo "  Run install:"
+  echo "  Run install from installer:"
   echo "    CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \\"
   echo "      ~/cluster_setup/k0s_cluster_with_stack.sh install"
   echo "================================================================"
-  echo ""
 }
 
-# ── Status command ────────────────────────────────────────────────────────────
+# ============================================================
+# STATUS
+# ============================================================
 cmd_status() {
   load_config
-
-  local stack_status
-  stack_status=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_EXISTS")
-
+  [[ ! -f "${STATE_FILE}" ]] && { log "No state file for '${STACK_NAME}'."; return; }
+  load_state
   echo ""
-  echo "Stack: ${STACK_NAME}  Status: ${stack_status}  Region: ${REGION}"
+  echo "Stack: ${STACK_NAME}  Region: ${REGION}  State: ${STATE_FILE}"
   echo ""
-
-  if [[ "$stack_status" == "NOT_EXISTS" ]]; then
-    echo "  (stack not found)"; return
-  fi
-
-  echo "Instances:"
   aws ec2 describe-instances \
     --region "${REGION}" \
     --filters "Name=tag:${TAG_KEY},Values=${STACK_NAME}" \
-    --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0], PrivateIpAddress, PublicIpAddress, State.Name, InstanceType]' \
+    --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],PrivateIpAddress,State.Name,InstanceType]' \
     --output table 2>/dev/null || true
-
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
-    local eip; eip=$(get_installer_eip)
-    local installer_priv_ip; installer_priv_ip=$(get_installer_private_ip)
-    echo ""
-    echo -n "MinIO health (http://${installer_priv_ip}:${MINIO_PORT}): "
+  echo ""
+  if [[ "${MINIO_ENABLED:-false}" == "true" && -n "${EIP:-}" ]]; then
+    echo -n "MinIO health (${EIP}): "
     local code
     code=$(ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-      "ec2-user@${eip}" \
-      "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${MINIO_PORT}/minio/health/live" 2>/dev/null || echo "unreachable")
-    if [[ "$code" == "200" ]]; then echo "OK"; else echo "FAIL (${code})"; fi
+      "ec2-user@${EIP}" \
+      "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${MINIO_PORT}/minio/health/live" \
+      2>/dev/null || echo "unreachable")
+    [[ "$code" == "200" ]] && echo "OK" || echo "FAIL (${code})"
   fi
-  echo ""
 }
 
-# ── Destroy command ───────────────────────────────────────────────────────────
+# ============================================================
+# DESTROY
+# ============================================================
 cmd_destroy() {
   load_config
+  [[ ! -f "${STATE_FILE}" ]] && { log "No state file for '${STACK_NAME}'. Nothing to destroy."; return; }
+  load_state
 
-  local stack_status
-  stack_status=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" --region "${REGION}" \
-    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_EXISTS")
+  echo ""
+  echo "WARNING: Permanently destroying all resources for stack '${STACK_NAME}' in ${REGION}."
+  local confirm=""
+  if [[ "${FORCE_DESTROY}" == "true" ]]; then
+    confirm="${STACK_NAME}"
+  elif [[ -t 0 ]]; then
+    read -r -p "Type the stack name to confirm: " confirm < /dev/tty
+  else
+    err "Destroy requires interactive confirmation. Run from a terminal or use --yes."
+  fi
+  [[ "$confirm" != "${STACK_NAME}" ]] && { log "Confirmation mismatch -- aborted."; return 1; }
 
-  if [[ "$stack_status" == "NOT_EXISTS" ]]; then
-    log "Stack '${STACK_NAME}' does not exist — nothing to destroy."; return 0
+  # Collect all instance IDs
+  local instance_ids=()
+  for v in $(compgen -v | grep '_INSTANCE'); do
+    [[ -n "${!v}" ]] && instance_ids+=("${!v}")
+  done
+  if [[ ${#instance_ids[@]} -gt 0 ]]; then
+    log "Terminating instances: ${instance_ids[*]}"
+    aws ec2 terminate-instances --instance-ids "${instance_ids[@]}" \
+      --region "${REGION}" &>/dev/null || true
+    log "Waiting for termination..."
+    aws ec2 wait instance-terminated --instance-ids "${instance_ids[@]}" \
+      --region "${REGION}" 2>/dev/null || warn "Wait timed out — instances may still be shutting down"
   fi
 
-  echo ""
-  echo "WARNING: This will permanently destroy all resources in stack '${STACK_NAME}':"
-  echo "  Region: ${REGION}"
-  echo "  Instances: controllers(${CTRL_COUNT}), cpu-workers(${CPU_COUNT}), gpu-workers(${GPU_COUNT}), installer"
-  echo "  Volumes, EIPs, VPC, and all data will be deleted."
-  echo ""
-  read -r -p "Type the stack name to confirm destruction: " confirm
-  [[ "$confirm" != "${STACK_NAME}" ]] && { log "Confirmation mismatch — aborting."; return 1; }
+  # Release EIP
+  if [[ -n "${EIP_ALLOC:-}" ]]; then
+    log "Releasing EIP ${EIP_ALLOC}..."
+    aws ec2 release-address --allocation-id "${EIP_ALLOC}" \
+      --region "${REGION}" 2>/dev/null || true
+  fi
 
-  # EBS volumes tagged with stack name (orphan-safe delete)
-  log "Finding and deleting EBS data volumes..."
-  local vol_ids
-  readarray -t vol_ids < <(aws ec2 describe-volumes \
-    --region "${REGION}" \
-    --filters "Name=tag:${TAG_KEY},Values=${STACK_NAME}" "Name=status,Values=available,in-use" \
-    --query 'Volumes[].VolumeId' --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$')
-
-  log "Deleting CloudFormation stack: ${STACK_NAME}..."
-  aws cloudformation delete-stack --stack-name "${STACK_NAME}" --region "${REGION}"
-  log "Waiting for stack deletion (this can take 5-10 minutes)..."
-  aws cloudformation wait stack-delete-complete --stack-name "${STACK_NAME}" --region "${REGION}" \
-    || warn "Stack delete wait timed out; check AWS console for stragglers"
-
-  # Delete any volumes that survived (e.g. if attach was stuck)
-  for vol_id in "${vol_ids[@]:-}"; do
-    [[ -z "$vol_id" ]] && continue
-    log "Deleting orphan volume: ${vol_id}"
-    aws ec2 delete-volume --volume-id "${vol_id}" --region "${REGION}" 2>/dev/null || true
+  # Delete data volumes
+  for v in $(compgen -v | grep '^GPU_VOL_\|^MINIO_VOL$'); do
+    [[ -z "${!v}" ]] && continue
+    log "Deleting volume ${!v}..."
+    aws ec2 wait volume-available --volume-ids "${!v}" --region "${REGION}" 2>/dev/null || true
+    aws ec2 delete-volume --volume-id "${!v}" --region "${REGION}" 2>/dev/null || true
   done
 
-  # Delete auto-created key pair
-  if [[ -z "$(cfg_default '.keyPair.name' '')" || "$(cfg_default '.keyPair.name' '')" == "null" ]]; then
-    local auto_key="${STACK_NAME}-key"
-    local kp_auto_created
-    kp_auto_created=$(aws ec2 describe-key-pairs \
-      --key-names "${auto_key}" --region "${REGION}" \
-      --query 'KeyPairs[0].Tags[?Key==`auto-created`].Value|[0]' \
+  # Delete security group (only if we created it — identified by tag)
+  if [[ -n "${SG_ID:-}" ]]; then
+    local sg_tag
+    sg_tag=$(aws ec2 describe-security-groups --region "${REGION}" \
+      --group-ids "${SG_ID}" \
+      --query "SecurityGroups[0].Tags[?Key=='${TAG_KEY}'].Value|[0]" \
       --output text 2>/dev/null || echo "")
-    if [[ "$kp_auto_created" == "true" ]]; then
-      log "Deleting auto-created key pair: ${auto_key}"
-      aws ec2 delete-key-pair --key-name "${auto_key}" --region "${REGION}" 2>/dev/null || true
-      if [[ -f "${KEY_LOCAL}" ]]; then
-        read -r -p "Delete local key file ${KEY_LOCAL}? [y/N]: " del_local
-        [[ "${del_local,,}" == "y" ]] && rm -f "${KEY_LOCAL}" && log "Deleted ${KEY_LOCAL}"
-      fi
+    if [[ "$sg_tag" == "${STACK_NAME}" ]]; then
+      log "Deleting security group ${SG_ID}..."
+      aws ec2 delete-security-group --group-id "${SG_ID}" \
+        --region "${REGION}" 2>/dev/null || warn "Could not delete SG ${SG_ID} (may still have dependencies)"
     fi
   fi
 
+  # Delete auto-created key pair
+  local auto_key="${STACK_NAME}-key"
+  local kp_auto
+  kp_auto=$(aws ec2 describe-key-pairs --key-names "${auto_key}" --region "${REGION}" \
+    --query 'KeyPairs[0].Tags[?Key==`auto-created`].Value|[0]' \
+    --output text 2>/dev/null || echo "")
+  if [[ "$kp_auto" == "true" ]]; then
+    log "Deleting auto-created key pair: ${auto_key}"
+    aws ec2 delete-key-pair --key-name "${auto_key}" --region "${REGION}" 2>/dev/null || true
+    if [[ -f "${KEY_LOCAL}" ]]; then
+      local del_local="n"
+      if [[ "${FORCE_DESTROY}" == "true" ]]; then
+        del_local="y"
+      elif [[ -t 0 ]]; then
+        read -r -p "Delete local key file ${KEY_LOCAL}? [y/N]: " del_local < /dev/tty
+      fi
+      [[ "$(echo "${del_local}" | tr '[:upper:]' '[:lower:]')" == "y" ]] && rm -f "${KEY_LOCAL}" && log "Deleted ${KEY_LOCAL}"
+    fi
+  fi
+
+  rm -f "${STATE_FILE}"
   log "Destroy complete."
 }
 
-# ── Validate / dry-run ────────────────────────────────────────────────────────
-cmd_validate() {
-  load_config
-  local ami_id; ami_id=$(get_rhel9_ami)
-  ensure_key_pair
-  generate_cfn_template "${ami_id}"
-  log "Validating template with AWS..."
-  aws cloudformation validate-template \
-    --template-body "file://${CFN_TEMPLATE}" \
-    --region "${REGION}" && log "Template is valid."
-  if command -v cfn-lint &>/dev/null; then
-    log "Running cfn-lint..."
-    cfn-lint "${CFN_TEMPLATE}" && log "cfn-lint: no issues."
-  else
-    warn "cfn-lint not installed (pip install cfn-lint) — skipping deep lint."
-  fi
-}
-
+# ============================================================
+# DRY RUN
+# ============================================================
 cmd_dryrun() {
-  cmd_validate
-  echo ""
-  echo "=== Dry-run complete. Template at: ${CFN_TEMPLATE} ==="
-  echo "Would create:"
-  echo "  1 VPC, 1 Subnet, 1 IGW, 1 Security Group"
-  echo "  1 Installer (${INST_TYPE}, ${INST_DISK}GB) + EIP"
-  echo "  ${CTRL_COUNT} Controller(s) (${CTRL_TYPE}, ${CTRL_DISK}GB)"
-  echo "  ${CPU_COUNT} CPU Worker(s) (${CPU_TYPE}, ${CPU_DISK}GB)"
-  echo "  ${GPU_COUNT} GPU Worker(s) (${GPU_TYPE}, ${GPU_DISK}GB root + ${GPU_DATA_DISK}GB /var/lib/k0s)"
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
-    echo "  MinIO on installer (${MINIO_DATA_DISK}GB /data/minio)"
-  fi
-  echo "  Region: ${REGION}  AZ: ${AZ}"
-}
-
-# ── Provision command ─────────────────────────────────────────────────────────
-cmd_provision() {
   load_config
   check_aws_auth
-
-  log "=== k0s AWS Provisioner ==="
-  log "Stack: ${STACK_NAME}  Region: ${REGION}  AZ: ${AZ}"
-
-  local ami_id; ami_id=$(get_rhel9_ami)
+  AMI_ID=$(get_rhel9_ami)
+  pick_subnet
   ensure_key_pair
-  generate_cfn_template "${ami_id}"
-
-  # Validate before deploying
-  log "Validating template..."
-  aws cloudformation validate-template \
-    --template-body "file://${CFN_TEMPLATE}" \
-    --region "${REGION}" &>/dev/null || err "Template validation failed. Run 'validate' for details."
-
-  deploy_stack
-
-  log "Waiting for all nodes to be SSH-reachable..."
-  wait_all_nodes_ssh
-
-  setup_installer
-
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
-    # Wait for /data/minio mount to complete (UserData runs async on RHEL 9)
-    local eip; eip=$(get_installer_eip)
-    log "Waiting for /data/minio mount on installer..."
-    local elapsed=0
-    while ! ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
-        'mountpoint -q /data/minio' 2>/dev/null; do
-      sleep 10; elapsed=$((elapsed+10))
-      [[ $elapsed -ge 300 ]] && err "/data/minio not mounted after 5 minutes. Check UserData logs: sudo cat /var/log/cloud-init-output.log"
-      echo -n "."
-    done; echo ""
-    install_minio
-  fi
-
-  push_k0s_config
-  cmd_output
+  echo ""
+  echo "=== Dry-run: would create the following in existing VPC ${VPC_ID} ==="
+  echo "  k0s nodes subnet    : ${SUBNET_ID} (${AZ}, private)"
+  echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${AZ}, public)"
+  echo "  Security Group: new '${STACK_NAME}-sg' (self-ref + SSH from ${SSH_CIDR})"
+  echo "  1 Installer    : ${INST_TYPE}, ${INST_DISK}GB root (encrypted) + EIP"
+  echo "  ${CTRL_COUNT} Controller(s) : ${CTRL_TYPE}, ${CTRL_DISK}GB root (encrypted)"
+  echo "  ${CPU_COUNT} CPU Worker(s)  : ${CPU_TYPE}, ${CPU_DISK}GB root (encrypted)"
+  echo "  ${GPU_COUNT} GPU Worker(s)  : ${GPU_TYPE}, ${GPU_DISK}GB root (encrypted) + ${GPU_DATA_DISK}GB /var/lib/k0s"
+  [[ "$MINIO_ENABLED" == "true" ]] && \
+    echo "  MinIO on installer: ${MINIO_DATA_DISK}GB /data/minio"
+  echo "  All instances: IMDSv2 required, EBS encrypted"
+  echo "  State file: ${STATE_FILE}"
+  echo ""
 }
 
-# ── Dispatch ──────────────────────────────────────────────────────────────────
+# ============================================================
+# DISPATCH
+# ============================================================
 case "$COMMAND" in
   provision) cmd_provision ;;
-  output)    load_config; cmd_output ;;
+  output)    load_config; load_state; cmd_output ;;
   status)    cmd_status ;;
   destroy)   cmd_destroy ;;
-  validate)  cmd_validate ;;
-  dry-run)   load_config; cmd_dryrun ;;
-  *) err "Unknown command: ${COMMAND}. Valid: provision output status destroy validate dry-run" ;;
+  dry-run)   cmd_dryrun ;;
+  *) err "Unknown command: ${COMMAND}. Valid: provision output status destroy dry-run" ;;
 esac
