@@ -649,6 +649,40 @@ wait_for_ssh_via_jump() {
   echo ""; log "SSH ready: ${label} (${host})"
 }
 
+# -- Verify outbound internet access from a private node via NAT --
+# Usage: check_nat_connectivity <private_ip> <label> <jump_eip>
+# Checks three endpoints that k0s install actually needs:
+#   get.k0s.sh  — k0s binary download
+#   developer.download.nvidia.com — NVIDIA driver repo
+#   registry-1.docker.io — container image pulls
+check_nat_connectivity() {
+  local host="$1" label="$2" jump="$3"
+  local proxy_opt="ProxyCommand=ssh -i ${KEY_LOCAL} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 -W %h:%p ec2-user@${jump}"
+  local ssh_base=(-i "${KEY_LOCAL}" -o "${proxy_opt}" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@${host}")
+
+  log "Checking NAT outbound connectivity on ${label} (${host})..."
+  local failed=0
+  local endpoints=("https://get.k0s.sh" "https://developer.download.nvidia.com" "https://registry-1.docker.io")
+  for url in "${endpoints[@]}"; do
+    local result
+    result=$(ssh "${ssh_base[@]}" \
+      "curl -sSf --max-time 10 -o /dev/null -w '%{http_code}' '${url}' 2>/dev/null || echo FAIL" \
+      2>/dev/null || echo "FAIL")
+    if [[ "$result" == "FAIL" || "$result" == "000" ]]; then
+      warn "  ${label}: UNREACHABLE — ${url}"
+      failed=1
+    else
+      log "  ${label}: OK (HTTP ${result}) — ${url}"
+    fi
+  done
+
+  if [[ $failed -eq 1 ]]; then
+    err "NAT connectivity check failed on ${label} (${host}). k0s install will fail without internet access.
+Check: NAT Gateway exists and private subnet route table has 0.0.0.0/0 → NAT GW."
+  fi
+  log "NAT connectivity OK on ${label}"
+}
+
 # -- Setup installer machine --
 setup_installer() {
   local eip="$1"
@@ -906,6 +940,13 @@ cmd_provision() {
   for v in $(compgen -v | grep '^CTRL_IP_\|^CPU_IP_\|^GPU_IP_'); do
     [[ -z "${!v}" ]] && continue
     wait_for_ssh_via_jump "${EIP}" "${!v}" "${v}"
+  done
+
+  # ---------- NAT connectivity check (all private nodes need internet for k0s install) ----------
+  load_state
+  for v in $(compgen -v | grep '^CTRL_IP_\|^CPU_IP_\|^GPU_IP_'); do
+    [[ -z "${!v}" ]] && continue
+    check_nat_connectivity "${!v}" "${v}" "${EIP}"
   done
 
   # ---------- Mount data disks via SSH (EBS is attached after boot) ----------
