@@ -1,8 +1,8 @@
 # ===================================================================
-# k0s AWS Provisioner — CHEAP TEST CONFIG (Level 2)
+# k0s AWS Provisioner -- CHEAP TEST CONFIG (Level 2)
 # ===================================================================
 # Uses t3.small/medium instances instead of GPU boxes.
-# Validates the full provision/output/destroy cycle for ~$1-2.
+# Validates the full provision/output/status/destroy cycle for ~$1-2.
 # Run:
 #   ./k0s_aws_provision.sh provision --config k0s-aws-provision-config-test.yaml
 #   ./k0s_aws_provision.sh output    --config k0s-aws-provision-config-test.yaml
@@ -11,10 +11,15 @@
 # ===================================================================
 
 stackName: k0s-infra-test
-region: us-east-2
-availabilityZone: us-east-2a
-airgap: false
+region: us-west-2
+availabilityZone: us-west-2a
 sshAllowedCidr: "0.0.0.0/0"
+
+# Existing ai-platform VPC -- required by SCP (account blocks creating new VPCs for RunInstances)
+network:
+  vpcId: vpc-09b191e89c83d588e
+  subnetId: subnet-0f10872b190a44521        # private us-west-2a (k0s nodes, NAT outbound)
+  installerSubnetId: subnet-0561d78f4f4744596  # public us-west-2a (installer, IGW for SSH via EIP)
 
 keyPair:
   name: ""
@@ -24,22 +29,22 @@ nodes:
   controller:
     count: 1
     instanceType: t3.medium
-    diskGb: 8
+    diskGb: 10
 
   cpuWorker:
     count: 1
     instanceType: t3.medium
-    diskGb: 8
+    diskGb: 10
 
   gpuWorker:
     count: 1
-    instanceType: t3.medium         # no GPU — tests provisioning + EBS mount flow only
-    diskGb: 8
-    dataDiskGb: 8                   # small, tests attach + XFS format + mount
+    instanceType: t3.medium         # no GPU -- tests provisioning + EBS mount flow only
+    diskGb: 10
+    dataDiskGb: 8                   # tests attach + XFS format + mount
 
 installer:
   instanceType: t3.small
-  diskGb: 8
+  diskGb: 10
 
 minio:
   enabled: true
