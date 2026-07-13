@@ -1,0 +1,91 @@
+# ===================================================================
+# k0s AWS Provisioner Configuration
+# ===================================================================
+# Creates EC2 infrastructure for k0s_cluster_with_stack.sh.
+# Run: ./k0s_aws_provision.sh provision --config k0s-aws-provision-config.yaml
+#
+# After provisioning, run:
+#   ./k0s_aws_provision.sh output --config k0s-aws-provision-config.yaml
+# to get the ready-to-paste block for k0s-cluster-config.yaml.
+# ===================================================================
+
+# CloudFormation stack name — must be unique per AWS account + region.
+# All resources are tagged with this name for easy cleanup.
+stackName: my-k0s-infra              # CHANGE THIS
+
+# AWS region for all resources.
+region: us-east-2                    # CHANGE THIS
+
+# Single availability zone for all nodes (avoids cross-AZ data transfer costs).
+availabilityZone: us-east-2a         # CHANGE THIS to a zone in your region
+
+# Set to true for air-gapped clusters. When true, k0s nodes are launched without
+# a public IP; the k0s installer is expected to run on the installer machine
+# (which does have a public IP via EIP) and reaches k0s nodes via private IP.
+# When false, k0s nodes get public IPs for internet access during k0s/NVIDIA
+# driver install.
+airgap: false
+
+# CIDR allowed to SSH to the installer machine. Use x.x.x.x/32 for your IP.
+# k0s nodes are not directly SSH-reachable from the internet — only via the
+# installer machine or via their private IP from within the VPC.
+sshAllowedCidr: "0.0.0.0/0"         # CHANGE THIS: use your-ip/32
+
+# ---------- SSH Key Pair ----------
+keyPair:
+  # Name of an existing AWS key pair. Leave empty to auto-create one named
+  # "<stackName>-key". The auto-created key is saved locally (see localPath).
+  name: ""
+
+  # Local path where the .pem file is (if name is set) or will be saved
+  # (if auto-created). Leave empty to save to ~/.ssh/<stackName>.pem.
+  localPath: ""
+
+# ---------- Node Configuration ----------
+nodes:
+  controller:
+    count: 1
+    instanceType: m6i.2xlarge       # 8 vCPU, 32 GB RAM
+    diskGb: 100                     # root volume (/var/lib/k0s control plane data)
+
+  cpuWorker:
+    count: 1
+    instanceType: m6i.4xlarge       # 16 vCPU, 64 GB RAM
+    diskGb: 200                     # root volume
+
+  gpuWorker:
+    count: 2
+    instanceType: g6e.12xlarge      # 4× NVIDIA L40S (48 GB each), 192 GB RAM
+    diskGb: 100                     # root volume
+    dataDiskGb: 500                 # separate EBS mounted at /var/lib/k0s (model weights)
+    # Uncomment if you have a capacity reservation for this instance type:
+    # capacityReservationId: ""
+
+# ---------- Installer Machine ----------
+# This machine runs the k0s install script and optionally hosts MinIO.
+# It lives in the same security group as k0s nodes so all communication
+# uses private IPs. It gets an Elastic IP for SSH access from your laptop.
+installer:
+  instanceType: t3.large            # 2 vCPU, 8 GB RAM
+  diskGb: 50                        # root volume (OS + tools + scripts)
+
+# ---------- MinIO Configuration ----------
+# When enabled, the provisioner installs MinIO on the installer machine
+# using tools/artifacts_download_upload_scripts/install_minio_ec2.sh.
+# MinIO data is stored on a separate EBS volume at /data/minio.
+minio:
+  enabled: false                    # CHANGE TO true to install MinIO
+
+  # Separate EBS data volume for MinIO storage, mounted at /data/minio.
+  dataDiskGb: 500
+
+  # MinIO bucket name (created automatically after install).
+  bucket: ai-platform
+
+  # MinIO credentials. Leave rootPassword empty to auto-generate a secure
+  # password (it will be printed in the output block).
+  rootUser: minioadmin
+  rootPassword: ""                  # leave empty to auto-generate
+
+  # MinIO server port.
+  port: 9000
