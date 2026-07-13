@@ -245,21 +245,22 @@ existing state file prompts for confirmation before overwriting.
 
 1. Validate AWS credentials (`aws sts get-caller-identity`)
 2. Look up RHEL 9 AMI (`describe-images --owners 309956199498`)
-3. Select subnets: private for k0s nodes, public for installer
-4. Create or reuse SSH key pair; save `.pem` to `keyPair.localPath`
-5. Create security group (SG-to-SG ingress + SSH from `sshAllowedCidr`)
-6. Launch all instances with IMDSv2 + encrypted root EBS
-7. Wait for all instances to reach `running` state
-8. Attach encrypted data EBS volumes (GPU workers + MinIO)
-9. Allocate and associate Elastic IP to installer
-10. Wait for SSH on installer (direct via EIP)
-11. Wait for SSH on k0s nodes (via installer as ProxyCommand jump host)
-12. Mount data disks via SSH: format XFS + add to `/etc/fstab` + mount
-13. Install prerequisites on installer (yq, kubectl, helm, jq, git)
-14. Copy cluster scripts (`*.sh`, `*.yaml`) to installer `~/cluster_setup/`
-15. If `minio.enabled`: run `install_minio_ec2.sh` on installer
-16. Generate and push `my-k0s-config.yaml` to installer `~/cluster_setup/`
-17. Print `output` block
+3. **If `network.vpcId` is empty:** create VPC + IGW + public subnet + NAT GW + private subnet *(UNTESTED — validate in sandbox first)*
+4. **If `network.vpcId` is set:** use existing VPC; select subnets by Name tag or explicit config
+5. Create or reuse SSH key pair; save `.pem` to `keyPair.localPath`
+6. Create security group (SG-to-SG ingress + SSH from `sshAllowedCidr`)
+7. Launch all instances with IMDSv2 + encrypted root EBS
+8. Wait for all instances to reach `running` state
+9. Attach encrypted data EBS volumes (GPU workers + MinIO)
+10. Allocate and associate Elastic IP to installer
+11. Wait for SSH on installer (direct via EIP)
+12. Wait for SSH on k0s nodes (via installer as ProxyCommand jump host)
+13. Mount data disks via SSH: format XFS + add to `/etc/fstab` + mount
+14. Install prerequisites on installer (yq, kubectl, helm, jq, git)
+15. Copy cluster scripts (`*.sh`, `*.yaml`) to installer `~/cluster_setup/`
+16. If `minio.enabled`: run `install_minio_ec2.sh` on installer
+17. Patch infra fields into `~/cluster_setup/my-k0s-config.yaml` (see below)
+18. Print `output` block
 
 ---
 
@@ -272,57 +273,76 @@ existing state file prompts for confirmation before overwriting.
 5. Delete data EBS volumes (GPU + MinIO)
 6. Delete security group (only if tagged as auto-created by this stack)
 7. Delete AWS key pair (only if auto-created) + optionally delete local `.pem`
-8. Remove state file
+8. **If auto-create network was used:** delete private RT → private subnet → NAT GW → NAT EIP → public RT → public subnet → IGW → VPC *(UNTESTED)*
+9. Remove state file
 
 ---
 
-## Integrating with `k0s_cluster_with_stack.sh`
+## `my-k0s-config.yaml` — How It's Managed
 
-### Option A — Run from installer (recommended)
+`provision` patches infrastructure fields into `~/cluster_setup/my-k0s-config.yaml`
+on the installer using `yq`. It never overwrites the whole file.
 
-The provisioner copies scripts and auto-generates `my-k0s-config.yaml` to the
-installer. After `provision` completes:
+### Behaviour
+
+| Situation | What happens |
+|---|---|
+| `my-k0s-config.yaml` **exists** on installer | Backed up as `my-k0s-config.bak-<timestamp>.yaml`, then patched in-place |
+| `my-k0s-config.yaml` **does not exist** | `k0s-cluster-config.yaml` (already uploaded) is copied as the base, then patched |
+
+### Fields patched (only these — everything else is preserved)
+
+```yaml
+cluster:
+  name:       <stackName>-cluster
+  region:     <region>
+  sshKeyPath: ~/.ssh/id_rsa        # key copied to installer by provisioner
+  sshUser:    ec2-user
+
+nodes:
+  existingIPs:
+    controllers:
+      - <private IP>               # from state file
+    workers:
+      - <private IP>               # cpu-workers then gpu-workers
+
+# Only when minio.enabled: true
+storage:
+  objectStore:
+    type:              minio
+    bucket:            <minio.bucket>
+    endpoint:          http://<installer-private-ip>:<port>
+    auth:
+      rootUser:        <minio.rootUser>
+      rootPassword:    <generated or configured>
+```
+
+### Fields you own (preserved exactly as-is)
+
+`images`, `operators`, `aiPlatform`, `metallb`, `ecr`, `imagePullSecrets`,
+`splunk`, `kubernetes`, `files`, `storage.storageClass`, `storage.vectorDbSize`,
+tolerations, node selectors — all untouched.
+
+### Workflow
 
 ```bash
-# 1. SSH to installer (exact command printed by 'output')
+# 1. Maintain your own k0s config in source control (images, versions, registry etc.)
+#    Edit tools/cluster_setup/k0s-cluster-config.yaml  ← used as base on first provision
+
+# 2. Provision infrastructure
+./k0s_aws_provision.sh provision --config k0s-aws-provision-config.yaml
+
+# 3. SSH to installer (exact command in 'output')
 ssh -i ~/.ssh/<stackName>.pem ec2-user@<EIP>
 
-# 2. On the installer — run the k0s install
+# 4. On the installer — my-k0s-config.yaml is ready with IPs + MinIO patched in
 CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \
   ~/cluster_setup/k0s_cluster_with_stack.sh install
 ```
 
-`my-k0s-config.yaml` is pre-filled with:
-- Private IPs for all controllers and workers
-- SSH key path (`~/.ssh/id_rsa`, copied there by the provisioner)
-- MinIO endpoint and credentials (if `minio.enabled: true`)
+### Running from your laptop instead
 
-Edit it before running install only if you need to change images, registry, or
-operator versions.
-
-### Option B — Run from your laptop
-
-Copy the paste block from `output` into your own `k0s-cluster-config.yaml`:
-
-```bash
-# 1. Copy the output block
-./k0s_aws_provision.sh output --config k0s-aws-provision-config.yaml
-
-# 2. Edit k0s-cluster-config.yaml with the printed values
-#    (cluster.sshKeyPath, nodes.existingIPs, storage.objectStore)
-
-# 3. Run the installer from your laptop
-#    (requires direct SSH access to the k0s nodes — they are in a private subnet,
-#     so you must either be on VPN or configure ProxyJump via the installer EIP)
-CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
-```
-
-**Note:** k0s nodes are in a private subnet. Without VPN or a ProxyJump config,
-your laptop cannot reach them directly. Option A (run from installer) is simpler.
-
-### ProxyJump config for Option B (laptop → installer → k0s nodes)
-
-Add to `~/.ssh/config`:
+k0s nodes are in a private subnet. Add a ProxyJump to `~/.ssh/config`:
 
 ```
 Host 10.0.34.*
@@ -332,7 +352,11 @@ Host 10.0.34.*
   ProxyCommand ssh -i ~/.ssh/<stackName>.pem -o StrictHostKeyChecking=no -W %h:%p ec2-user@<EIP>
 ```
 
-Then `k0s_cluster_with_stack.sh` can SSH to the private IPs transparently.
+Then run from your laptop:
+```bash
+CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
+```
+Note: `cluster.sshKeyPath` in the config must point to your local `.pem`, not `~/.ssh/id_rsa`.
 
 ---
 
@@ -394,6 +418,7 @@ Validates:
 - MinIO install + health check on RHEL 9
 - `output` prints correct private IPs and MinIO endpoint
 - `status` shows all running instances
+- `my-k0s-config.yaml` patched (not overwritten) with infra fields; backup created
 - `destroy` tears down all resources cleanly
 
 ### Level 3 — Full GPU integration (~$130, ~4 hr)
