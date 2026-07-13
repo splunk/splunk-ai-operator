@@ -9,6 +9,32 @@ attaches EBS data volumes, installs MinIO, and prints a ready-to-paste block for
 
 ---
 
+## Network Modes
+
+The script has two network modes selected automatically from `network.vpcId`:
+
+| `network.vpcId` | Mode | What happens |
+|---|---|---|
+| Set to an existing VPC ID | **Existing VPC** | Uses that VPC; subnets auto-selected by Name tag or pinned via `subnetId`/`installerSubnetId` |
+| Empty (`""`) | **Auto-create** | Creates VPC + IGW + public subnet + NAT GW EIP + NAT GW + private subnet; all resources tagged and removed on `destroy` |
+| *(omitted, region=us-west-2)* | **Existing VPC** | Defaults to `vpc-09b191e89c83d588e` (ai-platform-us-west-2-vpc) |
+
+**splunkcloud-ai-dev account:** SCP blocks new-VPC creation, so keep the default VPC or pin an existing one. Auto-create mode will fail in that account.  
+**Other accounts:** Set `network.vpcId: ""` to have the script build the entire network stack from scratch.
+
+### Auto-create network resources (in creation order)
+
+1. VPC (`vpcCidr`, default `10.0.0.0/16`)
+2. Internet Gateway — attached to VPC
+3. Public subnet (`publicSubnetCidr`, default `10.0.1.0/24`) — `0.0.0.0/0 → IGW`
+4. EIP for NAT Gateway
+5. NAT Gateway in public subnet (~60 s to become available)
+6. Private subnet (`privateSubnetCidr`, default `10.0.2.0/24`) — `0.0.0.0/0 → NAT GW`
+
+All six resources are tagged `k0s-provision-stack=<stackName>`, saved to the state file, and deleted in reverse order on `destroy`.
+
+---
+
 ## SCP Compliance (splunkcloud-ai-dev account)
 
 All API calls are structured to satisfy the SCP on account `658391232643`:
@@ -84,22 +110,39 @@ more reliable than UserData, which runs before the volume is present.
 
 ## Config File: `k0s-aws-provision-config.yaml`
 
+### Mandatory fields
+
+Only three fields are required — everything else has a default:
+
+```yaml
+stackName: my-k0s-infra   # names all resources and the ~/.k0s-provision-<name>.state file
+region: us-west-2
+availabilityZone: us-west-2a
+```
+
+### Full reference
+
 ```yaml
 stackName: my-k0s-infra
 region: us-west-2
 availabilityZone: us-west-2a
 
-# Your CIDR for SSH access to the installer. Use x.x.x.x/32 to lock down.
+# CIDR allowed to SSH to the installer's EIP. Default: 0.0.0.0/0 (open).
 sshAllowedCidr: "0.0.0.0/0"
 
-# Existing VPC and subnets (required by SCP — no new VPC creation allowed).
-# k0s nodes go in the private subnet (NAT outbound).
-# Installer goes in the public subnet (EIP inbound SSH).
-# Leave subnetId/installerSubnetId empty to auto-select by Name tag.
+# Network — see "Network Modes" section above.
+# vpcId empty → auto-create full network stack (VPC, IGW, subnets, NAT GW).
+# vpcId set   → use existing VPC; subnets auto-selected or pinned below.
+# Default for us-west-2: shared ai-platform VPC (required by SCP in splunkcloud-ai-dev).
 network:
-  vpcId: vpc-09b191e89c83d588e
-  subnetId: ""           # k0s nodes; auto-selects subnet tagged *private* in given AZ
-  installerSubnetId: ""  # installer; auto-selects subnet tagged *public* in given AZ
+  vpcId: vpc-09b191e89c83d588e   # omit or set "" to auto-create
+  subnetId: ""                   # k0s nodes (private); empty = auto-select *private* in AZ
+  installerSubnetId: ""          # installer (public); empty = auto-select *public* in AZ
+
+  # CIDRs used only in auto-create mode (vpcId: ""):
+  vpcCidr: "10.0.0.0/16"
+  publicSubnetCidr: "10.0.1.0/24"
+  privateSubnetCidr: "10.0.2.0/24"
 
 keyPair:
   name: ""        # empty = auto-create "<stackName>-key"
