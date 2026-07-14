@@ -766,6 +766,17 @@ PREREQ
     scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no -r \
       "${artifacts_dir}" "ec2-user@${eip}:~/" 2>/dev/null || true
     log "Copied artifacts_download_upload_scripts to installer"
+    # Redirect model downloads to the MinIO data disk (/data/minio) to avoid filling the root disk.
+    # download_from_huggingface.sh hardcodes DOWNLOAD_DIR=./model_artifacts (relative to its dir),
+    # so we symlink that path to /data/minio/model_artifacts on the big EBS volume.
+    if [[ "$MINIO_ENABLED" == "true" ]]; then
+      ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'SYMLINKSCRIPT'
+mkdir -p /data/minio/model_artifacts
+rm -rf ~/artifacts_download_upload_scripts/model_artifacts
+ln -sfn /data/minio/model_artifacts ~/artifacts_download_upload_scripts/model_artifacts
+SYMLINKSCRIPT
+      log "Symlinked artifacts_download_upload_scripts/model_artifacts → /data/minio/model_artifacts"
+    fi
   else
     warn "artifacts_download_upload_scripts not found at ${artifacts_dir} — model staging will fail"
   fi
