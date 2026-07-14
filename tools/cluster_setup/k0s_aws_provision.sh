@@ -649,12 +649,25 @@ mount_disk_via_ssh() {
   log "Mounting ${mp} on ${host}..."
   ssh "${ssh_opts[@]}" "ec2-user@${host}" "sudo bash -s" <<MOUNTSCRIPT
 set -e
+# Find the data disk: any block device not currently mounted and not the root disk.
+# Checks nvme*n1 devices in order; skips nvme0n1 (root on AWS RHEL AMIs).
+# Falls back to xvdb/sdb for non-NVMe instances.
 dev=""
-for c in /dev/nvme1n1 /dev/xvdb /dev/sdb; do [ -b "\$c" ] && dev="\$c" && break; done
-[ -z "\$dev" ] && { echo "ERROR: data disk not found on ${host}" >&2; exit 1; }
+for c in /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/xvdb /dev/sdb; do
+  [ -b "\$c" ] || continue
+  mountpoint -q "\$(lsblk -no MOUNTPOINT \$c 2>/dev/null | head -1)" 2>/dev/null && continue
+  lsblk -no MOUNTPOINT "\$c" 2>/dev/null | grep -q '/' && continue
+  dev="\$c" && break
+done
+[ -z "\$dev" ] && { echo "ERROR: data disk not found on ${host} (tried nvme1n1..3n1, xvdb, sdb)" >&2; exit 1; }
 blkid "\$dev" &>/dev/null || mkfs.xfs -f "\$dev"
 mkdir -p "${mp}"
-grep -q "\$dev" /etc/fstab || echo "\$dev ${mp} xfs defaults,nofail 0 2" >> /etc/fstab
+# Use UUID in fstab so entry survives kernel upgrades that rename nvme devices
+DEV_UUID=\$(blkid -s UUID -o value "\$dev")
+if ! grep -q "UUID=\${DEV_UUID}" /etc/fstab; then
+  sed -i '\|${mp}|d' /etc/fstab
+  echo "UUID=\${DEV_UUID} ${mp} xfs defaults,nofail 0 2" >> /etc/fstab
+fi
 mountpoint -q "${mp}" || mount "${mp}"
 echo "Mounted \$dev at ${mp}"
 MOUNTSCRIPT
