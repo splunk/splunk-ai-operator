@@ -1,0 +1,57 @@
+# ===================================================================
+# k0s AWS Provisioner — Production Config
+# ===================================================================
+# Provisions real GPU cluster (g6e.12xlarge) + MinIO for AI Platform.
+# Run:
+#   ./k0s_aws_provision.sh provision --config k0s-aws-provision-config-prod.yaml
+#   ./k0s_aws_provision.sh output    --config k0s-aws-provision-config-prod.yaml
+#   ./k0s_aws_provision.sh status    --config k0s-aws-provision-config-prod.yaml
+#   ./k0s_aws_provision.sh destroy   --config k0s-aws-provision-config-prod.yaml
+# ===================================================================
+
+stackName: k0s-ai-platform
+region: us-east-2
+# g6e.12xlarge was exhausted in all us-west-2 AZs; switching to us-east-2.
+# Installer stays in us-east-2a (only AZ with a public subnet in this VPC).
+# GPU workers use AZ fallback: us-east-2a → b → c in order of capacity availability.
+# attach_data_volume automatically uses each instance's subnet AZ for EBS placement.
+availabilityZone: us-east-2a
+sshAllowedCidr: "0.0.0.0/0"
+
+network:
+  vpcId: vpc-0dff3bdadac92320c              # ai-platform-us-east-2-vpc
+  subnetId: subnet-019bce74ffb1432c1        # private us-east-2a (k0s nodes, NAT outbound)
+  installerSubnetId: subnet-05185a5939b6ebf05  # public us-east-2a (installer, IGW + EIP)
+
+keyPair:
+  name: ""        # auto-create k0s-ai-platform-key
+  localPath: ""   # saved to ~/.ssh/k0s-ai-platform.pem
+
+nodes:
+  controller:
+    count: 1
+    instanceType: m6i.2xlarge       # 8 vCPU, 32 GB RAM
+    diskGb: 100
+
+  cpuWorker:
+    count: 1
+    instanceType: m6i.4xlarge       # 16 vCPU, 64 GB RAM
+    diskGb: 200
+
+  gpuWorker:
+    count: 2
+    instanceType: g6e.12xlarge      # 4× NVIDIA L40S (48 GB each), 192 GB RAM
+    diskGb: 100
+    dataDiskGb: 500                 # separate EBS at /var/lib/k0s (model weights)
+
+installer:
+  instanceType: t3.large            # 2 vCPU, 8 GB RAM
+  diskGb: 50
+
+minio:
+  enabled: true
+  dataDiskGb: 500                   # separate EBS at /data/minio
+  bucket: ai-platform
+  rootUser: minioadmin
+  rootPassword: ""                  # auto-generated, printed in output
+  port: 9000

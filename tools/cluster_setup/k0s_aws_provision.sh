@@ -558,6 +558,46 @@ launch_instance() {
   echo "${id}"
 }
 
+# -- Launch instance with AZ fallback (for GPU workers with scarce capacity) --
+# Tries each subnet in FALLBACK_SUBNETS (space-separated) until one succeeds.
+# Sets LAST_LAUNCHED_SUBNET to the subnet that worked (for EBS placement).
+# Usage: launch_instance_az_fallback <label> <type> <diskGb> <userdata_b64> <subnet1> [subnet2 ...]
+launch_instance_az_fallback() {
+  local label="$1" itype="$2" disk="$3" userdata_b64="$4"
+  shift 4
+  local subnets=("$@")
+  local id subnet
+  for subnet in "${subnets[@]}"; do
+    local az
+    az=$(aws ec2 describe-subnets --subnet-ids "${subnet}" \
+      --region "${REGION}" --query 'Subnets[0].AvailabilityZone' --output text 2>/dev/null)
+    log "Trying ${label} in subnet ${subnet} (${az})..."
+    id=$(aws ec2 run-instances \
+      --image-id "${AMI_ID}" \
+      --instance-type "${itype}" \
+      --key-name "${KEY_NAME}" \
+      --count 1 \
+      --subnet-id "${subnet}" \
+      --security-group-ids "${SG_ID}" \
+      --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+      --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${disk},\"VolumeType\":\"gp3\",\"Encrypted\":true,\"DeleteOnTermination\":true}}]" \
+      --user-data "${userdata_b64}" \
+      --tag-specifications \
+        "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-${label}},{Key=${TAG_KEY},Value=${STACK_NAME}},{Key=k0s-role,Value=${label}},{Key=project,Value=ai-platform},{Key=env,Value=dev}]" \
+        "ResourceType=volume,Tags=[{Key=Name,Value=${STACK_NAME}-${label}-root},{Key=${TAG_KEY},Value=${STACK_NAME}}]" \
+      --region "${REGION}" \
+      --query 'Instances[0].InstanceId' \
+      --output text 2>&1) && {
+        log "Launched ${label}: ${id} (${az})"
+        LAST_LAUNCHED_SUBNET="${subnet}"
+        echo "${id}"
+        return 0
+    }
+    warn "No capacity for ${itype} in ${az} (${subnet}): ${id}"
+  done
+  err "Failed to launch ${label} (${itype}) — no capacity in any fallback AZ. Tried: ${subnets[*]}"
+}
+
 # -- Wait for instance running --
 wait_running() {
   local id="$1" label="$2"
@@ -567,12 +607,13 @@ wait_running() {
 }
 
 # -- Attach a data EBS volume (encrypted) --
+# Optional 4th arg: az_override — use when the instance is in a different AZ than $AZ
 attach_data_volume() {
-  local instance_id="$1" label="$2" size_gb="$3"
-  log "Creating ${size_gb}GB encrypted data volume for ${label}..."
+  local instance_id="$1" label="$2" size_gb="$3" vol_az="${4:-${AZ}}"
+  log "Creating ${size_gb}GB encrypted data volume for ${label} in ${vol_az}..."
   local vol_id
   vol_id=$(aws ec2 create-volume \
-    --availability-zone "${AZ}" \
+    --availability-zone "${vol_az}" \
     --size "${size_gb}" \
     --volume-type gp3 \
     --encrypted \
@@ -719,6 +760,15 @@ PREREQ
   scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
     "${SCRIPT_DIR}/"*.sh "${SCRIPT_DIR}/"*.yaml \
     "ec2-user@${eip}:~/cluster_setup/" 2>/dev/null || true
+  # Copy artifacts_download_upload_scripts (sibling of cluster_setup) — required by model staging step
+  local artifacts_dir="${SCRIPT_DIR}/../artifacts_download_upload_scripts"
+  if [[ -d "${artifacts_dir}" ]]; then
+    scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no -r \
+      "${artifacts_dir}" "ec2-user@${eip}:~/" 2>/dev/null || true
+    log "Copied artifacts_download_upload_scripts to installer"
+  else
+    warn "artifacts_download_upload_scripts not found at ${artifacts_dir} — model staging will fail"
+  fi
 }
 
 # -- MinIO install --
@@ -789,10 +839,13 @@ fi
 yq eval -i '
   .cluster.name         = "${STACK_NAME}-cluster" |
   .cluster.region       = "${REGION}" |
-  .cluster.sshKeyPath   = "~/.ssh/id_rsa" |
+  .cluster.sshKeyPath   = "/home/ec2-user/.ssh/id_rsa" |
   .cluster.sshUser      = "ec2-user" |
   .nodes.existingIPs.controllers = ${ctrl_json} |
-  .nodes.existingIPs.workers     = ${worker_json}
+  .nodes.existingIPs.workers     = ${worker_json} |
+  .storage.modelStaging.enabled  = true |
+  .storage.minimumDiskSpace.controller = 90 |
+  .storage.minimumDiskSpace.cpuWorker  = 190
 ' "\$TARGET"
 
 # Step 3 — patch MinIO fields if enabled
@@ -839,6 +892,10 @@ cmd_provision() {
   pick_subnet
   save_state "SUBNET_ID" "${SUBNET_ID}"
   save_state "INSTALLER_SUBNET_ID" "${INSTALLER_SUBNET_ID}"
+  # Resolve installer AZ (may differ from $AZ when subnetId and installerSubnetId are in different AZs)
+  INSTALLER_AZ=$(aws ec2 describe-subnets --subnet-ids "${INSTALLER_SUBNET_ID}" \
+    --region "${REGION}" --query 'Subnets[0].AvailabilityZone' --output text)
+  save_state "INSTALLER_AZ" "${INSTALLER_AZ}"
   ensure_key_pair
   ensure_security_group
   save_state "SG_ID" "${SG_ID}"
@@ -863,9 +920,25 @@ cmd_provision() {
     save_state "CPU_INSTANCE_${i}" "${id}"
   done
 
+  # Build fallback subnet list for GPU workers: configured subnet first, then all other
+  # private subnets in the VPC (so we try every AZ before failing on capacity issues).
+  local all_private_subnets gpu_fallback_subnets=()
+  all_private_subnets=$(aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=${VPC_ID}" \
+    --region "${REGION}" \
+    --query 'Subnets[?MapPublicIpOnLaunch==`false`].SubnetId' \
+    --output text | tr '\t' ' ')
+  gpu_fallback_subnets=("${SUBNET_ID}")
+  for s in ${all_private_subnets}; do
+    [[ "${s}" != "${SUBNET_ID}" ]] && gpu_fallback_subnets+=("${s}")
+  done
+
   for ((i=0; i<GPU_COUNT; i++)); do
-    local id; id=$(launch_instance "gpu-worker-${i}" "${GPU_TYPE}" "${GPU_DISK}" "${ud_gpu}")
+    local id; LAST_LAUNCHED_SUBNET=""
+    id=$(launch_instance_az_fallback "gpu-worker-${i}" "${GPU_TYPE}" "${GPU_DISK}" "${ud_gpu}" \
+      "${gpu_fallback_subnets[@]}")
     save_state "GPU_INSTANCE_${i}" "${id}"
+    save_state "GPU_SUBNET_${i}" "${LAST_LAUNCHED_SUBNET}"
   done
 
   local inst_id
@@ -881,14 +954,22 @@ cmd_provision() {
   # ---------- Attach data volumes ----------
   load_state
   for ((i=0; i<GPU_COUNT; i++)); do
-    local inst_var="GPU_INSTANCE_${i}"
+    local inst_var="GPU_INSTANCE_${i}" subnet_var="GPU_SUBNET_${i}"
     load_state
-    local vid; vid=$(attach_data_volume "${!inst_var}" "gpu-worker-${i}" "${GPU_DATA_DISK}")
+    # EBS volume must be in same AZ as the instance — use per-worker subnet to derive AZ
+    local gpu_az
+    if [[ -n "${!subnet_var:-}" ]]; then
+      gpu_az=$(aws ec2 describe-subnets --subnet-ids "${!subnet_var}" \
+        --region "${REGION}" --query 'Subnets[0].AvailabilityZone' --output text 2>/dev/null || echo "${AZ}")
+    else
+      gpu_az="${AZ}"
+    fi
+    local vid; vid=$(attach_data_volume "${!inst_var}" "gpu-worker-${i}" "${GPU_DATA_DISK}" "${gpu_az}")
     save_state "GPU_VOL_${i}" "${vid}"
   done
   if [[ "$MINIO_ENABLED" == "true" ]]; then
     load_state
-    local vid; vid=$(attach_data_volume "${INSTALLER_INSTANCE}" "minio" "${MINIO_DATA_DISK}")
+    local vid; vid=$(attach_data_volume "${INSTALLER_INSTANCE}" "minio" "${MINIO_DATA_DISK}" "${INSTALLER_AZ}")
     save_state "MINIO_VOL" "${vid}"
   fi
 
@@ -1155,6 +1236,11 @@ cmd_dryrun() {
   AMI_ID=$(get_rhel9_ami)
   # In auto-create mode there is no VPC yet, so skip subnet lookup
   [[ "${AUTO_CREATE_NETWORK}" != "true" ]] && pick_subnet
+  local inst_az="${AZ}"
+  if [[ "${AUTO_CREATE_NETWORK}" != "true" && -n "${INSTALLER_SUBNET_ID}" ]]; then
+    inst_az=$(aws ec2 describe-subnets --subnet-ids "${INSTALLER_SUBNET_ID}" \
+      --region "${REGION}" --query 'Subnets[0].AvailabilityZone' --output text 2>/dev/null || echo "${AZ}")
+  fi
   echo ""
   if [[ "${AUTO_CREATE_NETWORK}" == "true" ]]; then
     echo "=== Dry-run: would create new network stack + instances ==="
@@ -1164,7 +1250,7 @@ cmd_dryrun() {
   else
     echo "=== Dry-run: would create instances in existing VPC ${VPC_ID} ==="
     echo "  k0s nodes subnet    : ${SUBNET_ID} (${AZ}, private)"
-    echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${AZ}, public)"
+    echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${inst_az}, public)"
   fi
   echo "  Security Group: new '${STACK_NAME}-sg' (self-ref + SSH from ${SSH_CIDR})"
   echo "  1 Installer    : ${INST_TYPE}, ${INST_DISK}GB root (encrypted) + EIP"
