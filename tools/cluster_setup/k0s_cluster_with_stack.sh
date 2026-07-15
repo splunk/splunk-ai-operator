@@ -2829,6 +2829,16 @@ _install_nvidia_on_node() {
           exit 1
         fi
         echo \"DKMS: \${DKMS_OUT}\"
+        # If DKMS is in 'added' state (registered but not yet built), build it
+        # explicitly. This happens when the package installs DKMS source but the
+        # automatic build was skipped (e.g. kernel was just upgraded + rebooted).
+        if echo \"\${DKMS_OUT}\" | grep -qE '^nvidia.*: added$'; then
+          echo 'DKMS module in added state — triggering explicit build+install...'
+          sudo dkms build -m nvidia -v \$(sudo dkms status | grep '^nvidia' | awk -F/ '{print \$2}' | awk '{print \$1}') -k \"\${KREL}\" 2>&1 || true
+          sudo dkms install -m nvidia -v \$(sudo dkms status | grep '^nvidia' | awk -F/ '{print \$2}' | awk '{print \$1}') -k \"\${KREL}\" 2>&1 || true
+          DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
+          echo \"DKMS after explicit build: \${DKMS_OUT}\"
+        fi
         if ! echo \"\${DKMS_OUT}\" | grep -qE 'installed|built'; then
           echo 'ERROR: nvidia DKMS module is not installed/built. See: sudo dkms status; dmesg | grep nvidia' >&2
           exit 1
