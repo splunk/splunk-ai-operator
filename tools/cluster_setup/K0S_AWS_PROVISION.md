@@ -33,100 +33,84 @@ resources created.
 ### Step 3 — Provision infrastructure
 
 ```bash
-./k0s_aws_provision.sh provision --config k0s-aws-provision-config-prod.yaml
+AWS_PROFILE=splunkcloud-ai-dev \
+  ./k0s_aws_provision.sh provision --config k0s-aws-provision-config-prod.yaml
 ```
 
 Takes ~10 min. When it completes, the installer EC2 has:
 - SSH key copied to `~/.ssh/id_rsa`
 - All cluster scripts in `~/cluster_setup/`
-- `~/cluster_setup/my-k0s-config.yaml` pre-patched with node IPs, MinIO
-  endpoint/credentials, `storage.modelStaging.enabled: true`, and absolute
-  `sshKeyPath`
-- MinIO running at `http://<private-ip>:9000`
-- `~/artifacts_download_upload_scripts/model_artifacts` → symlinked to
-  `/data/minio/model_artifacts` so model downloads land on the 500 GB disk
+- `~/cluster_setup/my-k0s-config.yaml` pre-patched with node IPs, region,
+  disk thresholds, object store config, and absolute `sshKeyPath`
+- Containerd ECR auth (`/etc/containerd/certs.d/<registry>/hosts.toml`)
+  pre-configured on **every k0s node** so images pull without `ImagePullBackOff`
+- If `minio.enabled: true`: MinIO running at `http://<private-ip>:9000` and
+  `~/artifacts_download_upload_scripts/model_artifacts` symlinked to
+  `/data/minio/model_artifacts` on the 500 GB disk
 
-### Step 4 — Add Docker Hub credentials (required for private images)
+The EIP and install command are printed at the end.
 
-The AI Platform uses `splunk/ray-head-build-preview:latest` (private Docker Hub).
-Before running install, add your Docker Hub pull secret:
-
-```bash
-EIP=<installer-eip>
-KEY=~/.ssh/k0s-ai-platform.pem
-
-ssh -i "$KEY" ec2-user@$EIP 'bash -s' <<'EOF'
-export KUBECONFIG=/var/lib/k0s/pki/admin.conf   # set after k0s is installed
-
-# Create imagePullSecret in the ai-platform namespace
-kubectl create secret docker-registry dockerhub-pull-secret \
-  --namespace ai-platform \
-  --docker-server=https://index.docker.io/v1/ \
-  --docker-username=<DOCKERHUB_USER> \
-  --docker-password=<DOCKERHUB_TOKEN>
-EOF
-```
-
-Then add to `my-k0s-config.yaml` on the installer before running install:
-
-```yaml
-imagePullSecrets:
-  - name: dockerhub-pull-secret
-```
-
-Or configure credentials in `my-k0s-config.yaml` before provisioning so
-`push_k0s_config` picks them up on the next run.
-
-### Step 5 — Run k0s install (from installer)
+### Step 4 — Run k0s install (from your laptop, backgrounded on installer)
 
 ```bash
-ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@<EIP>
+EIP=$(AWS_PROFILE=splunkcloud-ai-dev \
+  ./k0s_aws_provision.sh output --config k0s-aws-provision-config-prod.yaml \
+  | grep "ssh -i" | awk '{print $NF}')
 
-# On the installer:
-cd ~/cluster_setup
-SILENT_INSTALL=true CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \
-  ./k0s_cluster_with_stack.sh install
+ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP \
+  "cd ~/cluster_setup && \
+   CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \
+   nohup ./k0s_cluster_with_stack.sh install > ~/install.log 2>&1 &"
 ```
 
-`SILENT_INSTALL=true` skips all interactive prompts — the config values are
-used as-is. Monitor progress:
+Then monitor from your laptop:
 
 ```bash
-tail -f ~/k0s-install.log
+ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP "tail -f ~/install.log"
 ```
 
 Install phases (in order):
-1. **Preflight** — SSH reachability, disk space, tool checks on all nodes
-2. **Model staging** — downloads models from HuggingFace → uploads to MinIO
-3. **k0s cluster** — installs k0s on controller + workers
-4. **Phase 1 (parallel)** — cert-manager, kube-prometheus-stack, NVIDIA drivers
-5. **Phase 2 (parallel)** — OTel, KubeRay, Splunk operator, NVIDIA device plugin
-6. **MetalLB** — skipped (NodePort mode); only runs if `metallb.install: true`
+1. **Preflight** — SSH reachability, disk space, NVIDIA repo, tool checks
+2. **Model staging** — skipped if `storage.modelStaging.enabled: false` (e.g. SeaweedFS with pre-staged models)
+3. **k0s cluster** — installs k0s on controller + workers, NVIDIA drivers + DKMS
+4. **Phase 1 (parallel)** — cert-manager, kube-prometheus-stack, NVIDIA device plugin
+5. **Phase 2 (parallel)** — OTel, KubeRay, Splunk operator
+6. **MetalLB** — skipped in NodePort mode; only runs if `metallb.install: true`
 7. **Splunk Standalone + AI Platform operator + CR**
-8. **Health check** — verifies all pods running
+8. **Health check** — verifies all pods and CRs are ready
 
-Typical total time: ~2–3 hr (model staging is the longest phase).
+Typical total time:
+- **With SeaweedFS (models pre-staged):** ~30–40 min
+- **With MinIO (model download):** ~2–3 hr
 
-### Step 6 — Verify cluster
+### Step 5 — Verify cluster
 
 ```bash
-# From installer, SSH to controller
-ssh -i ~/.ssh/id_rsa ec2-user@<controller-private-ip>
-
-sudo k0s kubectl get nodes
-sudo k0s kubectl get pods -A
-sudo k0s kubectl get aiplatform,aiservice -n ai-platform
+ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP \
+  "ssh ec2-user@<controller-private-ip> \
+   'sudo k0s kubectl get nodes && \
+    sudo k0s kubectl get pods -A --no-headers | grep -v Running | grep -v Completed'"
 ```
 
-The AI Platform service is exposed at:
+The AI Platform SAIA API is exposed at:
 ```
 http://<any-worker-ip>:30080
 ```
 
-### Step 7 — Destroy when done
+Check Ray Serve model status:
+```bash
+ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP \
+  "ssh ec2-user@<controller-private-ip> \
+   'HEAD=\$(sudo k0s kubectl get pods -n ai-platform -l ray.io/node-type=head \
+     -o jsonpath=\"{.items[0].metadata.name}\"); \
+    sudo k0s kubectl exec -n ai-platform \$HEAD -c ray-head -- serve status'"
+```
+
+### Step 6 — Destroy when done
 
 ```bash
-./k0s_aws_provision.sh destroy --config k0s-aws-provision-config-prod.yaml --yes
+AWS_PROFILE=splunkcloud-ai-dev \
+  ./k0s_aws_provision.sh destroy --config k0s-aws-provision-config-prod.yaml --yes
 ```
 
 ---
@@ -348,7 +332,9 @@ minio:
     `/data/minio/model_artifacts` (prevents root disk fill during large model downloads)
 21. If `minio.enabled`: run `install_minio_ec2.sh` on installer
 22. Patch `~/cluster_setup/my-k0s-config.yaml` (see below)
-23. Print `output` block
+23. If `ecr.account` set: pre-configure containerd ECR auth on **all k0s nodes** via
+    `hosts.toml` — eliminates `ImagePullBackOff` on first pod scheduling
+24. Print `output` block
 
 ---
 
@@ -367,7 +353,7 @@ overwrites the whole file.
 
 ```yaml
 cluster:
-  name:       <stackName>-cluster
+  name:       <stackName>          # NOT "<stackName>-cluster" — keeps Job names ≤63 chars
   region:     <region>
   sshKeyPath: /home/ec2-user/.ssh/id_rsa   # absolute path — required for preflight
   sshUser:    ec2-user
@@ -382,24 +368,39 @@ nodes:
 
 storage:
   modelStaging:
-    enabled: true                            # enables HuggingFace download + MinIO upload
+    enabled: true                  # set to false automatically when seaweedfs configured
   minimumDiskSpace:
-    controller: 90                           # actual available on 100 GB root (~6 GB OS overhead)
-    cpuWorker: 190                           # actual available on 200 GB root
-  objectStore:                               # only when minio.enabled: true
-    type:         minio
-    bucket:       <minio.bucket>
-    endpoint:     http://<installer-private-ip>:<port>
+    controller: 75                 # conservative — g6e 100 GB root leaves ~81 GB usable
+    cpuWorker:  175                # conservative — 200 GB root leaves ~185 GB usable
+  objectStore:                     # only when minio.enabled: true or seaweedfs configured
+    type:         minio | seaweedfs
+    bucket:       <bucket>
+    endpoint:     http://<ip>:<port>
     auth:
-      rootUser:     <minio.rootUser>
-      rootPassword: <generated or configured>
+      rootUser:     <user>
+      rootPassword: <password>
+
+images:
+  registry: <ECR_ACCOUNT>.dkr.ecr.<ECR_REGION>.amazonaws.com   # only when ecr.account set
+  # NOTE: image tags (operator, ray, saia, splunk) are NOT patched here.
+  # They are owned by k0s-cluster-config.yaml. Edit that file to change image versions.
+
+ecr:                               # only when ecr.account set
+  account: <ECR_ACCOUNT>
+  region:  <ECR_REGION>
+
+imagePullSecrets:
+  autoCreateECR: true              # only when ecr.account set
 ```
 
-### Fields you own (preserved)
+### Fields you own (never touched by the provisioner)
 
-`images`, `operators`, `aiPlatform`, `metallb`, `imagePullSecrets`, `splunk`,
-`kubernetes`, `storage.storageClass`, `storage.vectorDbSize`, tolerations,
-node selectors — all untouched.
+`images.operator.image`, `images.ray.*`, `images.saia.*`, `images.splunk.*`,
+`operators`, `aiPlatform`, `metallb`, `imagePullSecrets` (other than autoCreateECR),
+`splunk`, `kubernetes`, `storage.storageClass`, `storage.vectorDbSize`,
+tolerations, node selectors — all untouched.
+
+**Image versions belong in `k0s-cluster-config.yaml`, not the provision config.**
 
 ---
 
@@ -430,30 +431,70 @@ Plain `key=value` bash, sourced by `output`, `status`, and `destroy`. Re-running
 
 ## Known Issues & Workarounds
 
-### Docker Hub private image pull
+### ECR ImagePullBackOff on first pod scheduling
 
-**Symptom:** RayCluster pods in `ImagePullBackOff`:
+**Symptom:** All pods stuck in `ImagePullBackOff` immediately after k0s install:
 ```
-Failed to pull image "splunk/ray-head-build-preview:latest":
-  pull access denied, repository does not exist or may require authorization
-```
-
-**Fix:** Create an `imagePullSecret` with Docker Hub credentials and add it to
-`my-k0s-config.yaml` before running install:
-
-```yaml
-# In my-k0s-config.yaml
-imagePullSecrets:
-  - name: dockerhub-pull-secret
+Failed to pull image "658...ecr.../ml-platform/ray/ray-head:build-953":
+  unauthorized: authentication required
 ```
 
+**Root cause:** k0s uses containerd v2, which reads ECR auth from
+`/etc/containerd/certs.d/<registry>/hosts.toml`. Without this file, containerd
+has no credentials and every ECR pull fails.
+
+**Fix (automatic since current version):** `provision` now calls
+`setup_ecr_containerd_auth()` which writes `hosts.toml` with a fresh ECR token
+on every k0s node before the install runs. No manual action needed.
+
+If you hit this on an older provision, run on the installer:
 ```bash
-kubectl create secret docker-registry dockerhub-pull-secret \
-  --namespace ai-platform \
-  --docker-server=https://index.docker.io/v1/ \
-  --docker-username=<USER> \
-  --docker-password=<TOKEN>
+ECR_REGISTRY=658391232643.dkr.ecr.us-east-2.amazonaws.com
+ECR_TOKEN=$(aws ecr get-login-password --region us-east-2)
+B64=$(echo -n "AWS:${ECR_TOKEN}" | base64 -w0)
+
+for NODE_IP in <ctrl> <cpu-worker> <gpu-worker-1> <gpu-worker-2>; do
+  ssh ec2-user@$NODE_IP \
+    "sudo mkdir -p /etc/containerd/certs.d/${ECR_REGISTRY} && \
+     sudo tee /etc/containerd/certs.d/${ECR_REGISTRY}/hosts.toml <<EOF
+server = \"https://${ECR_REGISTRY}\"
+[host.\"https://${ECR_REGISTRY}\"]
+  capabilities = [\"pull\", \"resolve\"]
+  [host.\"https://${ECR_REGISTRY}\".header]
+    Authorization = [\"Basic ${B64}\"]
+EOF"
+done
 ```
+
+---
+
+### SeaweedFS port 8333 unreachable from installer or worker nodes
+
+**Symptom:** Model loads fail or Ray workers can't pull model weights. `curl
+http://<seaweedfs-ip>:8333` times out from installer.
+
+**Root cause:** The SeaweedFS EC2 instance's security group doesn't allow
+inbound port 8333 from the installer's EIP or worker NAT gateway IP.
+
+**Fix:** Add port 8333 ingress rules to the SeaweedFS security group:
+```bash
+# Find the SeaweedFS instance security group
+aws ec2 describe-instances --instance-ids <seaweedfs-instance-id> \
+  --query 'Reservations[0].Instances[0].SecurityGroups'
+
+# Add rules for installer EIP and worker NAT IP
+SG_ID=<seaweedfs-sg-id>
+INSTALLER_EIP=<eip>/32
+WORKER_NAT_IP=<nat-gateway-ip>/32
+
+aws ec2 authorize-security-group-ingress --group-id $SG_ID \
+  --ip-permissions \
+    "IpProtocol=tcp,FromPort=8333,ToPort=8333,IpRanges=[{CidrIp=${INSTALLER_EIP}}]" \
+    "IpProtocol=tcp,FromPort=8333,ToPort=8333,IpRanges=[{CidrIp=${WORKER_NAT_IP}}]"
+```
+
+The worker NAT IP is the EIP of the NAT gateway in your VPC — all k0s worker
+outbound traffic exits through it.
 
 ---
 
@@ -590,24 +631,26 @@ re-run the `okta-aws-login` command if you see `ExpiredToken`.
 all provisioning logic (SCP compliance, EBS attach, MinIO, SSH jump, config
 patching) without GPU cost.
 
-### Level 3 — Full GPU integration (~$130, ~4 hr)
+### Level 3 — Full GPU integration (~$130, ~40 min with pre-staged models)
 
 ```bash
-# 1. Provision
-./k0s_aws_provision.sh provision --config k0s-aws-provision-config-prod.yaml
+# 1. Provision (provisions infra + pre-configures containerd ECR auth)
+AWS_PROFILE=splunkcloud-ai-dev \
+  ./k0s_aws_provision.sh provision --config k0s-aws-provision-config-prod.yaml
 
-# 2. Add Docker Hub pull secret (see Known Issues above)
+# 2. Launch install on installer (backgrounded, survives SSH disconnect)
+EIP=<printed-by-provision>
+ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP \
+  "cd ~/cluster_setup && \
+   CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \
+   nohup ./k0s_cluster_with_stack.sh install > ~/install.log 2>&1 &"
 
-# 3. SSH to installer (EIP printed in output)
-ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@<EIP>
+# 3. Monitor from your laptop
+ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP "tail -f ~/install.log"
 
-# 4. Run install
-cd ~/cluster_setup
-SILENT_INSTALL=true CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \
-  ./k0s_cluster_with_stack.sh install
-
-# 5. Destroy when done
-./k0s_aws_provision.sh destroy --config k0s-aws-provision-config-prod.yaml --yes
+# 4. Destroy when done
+AWS_PROFILE=splunkcloud-ai-dev \
+  ./k0s_aws_provision.sh destroy --config k0s-aws-provision-config-prod.yaml --yes
 ```
 
 ---
@@ -787,6 +830,59 @@ unmounted data disk and writes the fstab entry using UUID, not device path.
 
 ---
 
+### 16. All pods in ImagePullBackOff — containerd has no ECR credentials
+
+**What happened:** k0s installs containerd v2 which requires
+`/etc/containerd/certs.d/<registry>/hosts.toml` for auth. Without it every
+ECR image pull returns `unauthorized`. The k0s install script's
+`create_image_pull_secrets` step runs too late — pods are already scheduled
+before the secret exists.
+
+**Fix:** Added `setup_ecr_containerd_auth()` to the provision script. It runs
+after `push_k0s_config` and writes `hosts.toml` with a fresh 12-hour ECR token
+on every k0s node before the install ever starts.
+
+---
+
+### 17. Gemma431bIt never scheduled — `gpu_count:4` resource not available
+
+**What happened:** The ECR operator image (`build-v0.3.115-2-g7095706-ai-tier`)
+had `applications.yaml` baked in with `num_gpus: 4` for Gemma on L40S, from an
+older commit on the `ai-tier` branch. The `instance.yaml` in the same image
+only creates an `l40s-4-gpu` worker group with `instanceScale: 0` replicas, so
+Ray Serve's pending demand for `gpu_count:4` could never be satisfied.
+
+**Root cause:** The provision script was **overwriting** `images.operator.image`
+in `my-k0s-config.yaml` with the stale ECR build tag, stomping the correct
+`docker.io/splunk/splunk-ai-operator:0.2.0` already in `k0s-cluster-config.yaml`.
+
+**Fix:** The provision script no longer touches any image tags. Image versions
+are owned by `k0s-cluster-config.yaml`. The default operator image is
+`docker.io/splunk/splunk-ai-operator:0.2.0` which has the correct `num_gpus: 2`
+for Gemma on L40S.
+
+---
+
+### 18. Job name 65 chars — Kubernetes label limit is 63
+
+**What happened:** `cluster.name: k0s-ai-platform-cluster` caused the
+vector-db-setup posthook Job name to reach 65 characters:
+`k0s-ai-platform-cluster-ai-platform-saia-vector-db-setup-posthook`.
+
+**Fix:** `cluster.name` is now set to `${STACK_NAME}` directly (without the
+`-cluster` suffix). Job name becomes 57 chars.
+
+---
+
+### 19. Preflight disk check failures — thresholds above actual available space
+
+**What happened:** `minimumDiskSpace.controller: 90` failed because the 100 GB
+root volume only has ~81 GB available after OS. Same for cpuWorker (185 GB < 190 GB).
+
+**Fix:** Thresholds lowered to 75 GB (controller) and 175 GB (cpuWorker).
+
+---
+
 ### What worked first time
 
 - RHEL 9 AMI auto-discovery
@@ -800,3 +896,4 @@ unmounted data disk and writes the fstab entry using UUID, not device path.
 - k0s cluster install end-to-end (controller + 3 workers)
 - cert-manager, Prometheus, KubeRay, Splunk operator — all installed cleanly
 - AIPlatform + AIService CRs applied and reconciled
+- SeaweedFS as external object store (models pre-staged, `modelStaging.enabled: false`)
