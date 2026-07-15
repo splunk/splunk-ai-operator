@@ -903,6 +903,71 @@ install_minio() {
   log "MinIO ready at http://${installer_priv_ip}:${MINIO_PORT}"
 }
 
+# -- Pre-configure containerd ECR auth on all k0s nodes via the installer --
+# k0s uses containerd v2 which reads auth from /etc/containerd/certs.d/<reg>/hosts.toml.
+# Without this, all pods pull from ECR and get ImagePullBackOff on first boot.
+# Called after setup_installer (AWS creds already on installer) and after push_k0s_config
+# (node IPs already written into my-k0s-config.yaml so we can read them back).
+# The ECR token is valid 12 hours — long enough for the entire install.
+setup_ecr_containerd_auth() {
+  local eip="$1"
+  [[ -z "${ECR_ACCOUNT}" ]] && { log "No ECR account configured — skipping containerd auth setup"; return 0; }
+
+  log "Pre-configuring containerd ECR auth on all k0s nodes..."
+  local ecr_registry="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
+
+  # Collect all node IPs from state
+  local all_ips=()
+  for v in $(compgen -v | grep -E '^(CTRL_IP_|CPU_IP_|GPU_IP_)' | sort); do
+    [[ -n "${!v}" ]] && all_ips+=("${!v}")
+  done
+
+  if [[ ${#all_ips[@]} -eq 0 ]]; then
+    warn "No node IPs in state — skipping containerd auth setup"
+    return 0
+  fi
+
+  local nodes_str
+  nodes_str=$(printf '%s ' "${all_ips[@]}")
+
+  # Run on installer: get ECR token, push hosts.toml to every node
+  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
+    "bash -s '${ecr_registry}' '${nodes_str}'" <<'AUTHSCRIPT'
+set -e
+ECR_REGISTRY="$1"
+shift
+NODE_IPS=($@)
+
+echo "[ecr-auth] Getting ECR token..."
+ECR_TOKEN=$(aws ecr get-login-password --region "${AWS_DEFAULT_REGION:-us-east-2}" 2>/dev/null) || {
+  echo "[ecr-auth] WARN: could not get ECR token — containerd auth will not be pre-configured" >&2
+  exit 0
+}
+B64_TOKEN=$(echo -n "AWS:${ECR_TOKEN}" | base64 -w0)
+
+HOSTS_TOML=$(cat <<EOF
+server = "https://${ECR_REGISTRY}"
+
+[host."https://${ECR_REGISTRY}"]
+  capabilities = ["pull", "resolve"]
+  [host."https://${ECR_REGISTRY}".header]
+    Authorization = ["Basic ${B64_TOKEN}"]
+EOF
+)
+
+for NODE_IP in "${NODE_IPS[@]}"; do
+  echo "[ecr-auth] Configuring ${NODE_IP}..."
+  ssh -o StrictHostKeyChecking=no "ec2-user@${NODE_IP}" \
+    "sudo mkdir -p /etc/containerd/certs.d/${ECR_REGISTRY} && \
+     echo '${HOSTS_TOML}' | sudo tee /etc/containerd/certs.d/${ECR_REGISTRY}/hosts.toml > /dev/null && \
+     echo '[ecr-auth] hosts.toml written on ${NODE_IP}'"
+done
+
+echo "[ecr-auth] Containerd ECR auth configured on ${#NODE_IPS[@]} node(s)."
+AUTHSCRIPT
+  log "ECR containerd auth pre-configured on all nodes"
+}
+
 # -- Patch infra fields into my-k0s-config.yaml on the installer --
 # Behaviour:
 #   1. If ~/cluster_setup/my-k0s-config.yaml exists  → back it up, then patch in-place.
@@ -947,16 +1012,22 @@ else
 fi
 
 # Step 2 — patch infrastructure fields only
+# cluster.name is set to STACK_NAME directly (not STACK_NAME-cluster) to keep
+# Kubernetes object names within the 63-byte label limit. The AIPlatform CR and
+# its child Jobs are named "<cluster.name>-ai-platform[-<suffix>]" — adding
+# "-cluster" pushes the longest job name (saia-vector-db-setup-posthook) to 65
+# chars. minimumDiskSpace thresholds are set conservatively below real usage on
+# g6e.12xlarge (controller ~81 GB, CPU worker ~185 GB on 100/200 GB volumes).
 yq eval -i '
-  .cluster.name         = "${STACK_NAME}-cluster" |
+  .cluster.name         = "${STACK_NAME}" |
   .cluster.region       = "${REGION}" |
   .cluster.sshKeyPath   = "/home/ec2-user/.ssh/id_rsa" |
   .cluster.sshUser      = "ec2-user" |
   .nodes.existingIPs.controllers = ${ctrl_json} |
   .nodes.existingIPs.workers     = ${worker_json} |
   .storage.modelStaging.enabled  = true |
-  .storage.minimumDiskSpace.controller = 90 |
-  .storage.minimumDiskSpace.cpuWorker  = 190
+  .storage.minimumDiskSpace.controller = 75 |
+  .storage.minimumDiskSpace.cpuWorker  = 175
 ' "\$TARGET"
 
 # Step 2b — patch ECR registry + images if ECR account is configured
@@ -964,7 +1035,7 @@ if [[ -n "${ECR_ACCOUNT}" ]]; then
   ECR_REGISTRY="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
   yq eval -i '
     .images.registry                    = "'"${ECR_REGISTRY}"'" |
-    .images.operator.image              = "'"${ECR_REGISTRY}"'/ml-platform/splunk-ai-operator:build-v0.3.115-2-g7095706-ai-tier" |
+    .images.operator.image              = "docker.io/splunk/splunk-ai-operator:0.2.0" |
     .images.splunk.image                = "'"${ECR_REGISTRY}"'/splunk/splunk:10-2-ai-custom" |
     .images.ray.headImage               = "'"${ECR_REGISTRY}"'/ml-platform/ray/ray-head:build-953" |
     .images.ray.workerImage             = "'"${ECR_REGISTRY}"'/ml-platform/ray/ray-worker-gpu:build-953" |
@@ -1197,6 +1268,10 @@ cmd_provision() {
   # ---------- Push k0s config ----------
   load_state
   push_k0s_config "${EIP}" "${INSTALLER_PRIV_IP}"
+
+  # ---------- Pre-configure containerd ECR auth on all nodes ----------
+  load_state
+  setup_ecr_containerd_auth "${EIP}"
 
   local _provision_elapsed=$(( SECONDS - _PROVISION_START_TS ))
   local _provision_dur
