@@ -746,6 +746,80 @@ setup_installer() {
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
     'chmod 600 ~/.ssh/id_rsa'
 
+  # Forward AWS credentials to installer so ECR auth works during k0s install.
+  # Priority: 1) long-lived keys from config (ecr.accessKeyId/secretAccessKey)
+  #            2) current environment / dev-login resolved credentials
+  # STS tokens from dev-login expire in ~1hr — use permanent IAM keys for
+  # installs longer than that (model staging alone takes 2+ hrs).
+  log "Forwarding AWS credentials to installer..."
+  local ecr_key ecr_secret ecr_token ecr_region
+  ecr_key=$(yq eval '.ecr.accessKeyId // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  ecr_secret=$(yq eval '.ecr.secretAccessKey // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  ecr_region=$(yq eval '.ecr.region // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -z "${ecr_region}" ]] && ecr_region="${REGION:-us-east-2}"
+
+  if [[ -n "${ecr_key}" && "${ecr_key}" != "null" && \
+        -n "${ecr_secret}" && "${ecr_secret}" != "null" ]]; then
+    log "  Using long-lived ECR credentials from config (account: ${ECR_ACCOUNT})"
+  else
+    # Fall back to current environment — resolve via credential_process if needed
+    ecr_key=$(AWS_PROFILE="${AWS_PROFILE:-}" aws configure get aws_access_key_id 2>/dev/null || echo "")
+    ecr_secret=$(AWS_PROFILE="${AWS_PROFILE:-}" aws configure get aws_secret_access_key 2>/dev/null || echo "")
+    ecr_token=$(AWS_PROFILE="${AWS_PROFILE:-}" aws configure get aws_session_token 2>/dev/null || echo "")
+    # If configure get returns nothing, try env vars directly
+    [[ -z "${ecr_key}" ]]    && ecr_key="${AWS_ACCESS_KEY_ID:-}"
+    [[ -z "${ecr_secret}" ]] && ecr_secret="${AWS_SECRET_ACCESS_KEY:-}"
+    [[ -z "${ecr_token}" ]]  && ecr_token="${AWS_SESSION_TOKEN:-}"
+    if [[ -n "${ecr_key}" && -n "${ecr_secret}" ]]; then
+      log "  Using environment AWS credentials (may be STS — expiry risk for long installs)"
+      [[ "${ecr_key}" == ASIA* ]] && \
+        warn "  STS credentials detected (ASIA*). ECR token expires in ~1hr. For installs >1hr set ecr.accessKeyId/secretAccessKey (permanent IAM key) in your config."
+    else
+      warn "  No AWS credentials found — ECR secret creation will be skipped on installer."
+      warn "  To fix: run with AWS_PROFILE=splunkcloud-ai-dev or set ecr.accessKeyId in config."
+    fi
+  fi
+
+  if [[ -n "${ecr_key}" && -n "${ecr_secret}" ]]; then
+    ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
+      "bash -s ${ecr_key} ${ecr_secret} $(printf '%q' "${ecr_token}") ${ecr_region}" <<'CREDSCRIPT'
+set -e
+AWS_KEY="$1"; AWS_SECRET="$2"; AWS_TOKEN="$3"; AWS_REGION="$4"
+mkdir -p ~/.aws
+# Write credentials — omit session_token line if empty (permanent IAM key)
+{
+  echo "[default]"
+  echo "aws_access_key_id     = ${AWS_KEY}"
+  echo "aws_secret_access_key = ${AWS_SECRET}"
+  [[ -n "${AWS_TOKEN}" ]] && echo "aws_session_token     = ${AWS_TOKEN}"
+} > ~/.aws/credentials
+cat > ~/.aws/config <<EOF
+[default]
+region = ${AWS_REGION}
+output = json
+EOF
+chmod 600 ~/.aws/credentials ~/.aws/config
+echo "AWS credentials written to ~/.aws/ on installer."
+CREDSCRIPT
+    log "AWS credentials forwarded to installer"
+
+    # Install AWS CLI on installer if not present (needed for ECR token refresh)
+    ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'AWSCLI'
+set -e
+if ! command -v aws &>/dev/null; then
+  echo "Installing AWS CLI v2..."
+  curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp/
+  sudo /tmp/aws/install --update
+  rm -rf /tmp/awscliv2.zip /tmp/aws/
+  echo "AWS CLI installed: $(aws --version)"
+else
+  echo "AWS CLI already present: $(aws --version)"
+fi
+AWSCLI
+    log "AWS CLI ready on installer"
+  fi
+
   log "Installing prerequisites on installer (yq, kubectl, helm, jq)..."
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'PREREQ'
 set -e
