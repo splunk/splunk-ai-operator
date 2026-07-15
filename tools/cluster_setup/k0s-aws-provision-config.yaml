@@ -93,7 +93,7 @@ nodes:
 # It lives in the same security group as k0s nodes so all communication
 # uses private IPs. It gets an Elastic IP for SSH access from your laptop.
 installer:
-  instanceType: t3.large            # 2 vCPU, 8 GB RAM
+  instanceType: m6i.4xlarge            # 16 vCPU, 64 GB RAM
   diskGb: 50                        # root volume (OS + tools + scripts)
 
 # ---------- MinIO Configuration ----------
