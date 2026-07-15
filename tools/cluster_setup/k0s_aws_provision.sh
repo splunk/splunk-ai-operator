@@ -1030,18 +1030,15 @@ yq eval -i '
   .storage.minimumDiskSpace.cpuWorker  = 175
 ' "\$TARGET"
 
-# Step 2b — patch ECR registry + images if ECR account is configured
+# Step 2b — patch ECR account/region/imagePullSecrets if ECR account is configured.
+# Image tags (operator, splunk, ray, saia) are intentionally NOT set here — they
+# belong in k0s-cluster-config.yaml and should be managed there, not overwritten
+# by the provisioner.  Only the registry prefix and ECR metadata are patched so
+# the install script can locate the private registry without touching image tags.
 if [[ -n "${ECR_ACCOUNT}" ]]; then
   ECR_REGISTRY="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
   yq eval -i '
     .images.registry                    = "'"${ECR_REGISTRY}"'" |
-    .images.operator.image              = "docker.io/splunk/splunk-ai-operator:0.2.0" |
-    .images.splunk.image                = "'"${ECR_REGISTRY}"'/splunk/splunk:10-2-ai-custom" |
-    .images.ray.headImage               = "'"${ECR_REGISTRY}"'/ml-platform/ray/ray-head:build-953" |
-    .images.ray.workerImage             = "'"${ECR_REGISTRY}"'/ml-platform/ray/ray-worker-gpu:build-953" |
-    .images.saia.apiImage               = "'"${ECR_REGISTRY}"'/ml-platform/saia/saia-api:build-v2-main-c3b489d" |
-    .images.saia.apiV2Image             = "'"${ECR_REGISTRY}"'/ml-platform/saia/saia-api-v2:build-v2-main-c3b489d" |
-    .images.saia.dataLoaderImage        = "'"${ECR_REGISTRY}"'/ml-platform/saia/saia-data-loader:build-v2-main-c3b489d" |
     .ecr.account                        = "'"${ECR_ACCOUNT}"'" |
     .ecr.region                         = "'"${ECR_REGION}"'" |
     .imagePullSecrets.autoCreateECR     = true
