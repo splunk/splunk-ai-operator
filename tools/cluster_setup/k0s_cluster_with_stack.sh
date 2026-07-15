@@ -2672,12 +2672,27 @@ _install_nvidia_on_node() {
         sudo apt-get install -y \"linux-headers-\${KREL}\"
       else
         # Exact-match: every historical kernel-devel is usually in RHUI for
-        # RHEL 9/10. Fall back to the latest only when absent (rare).
+        # RHEL 9/10. When absent (e.g. AMI has an older kernel than current
+        # RHUI), install the latest kernel+kernel-devel and reboot into it so
+        # DKMS builds for the running kernel. The node rejoins k0s after reboot;
+        # the installer retries SSH so the install continues automatically.
         if ! sudo dnf install -y \"kernel-devel-\${KREL}\" \"kernel-headers-\${KREL}\"; then
-          echo \"WARN: Exact kernel-devel-\${KREL} not found; installing latest kernel-devel/headers.\"
-          echo \"      DKMS will build against the latest headers — if they don't match the running kernel,\"
-          echo \"      modprobe will fail below and you'll need to reboot into the updated kernel.\"
-          sudo dnf install -y kernel-devel kernel-headers
+          echo \"WARN: Exact kernel-devel-\${KREL} not found in repos.\"
+          # Get the latest available kernel version from the repo
+          LATEST_KVER=\$(sudo dnf list available kernel --quiet 2>/dev/null | awk '/^kernel/{print \$2\".x86_64\"}' | tail -1)
+          if [ -n \"\${LATEST_KVER}\" ] && [ \"\${KREL}\" != \"\${LATEST_KVER}\" ]; then
+            echo \"Installing latest kernel (\${LATEST_KVER}) + matching kernel-devel so DKMS can build.\"
+            sudo dnf install -y \"kernel-\${LATEST_KVER%.*}\" \"kernel-devel-\${LATEST_KVER%.*}\" \"kernel-headers-\${LATEST_KVER%.*}\" 2>/dev/null || \
+              sudo dnf install -y kernel kernel-devel kernel-headers
+            echo \"REBOOT_REQUIRED: kernel upgraded from \${KREL} to \${LATEST_KVER%.*} — rebooting now\"
+            # Signal the outer SSH call to detect the reboot and wait
+            sudo reboot &
+            sleep 5
+            exit 42
+          else
+            echo \"WARN: No newer kernel in repos; installing latest kernel-devel/headers (may mismatch).\"
+            sudo dnf install -y kernel-devel kernel-headers
+          fi
         fi
       fi
 
@@ -2835,6 +2850,19 @@ _install_nvidia_on_node() {
         exit 1
       }
     "; then
+      local _rc=$?
+      if [[ "${_rc}" -eq 42 ]]; then
+        # exit 42 = kernel upgrade triggered a reboot; wait for node and retry
+        echo "Kernel upgraded on ${gpu_ip} — waiting for reboot (up to 5 min)..."
+        local _wait=0
+        while ! ssh_exec "${gpu_ip}" "echo ok" &>/dev/null; do
+          sleep 15; _wait=$(( _wait + 15 ))
+          [[ "${_wait}" -ge 300 ]] && { echo "❌ ${gpu_ip} did not come back after kernel reboot" >&2; return 1; }
+        done
+        echo "Node ${gpu_ip} is back (kernel: $(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null)). Retrying NVIDIA install..."
+        _install_nvidia_on_node "${gpu_ip}"
+        return $?
+      fi
       echo "❌ NVIDIA driver install failed on ${gpu_ip}" >&2
       return 1
     fi
