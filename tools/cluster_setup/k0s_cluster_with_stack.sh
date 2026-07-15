@@ -164,37 +164,60 @@ trap cleanup_tmp EXIT
 #        step_fail "reason"                  → marks it failed (does not exit)
 # show_step_summary                          → final table printed at end of install
 declare -a _STEP_NAMES=()
-declare -a _STEP_STATUS=()  # "ok" | "fail" | "skip"
+declare -a _STEP_STATUS=()   # "ok" | "fail" | "skip"
+declare -a _STEP_START_TS=() # epoch seconds at step_start
+declare -a _STEP_ELAPSED=()  # seconds taken, set by step_ok/fail/skip
 _STEP_CURRENT=""
+_INSTALL_START_TS=${SECONDS}
 
 step_start() {
   _STEP_CURRENT="$1"
   _STEP_NAMES+=("$1")
   _STEP_STATUS+=("running")
+  _STEP_START_TS+=("${SECONDS}")
+  _STEP_ELAPSED+=(0)
   local n=${#_STEP_NAMES[@]}
   echo -e "\n\033[1;34m[$(_ts) ── STEP ${n}: $1 ──]\033[0m" >&2
 }
 
+_step_record_elapsed() {
+  local last=$(( ${#_STEP_START_TS[@]} - 1 ))
+  _STEP_ELAPSED[$last]=$(( SECONDS - _STEP_START_TS[$last] ))
+}
+
 step_ok() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="ok"
+  local elapsed="${_STEP_ELAPSED[$last]}"
+  echo -e "\033[1;32m[$(_ts) ✔ ${_STEP_NAMES[$last]} — $(printf '%dm%02ds' $((elapsed/60)) $((elapsed%60)))]\033[0m" >&2
 }
 
 step_fail() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="fail:${1:-unknown error}"
 }
 
 step_skip() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="skip:${1:-}"
 }
 
 show_step_summary() {
+  local total_elapsed=$(( SECONDS - _INSTALL_START_TS ))
   echo -e "\n\033[1;34m[$(_ts) ════ INSTALL SUMMARY ════]\033[0m" >&2
   local total=${#_STEP_NAMES[@]} ok=0 fail=0 skip=0
   for i in "${!_STEP_NAMES[@]}"; do
     local s="${_STEP_STATUS[$i]}"
+    local elapsed="${_STEP_ELAPSED[$i]:-0}"
+    local duration
+    if (( elapsed >= 60 )); then
+      duration=$(printf '%dm%02ds' $((elapsed/60)) $((elapsed%60)))
+    else
+      duration="${elapsed}s"
+    fi
     local icon color label
     case "${s%%:*}" in
       ok)      icon="✔"; color="\033[1;32m"; label="OK";           ok=$((ok+1)) ;;
@@ -203,13 +226,19 @@ show_step_summary() {
       running) icon="?"; color="\033[1;33m"; label="interrupted";  fail=$((fail+1)) ;;
       *)       icon="?"; color="\033[0m";    label="${s}" ;;
     esac
-    printf "  ${color}${icon}\033[0m  %-45s %s\n" "${_STEP_NAMES[$i]}" "${label}" >&2
+    printf "  ${color}${icon}\033[0m  %-45s %-8s %s\n" "${_STEP_NAMES[$i]}" "${duration}" "${label}" >&2
   done
   echo "" >&2
-  if (( fail == 0 )); then
-    echo -e "  \033[1;32mAll ${total} steps completed successfully.\033[0m" >&2
+  local total_dur
+  if (( total_elapsed >= 3600 )); then
+    total_dur=$(printf '%dh%02dm%02ds' $((total_elapsed/3600)) $(((total_elapsed%3600)/60)) $((total_elapsed%60)))
   else
-    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped.\033[0m" >&2
+    total_dur=$(printf '%dm%02ds' $((total_elapsed/60)) $((total_elapsed%60)))
+  fi
+  if (( fail == 0 )); then
+    echo -e "  \033[1;32mAll ${total} steps completed successfully in ${total_dur}.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped. Total: ${total_dur}\033[0m" >&2
     echo -e "  \033[1;31mSee log: ${LOG_FILE}\033[0m" >&2
   fi
   echo "" >&2

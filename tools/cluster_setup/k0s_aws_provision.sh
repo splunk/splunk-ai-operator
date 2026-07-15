@@ -119,6 +119,13 @@ load_config() {
   MINIO_PORT="$(cfg_default '.minio.port' '9000')"
   [[ "$MINIO_PASS" == "null" || -z "$MINIO_PASS" ]] && MINIO_PASS=""
 
+  # External SeaweedFS (or any S3-compatible store) — used when minio.enabled=false
+  SEAWEED_ENDPOINT="$(cfg_default '.seaweedfs.endpoint' '')"
+  SEAWEED_BUCKET="$(cfg_default   '.seaweedfs.bucket'   'ai-platform-bucket')"
+  SEAWEED_USER="$(cfg_default     '.seaweedfs.rootUser'  'minioadmin')"
+  SEAWEED_PASS="$(cfg_default     '.seaweedfs.rootPassword' 'minioadmin')"
+  [[ "$SEAWEED_ENDPOINT" == "null" ]] && SEAWEED_ENDPOINT=""
+
   TAG_KEY="k0s-provision-stack"
   STATE_FILE="${HOME}/.k0s-provision-${STACK_NAME}.state"
 }
@@ -946,7 +953,26 @@ yq eval -i '
   .storage.minimumDiskSpace.cpuWorker  = 190
 ' "\$TARGET"
 
-# Step 3 — patch MinIO fields if enabled
+# Step 2b — patch ECR registry + images if ECR account is configured
+if [[ -n "${ECR_ACCOUNT}" ]]; then
+  ECR_REGISTRY="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
+  yq eval -i '
+    .images.registry                    = "'"${ECR_REGISTRY}"'" |
+    .images.operator.image              = "'"${ECR_REGISTRY}"'/ml-platform/splunk-ai-operator:build-v0.3.115-2-g7095706-ai-tier" |
+    .images.splunk.image                = "'"${ECR_REGISTRY}"'/splunk/splunk:10-2-ai-custom" |
+    .images.ray.headImage               = "'"${ECR_REGISTRY}"'/ml-platform/ray/ray-head:build-953" |
+    .images.ray.workerImage             = "'"${ECR_REGISTRY}"'/ml-platform/ray/ray-worker-gpu:build-953" |
+    .images.saia.apiImage               = "'"${ECR_REGISTRY}"'/ml-platform/saia/saia-api:build-v2-main-c3b489d" |
+    .images.saia.apiV2Image             = "'"${ECR_REGISTRY}"'/ml-platform/saia/saia-api-v2:build-v2-main-c3b489d" |
+    .images.saia.dataLoaderImage        = "'"${ECR_REGISTRY}"'/ml-platform/saia/saia-data-loader:build-v2-main-c3b489d" |
+    .ecr.account                        = "'"${ECR_ACCOUNT}"'" |
+    .ecr.region                         = "'"${ECR_REGION}"'" |
+    .imagePullSecrets.autoCreateECR     = true
+  ' "\$TARGET"
+  echo "[k0s-provision] Patched ECR registry: ${ECR_REGISTRY}"
+fi
+
+# Step 3 — patch object store fields
 if [[ "${MINIO_ENABLED}" == "true" ]]; then
   yq eval -i '
     .storage.objectStore.type                  = "minio" |
@@ -955,6 +981,16 @@ if [[ "${MINIO_ENABLED}" == "true" ]]; then
     .storage.objectStore.auth.rootUser         = "${MINIO_USER}" |
     .storage.objectStore.auth.rootPassword     = "${MINIO_PASS}"
   ' "\$TARGET"
+elif [[ -n "${SEAWEED_ENDPOINT}" ]]; then
+  yq eval -i '
+    .storage.objectStore.type                  = "seaweedfs" |
+    .storage.objectStore.bucket                = "${SEAWEED_BUCKET}" |
+    .storage.objectStore.endpoint              = "${SEAWEED_ENDPOINT}" |
+    .storage.objectStore.auth.rootUser         = "${SEAWEED_USER}" |
+    .storage.objectStore.auth.rootPassword     = "${SEAWEED_PASS}" |
+    .storage.modelStaging.enabled              = false
+  ' "\$TARGET"
+  echo "[k0s-provision] Object store: seaweedfs at ${SEAWEED_ENDPOINT} (modelStaging disabled — models already staged)"
 fi
 
 echo "[k0s-provision] Patched infra fields into my-k0s-config.yaml"
@@ -981,8 +1017,11 @@ cmd_provision() {
   fi
 
   : > "${STATE_FILE}"
+  local _PROVISION_START_TS=${SECONDS}
+  local _PROVISION_START_WALL; _PROVISION_START_WALL=$(date '+%Y-%m-%d %H:%M:%S')
   log "=== k0s AWS Provisioner ==="
   log "Stack: ${STACK_NAME}  Region: ${REGION}  AZ: ${AZ}"
+  log "Provision started at: ${_PROVISION_START_WALL}"
 
   AMI_ID=$(get_rhel9_ami)
   ensure_network   # no-op when VPC_ID is already set; creates full stack otherwise
@@ -1152,6 +1191,23 @@ cmd_provision() {
   # ---------- Push k0s config ----------
   load_state
   push_k0s_config "${EIP}" "${INSTALLER_PRIV_IP}"
+
+  local _provision_elapsed=$(( SECONDS - _PROVISION_START_TS ))
+  local _provision_dur
+  if (( _provision_elapsed >= 3600 )); then
+    _provision_dur=$(printf '%dh%02dm%02ds' $((_provision_elapsed/3600)) $(((_provision_elapsed%3600)/60)) $((_provision_elapsed%60)))
+  else
+    _provision_dur=$(printf '%dm%02ds' $((_provision_elapsed/60)) $((_provision_elapsed%60)))
+  fi
+  log "================================================================"
+  log "  PROVISION COMPLETE"
+  log "  Started:  ${_PROVISION_START_WALL}"
+  log "  Finished: $(date '+%Y-%m-%d %H:%M:%S')"
+  log "  Elapsed:  ${_provision_dur}"
+  log "  Installer EIP: ${EIP}"
+  log "  SSH: ssh -i ${KEY_LOCAL} ec2-user@${EIP}"
+  log "  Run SILENT_INSTALL on installer to bring up k0s + stack"
+  log "================================================================"
 
   cmd_output
 }

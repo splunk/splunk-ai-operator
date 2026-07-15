@@ -49,12 +49,7 @@ installer:
   diskGb: 50
 
 minio:
-  enabled: true
-  dataDiskGb: 500                   # separate EBS at /data/minio
-  bucket: ai-platform
-  rootUser: minioadmin
-  rootPassword: ""                  # auto-generated, printed in output
-  port: 9000
+  enabled: false                    # using external SeaweedFS at 18.116.39.79:8333
 
 # ---------- ECR Configuration ----------
 # Long-lived IAM credentials for ECR image pulls during k0s install.
@@ -73,3 +68,10 @@ ecr:
   region: us-east-2
   accessKeyId: ""      # AKIA... permanent key  (leave empty to use current AWS_PROFILE)
   secretAccessKey: ""  # corresponding secret key
+
+# ---------- SeaweedFS (external object store — models already staged) ----------
+seaweedfs:
+  endpoint: "http://18.116.39.79:8333"
+  bucket: "ai-platform-bucket"
+  rootUser: "minioadmin"
+  rootPassword: "minioadmin"
