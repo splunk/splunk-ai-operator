@@ -119,6 +119,12 @@ load_config() {
   MINIO_PORT="$(cfg_default '.minio.port' '9000')"
   [[ "$MINIO_PASS" == "null" || -z "$MINIO_PASS" ]] && MINIO_PASS=""
 
+  # ECR configuration
+  ECR_ACCOUNT="$(cfg_default '.ecr.account' '')"
+  ECR_REGION="$(cfg_default  '.ecr.region'  "${REGION:-us-east-2}")"
+  [[ "$ECR_ACCOUNT" == "null" ]] && ECR_ACCOUNT=""
+  [[ "$ECR_REGION"  == "null" ]] && ECR_REGION="${REGION:-us-east-2}"
+
   # External SeaweedFS (or any S3-compatible store) — used when minio.enabled=false
   SEAWEED_ENDPOINT="$(cfg_default '.seaweedfs.endpoint' '')"
   SEAWEED_BUCKET="$(cfg_default   '.seaweedfs.bucket'   'ai-platform-bucket')"
