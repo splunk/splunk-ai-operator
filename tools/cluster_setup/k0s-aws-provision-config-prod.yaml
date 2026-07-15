@@ -55,3 +55,21 @@ minio:
   rootUser: minioadmin
   rootPassword: ""                  # auto-generated, printed in output
   port: 9000
+
+# ---------- ECR Configuration ----------
+# Long-lived IAM credentials for ECR image pulls during k0s install.
+# The install takes 2-4 hrs; STS tokens from dev-login expire in ~1hr and
+# will break image pulls mid-install. Use a permanent IAM key here instead.
+#
+# Minimum IAM policy required:
+#   arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+#
+# To create a key:
+#   aws iam create-access-key --user-name <iam-user>
+#
+# Keep this file git-ignored or use a separate k0s-config.local.yaml overlay.
+ecr:
+  account: "658391232643"
+  region: us-east-2
+  accessKeyId: ""      # AKIA... permanent key  (leave empty to use current AWS_PROFILE)
+  secretAccessKey: ""  # corresponding secret key
