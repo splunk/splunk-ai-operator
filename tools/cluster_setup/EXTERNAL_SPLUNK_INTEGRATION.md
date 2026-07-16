@@ -31,27 +31,33 @@ Use this when:
 ## Architecture Overview
 
 ```
-Browser
+Browser (Splunk AI Assistant)
   │
-  │  HTTP/HTTPS :8000
-  ▼
-Splunk Enterprise (external host, e.g. 43.203.164.228)
-  │  Issues JWT tokens (issuer = https://<public-ip>:8089)
-  │  Port 8089 must be reachable from the SAIA backend cluster
+  ├─── HTTP/HTTPS :8000 ──────────────────────────────────────────────────────►
+  │                                                                Splunk Enterprise
+  │                                                          (external host, e.g. 43.203.164.228)
+  │◄── JWT token (issuer = https://<issuer_uri>:8089) ─────────────────────────
   │
-  │  Bearer token in request
+  │  XHR / EventSource — SAIA API calls with Bearer token
+  │  (browser calls SAIA directly — NOT through Splunk)
   ▼
 SAIA Backend (k0s cluster, e.g. 15.164.171.171)
-  │  Validates JWT: checks issuer, fetches JWKS from Splunk :8089
-  │  Allowed issuers controlled by AIPlatform CR → AIService → ConfigMap → pod env
+  │  1. Validates JWT: issuer must be in SPLUNK_ISSUERS (ConfigMap <name>-saia-config)
+  │  2. Fetches JWKS from https://<issuer_uri>:8089/.well-known/oauth2_keys
+  │     → port 8089 must be reachable from k0s cluster nodes
   ▼
 Ray inference / LLM
 ```
 
+**Important:** The browser calls SAIA directly using the URL in `saia_sok_url`. Splunk
+only issues the JWT token — it is not a proxy for SAIA requests. Firewall/SG rules must
+allow access from the **browser's network** (not just from the Splunk host) to the SAIA
+endpoint.
+
 Key constraint: the SAIA backend fetches the public signing keys from
 `<issuer_uri>/.well-known/oauth2_keys` at JWT validation time. The `issuer_uri`
 in the token must exactly match an entry in the SAIA backend's `SPLUNK_ISSUERS`
-allowlist, and it must be reachable from the k0s cluster nodes.
+ConfigMap key — patched directly as described in Step 4.
 
 ---
 
@@ -299,11 +305,17 @@ when the key is absent or empty. Importantly:
     kubectl get configmap -n <namespace> | grep saia-config
     ```
 
-2. Patch `SPLUNK_ISSUERS` with the external Splunk's public issuer URL:
+2. Patch `SPLUNK_ISSUERS` with the **exact** `issuer_uri` value from
+   `authentication.conf` — this must be a character-for-character match (IP or
+   FQDN, same scheme and port) because SAIA compares it literally against the
+   `iss` claim in each JWT:
 
     ```bash
+    # Use the exact issuer_uri value from Step 1/2, e.g.:
+    #   https://43.203.164.228:8089   (if configured as IP)
+    #   https://splunk.example.com:8089  (if configured as FQDN)
     kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
-      -p '{"data":{"SPLUNK_ISSUERS":"https://<PUBLIC_IP>:8089"}}'
+      -p '{"data":{"SPLUNK_ISSUERS":"https://<EXACT_ISSUER_URI>:8089"}}'
     ```
 
     To allow **both** the in-cluster Splunk and the external Splunk simultaneously,
@@ -311,7 +323,7 @@ when the key is absent or empty. Importantly:
 
     ```bash
     kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
-      -p '{"data":{"SPLUNK_ISSUERS":"https://splunk-splunk-standalone-standalone-service:8089 https://<PUBLIC_IP>:8089"}}'
+      -p '{"data":{"SPLUNK_ISSUERS":"https://splunk-splunk-standalone-standalone-service:8089 https://<EXACT_ISSUER_URI>:8089"}}'
     ```
 
 3. Confirm the value is set:
