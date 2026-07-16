@@ -175,7 +175,7 @@ and block HTTPS pages from making HTTP sub-requests.
 | Option | When to use |
 |--------|-------------|
 | [Option A — Disable Splunk Web SSL](#option-a--disable-splunk-web-ssl-temporary-workaround) | Testing / short-term debugging only |
-| [Option B — Deploy Traefik HTTPS Ingress](#option-b--deploy-traefik-https-ingress-production-fix) | Production — eliminates root cause |
+| [Option B — TLS Termination via Load Balancer or Ingress](#option-b--tls-termination-via-load-balancer-or-ingress-production-fix) | Production — eliminates root cause |
 
 ---
 
@@ -195,8 +195,11 @@ and block HTTPS pages from making HTTP sub-requests.
     ```bash
     curl -sv http://<public-ip>:8000 2>&1 | grep -E "< HTTP|Location"
     # Expected: HTTP/1.1 303 or 200
-    curl -sv https://<public-ip>:8000 2>&1 | grep "connect to"
-    # Expected: connection refused
+
+    # Confirm HTTPS is no longer serving (port 8000 still open but speaks HTTP,
+    # so TLS negotiation fails — not "connection refused"):
+    curl -sv https://<public-ip>:8000 2>&1 | grep -E "SSL|TLS|handshake|wrong version|unknown protocol"
+    # Expected: one of the above TLS error strings
     ```
 
 > **Remember to revert this** once the SAIA backend is served over HTTPS or
@@ -354,11 +357,20 @@ owned by another user. The command exits without touching the running process.
     stat -c '%U' $SPLUNK_HOME      # Linux
     ```
 
-2. If not root, run as the owning user (without sudo):
+2. Run as the owning user. If you are already logged in as the owner:
 
     ```bash
     $SPLUNK_HOME/bin/splunk stop
     $SPLUNK_HOME/bin/splunk start --answer-yes --accept-license
+    ```
+
+    If the SSH user is different from the owner (e.g. logged in as `ec2-user`
+    but Splunk is owned by `splunk`), use `sudo -H -u`:
+
+    ```bash
+    SPLUNK_OWNER=$(stat -c '%U' $SPLUNK_HOME)
+    sudo -H -u "${SPLUNK_OWNER}" $SPLUNK_HOME/bin/splunk stop
+    sudo -H -u "${SPLUNK_OWNER}" $SPLUNK_HOME/bin/splunk start --answer-yes --accept-license
     ```
 
 3. Confirm the PID actually changed (a matching old/new PID means it didn't restart):
@@ -416,23 +428,29 @@ After testing is complete, revert the temporary workaround from Step 3:
 **Check for side-effects on the k0s cluster:**
 
 If the k0s cluster previously had its own bundled Splunk standalone, the
-`AIPlatform` patch in Step 4 replaced that instance in the issuer allowlist
-with the external Splunk. Verify nothing else on the cluster depended on the
-bundled instance:
+ConfigMap patch in Step 4 may have replaced the in-cluster issuer with the
+external one. Verify nothing else on the cluster depended on the bundled
+instance:
 
 ```bash
 # Check if the in-cluster Splunk standalone still exists and is healthy
 kubectl get standalone -n ai-platform
 kubectl get pods -n ai-platform | grep splunk
 
-# Check AIService still shows the correct (external) endpoint
-kubectl get aiservice -n ai-platform -o jsonpath='{.items[0].spec.splunkConfiguration.endpoint}'
+# Check current SPLUNK_ISSUERS value in the ConfigMap
+kubectl get configmap -n ai-platform -o json | jq -r '.items[].data | select(has("SPLUNK_ISSUERS")) | .SPLUNK_ISSUERS'
 ```
 
 If the in-cluster Splunk is still deployed and needs to be trusted alongside
-the external one, the `AIPlatform` CR may support a list of endpoints (check
-the CRD spec). Otherwise, decommission whichever Splunk instance is no longer
-the source of truth.
+the external one, patch `SPLUNK_ISSUERS` with both URLs as shown in Step 4:
+
+```bash
+kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
+  -p '{"data":{"SPLUNK_ISSUERS":"https://splunk-splunk-standalone-standalone-service:8089 https://<PUBLIC_IP>:8089"}}'
+```
+
+Otherwise, decommission whichever Splunk instance is no longer the source of
+truth and leave only its issuer in `SPLUNK_ISSUERS`.
 
 ---
 
