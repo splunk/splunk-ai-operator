@@ -133,14 +133,20 @@ loopback. The JWT validation (JWKS fetch) fails.
     sslPassword = <passphrase>
     ```
 
-2. Verify port 8089 is reachable from outside:
+2. Verify port 8089 is reachable **from the k0s cluster** (this is the path that
+   actually performs JWT validation — a check from your laptop can pass while
+   SAIA pods are still blocked by a security group or firewall):
 
     ```bash
-    # Run from any machine outside the Splunk host (e.g. your laptop)
+    # Run from any k0s cluster node (e.g. the installer or controller)
     nc -zv <public-ip> 8089
     # or
     curl -sk https://<public-ip>:8089/services/server/info | grep -c "<title>"
     ```
+
+    If the check passes from your laptop but fails from the cluster, update the
+    Splunk host's security-group inbound rules to allow port 8089 from the
+    cluster nodes' IP range.
 
 3. Restart Splunk (see [Step 5](#step-5--restart-splunk-correctly)).
 
@@ -240,7 +246,8 @@ SAIA service (in-cluster HTTP)
 
     ```ini
     # splunkaiassistant.conf
-    [general]
+    [saia_sok_configurations]
+    saia_sok_enabled = true
     saia_sok_url = https://<host>:<port>
     ```
 
@@ -269,44 +276,53 @@ SAIA service (in-cluster HTTP)
 
 (or whatever the old issuer was)
 
-**Root cause:** The SAIA backend maintains an allowlist of trusted JWT issuers
-in a `ConfigMap` (e.g. `SPLUNK_ISSUERS` env var). That ConfigMap is
-**operator-managed** — editing it directly or editing `AIService.spec.splunkConfiguration`
-gets reverted within seconds by the operator's reconcile loop.
+**Root cause:** `SPLUNK_ISSUERS` is a key in the SAIA config `ConfigMap`. The
+operator sets it to the hardcoded default (`https://splunk-splunk-standalone-standalone-service:8089`)
+when the key is absent or empty. Importantly:
 
-**Fix — patch the `AIPlatform` CR (the actual source of truth):**
+- `AIService.spec.splunkConfiguration.endpoint` is the **HEC telemetry endpoint**
+  (used by the log-forwarding sidecar as `<endpoint>/services/collector`) — it is
+  **not** used to populate `SPLUNK_ISSUERS`. Patching `AIPlatform.spec.splunkConfiguration`
+  will not update the issuer allowlist and will redirect telemetry to the wrong endpoint.
+- The reconciler only fills **missing or empty** ConfigMap keys — once `SPLUNK_ISSUERS`
+  is set, the operator will not overwrite it. Editing the ConfigMap directly is safe
+  and is the correct fix.
 
-1. Find the `AIPlatform` CR name:
+**Fix — edit the SAIA ConfigMap directly:**
 
-    ```bash
-    kubectl get aiplatform -A
-    ```
-
-2. Patch it with the external Splunk's public issuer URL:
-
-    ```bash
-    kubectl patch aiplatform <name> -n <namespace> --type merge \
-      -p '{"spec":{"splunkConfiguration":{"endpoint":"https://<PUBLIC_IP>:8089"}}}'
-    ```
-
-3. Wait 30–60 seconds for the operator to reconcile, then confirm the change
-   propagated to `AIService` and the `ConfigMap`:
+1. Find the SAIA config ConfigMap:
 
     ```bash
-    # AIService should reflect the new endpoint
-    kubectl get aiservice <name> -n <namespace> \
-      -o jsonpath='{.spec.splunkConfiguration.endpoint}'
-
-    # ConfigMap SPLUNK_ISSUERS should contain the new URL
-    kubectl get configmap -n <namespace> \
-      -o json | jq -r '.items[].data | select(has("SPLUNK_ISSUERS")) | .SPLUNK_ISSUERS'
+    kubectl get configmap -n <namespace> | grep saia-config
     ```
 
-4. Force SAIA pods to restart so they pick up the new `ConfigMap` value.
+2. Patch `SPLUNK_ISSUERS` with the external Splunk's public issuer URL:
+
+    ```bash
+    kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
+      -p '{"data":{"SPLUNK_ISSUERS":"https://<PUBLIC_IP>:8089"}}'
+    ```
+
+    To allow **both** the in-cluster Splunk and the external Splunk simultaneously,
+    separate the URLs with a space:
+
+    ```bash
+    kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
+      -p '{"data":{"SPLUNK_ISSUERS":"https://splunk-splunk-standalone-standalone-service:8089 https://<PUBLIC_IP>:8089"}}'
+    ```
+
+3. Confirm the value is set:
+
+    ```bash
+    kubectl get configmap <name>-saia-config -n <namespace> \
+      -o jsonpath='{.data.SPLUNK_ISSUERS}'
+    ```
+
+4. Force SAIA pods to restart so they pick up the updated `ConfigMap`.
 
     > **Why not `kubectl rollout restart`?** The operator's reconcile loop can
-    > revert a `rollout restart` mid-flight. Deleting pods directly is more
-    > reliable — the operator recreates them with the current (updated) `ConfigMap`.
+    > race with a rollout restart. Deleting pods directly is more reliable — the
+    > operator recreates them with the current ConfigMap value.
 
     ```bash
     # Find the SAIA v1 and v2 pods
@@ -430,4 +446,4 @@ the source of truth.
 | `{"detail":"Issuer '...' is not allowed"}` | External issuer not in `SPLUNK_ISSUERS` allowlist | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
 | Config change has no effect after restart | Restarted with `sudo` but Splunk owned by another user | [Step 5](#step-5--restart-splunk-correctly) |
 | Fresh fix works but old browser session still fails | Stale JWT from before the restart — log out and back in | [Step 6](#step-6--final-verification) |
-| Direct `ConfigMap` edit reverted within seconds | Operator-managed resource — must patch `AIPlatform` CR | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
+| Patching `AIPlatform.splunkConfiguration.endpoint` doesn't fix issuer | That field is the HEC endpoint, not the issuer — patch `SPLUNK_ISSUERS` in the ConfigMap directly | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
