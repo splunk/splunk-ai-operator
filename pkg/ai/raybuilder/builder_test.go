@@ -74,6 +74,8 @@ func TestBuilder_Build(t *testing.T) {
 	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
 	os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
 	os.Setenv("INSTANCE_FILE", "../../../config/configs/instance.yaml")
+	os.Setenv("MODEL_SCALE_FILE", "../../../config/configs/model-scale.yaml")
+	os.Setenv("WORKER_SCALE_FILE", "../../../config/configs/worker-scale.yaml")
 
 	s := scheme.Scheme
 	_ = aiv1.AddToScheme(s)

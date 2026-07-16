@@ -166,6 +166,11 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 		allErrs = append(allErrs, errs...)
 	}
 
+	// Validate top-level ScaleFactor
+	if errs := v.validateScaleFactor(aiplatform.Spec.ScaleFactor, field.NewPath("spec").Child("scaleFactor")); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+
 	if len(allErrs) > 0 {
 		return warnings, allErrs.ToAggregate()
 	}
@@ -464,6 +469,23 @@ func (v *AIPlatformCustomValidator) validateMTLS(mtls *aiv1.MTLSConfig, certific
 	return allErrs
 }
 
+// validateScaleFactor validates the platform-wide scaleFactor. The CRD
+// Minimum=0 marker is the primary guard; this mirrors it for defense in depth.
+// 0 is allowed and scales the whole platform to zero (deploy nothing).
+func (v *AIPlatformCustomValidator) validateScaleFactor(scaleFactor *int32, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if scaleFactor != nil && *scaleFactor < 0 {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath,
+			*scaleFactor,
+			"scaleFactor must be at least 0",
+		))
+	}
+
+	return allErrs
+}
+
 // validateFeatures validates the Features configuration
 func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
@@ -489,15 +511,6 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 			))
 		}
 		featureNames[feature.Name] = true
-
-		// Validate scaleFactor if specified
-		if feature.ScaleFactor != nil && *feature.ScaleFactor < 1 {
-			allErrs = append(allErrs, field.Invalid(
-				featurePath.Child("scaleFactor"),
-				*feature.ScaleFactor,
-				"scaleFactor must be at least 1",
-			))
-		}
 	}
 
 	return allErrs

@@ -4530,6 +4530,15 @@ EOF
     log "SAIA public exposure: ${svc_type}${svc_node_port:+ (nodePort=${svc_node_port})}"
   fi
 
+  # Platform-wide capacity multiplier (aiPlatform.scaleFactor). Scales both
+  # model replicas and GPU worker pods together. Omitted => operator default (1).
+  local scale_factor_yaml="" ai_scale_factor
+  ai_scale_factor=$(yq eval '.aiPlatform.scaleFactor // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "$ai_scale_factor" && "$ai_scale_factor" != "null" ]]; then
+    scale_factor_yaml="  scaleFactor: ${ai_scale_factor}"$'\n'
+    log "  scaleFactor: ${ai_scale_factor}"
+  fi
+
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
   local feature_count
@@ -4577,6 +4586,8 @@ ${image_pull_secrets}
   # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
+  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
+${scale_factor_yaml}
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}

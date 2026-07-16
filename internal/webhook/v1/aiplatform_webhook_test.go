@@ -156,5 +156,33 @@ var _ = Describe("AIPlatform Webhook", func() {
 				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
 			})
 		})
+
+		Describe("scaleFactor validation", func() {
+			sfPath := field.NewPath("spec").Child("scaleFactor")
+
+			It("should accept scaleFactor of 0 (deploy nothing)", func() {
+				zero := int32(0)
+				errs := validator.validateScaleFactor(&zero, sfPath)
+				Expect(errs).To(BeEmpty())
+			})
+
+			It("should reject a negative scaleFactor", func() {
+				neg := int32(-1)
+				errs := validator.validateScaleFactor(&neg, sfPath)
+				Expect(errs).NotTo(BeEmpty(), "expected a scaleFactor error")
+				Expect(errs[0].Detail).To(ContainSubstring("at least 0"))
+			})
+
+			It("should accept a scaleFactor of 1", func() {
+				one := int32(1)
+				errs := validator.validateScaleFactor(&one, sfPath)
+				Expect(errs).To(BeEmpty())
+			})
+
+			It("should accept an unset scaleFactor (defaults to 1)", func() {
+				errs := validator.validateScaleFactor(nil, sfPath)
+				Expect(errs).To(BeEmpty())
+			})
+		})
 	})
 })

@@ -65,6 +65,18 @@ type AIPlatformSpec struct {
 	// +kubebuilder:validation:MaxItems=10
 	Features []FeatureSpec `json:"features,omitempty"`
 
+	// ScaleFactor is a platform-wide capacity multiplier. It uniformly scales
+	// BOTH the model (Serve) replicas AND the GPU worker-pool pod counts, so a
+	// single knob grows capacity without needing to know which models exist or
+	// how many GPUs each uses. The cluster must have proportionally more GPUs
+	// available before raising it. Defaults to 1 (single-capacity deployment).
+	// Set to 0 to deploy nothing (all model replicas and GPU worker pods scale
+	// to zero) — useful for pausing the platform without deleting the CR.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=1
+	ScaleFactor *int32 `json:"scaleFactor,omitempty"`
+
 	// WorkerGroupConfig defines the Ray worker group configuration
 	// +kubebuilder:validation:Optional
 	WorkerGroupConfig *WorkerGroupConfig `json:"workerGroupConfig,omitempty"`
@@ -184,10 +196,6 @@ type FeatureSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
 	Version string `json:"version,omitempty"`
-	// ScaleFactor is the desired fixed number of replicas for the feature.
-	// +kubebuilder:validation:Minimum=1
-	// +optional
-	ScaleFactor *int32 `json:"scaleFactor,omitempty"`
 }
 
 // WeaviateSpec defines the configuration for the Weaviate vector database

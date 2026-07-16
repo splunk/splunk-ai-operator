@@ -1051,12 +1051,6 @@ spec:
                     - seca
                     - slim
                     type: string
-                  scaleFactor:
-                    description: ScaleFactor is the desired fixed number of replicas
-                      for the feature.
-                    format: int32
-                    minimum: 1
-                    type: integer
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature

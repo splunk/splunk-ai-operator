@@ -217,6 +217,16 @@ aiPlatform:
   name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
 
+  # scaleFactor: 2
+  #   Optional, platform-wide. Runs the whole platform at N times its normal
+  #   capacity — scales BOTH the model replicas AND the GPU worker pods
+  #   together, so you never need to know which models exist or how many GPUs
+  #   each one uses. Omit or set to 1 for the default single-capacity
+  #   deployment. Your cluster must have proportionally more GPUs available
+  #   before raising this (e.g. 2x the GPUs on the node pool for scaleFactor: 2).
+  #   Set to 0 to deploy nothing (all model replicas and GPU worker pods scale
+  #   to zero) — a way to pause the platform without deleting the CR.
+
   workerGroupConfig:
     imageRegistry: ""
 
