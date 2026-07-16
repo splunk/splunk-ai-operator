@@ -2638,7 +2638,10 @@ _install_nvidia_on_node() {
     # ---- Phase B: install driver + supporting packages --------------------
     # `set -euo pipefail` means ANY failure aborts the block. Each step below
     # must either succeed or have an explicit fallback branch that succeeds.
-    if ! ssh_exec "${gpu_ip}" "
+    # Capture exit code explicitly — `if ! ssh_exec ...; then` loses it because
+    # bash sets $? to 0 after the ! negation regardless of the real exit code.
+    local _nvidia_rc=0
+    ssh_exec "${gpu_ip}" "
       set -euo pipefail
 
       # --- OS detection (RHEL 9 is the only supported path) ---
@@ -2859,7 +2862,7 @@ _install_nvidia_on_node() {
         echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
         exit 1
       }
-    " || local _nvidia_rc=$?
+    " || _nvidia_rc=$?
     if [[ "${_nvidia_rc:-0}" -ne 0 ]]; then
       if [[ "${_nvidia_rc}" -eq 42 ]]; then
         # exit 42 = kernel upgrade triggered a reboot; wait for node and retry
