@@ -166,9 +166,9 @@ ensure_network() {
     --region "${REGION}" \
     --query 'Vpc.VpcId' --output text)
   aws ec2 modify-vpc-attribute --vpc-id "${VPC_ID}" \
-    --enable-dns-support --region "${REGION}"
+    --enable-dns-support '{"Value":true}' --region "${REGION}"
   aws ec2 modify-vpc-attribute --vpc-id "${VPC_ID}" \
-    --enable-dns-hostnames --region "${REGION}"
+    --enable-dns-hostnames '{"Value":true}' --region "${REGION}"
   aws ec2 create-tags --resources "${VPC_ID}" \
     --tags "Key=Name,Value=${STACK_NAME}-vpc" "Key=${TAG_KEY},Value=${STACK_NAME}" \
     --region "${REGION}"
@@ -871,7 +871,10 @@ PREREQ
     # so we symlink that path to /data/minio/model_artifacts on the big EBS volume.
     if [[ "$MINIO_ENABLED" == "true" ]]; then
       ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'SYMLINKSCRIPT'
-mkdir -p /data/minio/model_artifacts
+set -e
+# /data/minio is root-owned after mount; ensure ec2-user can write to it
+sudo mkdir -p /data/minio/model_artifacts
+sudo chown -R ec2-user:ec2-user /data/minio
 rm -rf ~/artifacts_download_upload_scripts/model_artifacts
 ln -sfn /data/minio/model_artifacts ~/artifacts_download_upload_scripts/model_artifacts
 SYMLINKSCRIPT
@@ -957,10 +960,18 @@ EOF
 
 for NODE_IP in "${NODE_IPS[@]}"; do
   echo "[ecr-auth] Configuring ${NODE_IP}..."
-  ssh -o StrictHostKeyChecking=no "ec2-user@${NODE_IP}" \
-    "sudo mkdir -p /etc/containerd/certs.d/${ECR_REGISTRY} && \
-     echo '${HOSTS_TOML}' | sudo tee /etc/containerd/certs.d/${ECR_REGISTRY}/hosts.toml > /dev/null && \
-     echo '[ecr-auth] hosts.toml written on ${NODE_IP}'"
+  ssh -o StrictHostKeyChecking=no "ec2-user@${NODE_IP}" "bash -s" <<NODEAUTH
+set -e
+# k0s reads containerd registry config from /etc/k0s/containerd/certs.d/<reg>/hosts.toml.
+# A drop-in under /etc/k0s/containerd.d/ must set config_path to point containerd there.
+sudo mkdir -p /etc/k0s/containerd.d
+printf '[plugins."io.containerd.cri.v1.images".registry]\n  config_path = "/etc/k0s/containerd/certs.d"\n' \
+  | sudo tee /etc/k0s/containerd.d/ecr-registry-config-path.toml >/dev/null
+sudo mkdir -p "/etc/k0s/containerd/certs.d/${ECR_REGISTRY}"
+printf '%s' '${HOSTS_TOML}' \
+  | sudo tee "/etc/k0s/containerd/certs.d/${ECR_REGISTRY}/hosts.toml" >/dev/null
+echo "[ecr-auth] hosts.toml written on ${NODE_IP}"
+NODEAUTH
 done
 
 echo "[ecr-auth] Containerd ECR auth configured on ${#NODE_IPS[@]} node(s)."
@@ -1145,9 +1156,14 @@ cmd_provision() {
   done
 
   for ((i=0; i<GPU_COUNT; i++)); do
-    local id; LAST_LAUNCHED_SUBNET=""
-    id=$(launch_instance_az_fallback "gpu-worker-${i}" "${GPU_TYPE}" "${GPU_DISK}" "${ud_gpu}" \
-      "${gpu_fallback_subnets[@]}")
+    # launch_instance_az_fallback sets LAST_LAUNCHED_SUBNET in the caller's
+    # scope only when called directly (not via command substitution subshell).
+    # Capture the instance ID via a tempfile so the subnet variable propagates.
+    LAST_LAUNCHED_SUBNET=""
+    local _id_file; _id_file=$(mktemp)
+    launch_instance_az_fallback "gpu-worker-${i}" "${GPU_TYPE}" "${GPU_DISK}" "${ud_gpu}" \
+      "${gpu_fallback_subnets[@]}" > "${_id_file}"
+    local id; id=$(cat "${_id_file}"); rm -f "${_id_file}"
     save_state "GPU_INSTANCE_${i}" "${id}"
     save_state "GPU_SUBNET_${i}" "${LAST_LAUNCHED_SUBNET}"
   done
