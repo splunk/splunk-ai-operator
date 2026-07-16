@@ -1125,12 +1125,14 @@ cmd_provision() {
   # ---------- Launch instances ----------
   local ud_k0s ud_gpu ud_installer
   ud_k0s=$(make_userdata "")
-  ud_gpu=$(make_userdata "/var/lib/k0s")
-  if [[ "$MINIO_ENABLED" == "true" ]]; then
-    ud_installer=$(make_userdata "/data/minio")
-  else
-    ud_installer=$(make_userdata "")
-  fi
+  # GPU workers and the installer must NOT mount their data disk in userdata.
+  # On g6e.12xlarge the local NVMe instance-store disks appear at boot (before
+  # EBS attaches); a blind nvme1n1 scan would format and mount ephemeral storage
+  # at /var/lib/k0s instead of the paid EBS volume. The correct mount happens
+  # via mount_disk_via_ssh after attach_data_volume, which skips already-mounted
+  # devices and uses UUID-based fstab entries.
+  ud_gpu=$(make_userdata "")
+  ud_installer=$(make_userdata "")
 
   for ((i=0; i<CTRL_COUNT; i++)); do
     local id; id=$(launch_instance "controller-${i}" "${CTRL_TYPE}" "${CTRL_DISK}" "${ud_k0s}")
