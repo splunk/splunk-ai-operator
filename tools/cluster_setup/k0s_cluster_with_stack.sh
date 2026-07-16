@@ -2859,9 +2859,9 @@ _install_nvidia_on_node() {
         echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
         exit 1
       }
-    "; then
-      local _rc=$?
-      if [[ "${_rc}" -eq 42 ]]; then
+    " || local _nvidia_rc=$?
+    if [[ "${_nvidia_rc:-0}" -ne 0 ]]; then
+      if [[ "${_nvidia_rc}" -eq 42 ]]; then
         # exit 42 = kernel upgrade triggered a reboot; wait for node and retry
         echo "Kernel upgraded on ${gpu_ip} — waiting for reboot (up to 5 min)..."
         local _wait=0
