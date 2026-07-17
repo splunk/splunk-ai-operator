@@ -398,7 +398,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalMode(t *testing.T) {
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://splunk-splunk-standalone-standalone-service:8089 https://external.splunk:8089",
+		"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089 https://external.splunk:8089",
 		cm.Data["SPLUNK_ISSUERS"],
 		"internal mode: in-cluster issuer must be prepended, TrustedIssuers appended")
 }
@@ -419,7 +419,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalModeNoExtra(t *testing.T
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://splunk-splunk-standalone-standalone-service:8089",
+		"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089",
 		cm.Data["SPLUNK_ISSUERS"],
 		"internal mode with no TrustedIssuers: only the in-cluster issuer")
 }
@@ -448,15 +448,16 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_AlwaysRecomputed(t *testing.T) {
 		"spec-driven SPLUNK_ISSUERS must be recomputed on every reconcile, not preserved from old value")
 }
 
-func Test_reconcileSAIAConfigMap_TrustedIssuers_ManualOverridePreservedWhenNoSpec(t *testing.T) {
-	// When no TrustedIssuers are set and no SplunkCustomResourceRef, a manually-patched
-	// SPLUNK_ISSUERS in the ConfigMap must be preserved (fill-if-missing behavior).
+func Test_reconcileSAIAConfigMap_TrustedIssuers_ClearedWhenSpecEmpty(t *testing.T) {
+	// When spec has no SplunkConfiguration (CRRef, Endpoint, TrustedIssuers all empty),
+	// SPLUNK_ISSUERS must be cleared to empty string so stale issuers from a previous
+	// configuration do not persist in the ConfigMap.
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService() // no SplunkConfiguration set
 
 	existing := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
-		Data:       map[string]string{"SPLUNK_ISSUERS": "https://manually-patched.splunk:8089"},
+		Data:       map[string]string{"SPLUNK_ISSUERS": "https://old-stale.splunk:8089"},
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
 	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
@@ -467,8 +468,31 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_ManualOverridePreservedWhenNoSpe
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
-	assert.Equal(t, "https://manually-patched.splunk:8089", cm.Data["SPLUNK_ISSUERS"],
-		"no spec-driven issuers: manual ConfigMap override must be preserved")
+	assert.Equal(t, "", cm.Data["SPLUNK_ISSUERS"],
+		"empty spec: stale SPLUNK_ISSUERS must be cleared to prevent orphaned issuer trust")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
+	// When splunkConfiguration.endpoint is set (no CRRef), the endpoint itself is used
+	// as the JWT issuer — this covers in-cluster installs that set the endpoint directly
+	// via the cluster installer rather than via SplunkCustomResourceRef.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"endpoint mode: endpoint must be used as the JWT issuer")
 }
 
 func Test_reconcileSAIAv2Deployment(t *testing.T) {
