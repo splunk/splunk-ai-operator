@@ -142,7 +142,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 
 			It("should accept an empty Splunk config (Splunk disabled)", func() {
 				splunkConfig := &aiv1.SplunkConfigurationSpec{}
-				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
+			errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
 			})
 

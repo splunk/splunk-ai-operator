@@ -132,6 +132,7 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		return fmt.Errorf("sidecars.otel requires a Kubernetes secretRef; vault-backed telemetry is not yet supported for the OTel collector path")
 	}
 
+
 	// seed or update the ConfigMap
 	if err := s.reconcileOtelConfigMap(ctx, p); err != nil {
 		return fmt.Errorf("reconcile otel configmap: %w", err)
