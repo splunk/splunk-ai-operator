@@ -345,8 +345,11 @@ validate_image_config() {
     err "REQUIRED: images.operator.image must be specified in cluster-config.yaml"
   fi
 
-  if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.splunk.image must be specified in cluster-config.yaml"
+  # Splunk images are only required when in-cluster Splunk will actually be
+  # installed (SPLUNK_MODE=internal). disabled/external modes never render
+  # the Splunk Operator/Standalone manifests, so the image can be absent.
+  if [[ "${SPLUNK_MODE}" == "internal" ]] && { [[ -z "$SPLUNK_IMAGE" ]] || [[ "$SPLUNK_IMAGE" == "null" ]]; }; then
+    err "REQUIRED: images.splunk.image must be specified in cluster-config.yaml (splunk.mode=internal)"
   fi
 
   if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
@@ -2721,11 +2724,86 @@ check_aiplatform_status() {
 
 install_ai_platform_cr() {
   local secret_name="${1:-}"
-  if [[ -z "$secret_name" ]]; then
+  if [[ -z "$secret_name" && "${SPLUNK_MODE}" == "internal" ]]; then
     secret_name="$(find_splunk_standalone_secret_name "${AI_NS}" "${AI_STANDALONE_NAME}")"
   fi
-  log "Installing AIPlatform CR (${AI_PLATFORM_NAME}) in ${AI_NS} using secretRef.name=${secret_name}"
+  log "Installing AIPlatform CR (${AI_PLATFORM_NAME}) in ${AI_NS}, Splunk mode=${SPLUNK_MODE}"
   ensure_namespace "${AI_NS}"
+
+  # Build trustedIssuers YAML fragment from config (splunk.trustedIssuers[]).
+  # Used in all modes: appended to in-cluster issuer (internal) or sole source (external/disabled).
+  local trusted_issuers_yaml=""
+  local trusted_issuers_count
+  trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${trusted_issuers_count}" -gt 0 ]]; then
+    trusted_issuers_yaml="    trustedIssuers:"$'\n'
+    local _ti=0
+    while [[ $_ti -lt $trusted_issuers_count ]]; do
+      local _url
+      _url=$(yq eval ".splunk.trustedIssuers[$_ti]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      [[ -n "${_url}" && "${_url}" != "null" ]] && trusted_issuers_yaml+="      - \"${_url}\""$'\n'
+      _ti=$((_ti + 1))
+    done
+  fi
+
+  # Splunk telemetry block for the AIPlatform CR. Rendered by mode:
+  #   disabled — omits telemetry fields; trustedIssuers still written if set.
+  #   internal — point at the in-cluster Standalone HEC + operator-managed secret.
+  #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
+  #              var and point at the customer's external HEC endpoint.
+  local splunk_config_yaml=""
+  case "${SPLUNK_MODE}" in
+    internal)
+      log "Using Splunk secret: ${secret_name}"
+      splunk_config_yaml=$(cat <<EOF
+  splunkConfiguration:
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    secretRef:
+      name: ${secret_name}
+      namespace: ${AI_NS}
+${trusted_issuers_yaml}
+EOF
+)
+      ;;
+    external)
+      # The HEC token comes from the env var only (never the config file). The
+      # namespace is guaranteed here (internal mode created it via the Standalone
+      # install; external mode skips that, so ensure it now before the Secret).
+      ensure_namespace "${AI_NS}"
+      if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
+        err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
+      fi
+      log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
+      # --dry-run|apply keeps this idempotent across re-runs. The token value is
+      # never echoed; only the secret name is logged.
+      kubectl -n "${AI_NS}" create secret generic "${SPLUNK_EXTERNAL_SECRET_NAME}" \
+        --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
+        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+      log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
+      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
+      splunk_config_yaml=$(cat <<EOF
+  splunkConfiguration:
+    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
+    secretRef:
+      name: ${SPLUNK_EXTERNAL_SECRET_NAME}
+      namespace: ${AI_NS}
+${trusted_issuers_yaml}
+EOF
+)
+      ;;
+    *)
+      if [[ -n "${trusted_issuers_yaml}" ]]; then
+        log "Splunk telemetry disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
+        splunk_config_yaml=$(cat <<EOF
+  splunkConfiguration:
+${trusted_issuers_yaml}
+EOF
+)
+      else
+        log "Splunk telemetry disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+      fi
+      ;;
+  esac
 
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: cert-manager.io/v1
@@ -2831,12 +2909,8 @@ ${svc_template_yaml}
     tls:
       - hosts: [ ${INGRESS_HOST} ]
         secretName: ${INGRESS_TLS_SECRET}
-  splunkConfiguration:
-    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
-    secretRef:
-      name: ${secret_name}
-      namespace: ${AI_NS}
   certificateRef: ${CERT_ISSUER}
+${splunk_config_yaml}
 YAML
 
   wait_aiplatform_ready
