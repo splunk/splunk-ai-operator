@@ -2435,8 +2435,8 @@ all_models_staged() {
       for i in "${!ids[@]}"; do
         local id="${ids[$i]}" hf_url="${hf_urls[$i]:-}"
         local marker_path="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
-        local content
-        content=$(mc cat "${marker_path}" 2>/dev/null) || { missing+=("${id}"); continue; }
+        local content=""
+        content=$(mc cat "${marker_path}" 2>/dev/null) || content=""
         _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
       done
       ;;
@@ -3347,9 +3347,8 @@ install_nvidia_host_drivers() {
   done
 
   if [[ "${all_gpu_ready}" != "true" ]]; then
-    warn "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s — continuing install."
-    warn "Check node status after install: kubectl get nodes"
-    warn "If nodes are NotReady due to a pending reboot, reboot the node and re-run the installer."
+    err "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s. \
+Check 'kubectl get nodes' and reboot any NotReady GPU node, then re-run the installer."
   fi
 
   # Verify GPUs are visible to Kubernetes. If the device-plugin DaemonSet
@@ -3751,9 +3750,12 @@ install_splunk_ai_operator() {
     warn "Certificate resources may not have been created — the AI operator webhook may not work"
   fi
 
-  # Specifically ensure ClusterRole is updated (common RBAC update issue)
+  # Specifically ensure ClusterRole is updated (common RBAC update issue).
+  # Capture output so we can filter the log but preserve the apply exit code.
   log "Verifying ClusterRole RBAC permissions..."
-  kubectl apply -f "${SPLUNK_AI_FILE}" --server-side --force-conflicts 2>&1 | grep -i "clusterrole" || true
+  local clusterrole_output
+  clusterrole_output=$(kubectl apply -f "${SPLUNK_AI_FILE}" --server-side --force-conflicts 2>&1)
+  echo "${clusterrole_output}" | grep -i "clusterrole" || true
 
   # Find the operator deployment
   log "Waiting for Splunk AI Operator deployment..."
@@ -4276,9 +4278,24 @@ install_ai_platform_cr() {
     xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
   log "✓ Cleanup complete"
 
+  # Build trustedIssuers YAML fragment from config (splunk.trustedIssuers[]).
+  # Used in all modes: appended to in-cluster issuer (internal) or sole source (external/disabled).
+  local trusted_issuers_yaml=""
+  local trusted_issuers_count
+  trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${trusted_issuers_count}" -gt 0 ]]; then
+    trusted_issuers_yaml="    trustedIssuers:"$'\n'
+    local _ti=0
+    while [[ $_ti -lt $trusted_issuers_count ]]; do
+      local _url
+      _url=$(yq eval ".splunk.trustedIssuers[$_ti]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      [[ -n "${_url}" && "${_url}" != "null" ]] && trusted_issuers_yaml+="      - \"${_url}\""$'\n'
+      _ti=$((_ti + 1))
+    done
+  fi
+
   # Splunk telemetry block for the AIPlatform CR. Rendered by mode:
-  #   disabled — block stays empty; the operator treats an absent
-  #              splunkConfiguration as "no telemetry" (graceful skip).
+  #   disabled — omits telemetry fields; trustedIssuers still written if set.
   #   internal — point at the in-cluster Standalone HEC + operator-managed secret.
   #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
   #              var and point at the customer's external HEC endpoint.
@@ -4295,6 +4312,7 @@ install_ai_platform_cr() {
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
+${trusted_issuers_yaml}
 EOF
 )
       ;;
@@ -4322,11 +4340,23 @@ EOF
     secretRef:
       name: ${SPLUNK_EXTERNAL_SECRET_NAME}
       namespace: ${AI_NS}
+${trusted_issuers_yaml}
 EOF
 )
       ;;
     *)
-      log "Splunk telemetry disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+      if [[ -n "${trusted_issuers_yaml}" ]]; then
+        log "Splunk telemetry disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
+        splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (disabled — trustedIssuers only for JWT validation)
+  splunkConfiguration:
+${trusted_issuers_yaml}
+EOF
+)
+      else
+        log "Splunk telemetry disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+      fi
       ;;
   esac
 
