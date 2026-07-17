@@ -4822,6 +4822,97 @@ patch_k0s_saia_public_service_workaround() {
   patch_k0s_saia_service_disable_nodeport
 }
 
+# True when the "slim" feature is present in aiPlatform.features[]. slim has no
+# v1/v2/nginx split, so its public Service is just <platform>-slim-slim-service.
+k0s_slim_feature_enabled() {
+  local names
+  names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  while IFS= read -r n; do
+    [[ "${n}" == "slim" ]] && return 0
+  done <<< "${names}"
+  return 1
+}
+
+# Expose the slim public Service the same way SAIA is exposed, but on a DISTINCT
+# NodePort (aiPlatform.serviceTemplate.slimNodePort, default 30081). This is
+# required because the AIPlatform reconciler copies AIPlatform.spec.serviceTemplate
+# down to EVERY feature's AIService verbatim, so slim would otherwise inherit
+# SAIA's nodePort (30080) and collide — a single NodePort can back only one
+# Service. We patch slim's own AIService.spec.serviceTemplate after it exists;
+# reconcileSlimService only mutates Selector/Ports on the existing Service and
+# the AIPlatform reconciler preserves an admin-patched serviceTemplate
+# (pkg/ai/reconciler.go), so this patch survives subsequent reconciles.
+patch_k0s_slim_public_service_workaround() {
+  k0s_slim_feature_enabled || return 0
+
+  local platform_name="${CLUSTER_NAME}-ai-platform"
+  local aiservice_name="${platform_name}-slim"
+  local public_svc_name="${aiservice_name}-slim-service"
+  local svc_type svc_node_port slim_node_port
+
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  # slimNodePort keeps slim off SAIA's port; fall back to nodePort+1 if unset so
+  # a config that only sets one shared nodePort still avoids a hard collision.
+  slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ ( -z "${slim_node_port}" || "${slim_node_port}" == "null" ) && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
+    slim_node_port=$((svc_node_port + 1))
+  fi
+
+  wait_for_k0s_aiservice_exists "${aiservice_name}"
+
+  if saia_service_template_enabled_k0s; then
+    log "Patching AIService/${aiservice_name} with slim public exposure settings (type=${svc_type})..."
+    if [[ "${svc_type}" == "NodePort" && -n "${slim_node_port}" && "${slim_node_port}" != "null" ]]; then
+      log "slim exposed via NodePort ${slim_node_port} — reach it at http://<worker-ip>:${slim_node_port} (front with a cloud LB on cloud VMs). Distinct from SAIA's ${svc_node_port} to avoid a NodePort collision." >&2
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${slim_node_port}
+          }
+        ]
+      }
+    }
+  }
+}"
+    else
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"${svc_type}\"
+      }
+    }
+  }
+}"
+    fi
+  fi
+
+  apply_k0s_saia_service_annotations "${aiservice_name}"
+
+  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
+
+  if saia_service_template_enabled_k0s; then
+    log "Recreating slim public Service to ensure patched settings take effect..."
+    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+    # Wait briefly for the operator to recreate it before moving on; if it
+    # doesn't come back in time the next reconcile will render it anyway.
+    local waited=0
+    while ! kubectl -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
+      [[ ${waited} -ge 300 ]] && break
+      sleep 5
+      waited=$((waited + 5))
+    done
+  fi
+}
+
 # ====== INSTALL FULL STACK ======
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
@@ -4916,6 +5007,8 @@ install_ai_platform_stack() {
   install_splunk_ai_operator
   install_ai_platform_cr
   patch_k0s_saia_public_service_workaround
+  # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
+  patch_k0s_slim_public_service_workaround
 
   # Now wait for Splunk Standalone to be ready (likely already done by now)
   wait_for_splunk_standalone

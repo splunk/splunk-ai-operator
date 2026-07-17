@@ -56,7 +56,7 @@ serviceAccountName: ""
 gpuInstanceType: "g6.24xlarge"
 
 # List of defined features to enable in the AI platform
-# Options include: saia, seca
+# Options include: saia, seca, slim
 features: []
 # Example:
 # - name: "saia"

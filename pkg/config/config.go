@@ -33,4 +33,8 @@ type OperatorConfig struct {
 
 	// DebugSaiaEndpoint overrides SAIA service endpoint in debug mode.
 	DebugSaiaEndpoint string
+
+	// DebugSlimEndpoint overrides SLIM API service endpoint in debug mode.
+	// Example: "http://localhost:8080"
+	DebugSlimEndpoint string
 }

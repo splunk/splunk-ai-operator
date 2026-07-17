@@ -177,8 +177,8 @@ type VectorDBStorageSpec struct {
 
 // FeatureSpec defines the features to enable in the AIPlatform
 type FeatureSpec struct {
-	// Name of the feature, e.g. "saia" or "seca"
-	// +kubebuilder:validation:Enum=saia;seca
+	// Name of the feature, e.g. "saia", "seca" or "slim"
+	// +kubebuilder:validation:Enum=saia;seca;slim
 	Name string `json:"name,omitempty"`
 	// ServiceAccountName is the name of the service account to use for the feature
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
