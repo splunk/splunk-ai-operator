@@ -140,7 +140,7 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 	}
 
 	// Validate SplunkConfiguration
-	if errs := v.validateSplunkConfiguration(&aiplatform.Spec.SplunkConfiguration, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
+	if errs := v.validateSplunkConfiguration(&aiplatform.Spec.SplunkConfiguration, aiplatform.Spec.Sidecars.Otel, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -257,37 +257,29 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 	return allErrs
 }
 
-// validateSplunkConfiguration validates the Splunk configuration
-func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, fldPath *field.Path) field.ErrorList {
+// validateSplunkConfiguration validates the Splunk configuration.
+// otelEnabled indicates whether the OTel sidecar is enabled; it affects secretRef requirements.
+func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, otelEnabled bool, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
 	hasEndpoint := splunkConfig.Endpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
+	hasSecretRef := splunkConfig.SecretRef.Name != ""
 
-	// Empty Splunk configuration means "Splunk disabled" — no telemetry. This
-	// mirrors the graceful-skip the reconcilers already implement, so a platform
-	// can run without any Splunk. A partially-filled config still validates below.
-	if !hasEndpoint && !hasCRRef {
+	// Completely empty config means Splunk disabled — no telemetry.
+	// A partial config (e.g. only vaultFilePath set) is a misconfiguration
+	// and must fail validation below rather than silently disabling telemetry.
+	if !hasEndpoint && !hasCRRef && !hasSecretRef && splunkConfig.VaultFilePath == "" {
 		return allErrs
 	}
 
-	// TODO: Temporarily disabled - allow service names without http:// prefix
-	// This validation was preventing valid Kubernetes service names from being used
-	// We may want to add smarter validation later that distinguishes between URLs and service names
-	/*
-		if hasEndpoint && !strings.HasPrefix(splunkConfig.Endpoint, "http://") && !strings.HasPrefix(splunkConfig.Endpoint, "https://") {
-			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("endpoint"),
-				splunkConfig.Endpoint,
-				"endpoint must start with http:// or https://",
-			))
-		}
-	*/
-
-	// Vault source supplies its token via a file; it does not use a k8s SecretRef.
-	// All other sources require SecretRef when an explicit endpoint is set.
-	if splunkConfig.SecretSource != aiv1.SecretSourceVault {
-		if hasEndpoint && splunkConfig.SecretRef.Name == "" {
+	// All sources require secretRef when an endpoint is set, EXCEPT vault when
+	// the OTel sidecar is disabled. The OTel collector path (renderOtelConf and
+	// the collector env) has not been ported to vault: it still emits a
+	// secretKeyRef and does a Kubernetes Secret Get, so vault-only configs with
+	// otel enabled would write a broken collector. Require secretRef in that case.
+	if splunkConfig.SecretSource != aiv1.SecretSourceVault || otelEnabled {
+		if hasEndpoint && !hasSecretRef {
 			allErrs = append(allErrs, field.Required(
 				fldPath.Child("secretRef").Child("name"),
 				"secretRef.name is required when using endpoint",

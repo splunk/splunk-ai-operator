@@ -120,23 +120,14 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		return nil
 	}
 
-	// Completely disabled Splunk (no fields set at all) ⇒ skip the collector.
-	// A vault-only config that omits SecretRef must NOT reach renderOtelConf —
-	// the collector spec always emits a secretKeyRef env var and renderOtelConf
-	// does a Kubernetes Secret Get, both of which break without a valid SecretRef.
-	// Keep requiring secretRef for the OTel path; partial configs fall through to
-	// ValidateAndEnrichSplunkConfig for a proper error rather than a broken collector.
 	sc := p.Spec.SplunkConfiguration
 	if sc.Endpoint == "" &&
 		sc.SplunkCustomResourceRef.Name == "" &&
 		sc.SecretRef.Name == "" &&
-		sc.VaultFilePath == "" &&
-		len(sc.TrustedIssuers) == 0 {
+		sc.VaultFilePath == "" {
 		return nil
 	}
 
-	// Vault-backed configs don't have a Kubernetes SecretRef — the OTel collector
-	// path has not been converted to vault yet, so refuse to create a broken collector.
 	if sc.SecretRef.Name == "" {
 		return fmt.Errorf("sidecars.otel requires a Kubernetes secretRef; vault-backed telemetry is not yet supported for the OTel collector path")
 	}

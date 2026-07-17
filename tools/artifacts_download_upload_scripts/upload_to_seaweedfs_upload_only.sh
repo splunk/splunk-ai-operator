@@ -174,7 +174,7 @@ while [[ $idx -lt $total ]]; do
     # verification step finds a current marker.
     if [[ "$SKIP_IF_STAGED" == "1" ]]; then
       local_hf_url=$(grep "^hf_url=" "${artifact_path}/.staging_complete" 2>/dev/null | cut -d= -f2-)
-      remote_hf_url=$(mc cat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-)
+      remote_hf_url=$(mc cat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-) || remote_hf_url=""
       if [[ -n "$local_hf_url" && "$local_hf_url" == "$remote_hf_url" ]]; then
         echo "✓ $id already staged (hf_url matches) — skipping."
         idx=$((idx + 1))

@@ -35,15 +35,11 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 		}
 	}
 
-	// Completely empty Splunk configuration means "Splunk disabled" — skip enrichment.
-	// A partial config (e.g. only vaultFilePath set) is a misconfiguration and must
-	// be rejected by ValidateAndEnrichSplunkConfig rather than silently disabled.
 	sc := p.Spec.SplunkConfiguration
 	if sc.Endpoint == "" &&
 		sc.SplunkCustomResourceRef.Name == "" &&
 		sc.SecretRef.Name == "" &&
-		sc.VaultFilePath == "" &&
-		len(sc.TrustedIssuers) == 0 {
+		sc.VaultFilePath == "" {
 		r.Recorder.Event(p, corev1.EventTypeWarning, "SplunkConfigMissing",
 			"Splunk configuration is missing; assuming no telemetry")
 		return nil
