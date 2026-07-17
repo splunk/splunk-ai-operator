@@ -2,12 +2,12 @@ package saia
 
 import (
 	"context"
-	"strings"
-
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -316,6 +316,39 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 	return nil
 }
 
+// buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
+// The JWT issuer is the Splunk management endpoint (port 8089).
+// Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
+func buildSplunkIssuersVal(ai *aiv1.AIService) string {
+	var issuers []string
+	sc := ai.Spec.SplunkConfiguration
+	switch {
+	case sc.SplunkCustomResourceRef.Name != "":
+		kind := sc.SplunkCustomResourceRef.Kind
+		if kind == "" {
+			kind = "Standalone"
+		}
+		instanceType := "standalone"
+		if kind == "IndexerCluster" {
+			instanceType = "indexer"
+		}
+		refNS := sc.SplunkCustomResourceRef.Namespace
+		if refNS == "" {
+			refNS = ai.Namespace
+		}
+		clusterDomain := ai.Spec.ClusterDomain
+		if clusterDomain == "" {
+			clusterDomain = "cluster.local"
+		}
+		svc := fmt.Sprintf("splunk-%s-%s-service.%s.svc.%s", sc.SplunkCustomResourceRef.Name, instanceType, refNS, clusterDomain)
+		issuers = append(issuers, fmt.Sprintf("https://%s:%d", svc, splunkutils.SplunkMgmtPort))
+	case sc.Endpoint != "":
+		issuers = append(issuers, sc.Endpoint)
+	}
+	issuers = append(issuers, sc.TrustedIssuers...)
+	return strings.Join(issuers, ",")
+}
+
 // reconcileSAIAConfigMap manages the SAIA config ConfigMap for SPLUNK_ISSUERS.
 func (r *SaiaReconciler) reconcileSAIAConfigMap(
 	ctx context.Context,
@@ -335,11 +368,13 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 	//   403 {"detail":"Admin endpoints require an authenticated EC user token."}
 	// There is no authorization-skip value that also preserves CMP bridging —
 	// the value IS "true" even in airgap CMP mode.
+	splunkIssuersVal := buildSplunkIssuersVal(ai)
+
 	defaults := map[string]string{
 		// previously hardcoded
 		"SERVICE_NAME":                    "splunk_ai_assistant",
 		"SERVICE_INTERNAL_NAME":           "SAIA",
-		"SPLUNK_ISSUERS":                  "https://splunk-splunk-standalone-standalone-service:8089",
+		"SPLUNK_ISSUERS":                  splunkIssuersVal,
 		"SPLUNK_AI_ASSISTANT_SERVICE_CMP": "true",
 		"ENABLE_AUTHZ":                    "true",
 		"FEATURE_CONFIG_FILE_LOCATION":    "/etc/config/features_config.yaml",
@@ -364,12 +399,22 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 		return fmt.Errorf("fetching SAIA ConfigMap %q: %w", cmName, err)
 	}
 
-	// Merge defaults for any missing keys, but don't override user-set values.
+	// Merge defaults: SPLUNK_ISSUERS is always recomputed from spec so that
+	// removing or changing a CRRef/endpoint/trustedIssuers is reflected immediately
+	// (including clearing to empty when Splunk is disabled).
+	// All other keys use fill-if-missing to preserve manual overrides.
 	if found.Data == nil {
 		found.Data = map[string]string{}
 	}
 	needsUpdate := false
 	for k, v := range defaults {
+		if k == "SPLUNK_ISSUERS" {
+			if found.Data[k] != v {
+				found.Data[k] = v
+				needsUpdate = true
+			}
+			continue
+		}
 		if _, ok := found.Data[k]; !ok || found.Data[k] == "" {
 			found.Data[k] = v
 			needsUpdate = true
@@ -1003,10 +1048,13 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		labels[k] = v
 	}
 
+	issuersVal := buildSplunkIssuersVal(ai)
+	issuersChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 	annotations := map[string]string{
-		"prometheus.io/port":   "8088",
-		"prometheus.io/path":   "/metrics",
-		"prometheus.io/scheme": "http",
+		"prometheus.io/port":                  "8088",
+		"prometheus.io/path":                  "/metrics",
+		"prometheus.io/scheme":                "http",
+		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
 	for k, v := range ai.Annotations {
 		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
