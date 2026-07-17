@@ -1045,10 +1045,11 @@ spec:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
                   name:
-                    description: Name of the feature, e.g. "saia" or "seca"
+                    description: Name of the feature, e.g. "saia", "seca" or "slim"
                     enum:
                     - saia
                     - seca
+                    - slim
                     type: string
                   scaleFactor:
                     description: ScaleFactor is the desired fixed number of replicas

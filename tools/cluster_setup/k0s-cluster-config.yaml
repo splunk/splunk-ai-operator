@@ -250,11 +250,20 @@ aiPlatform:
   # serviceTemplate block AND set metallb.install: false.
   serviceTemplate:
     type: NodePort          # ClusterIP | NodePort | LoadBalancer
-    nodePort: 30080         # Fixed NodePort (30000-32767). Required only for NodePort.
+    nodePort: 30080         # Fixed NodePort (30000-32767) for the SAIA public service. Required only for NodePort.
+    # AIPlatform.serviceTemplate propagates identically to EVERY feature's
+    # AIService, so slim would otherwise inherit the same 30080 and collide with
+    # SAIA (a NodePort can back only one Service). When the "slim" feature is
+    # enabled under NodePort, the installer patches slim's public Service to this
+    # DISTINCT port instead. Reach slim at http://<any-worker-ip>:<slimNodePort>.
+    slimNodePort: 30081     # Fixed NodePort for the slim public service. Only used when slim is enabled + type=NodePort.
 
   features:
     - name: "saia"
       version: "1.1.0"
+    # Enable the slim-api service (no v1/v2 routing). Exposed on slimNodePort above.
+    - name: "slim"
+      version: "1.0.0"
 
   cpuScheduling:
     nodeSelector: {}
