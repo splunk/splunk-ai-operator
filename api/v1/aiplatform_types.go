@@ -311,6 +311,14 @@ type SplunkConfigurationSpec struct {
 	// VaultFilePath is the path where Vault Agent injects the Splunk HEC token
 	// +kubebuilder:validation:Optional
 	VaultFilePath string `json:"vaultFilePath,omitempty"`
+
+	// TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+	// e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+	// When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+	// its issuer is included automatically and TrustedIssuers are appended.
+	// In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+	// +optional
+	TrustedIssuers []string `json:"trustedIssuers,omitempty"`
 }
 
 // ReplicasSpec sets min/max worker replicas

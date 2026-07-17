@@ -335,11 +335,21 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 	//   403 {"detail":"Admin endpoints require an authenticated EC user token."}
 	// There is no authorization-skip value that also preserves CMP bridging —
 	// the value IS "true" even in airgap CMP mode.
+	// Build SPLUNK_ISSUERS from spec.
+	// In-cluster issuer is included only when SplunkCustomResourceRef is set
+	// (internal mode) — external and disabled modes rely solely on TrustedIssuers.
+	var splunkIssuers []string
+	if ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != "" {
+		splunkIssuers = append(splunkIssuers, "https://splunk-splunk-standalone-standalone-service:8089")
+	}
+	splunkIssuers = append(splunkIssuers, ai.Spec.SplunkConfiguration.TrustedIssuers...)
+	splunkIssuersVal := strings.Join(splunkIssuers, " ")
+
 	defaults := map[string]string{
 		// previously hardcoded
 		"SERVICE_NAME":                    "splunk_ai_assistant",
 		"SERVICE_INTERNAL_NAME":           "SAIA",
-		"SPLUNK_ISSUERS":                  "https://splunk-splunk-standalone-standalone-service:8089",
+		"SPLUNK_ISSUERS":                  splunkIssuersVal,
 		"SPLUNK_AI_ASSISTANT_SERVICE_CMP": "true",
 		"ENABLE_AUTHZ":                    "true",
 		"FEATURE_CONFIG_FILE_LOCATION":    "/etc/config/features_config.yaml",
@@ -364,12 +374,23 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 		return fmt.Errorf("fetching SAIA ConfigMap %q: %w", cmName, err)
 	}
 
-	// Merge defaults for any missing keys, but don't override user-set values.
+	// Merge defaults: SPLUNK_ISSUERS is always authoritative when the spec
+	// provides a source of truth (internal mode or TrustedIssuers set).
+	// All other keys use fill-if-missing to preserve manual overrides.
+	specDrivenIssuers := ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != "" ||
+		len(ai.Spec.SplunkConfiguration.TrustedIssuers) > 0
 	if found.Data == nil {
 		found.Data = map[string]string{}
 	}
 	needsUpdate := false
 	for k, v := range defaults {
+		if k == "SPLUNK_ISSUERS" && specDrivenIssuers {
+			if found.Data[k] != v {
+				found.Data[k] = v
+				needsUpdate = true
+			}
+			continue
+		}
 		if _, ok := found.Data[k]; !ok || found.Data[k] == "" {
 			found.Data[k] = v
 			needsUpdate = true

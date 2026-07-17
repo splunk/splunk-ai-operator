@@ -353,6 +353,124 @@ func Test_reconcileSAIAConfigMap_PreservesUserOverride(t *testing.T) {
 		"user-set ENABLE_AUTHZ=false must be preserved across reconciles")
 }
 
+func Test_reconcileSAIAConfigMap_TrustedIssuers_DisabledMode(t *testing.T) {
+	// splunk.enabled=false (no SplunkCustomResourceRef): SPLUNK_ISSUERS must be
+	// populated solely from TrustedIssuers — the in-cluster issuer must NOT appear.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.TrustedIssuers = []string{
+		"https://43.203.164.228:8089",
+		"https://splunk.example.com:8089",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://43.203.164.228:8089 https://splunk.example.com:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"disabled mode: SPLUNK_ISSUERS must be exactly the TrustedIssuers list")
+	assert.NotContains(t, cm.Data["SPLUNK_ISSUERS"], "splunk-splunk-standalone",
+		"disabled mode: in-cluster issuer must not be auto-included")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalMode(t *testing.T) {
+	// splunk.enabled=true (internal): in-cluster issuer is auto-prepended,
+	// TrustedIssuers are appended (supports simultaneous internal + external Splunk).
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name = "splunk-standalone"
+	ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://external.splunk:8089"}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://splunk-splunk-standalone-standalone-service:8089 https://external.splunk:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"internal mode: in-cluster issuer must be prepended, TrustedIssuers appended")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalModeNoExtra(t *testing.T) {
+	// internal mode with no TrustedIssuers: only the in-cluster issuer.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name = "splunk-standalone"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://splunk-splunk-standalone-standalone-service:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"internal mode with no TrustedIssuers: only the in-cluster issuer")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_AlwaysRecomputed(t *testing.T) {
+	// When TrustedIssuers is set, a subsequent reconcile must update SPLUNK_ISSUERS
+	// even if the ConfigMap already exists with a stale value (spec-driven, not fill-if-missing).
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://new.splunk:8089"}
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
+		Data:       map[string]string{"SPLUNK_ISSUERS": "https://old.splunk:8089"},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t, "https://new.splunk:8089", cm.Data["SPLUNK_ISSUERS"],
+		"spec-driven SPLUNK_ISSUERS must be recomputed on every reconcile, not preserved from old value")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_ManualOverridePreservedWhenNoSpec(t *testing.T) {
+	// When no TrustedIssuers are set and no SplunkCustomResourceRef, a manually-patched
+	// SPLUNK_ISSUERS in the ConfigMap must be preserved (fill-if-missing behavior).
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService() // no SplunkConfiguration set
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
+		Data:       map[string]string{"SPLUNK_ISSUERS": "https://manually-patched.splunk:8089"},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t, "https://manually-patched.splunk:8089", cm.Data["SPLUNK_ISSUERS"],
+		"no spec-driven issuers: manual ConfigMap override must be preserved")
+}
+
 func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
