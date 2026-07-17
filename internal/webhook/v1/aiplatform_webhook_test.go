@@ -139,6 +139,22 @@ var _ = Describe("AIPlatform Webhook", func() {
 					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
 				}
 			})
+
+			It("should accept an empty Splunk config (Splunk disabled)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{}
+				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
+			})
+
+			It("should still require secretRef when endpoint is set (partial config)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:     "http://splunk:8088",
+					SecretSource: aiv1.SecretSourceKubernetes,
+				}
+				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				e := findErr(errs, "secretRef")
+				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
+			})
 		})
 	})
 })

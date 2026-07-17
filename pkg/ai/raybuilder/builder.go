@@ -1138,7 +1138,9 @@ func buildWorkerAnnotationsAndLabels(aiPlatform *enterpriseApi.AIPlatform, cfg I
 	annotations["prometheus.io/port"] = "8080"
 	annotations["prometheus.io/scheme"] = "http"
 	annotations["ray.io/overwrite-container-cmd"] = "true"
-	if aiPlatform.Spec.Sidecars.Otel {
+	splunkEnabled := aiPlatform.Spec.SplunkConfiguration.Endpoint != "" ||
+		aiPlatform.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != ""
+	if aiPlatform.Spec.Sidecars.Otel && splunkEnabled {
 		annotations["sidecar.opentelemetry.io/inject"] = fmt.Sprintf("%s-otel-coll", aiPlatform.Name)
 		annotations["sidecar.opentelemetry.io/auto-instrument"] = "true"
 	}
@@ -1172,7 +1174,9 @@ func buildHeadAnnotationsAndLabels(aiPlatform *enterpriseApi.AIPlatform) (map[st
 	annotations["prometheus.io/scheme"] = "http"
 	annotations["ray.io/overwrite-container-cmd"] = "true"
 
-	if aiPlatform.Spec.Sidecars.Otel {
+	splunkEnabledHead := aiPlatform.Spec.SplunkConfiguration.Endpoint != "" ||
+		aiPlatform.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != ""
+	if aiPlatform.Spec.Sidecars.Otel && splunkEnabledHead {
 		annotations["sidecar.opentelemetry.io/inject"] = fmt.Sprintf("%s-otel-coll", aiPlatform.Name)
 		annotations["sidecar.opentelemetry.io/auto-instrument"] = "true"
 	}

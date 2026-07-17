@@ -35,6 +35,16 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 		}
 	}
 
+	sc := p.Spec.SplunkConfiguration
+	if sc.Endpoint == "" &&
+		sc.SplunkCustomResourceRef.Name == "" &&
+		sc.SecretRef.Name == "" &&
+		sc.VaultFilePath == "" {
+		r.Recorder.Event(p, corev1.EventTypeWarning, "SplunkConfigMissing",
+			"Splunk configuration is missing; assuming no telemetry")
+		return nil
+	}
+
 	var resolver splunkutils.SplunkSecretResolver
 	if p.Spec.SplunkConfiguration.SecretSource == aiApi.SecretSourceVault {
 		resolver = &splunkutils.VaultFileResolver{}

@@ -120,6 +120,18 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		return nil
 	}
 
+	sc := p.Spec.SplunkConfiguration
+	if sc.Endpoint == "" &&
+		sc.SplunkCustomResourceRef.Name == "" &&
+		sc.SecretRef.Name == "" &&
+		sc.VaultFilePath == "" {
+		return nil
+	}
+
+	if sc.SecretRef.Name == "" {
+		return fmt.Errorf("sidecars.otel requires a Kubernetes secretRef; vault-backed telemetry is not yet supported for the OTel collector path")
+	}
+
 	// seed or update the ConfigMap
 	if err := s.reconcileOtelConfigMap(ctx, p); err != nil {
 		return fmt.Errorf("reconcile otel configmap: %w", err)
