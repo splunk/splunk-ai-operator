@@ -316,7 +316,7 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 	return nil
 }
 
-// buildSplunkIssuersVal computes the space-separated SPLUNK_ISSUERS value from the AIService spec.
+// buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
 // The JWT issuer is the Splunk management endpoint (port 8089).
 // Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
 func buildSplunkIssuersVal(ai *aiv1.AIService) string {
@@ -346,7 +346,7 @@ func buildSplunkIssuersVal(ai *aiv1.AIService) string {
 		issuers = append(issuers, sc.Endpoint)
 	}
 	issuers = append(issuers, sc.TrustedIssuers...)
-	return strings.Join(issuers, " ")
+	return strings.Join(issuers, ",")
 }
 
 // reconcileSAIAConfigMap manages the SAIA config ConfigMap for SPLUNK_ISSUERS.

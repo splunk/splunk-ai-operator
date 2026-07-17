@@ -373,7 +373,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_DisabledMode(t *testing.T) {
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://43.203.164.228:8089 https://splunk.example.com:8089",
+		"https://43.203.164.228:8089,https://splunk.example.com:8089",
 		cm.Data["SPLUNK_ISSUERS"],
 		"disabled mode: SPLUNK_ISSUERS must be exactly the TrustedIssuers list")
 	assert.NotContains(t, cm.Data["SPLUNK_ISSUERS"], "splunk-splunk-standalone",
@@ -398,7 +398,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalMode(t *testing.T) {
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089 https://external.splunk:8089",
+		"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089,https://external.splunk:8089",
 		cm.Data["SPLUNK_ISSUERS"],
 		"internal mode: in-cluster issuer must be prepended, TrustedIssuers appended")
 }
