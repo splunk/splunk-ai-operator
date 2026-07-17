@@ -670,6 +670,83 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- if .Replicas.FmTimeseries }}
+  # FmTimeseries is a slim-feature model (see config/configs/features/slim.yaml).
+  # .Replicas.FmTimeseries is only populated when the "slim" feature is enabled,
+  # so this whole application is rendered only then — with saia alone it would
+  # otherwise emit "<no value>" for the replica counts and break the serve config.
+  - args:
+      application_name: FmTimeseries
+      # Cisco Time Series Model (CTSM) — a 250M-param decoder-only time-series
+      # forecaster served as a custom PyTorch deployment (NOT vLLM), so it has
+      # no engine_args / tensor_parallel_size / gpu_memory_utilization. It shares
+      # a GPU (num_gpus: 0.1). Weights are staged from HuggingFace
+      # (cisco-ai/cisco-time-series-model-1.0) to model_artifacts/fm_timeseries;
+      # CHECKPOINT_FILE names the checkpoint inside that prefix.
+      custom_deployment_import_path: fm_timeseries.main:FMTimeseriesDeployment
+      deployment_configs:
+        FMTimeseriesDeployment:
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.FmTimeseries}}
+              min_replicas: {{.Replicas.FmTimeseries}}
+            ray_actor_options:
+              num_gpus: 0.1
+      deployment_type: custom_deployment
+      model_definition:
+        model_config:
+          num_layers: 25
+        model_id: fm_timeseries
+        model_loader:
+          blob_storage:
+            # Only the checkpoint is needed — CiscoTsmMR reads its model config
+            # from inside torch_model.pt (loaded_checkpoint["config"]), not from
+            # config.json. artifacts_list restricts the download to exactly these
+            # files under blob_prefix, so this must name a file that exists in
+            # the bucket (verified: model_artifacts/fm_timeseries/torch_model.pt).
+            artifacts_list:
+              - torch_model.pt
+            blob_prefix: model_artifacts/fm_timeseries
+    name: FmTimeseries
+    import_path: main:create_serve_app
+    route_prefix: /fm_timeseries
+    runtime_env:
+      working_dir: "file:///home/ray/ray/applications/generic_application.zip"
+      env_vars:
+        API_VERSION: "v1"
+        APPLICATION_NAME: fm_timeseries
+        # Checkpoint filename inside blob_prefix. The public HF repo ships
+        # torch_model.pt (the deployment builds the path as
+        # <local_dir>/CHECKPOINT_FILE), so this must match a staged artifact.
+        CHECKPOINT_FILE: torch_model.pt
+        ARTIFACTS_S3_BUCKET: "{{.ArtifactBucketName}}"
+        S3_BUCKET: "{{.ArtifactBucketName}}"
+        ARTIFACTS_PROVIDER: "{{.ArtifactsProvider}}"
+        CLOUD_PROVIDER: "{{.CloudProvider}}"
+        S3COMPAT_OBJECT_STORE_ENDPOINT_URL: "{{.S3CompatObjectStoreEndpointUrl}}"
+        S3COMPAT_OBJECT_STORE_ACCESS_KEY: "{{.S3CompatObjectStoreAccessKey}}"
+        S3COMPAT_OBJECT_STORE_SECRET_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        # AWS / boto3 standard credential names — populated whenever the
+        # operator can load credentials from spec.objectStorage.secretRef. For
+        # CLOUD_PROVIDER=aws these are the values boto3 reads (the S3COMPAT_*
+        # names above are only consumed by the s3compat shim). Both code paths
+        # share the same source-of-truth Secret keys (s3_access_key /
+        # s3_secret_key) so emitting both pairs is safe — each provider only
+        # reads its own. AWS_REGION lets boto3 resolve the default regional S3
+        # endpoint when no AWS_ENDPOINT_URL is set; required for any AWS S3
+        # bucket outside us-east-1 to avoid PermanentRedirect on the first call.
+        AWS_ACCESS_KEY_ID: "{{.S3CompatObjectStoreAccessKey}}"
+        AWS_SECRET_ACCESS_KEY: "{{.S3CompatObjectStoreSecretKey}}"
+        AWS_REGION: "{{.Region}}"
+        AWS_DEFAULT_REGION: "{{.Region}}"
+        ENABLE_AUTHN: "false"
+        ENABLE_AUTHZ: "false"
+        SERVICE_EXTERNAL_NAME: "ai-platform-models"
+        SERVICE_INTERNAL_NAME: "ai_platform_models"
+        SERVICE_NAME: "ai_platform_models"
+        SKIP_VERIFICATION: "true"
+        USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
   - args:
       application_name: CrossEncoder
       deployment_configs:

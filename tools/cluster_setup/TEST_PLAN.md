@@ -115,8 +115,9 @@ grep -l "gemma-4-31b-it" \
 grep "^  - artifact-id:" tools/artifacts_download_upload_scripts/model_artifacts_configs.yaml \
   | awk '{print $3}' | sort
 
-# K0S_README.md model table — rows of the form "   | `<artifact-id>` |" with hyphens in name
-grep -E "^\s+\| \`[a-z][a-z0-9-]+\` \|" tools/cluster_setup/K0S_README.md \
+# K0S_README.md model table — rows of the form "   | `<artifact-id>` |" with
+# hyphens or underscores in the name (e.g. fm_timeseries).
+grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" tools/cluster_setup/K0S_README.md \
   | awk -F'`' '{print $2}' | sort
 ```
 

@@ -26,6 +26,15 @@ artifact-configs:
     hf-url: https://huggingface.co/Mike0307/multilingual-e5-language-detection
     is-a-gated-model: false
 
+  # Cisco Time Series Model (CTSM). artifact-id must equal the blob_prefix
+  # suffix in config/configs/applications.yaml (model_artifacts/fm_timeseries).
+  # images/ holds only README PNGs, not inference weights, so exclude them.
+  - artifact-id: fm_timeseries
+    hf-url: https://huggingface.co/cisco-ai/cisco-time-series-model-1.0
+    is-a-gated-model: false
+    files-to-exclude:
+      - images/
+
   - artifact-id: gpt-oss-20b
     hf-url: https://huggingface.co/openai/gpt-oss-20b
     is-a-gated-model: false
