@@ -134,6 +134,11 @@ images:
     apiV2Image: "splunk/saia-api-v2-build-preview:latest"
     dataLoaderImage: "splunk/saia-data-loader-build-preview:latest"
 
+  # slim-api service image (consumed via RELATED_IMAGE_SLIM_API). Only needed
+  # when the "slim" feature is enabled under aiPlatform.features[].
+  slim:
+    apiImage: "splunk/slim/slim-api:latest"
+
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
 

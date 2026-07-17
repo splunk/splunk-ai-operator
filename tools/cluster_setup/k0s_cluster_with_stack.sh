@@ -673,6 +673,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   NGINX_IMAGE="$(yq eval '.images.nginx.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -778,6 +779,13 @@ validate_image_config() {
   if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
     err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
   fi
+  # slim-api is only deployed when the "slim" feature is enabled, so require its
+  # image only in that case (mirrors the feature-gated Splunk image handling).
+  if k0s_slim_feature_enabled; then
+    if [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.slim.apiImage must be specified in k0s-cluster-config.yaml when the 'slim' feature is enabled"
+    fi
+  fi
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
     log "Using default Splunk Operator image: $SPLUNK_OPERATOR_IMAGE"
@@ -837,6 +845,10 @@ configure_images() {
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  # slim-api is optional (feature-gated); only build a URL when configured.
+  local slim_api_full=""
+  [[ -n "$SLIM_API_IMAGE" && "$SLIM_API_IMAGE" != "null" ]] && \
+    slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
   # Nginx is an upstream image; don't rewrite it to the ECR registry unless the
@@ -851,6 +863,7 @@ configure_images() {
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
   local saia_api_v2_escaped=$(echo "$saia_api_v2_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  local slim_api_escaped=$(echo "$slim_api_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
   local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
   local nginx_escaped=$(echo "$nginx_full" | sed 's/[\/&]/\\&/g')
@@ -874,6 +887,11 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  # slim-api is feature-gated; only rewrite when an image was configured so the
+  # manifest's default value survives untouched on saia-only installs.
+  if [[ -n "$slim_api_full" ]]; then
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_escaped}|" "$SPLUNK_AI_FILE"
+  fi
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
@@ -887,6 +905,7 @@ configure_images() {
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API_V2: $saia_api_v2_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  [[ -n "$slim_api_full" ]] && log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
   log "  ✓ Updated RELATED_IMAGE_NGINX: $nginx_full"
@@ -1212,7 +1231,7 @@ preflight_check_registry() {
 
   local probe_ref=""
   local probe_source=""
-  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE SLIM_API_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
     local _val="${!_candidate_var:-}"
     local _ref
     if _ref=$(_image_targets_registry "${_val}"); then
