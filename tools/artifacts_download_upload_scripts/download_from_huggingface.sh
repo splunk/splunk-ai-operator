@@ -16,7 +16,7 @@ Usage: $(basename "$0") [--accelerator <type>] [--skip-if-staged] [--help]
 
 Options:
   -a, --accelerator <type>  GPU accelerator type for which to download models.
-                            Supported: l40s (default), h100
+                            Supported: l40s (default), h100, rtx_pro_6000_blackwell
   --skip-if-staged          Check the configured object store first; skip
                             downloading (and uploading) any artifact that is
                             already fully staged there.
@@ -66,21 +66,26 @@ if [[ -z "$ACCEL_FLAG" && -z "$ACCELERATOR" ]]; then
   echo "Select GPU type:"
   echo "  1) l40s"
   echo "  2) h100"
-  read -rp "Enter 1 or 2: " GPU_CHOICE
+  echo "  3) rtx_pro_6000_blackwell"
+  read -rp "Enter 1, 2, or 3: " GPU_CHOICE
   case "$GPU_CHOICE" in
     1) ACCEL_FLAG="l40s" ;;
     2) ACCEL_FLAG="h100" ;;
-    *) echo "Error: invalid choice '${GPU_CHOICE}'. Please enter 1 or 2." >&2; exit 1 ;;
+    3) ACCEL_FLAG="rtx_pro_6000_blackwell" ;;
+    *) echo "Error: invalid choice '${GPU_CHOICE}'. Please enter 1, 2, or 3." >&2; exit 1 ;;
   esac
 fi
 
 ACCEL="$(printf '%s' "${ACCEL_FLAG:-${ACCELERATOR}}" | tr '[:upper:]' '[:lower:]')"
 
+# RTX PRO 6000 Blackwell uses the default (l40s) config: it needs the quantized
+# gemma-4-31b-it-qat-w4a16-ct artifact, which only exists in that config. The h100
+# config ships the full-precision gemma-4-31b-it instead.
 case "${ACCEL}" in
-  l40s|"") CONFIG_FILE="./model_artifacts_configs.yaml" ;;
-  h100)    CONFIG_FILE="./model_artifacts_configs_h100.yaml" ;;
+  l40s|""|rtx_pro_6000_blackwell) CONFIG_FILE="./model_artifacts_configs.yaml" ;;
+  h100)                           CONFIG_FILE="./model_artifacts_configs_h100.yaml" ;;
   *)
-    echo "Error: unsupported accelerator '${ACCEL}'. Supported values: l40s, h100" >&2
+    echo "Error: unsupported accelerator '${ACCEL}'. Supported values: l40s, h100, rtx_pro_6000_blackwell" >&2
     exit 1
     ;;
 esac

@@ -2097,15 +2097,15 @@ create_saia_route() {
 
   log "Creating SAIA Route: http://${route_host} ..."
 
-  # Wait for the SAIA service to exist (created by the operator after posthook)
-  local elapsed=0 timeout=300
-  while ! oc get svc "${svc_name}" -n "${AI_NS}" >/dev/null 2>&1; do
-    sleep 10; elapsed=$((elapsed + 10))
-    [[ ${elapsed} -ge ${timeout} ]] && { warn "Timed out waiting for SAIA service — Route not created"; return 0; }
-    log "  Waiting for SAIA service... (${elapsed}s)"
-  done
-
-  oc apply -f - <<EOF
+  # Create the Route immediately — do NOT wait for the SAIA service to exist.
+  # An OpenShift Route does not require its backend Service to be present at
+  # creation time: the router resolves the backend dynamically and returns 503
+  # until the service's endpoints appear, then serves traffic automatically.
+  # The operator can take tens of minutes to create the SAIA service (model
+  # download + vector-db posthook + reconcile), so blocking on it here caused
+  # the Route to be skipped whenever that exceeded the wait window — leaving the
+  # SAIA URL permanently unreachable even though the install reported success.
+  if ! oc apply -f - <<EOF
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
@@ -2122,8 +2122,26 @@ spec:
   port:
     targetPort: 8080
 EOF
+  then
+    warn "Failed to create SAIA Route. Create it manually once the SAIA service exists:"
+    warn "  oc apply -f - <<'ROUTE'"
+    warn "  apiVersion: route.openshift.io/v1"
+    warn "  kind: Route"
+    warn "  metadata: { name: saia, namespace: ${AI_NS} }"
+    warn "  spec: { host: ${route_host}, to: { kind: Service, name: ${svc_name} }, port: { targetPort: 8080 } }"
+    warn "  ROUTE"
+    return 0
+  fi
+
+  # Confirm the Route object now exists so a silent apply failure can't pass as success.
+  if ! oc get route saia -n "${AI_NS}" >/dev/null 2>&1; then
+    warn "SAIA Route apply reported success but the Route is not present — check cluster state."
+    return 0
+  fi
 
   log "  ✓ SAIA Route created: http://${route_host}"
+  log "    (Returns 503 until the SAIA service endpoints come up — this is expected"
+  log "     while the operator finishes reconciling; it self-heals, no rerun needed.)"
   log "    Use this URL in Splunk AI setup: http://${route_host}"
 }
 
