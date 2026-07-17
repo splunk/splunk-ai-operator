@@ -3875,11 +3875,146 @@ main_install() {
   log "Install complete"
 }
 
+# ---- validate-config: config-only sanity check, no AWS/eksctl calls ----
+# Deliberately does NOT call load_config (which shells out to
+# `aws sts get-caller-identity`); reads the YAML directly via yq so this
+# subcommand works even without AWS credentials configured yet.
+validate_config() {
+  local cfg="${CONFIG_FILE}"
+  need yq
+  [[ -f "$cfg" ]] || err "Config file not found: $cfg"
+
+  echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
+  local errors=0 warnings=0
+
+  _vcheck() {
+    local label="$1" val="$2" severity="${3:-error}" hint="${4:-}"
+    if [[ -z "${val}" || "${val}" == "null" || "${val}" == "<paste"* ]]; then
+      if [[ "${severity}" == "warn" ]]; then
+        echo -e "  \033[1;33m!\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        warnings=$(( warnings + 1 ))
+      else
+        echo -e "  \033[1;31m✖\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        errors=$(( errors + 1 ))
+      fi
+    else
+      echo -e "  \033[1;32m✔\033[0m ${label}" >&2
+    fi
+  }
+
+  local cluster_name cluster_region
+  cluster_name="$(yq eval '.cluster.name // ""' "$cfg" 2>/dev/null)"
+  cluster_region="$(yq eval '.cluster.region // ""' "$cfg" 2>/dev/null)"
+  _vcheck "cluster.name" "${cluster_name}"
+  if [[ -n "${cluster_name}" && "${cluster_name}" != "null" ]] && ! dns1123_ok "${cluster_name}"; then
+    echo -e "  \033[1;31m✖\033[0m cluster.name must be DNS-1123 compliant (lowercase alphanumeric and '-')" >&2
+    errors=$(( errors + 1 ))
+  fi
+  _vcheck "cluster.region" "${cluster_region}" "" "AWS region, e.g. us-east-2"
+
+  local obj_type obj_bucket obj_user obj_pass
+  obj_type=$(yq eval '.storage.objectStore.type // "aws"' "$cfg" 2>/dev/null)
+  obj_bucket=$(yq eval '.storage.objectStore.bucket // .storage.s3Bucket // ""' "$cfg" 2>/dev/null)
+  obj_user=$(yq eval '.storage.objectStore.auth.rootUser // ""' "$cfg" 2>/dev/null)
+  obj_pass=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "$cfg" 2>/dev/null)
+  _vcheck "storage.objectStore.type" "${obj_type}" "" "aws | s3compat | minio | seaweedfs"
+  case "${obj_type}" in
+    s3compat|minio|seaweedfs)
+      _vcheck "storage.objectStore.endpoint" "$(yq eval '.storage.objectStore.endpoint // ""' "$cfg" 2>/dev/null)" "" "required for external object stores"
+      _vcheck "storage.objectStore.auth.rootUser" "${obj_user}" "" "access key / root user"
+      _vcheck "storage.objectStore.auth.rootPassword" "${obj_pass}" "" "secret key / root password"
+      ;;
+    *)
+      if [[ -n "${obj_bucket}" ]] && ! s3_name_ok "${obj_bucket}"; then
+        echo -e "  \033[1;31m✖\033[0m storage.objectStore.bucket (or storage.s3Bucket) is not a valid S3 bucket name: ${obj_bucket}" >&2
+        errors=$(( errors + 1 ))
+      else
+        _vcheck "storage.objectStore.bucket" "${obj_bucket}" "" "name of the S3 bucket"
+      fi
+      ;;
+  esac
+
+  local img_reg img_op
+  img_reg=$(yq eval '.images.registry // ""' "$cfg" 2>/dev/null)
+  img_op=$(yq eval '.images.operator.image // ""' "$cfg" 2>/dev/null)
+  _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  if [[ -z "${img_reg}" || "${img_reg}" == "null" ]]; then
+    echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for private/ECR deployments." >&2
+    warnings=$(( warnings + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m images.registry = ${img_reg}" >&2
+  fi
+
+  local accel
+  accel="$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "$cfg" 2>/dev/null)"
+  _vcheck "aiPlatform.defaultAcceleratorType" "${accel}" "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
+  if [[ -n "${accel}" && "${accel}" != "null" ]]; then
+    local _valid=false _t _accel_upper
+    _accel_upper=$(echo "${accel}" | tr '[:lower:]' '[:upper:]')
+    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+      [[ "${_accel_upper}" == "$(echo "${_t}" | tr '[:lower:]' '[:upper:]')" ]] && _valid=true && break
+    done
+    if ! ${_valid}; then
+      echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${accel}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
+      errors=$(( errors + 1 ))
+    fi
+  fi
+
+  # Splunk telemetry mode — mirrors the SPLUNK_MODE derivation in load_config,
+  # but computed locally since load_config isn't called here.
+  local splunk_enabled splunk_ext_endpoint splunk_mode
+  splunk_enabled="$(yq eval '.splunk.enabled' "$cfg" 2>/dev/null || echo "null")"
+  [[ "${splunk_enabled}" == "false" ]] && splunk_enabled="false" || splunk_enabled="true"
+  splunk_ext_endpoint="$(yq eval '.splunk.external.endpoint // ""' "$cfg" 2>/dev/null)"
+  [[ "${splunk_ext_endpoint}" == "null" ]] && splunk_ext_endpoint=""
+  if [[ "${splunk_enabled}" != "true" ]]; then
+    splunk_mode="disabled"
+  elif [[ -n "${splunk_ext_endpoint}" ]]; then
+    splunk_mode="external"
+  else
+    splunk_mode="internal"
+  fi
+  echo -e "  \033[1;32m✔\033[0m splunk mode = ${splunk_mode} (splunk.enabled=${splunk_enabled}${splunk_ext_endpoint:+, external endpoint set})" >&2
+  case "${splunk_mode}" in
+    internal)
+      _vcheck "images.splunk.image" "$(yq eval '.images.splunk.image // ""' "$cfg" 2>/dev/null)" "" "required when splunk.enabled=true and no external endpoint"
+      _vcheck "images.splunk.operatorImage" "$(yq eval '.images.splunk.operatorImage // ""' "$cfg" 2>/dev/null)" "" "required in internal mode"
+      ;;
+    external)
+      if [[ -z "${SPLUNK_HEC_TOKEN:-}" ]]; then
+        echo -e "  \033[1;33m!\033[0m SPLUNK_HEC_TOKEN env var is not set — required at install time for external mode" >&2
+        warnings=$(( warnings + 1 ))
+      else
+        echo -e "  \033[1;32m✔\033[0m SPLUNK_HEC_TOKEN is set" >&2
+      fi
+      ;;
+  esac
+
+  local splunk_file ai_file
+  splunk_file=$(yq eval '.files.splunkOperatorManifest // ""' "$cfg" 2>/dev/null)
+  ai_file=$(yq eval '.files.splunkAiOperatorManifest // ""' "$cfg" 2>/dev/null)
+  [[ -f "${splunk_file}" ]] && echo -e "  \033[1;32m✔\033[0m files.splunkOperatorManifest exists: ${splunk_file}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.splunkOperatorManifest not found: ${splunk_file}" >&2; errors=$(( errors + 1 )); }
+  [[ -f "${ai_file}" ]] && echo -e "  \033[1;32m✔\033[0m files.splunkAiOperatorManifest exists: ${ai_file}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.splunkAiOperatorManifest not found: ${ai_file}" >&2; errors=$(( errors + 1 )); }
+
+  echo "" >&2
+  if (( errors == 0 && warnings == 0 )); then
+    echo -e "  \033[1;32mConfiguration looks complete. Ready to run install.\033[0m" >&2
+  elif (( errors == 0 )); then
+    echo -e "  \033[1;33m${warnings} warning(s). Configuration is usable but review the items above.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${errors} error(s), ${warnings} warning(s). Fix the errors above before running install.\033[0m" >&2
+    exit 1
+  fi
+}
+
 usage() {
-  echo "Usage: $0 {install|delete|delete-full}"
-  echo "  install      preflight + create/reconcile cluster and components (idempotent)"
-  echo "  delete       delete cluster and ALL AWS resources/roles/policies created by this script"
-  echo "  delete-full  uninstall CRs/operators then run comprehensive AWS cleanup"
+  echo "Usage: $0 {install|delete|delete-full|validate-config}"
+  echo "  install          preflight + create/reconcile cluster and components (idempotent)"
+  echo "  delete           delete cluster and ALL AWS resources/roles/policies created by this script"
+  echo "  delete-full      uninstall CRs/operators then run comprehensive AWS cleanup"
+  echo "  validate-config  check cluster-config.yaml for missing/invalid values (no AWS calls)"
 }
 
 case "${1:-install}" in
@@ -3893,6 +4028,9 @@ case "${1:-install}" in
   delete-full)
     load_config
     delete_everything
+    ;;
+  validate-config)
+    validate_config
     ;;
   *) usage; exit 1 ;;
 esac
