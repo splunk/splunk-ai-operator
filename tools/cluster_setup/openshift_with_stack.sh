@@ -138,8 +138,8 @@ force_delete_namespace() {
   not_ready_nodes=$(oc get nodes --no-headers 2>/dev/null \
     | awk '$2 != "Ready" {print $1}' | tr '\n' '|' | sed 's/|$//')
   if [[ -n "${not_ready_nodes}" ]]; then
-    oc get pods -n "${ns}" --no-headers 2>/dev/null \
-      | awk -v nodes="${not_ready_nodes}" '$0 ~ nodes {print $1}' \
+    oc get pods -n "${ns}" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null \
+      | awk -v nodes="${not_ready_nodes}" '$2 ~ nodes {print $1}' \
       | xargs -r oc delete pod -n "${ns}" --force --grace-period=0 &>/dev/null || true
   fi
 
@@ -180,8 +180,12 @@ wait_for_dependency() {
     local remaining=$(( max_wait - elapsed ))
     warn "  ${description} not ready yet. Retrying in ${interval}s (${remaining}s remaining)."
     warn "  Press Enter to retry now, or wait..."
-    if read -t "${interval}" -r 2>/dev/null; then
-      log "  Retrying immediately..."
+    if [[ -t 0 ]]; then
+      if read -t "${interval}" -r 2>/dev/null; then
+        log "  Retrying immediately..."
+      fi
+    else
+      sleep "${interval}"
     fi
     elapsed=$(( elapsed + interval ))
   done
@@ -1555,15 +1559,15 @@ ensure_ecr_pull_secret() {
   add_ecr_pull_secret_to_sa splunk-ai-operator-controller-manager splunk-ai-operator-system
 }
 
-# Append ecr-registry-secret to a service account's imagePullSecrets, preserving
+# Append a pull secret to a service account's imagePullSecrets, preserving
 # any existing entries. No-op if the secret is already listed, so reruns are safe.
-add_ecr_pull_secret_to_sa() {
-  local sa="$1" ns="$2"
+add_pull_secret_to_sa() {
+  local sa="$1" ns="$2" secret="$3"
 
   # Already present? nothing to do.
   if oc get serviceaccount "${sa}" -n "${ns}" \
       -o jsonpath='{.imagePullSecrets[*].name}' 2>/dev/null \
-      | tr ' ' '\n' | grep -qx "ecr-registry-secret"; then
+      | tr ' ' '\n' | grep -qx "${secret}"; then
     return 0
   fi
 
@@ -1572,11 +1576,53 @@ add_ecr_pull_secret_to_sa() {
   if oc get serviceaccount "${sa}" -n "${ns}" \
       -o jsonpath='{.imagePullSecrets}' 2>/dev/null | grep -q '\['; then
     oc patch serviceaccount "${sa}" -n "${ns}" --type=json \
-      -p '[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"ecr-registry-secret"}}]' 2>/dev/null || true
+      -p "[{\"op\":\"add\",\"path\":\"/imagePullSecrets/-\",\"value\":{\"name\":\"${secret}\"}}]" 2>/dev/null || true
   else
     oc patch serviceaccount "${sa}" -n "${ns}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+      -p "{\"imagePullSecrets\": [{\"name\": \"${secret}\"}]}" 2>/dev/null || true
   fi
+}
+
+# Convenience wrapper kept for callers that predate the generic function.
+add_ecr_pull_secret_to_sa() { add_pull_secret_to_sa "$1" "$2" "ecr-registry-secret"; }
+
+# Build a JSON array of {"name": "<secret>"} objects from a newline-separated list
+# of secret names, e.g. [{"name":"ecr-registry-secret"},{"name":"docker-hub-secret"}].
+pull_secrets_json_array() {
+  local names="$1"
+  local out="" name
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    [[ -n "${out}" ]] && out="${out},"
+    out="${out}{\"name\":\"${name}\"}"
+  done <<< "${names}"
+  echo "[${out}]"
+}
+
+# Return the names of the pull secrets this installer created that actually exist
+# in the given namespace. Used to patch deployments and service accounts after the
+# namespace's pull secrets have been created. Matches the fixed secret names used
+# by create_image_pull_secrets plus the (configurable) custom-registry secret name.
+get_pull_secret_names() {
+  local ns="$1"
+  local custom_name
+  custom_name=$(yq eval '.imagePullSecrets.custom.name // "custom-registry-secret"' "${CONFIG_FILE}" 2>/dev/null || echo "custom-registry-secret")
+  # Build an exact-match list of candidate secret names, then keep only those
+  # that exist in the namespace.
+  local candidates=("ecr-registry-secret" "docker-hub-secret" "gcr-secret" "acr-secret" "custom-registry-secret" "${custom_name}")
+  local existing
+  existing=$(oc get secrets -n "${ns}" --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null || true)
+  local seen=""
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -z "${c}" ]] && continue
+    # Skip duplicates (custom_name may equal the default).
+    case " ${seen} " in *" ${c} "*) continue ;; esac
+    if grep -qx "${c}" <<< "${existing}"; then
+      echo "${c}"
+      seen="${seen} ${c}"
+    fi
+  done
 }
 
 # ====== INSTALL SPLUNK AI OPERATOR ======
@@ -1605,17 +1651,26 @@ install_splunk_ai_operator() {
     oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1 || true
   fi
 
-  # Patch the operator SA and deployment with ECR pull secret AFTER the manifest apply
-  # (the SA is created by the manifest; patching before apply silently does nothing).
-  if [[ "${ECR_ENABLED}" == "true" ]]; then
-    oc patch serviceaccount splunk-ai-operator-controller-manager \
-      -n "${ai_operator_ns}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+  # Patch the operator SA and deployment with all configured pull secrets AFTER the
+  # manifest apply (the SA is created by the manifest; patching before apply silently
+  # does nothing). Covers ECR and non-ECR (DockerHub/GCR/ACR/custom) registries.
+  local _pull_secrets
+  _pull_secrets=$(get_pull_secret_names "${ai_operator_ns}")
+  if [[ -n "${_pull_secrets}" ]]; then
+    # Append each secret to the SA (preserves existing entries).
+    while IFS= read -r _secret; do
+      [[ -z "${_secret}" ]] && continue
+      add_pull_secret_to_sa splunk-ai-operator-controller-manager "${ai_operator_ns}" "${_secret}"
+    done <<< "${_pull_secrets}"
+    # Set the deployment's imagePullSecrets to the full list in one patch. A merge
+    # patch creates the field if absent and replaces it if present (idempotent).
+    local _ips_json
+    _ips_json=$(pull_secrets_json_array "${_pull_secrets}")
     oc patch deployment splunk-ai-operator-controller-manager \
-      -n "${ai_operator_ns}" --type=json \
-      -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"ecr-registry-secret"}]}]' \
+      -n "${ai_operator_ns}" --type=merge \
+      -p "{\"spec\":{\"template\":{\"spec\":{\"imagePullSecrets\":${_ips_json}}}}}" \
       2>/dev/null || true
-    log "  ✓ ECR pull secret patched into operator SA and deployment"
+    log "  ✓ Pull secrets patched into operator SA and deployment: $(echo "${_pull_secrets}" | tr '\n' ' ')"
   fi
 
   # Rollout restart so the deployment picks up the updated pull secrets.
@@ -1704,13 +1759,19 @@ install_splunk_operator() {
   # Force pod recreation so it picks up the new SCC grant
   oc delete replicaset -n "${splunk_operator_ns}" --all 2>/dev/null || true
 
-  # Patch deployment with pull secret if present
-  local dep_name
+  # Patch all configured pull secrets into the Splunk operator deployment.
+  local dep_name _splunk_pull_secrets
   dep_name=$(oc -n "${splunk_operator_ns}" get deploy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  if [[ -n "${dep_name}" ]] && oc get secret ecr-registry-secret -n "${splunk_operator_ns}" &>/dev/null; then
+  _splunk_pull_secrets=$(get_pull_secret_names "${splunk_operator_ns}")
+  if [[ -n "${dep_name}" && -n "${_splunk_pull_secrets}" ]]; then
+    # Set imagePullSecrets to the full list in one merge patch (creates the field if
+    # absent, replaces it if present). A JSON add to `/imagePullSecrets/-` would fail
+    # when the array does not yet exist on the podspec.
+    local _splunk_ips_json
+    _splunk_ips_json=$(pull_secrets_json_array "${_splunk_pull_secrets}")
     oc -n "${splunk_operator_ns}" patch deployment "${dep_name}" \
-      --type='json' \
-      -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"ecr-registry-secret"}]}]' \
+      --type=merge \
+      -p "{\"spec\":{\"template\":{\"spec\":{\"imagePullSecrets\":${_splunk_ips_json}}}}}" \
       2>/dev/null || true
     oc rollout restart deployment "${dep_name}" -n "${splunk_operator_ns}" 2>/dev/null || true
   fi
@@ -2405,6 +2466,10 @@ create_image_pull_secrets() {
 
   if [[ ${#secrets_created[@]} -gt 0 ]]; then
     log "  Pull secrets created in ${ns}: ${secrets_created[*]}"
+    # Attach every created secret to the default SA so pods using it can pull images.
+    for _s in "${secrets_created[@]}"; do
+      add_pull_secret_to_sa default "${ns}" "${_s}"
+    done
   else
     log "  No additional pull secrets configured"
   fi
