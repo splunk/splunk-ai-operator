@@ -124,6 +124,40 @@ show_step_summary() {
   echo "" >&2
 }
 
+# ====== FORCE DELETE NAMESPACE ======
+# Deletes a namespace cleanly. Before issuing the delete, force-removes any
+# pods stuck Terminating on NotReady nodes — those pod finalizers are what
+# cause namespaces to hang. Falls back to clearing namespace finalizers
+# directly if the namespace still gets stuck after pod cleanup.
+force_delete_namespace() {
+  local ns="$1" timeout="${2:-60}"
+
+  # Pre-emptively force-delete any pods stuck on NotReady nodes so the
+  # namespace can terminate without waiting for a dead kubelet.
+  local not_ready_nodes
+  not_ready_nodes=$(oc get nodes --no-headers 2>/dev/null \
+    | awk '$2 != "Ready" {print $1}' | tr '\n' '|' | sed 's/|$//')
+  if [[ -n "${not_ready_nodes}" ]]; then
+    oc get pods -n "${ns}" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null \
+      | awk -v nodes="${not_ready_nodes}" '$2 ~ nodes {print $1}' \
+      | xargs -r oc delete pod -n "${ns}" --force --grace-period=0 &>/dev/null || true
+  fi
+
+  oc delete namespace "${ns}" --timeout="${timeout}s" 2>/dev/null || true
+
+  # If still Terminating, clear namespace finalizers as a last resort.
+  if oc get namespace "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null | grep -q "Terminating"; then
+    log "  Namespace ${ns} stuck Terminating — clearing finalizers..."
+    oc get namespace "${ns}" -o json \
+      | python3 -c "import json,sys; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
+      | oc replace --raw "/api/v1/namespaces/${ns}/finalize" -f - &>/dev/null || true
+    local _w=0
+    until ! oc get namespace "${ns}" &>/dev/null || (( _w >= 30 )); do
+      sleep 2; (( _w += 2 ))
+    done
+  fi
+}
+
 # ====== PHASE SECTION MARKERS ======
 phase_start() { echo -e "\n\033[1;35m[$(_ts) ════════ PHASE: $* ════════]\033[0m" >&2; }
 phase_end()   { echo -e "\033[1;35m[$(_ts) ════════ END: $* ════════]\033[0m\n" >&2; }
@@ -146,8 +180,12 @@ wait_for_dependency() {
     local remaining=$(( max_wait - elapsed ))
     warn "  ${description} not ready yet. Retrying in ${interval}s (${remaining}s remaining)."
     warn "  Press Enter to retry now, or wait..."
-    if read -t "${interval}" -r 2>/dev/null; then
-      log "  Retrying immediately..."
+    if [[ -t 0 ]]; then
+      if read -t "${interval}" -r 2>/dev/null; then
+        log "  Retrying immediately..."
+      fi
+    else
+      sleep "${interval}"
     fi
     elapsed=$(( elapsed + interval ))
   done
@@ -204,7 +242,7 @@ resolve_accelerator_type() {
   # Normalize to uppercase for comparison, store normalized value.
   local _raw="${DEFAULT_ACCELERATOR:-}"
   if [[ -n "${_raw}" && "${_raw}" != "null" ]]; then
-    DEFAULT_ACCELERATOR="${_raw^^}"
+    DEFAULT_ACCELERATOR="$(echo "${_raw}" | tr '[:lower:]' '[:upper:]')"
   fi
 
   # Validate against supported list.
@@ -228,7 +266,7 @@ resolve_accelerator_type() {
   local answer=""
   while true; do
     read -r -p "  Enter accelerator type [${SUPPORTED_ACCELERATORS[*]}]: " answer
-    answer="${answer^^}"
+    answer="$(echo "${answer}" | tr '[:lower:]' '[:upper:]')"
     local _v=false
     for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
       [[ "${answer}" == "${_t}" ]] && _v=true && break
@@ -1145,12 +1183,9 @@ label_nodes() {
       ;;
 
     manual)
-      # openshift.nodes has cpu/gpu sub-arrays. Both CPU and GPU hosts get the single
-      # splunk.ai/ai-tier-node=true label (GPU workers are further constrained by their
-      # nvidia.com/gpu resource request), so collect hosts from both lists.
       while IFS= read -r node; do
         [[ -n "$node" && "$node" != "null" ]] && ai_nodes+=("$node")
-      done < <(yq eval '.openshift.nodes.cpu[], .openshift.nodes.gpu[]' "${CONFIG_FILE}" 2>/dev/null)
+      done < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null)
       ;;
 
     *)
@@ -1354,17 +1389,26 @@ install_local_path_provisioner() {
 # (no MCS categories) so any container can read/write the volume.
 relabel_worker_nodes_for_selinux() {
   log "Relabeling /opt/local-path-provisioner on worker nodes for SELinux..."
-  local workers
-  # Relabel all nodes — control-plane nodes may also carry workload labels and
-  # receive PVCs via local-path-provisioner (WaitForFirstConsumer).
-  workers=$(oc get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-  for node in ${workers}; do
+  local workers=()
+  case "${NODE_LABEL_STRATEGY:-auto}" in
+    manual)
+      while IFS= read -r node; do
+        [[ -n "$node" && "$node" != "null" ]] && workers+=("$node")
+      done < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null)
+      ;;
+    *)
+      while IFS= read -r node; do
+        [[ -n "$node" ]] && workers+=("$node")
+      done < <(oc get nodes -l node-role.kubernetes.io/worker -o name 2>/dev/null | sed 's|node/||')
+      ;;
+  esac
+  for node in "${workers[@]}"; do
     log "  Relabeling node ${node}..."
-    oc debug "node/${node}" --image=registry.access.redhat.com/ubi8/ubi-minimal -- \
+    timeout 60 oc debug "node/${node}" --request-timeout=60s --image=registry.access.redhat.com/ubi8/ubi-minimal -- \
       sh -c "mkdir -p /host/opt/local-path-provisioner && \
              chcon -Rt container_file_t -l s0 /host/opt/local-path-provisioner/ 2>/dev/null || true; \
              echo relabeled" 2>/dev/null || \
-    oc debug "node/${node}" -- \
+    timeout 60 oc debug "node/${node}" --request-timeout=60s -- \
       chroot /host sh -c "mkdir -p /opt/local-path-provisioner && \
              chcon -Rt container_file_t -l s0 /opt/local-path-provisioner/ 2>/dev/null || true" 2>/dev/null || true
   done
@@ -1379,6 +1423,20 @@ install_otel_operator() {
       -n opentelemetry-operator-system &>/dev/null; then
     log "  ✓ OpenTelemetry Operator already installed, skipping"
     return 0
+  fi
+
+  # If the namespace is stuck Terminating, force-clear its finalizers so helm
+  # can recreate it cleanly.
+  if oc get namespace opentelemetry-operator-system -o jsonpath='{.status.phase}' 2>/dev/null \
+      | grep -q "Terminating"; then
+    log "  Namespace opentelemetry-operator-system stuck Terminating — clearing finalizers..."
+    oc get namespace opentelemetry-operator-system -o json \
+      | python3 -c "import json,sys; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
+      | oc replace --raw /api/v1/namespaces/opentelemetry-operator-system/finalize -f - &>/dev/null || true
+    local _w=0
+    until ! oc get namespace opentelemetry-operator-system &>/dev/null || (( _w >= 30 )); do
+      sleep 2; (( _w += 2 ))
+    done
   fi
 
   local otel_chart_ref
@@ -1501,15 +1559,15 @@ ensure_ecr_pull_secret() {
   add_ecr_pull_secret_to_sa splunk-ai-operator-controller-manager splunk-ai-operator-system
 }
 
-# Append ecr-registry-secret to a service account's imagePullSecrets, preserving
+# Append a pull secret to a service account's imagePullSecrets, preserving
 # any existing entries. No-op if the secret is already listed, so reruns are safe.
-add_ecr_pull_secret_to_sa() {
-  local sa="$1" ns="$2"
+add_pull_secret_to_sa() {
+  local sa="$1" ns="$2" secret="$3"
 
   # Already present? nothing to do.
   if oc get serviceaccount "${sa}" -n "${ns}" \
       -o jsonpath='{.imagePullSecrets[*].name}' 2>/dev/null \
-      | tr ' ' '\n' | grep -qx "ecr-registry-secret"; then
+      | tr ' ' '\n' | grep -qx "${secret}"; then
     return 0
   fi
 
@@ -1518,11 +1576,53 @@ add_ecr_pull_secret_to_sa() {
   if oc get serviceaccount "${sa}" -n "${ns}" \
       -o jsonpath='{.imagePullSecrets}' 2>/dev/null | grep -q '\['; then
     oc patch serviceaccount "${sa}" -n "${ns}" --type=json \
-      -p '[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"ecr-registry-secret"}}]' 2>/dev/null || true
+      -p "[{\"op\":\"add\",\"path\":\"/imagePullSecrets/-\",\"value\":{\"name\":\"${secret}\"}}]" 2>/dev/null || true
   else
     oc patch serviceaccount "${sa}" -n "${ns}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+      -p "{\"imagePullSecrets\": [{\"name\": \"${secret}\"}]}" 2>/dev/null || true
   fi
+}
+
+# Convenience wrapper kept for callers that predate the generic function.
+add_ecr_pull_secret_to_sa() { add_pull_secret_to_sa "$1" "$2" "ecr-registry-secret"; }
+
+# Build a JSON array of {"name": "<secret>"} objects from a newline-separated list
+# of secret names, e.g. [{"name":"ecr-registry-secret"},{"name":"docker-hub-secret"}].
+pull_secrets_json_array() {
+  local names="$1"
+  local out="" name
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    [[ -n "${out}" ]] && out="${out},"
+    out="${out}{\"name\":\"${name}\"}"
+  done <<< "${names}"
+  echo "[${out}]"
+}
+
+# Return the names of the pull secrets this installer created that actually exist
+# in the given namespace. Used to patch deployments and service accounts after the
+# namespace's pull secrets have been created. Matches the fixed secret names used
+# by create_image_pull_secrets plus the (configurable) custom-registry secret name.
+get_pull_secret_names() {
+  local ns="$1"
+  local custom_name
+  custom_name=$(yq eval '.imagePullSecrets.custom.name // "custom-registry-secret"' "${CONFIG_FILE}" 2>/dev/null || echo "custom-registry-secret")
+  # Build an exact-match list of candidate secret names, then keep only those
+  # that exist in the namespace.
+  local candidates=("ecr-registry-secret" "docker-hub-secret" "gcr-secret" "acr-secret" "custom-registry-secret" "${custom_name}")
+  local existing
+  existing=$(oc get secrets -n "${ns}" --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null || true)
+  local seen=""
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -z "${c}" ]] && continue
+    # Skip duplicates (custom_name may equal the default).
+    case " ${seen} " in *" ${c} "*) continue ;; esac
+    if grep -qx "${c}" <<< "${existing}"; then
+      echo "${c}"
+      seen="${seen} ${c}"
+    fi
+  done
 }
 
 # ====== INSTALL SPLUNK AI OPERATOR ======
@@ -1551,17 +1651,26 @@ install_splunk_ai_operator() {
     oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1 || true
   fi
 
-  # Patch the operator SA and deployment with ECR pull secret AFTER the manifest apply
-  # (the SA is created by the manifest; patching before apply silently does nothing).
-  if [[ "${ECR_ENABLED}" == "true" ]]; then
-    oc patch serviceaccount splunk-ai-operator-controller-manager \
-      -n "${ai_operator_ns}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || true
+  # Patch the operator SA and deployment with all configured pull secrets AFTER the
+  # manifest apply (the SA is created by the manifest; patching before apply silently
+  # does nothing). Covers ECR and non-ECR (DockerHub/GCR/ACR/custom) registries.
+  local _pull_secrets
+  _pull_secrets=$(get_pull_secret_names "${ai_operator_ns}")
+  if [[ -n "${_pull_secrets}" ]]; then
+    # Append each secret to the SA (preserves existing entries).
+    while IFS= read -r _secret; do
+      [[ -z "${_secret}" ]] && continue
+      add_pull_secret_to_sa splunk-ai-operator-controller-manager "${ai_operator_ns}" "${_secret}"
+    done <<< "${_pull_secrets}"
+    # Set the deployment's imagePullSecrets to the full list in one patch. A merge
+    # patch creates the field if absent and replaces it if present (idempotent).
+    local _ips_json
+    _ips_json=$(pull_secrets_json_array "${_pull_secrets}")
     oc patch deployment splunk-ai-operator-controller-manager \
-      -n "${ai_operator_ns}" --type=json \
-      -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"ecr-registry-secret"}]}]' \
+      -n "${ai_operator_ns}" --type=merge \
+      -p "{\"spec\":{\"template\":{\"spec\":{\"imagePullSecrets\":${_ips_json}}}}}" \
       2>/dev/null || true
-    log "  ✓ ECR pull secret patched into operator SA and deployment"
+    log "  ✓ Pull secrets patched into operator SA and deployment: $(echo "${_pull_secrets}" | tr '\n' ' ')"
   fi
 
   # Rollout restart so the deployment picks up the updated pull secrets.
@@ -1650,13 +1759,19 @@ install_splunk_operator() {
   # Force pod recreation so it picks up the new SCC grant
   oc delete replicaset -n "${splunk_operator_ns}" --all 2>/dev/null || true
 
-  # Patch deployment with pull secret if present
-  local dep_name
+  # Patch all configured pull secrets into the Splunk operator deployment.
+  local dep_name _splunk_pull_secrets
   dep_name=$(oc -n "${splunk_operator_ns}" get deploy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  if [[ -n "${dep_name}" ]] && oc get secret ecr-registry-secret -n "${splunk_operator_ns}" &>/dev/null; then
+  _splunk_pull_secrets=$(get_pull_secret_names "${splunk_operator_ns}")
+  if [[ -n "${dep_name}" && -n "${_splunk_pull_secrets}" ]]; then
+    # Set imagePullSecrets to the full list in one merge patch (creates the field if
+    # absent, replaces it if present). A JSON add to `/imagePullSecrets/-` would fail
+    # when the array does not yet exist on the podspec.
+    local _splunk_ips_json
+    _splunk_ips_json=$(pull_secrets_json_array "${_splunk_pull_secrets}")
     oc -n "${splunk_operator_ns}" patch deployment "${dep_name}" \
-      --type='json' \
-      -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"ecr-registry-secret"}]}]' \
+      --type=merge \
+      -p "{\"spec\":{\"template\":{\"spec\":{\"imagePullSecrets\":${_splunk_ips_json}}}}}" \
       2>/dev/null || true
     oc rollout restart deployment "${dep_name}" -n "${splunk_operator_ns}" 2>/dev/null || true
   fi
@@ -1982,15 +2097,15 @@ create_saia_route() {
 
   log "Creating SAIA Route: http://${route_host} ..."
 
-  # Wait for the SAIA service to exist (created by the operator after posthook)
-  local elapsed=0 timeout=300
-  while ! oc get svc "${svc_name}" -n "${AI_NS}" >/dev/null 2>&1; do
-    sleep 10; elapsed=$((elapsed + 10))
-    [[ ${elapsed} -ge ${timeout} ]] && { warn "Timed out waiting for SAIA service — Route not created"; return 0; }
-    log "  Waiting for SAIA service... (${elapsed}s)"
-  done
-
-  oc apply -f - <<EOF
+  # Create the Route immediately — do NOT wait for the SAIA service to exist.
+  # An OpenShift Route does not require its backend Service to be present at
+  # creation time: the router resolves the backend dynamically and returns 503
+  # until the service's endpoints appear, then serves traffic automatically.
+  # The operator can take tens of minutes to create the SAIA service (model
+  # download + vector-db posthook + reconcile), so blocking on it here caused
+  # the Route to be skipped whenever that exceeded the wait window — leaving the
+  # SAIA URL permanently unreachable even though the install reported success.
+  if ! oc apply -f - <<EOF
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
@@ -2007,8 +2122,26 @@ spec:
   port:
     targetPort: 8080
 EOF
+  then
+    warn "Failed to create SAIA Route. Create it manually once the SAIA service exists:"
+    warn "  oc apply -f - <<'ROUTE'"
+    warn "  apiVersion: route.openshift.io/v1"
+    warn "  kind: Route"
+    warn "  metadata: { name: saia, namespace: ${AI_NS} }"
+    warn "  spec: { host: ${route_host}, to: { kind: Service, name: ${svc_name} }, port: { targetPort: 8080 } }"
+    warn "  ROUTE"
+    return 0
+  fi
+
+  # Confirm the Route object now exists so a silent apply failure can't pass as success.
+  if ! oc get route saia -n "${AI_NS}" >/dev/null 2>&1; then
+    warn "SAIA Route apply reported success but the Route is not present — check cluster state."
+    return 0
+  fi
 
   log "  ✓ SAIA Route created: http://${route_host}"
+  log "    (Returns 503 until the SAIA service endpoints come up — this is expected"
+  log "     while the operator finishes reconciling; it self-heals, no rerun needed.)"
   log "    Use this URL in Splunk AI setup: http://${route_host}"
 }
 
@@ -2351,6 +2484,10 @@ create_image_pull_secrets() {
 
   if [[ ${#secrets_created[@]} -gt 0 ]]; then
     log "  Pull secrets created in ${ns}: ${secrets_created[*]}"
+    # Attach every created secret to the default SA so pods using it can pull images.
+    for _s in "${secrets_created[@]}"; do
+      add_pull_secret_to_sa default "${ns}" "${_s}"
+    done
   else
     log "  No additional pull secrets configured"
   fi
@@ -2522,35 +2659,35 @@ main_delete() {
 
   # ── 2. AI Platform namespace (cascades all pods, PVCs, services, etc.) ──
   log "Deleting namespace ${AI_NS}..."
-  oc delete namespace "${AI_NS}" --timeout=180s 2>/dev/null || true
+  force_delete_namespace "${AI_NS}" 180
 
   # ── 3. Splunk AI Operator ──
   log "Removing Splunk AI Operator..."
-  oc delete namespace "${ai_operator_ns}" --timeout=60s 2>/dev/null || true
+  force_delete_namespace "${ai_operator_ns}" 60
   # Remove cluster-scoped resources (CRDs, ClusterRoles, webhooks) from manifests
   [[ -f "${SPLUNK_AI_FILE}" ]] && \
     oc delete -f "${SPLUNK_AI_FILE}" --ignore-not-found=true 2>/dev/null || true
 
   # ── 4. Splunk Operator ──
   log "Removing Splunk Operator..."
-  oc delete namespace "${splunk_operator_ns}" --timeout=60s 2>/dev/null || true
+  force_delete_namespace "${splunk_operator_ns}" 60
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && \
     oc delete -f "${SPLUNK_OPERATOR_FILE}" --ignore-not-found=true 2>/dev/null || true
 
   # ── 5. KubeRay Operator (helm) ──
   log "Removing KubeRay Operator..."
   helm uninstall kuberay-operator -n ray-system 2>/dev/null || true
-  oc delete namespace ray-system --timeout=60s 2>/dev/null || true
+  force_delete_namespace ray-system 60
 
   # ── 6. OpenTelemetry Operator (helm) ──
   log "Removing OpenTelemetry Operator..."
   helm uninstall opentelemetry-operator -n opentelemetry-operator-system 2>/dev/null || true
-  oc delete namespace opentelemetry-operator-system --timeout=60s 2>/dev/null || true
+  force_delete_namespace opentelemetry-operator-system 60
 
   # ── 7. cert-manager (helm) ──
   log "Removing cert-manager..."
   helm uninstall cert-manager -n cert-manager 2>/dev/null || true
-  oc delete namespace cert-manager --timeout=60s 2>/dev/null || true
+  force_delete_namespace cert-manager 60
   # Remove CRDs left by cert-manager (helm uninstall doesn't remove CRDs by default)
   oc get crd -o name 2>/dev/null | grep cert-manager | xargs -r oc delete --ignore-not-found=true 2>/dev/null || true
 
@@ -2558,7 +2695,7 @@ main_delete() {
   log "Removing local-path-provisioner..."
   oc delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml \
     --ignore-not-found=true 2>/dev/null || true
-  oc delete namespace local-path-storage --timeout=60s 2>/dev/null || true
+  force_delete_namespace local-path-storage 60
   oc delete storageclass local-path --ignore-not-found=true 2>/dev/null || true
 
   # ── 9. NVIDIA GPU Operator ──
@@ -2566,14 +2703,14 @@ main_delete() {
   oc delete clusterpolicy gpu-cluster-policy --ignore-not-found=true 2>/dev/null || true
   oc delete subscription gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
   oc delete csv -n nvidia-gpu-operator --all --ignore-not-found=true 2>/dev/null || true
-  oc delete namespace nvidia-gpu-operator --timeout=60s 2>/dev/null || true
+  force_delete_namespace nvidia-gpu-operator 60
 
   # ── 10. NFD ──
   log "Removing Node Feature Discovery..."
   oc delete nodefeaturediscovery nfd-instance -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
   oc delete subscription nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
   oc delete csv -n openshift-nfd --all --ignore-not-found=true 2>/dev/null || true
-  oc delete namespace openshift-nfd --timeout=60s 2>/dev/null || true
+  force_delete_namespace openshift-nfd 60
 
   # ── 11. Node labels and taints added by label_nodes() ──
   # Match both the current ai-tier-node label and the legacy workload-type label so

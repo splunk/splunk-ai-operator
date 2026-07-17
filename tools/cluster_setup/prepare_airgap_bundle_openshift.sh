@@ -289,7 +289,7 @@ docker.io/library/nginx:1.27-alpine
 # ── cert-manager (images extracted from bundled manifest) ─────────────────────
 IMGEOF
 
-grep -oP '(?<=image: )[^\s]+' "${STAGE_DIR}/manifests/cert-manager.yaml" 2>/dev/null | sort -u >> "${STAGE_DIR}/container-images.txt" || true
+grep 'image: ' "${STAGE_DIR}/manifests/cert-manager.yaml" 2>/dev/null | sed 's/.*image: *//' | awk '{print $1}' | sort -u >> "${STAGE_DIR}/container-images.txt" || true
 
 cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 
@@ -318,7 +318,7 @@ IMGEOF
     | sort -u
 } >> "${STAGE_DIR}/container-images.txt" || true
 
-grep -oP '(?<=image: )[^\s]+' "${STAGE_DIR}/manifests/local-path-storage.yaml" 2>/dev/null | sort -u >> "${STAGE_DIR}/container-images.txt" || true
+grep 'image: ' "${STAGE_DIR}/manifests/local-path-storage.yaml" 2>/dev/null | sed 's/.*image: *//' | awk '{print $1}' | sort -u >> "${STAGE_DIR}/container-images.txt" || true
 
 cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 
