@@ -803,31 +803,51 @@ validate_image_config() {
     log "Using default Ray runtime version: $RAY_RUNTIME_VERSION"
   fi
 
+  # Every workload container runs imagePullPolicy: IfNotPresent, so re-running
+  # install with an unchanged mutable tag (:latest, :preview, :stable-*) will
+  # NOT pick up a newer build pushed under that same tag — the kubelet serves
+  # the cached layer and the operator's CreateOrUpdate sees no template diff,
+  # so no rollout even happens. Upgrades require a new, distinct tag. This is
+  # a config-hygiene warning, not an error: mutable tags are still valid for
+  # first-time installs.
+  local mutable_tag_images=(
+    "images.operator.image:${OPERATOR_IMAGE}"
+    "images.ray.headImage:${RAY_HEAD_IMAGE}"
+    "images.ray.workerImage:${RAY_WORKER_IMAGE}"
+    "images.weaviate.image:${WEAVIATE_IMAGE}"
+    "images.saia.apiImage:${SAIA_API_IMAGE}"
+    "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
+    "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
+  )
+  local entry key image tag
+  for entry in "${mutable_tag_images[@]}"; do
+    key="${entry%%:*}"
+    image="${entry#*:}"
+    tag="${image##*:}"
+    if [[ -z "$image" || "$image" == "null" ]]; then
+      continue
+    fi
+    if [[ "$tag" == "$image" ]]; then
+      warn "${key} (${image}) has no explicit tag — defaults to :latest, which will NOT be re-pulled on a same-tag re-run of install (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
+    elif [[ "$tag" =~ ^(latest|preview|stable.*|dev|nightly)$ ]]; then
+      warn "${key} uses mutable tag ':${tag}' — re-running install without changing this tag will NOT upgrade the running image (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
+    fi
+  done
+
   log "✓ Image configuration validated successfully"
 }
 
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_AI_FILE}.original"
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  # Only back up / rewrite the Splunk Operator manifest when telemetry is
-  # internal mode only. External/disabled modes never apply the manifest, so
-  # touching it (which also requires the file to exist) is pointless and would
-  # break Splunk-free installs that don't ship splunk-operator-cluster.yaml.
-  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-      log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
-      cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-    fi
-  fi
-
-  log "Restoring from clean originals to ensure idempotent updates..."
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
-  [[ "${SPLUNK_MODE}" == "internal" ]] && cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
-
+  # Note: this rewrites artifacts.yaml / splunk-operator-cluster.yaml in place
+  # on every run via the sed substitutions below. There is no backup/restore
+  # from a pristine snapshot — a prior ".original" model silently reverted any
+  # legitimate change to these manifests (new operator release, new env var,
+  # new sidecar) on every re-run after the first, since the snapshot was never
+  # refreshed. The sed patterns below only ever touch their own named
+  # RELATED_IMAGE_*/image: fields, so re-running against an already-updated
+  # file is idempotent and safe.
   log "Updating $SPLUNK_AI_FILE..."
 
   local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")

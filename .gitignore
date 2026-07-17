@@ -38,10 +38,3 @@ tools/cluster_setup/logs/
 *.tgz
 helm-chart/**/charts/
 !helm-chart/**/charts/.gitkeep
-
-# Cluster-setup script byproducts (*.original): pristine-snapshot backups
-# written by tools/cluster_setup/k0s_cluster_with_stack.sh on first run and
-# reused as a reset point on subsequent runs (see configure_images()
-# → "Restoring from clean originals"). Needed locally for idempotent
-# re-installs; never committed.
-tools/cluster_setup/*.original
