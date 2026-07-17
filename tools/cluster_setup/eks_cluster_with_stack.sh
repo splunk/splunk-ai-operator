@@ -17,6 +17,10 @@ aws() { command /usr/bin/env aws "$@"; }
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/cluster-config.yaml}"
 
+# Supported GPU accelerator types. Add new types here — validate_config
+# derives its check from this constant (mirrors k0s_cluster_with_stack.sh).
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+
 # ====== LOAD CONFIGURATION FROM YAML ======
 load_config() {
   local cfg="$CONFIG_FILE"
@@ -114,6 +118,46 @@ load_config() {
     AI_STANDALONE_NAME="$(yq eval '.splunkStandalone.name' "$cfg")"
     STANDALONE_SA="$(yq eval '.splunkStandalone.serviceAccount' "$cfg")"
     SPLUNK_APP_LOCAL_PATH="$(yq eval '.splunkStandalone.localAppPath' "$cfg")"
+
+    # Splunk telemetry defaults to ENABLED (internal mode) — unlike the k0s
+    # installer's opt-in-disabled default, this script has always installed
+    # Splunk unconditionally, so existing eks cluster-config.yaml files have
+    # no splunk.enabled key at all. Defaulting a missing key to "false" would
+    # silently stop installing Splunk for every current deployment on the
+    # next run — the exact regression called out in
+    # docs/design/splunk-optional-and-otel-logging-plan.md. Only an explicit
+    # `splunk.enabled: false` opts out. yq returns "null" for an absent key,
+    # which we treat as true (preserve current behavior); yq also mishandles
+    # boolean false, so we normalise explicitly.
+    SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "$cfg" 2>/dev/null || echo "null")"
+    [[ "${SPLUNK_ENABLED}" == "false" ]] && SPLUNK_ENABLED="false" || SPLUNK_ENABLED="true"
+
+    # External Splunk: point telemetry at a Splunk running OUTSIDE the
+    # cluster. When splunk.external.endpoint is set (and splunk.enabled is
+    # true), the script does NOT install the in-cluster Splunk Operator/
+    # Standalone — it only wires the AIPlatform CR at the external HEC
+    # endpoint + a Secret holding the HEC token. The token is supplied via
+    # the SPLUNK_HEC_TOKEN env var (never the config file).
+    SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "$cfg" 2>/dev/null || echo "")"
+    [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
+    SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "$cfg" 2>/dev/null || echo "splunk-hec-external")"
+    [[ -z "${SPLUNK_EXTERNAL_SECRET_NAME}" || "${SPLUNK_EXTERNAL_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
+    SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+
+    # Derive a single mode so downstream logic is unambiguous:
+    #   disabled  — splunk.enabled=false: no Splunk, no telemetry
+    #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
+    #               in-cluster Splunk, use customer's external HEC
+    #   internal  — splunk.enabled=true, no external endpoint: install SOK +
+    #               Standalone in-cluster (legacy behavior — matches prior
+    #               EKS script default so existing deployments don't regress)
+    if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
+      SPLUNK_MODE="disabled"
+    elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+      SPLUNK_MODE="external"
+    else
+      SPLUNK_MODE="internal"
+    fi
 
     # Files
     SPLUNK_OPERATOR_FILE="$(yq eval '.files.splunkOperatorManifest' "$cfg")"
@@ -223,6 +267,13 @@ load_config() {
     GPU_CAPACITY_RESERVATION_ID=""
     GPU_CAPACITY_RESERVATION_AZ=""
     SPLUNK_APP_LOCAL_PATH=""
+    # No yq available to read splunk.enabled/external.* — preserve legacy
+    # always-install-Splunk behavior.
+    SPLUNK_ENABLED="true"
+    SPLUNK_EXTERNAL_ENDPOINT=""
+    SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
+    SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+    SPLUNK_MODE="internal"
 
     # Hardcoded subnets for fallback
     PRIVATE_SUBNETS=("subnet-0f4af6d2f36fbe73f" "subnet-024d4edaabe647586")
@@ -268,6 +319,7 @@ load_config() {
   LBC_POLICY_VERSION="v2.8.2" # upstream tag used to fetch iam_policy.json
 
   log "Configuration loaded: cluster=${CLUSTER_NAME}, region=${REGION}, namespace=${AI_NS}"
+  log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
 }
 
 # ---- logging ----
@@ -1674,6 +1726,10 @@ install_ray_operator() {
 
 # ---------- Splunk Operator(s) ----------
 install_splunk_operator() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Operator install (no in-cluster Splunk)"
+    return 0
+  fi
   log "Installing Splunk Operator (cluster-scope manifest in CWD)..."
   need_file "${SPLUNK_OPERATOR_FILE}"
   kubectl apply -f "${SPLUNK_OPERATOR_FILE}" --server-side --force-conflicts
@@ -2009,6 +2065,10 @@ resolve_aws_creds_for_secret() {
 }
 
 install_splunk_standalone() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Standalone install (no in-cluster Splunk)"
+    return 0
+  fi
   log "Creating/ensuring Splunk Standalone (${AI_STANDALONE_NAME}) in ${AI_NS}"
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
@@ -3611,9 +3671,11 @@ install_ai_platform_stack() {
 
   install_splunk_standalone
 
-  local splunk_secret
-  splunk_secret="$(find_splunk_standalone_secret_name "${AI_NS}" "${AI_STANDALONE_NAME}")"
-  splunk_secret="${splunk_secret//$'\r'/}"; splunk_secret="${splunk_secret//$'\n'/}"
+  local splunk_secret=""
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    splunk_secret="$(find_splunk_standalone_secret_name "${AI_NS}" "${AI_STANDALONE_NAME}")"
+    splunk_secret="${splunk_secret//$'\r'/}"; splunk_secret="${splunk_secret//$'\n'/}"
+  fi
 
   # update_splunk_secret_password_only "${AI_NS}" "${splunk_secret}"
 
