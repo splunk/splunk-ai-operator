@@ -124,6 +124,40 @@ show_step_summary() {
   echo "" >&2
 }
 
+# ====== FORCE DELETE NAMESPACE ======
+# Deletes a namespace cleanly. Before issuing the delete, force-removes any
+# pods stuck Terminating on NotReady nodes — those pod finalizers are what
+# cause namespaces to hang. Falls back to clearing namespace finalizers
+# directly if the namespace still gets stuck after pod cleanup.
+force_delete_namespace() {
+  local ns="$1" timeout="${2:-60}"
+
+  # Pre-emptively force-delete any pods stuck on NotReady nodes so the
+  # namespace can terminate without waiting for a dead kubelet.
+  local not_ready_nodes
+  not_ready_nodes=$(oc get nodes --no-headers 2>/dev/null \
+    | awk '$2 != "Ready" {print $1}' | tr '\n' '|' | sed 's/|$//')
+  if [[ -n "${not_ready_nodes}" ]]; then
+    oc get pods -n "${ns}" --no-headers 2>/dev/null \
+      | awk -v nodes="${not_ready_nodes}" '$0 ~ nodes {print $1}' \
+      | xargs -r oc delete pod -n "${ns}" --force --grace-period=0 &>/dev/null || true
+  fi
+
+  oc delete namespace "${ns}" --timeout="${timeout}s" 2>/dev/null || true
+
+  # If still Terminating, clear namespace finalizers as a last resort.
+  if oc get namespace "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null | grep -q "Terminating"; then
+    log "  Namespace ${ns} stuck Terminating — clearing finalizers..."
+    oc get namespace "${ns}" -o json \
+      | python3 -c "import json,sys; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
+      | oc replace --raw "/api/v1/namespaces/${ns}/finalize" -f - &>/dev/null || true
+    local _w=0
+    until ! oc get namespace "${ns}" &>/dev/null || (( _w >= 30 )); do
+      sleep 2; (( _w += 2 ))
+    done
+  fi
+}
+
 # ====== PHASE SECTION MARKERS ======
 phase_start() { echo -e "\n\033[1;35m[$(_ts) ════════ PHASE: $* ════════]\033[0m" >&2; }
 phase_end()   { echo -e "\033[1;35m[$(_ts) ════════ END: $* ════════]\033[0m\n" >&2; }
@@ -204,7 +238,7 @@ resolve_accelerator_type() {
   # Normalize to uppercase for comparison, store normalized value.
   local _raw="${DEFAULT_ACCELERATOR:-}"
   if [[ -n "${_raw}" && "${_raw}" != "null" ]]; then
-    DEFAULT_ACCELERATOR="${_raw^^}"
+    DEFAULT_ACCELERATOR="$(echo "${_raw}" | tr '[:lower:]' '[:upper:]')"
   fi
 
   # Validate against supported list.
@@ -228,7 +262,7 @@ resolve_accelerator_type() {
   local answer=""
   while true; do
     read -r -p "  Enter accelerator type [${SUPPORTED_ACCELERATORS[*]}]: " answer
-    answer="${answer^^}"
+    answer="$(echo "${answer}" | tr '[:lower:]' '[:upper:]')"
     local _v=false
     for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
       [[ "${answer}" == "${_t}" ]] && _v=true && break
@@ -1145,12 +1179,9 @@ label_nodes() {
       ;;
 
     manual)
-      # openshift.nodes has cpu/gpu sub-arrays. Both CPU and GPU hosts get the single
-      # splunk.ai/ai-tier-node=true label (GPU workers are further constrained by their
-      # nvidia.com/gpu resource request), so collect hosts from both lists.
       while IFS= read -r node; do
         [[ -n "$node" && "$node" != "null" ]] && ai_nodes+=("$node")
-      done < <(yq eval '.openshift.nodes.cpu[], .openshift.nodes.gpu[]' "${CONFIG_FILE}" 2>/dev/null)
+      done < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null)
       ;;
 
     *)
@@ -1354,17 +1385,26 @@ install_local_path_provisioner() {
 # (no MCS categories) so any container can read/write the volume.
 relabel_worker_nodes_for_selinux() {
   log "Relabeling /opt/local-path-provisioner on worker nodes for SELinux..."
-  local workers
-  # Relabel all nodes — control-plane nodes may also carry workload labels and
-  # receive PVCs via local-path-provisioner (WaitForFirstConsumer).
-  workers=$(oc get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-  for node in ${workers}; do
+  local workers=()
+  case "${NODE_LABEL_STRATEGY:-auto}" in
+    manual)
+      while IFS= read -r node; do
+        [[ -n "$node" && "$node" != "null" ]] && workers+=("$node")
+      done < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null)
+      ;;
+    *)
+      while IFS= read -r node; do
+        [[ -n "$node" ]] && workers+=("$node")
+      done < <(oc get nodes -l node-role.kubernetes.io/worker -o name 2>/dev/null | sed 's|node/||')
+      ;;
+  esac
+  for node in "${workers[@]}"; do
     log "  Relabeling node ${node}..."
-    oc debug "node/${node}" --image=registry.access.redhat.com/ubi8/ubi-minimal -- \
+    timeout 60 oc debug "node/${node}" --request-timeout=60s --image=registry.access.redhat.com/ubi8/ubi-minimal -- \
       sh -c "mkdir -p /host/opt/local-path-provisioner && \
              chcon -Rt container_file_t -l s0 /host/opt/local-path-provisioner/ 2>/dev/null || true; \
              echo relabeled" 2>/dev/null || \
-    oc debug "node/${node}" -- \
+    timeout 60 oc debug "node/${node}" --request-timeout=60s -- \
       chroot /host sh -c "mkdir -p /opt/local-path-provisioner && \
              chcon -Rt container_file_t -l s0 /opt/local-path-provisioner/ 2>/dev/null || true" 2>/dev/null || true
   done
@@ -1379,6 +1419,20 @@ install_otel_operator() {
       -n opentelemetry-operator-system &>/dev/null; then
     log "  ✓ OpenTelemetry Operator already installed, skipping"
     return 0
+  fi
+
+  # If the namespace is stuck Terminating, force-clear its finalizers so helm
+  # can recreate it cleanly.
+  if oc get namespace opentelemetry-operator-system -o jsonpath='{.status.phase}' 2>/dev/null \
+      | grep -q "Terminating"; then
+    log "  Namespace opentelemetry-operator-system stuck Terminating — clearing finalizers..."
+    oc get namespace opentelemetry-operator-system -o json \
+      | python3 -c "import json,sys; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
+      | oc replace --raw /api/v1/namespaces/opentelemetry-operator-system/finalize -f - &>/dev/null || true
+    local _w=0
+    until ! oc get namespace opentelemetry-operator-system &>/dev/null || (( _w >= 30 )); do
+      sleep 2; (( _w += 2 ))
+    done
   fi
 
   local otel_chart_ref
@@ -2522,35 +2576,35 @@ main_delete() {
 
   # ── 2. AI Platform namespace (cascades all pods, PVCs, services, etc.) ──
   log "Deleting namespace ${AI_NS}..."
-  oc delete namespace "${AI_NS}" --timeout=180s 2>/dev/null || true
+  force_delete_namespace "${AI_NS}" 180
 
   # ── 3. Splunk AI Operator ──
   log "Removing Splunk AI Operator..."
-  oc delete namespace "${ai_operator_ns}" --timeout=60s 2>/dev/null || true
+  force_delete_namespace "${ai_operator_ns}" 60
   # Remove cluster-scoped resources (CRDs, ClusterRoles, webhooks) from manifests
   [[ -f "${SPLUNK_AI_FILE}" ]] && \
     oc delete -f "${SPLUNK_AI_FILE}" --ignore-not-found=true 2>/dev/null || true
 
   # ── 4. Splunk Operator ──
   log "Removing Splunk Operator..."
-  oc delete namespace "${splunk_operator_ns}" --timeout=60s 2>/dev/null || true
+  force_delete_namespace "${splunk_operator_ns}" 60
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && \
     oc delete -f "${SPLUNK_OPERATOR_FILE}" --ignore-not-found=true 2>/dev/null || true
 
   # ── 5. KubeRay Operator (helm) ──
   log "Removing KubeRay Operator..."
   helm uninstall kuberay-operator -n ray-system 2>/dev/null || true
-  oc delete namespace ray-system --timeout=60s 2>/dev/null || true
+  force_delete_namespace ray-system 60
 
   # ── 6. OpenTelemetry Operator (helm) ──
   log "Removing OpenTelemetry Operator..."
   helm uninstall opentelemetry-operator -n opentelemetry-operator-system 2>/dev/null || true
-  oc delete namespace opentelemetry-operator-system --timeout=60s 2>/dev/null || true
+  force_delete_namespace opentelemetry-operator-system 60
 
   # ── 7. cert-manager (helm) ──
   log "Removing cert-manager..."
   helm uninstall cert-manager -n cert-manager 2>/dev/null || true
-  oc delete namespace cert-manager --timeout=60s 2>/dev/null || true
+  force_delete_namespace cert-manager 60
   # Remove CRDs left by cert-manager (helm uninstall doesn't remove CRDs by default)
   oc get crd -o name 2>/dev/null | grep cert-manager | xargs -r oc delete --ignore-not-found=true 2>/dev/null || true
 
@@ -2558,7 +2612,7 @@ main_delete() {
   log "Removing local-path-provisioner..."
   oc delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml \
     --ignore-not-found=true 2>/dev/null || true
-  oc delete namespace local-path-storage --timeout=60s 2>/dev/null || true
+  force_delete_namespace local-path-storage 60
   oc delete storageclass local-path --ignore-not-found=true 2>/dev/null || true
 
   # ── 9. NVIDIA GPU Operator ──
@@ -2566,14 +2620,14 @@ main_delete() {
   oc delete clusterpolicy gpu-cluster-policy --ignore-not-found=true 2>/dev/null || true
   oc delete subscription gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
   oc delete csv -n nvidia-gpu-operator --all --ignore-not-found=true 2>/dev/null || true
-  oc delete namespace nvidia-gpu-operator --timeout=60s 2>/dev/null || true
+  force_delete_namespace nvidia-gpu-operator 60
 
   # ── 10. NFD ──
   log "Removing Node Feature Discovery..."
   oc delete nodefeaturediscovery nfd-instance -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
   oc delete subscription nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
   oc delete csv -n openshift-nfd --all --ignore-not-found=true 2>/dev/null || true
-  oc delete namespace openshift-nfd --timeout=60s 2>/dev/null || true
+  force_delete_namespace openshift-nfd 60
 
   # ── 11. Node labels and taints added by label_nodes() ──
   # Match both the current ai-tier-node label and the legacy workload-type label so
