@@ -355,6 +355,79 @@ assert_eq "worker registry config called after k0s start succeeds" \
 assert_eq "returns early when IMAGE_REGISTRY is empty" \
   "1" "$(grep -A8 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '\[\[ -z.*registry.*\]\] && return 0' | tr -d '[:space:]')"
 
+# ── Codex review fixes ────────────────────────────────────────────────────────
+# Tests verifying the five logic bugs fixed in the Codex P1/P2 review pass.
+
+PROVISION="${SCRIPT_DIR}/k0s_aws_provision.sh"
+
+suite "fix: NVIDIA exit-42 capture (k0s_cluster_with_stack.sh)"
+
+assert_eq "ssh_exec result captured via || _nvidia_rc=\$? not if ! ssh_exec" \
+  "1" "$(grep -c '|| _nvidia_rc=\$?' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "_nvidia_rc declared local before the ssh_exec call" \
+  "1" "$(grep -c 'local _nvidia_rc=0' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "exit-42 branch checks _nvidia_rc not a dead \$? after negation" \
+  "1" "$(grep -c '"${_nvidia_rc}" -eq 42' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "no remaining if ! ssh_exec for the Phase B NVIDIA install block (code, not comment)" \
+  "0" "$(grep -A5 'Phase B: install driver' "${SCRIPT}" | grep 'if ! ssh_exec' | grep -cv '^\s*#' | tr -d '[:space:]')"
+
+suite "fix: LAST_LAUNCHED_SUBNET subshell (k0s_aws_provision.sh)"
+
+assert_eq "launch_instance_az_fallback NOT called inside \$() for GPU launch" \
+  "0" "$(grep 'id=\$(launch_instance_az_fallback' "${PROVISION}" | grep -c 'gpu-worker' | tr -d '[:space:]')"
+
+assert_eq "GPU instance ID captured via tempfile pattern" \
+  "1" "$(grep -c '_id_file.*mktemp' "${PROVISION}" | tr -d '[:space:]')"
+
+assert_eq "LAST_LAUNCHED_SUBNET reset before each GPU launch" \
+  "1" "$(grep -c 'LAST_LAUNCHED_SUBNET=""' "${PROVISION}" | tr -d '[:space:]')"
+
+suite "fix: ECR hosts.toml correct k0s path (k0s_aws_provision.sh)"
+
+assert_eq "hosts.toml written to /etc/k0s/containerd/certs.d not /etc/containerd/certs.d (code, not comment)" \
+  "0" "$(grep 'etc/containerd/certs\.d' "${PROVISION}" | grep -cv '^\s*#' | tr -d '[:space:]')"
+
+assert_eq "config_path drop-in written under /etc/k0s/containerd.d/" \
+  "1" "$(grep -c 'etc/k0s/containerd\.d/ecr-registry-config-path\.toml' "${PROVISION}" | tr -d '[:space:]')"
+
+assert_eq "config_path points at /etc/k0s/containerd/certs.d" \
+  "1" "$(grep -c 'config_path.*=.*\"/etc/k0s/containerd/certs\.d\"' "${PROVISION}" | tr -d '[:space:]')"
+
+suite "fix: /data/minio ownership (k0s_aws_provision.sh)"
+
+assert_eq "sudo mkdir used for /data/minio/model_artifacts" \
+  "1" "$(grep -c 'sudo mkdir -p /data/minio/model_artifacts' "${PROVISION}" | tr -d '[:space:]')"
+
+assert_eq "chown ec2-user applied to /data/minio after mkdir" \
+  "1" "$(grep -c 'sudo chown -R ec2-user:ec2-user /data/minio' "${PROVISION}" | tr -d '[:space:]')"
+
+suite "fix: modify-vpc-attribute boolean values (k0s_aws_provision.sh)"
+
+assert_eq "enable-dns-support passes {\"Value\":true}" \
+  "1" "$(grep 'enable-dns-support' "${PROVISION}" | grep -c '{"Value":true}' | tr -d '[:space:]')"
+
+assert_eq "enable-dns-hostnames passes {\"Value\":true}" \
+  "1" "$(grep 'enable-dns-hostnames' "${PROVISION}" | grep -c '{"Value":true}' | tr -d '[:space:]')"
+
+suite "fix: no real credentials in prod config (k0s-aws-provision-config-prod.yaml)"
+
+PROD_CFG="${SCRIPT_DIR}/k0s-aws-provision-config-prod.yaml"
+
+assert_eq "seaweedfs endpoint is empty (no real IP)" \
+  "1" "$(grep -c '^  endpoint: ""' "${PROD_CFG}" | tr -d '[:space:]')"
+
+assert_eq "seaweedfs rootUser is empty (no default credential)" \
+  "1" "$(grep -c '^  rootUser: ""' "${PROD_CFG}" | tr -d '[:space:]')"
+
+assert_eq "seaweedfs rootPassword is empty (no default credential)" \
+  "1" "$(grep -c '^  rootPassword: ""' "${PROD_CFG}" | tr -d '[:space:]')"
+
+assert_eq "minioadmin not present in prod config" \
+  "0" "$(grep -c 'minioadmin' "${PROD_CFG}" | tr -d '[:space:]')"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""

@@ -164,37 +164,60 @@ trap cleanup_tmp EXIT
 #        step_fail "reason"                  → marks it failed (does not exit)
 # show_step_summary                          → final table printed at end of install
 declare -a _STEP_NAMES=()
-declare -a _STEP_STATUS=()  # "ok" | "fail" | "skip"
+declare -a _STEP_STATUS=()   # "ok" | "fail" | "skip"
+declare -a _STEP_START_TS=() # epoch seconds at step_start
+declare -a _STEP_ELAPSED=()  # seconds taken, set by step_ok/fail/skip
 _STEP_CURRENT=""
+_INSTALL_START_TS=${SECONDS}
 
 step_start() {
   _STEP_CURRENT="$1"
   _STEP_NAMES+=("$1")
   _STEP_STATUS+=("running")
+  _STEP_START_TS+=("${SECONDS}")
+  _STEP_ELAPSED+=(0)
   local n=${#_STEP_NAMES[@]}
   echo -e "\n\033[1;34m[$(_ts) ── STEP ${n}: $1 ──]\033[0m" >&2
 }
 
+_step_record_elapsed() {
+  local last=$(( ${#_STEP_START_TS[@]} - 1 ))
+  _STEP_ELAPSED[$last]=$(( SECONDS - _STEP_START_TS[$last] ))
+}
+
 step_ok() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="ok"
+  local elapsed="${_STEP_ELAPSED[$last]}"
+  echo -e "\033[1;32m[$(_ts) ✔ ${_STEP_NAMES[$last]} — $(printf '%dm%02ds' $((elapsed/60)) $((elapsed%60)))]\033[0m" >&2
 }
 
 step_fail() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="fail:${1:-unknown error}"
 }
 
 step_skip() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="skip:${1:-}"
 }
 
 show_step_summary() {
+  local total_elapsed=$(( SECONDS - _INSTALL_START_TS ))
   echo -e "\n\033[1;34m[$(_ts) ════ INSTALL SUMMARY ════]\033[0m" >&2
   local total=${#_STEP_NAMES[@]} ok=0 fail=0 skip=0
   for i in "${!_STEP_NAMES[@]}"; do
     local s="${_STEP_STATUS[$i]}"
+    local elapsed="${_STEP_ELAPSED[$i]:-0}"
+    local duration
+    if (( elapsed >= 60 )); then
+      duration=$(printf '%dm%02ds' $((elapsed/60)) $((elapsed%60)))
+    else
+      duration="${elapsed}s"
+    fi
     local icon color label
     case "${s%%:*}" in
       ok)      icon="✔"; color="\033[1;32m"; label="OK";           ok=$((ok+1)) ;;
@@ -203,13 +226,19 @@ show_step_summary() {
       running) icon="?"; color="\033[1;33m"; label="interrupted";  fail=$((fail+1)) ;;
       *)       icon="?"; color="\033[0m";    label="${s}" ;;
     esac
-    printf "  ${color}${icon}\033[0m  %-45s %s\n" "${_STEP_NAMES[$i]}" "${label}" >&2
+    printf "  ${color}${icon}\033[0m  %-45s %-8s %s\n" "${_STEP_NAMES[$i]}" "${duration}" "${label}" >&2
   done
   echo "" >&2
-  if (( fail == 0 )); then
-    echo -e "  \033[1;32mAll ${total} steps completed successfully.\033[0m" >&2
+  local total_dur
+  if (( total_elapsed >= 3600 )); then
+    total_dur=$(printf '%dh%02dm%02ds' $((total_elapsed/3600)) $(((total_elapsed%3600)/60)) $((total_elapsed%60)))
   else
-    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped.\033[0m" >&2
+    total_dur=$(printf '%dm%02ds' $((total_elapsed/60)) $((total_elapsed%60)))
+  fi
+  if (( fail == 0 )); then
+    echo -e "  \033[1;32mAll ${total} steps completed successfully in ${total_dur}.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped. Total: ${total_dur}\033[0m" >&2
     echo -e "  \033[1;31mSee log: ${LOG_FILE}\033[0m" >&2
   fi
   echo "" >&2
@@ -317,6 +346,50 @@ resolve_model_staging() {
   esac
   echo "" >&2
   log "Model staging set to '${MODEL_STAGING_ENABLED}' by interactive prompt (overrides config value)."
+}
+
+# Supported GPU accelerator types. Add new types here — the interactive prompt
+# and validate_config both derive their lists from this constant.
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+
+# ====== RESOLVE ACCELERATOR TYPE ======
+# Called after load_config, before show_install_plan.
+# Prompts when defaultAcceleratorType is missing OR set to an unsupported value,
+# since the CR always requires this field and stage_model_artifacts needs a valid type.
+resolve_accelerator_type() {
+  # Return early only if already set to a valid supported type (case-insensitive).
+  # Normalize to the canonical casing from SUPPORTED_ACCELERATORS so the CR value
+  # matches the Ray builder's instanceMap keys exactly (e.g. L40S, H100).
+  local _cur
+  _cur=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
+  for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+    if [[ "${_cur}" == "${_t,,}" ]]; then
+      DEFAULT_ACCELERATOR="${_t}"
+      return 0
+    fi
+  done
+
+  local _supported_list="${SUPPORTED_ACCELERATORS[*]}"
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    err "aiPlatform.defaultAcceleratorType${DEFAULT_ACCELERATOR:+ ('${DEFAULT_ACCELERATOR}') is not supported} — must be one of: ${_supported_list}. Set it in your config."
+  fi
+  if [[ ! -t 0 ]]; then
+    err "aiPlatform.defaultAcceleratorType${DEFAULT_ACCELERATOR:+ ('${DEFAULT_ACCELERATOR}') is not supported} — set it in your config to one of: ${_supported_list}."
+  fi
+  echo "" >&2
+  echo "  Select GPU accelerator type:" >&2
+  for i in "${!SUPPORTED_ACCELERATORS[@]}"; do
+    echo "    $((i+1))) ${SUPPORTED_ACCELERATORS[$i]}" >&2
+  done
+  local _choice
+  read -rp "  Enter 1-${#SUPPORTED_ACCELERATORS[@]}: " _choice
+  if [[ "${_choice}" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= ${#SUPPORTED_ACCELERATORS[@]} )); then
+    DEFAULT_ACCELERATOR="${SUPPORTED_ACCELERATORS[$((_choice-1))]}"
+  else
+    err "Invalid choice '${_choice}'. Please enter a number between 1 and ${#SUPPORTED_ACCELERATORS[@]}."
+  fi
+  echo "" >&2
+  log "Accelerator type set to '${DEFAULT_ACCELERATOR}' by interactive prompt."
 }
 
 # ====== SHOW INSTALL PLAN ======
@@ -2318,13 +2391,10 @@ stage_model_artifacts() {
   fi
 
   # ---- Resolve accelerator (normalize to lowercase) ----
-  # Config uses uppercase (L40S, H100) to match the sample; internal logic requires lowercase.
+  # DEFAULT_ACCELERATOR is guaranteed to be set by resolve_accelerator_type()
+  # before main_install reaches this point.
   local _accel
-  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
-  if [[ -z "${_accel}" ]]; then
-    warn "aiPlatform.defaultAcceleratorType not set — defaulting to l40s for model download."
-    _accel="l40s"
-  fi
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
 
   # SKIP_IF_STAGED=1 by default: pre-check the object store before downloading so
   # re-runs skip models that are already fully staged (no re-download, no re-upload).
@@ -2568,7 +2638,10 @@ _install_nvidia_on_node() {
     # ---- Phase B: install driver + supporting packages --------------------
     # `set -euo pipefail` means ANY failure aborts the block. Each step below
     # must either succeed or have an explicit fallback branch that succeeds.
-    if ! ssh_exec "${gpu_ip}" "
+    # Capture exit code explicitly — `if ! ssh_exec ...; then` loses it because
+    # bash sets $? to 0 after the ! negation regardless of the real exit code.
+    local _nvidia_rc=0
+    ssh_exec "${gpu_ip}" "
       set -euo pipefail
 
       # --- OS detection (RHEL 9 is the only supported path) ---
@@ -2602,12 +2675,27 @@ _install_nvidia_on_node() {
         sudo apt-get install -y \"linux-headers-\${KREL}\"
       else
         # Exact-match: every historical kernel-devel is usually in RHUI for
-        # RHEL 9/10. Fall back to the latest only when absent (rare).
+        # RHEL 9/10. When absent (e.g. AMI has an older kernel than current
+        # RHUI), install the latest kernel+kernel-devel and reboot into it so
+        # DKMS builds for the running kernel. The node rejoins k0s after reboot;
+        # the installer retries SSH so the install continues automatically.
         if ! sudo dnf install -y \"kernel-devel-\${KREL}\" \"kernel-headers-\${KREL}\"; then
-          echo \"WARN: Exact kernel-devel-\${KREL} not found; installing latest kernel-devel/headers.\"
-          echo \"      DKMS will build against the latest headers — if they don't match the running kernel,\"
-          echo \"      modprobe will fail below and you'll need to reboot into the updated kernel.\"
-          sudo dnf install -y kernel-devel kernel-headers
+          echo \"WARN: Exact kernel-devel-\${KREL} not found in repos.\"
+          # Get the latest available kernel version from the repo
+          LATEST_KVER=\$(sudo dnf list available kernel --quiet 2>/dev/null | awk '/^kernel/{print \$2\".x86_64\"}' | tail -1)
+          if [ -n \"\${LATEST_KVER}\" ] && [ \"\${KREL}\" != \"\${LATEST_KVER}\" ]; then
+            echo \"Installing latest kernel (\${LATEST_KVER}) + matching kernel-devel so DKMS can build.\"
+            sudo dnf install -y \"kernel-\${LATEST_KVER%.*}\" \"kernel-devel-\${LATEST_KVER%.*}\" \"kernel-headers-\${LATEST_KVER%.*}\" 2>/dev/null || \
+              sudo dnf install -y kernel kernel-devel kernel-headers
+            echo \"REBOOT_REQUIRED: kernel upgraded from \${KREL} to \${LATEST_KVER%.*} — rebooting now\"
+            # Signal the outer SSH call to detect the reboot and wait
+            sudo reboot &
+            sleep 5
+            exit 42
+          else
+            echo \"WARN: No newer kernel in repos; installing latest kernel-devel/headers (may mismatch).\"
+            sudo dnf install -y kernel-devel kernel-headers
+          fi
         fi
       fi
 
@@ -2744,6 +2832,16 @@ _install_nvidia_on_node() {
           exit 1
         fi
         echo \"DKMS: \${DKMS_OUT}\"
+        # If DKMS is in 'added' state (registered but not yet built), build it
+        # explicitly. This happens when the package installs DKMS source but the
+        # automatic build was skipped (e.g. kernel was just upgraded + rebooted).
+        if echo \"\${DKMS_OUT}\" | grep -qE '^nvidia.*: added$'; then
+          echo 'DKMS module in added state — triggering explicit build+install...'
+          sudo dkms build -m nvidia -v \$(sudo dkms status | grep '^nvidia' | awk -F/ '{print \$2}' | awk '{print \$1}') -k \"\${KREL}\" 2>&1 || true
+          sudo dkms install -m nvidia -v \$(sudo dkms status | grep '^nvidia' | awk -F/ '{print \$2}' | awk '{print \$1}') -k \"\${KREL}\" 2>&1 || true
+          DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
+          echo \"DKMS after explicit build: \${DKMS_OUT}\"
+        fi
         if ! echo \"\${DKMS_OUT}\" | grep -qE 'installed|built'; then
           echo 'ERROR: nvidia DKMS module is not installed/built. See: sudo dkms status; dmesg | grep nvidia' >&2
           exit 1
@@ -2764,7 +2862,20 @@ _install_nvidia_on_node() {
         echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
         exit 1
       }
-    "; then
+    " || _nvidia_rc=$?
+    if [[ "${_nvidia_rc:-0}" -ne 0 ]]; then
+      if [[ "${_nvidia_rc}" -eq 42 ]]; then
+        # exit 42 = kernel upgrade triggered a reboot; wait for node and retry
+        echo "Kernel upgraded on ${gpu_ip} — waiting for reboot (up to 5 min)..."
+        local _wait=0
+        while ! ssh_exec "${gpu_ip}" "echo ok" &>/dev/null; do
+          sleep 15; _wait=$(( _wait + 15 ))
+          [[ "${_wait}" -ge 300 ]] && { echo "❌ ${gpu_ip} did not come back after kernel reboot" >&2; return 1; }
+        done
+        echo "Node ${gpu_ip} is back (kernel: $(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null)). Retrying NVIDIA install..."
+        _install_nvidia_on_node "${gpu_ip}"
+        return $?
+      fi
       echo "❌ NVIDIA driver install failed on ${gpu_ip}" >&2
       return 1
     fi
@@ -5796,6 +5907,7 @@ main_install() {
   load_config
 
   validate_image_config
+  resolve_accelerator_type
   configure_images
 
   resolve_model_staging
@@ -6325,6 +6437,21 @@ validate_config() {
   img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
   img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
   _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  _vcheck "aiPlatform.defaultAcceleratorType" \
+    "$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null)" \
+    "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
+  local _accel_val
+  _accel_val=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${_accel_val}" ]]; then
+    local _valid=false
+    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+      [[ "${_accel_val}" == "${_t,,}" ]] && _valid=true && break
+    done
+    if ! ${_valid}; then
+      echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
+      errors=$(( errors + 1 ))
+    fi
+  fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
     warnings=$(( warnings + 1 ))
@@ -6752,6 +6879,7 @@ case "${_CMD}" in
     ;;
   stage-artifacts)
     load_config
+    resolve_accelerator_type
     stage_model_artifacts
     ;;
   delete)

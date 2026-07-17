@@ -83,7 +83,7 @@ echo ""
 
 # ---- Source dir and count ----
 [[ ! -d "$SOURCE_DIR" ]] && { echo "Error: $SOURCE_DIR not found. Run ./download_from_huggingface.sh first."; exit 1; }
-artifact_count=$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+artifact_count=$(find -L "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
 [[ "$artifact_count" -eq 0 ]] && { echo "No artifacts in $SOURCE_DIR."; exit 1; }
 echo "Found $artifact_count artifacts to upload."
 echo ""
