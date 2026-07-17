@@ -1,0 +1,9 @@
+applicationScale:
+  FmTimeseries: 1
+instanceScale: {}
+# TODO when none of the models in saia.yaml are enabled, use the below instanceScale for slim models to work
+# instanceScale:
+#   L40S:
+#     l40s-1-gpu: 1
+#   H100:
+#     h100-1-gpu: 1

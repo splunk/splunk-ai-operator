@@ -28,11 +28,20 @@ func readApplicationsYAMLFromRepo(t *testing.T) string {
 	return string(raw)
 }
 
-// maskGoTemplates replaces `{{ ... }}` tokens with a plain string so the
-// result parses as valid YAML. applications.yaml interpolates Go template
-// variables at runtime (see Builder.ReconcileApplicationsConfigMap) — during
-// unit testing we never render them, so a syntactic mask is sufficient.
+// maskGoTemplates rewrites the Go template so the result parses as valid YAML.
+// applications.yaml interpolates Go template variables at runtime (see
+// Builder.ReconcileApplicationsConfigMap) — during unit testing we never render
+// them, so a syntactic mask is sufficient. Two kinds of directive exist:
+//
+//   - Standalone control-flow lines (`{{- if ... }}`, `{{- end }}`, `{{ range }}`,
+//     `{{ else }}`) occupy a whole line and would become a bare `PLACEHOLDER`
+//     scalar at column 0, which is invalid YAML. These lines are dropped
+//     entirely — since we never render, keeping both branches' bodies is fine.
+//   - Inline value interpolations (`{{.Replicas.X}}`) are replaced with a plain
+//     scalar so the surrounding key/value stays well formed.
 func maskGoTemplates(s string) string {
+	controlLine := regexp.MustCompile(`(?m)^[ \t]*\{\{-?\s*(if|else|end|range|with)\b[^}]*\}\}[ \t]*\n`)
+	s = controlLine.ReplaceAllString(s, "")
 	return regexp.MustCompile(`\{\{[^}]+\}\}`).ReplaceAllString(s, "PLACEHOLDER")
 }
 

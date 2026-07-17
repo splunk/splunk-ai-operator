@@ -641,6 +641,7 @@ The `install` command executes these steps in order:
    | `bi-encoder` | BGE small encoder |
    | `cross-encoder` | MS MARCO cross-encoder |
    | `e5-language-classifier` | Multilingual language detection |
+   | `fm_timeseries` | Cisco Time Series Model (CTSM) forecaster |
    | `mbart-translator` | Multilingual translation |
    | `pii-classifier` | PII detection |
    | `uae-large` | Embedding model |
