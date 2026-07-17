@@ -5693,6 +5693,8 @@ spec:
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-012
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-012
+        - name: RELATED_IMAGE_SLIM_API
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/slim/slim-api:build-1
         - name: SPLUNK_METRICS_INDEX_NAME
           value: _metrics
         - name: RELATED_IMAGE_FLUENT_BIT

@@ -2,6 +2,7 @@ package slim
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"reflect"
@@ -27,6 +28,7 @@ import (
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	common "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
+	"github.com/splunk/splunk-ai-operator/pkg/splunkutils"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -201,6 +203,42 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 	return nil
 }
 
+// buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
+// The JWT issuer is the Splunk management endpoint (port 8089).
+// Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
+//
+// This mirrors saia.buildSplunkIssuersVal; slim keeps its own copy so the two
+// feature packages stay decoupled.
+func buildSplunkIssuersVal(ai *aiv1.AIService) string {
+	var issuers []string
+	sc := ai.Spec.SplunkConfiguration
+	switch {
+	case sc.SplunkCustomResourceRef.Name != "":
+		kind := sc.SplunkCustomResourceRef.Kind
+		if kind == "" {
+			kind = "Standalone"
+		}
+		instanceType := "standalone"
+		if kind == "IndexerCluster" {
+			instanceType = "indexer"
+		}
+		refNS := sc.SplunkCustomResourceRef.Namespace
+		if refNS == "" {
+			refNS = ai.Namespace
+		}
+		clusterDomain := ai.Spec.ClusterDomain
+		if clusterDomain == "" {
+			clusterDomain = "cluster.local"
+		}
+		svc := fmt.Sprintf("splunk-%s-%s-service.%s.svc.%s", sc.SplunkCustomResourceRef.Name, instanceType, refNS, clusterDomain)
+		issuers = append(issuers, fmt.Sprintf("https://%s:%d", svc, splunkutils.SplunkMgmtPort))
+	case sc.Endpoint != "":
+		issuers = append(issuers, sc.Endpoint)
+	}
+	issuers = append(issuers, sc.TrustedIssuers...)
+	return strings.Join(issuers, ",")
+}
+
 // reconcileSlimConfigMap manages the ConfigMap holding the slim-api boot
 // configuration. The keys mirror the AITIER-mode env vars from the slim-api
 // repo's `run-slim-aipod` Makefile target, trimmed to only those the service
@@ -208,7 +246,8 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 //
 //   - DEPLOYMENT_TYPE=AITIER bypasses Vault/Consul/SCS auth in the entrypoint
 //     and flips the app to CMP (interactive-token) authorization.
-//   - SPLUNK_ISSUERS is the JWT issuer whitelist used by CMP auth.
+//   - SPLUNK_ISSUERS is the JWT issuer whitelist used by CMP auth; it is derived
+//     from the AIService spec (CRRef → endpoint → trustedIssuers), matching saia.
 //   - SERVICE_NAME / SERVICE_INTERNAL_NAME identify the service.
 //
 // PLATFORM_URL is injected on the Deployment (not here) because it is derived
@@ -216,11 +255,13 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AIService) error {
 	cmName := fmt.Sprintf("%s-slim-config", ai.Name)
 
+	splunkIssuersVal := buildSplunkIssuersVal(ai)
+
 	defaults := map[string]string{
 		"DEPLOYMENT_TYPE":       "AITIER",
 		"SERVICE_NAME":          "slim-api",
 		"SERVICE_INTERNAL_NAME": "SLIM",
-		"SPLUNK_ISSUERS":        "https://splunk-splunk-standalone-standalone-service:8089",
+		"SPLUNK_ISSUERS":        splunkIssuersVal,
 		"ENABLE_AUTHZ":          "false",
 		"API_VERSION":           "v1alpha1",
 	}
@@ -238,8 +279,19 @@ func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AI
 	if found.Data == nil {
 		found.Data = map[string]string{}
 	}
+	// Merge defaults: SPLUNK_ISSUERS is always recomputed from spec so that
+	// removing or changing a CRRef/endpoint/trustedIssuers is reflected immediately
+	// (including clearing to empty when Splunk is disabled).
+	// All other keys use fill-if-missing to preserve manual overrides.
 	needsUpdate := false
 	for k, v := range defaults {
+		if k == "SPLUNK_ISSUERS" {
+			if found.Data[k] != v {
+				found.Data[k] = v
+				needsUpdate = true
+			}
+			continue
+		}
 		if _, ok := found.Data[k]; !ok || found.Data[k] == "" {
 			found.Data[k] = v
 			needsUpdate = true
@@ -473,10 +525,15 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		labels[k] = v
 	}
 
+	// The issuers hash rolls the pods whenever the derived SPLUNK_ISSUERS value
+	// changes, so CMP auth picks up spec-driven issuer changes (matches saia).
+	issuersVal := buildSplunkIssuersVal(ai)
+	issuersChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 	annotations := map[string]string{
-		"prometheus.io/port":   "8088",
-		"prometheus.io/path":   "/metrics",
-		"prometheus.io/scheme": "http",
+		"prometheus.io/port":                     "8088",
+		"prometheus.io/path":                     "/metrics",
+		"prometheus.io/scheme":                   "http",
+		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
 	for k, v := range ai.Annotations {
 		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
