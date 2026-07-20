@@ -899,7 +899,14 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
+  # Anchor on the RAY_VERSION env entry (unique, always immediately precedes
+  # the operator container's image: line) rather than matching the image
+  # string's content. A content-based match like *splunk*ai*operator* only
+  # matches the pristine manifest's default image; once a custom
+  # image (e.g. a private registry with no such substring) has been written
+  # here, re-running install with a new tag would silently fail to match and
+  # leave the stale image in place.
+  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^        image:/ s|^        image:.*|        image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
 
   log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
   log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
@@ -924,7 +931,11 @@ configure_images() {
     local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
     "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
-    "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+    # Same rationale as the AI operator image above: anchor on the unique
+    # POD_NAME env entry that always immediately precedes this container's
+    # image: line, instead of content-matching *splunk*operator* in the
+    # image string itself.
+    "${SED_INPLACE[@]}" "/name: POD_NAME/,/^        image:/ s|^        image:.*|        image: ${splunk_op_escaped}|" "$SPLUNK_OPERATOR_FILE"
 
     log "  ✓ Updated Splunk Enterprise image: $splunk_full"
     log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
