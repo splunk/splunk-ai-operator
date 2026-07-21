@@ -818,16 +818,30 @@ validate_image_config() {
     "images.saia.apiImage:${SAIA_API_IMAGE}"
     "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
     "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
+    "images.fluentBit.image:${FLUENT_BIT_IMAGE}"
+    "images.nginx.image:${NGINX_IMAGE}"
   )
-  local entry key image tag
+  # images.splunk.image is only patched into the manifest (and only actually
+  # deployed) in internal mode — disabled/external modes never run it.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    mutable_tag_images+=("images.splunk.image:${SPLUNK_IMAGE}")
+  fi
+  local entry key image last_segment tag
   for entry in "${mutable_tag_images[@]}"; do
     key="${entry%%:*}"
     image="${entry#*:}"
-    tag="${image##*:}"
     if [[ -z "$image" || "$image" == "null" ]]; then
       continue
     fi
-    if [[ "$tag" == "$image" ]]; then
+    # Parse the tag from the last path segment only, so a registry port
+    # (e.g. localhost:5000/team/saia-api) is never mistaken for a tag.
+    last_segment="${image##*/}"
+    if [[ "$last_segment" == *:* ]]; then
+      tag="${last_segment##*:}"
+    else
+      tag=""
+    fi
+    if [[ -z "$tag" ]]; then
       warn "${key} (${image}) has no explicit tag — defaults to :latest, which will NOT be re-pulled on a same-tag re-run of install (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
     elif [[ "$tag" =~ ^(latest|preview|stable.*|dev|nightly)$ ]]; then
       warn "${key} uses mutable tag ':${tag}' — re-running install without changing this tag will NOT upgrade the running image (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
