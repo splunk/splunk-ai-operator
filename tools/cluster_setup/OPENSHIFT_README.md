@@ -81,7 +81,8 @@ The AI Platform workload namespace defaults to **`ai-platform`**.
 ## Prerequisites
 
 **Cluster**
-- A running OpenShift Container Platform **4.x** cluster (validated on **4.21**).
+- A running **OpenShift Container Platform 4.21** cluster. The installer is
+  validated on OCP 4.21.
 - 3 control-plane nodes (etcd HA quorum).
 - `cluster-admin` privileges (required for SCC grants, OLM installs, and the
   `oc debug node/` SELinux relabel).
@@ -131,7 +132,9 @@ $EDITOR openshift-cluster-config.yaml
 #   - set openshift.nodes[] (manual strategy) to your node names
 #   - set ecr.account / ecr.region if using ECR
 
-# 3. (Optional) stage model weights to your object store first
+# 3. Stage model weights to your object store.
+#    Required for a fresh object store — Ray workers fail to start if weights
+#    are missing. Skip only if the bucket is already staged from a prior run.
 CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh stage-artifacts
 
 # 4. Install the stack
@@ -231,6 +234,12 @@ storage:
 Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 `minio://` (minio **and** seaweedfs).
 
+> **`stage-artifacts` supports only `aws`, `minio`, and `seaweedfs`.** All four
+> types work at runtime, but the automated staging command has no uploader for
+> `s3compat` and will error out. If you use `s3compat`, **pre-stage the model
+> weights into the bucket manually** (see [Model Staging](#model-staging)) before
+> running `install` — the automated `stage-artifacts` step will not populate it.
+
 ### `splunk`
 ```yaml
 splunk:
@@ -280,7 +289,13 @@ ecr:
 ```
 When enabled, the installer creates `ecr-registry-secret` in all relevant
 namespaces using an `aws ecr get-login-password` token. Set `enabled: false` for
-non-ECR registries and use the `imagePullSecrets.*` blocks instead.
+non-ECR registries and use the `imagePullSecrets.*` blocks instead — see
+[Image Pull Secrets](#image-pull-secrets-ecr) for the exact keys.
+
+> **Non-ECR registries need `imagePullSecrets.*`.** Setting `ecr.enabled: false`
+> alone creates **no** pull secret. If your internal Ray/SAIA/operator images
+> live in a private (non-ECR) registry, you must enable the matching
+> `imagePullSecrets.*` block below, or pods will fail with `ImagePullBackOff`.
 
 ---
 
@@ -364,7 +379,22 @@ AI worker nodes are labeled `splunk.ai/node-role=worker`.
 | `splunk-operator` | `privileged` | Operator pod adds `NET_BIND_SERVICE` |
 | `local-path-storage` | `privileged` | Helper pod mounts host paths |
 
-These grants are reversed on `delete`.
+These group grants are added on `install` and removed on `delete` — but only
+when `openshift.grantPrivilegedSCC` is `"true"` **in the config used for that
+command**. The cleanup is conditional, so if you install with the grants
+enabled and later flip `grantPrivilegedSCC: "false"`, `delete` will **skip**
+the SCC cleanup and leave the `privileged`/`anyuid` group entries on the SCCs.
+Those stale entries re-apply to any workload that later reuses these namespace
+names. Run `delete` with the **same** `grantPrivilegedSCC` value you installed
+with, or remove the entries manually:
+
+```bash
+oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-ai-operator-system
+oc adm policy remove-scc-from-group anyuid     system:serviceaccounts:ai-platform
+oc adm policy remove-scc-from-group privileged system:serviceaccounts:ai-platform
+oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-operator
+oc adm policy remove-scc-from-group privileged system:serviceaccounts:local-path-storage
+```
 
 ### OpenShift Route (external access)
 SAIA is exposed via an OpenShift **Route** named `saia`, host
@@ -406,7 +436,53 @@ Two mechanisms exist:
    attaches it to the relevant service accounts.
 2. **`imagePullSecrets.*` blocks** — for DockerHub, GCR, ACR, or a custom
    registry, enable the matching block; the installer creates the secret and
-   attaches it to the namespace's `default` SA.
+   attaches it to the `default` service account.
+
+Both mechanisms run in all three namespaces: `ai-platform`,
+`splunk-ai-operator-system`, and `splunk-operator`.
+
+### Non-ECR registry schema
+
+If you set `ecr.enabled: false` (or leave it out) you **must** supply the keys
+below, or no pull secret is created and internal images fail with
+`ImagePullBackOff`. Enable only the block(s) you need — each is independent and
+all default to `enabled: false`:
+
+```yaml
+imagePullSecrets:
+  autoCreateECR: false          # set true to also create the ECR secret here
+
+  dockerHub:                    # → secret "docker-hub-secret" (server docker.io)
+    enabled: true
+    username: "myuser"
+    password: "mytoken"         # DockerHub access token or password
+    email: "me@example.com"     # optional
+
+  gcr:                          # → secret "gcr-secret" (server gcr.io)
+    enabled: false
+    jsonKey: |                  # full service-account JSON; username is "_json_key"
+      { "type": "service_account", ... }
+
+  acr:                          # → secret "acr-secret"
+    enabled: false
+    registry: "myregistry.azurecr.io"
+    username: "<sp-app-id>"
+    password: "<sp-password>"
+
+  custom:                       # → secret "custom-registry-secret" (or .name)
+    enabled: false
+    name: "custom-registry-secret"   # optional; overrides the secret name
+    server: "registry.internal.example.com"
+    username: "myuser"
+    password: "mypassword"
+    email: "me@example.com"          # optional
+```
+
+A block is only applied when `enabled: true` **and** its required credentials
+are present (username+password for DockerHub/ACR/custom, `jsonKey` for GCR,
+plus `server` for custom); otherwise the installer logs a warning and skips it.
+Point the platform's image fields at the same registry so the created secret
+matches the images being pulled.
 
 > **ECR tokens expire after 12 hours.** For long-running clusters you should set
 > up a refresh mechanism (e.g. a CronJob re-running the secret creation); this is
@@ -450,9 +526,24 @@ Air-gap uses two scripts plus a separate image-mirroring step:
    - `airgap-env.sh`, `container-images.txt`, `bundle-versions.txt`,
      `checksums.sha256`
 
-2. **Mirror container images** listed in `container-images.txt` to your internal
-   registry with `oc mirror` (or `crane`), then update `images.registry` and each
-   `images.*` field in the config to the mirrored paths.
+2. **Mirror container images** to your internal registry with `oc mirror` (or
+   `crane`), then update `images.registry` and each `images.*` field in the
+   config to the mirrored paths.
+
+   `container-images.txt` in the bundle lists the publicly available images
+   (Weaviate, KubeRay, OTel, Fluent Bit, nginx, cert-manager, Splunk,
+   Splunk Operator). **Three image groups are built internally and are not
+   listed as real entries** — they must be mirrored separately from your source
+   registry:
+
+   | Config key | Images to mirror |
+   |---|---|
+   | `images.operator.image` | Splunk AI Operator image |
+   | `images.ray.headImage`, `images.ray.workerImage` | Ray head + worker GPU images |
+   | `images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage` | SAIA API v1/v2 + data loader images |
+
+   Mirror all three groups in addition to the images in `container-images.txt`,
+   or the install will hit `ImagePullBackOff` on those pods.
 
 3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
    (`certified-operators`) via `oc mirror`, and apply the generated
@@ -505,6 +596,12 @@ Upload target is chosen by object-store type: `aws` → `upload_to_s3.sh`,
 `minio` → `upload_to_minio.sh`, `seaweedfs` →
 `upload_to_seaweedfs_upload_only.sh`. A `.staging_complete` marker per model lets
 re-runs skip already-staged artifacts (override with `SKIP_IF_STAGED=0`).
+
+> **`s3compat` is not supported by `stage-artifacts`.** Automated staging only
+> handles `aws`, `minio`, and `seaweedfs`; a `s3compat` store errors out. For a
+> generic S3-compatible store, upload the model weights into the bucket manually
+> (the layout the platform expects is `model_artifacts/<artifact-id>/...` under
+> your configured bucket) before running `install`.
 
 
 ---
@@ -567,8 +664,6 @@ them) rather than relabeling the GPU node — overwriting a GPU node's
 **Do not patch operator-owned resources directly**
 The Weaviate StatefulSet and other stack resources are owned by the AIPlatform
 CR. Patches to their `nodeSelector`/spec are reconciled back by the operator.
-Change scheduling via the AIPlatform CR fields (`cpuScheduler` /
-`cpuScheduling.tolerations`) instead.
 
 **Re-running the vector-db-setup job**
 A completed Job cannot be re-run in place, and it is owned by the AIService CR.
