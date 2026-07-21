@@ -820,6 +820,7 @@ validate_image_config() {
     "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
     "images.fluentBit.image:${FLUENT_BIT_IMAGE}"
     "images.nginx.image:${NGINX_IMAGE}"
+    "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}"
   )
   # images.splunk.image is only patched into the manifest (and only actually
   # deployed) in internal mode — disabled/external modes never run it.
