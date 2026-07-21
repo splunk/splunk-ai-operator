@@ -470,16 +470,15 @@ func (v *AIPlatformCustomValidator) validateMTLS(mtls *aiv1.MTLSConfig, certific
 }
 
 // validateScaleFactor validates the platform-wide scaleFactor. The CRD
-// Minimum=0 marker is the primary guard; this mirrors it for defense in depth.
-// 0 is allowed and scales the whole platform to zero (deploy nothing).
+// Minimum=1 marker is the primary guard; this mirrors it for defense in depth.
 func (v *AIPlatformCustomValidator) validateScaleFactor(scaleFactor *int32, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
-	if scaleFactor != nil && *scaleFactor < 0 {
+	if scaleFactor != nil && *scaleFactor < 1 {
 		allErrs = append(allErrs, field.Invalid(
 			fldPath,
 			*scaleFactor,
-			"scaleFactor must be at least 0",
+			"scaleFactor must be at least 1",
 		))
 	}
 

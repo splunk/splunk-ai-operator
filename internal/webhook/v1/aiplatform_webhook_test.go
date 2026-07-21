@@ -160,17 +160,18 @@ var _ = Describe("AIPlatform Webhook", func() {
 		Describe("scaleFactor validation", func() {
 			sfPath := field.NewPath("spec").Child("scaleFactor")
 
-			It("should accept scaleFactor of 0 (deploy nothing)", func() {
+			It("should reject scaleFactor of 0", func() {
 				zero := int32(0)
 				errs := validator.validateScaleFactor(&zero, sfPath)
-				Expect(errs).To(BeEmpty())
+				Expect(errs).NotTo(BeEmpty(), "expected a scaleFactor error")
+				Expect(errs[0].Detail).To(ContainSubstring("at least 1"))
 			})
 
 			It("should reject a negative scaleFactor", func() {
 				neg := int32(-1)
 				errs := validator.validateScaleFactor(&neg, sfPath)
 				Expect(errs).NotTo(BeEmpty(), "expected a scaleFactor error")
-				Expect(errs[0].Detail).To(ContainSubstring("at least 0"))
+				Expect(errs[0].Detail).To(ContainSubstring("at least 1"))
 			})
 
 			It("should accept a scaleFactor of 1", func() {

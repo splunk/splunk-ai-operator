@@ -1,14 +1,18 @@
 package raybuilder
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"text/template"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -150,40 +154,47 @@ func TestBuildClusterConfig_GlobalScaleFactor(t *testing.T) {
 	require.True(t, found, "expected l40s-1-gpu worker group to be present")
 }
 
-// TestBuildClusterConfig_ZeroScaleFactor asserts that spec.scaleFactor = 0
-// scales every GPU worker tier to zero pods (pause the platform).
-func TestBuildClusterConfig_ZeroScaleFactor(t *testing.T) {
-	os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
-	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
-	os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
-
-	// Resolve before t.Chdir, since it's relative to this package's directory.
-	instanceFile, err := filepath.Abs("../../../config/configs/instance.yaml")
+// TestApplicationsTemplate_ReferencesEveryModelScaleEntry prevents a model
+// from silently falling back to Ray Serve's default replica count. Every key
+// in model-scale.yaml must be consumed by the production applications
+// template so scaleFactor applies uniformly.
+func TestApplicationsTemplate_ReferencesEveryModelScaleEntry(t *testing.T) {
+	modelScaleFile, err := filepath.Abs("../../../config/configs/model-scale.yaml")
+	require.NoError(t, err)
+	applicationsFile, err := filepath.Abs("../../../config/configs/applications.yaml")
 	require.NoError(t, err)
 
-	dir := writeScaleFixtures(t, modelScaleFixture, workerScaleFixture)
-	t.Chdir(dir)
-	os.Setenv("INSTANCE_FILE", instanceFile)
-	os.Setenv("WORKER_SCALE_FILE", filepath.Join(dir, "worker-scale.yaml"))
-
-	s := scheme.Scheme
-	_ = aiv1.AddToScheme(s)
-	_ = rayv1.AddToScheme(s)
-	fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
-	recorder := record.NewFakeRecorder(100)
-
-	// scaleFactor 0 => every tier scales to zero.
-	platform := newScaleFactorTestPlatform(int32PtrForTest(0))
-
-	ctx := context.Background()
-	builder := New(platform, fakeClient, s, recorder)
-	spec, err := builder.buildClusterConfig(ctx)
+	modelScaleData, err := os.ReadFile(modelScaleFile)
 	require.NoError(t, err)
+	var modelScale ScaleConfig
+	require.NoError(t, yaml.UnmarshalStrict(modelScaleData, &modelScale))
 
-	for _, wg := range spec.WorkerGroupSpecs {
-		require.Equal(t, int32(0), *wg.Replicas, "tier %s replicas", wg.GroupName)
-		require.Equal(t, int32(0), *wg.MinReplicas, "tier %s minReplicas", wg.GroupName)
+	applicationsData, err := os.ReadFile(applicationsFile)
+	require.NoError(t, err)
+	templateText := string(applicationsData)
+
+	for modelName := range modelScale.ApplicationScale {
+		require.True(t,
+			strings.Contains(templateText, "{{.Replicas."+modelName+"}}"),
+			"applications.yaml must consume the replica count for %s", modelName,
+		)
 	}
+
+	baseReplicas := make(map[string]int32, len(modelScale.ApplicationScale))
+	for modelName := range modelScale.ApplicationScale {
+		baseReplicas[modelName] = 1
+	}
+	tmpl, err := template.New("applications").Parse(templateText)
+	require.NoError(t, err)
+	var rendered bytes.Buffer
+	require.NoError(t, tmpl.Execute(&rendered, ApplicationParams{
+		Replicas:        baseReplicas,
+		AcceleratorType: "L40S",
+	}))
+
+	var applications map[interface{}]interface{}
+	require.NoError(t, yaml.Unmarshal(rendered.Bytes(), &applications))
+	require.Contains(t, rendered.String(), "min_replicas: 1")
 }
 
 // TestScaleFactor_DefaultsToOne_Parity asserts that when spec.scaleFactor is

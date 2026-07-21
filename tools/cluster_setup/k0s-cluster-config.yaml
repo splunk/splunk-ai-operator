@@ -224,8 +224,7 @@ aiPlatform:
   #   each one uses. Omit or set to 1 for the default single-capacity
   #   deployment. Your cluster must have proportionally more GPUs available
   #   before raising this (e.g. 2x the GPUs on the node pool for scaleFactor: 2).
-  #   Set to 0 to deploy nothing (all model replicas and GPU worker pods scale
-  #   to zero) — a way to pause the platform without deleting the CR.
+  #   The value must be an integer greater than or equal to 1.
 
   workerGroupConfig:
     imageRegistry: ""

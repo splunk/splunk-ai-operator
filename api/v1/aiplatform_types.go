@@ -70,10 +70,8 @@ type AIPlatformSpec struct {
 	// single knob grows capacity without needing to know which models exist or
 	// how many GPUs each uses. The cluster must have proportionally more GPUs
 	// available before raising it. Defaults to 1 (single-capacity deployment).
-	// Set to 0 to deploy nothing (all model replicas and GPU worker pods scale
-	// to zero) — useful for pausing the platform without deleting the CR.
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	ScaleFactor *int32 `json:"scaleFactor,omitempty"`
 

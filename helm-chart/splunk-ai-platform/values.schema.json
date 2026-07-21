@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "scaleFactor": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Platform-wide capacity multiplier for model replicas and worker pods."
+    }
+  }
+}

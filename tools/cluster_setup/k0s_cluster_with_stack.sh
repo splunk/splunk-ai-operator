@@ -747,8 +747,43 @@ build_image_url() {
   fi
 }
 
+# validate_scale_factor_config validates the user-facing k0s setting before
+# any installation work begins. An omitted value is valid and uses the CRD
+# default of 1; an explicitly configured value must be a YAML integer >= 1.
+validate_scale_factor_config() {
+  local present value value_tag
+  if ! present=$(yq eval '(.aiPlatform // {}) | has("scaleFactor")' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+
+  if [[ "${present}" != "true" ]]; then
+    return 0
+  fi
+  if ! value=$(yq eval '.aiPlatform.scaleFactor' "${CONFIG_FILE}" 2>/dev/null) || \
+     ! value_tag=$(yq eval '.aiPlatform.scaleFactor | tag' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ "${value_tag}" != "!!int" ]]; then
+    echo "aiPlatform.scaleFactor must be a YAML integer greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+  if [[ ! "${value}" =~ ^-?[0-9]+$ ]] || (( value < 1 )); then
+    echo "aiPlatform.scaleFactor must be greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+
+  return 0
+}
+
 validate_image_config() {
   log "Validating image configuration..."
+
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    err "${scale_factor_error}"
+  fi
 
   if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
     err "REQUIRED: images.operator.image must be specified in k0s-cluster-config.yaml"
@@ -4530,8 +4565,8 @@ EOF
     log "SAIA public exposure: ${svc_type}${svc_node_port:+ (nodePort=${svc_node_port})}"
   fi
 
-  # Platform-wide capacity multiplier (aiPlatform.scaleFactor). Scales both
-  # model replicas and GPU worker pods together. Omitted => operator default (1).
+  # Platform-wide positive-integer capacity multiplier
+  # (aiPlatform.scaleFactor). Omitted => operator default (1).
   local scale_factor_yaml="" ai_scale_factor
   ai_scale_factor=$(yq eval '.aiPlatform.scaleFactor // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   if [[ -n "$ai_scale_factor" && "$ai_scale_factor" != "null" ]]; then
@@ -6806,6 +6841,13 @@ validate_config() {
       echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
       errors=$(( errors + 1 ))
     fi
+  fi
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    echo -e "  \033[1;31m✖\033[0m ${scale_factor_error}" >&2
+    errors=$(( errors + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m aiPlatform.scaleFactor is a positive integer (default: 1)" >&2
   fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2

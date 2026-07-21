@@ -184,7 +184,7 @@ func (b *Builder) effectiveAcceleratorType() string {
 // model (Serve) replicas and GPU worker-pool pod counts so the two stay in
 // lockstep on the shared, fixed GPU pool.
 func (b *Builder) effectiveScaleFactor() int32 {
-	if b.ai.Spec.ScaleFactor != nil && *b.ai.Spec.ScaleFactor >= 0 {
+	if b.ai.Spec.ScaleFactor != nil && *b.ai.Spec.ScaleFactor >= 1 {
 		return *b.ai.Spec.ScaleFactor
 	}
 	return 1

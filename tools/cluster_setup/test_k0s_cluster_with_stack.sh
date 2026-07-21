@@ -89,6 +89,7 @@ _load_functions() {
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
+  eval "$(_extract_fn validate_scale_factor_config)"
   eval "$(_extract_fn object_store_auth_looks_like_placeholder)"
   eval "$(_extract_fn _pod_is_healthy)"
   eval "$(_extract_fn _classify_pod_failure)"
@@ -122,6 +123,51 @@ assert_eq "returns bare path when registry is empty" \
 assert_eq "returns bare path when registry is null" \
   "splunk/operator:1.0" \
   "$(build_image_url "null" "splunk/operator:1.0")"
+
+# ── Tests: validate_scale_factor_config ──────────────────────────────────────
+
+suite "validate_scale_factor_config"
+echo "▶ validate_scale_factor_config"
+
+# Stub yq so these tests stay local and exercise the validation branches
+# without depending on a particular yq installation.
+_scale_factor_present="false"
+_scale_factor_value="null"
+_scale_factor_tag="!!null"
+yq() {
+  if [[ "$*" == *"has(\"scaleFactor\")"* ]]; then
+    echo "${_scale_factor_present}"
+  elif [[ "$*" == *"| tag"* ]]; then
+    echo "${_scale_factor_tag}"
+  else
+    echo "${_scale_factor_value}"
+  fi
+}
+CONFIG_FILE="unused-by-yq-stub"
+
+assert_rc "accepts an omitted value (defaults to 1)" 0 validate_scale_factor_config
+
+_scale_factor_present="true"
+_scale_factor_value="1"; _scale_factor_tag="!!int"
+assert_rc "accepts integer 1" 0 validate_scale_factor_config
+
+_scale_factor_value="3"; _scale_factor_tag="!!int"
+assert_rc "accepts an integer greater than 1" 0 validate_scale_factor_config
+
+_scale_factor_value="0"; _scale_factor_tag="!!int"
+assert_rc "rejects zero" 1 validate_scale_factor_config
+
+_scale_factor_value="-1"; _scale_factor_tag="!!int"
+assert_rc "rejects negative integers" 1 validate_scale_factor_config
+
+_scale_factor_value="1.5"; _scale_factor_tag="!!float"
+assert_rc "rejects decimals" 1 validate_scale_factor_config
+
+_scale_factor_value="2"; _scale_factor_tag="!!str"
+assert_rc "rejects quoted integers" 1 validate_scale_factor_config
+
+_scale_factor_value="null"; _scale_factor_tag="!!null"
+assert_rc "rejects an explicitly null value" 1 validate_scale_factor_config
 
 # ── Tests: object_store_auth_looks_like_placeholder ───────────────────────────
 
