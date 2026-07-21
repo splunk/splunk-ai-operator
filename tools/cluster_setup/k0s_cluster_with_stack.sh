@@ -822,10 +822,14 @@ validate_image_config() {
     "images.nginx.image:${NGINX_IMAGE}"
     "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}"
   )
-  # images.splunk.image is only patched into the manifest (and only actually
-  # deployed) in internal mode — disabled/external modes never run it.
+  # images.splunk.image and images.splunk.operatorImage are only patched into
+  # the manifest (and only actually deployed) in internal mode — disabled/
+  # external modes never run them.
   if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    mutable_tag_images+=("images.splunk.image:${SPLUNK_IMAGE}")
+    mutable_tag_images+=(
+      "images.splunk.image:${SPLUNK_IMAGE}"
+      "images.splunk.operatorImage:${SPLUNK_OPERATOR_IMAGE}"
+    )
   fi
   local entry key image last_segment tag
   for entry in "${mutable_tag_images[@]}"; do
