@@ -23,6 +23,10 @@ jobs:
     uses: ./.github/workflows/main-unit-tests.yml
     needs: check-formatting
 
+  cluster-setup-tests:
+    uses: ./.github/workflows/cluster-setup-tests.yml
+    needs: check-formatting
+
   build-image:
     uses: ./.github/workflows/main-build-image.yml
     secrets: inherit

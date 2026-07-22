@@ -1,0 +1,24 @@
+name: Cluster Setup Tests
+on:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+
+      - name: Ensure yq is available
+        run: |
+          if ! command -v yq &> /dev/null; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+          yq --version
+
+      - name: Run cluster_setup unit tests
+        run: bash tools/cluster_setup/test_k0s_cluster_with_stack.sh
+
+      - name: Run Splunk-optional installer dry-run tests
+        run: bash tools/cluster_setup/test_installer_dry_run.sh

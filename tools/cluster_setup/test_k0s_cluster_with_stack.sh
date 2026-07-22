@@ -87,6 +87,8 @@ _load_functions() {
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
 
   eval "$(_extract_fn build_image_url)"
+  eval "$(_extract_fn validate_image_config)"
+  eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn object_store_auth_looks_like_placeholder)"
   eval "$(_extract_fn _pod_is_healthy)"
   eval "$(_extract_fn _classify_pod_failure)"
@@ -257,6 +259,181 @@ POD_LINES=(
 _print_unhealthy_pod_summary
 assert_eq "scenario 4: truncation ellipsis shown for downstream" \
   "1" "$(echo "${_captured}" | grep -c "… and" || true)"
+
+# ── Tests: configure_images upgrade idempotency ───────────────────────────────
+# Regression test for the bug fixed in b07745c: image: substitutions must be
+# anchored on a unique preceding field, not on the image string's own content,
+# so a second run with a new custom (non-"splunk*ai*operator") image actually
+# overwrites the first run's image instead of leaving it stale.
+
+suite "configure_images upgrade idempotency"
+echo "▶ configure_images upgrade idempotency"
+
+_CI_TMPDIR="$(mktemp -d)"
+trap '[[ -n "${_CI_TMPDIR:-}" ]] && rm -rf "${_CI_TMPDIR}"' EXIT
+
+# Minimal fixtures mirroring the real manifests' anchor structure: the
+# RELATED_IMAGE_* env/value pairs, the RAY_VERSION entry immediately
+# preceding the AI operator's image: line, and (for the Splunk Operator
+# manifest) the POD_NAME entry immediately preceding its image: line.
+cat > "${_CI_TMPDIR}/artifacts.yaml" <<'EOF'
+      containers:
+      - name: manager
+        env:
+        - name: RELATED_IMAGE_RAY_HEAD
+          value: placeholder
+        - name: RELATED_IMAGE_RAY_WORKER
+          value: placeholder
+        - name: RELATED_IMAGE_WEAVIATE
+          value: placeholder
+        - name: RELATED_IMAGE_SAIA_API
+          value: placeholder
+        - name: RELATED_IMAGE_SAIA_API_V2
+          value: placeholder
+        - name: RELATED_IMAGE_POST_INSTALL_HOOK
+          value: placeholder
+        - name: RELATED_IMAGE_FLUENT_BIT
+          value: placeholder
+        - name: RELATED_IMAGE_OTEL_COLLECTOR
+          value: placeholder
+        - name: RELATED_IMAGE_NGINX
+          value: placeholder
+        - name: MODEL_VERSION
+          value: placeholder
+        - name: RAY_VERSION
+          value: placeholder
+        image: ghcr.io/splunk/splunk-ai-operator:v0.1.0
+EOF
+
+cat > "${_CI_TMPDIR}/splunk-operator-cluster.yaml" <<'EOF'
+      containers:
+      - name: manager
+        env:
+        - name: RELATED_IMAGE_SPLUNK_ENTERPRISE
+          value: placeholder
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        image: docker.io/splunk/splunk-operator:3.0.0
+EOF
+
+_run_configure_images() {
+  local op_image="$1" splunk_op_image="$2"
+  OPERATOR_IMAGE="${op_image}" \
+  RAY_HEAD_IMAGE=ray-head:v1 RAY_WORKER_IMAGE=ray-worker:v1 \
+  WEAVIATE_IMAGE=weaviate:v1 SAIA_API_IMAGE=saia-api:v1 \
+  SAIA_API_V2_IMAGE=saia-api-v2:v1 SAIA_DATALOADER_IMAGE=saia-loader:v1 \
+  FLUENT_BIT_IMAGE=fluent-bit:v1 OTEL_COLLECTOR_IMAGE=otel:v1 NGINX_IMAGE=nginx:v1 \
+  MODEL_VERSION=v1 RAY_RUNTIME_VERSION=2.44.0 IMAGE_REGISTRY="" \
+  SPLUNK_MODE=internal SPLUNK_IMAGE=splunk:v1 SPLUNK_OPERATOR_IMAGE="${splunk_op_image}" \
+  SPLUNK_AI_FILE="${_CI_TMPDIR}/artifacts.yaml" \
+  SPLUNK_OPERATOR_FILE="${_CI_TMPDIR}/splunk-operator-cluster.yaml" \
+  bash -c "
+    $(declare -f build_image_url)
+    $(declare -f configure_images)
+    log() { :; }
+    configure_images
+  "
+}
+
+# A custom private-registry image containing none of "splunk"/"ai"/"operator"
+# as substrings — the exact case that broke the old content-based sed match.
+_run_configure_images "registry.example.com/team/platform:v1" "registry.example.com/team/splunk-op:v1" >/dev/null 2>&1
+
+assert_eq "first run: AI operator image set to v1" \
+  "1" "$(grep -c 'image: registry.example.com/team/platform:v1$' "${_CI_TMPDIR}/artifacts.yaml")"
+assert_eq "first run: Splunk Operator image set to v1" \
+  "1" "$(grep -c 'image: registry.example.com/team/splunk-op:v1$' "${_CI_TMPDIR}/splunk-operator-cluster.yaml")"
+
+# Second run ("upgrade"): same private-registry path, new tag. This is the
+# regression case — a content-based match never re-matches here because the
+# image string still contains no "splunk"/"ai"/"operator" substring.
+_run_configure_images "registry.example.com/team/platform:v2" "registry.example.com/team/splunk-op:v2" >/dev/null 2>&1
+
+assert_eq "upgrade run: AI operator image advances to v2 (not stale v1)" \
+  "1" "$(grep -c 'image: registry.example.com/team/platform:v2$' "${_CI_TMPDIR}/artifacts.yaml")"
+assert_eq "upgrade run: no stale v1 AI operator image remains" \
+  "0" "$(grep -c 'image: registry.example.com/team/platform:v1$' "${_CI_TMPDIR}/artifacts.yaml")"
+assert_eq "upgrade run: Splunk Operator image advances to v2 (not stale v1)" \
+  "1" "$(grep -c 'image: registry.example.com/team/splunk-op:v2$' "${_CI_TMPDIR}/splunk-operator-cluster.yaml")"
+assert_eq "upgrade run: no stale v1 Splunk Operator image remains" \
+  "0" "$(grep -c 'image: registry.example.com/team/splunk-op:v1$' "${_CI_TMPDIR}/splunk-operator-cluster.yaml")"
+assert_eq "upgrade run: RELATED_IMAGE_RAY_HEAD still updates on every run" \
+  "1" "$(grep -A1 'RELATED_IMAGE_RAY_HEAD' "${_CI_TMPDIR}/artifacts.yaml" | grep -c 'value: ray-head:v1')"
+
+rm -rf "${_CI_TMPDIR}"
+trap - EXIT
+
+# ── Tests: validate_image_config mutable-tag warnings ─────────────────────────
+# Covers the tag-parsing fix (registry ports must not be mistaken for tags)
+# and the full set of RELATED_IMAGE_* fields configure_images patches, since
+# every patched field needs a corresponding mutable-tag check to be useful.
+
+suite "validate_image_config mutable-tag warnings"
+echo "▶ validate_image_config mutable-tag warnings"
+
+_run_validate_image_config() {
+  # All required fields default to a safe, tagged value; only the fields the
+  # caller overrides (as VAR=value args) are exercised for warnings.
+  # SPLUNK_MODE=internal so the Splunk-guarded fields are always in scope.
+  # `env` (not a bare assignment prefix) is required here because the
+  # overrides arrive as already-expanded "$@" positional args, and bash only
+  # treats a literal VAR=value token as an assignment prefix — not one that
+  # came from a parameter expansion.
+  env \
+  OPERATOR_IMAGE="op:v1" RAY_HEAD_IMAGE="rh:v1" RAY_WORKER_IMAGE="rw:v1" \
+  WEAVIATE_IMAGE="wv:v1" SAIA_API_IMAGE="sa:v1" SAIA_API_V2_IMAGE="sa2:v1" \
+  SAIA_DATALOADER_IMAGE="sd:v1" SPLUNK_MODE="internal" SPLUNK_IMAGE="sp:v1" \
+  SPLUNK_OPERATOR_IMAGE="spo:v1" FLUENT_BIT_IMAGE="fb:v1" \
+  OTEL_COLLECTOR_IMAGE="otel:v1" NGINX_IMAGE="nginx:v1" MODEL_VERSION="v1" \
+  RAY_RUNTIME_VERSION="2.44.0" \
+  "$@" \
+  bash -c "
+    $(declare -f build_image_url)
+    $(declare -f validate_image_config)
+    log()  { :; }
+    err()  { echo \"ERR: \$*\"; exit 1; }
+    warn() { echo \"WARN: \$*\"; }
+    validate_image_config
+  "
+}
+
+_out="$(_run_validate_image_config OTEL_COLLECTOR_IMAGE="otel:latest")"
+assert_eq "otelCollector mutable tag ':latest' is checked (Codex follow-up)" \
+  "1" "$(echo "${_out}" | grep -c 'images.otelCollector.image.*mutable tag')"
+
+_out="$(_run_validate_image_config NGINX_IMAGE="nginx" 2>&1)"
+assert_eq "nginx untagged image is checked" \
+  "1" "$(echo "${_out}" | grep -c 'images.nginx.image.*no explicit tag')"
+
+_out="$(_run_validate_image_config FLUENT_BIT_IMAGE="fb:preview" 2>&1)"
+assert_eq "fluentBit mutable tag ':preview' is checked" \
+  "1" "$(echo "${_out}" | grep -c 'images.fluentBit.image.*mutable tag')"
+
+_out="$(_run_validate_image_config SPLUNK_IMAGE="sp:latest" 2>&1)"
+assert_eq "splunk.image (internal mode) mutable tag is checked" \
+  "1" "$(echo "${_out}" | grep -c 'images.splunk.image.*mutable tag')"
+
+_out="$(_run_validate_image_config SPLUNK_OPERATOR_IMAGE="spo:dev" 2>&1)"
+assert_eq "splunk.operatorImage (internal mode) mutable tag is checked" \
+  "1" "$(echo "${_out}" | grep -c 'images.splunk.operatorImage.*mutable tag')"
+
+_out="$(_run_validate_image_config SAIA_API_IMAGE="localhost:5000/team/saia-api" 2>&1)"
+assert_eq "untagged image behind a registry port is NOT mistaken for tagged" \
+  "1" "$(echo "${_out}" | grep -c 'images.saia.apiImage.*no explicit tag')"
+
+_out="$(_run_validate_image_config SAIA_API_IMAGE="localhost:5000/team/saia-api:v3" 2>&1)"
+assert_eq "tagged image behind a registry port parses the real tag, no false warning" \
+  "0" "$(echo "${_out}" | grep -c 'images.saia.apiImage')"
+
+_out="$(_run_validate_image_config RAY_HEAD_IMAGE="rh:stable-2024" 2>&1)"
+assert_eq "ray.headImage mutable 'stable*' tag is checked" \
+  "1" "$(echo "${_out}" | grep -c 'images.ray.headImage.*mutable tag')"
+
+_out="$(_run_validate_image_config OPERATOR_IMAGE="op:v1.2.3" 2>&1)"
+assert_eq "immutable semver-style tag produces no warning" \
+  "0" "$(echo "${_out}" | grep -c 'images.operator.image')"
 
 # ── Tests: k0s config path ────────────────────────────────────────────────────
 # Verify that the install script uses /etc/k0s/k0s.yaml (not /tmp/k0s.yaml)
