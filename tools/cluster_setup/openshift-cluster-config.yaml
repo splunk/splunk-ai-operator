@@ -78,6 +78,9 @@ splunk:
 aiPlatform:
   name: "openshift-ai-platform"
   defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
+  # Fresh-install capacity multiplier for both model replicas and GPU workers.
+  # Must be a YAML integer greater than or equal to 1.
+  scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
