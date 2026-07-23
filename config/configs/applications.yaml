@@ -34,6 +34,7 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- if .Replicas.Gemma431bIt }}
   - args:
       application_name: Gemma431bIt
       deployment_configs:
@@ -170,6 +171,8 @@ applications:
         # Airgap k0s has no Redis; cloud sets this to "False" and wires
         # RESPONSES_REDIS_ADDRESS to its in-namespace Redis StatefulSet.
         DISABLE_RESPONSES_API_REDIS: "True"
+{{- end }}
+{{- if .Replicas.GptOss20b }}
   - args:
       application_name: GptOss20b
       deployment_configs:
@@ -274,6 +277,8 @@ applications:
         # See Gemma431bIt above for rationale. Must be "True" in airgap (no
         # Redis) so vLLM uses NoOpOpenAIServingResponses.
         DISABLE_RESPONSES_API_REDIS: "True"
+{{- end }}
+{{- if .Replicas.UaeLarge }}
   - args:
       application_name: UaeLarge
       deployment_configs:
@@ -352,6 +357,8 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
+{{- if .Replicas.AllMinilmL6V2 }}
   - args:
       application_name: AllMinilmL6V2
       deployment_configs:
@@ -424,6 +431,8 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
+{{- if .Replicas.BiEncoder }}
   - args:
       application_name: BiEncoder
       deployment_configs:
@@ -493,6 +502,8 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
+{{- if .Replicas.MbartTranslator }}
   - args:
       application_name: MbartTranslator
       custom_deployment_import_path: mbart_translator:MbartTranslatorDeployment
@@ -553,6 +564,8 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
+{{- if .Replicas.XlmRobertaLanguageClassifier }}
   - args:
       application_name: XlmRobertaLanguageClassifier
       deployment_configs:
@@ -631,6 +644,7 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
   - args:
       application_name: PromptInjectionTfidf
       custom_deployment_import_path: prompt_injection_tfidf:PromptInjectionTfidfDeployment
@@ -747,6 +761,7 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
 {{- end }}
+{{- if .Replicas.CrossEncoder }}
   - args:
       application_name: CrossEncoder
       deployment_configs:
@@ -820,6 +835,8 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
+{{- if .Replicas.E5LanguageClassifier }}
   - args:
       application_name: E5LanguageClassifier
       deployment_configs:
@@ -898,6 +915,8 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
+{{- if .Replicas.PromptInjectionCrossEncoder }}
   - args:
       application_name: PromptInjectionCrossEncoder
       deployment_configs:
@@ -963,6 +982,7 @@ applications:
         SERVICE_NAME: "ai_platform_models"
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
+{{- end }}
   - args:
       application_name: PromptInjectionClassifier
       deployment_type: classification_model_deployment

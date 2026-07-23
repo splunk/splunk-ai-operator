@@ -59,6 +59,7 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		{"Certificate", r.reconcileCertificate},
 		{"SlimDeployment", r.reconcileSlimDeployment},
 		{"SlimService", r.reconcileSlimService},
+		{"SlimMetricsService", r.reconcileSlimMetricsService},
 		{"ServiceMonitor", r.reconcileServiceMonitor},
 	}
 
@@ -124,8 +125,12 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 			clusterDomain = "cluster.local"
 		}
 		if ai.Spec.AIPlatformUrl == "" {
-			ai.Spec.AIPlatformUrl = fmt.Sprintf("http://%s.%s.svc.%s:8000",
-				aiPlatform.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, clusterDomain)
+			scheme := ai.Spec.AIPlatformScheme
+			if scheme == "" {
+				scheme = "http"
+			}
+			ai.Spec.AIPlatformUrl = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
+				scheme, aiPlatform.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, clusterDomain)
 		}
 	}
 
@@ -613,74 +618,103 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	return nil
 }
 
+// reconcileSlimService ensures the public-facing Service, which may be exposed via
+// NodePort/LoadBalancer per ServiceTemplate. It intentionally excludes the metrics
+// port so that enabling public exposure never publishes /metrics or consumes an
+// extra NodePort; metrics are served by reconcileSlimMetricsService instead.
 func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AIService) error {
 	serviceTemplate := ai.Spec.ServiceTemplate.DeepCopy()
 	cleanServiceTemplate(serviceTemplate)
 
 	ports := []corev1.ServicePort{
 		{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
-		{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088)},
 	}
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		ports = append(ports, corev1.ServicePort{
 			Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443),
 		})
 	}
+
+	svcType := corev1.ServiceTypeClusterIP
+	switch serviceTemplate.Spec.Type {
+	case corev1.ServiceTypeLoadBalancer:
+		svcType = corev1.ServiceTypeLoadBalancer
+	case corev1.ServiceTypeNodePort:
+		svcType = corev1.ServiceTypeNodePort
+		for i, port := range ports {
+			for _, tplPort := range serviceTemplate.Spec.Ports {
+				if port.Name == tplPort.Name && tplPort.NodePort != 0 {
+					ports[i].NodePort = tplPort.NodePort
+				}
+			}
+		}
+	}
+
+	labels := map[string]string{"app": ai.Name}
+	for k, v := range ai.Labels {
+		labels[k] = v
+	}
+	annotations := map[string]string{}
+	for k, v := range ai.Annotations {
+		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
+			continue
+		}
+		annotations[k] = v
+	}
+
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ai.Name + "-slim-service",
 			Namespace: ai.Namespace,
-			Labels:    map[string]string{"app": ai.Name},
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": ai.Name, "component": ai.Name},
-			Ports:    ports,
-			Type:     corev1.ServiceTypeClusterIP,
 		},
 	}
-	for k, v := range ai.Labels {
-		svc.ObjectMeta.Labels[k] = v
-	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" {
-			continue
-		}
-		if k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
-		if svc.ObjectMeta.Annotations == nil {
-			svc.ObjectMeta.Annotations = map[string]string{}
-		}
-		svc.ObjectMeta.Annotations[k] = v
-	}
-
-	switch serviceTemplate.Spec.Type {
-	case corev1.ServiceTypeLoadBalancer:
-		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
-	case corev1.ServiceTypeNodePort:
-		svc.Spec.Type = corev1.ServiceTypeNodePort
-		for i, port := range svc.Spec.Ports {
-			for _, tplPort := range serviceTemplate.Spec.Ports {
-				if port.Name == tplPort.Name && tplPort.NodePort != 0 {
-					svc.Spec.Ports[i].NodePort = tplPort.NodePort
-				}
-			}
-		}
-	default:
-		svc.Spec.Type = corev1.ServiceTypeClusterIP
-	}
-
 	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Service failed")
 		return fmt.Errorf("ownerref on Service: %w", err)
 	}
+	// Type, Ports, and Selector are all set inside the mutate callback because
+	// CreateOrUpdate reloads the live Service from the cluster before invoking it,
+	// so any values set on svc beforehand are discarded on updates.
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.ObjectMeta.Labels = labels
+		svc.ObjectMeta.Annotations = annotations
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
 		svc.Spec.Ports = ports
+		svc.Spec.Type = svcType
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Service failed")
 		return fmt.Errorf("create/update Service: %w", err)
+	}
+	return nil
+}
+
+// reconcileSlimMetricsService creates an internal ClusterIP-only Service carrying the
+// metrics port, kept separate from the public Service so that NodePort/LoadBalancer
+// exposure never publishes /metrics. It carries the "component" label so the
+// ServiceMonitor's selector (app+component) matches it.
+func (r *SlimReconciler) reconcileSlimMetricsService(ctx context.Context, ai *aiv1.AIService) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ai.Name + "-slim-metrics-service",
+			Namespace: ai.Namespace,
+		},
+	}
+	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on metrics Service failed")
+		return fmt.Errorf("ownerref on metrics Service: %w", err)
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.ObjectMeta.Labels = map[string]string{"app": ai.Name, "component": ai.Name}
+		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
+		svc.Spec.Ports = []corev1.ServicePort{
+			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088)},
+		}
+		svc.Spec.Type = corev1.ServiceTypeClusterIP
+		return nil
+	}); err != nil {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update metrics Service failed")
+		return fmt.Errorf("create/update metrics Service: %w", err)
 	}
 	return nil
 }
