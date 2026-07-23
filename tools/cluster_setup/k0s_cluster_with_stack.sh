@@ -4165,7 +4165,14 @@ install_splunk_standalone() {
   fi
 
   # Create splunk-defaults ConfigMap (optional but recommended)
-  cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
+  #
+  # issuer_uri becomes the "iss" claim on every interactive JWT Splunk mints.
+  # It MUST byte-for-byte match splunkConfiguration.endpoint below (which feeds
+  # SPLUNK_ISSUERS on saia/slim) or CMP auth rejects every token with
+  # "Issuer '<iss>' is not allowed". Keep both in the
+  # https://splunk-<name>-standalone-service.<ns>.svc.<domain>:8089 form used by
+  # the operator's own SplunkCustomResourceRef path (buildSplunkIssuersVal).
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -4179,8 +4186,8 @@ data:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
-                certFile: $SPLUNK_HOME/etc/auth/server.pem
+                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+                certFile: \$SPLUNK_HOME/etc/auth/server.pem
                 sslPassword: password
 YAML
 
@@ -4326,8 +4333,11 @@ install_ai_platform_cr() {
       splunk_config_yaml=$(cat <<EOF
 
   # Splunk configuration (internal — in-cluster Standalone)
+  # Scheme+host here MUST byte-for-byte match the oauth2_settings.issuer_uri
+  # set in the splunk-defaults ConfigMap above (install_splunk_standalone) —
+  # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
@@ -6080,7 +6090,7 @@ show_platform_access_info() {
   log "     kubectl get pods -n ${AI_NS} -l app.kubernetes.io/instance=splunk-standalone"
   log "  "
   log "  💡 Access Splunk Web (once ready):"
-  log "     kubectl port-forward -n ${AI_NS} svc/splunk-standalone-standalone-service 8000:8000"
+  log "     kubectl port-forward -n ${AI_NS} svc/splunk-${AI_STANDALONE_NAME}-standalone-service 8000:8000"
   log "     Open: http://localhost:8000"
   log ""
 
