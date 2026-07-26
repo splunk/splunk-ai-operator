@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+# Temp files rendered during a run (e.g. patched manifest copies) are tracked
+# here and removed on exit so we never mutate committed manifests.
+TMP_FILES=()
+cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/null || true; }
+trap cleanup_tmp EXIT
+
 # =============================================================================
 # OpenShift Cluster Setup Script for Splunk AI Platform
 # =============================================================================
@@ -544,16 +550,23 @@ configure_images() {
 
   [[ -f "${SPLUNK_AI_FILE}" ]] || err "Manifest not found: ${SPLUNK_AI_FILE}"
 
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, oc apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
 
   if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
-    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-      cp "${SPLUNK_OPERATOR_FILE}" "${SPLUNK_OPERATOR_FILE}.original"
-    fi
-    cp "${SPLUNK_OPERATOR_FILE}.original" "${SPLUNK_OPERATOR_FILE}"
+    operator_rendered=$(mktemp) || err "failed to create temp manifest"
+    cp "${SPLUNK_OPERATOR_FILE}" "$operator_rendered"
+    TMP_FILES+=("$operator_rendered")
+    SPLUNK_OPERATOR_FILE="$operator_rendered"
   fi
 
   local operator_full ray_head_full ray_worker_full weaviate_full
@@ -637,10 +650,8 @@ configure_images() {
   # account-specific ECR URLs baked into the committed manifest file.
   if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
     log "Patching image references in ${SPLUNK_OPERATOR_FILE}..."
-    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-      cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-    fi
-    cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+    # SPLUNK_OPERATOR_FILE already points at the rendered temp from the first
+    # block; patch it in place (no backup/restore needed).
 
     local splunk_full splunk_esc splunk_op_full splunk_op_esc
     splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")

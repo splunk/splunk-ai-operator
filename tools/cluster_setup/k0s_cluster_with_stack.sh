@@ -902,14 +902,29 @@ validate_image_config() {
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  # Note: this rewrites artifacts.yaml / splunk-operator-cluster.yaml in place
-  # on every run via the sed substitutions below. There is no backup/restore
-  # from a pristine snapshot — a prior ".original" model silently reverted any
-  # legitimate change to these manifests (new operator release, new env var,
-  # new sidecar) on every re-run after the first, since the snapshot was never
-  # refreshed. The sed patterns below only ever touch their own named
-  # RELATED_IMAGE_*/image: fields, so re-running against an already-updated
-  # file is idempotent and safe.
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, kubectl apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
+
+  # Only render the Splunk Operator manifest when telemetry is internal mode
+  # only. External/disabled modes never apply the manifest, so touching it
+  # (which also requires the file to exist) is pointless and would break
+  # Splunk-free installs that don't ship splunk-operator-cluster.yaml.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    operator_rendered=$(mktemp) || err "failed to create temp manifest"
+    cp "$SPLUNK_OPERATOR_FILE" "$operator_rendered"
+    TMP_FILES+=("$operator_rendered")
+    SPLUNK_OPERATOR_FILE="$operator_rendered"
+  fi
+
   log "Updating $SPLUNK_AI_FILE..."
 
   local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")

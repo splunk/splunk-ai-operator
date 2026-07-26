@@ -379,7 +379,10 @@ _run_configure_images() {
     $(declare -f build_image_url)
     $(declare -f configure_images)
     log() { :; }
+    err() { echo \"ERROR: \$*\" >&2; exit 1; }
     configure_images
+    cp \"\$SPLUNK_AI_FILE\" \"${_CI_TMPDIR}/rendered-artifacts.yaml\"
+    cp \"\$SPLUNK_OPERATOR_FILE\" \"${_CI_TMPDIR}/rendered-splunk-operator.yaml\"
   "
 }
 
@@ -388,9 +391,9 @@ _run_configure_images() {
 _run_configure_images "registry.example.com/team/platform:v1" "registry.example.com/team/splunk-op:v1" >/dev/null 2>&1
 
 assert_eq "first run: AI operator image set to v1" \
-  "1" "$(grep -c 'image: registry.example.com/team/platform:v1$' "${_CI_TMPDIR}/artifacts.yaml")"
+  "1" "$(grep -c 'image: registry.example.com/team/platform:v1$' "${_CI_TMPDIR}/rendered-artifacts.yaml")"
 assert_eq "first run: Splunk Operator image set to v1" \
-  "1" "$(grep -c 'image: registry.example.com/team/splunk-op:v1$' "${_CI_TMPDIR}/splunk-operator-cluster.yaml")"
+  "1" "$(grep -c 'image: registry.example.com/team/splunk-op:v1$' "${_CI_TMPDIR}/rendered-splunk-operator.yaml")"
 
 # Second run ("upgrade"): same private-registry path, new tag. This is the
 # regression case — a content-based match never re-matches here because the
@@ -398,15 +401,15 @@ assert_eq "first run: Splunk Operator image set to v1" \
 _run_configure_images "registry.example.com/team/platform:v2" "registry.example.com/team/splunk-op:v2" >/dev/null 2>&1
 
 assert_eq "upgrade run: AI operator image advances to v2 (not stale v1)" \
-  "1" "$(grep -c 'image: registry.example.com/team/platform:v2$' "${_CI_TMPDIR}/artifacts.yaml")"
+  "1" "$(grep -c 'image: registry.example.com/team/platform:v2$' "${_CI_TMPDIR}/rendered-artifacts.yaml")"
 assert_eq "upgrade run: no stale v1 AI operator image remains" \
-  "0" "$(grep -c 'image: registry.example.com/team/platform:v1$' "${_CI_TMPDIR}/artifacts.yaml")"
+  "0" "$(grep -c 'image: registry.example.com/team/platform:v1$' "${_CI_TMPDIR}/rendered-artifacts.yaml")"
 assert_eq "upgrade run: Splunk Operator image advances to v2 (not stale v1)" \
-  "1" "$(grep -c 'image: registry.example.com/team/splunk-op:v2$' "${_CI_TMPDIR}/splunk-operator-cluster.yaml")"
+  "1" "$(grep -c 'image: registry.example.com/team/splunk-op:v2$' "${_CI_TMPDIR}/rendered-splunk-operator.yaml")"
 assert_eq "upgrade run: no stale v1 Splunk Operator image remains" \
-  "0" "$(grep -c 'image: registry.example.com/team/splunk-op:v1$' "${_CI_TMPDIR}/splunk-operator-cluster.yaml")"
+  "0" "$(grep -c 'image: registry.example.com/team/splunk-op:v1$' "${_CI_TMPDIR}/rendered-splunk-operator.yaml")"
 assert_eq "upgrade run: RELATED_IMAGE_RAY_HEAD still updates on every run" \
-  "1" "$(grep -A1 'RELATED_IMAGE_RAY_HEAD' "${_CI_TMPDIR}/artifacts.yaml" | grep -c 'value: ray-head:v1')"
+  "1" "$(grep -A1 'RELATED_IMAGE_RAY_HEAD' "${_CI_TMPDIR}/rendered-artifacts.yaml" | grep -c 'value: ray-head:v1')"
 
 rm -rf "${_CI_TMPDIR}"
 trap - EXIT
@@ -441,6 +444,8 @@ _run_validate_image_config() {
     log()  { :; }
     err()  { echo \"ERR: \$*\"; exit 1; }
     warn() { echo \"WARN: \$*\"; }
+    validate_scale_factor_config() { return 0; }
+    k0s_slim_feature_enabled() { return 1; }
     validate_image_config
   "
 }

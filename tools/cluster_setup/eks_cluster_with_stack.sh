@@ -398,21 +398,22 @@ replace_image_in_manifest() {
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  # Make backups only if they don't exist (preserve original clean versions)
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_AI_FILE}.original"
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
-    cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-  fi
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, kubectl apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
 
-  # Always restore from clean original before applying changes
-  # This ensures idempotent behavior - script can be run multiple times safely
-  log "Restoring from clean originals to ensure idempotent updates..."
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
-  cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+  operator_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_OPERATOR_FILE" "$operator_rendered"
+  TMP_FILES+=("$operator_rendered")
+  SPLUNK_OPERATOR_FILE="$operator_rendered"
 
   # artifacts.yaml - RELATED_IMAGE_* environment variables
   log "Updating $SPLUNK_AI_FILE..."
