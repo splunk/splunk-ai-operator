@@ -811,31 +811,70 @@ validate_image_config() {
     log "Using default Ray runtime version: $RAY_RUNTIME_VERSION"
   fi
 
+  # Every workload container runs imagePullPolicy: IfNotPresent, so re-running
+  # install with an unchanged mutable tag (:latest, :preview, :stable-*) will
+  # NOT pick up a newer build pushed under that same tag — the kubelet serves
+  # the cached layer and the operator's CreateOrUpdate sees no template diff,
+  # so no rollout even happens. Upgrades require a new, distinct tag. This is
+  # a config-hygiene warning, not an error: mutable tags are still valid for
+  # first-time installs.
+  local mutable_tag_images=(
+    "images.operator.image:${OPERATOR_IMAGE}"
+    "images.ray.headImage:${RAY_HEAD_IMAGE}"
+    "images.ray.workerImage:${RAY_WORKER_IMAGE}"
+    "images.weaviate.image:${WEAVIATE_IMAGE}"
+    "images.saia.apiImage:${SAIA_API_IMAGE}"
+    "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
+    "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
+    "images.fluentBit.image:${FLUENT_BIT_IMAGE}"
+    "images.nginx.image:${NGINX_IMAGE}"
+    "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}"
+  )
+  # images.splunk.image and images.splunk.operatorImage are only patched into
+  # the manifest (and only actually deployed) in internal mode — disabled/
+  # external modes never run them.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    mutable_tag_images+=(
+      "images.splunk.image:${SPLUNK_IMAGE}"
+      "images.splunk.operatorImage:${SPLUNK_OPERATOR_IMAGE}"
+    )
+  fi
+  local entry key image last_segment tag
+  for entry in "${mutable_tag_images[@]}"; do
+    key="${entry%%:*}"
+    image="${entry#*:}"
+    if [[ -z "$image" || "$image" == "null" ]]; then
+      continue
+    fi
+    # Parse the tag from the last path segment only, so a registry port
+    # (e.g. localhost:5000/team/saia-api) is never mistaken for a tag.
+    last_segment="${image##*/}"
+    if [[ "$last_segment" == *:* ]]; then
+      tag="${last_segment##*:}"
+    else
+      tag=""
+    fi
+    if [[ -z "$tag" ]]; then
+      warn "${key} (${image}) has no explicit tag — defaults to :latest, which will NOT be re-pulled on a same-tag re-run of install (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
+    elif [[ "$tag" =~ ^(latest|preview|stable.*|dev|nightly)$ ]]; then
+      warn "${key} uses mutable tag ':${tag}' — re-running install without changing this tag will NOT upgrade the running image (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
+    fi
+  done
+
   log "✓ Image configuration validated successfully"
 }
 
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_AI_FILE}.original"
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  # Only back up / rewrite the Splunk Operator manifest when telemetry is
-  # internal mode only. External/disabled modes never apply the manifest, so
-  # touching it (which also requires the file to exist) is pointless and would
-  # break Splunk-free installs that don't ship splunk-operator-cluster.yaml.
-  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-      log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
-      cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-    fi
-  fi
-
-  log "Restoring from clean originals to ensure idempotent updates..."
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
-  [[ "${SPLUNK_MODE}" == "internal" ]] && cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
-
+  # Note: this rewrites artifacts.yaml / splunk-operator-cluster.yaml in place
+  # on every run via the sed substitutions below. There is no backup/restore
+  # from a pristine snapshot — a prior ".original" model silently reverted any
+  # legitimate change to these manifests (new operator release, new env var,
+  # new sidecar) on every re-run after the first, since the snapshot was never
+  # refreshed. The sed patterns below only ever touch their own named
+  # RELATED_IMAGE_*/image: fields, so re-running against an already-updated
+  # file is idempotent and safe.
   log "Updating $SPLUNK_AI_FILE..."
 
   local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
@@ -897,7 +936,14 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
+  # Anchor on the RAY_VERSION env entry (unique, always immediately precedes
+  # the operator container's image: line) rather than matching the image
+  # string's content. A content-based match like *splunk*ai*operator* only
+  # matches the pristine manifest's default image; once a custom
+  # image (e.g. a private registry with no such substring) has been written
+  # here, re-running install with a new tag would silently fail to match and
+  # leave the stale image in place.
+  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^        image:/ s|^        image:.*|        image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
 
   log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
   log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
@@ -923,7 +969,11 @@ configure_images() {
     local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
     "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
-    "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+    # Same rationale as the AI operator image above: anchor on the unique
+    # POD_NAME env entry that always immediately precedes this container's
+    # image: line, instead of content-matching *splunk*operator* in the
+    # image string itself.
+    "${SED_INPLACE[@]}" "/name: POD_NAME/,/^        image:/ s|^        image:.*|        image: ${splunk_op_escaped}|" "$SPLUNK_OPERATOR_FILE"
 
     log "  ✓ Updated Splunk Enterprise image: $splunk_full"
     log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
