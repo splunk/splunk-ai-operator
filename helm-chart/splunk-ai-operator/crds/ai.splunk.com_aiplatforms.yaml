@@ -1060,12 +1060,6 @@ spec:
                       - seca
                       - slim
                       type: string
-                    scaleFactor:
-                      description: ScaleFactor is the desired fixed number of replicas
-                        for the feature.
-                      format: int32
-                      minimum: 1
-                      type: integer
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
                         to use for the feature
@@ -2265,6 +2259,17 @@ spec:
                 - path
                 - region
                 type: object
+              scaleFactor:
+                default: 1
+                description: |-
+                  ScaleFactor is a platform-wide capacity multiplier. It uniformly scales
+                  BOTH the model (Serve) replicas AND the GPU worker-pool pod counts, so a
+                  single knob grows capacity without needing to know which models exist or
+                  how many GPUs each uses. The cluster must have proportionally more GPUs
+                  available before raising it. Defaults to 1 (single-capacity deployment).
+                format: int32
+                minimum: 1
+                type: integer
               serviceAccountName:
                 description: |-
                   ServiceAccountName is the name of the service account to use for the AIPlatform

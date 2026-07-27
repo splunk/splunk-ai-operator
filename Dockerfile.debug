@@ -47,7 +47,8 @@ COPY --from=builder /workspace/manager .
 # Copy config files
 COPY config/configs/instance.yaml instance.yaml
 COPY config/configs/applications.yaml applications.yaml
-COPY config/configs/features/ features/
+COPY config/configs/model-scale.yaml model-scale.yaml
+COPY config/configs/worker-scale.yaml worker-scale.yaml
 COPY --from=builder /certs/tls.crt /certs/tls.crt
 COPY --from=builder /certs/tls.key /certs/tls.key
 
@@ -55,6 +56,8 @@ USER 65532:65532
 
 ENV INSTANCE_FILE=/instance.yaml
 ENV APPLICATION_FILE=/applications.yaml
+ENV MODEL_SCALE_FILE=/model-scale.yaml
+ENV WORKER_SCALE_FILE=/worker-scale.yaml
 
 # Start with delve for debugging
 ENTRYPOINT ["/dlv", "--listen=:2345", "--headless=true", "--api-version=2", "--accept-multiclient", "exec", "/manager", "--"]

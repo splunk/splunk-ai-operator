@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -153,7 +152,11 @@ type InstanceDetail struct {
 	Resources  corev1.ResourceRequirements `yaml:"resources"`
 }
 
-type FeatureConfig struct {
+// ScaleConfig models the two global scale files. model-scale.yaml supplies
+// applicationScale (model name -> base replica count); worker-scale.yaml
+// supplies instanceScale (accelerator -> tier -> base pod count). Each file
+// populates only its own field.
+type ScaleConfig struct {
 	ApplicationScale map[string]int32            `yaml:"applicationScale"`
 	InstanceScale    map[string]map[string]int32 `yaml:"instanceScale"`
 }
@@ -174,6 +177,37 @@ func (b *Builder) effectiveAcceleratorType() string {
 		return s
 	}
 	return "L40S"
+}
+
+// effectiveScaleFactor returns the platform-wide capacity multiplier from
+// spec.scaleFactor, defaulting to 1 when unset. It uniformly multiplies both
+// model (Serve) replicas and GPU worker-pool pod counts so the two stay in
+// lockstep on the shared, fixed GPU pool.
+func (b *Builder) effectiveScaleFactor() int32 {
+	if b.ai.Spec.ScaleFactor != nil && *b.ai.Spec.ScaleFactor >= 1 {
+		return *b.ai.Spec.ScaleFactor
+	}
+	return 1
+}
+
+// loadScaleConfig reads a global scale file (model-scale.yaml or
+// worker-scale.yaml) from the path in the given env var, falling back to
+// defaultFile in the working directory when the env var is unset (e.g. local
+// or test runs; in the operator image the env vars are always set).
+func loadScaleConfig(envVar, defaultFile string) (ScaleConfig, error) {
+	var cfg ScaleConfig
+	file := os.Getenv(envVar)
+	if file == "" {
+		file = defaultFile
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return cfg, fmt.Errorf("failed to read scale file %s: %w", file, err)
+	}
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("failed to parse scale file %s: %w", file, err)
+	}
+	return cfg, nil
 }
 
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
@@ -198,39 +232,21 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	// table, including AWS regional-endpoint detection.
 	cloudProvider, artifactsProvider, needsS3CompatCreds := classifyObjectStorage(u.Scheme, p.Spec.ObjectStorage.Endpoint)
 
-	// Initialize the replicas map by iterating through features
-	replicasMap := make(map[string]int32)
+	// Build the model replica map from the global model-scale.yaml, scaled by
+	// the platform-wide scaleFactor. Every model in the catalog is always
+	// deployed; sizing no longer depends on spec.Features (which now drives
+	// only AIService creation in ReconcileFeatures).
+	modelScale, err := loadScaleConfig("MODEL_SCALE_FILE", "model-scale.yaml")
+	if err != nil {
+		logger.Error(err, "Failed to load model scale config")
+		return err
+	}
+	scaleFactor := b.effectiveScaleFactor()
+	logger.V(1).Info("Loaded model scale config", "scaleFactor", scaleFactor, "models", len(modelScale.ApplicationScale))
 
-	for _, feature := range p.Spec.Features {
-		// Read YAML file for this feature
-		fileName := filepath.Join("features", feature.Name+".yaml")
-		yamlData, err := os.ReadFile(fileName)
-		if err != nil {
-			logger.Error(err, "Failed to read feature YAML file", "feature", feature.Name, "file", fileName)
-			continue
-		}
-
-		// Parse the YAML content into a map
-		var featureConfig FeatureConfig
-		err = yaml.UnmarshalStrict(yamlData, &featureConfig)
-		if err != nil {
-			logger.Error(err, "Failed to parse feature YAML", "feature", feature.Name, "file", fileName)
-			continue
-		}
-
-		// Calculate replicas multiplier from feature.Replicas (nil means auto => 1)
-		var multiplier int32 = 1
-		if feature.ScaleFactor != nil {
-			// Validation guarantees value >= 1
-			multiplier = *feature.ScaleFactor
-		}
-		// Use V(1) for verbose debug logging - only shown with --zap-log-level=debug
-		logger.V(1).Info("Loaded feature configuration", "feature", feature.Name, "scaleFactor", multiplier)
-
-		// Generate map from product of values and feature's Replicas setting
-		for appName, baseReplicas := range featureConfig.ApplicationScale {
-			replicasMap[appName] = baseReplicas * multiplier
-		}
+	replicasMap := make(map[string]int32, len(modelScale.ApplicationScale))
+	for appName, baseReplicas := range modelScale.ApplicationScale {
+		replicasMap[appName] = baseReplicas * scaleFactor
 	}
 
 	// S3-compatible endpoint is only meaningful when the classifier picked the
@@ -287,7 +303,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	// Use embedded applications.yaml content
 	applicationFile := os.Getenv("APPLICATION_FILE")
 	if applicationFile == "" {
-		applicationFile = "applications.yaml" // fallback for backward compatibility
+		applicationFile = "applications.yaml" // default when APPLICATION_FILE is unset (local/test runs)
 	}
 	templateData, err := os.ReadFile(applicationFile)
 	if err != nil {
@@ -744,7 +760,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 
 	instanceFile := os.Getenv("INSTANCE_FILE")
 	if instanceFile == "" {
-		instanceFile = "instance.yaml" // fallback for backward compatibility
+		instanceFile = "instance.yaml" // default when INSTANCE_FILE is unset (local/test runs)
 	}
 	instanceYamlFile, err := os.ReadFile(instanceFile)
 	if err != nil {
@@ -757,29 +773,20 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		return nil, fmt.Errorf("error reading YAML file: %v", err)
 	}
 
+	// Build the GPU worker-pool sizing from the global worker-scale.yaml,
+	// scaled by the same platform-wide scaleFactor used for Serve replicas so
+	// the worker pool grows in lockstep with the replicas it must schedule on
+	// the shared, fixed GPU pool.
+	workerScale, err := loadScaleConfig("WORKER_SCALE_FILE", "worker-scale.yaml")
+	if err != nil {
+		return nil, err
+	}
+	scaleFactor := b.effectiveScaleFactor()
+
 	// initialize instanceScale to avoid nil map assignment panic
 	instanceScale := make(map[string]int32)
-	for _, feature := range b.ai.Spec.Features {
-		// Read YAML file for this feature
-		fileName := filepath.Join("features", feature.Name+".yaml")
-		yamlData, err := os.ReadFile(fileName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read feature YAML file %s: %v", feature.Name, err)
-
-		}
-		var featureConfig FeatureConfig
-		err = yaml.UnmarshalStrict(yamlData, &featureConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse feature YAML file %s: %v", fileName, err)
-		}
-		for k, val := range featureConfig.InstanceScale[acceleratorType] {
-			old_val, ok := instanceScale[k]
-			if ok {
-				instanceScale[k] = old_val + val
-			} else {
-				instanceScale[k] = val
-			}
-		}
+	for k, val := range workerScale.InstanceScale[acceleratorType] {
+		instanceScale[k] = val * scaleFactor
 	}
 
 	var workers []rayv1.WorkerGroupSpec

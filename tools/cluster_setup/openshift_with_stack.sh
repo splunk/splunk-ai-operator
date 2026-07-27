@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+# Temp files rendered during a run (e.g. patched manifest copies) are tracked
+# here and removed on exit so we never mutate committed manifests.
+TMP_FILES=()
+cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/null || true; }
+trap cleanup_tmp EXIT
+
 # =============================================================================
 # OpenShift Cluster Setup Script for Splunk AI Platform
 # =============================================================================
@@ -291,6 +297,7 @@ show_install_plan() {
   echo -e "  \033[1mLog file         :\033[0m ${LOG_FILE}" >&2
   echo "" >&2
   echo -e "  \033[1mAccelerator type :\033[0m ${DEFAULT_ACCELERATOR:-<none>}" >&2
+  echo -e "  \033[1mScale factor     :\033[0m ${AI_SCALE_FACTOR:-1}" >&2
   echo -e "  \033[1mNode label strat :\033[0m ${NODE_LABEL_STRATEGY}" >&2
   echo -e "  \033[1mOperator image   :\033[0m ${OPERATOR_IMAGE}" >&2
   echo -e "  \033[1mImage registry   :\033[0m ${IMAGE_REGISTRY:-<none>}" >&2
@@ -398,6 +405,7 @@ ${yq_err}"
 
   AI_PLATFORM_NAME=$(yq eval '.aiPlatform.name // "openshift-ai-platform"' "${CONFIG_FILE}" 2>/dev/null || echo "openshift-ai-platform")
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  AI_SCALE_FACTOR=$(yq eval '.aiPlatform.scaleFactor // 1' "${CONFIG_FILE}" 2>/dev/null || echo "1")
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   STORAGE_CLASS=$(yq eval '.storage.storageClass // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   VECTORDB_SIZE=$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
@@ -479,8 +487,52 @@ build_image_url() {
   fi
 }
 
+validate_scale_factor_config() {
+  local legacy_count present value value_tag
+
+  if ! legacy_count=$(yq eval '[.aiPlatform.features[]? | select(has("scaleFactor"))] | length' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to inspect feature scaleFactor settings in ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ ! "${legacy_count}" =~ ^[0-9]+$ ]]; then
+    echo "Unable to inspect feature scaleFactor settings in ${CONFIG_FILE}"
+    return 1
+  fi
+  if (( legacy_count > 0 )); then
+    echo "aiPlatform.features[].scaleFactor is no longer supported; move the capacity multiplier to aiPlatform.scaleFactor"
+    return 1
+  fi
+
+  if ! present=$(yq eval '(.aiPlatform // {}) | has("scaleFactor")' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ "${present}" != "true" ]]; then
+    return 0
+  fi
+  if ! value=$(yq eval '.aiPlatform.scaleFactor' "${CONFIG_FILE}" 2>/dev/null) || \
+     ! value_tag=$(yq eval '.aiPlatform.scaleFactor | tag' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ "${value_tag}" != "!!int" ]]; then
+    echo "aiPlatform.scaleFactor must be a YAML integer greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+  if [[ ! "${value}" =~ ^-?[0-9]+$ ]] || (( value < 1 )); then
+    echo "aiPlatform.scaleFactor must be greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+
+  return 0
+}
+
 validate_image_config() {
   log "Validating image configuration..."
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    err "${scale_factor_error}"
+  fi
   [[ -z "$OPERATOR_IMAGE"        || "$OPERATOR_IMAGE"        == "null" ]] && err "REQUIRED: images.operator.image must be set in config"
   [[ -z "$RAY_HEAD_IMAGE"        || "$RAY_HEAD_IMAGE"        == "null" ]] && err "REQUIRED: images.ray.headImage must be set in config"
   [[ -z "$RAY_WORKER_IMAGE"      || "$RAY_WORKER_IMAGE"      == "null" ]] && err "REQUIRED: images.ray.workerImage must be set in config"
@@ -498,16 +550,23 @@ configure_images() {
 
   [[ -f "${SPLUNK_AI_FILE}" ]] || err "Manifest not found: ${SPLUNK_AI_FILE}"
 
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, oc apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
 
   if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
-    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-      cp "${SPLUNK_OPERATOR_FILE}" "${SPLUNK_OPERATOR_FILE}.original"
-    fi
-    cp "${SPLUNK_OPERATOR_FILE}.original" "${SPLUNK_OPERATOR_FILE}"
+    operator_rendered=$(mktemp) || err "failed to create temp manifest"
+    cp "${SPLUNK_OPERATOR_FILE}" "$operator_rendered"
+    TMP_FILES+=("$operator_rendered")
+    SPLUNK_OPERATOR_FILE="$operator_rendered"
   fi
 
   local operator_full ray_head_full ray_worker_full weaviate_full
@@ -591,10 +650,8 @@ configure_images() {
   # account-specific ECR URLs baked into the committed manifest file.
   if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
     log "Patching image references in ${SPLUNK_OPERATOR_FILE}..."
-    if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-      cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-    fi
-    cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+    # SPLUNK_OPERATOR_FILE already points at the rendered temp from the first
+    # block; patch it in place (no backup/restore needed).
 
     local splunk_full splunk_esc splunk_op_full splunk_op_esc
     splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
@@ -1884,6 +1941,44 @@ YAML
   log "  ✓ Splunk Standalone CR applied"
 }
 
+# render_ai_platform_manifest prints only the AIPlatform resource. Keeping the
+# renderer side-effect free makes the exact manifest testable without an
+# OpenShift cluster.
+render_ai_platform_manifest() {
+  cat <<YAML
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: ${AI_PLATFORM_NAME}
+spec:
+  objectStorage:
+    path: ${obj_path}
+    region: ${OBJ_STORE_REGION}
+    $( [[ -n "${obj_endpoint}" ]] && echo "endpoint: \"${obj_endpoint}\"" )
+    secretRef: minio-credentials
+${image_pull_secrets}
+  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
+  scaleFactor: ${AI_SCALE_FACTOR:-1}
+  features:
+${features_yaml}
+${svc_template_yaml}${storage_yaml}
+  workerGroupConfig:
+    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
+  cpuScheduler:
+    nodeSelector:
+      splunk.ai/ai-tier-node: "true"
+    tolerations: ${cpu_tolerations_inline}
+  gpuScheduler:
+    nodeSelector:
+      splunk.ai/ai-tier-node: "true"
+  splunkConfiguration:
+    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    secretRef:
+      name: ${splunk_ns_secret}
+      namespace: ${AI_NS}
+YAML
+}
+
 # ====== INSTALL AI PLATFORM CR ======
 install_ai_platform_cr() {
   log "Installing AIPlatform CR: ${AI_PLATFORM_NAME}..."
@@ -1927,18 +2022,15 @@ install_ai_platform_cr() {
   if [[ "${feature_count}" -gt 0 ]]; then
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fscale
+      local fname fver fsa
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}")
-      fscale=$(yq eval ".aiPlatform.features[$i].scaleFactor // \"\"" "${CONFIG_FILE}")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
         [[ -n "$fsa" && "$fsa" != "null" ]] && \
           features_yaml+="      serviceAccountName: ${fsa}"$'\n'
-        [[ -n "$fscale" && "$fscale" != "null" ]] && \
-          features_yaml+="      scaleFactor: ${fscale}"$'\n'
       fi
       i=$((i + 1))
     done
@@ -2031,37 +2123,7 @@ PROBE_EOF
   done
   rm -f "${tls_probe_file}" 2>/dev/null || true
 
-  oc -n "${AI_NS}" apply --server-side --force-conflicts -f - <<YAML
-apiVersion: ai.splunk.com/v1
-kind: AIPlatform
-metadata:
-  name: ${AI_PLATFORM_NAME}
-spec:
-  objectStorage:
-    path: ${obj_path}
-    region: ${OBJ_STORE_REGION}
-    $( [[ -n "${obj_endpoint}" ]] && echo "endpoint: \"${obj_endpoint}\"" )
-    secretRef: minio-credentials
-${image_pull_secrets}
-  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
-  features:
-${features_yaml}
-${svc_template_yaml}${storage_yaml}
-  workerGroupConfig:
-    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
-  cpuScheduler:
-    nodeSelector:
-      splunk.ai/ai-tier-node: "true"
-    tolerations: ${cpu_tolerations_inline}
-  gpuScheduler:
-    nodeSelector:
-      splunk.ai/ai-tier-node: "true"
-  splunkConfiguration:
-    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
-    secretRef:
-      name: ${splunk_ns_secret}
-      namespace: ${AI_NS}
-YAML
+  render_ai_platform_manifest | oc -n "${AI_NS}" apply --server-side --force-conflicts -f -
 
   log "  ✓ AIPlatform CR applied"
 

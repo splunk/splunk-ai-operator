@@ -2,6 +2,12 @@ applications:
   - name: Entrypoint
     import_path: main:SERVE_APP
     route_prefix: /
+    deployments:
+      - name: Entrypoint
+        autoscaling_config:
+          max_replicas: {{.Replicas.Entrypoint}}
+          min_replicas: {{.Replicas.Entrypoint}}
+          target_ongoing_requests: 20
     runtime_env:
       working_dir: "file:///home/ray/ray/applications/entrypoint.zip"
       env_vars:
@@ -648,6 +654,12 @@ applications:
   - args:
       application_name: PromptInjectionTfidf
       custom_deployment_import_path: prompt_injection_tfidf:PromptInjectionTfidfDeployment
+      deployment_configs:
+        PromptInjectionTfidfDeployment:
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.PromptInjectionTfidf}}
+              min_replicas: {{.Replicas.PromptInjectionTfidf}}
       deployment_type: custom_deployment
     name: PromptInjectionTfidf
     import_path: main:create_serve_app
@@ -985,6 +997,12 @@ applications:
 {{- end }}
   - args:
       application_name: PromptInjectionClassifier
+      deployment_configs:
+        ClassificationModelDeployment:
+          options:
+            autoscaling_config:
+              max_replicas: {{.Replicas.PromptInjectionClassifier}}
+              min_replicas: {{.Replicas.PromptInjectionClassifier}}
       deployment_type: classification_model_deployment
       model_definition:
         custom_model_import_path: prompt_injection_classifier:PromptInjectionClassificationModel

@@ -747,8 +747,43 @@ build_image_url() {
   fi
 }
 
+# validate_scale_factor_config validates the user-facing k0s setting before
+# any installation work begins. An omitted value is valid and uses the CRD
+# default of 1; an explicitly configured value must be a YAML integer >= 1.
+validate_scale_factor_config() {
+  local present value value_tag
+  if ! present=$(yq eval '(.aiPlatform // {}) | has("scaleFactor")' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+
+  if [[ "${present}" != "true" ]]; then
+    return 0
+  fi
+  if ! value=$(yq eval '.aiPlatform.scaleFactor' "${CONFIG_FILE}" 2>/dev/null) || \
+     ! value_tag=$(yq eval '.aiPlatform.scaleFactor | tag' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ "${value_tag}" != "!!int" ]]; then
+    echo "aiPlatform.scaleFactor must be a YAML integer greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+  if [[ ! "${value}" =~ ^-?[0-9]+$ ]] || (( value < 1 )); then
+    echo "aiPlatform.scaleFactor must be greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+
+  return 0
+}
+
 validate_image_config() {
   log "Validating image configuration..."
+
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    err "${scale_factor_error}"
+  fi
 
   if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
     err "REQUIRED: images.operator.image must be specified in k0s-cluster-config.yaml"
@@ -867,14 +902,29 @@ validate_image_config() {
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  # Note: this rewrites artifacts.yaml / splunk-operator-cluster.yaml in place
-  # on every run via the sed substitutions below. There is no backup/restore
-  # from a pristine snapshot — a prior ".original" model silently reverted any
-  # legitimate change to these manifests (new operator release, new env var,
-  # new sidecar) on every re-run after the first, since the snapshot was never
-  # refreshed. The sed patterns below only ever touch their own named
-  # RELATED_IMAGE_*/image: fields, so re-running against an already-updated
-  # file is idempotent and safe.
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, kubectl apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
+
+  # Only render the Splunk Operator manifest when telemetry is internal mode
+  # only. External/disabled modes never apply the manifest, so touching it
+  # (which also requires the file to exist) is pointless and would break
+  # Splunk-free installs that don't ship splunk-operator-cluster.yaml.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    operator_rendered=$(mktemp) || err "failed to create temp manifest"
+    cp "$SPLUNK_OPERATOR_FILE" "$operator_rendered"
+    TMP_FILES+=("$operator_rendered")
+    SPLUNK_OPERATOR_FILE="$operator_rendered"
+  fi
+
   log "Updating $SPLUNK_AI_FILE..."
 
   local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
@@ -4530,6 +4580,15 @@ EOF
     log "SAIA public exposure: ${svc_type}${svc_node_port:+ (nodePort=${svc_node_port})}"
   fi
 
+  # Platform-wide positive-integer capacity multiplier
+  # (aiPlatform.scaleFactor). Omitted => operator default (1).
+  local scale_factor_yaml="" ai_scale_factor
+  ai_scale_factor=$(yq eval '.aiPlatform.scaleFactor // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "$ai_scale_factor" && "$ai_scale_factor" != "null" ]]; then
+    scale_factor_yaml="  scaleFactor: ${ai_scale_factor}"$'\n'
+    log "  scaleFactor: ${ai_scale_factor}"
+  fi
+
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
   local feature_count
@@ -4577,6 +4636,8 @@ ${image_pull_secrets}
   # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
+  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
+${scale_factor_yaml}
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}
@@ -6795,6 +6856,13 @@ validate_config() {
       echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
       errors=$(( errors + 1 ))
     fi
+  fi
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    echo -e "  \033[1;31m✖\033[0m ${scale_factor_error}" >&2
+    errors=$(( errors + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m aiPlatform.scaleFactor is a positive integer (default: 1)" >&2
   fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2

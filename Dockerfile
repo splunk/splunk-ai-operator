@@ -39,7 +39,8 @@ WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY config/configs/instance.yaml instance.yaml
 COPY config/configs/applications.yaml applications.yaml
-COPY config/configs/features/ features/
+COPY config/configs/model-scale.yaml model-scale.yaml
+COPY config/configs/worker-scale.yaml worker-scale.yaml
 COPY LICENSE LICENSE-2.0.txt
 COPY --from=builder /certs/tls.crt /certs/tls.crt
 COPY --from=builder /certs/tls.key /certs/tls.key
@@ -51,4 +52,6 @@ COPY --from=builder /certs/tls.key /certs/tls.key
 USER 1001:0
 ENV INSTANCE_FILE=/instance.yaml
 ENV APPLICATION_FILE=/applications.yaml
+ENV MODEL_SCALE_FILE=/model-scale.yaml
+ENV WORKER_SCALE_FILE=/worker-scale.yaml
 ENTRYPOINT ["/manager"]
