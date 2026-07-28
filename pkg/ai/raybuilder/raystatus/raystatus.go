@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	kuberayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 )
 
 // RaySnapshot is a normalized view we can write into CR status or use to derive conditions.
@@ -50,9 +51,15 @@ type RaySnapshot struct {
 
 // CollectRaySnapshot gathers status from RayService, RayCluster, and K8s Services/Endpoints.
 func CollectRaySnapshot(ctx context.Context, c client.Client, ns, name string) (*RaySnapshot, error) {
+	// Derive the stable service names the same way KubeRay does (CheckName front-truncates
+	// names over ~41 chars), so status never publishes a Service that doesn't exist.
+	headServiceName, err := kuberayutils.GenerateHeadServiceName(kuberayutils.RayServiceCRD, rayv1.RayClusterSpec{}, name)
+	if err != nil {
+		return nil, fmt.Errorf("generate RayService head service name: %w", err)
+	}
 	snap := &RaySnapshot{
-		HeadServiceName:  fmt.Sprintf("%s-head-svc", name),
-		ServeServiceName: fmt.Sprintf("%s-serve-svc", name),
+		HeadServiceName:  headServiceName,
+		ServeServiceName: kuberayutils.GenerateServeServiceName(name),
 	}
 
 	// 1) RayService
@@ -88,12 +95,11 @@ func CollectRaySnapshot(ctx context.Context, c client.Client, ns, name string) (
 	snap.ServePort = parsePort(snap.ServeURL)
 	snap.DashboardPort = parsePort(snap.DashboardURL)
 
-	// optional head status from RayClusterStatus if populated
-	if h := rs.Status.ActiveServiceStatus.RayClusterStatus.Head; h.ServiceName != "" {
-		snap.HeadServiceName = h.ServiceName
-		snap.HeadServiceIP = h.ServiceIP
-		snap.HeadPodName = h.PodName
-	}
+	// Collect active RayCluster head details for diagnostics, but keep
+	// HeadServiceName on the stable RayService endpoint initialized above.
+	h := rs.Status.ActiveServiceStatus.RayClusterStatus.Head
+	snap.HeadServiceIP = h.ServiceIP
+	snap.HeadPodName = h.PodName
 
 	// fallback cluster naming if not present
 	if snap.ActiveClusterName == "" {

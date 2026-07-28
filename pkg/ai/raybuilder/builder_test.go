@@ -95,6 +95,7 @@ func TestBuilder_Build(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-platform",
 					Namespace: "default",
+					Labels:    map[string]string{"test-label": "test-value"},
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
@@ -178,6 +179,14 @@ func TestBuilder_Build(t *testing.T) {
 				// Verify RayClusterSpec is populated
 				assert.NotNil(t, rayService.Spec.RayClusterSpec)
 				assert.NotNil(t, rayService.Spec.RayClusterSpec.HeadGroupSpec)
+				headService := rayService.Spec.RayClusterSpec.HeadGroupSpec.HeadService
+				require.NotNil(t, headService)
+				assert.Empty(t, headService.Name)
+				assert.Empty(t, headService.Namespace)
+				assert.Equal(t, "/metrics", headService.Annotations["prometheus.io/path"])
+				for key, value := range tt.platform.Labels {
+					assert.Equal(t, value, headService.Labels[key])
+				}
 			}
 		})
 	}
@@ -500,4 +509,3 @@ func TestSetImageRegistry(t *testing.T) {
 		})
 	}
 }
-

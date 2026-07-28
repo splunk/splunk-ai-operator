@@ -577,7 +577,10 @@ func TestBuilder_makeWorkerTemplate(t *testing.T) {
 				}
 				assert.Equal(t, "nvidia-a100", envMap["DEFAULT_GPU_TYPE"])
 				assert.Equal(t, "nvidia-a100", envMap["GPU_TYPE"])
-				assert.Contains(t, envMap["RAY_HEAD_SERVICE_HOST"], "test-platform-head-svc")
+				assert.NotContains(t, envMap, "RAY_HEAD_SERVICE_HOST")
+				if assert.NotEmpty(t, rayWorker.Args) {
+					assert.Contains(t, rayWorker.Args[0], `export RAY_HEAD_SERVICE_HOST="${FQ_RAY_IP}";`)
+				}
 
 				// Verify resources
 				assert.Equal(t, resource.MustParse("8"), rayWorker.Resources.Requests[corev1.ResourceCPU])
