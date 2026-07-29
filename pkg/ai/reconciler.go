@@ -70,6 +70,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		{"Sidecars", sidecarBuilder.Reconcile},
 		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
 		{"RayService", raybuilder.ReconcileRayService},
+		{"ActiveClusterScale", raybuilder.ReconcileActiveClusterScale},
 		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
 		{"Ingress", r.ReconcileIngress},
 		// collect status of each stage
