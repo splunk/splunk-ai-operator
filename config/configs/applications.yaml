@@ -722,14 +722,25 @@ applications:
       model_definition:
         model_config:
           num_layers: 25
+          quantiles:
+            - 0.01
+            - 0.05
+            - 0.1
+            - 0.2
+            - 0.25
+            - 0.3
+            - 0.4
+            - 0.5
+            - 0.6
+            - 0.7
+            - 0.75
+            - 0.8
+            - 0.9
+            - 0.95
+            - 0.99
         model_id: fm_timeseries
         model_loader:
           blob_storage:
-            # Only the checkpoint is needed — CiscoTsmMR reads its model config
-            # from inside torch_model.pt (loaded_checkpoint["config"]), not from
-            # config.json. artifacts_list restricts the download to exactly these
-            # files under blob_prefix, so this must name a file that exists in
-            # the bucket (verified: model_artifacts/fm_timeseries/torch_model.pt).
             artifacts_list:
               - torch_model.pt
             blob_prefix: model_artifacts/fm_timeseries
