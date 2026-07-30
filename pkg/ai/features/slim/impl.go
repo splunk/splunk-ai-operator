@@ -474,11 +474,13 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	}
 
 	// slim-api (AITIER) expects PLATFORM_URL to be a fully-qualified URL
-	// pointing at the ML-Platform models API served by the Ray head.
+	// pointing at the Ray head's serve root. Each model is mounted at its own
+	// top-level route prefix (e.g. /gemma4_31b_it), so slim-api builds
+	// {PLATFORM_URL}/{model}/... directly. The Entrypoint catch-all app
+	// (.../ai-platform-models/v1) requires a leading {tenant} segment and does
+	// not serve model traffic, so the suffix must NOT be present here.
 	platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
-	if !strings.HasSuffix(platformURL, "/ai-platform-models/v1") {
-		platformURL += "/ai-platform-models/v1"
-	}
+	platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
 
 	env := []corev1.EnvVar{
 		{Name: "PLATFORM_URL", Value: platformURL},
