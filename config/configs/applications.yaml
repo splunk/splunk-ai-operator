@@ -55,6 +55,17 @@ applications:
               max_ongoing_requests: 6
               ray_actor_options:
                 num_gpus: 2
+            RTX_PRO_6000_BLACKWELL:
+              autoscaling_config:
+                max_replicas: {{.Replicas.Gemma431bIt}}
+                min_replicas: {{.Replicas.Gemma431bIt}}
+                target_ongoing_requests: 4
+              max_ongoing_requests: 10
+              ray_actor_options:
+                num_gpus: 1
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.Gemma431bIt}}
@@ -78,6 +89,14 @@ applications:
               max_num_batched_tokens: 4096
               max_num_seqs: 2
               tensor_parallel_size: 2
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              dtype: bfloat16
+              gpu_memory_utilization: 0.9
+              max_model_len: 120000
+              max_num_batched_tokens: 4096
+              max_num_seqs: 1
+              tensor_parallel_size: 1
         model_config:
           openai_serving_config:
             chat:
@@ -162,6 +181,17 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 1
+            RTX_PRO_6000_BLACKWELL:
+              autoscaling_config:
+                max_replicas: {{.Replicas.GptOss20b}}
+                min_replicas: {{.Replicas.GptOss20b}}
+                target_ongoing_requests: 4
+              max_ongoing_requests: 8
+              ray_actor_options:
+                num_gpus: 0.5
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.GptOss20b}}
@@ -177,6 +207,10 @@ applications:
           L40S:
             engine_args:
               gpu_memory_utilization: 0.95
+              tensor_parallel_size: 1
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.5
               tensor_parallel_size: 1
         model_config:
           openai_serving_config:
@@ -251,6 +285,12 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 0.075
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.031
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.UaeLarge}}
@@ -266,6 +306,9 @@ applications:
           L40S:
             engine_args:
               gpu_memory_utilization: 0.075
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.031
         model_config:
           engine_args:
             gpu_memory_utilization: 0.15
@@ -317,6 +360,12 @@ applications:
             H100:
               ray_actor_options:
                 num_gpus: 0.005
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.004
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.AllMinilmL6V2}}
@@ -329,6 +378,9 @@ applications:
           H100:
             engine_args:
               gpu_memory_utilization: 0.005
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.004
         model_config:
           engine_args:
             gpu_memory_utilization: 0.01
@@ -380,6 +432,12 @@ applications:
             H100:
               ray_actor_options:
                 num_gpus: 0.005
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.004
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.BiEncoder}}
@@ -392,6 +450,9 @@ applications:
           H100:
             engine_args:
               gpu_memory_utilization: 0.005
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.004
         model_config:
           engine_args:
             gpu_memory_utilization: 0.01
@@ -447,6 +508,12 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 0.1
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.05
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.MbartTranslator}}
@@ -500,6 +567,12 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 0.05
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.021
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
@@ -515,6 +588,9 @@ applications:
           L40S:
             engine_args:
               gpu_memory_utilization: 0.05
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.021
         model_config:
           engine_args:
             gpu_memory_utilization: 0.1
@@ -605,6 +681,12 @@ applications:
             H100:
               ray_actor_options:
                 num_gpus: 0.005
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.004
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.CrossEncoder}}
@@ -617,6 +699,9 @@ applications:
           H100:
             engine_args:
               gpu_memory_utilization: 0.005
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.004
         model_config:
           engine_args:
             gpu_memory_utilization: 0.01
@@ -672,6 +757,12 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 0.05
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.021
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.E5LanguageClassifier}}
@@ -687,6 +778,9 @@ applications:
           L40S:
             engine_args:
               gpu_memory_utilization: 0.05
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.021
         model_config:
           engine_args:
             gpu_memory_utilization: 0.1
@@ -741,6 +835,12 @@ applications:
             L40S:
               ray_actor_options:
                 num_gpus: 0.025
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.013
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: {{.Replicas.PromptInjectionCrossEncoder}}

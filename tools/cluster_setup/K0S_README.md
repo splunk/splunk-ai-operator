@@ -204,7 +204,7 @@ kubectl get pods --all-namespaces
 The `k0s-cluster-config.yaml` file controls all aspects of the deployment:
 
 ```yaml
-cluster:           # Cluster name, useExisting, SSH user/key
+cluster:           # Cluster name, useExisting, SSH user/key, optional API external address
 nodes:             # Controller/worker counts and existingIPs
 storage:           # storageClass, vectorDbSize, objectStore, minimumDiskSpace
 images:            # registry prefix, operator, splunk, ray, weaviate, saia, nginx, fluentBit, otelCollector
@@ -225,6 +225,8 @@ cluster:
   useExisting: auto               # auto | force | never
   sshUser: ubuntu
   sshKeyPath: ~/.ssh/prod-key.pem
+  # Set when workers cannot reach the controller's auto-detected private IP.
+  apiExternalAddress: api.prod.example.com
 
 nodes:
   controllers: 1
@@ -359,6 +361,7 @@ ecr:
 | `cluster.useExisting` | No | `never` | `auto` = detect existing cluster, `force` = fail if not found, `never` = always create new |
 | `cluster.sshUser` | Yes | `ubuntu` | SSH username for all nodes |
 | `cluster.sshKeyPath` | Yes | — | Path to SSH private key |
+| `cluster.apiExternalAddress` | No | Auto-detected private bind address | API IP or hostname reachable by every worker; set for public-only or routed worker topologies |
 
 #### Nodes Section
 
