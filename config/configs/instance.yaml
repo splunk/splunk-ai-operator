@@ -107,7 +107,7 @@ RTX_PRO_6000_BLACKWELL:
       limits:
         cpu: "16"
         memory: "48Gi"
-        ephemeral-storage: "200Gi"
+        ephemeral-storage: "150Gi"
         nvidia.com/gpu: "1"
   - tier: rtx-pro-6000-blackwell-2-gpu
     gpusPerPod: 2
@@ -117,5 +117,5 @@ RTX_PRO_6000_BLACKWELL:
       limits:
         cpu: "8"
         memory: "96Gi"
-        ephemeral-storage: "400Gi"
+        ephemeral-storage: "350Gi"
         nvidia.com/gpu: "2"
