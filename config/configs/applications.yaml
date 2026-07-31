@@ -450,6 +450,9 @@ applications:
           H100:
             engine_args:
               gpu_memory_utilization: 0.005
+          RTX_PRO_6000_BLACKWELL:
+            engine_args:
+              gpu_memory_utilization: 0.004
         model_config:
           engine_args:
             gpu_memory_utilization: 0.01

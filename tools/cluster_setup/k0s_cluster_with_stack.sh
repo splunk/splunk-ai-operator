@@ -504,6 +504,11 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   [[ "${USE_EXISTING}" == "null" ]] && USE_EXISTING="never"
   REGION=$(yq eval '.cluster.region // ""' "${CONFIG_FILE}" 2>/dev/null || grep '^  region:' "${CONFIG_FILE}" | awk '{print $2}')
   [[ "${REGION}" == "null" ]] && REGION=""
+  K0S_API_EXTERNAL_ADDRESS=$(yq eval '.cluster.apiExternalAddress // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${K0S_API_EXTERNAL_ADDRESS}" == "null" ]] && K0S_API_EXTERNAL_ADDRESS=""
+  if [[ -n "${K0S_API_EXTERNAL_ADDRESS}" && ! "${K0S_API_EXTERNAL_ADDRESS}" =~ ^[[:alnum:].:_-]+$ ]]; then
+    err "cluster.apiExternalAddress must be an IP address or hostname without a URL scheme"
+  fi
 
   # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
   # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically; customers
@@ -1645,8 +1650,16 @@ install_k0s_cluster() {
   log "Generating k0s configuration..."
   ssh_exec "${controller_ip}" "sudo mkdir -p /etc/k0s && k0s config create | sudo tee /etc/k0s/k0s.yaml >/dev/null"
 
-  # Configure k0s API with the controller IP for SANs and externalAddress
+  # Configure k0s API with the controller IP for SANs and externalAddress.
+  # By default k0s advertises the controller's private bind address. Clusters
+  # whose workers can only reach a public/routable address can override it in
+  # cluster.apiExternalAddress.
   log "Configuring k0s with controller IP ${controller_ip}..."
+  if [[ -n "${K0S_API_EXTERNAL_ADDRESS}" ]]; then
+    log "Using configured k0s API external address ${K0S_API_EXTERNAL_ADDRESS}"
+  else
+    log "Using the controller's auto-detected private address for the k0s API"
+  fi
   ssh_exec "${controller_ip}" "cat > /tmp/k0s-config-update.py <<'PYSCRIPT'
 import yaml
 
@@ -1664,6 +1677,10 @@ if 'sans' not in config['spec']['api']:
 
 config['spec']['api']['sans'].append('${controller_ip}')
 
+_configured_external_addr = '${K0S_API_EXTERNAL_ADDRESS}'
+if _configured_external_addr and _configured_external_addr not in config['spec']['api']['sans']:
+    config['spec']['api']['sans'].append(_configured_external_addr)
+
 # externalAddress must be an address that EVERY cluster member can reach --
 # including the controller reaching ITSELF. It is baked into the worker join
 # token AND into the in-cluster 'kubernetes' Service endpoint (10.96.0.1).
@@ -1677,18 +1694,15 @@ config['spec']['api']['sans'].append('${controller_ip}')
 #   2. same-VPC workers get a join token pointing at the public IP and need
 #      extra public-IP security-group rules just to fetch it.
 #
-# Use the node's PRIVATE bind address instead -- 'k0s config create' already
-# auto-detected it into spec.api.address (it is what kube-apiserver uses for
-# --advertise-address). The public/SSH IP stays in 'sans' above, so a kubeconfig
-# pointed at the public IP (e.g. a laptop outside the VPC) keeps a valid cert.
-#
-# NOTE: assumes controllers and workers share a private network (the common
-# single-VPC / same-subnet layout this installer targets). If workers can only
-# reach the controller over the public internet, set externalAddress back to a
-# publicly reachable address here.
+# Use cluster.apiExternalAddress when explicitly configured for public-only or
+# otherwise routed worker topologies. Otherwise use the node's PRIVATE bind
+# address -- 'k0s config create' already auto-detected it into spec.api.address
+# (it is what kube-apiserver uses for --advertise-address). The public/SSH IP
+# stays in 'sans' above, so a kubeconfig pointed at it keeps a valid cert.
 _internal_addr = config['spec']['api'].get('address')
-if _internal_addr:
-    config['spec']['api']['externalAddress'] = _internal_addr
+_external_addr = _configured_external_addr or _internal_addr
+if _external_addr:
+    config['spec']['api']['externalAddress'] = _external_addr
 # else: leave externalAddress unset -- k0s falls back to spec.api.address
 
 # Set Calico as network provider
@@ -2259,6 +2273,18 @@ ensure_s3compat_credentials() {
 
 # ====== MODEL ARTIFACT STAGING ======
 
+# Return the model-artifact manifest used by an accelerator. RTX Pro 6000
+# Blackwell uses the same quantized model set as H100. Keep this selection in
+# one place so pre-staging and post-upload verification cannot drift apart.
+model_artifacts_config_name() {
+  local accel
+  accel=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "${accel}" in
+    h100|rtx_pro_6000_blackwell) echo "model_artifacts_configs_h100.yaml" ;;
+    *)                           echo "model_artifacts_configs.yaml" ;;
+  esac
+}
+
 # all_models_staged <staging_dir> <accel>
 # Checks whether every artifact in the GPU-specific model config already has a
 # staging_state/<id>/.staging_complete marker in the object store AND that the
@@ -2273,10 +2299,7 @@ all_models_staged() {
   local accel="$2"
   local config_file
 
-  case "${accel}" in
-    h100) config_file="${staging_dir}/model_artifacts_configs_h100.yaml" ;;
-    *)    config_file="${staging_dir}/model_artifacts_configs.yaml" ;;
-  esac
+  config_file="${staging_dir}/$(model_artifacts_config_name "${accel}")"
 
   if [[ ! -f "${config_file}" ]]; then
     warn "all_models_staged: config file not found: ${config_file} — skipping pre-check."
@@ -2481,7 +2504,7 @@ stage_model_artifacts() {
   local _verify_alias="installer_verify"
   local _verify_ok=1
   local _config_for_verify
-  _config_for_verify="${staging_dir}/$( [[ "${_accel}" == "h100" ]] && echo model_artifacts_configs_h100.yaml || echo model_artifacts_configs.yaml)"
+  _config_for_verify="${staging_dir}/$(model_artifacts_config_name "${_accel}")"
 
   case "${OBJ_STORE_TYPE}" in
     aws)
