@@ -602,6 +602,26 @@ assert_eq "exit-42 branch checks _nvidia_rc not a dead \$? after negation" \
 assert_eq "no remaining if ! ssh_exec for the Phase B NVIDIA install block (code, not comment)" \
   "0" "$(grep -A5 'Phase B: install driver' "${SCRIPT}" | grep 'if ! ssh_exec' | grep -cv '^\s*#' | tr -d '[:space:]')"
 
+suite "fix: idempotent NVIDIA runtime setup (k0s_cluster_with_stack.sh)"
+
+NVIDIA_HEALTH_FN="$(_extract_fn _nvidia_runtime_is_healthy)"
+NVIDIA_INSTALL_FN="$(_extract_fn _install_nvidia_on_node)"
+
+assert_eq "health check validates runtime config, resolvable indexed CDI devices, and k0sworker" \
+  "6" "$(printf '%s\n' "${NVIDIA_HEALTH_FN}" | grep -Ec 'default_runtime_name|nvidia-ctk cdi list|query-gpu=index|systemctl is-active.*k0sworker')"
+
+assert_eq "health check does not assume generated CDI specs contain physical GPU UUIDs" \
+  "0" "$(printf '%s\n' "${NVIDIA_HEALTH_FN}" | grep -c 'query-gpu=uuid' | tr -d '[:space:]')"
+
+assert_eq "healthy runtime skips reconfiguration and worker restart" \
+  "2" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec '_nvidia_runtime_is_healthy|skipping reconfiguration and k0sworker restart')"
+
+assert_eq "runtime repair does not kill container shims or remove the containerd socket" \
+  "0" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'pkill.*containerd-shim|rm -f /run/k0s/containerd\\.sock')"
+
+assert_eq "unhealthy runtime uses a checked k0sworker restart" \
+  "2" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'systemctl restart k0sworker|systemctl is-active --quiet k0sworker')"
+
 suite "fix: LAST_LAUNCHED_SUBNET subshell (k0s_aws_provision.sh)"
 
 assert_eq "launch_instance_az_fallback NOT called inside \$() for GPU launch" \

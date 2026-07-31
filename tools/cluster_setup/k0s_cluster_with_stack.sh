@@ -2811,6 +2811,58 @@ EOF
 #     internal testing but are not supported (blocked by _check_node_os).
 #
 # Returns 0 on fully-successful install, non-zero on any verification failure.
+_nvidia_runtime_is_healthy() {
+  local gpu_ip="$1"
+
+  ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+
+    nvidia-smi -L >/dev/null
+    command -v nvidia-ctk >/dev/null
+    command -v nvidia-container-runtime >/dev/null
+    lsmod | grep -q '^nvidia '
+    if ! ldconfig -p 2>/dev/null | grep -q 'libnvidia-ml\\.so\\.1'; then
+      ls /usr/lib64/libnvidia-ml.so.1 \\
+         /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 \\
+         /usr/lib/libnvidia-ml.so.1 2>/dev/null | head -1 | grep -q .
+    fi
+
+    systemctl is-active --quiet k0sworker
+    [ -s /etc/k0s/containerd.toml ]
+    [ -s /etc/k0s/containerd.d/nvidia.toml ]
+    grep -q 'default_runtime_name = \"nvidia\"' /etc/k0s/containerd.d/nvidia.toml
+
+    if grep -q 'io\\.containerd\\.cri\\.v1\\.runtime' /etc/k0s/containerd.toml; then
+      grep -q 'io\\.containerd\\.cri\\.v1\\.runtime' /etc/k0s/containerd.d/nvidia.toml
+    else
+      grep -q 'io\\.containerd\\.grpc\\.v1\\.cri' /etc/k0s/containerd.d/nvidia.toml
+    fi
+
+    [ -s /etc/cdi/nvidia.yaml ]
+    grep -q 'name: ' /etc/cdi/nvidia.yaml
+
+    # Validate the generated CDI devices through nvidia-ctk instead of
+    # looking for physical GPU UUIDs in the YAML. The default CDI naming
+    # strategy uses GPU indexes, so a healthy spec need not contain UUIDs.
+    cdi_list_help=\$(nvidia-ctk cdi list --help 2>&1)
+    if [[ \"\${cdi_list_help}\" == *'--spec-dir'* ]]; then
+      cdi_devices=\$(nvidia-ctk cdi list --spec-dir /etc/cdi)
+    else
+      # nvidia-ctk 1.14 scans the standard CDI directories and does not
+      # support restricting the list command to one directory.
+      cdi_devices=\$(nvidia-ctk cdi list)
+    fi
+    printf '%s\\n' \"\${cdi_devices}\" | grep -qx 'nvidia.com/gpu=all'
+
+    gpu_count=0
+    for gpu_index in \$(nvidia-smi --query-gpu=index --format=csv,noheader); do
+      gpu_count=\$((gpu_count + 1))
+      printf '%s\\n' \"\${cdi_devices}\" | grep -qx \"nvidia.com/gpu=\${gpu_index}\"
+    done
+    [ \"\${gpu_count}\" -gt 0 ]
+  "
+}
+
 _install_nvidia_on_node() {
   local gpu_ip="$1"
 
@@ -3111,7 +3163,12 @@ _install_nvidia_on_node() {
     log "AIRGAP_MODE=true — skipping NVIDIA repo check for ${gpu_ip}; drivers must be pre-installed on the node"
   fi
 
-  echo "Installing NVIDIA Container Toolkit on ${gpu_ip}..."
+  if [[ "${_ctk_present}" == "yes" ]] && _nvidia_runtime_is_healthy "${gpu_ip}"; then
+    echo "✓ NVIDIA runtime and CDI already healthy on ${gpu_ip} — skipping reconfiguration and k0sworker restart"
+    return 0
+  fi
+
+  echo "Installing or repairing NVIDIA Container Toolkit on ${gpu_ip}..."
   if ! ssh_exec "${gpu_ip}" "
     set -euo pipefail
     if command -v nvidia-ctk >/dev/null 2>&1; then
@@ -3263,13 +3320,13 @@ _install_nvidia_on_node() {
       exit 1
     fi
 
-    # --- Restart k0sworker to pick up new runtime + CDI spec -----------
-    echo '--- Restarting k0sworker to pick up runtime changes ---'
-    sudo systemctl stop k0sworker || true
-    sleep 3
-    sudo pkill -9 containerd-shim || true
-    sudo rm -f /run/k0s/containerd.sock || true
-    sudo systemctl start k0sworker
+    # --- Restart k0sworker to pick up repaired runtime + CDI config -----
+    # Keep containerd shims alive: they preserve running containers across
+    # a daemon restart. Killing them turns an installer re-run into an
+    # outage and can leave GPU-owning child processes without supervision.
+    echo '--- Restarting k0sworker to pick up repaired runtime changes ---'
+    sudo systemctl restart k0sworker
+    sudo systemctl is-active --quiet k0sworker
 
     # Quick sanity: confirm nvidia-ctk + libnvidia-ml.so exist where expected.
     # Search all known paths (distributions differ): RHEL/Fedora use

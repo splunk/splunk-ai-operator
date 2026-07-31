@@ -202,7 +202,7 @@ func TestApplicationsTemplate_ReferencesEveryModelScaleEntry(t *testing.T) {
 	for modelName := range modelScale.ApplicationScale {
 		baseReplicas[modelName] = 1
 	}
-	tmpl, err := template.New("applications").Parse(templateText)
+	tmpl, err := template.New("applications").Funcs(applicationTemplateFuncMap()).Parse(templateText)
 	require.NoError(t, err)
 	var rendered bytes.Buffer
 	require.NoError(t, tmpl.Execute(&rendered, ApplicationParams{
@@ -213,6 +213,133 @@ func TestApplicationsTemplate_ReferencesEveryModelScaleEntry(t *testing.T) {
 	var applications map[interface{}]interface{}
 	require.NoError(t, yaml.Unmarshal(rendered.Bytes(), &applications))
 	require.Contains(t, rendered.String(), "min_replicas: 1")
+}
+
+type renderedServeDeployment struct {
+	Name               string           `yaml:"name"`
+	AutoscalingConfig  map[string]int32 `yaml:"autoscaling_config"`
+	MaxOngoingRequests *int32           `yaml:"max_ongoing_requests"`
+}
+
+type renderedServeApplication struct {
+	Name        string                      `yaml:"name"`
+	ImportPath  string                      `yaml:"import_path"`
+	RoutePrefix string                      `yaml:"route_prefix"`
+	RuntimeEnv  map[interface{}]interface{} `yaml:"runtime_env"`
+	Args        map[interface{}]interface{} `yaml:"args"`
+	Deployments []renderedServeDeployment   `yaml:"deployments"`
+}
+
+func renderProductionApplications(t *testing.T, scaleFactor int32, acceleratorType string) []renderedServeApplication {
+	t.Helper()
+
+	modelScaleData, err := os.ReadFile("../../../config/configs/model-scale.yaml")
+	require.NoError(t, err)
+	var modelScale ScaleConfig
+	require.NoError(t, yaml.UnmarshalStrict(modelScaleData, &modelScale))
+
+	replicas := make(map[string]int32, len(modelScale.ApplicationScale))
+	for name, base := range modelScale.ApplicationScale {
+		replicas[name] = base * scaleFactor
+	}
+
+	templateData, err := os.ReadFile("../../../config/configs/applications.yaml")
+	require.NoError(t, err)
+	tmpl, err := template.New("applications").Funcs(applicationTemplateFuncMap()).Parse(string(templateData))
+	require.NoError(t, err)
+
+	var rendered bytes.Buffer
+	require.NoError(t, tmpl.Execute(&rendered, ApplicationParams{
+		Replicas:        replicas,
+		AcceleratorType: acceleratorType,
+	}))
+
+	var doc struct {
+		Applications []renderedServeApplication `yaml:"applications"`
+	}
+	require.NoError(t, yaml.Unmarshal(rendered.Bytes(), &doc))
+	return doc.Applications
+}
+
+func indexRenderedApplications(apps []renderedServeApplication) map[string]renderedServeApplication {
+	indexed := make(map[string]renderedServeApplication, len(apps))
+	for _, app := range apps {
+		indexed[app.Name] = app
+	}
+	return indexed
+}
+
+func indexRenderedDeployments(deployments []renderedServeDeployment) map[string]renderedServeDeployment {
+	indexed := make(map[string]renderedServeDeployment, len(deployments))
+	for _, deployment := range deployments {
+		indexed[deployment.Name] = deployment
+	}
+	return indexed
+}
+
+// TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides
+// protects the Ray Serve in-place scaling contract. Ray includes application
+// args in its code-version hash, so changing replica counts there rebuilds the
+// application and replaces healthy replicas. Only top-level deployment
+// autoscaling/max-request overrides may vary across a scaleFactor transition.
+func TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides(t *testing.T) {
+	atOne := indexRenderedApplications(renderProductionApplications(t, 1, "L40S"))
+	atTwo := indexRenderedApplications(renderProductionApplications(t, 2, "L40S"))
+	require.Equal(t, len(atOne), len(atTwo))
+
+	for name, one := range atOne {
+		two, ok := atTwo[name]
+		require.True(t, ok, "application %s disappeared at scaleFactor 2", name)
+		require.Equal(t, one.ImportPath, two.ImportPath, "%s import_path changed", name)
+		require.Equal(t, one.RoutePrefix, two.RoutePrefix, "%s route_prefix changed", name)
+		require.Equal(t, one.RuntimeEnv, two.RuntimeEnv, "%s runtime_env changed", name)
+		require.Equal(t, one.Args, two.Args, "%s args changed and would force a Ray Serve rebuild", name)
+	}
+
+	expectedScaledDeployment := map[string]string{
+		"Entrypoint":                   "Entrypoint",
+		"Gemma431bIt":                  "LLMDeploymentL40S",
+		"GptOss20b":                    "LLMDeploymentL40S",
+		"UaeLarge":                     "EmbeddingModelDeployment",
+		"AllMinilmL6V2":                "EmbeddingModelDeployment",
+		"BiEncoder":                    "EmbeddingModelDeployment",
+		"MbartTranslator":              "MbartTranslatorDeployment",
+		"XlmRobertaLanguageClassifier": "ClassificationModelDeployment",
+		"PromptInjectionTfidf":         "PromptInjectionTfidfDeployment",
+		"CrossEncoder":                 "ScoringModelDeployment",
+		"E5LanguageClassifier":         "ClassificationModelDeployment",
+		"PromptInjectionCrossEncoder":  "ScoringModelDeployment",
+		"PromptInjectionClassifier":    "ClassificationModelDeployment",
+	}
+
+	for appName, deploymentName := range expectedScaledDeployment {
+		one := indexRenderedDeployments(atOne[appName].Deployments)[deploymentName]
+		two := indexRenderedDeployments(atTwo[appName].Deployments)[deploymentName]
+		require.NotNil(t, one.AutoscalingConfig, "%s missing autoscaling override", appName)
+		require.NotNil(t, two.AutoscalingConfig, "%s missing autoscaling override", appName)
+		require.Equal(t, int32(1), one.AutoscalingConfig["min_replicas"], "%s min replicas at factor 1", appName)
+		require.Equal(t, int32(1), one.AutoscalingConfig["max_replicas"], "%s max replicas at factor 1", appName)
+		require.Equal(t, int32(2), two.AutoscalingConfig["min_replicas"], "%s min replicas at factor 2", appName)
+		require.Equal(t, int32(2), two.AutoscalingConfig["max_replicas"], "%s max replicas at factor 2", appName)
+	}
+
+	gemmaDriverOne := indexRenderedDeployments(atOne["Gemma431bIt"].Deployments)["TextGenModelDeployment"]
+	gemmaDriverTwo := indexRenderedDeployments(atTwo["Gemma431bIt"].Deployments)["TextGenModelDeployment"]
+	require.Empty(t, gemmaDriverOne.AutoscalingConfig, "Gemma driver replica count must not scale")
+	require.Empty(t, gemmaDriverTwo.AutoscalingConfig, "Gemma driver replica count must not scale")
+	require.NotNil(t, gemmaDriverOne.MaxOngoingRequests)
+	require.NotNil(t, gemmaDriverTwo.MaxOngoingRequests)
+	require.Equal(t, int32(26), *gemmaDriverOne.MaxOngoingRequests)
+	require.Equal(t, int32(32), *gemmaDriverTwo.MaxOngoingRequests)
+
+	gptDriverOne := indexRenderedDeployments(atOne["GptOss20b"].Deployments)["TextGenModelDeployment"]
+	gptDriverTwo := indexRenderedDeployments(atTwo["GptOss20b"].Deployments)["TextGenModelDeployment"]
+	require.Empty(t, gptDriverOne.AutoscalingConfig, "GPT-OSS driver replica count must not scale")
+	require.Empty(t, gptDriverTwo.AutoscalingConfig, "GPT-OSS driver replica count must not scale")
+	require.NotNil(t, gptDriverOne.MaxOngoingRequests)
+	require.NotNil(t, gptDriverTwo.MaxOngoingRequests)
+	require.Equal(t, int32(50), *gptDriverOne.MaxOngoingRequests)
+	require.Equal(t, int32(80), *gptDriverTwo.MaxOngoingRequests)
 }
 
 // TestScaleFactor_DefaultsToOne_Parity asserts that when spec.scaleFactor is

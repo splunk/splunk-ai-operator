@@ -48,24 +48,24 @@ applications:
           gpu_type_options_override:
             H100:
               autoscaling_config:
-                max_replicas: {{.Replicas.Gemma431bIt}}
-                min_replicas: {{.Replicas.Gemma431bIt}}
+                max_replicas: 1
+                min_replicas: 1
                 target_ongoing_requests: 6
               max_ongoing_requests: 8
               ray_actor_options:
                 num_gpus: 1
             L40S:
               autoscaling_config:
-                max_replicas: {{.Replicas.Gemma431bIt}}
-                min_replicas: {{.Replicas.Gemma431bIt}}
+                max_replicas: 1
+                min_replicas: 1
                 target_ongoing_requests: 4
               max_ongoing_requests: 6
               ray_actor_options:
                 num_gpus: 2
             RTX_PRO_6000_BLACKWELL:
               autoscaling_config:
-                max_replicas: {{.Replicas.Gemma431bIt}}
-                min_replicas: {{.Replicas.Gemma431bIt}}
+                max_replicas: 1
+                min_replicas: 1
                 target_ongoing_requests: 4
               max_ongoing_requests: 10
               ray_actor_options:
@@ -75,8 +75,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.Gemma431bIt}}
-              min_replicas: {{.Replicas.Gemma431bIt}}
+              max_replicas: 1
+              min_replicas: 1
       deployment_type: text_gen_model_deployment
       gpu_types: '["{{.AcceleratorType}}"]'
       model_definition:
@@ -130,6 +130,16 @@ applications:
               - tokenizer.json
             blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
     name: Gemma431bIt
+    deployments:
+      - name: LLMDeployment{{.AcceleratorType}}
+        autoscaling_config:
+          downscale_delay_s: 1800
+          max_replicas: {{.Replicas.Gemma431bIt}}
+          min_replicas: {{.Replicas.Gemma431bIt}}
+          target_ongoing_requests: {{acceleratorValue .AcceleratorType 6 4 4}}
+          upscale_delay_s: 10
+      - name: TextGenModelDeployment
+        max_ongoing_requests: {{textGenDriverRequestLimit (acceleratorValue .AcceleratorType 8 6 10) .Replicas.Gemma431bIt 20}}
     import_path: main:create_serve_app
     route_prefix: /gemma4_31b_it
     runtime_env:
@@ -192,8 +202,8 @@ applications:
                 num_gpus: 1
             RTX_PRO_6000_BLACKWELL:
               autoscaling_config:
-                max_replicas: {{.Replicas.GptOss20b}}
-                min_replicas: {{.Replicas.GptOss20b}}
+                max_replicas: 1
+                min_replicas: 1
                 target_ongoing_requests: 4
               max_ongoing_requests: 8
               ray_actor_options:
@@ -203,8 +213,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.GptOss20b}}
-              min_replicas: {{.Replicas.GptOss20b}}
+              max_replicas: 1
+              min_replicas: 1
       deployment_type: text_gen_model_deployment
       gpu_types: '["{{.AcceleratorType}}"]'
       model_definition:
@@ -244,6 +254,16 @@ applications:
               - tokenizer.json
             blob_prefix: model_artifacts/gpt-oss-20b
     name: GptOss20b
+    deployments:
+      - name: LLMDeployment{{.AcceleratorType}}
+        autoscaling_config:
+          downscale_delay_s: 1800
+          max_replicas: {{.Replicas.GptOss20b}}
+          min_replicas: {{.Replicas.GptOss20b}}
+          target_ongoing_requests: {{acceleratorValue .AcceleratorType 20 20 4}}
+          upscale_delay_s: 10
+      - name: TextGenModelDeployment
+        max_ongoing_requests: {{textGenDriverRequestLimit (acceleratorValue .AcceleratorType 30 30 8) .Replicas.GptOss20b 20}}
     import_path: main:create_serve_app
     route_prefix: /gpt_oss_20b
     runtime_env:
@@ -304,8 +324,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.UaeLarge}}
-              min_replicas: {{.Replicas.UaeLarge}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.15
       deployment_type: embedding_model_deployment
@@ -329,6 +349,13 @@ applications:
           blob_storage:
             blob_prefix: model_artifacts/uae-large
     name: UaeLarge
+    deployments:
+      - name: EmbeddingModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.UaeLarge}}
+          min_replicas: {{.Replicas.UaeLarge}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /uae_large
     runtime_env:
@@ -381,8 +408,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.AllMinilmL6V2}}
-              min_replicas: {{.Replicas.AllMinilmL6V2}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.01
       deployment_type: embedding_model_deployment
@@ -403,6 +430,13 @@ applications:
           blob_storage:
             blob_prefix: model_artifacts/all-minilm-l6-v2
     name: AllMinilmL6V2
+    deployments:
+      - name: EmbeddingModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.AllMinilmL6V2}}
+          min_replicas: {{.Replicas.AllMinilmL6V2}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /all_minilm_l6_v2
     runtime_env:
@@ -455,8 +489,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.BiEncoder}}
-              min_replicas: {{.Replicas.BiEncoder}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.01
       deployment_type: embedding_model_deployment
@@ -474,6 +508,13 @@ applications:
           blob_storage:
             blob_prefix: model_artifacts/bi-encoder
     name: BiEncoder
+    deployments:
+      - name: EmbeddingModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.BiEncoder}}
+          min_replicas: {{.Replicas.BiEncoder}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /bi_encoder
     runtime_env:
@@ -530,12 +571,19 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.MbartTranslator}}
-              min_replicas: {{.Replicas.MbartTranslator}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.2
       deployment_type: custom_deployment
     name: MbartTranslator
+    deployments:
+      - name: MbartTranslatorDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.MbartTranslator}}
+          min_replicas: {{.Replicas.MbartTranslator}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /mbart_translator
     runtime_env:
@@ -591,8 +639,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
-              min_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.1
       deployment_type: classification_model_deployment
@@ -616,6 +664,13 @@ applications:
           blob_storage:
             blob_prefix: model_artifacts/xlm-roberta-language-classifier
     name: XlmRobertaLanguageClassifier
+    deployments:
+      - name: ClassificationModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
+          min_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /xlm_roberta_language_classifier
     runtime_env:
@@ -658,10 +713,17 @@ applications:
         PromptInjectionTfidfDeployment:
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.PromptInjectionTfidf}}
-              min_replicas: {{.Replicas.PromptInjectionTfidf}}
+              max_replicas: 1
+              min_replicas: 1
       deployment_type: custom_deployment
     name: PromptInjectionTfidf
+    deployments:
+      - name: PromptInjectionTfidfDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.PromptInjectionTfidf}}
+          min_replicas: {{.Replicas.PromptInjectionTfidf}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_tfidf
     runtime_env:
@@ -714,8 +776,8 @@ applications:
         FMTimeseriesDeployment:
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.FmTimeseries}}
-              min_replicas: {{.Replicas.FmTimeseries}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.1
       deployment_type: custom_deployment
@@ -745,6 +807,13 @@ applications:
               - torch_model.pt
             blob_prefix: model_artifacts/fm_timeseries
     name: FmTimeseries
+    deployments:
+      - name: FMTimeseriesDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.FmTimeseries}}
+          min_replicas: {{.Replicas.FmTimeseries}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /fm_timeseries
     runtime_env:
@@ -801,8 +870,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.CrossEncoder}}
-              min_replicas: {{.Replicas.CrossEncoder}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.01
       deployment_type: scoring_model_deployment
@@ -824,6 +893,13 @@ applications:
             blob_prefix: model_artifacts/cross-encoder
         model_type: vllm_scoring_model
     name: CrossEncoder
+    deployments:
+      - name: ScoringModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.CrossEncoder}}
+          min_replicas: {{.Replicas.CrossEncoder}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /cross_encoder
     runtime_env:
@@ -879,8 +955,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.E5LanguageClassifier}}
-              min_replicas: {{.Replicas.E5LanguageClassifier}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.1
       deployment_type: classification_model_deployment
@@ -904,6 +980,13 @@ applications:
           blob_storage:
             blob_prefix: model_artifacts/e5-language-classifier
     name: E5LanguageClassifier
+    deployments:
+      - name: ClassificationModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.E5LanguageClassifier}}
+          min_replicas: {{.Replicas.E5LanguageClassifier}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /e5_language_classifier
     runtime_env:
@@ -959,8 +1042,8 @@ applications:
                   "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.PromptInjectionCrossEncoder}}
-              min_replicas: {{.Replicas.PromptInjectionCrossEncoder}}
+              max_replicas: 1
+              min_replicas: 1
             ray_actor_options:
               num_gpus: 0.05
       deployment_type: scoring_model_deployment
@@ -971,6 +1054,13 @@ applications:
             local_path: /home/ray/local_model_artifacts/prompt-injection-cross-encoder-1114
         model_type: sentence_transformer_cross_encoder
     name: PromptInjectionCrossEncoder
+    deployments:
+      - name: ScoringModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.PromptInjectionCrossEncoder}}
+          min_replicas: {{.Replicas.PromptInjectionCrossEncoder}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_cross_encoder
     runtime_env:
@@ -1012,8 +1102,8 @@ applications:
         ClassificationModelDeployment:
           options:
             autoscaling_config:
-              max_replicas: {{.Replicas.PromptInjectionClassifier}}
-              min_replicas: {{.Replicas.PromptInjectionClassifier}}
+              max_replicas: 1
+              min_replicas: 1
       deployment_type: classification_model_deployment
       model_definition:
         custom_model_import_path: prompt_injection_classifier:PromptInjectionClassificationModel
@@ -1023,6 +1113,13 @@ applications:
             local_path: /home/ray/local_model_artifacts/prompt-injection-classifier-01052025
         model_type: custom_model
     name: PromptInjectionClassifier
+    deployments:
+      - name: ClassificationModelDeployment
+        autoscaling_config:
+          max_replicas: {{.Replicas.PromptInjectionClassifier}}
+          min_replicas: {{.Replicas.PromptInjectionClassifier}}
+          target_ongoing_requests: 10
+          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_classifier
     runtime_env:

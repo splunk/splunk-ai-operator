@@ -56,6 +56,28 @@ type ApplicationParams struct {
 	AcceleratorType                string           `yaml:"ACCELERATOR_TYPE"`
 }
 
+func applicationTemplateFuncMap() template.FuncMap {
+	return template.FuncMap{
+		"acceleratorValue": func(accelerator string, h100, l40s, rtxPro6000Blackwell int) int {
+			switch accelerator {
+			case "H100", "H100_NVL":
+				return h100
+			case "RTX_PRO_6000_BLACKWELL":
+				return rtxPro6000Blackwell
+			default:
+				return l40s
+			}
+		},
+		// TextGenModelDeployment admits requests for both the LLM deployment(s)
+		// and its tokenizer. Keep this scale-dependent value in the top-level
+		// Ray Serve deployment override rather than application args so changing
+		// scaleFactor remains a lightweight update.
+		"textGenDriverRequestLimit": func(perLLMReplica int, replicas int32, tokenizerLimit int) int32 {
+			return int32(perLLMReplica)*replicas + int32(tokenizerLimit)
+		},
+	}
+}
+
 // classifyObjectStorage maps an AIPlatform objectStorage URL scheme + endpoint
 // pair to the (cloudProvider, artifactsProvider, needsS3CompatCreds) tuple
 // expected by the SAIA / ML-platform SDK that runs inside Ray Serve replicas.
@@ -314,7 +336,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	}
 
 	// Create a new template and parse the embedded YAML as a template
-	tmpl, err := template.New("applications").Parse(string(templateData))
+	tmpl, err := template.New("applications").Funcs(applicationTemplateFuncMap()).Parse(string(templateData))
 	if err != nil {
 		logger.Error(err, "Failed to parse template")
 		return err
