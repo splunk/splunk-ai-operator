@@ -160,6 +160,60 @@ func Test_ApplicationsYAML_IsWellFormed(t *testing.T) {
 	}
 }
 
+// Test_ApplicationsYAML_BiEncoderRTXMemoryMatchesRayAllocation prevents Ray's
+// fractional GPU reservation from drifting below the model server's actual
+// memory allocation for RTX Pro 6000 Blackwell.
+func Test_ApplicationsYAML_BiEncoderRTXMemoryMatchesRayAllocation(t *testing.T) {
+	type rayActorOptions struct {
+		NumGPUs float64 `yaml:"num_gpus"`
+	}
+	type gpuTypeOptions struct {
+		RayActorOptions rayActorOptions `yaml:"ray_actor_options"`
+	}
+	type deploymentConfig struct {
+		GPUTypeOptionsOverride map[string]gpuTypeOptions `yaml:"gpu_type_options_override"`
+	}
+	type engineArgs struct {
+		GPUMemoryUtilization float64 `yaml:"gpu_memory_utilization"`
+	}
+	type modelConfigOverride struct {
+		EngineArgs engineArgs `yaml:"engine_args"`
+	}
+	type app struct {
+		Name string `yaml:"name"`
+		Args struct {
+			DeploymentConfigs map[string]deploymentConfig `yaml:"deployment_configs"`
+			ModelDefinition   struct {
+				GPUTypeModelConfigOverride map[string]modelConfigOverride `yaml:"gpu_type_model_config_override"`
+			} `yaml:"model_definition"`
+		} `yaml:"args"`
+	}
+	var doc struct {
+		Applications []app `yaml:"applications"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(maskGoTemplates(readApplicationsYAMLFromRepo(t))), &doc))
+
+	const accelerator = "RTX_PRO_6000_BLACKWELL"
+	for _, application := range doc.Applications {
+		if application.Name != "BiEncoder" {
+			continue
+		}
+		deployment, ok := application.Args.DeploymentConfigs["EmbeddingModelDeployment"]
+		require.True(t, ok, "BiEncoder is missing EmbeddingModelDeployment")
+		rayOptions, ok := deployment.GPUTypeOptionsOverride[accelerator]
+		require.True(t, ok, "BiEncoder is missing the %s Ray allocation", accelerator)
+		modelOverride, ok := application.Args.ModelDefinition.GPUTypeModelConfigOverride[accelerator]
+		require.True(t, ok, "BiEncoder is missing the %s model memory override", accelerator)
+
+		require.InDelta(t, 0.004, rayOptions.RayActorOptions.NumGPUs, 0.000001)
+		require.InDelta(t, rayOptions.RayActorOptions.NumGPUs,
+			modelOverride.EngineArgs.GPUMemoryUtilization, 0.000001,
+			"BiEncoder's RTX model memory utilization must match its Ray GPU reservation")
+		return
+	}
+	t.Fatal("BiEncoder application not found")
+}
+
 func keys(m map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

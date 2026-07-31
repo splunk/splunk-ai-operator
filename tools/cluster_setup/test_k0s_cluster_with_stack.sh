@@ -86,6 +86,7 @@ _load_functions() {
   # Extract _POD_FS assignment (single line, not a function)
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
 
+  eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
@@ -185,6 +186,26 @@ assert_rc "detects changeme (lowercase)" 0 \
 
 assert_rc "accepts real credentials (returns 1)" 1 \
   bash -c "$(declare -f object_store_auth_looks_like_placeholder); MINIO_ROOT_USER='admin' MINIO_ROOT_PASSWORD='s3cr3t!' object_store_auth_looks_like_placeholder"
+
+# ── Tests: model artifact config selection ───────────────────────────────────
+
+suite "model artifact config selection"
+echo "▶ model_artifacts_config_name"
+
+assert_eq "L40S uses the default artifact manifest" \
+  "model_artifacts_configs.yaml" "$(model_artifacts_config_name l40s)"
+
+assert_eq "H100 uses the H100 artifact manifest" \
+  "model_artifacts_configs_h100.yaml" "$(model_artifacts_config_name h100)"
+
+assert_eq "RTX Pro 6000 uses the H100 artifact manifest" \
+  "model_artifacts_configs_h100.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
+
+assert_eq "pre-staging check uses the shared artifact-manifest selector" \
+  "1" "$(grep -c 'config_file=.*model_artifacts_config_name.*accel' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "post-upload verification uses the shared artifact-manifest selector" \
+  "1" "$(grep -c '_config_for_verify=.*model_artifacts_config_name.*_accel' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: _pod_is_healthy ─────────────────────────────────────────────────────
 
@@ -506,6 +527,19 @@ assert_eq "python update script writes /etc/k0s/k0s.yaml" \
 
 assert_eq "verify step uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'grep.*api.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
+
+# ── Tests: k0s advertised API address ────────────────────────────────────────
+
+suite "k0s advertised API address"
+
+assert_eq "optional external API address is loaded from config" \
+  "1" "$(grep -c 'K0S_API_EXTERNAL_ADDRESS=.*cluster.apiExternalAddress' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "configured external API address is included in certificate SANs" \
+  "1" "$(grep -c '_configured_external_addr not in.*sans' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "configured external API address takes precedence over the private address" \
+  "1" "$(grep -c '_external_addr = _configured_external_addr or _internal_addr' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: kine compaction ─────────────────────────────────────────────────────
 # Verify that the generated k0s config passes --compact-interval to kine via
