@@ -2896,6 +2896,7 @@ _nvidia_runtime_is_healthy() {
 
 _install_nvidia_on_node() {
   local gpu_ip="$1"
+  local recovery_reboots="${2:-0}"
 
   # ---- OS gate: only RHEL 9 is supported for GPU driver install -----------
   _check_node_os "${gpu_ip}" "GPU worker"
@@ -3078,6 +3079,7 @@ _install_nvidia_on_node() {
       # because it has to remove conflicting nouveau packages. The flag is
       # a no-op on RHEL 9/AL2023 where there's nothing to erase.
       echo '--- Installing NVIDIA driver (meta package: cuda-drivers) ---'
+      REQUIRE_OPEN_MODULE=0
       if [ \"\${OS_FAMILY}\" = 'debian' ]; then
         sudo apt-get install -y nvidia-driver-550
       else
@@ -3111,15 +3113,22 @@ _install_nvidia_on_node() {
         _accel_lc=\$(printf '%s' \"\${REQUESTED_ACCEL}\" | tr '[:upper:]' '[:lower:]')
         case \"\${_accel_lc}\" in
           *blackwell*|rtx_pro_6000*)
+            REQUIRE_OPEN_MODULE=1
             echo \"--- Accelerator '\${REQUESTED_ACCEL}' requires the NVIDIA OPEN kernel module ---\"
             # Reset any previously-enabled nvidia-driver stream (e.g. a prior
             # proprietary 'latest-dkms') so the open-dkms stream enables cleanly.
-            # Without this, 'dnf module install nvidia-driver:open-dkms' fails to
-            # switch streams on a node that had the closed stream enabled. No-op
-            # on a fresh node. RHEL-9 module path only; non-fatal under pipefail.
-            [ \"\${OS_VERSION}\" = '9' ] && { sudo dnf -y module reset nvidia-driver || true; }
-            if [ \"\${OS_VERSION}\" = '9' ] && sudo dnf module install -y nvidia-driver:open-dkms; then
-              echo '✓ Installed nvidia-driver:open-dkms via dnf module (open kernel module)'
+            # RHEL 9 needs the open-dkms stream enabled before installing the
+            # nvidia-open meta-package. Installing the stream directly can leave
+            # packages from the previously enabled proprietary stream in place.
+            if [ \"\${OS_VERSION}\" = '9' ]; then
+              sudo dnf -y module reset nvidia-driver || true
+              if sudo dnf -y module enable nvidia-driver:open-dkms && \
+                 sudo dnf install -y --allowerasing nvidia-open; then
+                echo '✓ Enabled nvidia-driver:open-dkms and installed nvidia-open'
+              else
+                echo 'ERROR: failed to switch RHEL 9 to the nvidia-driver:open-dkms stream.' >&2
+                exit 1
+              fi
             elif sudo dnf install -y --allowerasing nvidia-open; then
               echo '✓ Installed nvidia-open metapackage (open kernel module)'
             else
@@ -3166,15 +3175,20 @@ _install_nvidia_on_node() {
           exit 1
         fi
         echo \"DKMS: \${DKMS_OUT}\"
-        # If DKMS is in 'added' state (registered but not yet built), build it
-        # explicitly. This happens when the package installs DKMS source but the
-        # automatic build was skipped (e.g. kernel was just upgraded + rebooted).
+        # Package hooks can register the NVIDIA source without building it,
+        # leaving DKMS in \"added\" state. Build/install it explicitly for the
+        # running kernel before applying the normal gate.
         if echo \"\${DKMS_OUT}\" | grep -qE '^nvidia.*: added$'; then
-          echo 'DKMS module in added state — triggering explicit build+install...'
-          sudo dkms build -m nvidia -v \$(sudo dkms status | grep '^nvidia' | awk -F/ '{print \$2}' | awk '{print \$1}') -k \"\${KREL}\" 2>&1 || true
-          sudo dkms install -m nvidia -v \$(sudo dkms status | grep '^nvidia' | awk -F/ '{print \$2}' | awk '{print \$1}') -k \"\${KREL}\" 2>&1 || true
+          _nv_ver=\$(echo \"\${DKMS_OUT}\" | grep -oE '[0-9]+\\.[0-9][0-9.]*' | head -1 || true)
+          if [ -z \"\${_nv_ver}\" ]; then
+            echo \"ERROR: could not determine NVIDIA version from DKMS status: \${DKMS_OUT}\" >&2
+            exit 1
+          fi
+          echo \"--- DKMS nvidia/\${_nv_ver} is only registered; building for \${KREL} ---\"
+          sudo dkms build \"nvidia/\${_nv_ver}\" -k \"\${KREL}\" 2>&1 || true
+          sudo dkms install \"nvidia/\${_nv_ver}\" -k \"\${KREL}\" 2>&1 || true
           DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
-          echo \"DKMS after explicit build: \${DKMS_OUT}\"
+          echo \"DKMS (after explicit build): \${DKMS_OUT}\"
         fi
         if ! echo \"\${DKMS_OUT}\" | grep -qE 'installed|built'; then
           echo 'ERROR: nvidia DKMS module is not installed/built. See: sudo dkms status; dmesg | grep nvidia' >&2
@@ -3191,7 +3205,7 @@ _install_nvidia_on_node() {
         if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
           echo \"WARN: DKMS built nvidia module for a different kernel than running \${KREL}; rebuilding.\" >&2
           echo \"      'sudo dkms status' shows: \${DKMS_OUT}\" >&2
-          _nv_ver=\$(echo \"\${DKMS_OUT}\" | grep -oE '[0-9]+\\.[0-9][0-9.]*' | head -1)
+          _nv_ver=\$(echo \"\${DKMS_OUT}\" | grep -oE '[0-9]+\\.[0-9][0-9.]*' | head -1 || true)
           if [ -n \"\${_nv_ver}\" ]; then
             echo \"--- Rebuilding nvidia/\${_nv_ver} DKMS module for running kernel \${KREL} ---\"
             sudo dkms install \"nvidia/\${_nv_ver}\" -k \"\${KREL}\" || sudo dkms autoinstall -k \"\${KREL}\" || true
@@ -3210,11 +3224,77 @@ _install_nvidia_on_node() {
           fi
         fi
       fi
+      # Installing a different kmod package does not replace a module that is
+      # already resident in the running kernel. This is the common rerun case:
+      # the proprietary module remains loaded, modprobe is a successful no-op,
+      # and Blackwell still reports \"No devices were found\". For Blackwell,
+      # stop GPU consumers, unload the old module stack, and load the newly
+      # installed open module. If a consumer keeps the module busy, fail with a
+      # clear reboot-and-rerun instruction instead of continuing to nvidia-smi.
+      K0S_WAS_ACTIVE=0
+      PERSISTENCE_WAS_ACTIVE=0
+      if [ \"\${REQUIRE_OPEN_MODULE}\" = '1' ]; then
+        # Refresh module metadata before modinfo: a package switch may have
+        # replaced the on-disk module during this same shell session.
+        sudo depmod -a \"\${KREL}\"
+        ON_DISK_LICENSE=\$(modinfo -F license nvidia 2>/dev/null || true)
+        if ! printf '%s' \"\${ON_DISK_LICENSE}\" | grep -qiE 'MIT|GPL'; then
+          echo \"ERROR: the installed nvidia module is not the required open module (license: \${ON_DISK_LICENSE:-unknown}).\" >&2
+          echo '       Check that the nvidia-driver:open-dkms stream is enabled, then re-run.' >&2
+          exit 1
+        fi
+
+        if grep -q '^nvidia ' /proc/modules 2>/dev/null; then
+          echo '--- Replacing the currently loaded NVIDIA module with the open module ---'
+          if sudo systemctl is-active --quiet k0sworker; then
+            K0S_WAS_ACTIVE=1
+            sudo systemctl stop k0sworker
+          fi
+          if sudo systemctl is-active --quiet nvidia-persistenced; then
+            PERSISTENCE_WAS_ACTIVE=1
+            sudo systemctl stop nvidia-persistenced
+          fi
+
+          for _mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia_peermem nvidia; do
+            if grep -q \"^\${_mod} \" /proc/modules 2>/dev/null; then
+              sudo modprobe -r \"\${_mod}\" 2>/dev/null || true
+            fi
+          done
+
+          if grep -q '^nvidia ' /proc/modules 2>/dev/null; then
+            echo 'ERROR: the old NVIDIA module is still busy and cannot be replaced safely.' >&2
+            sudo fuser -v /dev/nvidia* 2>/dev/null || true
+            [ \"\${PERSISTENCE_WAS_ACTIVE}\" = '1' ] && sudo systemctl start nvidia-persistenced || true
+            [ \"\${K0S_WAS_ACTIVE}\" = '1' ] && sudo systemctl start k0sworker || true
+            echo '       Reboot this GPU node once, then re-run the same install command.' >&2
+            exit 1
+          fi
+        fi
+      fi
+
       sudo modprobe nvidia || {
         echo 'ERROR: modprobe nvidia failed after DKMS build succeeded.' >&2
         echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
+        [ \"\${PERSISTENCE_WAS_ACTIVE}\" = '1' ] && sudo systemctl start nvidia-persistenced || true
+        [ \"\${K0S_WAS_ACTIVE}\" = '1' ] && sudo systemctl start k0sworker || true
         exit 1
       }
+      if [ \"\${REQUIRE_OPEN_MODULE}\" = '1' ]; then
+        # /sys/module/nvidia/license is not exposed on all RHEL kernels. The
+        # loaded driver's own runtime banner is authoritative and explicitly
+        # identifies the open flavor.
+        LOADED_VERSION=\$(cat /proc/driver/nvidia/version 2>/dev/null || true)
+        if ! printf '%s' \"\${LOADED_VERSION}\" | grep -qi 'Open Kernel Module'; then
+          echo 'ERROR: the loaded nvidia module is not the required open module.' >&2
+          echo \"       Runtime version: \${LOADED_VERSION:-unknown}\" >&2
+          [ \"\${PERSISTENCE_WAS_ACTIVE}\" = '1' ] && sudo systemctl start nvidia-persistenced || true
+          [ \"\${K0S_WAS_ACTIVE}\" = '1' ] && sudo systemctl start k0sworker || true
+          exit 1
+        fi
+        echo \"✓ \$(printf '%s\n' \"\${LOADED_VERSION}\" | head -1)\"
+      fi
+      [ \"\${PERSISTENCE_WAS_ACTIVE}\" = '1' ] && sudo systemctl start nvidia-persistenced || true
+      [ \"\${K0S_WAS_ACTIVE}\" = '1' ] && sudo systemctl start k0sworker || true
     " || _nvidia_rc=$?
     if [[ "${_nvidia_rc:-0}" -ne 0 ]]; then
       if [[ "${_nvidia_rc}" -eq 42 ]]; then
@@ -3237,6 +3317,52 @@ _install_nvidia_on_node() {
     local ver_check
     ver_check=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1" || echo "")
     if [[ -z "${ver_check}" ]] || ! [[ "${ver_check}" =~ ^[0-9]+\.[0-9]+ ]]; then
+      # Switching proprietary -> open modules can leave Blackwell's GSP
+      # firmware resident in a state that a module reload cannot reset:
+      #   _kgspBootGspRm: unexpected WPR2 already up
+      # NVIDIA's kernel log explicitly says the GPU needs a reset. Perform one
+      # bounded node reboot and retry; never loop indefinitely on real faults.
+      local gsp_reset_required=""
+      if (( recovery_reboots < 1 )) && [[ "${ver_check}" == *"No devices were found"* ]]; then
+        gsp_reset_required=$(ssh_exec "${gpu_ip}" \
+          "sudo dmesg | grep -qiE 'unexpected WPR2 already up|likely in a bad state and may need to be reset' && echo yes || echo no" \
+          2>/dev/null || echo no)
+      fi
+      if [[ "${gsp_reset_required}" == "yes" ]]; then
+        echo "NVIDIA GSP firmware on ${gpu_ip} requires a hardware reset; rebooting once..."
+        # Make sure the open module is loaded automatically after the reboot.
+        ssh_exec "${gpu_ip}" \
+          "sudo mkdir -p /etc/modules-load.d && printf 'nvidia\nnvidia_uvm\nnvidia_modeset\n' | sudo tee /etc/modules-load.d/nvidia.conf >/dev/null" \
+          >/dev/null
+        ssh_exec "${gpu_ip}" "sudo systemctl reboot" >/dev/null 2>&1 || true
+
+        # First observe the node going down so a still-alive SSH connection
+        # cannot be mistaken for a completed reboot.
+        sleep 5
+        local down_wait=0
+        while ssh_exec "${gpu_ip}" "echo ok" &>/dev/null; do
+          sleep 5
+          down_wait=$((down_wait + 5))
+          if (( down_wait >= 60 )); then
+            echo "❌ ${gpu_ip} did not begin rebooting within 60 seconds" >&2
+            return 1
+          fi
+        done
+
+        local up_wait=0
+        until ssh_exec "${gpu_ip}" "echo ok" &>/dev/null; do
+          sleep 10
+          up_wait=$((up_wait + 10))
+          if (( up_wait >= 300 )); then
+            echo "❌ ${gpu_ip} did not return after the NVIDIA recovery reboot" >&2
+            return 1
+          fi
+        done
+        echo "Node ${gpu_ip} is back (kernel: $(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null)); retrying NVIDIA setup..."
+        sleep 5
+        _install_nvidia_on_node "${gpu_ip}" "$((recovery_reboots + 1))"
+        return $?
+      fi
       echo "❌ nvidia-smi verification failed on ${gpu_ip} (got: '${ver_check}')" >&2
       return 1
     fi

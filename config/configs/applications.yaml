@@ -60,6 +60,8 @@ applications:
                 num_gpus: 2
             RTX_PRO_6000_BLACKWELL:
               autoscaling_config:
+                max_replicas: {{.Replicas.Gemma431bIt}}
+                min_replicas: {{.Replicas.Gemma431bIt}}
                 target_ongoing_requests: 4
               max_ongoing_requests: 10
               ray_actor_options:
@@ -192,6 +194,8 @@ applications:
                 num_gpus: 1
             RTX_PRO_6000_BLACKWELL:
               autoscaling_config:
+                max_replicas: {{.Replicas.GptOss20b}}
+                min_replicas: {{.Replicas.GptOss20b}}
                 target_ongoing_requests: 4
               max_ongoing_requests: 8
               ray_actor_options:

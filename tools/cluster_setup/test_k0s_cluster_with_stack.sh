@@ -620,7 +620,7 @@ assert_eq "runtime repair does not kill container shims or remove the containerd
   "0" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'pkill.*containerd-shim|rm -f /run/k0s/containerd\\.sock')"
 
 assert_eq "unhealthy runtime uses a checked k0sworker restart" \
-  "2" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'systemctl restart k0sworker|systemctl is-active --quiet k0sworker')"
+  "3" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'systemctl restart k0sworker|systemctl is-active --quiet k0sworker')"
 
 suite "fix: LAST_LAUNCHED_SUBNET subshell (k0s_aws_provision.sh)"
 
@@ -742,6 +742,61 @@ _clean_all_propagates_aggressive_failure() (
 
 assert_rc "clean-all returns failure when aggressive node cleanup failed" \
   "1" _clean_all_propagates_aggressive_failure
+
+# ── Tests: Blackwell NVIDIA open-module switch ───────────────────────────────
+# A package change alone does not replace a proprietary NVIDIA module already
+# loaded in the running kernel. Verify the installer selects the RHEL 9 open
+# stream and explicitly replaces/validates the resident module on reruns.
+
+suite "Blackwell NVIDIA open-module switch"
+
+assert_eq "RHEL 9 enables the open-dkms module stream" \
+  "1" "$(grep -c 'module enable nvidia-driver:open-dkms' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "does not directly install the open-dkms stream" \
+  "0" "$(grep -c 'dnf module install -y nvidia-driver:open-dkms' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "marks Blackwell as requiring the open module" \
+  "1" "$(grep -c 'REQUIRE_OPEN_MODULE=1' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "refreshes module metadata before checking the installed license" \
+  "1" "$(awk '/depmod -a.*KREL/{depmod=NR} /ON_DISK_LICENSE=.*modinfo/{license=NR; exit} END{print(depmod > 0 && depmod < license)}' "${SCRIPT}")"
+
+assert_eq "stops k0sworker before replacing a loaded GPU module" \
+  "1" "$(awk '/Replacing the currently loaded NVIDIA module/{found=1} found && /systemctl stop k0sworker/{count++} found && /sudo modprobe nvidia \|\|/{print count; exit}' "${SCRIPT}")"
+
+assert_eq "unloads the NVIDIA dependency stack in order" \
+  "1" "$(grep -c 'for _mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia_peermem nvidia' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "removes each loaded NVIDIA module" \
+  "1" "$(grep -c 'modprobe -r.*_mod' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "validates the running open-module banner after modprobe" \
+  "1" "$(grep -c 'cat /proc/driver/nvidia/version' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "does not rely on the optional sysfs module-license file" \
+  "0" "$(grep -c 'cat /sys/module/nvidia/license' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "gives a reboot-and-rerun recovery when the old module is busy" \
+  "1" "$(grep -c 'Reboot this GPU node once, then re-run the same install command' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "DKMS version parsing cannot abort its fallback under pipefail" \
+  "2" "$(grep -c '_nv_ver=.*head -1 || true' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "recovers DKMS entries stuck in added state (reused from ai-tier-ga)" \
+  "1" "$(grep -c 'DKMS_OUT.*grep -qE.*added' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "rechecks DKMS after the explicit added-state build" \
+  "1" "$(grep -c 'DKMS (after explicit build)' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "recognizes the Blackwell GSP WPR2 reset signature" \
+  "1" "$(grep -c 'grep -qiE.*unexpected WPR2 already up' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "allows only one automatic NVIDIA recovery reboot" \
+  "1" "$(grep -c 'recovery_reboots < 1' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "waits for the node to return after the recovery reboot" \
+  "1" "$(grep -c 'did not return after the NVIDIA recovery reboot' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
