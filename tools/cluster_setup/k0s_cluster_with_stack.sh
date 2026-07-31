@@ -321,7 +321,7 @@ resolve_model_staging() {
 
 # Supported GPU accelerator types. Add new types here — the interactive prompt
 # and validate_config both derive their lists from this constant.
-readonly SUPPORTED_ACCELERATORS=("L40S" "H100")
+readonly SUPPORTED_ACCELERATORS=("L40S" "H100" "RTX_PRO_6000_BLACKWELL")
 
 # ====== RESOLVE ACCELERATOR TYPE ======
 # Called after load_config, before show_install_plan.
@@ -1664,8 +1664,32 @@ if 'sans' not in config['spec']['api']:
 
 config['spec']['api']['sans'].append('${controller_ip}')
 
-# Use the same IP for externalAddress so konnectivity-agents can connect
-config['spec']['api']['externalAddress'] = '${controller_ip}'
+# externalAddress must be an address that EVERY cluster member can reach --
+# including the controller reaching ITSELF. It is baked into the worker join
+# token AND into the in-cluster 'kubernetes' Service endpoint (10.96.0.1).
+#
+# On clouds (AWS/GCP/Azure) an instance CANNOT reach its own PUBLIC IP -- there
+# is no NAT hairpin for an instance's own elastic IP. So if the config's
+# controller IP is a public IP and we use it here:
+#   1. the controller's own pods (e.g. calico-node) can't reach the API via the
+#      ClusterIP, the CNI never initializes, and the control-plane node stays
+#      NotReady ('cni plugin not initialized' / dial 10.96.0.1:443 i/o timeout);
+#   2. same-VPC workers get a join token pointing at the public IP and need
+#      extra public-IP security-group rules just to fetch it.
+#
+# Use the node's PRIVATE bind address instead -- 'k0s config create' already
+# auto-detected it into spec.api.address (it is what kube-apiserver uses for
+# --advertise-address). The public/SSH IP stays in 'sans' above, so a kubeconfig
+# pointed at the public IP (e.g. a laptop outside the VPC) keeps a valid cert.
+#
+# NOTE: assumes controllers and workers share a private network (the common
+# single-VPC / same-subnet layout this installer targets). If workers can only
+# reach the controller over the public internet, set externalAddress back to a
+# publicly reachable address here.
+_internal_addr = config['spec']['api'].get('address')
+if _internal_addr:
+    config['spec']['api']['externalAddress'] = _internal_addr
+# else: leave externalAddress unset -- k0s falls back to spec.api.address
 
 # Set Calico as network provider
 if 'network' not in config['spec']:
@@ -1827,10 +1851,14 @@ PYSCRIPT"
     ssh_exec "${controller_ip}" "sudo k0s kubectl get nodes -o wide"
 
     log ""
-    warn "Possible issues:"
-    warn "  1. Workers cannot reach controller's API server"
-    warn "  2. Network connectivity issues between nodes"
-    warn "  3. k0s worker process failed to start"
+    warn "Most common cause: the controller's control-plane ports are not"
+    warn "reachable from the workers. Ensure security-group / firewall ingress"
+    warn "allows TCP 6443 (kube-apiserver) and 8132 (konnectivity) from each"
+    warn "worker to the controller's PRIVATE IP (${controller_ip})."
+    warn "Verify from a worker (nc is often absent on RHEL — use bash /dev/tcp):"
+    warn "  for p in 6443 8132; do timeout 5 bash -c \"echo > /dev/tcp/${controller_ip}/\$p\" 2>/dev/null && echo \"OK \$p\" || echo \"FAIL \$p\"; done"
+    warn "Other possibilities: node-to-node network issue, or the k0s worker"
+    warn "process failed to start (see logs below)."
     warn ""
     warn "Checking worker logs..."
 
@@ -2612,6 +2640,13 @@ _install_nvidia_on_node() {
     if ! ssh_exec "${gpu_ip}" "
       set -euo pipefail
 
+      # Requested accelerator type (expanded locally from DEFAULT_ACCELERATOR).
+      # Blackwell (GB202 / RTX PRO 6000) REQUIRES the NVIDIA open kernel module;
+      # the proprietary 'cuda-drivers' kmod loads but binds zero Blackwell GPUs
+      # (dmesg: 'requires use of the NVIDIA open kernel modules', RmInitAdapter
+      # failed) so nvidia-smi reports 'No devices were found'. See Step 4.
+      REQUESTED_ACCEL='${DEFAULT_ACCELERATOR:-}'
+
       # --- OS detection (RHEL 9 is the only supported path) ---
       # Code paths for other OS families are kept for internal testing.
       # _check_node_os() already gated unsupported OS before this block runs.
@@ -2752,26 +2787,67 @@ _install_nvidia_on_node() {
           sudo dracut --force 2>/dev/null || true
         fi
 
-        # Primary strategy: cuda-drivers meta-package (works on RHEL 9, RHEL 10,
-        # AL2023 — the CUDA repo ships the same package name everywhere).
-        if sudo dnf install -y --allowerasing cuda-drivers; then
-          echo '✓ Installed cuda-drivers meta-package'
-        elif [ \"\${OS_VERSION}\" = '9' ] && sudo dnf module install -y nvidia-driver:latest-dkms; then
-          # RHEL 9 fallback: classic dnf module stream (RHEL 10 dropped modularity).
-          # Kept as a safety net — cuda-drivers should always work above.
-          echo '✓ Installed nvidia-driver:latest-dkms via dnf module (RHEL 9 legacy path)'
-        elif sudo dnf install -y --allowerasing nvidia-open; then
-          # Last-resort fallback: open-source kernel driver.
-          echo '✓ Installed nvidia-open (open-kernel fallback)'
-        else
-          echo 'ERROR: all NVIDIA driver install strategies failed' >&2
-          echo '  Tried: cuda-drivers, nvidia-driver:latest-dkms (module), nvidia-open' >&2
-          echo '  Possible causes:' >&2
-          echo '    - CUDA repo URL incorrect for OS version \${OS_VERSION}' >&2
-          echo '    - EPEL/DKMS not available' >&2
-          echo '    - Network blocked to developer.download.nvidia.com' >&2
-          exit 1
-        fi
+        # Driver-module variant depends on the GPU architecture:
+        #
+        #   * Blackwell and newer (RTX PRO 6000 / GB202, and all future archs)
+        #     ONLY support the NVIDIA OPEN kernel module. The proprietary module
+        #     shipped by 'cuda-drivers' installs cleanly but refuses to bind the
+        #     GPU, so nvidia-smi shows 'No devices were found'. These MUST use
+        #     the open driver.
+        #   * Turing/Ampere/Ada/Hopper (L40S, H100, etc.) work with either; we
+        #     keep the proven proprietary 'cuda-drivers' path for them to avoid
+        #     regressing existing deployments.
+        #
+        # Package names in the CUDA repo (rhel9):
+        #   nvidia-driver:open-dkms  -> dnf module stream, open kernel module,
+        #                               version-agnostic (tracks current branch)
+        #   nvidia-open              -> metapackage, open kernel module
+        #   cuda-drivers             -> metapackage, proprietary kernel module
+        _accel_lc=\$(printf '%s' \"\${REQUESTED_ACCEL}\" | tr '[:upper:]' '[:lower:]')
+        case \"\${_accel_lc}\" in
+          *blackwell*|rtx_pro_6000*)
+            echo \"--- Accelerator '\${REQUESTED_ACCEL}' requires the NVIDIA OPEN kernel module ---\"
+            # Reset any previously-enabled nvidia-driver stream (e.g. a prior
+            # proprietary 'latest-dkms') so the open-dkms stream enables cleanly.
+            # Without this, 'dnf module install nvidia-driver:open-dkms' fails to
+            # switch streams on a node that had the closed stream enabled. No-op
+            # on a fresh node. RHEL-9 module path only; non-fatal under pipefail.
+            [ \"\${OS_VERSION}\" = '9' ] && { sudo dnf -y module reset nvidia-driver || true; }
+            if [ \"\${OS_VERSION}\" = '9' ] && sudo dnf module install -y nvidia-driver:open-dkms; then
+              echo '✓ Installed nvidia-driver:open-dkms via dnf module (open kernel module)'
+            elif sudo dnf install -y --allowerasing nvidia-open; then
+              echo '✓ Installed nvidia-open metapackage (open kernel module)'
+            else
+              echo 'ERROR: open-module install failed for a Blackwell-class GPU.' >&2
+              echo '  Tried: nvidia-driver:open-dkms (module), nvidia-open (metapackage)' >&2
+              echo '  Blackwell GPUs cannot use the proprietary driver, so cuda-drivers is NOT a valid fallback here.' >&2
+              echo '  Possible causes: CUDA repo URL wrong for OS \${OS_VERSION}; EPEL/DKMS missing;' >&2
+              echo '  network blocked to developer.download.nvidia.com.' >&2
+              exit 1
+            fi
+            ;;
+          *)
+            # Proprietary path for pre-Blackwell GPUs (L40S, H100, ...).
+            # Primary: cuda-drivers meta-package (works on RHEL 9, RHEL 10, AL2023).
+            if sudo dnf install -y --allowerasing cuda-drivers; then
+              echo '✓ Installed cuda-drivers meta-package'
+            elif [ \"\${OS_VERSION}\" = '9' ] && sudo dnf module install -y nvidia-driver:latest-dkms; then
+              # RHEL 9 fallback: classic dnf module stream (RHEL 10 dropped modularity).
+              echo '✓ Installed nvidia-driver:latest-dkms via dnf module (RHEL 9 legacy path)'
+            elif sudo dnf install -y --allowerasing nvidia-open; then
+              # Last-resort fallback: open-source kernel driver.
+              echo '✓ Installed nvidia-open (open-kernel fallback)'
+            else
+              echo 'ERROR: all NVIDIA driver install strategies failed' >&2
+              echo '  Tried: cuda-drivers, nvidia-driver:latest-dkms (module), nvidia-open' >&2
+              echo '  Possible causes:' >&2
+              echo '    - CUDA repo URL incorrect for OS version \${OS_VERSION}' >&2
+              echo '    - EPEL/DKMS not available' >&2
+              echo '    - Network blocked to developer.download.nvidia.com' >&2
+              exit 1
+            fi
+            ;;
+        esac
       fi
 
       # --- Step 5: verify DKMS built + load kmod ---------------------------
@@ -2789,15 +2865,34 @@ _install_nvidia_on_node() {
           echo 'ERROR: nvidia DKMS module is not installed/built. See: sudo dkms status; dmesg | grep nvidia' >&2
           exit 1
         fi
-        # Check the built-for kernel matches the running kernel. If not,
-        # a reboot into the newer installed kernel is required — DO NOT pretend
-        # modprobe will work. This is exactly what prevents false-positive
-        # 'install succeeded' on nodes that had a pending kernel update.
+        # Check the built-for kernel matches the running kernel. If DKMS built
+        # against an OLDER kernel (a kernel update was staged after the driver
+        # install, so the running kernel moved ahead), modprobe would fail with
+        # a cryptic 'Module not found'. Rather than force a reboot + full re-run,
+        # rebuild the module against the RUNNING kernel in place — Step 1 already
+        # installed kernel-devel-\${KREL}, so the build deps are present. This
+        # automates the manual recovery we performed on a Blackwell node that had
+        # a pending kernel update (dkms install nvidia/<ver> -k \$(uname -r)).
         if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
-          echo \"ERROR: DKMS built nvidia module for a different kernel than \${KREL}.\" >&2
-          echo \"       'sudo dkms status' shows: \${DKMS_OUT}\" >&2
-          echo \"       Action: reboot the node into the kernel DKMS built for, then re-run.\" >&2
-          exit 1
+          echo \"WARN: DKMS built nvidia module for a different kernel than running \${KREL}; rebuilding.\" >&2
+          echo \"      'sudo dkms status' shows: \${DKMS_OUT}\" >&2
+          _nv_ver=\$(echo \"\${DKMS_OUT}\" | grep -oE '[0-9]+\\.[0-9][0-9.]*' | head -1)
+          if [ -n \"\${_nv_ver}\" ]; then
+            echo \"--- Rebuilding nvidia/\${_nv_ver} DKMS module for running kernel \${KREL} ---\"
+            sudo dkms install \"nvidia/\${_nv_ver}\" -k \"\${KREL}\" || sudo dkms autoinstall -k \"\${KREL}\" || true
+          else
+            sudo dkms autoinstall -k \"\${KREL}\" || true
+          fi
+          # Re-check: the running kernel MUST now appear, else the module truly
+          # can't build for it (missing kernel-devel-\${KREL}, etc.) — keep the
+          # false-positive guard and fail hard instead of pretending success.
+          DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
+          echo \"DKMS (after rebuild): \${DKMS_OUT}\"
+          if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
+            echo \"ERROR: DKMS could not build nvidia for running kernel \${KREL}.\" >&2
+            echo \"       Ensure kernel-devel-\${KREL} is installed then re-run, or reboot.\" >&2
+            exit 1
+          fi
         fi
       fi
       sudo modprobe nvidia || {
@@ -2819,6 +2914,19 @@ _install_nvidia_on_node() {
     fi
     echo "✓ NVIDIA driver v${ver_check} running on ${gpu_ip}"
   fi
+
+  # ---- Phase C.5: persist nvidia kmod autoload across reboots -----------
+  # `modprobe nvidia` (Step 5) only loads the module for the CURRENT boot, and
+  # the only modules-load.d drop-in this installer writes (k0s.conf, in
+  # prepare_nodes_for_k0s) covers br_netfilter/overlay/nf_conntrack — NOT nvidia.
+  # Without this drop-in the GPU comes up with no nvidia kmod after a reboot,
+  # the CDI device nodes vanish, and nvidia-device-plugin crash-loops.
+  # Written unconditionally (idempotent) so it also repairs the
+  # "driver already installed" short-circuit path above and pre-provisioned nodes.
+  ssh_exec "${gpu_ip}" "
+    sudo mkdir -p /etc/modules-load.d
+    printf 'nvidia\nnvidia_uvm\nnvidia_modeset\n' | sudo tee /etc/modules-load.d/nvidia.conf >/dev/null
+  " || warn "Could not persist nvidia module autoload on ${gpu_ip} (/etc/modules-load.d/nvidia.conf)"
 
   # ---- Phase D: NVIDIA Container Toolkit install ------------------------
   # Short-circuit the repo reachability check if nvidia-ctk is already present.
