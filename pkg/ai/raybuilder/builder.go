@@ -38,8 +38,9 @@ import (
 type Builder struct {
 	ai *enterpriseApi.AIPlatform
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme               *runtime.Scheme
+	Recorder             record.EventRecorder
+	reconciledRayService *rayv1.RayService
 }
 
 type ApplicationParams struct {
@@ -213,6 +214,7 @@ func loadScaleConfig(envVar, defaultFile string) (ScaleConfig, error) {
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
 func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPlatform) error {
 	logger := log.FromContext(ctx) // Define logger
+	b.reconciledRayService = nil
 	rs, err := b.Build(ctx)
 	if err != nil {
 		logger.Error(err, "Failed to build RayService")
@@ -384,6 +386,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 				if err := b.Client.Create(ctx, rayService); err != nil {
 					return err
 				}
+				b.reconciledRayService = rayService.DeepCopy()
 				b.Recorder.Event(p, corev1.EventTypeNormal, "RayServiceCreated", "RayService resource created successfully")
 				return nil
 			}
@@ -395,7 +398,11 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 		current.Spec = rs.Spec
 		// now try update
 		controllerutil.SetOwnerReference(p, &current, b.Scheme)
-		return b.Client.Update(ctx, &current)
+		if err := b.Client.Update(ctx, &current); err != nil {
+			return err
+		}
+		b.reconciledRayService = current.DeepCopy()
+		return nil
 	})
 }
 

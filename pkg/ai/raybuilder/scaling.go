@@ -2,6 +2,7 @@ package raybuilder
 
 import (
 	"context"
+	"time"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	kuberayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
@@ -10,7 +11,10 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+const pendingClusterRequeueAfter = 5 * time.Second
 
 // ReconcileActiveClusterScale patches the ALREADY-RUNNING active RayCluster's worker-group
 // replica counts to match the just-reconciled RayService, when — and only when — the two
@@ -30,41 +34,45 @@ import (
 // This stage deliberately does NOT touch anything else: head group, pod templates, images,
 // scheduling, and autoscaling options are left untouched, and any non-replica spec change is
 // treated as a signal to back off and let KubeRay run its normal NewCluster rollout.
-func (b *Builder) ReconcileActiveClusterScale(ctx context.Context, p *enterpriseApi.AIPlatform) error {
+func (b *Builder) ReconcileActiveClusterScale(ctx context.Context, p *enterpriseApi.AIPlatform) (reconcile.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the API-server-stored RayService the reconciler just wrote so the desired
-	// sizing and non-replica comparison use the same defaulted representation as the
-	// live RayCluster.
-	var rayService rayv1.RayService
-	if err := b.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Name}, &rayService); err != nil {
-		if apierrors.IsNotFound(err) {
-			// RayService doesn't exist yet (e.g. first reconcile ordering); nothing to scale.
-			return nil
+	// Prefer the API-server response captured by ReconcileRayService. Reading through
+	// the controller-runtime client immediately after that write can return the old
+	// cached RayService and silently drop the new replica counts.
+	rayService := b.reconciledRayService
+	if rayService == nil {
+		// Fallback for direct callers that did not run ReconcileRayService first.
+		rayService = &rayv1.RayService{}
+		if err := b.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Name}, rayService); err != nil {
+			if apierrors.IsNotFound(err) {
+				// RayService doesn't exist yet (e.g. first reconcile ordering); nothing to scale.
+				return reconcile.Result{}, nil
+			}
+			return reconcile.Result{}, err
 		}
-		return err
 	}
 
 	activeName := rayService.Status.ActiveServiceStatus.RayClusterName
 	if activeName == "" {
 		// No active cluster yet — RayService hasn't reported one, or none exists.
-		return nil
+		return reconcile.Result{}, nil
 	}
 
 	// If KubeRay has started a zero-downtime rollout, leave both the active and pending
 	// clusters to KubeRay. The deployed KubeRay v1.2.2 does not publish the newer
 	// UpgradeInProgress condition, so the pending cluster is the compatible signal.
 	if rayService.Status.PendingServiceStatus.RayClusterName != "" {
-		return nil
+		return reconcile.Result{RequeueAfter: pendingClusterRequeueAfter}, nil
 	}
 
 	desiredSpec := rayService.Spec.RayClusterSpec
 	desiredHash, err := hashWithoutReplicas(desiredSpec)
 	if err != nil {
-		return err
+		return reconcile.Result{}, err
 	}
 
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var live rayv1.RayCluster
 		if err := b.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: activeName}, &live); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -106,6 +114,7 @@ func (b *Builder) ReconcileActiveClusterScale(ctx context.Context, p *enterprise
 		patch := client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
 		return b.Patch(ctx, &live, patch)
 	})
+	return reconcile.Result{}, err
 }
 
 // hashWithoutReplicas mirrors KubeRay's generateHashWithoutReplicasAndWorkersToDelete

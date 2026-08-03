@@ -3,6 +3,7 @@ package raybuilder
 import (
 	"context"
 	"testing"
+	"time"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
@@ -61,10 +62,14 @@ func activeClusterScaleTestBuilder(
 }
 
 func workerReplicas(t *testing.T, c client.Client, namespace string) int32 {
+	return workerReplicasForCluster(t, c, namespace, "active-cluster")
+}
+
+func workerReplicasForCluster(t *testing.T, c client.Client, namespace, name string) int32 {
 	t.Helper()
 	var cluster rayv1.RayCluster
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{
-		Name: "active-cluster", Namespace: namespace,
+		Name: name, Namespace: namespace,
 	}, &cluster))
 	require.NotNil(t, cluster.Spec.WorkerGroupSpecs[0].Replicas)
 	return *cluster.Spec.WorkerGroupSpecs[0].Replicas
@@ -76,7 +81,8 @@ func TestReconcileActiveClusterScale(t *testing.T) {
 			t, fixedWorkerSpec(2), fixedWorkerSpec(4), "",
 		)
 
-		require.NoError(t, builder.ReconcileActiveClusterScale(context.Background(), platform))
+		_, err := builder.ReconcileActiveClusterScale(context.Background(), platform)
+		require.NoError(t, err)
 		require.Equal(t, int32(4), workerReplicas(t, c, platform.Namespace))
 	})
 
@@ -87,16 +93,53 @@ func TestReconcileActiveClusterScale(t *testing.T) {
 		desired.WorkerGroupSpecs[0].RayStartParams = map[string]string{"num-cpus": "8"}
 		builder, c, platform := activeClusterScaleTestBuilder(t, live, desired, "")
 
-		require.NoError(t, builder.ReconcileActiveClusterScale(context.Background(), platform))
+		_, err := builder.ReconcileActiveClusterScale(context.Background(), platform)
+		require.NoError(t, err)
 		require.Equal(t, int32(2), workerReplicas(t, c, platform.Namespace))
 	})
 
-	t.Run("skips while a pending cluster exists", func(t *testing.T) {
+	t.Run("uses the post-write snapshot instead of stale cached sizing", func(t *testing.T) {
+		builder, c, platform := activeClusterScaleTestBuilder(
+			t, fixedWorkerSpec(2), fixedWorkerSpec(2), "",
+		)
+		builder.reconciledRayService = &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{RayClusterSpec: fixedWorkerSpec(4)},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{RayClusterName: "active-cluster"},
+			},
+		}
+
+		_, err := builder.ReconcileActiveClusterScale(context.Background(), platform)
+		require.NoError(t, err)
+		require.Equal(t, int32(4), workerReplicas(t, c, platform.Namespace))
+	})
+
+	t.Run("requeues while pending and scales the promoted cluster", func(t *testing.T) {
 		builder, c, platform := activeClusterScaleTestBuilder(
 			t, fixedWorkerSpec(2), fixedWorkerSpec(4), "pending-cluster",
 		)
+		pending := &rayv1.RayCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "pending-cluster", Namespace: platform.Namespace},
+			Spec:       fixedWorkerSpec(2),
+		}
+		require.NoError(t, c.Create(context.Background(), pending))
 
-		require.NoError(t, builder.ReconcileActiveClusterScale(context.Background(), platform))
+		result, err := builder.ReconcileActiveClusterScale(context.Background(), platform)
+		require.NoError(t, err)
+		require.Equal(t, 5*time.Second, result.RequeueAfter)
+		require.Equal(t, int32(2), workerReplicas(t, c, platform.Namespace))
+		require.Equal(t, int32(2), workerReplicasForCluster(t, c, platform.Namespace, "pending-cluster"))
+
+		builder.reconciledRayService = &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{RayClusterSpec: fixedWorkerSpec(4)},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{RayClusterName: "pending-cluster"},
+			},
+		}
+		result, err = builder.ReconcileActiveClusterScale(context.Background(), platform)
+		require.NoError(t, err)
+		require.Zero(t, result.RequeueAfter)
+		require.Equal(t, int32(4), workerReplicasForCluster(t, c, platform.Namespace, "pending-cluster"))
 		require.Equal(t, int32(2), workerReplicas(t, c, platform.Namespace))
 	})
 }

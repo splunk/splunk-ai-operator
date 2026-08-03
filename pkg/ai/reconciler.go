@@ -58,6 +58,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	}()
 	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
 	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
+	var scaleResult reconcile.Result
 
 	stages := []struct {
 		name string
@@ -70,7 +71,11 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		{"Sidecars", sidecarBuilder.Reconcile},
 		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
 		{"RayService", raybuilder.ReconcileRayService},
-		{"ActiveClusterScale", raybuilder.ReconcileActiveClusterScale},
+		{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
+			var err error
+			scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
+			return err
+		}},
 		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
 		{"Ingress", r.ReconcileIngress},
 		// collect status of each stage
@@ -113,7 +118,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		LastTransitionTime: metav1.Now(),
 	})
 
-	return reconcile.Result{}, nil
+	return scaleResult, nil
 }
 
 // ReconcileFeatures ensures each feature's AIService exists and is up to date.
