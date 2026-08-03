@@ -102,6 +102,12 @@ func TestReconcileRayService_GlobalScaleFactor(t *testing.T) {
 	ctx := context.Background()
 	builder := New(platform, fakeClient, s, recorder)
 	require.NoError(t, builder.ReconcileRayService(ctx, platform))
+	require.NotNil(t, builder.reconciledRayService)
+
+	var createdRayService rayv1.RayService
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-platform"}, &createdRayService))
+	require.Equal(t, createdRayService.ResourceVersion, builder.reconciledRayService.ResourceVersion)
+	require.Equal(t, createdRayService.Spec.ServeConfigV2, builder.reconciledRayService.Spec.ServeConfigV2)
 
 	var cm corev1.ConfigMap
 	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-platform-serve-config"}, &cm))
@@ -110,6 +116,18 @@ func TestReconcileRayService_GlobalScaleFactor(t *testing.T) {
 	// ModelA base 1 * scaleFactor 3 => 3; ModelB base 2 * 3 => 6.
 	require.Contains(t, rendered, "modelA_replicas: 3")
 	require.Contains(t, rendered, "modelB_replicas: 6")
+
+	createSnapshot := builder.reconciledRayService
+	platform.Spec.ScaleFactor = int32PtrForTest(2)
+	require.NoError(t, builder.ReconcileRayService(ctx, platform))
+	require.NotNil(t, builder.reconciledRayService)
+	require.NotSame(t, createSnapshot, builder.reconciledRayService)
+
+	var updatedRayService rayv1.RayService
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-platform"}, &updatedRayService))
+	require.Equal(t, updatedRayService.ResourceVersion, builder.reconciledRayService.ResourceVersion)
+	require.Equal(t, updatedRayService.Spec.ServeConfigV2, builder.reconciledRayService.Spec.ServeConfigV2)
+	require.NotEqual(t, createdRayService.Spec, updatedRayService.Spec)
 }
 
 // TestBuildClusterConfig_GlobalScaleFactor asserts each GPU worker tier's
