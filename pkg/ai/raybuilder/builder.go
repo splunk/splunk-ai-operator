@@ -746,14 +746,15 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		},
 		HeadService: &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        b.ai.Name + "-head-svc",
-				Namespace:   b.ai.Namespace,
 				Annotations: annotations,
 				Labels:      labels,
 			},
 		},
 		Template: b.makeHeadTemplate(),
 	}
+	// Leave the custom head Service unnamed so KubeRay assigns the generated
+	// RayCluster-specific name. Setting a name here would make active and pending
+	// RayClusters contend with the stable RayService head Service.
 
 	head.Template.ObjectMeta.Annotations = annotations
 	head.Template.ObjectMeta.Labels = labels
@@ -1002,7 +1003,6 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec {
 	defaultEnv := []corev1.EnvVar{
 		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
-		{Name: "RAY_HEAD_SERVICE_HOST", Value: fmt.Sprintf("%s.%s.svc.%s", b.ai.Name+"-head-svc", b.ai.Namespace, os.Getenv("CLUSTER_DOMAIN"))},
 		{Name: "SERVICE_NAME", Value: b.ai.Name},
 		{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
 		{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
@@ -1033,7 +1033,8 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
 	rayCommand := fmt.Sprintf(`echo %s worker;
         ulimit -n 65536;
-    	export PATH="/home/ray/anaconda3/bin:$PATH";
+        export PATH="/home/ray/anaconda3/bin:$PATH";
+        export RAY_HEAD_SERVICE_HOST="${FQ_RAY_IP}";
         KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
         $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
