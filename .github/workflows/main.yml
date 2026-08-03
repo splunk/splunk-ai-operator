@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - ai-tier-ga
   push:
     branches:
       - main
