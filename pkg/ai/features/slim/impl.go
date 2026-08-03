@@ -542,10 +542,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		"prometheus.io/scheme":                   "http",
 		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
 
@@ -656,13 +653,7 @@ func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AISe
 	for k, v := range ai.Labels {
 		labels[k] = v
 	}
-	annotations := map[string]string{}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
-		annotations[k] = v
-	}
+	annotations := common.FilterPropagatedAnnotations(ai.Annotations)
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{

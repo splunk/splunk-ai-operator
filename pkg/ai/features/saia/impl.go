@@ -959,10 +959,7 @@ func saiaLabelsAndAnnotations(ai *aiv1.AIService, component string) (map[string]
 		"prometheus.io/path":   "/metrics",
 		"prometheus.io/scheme": "http",
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
 	return labels, annotations
@@ -1051,15 +1048,12 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	issuersVal := buildSplunkIssuersVal(ai)
 	issuersChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 	annotations := map[string]string{
-		"prometheus.io/port":                  "8088",
-		"prometheus.io/path":                  "/metrics",
-		"prometheus.io/scheme":                "http",
+		"prometheus.io/port":                     "8088",
+		"prometheus.io/path":                     "/metrics",
+		"prometheus.io/scheme":                   "http",
 		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
 
@@ -1731,13 +1725,7 @@ func (r *SaiaReconciler) reconcileSAIAService(
 	for k, v := range ai.Labels {
 		svc.ObjectMeta.Labels[k] = v
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" {
-			continue
-		} // Ignore last-applied-configuration annotation
-		if k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		} // Ignore restartedAt annotation
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		svc.ObjectMeta.Annotations[k] = v
 	}
 
