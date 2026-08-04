@@ -746,6 +746,7 @@ func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 		"operator.splunk.com/example":                      "v1",
 		"kubectl.kubernetes.io/restartedAt":                "should-be-skipped",
 		"kubectl.kubernetes.io/last-applied-configuration": "should-be-skipped",
+		"script-reconcile-ts":                              "should-be-skipped",
 	}
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
@@ -763,6 +764,7 @@ func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 	assert.Equal(t, "v1", svc.Annotations["operator.splunk.com/example"])
 	assert.NotContains(t, svc.Annotations, "kubectl.kubernetes.io/restartedAt")
 	assert.NotContains(t, svc.Annotations, "kubectl.kubernetes.io/last-applied-configuration")
+	assert.NotContains(t, svc.Annotations, "script-reconcile-ts")
 }
 
 func Test_reconcileSAIAv1Service(t *testing.T) {

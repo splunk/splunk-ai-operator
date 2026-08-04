@@ -172,7 +172,7 @@ func New(ai *enterpriseApi.AIPlatform, client client.Client, scheme *runtime.Sch
 	}
 }
 
-// effectiveAcceleratorType returns spec.defaultAcceleratorType or L40S when unset, matching instance.yaml keys (L40S, H100_NVL).
+// effectiveAcceleratorType returns spec.defaultAcceleratorType or L40S when unset, matching instance.yaml keys.
 func (b *Builder) effectiveAcceleratorType() string {
 	if s := strings.TrimSpace(b.ai.Spec.DefaultAcceleratorType); s != "" {
 		return s
@@ -800,7 +800,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	var workers []rayv1.WorkerGroupSpec
 	gpuConfigs := instanceMap[acceleratorType]
 	if len(gpuConfigs) == 0 {
-		return nil, fmt.Errorf("instance.yaml has no worker tiers for defaultAcceleratorType %q; keys must match exactly (e.g. L40S, H100_NVL)", acceleratorType)
+		return nil, fmt.Errorf("instance.yaml has no worker tiers for defaultAcceleratorType %q; keys must match exactly (e.g. L40S, H100)", acceleratorType)
 	}
 	for _, cfg := range gpuConfigs {
 		annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
