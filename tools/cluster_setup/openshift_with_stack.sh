@@ -2207,6 +2207,19 @@ EOF
   log "    Use this URL in Splunk AI setup: http://${route_host}"
 }
 
+# Return the model-artifact manifest used by an accelerator. RTX Pro 6000
+# Blackwell uses the same quantized model set as H100 (see
+# download_from_huggingface.sh). Keep this selection in one place so
+# pre-staging and post-upload verification cannot drift apart.
+model_artifacts_config_name() {
+  local accel
+  accel=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "${accel}" in
+    h100|rtx_pro_6000_blackwell) echo "model_artifacts_configs_h100.yaml" ;;
+    *)                           echo "model_artifacts_configs.yaml" ;;
+  esac
+}
+
 # ====== ALL MODELS STAGED PRE-CHECK ======
 # all_models_staged <staging_dir> <accel>
 # Checks whether every artifact already has a staging_complete marker with matching hf_url.
@@ -2215,12 +2228,7 @@ EOF
 all_models_staged() {
   local staging_dir="$1"
   local accel="$2"
-  local config_file
-
-  case "${accel}" in
-    h100) config_file="${staging_dir}/model_artifacts_configs_h100.yaml" ;;
-    *)    config_file="${staging_dir}/model_artifacts_configs.yaml" ;;
-  esac
+  local config_file="${staging_dir}/$(model_artifacts_config_name "${accel}")"
 
   if [[ ! -f "${config_file}" ]]; then
     warn "all_models_staged: config file not found: ${config_file} — skipping pre-check."
