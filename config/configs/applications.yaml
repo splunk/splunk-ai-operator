@@ -113,7 +113,7 @@ applications:
         model_id: gemma4_31b_it
         model_loader:
           blob_storage:
-            blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
+            blob_prefix: model_artifacts/gemma-4-31b-it{{if eq .AcceleratorType "L40S"}}{{else}}-qat-w4a16-ct{{end}}
       tokenizer_definition:
         model_id: gemma4_31b_it
         model_loader:
@@ -124,7 +124,7 @@ applications:
               - processor_config.json
               - tokenizer_config.json
               - tokenizer.json
-            blob_prefix: model_artifacts/gemma-4-31b-it-qat-w4a16-ct
+            blob_prefix: model_artifacts/gemma-4-31b-it{{if eq .AcceleratorType "L40S"}}{{else}}-qat-w4a16-ct{{end}}
     name: Gemma431bIt
     deployments:
       - name: LLMDeployment{{.AcceleratorType}}
