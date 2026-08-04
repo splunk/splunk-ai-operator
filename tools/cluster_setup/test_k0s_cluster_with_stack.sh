@@ -86,6 +86,7 @@ _load_functions() {
   # Extract _POD_FS assignment (single line, not a function)
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
 
+  eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
@@ -185,6 +186,26 @@ assert_rc "detects changeme (lowercase)" 0 \
 
 assert_rc "accepts real credentials (returns 1)" 1 \
   bash -c "$(declare -f object_store_auth_looks_like_placeholder); MINIO_ROOT_USER='admin' MINIO_ROOT_PASSWORD='s3cr3t!' object_store_auth_looks_like_placeholder"
+
+# ── Tests: model artifact config selection ───────────────────────────────────
+
+suite "model artifact config selection"
+echo "▶ model_artifacts_config_name"
+
+assert_eq "L40S uses the default artifact manifest" \
+  "model_artifacts_configs.yaml" "$(model_artifacts_config_name l40s)"
+
+assert_eq "H100 uses the H100 artifact manifest" \
+  "model_artifacts_configs_h100.yaml" "$(model_artifacts_config_name h100)"
+
+assert_eq "RTX Pro 6000 uses the H100 artifact manifest" \
+  "model_artifacts_configs_h100.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
+
+assert_eq "pre-staging check uses the shared artifact-manifest selector" \
+  "1" "$(grep -c 'config_file=.*model_artifacts_config_name.*accel' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "post-upload verification uses the shared artifact-manifest selector" \
+  "1" "$(grep -c '_config_for_verify=.*model_artifacts_config_name.*_accel' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: _pod_is_healthy ─────────────────────────────────────────────────────
 
@@ -507,6 +528,19 @@ assert_eq "python update script writes /etc/k0s/k0s.yaml" \
 assert_eq "verify step uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'grep.*api.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
 
+# ── Tests: k0s advertised API address ────────────────────────────────────────
+
+suite "k0s advertised API address"
+
+assert_eq "optional external API address is loaded from config" \
+  "1" "$(grep -c 'K0S_API_EXTERNAL_ADDRESS=.*cluster.apiExternalAddress' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "configured external API address is included in certificate SANs" \
+  "1" "$(grep -c '_configured_external_addr not in.*sans' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "configured external API address takes precedence over the private address" \
+  "1" "$(grep -c '_external_addr = _configured_external_addr or _internal_addr' "${SCRIPT}" | tr -d '[:space:]')"
+
 # ── Tests: kine compaction ─────────────────────────────────────────────────────
 # Verify that the generated k0s config passes --compact-interval to kine via
 # extraArgs (the only valid path — KineConfig has no compactInterval field).
@@ -620,7 +654,7 @@ assert_eq "runtime repair does not kill container shims or remove the containerd
   "0" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'pkill.*containerd-shim|rm -f /run/k0s/containerd\\.sock')"
 
 assert_eq "unhealthy runtime uses a checked k0sworker restart" \
-  "2" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'systemctl restart k0sworker|systemctl is-active --quiet k0sworker')"
+  "3" "$(printf '%s\n' "${NVIDIA_INSTALL_FN}" | grep -Ec 'systemctl restart k0sworker|systemctl is-active --quiet k0sworker')"
 
 suite "fix: LAST_LAUNCHED_SUBNET subshell (k0s_aws_provision.sh)"
 
@@ -742,6 +776,61 @@ _clean_all_propagates_aggressive_failure() (
 
 assert_rc "clean-all returns failure when aggressive node cleanup failed" \
   "1" _clean_all_propagates_aggressive_failure
+
+# ── Tests: Blackwell NVIDIA open-module switch ───────────────────────────────
+# A package change alone does not replace a proprietary NVIDIA module already
+# loaded in the running kernel. Verify the installer selects the RHEL 9 open
+# stream and explicitly replaces/validates the resident module on reruns.
+
+suite "Blackwell NVIDIA open-module switch"
+
+assert_eq "RHEL 9 enables the open-dkms module stream" \
+  "1" "$(grep -c 'module enable nvidia-driver:open-dkms' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "does not directly install the open-dkms stream" \
+  "0" "$(grep -c 'dnf module install -y nvidia-driver:open-dkms' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "marks Blackwell as requiring the open module" \
+  "1" "$(grep -c 'REQUIRE_OPEN_MODULE=1' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "refreshes module metadata before checking the installed license" \
+  "1" "$(awk '/depmod -a.*KREL/{depmod=NR} /ON_DISK_LICENSE=.*modinfo/{license=NR; exit} END{print(depmod > 0 && depmod < license)}' "${SCRIPT}")"
+
+assert_eq "stops k0sworker before replacing a loaded GPU module" \
+  "1" "$(awk '/Replacing the currently loaded NVIDIA module/{found=1} found && /systemctl stop k0sworker/{count++} found && /sudo modprobe nvidia \|\|/{print count; exit}' "${SCRIPT}")"
+
+assert_eq "unloads the NVIDIA dependency stack in order" \
+  "1" "$(grep -c 'for _mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia_peermem nvidia' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "removes each loaded NVIDIA module" \
+  "1" "$(grep -c 'modprobe -r.*_mod' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "validates the running open-module banner after modprobe" \
+  "1" "$(grep -c 'cat /proc/driver/nvidia/version' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "does not rely on the optional sysfs module-license file" \
+  "0" "$(grep -c 'cat /sys/module/nvidia/license' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "gives a reboot-and-rerun recovery when the old module is busy" \
+  "1" "$(grep -c 'Reboot this GPU node once, then re-run the same install command' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "DKMS version parsing cannot abort its fallback under pipefail" \
+  "2" "$(grep -c '_nv_ver=.*head -1 || true' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "recovers DKMS entries stuck in added state (reused from ai-tier-ga)" \
+  "1" "$(grep -c 'DKMS_OUT.*grep -qE.*added' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "rechecks DKMS after the explicit added-state build" \
+  "1" "$(grep -c 'DKMS (after explicit build)' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "recognizes the Blackwell GSP WPR2 reset signature" \
+  "1" "$(grep -c 'grep -qiE.*unexpected WPR2 already up' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "allows only one automatic NVIDIA recovery reboot" \
+  "1" "$(grep -c 'recovery_reboots < 1' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "waits for the node to return after the recovery reboot" \
+  "1" "$(grep -c 'did not return after the NVIDIA recovery reboot' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
