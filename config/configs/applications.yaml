@@ -48,24 +48,18 @@ applications:
           gpu_type_options_override:
             H100:
               autoscaling_config:
-                max_replicas: 1
-                min_replicas: 1
                 target_ongoing_requests: 6
               max_ongoing_requests: 8
               ray_actor_options:
                 num_gpus: 1
             L40S:
               autoscaling_config:
-                max_replicas: 1
-                min_replicas: 1
                 target_ongoing_requests: 4
               max_ongoing_requests: 6
               ray_actor_options:
                 num_gpus: 2
             RTX_PRO_6000_BLACKWELL:
               autoscaling_config:
-                max_replicas: 1
-                min_replicas: 1
                 target_ongoing_requests: 4
               max_ongoing_requests: 10
               ray_actor_options:
@@ -133,13 +127,9 @@ applications:
     deployments:
       - name: LLMDeployment{{.AcceleratorType}}
         autoscaling_config:
-          downscale_delay_s: 1800
           max_replicas: {{.Replicas.Gemma431bIt}}
           min_replicas: {{.Replicas.Gemma431bIt}}
-          target_ongoing_requests: {{acceleratorValue .AcceleratorType 6 4 4}}
-          upscale_delay_s: 10
-      - name: TextGenModelDeployment
-        max_ongoing_requests: {{textGenDriverRequestLimit (acceleratorValue .AcceleratorType 8 6 10) .Replicas.Gemma431bIt 20}}
+          target_ongoing_requests: {{if eq .AcceleratorType "H100"}}6{{else}}4{{end}}
     import_path: main:create_serve_app
     route_prefix: /gemma4_31b_it
     runtime_env:
@@ -202,8 +192,6 @@ applications:
                 num_gpus: 1
             RTX_PRO_6000_BLACKWELL:
               autoscaling_config:
-                max_replicas: 1
-                min_replicas: 1
                 target_ongoing_requests: 4
               max_ongoing_requests: 8
               ray_actor_options:
@@ -257,13 +245,9 @@ applications:
     deployments:
       - name: LLMDeployment{{.AcceleratorType}}
         autoscaling_config:
-          downscale_delay_s: 1800
           max_replicas: {{.Replicas.GptOss20b}}
           min_replicas: {{.Replicas.GptOss20b}}
-          target_ongoing_requests: {{acceleratorValue .AcceleratorType 20 20 4}}
-          upscale_delay_s: 10
-      - name: TextGenModelDeployment
-        max_ongoing_requests: {{textGenDriverRequestLimit (acceleratorValue .AcceleratorType 30 30 8) .Replicas.GptOss20b 20}}
+          target_ongoing_requests: {{if eq .AcceleratorType "RTX_PRO_6000_BLACKWELL"}}4{{else}}20{{end}}
     import_path: main:create_serve_app
     route_prefix: /gpt_oss_20b
     runtime_env:
@@ -355,7 +339,6 @@ applications:
           max_replicas: {{.Replicas.UaeLarge}}
           min_replicas: {{.Replicas.UaeLarge}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /uae_large
     runtime_env:
@@ -436,7 +419,6 @@ applications:
           max_replicas: {{.Replicas.AllMinilmL6V2}}
           min_replicas: {{.Replicas.AllMinilmL6V2}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /all_minilm_l6_v2
     runtime_env:
@@ -514,7 +496,6 @@ applications:
           max_replicas: {{.Replicas.BiEncoder}}
           min_replicas: {{.Replicas.BiEncoder}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /bi_encoder
     runtime_env:
@@ -583,7 +564,6 @@ applications:
           max_replicas: {{.Replicas.MbartTranslator}}
           min_replicas: {{.Replicas.MbartTranslator}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /mbart_translator
     runtime_env:
@@ -670,7 +650,6 @@ applications:
           max_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
           min_replicas: {{.Replicas.XlmRobertaLanguageClassifier}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /xlm_roberta_language_classifier
     runtime_env:
@@ -723,7 +702,6 @@ applications:
           max_replicas: {{.Replicas.PromptInjectionTfidf}}
           min_replicas: {{.Replicas.PromptInjectionTfidf}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_tfidf
     runtime_env:
@@ -813,7 +791,6 @@ applications:
           max_replicas: {{.Replicas.FmTimeseries}}
           min_replicas: {{.Replicas.FmTimeseries}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /fm_timeseries
     runtime_env:
@@ -899,7 +876,6 @@ applications:
           max_replicas: {{.Replicas.CrossEncoder}}
           min_replicas: {{.Replicas.CrossEncoder}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /cross_encoder
     runtime_env:
@@ -986,7 +962,6 @@ applications:
           max_replicas: {{.Replicas.E5LanguageClassifier}}
           min_replicas: {{.Replicas.E5LanguageClassifier}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /e5_language_classifier
     runtime_env:
@@ -1060,7 +1035,6 @@ applications:
           max_replicas: {{.Replicas.PromptInjectionCrossEncoder}}
           min_replicas: {{.Replicas.PromptInjectionCrossEncoder}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_cross_encoder
     runtime_env:
@@ -1119,7 +1093,6 @@ applications:
           max_replicas: {{.Replicas.PromptInjectionClassifier}}
           min_replicas: {{.Replicas.PromptInjectionClassifier}}
           target_ongoing_requests: 10
-          upscale_delay_s: 10
     import_path: main:create_serve_app
     route_prefix: /prompt_injection_classifier
     runtime_env:
