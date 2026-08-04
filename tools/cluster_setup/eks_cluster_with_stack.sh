@@ -115,6 +115,21 @@ load_config() {
     STANDALONE_SA="$(yq eval '.splunkStandalone.serviceAccount' "$cfg")"
     SPLUNK_APP_LOCAL_PATH="$(yq eval '.splunkStandalone.localAppPath' "$cfg")"
 
+    # Splunk telemetry mode (AIP-4614). Mirrors k0s/OpenShift: splunk.enabled
+    # gates whether any in-cluster Splunk is installed at all; splunk.external.*
+    # switches to a customer-managed Splunk instead of the in-cluster Standalone.
+    SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "$cfg" 2>/dev/null || echo "null")"
+    [[ "${SPLUNK_ENABLED}" != "true" ]] && SPLUNK_ENABLED="false"
+
+    SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "$cfg" 2>/dev/null || echo "")"
+    [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
+    SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "$cfg" 2>/dev/null || echo "splunk-hec-external")"
+    [[ -z "${SPLUNK_EXTERNAL_SECRET_NAME}" || "${SPLUNK_EXTERNAL_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
+    SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+
+    SPLUNK_EXTERNAL_CA_SECRET_NAME="$(yq eval '.splunk.external.caCertSecretName // ""' "$cfg" 2>/dev/null || echo "")"
+    [[ "${SPLUNK_EXTERNAL_CA_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_CA_SECRET_NAME=""
+
     # Files
     SPLUNK_OPERATOR_FILE="$(yq eval '.files.splunkOperatorManifest' "$cfg")"
     SPLUNK_AI_FILE="$(yq eval '.files.splunkAiOperatorManifest' "$cfg")"
@@ -181,6 +196,11 @@ load_config() {
     AI_NS="$(grep 'namespace:' "$cfg" | grep -A2 'aiPlatform:' | tail -1 | sed 's/.*namespace: *"\(.*\)".*/\1/')"
     AI_PLATFORM_NAME="splunk-ai-stack"
     AI_STANDALONE_NAME="splunk-standalone"
+    SPLUNK_ENABLED="false"
+    SPLUNK_EXTERNAL_ENDPOINT=""
+    SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
+    SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+    SPLUNK_EXTERNAL_CA_SECRET_NAME=""
     STORAGE_CLASS="gp3"
     VECTORDB_SIZE="50Gi"
     RAY_HEAD_SA="ray-head-sa"
@@ -227,6 +247,20 @@ load_config() {
     # Hardcoded subnets for fallback
     PRIVATE_SUBNETS=("subnet-0f4af6d2f36fbe73f" "subnet-024d4edaabe647586")
     PUBLIC_SUBNETS=("subnet-0439b4f08a984ae52" "subnet-06aef8e454c0e5542" "subnet-0a183703673334cb4")
+  fi
+
+  # Derive a single Splunk telemetry mode so downstream logic is unambiguous:
+  #   disabled  — splunk.enabled=false: no Splunk, no telemetry
+  #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
+  #               in-cluster Splunk, use customer's external HEC
+  #   internal  — splunk.enabled=true, no external endpoint: install the
+  #               Splunk Operator + Standalone in-cluster (legacy behavior)
+  if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
+    SPLUNK_MODE="disabled"
+  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+    SPLUNK_MODE="external"
+  else
+    SPLUNK_MODE="internal"
   fi
 
   # Derived values
@@ -293,8 +327,10 @@ validate_image_config() {
     err "REQUIRED: images.operator.image must be specified in cluster-config.yaml"
   fi
 
-  if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.splunk.image must be specified in cluster-config.yaml"
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.splunk.image must be specified in cluster-config.yaml when splunk.enabled is true (internal mode)"
+    fi
   fi
 
   if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
@@ -1430,6 +1466,163 @@ install_cert_manager() {
   check_ready cert-manager "app.kubernetes.io/instance=cert-manager,app.kubernetes.io/component=controller"
 }
 
+wait_for_cert_manager_webhook() {
+  local max_attempts="${1:-30}"
+  local sleep_interval="${2:-10}"
+
+  log "Verifying cert-manager webhook is responsive..."
+
+  if ! kubectl get namespace cert-manager &>/dev/null; then
+    warn "cert-manager namespace not found, skipping webhook check"
+    return 0
+  fi
+
+  kubectl wait --for=condition=ready pod \
+    -l app.kubernetes.io/component=webhook \
+    -n cert-manager --timeout=120s 2>/dev/null \
+    || warn "cert-manager webhook pod may not be fully ready"
+
+  local attempt=0
+  while (( attempt < max_attempts )); do
+    local webhook_ip
+    webhook_ip=$(kubectl -n cert-manager get endpoints cert-manager-webhook \
+      -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || echo "")
+
+    if [[ -n "${webhook_ip}" ]]; then
+      log "cert-manager webhook endpoint: ${webhook_ip}"
+      break
+    fi
+
+    log "  Waiting for cert-manager webhook endpoint... (${attempt}/${max_attempts})"
+    sleep "${sleep_interval}"
+    attempt=$((attempt + 1))
+  done
+
+  if (( attempt >= max_attempts )); then
+    warn "cert-manager webhook endpoint not found after ${max_attempts} attempts"
+    return 1
+  fi
+
+  local test_ok=false
+  for i in $(seq 1 "${max_attempts}"); do
+    if kubectl apply -f - <<'TESTEOF' 2>/dev/null
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: cert-manager-webhook-test
+  namespace: cert-manager
+spec:
+  selfSigned: {}
+TESTEOF
+    then
+      kubectl delete issuer cert-manager-webhook-test -n cert-manager \
+        --ignore-not-found=true 2>/dev/null || true
+      test_ok=true
+      log "✓ cert-manager webhook is responsive"
+      break
+    fi
+    log "  cert-manager webhook not yet accepting requests... (${i}/${max_attempts})"
+    sleep "${sleep_interval}"
+  done
+
+  if [[ "${test_ok}" != "true" ]]; then
+    warn "cert-manager webhook did not become responsive after ${max_attempts} attempts"
+    return 1
+  fi
+
+  return 0
+}
+
+# AIP-4614: Provision the Splunk server TLS cert via cert-manager before the
+# Standalone CR is applied, so the cert volume/secret already exists when
+# install_splunk_standalone mounts it.
+provision_splunk_cert() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk cert provisioning (no in-cluster Splunk)"
+    return 0
+  fi
+
+  log "Provisioning Splunk server TLS cert (service DNS SANs) via cert-manager..."
+
+  ensure_namespace "${AI_NS}"
+  wait_for_cert_manager_webhook 30 10
+
+  # Service names the Splunk Operator actually creates for a Standalone CR
+  # (GetSplunkServiceName in the vendored operator: "splunk-%s-%s-%s" with
+  # instanceType=standalone, suffix=service|headless).
+  local svc="splunk-${AI_STANDALONE_NAME}-standalone-service"
+  local headless="splunk-${AI_STANDALONE_NAME}-standalone-headless"
+
+  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-ca
+spec:
+  isCA: true
+  commonName: ai-splunk-ca
+  secretName: ai-splunk-ca-tls
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ai-splunk-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-ca-issuer
+spec:
+  ca:
+    secretName: ai-splunk-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-server
+spec:
+  secretName: ai-splunk-server-tls
+  duration: 2160h      # 90d leaf lifetime — pinned explicitly (Part G.1)
+  renewBefore: 720h    # reissue 30d before expiry
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: ai-splunk-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  dnsNames:
+    - ${svc}
+    - ${svc}.${AI_NS}
+    - ${svc}.${AI_NS}.svc
+    - ${svc}.${AI_NS}.svc.cluster.local
+    - ${headless}
+    - ${headless}.${AI_NS}
+    - ${headless}.${AI_NS}.svc
+    - ${headless}.${AI_NS}.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+  additionalOutputFormats:
+    - type: CombinedPEM
+YAML
+
+  log "Waiting for Splunk server certificate to be Ready..."
+  kubectl wait --for=condition=Ready certificate/ai-splunk-server -n "${AI_NS}" --timeout=180s \
+    || warn "ai-splunk-server certificate not Ready after 180s; Splunk Standalone install may stall once the cert volume is wired in"
+
+  log "Splunk server certificate provisioned (secret: ai-splunk-server-tls, CA: ai-splunk-ca-tls)"
+}
+
 # ---------- AWS Load Balancer Controller (LBC) ----------
 # LBC watches Services with the "aws-load-balancer-type: external" annotation
 # (the in-tree cloud controller skips those Services on purpose) and drives
@@ -1675,6 +1868,10 @@ install_ray_operator() {
 
 # ---------- Splunk Operator(s) ----------
 install_splunk_operator() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Operator install (no in-cluster Splunk)"
+    return 0
+  fi
   log "Installing Splunk Operator (cluster-scope manifest in CWD)..."
   need_file "${SPLUNK_OPERATOR_FILE}"
   kubectl apply -f "${SPLUNK_OPERATOR_FILE}" --server-side --force-conflicts
@@ -2010,6 +2207,11 @@ resolve_aws_creds_for_secret() {
 }
 
 install_splunk_standalone() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Standalone install (no in-cluster Splunk)"
+    return 0
+  fi
+
   log "Creating/ensuring Splunk Standalone (${AI_STANDALONE_NAME}) in ${AI_NS}"
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
@@ -2044,7 +2246,17 @@ install_splunk_standalone() {
     fi
   fi
 
-  cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
+  # issuer_uri becomes the "iss" claim on every interactive JWT Splunk mints.
+  # It MUST byte-for-byte match splunkConfiguration.endpoint in the AIPlatform
+  # CR (which feeds SPLUNK_ISSUERS on saia/slim) or CMP auth rejects every
+  # token with "Issuer '<iss>' is not allowed".
+  #
+  # server/web conf stanzas point splunkd, KV Store (inherits [sslConfig]) and
+  # Splunk Web at the AIP-4614 cert-manager cert provisioned by
+  # provision_splunk_cert() (mounted at /mnt/splunk-certs — see the Standalone
+  # CR volumes below). sslRootCAPath keeps KV Store trusting the same CA the
+  # leaf chains to.
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -2053,14 +2265,31 @@ data:
   default.yml: |
     splunk:
       conf:
+        - key: server
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              sslConfig:
+                serverCert: /mnt/splunk-certs/tls-combined.pem
+                sslRootCAPath: /mnt/splunk-certs/ca.crt
+                sslPassword: ""
+        - key: web
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              settings:
+                enableSplunkWebSSL: true
+                serverCert: /mnt/splunk-certs/tls-combined.pem
+                privKeyPath: /mnt/splunk-certs/tls-combined.pem
+                caCertPath: /mnt/splunk-certs/ca.crt
         - key: authentication
           value:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
-                certFile: $SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
+                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+                certFile: /mnt/splunk-certs/tls-combined.pem
+                sslPassword: ""
 YAML
 
   # Standalone app repo: external S3-compatible when objectStore.type is s3compat/minio/seaweedfs, else S3
@@ -2082,6 +2311,9 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-certs
+      secret:
+        secretName: ai-splunk-server-tls
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appInstallPeriodSeconds: 90
@@ -2119,6 +2351,9 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-certs
+      secret:
+        secretName: ai-splunk-server-tls
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appInstallPeriodSeconds: 90
@@ -2662,10 +2897,10 @@ check_aiplatform_status() {
 
 install_ai_platform_cr() {
   local secret_name="${1:-}"
-  if [[ -z "$secret_name" ]]; then
+  if [[ "${SPLUNK_MODE}" == "internal" && -z "$secret_name" ]]; then
     secret_name="$(find_splunk_standalone_secret_name "${AI_NS}" "${AI_STANDALONE_NAME}")"
   fi
-  log "Installing AIPlatform CR (${AI_PLATFORM_NAME}) in ${AI_NS} using secretRef.name=${secret_name}"
+  log "Installing AIPlatform CR (${AI_PLATFORM_NAME}) in ${AI_NS}, Splunk mode=${SPLUNK_MODE}"
   ensure_namespace "${AI_NS}"
 
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
@@ -2728,6 +2963,107 @@ YAML
     fi
   fi
 
+  # Build trustedIssuers YAML fragment from config (splunk.trustedIssuers[]).
+  # Used in all modes: appended to in-cluster issuer (internal) or sole source (external/disabled).
+  local trusted_issuers_yaml=""
+  local trusted_issuers_count
+  trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${trusted_issuers_count}" -gt 0 ]]; then
+    trusted_issuers_yaml="    trustedIssuers:"$'\n'
+    local _ti=0
+    while [[ $_ti -lt $trusted_issuers_count ]]; do
+      local _url
+      _url=$(yq eval ".splunk.trustedIssuers[$_ti]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      [[ -n "${_url}" && "${_url}" != "null" ]] && trusted_issuers_yaml+="      - \"${_url}\""$'\n'
+      _ti=$((_ti + 1))
+    done
+  fi
+
+  # Splunk telemetry block for the AIPlatform CR. Rendered by mode:
+  #   disabled — omits telemetry fields; trustedIssuers still written if set.
+  #   internal — point at the in-cluster Standalone HEC + operator-managed secret.
+  #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
+  #              var and point at the customer's external HEC endpoint.
+  local splunk_config_yaml=""
+  case "${SPLUNK_MODE}" in
+    internal)
+      log "Using Splunk secret: ${secret_name}"
+      splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (internal — in-cluster Standalone)
+  # Scheme+host here MUST byte-for-byte match the oauth2_settings.issuer_uri
+  # set in the splunk-defaults ConfigMap above (install_splunk_standalone) —
+  # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
+  splunkConfiguration:
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    secretRef:
+      name: ${secret_name}
+      namespace: ${AI_NS}
+    # CA that signed the Standalone's server cert (provision_splunk_cert) — lets
+    # SAIA/SLIM validate the hostname-correct leaf cert instead of skipping TLS
+    # verification (AIP-4614 Part C).
+    caCertRef:
+      name: ai-splunk-server-tls
+      namespace: ${AI_NS}
+      key: ca.crt
+${trusted_issuers_yaml}
+EOF
+)
+      ;;
+    external)
+      ensure_namespace "${AI_NS}"
+      if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
+        err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
+      fi
+      log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
+      kubectl -n "${AI_NS}" create secret generic "${SPLUNK_EXTERNAL_SECRET_NAME}" \
+        --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
+        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+      log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
+      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
+      # Only emitted when the customer set splunk.external.caCertSecretName —
+      # a Secret they pre-create themselves. Left unset, SAIA falls back to
+      # its image's system trust store, which is correct whenever the
+      # external Splunk's cert is publicly trusted.
+      local external_ca_cert_yaml=""
+      if [[ -n "${SPLUNK_EXTERNAL_CA_SECRET_NAME}" ]]; then
+        log "Using external Splunk CA secret: ${SPLUNK_EXTERNAL_CA_SECRET_NAME}"
+        external_ca_cert_yaml=$(cat <<EOF
+    caCertRef:
+      name: ${SPLUNK_EXTERNAL_CA_SECRET_NAME}
+      namespace: ${AI_NS}
+      key: ca.crt
+EOF
+)
+      fi
+      splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (external — customer-managed Splunk)
+  splunkConfiguration:
+    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
+    secretRef:
+      name: ${SPLUNK_EXTERNAL_SECRET_NAME}
+      namespace: ${AI_NS}
+${external_ca_cert_yaml}${trusted_issuers_yaml}
+EOF
+)
+      ;;
+    *)
+      if [[ -n "${trusted_issuers_yaml}" ]]; then
+        log "Splunk telemetry disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
+        splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (disabled — trustedIssuers only for JWT validation)
+  splunkConfiguration:
+${trusted_issuers_yaml}
+EOF
+)
+      else
+        log "Splunk telemetry disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+      fi
+      ;;
+  esac
+
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -2772,11 +3108,7 @@ ${svc_template_yaml}
     tls:
       - hosts: [ ${INGRESS_HOST} ]
         secretName: ${INGRESS_TLS_SECRET}
-  splunkConfiguration:
-    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
-    secretRef:
-      name: ${secret_name}
-      namespace: ${AI_NS}
+${splunk_config_yaml}
   certificateRef: ${CERT_ISSUER}
 YAML
 
@@ -3610,11 +3942,17 @@ install_ai_platform_stack() {
   add_ecr_permissions_to_role "IRSA-${CLUSTER_NAME}-${RAY_WORKER_SA}"
   add_ecr_permissions_to_role "IRSA-${CLUSTER_NAME}-${SAIA_SERVICE_SA}"
 
+  # Provision the Splunk server TLS cert (AIP-4614) before the Standalone CR so
+  # the cert volume/secret already exists when install_splunk_standalone mounts it.
+  # No-op when SPLUNK_MODE != internal.
+  provision_splunk_cert
   install_splunk_standalone
 
-  local splunk_secret
-  splunk_secret="$(find_splunk_standalone_secret_name "${AI_NS}" "${AI_STANDALONE_NAME}")"
-  splunk_secret="${splunk_secret//$'\r'/}"; splunk_secret="${splunk_secret//$'\n'/}"
+  local splunk_secret=""
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    splunk_secret="$(find_splunk_standalone_secret_name "${AI_NS}" "${AI_STANDALONE_NAME}")"
+    splunk_secret="${splunk_secret//$'\r'/}"; splunk_secret="${splunk_secret//$'\n'/}"
+  fi
 
   # update_splunk_secret_password_only "${AI_NS}" "${splunk_secret}"
 
