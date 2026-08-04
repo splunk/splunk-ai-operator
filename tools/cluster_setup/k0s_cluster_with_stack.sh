@@ -39,9 +39,12 @@ export LANG=C LC_ALL=C
 # - VERIFY_RC                set by main_install from verify_all_pods_healthy;
 #                            read by show_platform_access_info to choose
 #                            between success / partial-readiness banners.
+# - K0S_RESET_FAILED         passed from main_delete to clean_all so the final
+#                            command status includes failures from both phases.
 declare -a POD_LINES=()
 WORKLOAD_PENDING_REASON=""
 VERIFY_RC=0
+K0S_RESET_FAILED=0
 
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
@@ -6612,6 +6615,7 @@ main_install() {
 
 # ====== MAIN DELETE FLOW ======
 main_delete() {
+  local cleanup_mode="${1:-delete}"
   load_config
 
   log "============================================"
@@ -6656,22 +6660,36 @@ main_delete() {
   IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
   IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
 
-  log "Stopping k0s on controller nodes..."
-  for ip in "${CONTROLLER_IPS[@]}"; do
-    log "  Stopping k0s on controller: ${ip}..."
-    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
+  local reset_succeeded=0
+  local reset_failed=0
+  local -a reset_failed_nodes=()
+  local -a all_node_ips=("${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}")
+
+  log "Stopping and resetting k0s on configured nodes..."
+  for ip in "${all_node_ips[@]}"; do
+    log "  Resetting k0s on node: ${ip}..."
+    if ssh_exec "${ip}" "
+      if command -v k0s >/dev/null 2>&1; then
+        sudo k0s stop || true
+        sudo k0s reset
+      else
+        echo 'k0s binary is already absent; nothing to reset'
+      fi
+    "; then
+      reset_succeeded=$((reset_succeeded + 1))
+    else
+      warn "Failed to reset k0s on ${ip}"
+      reset_failed=$((reset_failed + 1))
+      reset_failed_nodes+=("${ip}")
+    fi
   done
 
-  log "Stopping k0s on worker nodes..."
-  for ip in "${WORKER_IPS[@]}"; do
-    log "  Stopping k0s on worker: ${ip}..."
-    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
-  done
+  K0S_RESET_FAILED="${reset_failed}"
 
-  log "k0s stopped on all nodes"
-  log "NOTE: Node machines are still running. To clean up completely:"
-  log "  - Remove k0s binaries: sudo rm -f /usr/local/bin/k0s"
-  log "  - Clean up data: sudo rm -rf /var/lib/k0s /etc/k0s"
+  log "k0s reset results: ${reset_succeeded} succeeded/already absent, ${reset_failed} failed"
+  if (( reset_failed > 0 )); then
+    warn "Nodes that failed k0s reset: ${reset_failed_nodes[*]}"
+  fi
 
   # Clean up local files
   log "Cleaning up local files..."
@@ -6679,42 +6697,26 @@ main_delete() {
   for kc in "${HOME}/.kube/k0s-${CLUSTER_NAME}" "${HOME}/.kube/k0s-${CLUSTER_NAME}.bak"; do
     if [[ -f "${kc}" ]]; then
       rm -f "${kc}"
-      ((kubeconfig_count++))
+      kubeconfig_count=$((kubeconfig_count + 1))
     fi
   done
   rm -rf "/tmp/splunk-ai-operator" || true
 
-  log "============================================"
-  log "Cleanup Summary"
-  log "============================================"
+  if [[ "${cleanup_mode}" == "delete" ]]; then
+    log "============================================"
+    log "Delete Summary"
+    log "============================================"
+    log "  - k0s reset: ${reset_succeeded} succeeded/already absent, ${reset_failed} failed"
+    log "  - Kubeconfig files: ${kubeconfig_count} cleaned up"
+    log "  - Node machines remain running"
 
-  log "Infrastructure: On-premises"
-  log "  - k0s stopped and reset on all nodes"
-  log "  - NOTE: Nodes are still running, k0s binaries remain"
+    if (( reset_failed > 0 )); then
+      warn "Delete completed with node reset failures."
+      return 1
+    fi
 
-  log ""
-  log "Kubernetes Resources:"
-  log "  - AI Platform resources deleted"
-  log "  - Splunk Standalone deleted"
-  log "  - Ray services/clusters deleted"
-  log "  - All operators uninstalled"
-  log "  - All namespaces deleted"
-  log ""
-  log "Local Files:"
-  log "  - Kubeconfig files: ${kubeconfig_count} cleaned up"
-
-  log ""
-  log "============================================"
-  log "Cleanup complete!"
-  log "============================================"
-  log ""
-  log "Cluster '${CLUSTER_NAME}' has been deleted."
-
-  log ""
-  log "Nodes are still running with k0s stopped."
-  log "To fully clean up each node, run:"
-  log "  sudo rm -f /usr/local/bin/k0s"
-  log "  sudo rm -rf /var/lib/k0s /etc/k0s"
+    log "Delete complete!"
+  fi
 }
 
 # ====== CLEAN ALL (AGGRESSIVE CLEANUP) ======
@@ -6724,10 +6726,12 @@ clean_all() {
   log "============================================"
   warn "This will forcefully remove all resources and data!"
 
-  load_config
-
   # Run normal delete first
-  main_delete
+  main_delete clean-all
+
+  local aggressive_succeeded=0
+  local aggressive_failed=0
+  local -a aggressive_failed_nodes=()
 
   # Additional aggressive cleanup for on-prem
   if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
@@ -6737,21 +6741,46 @@ clean_all() {
     log "Performing aggressive cleanup on nodes..."
     for ip in "${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}"; do
       log "  Deep cleaning node: ${ip}..."
-      ssh_exec "${ip}" "
-        sudo systemctl stop k0scontroller k0sworker || true
-        sudo systemctl disable k0scontroller k0sworker || true
-        sudo rm -rf /var/lib/k0s /etc/k0s
-        sudo rm -f /usr/local/bin/k0s
-        sudo rm -rf /var/lib/kubelet /etc/cni /opt/cni
-        sudo rm -rf /var/lib/calico /etc/calico
-        sudo iptables -F || true
-        sudo iptables -X || true
-        sudo iptables -t nat -F || true
-        sudo iptables -t nat -X || true
-        sudo iptables -t mangle -F || true
-        sudo iptables -t mangle -X || true
-      " || warn "Failed aggressive cleanup on ${ip}"
+      if ssh_exec "${ip}" "
+        cleanup_failed=0
+        sudo systemctl stop k0scontroller k0sworker >/dev/null 2>&1 || true
+        sudo systemctl disable k0scontroller k0sworker >/dev/null 2>&1 || true
+        if mountpoint -q /var/lib/k0s; then
+          sudo find /var/lib/k0s -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || cleanup_failed=1
+        else
+          sudo rm -rf /var/lib/k0s || cleanup_failed=1
+        fi
+        sudo rm -rf /etc/k0s || cleanup_failed=1
+        sudo rm -f /usr/local/bin/k0s || cleanup_failed=1
+        sudo rm -rf /var/lib/kubelet /etc/cni /opt/cni || cleanup_failed=1
+        sudo rm -rf /var/lib/calico /etc/calico || cleanup_failed=1
+        if command -v iptables >/dev/null 2>&1; then
+          sudo iptables -F || cleanup_failed=1
+          sudo iptables -X || cleanup_failed=1
+          sudo iptables -t nat -F || cleanup_failed=1
+          sudo iptables -t nat -X || cleanup_failed=1
+          sudo iptables -t mangle -F || cleanup_failed=1
+          sudo iptables -t mangle -X || cleanup_failed=1
+        fi
+        exit \${cleanup_failed}
+      "; then
+        aggressive_succeeded=$((aggressive_succeeded + 1))
+      else
+        warn "Failed aggressive cleanup on ${ip}"
+        aggressive_failed=$((aggressive_failed + 1))
+        aggressive_failed_nodes+=("${ip}")
+      fi
     done
+
+    log "Aggressive cleanup results: ${aggressive_succeeded} succeeded, ${aggressive_failed} failed"
+    if (( aggressive_failed > 0 )); then
+      warn "Nodes that failed aggressive cleanup: ${aggressive_failed_nodes[*]}"
+    fi
+  fi
+
+  if (( K0S_RESET_FAILED > 0 || aggressive_failed > 0 )); then
+    warn "Clean-all completed with cleanup failures. Review the failed nodes above."
+    return 1
   fi
 
   log "Aggressive cleanup complete!"

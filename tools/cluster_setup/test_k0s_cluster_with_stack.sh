@@ -676,6 +676,73 @@ assert_eq "seaweedfs rootPassword is empty (no default credential)" \
 assert_eq "minioadmin not present in prod config" \
   "0" "$(grep -c 'minioadmin' "${PROD_CFG}" | tr -d '[:space:]')"
 
+suite "fix: clean-all reset and kubeconfig cleanup"
+
+DELETE_FN="$(_extract_fn main_delete)"
+CLEAN_ALL_FN="$(_extract_fn clean_all)"
+
+assert_eq "k0s reset does not use the unsupported --force flag" \
+  "0" "$(grep -c 'k0s reset --force' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "kubeconfig counter avoids post-increment under set -e" \
+  "0" "$(grep -c '((kubeconfig_count++))' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "clean-all delegates configuration loading to main_delete" \
+  "0" "$(printf '%s\n' "${CLEAN_ALL_FN}" | grep -c 'load_config' | tr -d '[:space:]')"
+
+assert_eq "aggressive cleanup quietly handles leftover k0s services" \
+  "2" "$(printf '%s\n' "${CLEAN_ALL_FN}" | grep -Ec 'systemctl (stop|disable) k0s.*>/dev/null 2>&1 \|\| true' | tr -d '[:space:]')"
+
+assert_eq "mounted k0s data volume is emptied without removing its mount point" \
+  "2" "$(printf '%s\n' "${CLEAN_ALL_FN}" | grep -Ec 'mountpoint -q /var/lib/k0s|find /var/lib/k0s -mindepth 1' | tr -d '[:space:]')"
+
+assert_eq "aggressive cleanup does not stop after the first failed step" \
+  "0" "$(printf '%s\n' "${CLEAN_ALL_FN}" | grep -c 'set -e' | tr -d '[:space:]')"
+
+assert_eq "aggressive cleanup returns its accumulated failure status" \
+  "1" "$(printf '%s\n' "${CLEAN_ALL_FN}" | grep -c 'exit \\${cleanup_failed}' | tr -d '[:space:]')"
+
+assert_eq "aggressive cleanup skips iptables when the binary is absent" \
+  "1" "$(printf '%s\n' "${CLEAN_ALL_FN}" | grep -c 'if command -v iptables >/dev/null 2>&1' | tr -d '[:space:]')"
+
+assert_eq "node cleanup reports separate reset and aggressive results" \
+  "2" "$(printf '%s\n%s\n' "${DELETE_FN}" "${CLEAN_ALL_FN}" | grep -Ec 'reset results:|Aggressive cleanup results:' | tr -d '[:space:]')"
+
+assert_eq "main delete exposes reset failures to clean-all" \
+  "1" "$(printf '%s\n' "${DELETE_FN}" | grep -c 'K0S_RESET_FAILED="${reset_failed}"' | tr -d '[:space:]')"
+
+_clean_all_propagates_reset_failure() (
+  eval "${CLEAN_ALL_FN}"
+  log() { :; }
+  warn() { :; }
+  main_delete() {
+    EXISTING_CONTROLLER_IPS="10.0.0.1"
+    EXISTING_WORKER_IPS="10.0.0.2"
+    K0S_RESET_FAILED=1
+  }
+  ssh_exec() { return 0; }
+  clean_all
+)
+
+assert_rc "clean-all returns failure when the k0s reset phase failed" \
+  "1" _clean_all_propagates_reset_failure
+
+_clean_all_propagates_aggressive_failure() (
+  eval "${CLEAN_ALL_FN}"
+  log() { :; }
+  warn() { :; }
+  main_delete() {
+    EXISTING_CONTROLLER_IPS="10.0.0.1"
+    EXISTING_WORKER_IPS="10.0.0.2"
+    K0S_RESET_FAILED=0
+  }
+  ssh_exec() { return 1; }
+  clean_all
+)
+
+assert_rc "clean-all returns failure when aggressive node cleanup failed" \
+  "1" _clean_all_propagates_aggressive_failure
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""
