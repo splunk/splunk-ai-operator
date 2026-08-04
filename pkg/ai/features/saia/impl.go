@@ -910,6 +910,63 @@ func buildSAIATLSEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.V
 	return env, volumes, mounts, ports
 }
 
+// buildSAIACABundleEnv appends the Splunk CA-trust volume/mount/env when
+// SplunkConfiguration.CACertRef is set, so SAIA's outbound HTTPS calls to
+// Splunk (JWKS fetch, token validation) can verify Splunk's TLS cert chain
+// (AIP-4614 Part C). Mirrors buildSAIATLSEnv's volume/mount/env pattern.
+//
+// The Secret must live in the same namespace as the AIService — Kubernetes
+// Secret volumes cannot reference a different namespace, so CACertRef.Namespace
+// is not used here (it exists on the CRD field for documentation/validation
+// symmetry with SecretRef, but callers are expected to keep it same-namespace).
+func buildSAIACABundleEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return env, volumes, mounts
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	volumes = append(volumes, corev1.Volume{
+		Name: "splunk-ca",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+		},
+	})
+	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true})
+	caPath := "/etc/splunk-ca/" + key
+	env = append(env,
+		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: caPath},
+		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: caPath},
+	)
+	return env, volumes, mounts
+}
+
+// splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
+// roll when the CA bundle's content changes in place (e.g. the customer
+// rotates their external Splunk CA and updates the Secret referenced by
+// CACertRef without renaming it) — not just when the reference itself
+// changes. Returns "" (no annotation) when CACertRef is unset or the Secret
+// can't be read yet (e.g. not created before the first reconcile); the
+// reconcile is not blocked on this — a later reconcile will pick it up once
+// the Secret exists.
+func splunkCACertChecksum(ctx context.Context, c client.Client, ai *aiv1.AIService) string {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return ""
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ai.Namespace}, secret); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(secret.Data[key]))
+}
+
 // saiaEnvFrom returns the EnvFromSource for the SAIA ConfigMap.
 func saiaEnvFrom(ai *aiv1.AIService) []corev1.EnvFromSource {
 	return []corev1.EnvFromSource{
@@ -1012,6 +1069,9 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		env = append(env, corev1.EnvVar{Name: "TLS_DISABLED", Value: "true"})
 	}
 
+	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
+	env, volumes, mounts = buildSAIACABundleEnv(ai, env, volumes, mounts)
+
 	// Import ALL static keys from the SAIA ConfigMap as env vars.
 	envFrom := []corev1.EnvFromSource{
 		{
@@ -1052,6 +1112,12 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		"prometheus.io/path":                     "/metrics",
 		"prometheus.io/scheme":                   "http",
 		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
+	}
+	// Rolls the pod when the referenced CA Secret's content changes in place
+	// (rotation) — AIP-4614 Part G.2. Absent (not just empty) when CACertRef
+	// is unset, so pods with no CA-trust config never carry this annotation.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
 	}
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
@@ -1147,10 +1213,17 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 	env = append(env, buildV2ExtraEnv(ai)...)
 	env = append(env, corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"})
 	env, volumes, mounts, ports = buildSAIATLSEnv(ai, env, volumes, mounts, ports)
+	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
+	env, volumes, mounts = buildSAIACABundleEnv(ai, env, volumes, mounts)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-api"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
+	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1274,10 +1347,17 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 		corev1.EnvVar{Name: "WORKER_HEARTBEAT_PATH", Value: "/tmp/ingestion_worker_heartbeat"},
 	)
 	env, volumes, mounts, _ = buildSAIATLSEnv(ai, env, volumes, mounts, nil)
+	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
+	env, volumes, mounts = buildSAIACABundleEnv(ai, env, volumes, mounts)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-worker"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
+	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{

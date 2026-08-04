@@ -653,6 +653,14 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # HEC token: env var only (keep it out of the config file and logs).
   SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
 
+  # Optional customer-supplied CA for a private/internal external Splunk cert
+  # (AIP-4614 Part E). Empty by default — SAIA falls back to its image's
+  # system trust store, which is correct when the external Splunk's cert is
+  # publicly trusted (the common case). The customer pre-creates the Secret
+  # (key ca.crt) themselves; this installer never generates or touches it.
+  SPLUNK_EXTERNAL_CA_SECRET_NAME="$(yq eval '.splunk.external.caCertSecretName // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${SPLUNK_EXTERNAL_CA_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_CA_SECRET_NAME=""
+
   # Derive a single mode so downstream logic is unambiguous:
   #   disabled  — splunk.enabled=false: no Splunk, no telemetry
   #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
@@ -2850,6 +2858,106 @@ EOF
   log "cert-manager installed successfully"
 }
 
+# ====== PROVISION SPLUNK SERVER TLS CERT (AIP-4614) ======
+# The Splunk Operator's auto-generated server.pem has no Kubernetes service
+# DNS name in its SANs, so SAIA's HTTPS calls to Splunk (JWKS fetch at
+# https://<service>:8089) fail with CERTIFICATE_VERIFY_FAILED. This issues a
+# proper cert-manager leaf cert with the correct SANs, signed by a per-install
+# CA, so install_splunk_standalone (below) can mount it into the Standalone CR.
+#
+# renewBefore is pinned explicitly (not left at cert-manager's implicit
+# default) so the rotation cadence is a documented choice, not an accident —
+# see docs/design/splunk-tls-hostname-validation-plan.md Part G.1. Note: as of
+# this commit there is no pod-restart-on-renewal trigger yet (that's Part B /
+# the Standalone CR hash annotation) — cert-manager will reissue this leaf
+# automatically, but splunkd will not pick it up without a pod restart.
+provision_splunk_cert() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk cert provisioning (no in-cluster Splunk)"
+    return 0
+  fi
+
+  log "Provisioning Splunk server TLS cert (service DNS SANs) via cert-manager..."
+
+  ensure_namespace "${AI_NS}"
+  wait_for_cert_manager_webhook 30 10
+
+  # Service names the Splunk Operator actually creates for a Standalone CR
+  # (GetSplunkServiceName in the vendored operator: "splunk-%s-%s-%s" with
+  # instanceType=standalone, suffix=service|headless).
+  local svc="splunk-${AI_STANDALONE_NAME}-standalone-service"
+  local headless="splunk-${AI_STANDALONE_NAME}-standalone-headless"
+
+  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-ca
+spec:
+  isCA: true
+  commonName: ai-splunk-ca
+  secretName: ai-splunk-ca-tls
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ai-splunk-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-ca-issuer
+spec:
+  ca:
+    secretName: ai-splunk-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-server
+spec:
+  secretName: ai-splunk-server-tls
+  duration: 2160h      # 90d leaf lifetime — pinned explicitly (Part G.1)
+  renewBefore: 720h    # reissue 30d before expiry
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: ai-splunk-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  dnsNames:
+    - ${svc}
+    - ${svc}.${AI_NS}
+    - ${svc}.${AI_NS}.svc
+    - ${svc}.${AI_NS}.svc.cluster.local
+    - ${headless}
+    - ${headless}.${AI_NS}
+    - ${headless}.${AI_NS}.svc
+    - ${headless}.${AI_NS}.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+  additionalOutputFormats:
+    - type: CombinedPEM
+YAML
+
+  log "Waiting for Splunk server certificate to be Ready..."
+  kubectl wait --for=condition=Ready certificate/ai-splunk-server -n "${AI_NS}" --timeout=180s \
+    || warn "ai-splunk-server certificate not Ready after 180s; Splunk Standalone install may stall once the cert volume is wired in"
+
+  log "Splunk server certificate provisioned (secret: ai-splunk-server-tls, CA: ai-splunk-ca-tls)"
+}
+
 # ====== INSTALL NVIDIA DRIVERS ON GPU NODES (bare-metal / EC2) ======
 # Per-node NVIDIA driver + container toolkit install (called in parallel).
 #
@@ -4589,6 +4697,13 @@ install_splunk_standalone() {
   # "Issuer '<iss>' is not allowed". Keep both in the
   # https://splunk-<name>-standalone-service.<ns>.svc.<domain>:8089 form used by
   # the operator's own SplunkCustomResourceRef path (buildSplunkIssuersVal).
+  #
+  # server/web conf stanzas point splunkd, KV Store (inherits [sslConfig]) and
+  # Splunk Web at the AIP-4614 cert-manager cert provisioned by
+  # provision_splunk_cert() above (mounted at /mnt/splunk-certs — see the
+  # Standalone CR volumes below). sslRootCAPath keeps KV Store trusting the
+  # same CA the leaf chains to, so swapping in this cert doesn't break KV
+  # Store's self-signed-cert trust (docs/design/splunk-tls-hostname-validation-plan.md Part B).
   cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -4598,14 +4713,31 @@ data:
   default.yml: |
     splunk:
       conf:
+        - key: server
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              sslConfig:
+                serverCert: /mnt/splunk-certs/tls-combined.pem
+                sslRootCAPath: /mnt/splunk-certs/ca.crt
+                sslPassword: ""
+        - key: web
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              settings:
+                enableSplunkWebSSL: true
+                serverCert: /mnt/splunk-certs/tls-combined.pem
+                privKeyPath: /mnt/splunk-certs/tls-combined.pem
+                caCertPath: /mnt/splunk-certs/ca.crt
         - key: authentication
           value:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
                 issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
-                certFile: \$SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
+                certFile: /mnt/splunk-certs/tls-combined.pem
+                sslPassword: ""
 YAML
 
   # Ensure default ServiceAccount has imagePullSecrets for ECR
@@ -4665,6 +4797,9 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-certs
+      secret:
+        secretName: ai-splunk-server-tls
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appInstallPeriodSeconds: 90
@@ -4758,6 +4893,13 @@ install_ai_platform_cr() {
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
+    # CA that signed the Standalone's server cert (provision_splunk_cert) — lets
+    # SAIA/SLIM validate the hostname-correct leaf cert instead of skipping TLS
+    # verification (AIP-4614 Part C).
+    caCertRef:
+      name: ai-splunk-server-tls
+      namespace: ${AI_NS}
+      key: ca.crt
 ${trusted_issuers_yaml}
 EOF
 )
@@ -4778,6 +4920,21 @@ EOF
         --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
       log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
       log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
+      # Only emitted when the customer set splunk.external.caCertSecretName —
+      # a Secret they pre-create themselves (AIP-4614 Part E). Left unset,
+      # SAIA falls back to its image's system trust store, which is correct
+      # whenever the external Splunk's cert is publicly trusted.
+      local external_ca_cert_yaml=""
+      if [[ -n "${SPLUNK_EXTERNAL_CA_SECRET_NAME}" ]]; then
+        log "Using external Splunk CA secret: ${SPLUNK_EXTERNAL_CA_SECRET_NAME}"
+        external_ca_cert_yaml=$(cat <<EOF
+    caCertRef:
+      name: ${SPLUNK_EXTERNAL_CA_SECRET_NAME}
+      namespace: ${AI_NS}
+      key: ca.crt
+EOF
+)
+      fi
       splunk_config_yaml=$(cat <<EOF
 
   # Splunk configuration (external — customer-managed Splunk)
@@ -4786,7 +4943,7 @@ EOF
     secretRef:
       name: ${SPLUNK_EXTERNAL_SECRET_NAME}
       namespace: ${AI_NS}
-${trusted_issuers_yaml}
+${external_ca_cert_yaml}${trusted_issuers_yaml}
 EOF
 )
       ;;
@@ -5448,6 +5605,10 @@ install_ai_platform_stack() {
 
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
+
+  # Provision the Splunk server TLS cert (AIP-4614) before the Standalone CR so
+  # the cert volume/secret already exists when install_splunk_standalone mounts it.
+  provision_splunk_cert
 
   # Apply Splunk Standalone CR (non-blocking — pod boots in background)
   install_splunk_standalone

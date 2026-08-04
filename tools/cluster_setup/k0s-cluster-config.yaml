@@ -211,6 +211,14 @@ splunk:
   # external:
   #   endpoint: https://splunk.example.com:8088   # base HEC URL (operator appends /services/collector)
   #   secretName: splunk-hec-external             # optional; k8s Secret name the script creates (key: hec_token)
+  #   caCertSecretName: splunk-external-ca        # optional; only needed if your Splunk cert is
+  #                                                # signed by a private/internal CA. Pre-create the
+  #                                                # Secret yourself (key: ca.crt) before running the
+  #                                                # installer — it is never generated or modified here:
+  #                                                #   kubectl create secret generic splunk-external-ca \
+  #                                                #     --from-file=ca.crt=<path> -n ai-platform
+  #                                                # Leave unset if your Splunk cert is publicly trusted;
+  #                                                # SAIA falls back to its image's system trust store.
 
 # ---------- AI Platform Configuration ----------
 aiPlatform:

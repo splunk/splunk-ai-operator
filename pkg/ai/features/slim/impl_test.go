@@ -132,6 +132,126 @@ func Test_reconcileSlimService_ServiceTypeVariations(t *testing.T) {
 	}
 }
 
+// findVolume returns the named volume, or nil if absent.
+func findSlimVolume(volumes []corev1.Volume, name string) *corev1.Volume {
+	for i := range volumes {
+		if volumes[i].Name == name {
+			return &volumes[i]
+		}
+	}
+	return nil
+}
+
+// slimEnvToMap converts a slice of EnvVar to a map for easy assertion.
+func slimEnvToMap(envs []corev1.EnvVar) map[string]string {
+	m := make(map[string]string)
+	for _, e := range envs {
+		if e.ValueFrom == nil {
+			m[e.Name] = e.Value
+		}
+	}
+	return m
+}
+
+func newTestSlimAIService(name string) *aiv1.AIService {
+	return &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			UID:       "uid-123",
+		},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformUrl:      "http://platform:8000",
+			Replicas:           1,
+			ServiceAccountName: "test-sa",
+		},
+	}
+}
+
+func Test_reconcileSlimDeployment_CABundle_NotSetByDefault(t *testing.T) {
+	scheme := buildTestScheme(t)
+	ai := newTestSlimAIService("slim-cabundle-default")
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := slimEnvToMap(container.Env)
+	assert.NotContains(t, envMap, "REQUESTS_CA_BUNDLE")
+	assert.NotContains(t, envMap, "SSL_CERT_FILE")
+	assert.Nil(t, findSlimVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSlimDeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
+	scheme := buildTestScheme(t)
+	ai := newTestSlimAIService("slim-cabundle-wired")
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem-1")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := slimEnvToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["SSL_CERT_FILE"])
+
+	vol := findSlimVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca")
+	require.NotNil(t, vol)
+	require.NotNil(t, vol.Secret)
+	assert.Equal(t, "ai-splunk-server-tls", vol.Secret.SecretName)
+
+	hash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
+	assert.NotEmpty(t, hash1)
+
+	// Rotating the Secret's content in place (same name) must change the hash,
+	// so the pod rolls even though CACertRef itself didn't change (AIP-4614 Part G.2).
+	caSecret.Data["ca.crt"] = []byte("fake-ca-pem-2-rotated")
+	require.NoError(t, fakeClient.Update(context.Background(), caSecret))
+
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+
+	dep2 := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: "default"}, dep2))
+	hash2 := dep2.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
+	assert.NotEmpty(t, hash2)
+	assert.NotEqual(t, hash1, hash2)
+}
+
+func Test_reconcileSlimDeployment_CABundle_MissingSecretOmitsHash(t *testing.T) {
+	scheme := buildTestScheme(t)
+	ai := newTestSlimAIService("slim-cabundle-missing")
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "does-not-exist"}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := slimEnvToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
 // sanitize turns a free-form subtest name into a valid k8s resource name.
 func sanitize(s string) string {
 	s = strings.ToLower(s)

@@ -1113,6 +1113,185 @@ func Test_extractBucketName(t *testing.T) {
 	}
 }
 
+// findVolume returns the named volume, or nil if absent.
+func findVolume(volumes []corev1.Volume, name string) *corev1.Volume {
+	for i := range volumes {
+		if volumes[i].Name == name {
+			return &volumes[i]
+		}
+	}
+	return nil
+}
+
+func Test_reconcileSAIADeployment_CABundle_NotSetByDefault(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService() // no SplunkConfiguration.CACertRef
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.NotContains(t, envMap, "REQUESTS_CA_BUNDLE")
+	assert.NotContains(t, envMap, "SSL_CERT_FILE")
+	assert.Nil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSAIADeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem-1")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["SSL_CERT_FILE"])
+
+	vol := findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca")
+	require.NotNil(t, vol)
+	require.NotNil(t, vol.Secret)
+	assert.Equal(t, "ai-splunk-server-tls", vol.Secret.SecretName)
+
+	hash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
+	assert.NotEmpty(t, hash1)
+
+	// Rotating the Secret's content in place (same name) must change the hash,
+	// so the pod rolls even though CACertRef itself didn't change (AIP-4614 Part G.2).
+	caSecret.Data["ca.crt"] = []byte("fake-ca-pem-2-rotated")
+	require.NoError(t, fakeClient.Update(context.Background(), caSecret))
+
+	err = r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep2 := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep2))
+	hash2 := dep2.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
+	assert.NotEmpty(t, hash2)
+	assert.NotEqual(t, hash1, hash2)
+}
+
+func Test_reconcileSAIADeployment_CABundle_MissingSecretOmitsHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "does-not-exist"}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	// Env/volume are wired regardless (the Secret is expected to appear later);
+	// only the hash annotation is skipped until the Secret can actually be read.
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSAIADeployment_CABundle_CustomKey(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "external-ca", Key: "bundle.pem"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-ca", Namespace: "default"},
+		Data:       map[string][]byte{"bundle.pem": []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/bundle.pem", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+}
+
+func Test_reconcileSAIAv2Deployment_CABundle_WiresEnvAndHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Deployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["SSL_CERT_FILE"])
+	assert.NotNil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+}
+
+func Test_reconcileSAIAv2Worker_CABundle_WiresEnvAndHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Worker(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-worker", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["SSL_CERT_FILE"])
+	assert.NotNil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+}
+
 // envToMap converts a slice of EnvVar to a map for easy assertion.
 // Only includes env vars with direct values (not ValueFrom).
 func envToMap(envs []corev1.EnvVar) map[string]string {

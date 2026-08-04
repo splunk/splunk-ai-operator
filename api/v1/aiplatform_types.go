@@ -325,6 +325,32 @@ type SplunkConfigurationSpec struct {
 	// In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
 	// +optional
 	TrustedIssuers []string `json:"trustedIssuers,omitempty"`
+
+	// CACertRef references a Secret/ConfigMap key holding the PEM CA bundle that
+	// signs the Splunk server certificate, so SAIA (and SLIM) can verify Splunk's
+	// TLS cert on their outbound HTTPS calls (JWKS fetch, token validation).
+	// Required whenever Splunk's cert chains to a CA not already in the image's
+	// system trust store — always true for the installer's self-signed internal
+	// chain, and common for external Splunk behind a private/internal CA.
+	// +kubebuilder:validation:Optional
+	CACertRef *CABundleRef `json:"caCertRef,omitempty"`
+}
+
+// CABundleRef references a Kubernetes Secret key holding a PEM-encoded CA bundle.
+type CABundleRef struct {
+	// Name is the Secret name containing the CA bundle
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Namespace is the Secret's namespace. Defaults to the AIPlatform/AIService's
+	// own namespace when omitted.
+	// +kubebuilder:validation:Optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Key is the data key within the Secret holding the PEM CA bundle
+	// +kubebuilder:default:="ca.crt"
+	// +kubebuilder:validation:Optional
+	Key string `json:"key,omitempty"`
 }
 
 // ReplicasSpec sets min/max worker replicas

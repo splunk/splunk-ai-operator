@@ -208,6 +208,56 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 	return nil
 }
 
+// buildSlimCABundleEnv appends the Splunk CA-trust volume/mount/env when
+// SplunkConfiguration.CACertRef is set, so slim-api's outbound HTTPS calls to
+// Splunk (JWKS fetch, token validation) can verify Splunk's TLS cert chain
+// (AIP-4614 Part C.4 — mirrors saia.buildSAIACABundleEnv byte-for-byte; kept
+// as its own copy so the two feature packages stay decoupled, same rationale
+// as buildSplunkIssuersVal above).
+func buildSlimCABundleEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return env, volumes, mounts
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	volumes = append(volumes, corev1.Volume{
+		Name: "splunk-ca",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+		},
+	})
+	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true})
+	caPath := "/etc/splunk-ca/" + key
+	env = append(env,
+		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: caPath},
+		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: caPath},
+	)
+	return env, volumes, mounts
+}
+
+// splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
+// roll when the CA bundle's content changes in place — not just when the
+// reference itself changes. Returns "" (no annotation) when CACertRef is
+// unset or the Secret can't be read yet. Mirrors saia.splunkCACertChecksum.
+func splunkCACertChecksum(ctx context.Context, c client.Client, ai *aiv1.AIService) string {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return ""
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ai.Namespace}, secret); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(secret.Data[key]))
+}
+
 // buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
 // The JWT issuer is the Splunk management endpoint (port 8089).
 // Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
@@ -503,6 +553,9 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		env = append(env, corev1.EnvVar{Name: "TLS_DISABLED", Value: "true"})
 	}
 
+	// Splunk CA trust (AIP-4614 Part C.4) — no-op unless SplunkConfiguration.CACertRef is set.
+	env, volumes, mounts = buildSlimCABundleEnv(ai, env, volumes, mounts)
+
 	envFrom := []corev1.EnvFromSource{
 		{
 			ConfigMapRef: &corev1.ConfigMapEnvSource{
@@ -541,6 +594,11 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		"prometheus.io/path":                     "/metrics",
 		"prometheus.io/scheme":                   "http",
 		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
+	}
+	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
+	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
 	}
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v

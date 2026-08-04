@@ -832,6 +832,104 @@ assert_eq "allows only one automatic NVIDIA recovery reboot" \
 assert_eq "waits for the node to return after the recovery reboot" \
   "1" "$(grep -c 'did not return after the NVIDIA recovery reboot' "${SCRIPT}" | tr -d '[:space:]')"
 
+# ── Tests: AIP-4614 Splunk TLS cert provisioning (provision_splunk_cert) ──────
+# Covers the cert-manager selfSigned→CA→CA-Issuer→leaf chain that provisions a
+# hostname-correct Splunk server cert, and the caCertRef wiring that lets SAIA
+# trust it instead of skipping TLS verification.
+
+suite "provision_splunk_cert"
+
+assert_eq "gated on SPLUNK_MODE != internal (early return)" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -A2 'SPLUNK_MODE.*!= .internal.' | grep -c 'return 0')"
+
+assert_eq "waits for cert-manager webhook before applying the chain" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'wait_for_cert_manager_webhook')"
+
+assert_eq "derives the Standalone service name from AI_STANDALONE_NAME (operator's GetSplunkServiceName)" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'svc="splunk-\${AI_STANDALONE_NAME}-standalone-service"')"
+
+assert_eq "derives the headless service name from AI_STANDALONE_NAME" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'headless="splunk-\${AI_STANDALONE_NAME}-standalone-headless"')"
+
+assert_eq "selfSigned root Issuer is defined and referenced by the CA cert's issuerRef" \
+  "2" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'name: ai-splunk-selfsigned')"
+
+assert_eq "CA Certificate is isCA and stored in ai-splunk-ca-tls" \
+  "1" "$(awk '/name: ai-splunk-ca$/{f=1} f && /secretName: ai-splunk-ca-tls/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-ca-tls')"
+
+assert_eq "CA Issuer chains off the ai-splunk-ca-tls secret" \
+  "1" "$(awk '/name: ai-splunk-ca-issuer/{f=1} f && /secretName: ai-splunk-ca-tls/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-ca-tls')"
+
+assert_eq "leaf Certificate ai-splunk-server writes to ai-splunk-server-tls" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /secretName: ai-splunk-server-tls/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-server-tls')"
+
+assert_eq "leaf cert issued by the CA issuer (not the selfsigned root)" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /issuerRef:/{g=1} f && g && /name: ai-splunk-ca-issuer/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-ca-issuer')"
+
+assert_eq "leaf cert SANs cover both the standalone service and headless service (short/ns/svc/cluster.local forms)" \
+  "8" "$(awk '/name: ai-splunk-server$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -cE '\$\{svc\}|\$\{headless\}')"
+
+assert_eq "leaf cert requests a CombinedPEM output (splunkd needs cert+key in one file)" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -c 'type: CombinedPEM')"
+
+assert_eq "leaf cert has an explicit 90d duration / 30d renewBefore (Part G.1)" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -c 'duration: 2160h')"
+
+assert_eq "waits for the leaf cert to reach Ready before returning" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c -e 'kubectl wait --for=condition=Ready certificate/ai-splunk-server')"
+
+assert_eq "orchestrator provisions the cert before the Standalone CR is applied (cert must exist first)" \
+  "1" "$(awk '/provision_splunk_cert$/{p=NR} /install_splunk_standalone$/{s=NR} END{print(p > 0 && s > 0 && p < s)}' "${SCRIPT}")"
+
+assert_eq "orchestrator provisions the cert after image pull secrets exist (SA needs ECR creds first)" \
+  "1" "$(awk '/create_image_pull_secrets "\$\{AI_NS\}"/{c=NR} /provision_splunk_cert$/{p=NR} END{print(c > 0 && p > 0 && c < p)}' "${SCRIPT}")"
+
+# ── Tests: caCertRef wiring into the AIPlatform CR (internal Splunk mode) ────
+# So SAIA/SLIM trust the cert-manager-issued CA instead of skipping TLS
+# verification against Splunk's HEC/management endpoints (AIP-4614 Part C).
+
+suite "caCertRef wiring (install_ai_platform_cr, internal mode)"
+
+# Scope to install_ai_platform_cr's body — "internal)"/"external)" also appear
+# as case labels in validate_image_config() earlier in the file.
+_AIPC_BODY() { awk '/^install_ai_platform_cr\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+
+assert_eq "internal-mode splunkConfiguration includes a caCertRef" \
+  "1" "$(_AIPC_BODY | awk '/^ *internal\)$/{f=1} f && /;;/{exit} f' | grep -c 'caCertRef:')"
+
+assert_eq "caCertRef points at the cert provisioned by provision_splunk_cert (ai-splunk-server-tls)" \
+  "1" "$(_AIPC_BODY | awk '/^ *internal\)$/{f=1} f && /;;/{exit} f' | grep -c 'name: ai-splunk-server-tls')"
+
+assert_eq "caCertRef key matches the leaf Certificate's default CA output key (ca.crt)" \
+  "1" "$(_AIPC_BODY | awk '/^ *internal\)$/{f=1} f && /;;/{exit} f' | grep -c 'key: ca.crt')"
+
+assert_eq "disabled mode does not set caCertRef (no Splunk to trust at all)" \
+  "0" "$(_AIPC_BODY | awk '/^ *\*\)$/{f=1} /;;/{f=0} f' | grep -c 'caCertRef:')"
+
+# ── Tests: caCertRef wiring into the AIPlatform CR (external Splunk mode) ────
+# Part E — a customer-supplied CA for a private/internal external Splunk, only
+# emitted when splunk.external.caCertSecretName is set. Left unset, SAIA falls
+# back to its image's system trust store (correct for publicly-trusted certs).
+
+suite "caCertRef wiring (install_ai_platform_cr, external mode)"
+
+_AIPC_EXTERNAL_BODY() { _AIPC_BODY | awk '/^ *external\)$/{f=1} f && /;;/{exit} f'; }
+
+assert_eq "config parser reads splunk.external.caCertSecretName via yq" \
+  "1" "$(grep -c 'yq eval .\.splunk\.external\.caCertSecretName' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "external-mode caCertRef emission is gated on SPLUNK_EXTERNAL_CA_SECRET_NAME being set" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'if \[\[ -n \"\${SPLUNK_EXTERNAL_CA_SECRET_NAME}\" \]\]')"
+
+assert_eq "external-mode caCertRef uses the customer-supplied secret name (not a hardcoded one)" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'name: \${SPLUNK_EXTERNAL_CA_SECRET_NAME}')"
+
+assert_eq "external-mode caCertRef key matches the documented convention (ca.crt)" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'key: ca.crt')"
+
+assert_eq "external-mode caCertRef fragment is interpolated into splunk_config_yaml (not dropped)" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'external_ca_cert_yaml}\${trusted_issuers_yaml}')"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""

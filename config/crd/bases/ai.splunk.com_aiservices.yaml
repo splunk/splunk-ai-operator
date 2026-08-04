@@ -1741,6 +1741,31 @@ spec:
                 description: SplunkConfiguration specifies the Splunk configuration
                   for the AIService
                 properties:
+                  caCertRef:
+                    description: |-
+                      CACertRef references a Secret/ConfigMap key holding the PEM CA bundle that
+                      signs the Splunk server certificate, so SAIA (and SLIM) can verify Splunk's
+                      TLS cert on their outbound HTTPS calls (JWKS fetch, token validation).
+                      Required whenever Splunk's cert chains to a CA not already in the image's
+                      system trust store — always true for the installer's self-signed internal
+                      chain, and common for external Splunk behind a private/internal CA.
+                    properties:
+                      key:
+                        default: ca.crt
+                        description: Key is the data key within the Secret holding
+                          the PEM CA bundle
+                        type: string
+                      name:
+                        description: Name is the Secret name containing the CA bundle
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace is the Secret's namespace. Defaults to the AIPlatform/AIService's
+                          own namespace when omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
                   endpoint:
                     description: |-
                       Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)

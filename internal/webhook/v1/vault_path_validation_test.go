@@ -15,10 +15,10 @@ func TestVaultPathValidation_AIService(t *testing.T) {
 	fldPath := field.NewPath("spec").Child("splunkConfiguration")
 
 	tests := []struct {
-		name        string
-		cfg         aiv1.SplunkConfigurationSpec
+		name         string
+		cfg          aiv1.SplunkConfigurationSpec
 		wantErrField string // empty string means no error expected on vaultFilePath
-		wantErrMsg  string
+		wantErrMsg   string
 	}{
 		{
 			name: "blocked: SA token path (VULN-87311 PoC)",
