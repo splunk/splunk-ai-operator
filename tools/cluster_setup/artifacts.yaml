@@ -2817,10 +2817,51 @@ spec:
               splunkConfiguration:
                 description: SplunkConfiguration defines the Splunk integration configuration
                 properties:
+                  caCertRef:
+                    description: |-
+                      CACertRef references a Secret/ConfigMap key holding the PEM CA bundle that
+                      signs the Splunk server certificate, so SAIA (and SLIM) can verify Splunk's
+                      TLS cert on their outbound HTTPS calls (JWKS fetch, token validation).
+                      Required whenever Splunk's cert chains to a CA not already in the image's
+                      system trust store — always true for the installer's self-signed internal
+                      chain, and common for external Splunk behind a private/internal CA.
+                    properties:
+                      key:
+                        default: ca.crt
+                        description: Key is the data key within the Secret holding
+                          the PEM CA bundle
+                        type: string
+                      name:
+                        description: Name is the Secret name containing the CA bundle
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace is the Secret's namespace. Defaults to the AIPlatform/AIService's
+                          own namespace when omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL (typically port 8089), used as
+                      the JWT issuer for SAIA token validation (mutually exclusive with
+                      SplunkCustomResourceRef). Either Endpoint or SplunkCustomResourceRef must
+                      be provided. When HECEndpoint is not set, this value is also used to
+                      derive the HEC ingestion URL for the OTel sidecar — which is only
+                      correct if Endpoint and the HEC listener share the same host; management
+                      (8089) and HEC (8088) are different ports on most Splunk deployments, so
+                      set HECEndpoint explicitly whenever OTel telemetry is enabled.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL (typically port
+                      8088) used by the OTel sidecar to ship telemetry. Distinct from Endpoint,
+                      which is the management/JWKS URL used for JWT issuer validation — HEC
+                      and management are different ports on most Splunk deployments. Falls
+                      back to Endpoint when unset, for backward compatibility with configs
+                      that predate this field (only correct when both happen to share a host
+                      and port, which is not the general case).
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials
@@ -2887,6 +2928,16 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
@@ -4813,10 +4864,51 @@ spec:
                 description: SplunkConfiguration specifies the Splunk configuration
                   for the AIService
                 properties:
+                  caCertRef:
+                    description: |-
+                      CACertRef references a Secret/ConfigMap key holding the PEM CA bundle that
+                      signs the Splunk server certificate, so SAIA (and SLIM) can verify Splunk's
+                      TLS cert on their outbound HTTPS calls (JWKS fetch, token validation).
+                      Required whenever Splunk's cert chains to a CA not already in the image's
+                      system trust store — always true for the installer's self-signed internal
+                      chain, and common for external Splunk behind a private/internal CA.
+                    properties:
+                      key:
+                        default: ca.crt
+                        description: Key is the data key within the Secret holding
+                          the PEM CA bundle
+                        type: string
+                      name:
+                        description: Name is the Secret name containing the CA bundle
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace is the Secret's namespace. Defaults to the AIPlatform/AIService's
+                          own namespace when omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL (typically port 8089), used as
+                      the JWT issuer for SAIA token validation (mutually exclusive with
+                      SplunkCustomResourceRef). Either Endpoint or SplunkCustomResourceRef must
+                      be provided. When HECEndpoint is not set, this value is also used to
+                      derive the HEC ingestion URL for the OTel sidecar — which is only
+                      correct if Endpoint and the HEC listener share the same host; management
+                      (8089) and HEC (8088) are different ports on most Splunk deployments, so
+                      set HECEndpoint explicitly whenever OTel telemetry is enabled.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL (typically port
+                      8088) used by the OTel sidecar to ship telemetry. Distinct from Endpoint,
+                      which is the management/JWKS URL used for JWT issuer validation — HEC
+                      and management are different ports on most Splunk deployments. Falls
+                      back to Endpoint when unset, for backward compatibility with configs
+                      that predate this field (only correct when both happen to share a host
+                      and port, which is not the general case).
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials
@@ -4883,6 +4975,16 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
