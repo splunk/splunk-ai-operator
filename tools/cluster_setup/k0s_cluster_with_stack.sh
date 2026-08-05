@@ -2816,6 +2816,17 @@ install_cert_manager() {
   kubectl apply -f "${_cm_url}"
 
   wait_for_crd certificates.cert-manager.io 300
+
+  # additionalOutputFormats: CombinedPEM (used below to produce tls-combined.pem
+  # for Splunk's sslConfig.serverCert) is gated behind the
+  # AdditionalCertificateOutputFormats alpha feature gate in cert-manager
+  # v1.13.0 (default off). The raw manifest has no --set/values mechanism, so
+  # patch the controller Deployment's args directly and let it roll.
+  log "Enabling AdditionalCertificateOutputFormats feature gate on cert-manager controller..."
+  kubectl patch deployment cert-manager -n cert-manager --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=AdditionalCertificateOutputFormats=true"}]'
+  kubectl rollout status deployment/cert-manager -n cert-manager --timeout=120s
+
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
 
   # Wait for webhook to be fully operational
