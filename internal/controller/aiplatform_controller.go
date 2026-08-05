@@ -179,7 +179,19 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("aiplatform").
-		For(&aiv1.AIPlatform{}).
+		// Predicates scoped to the primary resource via For()'s own
+		// WithPredicates, NOT WithEventFilter — WithEventFilter populates
+		// globalPredicates, which controller-runtime ANDs onto every Watches()/
+		// Owns() too (see doWatch() in controller-runtime's builder package). That
+		// would silently defeat the CACertRef Secret watch below: Secrets never
+		// bump metadata.generation, and a pure .data rotation touches neither
+		// annotations nor labels, so a global filter requiring one of those AND
+		// SecretChangedPredicate never fires (AIP-4614 Part D — found in review).
+		For(&aiv1.AIPlatform{}, builder.WithPredicates(predicate.Or(
+			common.GenerationChangedPredicate(),
+			common.AnnotationChangedPredicate(),
+			common.LabelChangedPredicate(),
+		))).
 		// AIPlatform owns its AIService children - reconcile on generation changes
 		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Or(
 			common.GenerationChangedPredicate(),
@@ -209,12 +221,6 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findAIPlatformsForCACertSecret),
 			builder.WithPredicates(common.SecretChangedPredicate()),
 		).
-		// Keep platform predicates light and scoped to the primary resource
-		WithEventFilter(predicate.Or(
-			common.GenerationChangedPredicate(),
-			common.AnnotationChangedPredicate(),
-			common.LabelChangedPredicate(),
-		)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,
 		})
