@@ -1,0 +1,44 @@
+# Single RBAC source for the Traefik controller — do not also embed RBAC in
+# the DaemonSet manifest (two sources of truth is how this drifts and one of
+# them stops matching what the controller actually needs).
+#
+# ClusterRole (not Role) is required because IngressRoute/IngressRouteTCP
+# objects live in ${AI_NS} next to the Splunk/SAIA Services, while the
+# controller itself runs in the "ingress" namespace — a namespaced Role
+# could not see across that boundary.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traefik
+  namespace: ingress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traefik-ingress-controller
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["traefik.io"]
+    resources:
+      - "ingressroutes"
+      - "ingressroutetcps"
+      - "middlewares"
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traefik-ingress-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traefik-ingress-controller
+subjects:
+  - kind: ServiceAccount
+    name: traefik
+    namespace: ingress

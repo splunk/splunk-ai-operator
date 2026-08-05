@@ -753,6 +753,30 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   IMAGE_PULL_SECRETS_ACR_ENABLED=$(yq eval '.imagePullSecrets.acr.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_CUSTOM_ENABLED=$(yq eval '.imagePullSecrets.custom.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
 
+  # Traefik HTTPS ingress is OPT-IN and defaults to DISABLED. When disabled,
+  # install_traefik_ingress no-ops and the installer behaves exactly as it
+  # does today (NodePort/tunnel access only). See TRAEFIK_HTTPS_DESIGN.md.
+  # yq returns "null" for an absent key, which we treat as false. yq also
+  # mishandles boolean false, so we normalise explicitly (same pattern as
+  # SPLUNK_ENABLED above).
+  INGRESS_ENABLED="$(yq eval '.ingress.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  [[ "${INGRESS_ENABLED}" != "true" ]] && INGRESS_ENABLED="false"
+  INGRESS_HOSTNAME="$(yq eval '.ingress.hostname // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${INGRESS_HOSTNAME}" == "null" ]] && INGRESS_HOSTNAME=""
+  # off | only — see TRAEFIK_HTTPS_DESIGN.md §3. "only" requires the customer
+  # to also supply a FIPS-capable images.ingress.traefikImage.
+  INGRESS_FIPS="$(yq eval '.ingress.fips // "off"' "${CONFIG_FILE}" 2>/dev/null || echo "off")"
+  [[ "${INGRESS_FIPS}" == "null" || -z "${INGRESS_FIPS}" ]] && INGRESS_FIPS="off"
+  INGRESS_TLS_MODE="$(yq eval '.ingress.tls.mode // "selfsigned"' "${CONFIG_FILE}" 2>/dev/null || echo "selfsigned")"
+  [[ "${INGRESS_TLS_MODE}" == "null" || -z "${INGRESS_TLS_MODE}" ]] && INGRESS_TLS_MODE="selfsigned"
+  INGRESS_SAIA_PORT="$(yq eval '.ingress.entryPoints.saia.port // 8443' "${CONFIG_FILE}" 2>/dev/null || echo "8443")"
+  INGRESS_SPLUNKWEB_PORT="$(yq eval '.ingress.entryPoints.splunkWeb.port // 8000' "${CONFIG_FILE}" 2>/dev/null || echo "8000")"
+  INGRESS_SPLUNKMGMT_PORT="$(yq eval '.ingress.entryPoints.splunkMgmt.port // 8089' "${CONFIG_FILE}" 2>/dev/null || echo "8089")"
+  INGRESS_SPLUNKMGMT_ENABLED="$(yq eval '.ingress.entryPoints.splunkMgmt.enabled // true' "${CONFIG_FILE}" 2>/dev/null || echo "true")"
+  [[ "${INGRESS_SPLUNKMGMT_ENABLED}" != "true" ]] && INGRESS_SPLUNKMGMT_ENABLED="false"
+  TRAEFIK_IMAGE="$(yq eval '.images.ingress.traefikImage // "docker.io/library/traefik:v3.6.14"' "${CONFIG_FILE}" 2>/dev/null || echo "docker.io/library/traefik:v3.6.14")"
+  [[ "${TRAEFIK_IMAGE}" == "null" || -z "${TRAEFIK_IMAGE}" ]] && TRAEFIK_IMAGE="docker.io/library/traefik:v3.6.14"
+
   # File paths
   SPLUNK_OPERATOR_FILE=$(yq eval '.files.splunkOperator' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
@@ -761,6 +785,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
   log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_HEC_ENDPOINT:+, external endpoints set})"
+  log "Traefik HTTPS ingress: enabled=${INGRESS_ENABLED} (ingress.enabled)"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -5342,6 +5367,10 @@ apply_k0s_saia_service_annotations() {
 # Layer-2 (ARP/NDP) or BGP. We pin the chart version for supply-chain
 # reproducibility (codeguard-0-supply-chain-security).
 
+ingress_enabled_k0s() {
+  [[ "${INGRESS_ENABLED}" == "true" ]]
+}
+
 metallb_enabled_k0s() {
   local v
   v="$(yq eval '.metallb.install // false' "${CONFIG_FILE}" 2>/dev/null || echo false)"
@@ -5470,6 +5499,254 @@ YAML
   fi
 
   log "✓ MetalLB ${chart_version} installed (${mode}, pool=${pool_name})"
+}
+
+# ---------- Traefik HTTPS ingress (additive; see TRAEFIK_HTTPS_DESIGN.md) ----------
+# Deploys Traefik v3 as a hostPort DaemonSet (one independent pod per worker
+# node — there is no single shared controller IP) terminating HTTPS for SAIA
+# (:8443), Splunk Web (:8000) and, optionally, Splunk's management port
+# (:8089, TCP passthrough so Splunk's own cert stays end-to-end). Additive:
+# existing NodePort/tunnel access is untouched and keeps working regardless
+# of ingress.enabled.
+install_traefik_ingress() {
+  ingress_enabled_k0s || { log "ingress.enabled != true — skipping Traefik HTTPS ingress"; return 0; }
+
+  log "Installing Traefik HTTPS ingress..."
+  wait_for_cert_manager_webhook 30 10
+
+  local ingress_ns="ingress"
+  ensure_namespace "${ingress_ns}"
+
+  local manifest_dir="${TRAEFIK_MANIFEST_DIR:-$(dirname "$0")/traefik}"
+  kubectl apply -f "${manifest_dir}/traefik-crds.yaml"
+  wait_for_crd ingressroutes.traefik.io 300
+  wait_for_crd ingressroutetcps.traefik.io 300
+  wait_for_crd middlewares.traefik.io 300
+
+  kubectl apply -f "${manifest_dir}/traefik-rbac.yaml"
+
+  # cert-manager selfSigned → CA → CA-Issuer → leaf chain (mirrors
+  # provision_splunk_cert / eks_cluster_with_stack.sh:2671-2696), retargeted
+  # to the ingress namespace with a 4th, leaf object added.
+  #
+  # Why all worker IPs, not one: Traefik is a DaemonSet, so every worker node
+  # runs its own independent pod, hostPort-bound to that node's own IP. The
+  # single internal-domain-tls secret is mounted identically into every one
+  # of those pods, so its SAN list must cover whichever worker IP a client
+  # dials, or TLS fails with a hostname/IP mismatch on any worker not listed.
+  if [[ ${#WORKER_IPS[@]} -eq 0 && -n "${EXISTING_WORKER_IPS}" ]]; then
+    IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
+  fi
+  if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
+    err "ingress.enabled=true but no worker IPs are known (nodes.existingIPs.workers[] empty); the Traefik cert needs at least one worker IP as a SAN."
+  fi
+
+  local ip_sans=""
+  local ip
+  for ip in "${WORKER_IPS[@]}"; do
+    ip_sans+="    - ${ip}"$'\n'
+  done
+  local dns_sans=""
+  if [[ -n "${INGRESS_HOSTNAME}" ]]; then
+    dns_sans="  dnsNames:"$'\n'"    - ${INGRESS_HOSTNAME}"$'\n'
+  fi
+
+  log "Provisioning internal-domain-tls cert (SANs: ${WORKER_IPS[*]}${INGRESS_HOSTNAME:+, ${INGRESS_HOSTNAME}})..."
+  cat <<YAML | kubectl -n "${ingress_ns}" apply --server-side --force-conflicts -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ingress-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ingress-ca
+spec:
+  isCA: true
+  commonName: ai-platform-ingress-ca
+  secretName: ai-platform-ingress-ca-tls
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ingress-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ingress-ca-issuer
+spec:
+  ca:
+    secretName: ai-platform-ingress-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: internal-domain-tls
+spec:
+  secretName: internal-domain-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: ingress-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+${dns_sans}  ipAddresses:
+${ip_sans}
+YAML
+
+  kubectl wait --for=condition=Ready certificate/internal-domain-tls -n "${ingress_ns}" --timeout=180s \
+    || warn "internal-domain-tls certificate not Ready after 180s; Traefik pods may fail to start"
+
+  create_image_pull_secrets "${ingress_ns}"
+
+  # fips140=off is a documented no-op on the default (non-FIPS) Traefik
+  # image; fips140=only requires the customer's own FIPS-capable image
+  # (images.ingress.traefikImage) — see TRAEFIK_HTTPS_DESIGN.md §3.
+  log "Deploying Traefik DaemonSet (image=${TRAEFIK_IMAGE}, fips=${INGRESS_FIPS})..."
+  cat <<YAML | kubectl -n "${ingress_ns}" apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: traefik
+  namespace: ${ingress_ns}
+  labels:
+    app: traefik
+spec:
+  selector:
+    matchLabels:
+      app: traefik
+  template:
+    metadata:
+      labels:
+        app: traefik
+    spec:
+      serviceAccountName: traefik
+      # ClusterFirst (not ClusterFirstWithHostNet) — the pod uses hostPort,
+      # not hostNetwork, so it still needs normal cluster DNS to resolve the
+      # in-cluster Services it routes to (design doc §13 bug #1).
+      dnsPolicy: ClusterFirst
+      # splunk.ai/node-role=worker (not node-role.kubernetes.io/worker, which
+      # this installer never sets) matches every worker — CPU and GPU alike.
+      # Traefik must run on ALL of them (DaemonSet, one pod per worker's own
+      # IP), so it also needs to tolerate the GPU-node taint
+      # (nvidia.com/gpu=true:NoSchedule, applied to every GPU worker above).
+      nodeSelector:
+        splunk.ai/node-role: worker
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: traefik
+          image: ${TRAEFIK_IMAGE}
+          args:
+            - --providers.kubernetescrd
+            - --providers.kubernetescrd.allowCrossNamespace=true
+            - --entrypoints.websecure.address=:8443
+            - --entrypoints.splunkweb.address=:8000
+            - --entrypoints.splunkmgmt.address=:8089
+            - --entrypoints.websecure.http.tls=true
+            - --entrypoints.splunkweb.http.tls=true
+          env:
+            - name: GODEBUG
+              value: fips140=${INGRESS_FIPS}
+          ports:
+            - name: websecure
+              containerPort: 8443
+              hostPort: 8443
+            - name: splunkweb
+              containerPort: 8000
+              hostPort: 8000
+            - name: splunkmgmt
+              containerPort: 8089
+              hostPort: 8089
+YAML
+
+  wait_rollout "${ingress_ns}" daemonset traefik 180
+
+  local saia_svc="${CLUSTER_NAME}-ai-platform-saia-saia-service"
+  local splunkweb_svc="splunk-${AI_STANDALONE_NAME}-standalone-service"
+
+  log "Applying IngressRoute for SAIA (${saia_svc}:8080) on entryPoint websecure..."
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: saia-websecure
+  namespace: ${AI_NS}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: PathPrefix(\`/\`)
+      kind: Rule
+      services:
+        - name: ${saia_svc}
+          port: 8080
+  tls:
+    secretName: internal-domain-tls
+YAML
+
+  log "Applying IngressRoute for Splunk Web (${splunkweb_svc}:8000) on entryPoint splunkweb..."
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunkweb-splunkweb
+  namespace: ${AI_NS}
+spec:
+  entryPoints:
+    - splunkweb
+  routes:
+    - match: PathPrefix(\`/\`)
+      kind: Rule
+      services:
+        - name: ${splunkweb_svc}
+          port: 8000
+  tls:
+    secretName: internal-domain-tls
+YAML
+
+  if [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]]; then
+    log "Applying IngressRouteTCP for Splunk mgmt (${splunkweb_svc}:8089, TLS passthrough)..."
+    cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: splunkmgmt-passthrough
+  namespace: ${AI_NS}
+spec:
+  entryPoints:
+    - splunkmgmt
+  routes:
+    - match: HostSNI(\`*\`)
+      services:
+        - name: ${splunkweb_svc}
+          port: 8089
+  tls:
+    passthrough: true
+YAML
+  else
+    log "ingress.entryPoints.splunkMgmt.enabled != true — skipping Splunk mgmt passthrough route"
+  fi
+
+  log "✓ Traefik HTTPS ingress installed."
+  local url_host="${INGRESS_HOSTNAME:-${WORKER_IPS[0]}}"
+  log "  SAIA / AI Assistant URL: https://${url_host}:8443"
+  log "  Splunk Web URL:         https://${url_host}:8000"
+  [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]] && log "  Splunk mgmt (passthrough): https://${url_host}:8089"
+  log "  Any worker IP works equally (ClusterIP Service backends route cross-node)."
+  log "  Self-signed CA secret: ${ingress_ns}/ai-platform-ingress-ca-tls (import ca.crt to trust the cert)."
 }
 
 # Disable kube-proxy NodePort allocation on the rendered SAIA Service so
@@ -5750,6 +6027,10 @@ install_ai_platform_stack() {
 
   # Install AI Platform operator and CR while Splunk Standalone boots
   install_splunk_ai_operator
+  # Traefik HTTPS ingress (additive, no-op unless ingress.enabled=true) —
+  # installed here so cert-manager/webhook are already proven ready and the
+  # IngressRoutes exist before the AIPlatform CR triggers SAIA's Service.
+  install_traefik_ingress
   install_ai_platform_cr
   patch_k0s_saia_public_service_workaround
   # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).

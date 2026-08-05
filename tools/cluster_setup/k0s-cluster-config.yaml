@@ -151,6 +151,12 @@ images:
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
 
+  # Traefik HTTPS ingress (see the "ingress" block below). Only pulled/used
+  # when ingress.enabled: true. The default image is NOT FIPS-certified — if
+  # ingress.fips: "only", point this at your own FIPS-capable Traefik build.
+  ingress:
+    traefikImage: "docker.io/library/traefik:v3.6.14"
+
 # ---------- Operator Versions ----------
 operators:
   ray:
@@ -339,6 +345,36 @@ metallb:
     # - peerAddress: "10.0.0.1"
     #   peerASN: 65001
     #   myASN: 65000
+
+# ---------- Traefik HTTPS Ingress ----------
+# OPT-IN, defaults to DISABLED. When false (or absent): none of this runs —
+# your install behaves exactly as it does today (NodePort/tunnel access
+# only). See TRAEFIK_HTTPS_DESIGN.md and TRAEFIK_HTTPS_SETUP.md.
+#
+# When enabled, the installer deploys Traefik v3 as a DaemonSet (one
+# independent pod per worker node, hostPort-bound to that worker's own IP —
+# there is no single shared controller address) terminating HTTPS for SAIA
+# (:8443) and Splunk Web (:8000), plus an optional TCP-passthrough route for
+# Splunk's management port (:8089). This is purely additive: existing
+# NodePort/tunnel access keeps working unchanged either way.
+ingress:
+  enabled: false                 # master gate — set true to turn this on
+  hostname: ""                   # optional DNS SAN for the cert; leave blank to
+                                  # access via worker IP instead (any worker IP
+                                  # works — see TRAEFIK_HTTPS_SETUP.md)
+  fips: "off"                    # off | only — "only" requires you to also set
+                                  # images.ingress.traefikImage to a FIPS-capable build
+  tls:
+    mode: selfsigned             # selfsigned is the only mode implemented today
+  entryPoints:
+    saia:
+      port: 8443
+    splunkWeb:
+      port: 8000
+    splunkMgmt:
+      port: 8089
+      enabled: true               # set false if no external system needs direct
+                                   # access to Splunk's management port
 
 # ---------- Image Pull Secrets ----------
 imagePullSecrets:

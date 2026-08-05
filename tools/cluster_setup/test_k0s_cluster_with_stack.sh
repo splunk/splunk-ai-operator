@@ -1057,6 +1057,71 @@ assert_eq "external CR hecEndpoint is distinct HEC URL" \
 assert_eq "external rendering fails if either required endpoint is absent" \
   "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'requires both splunk.external.managementEndpoint and splunk.external.hecEndpoint')"
 
+# ── Tests: Traefik HTTPS ingress (install_traefik_ingress) ──────────────────
+# TRAEFIK_HTTPS_DESIGN.md / TRAEFIK_HTTPS_SETUP.md — additive, opt-in HTTPS
+# access to SAIA/Splunk Web via a Traefik v3 DaemonSet.
+
+suite "install_traefik_ingress"
+
+_TRAEFIK_BODY() { awk '/^install_traefik_ingress\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+
+assert_eq "gated on ingress_enabled_k0s (early return when disabled)" \
+  "1" "$(_TRAEFIK_BODY | grep -A1 'ingress_enabled_k0s ||' | grep -c 'return 0')"
+
+assert_eq "ingress_enabled_k0s reads ingress.enabled (normalised to true/false, not raw yq null)" \
+  "1" "$(grep -c 'INGRESS_ENABLED="\$(yq eval .\.ingress\.enabled.' "${SCRIPT}")"
+
+assert_eq "waits for cert-manager webhook before applying the cert chain" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'wait_for_cert_manager_webhook')"
+
+assert_eq "DaemonSet uses dnsPolicy: ClusterFirst (NOT ClusterFirstWithHostNet — design bug #1)" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'dnsPolicy: ClusterFirst$')"
+
+assert_eq "DaemonSet spec does not actually set dnsPolicy to ClusterFirstWithHostNet" \
+  "0" "$(_TRAEFIK_BODY | grep -c 'dnsPolicy: ClusterFirstWithHostNet')"
+
+assert_eq "DaemonSet binds exactly the three documented hostPorts (8443/8000/8089)" \
+  "3" "$(_TRAEFIK_BODY | grep -cE 'hostPort: (8443|8000|8089)$')"
+
+assert_eq "DaemonSet templates GODEBUG=fips140= from ingress.fips config (INGRESS_FIPS)" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'value: fips140=\${INGRESS_FIPS}')"
+
+assert_eq "RBAC is applied from a single static manifest, not re-embedded in the DaemonSet apply (design bug #2)" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'traefik-rbac.yaml')"
+
+assert_eq "DaemonSet apply itself carries no ClusterRole/ClusterRoleBinding (RBAC stays single-sourced)" \
+  "0" "$(_TRAEFIK_BODY | awk '/kind: DaemonSet/{f=1} f && /^YAML$/{exit} f' | grep -c 'kind: ClusterRole')"
+
+assert_eq "SAIA IngressRoute targets the public nginx Service (…-saia-saia-service), not v1/v2 directly" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'name: \${saia_svc}')"
+
+assert_eq "SAIA IngressRoute backend port is nginx's plain-HTTP port (8080), which Traefik then TLS-terminates" \
+  "1" "$(_TRAEFIK_BODY | awk '/name: saia-websecure/{f=1} f && /^YAML$/{exit} f' | grep -c 'port: 8080')"
+
+assert_eq "Splunk mgmt route uses tls.passthrough (Splunk's own cert stays end-to-end, not re-terminated)" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'passthrough: true')"
+
+assert_eq "Splunk mgmt route is gated on INGRESS_SPLUNKMGMT_ENABLED" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'if \[\[ \"\${INGRESS_SPLUNKMGMT_ENABLED}\" == \"true\" \]\]')"
+
+assert_eq "leaf cert secretName is internal-domain-tls (shared by Traefik entryPoints + IngressRoutes)" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'name: internal-domain-tls')"
+
+assert_eq "leaf cert SANs are built by looping ALL worker IPs, not a single representative one" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'for ip in \"\${WORKER_IPS\[@\]}\"; do')"
+
+assert_eq "waits for the leaf cert to reach Ready before deploying the DaemonSet" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'kubectl wait --for=condition=Ready certificate/internal-domain-tls')"
+
+assert_eq "fails loudly if enabled with zero known worker IPs (cert would have no valid SAN)" \
+  "1" "$(_TRAEFIK_BODY | grep -c 'err \"ingress.enabled=true but no worker IPs are known')"
+
+assert_eq "orchestrator installs Traefik ingress before the AIPlatform CR is applied" \
+  "1" "$(awk '/install_traefik_ingress$/{t=NR} /install_ai_platform_cr$/{c=NR} END{print(t > 0 && c > 0 && t < c)}' "${SCRIPT}")"
+
+assert_eq "orchestrator installs Traefik ingress after the Splunk AI operator (services must exist first)" \
+  "1" "$(awk '/install_splunk_ai_operator$/{o=NR} /install_traefik_ingress$/{t=NR} END{print(o > 0 && t > 0 && o < t)}' "${SCRIPT}")"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""

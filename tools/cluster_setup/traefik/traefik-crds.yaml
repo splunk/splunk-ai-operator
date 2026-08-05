@@ -1,0 +1,78 @@
+# Minimal Traefik v3.6.x CRD set — only the kinds this installer actually
+# uses (IngressRoute, IngressRouteTCP, Middleware). Not the full upstream
+# CRD bundle. Pinned to the v3.6.x schema; re-verify compatibility before
+# bumping images.ingress.traefikImage to a different minor version.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ingressroutes.traefik.io
+spec:
+  group: traefik.io
+  names:
+    kind: IngressRoute
+    plural: ingressroutes
+    singular: ingressroute
+    listKind: IngressRouteList
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ingressroutetcps.traefik.io
+spec:
+  group: traefik.io
+  names:
+    kind: IngressRouteTCP
+    plural: ingressroutetcps
+    singular: ingressroutetcp
+    listKind: IngressRouteTCPList
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: middlewares.traefik.io
+spec:
+  group: traefik.io
+  names:
+    kind: Middleware
+    plural: middlewares
+    singular: middleware
+    listKind: MiddlewareList
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+          x-kubernetes-preserve-unknown-fields: true
