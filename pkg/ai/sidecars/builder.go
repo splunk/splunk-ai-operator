@@ -171,15 +171,25 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 	}
 
 	// Mount the same CACertRef Secret SAIA/SLIM already trust (AIP-4614 Part
-	// C), so the OTel sidecar can verify Splunk's HEC certificate instead of
-	// skipping TLS verification. Absent CACertRef, renderOtelConf falls back
-	// to insecure_skip_verify (see below) — correct only for a publicly
-	// trusted HEC certificate.
+	// C), so the OTel sidecar can verify Splunk's HEC certificate. Absent
+	// CACertRef, renderOtelConf relies on the collector image's system trust
+	// store (see below) — correct only for a publicly trusted HEC certificate.
 	if ref := p.Spec.SplunkConfiguration.CACertRef; ref != nil && ref.Name != "" {
+		key := ref.Key
+		if key == "" {
+			key = "ca.crt"
+		}
 		specMap["volumes"] = []map[string]interface{}{
 			{
-				"name":   "splunk-ca",
-				"secret": map[string]interface{}{"secretName": ref.Name},
+				"name": "splunk-ca",
+				// Project only the CA key, not the whole Secret — CACertRef may
+				// point at a leaf-cert Secret (e.g. the installer's
+				// ai-splunk-server-tls) that also holds tls.key, which must
+				// never land in this container's filesystem.
+				"secret": map[string]interface{}{
+					"secretName": ref.Name,
+					"items":      []map[string]interface{}{{"key": key, "path": key}},
+				},
 			},
 		}
 		specMap["volumeMounts"] = []map[string]interface{}{
@@ -265,10 +275,13 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 	}
 
 	// Verify the HEC certificate against the same CA SAIA/SLIM trust when
-	// CACertRef is set (mounted at /etc/splunk-ca by the caller); otherwise
-	// fall back to skipping verification, which is only safe for a publicly
-	// trusted certificate.
-	tlsConfig := map[string]interface{}{"insecure_skip_verify": true}
+	// CACertRef is set (mounted at /etc/splunk-ca by the caller). Absent
+	// CACertRef, default to verifying against the collector image's system
+	// trust store (insecure_skip_verify: false) rather than silently skipping
+	// verification — correct for a publicly trusted certificate, and fails
+	// loudly (connection refused/cert error) instead of silently accepting
+	// any certificate when the deployment actually needs a private CA.
+	tlsConfig := map[string]interface{}{"insecure_skip_verify": false}
 	if ref := cr.Spec.SplunkConfiguration.CACertRef; ref != nil && ref.Name != "" {
 		key := ref.Key
 		if key == "" {

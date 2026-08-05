@@ -398,7 +398,7 @@ func TestRenderOtelConf_CACertRefEnablesTLSVerification(t *testing.T) {
 	assert.Equal(t, "/etc/splunk-ca/ca.crt", tlsConf["ca_file"])
 }
 
-func TestRenderOtelConf_NoCACertRefSkipsVerification(t *testing.T) {
+func TestRenderOtelConf_NoCACertRefVerifiesAgainstSystemTrustStore(t *testing.T) {
 	ctx := context.Background()
 	scheme := setupFakeScheme()
 
@@ -427,8 +427,8 @@ func TestRenderOtelConf_NoCACertRefSkipsVerification(t *testing.T) {
 	splunkHec := exporters["splunk_hec"].(map[string]interface{})
 	tlsConf := splunkHec["tls"].(map[string]interface{})
 
-	assert.Equal(t, true, tlsConf["insecure_skip_verify"],
-		"falls back to insecure_skip_verify when CACertRef is unset")
+	assert.Equal(t, false, tlsConf["insecure_skip_verify"],
+		"absent CACertRef must still verify against the collector image's system trust store, not skip verification")
 	assert.NotContains(t, tlsConf, "ca_file")
 }
 
