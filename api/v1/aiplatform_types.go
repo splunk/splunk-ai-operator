@@ -301,10 +301,26 @@ type SplunkConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	SecretRef corev1.SecretReference `json:"secretRef,omitempty"`
 
-	// Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-	// Either Endpoint or SplunkCustomResourceRef must be provided
+	// Endpoint is the Splunk management/JWKS URL (typically port 8089), used as
+	// the JWT issuer for SAIA token validation (mutually exclusive with
+	// SplunkCustomResourceRef). Either Endpoint or SplunkCustomResourceRef must
+	// be provided. When HECEndpoint is not set, this value is also used to
+	// derive the HEC ingestion URL for the OTel sidecar — which is only
+	// correct if Endpoint and the HEC listener share the same host; management
+	// (8089) and HEC (8088) are different ports on most Splunk deployments, so
+	// set HECEndpoint explicitly whenever OTel telemetry is enabled.
 	// +kubebuilder:validation:Optional
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// HECEndpoint is the Splunk HTTP Event Collector base URL (typically port
+	// 8088) used by the OTel sidecar to ship telemetry. Distinct from Endpoint,
+	// which is the management/JWKS URL used for JWT issuer validation — HEC
+	// and management are different ports on most Splunk deployments. Falls
+	// back to Endpoint when unset, for backward compatibility with configs
+	// that predate this field (only correct when both happen to share a host
+	// and port, which is not the general case).
+	// +kubebuilder:validation:Optional
+	HECEndpoint string `json:"hecEndpoint,omitempty"`
 
 	// Token is the Splunk HEC token (consider using SecretRef instead)
 	// +kubebuilder:validation:Optional

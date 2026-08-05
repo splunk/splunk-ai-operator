@@ -294,6 +294,144 @@ func TestRenderOtelConf(t *testing.T) {
 	assert.Contains(t, service, "pipelines")
 }
 
+func TestRenderOtelConf_HECEndpointOverridesEndpoint(t *testing.T) {
+	// Regression: Endpoint (management/JWKS, e.g. :8089) and HECEndpoint
+	// (HEC ingestion, e.g. :8088) are different Splunk listeners. Before
+	// HECEndpoint existed, renderOtelConf always derived the HEC URL from
+	// Endpoint, so an internal-mode config pointed OTel at the wrong port.
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token-123")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef:   corev1.SecretReference{Name: "splunk-secret"},
+				Endpoint:    "https://splunk.example.com:8089",
+				HECEndpoint: "https://splunk.example.com:8088",
+			},
+		},
+	}
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	conf := builder.renderOtelConf(ctx, platform)
+	exporters := conf["exporters"].(map[string]interface{})
+	splunkHec := exporters["splunk_hec"].(map[string]interface{})
+
+	assert.Equal(t, "https://splunk.example.com:8088/services/collector", splunkHec["endpoint"],
+		"HECEndpoint must be used for the HEC URL, not Endpoint")
+}
+
+func TestRenderOtelConf_FallsBackToEndpointWhenHECEndpointUnset(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token-123")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+				Endpoint:  "https://splunk.example.com:8088",
+			},
+		},
+	}
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	conf := builder.renderOtelConf(ctx, platform)
+	exporters := conf["exporters"].(map[string]interface{})
+	splunkHec := exporters["splunk_hec"].(map[string]interface{})
+
+	assert.Equal(t, "https://splunk.example.com:8088/services/collector", splunkHec["endpoint"],
+		"backward-compat: Endpoint must still be used when HECEndpoint is unset")
+}
+
+func TestRenderOtelConf_CACertRefEnablesTLSVerification(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token-123")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+				Endpoint:  "https://splunk.example.com:8088",
+				CACertRef: &aiApi.CABundleRef{Name: "splunk-ca-bundle"},
+			},
+		},
+	}
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	conf := builder.renderOtelConf(ctx, platform)
+	exporters := conf["exporters"].(map[string]interface{})
+	splunkHec := exporters["splunk_hec"].(map[string]interface{})
+	tlsConf := splunkHec["tls"].(map[string]interface{})
+
+	assert.Equal(t, false, tlsConf["insecure_skip_verify"],
+		"TLS verification must be enabled when CACertRef is set")
+	assert.Equal(t, "/etc/splunk-ca/ca.crt", tlsConf["ca_file"])
+}
+
+func TestRenderOtelConf_NoCACertRefSkipsVerification(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token-123")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+				Endpoint:  "https://splunk.example.com:8088",
+			},
+		},
+	}
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	conf := builder.renderOtelConf(ctx, platform)
+	exporters := conf["exporters"].(map[string]interface{})
+	splunkHec := exporters["splunk_hec"].(map[string]interface{})
+	tlsConf := splunkHec["tls"].(map[string]interface{})
+
+	assert.Equal(t, true, tlsConf["insecure_skip_verify"],
+		"falls back to insecure_skip_verify when CACertRef is unset")
+	assert.NotContains(t, tlsConf, "ca_file")
+}
+
 func TestRenderOtelConf_SecretMissing(t *testing.T) {
 	ctx := context.Background()
 	scheme := setupFakeScheme()

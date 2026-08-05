@@ -170,6 +170,23 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		"config": cfg,
 	}
 
+	// Mount the same CACertRef Secret SAIA/SLIM already trust (AIP-4614 Part
+	// C), so the OTel sidecar can verify Splunk's HEC certificate instead of
+	// skipping TLS verification. Absent CACertRef, renderOtelConf falls back
+	// to insecure_skip_verify (see below) — correct only for a publicly
+	// trusted HEC certificate.
+	if ref := p.Spec.SplunkConfiguration.CACertRef; ref != nil && ref.Name != "" {
+		specMap["volumes"] = []map[string]interface{}{
+			{
+				"name":   "splunk-ca",
+				"secret": map[string]interface{}{"secretName": ref.Name},
+			},
+		}
+		specMap["volumeMounts"] = []map[string]interface{}{
+			{"name": "splunk-ca", "mountPath": "/etc/splunk-ca", "readOnly": true},
+		}
+	}
+
 	// CreateOrUpdate the Collector
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(schema.GroupVersionKind{Group: "opentelemetry.io", Version: "v1beta1", Kind: "OpenTelemetryCollector"})
@@ -233,11 +250,36 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 		return map[string]interface{}{"error": "hec_token field not found in secret"}
 	}
 
-	endpoint := fmt.Sprintf("%s/services/collector", cr.Spec.SplunkConfiguration.Endpoint)
+	// HECEndpoint (port 8088) is the correct ingestion URL. Endpoint (port
+	// 8089) is the management/JWKS URL used for JWT issuer validation
+	// elsewhere; falling back to it here is only correct for configs
+	// predating HECEndpoint where both happen to share host/port.
+	hecBase := cr.Spec.SplunkConfiguration.HECEndpoint
+	if hecBase == "" {
+		hecBase = cr.Spec.SplunkConfiguration.Endpoint
+	}
+	endpoint := fmt.Sprintf("%s/services/collector", hecBase)
 	metricsIndexName, exists := os.LookupEnv("SPLUNK_METRICS_INDEX_NAME")
 	if !exists {
 		metricsIndexName = "_metrics"
 	}
+
+	// Verify the HEC certificate against the same CA SAIA/SLIM trust when
+	// CACertRef is set (mounted at /etc/splunk-ca by the caller); otherwise
+	// fall back to skipping verification, which is only safe for a publicly
+	// trusted certificate.
+	tlsConfig := map[string]interface{}{"insecure_skip_verify": true}
+	if ref := cr.Spec.SplunkConfiguration.CACertRef; ref != nil && ref.Name != "" {
+		key := ref.Key
+		if key == "" {
+			key = "ca.crt"
+		}
+		tlsConfig = map[string]interface{}{
+			"insecure_skip_verify": false,
+			"ca_file":              "/etc/splunk-ca/" + key,
+		}
+	}
+
 	return map[string]interface{}{
 		"exporters": map[string]interface{}{
 			"splunk_hec": map[string]interface{}{
@@ -248,7 +290,7 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 				"index":               metricsIndexName,
 				"disable_compression": false,
 				"timeout":             "10s",
-				"tls":                 map[string]interface{}{"insecure_skip_verify": true},
+				"tls":                 tlsConfig,
 				"splunk_app_name":     "OpenTelemetry-Collector Splunk Exporter",
 				"splunk_app_version":  "v0.0.1",
 				"heartbeat":           map[string]interface{}{"interval": "30s"},

@@ -4890,6 +4890,11 @@ install_ai_platform_cr() {
   # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
     endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    # HEC ingestion endpoint (port 8088) for the OTel sidecar. Distinct from
+    # "endpoint" above (management/JWKS, port 8089, used as the JWT issuer) —
+    # without this, OTel telemetry was sent to the management port and
+    # silently failed to reach the HEC listener.
+    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
