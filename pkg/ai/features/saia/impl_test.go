@@ -1295,6 +1295,12 @@ func Test_reconcileSAIADeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
 	require.NotNil(t, vol)
 	require.NotNil(t, vol.Secret)
 	assert.Equal(t, "ai-splunk-server-tls", vol.Secret.SecretName)
+	// ai-splunk-server-tls is a leaf-cert Secret that also holds tls.key;
+	// the volume must project only ca.crt, never the whole Secret, or the
+	// private key ends up in this container's filesystem.
+	require.Len(t, vol.Secret.Items, 1)
+	assert.Equal(t, "ca.crt", vol.Secret.Items[0].Key)
+	assert.Equal(t, "ca.crt", vol.Secret.Items[0].Path)
 	require.NotNil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca-combined"))
 
 	// A splunk-ca-merge initContainer combines the system trust store with the

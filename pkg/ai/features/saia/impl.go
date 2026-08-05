@@ -952,7 +952,14 @@ func buildSAIACABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar,
 		corev1.Volume{
 			Name: "splunk-ca",
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+				// Project only the CA key, not the whole Secret — CACertRef may
+				// point at a leaf-cert Secret (e.g. the installer's
+				// ai-splunk-server-tls) that also holds tls.key, which must
+				// never land in this container's filesystem.
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: ref.Name,
+					Items:      []corev1.KeyToPath{{Key: key, Path: key}},
+				},
 			},
 		},
 		corev1.Volume{
