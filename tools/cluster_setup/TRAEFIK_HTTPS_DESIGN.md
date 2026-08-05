@@ -1,7 +1,10 @@
 # Traefik HTTPS Ingress — Architecture Design
 
 **Status:** Design / for-implementation
-**Target:** k0s on EC2 (1 controller, 1 CPU worker, 2 GPU workers, 1 installer/jump node)
+**Target:** k0s (1 controller, 1 CPU worker, 2 GPU workers, 1 installer/jump node) — on any
+infrastructure: cloud VM, bare metal, or on-prem. Cloud-specific notes (e.g. EC2) are called out
+explicitly where the underlying mechanism differs; everything else in this design is
+infrastructure-agnostic.
 **Namespace:** `ai-platform` (services), `ingress` (Traefik)
 **Installer:** `k0s_cluster_with_stack.sh` + `k0s-cluster-config.yaml`
 
@@ -10,10 +13,12 @@
 ## Table of Contents
 
 - [1. Problem Statement](#1-problem-statement)
+- [1a. Requirements](#1a-requirements)
 - [2. How the Existing YAML Files Fit In](#2-how-the-existing-yaml-files-fit-in)
 - [3. FIPS / GODEBUG Behavior](#3-fips--godebug-behavior)
 - [4. Architecture Decision: Raw Manifests vs Helm](#4-architecture-decision-raw-manifests-vs-helm)
 - [5. TLS Certificate Strategy](#5-tls-certificate-strategy)
+- [5a. TLS/mTLS Topology and External Exposure](#5a-tlsmtls-topology-and-external-exposure)
 - [6. Entry Point Design](#6-entry-point-design)
 - [7. IngressRoute Design](#7-ingressroute-design)
 - [8. Required Changes to Existing Files](#8-required-changes-to-existing-files)
@@ -52,6 +57,22 @@ Traefik v3 runs as a DaemonSet with hostPorts on the k0s workers. It terminates 
 - SAIA → `https://<host>:8443` (same HTTPS scheme → no mixed-content)
 - Certificates issued by cert-manager (already installed)
 - SSH tunnels replaced by direct HTTPS or a single stable jump-host tunnel
+
+## 1a. Requirements
+
+- **Optional.** Traefik setup is gated behind `ingress.enabled` (default `false`). Installs that
+  don't set it get zero behavior change — no Traefik namespace, no DaemonSet, no CRDs, no
+  cert-manager chain beyond what's already installed for other purposes. This is additive to,
+  not a replacement for, the existing NodePort/tunnel access path (§14 Migration Path).
+- **In-cluster service routing.** When enabled, Traefik must provide a working route from its
+  external-facing hostPorts to each in-cluster service it fronts — SAIA
+  (`…-saia-saia-service:8080`), Splunk Web (`…-standalone-service:8000`), and Splunk mgmt
+  (`…-standalone-service:8089`, TCP passthrough) — using `IngressRoute`/`IngressRouteTCP`
+  objects that resolve those ClusterIP/NodePort services by their in-cluster DNS names (§7).
+  Routing must work regardless of which namespace the backend service lives in (`ai-platform`),
+  which requires Traefik's ClusterRole to have cluster-wide watch on `IngressRoute`/
+  `IngressRouteTCP` objects (§9) and correct `dnsPolicy` so it can resolve in-cluster DNS at all
+  (§13, bug #1).
 
 ### 1.1 Why fronting SAIA with TLS actually fixes mixed-content blocking
 
@@ -234,7 +255,7 @@ This changes §10's config block and §11's table below — see the corrected ve
 
 ### Why not Helm
 
-The upstream `traefik/traefik` Helm chart defaults to a `Deployment` + `Service` (NodePort/LoadBalancer), which reintroduces the very problem we are solving. Reconfiguring it to match the DaemonSet + hostPort model used by the provided files would require extensive values overrides that end up more complex than the raw manifests. MetalLB does not work on AWS VPCs (documented in `k0s-cluster-config.yaml` lines 205-212), so the chart's LoadBalancer default is a dead end.
+The upstream `traefik/traefik` Helm chart defaults to a `Deployment` + `Service` (NodePort/LoadBalancer), which reintroduces the very problem we are solving. Reconfiguring it to match the DaemonSet + hostPort model used by the provided files would require extensive values overrides that end up more complex than the raw manifests. MetalLB does not work on AWS VPCs (documented in `k0s-cluster-config.yaml` lines 205-212) because AWS's software-defined networking blocks the L2 ARP/BGP announcements MetalLB relies on — so on AWS, the chart's LoadBalancer default is a dead end. **On bare metal/on-prem with a normal L2 network, MetalLB has no such restriction** and is a legitimate alternative to the hostPort DaemonSet model (see §5a.1) — noted here for completeness, but not adopted as the default so the design stays identical across all target infrastructures.
 
 ### Why raw manifests
 
@@ -300,19 +321,34 @@ spec:
   dnsNames:
     - ai.example.internal            # optional, user-supplied
   ipAddresses:
-    - 203.0.113.10                   # installer EIP or worker IP (SAN for IP access)
+    - 203.0.113.10                   # EVERY worker IP, not just one — see note below
+    - 203.0.113.11
+    - 203.0.113.12
 ```
 
-- **User provides:** nothing beyond the IP/hostname (auto-detected by installer)
+- **User provides:** nothing beyond the IP/hostname (auto-detected by installer from the config's worker IP list — this is already infrastructure-agnostic, see `k0s_cluster_with_stack.sh:577`)
 - **Pros:** zero external dependency, works airgapped, works with bare IP SANs
 - **Cons:** browser shows "not trusted" — user must import CA cert to client trust store once. For external Splunk JWT validation, the external Splunk must trust this CA or use `sslVerifyServerCert=false`.
+
+> **Important — SAN list must cover every worker, not just one.** Traefik runs as a DaemonSet
+> (§4), so there is one independent Traefik pod per worker node, each bound via `hostPort` to
+> that node's own IP (§5a.1 has the full explanation). The leaf `Certificate` above is a single
+> object whose `secretName: internal-domain-tls` is mounted identically into every one of those
+> pods — so its `ipAddresses` SAN list must include **all** worker IPs (every entry in
+> `nodes.existingIPs.workers[]` / the installer's `WORKER_IPS` array,
+> `k0s_cluster_with_stack.sh:576-577`), not a single representative IP as earlier examples in
+> this doc implied. If a client hits a worker IP that's missing from the SAN list, TLS
+> validation fails with a hostname/IP mismatch even though that worker's Traefik pod is healthy
+> and serving correctly. The installer must populate this list at apply-time from the same
+> worker-IP source the rest of the script already uses — no new IP-discovery mechanism needed,
+> just reuse of the existing one.
 
 ### Option B: ACME / Let's Encrypt (public DNS only)
 
 A publicly-trusted cert — no client trust import required.
 
 - **User provides:** public DNS name resolving to the cluster, port 80/443 reachable from the internet (HTTP-01 challenge) or DNS provider API credentials (DNS-01)
-- **Not viable** for private EC2 VPC deployments with no public DNS
+- **Not viable** for private-network deployments with no public DNS — true whether that network is an AWS VPC, an on-prem VLAN, or a bare-metal lab segment
 
 ### Option C: BYO cert (internal PKI / wildcard)
 
@@ -321,6 +357,150 @@ User supplies `tls.crt` + `tls.key`; installer creates the secret directly.
 - **User provides:** cert + key PEM files
 
 **Default in installer:** Option A (self-signed). Config key `ingress.tls.mode: selfsigned | acme | provided`.
+
+---
+
+## 5a. TLS/mTLS Topology and External Exposure
+
+This section makes explicit what is TLS-terminated where, what is (and is **not**) mutual TLS
+today, and how traffic actually reaches the cluster from outside. All three diagrams assume
+Option A (self-signed CA, §5).
+
+### 5a.1 External exposure — no cloud LoadBalancer involved
+
+Traefik is a **hostPort DaemonSet**, not a `Service: LoadBalancer`. It binds ports directly on
+each worker's host network interface. There is no cloud-native ingress/ELB in this design —
+reachability from outside the cluster's network depends entirely on a firewall/ACL being opened
+for those hostPorts (§11, customer-owned action), whatever form that takes on the target
+infrastructure:
+
+| Infrastructure | What "open the ports" means |
+|---|---|
+| AWS (EC2) | EC2 security-group ingress rule on the worker instances/ENIs |
+| Other cloud VMs (GCP, Azure, etc.) | Equivalent cloud firewall rule (GCP firewall rule, Azure NSG, etc.) |
+| Bare metal / on-prem | Host firewall on each worker (`iptables`/`nftables`/`firewalld`/`ufw`) + any network/switch ACL or perimeter firewall between the client and the worker's network segment |
+
+```mermaid
+flowchart LR
+    subgraph Outside["Outside the cluster's network"]
+        Client["Browser / curl / external Splunk"]
+    end
+    subgraph FW["Firewall / ACL\n(must be opened manually — §11)\nEC2 SG, cloud FW rule, or host/network firewall"]
+        Ports["hostPorts 8443 / 8000 / 8089"]
+    end
+    subgraph Worker["k0s worker node"]
+        Traefik["Traefik pod\n(hostPort bind, one per worker)"]
+    end
+    Client -->|"https://&lt;worker-ip&gt;:8443/8000\nTCP passthrough :8089"| FW
+    FW --> Ports --> Traefik
+```
+
+Two supported access patterns (§12 has the full detail), neither of which is cloud-specific:
+- **Workers directly reachable** (routable IP on the client's network + firewall rule open) →
+  hit `https://<worker-ip>:<port>` directly. Applies equally to an EC2 instance with a public/
+  VPC-routable IP or a bare-metal box on a reachable LAN/VLAN.
+- **Workers stay on a private network segment** → a single stable SSH tunnel to a jump host,
+  forwarding to the worker's hostPorts — no `kubectl port-forward` needed since the ports are
+  stable on the host, not ephemeral pod IPs. This is the same pattern whether the jump host is
+  an EC2 instance or a bare-metal/on-prem gateway box.
+
+**Multi-worker access (DaemonSet caveat, infrastructure-agnostic):** because each worker
+independently binds the hostPorts, a client must either target one worker IP directly (simplest,
+no HA) or something must load-balance across workers. On AWS this is normally left unaddressed
+in this design (no ELB is used — see §4). On bare metal/on-prem, **MetalLB is a viable option**
+(§4) since it isn't blocked the way it is on AWS VPCs; alternatively, an existing hardware/
+software load balancer the customer already operates (F5, HAProxy, keepalived+VIP, etc.) can
+front the worker IPs. This decision is out of scope for the default design and left as a
+customer/operator choice either way.
+
+**"Which worker IP does the Traefik controller use?"** There is no single controller with one
+IP — the DaemonSet means **every** worker (in the reference topology: 1 CPU + 2 GPU = 3 nodes)
+runs its own independent Traefik pod, bound via `hostPort` to that node's own IP. Hitting
+`https://<cpu-worker-ip>:8443` and `https://<gpu-worker-1-ip>:8443` reaches two *different* pods
+— there is no routing between them absent a load balancer (above). This is why §5's leaf
+`Certificate` SAN list must include every worker IP, not just one: whichever IP a client picks,
+that worker's Traefik pod must present a cert that's valid for the IP the client actually dialed.
+
+**Which URL to give the SAIA app / onboarding wizard (`saia_endpoint`/`saia_sok_url` in
+`splunkaiassistant.conf`):** because the IngressRoute's backend (`…-saia-saia-service`, §7) is a
+ClusterIP `Service`, Kubernetes' pod network already routes cross-node — a Traefik pod on
+worker A can reach a SAIA nginx pod scheduled on worker B via the CNI overlay. **This means any
+one worker's IP works identically for reaching SAIA — it does not need to be the worker SAIA's
+own pod happens to be running on.** Recommended value: `https://<any-one-worker-ip>:8443`,
+picking whichever worker IP is simplest for the deployment (any address in the leaf cert's SAN
+list works, since all of them now share that requirement above). If `ingress.hostname` is
+configured and resolves via DNS to a worker IP, prefer `https://<hostname>:8443` instead — it
+survives that worker being replaced without requiring a config update, as long as the DNS record
+is repointed and the new IP is (still) in the cert's SAN list.
+
+### 5a.2 Case 1 — Plain TLS (nginx mTLS disabled; today's default)
+
+Traefik terminates the **only** TLS hop in the path. Everything from Traefik inward — to nginx,
+and nginx's own proxy to the SAIA v1/v2 upstreams — is plain HTTP inside the cluster network.
+This is one-way TLS: the client validates Traefik's cert; nothing validates a client cert at any
+hop.
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Traefik as Traefik<br/>(hostPort :8443)
+    participant Nginx as SAIA nginx<br/>(ClusterIP :8080, HTTP only)
+    participant V1V2 as saia_v1 / saia_v2<br/>upstreams
+
+    Browser->>Traefik: HTTPS (TLS: internal-domain-tls leaf cert)
+    Note over Browser,Traefik: Only TLS hop.<br/>Server-auth only — no client cert requested.
+    Traefik->>Nginx: HTTP (plain, in-cluster)
+    Nginx->>V1V2: HTTP (path-routed by /saia-api-v2/ prefix)
+    V1V2-->>Nginx: response
+    Nginx-->>Traefik: response
+    Traefik-->>Browser: response (TLS)
+```
+
+### 5a.3 Case 2 — nginx TLS enabled (`AIService.spec.mtls.enabled: true`) — still NOT mutual TLS
+
+Despite the field being named `mtls`, nginx today only adds a second **server-auth-only** TLS
+listener on :8443 (`ssl_certificate` / `ssl_certificate_key` — `impl.go:1560-1567`). There is no
+`ssl_verify_client` directive anywhere in the codebase, so nginx never requests or validates a
+client certificate. If Traefik is pointed at this port, the hop becomes TLS instead of plain
+HTTP, but it is **one-way TLS twice in a row**, not end-to-end mutual TLS.
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Traefik as Traefik<br/>(hostPort :8443)
+    participant Nginx as SAIA nginx<br/>(ClusterIP :8443, TLS)
+    participant V1V2 as saia_v1 / saia_v2<br/>upstreams
+
+    Browser->>Traefik: HTTPS (TLS: internal-domain-tls leaf cert)
+    Note over Browser,Traefik: Hop 1 — server-auth only
+    Traefik->>Nginx: HTTPS (TLS: nginx's own mtls.secretName cert)
+    Note over Traefik,Nginx: Hop 2 — ALSO server-auth only.<br/>Traefik never presents a client cert;<br/>nginx never asks for one.<br/>Requires a Traefik ServersTransport<br/>trusting nginx's cert (or its CA).
+    Nginx->>V1V2: HTTP (plain, unchanged)
+    V1V2-->>Nginx: response
+    Nginx-->>Traefik: response (TLS)
+    Traefik-->>Browser: response (TLS)
+```
+
+**To make this a trusted hop (not "not verified"/skip-verify):** issue nginx's cert from the
+*same* CA as Traefik's leaf cert (extend §5 Option A — promote `ai-platform-ca-issuer` to a
+`ClusterIssuer` so both `ingress` and `ai-platform` namespaces can request from it, then point
+`AIService.spec.mtls.issuerRef` at it) and configure a Traefik `ServersTransport` with
+`rootCAsSecrets: [ai-platform-ca-tls]` for the SAIA backend. This still is not mTLS — it just
+makes hop 2 verifiable instead of blindly trusted.
+
+**True mTLS (nginx demanding and validating a client cert from Traefik) does not exist today**
+and is out of scope for this plan — it would require adding `ssl_verify_client on;` +
+`ssl_client_certificate` to the nginx config template in `impl.go`, a code change to the SAIA
+feature itself, not something the installer/cert-manager plumbing alone can add.
+
+### 5a.4 Recommendation for this plan
+
+Default to **Case 1** (Traefik → nginx:8080, plain HTTP) regardless of whether SAIA's own
+`mtls.enabled` flag is set — it is simplest, matches every other in-cluster hop in this design
+(Splunk Web, Splunk mgmt passthrough), and does not require coordinating two independently-owned
+toggles (`ingress.enabled` for Traefik, `mtls.enabled` on `AIService`). Document Case 2 as a
+future enhancement rather than building the `ClusterIssuer` promotion + `ServersTransport` wiring
+now, since it adds complexity without adding real mutual authentication.
 
 ---
 
@@ -558,11 +738,14 @@ Add an `ingress` block:
 # Terminates TLS for Splunk Web (:8000) and SAIA (:8443), eliminating the SSH
 # tunnel requirement and browser mixed-content blocks.
 #
-# Prerequisites: EC2 security-group rules opening the chosen hostPorts from
-# your client/VPN CIDR to the worker nodes.
+# Prerequisites: firewall/ACL rules opening the chosen hostPorts from your
+# client/VPN network to the worker nodes — an EC2 security-group rule on AWS,
+# or the equivalent host/network firewall rule on bare metal / on-prem.
 ingress:
   enabled: false                    # set true to enable Traefik HTTPS ingress
-  hostname: ""                      # optional DNS name; empty → IP SAN only (EC2 EIP)
+  hostname: ""                      # optional DNS name; empty → IP SAN only
+                                    # (worker's routable IP — an EC2 EIP on AWS,
+                                    # or a static/DHCP-reserved LAN IP on bare metal)
   fips: "off"                       # off | only — sets GODEBUG=fips140= in Traefik pod
                                     # Use "only" for FedRAMP/US-gov deployments.
                                     # NOTE: the default images.ingress.traefikImage below is
@@ -601,7 +784,8 @@ When `ingress.enabled: true`, the installer should implicitly set `aiPlatform.se
 | **TLS decision** | selfsigned (default, nothing extra), ACME (DNS name + email), or BYO cert | Always — defaults to selfsigned |
 | **Hostname or accept IP-only** | For a fully-trusted cert a DNS name is needed; otherwise IP SAN + client CA import once | selfsigned/ACME |
 | **CA cert import** | Download the installer-generated CA cert and add it to browser/OS trust store | selfsigned only |
-| **EC2 security-group rules** | Open hostPorts 8443 + 8000 (+ 8089 if mgmt) from client/VPN CIDR to workers | Always |
+| **Firewall/ACL rules** | Open hostPorts 8443 + 8000 (+ 8089 if mgmt) from client/VPN network to workers — an EC2 security-group rule on AWS, or the equivalent host/network firewall rule on bare metal / on-prem (§5a.1) | Always |
+| **Multi-worker access decision (bare metal/on-prem only)** | Pick one: target a single worker IP directly, deploy MetalLB (viable off-AWS — §4/§5a.1), or front the workers with an existing hardware/software load balancer | Only relevant with more than one worker; not required on AWS (single-worker-IP or no-LB is the default there too) |
 | **External Splunk CA trust** | Configure external Splunk to trust this CA cert, or set `sslVerifyServerCert=false` | When using external Splunk (see `EXTERNAL_SPLUNK_INTEGRATION.md`) |
 | **FIPS setting** | Set `ingress.fips: "only"` in config | FedRAMP/US-gov deployments only |
 | **Registry access** | Default is public `docker.io/library/traefik:v3.6.14` — no extra access needed beyond normal internet/registry-mirror reachability (same as SAIA/other images). Only for FedRAMP/US-gov (`ingress.fips: "only"`): must set `images.ingress.traefikImage` to a FIPS-capable build you can pull yourself | Always (default); FIPS override only when `fips: "only"` |
@@ -609,6 +793,9 @@ When `ingress.enabled: true`, the installer should implicitly set `aiPlatform.se
 ---
 
 ## 12. Access Pattern After Deployment
+
+Examples below use `ec2-user@<EIP>` for concreteness (the AWS case); on bare metal/on-prem this
+is just `<any-ssh-user>@<jump-host-IP-or-hostname>` — the tunnel mechanics are identical.
 
 ### Before (today)
 
