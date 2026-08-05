@@ -736,6 +736,129 @@ func Test_reconcileNginxDeployment_imageOverride(t *testing.T) {
 		dep.Spec.Template.Spec.Containers[0].Image)
 }
 
+func Test_reconcileNginxConfigMap_NoTLSServerBlockByDefault(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+
+	conf := cm.Data["nginx.conf"]
+	assert.NotContains(t, conf, "listen 8443",
+		"no TLS server block should be generated when MTLS is disabled")
+	assert.NotContains(t, conf, "ssl_certificate")
+}
+
+func Test_reconcileNginxConfigMap_TLSServerBlockWhenMTLSEnabled(t *testing.T) {
+	// Regression: the public "<name>-saia-service" Service conditionally adds
+	// an https:8443 ServicePort when MTLS.Enabled && Termination=="operator"
+	// (reconcileSAIAService), but nothing behind the nginx selector ever
+	// listened on 8443 — nginx only had "listen 8080" with no TLS directives.
+	// nginx must terminate TLS on 8443 too, so that Service port has a live
+	// listener behind it.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.MTLS = aiv1.MTLSConfig{
+		Enabled:     true,
+		Termination: "operator",
+		SecretName:  "test-tls",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+
+	conf := cm.Data["nginx.conf"]
+	assert.Contains(t, conf, "listen 8443 ssl;")
+	assert.Contains(t, conf, "ssl_certificate     /etc/nginx-tls/tls.crt;")
+	assert.Contains(t, conf, "ssl_certificate_key /etc/nginx-tls/tls.key;")
+
+	// Both the plain-HTTP and TLS server blocks must carry the same routing
+	// and CORS behavior — otherwise clients hitting 8443 vs 8080 would see
+	// different behavior depending on which port they used.
+	assert.Equal(t, 2, strings.Count(conf, "location ~ /saia-api-v2/"),
+		"v2 routing must exist in both the 8080 and 8443 server blocks")
+	assert.Equal(t, 2, strings.Count(conf, "proxy_pass http://saia_v1"),
+		"v1 routing must exist in both the 8080 and 8443 server blocks")
+	assert.Equal(t, 4, strings.Count(conf, "if ($request_method = OPTIONS)"),
+		"CORS preflight short-circuit must exist in both v1/v2 locations, on both server blocks")
+}
+
+func Test_reconcileNginxDeployment_MTLSDisabled_No8443(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	assert.Len(t, container.Ports, 1)
+	assert.Equal(t, int32(8080), container.Ports[0].ContainerPort)
+	assert.Len(t, container.VolumeMounts, 1, "no TLS secret mount expected when MTLS is disabled")
+}
+
+func Test_reconcileNginxDeployment_MTLSEnabled_MountsTLSSecretAnd8443(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.MTLS = aiv1.MTLSConfig{
+		Enabled:     true,
+		Termination: "operator",
+		SecretName:  "test-tls",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	require.Len(t, container.Ports, 2)
+	assert.Equal(t, int32(8080), container.Ports[0].ContainerPort)
+	assert.Equal(t, "https", container.Ports[1].Name)
+	assert.Equal(t, int32(8443), container.Ports[1].ContainerPort)
+
+	var tlsMount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == "nginx-tls" {
+			tlsMount = &container.VolumeMounts[i]
+		}
+	}
+	require.NotNil(t, tlsMount, "expected an nginx-tls VolumeMount")
+	assert.Equal(t, "/etc/nginx-tls", tlsMount.MountPath)
+	assert.True(t, tlsMount.ReadOnly)
+
+	var tlsVolume *corev1.Volume
+	for i := range dep.Spec.Template.Spec.Volumes {
+		if dep.Spec.Template.Spec.Volumes[i].Name == "nginx-tls" {
+			tlsVolume = &dep.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	require.NotNil(t, tlsVolume, "expected an nginx-tls Volume")
+	require.NotNil(t, tlsVolume.Secret)
+	assert.Equal(t, "test-tls", tlsVolume.Secret.SecretName)
+}
+
 func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 	// Regression: the pre-existing code did not initialize svc.Annotations, so
 	// any user-provided annotation on the AIService caused a "assignment to

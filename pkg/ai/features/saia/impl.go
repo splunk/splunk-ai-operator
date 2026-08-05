@@ -1456,41 +1456,10 @@ func (r *SaiaReconciler) reconcileNginxConfigMap(
 	v1ServiceName := ai.Name + "-saia-v1-service"
 	v2ServiceName := ai.Name + "-saia-v2-service"
 
-	nginxConf := fmt.Sprintf(`worker_processes auto;
-error_log /dev/stderr warn;
-pid /tmp/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    log_format routing '$remote_addr - [$time_local] "$request" '
-                       'status=$status upstream=$upstream_addr '
-                       'rt=$request_time uct=$upstream_connect_time urt=$upstream_response_time';
-
-    access_log /dev/stdout routing;
-
-    upstream saia_v1 {
-        server %s:8080;
-    }
-
-    upstream saia_v2 {
-        server %s:8000;
-    }
-
-    # Reflect Access-Control-Request-Headers back on preflight. If the browser
-    # didn't send any (rare), fall back to a broad default. Safer than a
-    # hardcoded allowlist because spl-copilot (and future clients) may add
-    # custom headers like x-requested-with, x-csrf-token, x-splunk-*, etc.
-    map $http_access_control_request_headers $cors_allow_headers {
-        default $http_access_control_request_headers;
-        ""      "authorization, content-type, x-ec-token, x-es-tenant-bearer, x-stack-url, x-stack-url-legacy, splunk-client, x-conversation-key, x-request-id, x-admin-preferences-filename, x-requested-with";
-    }
-
-    server {
-        listen 8080;
-
+	// Shared between the plain-HTTP (8080) and, when mTLS is enabled with
+	// operator-managed termination, the TLS (8443) server blocks so routing
+	// and CORS behavior can never drift between the two listeners.
+	locationsConf := `
         # Nginx health/status endpoints MUST be declared before the v2 regex
         # match; otherwise nginx's longest-prefix-before-regex rule would let
         # exact matches win only if explicitly marked with "^~" or "=", and we
@@ -1577,9 +1546,64 @@ http {
             proxy_send_timeout 300s;
             proxy_buffering off;
         }
-    }
+`
+
+	// Terminate client-facing TLS at nginx itself when mTLS is enabled with
+	// operator-managed termination, using the same cert-manager Secret
+	// (ai.Spec.MTLS.SecretName) mounted into the nginx pod by
+	// reconcileNginxDeployment. Without this, the public Service's
+	// https:8443 port has no listening container behind it (see
+	// reconcileSAIAService, which adds that ServicePort under the same
+	// condition).
+	tlsServerBlock := ""
+	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
+		tlsServerBlock = fmt.Sprintf(`
+    server {
+        listen 8443 ssl;
+
+        ssl_certificate     /etc/nginx-tls/tls.crt;
+        ssl_certificate_key /etc/nginx-tls/tls.key;
+%s    }
+`, locationsConf)
+	}
+
+	nginxConf := fmt.Sprintf(`worker_processes auto;
+error_log /dev/stderr warn;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
 }
-`, v1ServiceName, v2ServiceName)
+
+http {
+    log_format routing '$remote_addr - [$time_local] "$request" '
+                       'status=$status upstream=$upstream_addr '
+                       'rt=$request_time uct=$upstream_connect_time urt=$upstream_response_time';
+
+    access_log /dev/stdout routing;
+
+    upstream saia_v1 {
+        server %s:8080;
+    }
+
+    upstream saia_v2 {
+        server %s:8000;
+    }
+
+    # Reflect Access-Control-Request-Headers back on preflight. If the browser
+    # didn't send any (rare), fall back to a broad default. Safer than a
+    # hardcoded allowlist because spl-copilot (and future clients) may add
+    # custom headers like x-requested-with, x-csrf-token, x-splunk-*, etc.
+    map $http_access_control_request_headers $cors_allow_headers {
+        default $http_access_control_request_headers;
+        ""      "authorization, content-type, x-ec-token, x-es-tenant-bearer, x-stack-url, x-stack-url-legacy, splunk-client, x-conversation-key, x-request-id, x-admin-preferences-filename, x-requested-with";
+    }
+
+    server {
+        listen 8080;
+%s    }
+%s}
+`, v1ServiceName, v2ServiceName, locationsConf, tlsServerBlock)
 
 	cmName := ai.Name + "-saia-nginx-config"
 	cm := &corev1.ConfigMap{
@@ -1631,6 +1655,35 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 		nginxImage = "nginx:1.27-alpine"
 	}
 
+	ports := []corev1.ContainerPort{
+		{Name: "http", ContainerPort: 8080},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{Name: "nginx-config", MountPath: "/etc/nginx/nginx.conf", SubPath: "nginx.conf"},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "nginx-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: ai.Name + "-saia-nginx-config",
+					},
+				},
+			},
+		},
+	}
+	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
+		ports = append(ports, corev1.ContainerPort{Name: "https", ContainerPort: 8443})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "nginx-tls", MountPath: "/etc/nginx-tls", ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{
+			Name: "nginx-tls",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: ai.Spec.MTLS.SecretName},
+			},
+		})
+	}
+
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
 		deployment.ObjectMeta.Annotations = annotations
@@ -1652,12 +1705,8 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 					Name:            "nginx",
 					Image:           nginxImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
-					Ports: []corev1.ContainerPort{
-						{Name: "http", ContainerPort: 8080},
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "nginx-config", MountPath: "/etc/nginx/nginx.conf", SubPath: "nginx.conf"},
-					},
+					Ports:           ports,
+					VolumeMounts:    volumeMounts,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("100m"),
@@ -1683,18 +1732,7 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 						FailureThreshold: 3,
 					},
 				}},
-				Volumes: []corev1.Volume{
-					{
-						Name: "nginx-config",
-						VolumeSource: corev1.VolumeSource{
-							ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: ai.Name + "-saia-nginx-config",
-								},
-							},
-						},
-					},
-				},
+				Volumes:          volumes,
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
