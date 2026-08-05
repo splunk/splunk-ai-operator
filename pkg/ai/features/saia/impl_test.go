@@ -1376,6 +1376,40 @@ func Test_reconcileSAIADeployment_CABundle_CustomKey(t *testing.T) {
 	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
 }
 
+// Test_reconcileSAIADeployment_CABundle_KeyWithShellMetacharacters guards
+// against command injection via CACertRef.Key: the splunk-ca-merge
+// initContainer must never string-interpolate the key into its shell
+// script — paths are passed as env vars, so a key containing shell
+// metacharacters is inert.
+func Test_reconcileSAIADeployment_CABundle_KeyWithShellMetacharacters(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	maliciousKey := `ca.crt"; rm -rf / #`
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "external-ca", Key: maliciousKey}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-ca", Namespace: "default"},
+		Data:       map[string][]byte{maliciousKey: []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
+	initC := dep.Spec.Template.Spec.InitContainers[0]
+	require.Len(t, initC.Args, 1)
+	assert.NotContains(t, initC.Args[0], maliciousKey, "the key must never be interpolated into the shell script text")
+
+	initEnvMap := envToMap(initC.Env)
+	assert.Contains(t, initEnvMap["PRIVATE_CA_PATH"], maliciousKey, "the key-derived path is carried via env var, not script interpolation")
+}
+
 func Test_reconcileSAIAv2Deployment_CABundle_WiresEnvAndHash(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()

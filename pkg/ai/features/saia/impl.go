@@ -976,11 +976,16 @@ func buildSAIACABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar,
 		Name:            "splunk-ca-merge",
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"/bin/sh", "-c"},
-		Args: []string{fmt.Sprintf(
-			`if [ -f %s ]; then cat %s %s > %s; else cp %s %s; fi`,
-			systemCABundlePath, systemCABundlePath, privateCAPath, combinedPath, privateCAPath, combinedPath,
-		)},
+		// Paths derived from ref.Key (a CRD-settable field) are passed as env
+		// vars rather than interpolated into the script string, so a key value
+		// containing shell metacharacters can't be re-parsed as command syntax.
+		Env: []corev1.EnvVar{
+			{Name: "SYSTEM_CA_PATH", Value: systemCABundlePath},
+			{Name: "PRIVATE_CA_PATH", Value: privateCAPath},
+			{Name: "COMBINED_PATH", Value: combinedPath},
+		},
+		Command: []string{"/bin/sh", "-c"},
+		Args:    []string{caMergeScript},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true},
 			{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath},
@@ -988,6 +993,11 @@ func buildSAIACABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar,
 	})
 	return env, volumes, mounts, initContainers
 }
+
+// caMergeScript is a static shell script (no string interpolation of
+// CRD-controlled values) — the paths it operates on arrive via env vars
+// set on the initContainer, never substituted into the script text itself.
+const caMergeScript = `if [ -f "$SYSTEM_CA_PATH" ]; then cat "$SYSTEM_CA_PATH" "$PRIVATE_CA_PATH" > "$COMBINED_PATH"; else cp "$PRIVATE_CA_PATH" "$COMBINED_PATH"; fi`
 
 // splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
 // roll when the CA bundle's content changes in place (e.g. the customer
