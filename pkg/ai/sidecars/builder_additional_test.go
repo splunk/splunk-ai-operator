@@ -361,6 +361,43 @@ func TestRenderOtelConf_FallsBackToEndpointWhenHECEndpointUnset(t *testing.T) {
 
 	assert.Equal(t, "https://splunk.example.com:8088/services/collector", splunkHec["endpoint"],
 		"backward-compat: Endpoint must still be used when HECEndpoint is unset")
+
+	select {
+	case ev := <-recorder.Events:
+		assert.Contains(t, ev, "HECEndpointFallback", "falling back to endpoint must emit a warning Event so the conflation is visible, not silent")
+	default:
+		t.Fatal("expected a warning Event when falling back from hecEndpoint to endpoint")
+	}
+}
+
+func TestRenderOtelConf_NoEndpointAtAllReturnsError(t *testing.T) {
+	// Neither hecEndpoint nor endpoint set: there is nothing safe to fall
+	// back to, so renderOtelConf must fail loudly instead of shipping
+	// telemetry to an empty/services/collector URL.
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token-123")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+			},
+		},
+	}
+
+	recorder := record.NewFakeRecorder(100)
+	builder := New(fakeClient, scheme, recorder, platform)
+
+	conf := builder.renderOtelConf(ctx, platform)
+	assert.Contains(t, conf, "error")
 }
 
 func TestRenderOtelConf_CACertRefEnablesTLSVerification(t *testing.T) {

@@ -263,10 +263,18 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 	// HECEndpoint (port 8088) is the correct ingestion URL. Endpoint (port
 	// 8089) is the management/JWKS URL used for JWT issuer validation
 	// elsewhere; falling back to it here is only correct for configs
-	// predating HECEndpoint where both happen to share host/port.
+	// predating HECEndpoint where both happen to share host/port, so surface
+	// a warning Event rather than silently pointing OTel at the wrong port.
 	hecBase := cr.Spec.SplunkConfiguration.HECEndpoint
 	if hecBase == "" {
 		hecBase = cr.Spec.SplunkConfiguration.Endpoint
+		if hecBase != "" && s.Recorder != nil {
+			s.Recorder.Eventf(cr, corev1.EventTypeWarning, "HECEndpointFallback",
+				"splunkConfiguration.hecEndpoint is not set; falling back to splunkConfiguration.endpoint (%s) for the OTel HEC exporter. This is only correct if the management (JWKS) and HEC listeners share the same host and port. Set hecEndpoint explicitly to silence this warning.", hecBase)
+		}
+	}
+	if hecBase == "" {
+		return map[string]interface{}{"error": "splunkConfiguration.hecEndpoint (or endpoint as a fallback) must be set for the OTel sidecar to ship telemetry"}
 	}
 	endpoint := fmt.Sprintf("%s/services/collector", hecBase)
 	metricsIndexName, exists := os.LookupEnv("SPLUNK_METRICS_INDEX_NAME")
