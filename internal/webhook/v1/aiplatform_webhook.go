@@ -140,7 +140,7 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 	}
 
 	// Validate SplunkConfiguration
-	if errs := v.validateSplunkConfiguration(&aiplatform.Spec.SplunkConfiguration, aiplatform.Spec.Sidecars.Otel, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
+	if errs := v.validateSplunkConfiguration(&aiplatform.Spec.SplunkConfiguration, aiplatform.Spec.Sidecars.Otel, aiplatform.Namespace, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -264,7 +264,8 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 
 // validateSplunkConfiguration validates the Splunk configuration.
 // otelEnabled indicates whether the OTel sidecar is enabled; it affects secretRef requirements.
-func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, otelEnabled bool, fldPath *field.Path) field.ErrorList {
+// namespace is the AIPlatform's own namespace, used to validate caCertRef.namespace.
+func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, otelEnabled bool, namespace string, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
 	hasEndpoint := splunkConfig.Endpoint != ""
@@ -327,6 +328,18 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 				}
 			}
 		}
+	}
+
+	// CACertRef's Secret is mounted as a same-namespace Secret volume
+	// (buildSAIACABundleEnv/buildSlimCABundleEnv); a cross-namespace value is
+	// silently ignored at runtime, which looks like a working config but never
+	// actually mounts the intended CA. Reject it at admission instead.
+	if ref := splunkConfig.CACertRef; ref != nil && ref.Namespace != "" && ref.Namespace != namespace {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("caCertRef").Child("namespace"),
+			ref.Namespace,
+			fmt.Sprintf("caCertRef.namespace must be empty or match the AIPlatform's own namespace (%q); cross-namespace Secret references are not supported (the CA Secret is mounted as a same-namespace Secret volume)", namespace),
+		))
 	}
 
 	return allErrs

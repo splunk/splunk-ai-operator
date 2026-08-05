@@ -170,7 +170,7 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 	}
 
 	// Validate SplunkConfiguration
-	if errs := v.validateSplunkConfigurationForService(&aiservice.Spec.SplunkConfiguration, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
+	if errs := v.validateSplunkConfigurationForService(&aiservice.Spec.SplunkConfiguration, aiservice.Namespace, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -302,8 +302,9 @@ func (v *AIServiceCustomValidator) validateTaskVolume(taskVolume *aiv1.ObjectSto
 	return allErrs
 }
 
-// validateSplunkConfigurationForService validates the Splunk configuration for AIService
-func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkConfig *aiv1.SplunkConfigurationSpec, fldPath *field.Path) field.ErrorList {
+// validateSplunkConfigurationForService validates the Splunk configuration for AIService.
+// namespace is the AIService's own namespace, used to validate caCertRef.namespace.
+func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkConfig *aiv1.SplunkConfigurationSpec, namespace string, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
 	hasEndpoint := splunkConfig.Endpoint != ""
@@ -375,6 +376,18 @@ func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkC
 				}
 			}
 		}
+	}
+
+	// CACertRef's Secret is mounted as a same-namespace Secret volume
+	// (buildSAIACABundleEnv/buildSlimCABundleEnv); a cross-namespace value is
+	// silently ignored at runtime, which looks like a working config but never
+	// actually mounts the intended CA. Reject it at admission instead.
+	if ref := splunkConfig.CACertRef; ref != nil && ref.Namespace != "" && ref.Namespace != namespace {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("caCertRef").Child("namespace"),
+			ref.Namespace,
+			fmt.Sprintf("caCertRef.namespace must be empty or match the AIService's own namespace (%q); cross-namespace Secret references are not supported (the CA Secret is mounted as a same-namespace Secret volume)", namespace),
+		))
 	}
 
 	return allErrs

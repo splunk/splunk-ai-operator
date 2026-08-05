@@ -225,6 +225,14 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				common.AnnotationChangedPredicate(),
 			)),
 		).
+		// Watch CACertRef Secrets (not owned by AIService - customer/installer
+		// pre-creates them) so rotating the CA bundle's content in place
+		// triggers a reconcile (AIP-4614 Tier 1 item 4).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForCACertSecret),
+			builder.WithPredicates(common.SecretChangedPredicate()),
+		).
 		// Add predicates to filter events and avoid unnecessary reconciliations
 		WithEventFilter(predicate.Or(
 			common.GenerationChangedPredicate(),
@@ -320,6 +328,33 @@ func (r *AIServiceReconciler) findAIServicesForPlatform(ctx context.Context, pla
 		}
 	}
 
+	return requests
+}
+
+// findAIServicesForCACertSecret maps a Secret to the AIServices in the same
+// namespace whose splunkConfiguration.caCertRef references it by name, so
+// rotating the CA bundle's content (without renaming the Secret) triggers a
+// reconcile instead of only being picked up on some unrelated trigger.
+func (r *AIServiceReconciler) findAIServicesForCACertSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+
+	var services aiv1.AIServiceList
+	if err := r.List(ctx, &services, client.InNamespace(secret.GetNamespace())); err != nil {
+		log.Error(err, "failed to list AIServices for CACertRef Secret", "secret", secret.GetName())
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range services.Items {
+		svc := &services.Items[i]
+		ref := svc.Spec.SplunkConfiguration.CACertRef
+		if ref == nil || ref.Name != secret.GetName() {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKeyFromObject(svc),
+		})
+	}
 	return requests
 }
 

@@ -84,7 +84,7 @@ func TestVaultPathValidation_AIService(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			errs := v.validateSplunkConfigurationForService(&tc.cfg, fldPath)
+			errs := v.validateSplunkConfigurationForService(&tc.cfg, "default", fldPath)
 
 			if tc.wantErrField == "" {
 				for _, e := range errs {
@@ -179,7 +179,7 @@ func TestVaultPathValidation_AIPlatform(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			errs := v.validateSplunkConfiguration(&tc.cfg, false, fldPath)
+			errs := v.validateSplunkConfiguration(&tc.cfg, false, "default", fldPath)
 
 			if tc.wantErrField == "" {
 				for _, e := range errs {

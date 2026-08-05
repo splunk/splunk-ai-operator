@@ -72,7 +72,7 @@ var _ = Describe("AIService Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "",
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring("required"))
@@ -84,7 +84,7 @@ var _ = Describe("AIService Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
@@ -96,7 +96,7 @@ var _ = Describe("AIService Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/vault/secrets/../../../etc/passwd",
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring(".."))
@@ -108,7 +108,7 @@ var _ = Describe("AIService Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/vault/secrets-evil/token",
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
@@ -121,7 +121,7 @@ var _ = Describe("AIService Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/vault/secrets/splunk-hec-token",
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				// The only errors (if any) should NOT be about vaultFilePath
 				for _, e := range errs {
 					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
@@ -135,7 +135,7 @@ var _ = Describe("AIService Webhook", func() {
 					SecretSource:  aiv1.SecretSourceKubernetes,
 					VaultFilePath: "/etc/passwd", // would be invalid if vault source
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				for _, e := range errs {
 					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
 				}
@@ -143,7 +143,7 @@ var _ = Describe("AIService Webhook", func() {
 
 			It("should accept an empty Splunk config (Splunk disabled)", func() {
 				splunkConfig := &aiv1.SplunkConfigurationSpec{}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
 			})
 
@@ -152,9 +152,56 @@ var _ = Describe("AIService Webhook", func() {
 					Endpoint:     "http://splunk:8088",
 					SecretSource: aiv1.SecretSourceKubernetes,
 				}
-				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				e := findErr(errs, "secretRef")
 				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
+			})
+		})
+
+		Describe("caCertRef.namespace validation (AIP-4614 Tier 1)", func() {
+			fldPath := field.NewPath("spec").Child("splunkConfiguration")
+
+			findErr := func(errs field.ErrorList, fieldSubstr string) *field.Error {
+				for _, e := range errs {
+					if strings.Contains(e.Field, fieldSubstr) {
+						return e
+					}
+				}
+				return nil
+			}
+
+			It("should reject a caCertRef.namespace that differs from the AIService's own namespace", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:  "http://splunk:8088",
+					SecretRef: corev1.SecretReference{Name: "my-secret"},
+					CACertRef: &aiv1.CABundleRef{Name: "splunk-ca", Namespace: "other-namespace"},
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
+				e := findErr(errs, "caCertRef")
+				Expect(e).NotTo(BeNil(), "cross-namespace caCertRef must be rejected")
+				Expect(e.Detail).To(ContainSubstring("cross-namespace"))
+			})
+
+			It("should accept a caCertRef.namespace that matches the AIService's own namespace", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:  "http://splunk:8088",
+					SecretRef: corev1.SecretReference{Name: "my-secret"},
+					CACertRef: &aiv1.CABundleRef{Name: "splunk-ca", Namespace: "default"},
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
+				e := findErr(errs, "caCertRef")
+				Expect(e).To(BeNil(), "same-namespace caCertRef must be admitted")
+			})
+
+			It("should accept an empty caCertRef.namespace (defaults to same namespace)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:  "http://splunk:8088",
+					SecretRef: corev1.SecretReference{Name: "my-secret"},
+					CACertRef: &aiv1.CABundleRef{Name: "splunk-ca"},
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
+				e := findErr(errs, "caCertRef")
+				Expect(e).To(BeNil(), "unset caCertRef.namespace must be admitted")
 			})
 		})
 	})

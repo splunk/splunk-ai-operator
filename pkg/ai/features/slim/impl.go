@@ -208,34 +208,71 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 	return nil
 }
 
-// buildSlimCABundleEnv appends the Splunk CA-trust volume/mount/env when
-// SplunkConfiguration.CACertRef is set, so slim-api's outbound HTTPS calls to
+// systemCABundlePath is the system trust store location in SAIA/SLIM's
+// Debian-based base images.
+const systemCABundlePath = "/etc/ssl/certs/ca-certificates.crt"
+
+// splunkCACombinedMountPath/File hold the merged (system + private CA) bundle
+// produced by the splunk-ca-merge initContainer (AIP-4614 Tier 1 item 5).
+const splunkCACombinedMountPath = "/etc/splunk-ca-combined"
+const splunkCACombinedFile = "ca-certificates.crt"
+
+// buildSlimCABundleEnv appends the Splunk CA-trust volume/mount/env/initContainer
+// when SplunkConfiguration.CACertRef is set, so slim-api's outbound HTTPS calls to
 // Splunk (JWKS fetch, token validation) can verify Splunk's TLS cert chain
 // (AIP-4614 Part C.4 — mirrors saia.buildSAIACABundleEnv byte-for-byte; kept
 // as its own copy so the two feature packages stay decoupled, same rationale
 // as buildSplunkIssuersVal above).
-func buildSlimCABundleEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+//
+// SSL_CERT_FILE/REQUESTS_CA_BUNDLE replace rather than augment the process's
+// default trust store, so a splunk-ca-merge initContainer (running the main
+// container's own image) concatenates the system bundle with the private CA
+// onto a shared emptyDir, and the env vars point at that combined file instead
+// (AIP-4614 Tier 1 item 5).
+func buildSlimCABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount, initContainers []corev1.Container) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount, []corev1.Container) {
 	ref := ai.Spec.SplunkConfiguration.CACertRef
 	if ref == nil || ref.Name == "" {
-		return env, volumes, mounts
+		return env, volumes, mounts, initContainers
 	}
 	key := ref.Key
 	if key == "" {
 		key = "ca.crt"
 	}
-	volumes = append(volumes, corev1.Volume{
-		Name: "splunk-ca",
-		VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+	privateCAPath := "/etc/splunk-ca/" + key
+	combinedPath := splunkCACombinedMountPath + "/" + splunkCACombinedFile
+
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "splunk-ca",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+			},
+		},
+		corev1.Volume{
+			Name:         "splunk-ca-combined",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	)
+	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath, ReadOnly: true})
+	env = append(env,
+		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: combinedPath},
+		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: combinedPath},
+	)
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "splunk-ca-merge",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/bin/sh", "-c"},
+		Args: []string{fmt.Sprintf(
+			`if [ -f %s ]; then cat %s %s > %s; else cp %s %s; fi`,
+			systemCABundlePath, systemCABundlePath, privateCAPath, combinedPath, privateCAPath, combinedPath,
+		)},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true},
+			{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath},
 		},
 	})
-	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true})
-	caPath := "/etc/splunk-ca/" + key
-	env = append(env,
-		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: caPath},
-		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: caPath},
-	)
-	return env, volumes, mounts
+	return env, volumes, mounts, initContainers
 }
 
 // splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
@@ -554,7 +591,9 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	}
 
 	// Splunk CA trust (AIP-4614 Part C.4) — no-op unless SplunkConfiguration.CACertRef is set.
-	env, volumes, mounts = buildSlimCABundleEnv(ai, env, volumes, mounts)
+	slimImage := os.Getenv("RELATED_IMAGE_SLIM_API")
+	var initContainers []corev1.Container
+	env, volumes, mounts, initContainers = buildSlimCABundleEnv(ai, slimImage, env, volumes, mounts, initContainers)
 
 	envFrom := []corev1.EnvFromSource{
 		{
@@ -660,6 +699,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     initContainers,
 				Containers:         containers,
 				Volumes:            volumes,
 				Affinity:           &ai.Spec.Affinity,

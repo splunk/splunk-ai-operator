@@ -910,37 +910,76 @@ func buildSAIATLSEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.V
 	return env, volumes, mounts, ports
 }
 
-// buildSAIACABundleEnv appends the Splunk CA-trust volume/mount/env when
-// SplunkConfiguration.CACertRef is set, so SAIA's outbound HTTPS calls to
+// systemCABundlePath is the system trust store location in SAIA/SLIM's
+// Debian-based base images.
+const systemCABundlePath = "/etc/ssl/certs/ca-certificates.crt"
+
+// splunkCACombinedMountPath/File hold the merged (system + private CA) bundle
+// produced by the splunk-ca-merge initContainer (AIP-4614 Tier 1 item 5).
+const splunkCACombinedMountPath = "/etc/splunk-ca-combined"
+const splunkCACombinedFile = "ca-certificates.crt"
+
+// buildSAIACABundleEnv appends the Splunk CA-trust volume/mount/env/initContainer
+// when SplunkConfiguration.CACertRef is set, so SAIA's outbound HTTPS calls to
 // Splunk (JWKS fetch, token validation) can verify Splunk's TLS cert chain
 // (AIP-4614 Part C). Mirrors buildSAIATLSEnv's volume/mount/env pattern.
+//
+// SSL_CERT_FILE/REQUESTS_CA_BUNDLE replace rather than augment the process's
+// default trust store, so pointing them at the private CA alone would drop
+// trust for all public CAs SAIA's other outbound HTTPS calls rely on. A
+// splunk-ca-merge initContainer (running the main container's own image, which
+// already has the system bundle) concatenates the system bundle with the
+// private CA onto a shared emptyDir, and the env vars point at that combined
+// file instead (AIP-4614 Tier 1 item 5).
 //
 // The Secret must live in the same namespace as the AIService — Kubernetes
 // Secret volumes cannot reference a different namespace, so CACertRef.Namespace
 // is not used here (it exists on the CRD field for documentation/validation
 // symmetry with SecretRef, but callers are expected to keep it same-namespace).
-func buildSAIACABundleEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+func buildSAIACABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount, initContainers []corev1.Container) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount, []corev1.Container) {
 	ref := ai.Spec.SplunkConfiguration.CACertRef
 	if ref == nil || ref.Name == "" {
-		return env, volumes, mounts
+		return env, volumes, mounts, initContainers
 	}
 	key := ref.Key
 	if key == "" {
 		key = "ca.crt"
 	}
-	volumes = append(volumes, corev1.Volume{
-		Name: "splunk-ca",
-		VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+	privateCAPath := "/etc/splunk-ca/" + key
+	combinedPath := splunkCACombinedMountPath + "/" + splunkCACombinedFile
+
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "splunk-ca",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
+			},
+		},
+		corev1.Volume{
+			Name:         "splunk-ca-combined",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	)
+	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath, ReadOnly: true})
+	env = append(env,
+		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: combinedPath},
+		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: combinedPath},
+	)
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "splunk-ca-merge",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/bin/sh", "-c"},
+		Args: []string{fmt.Sprintf(
+			`if [ -f %s ]; then cat %s %s > %s; else cp %s %s; fi`,
+			systemCABundlePath, systemCABundlePath, privateCAPath, combinedPath, privateCAPath, combinedPath,
+		)},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true},
+			{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath},
 		},
 	})
-	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true})
-	caPath := "/etc/splunk-ca/" + key
-	env = append(env,
-		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: caPath},
-		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: caPath},
-	)
-	return env, volumes, mounts
+	return env, volumes, mounts, initContainers
 }
 
 // splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
@@ -1070,7 +1109,9 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	}
 
 	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
-	env, volumes, mounts = buildSAIACABundleEnv(ai, env, volumes, mounts)
+	saiaImage := os.Getenv("RELATED_IMAGE_SAIA_API")
+	var initContainers []corev1.Container
+	env, volumes, mounts, initContainers = buildSAIACABundleEnv(ai, saiaImage, env, volumes, mounts, initContainers)
 
 	// Import ALL static keys from the SAIA ConfigMap as env vars.
 	envFrom := []corev1.EnvFromSource{
@@ -1149,6 +1190,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     initContainers,
 				Containers: []corev1.Container{{
 					Name:            ai.Name,
 					Image:           os.Getenv("RELATED_IMAGE_SAIA_API"),
@@ -1214,7 +1256,8 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 	env = append(env, corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"})
 	env, volumes, mounts, ports = buildSAIATLSEnv(ai, env, volumes, mounts, ports)
 	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
-	env, volumes, mounts = buildSAIACABundleEnv(ai, env, volumes, mounts)
+	var v2InitContainers []corev1.Container
+	env, volumes, mounts, v2InitContainers = buildSAIACABundleEnv(ai, ai.Spec.V2.Image, env, volumes, mounts, v2InitContainers)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-api"
@@ -1270,6 +1313,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     v2InitContainers,
 				Containers: []corev1.Container{{
 					Name:            "saia-v2-api",
 					Image:           ai.Spec.V2.Image,
@@ -1348,7 +1392,8 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	)
 	env, volumes, mounts, _ = buildSAIATLSEnv(ai, env, volumes, mounts, nil)
 	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
-	env, volumes, mounts = buildSAIACABundleEnv(ai, env, volumes, mounts)
+	var workerInitContainers []corev1.Container
+	env, volumes, mounts, workerInitContainers = buildSAIACABundleEnv(ai, ai.Spec.V2.Image, env, volumes, mounts, workerInitContainers)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-worker"
@@ -1404,6 +1449,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     workerInitContainers,
 				Containers: []corev1.Container{{
 					Name:            "saia-v2-worker",
 					Image:           ai.Spec.V2.Image,

@@ -208,13 +208,22 @@ func Test_reconcileSlimDeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
 
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := slimEnvToMap(container.Env)
-	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
-	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["SSL_CERT_FILE"])
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["SSL_CERT_FILE"])
 
 	vol := findSlimVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca")
 	require.NotNil(t, vol)
 	require.NotNil(t, vol.Secret)
 	assert.Equal(t, "ai-splunk-server-tls", vol.Secret.SecretName)
+	require.NotNil(t, findSlimVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca-combined"))
+
+	// A splunk-ca-merge initContainer combines the system trust store with the
+	// private CA so REQUESTS_CA_BUNDLE/SSL_CERT_FILE don't drop public CA trust
+	// (AIP-4614 Tier 1 item 5).
+	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
+	initC := dep.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, "splunk-ca-merge", initC.Name)
+	assert.Equal(t, container.Image, initC.Image)
 
 	hash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
 	assert.NotEmpty(t, hash1)
@@ -248,7 +257,7 @@ func Test_reconcileSlimDeployment_CABundle_MissingSecretOmitsHash(t *testing.T) 
 
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := slimEnvToMap(container.Env)
-	assert.Equal(t, "/etc/splunk-ca/ca.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
 	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
 }
 
