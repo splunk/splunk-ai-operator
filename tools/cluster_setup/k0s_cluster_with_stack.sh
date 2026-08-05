@@ -626,6 +626,12 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
 
+  # Kubernetes cluster DNS domain (used in cert-manager Certificate dnsNames
+  # and Splunk endpoint URLs). Defaults to the Kubernetes standard, but can be
+  # overridden for clusters configured with a non-default clusterDomain.
+  CLUSTER_DOMAIN=$(yq eval '.kubernetes.clusterDomain' "${CONFIG_FILE}" 2>/dev/null || echo "cluster.local")
+  [[ "${CLUSTER_DOMAIN}" == "null" || -z "${CLUSTER_DOMAIN}" ]] && CLUSTER_DOMAIN="cluster.local"
+
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
@@ -2939,11 +2945,11 @@ spec:
     - ${svc}
     - ${svc}.${AI_NS}
     - ${svc}.${AI_NS}.svc
-    - ${svc}.${AI_NS}.svc.cluster.local
+    - ${svc}.${AI_NS}.svc.${CLUSTER_DOMAIN}
     - ${headless}
     - ${headless}.${AI_NS}
     - ${headless}.${AI_NS}.svc
-    - ${headless}.${AI_NS}.svc.cluster.local
+    - ${headless}.${AI_NS}.svc.${CLUSTER_DOMAIN}
     - localhost
   ipAddresses:
     - 127.0.0.1
@@ -4735,7 +4741,7 @@ data:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.${CLUSTER_DOMAIN}:8089
                 certFile: /mnt/splunk-certs/tls-combined.pem
                 sslPassword: ""
 YAML
@@ -4889,12 +4895,12 @@ install_ai_platform_cr() {
   # set in the splunk-defaults ConfigMap above (install_splunk_standalone) —
   # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
-    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.${CLUSTER_DOMAIN}:8089
     # HEC ingestion endpoint (port 8088) for the OTel sidecar. Distinct from
     # "endpoint" above (management/JWKS, port 8089, used as the JWT issuer) —
     # without this, OTel telemetry was sent to the management port and
     # silently failed to reach the HEC listener.
-    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.${CLUSTER_DOMAIN}:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}

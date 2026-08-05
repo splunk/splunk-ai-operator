@@ -167,6 +167,7 @@ operators:
 # ---------- Kubernetes ----------
 kubernetes:
   namespace: ai-platform
+  # clusterDomain: cluster.local  # UNCOMMENT to override if the cluster uses a non-default DNS domain
 
 # ---------- File Paths ----------
 files:
