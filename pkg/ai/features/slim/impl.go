@@ -309,7 +309,11 @@ func splunkCACertChecksum(ctx context.Context, c client.Client, ai *aiv1.AIServi
 	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ai.Namespace}, secret); err != nil {
 		return ""
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(secret.Data[key]))
+	caData, exists := secret.Data[key]
+	if !exists {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(caData))
 }
 
 // buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
@@ -484,6 +488,9 @@ func hasOwnerReference(obj metav1.Object, owner metav1.Object) bool {
 	return false
 }
 
+// reconcileCertificate manages server TLS for the legacy mtls API field.
+// Kubernetes Event reason identifiers retain their MTLS prefix for backward
+// compatibility; their messages describe the current server-TLS behavior.
 func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AIService) error {
 	if !ai.Spec.MTLS.Enabled || ai.Spec.MTLS.Termination != "operator" {
 		return nil
@@ -495,7 +502,7 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 	if err := r.Get(ctx, certKey, existingCert); err != nil {
 		if apierrors.IsNotFound(err) {
 			certExists = false
-			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating mTLS certificate")
+			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating server TLS certificate")
 		}
 	}
 
@@ -515,7 +522,7 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 		},
 	}
 	if err := controllerutil.SetControllerReference(ai, cert, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on Certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on server TLS Certificate")
 		return fmt.Errorf("ownerref on Certificate: %w", err)
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
@@ -530,12 +537,12 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 		}
 		return nil
 	}); err != nil {
-		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update Certificate: %v", err)
+		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update server TLS Certificate: %v", err)
 		return fmt.Errorf("create/update Certificate: %w", err)
 	}
 
 	if !certExists {
-		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "mTLS Certificate created successfully")
+		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "Server TLS Certificate created successfully")
 	}
 
 	certReady := false
@@ -547,11 +554,11 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 	}
 
 	if !certReady {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue the server TLS certificate")
 		return fmt.Errorf("waiting for Certificate %q to become Ready", cert.Name)
 	}
 
-	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "mTLS certificate issued successfully")
+	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "Server TLS certificate issued successfully")
 	return nil
 }
 
@@ -651,13 +658,13 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		"prometheus.io/scheme":                   "http",
 		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
-	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
-	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
-	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
-		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
-	}
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
+	}
+	// Set the operator-owned rollout hash after propagating user annotations so
+	// a stale or malicious AIService annotation cannot suppress CA rotation.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
 	}
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {

@@ -1271,6 +1271,11 @@ func Test_reconcileSAIADeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
 	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+	ai.Annotations = map[string]string{
+		"example.com/preserved":                  "kept",
+		"splunk-ai-operator/splunk-ca-hash":      "stale-user-supplied-hash",
+		"splunk-ai-operator/splunk-issuers-hash": "stale-user-supplied-issuers-hash",
+	}
 
 	caSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
@@ -1313,6 +1318,9 @@ func Test_reconcileSAIADeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
 
 	hash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
 	assert.NotEmpty(t, hash1)
+	assert.NotEqual(t, "stale-user-supplied-hash", hash1, "operator CA hash must override propagated user annotations")
+	assert.NotEqual(t, "stale-user-supplied-issuers-hash", dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"], "operator issuer hash must override propagated user annotations")
+	assert.Equal(t, "kept", dep.Spec.Template.Annotations["example.com/preserved"])
 
 	// Rotating the Secret's content in place (same name) must change the hash,
 	// so the pod rolls even though CACertRef itself didn't change (AIP-4614 Part G.2).
@@ -1348,6 +1356,24 @@ func Test_reconcileSAIADeployment_CABundle_MissingSecretOmitsHash(t *testing.T) 
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := envToMap(container.Env)
 	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSAIADeployment_CABundle_MissingKeyOmitsHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ca-with-wrong-key"}
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ca-with-wrong-key", Namespace: "default"},
+		Data:       map[string][]byte{"other.crt": []byte("not-the-referenced-key")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
 	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
 }
 
@@ -1413,6 +1439,7 @@ func Test_reconcileSAIADeployment_CABundle_KeyWithShellMetacharacters(t *testing
 func Test_reconcileSAIAv2Deployment_CABundle_WiresEnvAndHash(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-one.example.test:8089"
 	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
 
 	caSecret := &corev1.Secret{
@@ -1437,6 +1464,14 @@ func Test_reconcileSAIAv2Deployment_CABundle_WiresEnvAndHash(t *testing.T) {
 	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
 	assert.Equal(t, "splunk-ca-merge", dep.Spec.Template.Spec.InitContainers[0].Name)
 	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+	issuerHash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"]
+	assert.NotEmpty(t, issuerHash1)
+
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-two.example.test:8089"
+	require.NoError(t, r.reconcileSAIAv2Deployment(context.Background(), ai))
+	dep2 := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-deployment", Namespace: "default"}, dep2))
+	assert.NotEqual(t, issuerHash1, dep2.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"], "issuer changes must roll SAIA v2 pods that consume the ConfigMap through envFrom")
 }
 
 func Test_reconcileSAIAv2Worker_CABundle_WiresEnvAndHash(t *testing.T) {
@@ -1466,6 +1501,7 @@ func Test_reconcileSAIAv2Worker_CABundle_WiresEnvAndHash(t *testing.T) {
 	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
 	assert.Equal(t, "splunk-ca-merge", dep.Spec.Template.Spec.InitContainers[0].Name)
 	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"])
 }
 
 // envToMap converts a slice of EnvVar to a map for easy assertion.

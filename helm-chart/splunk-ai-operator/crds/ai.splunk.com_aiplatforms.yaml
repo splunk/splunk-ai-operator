@@ -65,8 +65,9 @@ spec:
             description: AIPlatformSpec defines the desired state
             properties:
               certificateRef:
-                description: CertificateRef references a cert-manager Certificate
-                  or Issuer for mTLS
+                description: |-
+                  CertificateRef references the cert-manager issuer used for the legacy
+                  mtls field's server-authentication TLS certificate.
                 type: string
               clusterDomain:
                 default: cluster.local
@@ -2174,9 +2175,9 @@ spec:
                 type: object
               mtls:
                 description: |-
-                  MTLS configures TLS for AIService's nginx listener (propagated to each
-                  AIService created from this platform). See MTLSConfig's doc comment:
-                  despite the name, this is currently one-way TLS, not mutual TLS.
+                  MTLS is the legacy API field that configures one-way, server-authentication
+                  TLS for each AIService's nginx listener. Client certificates are not
+                  requested or validated; mutual TLS is not currently implemented.
                 properties:
                   dnsNames:
                     description: DNSNames is the list of DNS names for the certificate
@@ -2185,9 +2186,8 @@ spec:
                     type: array
                   enabled:
                     description: |-
-                      Enabled determines whether to enable TLS on nginx's listener. NOTE: this
-                      is currently one-way TLS only (server-auth), not mutual TLS — nginx never
-                      validates a client certificate. See MTLSConfig's doc comment.
+                      Enabled enables one-way, server-authentication TLS on nginx's listener.
+                      It does not enable client-certificate authentication.
                     type: boolean
                   issuerRef:
                     description: IssuerRef references the cert-manager Issuer for
@@ -2817,9 +2817,9 @@ spec:
                 properties:
                   caCertRef:
                     description: |-
-                      CACertRef references a Secret/ConfigMap key holding the PEM CA bundle that
-                      signs the Splunk server certificate, so SAIA (and SLIM) can verify Splunk's
-                      TLS cert on their outbound HTTPS calls (JWKS fetch, token validation).
+                      CACertRef references a Secret key holding the PEM CA bundle that signs the
+                      Splunk server certificate, so SAIA and SLIM can verify management/JWKS
+                      calls and the OTel sidecar can verify HEC delivery when it is enabled.
                       Required whenever Splunk's cert chains to a CA not already in the image's
                       system trust store — always true for the installer's self-signed internal
                       chain, and common for external Splunk behind a private/internal CA.
@@ -2845,24 +2845,27 @@ spec:
                       Endpoint is the Splunk management/JWKS URL (typically port 8089), used as
                       the JWT issuer for SAIA token validation (mutually exclusive with
                       SplunkCustomResourceRef). Either Endpoint or SplunkCustomResourceRef must
-                      be provided. When HECEndpoint is not set, this value is also used to
-                      derive the HEC ingestion URL for the OTel sidecar — which is only
-                      correct if Endpoint and the HEC listener share the same host; management
-                      (8089) and HEC (8088) are different ports on most Splunk deployments, so
-                      set HECEndpoint explicitly whenever OTel telemetry is enabled.
+                      be provided for management/JWKS access. Endpoint is never used as a
+                      fallback HEC ingestion URL; set HECEndpoint explicitly when OTel telemetry
+                      is enabled.
                     type: string
                   hecEndpoint:
                     description: |-
                       HECEndpoint is the Splunk HTTP Event Collector base URL (typically port
                       8088) used by the OTel sidecar to ship telemetry. Distinct from Endpoint,
                       which is the management/JWKS URL used for JWT issuer validation — HEC
-                      and management are different ports on most Splunk deployments. Falls
-                      back to Endpoint when unset, for backward compatibility with configs
-                      that predate this field (only correct when both happen to share a host
-                      and port, which is not the general case).
+                      and management are different ports on most Splunk deployments. There is
+                      no fallback to Endpoint. HECEndpoint is required when sidecars.otel is
+                      enabled and Splunk telemetry is configured.
                     type: string
                   secretRef:
-                    description: SecretRef references a Secret containing Splunk credentials
+                    description: |-
+                      SecretRef references a Secret containing Splunk credentials. It is
+                      required for every non-empty Splunk telemetry configuration when
+                      sidecars.otel is enabled because the OTel collector reads the HEC token
+                      from this Secret. Namespace must be empty or match the AIPlatform or
+                      AIService namespace; Kubernetes pod Secret references cannot cross
+                      namespaces.
                     properties:
                       name:
                         description: name is unique within a namespace to reference
@@ -2875,8 +2878,10 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   secretSource:
-                    description: SecretSource indicates whether token comes from Kubernetes
-                      Secret or Vault Agent
+                    description: |-
+                      SecretSource indicates whether the token comes from a Kubernetes Secret or
+                      Vault Agent. Vault-only credentials are not supported when sidecars.otel is
+                      enabled.
                     type: string
                   splunkCustomResourceRef:
                     description: SplunkCustomResourceRef references an existing SplunkConfiguration

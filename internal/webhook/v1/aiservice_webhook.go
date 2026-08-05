@@ -99,7 +99,7 @@ func (d *AIServiceCustomDefaulter) Default(_ context.Context, obj runtime.Object
 		aiservice.Spec.Metrics.Port = 9090
 	}
 
-	// Default MTLS termination
+	// Default TLS termination for the legacy mtls field.
 	if aiservice.Spec.MTLS.Enabled && aiservice.Spec.MTLS.Termination == "" {
 		aiservice.Spec.MTLS.Termination = "operator"
 	}
@@ -192,7 +192,7 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 		))
 	}
 
-	// Validate MTLS
+	// Validate the legacy mtls field (currently one-way server TLS).
 	if errs := v.validateMTLSForService(&aiservice.Spec.MTLS, field.NewPath("spec").Child("mtls")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
@@ -307,6 +307,26 @@ func (v *AIServiceCustomValidator) validateTaskVolume(taskVolume *aiv1.ObjectSto
 func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkConfig *aiv1.SplunkConfigurationSpec, namespace string, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
+	// CACertRef's Secret is mounted as a same-namespace Secret volume
+	// (buildSAIACABundleEnv/buildSlimCABundleEnv); a cross-namespace value is
+	// silently ignored at runtime, which looks like a working config but never
+	// actually mounts the intended CA. Validate this before the empty-config
+	// return because caCertRef and trustedIssuers are valid on their own.
+	if ref := splunkConfig.CACertRef; ref != nil && ref.Namespace != "" && ref.Namespace != namespace {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("caCertRef").Child("namespace"),
+			ref.Namespace,
+			fmt.Sprintf("caCertRef.namespace must be empty or match the AIService's own namespace (%q); cross-namespace Secret references are not supported (the CA Secret is mounted as a same-namespace Secret volume)", namespace),
+		))
+	}
+	if refNamespace := splunkConfig.SecretRef.Namespace; refNamespace != "" && refNamespace != namespace {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("secretRef").Child("namespace"),
+			refNamespace,
+			fmt.Sprintf("secretRef.namespace must be empty or match the AIService's own namespace (%q); Kubernetes Secret references used by pods cannot cross namespaces", namespace),
+		))
+	}
+
 	hasEndpoint := splunkConfig.Endpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
 
@@ -378,22 +398,10 @@ func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkC
 		}
 	}
 
-	// CACertRef's Secret is mounted as a same-namespace Secret volume
-	// (buildSAIACABundleEnv/buildSlimCABundleEnv); a cross-namespace value is
-	// silently ignored at runtime, which looks like a working config but never
-	// actually mounts the intended CA. Reject it at admission instead.
-	if ref := splunkConfig.CACertRef; ref != nil && ref.Namespace != "" && ref.Namespace != namespace {
-		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("caCertRef").Child("namespace"),
-			ref.Namespace,
-			fmt.Sprintf("caCertRef.namespace must be empty or match the AIService's own namespace (%q); cross-namespace Secret references are not supported (the CA Secret is mounted as a same-namespace Secret volume)", namespace),
-		))
-	}
-
 	return allErrs
 }
 
-// validateMTLSForService validates the MTLS configuration for AIService
+// validateMTLSForService validates the legacy mtls field for one-way server TLS.
 func (v *AIServiceCustomValidator) validateMTLSForService(mtls *aiv1.MTLSConfig, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
@@ -407,12 +415,12 @@ func (v *AIServiceCustomValidator) validateMTLSForService(mtls *aiv1.MTLSConfig,
 			))
 		}
 
-		// If using operator termination, need IssuerRef
+		// Operator-managed server TLS needs an IssuerRef.
 		if mtls.Termination == "operator" || mtls.Termination == "" {
 			if mtls.IssuerRef.Name == "" {
 				allErrs = append(allErrs, field.Required(
 					fldPath.Child("issuerRef").Child("name"),
-					"issuerRef.name must be specified when MTLS is enabled with operator termination",
+					"issuerRef.name must be specified when mtls.enabled is true with operator-managed server TLS termination",
 				))
 			}
 		}
@@ -421,7 +429,7 @@ func (v *AIServiceCustomValidator) validateMTLSForService(mtls *aiv1.MTLSConfig,
 		if len(mtls.DNSNames) == 0 {
 			allErrs = append(allErrs, field.Required(
 				fldPath.Child("dnsNames"),
-				"at least one DNS name must be specified when MTLS is enabled",
+				"at least one DNS name must be specified when mtls.enabled is true for server TLS",
 			))
 		}
 	}

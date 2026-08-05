@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// --- 2️⃣ reconcileCertificate: issue a cert-manager Certificate for mTLS ---
+// --- 2️⃣ reconcileCertificate: issue a cert-manager server TLS Certificate ---
 func (r *AIPlatformReconciler) reconcileCertificate(ctx context.Context, p *aiApi.AIPlatform) error {
 	certName := p.Name + "-tls"
 	cert := &certmanagerv1.Certificate{

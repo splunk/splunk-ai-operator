@@ -72,7 +72,7 @@ spec:
 {{- end }}
 
 {{- if .Values.certificateRef }}
-  # Certificate reference for mTLS
+  # Issuer reference for the legacy mtls field's server TLS certificate
   certificateRef: {{ .Values.certificateRef | quote }}
 {{- end }}
 
@@ -147,7 +147,7 @@ spec:
 {{- end }}
 
 {{- if .Values.mtls }}
-  # mTLS configuration
+  # One-way server TLS configuration (legacy API field name)
   mtls:
     enabled: {{ .Values.mtls.enabled | default false }}
 {{- if .Values.mtls.issuerRef }}

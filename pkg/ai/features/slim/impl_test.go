@@ -192,6 +192,11 @@ func Test_reconcileSlimDeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
 	scheme := buildTestScheme(t)
 	ai := newTestSlimAIService("slim-cabundle-wired")
 	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+	ai.Annotations = map[string]string{
+		"example.com/preserved":                  "kept",
+		"splunk-ai-operator/splunk-ca-hash":      "stale-user-supplied-hash",
+		"splunk-ai-operator/splunk-issuers-hash": "stale-user-supplied-issuers-hash",
+	}
 
 	caSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
@@ -233,6 +238,9 @@ func Test_reconcileSlimDeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
 
 	hash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
 	assert.NotEmpty(t, hash1)
+	assert.NotEqual(t, "stale-user-supplied-hash", hash1, "operator CA hash must override propagated user annotations")
+	assert.NotEqual(t, "stale-user-supplied-issuers-hash", dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"], "operator issuer hash must override propagated user annotations")
+	assert.Equal(t, "kept", dep.Spec.Template.Annotations["example.com/preserved"])
 
 	// Rotating the Secret's content in place (same name) must change the hash,
 	// so the pod rolls even though CACertRef itself didn't change (AIP-4614 Part G.2).
@@ -297,6 +305,24 @@ func Test_reconcileSlimDeployment_CABundle_MissingSecretOmitsHash(t *testing.T) 
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := slimEnvToMap(container.Env)
 	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSlimDeployment_CABundle_MissingKeyOmitsHash(t *testing.T) {
+	scheme := buildTestScheme(t)
+	ai := newTestSlimAIService("slim-cabundle-missing-key")
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ca-with-wrong-key"}
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ca-with-wrong-key", Namespace: "default"},
+		Data:       map[string][]byte{"other.crt": []byte("not-the-referenced-key")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: "default"}, dep))
 	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
 }
 

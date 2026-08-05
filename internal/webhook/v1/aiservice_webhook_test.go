@@ -182,6 +182,27 @@ var _ = Describe("AIService Webhook", func() {
 				Expect(e.Detail).To(ContainSubstring("cross-namespace"))
 			})
 
+			It("should reject a cross-namespace caCertRef when it is the only Splunk setting", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					CACertRef: &aiv1.CABundleRef{Name: "splunk-ca", Namespace: "other-namespace"},
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
+				e := findErr(errs, "caCertRef")
+				Expect(e).NotTo(BeNil(), "the empty-config fast path must not bypass caCertRef validation")
+				Expect(e.Detail).To(ContainSubstring("cross-namespace"))
+			})
+
+			It("should reject a cross-namespace caCertRef with trustedIssuers only", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					TrustedIssuers: []string{"https://splunk.example.test:8089"},
+					CACertRef:      &aiv1.CABundleRef{Name: "splunk-ca", Namespace: "other-namespace"},
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
+				e := findErr(errs, "caCertRef")
+				Expect(e).NotTo(BeNil(), "trustedIssuers must not make the empty-config fast path bypass caCertRef validation")
+				Expect(e.Detail).To(ContainSubstring("cross-namespace"))
+			})
+
 			It("should accept a caCertRef.namespace that matches the AIService's own namespace", func() {
 				splunkConfig := &aiv1.SplunkConfigurationSpec{
 					Endpoint:  "http://splunk:8088",
@@ -202,6 +223,20 @@ var _ = Describe("AIService Webhook", func() {
 				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
 				e := findErr(errs, "caCertRef")
 				Expect(e).To(BeNil(), "unset caCertRef.namespace must be admitted")
+			})
+
+			It("should reject a cross-namespace Splunk secretRef", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint: "https://splunk.example.test:8089",
+					SecretRef: corev1.SecretReference{
+						Name:      "splunk-secret",
+						Namespace: "other-namespace",
+					},
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, "default", fldPath)
+				e := findErr(errs, "secretRef.namespace")
+				Expect(e).NotTo(BeNil(), "pod Secret references cannot cross namespaces")
+				Expect(e.Detail).To(ContainSubstring("cannot cross namespaces"))
 			})
 		})
 	})

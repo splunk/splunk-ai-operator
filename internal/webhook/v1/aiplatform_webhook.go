@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -93,7 +94,7 @@ func (d *AIPlatformCustomDefaulter) Default(_ context.Context, obj runtime.Objec
 		}
 	}
 
-	// Default MTLS termination if enabled
+	// Default TLS termination for the legacy mtls field if enabled.
 	if aiplatform.Spec.MTLS.Enabled && aiplatform.Spec.MTLS.Termination == "" {
 		aiplatform.Spec.MTLS.Termination = "operator"
 	}
@@ -156,7 +157,7 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 		}
 	}
 
-	// Validate MTLS
+	// Validate the legacy mtls field (currently one-way server TLS).
 	if errs := v.validateMTLS(&aiplatform.Spec.MTLS, aiplatform.Spec.CertificateRef, field.NewPath("spec")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
@@ -194,8 +195,23 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
-	// Run the same validations as create
-	if createWarnings, err := v.ValidateCreate(ctx, newObj); err != nil {
+	// Run the same validations as create. Grandfather an endpoint-only OTel
+	// configuration admitted by an older operator only for unrelated updates:
+	// OTel must already have been enabled, the Splunk configuration must be
+	// byte-for-byte unchanged, and neither object may have hecEndpoint. This
+	// lets operators update other fields while still requiring an explicit HEC
+	// URL whenever OTel or any Splunk setting is changed.
+	validationObj := aiplatform
+	legacyEndpointOnlyUpdate := oldPlatform.Spec.Sidecars.Otel && aiplatform.Spec.Sidecars.Otel &&
+		oldPlatform.Spec.SplunkConfiguration.HECEndpoint == "" && aiplatform.Spec.SplunkConfiguration.HECEndpoint == "" &&
+		!isEmptySplunkConfiguration(&oldPlatform.Spec.SplunkConfiguration) &&
+		reflect.DeepEqual(oldPlatform.Spec.SplunkConfiguration, aiplatform.Spec.SplunkConfiguration)
+	if legacyEndpointOnlyUpdate {
+		validationObj = aiplatform.DeepCopy()
+		validationObj.Spec.SplunkConfiguration.HECEndpoint = "https://legacy-update-validation.invalid:8088"
+		warnings = append(warnings, "this legacy OTel configuration has no splunkConfiguration.hecEndpoint; unrelated updates are temporarily allowed, but set an explicit HEC URL before changing OTel or Splunk configuration")
+	}
+	if createWarnings, err := v.ValidateCreate(ctx, validationObj); err != nil {
 		return createWarnings, err
 	} else {
 		warnings = append(warnings, createWarnings...)
@@ -214,6 +230,12 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 	}
 
 	return warnings, nil
+}
+
+func isEmptySplunkConfiguration(config *aiv1.SplunkConfigurationSpec) bool {
+	return config.Endpoint == "" && config.HECEndpoint == "" &&
+		config.SplunkCustomResourceRef.Name == "" && config.SecretRef.Name == "" &&
+		config.VaultFilePath == ""
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type AIPlatform.
@@ -263,34 +285,69 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 }
 
 // validateSplunkConfiguration validates the Splunk configuration.
-// otelEnabled indicates whether the OTel sidecar is enabled; it affects secretRef requirements.
+// otelEnabled indicates whether the OTel sidecar is enabled; it affects HEC
+// endpoint and secretRef requirements.
 // namespace is the AIPlatform's own namespace, used to validate caCertRef.namespace.
 func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, otelEnabled bool, namespace string, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
+	// CACertRef's Secret is mounted as a same-namespace Secret volume
+	// (buildSAIACABundleEnv/buildSlimCABundleEnv); a cross-namespace value is
+	// silently ignored at runtime, which looks like a working config but never
+	// actually mounts the intended CA. Validate this before the empty-config
+	// return because caCertRef and trustedIssuers are valid on their own.
+	if ref := splunkConfig.CACertRef; ref != nil && ref.Namespace != "" && ref.Namespace != namespace {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("caCertRef").Child("namespace"),
+			ref.Namespace,
+			fmt.Sprintf("caCertRef.namespace must be empty or match the AIPlatform's own namespace (%q); cross-namespace Secret references are not supported (the CA Secret is mounted as a same-namespace Secret volume)", namespace),
+		))
+	}
+	if refNamespace := splunkConfig.SecretRef.Namespace; refNamespace != "" && refNamespace != namespace {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("secretRef").Child("namespace"),
+			refNamespace,
+			fmt.Sprintf("secretRef.namespace must be empty or match the AIPlatform's own namespace (%q); Kubernetes Secret references used by pods and the OTel collector cannot cross namespaces", namespace),
+		))
+	}
+
 	hasEndpoint := splunkConfig.Endpoint != ""
+	hasHECEndpoint := splunkConfig.HECEndpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
 	hasSecretRef := splunkConfig.SecretRef.Name != ""
 
 	// Completely empty config means Splunk disabled — no telemetry.
 	// A partial config (e.g. only vaultFilePath set) is a misconfiguration
 	// and must fail validation below rather than silently disabling telemetry.
-	if !hasEndpoint && !hasCRRef && !hasSecretRef && splunkConfig.VaultFilePath == "" {
+	if !hasEndpoint && !hasHECEndpoint && !hasCRRef && !hasSecretRef && splunkConfig.VaultFilePath == "" {
 		return allErrs
 	}
 
-	// All sources require secretRef when an endpoint is set, EXCEPT vault when
-	// the OTel sidecar is disabled. The OTel collector path (renderOtelConf and
-	// the collector env) has not been ported to vault: it still emits a
-	// secretKeyRef and does a Kubernetes Secret Get, so vault-only configs with
-	// otel enabled would write a broken collector. Require secretRef in that case.
-	if splunkConfig.SecretSource != aiv1.SecretSourceVault || otelEnabled {
-		if hasEndpoint && !hasSecretRef {
-			allErrs = append(allErrs, field.Required(
-				fldPath.Child("secretRef").Child("name"),
-				"secretRef.name is required when using endpoint",
-			))
-		}
+	// The OTel exporter sends to HEC, while Endpoint is the management/JWKS
+	// URL. Requiring the HEC URL at admission avoids silently sending telemetry
+	// to the management port. A truly empty/no-telemetry Splunk configuration
+	// returns above and remains valid even when the global OTel toggle is on.
+	if otelEnabled && !hasHECEndpoint {
+		allErrs = append(allErrs, field.Required(
+			fldPath.Child("hecEndpoint"),
+			"hecEndpoint must be specified when sidecars.otel is enabled and Splunk telemetry is configured; endpoint is not used as a fallback",
+		))
+	}
+
+	// The OTel collector always reads its HEC token from a Kubernetes Secret,
+	// for every non-empty Splunk configuration. Vault-only credentials remain
+	// supported only when OTel is disabled. Outside the OTel path, an explicit
+	// management endpoint still requires a Secret unless Vault supplies it.
+	if otelEnabled && !hasSecretRef {
+		allErrs = append(allErrs, field.Required(
+			fldPath.Child("secretRef").Child("name"),
+			"secretRef.name is required when sidecars.otel is enabled and Splunk telemetry is configured; the OTel collector does not support vault-only credentials",
+		))
+	} else if splunkConfig.SecretSource != aiv1.SecretSourceVault && hasEndpoint && !hasSecretRef {
+		allErrs = append(allErrs, field.Required(
+			fldPath.Child("secretRef").Child("name"),
+			"secretRef.name is required when using endpoint",
+		))
 	}
 
 	// Guard against path traversal: vaultFilePath must be under /vault/secrets/.
@@ -328,18 +385,6 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 				}
 			}
 		}
-	}
-
-	// CACertRef's Secret is mounted as a same-namespace Secret volume
-	// (buildSAIACABundleEnv/buildSlimCABundleEnv); a cross-namespace value is
-	// silently ignored at runtime, which looks like a working config but never
-	// actually mounts the intended CA. Reject it at admission instead.
-	if ref := splunkConfig.CACertRef; ref != nil && ref.Namespace != "" && ref.Namespace != namespace {
-		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("caCertRef").Child("namespace"),
-			ref.Namespace,
-			fmt.Sprintf("caCertRef.namespace must be empty or match the AIPlatform's own namespace (%q); cross-namespace Secret references are not supported (the CA Secret is mounted as a same-namespace Secret volume)", namespace),
-		))
 	}
 
 	return allErrs
@@ -451,7 +496,7 @@ func (v *AIPlatformCustomValidator) validateIngress(ingress *aiv1.IngressSpec, f
 	return allErrs
 }
 
-// validateMTLS validates the MTLS configuration
+// validateMTLS validates the legacy mtls configuration for one-way server TLS.
 func (v *AIPlatformCustomValidator) validateMTLS(mtls *aiv1.MTLSConfig, certificateRef string, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
@@ -465,7 +510,7 @@ func (v *AIPlatformCustomValidator) validateMTLS(mtls *aiv1.MTLSConfig, certific
 			))
 		}
 
-		// If using operator termination, need either IssuerRef or certificateRef
+		// Operator-managed server TLS needs either IssuerRef or certificateRef.
 		if mtls.Termination == "operator" || mtls.Termination == "" {
 			hasIssuerRef := mtls.IssuerRef.Name != ""
 			hasCertRef := certificateRef != ""
@@ -473,7 +518,7 @@ func (v *AIPlatformCustomValidator) validateMTLS(mtls *aiv1.MTLSConfig, certific
 			if !hasIssuerRef && !hasCertRef {
 				allErrs = append(allErrs, field.Required(
 					fldPath.Child("mtls"),
-					"either mtls.issuerRef or certificateRef must be specified when MTLS is enabled with operator termination",
+					"either mtls.issuerRef or certificateRef must be specified when mtls.enabled is true with operator-managed server TLS termination",
 				))
 			}
 		}

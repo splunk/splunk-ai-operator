@@ -60,7 +60,7 @@ appVersion: "0.2.0"
 # Dependencies required by the Splunk AI Operator
 # These operators must be installed for the AI Operator to function correctly
 dependencies:
-  # cert-manager - Required for webhook certificates and mTLS
+  # cert-manager - Required for webhook and operator-managed server TLS certificates
   - name: cert-manager
     version: "1.18.0"
     repository: "https://charts.jetstack.io"

@@ -64,7 +64,7 @@ OPTIONS:
 TEST SELECTION:
   --storage-only             Run only storage tests
   --ingress-only             Run only ingress tests
-  --mtls-only                Run only MTLS tests
+  --mtls-only                Run only server TLS tests (legacy flag name)
   --status-only              Run only status condition tests
   --events-only              Run only event tracking tests
 
@@ -561,14 +561,14 @@ EOF
 	success "Ingress tests completed"
 }
 
-# Run MTLS tests
+# Run server TLS tests (function and environment names are retained for compatibility).
 run_mtls_tests() {
 	if [[ "$RUN_MTLS_TESTS" != "true" ]]; then
 		return 0
 	fi
 
 	log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	log "Running MTLS Configuration Tests"
+	log "Running Server TLS Configuration Tests"
 	log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 	# Create self-signed issuer for testing
@@ -617,7 +617,7 @@ EOF
 	kubectl delete aiplatform "$test_name" -n "$TEST_NAMESPACE" --ignore-not-found=true
 	kubectl delete issuer test-ca-issuer -n "$TEST_NAMESPACE" --ignore-not-found=true
 
-	success "MTLS tests completed"
+	success "Server TLS tests completed"
 }
 
 # Run status condition tests

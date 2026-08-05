@@ -22,3 +22,8 @@ jobs:
 
       - name: Run Splunk-optional installer dry-run tests
         run: bash tools/cluster_setup/test_installer_dry_run.sh
+
+      - name: Run cloud installer manifest render tests
+        run: |
+          bash tools/cluster_setup/test_eks_with_stack.sh
+          bash tools/cluster_setup/test_openshift_with_stack.sh

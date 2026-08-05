@@ -32,6 +32,9 @@ jobs:
       - name: Run Unit Tests with Coverage
         run: make test
 
+      - name: Verify generated CRD distribution copies
+        run: make check-crd-artifacts
+
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e # v2
         with:

@@ -32,6 +32,8 @@ func TestFilterPropagatedAnnotations(t *testing.T) {
 		"example.com/last-applied-configuration":           "kept",
 		"kubectl.kubernetes.io/restartedAt":                "drop",
 		"script-reconcile-ts":                              "drop",
+		"splunk-ai-operator/splunk-ca-hash":                "drop",
+		"splunk-ai-operator/splunk-issuers-hash":           "drop",
 	}
 
 	filtered := FilterPropagatedAnnotations(src)

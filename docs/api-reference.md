@@ -82,7 +82,9 @@ spec:
     secretRef:
         name: "splunk-secret"
         namespace: "default"
-    endpoint: "https://splunk.default.svc.cluster.local:8089"
+    endpoint: "https://splunk.default.svc.cluster.local:8089" # management/JWKS
+    # Required with sidecars.otel; endpoint is never used as a HEC fallback.
+    hecEndpoint: "https://splunk.default.svc.cluster.local:8088"
     # Optional, if not using secretRef
     # token: "splunk-token"
   # Persistent storage for Weaviate vector database
@@ -127,7 +129,7 @@ spec:
           - "ai.example.com"
         secretName: "ai-platform-tls"
 
-  # mTLS certificates for secure communication (optional)
+  # One-way server TLS (optional; `mtls` is the legacy API field name)
   mtls:
     enabled: true
     termination: "operator"  # Operator manages certificates
@@ -152,13 +154,13 @@ The `AIPlatform` resource provides the following `Spec` configuration parameters
 | sidecars   | object | Enable/disable sidecars: `envoy`, `otel`, `prometheusOperator` |
 | clusterDomain   | string | Kubernetes cluster domain suffix. Default: `cluster.local` |
 | images   | object | Container image overrides for Ray head/worker, SAIA, Weaviate |
-| certificateRef   | string | References a cert-manager Certificate or Issuer for mTLS |
+| certificateRef   | string | References the cert-manager issuer used to provision the legacy `mtls` field's server TLS certificate |
 | splunkConfiguration   | object | Connection details for Splunk Enterprise instance |
 | **storage**   | object | **Persistent storage** for Weaviate vector database. See [Storage Configuration](storage-configuration.md) |
 | gpuScheduler   | object | Node selectors, affinity, tolerations for GPU workloads |
 | cpuScheduler   | object | Node selectors, affinity, tolerations for CPU workloads (head, Weaviate) |
 | **ingress**   | object | **External access** configuration. Exposes AI services via HTTP/HTTPS. See [Ingress Usage](ingress-configuration.md) |
-| **mtls**   | object | **mTLS/TLS certificates** managed by cert-manager for secure service communication |
+| **mtls**   | object | Legacy field for **one-way, server-authentication TLS** managed by cert-manager. It does not request or validate client certificates |
 | serviceTemplate   | object | Template used to create Kubernetes services for platform components |
 
 ## AI Service Spec Parameters

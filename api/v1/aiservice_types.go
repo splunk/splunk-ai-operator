@@ -110,7 +110,8 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Optional
 	Metrics MetricsConfig `json:"metrics,omitempty"`
 
-	// MTLS configuration for secure communication
+	// MTLS is the legacy API field for one-way, server-authentication TLS.
+	// Client certificates are not requested or validated.
 	// +kubebuilder:validation:Optional
 	MTLS MTLSConfig `json:"mtls,omitempty"`
 
@@ -185,15 +186,13 @@ type MetricsConfig struct {
 	Port int32 `json:"port,omitempty"`
 }
 
-// MTLSConfig configures TLS termination for the AIService's nginx listener.
-// Despite the field name, this is currently one-way (server-auth-only) TLS:
-// nginx presents a certificate but never requests or validates a client
-// certificate (no ssl_verify_client directive is configured). True mutual
-// TLS is not yet implemented; treat "mtls.enabled" as "tls.enabled" until it is.
+// MTLSConfig configures one-way TLS termination for the AIService's nginx
+// listener. The type and JSON field retain their legacy names for API
+// compatibility; nginx presents a server certificate but does not request or
+// validate client certificates. Mutual TLS is not currently implemented.
 type MTLSConfig struct {
-	// Enabled determines whether to enable TLS on nginx's listener. NOTE: this
-	// is currently one-way TLS only (server-auth), not mutual TLS — nginx never
-	// validates a client certificate. See MTLSConfig's doc comment.
+	// Enabled enables one-way, server-authentication TLS on nginx's listener.
+	// It does not enable client-certificate authentication.
 	// +kubebuilder:validation:Required
 	Enabled bool `json:"enabled"`
 

@@ -217,7 +217,8 @@ make install
 
 2. **Update Generated Code** (if API changed)
    ```bash
-   make manifests generate
+   make generate sync-crd-artifacts
+   make check-crd-artifacts
    ```
 
 3. **Run Tests**
@@ -267,8 +268,9 @@ make build
 # Run tests
 make test
 
-# Update CRDs
-make manifests
+# Update canonical and distributed CRD copies
+make sync-crd-artifacts
+make check-crd-artifacts
 make install
 
 # Lint

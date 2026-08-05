@@ -77,7 +77,7 @@
 - [ ] New and existing unit tests pass locally with my changes
 - [ ] Any dependent changes have been merged and published
 - [ ] I have updated the Helm chart version (if applicable)
-- [ ] I have updated CRD schemas (if applicable)
+- [ ] I have synchronized and verified CRD distribution copies with `make sync-crd-artifacts check-crd-artifacts` (if applicable)
 
 ## Breaking Changes
 

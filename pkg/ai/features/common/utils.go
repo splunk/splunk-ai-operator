@@ -18,6 +18,8 @@ var nonPropagatedAnnotations = map[string]struct{}{
 	"kubectl.kubernetes.io/last-applied-configuration": {},
 	"kubectl.kubernetes.io/restartedAt":                {},
 	"script-reconcile-ts":                              {},
+	"splunk-ai-operator/splunk-ca-hash":                {},
+	"splunk-ai-operator/splunk-issuers-hash":           {},
 }
 
 // FilterPropagatedAnnotations copies annotations that are safe to propagate

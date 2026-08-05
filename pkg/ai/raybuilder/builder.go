@@ -6,6 +6,7 @@ package raybuilder
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"os"
@@ -745,7 +746,11 @@ func (b *Builder) Build(ctx context.Context) (*rayv1.RayService, error) {
 
 func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec, error) {
 	acceleratorType := b.effectiveAcceleratorType()
+	otelCAChecksum := b.otelCACertChecksum(ctx)
 	annotations, labels := buildHeadAnnotationsAndLabels(b.ai)
+	if otelCAChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = otelCAChecksum
+	}
 	head := rayv1.HeadGroupSpec{
 		RayStartParams: map[string]string{
 			"dashboard-host": "0.0.0.0",
@@ -804,6 +809,9 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	}
 	for _, cfg := range gpuConfigs {
 		annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
+		if otelCAChecksum != "" {
+			annotations["splunk-ai-operator/splunk-ca-hash"] = otelCAChecksum
+		}
 
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
 		replicas := instanceScale[cfg.Tier]
@@ -841,6 +849,39 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		HeadGroupSpec:           head,
 		WorkerGroupSpecs:        workers,
 	}, nil
+}
+
+// otelCACertChecksum hashes the CA bytes consumed by OTel sidecars. The
+// OpenTelemetry Collector loads ca_file into its TLS client at startup, so a
+// projected Secret update alone does not refresh trust for an already-running
+// sidecar. Putting this digest on both Ray pod templates forces KubeRay to
+// replace those pods when the referenced CA key changes.
+//
+// Keep this inactive unless the OTel sidecar is actually enabled. Missing
+// Secrets/keys are left unannotated; the controller's Secret watch will
+// reconcile again when the referenced material is created or updated.
+func (b *Builder) otelCACertChecksum(ctx context.Context) string {
+	if !b.ai.Spec.Sidecars.Otel {
+		return ""
+	}
+	ref := b.ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return ""
+	}
+
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	secret := &corev1.Secret{}
+	if err := b.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: b.ai.Namespace}, secret); err != nil {
+		return ""
+	}
+	caData, exists := secret.Data[key]
+	if !exists {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(caData))
 }
 
 // objectStorageSecretEnv returns env vars for S3COMPAT_OBJECT_STORE_ACCESS_KEY and S3COMPAT_OBJECT_STORE_SECRET_KEY from

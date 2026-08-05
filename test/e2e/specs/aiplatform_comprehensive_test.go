@@ -20,7 +20,7 @@ import (
 // Comprehensive E2E tests covering all AIPlatform features:
 // - Storage (persistent volumes for Weaviate)
 // - Ingress (external access)
-// - MTLS (certificate management)
+// - Server TLS (certificate management through the legacy mtls field)
 // - Status conditions
 // - Event tracking
 // - Component health
@@ -213,9 +213,9 @@ var _ = Describe("AIPlatform Comprehensive E2E", Ordered, func() {
 		})
 	})
 
-	Describe("MTLS Configuration", func() {
-		Context("With MTLS enabled via certificateRef", func() {
-			It("references certificate for secure communication", func() {
+	Describe("Server TLS Configuration", func() {
+		Context("With server TLS configured via certificateRef", func() {
+			It("references an issuer for server certificate provisioning", func() {
 				By("creating certificate issuer")
 				err := createCertificateIssuer(testNS, "test-ca-issuer")
 				Expect(err).NotTo(HaveOccurred())
@@ -402,7 +402,7 @@ var _ = Describe("AIPlatform Comprehensive E2E", Ordered, func() {
 
 	Describe("Integration Scenarios", func() {
 		Context("Full stack with all features enabled", func() {
-			It("successfully deploys platform with storage, ingress, and MTLS", func() {
+			It("successfully deploys platform with storage, ingress, and server TLS", func() {
 				manifestPath := createFullStackTestManifest(testNS)
 				defer os.Remove(manifestPath)
 

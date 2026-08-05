@@ -352,10 +352,19 @@ flowchart TB
 - **Weaviate** is the vector database (CPU workload); a `vector-db-setup` job
   populates it after install.
 - **SAIA** is the RAG API fronted by nginx and exposed via the Route.
-- **Splunk Standalone** is deployed by the Splunk Operator; SAIA sends data to it
-  over HEC at
-  `http://splunk-<standalone-name>-standalone-service.<ns>.svc.cluster.local:8088`.
+- **Splunk Standalone** is deployed by the Splunk Operator. The installer issues
+  a service-DNS certificate and configures Splunk management/JWKS at
+  `https://splunk-<standalone-name>-standalone-service.<ns>.svc.cluster.local:8089`
+  and HEC at the distinct
+  `https://splunk-<standalone-name>-standalone-service.<ns>.svc.cluster.local:8088`
+  endpoint. AI workloads receive only the public `ca.crt` entry; the leaf
+  private key is mounted only in the Splunk Standalone.
 - **Model weights** are staged to the object store and pulled by Ray workers.
+
+> **Certificate renewal:** cert-manager renews the Splunk leaf Secret, but the
+> installer does not implement a supported splunkd hot reload or automatic pod
+> restart. After renewal, perform a controlled Splunk Standalone restart using
+> your normal operational procedure so splunkd begins serving the new leaf.
 
 ### Node model & scheduling
 All AI-tier nodes share a single `splunk.ai/ai-tier-node=true` label; both the

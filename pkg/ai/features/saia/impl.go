@@ -512,7 +512,10 @@ func hasOwnerReference(obj metav1.Object, owner metav1.Object) bool {
 	return false
 }
 
-// reconcileCertificate manages cert-manager Certificate for mTLS.
+// reconcileCertificate manages the cert-manager server TLS Certificate for the
+// legacy mtls API field. nginx does not authenticate client certificates.
+// Kubernetes Event reason identifiers retain their MTLS prefix for backward
+// compatibility; their messages describe the current server-TLS behavior.
 func (r *SaiaReconciler) reconcileCertificate(
 	ctx context.Context,
 	ai *aiv1.AIService,
@@ -528,7 +531,7 @@ func (r *SaiaReconciler) reconcileCertificate(
 	if err := r.Get(ctx, certKey, existingCert); err != nil {
 		if apierrors.IsNotFound(err) {
 			certExists = false
-			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating mTLS certificate")
+			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating server TLS certificate")
 		}
 	}
 
@@ -548,7 +551,7 @@ func (r *SaiaReconciler) reconcileCertificate(
 		},
 	}
 	if err := controllerutil.SetControllerReference(ai, cert, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on Certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on server TLS Certificate")
 		return fmt.Errorf("ownerref on Certificate: %w", err)
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
@@ -564,12 +567,12 @@ func (r *SaiaReconciler) reconcileCertificate(
 		}
 		return nil
 	}); err != nil {
-		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update Certificate: %v", err)
+		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update server TLS Certificate: %v", err)
 		return fmt.Errorf("create/update Certificate: %w", err)
 	}
 
 	if !certExists {
-		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "mTLS Certificate created successfully")
+		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "Server TLS Certificate created successfully")
 	}
 
 	// Wait until Certificate is Ready
@@ -582,12 +585,12 @@ func (r *SaiaReconciler) reconcileCertificate(
 	}
 
 	if !certReady {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue the server TLS certificate")
 		return fmt.Errorf("waiting for Certificate %q to become Ready", cert.Name)
 	}
 
 	// Emit success event when certificate becomes ready
-	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "mTLS certificate issued successfully")
+	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "Server TLS certificate issued successfully")
 	return nil
 }
 
@@ -1020,7 +1023,11 @@ func splunkCACertChecksum(ctx context.Context, c client.Client, ai *aiv1.AIServi
 	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ai.Namespace}, secret); err != nil {
 		return ""
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(secret.Data[key]))
+	caData, exists := secret.Data[key]
+	if !exists {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(caData))
 }
 
 // saiaEnvFrom returns the EnvFromSource for the SAIA ConfigMap.
@@ -1107,7 +1114,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 
 	env := buildSAIABaseEnv(ai)
 
-	// mTLS handling (dynamic)
+	// Server TLS handling for the legacy mtls field (dynamic).
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		volumes = append(volumes, corev1.Volume{
 			Name: "tls",
@@ -1171,14 +1178,15 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		"prometheus.io/scheme":                   "http",
 		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
-	// Rolls the pod when the referenced CA Secret's content changes in place
-	// (rotation) — AIP-4614 Part G.2. Absent (not just empty) when CACertRef
-	// is unset, so pods with no CA-trust config never carry this annotation.
-	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
-		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
-	}
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
+	}
+	// Set the operator-owned CA rollout hash after propagating user annotations so a
+	// stale or malicious AIService annotation cannot suppress CA rotation.
+	// Absent (not just empty) when CACertRef is unset, so pods with no CA-trust
+	// config never carry this annotation.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
 	}
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
@@ -1279,6 +1287,10 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	component := ai.Name + "-v2-api"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	// SPLUNK_ISSUERS comes from an envFrom ConfigMap, so changing that ConfigMap
+	// alone does not restart an existing pod. Hash the derived value into the
+	// template just as the v1 and SLIM deployments do.
+	annotations["splunk-ai-operator/splunk-issuers-hash"] = fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
 	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
 	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
 	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
@@ -1415,6 +1427,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 
 	component := ai.Name + "-v2-worker"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	annotations["splunk-ai-operator/splunk-issuers-hash"] = fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
 	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
 	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
 	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
@@ -1519,7 +1532,8 @@ func (r *SaiaReconciler) reconcileNginxConfigMap(
 	v1ServiceName := ai.Name + "-saia-v1-service"
 	v2ServiceName := ai.Name + "-saia-v2-service"
 
-	// Shared between the plain-HTTP (8080) and, when mTLS is enabled with
+	// Shared between the plain-HTTP (8080) and, when the legacy mtls field is
+	// enabled with
 	// operator-managed termination, the TLS (8443) server blocks so routing
 	// and CORS behavior can never drift between the two listeners.
 	locationsConf := `
@@ -1611,7 +1625,8 @@ func (r *SaiaReconciler) reconcileNginxConfigMap(
         }
 `
 
-	// Terminate client-facing TLS at nginx itself when mTLS is enabled with
+	// Terminate client-facing, server-authentication TLS at nginx itself when
+	// the legacy mtls field is enabled with
 	// operator-managed termination, using the same cert-manager Secret
 	// (ai.Spec.MTLS.SecretName) mounted into the nginx pod by
 	// reconcileNginxDeployment. Without this, the public Service's
