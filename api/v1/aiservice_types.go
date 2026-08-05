@@ -185,9 +185,15 @@ type MetricsConfig struct {
 	Port int32 `json:"port,omitempty"`
 }
 
-// MTLSConfig defines the mTLS configuration for secure communication
+// MTLSConfig configures TLS termination for the AIService's nginx listener.
+// Despite the field name, this is currently one-way (server-auth-only) TLS:
+// nginx presents a certificate but never requests or validates a client
+// certificate (no ssl_verify_client directive is configured). True mutual
+// TLS is not yet implemented; treat "mtls.enabled" as "tls.enabled" until it is.
 type MTLSConfig struct {
-	// Enabled determines whether to enable mTLS
+	// Enabled determines whether to enable TLS on nginx's listener. NOTE: this
+	// is currently one-way TLS only (server-auth), not mutual TLS — nginx never
+	// validates a client certificate. See MTLSConfig's doc comment.
 	// +kubebuilder:validation:Required
 	Enabled bool `json:"enabled"`
 

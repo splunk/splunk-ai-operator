@@ -1110,7 +1110,10 @@ spec:
                       type: string
                     type: array
                   enabled:
-                    description: Enabled determines whether to enable mTLS
+                    description: |-
+                      Enabled determines whether to enable TLS on nginx's listener. NOTE: this
+                      is currently one-way TLS only (server-auth), not mutual TLS — nginx never
+                      validates a client certificate. See MTLSConfig's doc comment.
                     type: boolean
                   issuerRef:
                     description: IssuerRef references the cert-manager Issuer for

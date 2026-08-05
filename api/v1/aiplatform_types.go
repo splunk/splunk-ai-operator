@@ -122,7 +122,9 @@ type AIPlatformSpec struct {
 	// +kubebuilder:validation:Optional
 	Ingress *IngressSpec `json:"ingress,omitempty"`
 
-	// MTLS defines the mTLS configuration for secure communication
+	// MTLS configures TLS for AIService's nginx listener (propagated to each
+	// AIService created from this platform). See MTLSConfig's doc comment:
+	// despite the name, this is currently one-way TLS, not mutual TLS.
 	// +kubebuilder:validation:Optional
 	MTLS MTLSConfig `json:"mtls,omitempty"`
 

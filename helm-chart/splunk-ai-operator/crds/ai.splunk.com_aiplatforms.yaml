@@ -2173,7 +2173,10 @@ spec:
                     type: array
                 type: object
               mtls:
-                description: MTLS defines the mTLS configuration for secure communication
+                description: |-
+                  MTLS configures TLS for AIService's nginx listener (propagated to each
+                  AIService created from this platform). See MTLSConfig's doc comment:
+                  despite the name, this is currently one-way TLS, not mutual TLS.
                 properties:
                   dnsNames:
                     description: DNSNames is the list of DNS names for the certificate
@@ -2181,7 +2184,10 @@ spec:
                       type: string
                     type: array
                   enabled:
-                    description: Enabled determines whether to enable mTLS
+                    description: |-
+                      Enabled determines whether to enable TLS on nginx's listener. NOTE: this
+                      is currently one-way TLS only (server-auth), not mutual TLS — nginx never
+                      validates a client certificate. See MTLSConfig's doc comment.
                     type: boolean
                   issuerRef:
                     description: IssuerRef references the cert-manager Issuer for
