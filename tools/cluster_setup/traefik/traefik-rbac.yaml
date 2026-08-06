@@ -1,24 +1,27 @@
-# Single RBAC source for the Traefik controller — do not also embed RBAC in
-# the DaemonSet manifest (two sources of truth is how this drifts and one of
-# them stops matching what the controller actually needs).
-#
-# ClusterRole (not Role) is required because IngressRoute/IngressRouteTCP
-# objects live in ${AI_NS} next to the Splunk/SAIA Services, while the
-# controller itself runs in the "ingress" namespace — a namespaced Role
-# could not see across that boundary.
+# Rendered by k0s_cluster_with_stack.sh. __AI_NAMESPACE__ is replaced with the
+# configured AI namespace before apply.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: traefik
   namespace: ingress
+  labels:
+    app.kubernetes.io/name: traefik
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: traefik-ingress-controller
+  name: splunk-ai-traefik
+  namespace: __AI_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: traefik
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 rules:
   - apiGroups: [""]
-    resources: ["services", "endpoints", "secrets"]
+    resources: ["services", "secrets", "configmaps"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
@@ -26,18 +29,30 @@ rules:
   - apiGroups: ["traefik.io"]
     resources:
       - "ingressroutes"
-      - "ingressroutetcps"
       - "middlewares"
+      - "middlewaretcps"
+      - "ingressroutetcps"
+      - "ingressrouteudps"
+      - "tlsoptions"
+      - "serverstransports"
+      - "serverstransporttcps"
+      - "tlsstores"
+      - "traefikservices"
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: traefik-ingress-controller
+  name: splunk-ai-traefik
+  namespace: __AI_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: traefik
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: traefik-ingress-controller
+  kind: Role
+  name: splunk-ai-traefik
 subjects:
   - kind: ServiceAccount
     name: traefik

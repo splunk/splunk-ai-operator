@@ -153,9 +153,9 @@ images:
 
   # Traefik HTTPS ingress (see the "ingress" block below). Only pulled/used
   # when ingress.enabled: true. The default image is NOT FIPS-certified — if
-  # ingress.fips: "only", point this at your own FIPS-capable Traefik build.
+  # ingress.fips: "on", point this at your own approved FIPS-capable build.
   ingress:
-    traefikImage: "docker.io/library/traefik:v3.6.14"
+    traefikImage: "docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"
 
 # ---------- Operator Versions ----------
 operators:
@@ -362,18 +362,19 @@ ingress:
   hostname: ""                   # optional DNS SAN for the cert; leave blank to
                                   # access via worker IP instead (any worker IP
                                   # works — see TRAEFIK_HTTPS_SETUP.md)
-  fips: "off"                    # off | only — "only" requires you to also set
+  fips: "off"                    # off | on — "on" requires you to also set
                                   # images.ingress.traefikImage to a FIPS-capable build
   tls:
     mode: selfsigned             # selfsigned is the only mode implemented today
   entryPoints:
+    # Ports must be unique; 9000 is reserved for the controller health probe.
     saia:
       port: 8443
     splunkWeb:
       port: 8000
     splunkMgmt:
       port: 8089
-      enabled: true               # set false if no external system needs direct
+      enabled: false              # opt in only when an external system needs direct
                                    # access to Splunk's management port
 
 # ---------- Image Pull Secrets ----------

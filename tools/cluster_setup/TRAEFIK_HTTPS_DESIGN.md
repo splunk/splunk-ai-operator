@@ -1,11 +1,15 @@
 # Traefik HTTPS Ingress — Architecture Design
 
-**Status:** Design / for-implementation
+**Status:** Implementation contract for the supported first release
+
 **Target:** k0s (1 controller, 1 CPU worker, 2 GPU workers, 1 installer/jump node) — on any
 infrastructure: cloud VM, bare metal, or on-prem. Cloud-specific notes (e.g. EC2) are called out
 explicitly where the underlying mechanism differs; everything else in this design is
 infrastructure-agnostic.
-**Namespace:** `ai-platform` (services), `ingress` (Traefik)
+
+**Namespace:** the configured AI namespace (`ai-platform` in examples) for services/routes and
+`ingress` for the Traefik workload
+
 **Installer:** `k0s_cluster_with_stack.sh` + `k0s-cluster-config.yaml`
 
 ---
@@ -21,33 +25,41 @@ infrastructure-agnostic.
 - [5a. TLS/mTLS Topology and External Exposure](#5a-tlsmtls-topology-and-external-exposure)
 - [6. Entry Point Design](#6-entry-point-design)
 - [7. IngressRoute Design](#7-ingressroute-design)
-- [8. Required Changes to Existing Files](#8-required-changes-to-existing-files)
-- [9. New Resources Needed](#9-new-resources-needed)
+- [8. Adaptations from the Reference Files](#8-adaptations-from-the-reference-files)
+- [9. Installer-Owned and Consumed Resources](#9-installer-owned-and-consumed-resources)
 - [10. Installer Changes](#10-installer-changes)
 - [11. What the End User Must Provide](#11-what-the-end-user-must-provide)
 - [12. Access Pattern After Deployment](#12-access-pattern-after-deployment)
-- [13. Bugs and Issues to Fix](#13-bugs-and-issues-to-fix)
+- [13. Resolved Reference-Manifest Issues](#13-resolved-reference-manifest-issues)
 - [14. Migration Path](#14-migration-path)
 
 ---
 
 ## 1. Problem Statement
 
-Everything in the k0s AI Platform runs over plain HTTP:
+Without optional Traefik ingress, there is no stable worker-host HTTPS endpoint shared by Splunk
+Web and SAIA:
 
-- Splunk Web (`splunk-splunk-standalone-standalone-service:8000`) — ClusterIP only
-- SAIA (`k0s-ai-platform-ai-platform-saia-saia-service`) — NodePort 30080
+- Splunk Web (`splunk-splunk-standalone-standalone-service:8000`) — cert-manager-backed HTTPS,
+  but ClusterIP-only and normally reached through a port-forward/tunnel
+- SAIA (`k0s-ai-platform-ai-platform-saia-saia-service`) — plain HTTP on NodePort 30080 in the
+  example configuration
 
 This causes three concrete failures today:
 
-**1. Browser mixed-content blocking.** The moment Splunk Web is fronted by HTTPS, the browser refuses the `http://…:30080` XHR/fetch/EventSource calls the AI Assistant makes to SAIA. The chat panel shows a permanent spinner — the same failure documented in `K0S_README.md` (the onboarding wizard hanging because the SAIA tunnel wasn't open). Mixed-content is enforced by the browser and cannot be worked around server-side.
+**1. Browser mixed-content blocking.** When the browser loads the installer-configured Splunk Web
+over HTTPS, it refuses the `http://…:30080` XHR/fetch/EventSource calls the AI Assistant makes to
+SAIA. The chat panel shows a permanent spinner. Mixed-content is enforced by the browser and
+cannot be worked around server-side.
 
 **2. Fragile SSH tunnel dependency.** Access today requires:
 - A `kubectl port-forward` on the installer node (dies silently)
 - Two SSH tunnels open simultaneously in separate terminals
 - SAIA URL changes to `localhost:30080` every session
 
-**3. External Splunk JWT trust.** External Splunk instances need a stable, TLS-terminated, publicly-trustable URL to validate JWTs against SAIA's signing endpoint — not a NodePort on a private IP.
+**3. External Splunk JWT trust.** External Splunk instances need a stable, TLS-terminated URL whose
+generated CA they explicitly trust to validate JWTs against SAIA's signing endpoint — not a
+NodePort on a private IP.
 
 ### End state
 
@@ -55,24 +67,41 @@ Traefik v3 runs as a DaemonSet with hostPorts on the k0s workers. It terminates 
 
 - Splunk Web → `https://<host>:8000` (TLS terminated at Traefik)
 - SAIA → `https://<host>:8443` (same HTTPS scheme → no mixed-content)
-- Certificates issued by cert-manager (already installed)
+- A cert-manager-generated self-signed CA and leaf certificate (the only supported TLS mode)
+- Verified HTTPS from Traefik to Splunk Web; plain in-cluster HTTP only for SAIA
 - SSH tunnels replaced by direct HTTPS or a single stable jump-host tunnel
+
+The Splunk Web and management listeners above apply only when the installer manages internal
+Splunk. External or disabled Splunk mode publishes the SAIA listener only and omits hostPorts 8000
+and 8089 because there is no in-cluster Splunk Service to route to.
 
 ## 1a. Requirements
 
-- **Optional.** Traefik setup is gated behind `ingress.enabled` (default `false`). Installs that
-  don't set it get zero behavior change — no Traefik namespace, no DaemonSet, no CRDs, no
-  cert-manager chain beyond what's already installed for other purposes. This is additive to,
-  not a replacement for, the existing NodePort/tunnel access path (§14 Migration Path).
+- **Optional.** Traefik setup is gated behind `ingress.enabled` (default `false`). A fresh install
+  that never enables it gets no Traefik namespace, DaemonSet, CRDs, or ingress certificate chain.
+  Disabling a previously enabled installation removes installer-owned resources but deliberately
+  retains the shared cluster-scoped CRDs (§14). This is additive to the existing NodePort/tunnel
+  access path. Disable reconciliation must use the same `kubernetes.namespace` used when ingress
+  was enabled; it does not search other namespaces or adopt unlabelled common-name objects.
+- **Platform compatibility baseline.** The current installer pins `k0s v1.33.13+k0s.1`
+  (Kubernetes 1.33.13) with cert-manager `v1.21.1`. Its cert-manager gate accepts Kubernetes
+  1.33–1.36, but an explicit 1.34–1.36 override still requires independent validation of the
+  Splunk Operator and the rest of the platform. It reuses an existing cert-manager only when its
+  controller, webhook, and cainjector images are all exactly `v1.21.1`. A different version must
+  be upgraded through every intermediate cert-manager minor using its existing owner and upstream
+  procedure. Before a fresh install, the supplied manifest is parsed and all three image versions
+  are checked without mutating the cluster; any canonical leftover CRD, webhook, RBAC, Service, or
+  workload blocks adoption. The admin workstation must resolve
+  `#!/usr/bin/env bash` to Bash 4 or newer (Homebrew Bash before `/bin` in `PATH` on macOS).
 - **In-cluster service routing.** When enabled, Traefik must provide a working route from its
   external-facing hostPorts to each in-cluster service it fronts — SAIA
-  (`…-saia-saia-service:8080`), Splunk Web (`…-standalone-service:8000`), and Splunk mgmt
-  (`…-standalone-service:8089`, TCP passthrough) — using `IngressRoute`/`IngressRouteTCP`
+  (`…-saia-saia-service:8080`), Splunk Web (`…-standalone-service:8000` over verified HTTPS),
+  and, only when explicitly enabled, Splunk mgmt (`…-standalone-service:8089`, TCP passthrough)
+  — using `IngressRoute`/`IngressRouteTCP`
   objects that resolve those ClusterIP/NodePort services by their in-cluster DNS names (§7).
-  Routing must work regardless of which namespace the backend service lives in (`ai-platform`),
-  which requires Traefik's ClusterRole to have cluster-wide watch on `IngressRoute`/
-  `IngressRouteTCP` objects (§9) and correct `dnsPolicy` so it can resolve in-cluster DNS at all
-  (§13, bug #1).
+  The routes and backends live together in `ai-platform`, so cross-namespace references are not
+  required. Traefik still needs read-only RBAC for every informer it starts and `dnsPolicy:
+  ClusterFirst` so it can resolve in-cluster DNS (§8).
 
 ### 1.1 Why fronting SAIA with TLS actually fixes mixed-content blocking
 
@@ -95,8 +124,9 @@ sequenceDiagram
 ```
 
 Once Traefik terminates TLS for **both** Splunk Web and SAIA at the cluster edge, the browser
-sees HTTPS→HTTPS on both legs and the check passes — everything behind Traefik (Traefik→Splunk
-Web, Traefik→SAIA) stays plain HTTP internally, which the browser never inspects:
+sees HTTPS→HTTPS on both legs and the check passes. Traefik validates Splunk Web's HTTPS backend
+certificate; the SAIA backend remains HTTP inside the cluster. The browser does not inspect
+either backend hop:
 
 ```mermaid
 sequenceDiagram
@@ -106,43 +136,43 @@ sequenceDiagram
     participant SAIA as SAIA (nginx:8080)
 
     Browser->>Traefik: GET https://host:8000/  (splunkweb entrypoint)
-    Traefik->>SplunkWeb: proxy (plain HTTP inside cluster)
+    Traefik->>SplunkWeb: HTTPS (CA + hostname verified by ServersTransport)
     Traefik-->>Browser: HTML + chat-widget JS  (origin: HTTPS)
     Browser->>Traefik: fetch("https://host:8443/chat")  (websecure entrypoint)
     Note over Browser,Traefik: Same scheme (HTTPS→HTTPS) — check<br/>passes, request proceeds
-    Traefik->>SAIA: proxy (plain HTTP inside cluster)
+    Traefik->>SAIA: HTTP (in-cluster)
     SAIA-->>Traefik: response
     Traefik-->>Browser: response (chat panel works)
 ```
 
-**This fix depends on three conditions all being true simultaneously — missing any one leaves
-the bug in place:**
+**The complete stable Traefik access pattern depends on three conditions:**
 
 ```mermaid
 flowchart LR
-    Fix["Enable TLS<br/>for SAIA"] --> C1{"Is Splunk Web<br/>ALSO fronted by<br/>HTTPS (splunkweb<br/>entry point)?"}
-    C1 -->|"No"| N1["No mixed-content problem existed —\nbut Splunk Web is still plain HTTP,\nwhich defeats the reason for doing this"]
+    Fix["Enable the Traefik<br/>HTTPS path"] --> C1{"Is the browser loading<br/>Splunk Web from the new<br/>https://host:8000<br/>entry point?"}
+    C1 -->|"No"| N1["Existing ClusterIP/tunnel access remains,\nbut the new stable access path\nis not being exercised"]
     C1 -->|"Yes"| C2{"Is the chat widget's\nconfigured SAIA base URL\nupdated to the new https://\nendpoint?"}
     C2 -->|"No — still hardcoded\nto http://host:30080"| N2["Still blocked — the browser only cares\nabout the URL it's TOLD to call,\nnot whether SAIA CAN serve HTTPS"]
-    C2 -->|"Yes"| C3{"Are Splunk Web and SAIA\nrouted through Traefik's\nwebsecure/splunkweb entry\npoints (§6-7), not left on\nNodePort/ClusterIP?"}
-    C3 -->|"No"| N3["Old NodePort/ClusterIP paths\nremain HTTP — still blocked if the\nwidget or a bookmark still points there"]
-    C3 -->|"Yes"| Fixed["Mixed content resolved"]
+    C2 -->|"Yes"| C3{"Are both Traefik routes\nhealthy and reachable on\nthe configured hostPorts\n(§6-7)?"}
+    C3 -->|"No"| N3["HTTPS request fails on routing or\nnetwork reachability even though\nthe scheme is now correct"]
+    C3 -->|"Yes"| Fixed["Stable HTTPS access works;\nmixed content is resolved"]
 ```
 
-1. **Splunk Web must also be HTTPS** (§6's `splunkweb` entry point, `:8000`) — an HTTP page
-   calling an HTTPS endpoint is *not* blocked, so if Splunk Web stayed plain HTTP there'd be no
-   mixed-content error to fix in the first place, but you also wouldn't have gained anything,
-   since Splunk Web being HTTPS is presumably part of the motivation.
+1. **Load Splunk Web through Traefik's HTTPS entry point** (§6's `splunkweb` entry point,
+   `:8000`). The underlying Splunk service already uses HTTPS; the new entry point supplies the
+   stable worker-host address and the separately generated ingress certificate clients trust.
 2. **The chat widget's SAIA base URL must be updated to point at the new `https://<host>:8443`
    endpoint** (§7's `saia-ingressroute.yaml`). TLS capability on SAIA's side is necessary but
    not sufficient — if the widget config still resolves to `http://<node>:30080`, the browser
    is still instructed to make an HTTP call and still blocks it. This is a config/wiring change
    that must ship alongside the IngressRoute, not an automatic side effect of it.
-3. **Both services must actually be routed through Traefik's entry points**, not left
-   reachable on their old NodePort/ClusterIP paths — this design is explicitly **additive**
-   (§14 Migration Path), so the old plain-HTTP paths keep working during the transition; any
-   client (bookmark, saved widget config) still pointed at the old URL will still hit the
-   mixed-content wall until it's repointed at the Traefik-fronted URL.
+3. **Both Traefik routes must be healthy and reachable.** This design is explicitly **additive**
+   (§14 Migration Path), so the old ClusterIP/tunnel path and SAIA HTTP NodePort can remain during
+   transition. A widget still pointed at the old `http://` SAIA URL will continue to hit the
+   mixed-content wall even though the new HTTPS route exists.
+
+The browser's mixed-content decision itself depends on the page and request schemes; route health
+is the separate connectivity condition required for the complete access pattern.
 
 **Related but separate check — not fixed by this at all:** Splunk Web (`:8000`) and SAIA
 (`:8443`) are different origins even once both are HTTPS (different ports), so cross-origin
@@ -157,23 +187,28 @@ independent browser checks; fixing one doesn't touch the other.
 
 These files come from an existing **Splunk Cloud internal production deployment** — a multi-component Splunk cluster with cluster manager, license manager, SHC, indexers, etc. They are the sanctioned Splunk production pattern for Traefik and are the correct reference. However, they encode components the AI Platform does not have. Treat them as a template to prune, not a drop-in.
 
-They are generated together and distributed as a **compressed archive** — `ingress.yaml` is the centrepiece (DaemonSet + entry points + FIPS control); the rest define the CRDs, RBAC, and per-service routing rules.
+The original reference files were generated together and distributed as a **compressed archive**,
+with `ingress.yaml` as the centrepiece (DaemonSet + entry points + FIPS control). The current
+installer does not deploy that file: it vendors only the complete CRD set and namespaced RBAC
+template, then renders the DaemonSet and routes inline. References to the other filenames below
+describe the historical input and the adaptations carried into the implementation.
 
 | File | What it is | Reusable? | Action needed |
 |---|---|---|---|
-| `ingress.yaml` | Traefik DaemonSet + entry-point/hostPort definitions + RBAC + image. **Contains the `GODEBUG` FIPS control env var (see §3).** | Core — yes | Prune entry points; fix `dnsPolicy` bug; remove duplicate RBAC; swap to internal image; set `GODEBUG` appropriately |
-| `traefik-crds.yaml` | Full Traefik v3 CRD set (IngressRoute, IngressRouteTCP, Middleware, ServersTransport, TLSStore, etc.) | Yes, as-is | Apply verbatim — CRDs are cluster-scoped |
-| `traefik-crds-rbac.yaml` | ClusterRole + ClusterRoleBinding for Traefik | Yes | Use as the **single** RBAC source; remove the duplicate embedded in `ingress.yaml` |
+| `ingress.yaml` | Historical Traefik DaemonSet + entry-point/hostPort definitions + RBAC + image. **Contains the `GODEBUG` FIPS control env var (see §3).** | Pattern only | Carry the pruned entry points, corrected `dnsPolicy`, image override, and `GODEBUG` setting into the installer's inline DaemonSet; do not deploy the original file |
+| `traefik-crds.yaml` | Complete CRD set vendored from the exact Traefik v3.6.25 release | Yes | Keep all ten CRDs together; an apparently unused missing type prevents the provider's informer caches from synchronizing |
+| `traefik-rbac.yaml` | ServiceAccount + namespaced, read-only RBAC for the Kubernetes CRD provider | Yes | Render its AI namespace placeholder and use it as the **single** RBAC source; remove duplicate embedded RBAC |
 | `splunk_ingress.yaml` | Port-based IngressRoutes for cm/lm/mc/shc/s1/s2s; an insecure legacy backend transport; references `internal-domain-tls`; namespace `splunk` | Pattern only | **Drop** cm/lm/mc/shc/s2s routes. Keep s1/standalone pattern. Change ns → `ai-platform`, update service names, align TLS secret, and replace the transport with the verified §7 design |
 | `splunk_ingress_named.yaml` | Host-based routes via `HostRegexp` (e.g. `manager.*`, `s1.*`) | Optional | Only if user has DNS names per service. Can be provided as a DNS-mode alternative |
-| `monitoring.yaml` | IngressRoutes for Prometheus (:9090) and Perses (:3000) | Prometheus only | Keep Prometheus route (kube-prometheus-stack is deployed); drop Perses (not in platform) |
+| `monitoring.yaml` | IngressRoutes for Prometheus (:9090) and Perses (:3000) | Not in first release | Do not apply; metrics exposure needs a separate access-control and cross-namespace design |
 | `s3-upload-ingressroute.yaml` | IngressRoute for Ceph RGW (in-cluster S3) in namespace `rook-ceph` | **Drop** | AI Platform uses **external** object store. No `rook-ceph` deployed. Remove entirely |
 
 ---
 
 ## 3. FIPS / GODEBUG Behavior
 
-The `ingress.yaml` DaemonSet contains this env var:
+The historical `ingress.yaml` DaemonSet contained this environment variable; the current installer
+renders the equivalent value into its inline DaemonSet:
 
 ```yaml
 env:
@@ -182,9 +217,9 @@ env:
 ```
 
 This is a Go runtime control, but it is **not by itself a compliance claim**. In the source manifest
-(the internal Splunk Cloud deployment these files came from, §2), the Traefik image is the internal
-`docker.repo.splunkdev.net/splcore/contrib/traefik:v3.6.14-1783379655-0246af9e4924`
-build. **This installer does not ship that image by default** — see the "Image sourcing" note below.
+(the internal Splunk Cloud deployment these files came from, §2), the Traefik image is a legacy
+internal `docker.repo.splunkdev.net/splcore/contrib/traefik` build. **This installer does
+not ship that image by default** — see the "Image sourcing" note below.
 The selected image must be built with an appropriate Go Cryptographic Module and validated for the
 target operating environment; a runtime flag cannot make an arbitrary image FedRAMP/FIPS compliant.
 
@@ -192,7 +227,9 @@ target operating environment; a runtime flag cannot make an arbitrary image FedR
 |---|---|
 | `fips140=off` | FIPS mode disabled. This is the normal default |
 | `fips140=on` | Enable Go's FIPS 140-3 mode. Use only with a suitably built and validated image |
-| `fips140=only` | Best-effort assessment/debug mode: non-approved operations error or panic. Go explicitly says this is not intended for production |
+
+The installer accepts only `off` and `on`. It must reject `only`; Go documents that setting as an
+assessment/debug aid rather than the normal production mode.
 
 ### Decision for the AI Platform installer
 
@@ -203,12 +240,12 @@ ingress:
   fips: "off"    # off | on — controls GODEBUG=fips140= in Traefik
 ```
 
-The installer substitutes this value into the DaemonSet manifest at deploy time (same
-`sed`/`envsubst` pattern used for image tags). A standard deployment gets `fips140=off`. A
-FIPS-scoped deployment may set `fips: "on"`, but must also supply an image built with the approved
-Go module and complete its own operating-environment/compliance validation. Go recommends selecting
-the module at build time with `GOFIPS140`; `GODEBUG=fips140=only` is an assessment/debug aid and must
-not be offered as the production setting.
+The installer renders this value into its inline DaemonSet YAML at deploy time. A standard
+deployment gets `fips140=off`. A FIPS-scoped deployment may set `fips: "on"`, but must also supply
+an image built with the approved Go module and complete its own operating-environment/compliance
+validation. The installer cannot inspect attestations or prove that an arbitrary override is
+FIPS-capable. Go recommends selecting the module at build time with `GOFIPS140`;
+`GODEBUG=fips140=only` is an assessment/debug aid and must not be offered as the production setting.
 
 > **Backend TLS note:** cipher suites are negotiated by TLS peers; a certificate does not
 > "present a cipher." With `fips140=on`, Traefik's HTTPS connection to Splunk Web succeeds only if
@@ -219,35 +256,30 @@ not be offered as the production setting.
 > backend or establish compliance by itself. See the official Go FIPS guidance:
 > <https://go.dev/doc/security/fips140>.
 
-### Image sourcing — gap in this design as written
+### Image sourcing
 
-Every code sample above hardcodes a single image:
-`docker.repo.splunkdev.net/splcore/contrib/traefik:v3.6.14-1783379655-0246af9e4924`, and §11
-just says the customer needs "pull access... same as existing SAIA image access." **That
-claim doesn't hold up.** `docker.repo.splunkdev.net` is Splunk's internal corporate
-Artifactory — it's the source these YAML files came from (§2: "an existing Splunk Cloud
-internal production deployment"), not something a customer running this installer
-standalone has network access to. Every other image in the stack is sourced differently:
+The source manifests used a Splunk-internal Artifactory image that standalone customers cannot
+pull. The installer instead follows the repository's normal public-image/override pattern:
 
 - All images default to **public registries** (`docker.io/splunk/...`,
   `quay.io/kuberay/operator`, `docker.io/semitechnologies/weaviate`, etc.) under the
   `images:` block in `k0s-cluster-config.yaml` (see `images.operator.image`,
   `images.saia.apiImage`, ...).
-- Customers who need a mirror set `images.registry` (a prefix) and the installer rewrites
-  every image reference to go through it — that's the actual "same access as SAIA" path,
-  not direct access to a Splunk-internal host.
-- Airgap bundling (`prepare_airgap_bundle.sh`) enumerates every add-on image it needs to
-  pre-stage (`container-images.txt`, `addon-images.list` from rendered charts/manifests) —
-  **Traefik has no entry in either list today**, so an airgapped install would silently fail
-  to pull it.
+- The Traefik pull reference is explicit at `images.ingress.traefikImage`. Customers using a
+  mirror set that key to the exact mirrored tag or digest; the generic `images.registry` prefix
+  is not applied to this image.
+- Airgap bundling (`prepare_airgap_bundle.sh --config <install-config>`) reads the configured
+  ingress image when `ingress.enabled: true` and adds the exact reference to both
+  `container-images.txt` and the add-on image tar.
 
 **Resolution — match the existing pattern instead of introducing a new one:**
 
-1. **Default to the public upstream image**, consistent with every other component:
-   `images.ingress.traefikImage: docker.io/library/traefik:v3.6.14`. This is reachable by any
-   customer with normal internet/registry-mirror access and participates in the existing
-   `images.registry` prefix-rewrite mechanism (§8/§10 below) — no new override plumbing
-   needed.
+1. **Default to the public upstream image**, consistent with every other component. Pin the
+   verified multi-architecture index rather than a mutable tag:
+   `docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d`.
+   This is reachable by any
+   customer with normal internet access. Mirror users override the same key with the exact
+   mirrored reference (§10).
 2. **Treat a validated FIPS build as an explicit, opt-in override**, not the default:
    customers who set `ingress.fips: "on"` must also set
    `images.ingress.traefikImage` themselves to an image they can actually pull — either
@@ -255,10 +287,10 @@ standalone has network access to. Every other image in the stack is sourced diff
    network access) or their own mirror of an appropriately built and validated Traefik image. Document this
    requirement next to the `fips` knob rather than assuming a default value nobody but
    Splunk-internal deployments can reach.
-3. **Add Traefik to the airgap bundle** when `ingress.enabled: true`: append the resolved
-   `images.ingress.traefikImage` to `container-images.txt` (manual-mirror doc) and to the
-   `ADDON_LIST` enumeration in `prepare_airgap_bundle.sh` §4b so `k0s airgap
-   bundle-artifacts` actually stages it.
+3. **Build airgap bundles from the install config:** passing `--config` makes the bundler append
+   the resolved `images.ingress.traefikImage` to `container-images.txt` and to `ADDON_LIST`, so
+   `k0s airgap bundle-artifacts` stages it. A bundle built without the config does not infer that
+   ingress will later be enabled.
 
 This changes §10's config block and §11's table below — see the corrected versions in each.
 
@@ -266,7 +298,7 @@ This changes §10's config block and §11's table below — see the corrected ve
 
 ## 4. Architecture Decision: Raw Manifests vs Helm
 
-**Decision: Raw manifests, templated by the installer's existing `sed`/`envsubst` mechanism. No upstream Traefik Helm chart.**
+**Decision: Raw Kubernetes YAML (vendored CRD/RBAC files plus inline rendered workload/routes). No upstream Traefik Helm chart.**
 
 ### Why not Helm
 
@@ -274,8 +306,10 @@ The upstream `traefik/traefik` Helm chart defaults to a `Deployment` + `Service`
 
 ### Why raw manifests
 
-- The provided files are already the sanctioned Splunk production pattern — DaemonSet + hostPort, exact entry-point names, same FIPS env var. Wrapping them in Helm values would only obscure this.
-- The installer already applies raw manifests with substitution (e.g. `install_cert_manager` at line 2537). The image/namespace substitution via `sed` is how SAIA images are injected today. Adding Traefik as a `kubectl apply -f` step is entirely consistent.
+- The reference files establish the sanctioned DaemonSet + hostPort pattern, entry-point names, and
+  FIPS environment control. Wrapping those concepts in Helm values would only obscure them.
+- The installer already applies raw Kubernetes YAML. For Traefik it renders the workload and routes
+  inline and applies the vendored CRD/RBAC files directly, which avoids a separate chart lifecycle.
 - Airgap compatibility: every URL in the installer is overridable for airgap. Raw manifests + a pinned internal image slot directly into the airgap bundle without a separate chart-resolution step.
 
 **When to reconsider:** if Traefik config later grows many tunable knobs, wrap the pruned manifests in a thin local Helm chart under `tools/cluster_setup/helm-charts/traefik/` — this adds upgrade ergonomics without losing the hostPort DaemonSet model.
@@ -284,13 +318,14 @@ The upstream `traefik/traefik` Helm chart defaults to a `Deployment` + `Service`
 
 ## 5. TLS Certificate Strategy
 
-The provided files reference `internal-domain-tls` everywhere but **never create it** — in the source deployment it was provisioned out of band. We must create it. cert-manager is already installed by the platform installer.
+The supported first release has one certificate strategy: cert-manager creates a self-signed CA
+and issues the ingress leaf from it. ACME and user-provided certificate modes are not implemented
+and must not be advertised as accepted config values. cert-manager is already installed by the
+platform installer.
 
-Three options:
+### cert-manager self-signed CA
 
-### Option A (recommended default): cert-manager self-signed CA
-
-Create a self-signed `ClusterIssuer` → CA `Certificate`/`Issuer` → leaf `Certificate` producing
+Create a namespaced self-signed `Issuer` → CA `Certificate`/`Issuer` → leaf `Certificate` producing
 the `internal-domain-tls` Secret in the `ai-platform` namespace. Traefik resolves
 `spec.tls.secretName` in the `IngressRoute` namespace, not in the namespace where the Traefik pod
 runs. Because the SAIA and Splunk Web routes below live in `ai-platform`, their TLS Secret must live
@@ -298,35 +333,41 @@ there too; `allowCrossNamespace` cannot change this rule because `tls.secretName
 field.
 
 ```yaml
-# ai-platform-selfsigned-issuer.yaml
 apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
+kind: Issuer
 metadata:
-  name: ai-platform-selfsigned
+  name: ingress-selfsigned
+  namespace: ai-platform
 spec:
   selfSigned: {}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: ai-platform-ca
+  name: ingress-ca
   namespace: ai-platform
 spec:
   isCA: true
-  commonName: ai-platform-ca
-  secretName: ai-platform-ca-tls
+  commonName: ai-platform-ingress-ca
+  secretName: ai-platform-ingress-ca-tls
+  duration: 87600h       # 10-year trust anchor
+  renewBefore: 8760h     # renew one year before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
   issuerRef:
-    name: ai-platform-selfsigned
-    kind: ClusterIssuer
+    name: ingress-selfsigned
+    kind: Issuer
 ---
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
-  name: ai-platform-ca-issuer
+  name: ingress-ca-issuer
   namespace: ai-platform
 spec:
   ca:
-    secretName: ai-platform-ca-tls
+    secretName: ai-platform-ingress-ca-tls
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -335,8 +376,14 @@ metadata:
   namespace: ai-platform
 spec:
   secretName: internal-domain-tls    # name Traefik IngressRoutes reference
+  duration: 2160h                    # 90-day leaf
+  renewBefore: 720h                  # renew 30 days before expiry
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
   issuerRef:
-    name: ai-platform-ca-issuer
+    name: ingress-ca-issuer
     kind: Issuer
   dnsNames:
     - ai.example.internal            # optional, user-supplied
@@ -346,7 +393,8 @@ spec:
     - 203.0.113.12
 ```
 
-- **User provides:** nothing beyond the IP/hostname (auto-detected by installer from the config's worker IP list — this is already infrastructure-agnostic, see `k0s_cluster_with_stack.sh:577`)
+- **User provides:** nothing beyond the optional hostname and the installer-managed ingress-node
+  IP inventory. The supported single-node topology includes its worker-enabled controller.
 - **Pros:** zero external dependency, works airgapped, works with bare IP SANs
 - **Cons:** browser shows "not trusted" until the user imports the CA certificate into the client
   trust store. Any external Splunk client that calls these endpoints must trust the same CA while
@@ -356,38 +404,30 @@ spec:
 > (§4), so there is one independent Traefik pod per worker node, each bound via `hostPort` to
 > that node's own IP (§5a.1 has the full explanation). The leaf `Certificate` above is a single
 > object watched through the Kubernetes CRD provider and used by every Traefik instance — it is not
-> a pod-local mount. Its `ipAddresses` SAN list must therefore include **all** worker IPs (every entry in
-> `nodes.existingIPs.workers[]` / the installer's `WORKER_IPS` array,
-> `k0s_cluster_with_stack.sh:576-577`), not a single representative IP as earlier examples in
-> this doc implied. If a client hits a worker IP that's missing from the SAN list, TLS
+> a pod-local mount. Its `ipAddresses` SAN list must therefore include **all** ingress-node IPs
+> returned by the installer's `ingress_node_ips_k0s` helper, not a single representative
+> IP as earlier examples in this doc implied. If a client hits a worker IP that's missing from
+> the SAN list, TLS
 > validation fails with a hostname/IP mismatch even though that worker's Traefik pod is healthy
-> and serving correctly. The installer must populate this list at apply-time from the same
-> worker-IP source the rest of the script already uses — no new IP-discovery mechanism needed,
-> just reuse of the existing one.
+> and serving correctly. The current installer populates this list at apply-time from
+> `ingress_node_ips_k0s`, the same worker-IP source the rest of the script uses.
 
-### Option B: ACME / Let's Encrypt (public DNS only)
-
-A publicly-trusted cert — no client trust import required.
-
-- **User provides:** public DNS name resolving to the cluster, port 80/443 reachable from the internet (HTTP-01 challenge) or DNS provider API credentials (DNS-01)
-- **Not viable** for private-network deployments with no public DNS — true whether that network is an AWS VPC, an on-prem VLAN, or a bare-metal lab segment
-
-### Option C: BYO cert (internal PKI / wildcard)
-
-User supplies `tls.crt` + `tls.key`; installer creates `internal-domain-tls` directly in
-`ai-platform`, alongside the referencing routes.
-
-- **User provides:** cert + key PEM files
-
-**Default in installer:** Option A (self-signed). Config key `ingress.tls.mode: selfsigned | acme | provided`.
+The installer waits for the leaf `Certificate` to report Ready for its current generation and
+treats timeout as a failed install. Label-verified disable cleanup removes the installer-owned
+Certificates, Issuers, CA and leaf Secrets; re-enable therefore generates a new CA and requires
+client re-import. Traefik watches the frontend leaf Secret and reloads renewed leaf material, but
+client trust stores are outside Kubernetes: during long-lived operation cert-manager renews the
+ingress CA before expiry, so operators must redistribute the current public CA before the old trust
+anchor expires. This frontend trust-anchor lifecycle is separate from the Splunk backend CA
+snapshot described in §7. The cluster-scoped Traefik CRDs are retained because they may be shared.
 
 ---
 
 ## 5a. TLS/mTLS Topology and External Exposure
 
 This section makes explicit what is TLS-terminated where, what is (and is **not**) mutual TLS
-today, and how traffic actually reaches the cluster from outside. All three diagrams assume
-Option A (self-signed CA, §5).
+today, and how traffic actually reaches the cluster from outside. All diagrams assume the
+self-signed CA described in §5.
 
 ### 5a.1 External exposure — no cloud LoadBalancer involved
 
@@ -409,12 +449,12 @@ flowchart LR
         Client["Browser / curl / external Splunk"]
     end
     subgraph FW["Firewall / ACL\n(must be opened manually — §11)\nEC2 SG, cloud FW rule, or host/network firewall"]
-        Ports["hostPorts 8443 / 8000 / 8089"]
+        Ports["hostPorts 8443 / 8000\n+ optional 8089"]
     end
     subgraph Worker["k0s worker node"]
         Traefik["Traefik pod\n(hostPort bind, one per worker)"]
     end
-    Client -->|"https://&lt;worker-ip&gt;:8443/8000\nTCP passthrough :8089"| FW
+    Client -->|"https://&lt;worker-ip&gt;:8443/8000\noptional TCP passthrough :8089"| FW
     FW --> Ports --> Traefik
 ```
 
@@ -446,7 +486,7 @@ that worker's Traefik pod must present a cert that's valid for the IP the client
 
 **Which URL to give the SAIA app / onboarding wizard (`saia_endpoint`/`saia_sok_url` in
 `splunkaiassistant.conf`):** because the IngressRoute's backend (`…-saia-saia-service`, §7) is a
-ClusterIP `Service`, Kubernetes' pod network already routes cross-node — a Traefik pod on
+cluster-addressable Kubernetes `Service`, Kubernetes' pod network already routes cross-node — a Traefik pod on
 worker A can reach a SAIA nginx pod scheduled on worker B via the CNI overlay. **This means any
 one worker's IP works identically for reaching SAIA — it does not need to be the worker SAIA's
 own pod happens to be running on.** Recommended value: `https://<any-one-worker-ip>:8443`,
@@ -505,10 +545,13 @@ sequenceDiagram
 ```
 
 **To make this a trusted hop (not "not verified"/skip-verify):** issue nginx's cert from the
-same `ai-platform-ca-issuer` used by §5 Option A (both resources now live in `ai-platform`), point
+same `ingress-ca-issuer` used by §5 (both resources now live in `ai-platform`), point
 `AIService.spec.mtls.issuerRef` at it, and configure a Traefik `ServersTransport` in
-`ai-platform` with `rootCAs: [ai-platform-ca-tls]` and the correct `serverName`. In Traefik v3.6,
-`rootCAs` contains CA Secret names; the Secret must expose the CA under `ca.crt` or `tls.ca`.
+`ai-platform` with `rootCAs: [{configMap: ingress-ca-public}]` and the correct `serverName`. Publish
+only `ca.crt` into that ConfigMap; do not configure a transport reference to the CA
+Secret/private key. In
+Traefik v3.6, each `rootCAs` entry is an object containing `secret` or `configMap`; the referenced
+object must expose the CA under `ca.crt` or `tls.ca`.
 This still is not mTLS — it only makes hop 2 verifiable instead of blindly trusted.
 
 **True mTLS (nginx demanding and validating a client cert from Traefik) does not exist today**
@@ -519,34 +562,43 @@ feature itself, not something the installer/cert-manager plumbing alone can add.
 ### 5a.4 Recommendation for this plan
 
 Default to **Case 1** (Traefik → nginx:8080, plain HTTP) regardless of whether SAIA's own
-`mtls.enabled` flag is set — it is simplest, matches every other in-cluster hop in this design
-(Splunk Web, Splunk mgmt passthrough), and does not require coordinating two independently-owned
-toggles (`ingress.enabled` for Traefik, `mtls.enabled` on `AIService`). Document Case 2 as a
-future enhancement rather than building the `ClusterIssuer` promotion + `ServersTransport` wiring
-now, since it adds complexity without adding real mutual authentication.
+`mtls.enabled` flag is set. Splunk Web is deliberately different: its backend is HTTPS and is
+verified by the §7 `ServersTransport`. Keeping SAIA on its established HTTP service avoids
+coordinating two independently-owned toggles (`ingress.enabled` for Traefik, `mtls.enabled` on
+`AIService`). Document Case 2 as a future enhancement rather than building the additional issuer,
+CA-publication, and `ServersTransport` wiring now, since it adds complexity without adding real
+mutual authentication.
 
 ---
 
 ## 6. Entry Point Design
 
-The reference `ingress.yaml` defines 11 entry points for a full Splunk cluster. The AI Platform needs 4–5. Bind only what is needed — every hostPort must be free on every worker and opened in the EC2 security group.
+The reference `ingress.yaml` defines 11 entry points for a full Splunk cluster. The AI Platform
+always needs SAIA; internal Splunk mode adds Splunk Web and can opt into a third management
+listener. Bind only what is needed: every hostPort must be free on every worker and allowed by the
+applicable cloud/host/network firewall.
 
 | Entry point name | Traefik port | hostPort | Backend | Purpose |
 |---|---|---|---|---|
 | `websecure` | 8443 | 8443 | `saia-saia-service:8080` | SAIA API HTTPS — **fixes mixed-content** |
-| `splunkweb` | 8000 | 8000 | `splunk-…-standalone-service:8000` | Splunk Web HTTPS |
-| `splunkmgmt` | 8089 | 8089 | `splunk-…-standalone-service:8089` | Splunk mgmt API (TCP passthrough) |
-| `web` (redirect) | 8080 | 8080 | — | HTTP→HTTPS redirect helper (optional) |
-| `prom` | 9090 | 9090 | `monitoring/prometheus:9090` | Prometheus (optional) |
+| `splunkweb` | 8000 | 8000 | `splunk-…-standalone-service:8000` | Splunk Web HTTPS; internal Splunk mode only |
+| `splunkmgmt` (default off) | 8089 | 8089 | `splunk-…-standalone-service:8089` | Optional Splunk mgmt API (TCP passthrough) |
 
 **Remove from AI Platform** (not deployed): `cm`, `lm`, `mc`, `shc1-deployer`, `named-api`, `perses`, `s3`, `s2s`.
 
-**Why hostPort and not NodePort Service:** the DaemonSet + hostPort model means `https://<any-worker-ip>:8443` works directly. NodePort services on the other hand have a different port mapping and no TLS — they are what we are replacing.
+**Why hostPort and not another NodePort Service:** the DaemonSet + hostPort model means
+`https://<any-worker-ip>:8443` works directly. Existing NodePort exposure remains additive until an
+operator retires it; the installer does not silently rewrite or remove that Service configuration.
 
-**Splunk mgmt (:8089):** Splunk's management port is already HTTPS internally. Use an
+There is **no cleartext HTTP entry point** in the supported scope, so the installer must not
+create an HTTP-to-HTTPS redirect middleware. A redirect becomes meaningful only if a separate
+HTTP listener and route are deliberately added later.
+
+**Splunk mgmt (:8089, default disabled):** Splunk's management port is already HTTPS internally.
+Only when `entryPoints.splunkMgmt.enabled: true`, bind the entry point/hostPort and create an
 `IngressRouteTCP` with `tls.passthrough: true` rather than terminating at Traefik. This preserves
 Splunk's own certificate end-to-end, which also means the client—not Traefik—validates that
-certificate. When this entry point is enabled, `provision_splunk_cert()` must add
+certificate. When this entry point is enabled, `provision_splunk_cert()` adds
 `ingress.hostname` and every advertised worker IP to the `ai-splunk-server` leaf SANs. The current
 service-DNS/localhost-only SAN set is insufficient for `https://<worker-ip>:8089`.
 
@@ -587,15 +639,15 @@ metadata:
 spec:
   # Must exactly match a DNS SAN on the installer-issued Splunk leaf.
   serverName: splunk-splunk-standalone-standalone-service.ai-platform.svc.${CLUSTER_DOMAIN}
-  # Traefik v3.6 resolves these Secret names in the ServersTransport namespace.
-  # ai-splunk-server-tls contains ca.crt; Traefik loads that CA entry for verification.
+  # The installer copies only ca.crt from ai-splunk-server-tls into this ConfigMap.
+  # The transport never directly references the private-key-bearing Secret.
   rootCAs:
-    - ai-splunk-server-tls
+    - configMap: ai-splunk-ca-public
 ---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
-  name: splunkweb
+  name: splunkweb-splunkweb
   namespace: ai-platform
 spec:
   entryPoints: [splunkweb]       # :8000
@@ -613,8 +665,47 @@ spec:
     secretName: internal-domain-tls
 ```
 
+The CA-only ConfigMap removes the private-key-bearing Secret from the backend transport
+configuration. It is not a Kubernetes RBAC isolation boundary: Traefik's CRD provider must
+list/watch Secrets in its watched namespace to serve route certificates, and Kubernetes RBAC
+cannot restrict `list`/`watch` by `resourceNames`. Treat the controller ServiceAccount as trusted
+within the configured AI namespace (`ai-platform` in these examples); stronger Secret isolation
+would require a separate routing namespace and a different cross-namespace backend design.
+
+`ai-splunk-ca-public` is a snapshot, not a projection or controller-managed mirror. The installer
+copies `ca.crt` from `Secret/ai-splunk-server-tls` only when the installer runs; a cert-manager
+renewal does not refresh the ConfigMap by itself. Splunk also uses an `OnDelete` StatefulSet and
+does not hot-reload its renewed certificate files. After `Certificate/ai-splunk-server` or its CA
+renews, re-run the full installer with the original AI namespace. That run fingerprints the current
+Splunk leaf, explicitly recycles the singleton Splunk pod when the leaf changed, waits for its
+replacement, and refreshes the CA-only ConfigMap before reconciling Traefik. A Secret update alone
+is not the end of this rotation workflow.
+
 Do not replace this transport with `insecureSkipVerify: true`: that would encrypt the hop while
 discarding both chain and hostname authentication.
+
+The underlying Splunk TLS setup uses only cert-manager's standard `tls.crt`, `tls.key`, and
+`ca.crt` Secret entries. Its Splunk-Ansible pre-task builds `server.pem` in
+certificate-then-private-key order on a pod-private memory volume. It deliberately does not use
+`additionalOutputFormats: CombinedPEM`, so no alpha cert-manager feature gate is part of this
+design.
+
+### Default frontend certificate (`TLSStore`)
+
+TLS certificate selection occurs before HTTP routing. Some clients connecting to a raw IP omit
+SNI; without a default store certificate Traefik presents its generated internal certificate
+instead of `internal-domain-tls`. Install the special `default` store alongside the routes:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  namespace: ai-platform
+spec:
+  defaultCertificate:
+    secretName: internal-domain-tls
+```
 
 ### Splunk mgmt — TCP passthrough
 
@@ -622,7 +713,7 @@ discarding both chain and hostname authentication.
 apiVersion: traefik.io/v1alpha1
 kind: IngressRouteTCP
 metadata:
-  name: splunkmgmt
+  name: splunkmgmt-passthrough
   namespace: ai-platform
 spec:
   entryPoints: [splunkmgmt]      # :8089
@@ -641,25 +732,11 @@ and `ingress.hostname`; otherwise conforming clients will reject the passthrough
 hostname/SAN mismatch. If those SANs cannot be issued, leave this entry point disabled or redesign
 it as explicit TLS termination plus verified re-encryption.
 
-### HTTP→HTTPS redirect middleware
+### HTTP redirects are out of scope
 
-```yaml
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: redirect-https
-  namespace: ai-platform
-spec:
-  redirectScheme:
-    scheme: https
-    port: "8443"
-    permanent: true
-```
-
-Attach this to the optional `web` entry point on port 8080 to redirect SAIA clients from
-`http://host:8080` to `https://host:8443`. Port 8000 is itself the TLS-only `splunkweb` entry
-point; it cannot simultaneously be documented as the cleartext redirect source. Supporting a
-cleartext Splunk Web redirect would require another dedicated HTTP entry point and route.
+No HTTP listener is configured, so no redirect `Middleware` is created. Clients use the HTTPS
+URLs directly. If an HTTP listener is introduced later, its redirect route and firewall exposure
+must be designed and tested together rather than adding an unused middleware object.
 
 ### Weaviate — intentionally NOT exposed
 
@@ -670,25 +747,28 @@ Weaviate (`k0s-ai-platform-ai-platform-weaviate:80`) is internal-only. SAIA reac
 | Route | Entry point | Backend | TLS |
 |---|---|---|---|
 | SAIA API | `websecure` :8443 | `saia-service:8080` | Terminate (leaf cert) |
-| Splunk Web | `splunkweb` :8000 | `standalone-service:8000` | Terminate; verified HTTPS re-encryption via `splunk-web-tls` |
-| Splunk mgmt | `splunkmgmt` :8089 | `standalone-service:8089` | TCP passthrough |
-| Prometheus (opt) | `prom` :9090 | `monitoring/prometheus:9090` | Terminate |
+| Splunk Web | `splunkweb` :8000 | `standalone-service:8000` | Internal Splunk mode only; terminate and use verified HTTPS re-encryption via `splunk-web-tls` |
+| Splunk mgmt (default off) | `splunkmgmt` :8089 | `standalone-service:8089` | TCP passthrough |
 
 ---
 
-## 8. Required Changes to Existing Files
+## 8. Adaptations from the Reference Files
 
-### `ingress.yaml`
+The entries in this section are a regression checklist for how the historical reference archive was
+adapted. The current installer renders the workload and routes inline; it does not expect these
+per-route files to exist at runtime.
+
+### Historical `ingress.yaml`
 
 | # | Change | Reason |
 |---|---|---|
 | 1 | `dnsPolicy: ClusterFirst` (was `ClusterFirstWithHostNet`) | `hostNetwork: false` + `ClusterFirstWithHostNet` is wrong — Traefik can't resolve in-cluster DNS → all routes 502 |
-| 2 | Remove the embedded `ClusterRole`/`ClusterRoleBinding` | Conflicts with `traefik-crds-rbac.yaml`; duplicate bindings leave Traefik without watch permissions |
-| 3 | Image: templated from `images.ingress.traefikImage` (default `docker.io/library/traefik:v3.6.14`; override with an appropriately built and validated image when `ingress.fips: "on"` — see §3) | Replace the manifest's hardcoded `docker.repo.splunkdev.net/...` reference — that's Splunk's internal registry, unreachable by standalone customer installs |
+| 2 | Remove the embedded `ClusterRole`/`ClusterRoleBinding` | Conflicts with `traefik-rbac.yaml` and grants broader access than the namespaced provider needs |
+| 3 | Image: rendered from `images.ingress.traefikImage` (default v3.6.25 at the verified multi-arch digest in §3; override with an appropriately built and validated image when `ingress.fips: "on"`) | Replace the manifest's hardcoded Splunk-internal reference and prevent tag drift |
 | 4 | Remove entry points: `cm`, `lm`, `mc`, `s2s`, `shc1-deployer`, `named-api`, `perses`, `s3` | Not deployed in AI Platform; unused hostPorts are a risk |
-| 5 | Add entry points: `websecure(:8443)`, `splunkweb(:8000)`, `splunkmgmt(:8089)` | The AI Platform routes |
-| 6 | `GODEBUG` value: templated from `ingress.fips` config key | `fips140=off` default; `fips140=on` only with a suitably built/validated image. Never use `only` as the production setting |
-| 7 | Add `nodeSelector` | Pin Traefik to workers (not controller) |
+| 5 | Add `websecure(:8443)`; add `splunkweb(:8000)` in internal Splunk mode and `splunkmgmt(:8089)` only when explicitly enabled | Do not bind listeners that have no supported backend or are default-off |
+| 6 | `GODEBUG` value: rendered from `ingress.fips` config key | `fips140=off` default; `fips140=on` only with a suitably built/validated image. Never use `only` as the production setting |
+| 7 | Add `nodeSelector` | Pin Traefik to ingress-labelled workers, including the worker-enabled controller in supported single-node mode |
 
 ### `splunk_ingress.yaml`
 
@@ -708,21 +788,31 @@ Same namespace + service name fixes as above. Provide as an **optional** DNS-mod
 
 ### `monitoring.yaml`
 
-Keep the Prometheus route, drop Perses. The `IngressRoute` for Prometheus must reference the correct service name in the `monitoring` namespace. Since Traefik needs `allowCrossNamespace: true` to route to `monitoring` — add that arg to the DaemonSet.
+Do not apply it in the supported first release. Prometheus exposure is not an implemented entry
+point and would require a separate security decision; the core routes need no cross-namespace
+references, so `allowCrossNamespace` remains false.
 
 ### `s3-upload-ingressroute.yaml`
 
 **Delete.** No `rook-ceph` in the AI Platform.
 
-### `traefik-crds.yaml` / `traefik-crds-rbac.yaml`
+### `traefik-crds.yaml` / `traefik-rbac.yaml`
 
-Apply verbatim. No changes required. Verify CRD version matches Traefik v3.6.14.
+Vendor the complete definitions from the exact Traefik v3.6.25 release: `IngressRoute`,
+`Middleware`, `MiddlewareTCP`, `IngressRouteTCP`, `IngressRouteUDP`, `TLSOption`,
+`ServersTransport`, `ServersTransportTCP`, `TLSStore`, and `TraefikService`. The v3.6 CRD
+provider starts informers for all ten types whether or not a route uses them; omitting an
+"unused" CRD prevents cache synchronization and leaves every route unavailable. RBAC must also
+cover the provider's Services, EndpointSlices, ConfigMaps, Secrets, and all ten Traefik resource
+informers with read-only verbs. Set `namespaces: ${AI_NS}` and
+`disableClusterScopeResources: true`; this deployment does not use IngressClass or NodePortLB, so
+it does not need cluster-wide Node access.
 
 ---
 
-## 9. New Resources Needed
+## 9. Installer-Owned and Consumed Resources
 
-These do not exist anywhere in the current repo and must be created:
+The installer owns and reconciles these resources:
 
 1. **cert-manager issuer chain + leaf Certificate** producing `internal-domain-tls` in the
    `ai-platform` namespace (§5 / §7), the same namespace as the referencing `IngressRoute`s.
@@ -730,17 +820,30 @@ These do not exist anywhere in the current repo and must be created:
 
 2. **SAIA `IngressRoute`** (`saia-websecure`, §7) — the single most important new object.
 
-3. **Splunk Web `IngressRoute`** and **Splunk mgmt `IngressRouteTCP`** (§7).
+3. In internal Splunk mode, **Splunk Web `IngressRoute`** and, only when enabled, **Splunk mgmt
+   `IngressRouteTCP`** (§7).
 
-4. **`redirect-https` Middleware** (§7).
+4. **`TLSStore/default`** in `ai-platform`, referencing `internal-domain-tls` for clients that do
+   not send SNI (§7). No redirect Middleware is needed because there is no HTTP listener.
 
-5. **Image pull secret in `ingress` namespace.** The installer's `create_image_pull_secrets` helper creates pull secrets per-namespace for ECR — extend it to include `ingress`.
+5. **Image pull secret in `ingress` namespace.** The installer creates enabled provider
+   credentials there and attaches discovered credentials to the Traefik pod. A manually listed
+   `imagePullSecrets.secrets[]` entry is copied from the AI namespace only when necessary, labelled
+   as installer-owned, and reconciled from its source on later runs. Disable cleanup removes these
+   labelled copies but retains pre-existing/unowned registry credentials in `ingress`; remove a
+   retained credential explicitly only after confirming that no workload still consumes it.
 
-6. **EC2 security-group rules** opening hostPorts 8443, 8000, 8089 from the client/VPN CIDR to the worker nodes. The provision script (`k0s_aws_provision.sh`) must add these to the stack SG at provision time, or document them as a manual prerequisite.
+6. **Customer firewall rules** opening hostPort 8443 from the client/VPN CIDR to the worker nodes,
+   plus 8000 in internal Splunk mode and 8089 only when management ingress is enabled. These remain
+   a documented customer prerequisite because the installer does not own external firewall policy.
 
-7. **`ServersTransport: splunk-web-tls`** in `ai-platform`, with `serverName` matching the Splunk
-   service-DNS SAN and `rootCAs: [ai-splunk-server-tls]`. Use it with explicit `scheme: https` for
-   Splunk Web; do not use `insecureSkipVerify`.
+7. In internal Splunk mode, **`ServersTransport: splunk-web-tls`** in `ai-platform`, with
+   `serverName` matching the Splunk service-DNS SAN and
+   `rootCAs: [{configMap: ai-splunk-ca-public}]`. The ConfigMap contains only
+   the public `ca.crt` copied from `ai-splunk-server-tls`, never its private key, and is refreshed
+   only on an installer run. Use it with explicit `scheme: https`; do not use
+   `insecureSkipVerify`. Traefik's namespaced Role still permits `get/list/watch` on every Secret in
+   the AI namespace because its CRD provider needs a Secret informer for route certificates.
 
 ---
 
@@ -748,48 +851,86 @@ These do not exist anywhere in the current repo and must be created:
 
 ### `k0s_cluster_with_stack.sh`
 
-Add `install_traefik_ingress()`, modeled on `install_cert_manager` (line ~2537) and `install_ray_operator` (line ~3444). Call it in Phase 2, **after** `wait_for_cert_manager_webhook` and **before** `install_ai_platform_cr`.
-
-Steps inside the function:
+Before `install_traefik_ingress()`, the install flow provisions the Splunk server Certificate. On
+a rerun, `install_splunk_standalone()` compares the current leaf fingerprint with the value recorded
+on the existing Standalone and explicitly recycles its `OnDelete` pod when that leaf changed.
+`install_traefik_ingress()` then runs after cert-manager and the AI operator are available and before
+the AIPlatform CR is applied. The current function performs these steps:
 
 ```
-1. ensure_namespace ingress
-2. kubectl apply -f traefik-crds.yaml
-3. wait_for_crd ingressroutes.traefik.io 300
-4. kubectl apply -f traefik-crds-rbac.yaml
-5. Apply cert-manager issuer chain + Certificate in ai-platform
-6. kubectl wait --for=condition=Ready certificate/internal-domain-tls -n ai-platform --timeout=180s
-7. create_image_pull_secrets ingress
-8. envsubst TRAEFIK_IMAGE, GODEBUG_VALUE, WORKER_IP into ingress.yaml → apply
-9. kubectl rollout status daemonset/traefik -n ingress --timeout=180s
-10. If splunkmgmt is enabled, reissue ai-splunk-server with ingress.hostname + every worker IP SAN
-11. kubectl apply -f saia-ingressroute.yaml, splunkweb-transport.yaml, splunkweb-ingressroute.yaml, splunkmgmt-ingressroute.yaml
+1. Create `ingress` and verify fixed-name objects are absent or carry both installer ownership labels.
+2. Install all ten pinned v3.6.25 CRDs only when none exist. Accept an existing complete set only
+   when server-side diff is empty; refuse partial/different shared schemas.
+3. Wait for all ten CRDs to be Established.
+4. Render `__AI_NAMESPACE__` in `traefik-rbac.yaml` and apply the namespaced Role/RoleBinding.
+5. Refuse a legacy cluster-wide binding instead of deleting an unowned cluster-scoped object.
+6. Resolve every configured ingress IP to a distinct Ready Node and reconcile the scheduling label
+   to that exact set; then apply the issuer/CA/leaf chain and wait for Ready on the **current
+   Certificate generation**.
+7. In internal Splunk mode, refresh `ai-splunk-ca-public` from the current
+   `ai-splunk-server-tls/ca.crt` snapshot.
+8. Create/reconcile image pull credentials in `ingress`; configured manual Secrets are copied
+   from the AI namespace with installer labels and refreshed on later runs.
+9. Render and apply the inline DaemonSet with unique selector, security context, probes, and only
+   the entry points enabled by current config/Splunk mode.
+10. Wait for DaemonSet rollout, require desired/updated/Ready counts to equal the configured target
+    count (a zero-target rollout is not success), and reject provider informer/RBAC errors.
+11. Apply the supported routes; internal Splunk mode also gets the verified Splunk Web
+    `ServersTransport`/route (`TLSStore/default` is applied with the ingress certificate chain).
+12. When disabled, remove only label-verified installer resources and fail if deletion fails.
 ```
 
-**SAIA service interaction.** When Traefik is enabled, SAIA no longer needs NodePort — Traefik reaches it in-cluster over ClusterIP. Set `aiPlatform.serviceTemplate.type: ClusterIP` implicitly when `ingress.enabled: true`. This interacts with the SAIA exposure logic at lines ~4262–4277 and ~4598–4627 — those must check for Traefik mode and skip forcing NodePort/LoadBalancer.
+**SAIA service interaction.** Traefik reaches SAIA through its Kubernetes Service, but enabling
+Traefik is deliberately additive: it does not rewrite an existing NodePort/LoadBalancer setting.
+Configured hostPorts are rejected when they equal the retained SAIA/slim NodePorts. An explicit
+feature list must contain `saia`; otherwise installation fails instead of creating a dangling
+route.
 
-**Airgap.** All manifest paths must be overridable via env vars (`TRAEFIK_MANIFEST_DIR`, `TRAEFIK_IMAGE`) following the existing `AIRGAP_MODE` pattern. `prepare_airgap_bundle.sh` must add the resolved `images.ingress.traefikImage` to both `container-images.txt` (manual-mirror instructions) and the `ADDON_LIST` enumeration in §4b (`k0s airgap bundle-artifacts` staging) — neither currently has a Traefik entry, so airgapped installs with `ingress.enabled: true` would fail to pull it until this is added.
+**Airgap.** The manifest path is overridable with `TRAEFIK_MANIFEST_DIR`; the image is set through
+`images.ingress.traefikImage` (there is no environment-variable image override).
+Build the bundle with `prepare_airgap_bundle.sh --config <install-config>`; when that config enables
+ingress, the script adds the resolved `images.ingress.traefikImage` to both
+`container-images.txt` and the `ADDON_LIST` used for `k0s airgap bundle-artifacts`, and embeds the
+CRD/RBAC manifests. The wrapper rejects version/config/image mismatches before installing bundled
+binaries. A manually sourced `airgap-env.sh` exports the same verified metadata, and the main
+installer enforces the same Traefik-image contract. Bundle construction requires a Linux/amd64
+host because it executes k0s.
 
-**Install summary.** The final "Access info" output (end of `cmd_install`) must print HTTPS URLs instead of the two-tunnel instructions when Traefik is enabled.
+**Install output.** Traefik reconciliation prints the HTTPS URLs for the first ingress-capable
+node (or `ingress.hostname`) when it is enabled.
 
 **Gate on config key:**
 ```yaml
 ingress:
   enabled: false   # set true to deploy Traefik HTTPS ingress
 ```
-When `false`, the installer skips `install_traefik_ingress` entirely and behaves exactly as today.
+On a never-enabled cluster, `false` finds no ownership-labelled resources and leaves common-name
+foreign objects untouched; an active fixed-name `DaemonSet/traefik` is reported as a blocking
+collision rather than a successful disable. On a previously enabled cluster, it deletes only resources carrying
+both installer labels; any delete error is fatal. Labelled pull-Secret copies are removed, while
+shared cluster-scoped CRDs and pre-existing/unowned registry credentials are retained. Use the
+original AI namespace when disabling: the installer does not
+search a former namespace after `kubernetes.namespace` changes. A later re-enable creates a new CA,
+so clients must import the replacement trust anchor.
+
+Unlabelled objects created by an earlier prototype and foreign objects with common names are never
+adopted or deleted automatically. An operator must inspect and remove confirmed legacy runtime/RBAC
+objects explicitly. Likewise, existing complete cluster-scoped CRDs are only compared with the
+pinned bundle; partial or different CRDs block installation, and routine disable never removes
+them. Migrating shared CRDs requires coordination with their cluster-level owner.
 
 ### `k0s-cluster-config.yaml`
 
 Add an `images.ingress.traefikImage` key next to the other image overrides (same block as
-`images.operator.image`, `images.saia.apiImage`, etc.), so it participates in the existing
-`images.registry` prefix-rewrite and airgap tooling instead of a bespoke `ingress.image` key:
+`images.operator.image`, `images.saia.apiImage`, etc.). It is the exact image pull reference;
+the generic `images.registry` prefix is not applied. Airgap tooling reads this key directly:
 
 ```yaml
 images:
   ingress:
-    traefikImage: "docker.io/library/traefik:v3.6.14"   # public default — works for
-                                                          # standard/non-FIPS deployments.
+    traefikImage: "docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"
+                                                          # verified multi-arch index;
+                                                          # standard/non-FIPS default.
                                                           # Override to an appropriately built
                                                           # and validated image
                                                           # (e.g. an internal Splunk registry
@@ -801,8 +942,8 @@ Add an `ingress` block:
 ```yaml
 # ---------- Ingress / HTTPS Configuration ----------
 # Deploys Traefik v3 as a DaemonSet with hostPort bindings on the worker nodes.
-# Terminates TLS for Splunk Web (:8000) and SAIA (:8443), eliminating the SSH
-# tunnel requirement and browser mixed-content blocks.
+# Terminates TLS for SAIA (:8443) and, in internal Splunk mode, Splunk Web
+# (:8000), eliminating the SSH tunnel requirement and browser mixed-content blocks.
 #
 # Prerequisites: firewall/ACL rules opening the chosen hostPorts from your
 # client/VPN network to the worker nodes — an EC2 security-group rule on AWS,
@@ -820,25 +961,23 @@ ingress:
                                     # compliance claim. Never use fips140=only in production.
 
   tls:
-    mode: selfsigned                # selfsigned | acme | provided
-    # acmeEmail: ""                 # required when mode=acme
-    # certFile: ""                  # required when mode=provided (path to PEM)
-    # keyFile: ""                   # required when mode=provided
+    mode: selfsigned                # only supported mode in this release
 
   entryPoints:
+    # All hostPorts must be unique integers from 1024 through 65535. Port 9000
+    # is reserved for the pod-local Traefik ping/readiness endpoint.
     saia:
       port: 8443                    # SAIA HTTPS (fixes mixed-content)
     splunkWeb:
       port: 8000                    # Splunk Web HTTPS
     splunkMgmt:
       port: 8089                    # Splunk mgmt API (TCP passthrough)
-      enabled: false                # disable if external Splunk doesn't need direct mgmt access
-    prometheus:
-      port: 9090
-      enabled: false                # optional metrics exposure
+      enabled: false                # opt in only for direct access to installer-managed Splunk
 ```
 
-When `ingress.enabled: true`, the installer should implicitly set `aiPlatform.serviceTemplate.type: ClusterIP` and log a notice that the NodePort is being replaced by Traefik ingress.
+Traefik is additive: enabling it does not mutate or remove an existing NodePort/LoadBalancer
+service configuration. Operators can retire an older exposure path separately after validating
+the HTTPS cutover.
 
 ---
 
@@ -846,14 +985,15 @@ When `ingress.enabled: true`, the installer should implicitly set `aiPlatform.se
 
 | Requirement | Detail | When required |
 |---|---|---|
-| **TLS decision** | selfsigned (default, nothing extra), ACME (DNS name + email), or BYO cert | Always — defaults to selfsigned |
-| **Hostname or accept IP-only** | For a fully-trusted cert a DNS name is needed; otherwise IP SAN + client CA import once | selfsigned/ACME |
-| **CA cert import** | Download the installer-generated CA cert and add it to browser/OS trust store | selfsigned only |
-| **Firewall/ACL rules** | Open hostPorts 8443 + 8000 (+ 8089 if mgmt) from client/VPN network to workers — an EC2 security-group rule on AWS, or the equivalent host/network firewall rule on bare metal / on-prem (§5a.1) | Always |
+| **TLS model** | The installer supports only its cert-manager-generated self-signed CA in this release | Always |
+| **Hostname or IP** | Supply an optional stable DNS name or use an advertised worker IP; either value must appear in the leaf SANs | Always |
+| **CA cert import** | Download the installer-generated CA cert and add it to browser/OS trust stores; redistribute it after scheduled CA renewal and repeat after disable/re-enable because cleanup removes the old CA | Always |
+| **Splunk certificate renewal** | Monitor the internal Splunk leaf/CA and re-run the full installer after renewal so the OnDelete Splunk pod is recycled when its leaf changes and `ai-splunk-ca-public` is refreshed | Internal Splunk mode |
+| **Firewall/ACL rules** | Open hostPort 8443, plus 8000 for internal Splunk and 8089 if management is enabled, from the client/VPN network to workers — an EC2 security-group rule on AWS, or the equivalent host/network firewall rule on bare metal / on-prem (§5a.1) | Always |
 | **Multi-worker access decision (bare metal/on-prem only)** | Pick one: target a single worker IP directly, deploy MetalLB (viable off-AWS — §4/§5a.1), or front the workers with an existing hardware/software load balancer | Only relevant with more than one worker; not required on AWS (single-worker-IP or no-LB is the default there too) |
 | **External Splunk CA trust** | Exchange/import the required CA certificates and keep hostname verification enabled; do not use `sslVerifyServerCert=false` as the deployment solution | When using external Splunk (see `EXTERNAL_SPLUNK_INTEGRATION.md`) |
 | **FIPS setting** | Set `ingress.fips: "on"` only together with an appropriately built and validated image/environment | Compliance-scoped deployments only |
-| **Registry access** | Default is public `docker.io/library/traefik:v3.6.14`. Compliance-scoped deployments must override `images.ingress.traefikImage` with the approved image they can pull; `fips: "on"` alone is insufficient | Always (default); approved-image override when required |
+| **Registry access** | Default is public v3.6.25 pinned to the verified multi-arch digest shown in §3/§10. Compliance-scoped deployments must override it with the approved image they can pull; `fips: "on"` alone is insufficient | Always (default); approved-image override when required |
 
 ---
 
@@ -875,7 +1015,7 @@ ssh -N -L 8000:localhost:8000 ec2-user@<EIP>
 ssh -N -L 30080:<worker-ip>:30080 ec2-user@<EIP>
 ```
 
-Browser: `http://localhost:8000` | SAIA URL: `http://localhost:30080`
+Browser: `https://localhost:8000` | SAIA URL: `http://localhost:30080`
 
 ### After — workers directly reachable (or DNS)
 
@@ -884,7 +1024,8 @@ Splunk Web:  https://<worker-ip>:8000   (or https://ai.example.internal:8000)
 SAIA:        https://<worker-ip>:8443   (or https://ai.example.internal:8443)
 ```
 
-No port-forward, no NodePort, no tunnel. Same HTTPS scheme → no mixed-content.
+The new HTTPS path needs no port-forward, NodePort, or tunnel. Existing additive NodePort exposure
+is unchanged until an operator retires it. Same HTTPS scheme → no mixed-content.
 
 ### After — workers still private (EC2 VPC, via jump host)
 
@@ -912,65 +1053,81 @@ mismatch.
 
 ---
 
-## 13. Bugs and Issues to Fix
+## 13. Resolved Reference-Manifest Issues
+
+These were defects or gaps in the historical reference inputs. The current installer addresses
+them; keep this table as a regression checklist rather than a list of pending implementation work.
 
 | # | File | Bug | Impact if unfixed |
 |---|---|---|---|
 | 1 | `ingress.yaml` | `dnsPolicy: ClusterFirstWithHostNet` with `hostNetwork: false` | Traefik can't resolve in-cluster DNS → all routes 502 |
-| 2 | `ingress.yaml` | Duplicate ClusterRole/Binding (conflicts with `traefik-crds-rbac.yaml`) | Traefik logs `forbidden` watching IngressRoutes → routes never populate |
-| 3 | `ingress.yaml` | Image `docker.io/library/traefik:v3.6.14` | Pull fails in airgap / internal registry environments |
+| 2 | `ingress.yaml` | Duplicate ClusterRole/Binding (conflicts with `traefik-rbac.yaml`) | Cluster-wide Secret access survives even though the provider is namespace-scoped |
+| 3 | Airgap bundle | Configured Traefik image omitted from image tar | Pull fails in airgap / internal registry environments |
 | 4 | `splunk_ingress*.yaml` | `namespace: splunk` — doesn't exist in AI Platform | IngressRoutes reference missing services → 404/503 |
 | 5 | All IngressRoute files | `internal-domain-tls` secret never created | Traefik serves its default self-signed cert; browser errors; `tls: secret not found` in logs |
 | 6 | `ingress.yaml` | No image pull secret on the SA in `ingress` ns | `ImagePullBackOff` for the internal registry image |
 | 7 | `ingress.yaml` | Unused entry points bind hostPorts (cm/lm/mc/etc.) | Port conflicts on workers → DaemonSet pod `CrashLoopBackOff` on nodes where those ports are taken |
 | 8 | `s3-upload-ingressroute.yaml` | References `rook-ceph` namespace/service — doesn't exist | Harmless but messy; IngressRoute will error-state perpetually |
+| 9 | `traefik-crds.yaml` / RBAC | Only route types currently used are installed/authorized | v3.6.25 starts all provider informers; a missing CRD or read permission prevents every cache from syncing |
+| 10 | Splunk Web route | Backend defaults to HTTP or uses `insecureSkipVerify` | HTTPS-enabled Splunk Web returns 502, or encryption loses chain/hostname authentication |
+| 11 | Frontend TLS | No `TLSStore/default` | Raw-IP clients that omit SNI receive Traefik's generated certificate instead of the trusted ingress leaf |
+| 12 | Management entry point | 8089 hostPort exists while the feature is disabled | Unnecessary listener/exposure and possible host-port conflict |
+| 13 | Disable path | `ingress.enabled: false` merely skips installation | Old DaemonSet, routes, Secrets, RBAC, and hostPorts remain active |
 
 ---
 
 ## 14. Migration Path
 
-Traefik is **additive** — it terminates in front of unchanged in-cluster services. The existing NodePort and tunnels continue working until the final cutover step. Rollback at any point = delete Traefik DaemonSet.
+Traefik is **additive** — it terminates in front of unchanged in-cluster services. The existing
+NodePort and tunnels continue working until the final cutover step. Routine rollback is performed
+by setting `ingress.enabled: false` and re-running the installer so every installer-owned resource,
+not only the DaemonSet, is cleaned up.
 
 ```
-Step 1 — Prep (no cluster impact)
-  - Land pruned manifests in tools/cluster_setup/
-  - Add install_traefik_ingress() to installer
-  - Add ingress: block to k0s-cluster-config.yaml
+Step 1 — Prepare configuration (no cluster impact)
+  - Keep the original kubernetes.namespace for the lifetime of this ingress installation
+  - Set ingress.enabled: true and choose non-conflicting hostPorts
+  - Set images.ingress.traefikImage explicitly when using a mirror or approved FIPS image
+  - Open only the required external firewall/ACL ports
 
-Step 2 — Issue certs
-  - Apply cert-manager issuer chain + Certificate
-  - kubectl wait --for=condition=Ready certificate/internal-domain-tls -n ai-platform
-  - Download the CA cert for client trust import
+Step 2 — Run the installer
+  - On a clean cluster it installs the complete pinned CRD bundle
+  - On a cluster with existing CRDs it accepts only an exact complete match
+  - It issues the certificates, deploys Traefik, and applies routes as one reconciled flow
+  - Unlabelled legacy/common-name objects block migration and require explicit operator handling
 
-Step 3 — Deploy Traefik
-  - Apply CRDs, RBAC, DaemonSet
-  - kubectl rollout status daemonset/traefik -n ingress
-  - Verify hostPorts bound: ss -tlnp | grep -E '8443|8000|8089' on a worker
+Step 3 — Establish trust
+  - Download the current ingress CA from the configured AI namespace
+  - Import it into every client trust store
+  - Monitor CA renewal and redistribute the current CA before the old trust anchor expires
 
-Step 4 — Apply IngressRoutes
-  - kubectl apply -f saia-ingressroute.yaml splunkweb-transport.yaml splunkweb-ingressroute.yaml
-  - Enable splunkmgmt only after the Splunk leaf includes external hostname/worker-IP SANs
+Step 4 — Validate the additive HTTPS path
+  - Verify DaemonSet rollout and hostPort 8443, plus 8000 in internal Splunk mode
+  - Verify 8089 exists only when management exposure is enabled
+  - Validate SAIA and, in internal Splunk mode, Splunk Web with --cacert, never -k
   - Old NodePort (30080) and tunnels still work — nothing removed yet
 
-Step 5 — Open EC2 security-group rules
-  - Add ingress rules for ports 8443/8000/8089 from client/VPN CIDR to workers
-
-Step 6 — Validate HTTPS side-by-side
-  - curl -vk https://<worker-ip>:8443/health  → 200 from SAIA
-  - curl -vk https://<worker-ip>:8000         → 302/200 from Splunk Web
-  - Import CA cert to browser; reload Splunk AI Assistant
+Step 5 — Cut over
   - In onboarding wizard, set SAIA URL to https://<worker-ip>:8443
   - Confirm chat panel loads, no mixed-content console errors
-
-Step 7 — Cut over
-  - Switch saia_sok_url in splunkaiassistant.conf to https://
-  - Update AIPlatform splunkConfiguration.endpoint to https:// (if using external Splunk)
   - Users switch to single-tunnel or direct HTTPS access (§12)
 
-Step 8 — Decommission NodePort (last, optional)
+Step 6 — Decommission NodePort (last, optional)
   - Set ingress.enabled: true + aiPlatform.serviceTemplate.type: ClusterIP in config
   - Re-run installer or patch AIService
   - Close NodePort SG rule for 30080
+
+Ongoing — Reconcile certificate renewal
+  - cert-manager renews certificates autonomously
+  - Re-run the full installer after internal Splunk leaf/CA renewal
+  - The rerun recycles the OnDelete Splunk pod when its leaf changed and refreshes
+    ai-splunk-ca-public for Traefik's backend verification
 ```
 
-**Rollback (any step):** `kubectl delete daemonset/traefik -n ingress` and revert the SAIA service to NodePort. Traefik never mutates the in-cluster services it routes to — removing it restores the exact prior HTTP/tunnel behavior instantly.
+**Rollback (any step):** set `ingress.enabled: false` and re-run the installer with the original
+`kubernetes.namespace`. Cleanup removes label-verified installer-owned routes, transport/store,
+DaemonSet/hostPorts, RBAC, Certificates/Issuers, CA/leaf Secrets, and labelled pull-Secret copies.
+It retains cluster-scoped CRDs and pre-existing/unowned registry credentials, and it refuses to
+delete unowned fixed-name objects; inspect confirmed legacy objects explicitly. Revert SAIA to
+NodePort if it was changed during cutover. A later
+re-enable creates a new CA and requires client trust re-import.

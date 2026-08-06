@@ -16,6 +16,7 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
   - [k0s Config Persistence](#k0s-config-persistence)
   - [Kine Compaction](#kine-compaction)
   - [Insecure Registry Support (containerd v2)](#insecure-registry-support-containerd-v2)
+- [Traefik HTTPS Ingress](#traefik-https-ingress)
 - [Air-Gapped Deployment](#air-gapped-deployment)
 - [Splunk AI Assistant App](#splunk-ai-assistant-app)
   - [Onboarding to the AI Tier](#onboarding-to-the-ai-tier)
@@ -54,10 +55,10 @@ The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI Platform o
 
 The script installs everything needed for the AI Platform:
 
-1. **k0s Kubernetes Cluster** — CNCF certified, single-binary Kubernetes
+1. **k0s v1.33.13+k0s.1 Kubernetes Cluster** — Pinned full-stack compatibility baseline
 2. **Calico CNI** — High-performance networking with VXLAN
 3. **local-path Storage Provisioner** — Default StorageClass for PVCs
-4. **Cert-Manager v1.13.0** — Automated certificate management
+4. **Cert-Manager v1.21.1** — Automated certificate management; its installer gate accepts Kubernetes 1.33–1.36
 5. **Kube-Prometheus Stack** — Monitoring with Prometheus + Grafana
 6. **OpenTelemetry Operator** — Distributed tracing and telemetry
 7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9)
@@ -65,6 +66,7 @@ The script installs everything needed for the AI Platform:
 9. **Splunk Operator** — Splunk Enterprise management
 10. **Splunk AI Platform Operator** — AI platform orchestration (SAIA feature)
 11. **AIPlatform CR** — Complete AI deployment with features, scheduling, and secrets
+12. **Optional Traefik HTTPS ingress** — HostPort-based HTTPS for SAIA and, in internal mode, Splunk Web
 
 ### Operational Features
 
@@ -97,21 +99,51 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ```bash
 # Install required tools on macOS
-brew install kubectl helm git jq yq
+brew install bash kubectl helm git jq yq
+# The installer uses /usr/bin/env bash and requires Bash >= 4. Put Homebrew Bash first.
+export PATH="$(brew --prefix)/bin:$PATH"
 
 # Install required tools on Ubuntu/Debian
 sudo apt-get update
-sudo apt-get install -y kubectl helm git jq
+sudo apt-get install -y bash kubectl helm git jq
 wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
 chmod +x /usr/local/bin/yq
 
 # Verify installations
+bash --version
 kubectl version --client
 helm version
 git --version
 jq --version
 yq --version
 ```
+
+`k0s_cluster_with_stack.sh` requires Bash 4 or newer; Bash 5 is recommended. macOS ships an
+older `/bin/bash`, so either keep Homebrew's `bin` directory first in `PATH` as shown above or
+invoke the script explicitly with `"$(brew --prefix)/bin/bash"`. The script exits before making
+cluster changes when the resolved Bash is too old.
+
+### Kubernetes and cert-manager Compatibility Baseline
+
+The online installer and air-gap builder default to the same compatibility baseline:
+
+| Component | Pinned version / range |
+|---|---|
+| k0s | `v1.33.13+k0s.1` (embeds Kubernetes 1.33.13) |
+| cert-manager | `v1.21.1` |
+| cert-manager preflight server range | Kubernetes 1.33–1.36 |
+
+`K0S_VERSION` and the air-gap builder's `--k0s-version` option may select another k0s release only
+when it embeds Kubernetes 1.33–1.36. That range is cert-manager's gate, not a statement that the
+rest of the platform is validated on every minor: an explicit Kubernetes 1.34–1.36 override
+requires the operator to validate Splunk Operator and full-stack compatibility independently.
+The installer checks the live server version before touching cert-manager. It reuses an existing
+installation only when the controller, webhook, and cainjector Deployments are all present and
+their live container images use exactly `v1.21.1`; it will not upgrade or take ownership of a
+different/mixed version, or adopt cert-manager CRDs when the controller Deployment is absent.
+Follow [Migrating an Existing cert-manager
+Installation](#migrating-an-existing-cert-manager-installation) before running the installer on
+such a cluster.
 
 ### Hardware Requirements
 
@@ -144,6 +176,8 @@ Open the following ports between nodes:
 | 179 | TCP | Calico BGP |
 | 4789 | UDP | Calico VXLAN |
 | 30000-32767 | TCP | NodePort services (optional) |
+| 8443 / 8000 | TCP | Optional Traefik HTTPS hostPorts for SAIA / internal Splunk Web; port 8000 is not bound in external/disabled Splunk mode; open only from the client/VPN network |
+| 8089 | TCP | Optional Traefik TCP passthrough for Splunk management; disabled by default |
 
 ### External Object Storage
 
@@ -207,7 +241,7 @@ The `k0s-cluster-config.yaml` file controls all aspects of the deployment:
 cluster:           # Cluster name, useExisting, SSH user/key, optional API external address
 nodes:             # Controller/worker counts and existingIPs
 storage:           # storageClass, vectorDbSize, objectStore, minimumDiskSpace
-images:            # registry prefix, operator, splunk, ray, weaviate, saia, nginx, fluentBit, otelCollector
+images:            # registry prefix plus exact component refs; Traefik has an independent exact ref
 operators:         # ray (version/modelVersion/rayVersion), certManager, nvidia devicePluginVersion
 kubernetes:        # namespace
 files:             # splunkOperator, aiPlatform manifest paths
@@ -215,6 +249,7 @@ splunk:            # standaloneName
 aiPlatform:        # defaultAcceleratorType, workerGroupConfig, features, scheduling, serviceTemplate
 imagePullSecrets:  # secrets list, autoCreateECR, dockerHub, gcr, acr, custom
 ecr:               # account, region
+ingress:           # optional Traefik HTTPS gate, hostname, FIPS setting, and hostPorts
 ```
 
 ### Configuration Example
@@ -280,6 +315,9 @@ images:
     image: "docker.io/fluent/fluent-bit:1.9.6"
   otelCollector:
     image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+  ingress:
+    # Exact reference: images.registry is not prepended to Traefik.
+    traefikImage: "docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"
 
 operators:
   ray:
@@ -321,6 +359,21 @@ aiPlatform:
   serviceTemplate:                      # Optional: expose SAIA externally
     type: "NodePort"                    # NodePort | LoadBalancer
     nodePort: 30080                     # Port for NodePort type
+
+ingress:
+  enabled: false                        # opt in to Traefik HTTPS ingress
+  hostname: ""                          # optional DNS SAN; worker IP SANs are automatic
+  fips: "off"                           # off | on; "on" also requires an approved image
+  tls:
+    mode: selfsigned                    # only supported mode
+  entryPoints:
+    saia:
+      port: 8443
+    splunkWeb:
+      port: 8000
+    splunkMgmt:
+      port: 8089
+      enabled: false                    # opt in only when direct management access is needed
 
 imagePullSecrets:
   secrets: []
@@ -423,7 +476,10 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 
 #### Images Section
 
-Short image paths (without a FQDN) are automatically prefixed with `images.registry`.
+Short application image paths (without a FQDN) are automatically prefixed with
+`images.registry`. Traefik is an intentional exception: its exact
+`images.ingress.traefikImage` value is used verbatim so a tag/digest pin cannot be silently
+rewritten.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -441,6 +497,7 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
+| `images.ingress.traefikImage` | No | `docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d` | Exact Traefik pull reference used only when `ingress.enabled: true`; set this key explicitly for a mirror or approved FIPS build because `images.registry` is not applied |
 
 **Secure vs insecure registry — which to use:**
 
@@ -453,9 +510,11 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 
 > **Do not set `registryInsecure: true` for HTTPS registries.** It has no effect on TLS registries and may cause unexpected behaviour.
 
-**Image patching chain:** The script reads these config values, resolves them via `build_image_url()` (prepends registry if needed), then uses `sed` to patch the corresponding `RELATED_IMAGE_*` env vars in manifest files:
+**Image rendering chain:** The script reads these config values and resolves application images via
+`build_image_url()` (which prepends the registry when needed). Traefik bypasses that helper and is
+rendered verbatim into its inline DaemonSet:
 
-| Config field | Env var patched | Target file |
+| Config field | Rendered field / env var | Target |
 |---|---|---|
 | `images.operator.image` | Container `image:` field | `artifacts.yaml` |
 | `images.splunk.image` | `RELATED_IMAGE_SPLUNK_ENTERPRISE` | `splunk-operator-cluster.yaml` |
@@ -471,6 +530,7 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
 | `operators.ray.modelVersion` | `MODEL_VERSION` | `artifacts.yaml` |
 | `operators.ray.rayVersion` | `RAY_VERSION` | `artifacts.yaml` |
+| `images.ingress.traefikImage` | Inline DaemonSet `image:` | Installer-rendered Traefik DaemonSet (used verbatim; no `images.registry` prefix) |
 
 #### AI Platform Section
 
@@ -490,13 +550,37 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
 | `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
 
+#### Traefik Ingress Section
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `ingress.enabled` | No | `false` | Enables the optional Traefik hostPort DaemonSet. An explicit feature list must include `saia`. |
+| `ingress.hostname` | No | `""` | Optional lowercase DNS SAN. The installer also adds every ingress-node IP SAN. |
+| `ingress.fips` | No | `"off"` | `off` or `on`. `on` only sets `GODEBUG=fips140=on`; it also requires an appropriately built and independently validated image. |
+| `ingress.tls.mode` | No | `selfsigned` | Only `selfsigned` is implemented; `provided` and `acme` are rejected. |
+| `ingress.entryPoints.saia.port` | No | `8443` | SAIA HTTPS hostPort. |
+| `ingress.entryPoints.splunkWeb.port` | No | `8000` | Internal Splunk Web HTTPS hostPort; not bound in external/disabled Splunk mode. |
+| `ingress.entryPoints.splunkMgmt.port` | No | `8089` | Splunk management TCP-passthrough hostPort. |
+| `ingress.entryPoints.splunkMgmt.enabled` | No | `false` | Binds the management listener only when explicitly enabled in internal Splunk mode. |
+
+Ingress ports must be integers from 1024 through 65535, must be unique, cannot use Traefik's
+pod-local health port `9000`, and cannot collide with retained SAIA/slim NodePorts. Enabling
+ingress is additive; it does not rewrite the configured SAIA Service type.
+
 #### Image Pull Secrets Section
 
-The `secrets` list is **not consumed** by the script. Instead, the script auto-detects which secrets exist in the namespace by checking for hardcoded names: `ecr-registry-secret`, `docker-hub-secret`, `gcr-secret`, `acr-secret`, `custom-registry-secret`.
+For platform workloads, the script auto-detects known provider Secret names in the AI namespace.
+When Traefik is enabled, each name in `imagePullSecrets.secrets[]` can also be a source Secret in
+the AI namespace. If the name is absent from `ingress`, or the existing copy is installer-owned,
+the installer validates the source, creates or refreshes a labelled copy, and attaches it to the
+Traefik pod. A valid, pre-existing unowned Secret of the same name in `ingress` is used without
+being adopted or overwritten. Disable reconciliation deletes the labelled installer copies, but
+retains pre-existing/unowned registry credentials in `ingress`; remove a retained credential
+explicitly only after confirming it has no consumer.
 
 ```yaml
 imagePullSecrets:
-  secrets: []                         # NOT consumed; script auto-detects in namespace
+  secrets: []                         # source names copied into ingress when Traefik is enabled
   autoCreateECR: true                 # Consumed → creates ECR secret from AWS creds
 
   dockerHub:
@@ -722,9 +806,16 @@ The `install` command executes these steps in order:
    - Phase 1 (parallel): cert-manager, kube-prometheus, NVIDIA host drivers
    - Between phases: Ensure S3 credentials secret
    - Phase 2 (parallel): OTel operator, Ray operator, Splunk operator, NVIDIA device plugin
-   - Sequential: Image pull secrets → Splunk standalone → AI operator → AIPlatform CR
+   - Sequential: Image pull secrets → Splunk TLS Certificate → Splunk Standalone (including a
+     controlled OnDelete recycle on changed leaf) → AI operator → optional Traefik reconciliation
+     (including the CA-only ConfigMap refresh) → AIPlatform CR
 8. **Health checks** — Verify all components are running
 9. **Access info** — Display kubeconfig path and service endpoints
+
+The Splunk TLS step consumes only cert-manager's standard `tls.crt`, `tls.key`, and `ca.crt`
+Secret entries. A Splunk-Ansible pre-task assembles `server.pem` in certificate-then-private-key
+order on the pod's memory-backed volume; the installer does not request `CombinedPEM` or
+`additionalOutputFormats`, and does not require that alpha feature gate.
 
 ### join-workers Command
 
@@ -1181,6 +1272,55 @@ sudo k0s etcd snapshot restore /tmp/etcd-backup.db
 
 ---
 
+## Traefik HTTPS Ingress
+
+Set `ingress.enabled: true` to add the SAIA HTTPS hostPort (`8443`). In internal Splunk mode it
+also adds Splunk Web (`8000`); management passthrough (`8089`) remains disabled unless explicitly
+enabled. External/disabled Splunk modes omit both Splunk listeners. The existing
+NodePort/LoadBalancer exposure is not mutated, so validate the HTTPS path before retiring an older
+access path. See [TRAEFIK_HTTPS_SETUP.md](TRAEFIK_HTTPS_SETUP.md) for firewall, client trust, and
+verification steps.
+
+The installer creates the complete pinned Traefik v3.6.25 CRD set only when none of those CRDs
+exist. If a complete set already exists, it must match the pinned schemas exactly; partial or
+different shared CRDs block installation. The installer never takes ownership of, upgrades, or
+removes existing shared CRDs automatically. Coordinate any migration with their cluster-level
+owner.
+
+### Certificate renewal and Secret boundary
+
+The CA-only `ConfigMap/ai-splunk-ca-public` keeps `ServersTransport` from directly referencing
+`Secret/ai-splunk-server-tls`, which also contains `tls.key`. This is not API-level Secret
+isolation. Traefik's namespaced CRD provider needs `get/list/watch` for all Secrets in the
+configured AI namespace to load route certificates; Kubernetes RBAC cannot restrict `list` or
+`watch` to individual Secret names. Treat `ingress/ServiceAccount/traefik` as trusted within that
+namespace.
+
+cert-manager renews certificates autonomously, but `ai-splunk-ca-public` is copied only during an
+installer run and Splunk does not hot-reload certificate files. Its StatefulSet uses `OnDelete`.
+Monitor `Certificate/ai-splunk-server` and `Certificate/ai-splunk-ca`; after the internal Splunk
+leaf or CA renews, re-run the full installer with the original AI namespace. The installer detects
+a changed leaf, explicitly recycles the singleton Splunk pod, waits for its replacement, and then
+refreshes the CA-only ConfigMap while reconciling Traefik. Also monitor the separate
+`Certificate/ingress-ca` and redistribute its current public CA to clients before their old trust
+anchor expires.
+
+### Disable and migration semantics
+
+To disable ingress, set `ingress.enabled: false` and re-run the installer with the same
+`kubernetes.namespace` used to enable it. Cleanup removes only objects carrying both installer
+ownership labels and treats delete failures as fatal. This removes labelled pull-Secret copies but
+retains cluster-scoped CRDs and pre-existing/unowned registry credentials in `ingress`. It does not
+search an old AI namespace after the config changes.
+
+Unlabelled resources from an earlier prototype and foreign objects with common names such as
+`DaemonSet/traefik` or `TLSStore/default` are not adopted or deleted. Inspect their ownership and
+remove only confirmed legacy objects explicitly. An active unowned fixed-name DaemonSet blocks
+disable reconciliation so the installer cannot claim that hostPorts were closed when they remain
+active.
+
+---
+
 ## Air-Gapped Deployment
 
 Complete guide for deploying the Splunk AI Platform in environments with no outbound internet access from the cluster nodes or the install machine.
@@ -1191,21 +1331,23 @@ Two helper scripts bridge the gap between a connected machine and an air-gapped 
 
 | Script | Where to run | What it does |
 |---|---|---|
-| `prepare_airgap_bundle.sh` | Internet-connected machine | Downloads every binary, chart, and manifest into a versioned `.tar.gz` bundle |
+| `prepare_airgap_bundle.sh` | Internet-connected Linux/amd64 machine | Downloads every binary, chart, and manifest into a versioned `.tar.gz` bundle and executes k0s to build image archives |
 | `install_from_airgap_bundle.sh` | Air-gapped install machine | Extracts the bundle, sets env-var overrides, invokes the main installer |
 
 The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. `install_from_airgap_bundle.sh` sets all of them automatically.
 
 ### Prerequisites
 
-**Internet-connected machine (bundle preparation):**
+**Internet-connected Linux/amd64 machine (bundle preparation):** macOS/Apple Silicon is not
+supported because bundle construction executes the downloaded k0s Linux/amd64 binary.
 
 | Tool | Install |
 |---|---|
-| `curl` | `brew install curl` / `apt install curl` |
+| `curl` | `apt install curl` / the equivalent Linux package |
 | `helm` | https://helm.sh/docs/intro/install/ |
 | `tar` | Pre-installed on most systems |
-| `sha256sum` or `shasum` | Pre-installed (Linux / macOS) |
+| `sha256sum` | Pre-installed on most Linux systems |
+| `yq` v4 | Required when passing `--config` so the exact optional Traefik image can be staged |
 
 **Air-gapped install machine:**
 
@@ -1230,17 +1372,27 @@ The main installer has no hardcoded download URLs — every internet address is 
 cd tools/cluster_setup
 ./prepare_airgap_bundle.sh --output-dir /mnt/transfer
 
-# Pin a specific k0s version
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
+# Optional cert-manager-compatible override; validate the rest of the platform independently
+./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.35.2+k0s.0
+
+# If the offline install enables Traefik, build with that exact install config.
+./prepare_airgap_bundle.sh \
+  --config ./my-cluster-config.yaml \
+  --output-dir /mnt/transfer
 ```
+
+Bundle preparation must run on a connected Linux/amd64 host. When `--config` contains
+`ingress.enabled: true`, the builder stages the exact `images.ingress.traefikImage` reference.
+Use the same config for the offline install; a bundle built without it does not infer that Traefik
+will later be enabled.
 
 **What gets downloaded into the bundle:**
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
-| **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
-| Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
+| Binaries | `k0s v1.33.13+k0s.1` compatibility baseline (or a cert-manager-compatible explicit `--k0s-version`), `yq v4.44.1` |
+| **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox, plus the exact configured Traefik image when ingress is enabled in `--config`). Both are staged to `/var/lib/k0s/images/` on every node at install time. |
+| Manifests | `cert-manager v1.21.1`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3`, complete Traefik v3.6.25 CRDs and namespaced RBAC template |
 | Helm charts | `kube-prometheus-stack` (version captured at bundle time), `opentelemetry-operator` (version captured at bundle time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
 | GPU packages | `epel-release-latest-9.noarch.rpm`, `cuda-rhel9.repo`, `nvidia-container-toolkit.repo`, PyYAML wheel (all nodes) |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
@@ -1260,7 +1412,10 @@ Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the imag
 
 ### Step 2 — Mirror Container Images
 
-Container images are **not** in the bundle (they would add many GB). Mirror them separately to an internal registry that the cluster nodes can reach.
+Platform application images are **not** in the bundle (they would add many GB). Mirror them
+separately to an internal registry that the cluster nodes can reach. Infrastructure/add-on images,
+including the configured Traefik image when selected through `--config`, are already in
+`addon-images.tar` under their exact source references.
 
 The bundle includes a ready-made image list:
 
@@ -1300,6 +1455,9 @@ images:
   operator:
     image: "registry.airgap.local/splunk-ai-operator:latest"
   # ... all other image fields pointing at your internal registry
+  ingress:
+    # Used verbatim; generic images.registry is not prepended.
+    traefikImage: "registry.airgap.local/traefik:v3.6.25"
 
 imagePullSecrets:
   autoCreateECR: false   # disable automatic ECR token refresh
@@ -1354,6 +1512,11 @@ scp tools/cluster_setup/k0s_cluster_with_stack.sh \
     tools/cluster_setup/k0s-cluster-config.yaml \
     admin@install-machine:/opt/splunk-ai/
 
+# The air-gap bundle also contains these manifests. Copy them when transferring
+# installer files without a freshly built bundle.
+scp -r tools/cluster_setup/traefik \
+    admin@install-machine:/opt/splunk-ai/
+
 # Copy your edited cluster config
 scp my-cluster-config.yaml admin@install-machine:/opt/splunk-ai/
 ```
@@ -1389,10 +1552,17 @@ chmod +x install_from_airgap_bundle.sh k0s_cluster_with_stack.sh
 
 1. Extracts the bundle to `/opt/airgap` (override with `--extract-dir`)
 2. Verifies SHA-256 checksums of every bundled file
-3. Installs `k0s` and `yq` from the bundle
-4. Registers a local Helm repository from the bundled `.tgz` files
-5. Exports all env-var overrides (13 URL + path variables)
-6. Runs `k0s_cluster_with_stack.sh install`
+3. Validates unique version metadata, the independent k0s version marker, cert-manager `v1.21.1`,
+   and the install config's exact Traefik image **before changing host binaries**
+4. Installs `k0s` and `yq` from the bundle
+5. Registers a local Helm repository from the bundled `.tgz` files
+6. Exports the local paths plus verified bundle metadata and `AIRGAP_MODE=true`
+7. Runs `k0s_cluster_with_stack.sh install`
+
+For an advanced manual extraction, sourcing the generated `airgap-env.sh` performs the same
+metadata checks and exports the image-archive directory. The main installer then independently
+enforces the bundle k0s/cert-manager and Traefik config/image contract; do not recreate a partial
+set of these environment variables by hand.
 
 The install plan displayed before any changes are made will show `Air-gap mode: true` — confirm this before proceeding.
 
@@ -1546,6 +1716,7 @@ These variables are set automatically by `install_from_airgap_bundle.sh`. Set th
 | `CERT_MANAGER_MANIFEST_URL` | GitHub cert-manager release URL | `file:///opt/airgap/bundle/manifests/cert-manager.yaml` |
 | `LOCAL_PATH_MANIFEST_URL` | GitHub rancher/local-path-provisioner URL | `file:///opt/airgap/bundle/manifests/local-path-storage.yaml` |
 | `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA/k8s-device-plugin URL | `file:///opt/airgap/bundle/manifests/nvidia-device-plugin.yml` |
+| `TRAEFIK_MANIFEST_DIR` | `tools/cluster_setup/traefik` | `/opt/airgap/bundle/manifests/traefik` (complete CRDs + RBAC template; there is no `TRAEFIK_IMAGE` environment override) |
 
 **Helm Chart Paths:**
 
@@ -1596,7 +1767,8 @@ Unset variables fall back to the default public URLs automatically.
 | "Expected chart not found" | Helm uses underscores vs dashes in filename | `ls /opt/airgap/airgap-bundle-*/charts/` and set `PROMETHEUS_CHART_PATH` explicitly |
 | "k0s not found on remote nodes" | `K0S_INSTALL_URL` not set to bundle path | Verify `file://` path exists on install machine, not remote node |
 | "nvidia-smi not found" in AIRGAP_MODE | Driver not pre-installed | Pre-install using Strategy 1 above |
-| Images failing to pull | Images not mirrored or `images.registry` wrong | Confirm all images in `container-images.txt` were mirrored and `images.registry` is correct |
+| Application images failing to pull | Images not mirrored or `images.registry` wrong | Confirm the application images in `container-images.txt` were mirrored and their component fields / `images.registry` are correct |
+| Air-gapped Traefik is `ImagePullBackOff` | Bundle omitted the ingress-enabled config, or the install config uses a different exact Traefik reference | Rebuild with `prepare_airgap_bundle.sh --config <the-install-config>`; set `images.ingress.traefikImage` explicitly for a mirror because `images.registry` is not applied |
 
 ---
 
@@ -1618,39 +1790,29 @@ Enterprise instance after the cluster is fully healthy.
 
 ### Finding the Splunk Web URL
 
-Splunk Enterprise listens on port **8000**. How you reach it depends on your
-service configuration.
+The installer enables TLS on Splunk Web port **8000**. With Traefik enabled, use
+`https://<worker-ip-or-ingress-hostname>:8000` and trust the generated ingress CA as described in
+[TRAEFIK_HTTPS_SETUP.md](TRAEFIK_HTTPS_SETUP.md#step-5--trust-the-generated-ca).
 
-**NodePort (default)**
-
-```bash
-# Discover the assigned NodePort
-kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
-```
-
-Access URL: `http://<any-worker-node-ip>:<nodePort>`
-
-**LoadBalancer (MetalLB)**
+Without Traefik, the Splunk Service remains ClusterIP-only. Use a port-forward/tunnel and the
+internal Splunk CA. These commands use the default `splunk.standaloneName: splunk-standalone` and
+`kubernetes.namespace: ai-platform`; adjust both when your config differs:
 
 ```bash
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia \
-  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}'
+kubectl port-forward -n ai-platform \
+  svc/splunk-splunk-standalone-standalone-service 8000:8000
+
+kubectl -n ai-platform get secret ai-splunk-server-tls \
+  -o jsonpath='{.data.ca\.crt}' | base64 --decode > splunk-internal-ca.crt
 ```
 
-Access URL: `http://<EXTERNAL-IP>`
-
-**kubectl port-forward (quick access, no external exposure)**
-
-```bash
-kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
-```
-
-Open `http://localhost:8000` in your browser.
+Open `https://localhost:8000` and import `splunk-internal-ca.crt` into the relevant browser/OS
+trust store. The certificate includes `localhost`; do not downgrade this endpoint to HTTP.
 
 **Retrieve the admin password**
 
 ```bash
-kubectl get secret splunk-standalone-secret -n ai-platform \
+kubectl get secret splunk-splunk-standalone-standalone-secret-v1 -n ai-platform \
   -o jsonpath='{.data.password}' | base64 --decode && echo
 ```
 
@@ -1678,7 +1840,7 @@ the pod using `kubectl`:
 ```bash
 APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
 NAMESPACE="ai-platform"
-POD="splunk-standalone-0"
+POD="splunk-splunk-standalone-standalone-0"
 
 # 1. Copy the archive into the pod
 kubectl cp "${APP_TGZ}" "${NAMESPACE}/${POD}:/tmp/${APP_TGZ}"
@@ -1719,8 +1881,8 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 **Via Splunk REST API (from inside the pod)**
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
-  curl -sku admin:"$(kubectl get secret splunk-standalone-secret \
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- \
+  curl -sku admin:"$(kubectl get secret splunk-splunk-standalone-standalone-secret-v1 \
     -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)" \
   https://localhost:8089/services/apps/local/Splunk_AI_Assistant_Cloud \
   | grep -E "<title>|disabled|version"
@@ -1736,7 +1898,21 @@ Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm a
 
 After the app is installed, you must point it at the SAIA API endpoint so prompts are routed to the AI inference backend. This is the onboarding step that activates the AI functionality.
 
-**Step 1 — find the SAIA NodePort**
+**Step 1 — choose the SAIA HTTPS endpoint**
+
+When Traefik is enabled, use its stable endpoint and a worker IP covered by the generated
+certificate, or the configured `ingress.hostname`:
+
+```text
+https://<worker-ip-or-ingress-hostname>:8443
+```
+
+Import the ingress CA first, following
+[TRAEFIK_HTTPS_SETUP.md](TRAEFIK_HTTPS_SETUP.md#step-5--trust-the-generated-ca). The underlying
+SAIA Service remains reachable through whatever `serviceTemplate` you configured, but enabling
+Traefik does not rewrite that Service.
+
+To inspect a legacy NodePort or LoadBalancer path for diagnosis:
 
 ```bash
 kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
@@ -1746,15 +1922,9 @@ kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
 #                                                           nodePort
 ```
 
-The SAIA API URL is `http://<any-worker-node-ip>:<nodePort>` (e.g. `http://10.0.0.21:30080`).
-
-For LoadBalancer deployments:
-
-```bash
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia \
-  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}'
-# URL: http://<EXTERNAL-IP>
-```
+Do not configure that raw `http://<worker>:<nodePort>` URL in a browser app loaded from the
+installer's HTTPS Splunk Web endpoint: the browser blocks it as active mixed content. If Traefik
+is disabled, provide another reviewed TLS endpoint for SAIA before onboarding.
 
 **Step 2 — set the endpoint via Splunk UI**
 
@@ -1763,10 +1933,10 @@ In Splunk Web: **Splunk AI Assistant → Configuration** (or navigate to `/en-US
 **Step 2 (alternative) — set via `splunkaiassistant.conf` (scripted / air-gapped)**
 
 ```bash
-# Replace <worker-node-ip> and <nodePort> with values from Step 1
-SAIA_URL="http://<worker-node-ip>:<nodePort>"
+# Replace with a certificate-covered worker IP or ingress.hostname from Step 1
+SAIA_URL="https://<worker-ip-or-ingress-hostname>:8443"
 
-kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- bash -c "
   mkdir -p /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local
   cat > /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf <<EOF
 [splunk_ai_assistant]
@@ -1777,10 +1947,10 @@ saia_endpoint = ${SAIA_URL}
 EOF"
 
 # Reload app config without a full Splunk restart
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- \
   /opt/splunk/bin/splunk _internal call \
   /apps/local/Splunk_AI_Assistant_Cloud/_reload \
-  -auth admin:"\$(kubectl get secret splunk-standalone-secret \
+  -auth admin:"\$(kubectl get secret splunk-splunk-standalone-standalone-secret-v1 \
     -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)"
 ```
 
@@ -1795,7 +1965,7 @@ Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm a
 **App does not appear after upload**
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- \
   tail -50 /opt/splunk/var/log/splunk/splunkd.log | grep -iE "install|app|error"
 ```
 
@@ -1805,11 +1975,16 @@ kubectl exec -n ai-platform splunk-standalone-0 -- \
 # Check SAIA service and pods are running
 kubectl get pods,svc -n ai-platform | grep saia
 
-# Test API reachability from inside the Splunk pod
-kubectl exec -n ai-platform splunk-standalone-0 -- \
-  curl -sv http://<worker-ip>:<nodePort>/health
+# Test the in-cluster backend independently of Traefik/browser TLS
+SAIA_SERVICE="$(kubectl get svc -n ai-platform \
+  -l app.kubernetes.io/component=saia -o jsonpath='{.items[0].metadata.name}')"
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- \
+  curl -sv "http://${SAIA_SERVICE}:8080/health"
 # Expected: HTTP 200
 ```
+
+If that succeeds but the browser still fails, verify that the configured app endpoint is the
+Traefik `https://...:8443` URL, that its ingress CA is trusted, and that port 8443 is reachable.
 
 **`deployStatus: -1` — app deployment error**
 
@@ -1823,9 +1998,9 @@ kubectl logs -n splunk-operator deploy/splunk-operator-controller-manager \
 A malformed `splunkaiassistant.conf` is the most common cause. Remove and restart:
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- \
   rm -f /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n ai-platform splunk-splunk-standalone-standalone-0 -- \
   /opt/splunk/bin/splunk restart
 ```
 
@@ -2102,7 +2277,7 @@ The script downloads various binaries, manifests, Helm charts, OS packages, and 
 | What | URL / Source |
 |------|-------------|
 | Public IP detection | `https://checkip.amazonaws.com`, `https://ipinfo.io/ip`, `https://api.ipify.org` |
-| cert-manager manifest | `https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml` |
+| cert-manager manifest | `https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml` |
 | NVIDIA k8s device plugin | `https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/<version>/deployments/static/nvidia-device-plugin.yml` |
 | local-path-provisioner | `https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml` |
 | Prometheus Helm repo | `https://prometheus-community.github.io/helm-charts` |
@@ -2118,7 +2293,7 @@ The script downloads various binaries, manifests, Helm charts, OS packages, and 
 |------|-------------|
 | iptables-nft | `dnf install -y iptables-nft` (RHEL/Fedora, if missing) |
 | python3-pyyaml | `dnf install -y python3-pyyaml` or `apt-get install -y python3-yaml` or `pip3 install pyyaml` |
-| k0s binary | `curl -sSLf https://get.k0s.sh | sudo sh` (if not already installed) |
+| k0s binary | `curl -sSLf https://get.k0s.sh | sudo env K0S_VERSION=v1.33.13+k0s.1 sh` (compatibility pin; if not already installed) |
 
 ### Downloads on GPU Worker Nodes via SSH
 
@@ -2184,22 +2359,39 @@ mc mirror ./s3-backup/ my-storage/ai-platform-bucket/
 kubectl apply -f aiplatform-backup.yaml
 ```
 
+### Migrating an Existing cert-manager Installation
+
+The installer does not automatically upgrade or take over cert-manager. It accepts an existing
+installation only when the controller, webhook, and cainjector Deployments are all present and
+every expected container image uses exactly `v1.21.1`. It also refuses mixed versions, missing
+components, or an installation where cert-manager CRDs exist but the controller does not.
+
+For an older installation, use the same ownership mechanism that originally installed it (for
+example, its existing Helm release or static manifests) and follow cert-manager's
+[upstream upgrade guide](https://cert-manager.io/docs/installation/upgrade/):
+
+1. Back up the cert-manager resources and identify their current owner and version.
+2. Upgrade **one cert-manager minor at a time**, selecting the latest patch in every intermediate
+   minor and verifying controller/webhook readiness after each step. For example, a 1.13
+   installation must progress through 1.14, 1.15, and each following minor through 1.21; do not
+   apply the repository's 1.21.1 manifest directly over 1.13.
+3. Keep Kubernetes within each intermediate cert-manager release's published compatibility range;
+   where necessary, complete the cert-manager steps before upgrading Kubernetes.
+4. Finish on cert-manager `v1.21.1`, then ensure the target Kubernetes server is 1.33–1.36 before
+   rerunning this installer.
+
+If only orphaned CRDs remain, reconcile them with their known owner. Do not delete or adopt shared
+certificate data merely to bypass the preflight.
+
 ### Upgrading k0s Version
 
-```bash
-# On controller node
-ssh ubuntu@controller-ip
-
-# Download new k0s version
-wget https://github.com/k0sproject/k0s/releases/download/v1.30.0/k0s
-sudo install k0s /usr/local/bin/k0s
-
-# Restart controller
-sudo k0s stop
-sudo k0s start
-
-# Repeat for all workers
-```
+Keep k0s and cert-manager inside the documented compatibility envelope. The repository defaults to
+`k0s v1.33.13+k0s.1` (Kubernetes 1.33.13) with cert-manager `v1.21.1`; the installer rejects a live
+Kubernetes server outside 1.33–1.36. Kubernetes 1.34–1.36 is within cert-manager's range but needs
+separate validation against the Splunk Operator and the rest of the platform. Follow the official
+[k0s upgrade procedure](https://docs.k0sproject.io/stable/upgrade/) rather than replacing binaries
+and restarting every node simultaneously, and validate the cert-manager support matrix before
+selecting a different k0s patch.
 
 ---
 
@@ -2220,5 +2412,5 @@ sudo k0s start
 ---
 
 **Version:** 3.0
-**Last Updated:** April 2026
+**Last Updated:** August 2026
 **Maintainer:** Splunk AI Platform Team

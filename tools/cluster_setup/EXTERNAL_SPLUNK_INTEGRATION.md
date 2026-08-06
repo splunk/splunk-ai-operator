@@ -23,6 +23,7 @@ Use this when:
 - [Step 4 — Fix "Issuer Not Allowed" from SAIA Backend](#step-4--fix-issuer-not-allowed-from-saia-backend)
 - [Step 5 — Restart Splunk Correctly](#step-5--restart-splunk-correctly)
 - [Step 6 — Final Verification](#step-6--final-verification)
+- [Certificate Renewal and Expiry](#certificate-renewal-and-expiry)
 - [Cleanup](#cleanup)
 - [Troubleshooting Quick Reference](#troubleshooting-quick-reference)
 
@@ -413,6 +414,26 @@ owned by another user. The command exits without touching the running process.
     ```bash
     kubectl logs -n <namespace> <saia-v1-pod> --tail=20 | grep -E "200|401|issuer|token"
     ```
+
+---
+
+## Certificate Renewal and Expiry
+
+The AI Platform does not renew certificates owned by an external Splunk
+deployment. The customer must monitor the certificate served on the management
+and HEC endpoints, renew it, install the complete chain, and perform the
+Splunk-supported reload or restart before expiry.
+
+If the certificate uses a private CA and that CA changes, update the
+`caCertRef` Secret with an old-plus-new overlap bundle before changing the
+server certificate. Wait for the AI workloads to reconcile, rotate and reload
+the external Splunk certificate, verify management/JWKS and HEC connectivity,
+and only then remove the old CA. If the certificate has already expired,
+verified calls fail until the external Splunk process presents a valid chain;
+the customer owns that recovery.
+
+See [Enabling TLS Trust Between AI Platform and Splunk](../../docs/configuration/splunk-tls-trust.md#certificate-renewal-expiry-and-customer-responsibilities)
+for commands and the full internal/external responsibility matrix.
 
 ---
 

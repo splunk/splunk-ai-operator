@@ -208,21 +208,77 @@ If you still see `CERTIFICATE_VERIFY_FAILED`, confirm:
 
 ---
 
-## Rotating or updating the CA later
+## Certificate renewal, expiry, and customer responsibilities
 
-- **In-cluster Splunk (k0s, EKS, and OpenShift installers):** cert-manager
-  renews the leaf Secret automatically (90-day lifetime, renewed 30 days out),
-  but splunkd does not hot-reload it and the installers do not implement an
-  automatic restart trigger. After renewal, perform a supported, controlled
-  Splunk Standalone restart. The new pod's pre-task rebuilds `server.pem` from
-  the latest Secret before Splunk starts. The installer-owned root CA uses a
-  stable key and a ten-year lifetime to avoid frequent trust-anchor churn.
-- **External Splunk:** if your organization rotates its CA, update the same
-  Secret in place (`kubectl create secret generic <name> --from-file=ca.crt=<new-path> --dry-run=client -o yaml | kubectl apply -f -`).
-  Kubernetes propagates the new file into the mounted volume automatically;
-  the Secret data change triggers reconciliation and rolls SAIA, SLIM, and
-  OTel-enabled Ray pod templates so each process starts with the new CA.
-- **Adding CA trust for the first time** (you skipped `caCertRef` at initial
-  install): create the Secret, set `caCertRef` (or `caCertSecretName` in the
-  k0s installer config), and re-apply/re-run the installer. This is
-  idempotent and safe to repeat.
+Do not wait for a certificate to expire. When `caCertRef` is configured, an
+expired Splunk leaf certificate, an expired issuing CA, or a hostname mismatch
+causes TLS verification to fail and Splunk-dependent requests stop. The
+operator does not fall back to unverified TLS when configured trust material is
+invalid. The workloads normally remain running, but management/JWKS calls and
+OTel HEC delivery fail until Splunk presents a valid certificate chain again.
+
+| Deployment | What is automated | What the customer must do |
+|---|---|---|
+| Installer-managed internal Splunk | cert-manager renews the 90-day leaf Secret 30 days before expiry. The installer-owned root CA has a ten-year lifetime and stable private key. | Monitor both Certificates. After leaf renewal, make Splunk load the renewed Secret before the old in-memory certificate expires. For k0s, re-run the full installer with the original config and AI namespace; it performs the controlled `OnDelete` pod recycle when the certificate fingerprint changes. For EKS and OpenShift, perform a supported controlled Splunk Standalone restart; those installers do not currently automate the restart. |
+| External Splunk with a publicly trusted certificate | Nothing in the AI Platform renews or reloads the external certificate. | Renew the certificate on the external Splunk deployment, install the complete leaf and intermediate chain, and reload or restart Splunk before expiry. `caCertRef` remains unset. |
+| External Splunk with a private CA | The operator watches an updated `caCertRef` Secret and rolls affected SAIA, SLIM, and OTel-enabled Ray pod templates. | Renew and reload the Splunk server certificate. If the issuing CA changes, update the Kubernetes CA bundle using the overlap procedure below. The AI Platform never renews an external certificate or CA. |
+
+Monitor the installer-managed Certificates and inspect the currently issued
+leaf without exposing its private key:
+
+```bash
+kubectl get certificate ai-splunk-server ai-splunk-ca -n <namespace>
+
+kubectl get secret ai-splunk-server-tls -n <namespace> \
+  -o jsonpath='{.data.tls\.crt}' | base64 --decode | \
+  openssl x509 -noout -subject -issuer -dates
+```
+
+For external Splunk, inspect the certificate that clients actually receive:
+
+```bash
+openssl s_client -connect <splunk-host>:8089 -servername <splunk-host> \
+  </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+```
+
+### Rotating an external private CA
+
+Avoid a trust gap by overlapping the old and new CAs:
+
+1. Before changing Splunk's server certificate, create a PEM bundle containing
+   the old CA followed by the new CA.
+2. Update the existing `caCertRef` Secret in place:
+   ```bash
+   kubectl create secret generic <ca-secret-name> \
+     --from-file=ca.crt=<old-and-new-ca-bundle.pem> \
+     -n <namespace> --dry-run=client -o yaml | kubectl apply -f -
+   ```
+3. Wait for the affected workloads to reconcile and restart with the overlap
+   bundle.
+4. Install the new server certificate and complete chain on external Splunk,
+   then perform the Splunk-supported reload or restart.
+5. Verify management/JWKS and HEC connectivity. After every client has moved
+   to the new chain, remove the old CA from the bundle in a later maintenance
+   window.
+
+### If the certificate has already expired
+
+- **Internal k0s:** first confirm cert-manager has written a renewed
+  `ai-splunk-server-tls` Secret, then re-run the full installer with the
+  original config and namespace so Splunk is recycled onto the renewed
+  certificate. If the Certificate is not `Ready`, repair cert-manager issuance
+  first.
+- **Internal EKS/OpenShift:** confirm the renewed Secret exists, then perform a
+  supported controlled Splunk Standalone restart so its pre-task rebuilds
+  `server.pem` from the current Secret.
+- **External Splunk:** renew and install the server certificate and full chain,
+  update the `caCertRef` Secret first if the CA changed, and reload or restart
+  Splunk. The customer owns recovery of the external endpoint.
+
+Expect verified calls to remain unavailable until the serving Splunk process
+has loaded the valid certificate. Do not work around expiry by disabling
+certificate or hostname verification.
+
+**Adding CA trust for the first time:** create the Secret, set `caCertRef` (or
+`caCertSecretName` in the k0s installer config), and re-apply or re-run the
+installer. This is idempotent and safe to repeat.
