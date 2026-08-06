@@ -192,14 +192,17 @@ assert_rc "accepts real credentials (returns 1)" 1 \
 suite "model artifact config selection"
 echo "▶ model_artifacts_config_name"
 
-assert_eq "L40S uses the default artifact manifest" \
-  "model_artifacts_configs.yaml" "$(model_artifacts_config_name l40s)"
+assert_eq "L40S uses the unquantized artifact manifest" \
+  "model_artifacts_configs_unquantized.yaml" "$(model_artifacts_config_name l40s)"
 
-assert_eq "H100 uses the H100 artifact manifest" \
-  "model_artifacts_configs_h100.yaml" "$(model_artifacts_config_name h100)"
+assert_eq "H100 uses the quantized artifact manifest" \
+  "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name h100)"
 
-assert_eq "RTX Pro 6000 uses the H100 artifact manifest" \
-  "model_artifacts_configs_h100.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
+assert_eq "RTX Pro 6000 uses the quantized artifact manifest" \
+  "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
+
+assert_eq "defaultAcceleratorType values are normalized" \
+  "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name RTX_PRO_6000_BLACKWELL)"
 
 assert_eq "pre-staging check uses the shared artifact-manifest selector" \
   "1" "$(grep -c 'config_file=.*model_artifacts_config_name.*accel' "${SCRIPT}" | tr -d '[:space:]')"

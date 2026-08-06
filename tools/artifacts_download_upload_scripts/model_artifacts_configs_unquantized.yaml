@@ -1,4 +1,5 @@
 ---
+# Unquantized artifact profile used by L40S deployments.
 # Hugging Face credentials for gated models. Not required if there are no gated models
 hf-username: <CHANGE ME>
 hf-token: <CHANGE ME>
@@ -42,8 +43,8 @@ artifact-configs:
     hf-url: https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt
     is-a-gated-model: false
 
-  - artifact-id: gemma-4-31b-it-qat-w4a16-ct
-    hf-url: https://huggingface.co/google/gemma-4-31B-it-qat-w4a16-ct
+  - artifact-id: gemma-4-31b-it
+    hf-url: https://huggingface.co/google/gemma-4-31B-it
     is-a-gated-model: false
 
   - artifact-id: pii-classifier

@@ -42,6 +42,12 @@ extract_function() {
 
 eval "$(extract_function validate_scale_factor_config)"
 eval "$(extract_function render_ai_platform_manifest)"
+eval "$(extract_function model_artifacts_config_name)"
+eval "$(extract_function resolve_accelerator_type)"
+eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
+
+log() { :; }
+err() { return 1; }
 
 scale_present="false"
 scale_value="null"
@@ -60,6 +66,25 @@ yq() {
   fi
 }
 CONFIG_FILE="test-config.yaml"
+
+echo "OpenShift model artifact config selection"
+assert_eq "RTX Pro 6000 uses the quantized artifact manifest" \
+  "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
+assert_eq "defaultAcceleratorType values are normalized" \
+  "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name RTX_PRO_6000_BLACKWELL)"
+assert_rc "unsupported artifact accelerator is rejected" 1 model_artifacts_config_name A100
+
+echo "OpenShift accelerator validation"
+DEFAULT_ACCELERATOR=""
+assert_rc "omitted accelerator defaults to RTX Pro 6000" 0 resolve_accelerator_type
+assert_eq "omitted accelerator resolves to the supported value" \
+  "RTX_PRO_6000_BLACKWELL" "${DEFAULT_ACCELERATOR}"
+DEFAULT_ACCELERATOR="rtx_pro_6000_blackwell"
+assert_rc "lowercase RTX Pro 6000 is normalized" 0 resolve_accelerator_type
+assert_eq "configured accelerator is canonicalized" \
+  "RTX_PRO_6000_BLACKWELL" "${DEFAULT_ACCELERATOR}"
+DEFAULT_ACCELERATOR="A100"
+assert_rc "unsupported OpenShift accelerator is rejected" 1 resolve_accelerator_type
 
 echo "OpenShift scaleFactor validation"
 assert_rc "omitted value defaults to 1" 0 validate_scale_factor_config
@@ -103,7 +128,7 @@ AI_PLATFORM_NAME="test-platform"
 AI_NS="ai-platform"
 AI_STANDALONE_NAME="splunk"
 AI_SCALE_FACTOR="3"
-DEFAULT_ACCELERATOR="L40S"
+DEFAULT_ACCELERATOR="RTX_PRO_6000_BLACKWELL"
 OBJ_STORE_REGION="us-east-2"
 WORKER_IMAGE_REGISTRY="example.invalid/worker"
 obj_path="s3://test-bucket"
@@ -122,6 +147,8 @@ assert_eq "renders exactly one scaleFactor field" "1" "${scale_count}"
 assert_eq "renders scaleFactor at AIPlatform spec level" "1" \
   "$(grep -c '^  scaleFactor: 3$' <<<"${manifest}" || true)"
 assert_eq "does not render feature scaleFactor" "0" "${feature_scale_count}"
+assert_eq "renders the supported OpenShift accelerator" "1" \
+  "$(grep -c '^  defaultAcceleratorType: RTX_PRO_6000_BLACKWELL$' <<<"${manifest}" || true)"
 assert_eq "renders configured feature" "1" \
   "$(grep -c '^    - name: saia$' <<<"${manifest}" || true)"
 

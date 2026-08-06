@@ -250,7 +250,8 @@ splunk:
 ```yaml
 aiPlatform:
   name: "openshift-ai-platform"
-  defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"   # L40S | H100 | RTX_PRO_6000_BLACKWELL
+  defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"   # OpenShift supports RTX Pro 6000 Blackwell only
+  scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
   features:
@@ -262,6 +263,29 @@ aiPlatform:
 > **OpenShift Route** regardless (bare-metal node IPs are usually not externally
 > routable). Only add a `serviceTemplate` block (e.g. `type: NodePort`,
 > `nodePort: 30080`) if you specifically need the service exposed as NodePort.
+
+#### Scaling Deployment Capacity
+
+Set `scaleFactor` under `aiPlatform` to change AI workload capacity:
+
+```yaml
+aiPlatform:
+  scaleFactor: 2
+```
+
+Use a whole number of `1` or higher. The default is `1`; for example, `2`
+doubles the standard capacity. Increasing this value does not add GPU nodes, so
+ask your cluster administrator to add the required RTX Pro GPU capacity first.
+
+Save the configuration and run the installer in interactive mode:
+
+```bash
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
+```
+
+> **Downscaling notice:** Reducing `scaleFactor` causes temporary service
+> downtime while workloads are resized. Plan downscaling during a maintenance
+> window.
 
 
 ### `operators`
@@ -331,7 +355,7 @@ flowchart TB
       SAIA["SAIA API (v1/v2 + nginx)"]
       SPL["Splunk Standalone"]
     end
-    subgraph GPUW["GPU worker(s) — RTX PRO 6000 / L40S"]
+    subgraph GPUW["GPU worker(s) — RTX PRO 6000 Blackwell"]
       RW["Ray workers (GPU)"]
     end
     RT["OpenShift Route: saia.<ingress-domain>"]
@@ -577,7 +601,8 @@ Model artifacts are downloaded from HuggingFace and uploaded to your object
 store. Staging is controlled by `storage.modelStaging.enabled` (or forced by the
 `stage-artifacts` subcommand) and is skipped entirely in air-gap mode.
 
-The model set (`model_artifacts_configs.yaml`, all non-gated):
+OpenShift uses `model_artifacts_configs_quantized.yaml` for RTX Pro 6000
+Blackwell deployments (all models are non-gated):
 
 | artifact-id | source |
 |---|---|
@@ -585,6 +610,7 @@ The model set (`model_artifacts_configs.yaml`, all non-gated):
 | bi-encoder | BAAI/bge-small-en-v1.5 |
 | cross-encoder | cross-encoder/ms-marco-MiniLM-L-6-v2 |
 | e5-language-classifier | Mike0307/multilingual-e5-language-detection |
+| fm_timeseries | cisco-ai/cisco-time-series-model-1.0 |
 | gpt-oss-20b | openai/gpt-oss-20b |
 | mbart-translator | facebook/mbart-large-50-many-to-many-mmt |
 | gemma-4-31b-it-qat-w4a16-ct | google/gemma-4-31B-it-qat-w4a16-ct |

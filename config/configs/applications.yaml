@@ -740,10 +740,8 @@ applications:
         SKIP_VERIFICATION: "true"
         USE_SYSTEM_PERMISSIONS: "true"
 {{- if .Replicas.FmTimeseries }}
-  # FmTimeseries is a slim-feature model (see config/configs/features/slim.yaml).
-  # .Replicas.FmTimeseries is only populated when the "slim" feature is enabled,
-  # so this whole application is rendered only then — with saia alone it would
-  # otherwise emit "<no value>" for the replica counts and break the serve config.
+  # FmTimeseries is part of the global model catalog. Its replica count comes
+  # from model-scale.yaml and is multiplied by AIPlatform.spec.scaleFactor.
   - args:
       application_name: FmTimeseries
       # Cisco Time Series Model (CTSM) — a 250M-param decoder-only time-series

@@ -108,21 +108,33 @@ grep -l "gemma-4-31b-it" \
 
 ---
 
-### T1-5: Model list in artifacts README matches source of truth
+### T1-5: Documented model lists match both artifact profiles
 
 ```bash
-# Source of truth — YAML uses "  - artifact-id:" (2 spaces + dash)
-grep "^  - artifact-id:" tools/artifacts_download_upload_scripts/model_artifacts_configs.yaml \
-  | awk '{print $3}' | sort
+# Source of truth: the unique artifact IDs across both profiles.
+artifact_ids() {
+  grep -h "^  - artifact-id:" \
+    tools/artifacts_download_upload_scripts/model_artifacts_configs_unquantized.yaml \
+    tools/artifacts_download_upload_scripts/model_artifacts_configs_quantized.yaml \
+    | awk '{print $3}' | sort -u
+}
 
-# K0S_README.md model table — rows of the form "   | `<artifact-id>` |" with
-# hyphens or underscores in the name (e.g. fm_timeseries).
-grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" tools/cluster_setup/K0S_README.md \
-  | awk -F'`' '{print $2}' | sort
+# No output means the K0s model table contains every artifact ID.
+comm -3 \
+  <(artifact_ids) \
+  <(grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" tools/cluster_setup/K0S_README.md \
+    | awk -F'`' '{print $2}' | sort -u)
+
+# No output means the artifacts README contains every artifact ID.
+comm -3 \
+  <(artifact_ids) \
+  <(sed -n '/The following artifacts are pre-configured/,/Each artifact includes:/p' \
+      tools/artifacts_download_upload_scripts/README.md \
+    | grep -E '^- `[^`]+` -' | awk -F'`' '{print $2}' | sort -u)
 ```
 
-**Pass:** Both lists are identical.
-**Fail:** Any model present in the YAML is absent from K0S_README.md, or vice versa.
+**Pass:** Both `comm` commands produce no output.
+**Fail:** Either command reports an artifact missing from or added to a documented list.
 
 ---
 

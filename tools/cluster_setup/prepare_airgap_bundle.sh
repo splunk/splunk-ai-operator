@@ -549,9 +549,11 @@ docker.io/library/nginx:1.27-alpine
 # ── NOTE: Model weights (HuggingFace) ────────────────────────────────────────
 # Model weights (~60 GB total) are NOT container images.
 # Use tools/artifacts_download_upload_scripts/ to stage them separately.
-# Models: gemma-4-31b-it, gpt-oss-20b, all-minilm-l6-v2, bi-encoder,
-#         cross-encoder, e5-language-classifier, mbart-translator,
-#         pii-classifier, uae-large, xlm-roberta-language-classifier
+# Gemma artifact: gemma-4-31b-it for L40S, or
+#                 gemma-4-31b-it-qat-w4a16-ct for H100 and RTX Pro.
+# Other models: gpt-oss-20b, all-minilm-l6-v2, bi-encoder, cross-encoder,
+#               e5-language-classifier, fm_timeseries, mbart-translator,
+#               pii-classifier, uae-large, xlm-roberta-language-classifier
 IMGEOF
 
 # ── 8. Write version manifest ─────────────────────────────────────────────────

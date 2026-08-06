@@ -238,52 +238,28 @@ resolve_model_staging() {
   fi
 }
 
-# ====== SUPPORTED ACCELERATOR TYPES ======
-readonly SUPPORTED_ACCELERATORS=("L40S" "H100" "RTX_PRO_6000_BLACKWELL")
+# ====== SUPPORTED ACCELERATOR TYPE ======
+readonly OPENSHIFT_ACCELERATOR="RTX_PRO_6000_BLACKWELL"
 
 # ====== RESOLVE ACCELERATOR TYPE ======
-# Normalizes and validates DEFAULT_ACCELERATOR. Prompts interactively if missing
-# or invalid (unless SILENT_INSTALL is true, in which case it errors out).
+# OpenShift deployments are qualified only for RTX Pro 6000 Blackwell. Default
+# an omitted value to that accelerator and reject every other configured value.
 resolve_accelerator_type() {
-  # Normalize to uppercase for comparison, store normalized value.
   local _raw="${DEFAULT_ACCELERATOR:-}"
-  if [[ -n "${_raw}" && "${_raw}" != "null" ]]; then
-    DEFAULT_ACCELERATOR="$(echo "${_raw}" | tr '[:lower:]' '[:upper:]')"
-  fi
-
-  # Validate against supported list.
-  local _valid=false
-  for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
-    [[ "${DEFAULT_ACCELERATOR}" == "${_t}" ]] && _valid=true && break
-  done
-
-  if ${_valid}; then
-    log "Accelerator type: ${DEFAULT_ACCELERATOR}"
+  if [[ -z "${_raw}" || "${_raw}" == "null" ]]; then
+    DEFAULT_ACCELERATOR="${OPENSHIFT_ACCELERATOR}"
+    log "Accelerator type defaulted to: ${DEFAULT_ACCELERATOR}"
     return 0
   fi
 
-  # Not valid — prompt interactively or error in silent mode.
-  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
-    err "aiPlatform.defaultAcceleratorType '${DEFAULT_ACCELERATOR:-<unset>}' is not supported. Must be one of: ${SUPPORTED_ACCELERATORS[*]}"
+  DEFAULT_ACCELERATOR="$(printf '%s' "${_raw}" | tr '[:lower:]' '[:upper:]')"
+
+  if [[ "${DEFAULT_ACCELERATOR}" != "${OPENSHIFT_ACCELERATOR}" ]]; then
+    err "OpenShift deployments support only ${OPENSHIFT_ACCELERATOR}; got '${DEFAULT_ACCELERATOR}'"
+    return 1
   fi
 
-  echo -e "\n  \033[1mAccelerator type:\033[0m" >&2
-  echo -e "  Supported types: ${SUPPORTED_ACCELERATORS[*]}" >&2
-  local answer=""
-  while true; do
-    read -r -p "  Enter accelerator type [${SUPPORTED_ACCELERATORS[*]}]: " answer
-    answer="$(echo "${answer}" | tr '[:lower:]' '[:upper:]')"
-    local _v=false
-    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
-      [[ "${answer}" == "${_t}" ]] && _v=true && break
-    done
-    if ${_v}; then
-      DEFAULT_ACCELERATOR="${answer}"
-      log "Accelerator type set to: ${DEFAULT_ACCELERATOR}"
-      return 0
-    fi
-    echo -e "  \033[1;31mInvalid choice '${answer}'. Must be one of: ${SUPPORTED_ACCELERATORS[*]}\033[0m" >&2
-  done
+  log "Accelerator type: ${DEFAULT_ACCELERATOR}"
 }
 
 # ====== SHOW INSTALL PLAN ======
@@ -2104,7 +2080,7 @@ metadata:
   name: webhook-tls-probe
   namespace: splunk-ai-operator-system
 spec:
-  defaultAcceleratorType: L40S
+  defaultAcceleratorType: RTX_PRO_6000_BLACKWELL
   objectStorage:
     path: s3://probe/probe
 PROBE_EOF
@@ -2207,6 +2183,17 @@ EOF
   log "    Use this URL in Splunk AI setup: http://${route_host}"
 }
 
+# Return the model-artifact profile used by an accelerator. Keep this selection
+# in one place so pre-staging and post-upload verification cannot drift apart.
+model_artifacts_config_name() {
+  local accel
+  accel=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "${accel}" in
+    rtx_pro_6000_blackwell) echo "model_artifacts_configs_quantized.yaml" ;;
+    *)                      return 1 ;;
+  esac
+}
+
 # ====== ALL MODELS STAGED PRE-CHECK ======
 # all_models_staged <staging_dir> <accel>
 # Checks whether every artifact already has a staging_complete marker with matching hf_url.
@@ -2215,12 +2202,12 @@ EOF
 all_models_staged() {
   local staging_dir="$1"
   local accel="$2"
-  local config_file
-
-  case "${accel}" in
-    h100) config_file="${staging_dir}/model_artifacts_configs_h100.yaml" ;;
-    *)    config_file="${staging_dir}/model_artifacts_configs.yaml" ;;
-  esac
+  local config_name config_file
+  config_name=$(model_artifacts_config_name "${accel}") || {
+    warn "all_models_staged: unsupported accelerator '${accel}'"
+    return 1
+  }
+  config_file="${staging_dir}/${config_name}"
 
   if [[ ! -f "${config_file}" ]]; then
     warn "all_models_staged: config file not found: ${config_file} — skipping pre-check."
