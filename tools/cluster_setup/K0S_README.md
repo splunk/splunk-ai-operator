@@ -160,7 +160,10 @@ such a cluster.
 - RHEL 9
 - Passwordless SSH access from admin workstation
 - Sudo privileges without password
-- Python 3.8+ installed
+
+Python and PyYAML are not required on cluster nodes. The installer runs `k0s config create` on the
+controller, applies the supported configuration changes with `yq` on the admin workstation, and
+copies the validated YAML back to `/etc/k0s/k0s.yaml` atomically.
 
 ### Network Requirements
 
@@ -1305,6 +1308,64 @@ refreshes the CA-only ConfigMap while reconciling Traefik. Also monitor the sepa
 `Certificate/ingress-ca` and redistribute its current public CA to clients before their old trust
 anchor expires.
 
+### Internal Splunk resource ownership
+
+After cert-manager Phase 1 and before Phase 2 can install or reconcile the Splunk Operator, the
+installer runs the first transaction-wide ownership preflight. It checks the seven fixed-name
+certificate and configuration resources and discovers the Splunk `Standalone` CRD. When that CRD
+already exists, the configured `Standalone` is checked too; when it is absent, no `Standalone`
+object can exist yet, so that one lookup is safely skipped. A discovery or object-read error is
+fatal. This prevents a pre-existing `Standalone` from being reconciled by a newly installed
+operator before its ownership has been verified.
+
+After Phase 2, the installer repeats the full preflight before the AI namespace's image-pull
+Secret reconciliation and before any CA, leaf key, certificate Secret, defaults ConfigMap, or
+`Standalone` is applied. An existing object is accepted only when all of this ownership metadata
+matches the current installation:
+
+```yaml
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+    app.kubernetes.io/instance: splunk-ai-internal
+  annotations:
+    ai.splunk.com/owner-id: <cluster.name>/<splunk.standaloneName>
+```
+
+The protected objects are `Issuer/ai-splunk-selfsigned`,
+`Certificate/ai-splunk-ca`, `Secret/ai-splunk-ca-tls`,
+`Issuer/ai-splunk-ca-issuer`, `Certificate/ai-splunk-server`,
+`Secret/ai-splunk-server-tls`, `ConfigMap/splunk-defaults`, and the configured
+Splunk `Standalone`. The Certificates propagate the same metadata to their generated Secrets.
+Routine reconciliation does not use server-side apply conflict forcing. A missing label, a missing
+or different owner ID, or an ownership lookup failure aborts the transaction before any guarded
+resource—or the subsequent pull-Secret creation step—is mutated. Certificate and workload
+functions repeat ownership checks as defense in depth.
+
+Older installations may have the same objects without ownership metadata. Do not adopt an object
+only because its name matches. First inspect its manifest and certificate data and verify that it
+was created for this exact cluster, namespace, and Standalone. Then adopt only the object named by
+the installer error, once:
+
+```bash
+AI_NS=ai-platform
+RESOURCE=certificate.cert-manager.io
+NAME=ai-splunk-server
+OWNER_ID='<cluster.name>/<splunk.standaloneName>'
+
+kubectl -n "${AI_NS}" get "${RESOURCE}" "${NAME}" -o yaml
+# Continue only after confirming this is the legacy object for OWNER_ID.
+kubectl -n "${AI_NS}" label "${RESOURCE}" "${NAME}" \
+  app.kubernetes.io/managed-by=splunk-ai-platform-installer \
+  app.kubernetes.io/instance=splunk-ai-internal --overwrite
+kubectl -n "${AI_NS}" annotate "${RESOURCE}" "${NAME}" \
+  "ai.splunk.com/owner-id=${OWNER_ID}" --overwrite
+```
+
+Repeat only for another object explicitly reported by the installer. If ownership cannot be
+proved, rename or remove the conflicting resource through its actual owner, or use another AI
+namespace; never apply the adoption metadata to bypass the guard.
+
 ### Disable and migration semantics
 
 To disable ingress, set `ingress.enabled: false` and re-run the installer with the same
@@ -1391,10 +1452,10 @@ will later be enabled.
 | Category | Contents |
 |---|---|
 | Binaries | `k0s v1.33.13+k0s.1` compatibility baseline (or a cert-manager-compatible explicit `--k0s-version`), `yq v4.44.1` |
-| **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox, plus the exact configured Traefik image when ingress is enabled in `--config`). Both are staged to `/var/lib/k0s/images/` on every node at install time. |
+| **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, the digest-only local-path helper, plus the exact configured Traefik image when ingress is enabled in `--config`). Both are staged to `/var/lib/k0s/images/` on new nodes. When reusing a running cluster, the installer maps every Kubernetes `Node` to a configured SSH endpoint and reconciles only those worker-enabled members; configured controller-only endpoints have no `Node` and are skipped. |
 | Manifests | `cert-manager v1.21.1`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3`, complete Traefik v3.6.25 CRDs and namespaced RBAC template |
 | Helm charts | `kube-prometheus-stack` (version captured at bundle time), `opentelemetry-operator` (version captured at bundle time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
-| GPU packages | `epel-release-latest-9.noarch.rpm`, `cuda-rhel9.repo`, `nvidia-container-toolkit.repo`, PyYAML wheel (all nodes) |
+| GPU packages | `epel-release-latest-9.noarch.rpm`, `cuda-rhel9.repo`, `nvidia-container-toolkit.repo` |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
 Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB)
@@ -1407,6 +1468,14 @@ Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the imag
 > rewrite never touches. They are **separate** from the platform application
 > images you mirror in [Step 2](#step-2--mirror-container-images). Both are
 > required for a working air-gapped cluster.
+
+The add-on inventory is fail-closed. The builder renders every staged Helm chart with the same
+image-affecting values used by installation, omits Helm test hooks, and collects the runtime image
+references from those renders and the required static manifests. A missing chart or manifest, a
+Helm render failure, an empty inventory, an unrendered value, or an untagged/`:latest` image aborts
+bundle creation. The untagged BusyBox helper embedded in local-path-provisioner `v0.0.24` is
+rewritten to the digest-only `docker.io/library/busybox@sha256:...` reference recorded as
+`local_path_helper_image` in `bundle-versions.txt`.
 
 ---
 
@@ -1557,7 +1626,22 @@ chmod +x install_from_airgap_bundle.sh k0s_cluster_with_stack.sh
 4. Installs `k0s` and `yq` from the bundle
 5. Registers a local Helm repository from the bundled `.tgz` files
 6. Exports the local paths plus verified bundle metadata and `AIRGAP_MODE=true`
-7. Runs `k0s_cluster_with_stack.sh install`
+7. Runs `k0s_cluster_with_stack.sh install`. For a new controller, the installer generates the
+   default configuration remotely, modifies and validates it with the bundled `yq` on the install
+   machine, and installs it atomically; no remote Python or PyYAML package is used.
+8. Stages OCI archives under `/var/lib/k0s/images/` before new k0s nodes start. When a running k0s
+   cluster is reused, the installer first maps the live Kubernetes `Node` objects to configured
+   SSH endpoints using node names, reported addresses, and each endpoint's hostname/FQDN/IPs.
+   Controller-only endpoints that have no Kubernetes `Node` are skipped; an actual `Node` with no
+   mapping is fatal because its offline image state cannot be guaranteed.
+9. On the installer host, reads every local archive's OCI `index.json` and derives exact
+   `<image-reference, sha256-digest>` records. On each mapped node, it accepts a record only when
+   `k0s ctr images list` reports that exact name and digest with
+   `io.cri-containerd.pinned=pinned`, proving the k0s bundle importer consumed it. Changed archives
+   are copied through a staging path and moved atomically into the watched directory. If an archive
+   hash already matches but any expected pinned digest is absent or stale, the installer touches
+   the current archive to retrigger k0s's live importer without retransferring it. It then waits
+   for the complete pinned digest inventory before installing the stack.
 
 For an advanced manual extraction, sourcing the generated `airgap-env.sh` performs the same
 metadata checks and exports the image-archive directory. The main installer then independently
@@ -1678,7 +1762,18 @@ After this succeeds on every GPU node, run `install_from_airgap_bundle.sh` norma
 - **device-plugin image.** The bundle includes `nvcr.io/nvidia/k8s-device-plugin` in `addon-images.tar`, staged to `/var/lib/k0s/images/` on every worker, so the DaemonSet starts without pulling from `nvcr.io`.
 - **worker image staging on rejoin.** Workers joined into an existing cluster also receive the image tarballs, so a GPU node added later still comes up Ready offline.
 
-> `install_from_airgap_bundle.sh` also sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the PyYAML artifact in the bundle's `packages/` directory so the installer uses it instead of calling `dnf install python3-pyyaml`. PyYAML does not publish a pure-Python (`none-any`) wheel, so this is normally the source sdist (`PyYAML-*.tar.gz`), which `pip3 install` builds on the node; if a pure-Python wheel is ever published the bundle prefers it. Either way the path is wired up for you — don't expect a specific `.whl` filename.
+The same archive reconciliation runs when the full installer reuses an existing air-gapped k0s
+cluster. It operates on every live Kubernetes `Node` that maps to a configured SSH endpoint,
+skips controller-only endpoints with no `Node`, and fails if any actual `Node` is unmapped.
+Verification compares the name and SHA-256 digest derived directly from each OCI archive index and
+requires k0s's `io.cri-containerd.pinned=pinned` label. A matching archive hash avoids network
+retransfer only when that pinned inventory is intact; otherwise the installer touches the current
+archive to make the running k0s watcher import it again. Image synchronization is fail-closed, so
+mapping, copy, checksum, import, or digest-verification failures stop installation instead of
+continuing toward `ImagePullBackOff`.
+
+Cluster nodes do not install or import PyYAML. YAML transformation happens on the air-gapped
+install machine using the bundled `yq` binary.
 
 **Strategy 2 — Local RPM mirror (for organizations with many nodes)**
 
@@ -1734,7 +1829,6 @@ These variables are set automatically by `install_from_airgap_bundle.sh`. Set th
 | `EPEL_RPM_URL_OVERRIDE` | `dl.fedoraproject.org/pub/epel/epel-release-latest-N.noarch.rpm` | EPEL release RPM for DKMS |
 | `CUDA_REPO_URL_OVERRIDE` | NVIDIA CUDA repo URL for the detected OS | CUDA package repo definition |
 | `NVIDIA_CTK_REPO_URL_OVERRIDE` | `nvidia.github.io/.../nvidia-container-toolkit.repo` | nvidia-container-toolkit repo |
-| `AIRGAP_PYYAML_WHEEL_PATH` | _(not set)_ | Path to the bundled PyYAML artifact (`.whl` if a pure-Python wheel exists, otherwise the `.tar.gz` sdist) for offline pip3 install |
 
 **Other:**
 
@@ -1742,6 +1836,7 @@ These variables are set automatically by `install_from_airgap_bundle.sh`. Set th
 |---|---|---|
 | `AIRGAP_MODE` | `false` | Set to `true` to skip HuggingFace and NVIDIA repo connectivity checks. Env var takes precedence over YAML `cluster.airgap`. |
 | `AIRGAP_BUNDLE_DIR` | _(not set)_ | Path to the extracted bundle directory. |
+| `AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS` | `600` | Positive number of seconds to wait for every OCI-index name/digest pair to appear in containerd with k0s's pinned label on each mapped Kubernetes `Node`. |
 
 **Partial air-gap (override one component only):**
 
@@ -1769,6 +1864,9 @@ Unset variables fall back to the default public URLs automatically.
 | "nvidia-smi not found" in AIRGAP_MODE | Driver not pre-installed | Pre-install using Strategy 1 above |
 | Application images failing to pull | Images not mirrored or `images.registry` wrong | Confirm the application images in `container-images.txt` were mirrored and their component fields / `images.registry` are correct |
 | Air-gapped Traefik is `ImagePullBackOff` | Bundle omitted the ingress-enabled config, or the install config uses a different exact Traefik reference | Rebuild with `prepare_airgap_bundle.sh --config <the-install-config>`; set `images.ingress.traefikImage` explicitly for a mirror because `images.registry` is not applied |
+| "Timed out ... waiting for pinned bundle image digests to import" | An OCI-index name/digest pair is absent, stale, or lacks `io.cri-containerd.pinned=pinned`, or k0s did not finish the retriggered import | Check free disk space and `sudo k0s status`; inspect `sudo k0s ctr images list` and k0s logs, then rerun. A same-hash archive is touched automatically when inventory is incomplete. Increase `AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS` only when a healthy node needs longer. |
+| "Kubernetes Node ... has no configured SSH endpoint" | The live cluster has a worker-enabled `Node` that cannot be matched to any configured controller/worker endpoint, hostname, FQDN, or IP | Add/correct that node in `nodes.existingIPs` and verify SSH hostname/address reporting. The installer will not continue with an unsynchronized Node. Controller-only endpoints without a Kubernetes `Node` are skipped normally. |
+| "Refusing to adopt or overwrite ..." for an internal Splunk object | The fixed-name resource is foreign, legacy/unlabelled, or belongs to another installer owner ID | Inspect the exact object. Adopt it with both label and annotation commands above only when its original ownership is proven; otherwise resolve it through its owner or use a different namespace. |
 
 ---
 
@@ -2292,8 +2390,10 @@ The script downloads various binaries, manifests, Helm charts, OS packages, and 
 | What | URL / Source |
 |------|-------------|
 | iptables-nft | `dnf install -y iptables-nft` (RHEL/Fedora, if missing) |
-| python3-pyyaml | `dnf install -y python3-pyyaml` or `apt-get install -y python3-yaml` or `pip3 install pyyaml` |
 | k0s binary | `curl -sSLf https://get.k0s.sh | sudo env K0S_VERSION=v1.33.13+k0s.1 sh` (compatibility pin; if not already installed) |
+
+The installer has no Python/PyYAML download on cluster nodes. It transforms the generated k0s
+configuration with `yq` on the admin workstation.
 
 ### Downloads on GPU Worker Nodes via SSH
 

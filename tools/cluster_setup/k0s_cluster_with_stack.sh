@@ -1413,34 +1413,295 @@ scp_file() {
   fi
 }
 
-# Stage pre-loaded container-image bundles onto a node so k0s auto-imports them
-# from disk at startup instead of pulling over a (blocked) internet link. Copies
-# EVERY *.tar from the bundle's images/ dir into the node's /var/lib/k0s/images/,
-# covering both k0s control-plane images (k0s-images.tar: pause/calico/kube-proxy/
-# coredns/…) and add-on component images (addon-images.tar: cert-manager/
-# prometheus/metallb/…). k0s imports all tarballs in that directory at startup.
+# Print the SHA-256 digest for a local file on both GNU/Linux and macOS.
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+# Stage pre-loaded container-image bundles onto a node so k0s imports them
+# instead of pulling over a blocked internet link. k0s watches
+# /var/lib/k0s/images while a worker is running, so this helper is valid both
+# before first start and while reconciling an existing cluster. A completed
+# archive is moved atomically into the watched directory; partially copied
+# archives never become visible to the k0s OCI-bundle reconciler.
 #
-# MUST be called AFTER `k0s install` (which, together with the stale-state cleanup,
-# recreates /var/lib/k0s) and BEFORE `k0s start` (k0s scans /var/lib/k0s/images/
-# only at kubelet startup). No-op unless AIRGAP_K0S_IMAGE_DIR points at a dir with
-# at least one *.tar (set only by install_from_airgap_bundle.sh).
+# No-op outside air-gap mode. In air-gap mode every copy/checksum failure is
+# fatal to the caller: continuing would only defer the failure to an opaque
+# ImagePullBackOff later in the installation.
 stage_k0s_image_bundle() {
-  local node_ip="$1"
-  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 0
+  local node_ip="$1" refresh_unchanged="${2:-false}"
+  if [[ -z "${AIRGAP_K0S_IMAGE_DIR:-}" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+      warn "AIRGAP_MODE=true but AIRGAP_K0S_IMAGE_DIR is not configured"
+      return 1
+    fi
+    return 0
+  fi
+  [[ -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || {
+    warn "Air-gap image directory does not exist: ${AIRGAP_K0S_IMAGE_DIR}"
+    return 1
+  }
   local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
-  [[ -f "${_tars[0]}" ]] || return 0
-  ssh_exec "${node_ip}" "sudo mkdir -p /var/lib/k0s/images" \
-    || { warn "    Could not create /var/lib/k0s/images on ${node_ip} — images may fail to pull"; return 0; }
-  local _tar _name
+  [[ -f "${_tars[0]}" ]] || {
+    warn "Air-gap image directory contains no OCI archives: ${AIRGAP_K0S_IMAGE_DIR}"
+    return 1
+  }
+  ssh_exec "${node_ip}" \
+    "sudo mkdir -p /var/lib/k0s/images /var/lib/k0s/.images-staging" \
+    || { warn "Could not prepare the k0s image directories on ${node_ip}"; return 1; }
+
+  local _tar _name _local_hash _remote_hash _remote_tmp _remote_staged
   for _tar in "${_tars[@]}"; do
     _name="$(basename "${_tar}")"
-    log "    Staging image bundle ${_name} on ${node_ip} (/var/lib/k0s/images/)..."
-    if scp_file "${_tar}" "${node_ip}" "/tmp/${_name}"; then
-      ssh_exec "${node_ip}" "sudo mv -f /tmp/${_name} /var/lib/k0s/images/${_name}" \
-        || warn "    Failed to place ${_name} on ${node_ip} — some images may fail to pull"
-    else
-      warn "    Failed to copy ${_name} to ${node_ip} — some images may fail to pull"
+    [[ "${_name}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+      warn "Unsafe OCI archive name: ${_name}"
+      return 1
+    }
+    _local_hash="$(sha256_file "${_tar}")" || {
+      warn "No SHA-256 utility is available to verify ${_tar}"
+      return 1
+    }
+    _remote_hash="$(ssh_exec "${node_ip}" \
+      "sudo sha256sum /var/lib/k0s/images/${_name} 2>/dev/null | awk '{print \$1}'" \
+      2>/dev/null || true)"
+    if [[ "${_remote_hash}" == "${_local_hash}" ]]; then
+      if [[ "${refresh_unchanged}" == "true" ]]; then
+        # A matching archive is not sufficient when containerd lost an image
+        # or an earlier live import failed. Change its mtime so k0s's running
+        # OCI-bundle reconciler processes the archive again without a network
+        # retransmission from the installer host.
+        ssh_exec "${node_ip}" "sudo touch /var/lib/k0s/images/${_name}" || {
+          warn "Failed to retrigger import of ${_name} on ${node_ip}"
+          return 1
+        }
+        log "    Retriggered import of current image bundle ${_name} on ${node_ip}"
+      else
+        log "    Image bundle ${_name} is already current on ${node_ip}"
+      fi
+      continue
     fi
+
+    log "    Staging image bundle ${_name} on ${node_ip} (/var/lib/k0s/images/)..."
+    _remote_tmp="/tmp/${_name}.${_local_hash}.partial"
+    _remote_staged="/var/lib/k0s/.images-staging/${_name}.${_local_hash}.partial"
+    scp_file "${_tar}" "${node_ip}" "${_remote_tmp}" || {
+      warn "Failed to copy ${_name} to ${node_ip}"
+      return 1
+    }
+    if ! ssh_exec "${node_ip}" "
+      set -eu
+      trap 'rm -f ${_remote_tmp}; sudo rm -f ${_remote_staged}' EXIT
+      sudo cp ${_remote_tmp} ${_remote_staged}
+      test \"\$(sudo sha256sum ${_remote_staged} | awk '{print \$1}')\" = '${_local_hash}'
+      sudo mv -f ${_remote_staged} /var/lib/k0s/images/${_name}
+    "; then
+      warn "Failed to verify or place ${_name} on ${node_ip}"
+      return 1
+    fi
+  done
+}
+
+airgap_expected_image_records() {
+  local archive index_json records="" all_records=""
+  local -a archives=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  [[ -f "${archives[0]}" ]] || {
+    warn "No OCI archives found in ${AIRGAP_K0S_IMAGE_DIR}"
+    return 1
+  }
+
+  for archive in "${archives[@]}"; do
+    index_json="$(tar -xOf "${archive}" index.json 2>/dev/null)" || {
+      warn "Unable to read OCI index.json from ${archive}"
+      return 1
+    }
+    records="$(jq -er '
+      .manifests[]
+      | .annotations["org.opencontainers.image.ref.name"] as $name
+      | select($name != null and $name != "")
+      | select(.digest | test("^sha256:[0-9a-f]{64}$"))
+      | [$name, .digest]
+      | @tsv
+    ' <<< "${index_json}" 2>/dev/null)" || {
+      warn "OCI archive has no valid named image descriptors: ${archive}"
+      return 1
+    }
+    all_records+="${records}"$'\n'
+  done
+
+  all_records="$(sed '/^$/d' <<< "${all_records}" | sort -u)"
+  [[ -n "${all_records}" ]] || {
+    warn "OCI archives contain no expected image records"
+    return 1
+  }
+  if ! awk -F '\t' '
+      seen[$1] && seen[$1] != $2 { exit 1 }
+      { seen[$1] = $2 }
+    ' <<< "${all_records}"; then
+    warn "OCI archives assign conflicting digests to the same image name"
+    return 1
+  fi
+  printf '%s\n' "${all_records}"
+}
+
+airgap_pinned_image_records_from_ctr_list() {
+  # containerd's columns are REF TYPE DIGEST SIZE PLATFORMS LABELS. Emit only
+  # records that k0s marked as sourced from an OCI bundle.
+  awk 'NR > 1 && index($0, "io.cri-containerd.pinned=pinned") { print $1 "\t" $3 }'
+}
+
+airgap_images_present_on_node() {
+  local node_ip="$1" expected_records="${2:-}" inventory="" record
+  [[ -n "${expected_records}" ]] || \
+    expected_records="$(airgap_expected_image_records)" || return 1
+
+  # The digest proves that a reused tag points at the content in this bundle;
+  # k0s's pinned label proves the OCI-bundle reconciler consumed it rather than
+  # merely finding an unrelated/pre-existing image with the same name.
+  inventory="$(ssh_exec "${node_ip}" "sudo k0s ctr images list" 2>/dev/null \
+    | airgap_pinned_image_records_from_ctr_list || true)"
+  while IFS= read -r record || [[ -n "${record}" ]]; do
+    [[ -n "${record}" ]] || continue
+    grep -Fqx -- "${record}" <<< "${inventory}" || return 1
+  done <<< "${expected_records}"
+  return 0
+}
+
+wait_for_airgap_images_on_node() {
+  local node_ip="$1"
+  local expected_records expected_count
+  expected_records="$(airgap_expected_image_records)" || return 1
+  expected_count="$(wc -l <<< "${expected_records}" | tr -d '[:space:]')"
+
+  local timeout_seconds="${AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS:-600}"
+  [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]] || {
+    warn "AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS must be a positive integer"
+    return 1
+  }
+  local elapsed=0
+  while (( elapsed <= timeout_seconds )); do
+    if airgap_images_present_on_node "${node_ip}" "${expected_records}"; then
+      log "    Verified ${expected_count} pinned bundle image digests on ${node_ip}"
+      return 0
+    fi
+    (( elapsed >= timeout_seconds )) && break
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  warn "Timed out after ${timeout_seconds}s waiting for pinned bundle image digests to import on ${node_ip}"
+  return 1
+}
+
+sync_airgap_images_to_existing_cluster() {
+  [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
+  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || {
+    warn "AIRGAP_MODE=true but AIRGAP_K0S_IMAGE_DIR is unavailable"
+    return 1
+  }
+
+  local -a configured_endpoints=() worker_endpoints=() mapped_nodes=()
+  IFS=' ' read -ra configured_endpoints <<< "${EXISTING_CONTROLLER_IPS:-} ${EXISTING_WORKER_IPS:-}"
+  (( ${#configured_endpoints[@]} > 0 )) || {
+    warn "An existing air-gapped cluster requires configured controller/worker IPs so image bundles can be synchronized"
+    return 1
+  }
+
+  local cluster_nodes_json node_pairs node_names
+  cluster_nodes_json="$(kubectl get nodes -o json)" || {
+    warn "Unable to discover worker-enabled members of the existing cluster"
+    return 1
+  }
+  node_names="$(jq -er '.items[].metadata.name' <<< "${cluster_nodes_json}" 2>/dev/null)" || {
+    warn "The existing cluster has no worker-enabled Kubernetes nodes"
+    return 1
+  }
+  node_pairs="$(jq -r '
+    .items[]
+    | .metadata.name as $node
+    | ([$node, $node], (.status.addresses[]? | [$node, .address]))
+    | @tsv
+  ' <<< "${cluster_nodes_json}")" || {
+    warn "Unable to read identities for the existing cluster nodes"
+    return 1
+  }
+
+  # Resolve configured SSH endpoints to actual Kubernetes Node identities.
+  # Controller-only k0s processes have no Node and are deliberately skipped;
+  # every real schedulable Node must map to one configured endpoint or the
+  # installer cannot safely guarantee an offline image inventory there.
+  local endpoint remote_ids identities matched_node pair_node pair_id existing
+  for endpoint in "${configured_endpoints[@]}"; do
+    [[ -n "${endpoint}" ]] || continue
+    existing=false
+    for pair_id in "${worker_endpoints[@]}"; do
+      [[ "${pair_id}" == "${endpoint}" ]] && existing=true
+    done
+    [[ "${existing}" == "true" ]] && continue
+
+    remote_ids="$(ssh_exec "${endpoint}" \
+      "{ hostname 2>/dev/null; hostname -f 2>/dev/null; hostname -I 2>/dev/null | tr ' ' '\\n'; } | sed '/^\$/d'" \
+      2>/dev/null)" || {
+      warn "Unable to identify configured k0s node ${endpoint}"
+      return 1
+    }
+    identities="$(printf '%s\n%s\n' "${endpoint}" "${remote_ids}" | sed '/^$/d' | sort -u)"
+    matched_node=""
+    while IFS=$'\t' read -r pair_node pair_id; do
+      [[ -n "${pair_node}" && -n "${pair_id}" ]] || continue
+      if grep -Fqx -- "${pair_id}" <<< "${identities}"; then
+        if [[ -n "${matched_node}" && "${matched_node}" != "${pair_node}" ]]; then
+          warn "Configured endpoint ${endpoint} ambiguously matches multiple Kubernetes Nodes"
+          return 1
+        fi
+        matched_node="${pair_node}"
+      fi
+    done <<< "${node_pairs}"
+    if [[ -z "${matched_node}" ]]; then
+      log "    Skipping configured controller-only or non-member endpoint ${endpoint}"
+      continue
+    fi
+
+    existing=false
+    for pair_node in "${mapped_nodes[@]}"; do
+      [[ "${pair_node}" == "${matched_node}" ]] && existing=true
+    done
+    if [[ "${existing}" == "false" ]]; then
+      worker_endpoints+=("${endpoint}")
+      mapped_nodes+=("${matched_node}")
+    fi
+  done
+
+  while IFS= read -r pair_node; do
+    [[ -n "${pair_node}" ]] || continue
+    existing=false
+    for pair_id in "${mapped_nodes[@]}"; do
+      [[ "${pair_id}" == "${pair_node}" ]] && existing=true
+    done
+    if [[ "${existing}" == "false" ]]; then
+      warn "Kubernetes Node ${pair_node} has no configured SSH endpoint; cannot synchronize its air-gap images"
+      return 1
+    fi
+  done <<< "${node_names}"
+
+  log "Synchronizing bundled images to the existing k0s cluster..."
+  local node_ip expected_records refresh_unchanged
+  expected_records="$(airgap_expected_image_records)" || return 1
+  for node_ip in "${worker_endpoints[@]}"; do
+    ssh_exec "${node_ip}" "command -v k0s >/dev/null 2>&1 && sudo k0s status >/dev/null 2>&1" || {
+      warn "Existing air-gap image synchronization supports k0s nodes only; ${node_ip} is not a running k0s worker"
+      return 1
+    }
+    refresh_unchanged=false
+    airgap_images_present_on_node "${node_ip}" "${expected_records}" || refresh_unchanged=true
+    stage_k0s_image_bundle "${node_ip}" "${refresh_unchanged}" || return 1
+    wait_for_airgap_images_on_node "${node_ip}" || return 1
   done
 }
 
@@ -1695,13 +1956,6 @@ preflight_check_remote_deps() {
   for ip in "${_all_ips[@]}"; do
     [[ -z "$ip" ]] && continue
 
-    # python3
-    if ssh_exec "${ip}" "command -v python3 >/dev/null 2>&1"; then
-      pf_ok "${ip}: python3 found"
-    else
-      pf_warn "${ip}: python3 not found — installer will attempt install via dnf/apt"
-    fi
-
     # passwordless sudo
     if ssh_exec "${ip}" "sudo -n true 2>/dev/null"; then
       pf_ok "${ip}: passwordless sudo available"
@@ -1790,29 +2044,6 @@ prepare_nodes_for_k0s() {
       # Persist across reboots
       sudo mkdir -p /etc/modules-load.d
       printf 'br_netfilter\noverlay\nnf_conntrack\n' | sudo tee /etc/modules-load.d/k0s.conf >/dev/null
-
-      # Ensure python3 + PyYAML are available (used for k0s config generation)
-      if python3 -c 'import yaml' 2>/dev/null; then
-        echo "python3+pyyaml already present"
-      else
-        echo "Installing python3-pyyaml..."
-        # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
-        # back to the OS package manager (which will succeed if a local repo
-        # mirror is configured on the node).  Internet-only paths are guarded
-        # by the AIRGAP_PYYAML_WHEEL_PATH check so we never silently skip them.
-        if [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
-          echo "Installing pyyaml from bundled wheel ${AIRGAP_PYYAML_WHEEL_PATH}..."
-          sudo pip3 install --no-index --find-links="$(dirname "${AIRGAP_PYYAML_WHEEL_PATH}")" pyyaml 2>/dev/null \
-            || sudo pip3 install "${AIRGAP_PYYAML_WHEEL_PATH}" 2>/dev/null \
-            || echo "WARN: pip3 wheel install failed — python3-pyyaml may be missing"
-        elif command -v dnf >/dev/null 2>&1; then
-          sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
-        elif command -v apt-get >/dev/null 2>&1; then
-          sudo apt-get install -y python3-yaml 2>/dev/null || true
-        else
-          echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
-        fi
-      fi
 
       # Install k0s binary if not present
       if command -v k0s >/dev/null 2>&1; then
@@ -2044,6 +2275,71 @@ configure_insecure_registry_on_node() {
   log "  ✓ Insecure registry configured on ${node_ip}"
 }
 
+# Generate the controller configuration without requiring Python or PyYAML on
+# the remote node. `k0s config create` still runs on the target so its detected
+# bind address is preserved; the installer-host yq then applies our supported
+# overrides before the file is atomically installed back on the controller.
+generate_k0s_controller_config() {
+  local controller_ip="$1"
+  local local_config remote_config remote_staged_config
+  local internal_address effective_external_address
+  local_config="$(mktemp)" || err "Unable to create a temporary k0s config file"
+  remote_config="/tmp/k0s-config-${BASHPID}.yaml"
+  remote_staged_config="/etc/k0s/.k0s-${BASHPID}.yaml"
+
+  if ! ssh_exec "${controller_ip}" "k0s config create" > "${local_config}"; then
+    rm -f "${local_config}"
+    err "Unable to generate the default k0s configuration on ${controller_ip}"
+  fi
+
+  internal_address="$(yq eval '.spec.api.address // ""' "${local_config}")" || {
+    rm -f "${local_config}"
+    err "Unable to read the generated k0s API address"
+  }
+  effective_external_address="${K0S_API_EXTERNAL_ADDRESS:-${internal_address}}"
+  if [[ -z "${effective_external_address}" ]]; then
+    rm -f "${local_config}"
+    err "The generated k0s configuration has no API address; set cluster.apiExternalAddress explicitly"
+  fi
+
+  if ! env \
+      K0S_CONTROLLER_IP="${controller_ip}" \
+      K0S_EFFECTIVE_EXTERNAL_ADDRESS="${effective_external_address}" \
+      yq eval --inplace '
+        .spec.api.sans = (
+          ((.spec.api.sans // [])
+            + [strenv(K0S_CONTROLLER_IP), strenv(K0S_EFFECTIVE_EXTERNAL_ADDRESS)])
+          | map(select(. != ""))
+          | unique
+        )
+        | .spec.api.externalAddress = strenv(K0S_EFFECTIVE_EXTERNAL_ADDRESS)
+        | .spec.network.provider = "calico"
+        | .spec.network.calico.mode = "vxlan"
+        | .spec.storage.type = "kine"
+        | .spec.storage.kine.extraArgs."compact-interval" = "5m"
+      ' "${local_config}"; then
+    rm -f "${local_config}"
+    err "Unable to apply installer settings to the generated k0s configuration"
+  fi
+
+  yq eval '.' "${local_config}" >/dev/null || {
+    rm -f "${local_config}"
+    err "Generated k0s configuration is not valid YAML"
+  }
+  scp_file "${local_config}" "${controller_ip}" "${remote_config}" || {
+    rm -f "${local_config}"
+    err "Unable to copy the generated k0s configuration to ${controller_ip}"
+  }
+  rm -f "${local_config}"
+
+  ssh_exec "${controller_ip}" "
+    set -eu
+    trap 'rm -f ${remote_config}; sudo rm -f ${remote_staged_config}' EXIT
+    sudo install -D -m 0600 ${remote_config} ${remote_staged_config}
+    sudo mv -f ${remote_staged_config} /etc/k0s/k0s.yaml
+  " || err "Unable to install /etc/k0s/k0s.yaml on ${controller_ip}"
+}
+
 # ====== K0S CLUSTER INSTALLATION ======
 install_k0s_cluster() {
   log "Installing k0s cluster..."
@@ -2059,7 +2355,7 @@ install_k0s_cluster() {
 
   log "Primary controller IP: ${controller_ip}"
 
-  # Prepare all nodes (firewalld, iptables, python3)
+  # Prepare all nodes (firewalld, kernel modules, and the pinned k0s binary)
   local all_ips=("${CONTROLLER_IPS[@]}")
   if [[ ${#WORKER_IPS[@]} -gt 0 ]]; then
     all_ips+=("${WORKER_IPS[@]}")
@@ -2097,7 +2393,6 @@ install_k0s_cluster() {
   # /tmp is cleared on reboot which caused k0s to fall back to defaults
   # (including --compact-interval=0) after a node restart.
   log "Generating k0s configuration..."
-  ssh_exec "${controller_ip}" "sudo mkdir -p /etc/k0s && k0s config create | sudo tee /etc/k0s/k0s.yaml >/dev/null"
 
   # Configure k0s API with the controller IP for SANs and externalAddress.
   # By default k0s advertises the controller's private bind address. Clusters
@@ -2109,77 +2404,7 @@ install_k0s_cluster() {
   else
     log "Using the controller's auto-detected private address for the k0s API"
   fi
-  ssh_exec "${controller_ip}" "cat > /tmp/k0s-config-update.py <<'PYSCRIPT'
-import yaml
-
-# Read the k0s config
-with open('/etc/k0s/k0s.yaml', 'r') as f:
-    config = yaml.safe_load(f)
-
-# Add the controller IP to SANs (for kubectl access and cluster communication)
-if 'spec' not in config:
-    config['spec'] = {}
-if 'api' not in config['spec']:
-    config['spec']['api'] = {}
-if 'sans' not in config['spec']['api']:
-    config['spec']['api']['sans'] = []
-
-config['spec']['api']['sans'].append('${controller_ip}')
-
-_configured_external_addr = '${K0S_API_EXTERNAL_ADDRESS}'
-if _configured_external_addr and _configured_external_addr not in config['spec']['api']['sans']:
-    config['spec']['api']['sans'].append(_configured_external_addr)
-
-# externalAddress must be an address that EVERY cluster member can reach --
-# including the controller reaching ITSELF. It is baked into the worker join
-# token AND into the in-cluster 'kubernetes' Service endpoint (10.96.0.1).
-#
-# On clouds (AWS/GCP/Azure) an instance CANNOT reach its own PUBLIC IP -- there
-# is no NAT hairpin for an instance's own elastic IP. So if the config's
-# controller IP is a public IP and we use it here:
-#   1. the controller's own pods (e.g. calico-node) can't reach the API via the
-#      ClusterIP, the CNI never initializes, and the control-plane node stays
-#      NotReady ('cni plugin not initialized' / dial 10.96.0.1:443 i/o timeout);
-#   2. same-VPC workers get a join token pointing at the public IP and need
-#      extra public-IP security-group rules just to fetch it.
-#
-# Use cluster.apiExternalAddress when explicitly configured for public-only or
-# otherwise routed worker topologies. Otherwise use the node's PRIVATE bind
-# address -- 'k0s config create' already auto-detected it into spec.api.address
-# (it is what kube-apiserver uses for --advertise-address). The public/SSH IP
-# stays in 'sans' above, so a kubeconfig pointed at it keeps a valid cert.
-_internal_addr = config['spec']['api'].get('address')
-_external_addr = _configured_external_addr or _internal_addr
-if _external_addr:
-    config['spec']['api']['externalAddress'] = _external_addr
-# else: leave externalAddress unset -- k0s falls back to spec.api.address
-
-# Set Calico as network provider
-if 'network' not in config['spec']:
-    config['spec']['network'] = {}
-config['spec']['network']['provider'] = 'calico'
-if 'calico' not in config['spec']['network']:
-    config['spec']['network']['calico'] = {}
-config['spec']['network']['calico']['mode'] = 'vxlan'
-
-# Set kine for storage with compaction enabled to prevent unbounded DB growth.
-# k0s KineConfig exposes extraArgs (map) and rawArgs (slice) — there is no
-# compactInterval field; the flag must be passed via extraArgs.
-if 'storage' not in config['spec']:
-    config['spec']['storage'] = {}
-config['spec']['storage']['type'] = 'kine'
-if 'kine' not in config['spec']['storage']:
-    config['spec']['storage']['kine'] = {}
-if 'extraArgs' not in config['spec']['storage']['kine']:
-    config['spec']['storage']['kine']['extraArgs'] = {}
-config['spec']['storage']['kine']['extraArgs']['compact-interval'] = '5m'
-
-# Write back
-with open('/etc/k0s/k0s.yaml', 'w') as f:
-    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-PYSCRIPT"
-
-  ssh_exec "${controller_ip}" "sudo python3 /tmp/k0s-config-update.py"
+  generate_k0s_controller_config "${controller_ip}"
 
   log "Verifying k0s configuration includes controller IP..."
   ssh_exec "${controller_ip}" "sudo grep -A3 'api:' /etc/k0s/k0s.yaml | head -5"
@@ -2187,9 +2412,9 @@ PYSCRIPT"
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."
   ssh_exec "${controller_ip}" "sudo k0s install controller --config /etc/k0s/k0s.yaml --enable-worker"
-  # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
-  # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
-  stage_k0s_image_bundle "${controller_ip}"
+  # Stage after install recreates /var/lib/k0s and before the first start.
+  stage_k0s_image_bundle "${controller_ip}" || \
+    err "Unable to stage air-gap images on controller ${controller_ip}"
   # Remove stale v1 drop-in before start — containerd 2.x rejects the grpc.v1.cri
   # plugin key at preflight, crashing k0s before configure_insecure_registry_on_node
   # can execute its own cleanup.
@@ -2240,7 +2465,8 @@ PYSCRIPT"
       log "  ✓ k0s installed on ${worker_ip}"
       # Air-gap: stage k0s system images now — after install (recreated
       # /var/lib/k0s), before this worker is started in the loop below.
-      stage_k0s_image_bundle "${worker_ip}"
+      stage_k0s_image_bundle "${worker_ip}" || \
+        err "Unable to stage air-gap images on worker ${worker_ip}"
     else
       warn "  ✗ Failed to install k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
@@ -3187,6 +3413,60 @@ CERT_MANAGER_COMPONENTS
 # cert-manager reissues the leaf automatically; an installer rerun compares
 # the certificate fingerprint and recycles the OnDelete Splunk pod so splunkd
 # actually loads the new files.
+splunk_assert_owned_or_absent() {
+  local namespace="$1" resource="$2" name="$3"
+  local object_json="" expected_owner_id="${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+
+  if ! object_json="$(kubectl -n "${namespace}" get "${resource}" "${name}" \
+      --ignore-not-found -o json)"; then
+    err "Unable to verify ownership of ${namespace}/${resource}/${name}"
+    return 1
+  fi
+  [[ -z "${object_json}" ]] && return 0
+
+  if ! jq -e --arg owner_id "${expected_owner_id}" '
+      .metadata.labels["app.kubernetes.io/managed-by"] == "splunk-ai-platform-installer"
+      and .metadata.labels["app.kubernetes.io/instance"] == "splunk-ai-internal"
+      and .metadata.annotations["ai.splunk.com/owner-id"] == $owner_id
+    ' <<< "${object_json}" >/dev/null; then
+    err "Refusing to adopt or overwrite ${namespace}/${resource}/${name}: it exists without this installer's Splunk ownership metadata.
+    Inspect it first: kubectl -n ${namespace} get ${resource} ${name} -o yaml
+    Only for a verified legacy object created by this installer, explicitly adopt it with:
+      kubectl -n ${namespace} label ${resource} ${name} app.kubernetes.io/managed-by=splunk-ai-platform-installer app.kubernetes.io/instance=splunk-ai-internal --overwrite
+      kubectl -n ${namespace} annotate ${resource} ${name} ai.splunk.com/owner-id='${expected_owner_id}' --overwrite
+    Otherwise rename/remove the conflicting object or choose a different namespace."
+    return 1
+  fi
+}
+
+preflight_internal_splunk_resource_ownership() {
+  [[ "${SPLUNK_MODE}" == "internal" ]] || return 0
+
+  # Check the entire fixed-name internal Splunk footprint before applying any
+  # certificate or workload object. This prevents a late ConfigMap/Standalone
+  # collision from leaving behind a newly created CA, leaf key, or Secret.
+  splunk_assert_owned_or_absent "${AI_NS}" issuer.cert-manager.io ai-splunk-selfsigned || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" certificate.cert-manager.io ai-splunk-ca || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" secret ai-splunk-ca-tls || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" issuer.cert-manager.io ai-splunk-ca-issuer || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" certificate.cert-manager.io ai-splunk-server || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" secret ai-splunk-server-tls || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" configmap splunk-defaults || return 1
+
+  # The first transaction preflight runs before the Splunk Operator installs
+  # its CRD. An absent CRD proves no Standalone object can exist; any discovery
+  # error remains fatal. Later preflights inspect the Standalone itself.
+  local standalone_crd=""
+  standalone_crd="$(kubectl get crd standalones.enterprise.splunk.com \
+    --ignore-not-found -o name)" || {
+    err "Unable to discover the Standalone CRD during ownership preflight"
+    return 1
+  }
+  if [[ -n "${standalone_crd}" ]]; then
+    splunk_assert_owned_or_absent "${AI_NS}" standalone.enterprise.splunk.com "${AI_STANDALONE_NAME}" || return 1
+  fi
+}
+
 provision_splunk_cert() {
   if [[ "${SPLUNK_MODE}" != "internal" ]]; then
     log "Splunk mode=${SPLUNK_MODE} — skipping Splunk cert provisioning (no in-cluster Splunk)"
@@ -3197,6 +3477,9 @@ provision_splunk_cert() {
 
   ensure_namespace "${AI_NS}"
   wait_for_cert_manager_webhook 30 10
+
+  preflight_internal_splunk_resource_ownership || \
+    err "Internal Splunk resource ownership preflight failed"
 
   # Service names the Splunk Operator actually creates for a Standalone CR
   # (GetSplunkServiceName in the vendored operator: "splunk-%s-%s-%s" with
@@ -3220,11 +3503,16 @@ provision_splunk_cert() {
     done
   fi
 
-  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
+  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side -f -
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
   name: ai-splunk-selfsigned
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   selfSigned: {}
 ---
@@ -3232,10 +3520,21 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: ai-splunk-ca
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   isCA: true
   commonName: ai-splunk-ca
   secretName: ai-splunk-ca-tls
+  secretTemplate:
+    annotations:
+      ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+    labels:
+      app.kubernetes.io/instance: splunk-ai-internal
+      app.kubernetes.io/managed-by: splunk-ai-platform-installer
   # Keep the installer-owned trust anchor stable and long-lived. Splunk does
   # not hot-reload renewed certificate files, so short default CA rotation
   # would create an avoidable trust mismatch before a controlled restart.
@@ -3254,6 +3553,11 @@ apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
   name: ai-splunk-ca-issuer
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   ca:
     secretName: ai-splunk-ca-tls
@@ -3262,8 +3566,19 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: ai-splunk-server
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   secretName: ai-splunk-server-tls
+  secretTemplate:
+    annotations:
+      ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+    labels:
+      app.kubernetes.io/instance: splunk-ai-internal
+      app.kubernetes.io/managed-by: splunk-ai-platform-installer
   duration: 2160h      # 90d leaf lifetime — pinned explicitly (Part G.1)
   renewBefore: 720h    # reissue 30d before expiry
   privateKey:
@@ -5090,6 +5405,12 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
+  # Fail before creating credentials or defaults when either fixed-name
+  # workload object belongs to another installation. This makes the
+  # ownership guard transactional for this provisioning function.
+  splunk_assert_owned_or_absent "${AI_NS}" configmap splunk-defaults
+  splunk_assert_owned_or_absent "${AI_NS}" standalone.enterprise.splunk.com "${AI_STANDALONE_NAME}"
+
   [[ -n "${SPLUNK_TLS_CERT_HASH}" ]] || \
     SPLUNK_TLS_CERT_HASH="$(certificate_secret_hash "${AI_NS}" ai-splunk-server-tls)" || \
     err "Unable to fingerprint ${AI_NS}/Secret/ai-splunk-server-tls before applying Splunk"
@@ -5135,6 +5456,11 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: splunk-defaults
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 data:
   default.yml: |
     ansible_pre_tasks:
@@ -5249,12 +5575,17 @@ YAML
   fi
   local endpoint_line="        endpoint: ${minio_endpoint}"
 
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  cat <<YAML | kubectl apply --server-side -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
   name: ${AI_STANDALONE_NAME}
   namespace: ${AI_NS}
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   replicas: 1
   etcVolumeStorageConfig:
@@ -6940,6 +7271,12 @@ install_ai_platform_stack() {
     before dependent workloads are installed. Fix the errors above and re-run."
   fi
 
+  # cert-manager CRDs are ready now. Check every existing fixed-name internal
+  # Splunk object before Phase 2 can install/reconcile the Splunk Operator; an
+  # absent Standalone CRD is safely treated as no Standalone object yet.
+  preflight_internal_splunk_resource_ownership || \
+    err "Internal Splunk resource ownership preflight failed"
+
   ensure_s3compat_credentials
 
   # --- Phase 2: cert-manager-dependent components (parallel) ---
@@ -6970,6 +7307,11 @@ install_ai_platform_stack() {
     done < "${phase2_logdir}/${phase2_names[$i]}.log"
   done
   rm -rf "${phase2_logdir}"
+
+  # Fail before the first internal Splunk instance mutation if any fixed-name
+  # certificate, Secret, ConfigMap, or Standalone belongs to somebody else.
+  preflight_internal_splunk_resource_ownership || \
+    err "Internal Splunk resource ownership preflight failed"
 
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
@@ -8364,6 +8706,11 @@ main_install() {
     log ""
   fi
 
+  if [[ "${use_existing_cluster}" == "true" ]]; then
+    sync_airgap_images_to_existing_cluster || \
+      err "Unable to synchronize bundled images to the existing air-gapped k0s cluster"
+  fi
+
   # Install AI Platform stack
   phase_start "AI Platform Stack"
   step_start "Install AI Platform stack"
@@ -9088,7 +9435,7 @@ join_workers() {
     # Thorough cleanup before rejoining (handles stale configurations)
     cleanup_worker_k0s "${worker_ip}"
 
-    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary).
+    # RHEL/Fedora compatibility (firewalld, kernel modules, pinned k0s binary).
     # Handles both online (curl get.k0s.sh) and air-gap (file:// scp) install paths.
     prepare_nodes_for_k0s "${worker_ip}"
 
@@ -9102,12 +9449,13 @@ join_workers() {
     fi
 
     # Air-gap: stage k0s system + add-on images now — after `k0s install`
-    # (which recreated /var/lib/k0s) and BEFORE the worker is started below.
+    # (which recreated /var/lib/k0s) and before the worker is started below.
     # Without this a worker joined via this subcommand starts with an empty
     # /var/lib/k0s/images/, so its calico/kube-proxy pods try to pull from the
     # (blocked) internet and the node never becomes Ready. No-op when
     # AIRGAP_K0S_IMAGE_DIR is unset (i.e. not an air-gap install).
-    stage_k0s_image_bundle "${worker_ip}"
+    stage_k0s_image_bundle "${worker_ip}" || \
+      err "Unable to stage air-gap images on worker ${worker_ip}"
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."

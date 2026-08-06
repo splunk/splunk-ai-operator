@@ -175,6 +175,15 @@ restart. The installer will:
 5. In internal Splunk mode, route Splunk Web to its HTTPS backend through a CA- and
    hostname-validating `ServersTransport`; the installer does not use `insecureSkipVerify`.
 6. Wire up SAIA and, if enabled, Splunk's management port, then print the HTTPS URLs.
+7. After cert-manager Phase 1 and before Phase 2 installs or can reconcile the Splunk Operator,
+   transaction-preflight the fixed-name resources. Check the configured Standalone when its CRD
+   exists; safely skip only that impossible object when the CRD is absent, and fail on discovery
+   errors. Repeat the full preflight after Phase 2 and before AI-namespace image-pull Secret
+   reconciliation or any internal Splunk mutation. Every existing object
+   must carry both installer labels and the exact
+   `ai.splunk.com/owner-id=<cluster.name>/<splunk.standaloneName>` annotation. A foreign,
+   unlabelled, or differently owned object blocks the entire transaction instead of allowing a
+   partial CA/key/workload mutation.
 
 With `ingress.enabled: false` (or an omitted block), the installer runs ownership-labelled disable
 reconciliation. On a never-enabled cluster with no fixed-name collision this changes nothing. An
@@ -313,6 +322,18 @@ The bundle wrapper validates its k0s/cert-manager metadata and this exact config
 copying binaries onto the install host. Sourcing the generated `airgap-env.sh` manually exports the
 same bundle metadata; the main installer repeats the match check.
 
+Bundle image enumeration is fail-closed: charts are rendered with the installation's
+image-affecting values and Helm test hooks excluded, required manifests must be present, and
+untagged/`:latest` or unrendered runtime references are rejected. The local-path-provisioner
+BusyBox helper is rewritten to a digest-only `docker.io/library/busybox@sha256:...` reference.
+When an existing running air-gapped k0s cluster is reused, the installer maps every Kubernetes
+`Node` to a configured SSH endpoint,
+skipping controller-only endpoints and failing if an actual `Node` is unmapped. It derives exact
+name/digest records from each OCI archive index and requires the corresponding
+`io.cri-containerd.pinned=pinned` containerd record. Changed archives are hash-synced into
+`/var/lib/k0s/images/`; if a same-hash archive has missing/stale inventory, touching it retriggers
+k0s import without retransmission or restart.
+
 ## Certificate Renewal Operations
 
 cert-manager renews both the Traefik frontend certificates and the internal Splunk certificates
@@ -405,3 +426,4 @@ The ConfigMap also does not follow Secret changes automatically; use the renewal
 | Splunk Web returns 502 after certificate renewal | Splunk still has old files loaded, or `ai-splunk-ca-public` is stale | Re-run the full installer with the original AI namespace; it performs the controlled OnDelete pod recycle when the leaf changed and refreshes the CA-only ConfigMap |
 | HTTPS works with `-k` but fails normally | Generated CA is not trusted, or the URL does not match a configured IP/DNS SAN | Import the current generated CA and use a worker IP or `ingress.hostname`; after disable/re-enable, import the newly generated CA |
 | Air-gapped Traefik pod is `ImagePullBackOff` | Bundle was built without the ingress-enabled config, or it used a different image reference | Rebuild with `prepare_airgap_bundle.sh --config <the-install-config>` and transfer the new bundle |
+| Installer refuses to adopt or overwrite an internal Splunk TLS object | The object lacks the two installer labels, has no owner ID, or belongs to another `<cluster>/<Standalone>` | Inspect the exact resource. Only for a proven legacy object from the same installation, run both `kubectl label` and `kubectl annotate` commands printed by the installer; otherwise resolve it through its owner or use another namespace. |

@@ -21,6 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 YQ_VERSION="v4.44.1"
 CERT_MANAGER_VERSION="v1.21.1"
 LOCAL_PATH_PROVISIONER_VERSION="v0.0.24"
+# local-path-provisioner v0.0.24 embeds an untagged helper image in its
+# ConfigMap. Rewrite that runtime manifest to an immutable digest before it is
+# bundled so an offline install never resolves the mutable implicit :latest.
+LOCAL_PATH_HELPER_IMAGE="docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
 NVIDIA_DEVICE_PLUGIN_VERSION="v0.17.3"
 METALLB_CHART_VERSION="0.14.8"
 KUBERAY_CHART_VERSION="1.2.2"
@@ -105,7 +109,6 @@ WHAT IS BUNDLED
     epel-release-latest-<N>.noarch.rpm  — EPEL RPM for RHEL/AL2023
     cuda-<os>.repo                      — CUDA package repository definition
     nvidia-container-toolkit.repo       — nvidia-container-toolkit RPM repo definition
-    pyyaml-*.whl                        — PyYAML pure-Python wheel (all nodes)
 
   airgap-env.sh         — Source this to set env-var overrides before a manual install
   container-images.txt  — List of container images to mirror to your internal registry
@@ -130,7 +133,6 @@ ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   EPEL_RPM_URL_OVERRIDE             URL/path to EPEL release RPM (GPU nodes)
   CUDA_REPO_URL_OVERRIDE            URL/path to CUDA .repo file (GPU nodes)
   NVIDIA_CTK_REPO_URL_OVERRIDE      URL/path to nvidia-container-toolkit .repo (GPU nodes)
-  AIRGAP_PYYAML_WHEEL_PATH          Path to PyYAML .whl file (all nodes, optional)
   AIRGAP_K0S_IMAGE_DIR              Directory containing offline OCI image archives
   AIRGAP_BUNDLE_VERSION_FILE        Verified bundle-versions.txt path
   BUNDLE_CERT_MANAGER_VERSION       Verified cert-manager version metadata
@@ -167,7 +169,6 @@ GPU NODE PACKAGES (packages/ directory)
     - EPEL release RPM (installs EPEL repo for DKMS)
     - CUDA .repo file (redirects dnf to the bundled content if served via HTTP)
     - nvidia-container-toolkit .repo file
-    - PyYAML wheel (pure Python, installed via pip3 --no-index)
 
   NOTE: The CUDA and nvidia-container-toolkit .repo files redirect dnf to
   developer.download.nvidia.com. For a truly offline install you still need
@@ -220,6 +221,144 @@ download() {
   if ! curl -fsSL --retry 3 --retry-delay 5 -o "$dest" "$url"; then
     err "Download failed: $url"
   fi
+}
+
+pin_local_path_helper_image() {
+  local manifest="$1"
+  local temp_manifest="${manifest}.tmp"
+
+  # The helperPod.yaml is embedded inside a ConfigMap, so a Kubernetes-aware
+  # YAML rewrite cannot address it as a normal Pod field. Require exactly one
+  # replacement; a changed upstream manifest must fail the bundle build rather
+  # than silently reintroduce an untagged helper image.
+  if ! awk -v replacement="${LOCAL_PATH_HELPER_IMAGE}" '
+    BEGIN { replacements = 0 }
+    /^[[:space:]]*image:[[:space:]]*busybox[[:space:]]*$/ {
+      sub(/busybox[[:space:]]*$/, replacement)
+      replacements++
+    }
+    { print }
+    END { if (replacements != 1) exit 42 }
+  ' "${manifest}" > "${temp_manifest}"; then
+    rm -f -- "${temp_manifest}"
+    err "Expected exactly one untagged local-path helper image in ${manifest}; upstream manifest format may have changed."
+  fi
+
+  mv -- "${temp_manifest}" "${manifest}"
+}
+
+extract_image_references() {
+  local manifest="$1"
+  local references
+
+  # Operators often carry images for workloads they create later in command
+  # arguments (for example --collector-image=... or
+  # --prometheus-config-reloader=...), not in their own Pod's `image:` field.
+  # Those deferred images are just as necessary offline as directly rendered
+  # containers, so enumerate both forms from the final rendered manifest.
+  references="$({
+    grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"'[:space:]]+' "${manifest}" \
+      | sed -E 's/^image:[[:space:]]*["'"'"']?//' || true
+    grep -hoE -- '--[[:alnum:]_.-]+=([[:alnum:]_.-]+(:[0-9]+)?/)+([[:alnum:]_.-]+:[[:alnum:]_][[:alnum:]_.-]*(@sha256:[[:xdigit:]]{64})?|[[:alnum:]_.-]+@sha256:[[:xdigit:]]{64})' "${manifest}" \
+      | sed -E 's/^--[[:alnum:]_.-]+=//' || true
+  } | sed '/^$/d')"
+  [[ -n "${references}" ]] || return 1
+  printf '%s\n' "${references}"
+}
+
+render_chart_for_image_inventory() {
+  local chart_path="$1" output_path="$2" chart_file release_name namespace
+  local -a install_values=()
+
+  chart_file="$(basename "${chart_path}")"
+  case "${chart_file}" in
+    kube-prometheus-stack-*.tgz)
+      release_name="kube-prometheus-stack"
+      namespace="monitoring"
+      install_values=(
+        --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+        --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false
+      )
+      ;;
+    opentelemetry-operator-*.tgz)
+      release_name="opentelemetry-operator"
+      namespace="opentelemetry-operator-system"
+      # Keep these values identical to install_otel_operator_and_contrib_collector.
+      install_values=(
+        --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib
+        --set admissionWebhooks.certManager.enabled=true
+      )
+      ;;
+    kuberay-operator-*.tgz)
+      release_name="kuberay-operator"
+      namespace="ray-system"
+      install_values=(
+        --set image.repository=quay.io/kuberay/operator
+        --set image.tag=v1.2.2
+      )
+      ;;
+    metallb-*.tgz)
+      release_name="metallb"
+      namespace="metallb-system"
+      ;;
+    *)
+      err "No install-equivalent image-rendering profile exists for chart: ${chart_file}"
+      ;;
+  esac
+
+  # Helm test hooks are not installed by `helm upgrade --install`; including
+  # them adds mutable helper images that are irrelevant to runtime and
+  # breaks deterministic offline inventory validation.
+  if ! helm template "${release_name}" "${chart_path}" \
+    --namespace "${namespace}" \
+    --skip-tests \
+    "${install_values[@]}" > "${output_path}"; then
+    err "Failed to render ${chart_file} while enumerating add-on images."
+  fi
+  [[ -s "${output_path}" ]] \
+    || err "Helm rendered no manifests for ${chart_file}; refusing an incomplete add-on image bundle."
+}
+
+validate_addon_image_reference() {
+  local image="$1" name_part leaf tag digest
+
+  [[ -n "${image}" ]] || err "Add-on image inventory contains an empty reference."
+  [[ "${image}" != *[[:space:]]* ]] \
+    || err "Add-on image reference contains whitespace: ${image}"
+  [[ "${image}" != *'{{'* && "${image}" != *'}}'* ]] \
+    || err "Add-on image reference was not fully rendered: ${image}"
+
+  name_part="${image%@*}"
+  [[ "${name_part}" != *@* ]] \
+    || err "Add-on image reference contains multiple digest separators: ${image}"
+  leaf="${name_part##*/}"
+  if [[ "${leaf}" == *:* ]]; then
+    tag="${leaf##*:}"
+    [[ -n "${tag}" ]] || err "Add-on image reference has an empty tag: ${image}"
+    [[ "${tag}" != "latest" ]] \
+      || err "Mutable :latest image is not allowed in the add-on bundle: ${image}"
+  elif [[ "${image}" != *@* ]]; then
+    err "Untagged image is not allowed in the add-on bundle: ${image}"
+  fi
+
+  if [[ "${image}" == *@* ]]; then
+    digest="${image##*@}"
+    [[ "${digest}" =~ ^sha256:[[:xdigit:]]{64}$ ]] \
+      || err "Add-on image has an invalid or unsupported digest: ${image}"
+  fi
+}
+
+validate_addon_image_list() {
+  local image image_count=0
+
+  while IFS= read -r image || [[ -n "${image}" ]]; do
+    image="${image%$'\r'}"
+    validate_addon_image_reference "${image}"
+    ((image_count += 1))
+  done < "$1"
+
+  (( image_count > 0 )) \
+    || err "Could not enumerate any add-on images from the staged charts and manifests."
 }
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────
@@ -347,6 +486,7 @@ download \
 download \
   "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml" \
   "${STAGE_DIR}/manifests/local-path-storage.yaml"
+pin_local_path_helper_image "${STAGE_DIR}/manifests/local-path-storage.yaml"
 
 download \
   "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${NVIDIA_DEVICE_PLUGIN_VERSION}/deployments/static/nvidia-device-plugin.yml" \
@@ -402,56 +542,60 @@ helm pull metallb/metallb \
 # every image those charts/manifests render plus the configured Traefik image,
 # then build a SECOND k0s image bundle (addon-images.tar) that the installer
 # drops at /var/lib/k0s/images/ alongside k0s-images.tar.
-# k0s imports every tarball in that dir at startup, so containerd already has the
-# exact image refs and pods pull them with IfNotPresent — no registry needed.
+# k0s imports every tarball in that directory before first start or through its
+# live image-directory watcher, so containerd has the exact image refs before
+# add-on installation continues — no registry needed.
 log "--- Enumerating add-on component images (rendering charts + manifests) ---"
 ADDON_LIST="${STAGE_DIR}/images/addon-images.list"
-{
-  # Static manifests: grep image: refs (skip the bare 'busybox' with no tag — we
-  # pin busybox:latest explicitly below so containerd has a concrete ref).
-  # Match BOTH *.yaml and *.yml — nvidia-device-plugin.yml uses the .yml
-  # extension, so a bare *.yaml glob silently skipped it and its image
-  # (nvcr.io/nvidia/k8s-device-plugin) never made it into the bundle, leaving
-  # the device-plugin DaemonSet in ImagePullBackOff on air-gapped GPU nodes.
-  # `|| true` on each grep pipeline: a no-match returns exit 1, which under
-  # `set -euo pipefail` would otherwise abort the whole bundle build before the
-  # `[[ -s "${ADDON_LIST}" ]] ... else warn` best-effort fallback below could
-  # run. Same guard the PyYAML URL resolution above already uses.
-  grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
-    "${STAGE_DIR}"/manifests/*.yaml "${STAGE_DIR}"/manifests/*.yml 2>/dev/null \
-    | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
-  # Helm charts: render with default values and grep image: refs. Guard the glob
-  # with compgen so an empty charts/ dir doesn't run the loop once with a literal
-  # unexpanded "*.tgz" path (which makes `helm template` fail and, under set -e,
-  # abort the build).
-  if compgen -G "${STAGE_DIR}/charts/*.tgz" >/dev/null 2>&1; then
-    for _tgz in "${STAGE_DIR}"/charts/*.tgz; do
-      helm template "${_tgz}" 2>/dev/null \
-        | grep -oE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
-        | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
-    done
-  fi
-  # busybox:latest (otel init) — pin a concrete tag so it resolves offline.
-  echo "busybox:latest"
-  # Traefik is configured directly rather than rendered from a chart/manifest,
-  # so include its exact configured reference explicitly when ingress is on.
-  if [[ "${INGRESS_ENABLED}" == "true" ]]; then
-    echo "${TRAEFIK_IMAGE}"
-  fi
-} | grep -E '[:/]' | grep -vE '^busybox$' | sort -u > "${ADDON_LIST}"
+ADDON_CANDIDATES="${STAGE_DIR}/images/.addon-images.candidates"
+: > "${ADDON_CANDIDATES}"
 
-if [[ -s "${ADDON_LIST}" ]]; then
-  log "Add-on images to bundle ($(wc -l < "${ADDON_LIST}")):"
-  while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
-  log "Building add-on image bundle (pulls the images above, may take several minutes)..."
-  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
-    -o "${STAGE_DIR}/images/addon-images.tar" \
-    < "${ADDON_LIST}" \
-    || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
-  log "Add-on image bundle written: ${STAGE_DIR}/images/addon-images.tar ($(du -h "${STAGE_DIR}/images/addon-images.tar" | cut -f1))"
-else
-  warn "Could not enumerate any add-on images from charts/manifests — add-on pods may fail to pull on air-gapped nodes."
+# Static manifests are installation inputs too. Require every expected manifest
+# to exist and contain at least one image rather than treating a missing glob or
+# parser mismatch as an empty, apparently successful inventory.
+for _manifest in \
+  "${STAGE_DIR}/manifests/cert-manager.yaml" \
+  "${STAGE_DIR}/manifests/local-path-storage.yaml" \
+  "${STAGE_DIR}/manifests/nvidia-device-plugin.yml"; do
+  [[ -s "${_manifest}" ]] || err "Required add-on manifest is missing or empty: ${_manifest}"
+  if ! extract_image_references "${_manifest}" >> "${ADDON_CANDIDATES}"; then
+    err "Could not enumerate an image from required add-on manifest: ${_manifest}"
+  fi
+done
+
+# Render the exact four charts that were staged. Each profile mirrors the
+# installer's values, and any Helm error or empty render aborts the build.
+for _tgz in \
+  "${STAGE_DIR}/charts/kube-prometheus-stack-${PROMETHEUS_CHART_VERSION}.tgz" \
+  "${STAGE_DIR}/charts/opentelemetry-operator-${OTEL_CHART_VERSION}.tgz" \
+  "${STAGE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION}.tgz" \
+  "${STAGE_DIR}/charts/metallb-${METALLB_CHART_VERSION}.tgz"; do
+  [[ -s "${_tgz}" ]] || err "Required add-on chart is missing or empty: ${_tgz}"
+  _rendered_manifest="${STAGE_DIR}/images/.rendered-$(basename "${_tgz}").yaml"
+  render_chart_for_image_inventory "${_tgz}" "${_rendered_manifest}"
+  if ! extract_image_references "${_rendered_manifest}" >> "${ADDON_CANDIDATES}"; then
+    err "Rendered chart contains no image references: ${_tgz}"
+  fi
+  rm -f -- "${_rendered_manifest}"
+done
+
+# Traefik is configured directly rather than rendered from a chart/manifest.
+if [[ "${INGRESS_ENABLED}" == "true" ]]; then
+  printf '%s\n' "${TRAEFIK_IMAGE}" >> "${ADDON_CANDIDATES}"
 fi
+
+sort -u "${ADDON_CANDIDATES}" > "${ADDON_LIST}"
+rm -f -- "${ADDON_CANDIDATES}"
+validate_addon_image_list "${ADDON_LIST}"
+
+log "Add-on images to bundle ($(wc -l < "${ADDON_LIST}")):"
+while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
+log "Building add-on image bundle (pulls the images above, may take several minutes)..."
+"${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+  -o "${STAGE_DIR}/images/addon-images.tar" \
+  < "${ADDON_LIST}" \
+  || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
+log "Add-on image bundle written: ${STAGE_DIR}/images/addon-images.tar ($(du -h "${STAGE_DIR}/images/addon-images.tar" | cut -f1))"
 
 # ── 5. GPU node OS packages ───────────────────────────────────────────────────
 # These files are SCPed to GPU nodes by install_from_airgap_bundle.sh before
@@ -464,7 +608,6 @@ fi
 #    local HTTP mirror and redirect CUDA_REPO_URL_OVERRIDE to it.
 #    Without a local mirror, the .repo file still points at NVIDIA's servers.
 #  - nvidia-container-toolkit .repo: same pattern.
-#  - PyYAML wheel: pure-Python, installed offline via pip3 --no-index.
 log "--- Downloading GPU node OS packages (target OS: ${GPU_NODE_OS}) ---"
 
 # Resolve EPEL major from GPU_NODE_OS
@@ -498,41 +641,6 @@ download "${CUDA_REPO_FILE_URL}" "${STAGE_DIR}/packages/${CUDA_REPO_FILENAME}"
 # nvidia-container-toolkit RPM repo definition (text file)
 CTK_REPO_URL="https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo"
 download "${CTK_REPO_URL}" "${STAGE_DIR}/packages/nvidia-container-toolkit.repo"
-
-# PyYAML — fetched from PyPI so the nodes can install it without pip's network
-# access (avoids requiring pip on the bundle machine). PyYAML does NOT publish a
-# pure-Python (none-any) wheel — every wheel is platform-specific (cp3x, manylinux,
-# win) — so we resolve the real download URL from PyPI's per-version JSON metadata
-# rather than guessing a path. The per-version endpoint (.../PyYAML/<ver>/json)
-# lists only that release's files in `urls[]`, so the source sdist is matched
-# reliably and the modern hash-based pythonhosted URL is used verbatim.
-#
-# Each grep is guarded with `|| true`: a no-match returns exit 1, which under
-# `set -euo pipefail` would otherwise abort the whole script mid-resolution.
-log "Resolving PyYAML download URL from PyPI..."
-PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
-  | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
-[[ -z "${PYYAML_VERSION}" ]] && err "Could not resolve latest PyYAML version from PyPI."
-
-PYYAML_META="$(curl -fsSL "https://pypi.org/pypi/PyYAML/${PYYAML_VERSION}/json")" \
-  || err "Could not fetch PyPI metadata for PyYAML ${PYYAML_VERSION}."
-
-# Prefer a pure-Python wheel if one is ever published (future-proofing); the
-# urls[] array here contains only this version's artifacts.
-PYYAML_WHEEL_URL="$(echo "${PYYAML_META}" \
-  | grep -o '"url":"[^"]*none-any\.whl"' | head -1 | cut -d'"' -f4 || true)"
-if [[ -z "${PYYAML_WHEEL_URL}" ]]; then
-  # No pure-Python wheel: fall back to the source sdist (pip3 install builds it
-  # in-place on the node — the on-node installer already handles this).
-  PYYAML_WHEEL_URL="$(echo "${PYYAML_META}" \
-    | grep -o '"url":"[^"]*\.tar\.gz"' | head -1 | cut -d'"' -f4 || true)"
-  warn "No pure-Python PyYAML wheel published; using source sdist for ${PYYAML_VERSION}."
-fi
-[[ -z "${PYYAML_WHEEL_URL}" ]] && err "Could not resolve a PyYAML download URL for ${PYYAML_VERSION}."
-PYYAML_FILENAME="$(basename "${PYYAML_WHEEL_URL}")"
-
-download "${PYYAML_WHEEL_URL}" "${STAGE_DIR}/packages/${PYYAML_FILENAME}"
-echo "${PYYAML_FILENAME}" > "${STAGE_DIR}/packages/pyyaml.filename"
 
 log "GPU node packages downloaded to ${STAGE_DIR}/packages/"
 
@@ -581,7 +689,7 @@ _airgap_env_configure() {
   local bundle_ingress_enabled bundle_traefik_image
   local bundle_prometheus_version bundle_otel_version
   local bundle_kuberay_version bundle_metallb_version
-  local marker_version pyyaml_fname _airgap_binary _airgap_marker
+  local marker_version _airgap_binary _airgap_marker
 
   if [[ -z "${AIRGAP_BUNDLE_DIR:-}" ]]; then
     _airgap_env_error "AIRGAP_BUNDLE_DIR must be set to the bundle extraction path"
@@ -677,16 +785,6 @@ _airgap_env_configure() {
   export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${bundle_kuberay_version}.tgz"
   export METALLB_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/metallb-${bundle_metallb_version}.tgz"
 
-  # GPU node OS packages — the installer reads this path to install PyYAML
-  # without internet when a wheel/source archive was bundled.
-  pyyaml_fname="$(cat "${AIRGAP_BUNDLE_DIR}/packages/pyyaml.filename" 2>/dev/null || true)"
-  if [[ -n "${pyyaml_fname}" ]]; then
-    if [[ ! -f "${AIRGAP_BUNDLE_DIR}/packages/${pyyaml_fname}" ]]; then
-      _airgap_env_error "PyYAML package marker references a missing file: ${pyyaml_fname}"
-      return 1
-    fi
-    export AIRGAP_PYYAML_WHEEL_PATH="${AIRGAP_BUNDLE_DIR}/packages/${pyyaml_fname}"
-  fi
 }
 
 _airgap_env_status=0
@@ -782,6 +880,7 @@ k0s_version=${K0S_VERSION}
 yq_version=${YQ_VERSION}
 cert_manager_version=${CERT_MANAGER_VERSION}
 local_path_provisioner_version=${LOCAL_PATH_PROVISIONER_VERSION}
+local_path_helper_image=${LOCAL_PATH_HELPER_IMAGE}
 nvidia_device_plugin_version=${NVIDIA_DEVICE_PLUGIN_VERSION}
 metallb_chart_version=${METALLB_CHART_VERSION}
 kuberay_chart_version=${KUBERAY_CHART_VERSION}

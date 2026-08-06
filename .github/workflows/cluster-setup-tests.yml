@@ -20,6 +20,12 @@ jobs:
       - name: Run cluster_setup unit tests
         run: bash tools/cluster_setup/test_k0s_cluster_with_stack.sh
 
+      - name: Run cluster_setup hardening regression tests
+        run: |
+          bash tools/cluster_setup/test_k0s_airgap_p0.sh
+          bash tools/cluster_setup/test_prepare_airgap_bundle_images.sh
+          bash tools/cluster_setup/test_splunk_resource_ownership.sh
+
       - name: Run Splunk-optional installer dry-run tests
         run: bash tools/cluster_setup/test_installer_dry_run.sh
 

@@ -93,6 +93,54 @@ the manual steps if you're deploying by hand.
 renewal still requires the controlled restart described below; automatic
 splunkd reload/restart is not implemented.
 
+### k0s ownership guard and legacy upgrades
+
+The k0s installer does not infer ownership from a common resource name. After cert-manager Phase 1
+and before Phase 2 installs or can reconcile the Splunk Operator, it transaction-preflights the
+fixed-name footprint. If the `Standalone` CRD exists, the configured `Standalone` is checked; if
+the CRD is absent, no such object can exist and only that lookup is safely skipped. Discovery
+errors remain fatal. The full preflight repeats after Phase 2 and before AI-namespace image-pull
+Secret reconciliation or any internal Splunk certificate/workload mutation. Both passes verify
+the installer labels and installation ID:
+
+```yaml
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+    app.kubernetes.io/instance: splunk-ai-internal
+  annotations:
+    ai.splunk.com/owner-id: <cluster.name>/<splunk.standaloneName>
+```
+
+This check covers `Issuer/ai-splunk-selfsigned`, `Certificate/ai-splunk-ca`,
+`Secret/ai-splunk-ca-tls`, `Issuer/ai-splunk-ca-issuer`,
+`Certificate/ai-splunk-server`, and `Secret/ai-splunk-server-tls` as one chain. The same guard
+includes `ConfigMap/splunk-defaults` and, whenever its CRD exists, the configured `Standalone`, so
+a pre-existing workload cannot be reconciled by a newly installed operator before ownership is
+verified and the complete footprint passes before any internal Splunk mutation.
+Certificate `secretTemplate` metadata preserves the labels and owner ID on generated Secrets.
+Normal reconciliation does not force server-side field conflicts, and narrower checks are repeated
+at the certificate/workload boundaries as defense in depth.
+
+Consequently, an older installer-created object without the metadata causes a deliberate failure,
+as does an object owned by another cluster/Standalone. First inspect the exact resource printed in
+the error and verify its certificate contents, namespace, SANs, and consumers. Only for a proven
+legacy object from this exact installation, apply both ownership operations shown by the error:
+
+```bash
+kubectl -n <namespace> get <resource> <name> -o yaml
+
+kubectl -n <namespace> label <resource> <name> \
+  app.kubernetes.io/managed-by=splunk-ai-platform-installer \
+  app.kubernetes.io/instance=splunk-ai-internal --overwrite
+kubectl -n <namespace> annotate <resource> <name> \
+  'ai.splunk.com/owner-id=<cluster.name>/<splunk.standaloneName>' --overwrite
+```
+
+Adopt only the object named by the error, then rerun the installer and repeat if another verified
+legacy object is reported. Never label or annotate a foreign or uncertain resource simply to pass
+the preflight; reconcile it through its current owner or use another namespace.
+
 ### Manual steps (if not using a stack installer)
 
 If you're standing up in-cluster Splunk yourself (a different installer, or

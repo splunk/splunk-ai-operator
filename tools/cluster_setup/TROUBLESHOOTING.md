@@ -675,16 +675,114 @@ install (it sets `K0S_INSTALL_URL` automatically).
 
 ---
 
-### python3-pyyaml missing on nodes in air-gap mode
+### "Unable to apply installer settings to the generated k0s configuration"
 
-`install_from_airgap_bundle.sh` automatically sets `AIRGAP_PYYAML_WHEEL_PATH`
-from the bundle's `packages/` directory. If you ran the main installer
-directly, set it manually:
+The controller no longer needs Python or PyYAML. It runs `k0s config create`, while the admin or
+air-gapped install machine applies the supported changes using `yq`, validates the result, and
+copies it back to `/etc/k0s/k0s.yaml` atomically.
+
+Check the installer-host tool and rerun with the current scripts/bundle:
 
 ```bash
-export AIRGAP_PYYAML_WHEEL_PATH="/opt/airgap/airgap-bundle-<date>/packages/PyYAML-6.0.2-cp39-cp39-linux_x86_64.whl"
+yq --version                    # must be mikefarah/yq v4
+command -v yq
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
+
+`install_from_airgap_bundle.sh` installs its bundled `yq` automatically. Do not install PyYAML on
+cluster nodes to address this error; inspect the preceding log message for a failed remote config
+generation, local transformation, copy, or atomic install instead.
+
+---
+
+### "Timed out ... waiting for pinned bundle image digests to import"
+
+When reusing a running air-gapped k0s cluster, the installer derives exact
+`<image-reference, sha256-digest>` records from every OCI archive's `index.json`. A record passes
+only when `k0s ctr images list` contains that exact name and digest with
+`io.cri-containerd.pinned=pinned`. This distinguishes the current bundle content from a stale or
+unrelated image with the same tag. The timeout is fatal so an incomplete reused node cannot be
+hidden until a later `ImagePullBackOff`. On newly installed nodes, archives are staged before k0s
+starts and subsequent node/workload readiness is the gate.
+
+Inspect the affected node:
+
+```bash
+ssh <node> 'sudo k0s status'
+ssh <node> 'df -h /var/lib/k0s && sudo ls -lh /var/lib/k0s/images/'
+ssh <node> 'sudo k0s ctr images list -q | sort'
+ssh <node> 'sudo journalctl -u k0scontroller -u k0sworker --since "15 minutes ago"'
+```
+
+Confirm that every Kubernetes `Node` maps to one configured SSH endpoint. Matching uses the Node
+name/status addresses and the endpoint's SSH-reported hostname, FQDN, and IPs. A configured
+controller-only endpoint has no Kubernetes `Node` and is skipped; an actual `Node` without a
+mapping is fatal. Repair mapping, connectivity, disk space, a corrupt archive, or the k0s service
+and rerun.
+
+If the remote archive hash matches but any pinned name/digest record is absent or stale, the
+installer touches the existing archive to retrigger k0s's live importer without copying the large
+tarball again. Look for `Retriggered import of current image bundle ...`; a fully intact archive
+and inventory instead logs `Image bundle ... is already current`. For a healthy slow node,
+override the 600-second default with a larger positive value:
+
+```bash
+AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS=1200 \
+  ./install_from_airgap_bundle.sh --bundle <bundle.tar.gz> --config <config.yaml>
+```
+
+---
+
+### Air-gap bundle creation stops while enumerating add-on images
+
+This is intentional fail-closed behavior. The builder renders each supported chart with the
+installation's image-affecting values and `--skip-tests`, inspects required static manifests, and
+rejects missing/empty renders, unrendered values, untagged images, and `:latest` images. It also
+rewrites the local-path-provisioner BusyBox helper to a digest-only
+`docker.io/library/busybox@sha256:...` reference.
+
+Use the complete current chart and manifest inputs and fix the first reported error. Do not bypass
+the check or manually delete an image from `addon-images.list`; that can create a bundle which
+passes transfer verification but cannot start offline.
+
+---
+
+### "Refusing to adopt or overwrite" an internal Splunk resource
+
+The installer protects its fixed-name internal Splunk resources with two labels and an
+installation-specific annotation:
+
+```text
+app.kubernetes.io/managed-by=splunk-ai-platform-installer
+app.kubernetes.io/instance=splunk-ai-internal
+ai.splunk.com/owner-id=<cluster.name>/<splunk.standaloneName>
+```
+
+The guard covers the two Issuers, two Certificates, both generated TLS Secrets,
+`ConfigMap/splunk-defaults`, and the configured Splunk `Standalone`. The first transaction
+preflight runs after cert-manager Phase 1 but before Phase 2 installs or can reconcile the Splunk
+Operator. If the Standalone CRD exists, the configured Standalone is checked; if it is absent, no
+Standalone can exist and only that lookup is skipped. CRD discovery errors remain fatal. The full
+preflight repeats after Phase 2 and before AI-namespace image-pull Secret reconciliation or any
+internal Splunk mutation. A failed ownership lookup stops the transaction; routine apply does not
+force field conflicts. Certificate/workload checks remain as defense in depth.
+
+For an upgrade from a verified legacy installation, adopt only the exact object named by the
+error. Inspect it first, then run both commands printed by the installer:
+
+```bash
+kubectl -n <namespace> get <resource> <name> -o yaml
+
+kubectl -n <namespace> label <resource> <name> \
+  app.kubernetes.io/managed-by=splunk-ai-platform-installer \
+  app.kubernetes.io/instance=splunk-ai-internal --overwrite
+kubectl -n <namespace> annotate <resource> <name> \
+  'ai.splunk.com/owner-id=<cluster.name>/<splunk.standaloneName>' --overwrite
+```
+
+Only do this after proving the resource belongs to the same cluster and Standalone. A matching
+name is not evidence of ownership. For foreign or uncertain resources, resolve the conflict with
+its actual owner or install into a different namespace.
 
 ---
 

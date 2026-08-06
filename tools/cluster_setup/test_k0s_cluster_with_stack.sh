@@ -509,7 +509,7 @@ assert_eq "immutable semver-style tag produces no warning" \
 
 # ── Tests: k0s config path ────────────────────────────────────────────────────
 # Verify that the install script uses /etc/k0s/k0s.yaml (not /tmp/k0s.yaml)
-# everywhere — config generation, python update script, install command, verify.
+# everywhere — config generation, yq update, install command, and verification.
 
 suite "k0s config path"
 
@@ -519,11 +519,11 @@ assert_eq "config create writes to /etc/k0s/k0s.yaml" \
 assert_eq "k0s install controller uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'k0s install controller.*--config /etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "python update script reads /etc/k0s/k0s.yaml" \
-  "1" "$(grep -c "open('/etc/k0s/k0s.yaml', 'r')" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "generated config is installed atomically at /etc/k0s/k0s.yaml" \
+  "1" "$(grep -c 'mv -f.*remote_staged_config.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "python update script writes /etc/k0s/k0s.yaml" \
-  "1" "$(grep -c "open('/etc/k0s/k0s.yaml', 'w')" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "remote config generation no longer depends on PyYAML" \
+  "0" "$(grep -cE 'import yaml|python3-pyyaml|k0s-config-update.py' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "verify step uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'grep.*api.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
@@ -536,10 +536,10 @@ assert_eq "optional external API address is loaded from config" \
   "1" "$(grep -c 'K0S_API_EXTERNAL_ADDRESS=.*cluster.apiExternalAddress' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "configured external API address is included in certificate SANs" \
-  "1" "$(grep -c '_configured_external_addr not in.*sans' "${SCRIPT}" | tr -d '[:space:]')"
+  "2" "$(grep -c 'strenv(K0S_EFFECTIVE_EXTERNAL_ADDRESS)' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "configured external API address takes precedence over the private address" \
-  "1" "$(grep -c '_external_addr = _configured_external_addr or _internal_addr' "${SCRIPT}" | tr -d '[:space:]')"
+  "1" "$(grep -c 'effective_external_address=.*K0S_API_EXTERNAL_ADDRESS:-.*internal_address' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: kine compaction ─────────────────────────────────────────────────────
 # Verify that the generated k0s config passes --compact-interval to kine via
@@ -550,17 +550,17 @@ suite "kine compaction"
 assert_eq "kine compact-interval passed via extraArgs" \
   "1" "$(grep -c "extraArgs.*compact-interval\|compact-interval.*5m" "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "extraArgs dict is initialised before setting compact-interval" \
-  "1" "$(grep -c "'extraArgs' not in config\['spec'\]\['storage'\]\['kine'\]" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "yq writes compact-interval through the kine extraArgs map" \
+  "1" "$(grep -c 'storage.kine.extraArgs."compact-interval" = "5m"' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "kine dict is initialised before setting extraArgs" \
-  "1" "$(grep -c "'kine' not in config\['spec'\]\['storage'\]" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "network provider is still set to calico" \
+  "1" "$(grep -c 'spec.network.provider = "calico"' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "storage type is still set to kine" \
-  "1" "$(grep -c "config\['spec'\]\['storage'\]\['type'\] = 'kine'" "${SCRIPT}" | tr -d '[:space:]')"
+  "1" "$(grep -c 'spec.storage.type = "kine"' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "no bare compactInterval field (would be silently ignored by k0s)" \
-  "0" "$(grep -c "kine\]\['compactInterval'\]" "${SCRIPT}" | tr -d '[:space:]')"
+  "0" "$(grep -c 'compactInterval' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: configure_insecure_registry_on_node ────────────────────────────────
 # Verify the function exists, is gated behind IMAGE_REGISTRY_INSECURE, uses
