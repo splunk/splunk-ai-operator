@@ -1,5 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
+
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "ERROR: k0s_cluster_with_stack.sh requires Bash 4 or newer (Bash 5 is recommended)." >&2
+  echo "On macOS, install Homebrew bash and ensure it appears before /bin in PATH." >&2
+  exit 1
+fi
 
 # =============================================================================
 # k0s Cluster Setup Script for Splunk AI Platform
@@ -45,6 +51,16 @@ declare -a POD_LINES=()
 WORKLOAD_PENDING_REASON=""
 VERIFY_RC=0
 K0S_RESET_FAILED=0
+SPLUNK_TLS_CERT_HASH=""
+TRAEFIK_EXPECTED_NODE_COUNT=0
+
+# Keep this pinned compatibility baseline aligned with
+# prepare_airgap_bundle.sh. Kubernetes 1.33 is within both cert-manager
+# v1.21's published matrix and the upper bound published for the current
+# Splunk Operator line; floating k0s would make that relationship drift.
+DEFAULT_K0S_VERSION="v1.33.13+k0s.1"
+K0S_VERSION="${K0S_VERSION:-${DEFAULT_K0S_VERSION}}"
+CERT_MANAGER_VERSION="v1.21.1"
 
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
@@ -416,7 +432,8 @@ show_install_plan() {
   echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
   if [[ "${SPLUNK_MODE}" == "external" ]]; then
-    echo -e "  \033[1mSplunk telemetry :\033[0m external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
+    echo -e "  \033[1mSplunk management:\033[0m ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" >&2
+    echo -e "  \033[1mSplunk HEC       :\033[0m ${SPLUNK_EXTERNAL_HEC_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
   else
     echo -e "  \033[1mSplunk telemetry :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
   fi
@@ -626,6 +643,12 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Kubernetes namespace
   AI_NS=$(yq eval '.kubernetes.namespace' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
 
+  # Kubernetes cluster DNS domain (used in cert-manager Certificate dnsNames
+  # and Splunk endpoint URLs). Defaults to the Kubernetes standard, but can be
+  # overridden for clusters configured with a non-default clusterDomain.
+  CLUSTER_DOMAIN=$(yq eval '.kubernetes.clusterDomain' "${CONFIG_FILE}" 2>/dev/null || echo "cluster.local")
+  [[ "${CLUSTER_DOMAIN}" == "null" || -z "${CLUSTER_DOMAIN}" ]] && CLUSTER_DOMAIN="cluster.local"
+
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
@@ -639,29 +662,62 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
   [[ "${SPLUNK_ENABLED}" != "true" ]] && SPLUNK_ENABLED="false"
 
-  # External Splunk: point telemetry at a Splunk running OUTSIDE the cluster.
-  # When splunk.external.endpoint is set (and splunk.enabled is true), the
-  # script does NOT install the in-cluster Splunk Operator/Standalone — it only
-  # wires the AIPlatform CR at the external HEC endpoint + a Secret holding the
-  # HEC token. The token is supplied via the SPLUNK_HEC_TOKEN env var (never the
-  # config file), mirroring how MINIO_ROOT_PASSWORD works; the script creates
-  # the Secret post-cluster-bootstrap so there is no chicken-and-egg ordering.
-  SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
-  [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
+  # External Splunk has two deliberately separate URLs:
+  #   managementEndpoint — splunkd/JWKS/JWT issuer (normally :8089)
+  #   hecEndpoint        — HEC telemetry ingestion (normally :8088)
+  #
+  # `external.endpoint` used to be documented as the HEC URL even though the
+  # installer rendered it into the management/JWKS field. Keep it as a
+  # deprecated compatibility alias: standard :8088/:8089 URLs can be split
+  # unambiguously; non-standard ports must opt in to the two explicit keys.
+  local _splunk_external_legacy_endpoint
+  _splunk_external_legacy_endpoint="$(yq eval '.splunk.external.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${_splunk_external_legacy_endpoint}" == "null" ]] && _splunk_external_legacy_endpoint=""
+  SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT="$(yq eval '.splunk.external.managementEndpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT=""
+  SPLUNK_EXTERNAL_HEC_ENDPOINT="$(yq eval '.splunk.external.hecEndpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_HEC_ENDPOINT=""
+
+  if [[ -n "${_splunk_external_legacy_endpoint}" ]]; then
+    warn "splunk.external.endpoint is deprecated; set splunk.external.managementEndpoint and splunk.external.hecEndpoint explicitly."
+    if [[ "${_splunk_external_legacy_endpoint}" =~ ^(https?://[^/]+):8088/?$ ]]; then
+      local _splunk_external_base="${BASH_REMATCH[1]}"
+      [[ -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]] && SPLUNK_EXTERNAL_HEC_ENDPOINT="${_splunk_external_legacy_endpoint}"
+      [[ -z "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" ]] && SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT="${_splunk_external_base}:8089"
+      warn "Derived managementEndpoint=${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT} from legacy HEC port 8088. Update the config to remove this inference."
+    elif [[ "${_splunk_external_legacy_endpoint}" =~ ^(https?://[^/]+):8089/?$ ]]; then
+      local _splunk_external_base="${BASH_REMATCH[1]}"
+      [[ -z "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" ]] && SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT="${_splunk_external_legacy_endpoint}"
+      [[ -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]] && SPLUNK_EXTERNAL_HEC_ENDPOINT="${_splunk_external_base}:8088"
+      warn "Derived hecEndpoint=${SPLUNK_EXTERNAL_HEC_ENDPOINT} from legacy management port 8089. Update the config to remove this inference."
+    else
+      # Preserve the old HEC interpretation, but do not guess a management URL
+      # for a custom port. Preflight below will require managementEndpoint.
+      [[ -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]] && SPLUNK_EXTERNAL_HEC_ENDPOINT="${_splunk_external_legacy_endpoint}"
+    fi
+  fi
   SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-hec-external")"
   [[ -z "${SPLUNK_EXTERNAL_SECRET_NAME}" || "${SPLUNK_EXTERNAL_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
   # HEC token: env var only (keep it out of the config file and logs).
   SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
 
+  # Optional customer-supplied CA for a private/internal external Splunk cert
+  # (AIP-4614 Part E). Empty by default — SAIA falls back to its image's
+  # system trust store, which is correct when the external Splunk's cert is
+  # publicly trusted (the common case). The customer pre-creates the Secret
+  # (key ca.crt) themselves; this installer never generates or touches it.
+  SPLUNK_EXTERNAL_CA_SECRET_NAME="$(yq eval '.splunk.external.caCertSecretName // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${SPLUNK_EXTERNAL_CA_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_CA_SECRET_NAME=""
+
   # Derive a single mode so downstream logic is unambiguous:
   #   disabled  — splunk.enabled=false: no Splunk, no telemetry
-  #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
-  #               in-cluster Splunk, use customer's external HEC
+  #   external  — splunk.enabled=true + either external URL set: skip
+  #               in-cluster Splunk, use customer's management/JWKS and HEC
   #   internal  — splunk.enabled=true, no external endpoint: install SOK +
   #               Standalone in-cluster (legacy behavior)
   if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
     SPLUNK_MODE="disabled"
-  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+  elif [[ -n "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" || -n "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" || -n "${_splunk_external_legacy_endpoint}" ]]; then
     SPLUNK_MODE="external"
   else
     SPLUNK_MODE="internal"
@@ -713,6 +769,128 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   IMAGE_PULL_SECRETS_ACR_ENABLED=$(yq eval '.imagePullSecrets.acr.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_CUSTOM_ENABLED=$(yq eval '.imagePullSecrets.custom.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "false")
 
+  # Traefik HTTPS ingress is OPT-IN and defaults to DISABLED. Read booleans
+  # without yq's `// true` operator: that operator treats an explicit YAML
+  # false as absent and silently changes it to true.
+  local ingress_enabled_tag ingress_mgmt_enabled_tag
+  INGRESS_ENABLED="$(yq eval '.ingress.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  if [[ "${INGRESS_ENABLED}" == "null" || -z "${INGRESS_ENABLED}" ]]; then
+    INGRESS_ENABLED="false"
+  else
+    ingress_enabled_tag="$(yq eval '.ingress.enabled | tag' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ "${ingress_enabled_tag}" == "!!bool" ]] || err "ingress.enabled must be a YAML boolean (true or false)"
+  fi
+  INGRESS_HOSTNAME="$(yq eval '.ingress.hostname // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${INGRESS_HOSTNAME}" == "null" ]] && INGRESS_HOSTNAME=""
+  # off | on — `only` is Go's assessment/debug mode and is deliberately not a
+  # supported production setting.
+  INGRESS_FIPS="$(yq eval '.ingress.fips // "off"' "${CONFIG_FILE}" 2>/dev/null || echo "off")"
+  [[ "${INGRESS_FIPS}" == "null" || -z "${INGRESS_FIPS}" ]] && INGRESS_FIPS="off"
+  INGRESS_TLS_MODE="$(yq eval '.ingress.tls.mode // "selfsigned"' "${CONFIG_FILE}" 2>/dev/null || echo "selfsigned")"
+  [[ "${INGRESS_TLS_MODE}" == "null" || -z "${INGRESS_TLS_MODE}" ]] && INGRESS_TLS_MODE="selfsigned"
+  INGRESS_SAIA_PORT="$(yq eval '.ingress.entryPoints.saia.port // 8443' "${CONFIG_FILE}" 2>/dev/null || echo "8443")"
+  INGRESS_SPLUNKWEB_PORT="$(yq eval '.ingress.entryPoints.splunkWeb.port // 8000' "${CONFIG_FILE}" 2>/dev/null || echo "8000")"
+  INGRESS_SPLUNKMGMT_PORT="$(yq eval '.ingress.entryPoints.splunkMgmt.port // 8089' "${CONFIG_FILE}" 2>/dev/null || echo "8089")"
+  INGRESS_SPLUNKMGMT_ENABLED="$(yq eval '.ingress.entryPoints.splunkMgmt.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  if [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "null" || -z "${INGRESS_SPLUNKMGMT_ENABLED}" ]]; then
+    INGRESS_SPLUNKMGMT_ENABLED="false"
+  elif [[ "${INGRESS_ENABLED}" == "true" ]]; then
+    ingress_mgmt_enabled_tag="$(yq eval '.ingress.entryPoints.splunkMgmt.enabled | tag' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ "${ingress_mgmt_enabled_tag}" == "!!bool" ]] || err "ingress.entryPoints.splunkMgmt.enabled must be a YAML boolean (true or false)"
+  else
+    # The disabled path only reconciles old resources away; subordinate stale
+    # values are deliberately ignored so they cannot keep listeners active.
+    INGRESS_SPLUNKMGMT_ENABLED="false"
+  fi
+
+  local default_traefik_image="docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"
+  TRAEFIK_IMAGE="$(yq eval ".images.ingress.traefikImage // \"${default_traefik_image}\"" "${CONFIG_FILE}" 2>/dev/null || echo "${default_traefik_image}")"
+  [[ "${TRAEFIK_IMAGE}" == "null" || -z "${TRAEFIK_IMAGE}" ]] && TRAEFIK_IMAGE="${default_traefik_image}"
+
+  # Both the wrapper and the generated airgap-env.sh identify the concrete
+  # bundle they validated. Re-check its compatibility in the main installer so
+  # a manually sourced environment cannot bypass the wrapper's config/image
+  # contract. Plain cluster.airgap=true remains available for customer-managed
+  # mirrors that do not use a generated bundle.
+  if [[ "${AIRGAP_MODE:-false}" == "true" && -n "${AIRGAP_BUNDLE_VERSION_FILE:-}" ]]; then
+    [[ -f "${AIRGAP_BUNDLE_VERSION_FILE}" ]] || \
+      err "AIRGAP_BUNDLE_VERSION_FILE does not exist: ${AIRGAP_BUNDLE_VERSION_FILE}"
+    [[ "${BUNDLE_K0S_VERSION:-}" == "${K0S_VERSION}" ]] || \
+      err "Air-gap bundle k0s version ${BUNDLE_K0S_VERSION:-missing} does not match installer pin ${K0S_VERSION}"
+    [[ "${BUNDLE_CERT_MANAGER_VERSION:-}" == "${CERT_MANAGER_VERSION}" ]] || \
+      err "Air-gap bundle cert-manager version ${BUNDLE_CERT_MANAGER_VERSION:-missing} does not match installer pin ${CERT_MANAGER_VERSION}"
+    [[ "${BUNDLE_INGRESS_ENABLED:-}" == "true" || "${BUNDLE_INGRESS_ENABLED:-}" == "false" ]] || \
+      err "Air-gap bundle ingress metadata is missing or invalid"
+    [[ -d "${AIRGAP_K0S_IMAGE_DIR:-}" ]] || \
+      err "Air-gap bundle image directory is missing: ${AIRGAP_K0S_IMAGE_DIR:-unset}"
+    compgen -G "${AIRGAP_K0S_IMAGE_DIR}/*.tar" >/dev/null 2>&1 || \
+      err "Air-gap bundle has no image archives in ${AIRGAP_K0S_IMAGE_DIR}"
+    if [[ "${INGRESS_ENABLED}" == "true" ]]; then
+      [[ "${BUNDLE_INGRESS_ENABLED}" == "true" ]] || \
+        err "Install config enables Traefik, but the selected air-gap bundle did not include it"
+      [[ "${BUNDLE_TRAEFIK_IMAGE:-}" == "${TRAEFIK_IMAGE}" ]] || \
+        err "Traefik image mismatch: bundle contains ${BUNDLE_TRAEFIK_IMAGE:-none}, install config requires ${TRAEFIK_IMAGE}"
+    fi
+  fi
+
+  # Validate ingress-only settings only while enabling the feature. A malformed
+  # stale field must not prevent ingress.enabled=false from closing hostPorts
+  # and removing installer-owned resources.
+  if [[ "${INGRESS_ENABLED}" == "true" ]]; then
+    [[ "${INGRESS_TLS_MODE}" == "selfsigned" ]] || \
+      err "ingress.tls.mode=${INGRESS_TLS_MODE} is not supported; this release supports selfsigned only"
+    [[ "${INGRESS_FIPS}" == "off" || "${INGRESS_FIPS}" == "on" ]] || \
+      err "ingress.fips must be one of: off, on"
+    if [[ "${INGRESS_FIPS}" == "on" && "${TRAEFIK_IMAGE}" == "${default_traefik_image}" ]]; then
+      err "ingress.fips=on requires an explicitly supplied images.ingress.traefikImage; the installer cannot attest that image's compliance status"
+    fi
+    if [[ -n "${INGRESS_HOSTNAME}" ]]; then
+      [[ ${#INGRESS_HOSTNAME} -le 253 && \
+         "${INGRESS_HOSTNAME}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && \
+         "${INGRESS_HOSTNAME}" != *..* ]] || \
+        err "ingress.hostname must be a lowercase DNS hostname without a URL scheme"
+      local -a ingress_hostname_labels=()
+      local ingress_hostname_label
+      IFS='.' read -ra ingress_hostname_labels <<< "${INGRESS_HOSTNAME}"
+      for ingress_hostname_label in "${ingress_hostname_labels[@]}"; do
+        [[ ${#ingress_hostname_label} -le 63 && \
+           "${ingress_hostname_label}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || \
+          err "ingress.hostname contains an invalid DNS label: ${ingress_hostname_label:-<empty>}"
+      done
+    fi
+    validate_ingress_entrypoint_ports_k0s
+
+    local -a active_ingress_ports=("${INGRESS_SAIA_PORT}")
+    if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+      active_ingress_ports+=("${INGRESS_SPLUNKWEB_PORT}")
+      [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]] && \
+        active_ingress_ports+=("${INGRESS_SPLUNKMGMT_PORT}")
+    fi
+
+    # A hostPort cannot safely reuse a kube-proxy NodePort on the same nodes.
+    # Preserve the additive NodePort exposure, but reject exact collisions.
+    local service_template_type saia_node_port slim_node_port configured_node_port
+    service_template_type="$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    if [[ "${service_template_type}" == "NodePort" ]]; then
+      saia_node_port="$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+      slim_node_port="$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+      for configured_node_port in "${saia_node_port}" "${slim_node_port}"; do
+        [[ -z "${configured_node_port}" || "${configured_node_port}" == "null" ]] && continue
+        local ingress_port
+        for ingress_port in "${active_ingress_ports[@]}"; do
+          [[ "${ingress_port}" != "${configured_node_port}" ]] || \
+            err "ingress entryPoint port ${ingress_port} conflicts with an existing configured NodePort"
+        done
+      done
+    fi
+    local configured_feature_count
+    configured_feature_count="$(yq eval '.aiPlatform.features // [] | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+    if (( configured_feature_count > 0 )) && \
+        ! yq eval '.aiPlatform.features[]?.name' "${CONFIG_FILE}" 2>/dev/null | grep -qx 'saia'; then
+      err "ingress.enabled=true requires the saia feature; otherwise the websecure route has no backend Service"
+    fi
+  fi
+
   # File paths
   SPLUNK_OPERATOR_FILE=$(yq eval '.files.splunkOperator' "${CONFIG_FILE}" 2>/dev/null || echo "./splunk-operator-cluster.yaml")
   SPLUNK_AI_FILE=$(yq eval '.files.aiPlatform' "${CONFIG_FILE}" 2>/dev/null || echo "./artifacts.yaml")
@@ -720,7 +898,8 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
-  log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
+  log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_HEC_ENDPOINT:+, external endpoints set})"
+  log "Traefik HTTPS ingress: enabled=${INGRESS_ENABLED} (ingress.enabled)"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -1107,12 +1286,19 @@ preflight_checks() {
       [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
       ;;
     external)
-      pf_ok "Splunk telemetry: external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME}, in-cluster Splunk skipped)"
+      pf_ok "Splunk telemetry: external (in-cluster Splunk skipped)"
+      [[ -n "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" ]] \
+        && pf_ok "External management/JWKS endpoint: ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" \
+        || pf_fail "External Splunk mode requires splunk.external.managementEndpoint (normally https://host:8089)."
+      [[ -n "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]] \
+        && pf_ok "External HEC endpoint: ${SPLUNK_EXTERNAL_HEC_ENDPOINT}" \
+        || pf_fail "External Splunk mode requires splunk.external.hecEndpoint (normally https://host:8088)."
       # The HEC token must be supplied via env; fail fast here rather than
       # discovering it at CR-apply time after the cluster is already up.
       [[ -n "${SPLUNK_HEC_TOKEN}" ]] && pf_ok "SPLUNK_HEC_TOKEN is set (external HEC token)" || pf_fail "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
-      # Endpoint should be a base HEC URL; the operator appends /services/collector.
-      [[ "${SPLUNK_EXTERNAL_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External HEC endpoint scheme OK" || pf_warn "splunk.external.endpoint should start with http:// or https:// (got: ${SPLUNK_EXTERNAL_ENDPOINT})"
+      [[ "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External management endpoint scheme OK" || pf_fail "splunk.external.managementEndpoint must start with http:// or https:// (got: ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT:-<empty>})"
+      # HEC endpoint is a base URL; the operator appends /services/collector.
+      [[ "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External HEC endpoint scheme OK" || pf_fail "splunk.external.hecEndpoint must start with http:// or https:// (got: ${SPLUNK_EXTERNAL_HEC_ENDPOINT:-<empty>})"
       ;;
     *)
       pf_ok "Splunk telemetry disabled (splunk.enabled=false) — Splunk Operator/Standalone will be skipped"
@@ -1227,34 +1413,295 @@ scp_file() {
   fi
 }
 
-# Stage pre-loaded container-image bundles onto a node so k0s auto-imports them
-# from disk at startup instead of pulling over a (blocked) internet link. Copies
-# EVERY *.tar from the bundle's images/ dir into the node's /var/lib/k0s/images/,
-# covering both k0s control-plane images (k0s-images.tar: pause/calico/kube-proxy/
-# coredns/…) and add-on component images (addon-images.tar: cert-manager/
-# prometheus/metallb/…). k0s imports all tarballs in that directory at startup.
+# Print the SHA-256 digest for a local file on both GNU/Linux and macOS.
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+# Stage pre-loaded container-image bundles onto a node so k0s imports them
+# instead of pulling over a blocked internet link. k0s watches
+# /var/lib/k0s/images while a worker is running, so this helper is valid both
+# before first start and while reconciling an existing cluster. A completed
+# archive is moved atomically into the watched directory; partially copied
+# archives never become visible to the k0s OCI-bundle reconciler.
 #
-# MUST be called AFTER `k0s install` (which, together with the stale-state cleanup,
-# recreates /var/lib/k0s) and BEFORE `k0s start` (k0s scans /var/lib/k0s/images/
-# only at kubelet startup). No-op unless AIRGAP_K0S_IMAGE_DIR points at a dir with
-# at least one *.tar (set only by install_from_airgap_bundle.sh).
+# No-op outside air-gap mode. In air-gap mode every copy/checksum failure is
+# fatal to the caller: continuing would only defer the failure to an opaque
+# ImagePullBackOff later in the installation.
 stage_k0s_image_bundle() {
-  local node_ip="$1"
-  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 0
+  local node_ip="$1" refresh_unchanged="${2:-false}"
+  if [[ -z "${AIRGAP_K0S_IMAGE_DIR:-}" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+      warn "AIRGAP_MODE=true but AIRGAP_K0S_IMAGE_DIR is not configured"
+      return 1
+    fi
+    return 0
+  fi
+  [[ -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || {
+    warn "Air-gap image directory does not exist: ${AIRGAP_K0S_IMAGE_DIR}"
+    return 1
+  }
   local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
-  [[ -f "${_tars[0]}" ]] || return 0
-  ssh_exec "${node_ip}" "sudo mkdir -p /var/lib/k0s/images" \
-    || { warn "    Could not create /var/lib/k0s/images on ${node_ip} — images may fail to pull"; return 0; }
-  local _tar _name
+  [[ -f "${_tars[0]}" ]] || {
+    warn "Air-gap image directory contains no OCI archives: ${AIRGAP_K0S_IMAGE_DIR}"
+    return 1
+  }
+  ssh_exec "${node_ip}" \
+    "sudo mkdir -p /var/lib/k0s/images /var/lib/k0s/.images-staging" \
+    || { warn "Could not prepare the k0s image directories on ${node_ip}"; return 1; }
+
+  local _tar _name _local_hash _remote_hash _remote_tmp _remote_staged
   for _tar in "${_tars[@]}"; do
     _name="$(basename "${_tar}")"
-    log "    Staging image bundle ${_name} on ${node_ip} (/var/lib/k0s/images/)..."
-    if scp_file "${_tar}" "${node_ip}" "/tmp/${_name}"; then
-      ssh_exec "${node_ip}" "sudo mv -f /tmp/${_name} /var/lib/k0s/images/${_name}" \
-        || warn "    Failed to place ${_name} on ${node_ip} — some images may fail to pull"
-    else
-      warn "    Failed to copy ${_name} to ${node_ip} — some images may fail to pull"
+    [[ "${_name}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+      warn "Unsafe OCI archive name: ${_name}"
+      return 1
+    }
+    _local_hash="$(sha256_file "${_tar}")" || {
+      warn "No SHA-256 utility is available to verify ${_tar}"
+      return 1
+    }
+    _remote_hash="$(ssh_exec "${node_ip}" \
+      "sudo sha256sum /var/lib/k0s/images/${_name} 2>/dev/null | awk '{print \$1}'" \
+      2>/dev/null || true)"
+    if [[ "${_remote_hash}" == "${_local_hash}" ]]; then
+      if [[ "${refresh_unchanged}" == "true" ]]; then
+        # A matching archive is not sufficient when containerd lost an image
+        # or an earlier live import failed. Change its mtime so k0s's running
+        # OCI-bundle reconciler processes the archive again without a network
+        # retransmission from the installer host.
+        ssh_exec "${node_ip}" "sudo touch /var/lib/k0s/images/${_name}" || {
+          warn "Failed to retrigger import of ${_name} on ${node_ip}"
+          return 1
+        }
+        log "    Retriggered import of current image bundle ${_name} on ${node_ip}"
+      else
+        log "    Image bundle ${_name} is already current on ${node_ip}"
+      fi
+      continue
     fi
+
+    log "    Staging image bundle ${_name} on ${node_ip} (/var/lib/k0s/images/)..."
+    _remote_tmp="/tmp/${_name}.${_local_hash}.partial"
+    _remote_staged="/var/lib/k0s/.images-staging/${_name}.${_local_hash}.partial"
+    scp_file "${_tar}" "${node_ip}" "${_remote_tmp}" || {
+      warn "Failed to copy ${_name} to ${node_ip}"
+      return 1
+    }
+    if ! ssh_exec "${node_ip}" "
+      set -eu
+      trap 'rm -f ${_remote_tmp}; sudo rm -f ${_remote_staged}' EXIT
+      sudo cp ${_remote_tmp} ${_remote_staged}
+      test \"\$(sudo sha256sum ${_remote_staged} | awk '{print \$1}')\" = '${_local_hash}'
+      sudo mv -f ${_remote_staged} /var/lib/k0s/images/${_name}
+    "; then
+      warn "Failed to verify or place ${_name} on ${node_ip}"
+      return 1
+    fi
+  done
+}
+
+airgap_expected_image_records() {
+  local archive index_json records="" all_records=""
+  local -a archives=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  [[ -f "${archives[0]}" ]] || {
+    warn "No OCI archives found in ${AIRGAP_K0S_IMAGE_DIR}"
+    return 1
+  }
+
+  for archive in "${archives[@]}"; do
+    index_json="$(tar -xOf "${archive}" index.json 2>/dev/null)" || {
+      warn "Unable to read OCI index.json from ${archive}"
+      return 1
+    }
+    records="$(jq -er '
+      .manifests[]
+      | .annotations["org.opencontainers.image.ref.name"] as $name
+      | select($name != null and $name != "")
+      | select(.digest | test("^sha256:[0-9a-f]{64}$"))
+      | [$name, .digest]
+      | @tsv
+    ' <<< "${index_json}" 2>/dev/null)" || {
+      warn "OCI archive has no valid named image descriptors: ${archive}"
+      return 1
+    }
+    all_records+="${records}"$'\n'
+  done
+
+  all_records="$(sed '/^$/d' <<< "${all_records}" | sort -u)"
+  [[ -n "${all_records}" ]] || {
+    warn "OCI archives contain no expected image records"
+    return 1
+  }
+  if ! awk -F '\t' '
+      seen[$1] && seen[$1] != $2 { exit 1 }
+      { seen[$1] = $2 }
+    ' <<< "${all_records}"; then
+    warn "OCI archives assign conflicting digests to the same image name"
+    return 1
+  fi
+  printf '%s\n' "${all_records}"
+}
+
+airgap_pinned_image_records_from_ctr_list() {
+  # containerd's columns are REF TYPE DIGEST SIZE PLATFORMS LABELS. Emit only
+  # records that k0s marked as sourced from an OCI bundle.
+  awk 'NR > 1 && index($0, "io.cri-containerd.pinned=pinned") { print $1 "\t" $3 }'
+}
+
+airgap_images_present_on_node() {
+  local node_ip="$1" expected_records="${2:-}" inventory="" record
+  [[ -n "${expected_records}" ]] || \
+    expected_records="$(airgap_expected_image_records)" || return 1
+
+  # The digest proves that a reused tag points at the content in this bundle;
+  # k0s's pinned label proves the OCI-bundle reconciler consumed it rather than
+  # merely finding an unrelated/pre-existing image with the same name.
+  inventory="$(ssh_exec "${node_ip}" "sudo k0s ctr images list" 2>/dev/null \
+    | airgap_pinned_image_records_from_ctr_list || true)"
+  while IFS= read -r record || [[ -n "${record}" ]]; do
+    [[ -n "${record}" ]] || continue
+    grep -Fqx -- "${record}" <<< "${inventory}" || return 1
+  done <<< "${expected_records}"
+  return 0
+}
+
+wait_for_airgap_images_on_node() {
+  local node_ip="$1"
+  local expected_records expected_count
+  expected_records="$(airgap_expected_image_records)" || return 1
+  expected_count="$(wc -l <<< "${expected_records}" | tr -d '[:space:]')"
+
+  local timeout_seconds="${AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS:-600}"
+  [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]] || {
+    warn "AIRGAP_IMAGE_IMPORT_TIMEOUT_SECONDS must be a positive integer"
+    return 1
+  }
+  local elapsed=0
+  while (( elapsed <= timeout_seconds )); do
+    if airgap_images_present_on_node "${node_ip}" "${expected_records}"; then
+      log "    Verified ${expected_count} pinned bundle image digests on ${node_ip}"
+      return 0
+    fi
+    (( elapsed >= timeout_seconds )) && break
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  warn "Timed out after ${timeout_seconds}s waiting for pinned bundle image digests to import on ${node_ip}"
+  return 1
+}
+
+sync_airgap_images_to_existing_cluster() {
+  [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
+  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || {
+    warn "AIRGAP_MODE=true but AIRGAP_K0S_IMAGE_DIR is unavailable"
+    return 1
+  }
+
+  local -a configured_endpoints=() worker_endpoints=() mapped_nodes=()
+  IFS=' ' read -ra configured_endpoints <<< "${EXISTING_CONTROLLER_IPS:-} ${EXISTING_WORKER_IPS:-}"
+  (( ${#configured_endpoints[@]} > 0 )) || {
+    warn "An existing air-gapped cluster requires configured controller/worker IPs so image bundles can be synchronized"
+    return 1
+  }
+
+  local cluster_nodes_json node_pairs node_names
+  cluster_nodes_json="$(kubectl get nodes -o json)" || {
+    warn "Unable to discover worker-enabled members of the existing cluster"
+    return 1
+  }
+  node_names="$(jq -er '.items[].metadata.name' <<< "${cluster_nodes_json}" 2>/dev/null)" || {
+    warn "The existing cluster has no worker-enabled Kubernetes nodes"
+    return 1
+  }
+  node_pairs="$(jq -r '
+    .items[]
+    | .metadata.name as $node
+    | ([$node, $node], (.status.addresses[]? | [$node, .address]))
+    | @tsv
+  ' <<< "${cluster_nodes_json}")" || {
+    warn "Unable to read identities for the existing cluster nodes"
+    return 1
+  }
+
+  # Resolve configured SSH endpoints to actual Kubernetes Node identities.
+  # Controller-only k0s processes have no Node and are deliberately skipped;
+  # every real schedulable Node must map to one configured endpoint or the
+  # installer cannot safely guarantee an offline image inventory there.
+  local endpoint remote_ids identities matched_node pair_node pair_id existing
+  for endpoint in "${configured_endpoints[@]}"; do
+    [[ -n "${endpoint}" ]] || continue
+    existing=false
+    for pair_id in "${worker_endpoints[@]}"; do
+      [[ "${pair_id}" == "${endpoint}" ]] && existing=true
+    done
+    [[ "${existing}" == "true" ]] && continue
+
+    remote_ids="$(ssh_exec "${endpoint}" \
+      "{ hostname 2>/dev/null; hostname -f 2>/dev/null; hostname -I 2>/dev/null | tr ' ' '\\n'; } | sed '/^\$/d'" \
+      2>/dev/null)" || {
+      warn "Unable to identify configured k0s node ${endpoint}"
+      return 1
+    }
+    identities="$(printf '%s\n%s\n' "${endpoint}" "${remote_ids}" | sed '/^$/d' | sort -u)"
+    matched_node=""
+    while IFS=$'\t' read -r pair_node pair_id; do
+      [[ -n "${pair_node}" && -n "${pair_id}" ]] || continue
+      if grep -Fqx -- "${pair_id}" <<< "${identities}"; then
+        if [[ -n "${matched_node}" && "${matched_node}" != "${pair_node}" ]]; then
+          warn "Configured endpoint ${endpoint} ambiguously matches multiple Kubernetes Nodes"
+          return 1
+        fi
+        matched_node="${pair_node}"
+      fi
+    done <<< "${node_pairs}"
+    if [[ -z "${matched_node}" ]]; then
+      log "    Skipping configured controller-only or non-member endpoint ${endpoint}"
+      continue
+    fi
+
+    existing=false
+    for pair_node in "${mapped_nodes[@]}"; do
+      [[ "${pair_node}" == "${matched_node}" ]] && existing=true
+    done
+    if [[ "${existing}" == "false" ]]; then
+      worker_endpoints+=("${endpoint}")
+      mapped_nodes+=("${matched_node}")
+    fi
+  done
+
+  while IFS= read -r pair_node; do
+    [[ -n "${pair_node}" ]] || continue
+    existing=false
+    for pair_id in "${mapped_nodes[@]}"; do
+      [[ "${pair_id}" == "${pair_node}" ]] && existing=true
+    done
+    if [[ "${existing}" == "false" ]]; then
+      warn "Kubernetes Node ${pair_node} has no configured SSH endpoint; cannot synchronize its air-gap images"
+      return 1
+    fi
+  done <<< "${node_names}"
+
+  log "Synchronizing bundled images to the existing k0s cluster..."
+  local node_ip expected_records refresh_unchanged
+  expected_records="$(airgap_expected_image_records)" || return 1
+  for node_ip in "${worker_endpoints[@]}"; do
+    ssh_exec "${node_ip}" "command -v k0s >/dev/null 2>&1 && sudo k0s status >/dev/null 2>&1" || {
+      warn "Existing air-gap image synchronization supports k0s nodes only; ${node_ip} is not a running k0s worker"
+      return 1
+    }
+    refresh_unchanged=false
+    airgap_images_present_on_node "${node_ip}" "${expected_records}" || refresh_unchanged=true
+    stage_k0s_image_bundle "${node_ip}" "${refresh_unchanged}" || return 1
+    wait_for_airgap_images_on_node "${node_ip}" || return 1
   done
 }
 
@@ -1509,13 +1956,6 @@ preflight_check_remote_deps() {
   for ip in "${_all_ips[@]}"; do
     [[ -z "$ip" ]] && continue
 
-    # python3
-    if ssh_exec "${ip}" "command -v python3 >/dev/null 2>&1"; then
-      pf_ok "${ip}: python3 found"
-    else
-      pf_warn "${ip}: python3 not found — installer will attempt install via dnf/apt"
-    fi
-
     # passwordless sudo
     if ssh_exec "${ip}" "sudo -n true 2>/dev/null"; then
       pf_ok "${ip}: passwordless sudo available"
@@ -1544,10 +1984,27 @@ preflight_check_remote_deps() {
 # ====== PREPARE NODES (RHEL/Fedora compatibility + k0s binary) ======
 prepare_nodes_for_k0s() {
   local node_ips=("$@")
+  if [[ ! "${K0S_VERSION}" =~ ^v1\.([0-9]+)\.[0-9]+\+k0s\.[0-9]+$ ]] || \
+      (( 10#${BASH_REMATCH[1]:-0} < 33 || 10#${BASH_REMATCH[1]:-0} > 36 )); then
+    err "K0S_VERSION=${K0S_VERSION} is unsupported with cert-manager ${CERT_MANAGER_VERSION}; use a pinned k0s Kubernetes 1.33-1.36 release (compatibility default: ${DEFAULT_K0S_VERSION})"
+  fi
   log "Preparing ${#node_ips[@]} node(s) for k0s (OS compatibility + binary)..."
   for node_ip in "${node_ips[@]}"; do
     log "  Preparing node ${node_ip}..."
     _check_node_os "${node_ip}" "node"
+
+    # A preinstalled binary previously bypassed the online pin completely.
+    # Refuse it before any cluster create/join operation unless it is the exact
+    # configured release (operators reusing another supported cluster can set
+    # K0S_VERSION explicitly to that cluster's pinned version).
+    local existing_k0s_version=""
+    if ssh_exec "${node_ip}" "command -v k0s >/dev/null 2>&1"; then
+      existing_k0s_version="$(ssh_exec "${node_ip}" \
+        "k0s version 2>/dev/null | grep -Eo 'v1\.[0-9]+\.[0-9]+\+k0s\.[0-9]+' | head -1")" || \
+        err "Unable to determine the preinstalled k0s version on ${node_ip}"
+      [[ "${existing_k0s_version}" == "${K0S_VERSION}" ]] || \
+        err "Node ${node_ip} has k0s ${existing_k0s_version:-unknown}, but this install requires ${K0S_VERSION}; upgrade/pin the node explicitly before continuing"
+    fi
 
     # Air-gap: push the bundled k0s binary from THIS host (the installer machine)
     # to the node. K0S_INSTALL_URL=file://... points at a path on the installer
@@ -1566,9 +2023,11 @@ prepare_nodes_for_k0s() {
       fi
     fi
 
+    local remote_prepare_rc=0
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
-      bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
+      bash -s -- "${K0S_VERSION}" <<'REMOTE_SCRIPT' || remote_prepare_rc=$?
+      K0S_VERSION_PIN="$1"
       # Disable firewalld if active (blocks k0s ports: 6443, 10250, 8472, etc.)
       if systemctl is-active firewalld >/dev/null 2>&1; then
         echo 'Disabling firewalld...'
@@ -1586,29 +2045,6 @@ prepare_nodes_for_k0s() {
       sudo mkdir -p /etc/modules-load.d
       printf 'br_netfilter\noverlay\nnf_conntrack\n' | sudo tee /etc/modules-load.d/k0s.conf >/dev/null
 
-      # Ensure python3 + PyYAML are available (used for k0s config generation)
-      if python3 -c 'import yaml' 2>/dev/null; then
-        echo "python3+pyyaml already present"
-      else
-        echo "Installing python3-pyyaml..."
-        # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
-        # back to the OS package manager (which will succeed if a local repo
-        # mirror is configured on the node).  Internet-only paths are guarded
-        # by the AIRGAP_PYYAML_WHEEL_PATH check so we never silently skip them.
-        if [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
-          echo "Installing pyyaml from bundled wheel ${AIRGAP_PYYAML_WHEEL_PATH}..."
-          sudo pip3 install --no-index --find-links="$(dirname "${AIRGAP_PYYAML_WHEEL_PATH}")" pyyaml 2>/dev/null \
-            || sudo pip3 install "${AIRGAP_PYYAML_WHEEL_PATH}" 2>/dev/null \
-            || echo "WARN: pip3 wheel install failed — python3-pyyaml may be missing"
-        elif command -v dnf >/dev/null 2>&1; then
-          sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
-        elif command -v apt-get >/dev/null 2>&1; then
-          sudo apt-get install -y python3-yaml 2>/dev/null || true
-        else
-          echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
-        fi
-      fi
-
       # Install k0s binary if not present
       if command -v k0s >/dev/null 2>&1; then
         echo "k0s binary already present ($(k0s version 2>/dev/null || echo unknown))"
@@ -1620,11 +2056,12 @@ prepare_nodes_for_k0s() {
         sudo cp /tmp/k0s-airgap /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
         rm -f /tmp/k0s-airgap
       else
-        echo "Installing k0s binary..."
+        echo "Installing pinned k0s ${K0S_VERSION_PIN} binary..."
         if [[ -n "${K0S_INSTALL_URL:-}" && "${K0S_INSTALL_URL}" == file://* ]]; then
           sudo cp "${K0S_INSTALL_URL#file://}" /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
         else
-          curl -sSLf "${K0S_INSTALL_URL:-https://get.k0s.sh}" | sudo sh
+          curl -sSLf "${K0S_INSTALL_URL:-https://get.k0s.sh}" | \
+            sudo env K0S_VERSION="${K0S_VERSION_PIN}" sh
         fi
       fi
 
@@ -1633,6 +2070,14 @@ prepare_nodes_for_k0s() {
         sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s
       fi
 REMOTE_SCRIPT
+    (( remote_prepare_rc == 0 )) || warn "  Preparation had issues on ${node_ip}"
+
+    local installed_k0s_version=""
+    installed_k0s_version="$(ssh_exec "${node_ip}" \
+      "k0s version 2>/dev/null | grep -Eo 'v1\.[0-9]+\.[0-9]+\+k0s\.[0-9]+' | head -1")" || \
+      err "k0s installation verification failed on ${node_ip}"
+    [[ "${installed_k0s_version}" == "${K0S_VERSION}" ]] || \
+      err "Node ${node_ip} reports k0s ${installed_k0s_version:-unknown} after preparation; expected ${K0S_VERSION}"
   done
 }
 
@@ -1830,6 +2275,71 @@ configure_insecure_registry_on_node() {
   log "  ✓ Insecure registry configured on ${node_ip}"
 }
 
+# Generate the controller configuration without requiring Python or PyYAML on
+# the remote node. `k0s config create` still runs on the target so its detected
+# bind address is preserved; the installer-host yq then applies our supported
+# overrides before the file is atomically installed back on the controller.
+generate_k0s_controller_config() {
+  local controller_ip="$1"
+  local local_config remote_config remote_staged_config
+  local internal_address effective_external_address
+  local_config="$(mktemp)" || err "Unable to create a temporary k0s config file"
+  remote_config="/tmp/k0s-config-${BASHPID}.yaml"
+  remote_staged_config="/etc/k0s/.k0s-${BASHPID}.yaml"
+
+  if ! ssh_exec "${controller_ip}" "k0s config create" > "${local_config}"; then
+    rm -f "${local_config}"
+    err "Unable to generate the default k0s configuration on ${controller_ip}"
+  fi
+
+  internal_address="$(yq eval '.spec.api.address // ""' "${local_config}")" || {
+    rm -f "${local_config}"
+    err "Unable to read the generated k0s API address"
+  }
+  effective_external_address="${K0S_API_EXTERNAL_ADDRESS:-${internal_address}}"
+  if [[ -z "${effective_external_address}" ]]; then
+    rm -f "${local_config}"
+    err "The generated k0s configuration has no API address; set cluster.apiExternalAddress explicitly"
+  fi
+
+  if ! env \
+      K0S_CONTROLLER_IP="${controller_ip}" \
+      K0S_EFFECTIVE_EXTERNAL_ADDRESS="${effective_external_address}" \
+      yq eval --inplace '
+        .spec.api.sans = (
+          ((.spec.api.sans // [])
+            + [strenv(K0S_CONTROLLER_IP), strenv(K0S_EFFECTIVE_EXTERNAL_ADDRESS)])
+          | map(select(. != ""))
+          | unique
+        )
+        | .spec.api.externalAddress = strenv(K0S_EFFECTIVE_EXTERNAL_ADDRESS)
+        | .spec.network.provider = "calico"
+        | .spec.network.calico.mode = "vxlan"
+        | .spec.storage.type = "kine"
+        | .spec.storage.kine.extraArgs."compact-interval" = "5m"
+      ' "${local_config}"; then
+    rm -f "${local_config}"
+    err "Unable to apply installer settings to the generated k0s configuration"
+  fi
+
+  yq eval '.' "${local_config}" >/dev/null || {
+    rm -f "${local_config}"
+    err "Generated k0s configuration is not valid YAML"
+  }
+  scp_file "${local_config}" "${controller_ip}" "${remote_config}" || {
+    rm -f "${local_config}"
+    err "Unable to copy the generated k0s configuration to ${controller_ip}"
+  }
+  rm -f "${local_config}"
+
+  ssh_exec "${controller_ip}" "
+    set -eu
+    trap 'rm -f ${remote_config}; sudo rm -f ${remote_staged_config}' EXIT
+    sudo install -D -m 0600 ${remote_config} ${remote_staged_config}
+    sudo mv -f ${remote_staged_config} /etc/k0s/k0s.yaml
+  " || err "Unable to install /etc/k0s/k0s.yaml on ${controller_ip}"
+}
+
 # ====== K0S CLUSTER INSTALLATION ======
 install_k0s_cluster() {
   log "Installing k0s cluster..."
@@ -1845,7 +2355,7 @@ install_k0s_cluster() {
 
   log "Primary controller IP: ${controller_ip}"
 
-  # Prepare all nodes (firewalld, iptables, python3)
+  # Prepare all nodes (firewalld, kernel modules, and the pinned k0s binary)
   local all_ips=("${CONTROLLER_IPS[@]}")
   if [[ ${#WORKER_IPS[@]} -gt 0 ]]; then
     all_ips+=("${WORKER_IPS[@]}")
@@ -1883,7 +2393,6 @@ install_k0s_cluster() {
   # /tmp is cleared on reboot which caused k0s to fall back to defaults
   # (including --compact-interval=0) after a node restart.
   log "Generating k0s configuration..."
-  ssh_exec "${controller_ip}" "sudo mkdir -p /etc/k0s && k0s config create | sudo tee /etc/k0s/k0s.yaml >/dev/null"
 
   # Configure k0s API with the controller IP for SANs and externalAddress.
   # By default k0s advertises the controller's private bind address. Clusters
@@ -1895,77 +2404,7 @@ install_k0s_cluster() {
   else
     log "Using the controller's auto-detected private address for the k0s API"
   fi
-  ssh_exec "${controller_ip}" "cat > /tmp/k0s-config-update.py <<'PYSCRIPT'
-import yaml
-
-# Read the k0s config
-with open('/etc/k0s/k0s.yaml', 'r') as f:
-    config = yaml.safe_load(f)
-
-# Add the controller IP to SANs (for kubectl access and cluster communication)
-if 'spec' not in config:
-    config['spec'] = {}
-if 'api' not in config['spec']:
-    config['spec']['api'] = {}
-if 'sans' not in config['spec']['api']:
-    config['spec']['api']['sans'] = []
-
-config['spec']['api']['sans'].append('${controller_ip}')
-
-_configured_external_addr = '${K0S_API_EXTERNAL_ADDRESS}'
-if _configured_external_addr and _configured_external_addr not in config['spec']['api']['sans']:
-    config['spec']['api']['sans'].append(_configured_external_addr)
-
-# externalAddress must be an address that EVERY cluster member can reach --
-# including the controller reaching ITSELF. It is baked into the worker join
-# token AND into the in-cluster 'kubernetes' Service endpoint (10.96.0.1).
-#
-# On clouds (AWS/GCP/Azure) an instance CANNOT reach its own PUBLIC IP -- there
-# is no NAT hairpin for an instance's own elastic IP. So if the config's
-# controller IP is a public IP and we use it here:
-#   1. the controller's own pods (e.g. calico-node) can't reach the API via the
-#      ClusterIP, the CNI never initializes, and the control-plane node stays
-#      NotReady ('cni plugin not initialized' / dial 10.96.0.1:443 i/o timeout);
-#   2. same-VPC workers get a join token pointing at the public IP and need
-#      extra public-IP security-group rules just to fetch it.
-#
-# Use cluster.apiExternalAddress when explicitly configured for public-only or
-# otherwise routed worker topologies. Otherwise use the node's PRIVATE bind
-# address -- 'k0s config create' already auto-detected it into spec.api.address
-# (it is what kube-apiserver uses for --advertise-address). The public/SSH IP
-# stays in 'sans' above, so a kubeconfig pointed at it keeps a valid cert.
-_internal_addr = config['spec']['api'].get('address')
-_external_addr = _configured_external_addr or _internal_addr
-if _external_addr:
-    config['spec']['api']['externalAddress'] = _external_addr
-# else: leave externalAddress unset -- k0s falls back to spec.api.address
-
-# Set Calico as network provider
-if 'network' not in config['spec']:
-    config['spec']['network'] = {}
-config['spec']['network']['provider'] = 'calico'
-if 'calico' not in config['spec']['network']:
-    config['spec']['network']['calico'] = {}
-config['spec']['network']['calico']['mode'] = 'vxlan'
-
-# Set kine for storage with compaction enabled to prevent unbounded DB growth.
-# k0s KineConfig exposes extraArgs (map) and rawArgs (slice) — there is no
-# compactInterval field; the flag must be passed via extraArgs.
-if 'storage' not in config['spec']:
-    config['spec']['storage'] = {}
-config['spec']['storage']['type'] = 'kine'
-if 'kine' not in config['spec']['storage']:
-    config['spec']['storage']['kine'] = {}
-if 'extraArgs' not in config['spec']['storage']['kine']:
-    config['spec']['storage']['kine']['extraArgs'] = {}
-config['spec']['storage']['kine']['extraArgs']['compact-interval'] = '5m'
-
-# Write back
-with open('/etc/k0s/k0s.yaml', 'w') as f:
-    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-PYSCRIPT"
-
-  ssh_exec "${controller_ip}" "sudo python3 /tmp/k0s-config-update.py"
+  generate_k0s_controller_config "${controller_ip}"
 
   log "Verifying k0s configuration includes controller IP..."
   ssh_exec "${controller_ip}" "sudo grep -A3 'api:' /etc/k0s/k0s.yaml | head -5"
@@ -1973,9 +2412,9 @@ PYSCRIPT"
   # Install k0s controller
   log "Installing k0s controller on ${controller_ip}..."
   ssh_exec "${controller_ip}" "sudo k0s install controller --config /etc/k0s/k0s.yaml --enable-worker"
-  # Air-gap: stage k0s system images AFTER install (recreates /var/lib/k0s) and
-  # BEFORE start (k0s imports /var/lib/k0s/images/ only at kubelet startup).
-  stage_k0s_image_bundle "${controller_ip}"
+  # Stage after install recreates /var/lib/k0s and before the first start.
+  stage_k0s_image_bundle "${controller_ip}" || \
+    err "Unable to stage air-gap images on controller ${controller_ip}"
   # Remove stale v1 drop-in before start — containerd 2.x rejects the grpc.v1.cri
   # plugin key at preflight, crashing k0s before configure_insecure_registry_on_node
   # can execute its own cleanup.
@@ -2026,7 +2465,8 @@ PYSCRIPT"
       log "  ✓ k0s installed on ${worker_ip}"
       # Air-gap: stage k0s system images now — after install (recreated
       # /var/lib/k0s), before this worker is started in the loop below.
-      stage_k0s_image_bundle "${worker_ip}"
+      stage_k0s_image_bundle "${worker_ip}" || \
+        err "Unable to stage air-gap images on worker ${worker_ip}"
     else
       warn "  ✗ Failed to install k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
@@ -2276,6 +2716,7 @@ label_nodes() {
         splunk.ai/workload-type=cpu \
         node.kubernetes.io/workload=ai-cpu \
         splunk.ai/instance-type=cpu-worker \
+        splunk.ai/ingress-node=true \
         --overwrite
       log "  ✓ CPU workload labels added to controller node"
     fi
@@ -2309,6 +2750,7 @@ label_nodes() {
         splunk.ai/workload-type=cpu \
         node.kubernetes.io/workload=ai-cpu \
         splunk.ai/instance-type=cpu-worker \
+        splunk.ai/ingress-node=true \
         --overwrite
     else
       log "Labeling GPU worker node: ${node_name} (${worker_ip})"
@@ -2317,6 +2759,7 @@ label_nodes() {
         splunk.ai/workload-type=gpu \
         node.kubernetes.io/workload=ai-gpu \
         splunk.ai/instance-type=gpu-worker \
+        splunk.ai/ingress-node=true \
         nvidia.com/gpu=true \
         --overwrite
     fi
@@ -2360,11 +2803,22 @@ label_nodes() {
         done
         if ${is_controller}; then
           log "  Recovery: labeling controller ${nn} (${ip})"
-          kubectl label nodes "${nn}" \
-            splunk.ai/node-role=controller \
-            splunk.ai/workload-type=control-plane \
-            node.kubernetes.io/role=controller \
-            --overwrite || true
+          if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
+            kubectl label nodes "${nn}" \
+              splunk.ai/node-role=controller \
+              splunk.ai/workload-type=cpu \
+              node.kubernetes.io/role=controller \
+              node.kubernetes.io/workload=ai-cpu \
+              splunk.ai/instance-type=cpu-worker \
+              splunk.ai/ingress-node=true \
+              --overwrite || true
+          else
+            kubectl label nodes "${nn}" \
+              splunk.ai/node-role=controller \
+              splunk.ai/workload-type=control-plane \
+              node.kubernetes.io/role=controller \
+              --overwrite || true
+          fi
         else
           local wi=0
           for wip in "${WORKER_IPS[@]}"; do
@@ -2378,6 +2832,7 @@ label_nodes() {
               splunk.ai/workload-type=cpu \
               node.kubernetes.io/workload=ai-cpu \
               splunk.ai/instance-type=cpu-worker \
+              splunk.ai/ingress-node=true \
               --overwrite || true
           else
             log "  Recovery: labeling GPU worker ${nn} (${ip})"
@@ -2386,6 +2841,7 @@ label_nodes() {
               splunk.ai/workload-type=gpu \
               node.kubernetes.io/workload=ai-gpu \
               splunk.ai/instance-type=gpu-worker \
+              splunk.ai/ingress-node=true \
               nvidia.com/gpu=true \
               --overwrite || true
           fi
@@ -2792,23 +3248,137 @@ stage_model_artifacts() {
 
 # ====== INSTALL CERT-MANAGER ======
 install_cert_manager() {
-  log "Installing cert-manager..."
+  log "Installing cert-manager ${CERT_MANAGER_VERSION}..."
+
+  local kubernetes_json kubernetes_major kubernetes_minor_raw kubernetes_minor
+  kubernetes_json="$(kubectl version -o json)" || \
+    err "Unable to read the Kubernetes server version before installing cert-manager"
+  kubernetes_major="$(jq -r '.serverVersion.major // ""' <<< "${kubernetes_json}")"
+  kubernetes_minor_raw="$(jq -r '.serverVersion.minor // ""' <<< "${kubernetes_json}")"
+  if [[ "${kubernetes_major}" != "1" || ! "${kubernetes_minor_raw}" =~ ^([0-9]+) ]]; then
+    err "Unable to parse Kubernetes server version ${kubernetes_major}.${kubernetes_minor_raw}"
+  fi
+  kubernetes_minor="${BASH_REMATCH[1]}"
+  if (( 10#${kubernetes_minor} < 33 || 10#${kubernetes_minor} > 36 )); then
+    err "cert-manager ${CERT_MANAGER_VERSION} supports Kubernetes 1.33-1.36; this cluster reports ${kubernetes_major}.${kubernetes_minor_raw}"
+  fi
 
   # kubectl runs locally on this (installer) host here, with KUBECONFIG already
   # set. `apply -f` accepts a local path or an http(s) URL but NOT the file://
   # scheme, so strip it to a bare path for air-gap bundle manifests.
-  local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+  local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml}"
   [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
-  kubectl apply -f "${_cm_url}"
+
+  # Do not silently seize or perform an unsupported multi-minor upgrade of an
+  # existing cert-manager installation. Reuse the exact supported version;
+  # otherwise require the cluster owner to follow cert-manager's documented
+  # sequential upgrade procedure first.
+  local existing_cm_json="" manifest_json=""
+  existing_cm_json="$(kubectl -n cert-manager get deployment cert-manager \
+    --ignore-not-found -o json)" || err "Unable to inspect an existing cert-manager deployment"
+  if [[ -n "${existing_cm_json}" ]]; then
+    log "Found an existing cert-manager installation; verifying every component before reuse"
+  else
+    # Parse and validate the supplied manifest before it can mutate CRDs, RBAC,
+    # webhooks, or workloads. A stale air-gap file must fail with zero cluster
+    # changes, rather than being applied and rejected only by the live-image
+    # check below.
+    manifest_json="$(kubectl create --dry-run=client --validate=false \
+      -f "${_cm_url}" -o json)" || \
+      err "Unable to parse the supplied cert-manager manifest ${_cm_url}"
+    local manifest_deployment manifest_container manifest_image
+    while IFS='|' read -r manifest_deployment manifest_container; do
+      manifest_image="$(jq -r --arg deployment "${manifest_deployment}" --arg container "${manifest_container}" '
+          (if .kind == "List" then .items else [.] end)
+          | first(.[]?
+              | select(.kind == "Deployment" and .metadata.name == $deployment)
+              | .spec.template.spec.containers[]?
+              | select(.name == $container)
+              | .image) // ""
+        ' <<< "${manifest_json}")"
+      case "${manifest_image}" in
+        *":${CERT_MANAGER_VERSION}"|*":${CERT_MANAGER_VERSION}@sha256:"*) ;;
+        *)
+          err "Supplied cert-manager manifest component ${manifest_deployment}/${manifest_container} uses ${manifest_image:-an unknown image}, not ${CERT_MANAGER_VERSION}; refusing to apply it"
+          ;;
+      esac
+    done <<'CERT_MANAGER_MANIFEST_COMPONENTS'
+cert-manager|cert-manager-controller
+cert-manager-webhook|cert-manager-webhook
+cert-manager-cainjector|cert-manager-cainjector
+CERT_MANAGER_MANIFEST_COMPONENTS
+
+    # Refuse to adopt any canonical object from a partial installation. Query
+    # every non-Namespace object declared by the pinned manifest so less-common
+    # leftovers (webhooks, RBAC, or another CRD) cannot evade a two-object
+    # sentinel check and then be overwritten by apply.
+    local object_kind object_namespace object_name existing_object
+    local -a partial_cm_objects=()
+    while IFS='|' read -r object_kind object_namespace object_name; do
+      [[ "${object_kind}" == "Namespace" ]] && continue
+      if [[ -n "${object_namespace}" && "${object_namespace}" != "null" ]]; then
+        existing_object="$(kubectl -n "${object_namespace}" get "${object_kind}" "${object_name}" \
+          --ignore-not-found -o name)" || \
+          err "Unable to inspect existing cert-manager object ${object_kind}/${object_name}"
+      else
+        existing_object="$(kubectl get "${object_kind}" "${object_name}" \
+          --ignore-not-found -o name)" || \
+          err "Unable to inspect existing cert-manager object ${object_kind}/${object_name}"
+      fi
+      [[ -z "${existing_object}" ]] || partial_cm_objects+=("${existing_object}")
+    done < <(jq -r '
+        (if .kind == "List" then .items else [.] end)[]?
+        | [.kind, (.metadata.namespace // ""), .metadata.name]
+        | @tsv
+      ' <<< "${manifest_json}" | tr '\t' '|')
+    (( ${#partial_cm_objects[@]} == 0 )) || \
+      err "Found a partial cert-manager installation (${partial_cm_objects[*]}). Refusing to adopt or overwrite it; reconcile its owner before rerunning."
+    kubectl apply -f "${_cm_url}"
+  fi
+
+  # Verify live images after either reuse or a fresh apply. This makes the
+  # version gate authoritative even when CERT_MANAGER_MANIFEST_URL points to a
+  # local/air-gap file and prevents a label-only or mixed-version install from
+  # being accepted as v1.21.1.
+  local deployment_name container_name deployment_json actual_image
+  while IFS='|' read -r deployment_name container_name; do
+    deployment_json="$(kubectl -n cert-manager get deployment "${deployment_name}" \
+      --ignore-not-found -o json)" || \
+      err "Unable to inspect cert-manager component ${deployment_name}"
+    [[ -n "${deployment_json}" ]] || \
+      err "cert-manager installation is partial: Deployment/${deployment_name} is missing"
+    actual_image="$(jq -r --arg container "${container_name}" '
+        first(.spec.template.spec.containers[]? | select(.name == $container) | .image) // ""
+      ' <<< "${deployment_json}")"
+    case "${actual_image}" in
+      *":${CERT_MANAGER_VERSION}"|*":${CERT_MANAGER_VERSION}@sha256:"*) ;;
+      *)
+        err "cert-manager component ${deployment_name}/${container_name} uses ${actual_image:-an unknown image}, not ${CERT_MANAGER_VERSION}. Upgrade one minor at a time using upstream guidance, then rerun the installer; automatic takeover is disabled."
+        ;;
+    esac
+  done <<'CERT_MANAGER_COMPONENTS'
+cert-manager|cert-manager-controller
+cert-manager-webhook|cert-manager-webhook
+cert-manager-cainjector|cert-manager-cainjector
+CERT_MANAGER_COMPONENTS
+  [[ -n "${existing_cm_json}" ]] && \
+    log "Reusing compatible existing cert-manager ${CERT_MANAGER_VERSION}; leaving its installation ownership unchanged"
 
   wait_for_crd certificates.cert-manager.io 300
+
+  # The raw manifest is used as supplied. Splunk's pre-task constructs its PEM
+  # directly from the standard tls.crt and tls.key Secret entries.
+  kubectl rollout status deployment/cert-manager -n cert-manager --timeout=120s
+  kubectl rollout status deployment/cert-manager-webhook -n cert-manager --timeout=120s
+  kubectl rollout status deployment/cert-manager-cainjector -n cert-manager --timeout=120s
+
   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
 
   # Wait for webhook to be fully operational
   log "Waiting for cert-manager webhooks to be ready..."
 
   # First, ensure webhook pods are running
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=webhook -n cert-manager --timeout=120s || warn "Webhook pods may not be ready"
+  kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=webhook -n cert-manager --timeout=120s
 
   # Wait for webhook endpoint to have addresses
   local retries=0
@@ -2825,29 +3395,255 @@ install_cert_manager() {
   done
 
   if (( retries >= max_retries )); then
-    warn "cert-manager webhook endpoint not found after ${max_retries} retries"
+    err "cert-manager webhook endpoint not found after ${max_retries} retries"
   fi
 
-  # Brief pause for webhook registration with API server
-  log "Waiting for webhooks to stabilize (10s)..."
-  sleep 10
+  log "cert-manager ${CERT_MANAGER_VERSION} is ready on Kubernetes ${kubernetes_major}.${kubernetes_minor_raw}"
+}
 
-  # Test webhook by creating a test Certificate resource
-  log "Testing cert-manager webhook functionality..."
-  cat <<EOF | kubectl apply -f - || warn "Webhook test failed, but continuing..."
+# ====== PROVISION SPLUNK SERVER TLS CERT (AIP-4614) ======
+# The Splunk Operator's auto-generated server.pem has no Kubernetes service
+# DNS name in its SANs, so SAIA's HTTPS calls to Splunk (JWKS fetch at
+# https://<service>:8089) fail with CERTIFICATE_VERIFY_FAILED. This issues a
+# proper cert-manager leaf cert with the correct SANs, signed by a per-install
+# CA, so install_splunk_standalone (below) can mount it into the Standalone CR.
+#
+# renewBefore is pinned explicitly (not left at cert-manager's implicit
+# default) so the rotation cadence is a documented choice, not an accident.
+# cert-manager reissues the leaf automatically; an installer rerun compares
+# the certificate fingerprint and recycles the OnDelete Splunk pod so splunkd
+# actually loads the new files.
+splunk_assert_owned_or_absent() {
+  local namespace="$1" resource="$2" name="$3"
+  local object_json="" expected_owner_id="${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+
+  if ! object_json="$(kubectl -n "${namespace}" get "${resource}" "${name}" \
+      --ignore-not-found -o json)"; then
+    err "Unable to verify ownership of ${namespace}/${resource}/${name}"
+    return 1
+  fi
+  [[ -z "${object_json}" ]] && return 0
+
+  if ! jq -e --arg owner_id "${expected_owner_id}" '
+      .metadata.labels["app.kubernetes.io/managed-by"] == "splunk-ai-platform-installer"
+      and .metadata.labels["app.kubernetes.io/instance"] == "splunk-ai-internal"
+      and .metadata.annotations["ai.splunk.com/owner-id"] == $owner_id
+    ' <<< "${object_json}" >/dev/null; then
+    err "Refusing to adopt or overwrite ${namespace}/${resource}/${name}: it exists without this installer's Splunk ownership metadata.
+    Inspect it first: kubectl -n ${namespace} get ${resource} ${name} -o yaml
+    Only for a verified legacy object created by this installer, explicitly adopt it with:
+      kubectl -n ${namespace} label ${resource} ${name} app.kubernetes.io/managed-by=splunk-ai-platform-installer app.kubernetes.io/instance=splunk-ai-internal --overwrite
+      kubectl -n ${namespace} annotate ${resource} ${name} ai.splunk.com/owner-id='${expected_owner_id}' --overwrite
+    Otherwise rename/remove the conflicting object or choose a different namespace."
+    return 1
+  fi
+}
+
+preflight_internal_splunk_resource_ownership() {
+  [[ "${SPLUNK_MODE}" == "internal" ]] || return 0
+
+  # Check the entire fixed-name internal Splunk footprint before applying any
+  # certificate or workload object. This prevents a late ConfigMap/Standalone
+  # collision from leaving behind a newly created CA, leaf key, or Secret.
+  splunk_assert_owned_or_absent "${AI_NS}" issuer.cert-manager.io ai-splunk-selfsigned || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" certificate.cert-manager.io ai-splunk-ca || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" secret ai-splunk-ca-tls || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" issuer.cert-manager.io ai-splunk-ca-issuer || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" certificate.cert-manager.io ai-splunk-server || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" secret ai-splunk-server-tls || return 1
+  splunk_assert_owned_or_absent "${AI_NS}" configmap splunk-defaults || return 1
+
+  # The first transaction preflight runs before the Splunk Operator installs
+  # its CRD. An absent CRD proves no Standalone object can exist; any discovery
+  # error remains fatal. Later preflights inspect the Standalone itself.
+  local standalone_crd=""
+  standalone_crd="$(kubectl get crd standalones.enterprise.splunk.com \
+    --ignore-not-found -o name)" || {
+    err "Unable to discover the Standalone CRD during ownership preflight"
+    return 1
+  }
+  if [[ -n "${standalone_crd}" ]]; then
+    splunk_assert_owned_or_absent "${AI_NS}" standalone.enterprise.splunk.com "${AI_STANDALONE_NAME}" || return 1
+  fi
+}
+
+provision_splunk_cert() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk cert provisioning (no in-cluster Splunk)"
+    return 0
+  fi
+
+  log "Provisioning Splunk server TLS cert (service DNS SANs) via cert-manager..."
+
+  ensure_namespace "${AI_NS}"
+  wait_for_cert_manager_webhook 30 10
+
+  preflight_internal_splunk_resource_ownership || \
+    err "Internal Splunk resource ownership preflight failed"
+
+  # Service names the Splunk Operator actually creates for a Standalone CR
+  # (GetSplunkServiceName in the vendored operator: "splunk-%s-%s-%s" with
+  # instanceType=standalone, suffix=service|headless).
+  local svc="splunk-${AI_STANDALONE_NAME}-standalone-service"
+  local headless="splunk-${AI_STANDALONE_NAME}-standalone-headless"
+  local splunk_ingress_dns_sans=""
+  local splunk_ingress_ip_sans=""
+  if ingress_enabled_k0s && [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]]; then
+    local -a ingress_node_ips=()
+    mapfile -t ingress_node_ips < <(ingress_node_ips_k0s)
+    [[ ${#ingress_node_ips[@]} -gt 0 ]] || \
+      err "Splunk management ingress requires at least one ingress-capable node IP"
+
+    if [[ -n "${INGRESS_HOSTNAME}" ]]; then
+      splunk_ingress_dns_sans+="    - ${INGRESS_HOSTNAME}"$'\n'
+    fi
+    local ingress_ip
+    for ingress_ip in "${ingress_node_ips[@]}"; do
+      splunk_ingress_ip_sans+="    - ${ingress_ip}"$'\n'
+    done
+  fi
+
+  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side -f -
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
-  name: test-selfsigned
-  namespace: cert-manager
+  name: ai-splunk-selfsigned
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   selfSigned: {}
-EOF
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-ca
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  isCA: true
+  commonName: ai-splunk-ca
+  secretName: ai-splunk-ca-tls
+  secretTemplate:
+    annotations:
+      ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+    labels:
+      app.kubernetes.io/instance: splunk-ai-internal
+      app.kubernetes.io/managed-by: splunk-ai-platform-installer
+  # Keep the installer-owned trust anchor stable and long-lived. Splunk does
+  # not hot-reload renewed certificate files, so short default CA rotation
+  # would create an avoidable trust mismatch before a controlled restart.
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: ai-splunk-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-ca-issuer
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  ca:
+    secretName: ai-splunk-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-server
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  secretName: ai-splunk-server-tls
+  secretTemplate:
+    annotations:
+      ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+    labels:
+      app.kubernetes.io/instance: splunk-ai-internal
+      app.kubernetes.io/managed-by: splunk-ai-platform-installer
+  duration: 2160h      # 90d leaf lifetime — pinned explicitly (Part G.1)
+  renewBefore: 720h    # reissue 30d before expiry
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  # Splunk KV Store uses this same certificate in both server and client roles.
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+  issuerRef:
+    name: ai-splunk-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  dnsNames:
+    - ${svc}
+    - ${svc}.${AI_NS}
+    - ${svc}.${AI_NS}.svc
+    - ${svc}.${AI_NS}.svc.${CLUSTER_DOMAIN}
+    - ${headless}
+    - ${headless}.${AI_NS}
+    - ${headless}.${AI_NS}.svc
+    - ${headless}.${AI_NS}.svc.${CLUSTER_DOMAIN}
+    - localhost
+${splunk_ingress_dns_sans}  ipAddresses:
+    - 127.0.0.1
+${splunk_ingress_ip_sans}
+YAML
 
-  # Clean up test issuer
-  kubectl delete issuer test-selfsigned -n cert-manager --ignore-not-found=true 2>/dev/null || true
+  log "Waiting for Splunk server certificate to be Ready..."
+  if ! kubectl wait --for=condition=Ready certificate/ai-splunk-server -n "${AI_NS}" --timeout=180s \
+      || ! wait_for_certificate_current_generation "${AI_NS}" ai-splunk-server 180; then
+    kubectl describe certificate ai-splunk-server -n "${AI_NS}" >&2 || true
+    err "ai-splunk-server Certificate did not become Ready; refusing to start a TLS-dependent Splunk Standalone."
+  fi
 
-  log "cert-manager installed successfully"
+  # Ready must mean the exact source files consumed by Splunk's supported
+  # Ansible pre-task exist. The pre-task assembles server.pem in Splunk's
+  # required certificate-then-private-key order from the standard Secret keys.
+  local secret_ready="false" attempt
+  for attempt in $(seq 1 60); do
+    if kubectl get secret ai-splunk-server-tls -n "${AI_NS}" -o json 2>/dev/null \
+      | jq -e '
+          .data as $data
+          | ["tls.crt", "tls.key", "ca.crt"]
+          | all(.[]; ($data[.] // "") != "")
+        ' >/dev/null; then
+      secret_ready="true"
+      break
+    fi
+    sleep 2
+  done
+  if [[ "${secret_ready}" != "true" ]]; then
+    kubectl describe certificate ai-splunk-server -n "${AI_NS}" >&2 || true
+    err "Secret ai-splunk-server-tls is missing tls.crt, tls.key, or ca.crt; refusing to start Splunk with incomplete TLS material."
+  fi
+
+  SPLUNK_TLS_CERT_HASH="$(certificate_secret_hash "${AI_NS}" ai-splunk-server-tls)" || \
+    err "Unable to fingerprint ${AI_NS}/Secret/ai-splunk-server-tls"
+
+  log "Splunk server certificate provisioned (secret: ai-splunk-server-tls, CA: ai-splunk-ca-tls)"
+  log "Certificate changes detected during an installer run are reconciled with a controlled Standalone rollout"
+  warn "cert-manager renewal is autonomous, but splunkd does not hot-reload: rerun the installer after ai-splunk-server renews so the controlled rollout occurs"
 }
 
 # ====== INSTALL NVIDIA DRIVERS ON GPU NODES (bare-metal / EC2) ======
@@ -4085,23 +4881,25 @@ wait_for_cert_manager_webhook() {
     return 1
   fi
 
-  # 3. Functional test: create and delete a test Issuer
+  # 3. Functional admission test. This verifies the API server can reach the
+  # cert-manager webhook before installer-owned manifests are applied.
   local test_ok=false
   for i in $(seq 1 "${max_attempts}"); do
-    if kubectl apply -f - <<'TESTEOF' 2>/dev/null
+    if kubectl apply --dry-run=server -f - <<'TESTEOF' 2>/dev/null
 apiVersion: cert-manager.io/v1
-kind: Issuer
+kind: Certificate
 metadata:
-  name: cert-manager-webhook-test
+  name: cert-manager-webhook-admission-test
   namespace: cert-manager
 spec:
-  selfSigned: {}
+  secretName: cert-manager-webhook-admission-test
+  issuerRef:
+    name: admission-test
+    kind: Issuer
 TESTEOF
     then
-      kubectl delete issuer cert-manager-webhook-test -n cert-manager \
-        --ignore-not-found=true 2>/dev/null || true
       test_ok=true
-      log "✓ cert-manager webhook is responsive"
+      log "✓ cert-manager webhook accepts Certificate resources"
       break
     fi
     log "  cert-manager webhook not yet accepting requests... (${i}/${max_attempts})"
@@ -4114,6 +4912,45 @@ TESTEOF
   fi
 
   return 0
+}
+
+# `kubectl wait --for=condition=Ready` can observe Ready=True from the previous
+# Certificate generation immediately after a spec/SAN update. Wait until the
+# Ready condition itself reports the current metadata.generation before using
+# or distributing the Secret.
+wait_for_certificate_current_generation() {
+  local namespace="$1" name="$2" timeout_seconds="${3:-180}"
+  local deadline=$((SECONDS + timeout_seconds)) certificate_json
+  while (( SECONDS < deadline )); do
+    certificate_json="$(kubectl -n "${namespace}" get certificate "${name}" -o json 2>/dev/null || true)"
+    if [[ -n "${certificate_json}" ]] && jq -e '
+        .metadata.generation as $generation
+        | any(.status.conditions[]?;
+            .type == "Ready"
+            and .status == "True"
+            and .observedGeneration == $generation)
+      ' <<< "${certificate_json}" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+certificate_secret_hash() {
+  local namespace="$1" secret_name="$2" encoded_certificate digest
+  encoded_certificate="$(kubectl -n "${namespace}" get secret "${secret_name}" \
+    -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)"
+  [[ -n "${encoded_certificate}" ]] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${encoded_certificate}" | sha256sum | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${encoded_certificate}" | shasum -a 256 | awk '{print $1}')"
+  else
+    digest="$(printf '%s' "${encoded_certificate}" | openssl dgst -sha256 | awk '{print $NF}')" || return 1
+  fi
+  [[ "${digest}" =~ ^[a-fA-F0-9]{64}$ ]] || return 1
+  printf '%s\n' "${digest}"
 }
 
 # ====== INSTALL SPLUNK AI OPERATOR ======
@@ -4568,6 +5405,24 @@ install_splunk_standalone() {
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
 
+  # Fail before creating credentials or defaults when either fixed-name
+  # workload object belongs to another installation. This makes the
+  # ownership guard transactional for this provisioning function.
+  splunk_assert_owned_or_absent "${AI_NS}" configmap splunk-defaults
+  splunk_assert_owned_or_absent "${AI_NS}" standalone.enterprise.splunk.com "${AI_STANDALONE_NAME}"
+
+  [[ -n "${SPLUNK_TLS_CERT_HASH}" ]] || \
+    SPLUNK_TLS_CERT_HASH="$(certificate_secret_hash "${AI_NS}" ai-splunk-server-tls)" || \
+    err "Unable to fingerprint ${AI_NS}/Secret/ai-splunk-server-tls before applying Splunk"
+  local standalone_json="" standalone_preexisting="false" loaded_tls_hash=""
+  standalone_json="$(kubectl -n "${AI_NS}" get standalone "${AI_STANDALONE_NAME}" \
+    --ignore-not-found -o json)" || err "Unable to inspect existing Splunk Standalone"
+  if [[ -n "${standalone_json}" ]]; then
+    standalone_preexisting="true"
+    loaded_tls_hash="$(jq -r '.metadata.annotations["ai.splunk.com/loaded-tls-sha256"] // ""' \
+      <<< "${standalone_json}")"
+  fi
+
   # Ensure credentials secret exists for Splunk App Framework
   if ! kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
     log "Creating minio-credentials secret in ${AI_NS}..."
@@ -4589,23 +5444,94 @@ install_splunk_standalone() {
   # "Issuer '<iss>' is not allowed". Keep both in the
   # https://splunk-<name>-standalone-service.<ns>.svc.<domain>:8089 form used by
   # the operator's own SplunkCustomResourceRef path (buildSplunkIssuersVal).
+  #
+  # The supported Splunk-Ansible pre-task below assembles server.pem in
+  # certificate-then-private-key order before Splunk starts. The source Secret
+  # is projected read-only at /mnt/splunk-cert-source and the server PEM is
+  # written to a pod-private, memory-backed emptyDir at /mnt/splunk-certs.
+  # sslRootCAPath keeps
+  # KV Store trusting the same CA the leaf chains to.
   cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: splunk-defaults
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 data:
   default.yml: |
+    ansible_pre_tasks:
+      - file:///mnt/defaults/prepare-server-pem.yml
     splunk:
+      # Use Splunk-Ansible's supported TLS inputs as well as the explicit conf
+      # stanzas below. The nested HEC settings override the operator Secret's
+      # deprecated plaintext default and preserve these paths in later API tasks.
+      ssl:
+        enable: true
+        cert: /mnt/splunk-certs/server.pem
+        password: ""
+        ca: /mnt/splunk-cert-source/ca.crt
+      hec:
+        enable: true
+        ssl: true
+        port: 8088
+        cert: /mnt/splunk-certs/server.pem
+        password: ""
+      http_enableSSL: 1
+      http_enableSSL_cert: /mnt/splunk-cert-source/tls.crt
+      http_enableSSL_privKey: /mnt/splunk-cert-source/tls.key
+      http_enableSSL_privKey_password: ""
       conf:
+        - key: server
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              sslConfig:
+                serverCert: /mnt/splunk-certs/server.pem
+                sslRootCAPath: /mnt/splunk-cert-source/ca.crt
+                sslPassword: ""
+        - key: web
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              settings:
+                enableSplunkWebSSL: true
+                serverCert: /mnt/splunk-cert-source/tls.crt
+                privKeyPath: /mnt/splunk-cert-source/tls.key
+                caCertPath: /mnt/splunk-cert-source/ca.crt
+                sslPassword: ""
+        - key: inputs
+          value:
+            directory: /opt/splunk/etc/apps/splunk_httpinput/local
+            content:
+              http:
+                enableSSL: 1
+                serverCert: /mnt/splunk-certs/server.pem
+                sslPassword: ""
         - key: authentication
           value:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
-                certFile: \$SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
+                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.${CLUSTER_DOMAIN}:8089
+                certFile: /mnt/splunk-certs/server.pem
+                sslPassword: ""
+  prepare-server-pem.yml: |
+    ---
+    - name: Assemble Splunk server PEM in certificate-first order
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          umask 077
+          cat /mnt/splunk-cert-source/tls.crt /mnt/splunk-cert-source/tls.key > /mnt/splunk-certs/server.pem.tmp
+          chmod 0600 /mnt/splunk-certs/server.pem.tmp
+          mv -f /mnt/splunk-certs/server.pem.tmp /mnt/splunk-certs/server.pem
+        executable: /bin/sh
+      changed_when: false
+      no_log: true
 YAML
 
   # Ensure default ServiceAccount has imagePullSecrets for ECR
@@ -4649,12 +5575,17 @@ YAML
   fi
   local endpoint_line="        endpoint: ${minio_endpoint}"
 
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+  cat <<YAML | kubectl apply --server-side -f -
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
   name: ${AI_STANDALONE_NAME}
   namespace: ${AI_NS}
+  annotations:
+    ai.splunk.com/owner-id: "${CLUSTER_NAME}/${AI_STANDALONE_NAME}"
+  labels:
+    app.kubernetes.io/instance: splunk-ai-internal
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
 spec:
   replicas: 1
   etcVolumeStorageConfig:
@@ -4665,6 +5596,21 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-cert-source
+      secret:
+        secretName: ai-splunk-server-tls
+        defaultMode: 0440
+        items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+          - key: ca.crt
+            path: ca.crt
+    - name: splunk-certs
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Mi
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appInstallPeriodSeconds: 90
@@ -4686,6 +5632,33 @@ ${endpoint_line}
         secretRef: minio-credentials
 YAML
 
+  if [[ "${standalone_preexisting}" == "true" && "${loaded_tls_hash}" != "${SPLUNK_TLS_CERT_HASH}" ]]; then
+    local splunk_statefulset="splunk-${AI_STANDALONE_NAME}-standalone"
+    local splunk_pod="${splunk_statefulset}-0"
+    local statefulset_waited=0
+    log "Splunk TLS certificate changed; preparing a controlled Standalone restart..."
+    while ! kubectl -n "${AI_NS}" get statefulset "${splunk_statefulset}" >/dev/null 2>&1; do
+      (( statefulset_waited >= 180 )) && \
+        err "Timed out waiting for StatefulSet/${splunk_statefulset} before TLS restart"
+      sleep 3
+      statefulset_waited=$((statefulset_waited + 3))
+    done
+    # Splunk Operator uses StatefulSet updateStrategy=OnDelete. A rollout
+    # restart only changes the pod template and does not recycle the singleton;
+    # delete that owned pod explicitly and wait for the StatefulSet replacement.
+    kubectl -n "${AI_NS}" delete "pod/${splunk_pod}" --ignore-not-found \
+      --wait=true --timeout=180s || \
+      err "Unable to delete ${AI_NS}/Pod/${splunk_pod} for its TLS certificate restart"
+    local replacement_waited=0
+    while ! kubectl -n "${AI_NS}" get "pod/${splunk_pod}" >/dev/null 2>&1; do
+      (( replacement_waited >= 180 )) && \
+        err "Timed out waiting for StatefulSet/${splunk_statefulset} to recreate ${splunk_pod}"
+      sleep 3
+      replacement_waited=$((replacement_waited + 3))
+    done
+    kubectl -n "${AI_NS}" wait --for=condition=Ready "pod/${splunk_pod}" --timeout=600s || \
+      err "Splunk Standalone failed to become Ready after its TLS certificate restart"
+  fi
   log "Splunk Standalone CR applied (pod starts in background)"
 }
 
@@ -4696,9 +5669,27 @@ wait_for_splunk_standalone() {
     return 0
   fi
 
-  log "Waiting for Splunk Standalone to be ready..."
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
-  log "Splunk Standalone is ready"
+  local splunk_pod="splunk-${AI_STANDALONE_NAME}-standalone-0"
+  log "Waiting for Splunk Standalone pod ${splunk_pod} to be ready..."
+  local pod_waited=0
+  while ! kubectl -n "${AI_NS}" get "pod/${splunk_pod}" >/dev/null 2>&1; do
+    (( pod_waited >= 600 )) && \
+      err "Timed out waiting for Splunk Operator to create pod/${splunk_pod}"
+    sleep 5
+    pod_waited=$((pod_waited + 5))
+  done
+  if ! kubectl -n "${AI_NS}" wait --for=condition=Ready "pod/${splunk_pod}" --timeout=600s; then
+    kubectl -n "${AI_NS}" describe "pod/${splunk_pod}" >&2 || true
+    err "Splunk Standalone pod ${splunk_pod} did not become Ready"
+  fi
+
+  [[ -n "${SPLUNK_TLS_CERT_HASH}" ]] || \
+    SPLUNK_TLS_CERT_HASH="$(certificate_secret_hash "${AI_NS}" ai-splunk-server-tls)" || \
+    err "Unable to fingerprint ${AI_NS}/Secret/ai-splunk-server-tls after Splunk became Ready"
+  kubectl -n "${AI_NS}" annotate standalone "${AI_STANDALONE_NAME}" \
+    "ai.splunk.com/loaded-tls-sha256=${SPLUNK_TLS_CERT_HASH}" --overwrite >/dev/null || \
+    err "Unable to record the TLS certificate loaded by Splunk Standalone"
+  log "Splunk Standalone is Ready with TLS certificate ${SPLUNK_TLS_CERT_HASH}"
 }
 
 # ====== INSTALL AI PLATFORM CR ======
@@ -4754,10 +5745,22 @@ install_ai_platform_cr() {
   # set in the splunk-defaults ConfigMap above (install_splunk_standalone) —
   # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
-    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.${CLUSTER_DOMAIN}:8089
+    # HEC ingestion endpoint (port 8088) for the OTel sidecar. Distinct from
+    # "endpoint" above (management/JWKS, port 8089, used as the JWT issuer) —
+    # without this, OTel telemetry was sent to the management port and
+    # silently failed to reach the HEC listener.
+    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.${CLUSTER_DOMAIN}:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
+    # CA that signed the Standalone's server cert (provision_splunk_cert) — lets
+    # SAIA/SLIM validate the hostname-correct leaf cert instead of skipping TLS
+    # verification (AIP-4614 Part C).
+    caCertRef:
+      name: ai-splunk-server-tls
+      namespace: ${AI_NS}
+      key: ca.crt
 ${trusted_issuers_yaml}
 EOF
 )
@@ -4770,6 +5773,9 @@ EOF
       if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
         err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
       fi
+      if [[ -z "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" || -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]]; then
+        err "Splunk external mode requires both splunk.external.managementEndpoint and splunk.external.hecEndpoint. Legacy endpoint inference is supported only for the standard 8088/8089 ports."
+      fi
       log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
       # --dry-run|apply keeps this idempotent across re-runs. The token value is
       # never echoed; only the secret name is logged.
@@ -4777,16 +5783,33 @@ EOF
         --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
         --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
       log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
-      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
+      log "Using external Splunk management/JWKS endpoint: ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}"
+      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_HEC_ENDPOINT}"
+      # Only emitted when the customer set splunk.external.caCertSecretName —
+      # a Secret they pre-create themselves (AIP-4614 Part E). Left unset,
+      # SAIA falls back to its image's system trust store, which is correct
+      # whenever the external Splunk's cert is publicly trusted.
+      local external_ca_cert_yaml=""
+      if [[ -n "${SPLUNK_EXTERNAL_CA_SECRET_NAME}" ]]; then
+        log "Using external Splunk CA secret: ${SPLUNK_EXTERNAL_CA_SECRET_NAME}"
+        external_ca_cert_yaml=$(cat <<EOF
+    caCertRef:
+      name: ${SPLUNK_EXTERNAL_CA_SECRET_NAME}
+      namespace: ${AI_NS}
+      key: ca.crt
+EOF
+)
+      fi
       splunk_config_yaml=$(cat <<EOF
 
   # Splunk configuration (external — customer-managed Splunk)
   splunkConfiguration:
-    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
+    endpoint: ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}
+    hecEndpoint: ${SPLUNK_EXTERNAL_HEC_ENDPOINT}
     secretRef:
       name: ${SPLUNK_EXTERNAL_SECRET_NAME}
       namespace: ${AI_NS}
-${trusted_issuers_yaml}
+${external_ca_cert_yaml}${trusted_issuers_yaml}
 EOF
 )
       ;;
@@ -5058,6 +6081,123 @@ apply_k0s_saia_service_annotations() {
 # Layer-2 (ARP/NDP) or BGP. We pin the chart version for supply-chain
 # reproducibility (codeguard-0-supply-chain-security).
 
+ingress_enabled_k0s() {
+  [[ "${INGRESS_ENABLED}" == "true" ]]
+}
+
+# Validate only listeners that will actually be rendered. Disabled management
+# and non-internal Splunk settings are inert and must not block reconciliation
+# because of stale/duplicate port values.
+validate_ingress_entrypoint_ports_k0s() {
+  if [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" && "${SPLUNK_MODE}" != "internal" ]]; then
+    err "ingress.entryPoints.splunkMgmt.enabled=true requires splunk.mode=internal"
+  fi
+
+  local -a active_ports=("${INGRESS_SAIA_PORT}")
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    active_ports+=("${INGRESS_SPLUNKWEB_PORT}")
+    [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]] && \
+      active_ports+=("${INGRESS_SPLUNKMGMT_PORT}")
+  fi
+
+  local -A seen_ports=()
+  local ingress_port
+  for ingress_port in "${active_ports[@]}"; do
+    [[ "${ingress_port}" =~ ^[1-9][0-9]{3,4}$ ]] || \
+      err "active ingress entryPoint ports must be integers between 1024 and 65535"
+    (( 10#${ingress_port} >= 1024 && 10#${ingress_port} <= 65535 )) || \
+      err "active ingress entryPoint ports must be between 1024 and 65535"
+    [[ "${ingress_port}" != "9000" ]] || \
+      err "ingress entryPoint port 9000 is reserved for Traefik health probes"
+    [[ -z "${seen_ports[${ingress_port}]+x}" ]] || \
+      err "active ingress entryPoint ports must be unique"
+    seen_ports["${ingress_port}"]=1
+  done
+}
+
+# Print one host IP per Traefik target node. Dedicated workers are preferred;
+# the controller is ingress-capable only in the supported single-node topology
+# where k0s runs the controller with --enable-worker.
+ingress_ip_literal_k0s() {
+  local value="$1" octet
+  if [[ "${value}" == *:* ]]; then
+    # cert-manager performs the final IPv6 parse. This precheck constrains the
+    # interpolation to IP-literal characters and rejects hostnames/YAML syntax.
+    [[ "${value}" =~ ^[0-9A-Fa-f:.]+$ && "${value}" != ":" ]]
+    return
+  fi
+  [[ "${value}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  local -a octets=()
+  IFS='.' read -ra octets <<< "${value}"
+  [[ ${#octets[@]} -eq 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "${octet}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    (( 10#${octet} <= 255 )) || return 1
+  done
+}
+
+ingress_node_ips_k0s() {
+  local -a ips=()
+  if [[ -n "${EXISTING_WORKER_IPS}" ]]; then
+    IFS=' ' read -ra ips <<< "${EXISTING_WORKER_IPS}"
+  else
+    IFS=' ' read -ra ips <<< "${EXISTING_CONTROLLER_IPS}"
+    [[ ${#ips[@]} -eq 1 ]] || return 1
+  fi
+
+  local ip
+  for ip in "${ips[@]}"; do
+    if [[ -n "${ip}" ]] && ! ingress_ip_literal_k0s "${ip}"; then
+      warn "Ingress target '${ip}' is not an IP literal; nodes.existingIPs must contain IPv4/IPv6 addresses"
+      return 1
+    fi
+  done
+  for ip in "${ips[@]}"; do
+    [[ -n "${ip}" ]] && printf '%s\n' "${ip}"
+  done
+}
+
+# Reconcile the installer-owned scheduling label to the exact configured
+# ingress-node set and verify every target exists and is Ready. This also fixes
+# existing-cluster paths that did not previously run the broader label_nodes
+# phase; without it a DaemonSet with desired=0 makes `rollout status` succeed.
+reconcile_traefik_ingress_nodes_k0s() {
+  local -a target_ips=("$@") current_labelled_nodes=()
+  local -A target_nodes=()
+  local target_ip node_name node_json current_node labelled_nodes_json
+  for target_ip in "${target_ips[@]}"; do
+    node_name="$(resolve_node_name "${target_ip}")"
+    [[ -n "${node_name}" ]] || \
+      err "Unable to resolve the Kubernetes node name for ingress target ${target_ip}"
+    [[ -z "${target_nodes[${node_name}]+x}" ]] || \
+      err "Multiple ingress target IPs resolve to the same Kubernetes node ${node_name}"
+    node_json="$(kubectl get node "${node_name}" --ignore-not-found -o json)" || \
+      err "Unable to inspect ingress target node ${node_name}"
+    [[ -n "${node_json}" ]] || \
+      err "Ingress target ${target_ip} resolves to ${node_name}, but that Node is absent from the cluster"
+    jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' \
+      <<< "${node_json}" >/dev/null || \
+      err "Ingress target node ${node_name} (${target_ip}) is not Ready"
+    target_nodes["${node_name}"]=1
+  done
+
+  labelled_nodes_json="$(kubectl get nodes -l splunk.ai/ingress-node=true -o json)" || \
+    err "Unable to inspect existing ingress-node labels"
+  mapfile -t current_labelled_nodes < <(jq -r '.items[]?.metadata.name' <<< "${labelled_nodes_json}")
+  for current_node in "${current_labelled_nodes[@]}"; do
+    if [[ -z "${target_nodes[${current_node}]+x}" ]]; then
+      kubectl label node "${current_node}" splunk.ai/ingress-node- || \
+        err "Unable to remove stale ingress-node label from ${current_node}"
+    fi
+  done
+  for node_name in "${!target_nodes[@]}"; do
+    kubectl label node "${node_name}" splunk.ai/ingress-node=true --overwrite || \
+      err "Unable to label ingress target node ${node_name}"
+  done
+  TRAEFIK_EXPECTED_NODE_COUNT="${#target_nodes[@]}"
+  (( TRAEFIK_EXPECTED_NODE_COUNT > 0 )) || err "No ingress target nodes were reconciled"
+}
+
 metallb_enabled_k0s() {
   local v
   v="$(yq eval '.metallb.install // false' "${CONFIG_FILE}" 2>/dev/null || echo false)"
@@ -5186,6 +6326,722 @@ YAML
   fi
 
   log "✓ MetalLB ${chart_version} installed (${mode}, pool=${pool_name})"
+}
+
+# ---------- Traefik HTTPS ingress (additive; see TRAEFIK_HTTPS_DESIGN.md) ----------
+# Deploys Traefik v3 as a hostPort DaemonSet (one independent pod per worker
+# node — there is no single shared controller IP) terminating HTTPS for SAIA
+# (:8443), Splunk Web (:8000) and, optionally, Splunk's management port
+# (:8089, TCP passthrough so Splunk's own cert stays end-to-end). Additive:
+# existing NodePort/tunnel access is untouched and keeps working regardless
+# of ingress.enabled.
+traefik_assert_owned_or_absent() {
+  local namespace="$1" resource="$2" name="$3"
+  local object_json
+  if ! object_json="$(kubectl -n "${namespace}" get "${resource}" "${name}" \
+      --ignore-not-found -o json)"; then
+    err "Unable to verify ownership of ${namespace}/${resource}/${name}"
+  fi
+  [[ -z "${object_json}" ]] && return 0
+
+  if ! jq -e '
+      .metadata.labels["app.kubernetes.io/managed-by"] == "splunk-ai-platform-installer"
+      and .metadata.labels["app.kubernetes.io/instance"] == "splunk-ai-ingress"
+    ' <<< "${object_json}" >/dev/null; then
+    err "Refusing to adopt ${namespace}/${resource}/${name}: the object exists without this installer's ownership labels"
+  fi
+}
+
+remove_traefik_ingress() {
+  local ingress_ns="ingress"
+  local managed_selector="app.kubernetes.io/managed-by=splunk-ai-platform-installer,app.kubernetes.io/instance=splunk-ai-ingress"
+  local cleanup_failures=0
+  log "Reconciling Traefik HTTPS ingress to disabled state..."
+
+  # Close hostPorts first. Delete only resources carrying both installer
+  # ownership labels; fixed names such as `traefik` and `TLSStore/default` are
+  # common in shared clusters and must never be adopted or removed by name.
+  if ! kubectl -n "${ingress_ns}" delete daemonset \
+      -l "${managed_selector}" --ignore-not-found --wait=true --timeout=180s; then
+    warn "Failed to remove installer-owned Traefik DaemonSet(s) from ${ingress_ns}"
+    cleanup_failures=$((cleanup_failures + 1))
+  fi
+
+  local crd resource crd_lookup
+  while IFS='|' read -r crd resource; do
+    [[ -z "${crd}" ]] && continue
+    crd_lookup=""
+    if ! crd_lookup="$(kubectl get crd "${crd}" --ignore-not-found -o name)"; then
+      warn "Unable to determine whether CRD ${crd} exists"
+      cleanup_failures=$((cleanup_failures + 1))
+    elif [[ -n "${crd_lookup}" ]]; then
+      if ! kubectl -n "${AI_NS}" delete "${resource}" \
+          -l "${managed_selector}" --ignore-not-found; then
+        warn "Failed to remove installer-owned ${resource} resources from ${AI_NS}"
+        cleanup_failures=$((cleanup_failures + 1))
+      fi
+    fi
+  done <<'TRAEFIK_CLEANUP_RESOURCES'
+ingressroutes.traefik.io|ingressroutes.traefik.io
+ingressroutetcps.traefik.io|ingressroutetcps.traefik.io
+serverstransports.traefik.io|serverstransports.traefik.io
+tlsstores.traefik.io|tlsstores.traefik.io
+certificates.cert-manager.io|certificates.cert-manager.io
+issuers.cert-manager.io|issuers.cert-manager.io
+TRAEFIK_CLEANUP_RESOURCES
+
+  for resource in configmaps secrets rolebindings.rbac.authorization.k8s.io roles.rbac.authorization.k8s.io; do
+    if ! kubectl -n "${AI_NS}" delete "${resource}" \
+        -l "${managed_selector}" --ignore-not-found; then
+      warn "Failed to remove installer-owned ${resource} resources from ${AI_NS}"
+      cleanup_failures=$((cleanup_failures + 1))
+    fi
+  done
+  if ! kubectl -n "${ingress_ns}" delete serviceaccounts \
+      -l "${managed_selector}" --ignore-not-found; then
+    warn "Failed to remove installer-owned ServiceAccount(s) from ${ingress_ns}"
+    cleanup_failures=$((cleanup_failures + 1))
+  fi
+  if ! kubectl -n "${ingress_ns}" delete secrets \
+      -l "${managed_selector}" --ignore-not-found; then
+    warn "Failed to remove installer-owned pull Secret copies from ${ingress_ns}"
+    cleanup_failures=$((cleanup_failures + 1))
+  fi
+
+  # Never auto-delete an unlabeled legacy/common Traefik deployment. Surface
+  # the collision so an operator can inspect ownership explicitly.
+  local existing_daemonset_json="" existing_owner=""
+  if ! existing_daemonset_json="$(kubectl -n "${ingress_ns}" get daemonset traefik \
+      --ignore-not-found -o json)"; then
+    warn "Unable to verify whether ${ingress_ns}/DaemonSet/traefik still exists"
+    cleanup_failures=$((cleanup_failures + 1))
+  elif [[ -n "${existing_daemonset_json}" ]]; then
+    existing_owner="$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' \
+      <<< "${existing_daemonset_json}")"
+    if [[ "${existing_owner}" == "splunk-ai-platform-installer" ]]; then
+      warn "Installer-owned ${ingress_ns}/DaemonSet/traefik still exists after deletion; hostPorts may remain open"
+    elif [[ -n "${existing_owner}" ]]; then
+      warn "Unowned ${ingress_ns}/DaemonSet/traefik remains untouched (managed-by=${existing_owner})"
+    else
+      warn "Unlabeled ${ingress_ns}/DaemonSet/traefik remains untouched; inspect and remove it manually if it is a legacy installer resource"
+    fi
+    cleanup_failures=$((cleanup_failures + 1))
+  fi
+
+  (( cleanup_failures == 0 )) || \
+    err "Traefik disable reconciliation failed; one or more installer-owned resources may still be active"
+  log "✓ Installer-owned Traefik workload, listeners, routes, certificates, RBAC and pull-Secret copies removed; shared CRDs and pre-existing/unowned registry credentials retained."
+}
+
+install_traefik_ingress() {
+  if ! ingress_enabled_k0s; then
+    remove_traefik_ingress
+    return 0
+  fi
+
+  log "Installing Traefik HTTPS ingress..."
+  wait_for_cert_manager_webhook 30 10 || \
+    err "cert-manager webhook is not ready; refusing to create the Traefik certificate chain"
+
+  local ingress_ns="ingress"
+  ensure_namespace "${ingress_ns}"
+  ensure_namespace "${AI_NS}"
+
+  local manifest_dir="${TRAEFIK_MANIFEST_DIR:-$(dirname "$0")/traefik}"
+  [[ -f "${manifest_dir}/traefik-crds.yaml" && -f "${manifest_dir}/traefik-rbac.yaml" ]] || \
+    err "Traefik manifests not found in ${manifest_dir}; provide TRAEFIK_MANIFEST_DIR or copy the installer traefik/ directory"
+
+  traefik_assert_owned_or_absent "${ingress_ns}" serviceaccount traefik
+  traefik_assert_owned_or_absent "${AI_NS}" role.rbac.authorization.k8s.io splunk-ai-traefik
+  traefik_assert_owned_or_absent "${AI_NS}" rolebinding.rbac.authorization.k8s.io splunk-ai-traefik
+
+  local crd
+  local -a traefik_crds=(
+    ingressroutes.traefik.io
+    middlewares.traefik.io
+    middlewaretcps.traefik.io
+    ingressroutetcps.traefik.io
+    ingressrouteudps.traefik.io
+    tlsoptions.traefik.io
+    serverstransports.traefik.io
+    serverstransporttcps.traefik.io
+    tlsstores.traefik.io
+    traefikservices.traefik.io
+  )
+  local existing_crd_count=0
+  for crd in "${traefik_crds[@]}"; do
+    kubectl get "crd/${crd}" >/dev/null 2>&1 && existing_crd_count=$((existing_crd_count + 1))
+  done
+  if (( existing_crd_count == 0 )); then
+    kubectl apply --server-side --field-manager=splunk-ai-platform-installer \
+      -f "${manifest_dir}/traefik-crds.yaml"
+  elif (( existing_crd_count != ${#traefik_crds[@]} )); then
+    err "Found a partial Traefik CRD installation (${existing_crd_count}/${#traefik_crds[@]}). Refusing to mix or overwrite shared CRDs; reconcile the cluster-wide Traefik CRD owner first."
+  else
+    local crd_diff_rc=0
+    kubectl diff --server-side --field-manager=splunk-ai-platform-installer \
+      -f "${manifest_dir}/traefik-crds.yaml" >/dev/null || crd_diff_rc=$?
+    if (( crd_diff_rc == 1 )); then
+      err "Existing cluster-wide Traefik CRDs differ from the pinned v3.6.25 bundle. Refusing to seize or downgrade shared schemas."
+    elif (( crd_diff_rc > 1 )); then
+      err "Unable to compare existing Traefik CRDs with the pinned v3.6.25 bundle"
+    fi
+  fi
+  for crd in "${traefik_crds[@]}"; do
+    if ! kubectl wait --for=condition=Established "crd/${crd}" --timeout=300s; then
+      kubectl describe "crd/${crd}" >&2 || true
+      err "Traefik CRD ${crd} did not become Established"
+    fi
+  done
+
+  # The controller runs in ingress but watches only AI_NS. Render a Role and
+  # RoleBinding into AI_NS instead of granting cluster-wide Secret access.
+  sed "s/__AI_NAMESPACE__/${AI_NS}/g" "${manifest_dir}/traefik-rbac.yaml" | kubectl apply -f -
+
+  # An unlabeled legacy ClusterRoleBinding would silently defeat the new
+  # namespace boundary. Do not delete a cluster-scoped object without proof of
+  # ownership; fail with an explicit migration action instead.
+  local legacy_binding_json=""
+  legacy_binding_json="$(kubectl get clusterrolebinding traefik-ingress-controller \
+    --ignore-not-found -o json)" || err "Unable to inspect legacy Traefik RBAC"
+  if [[ -n "${legacy_binding_json}" ]] && jq -e '
+      any(.subjects[]?;
+        .kind == "ServiceAccount" and .name == "traefik" and .namespace == "ingress")
+    ' <<< "${legacy_binding_json}" >/dev/null; then
+    err "Legacy ClusterRoleBinding/traefik-ingress-controller still grants cluster-wide access to ingress/traefik. Review its ownership and remove it explicitly before enabling this namespace-scoped deployment."
+  fi
+
+  local resource_name
+  for resource_name in ingress-selfsigned ingress-ca-issuer; do
+    traefik_assert_owned_or_absent "${AI_NS}" issuer.cert-manager.io "${resource_name}"
+  done
+  for resource_name in ingress-ca internal-domain-tls; do
+    traefik_assert_owned_or_absent "${AI_NS}" certificate.cert-manager.io "${resource_name}"
+  done
+  for resource_name in internal-domain-tls ai-platform-ingress-ca-tls; do
+    traefik_assert_owned_or_absent "${AI_NS}" secret "${resource_name}"
+  done
+  traefik_assert_owned_or_absent "${AI_NS}" tlsstore.traefik.io default
+  traefik_assert_owned_or_absent "${AI_NS}" ingressroute.traefik.io saia-websecure
+  traefik_assert_owned_or_absent "${AI_NS}" ingressroute.traefik.io splunkweb-splunkweb
+  traefik_assert_owned_or_absent "${AI_NS}" ingressroutetcp.traefik.io splunkmgmt-passthrough
+  traefik_assert_owned_or_absent "${AI_NS}" serverstransport.traefik.io splunk-web-tls
+  traefik_assert_owned_or_absent "${AI_NS}" configmap ai-splunk-ca-public
+  traefik_assert_owned_or_absent "${ingress_ns}" daemonset.apps traefik
+
+  local existing_daemonset_json=""
+  existing_daemonset_json="$(kubectl -n "${ingress_ns}" get daemonset traefik \
+    --ignore-not-found -o json)" || err "Unable to inspect ${ingress_ns}/DaemonSet/traefik"
+  if [[ -n "${existing_daemonset_json}" ]] && ! jq -e '
+      .spec.selector.matchLabels["app.kubernetes.io/instance"] == "splunk-ai-ingress"
+    ' <<< "${existing_daemonset_json}" >/dev/null; then
+    log "Recreating installer-owned Traefik DaemonSet to migrate its immutable selector..."
+    kubectl -n "${ingress_ns}" delete daemonset traefik --wait=true --timeout=180s
+  fi
+
+  # cert-manager selfSigned → CA → CA-Issuer → leaf chain. The leaf and every
+  # Traefik object that references it live in AI_NS because tls.secretName is
+  # always resolved in the IngressRoute namespace.
+  #
+  # Every hostPort target needs an IP SAN. In a supported single-node cluster
+  # the controller is also a worker and carries splunk.ai/ingress-node=true.
+  local -a ingress_node_ips=()
+  mapfile -t ingress_node_ips < <(ingress_node_ips_k0s)
+  if [[ ${#ingress_node_ips[@]} -eq 0 ]]; then
+    err "ingress.enabled=true requires worker IPs, or exactly one worker-enabled controller for single-node mode"
+  fi
+  reconcile_traefik_ingress_nodes_k0s "${ingress_node_ips[@]}"
+
+  local ip_sans=""
+  local ip
+  for ip in "${ingress_node_ips[@]}"; do
+    ip_sans+="    - ${ip}"$'\n'
+  done
+  local dns_sans=""
+  if [[ -n "${INGRESS_HOSTNAME}" ]]; then
+    dns_sans="  dnsNames:"$'\n'"    - ${INGRESS_HOSTNAME}"$'\n'
+  fi
+
+  log "Provisioning internal-domain-tls cert in ${AI_NS} (SANs: ${ingress_node_ips[*]}${INGRESS_HOSTNAME:+, ${INGRESS_HOSTNAME}})..."
+  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ingress-selfsigned
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ingress-ca
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  isCA: true
+  commonName: ai-platform-ingress-ca
+  secretName: ai-platform-ingress-ca-tls
+  secretTemplate:
+    labels:
+      app.kubernetes.io/instance: splunk-ai-ingress
+      app.kubernetes.io/managed-by: splunk-ai-platform-installer
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: ingress-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ingress-ca-issuer
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  ca:
+    secretName: ai-platform-ingress-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: internal-domain-tls
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  secretName: internal-domain-tls
+  secretTemplate:
+    labels:
+      app.kubernetes.io/instance: splunk-ai-ingress
+      app.kubernetes.io/managed-by: splunk-ai-platform-installer
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  issuerRef:
+    name: ingress-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+${dns_sans}  ipAddresses:
+${ip_sans}
+---
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  namespace: ${AI_NS}
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  defaultCertificate:
+    secretName: internal-domain-tls
+YAML
+
+  if ! kubectl wait --for=condition=Ready certificate/internal-domain-tls -n "${AI_NS}" --timeout=180s \
+      || ! wait_for_certificate_current_generation "${AI_NS}" internal-domain-tls 180; then
+    kubectl describe certificate internal-domain-tls -n "${AI_NS}" >&2 || true
+    err "internal-domain-tls certificate did not become Ready; refusing to publish HTTPS routes"
+  fi
+
+  # ServersTransport needs only the public Splunk CA. Publish a CA-only
+  # ConfigMap instead of pointing Traefik at ai-splunk-server-tls, which also
+  # contains Splunk's private key.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    if ! kubectl get secret ai-splunk-server-tls -n "${AI_NS}" -o json 2>/dev/null \
+        | jq -e --arg ns "${AI_NS}" '
+            (.data["ca.crt"] // "") as $ca
+            | select($ca != "")
+            | {
+                apiVersion: "v1",
+                kind: "ConfigMap",
+                metadata: {
+                  name: "ai-splunk-ca-public",
+                  namespace: $ns,
+                  labels: {
+                    "app.kubernetes.io/instance": "splunk-ai-ingress",
+                    "app.kubernetes.io/managed-by": "splunk-ai-platform-installer"
+                  }
+                },
+                data: {"ca.crt": ($ca | @base64d)}
+              }
+          ' \
+        | kubectl apply -f -; then
+      err "Unable to create CA-only ConfigMap from ${AI_NS}/ai-splunk-server-tls"
+    fi
+  else
+    kubectl -n "${AI_NS}" delete configmap ai-splunk-ca-public --ignore-not-found || \
+      err "Unable to remove stale ${AI_NS}/ConfigMap/ai-splunk-ca-public"
+  fi
+
+  # Registry credentials are created/reconciled in AI_NS earlier in the stack
+  # install. Never run the generic creator in `ingress`: it applies common
+  # fixed Secret names and could overwrite credentials owned by another
+  # component. Copy only explicitly configured credentials below, adding
+  # installer ownership labels to copies we create.
+  local image_pull_secret_entries=""
+  local -a configured_pull_secrets=()
+  mapfile -t configured_pull_secrets < <(yq eval '.imagePullSecrets.secrets[]' "${CONFIG_FILE}" 2>/dev/null || true)
+  local custom_pull_secret_name
+  custom_pull_secret_name="$(yq eval '.imagePullSecrets.custom.name // "custom-registry-secret"' "${CONFIG_FILE}" 2>/dev/null || echo custom-registry-secret)"
+  local -a pull_secret_candidates=(
+    "${configured_pull_secrets[@]}"
+    ecr-registry-secret docker-hub-secret gcr-secret acr-secret "${custom_pull_secret_name}"
+  )
+  local -A configured_pull_secret_set=()
+  local -A seen_pull_secret_set=()
+  local pull_secret pull_secret_json source_pull_secret_json reconcile_pull_secret_copy
+  for pull_secret in "${configured_pull_secrets[@]}"; do
+    [[ -n "${pull_secret}" && "${pull_secret}" != "null" ]] && configured_pull_secret_set["${pull_secret}"]=1
+  done
+  for pull_secret in "${pull_secret_candidates[@]}"; do
+    [[ -z "${pull_secret}" || "${pull_secret}" == "null" ]] && continue
+    [[ -n "${seen_pull_secret_set[${pull_secret}]+x}" ]] && continue
+    seen_pull_secret_set["${pull_secret}"]=1
+
+    pull_secret_json="$(kubectl -n "${ingress_ns}" get secret "${pull_secret}" \
+      --ignore-not-found -o json)" || err "Unable to inspect pull Secret ${ingress_ns}/${pull_secret}"
+    reconcile_pull_secret_copy="false"
+    if [[ -n "${pull_secret_json}" ]]; then
+      jq -e '
+          .type == "kubernetes.io/dockerconfigjson"
+          or .type == "kubernetes.io/dockercfg"
+        ' <<< "${pull_secret_json}" >/dev/null || \
+        err "Pull Secret ${ingress_ns}/${pull_secret} is not a Docker registry credential"
+      if [[ -n "${configured_pull_secret_set[${pull_secret}]+x}" ]] && jq -e '
+          .metadata.labels["app.kubernetes.io/managed-by"] == "splunk-ai-platform-installer"
+          and .metadata.labels["app.kubernetes.io/instance"] == "splunk-ai-ingress"
+        ' <<< "${pull_secret_json}" >/dev/null; then
+        reconcile_pull_secret_copy="true"
+      fi
+    elif [[ -n "${configured_pull_secret_set[${pull_secret}]+x}" ]]; then
+      reconcile_pull_secret_copy="true"
+    fi
+
+    if [[ "${reconcile_pull_secret_copy}" == "true" ]]; then
+      source_pull_secret_json="$(kubectl -n "${AI_NS}" get secret "${pull_secret}" \
+        --ignore-not-found -o json)" || err "Unable to inspect configured pull Secret ${AI_NS}/${pull_secret}"
+      [[ -n "${source_pull_secret_json}" ]] || \
+        err "Configured pull Secret ${AI_NS}/${pull_secret} is missing; refusing to retain a stale installer-owned copy"
+      jq -e '
+          .type == "kubernetes.io/dockerconfigjson"
+          or .type == "kubernetes.io/dockercfg"
+        ' <<< "${source_pull_secret_json}" >/dev/null || \
+        err "Configured pull Secret ${AI_NS}/${pull_secret} is not a Docker registry credential"
+      printf '%s\n' "${source_pull_secret_json}" | jq --arg ns "${ingress_ns}" '
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: {
+              name: .metadata.name,
+              namespace: $ns,
+              labels: {
+                "app.kubernetes.io/instance": "splunk-ai-ingress",
+                "app.kubernetes.io/managed-by": "splunk-ai-platform-installer"
+              }
+            },
+            type: .type,
+            data: .data
+          }
+        ' | kubectl apply -f - >/dev/null || \
+        err "Unable to copy configured pull Secret ${pull_secret} into ${ingress_ns}"
+      pull_secret_json="${source_pull_secret_json}"
+    fi
+    if [[ -n "${pull_secret_json}" ]]; then
+      image_pull_secret_entries+="        - name: ${pull_secret}"$'\n'
+    fi
+  done
+  local image_pull_secrets_yaml=""
+  if [[ -n "${image_pull_secret_entries}" ]]; then
+    image_pull_secrets_yaml="      imagePullSecrets:"$'\n'"${image_pull_secret_entries}"
+  fi
+
+  local optional_entrypoint_args=""
+  local optional_container_ports=""
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    optional_entrypoint_args+="            - --entrypoints.splunkweb.address=:${INGRESS_SPLUNKWEB_PORT}"$'\n'
+    optional_entrypoint_args+="            - --entrypoints.splunkweb.http.tls=true"$'\n'
+    optional_container_ports+="            - name: splunkweb"$'\n'
+    optional_container_ports+="              containerPort: ${INGRESS_SPLUNKWEB_PORT}"$'\n'
+    optional_container_ports+="              hostPort: ${INGRESS_SPLUNKWEB_PORT}"$'\n'
+    if [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]]; then
+      optional_entrypoint_args+="            - --entrypoints.splunkmgmt.address=:${INGRESS_SPLUNKMGMT_PORT}"$'\n'
+      optional_container_ports+="            - name: splunkmgmt"$'\n'
+      optional_container_ports+="              containerPort: ${INGRESS_SPLUNKMGMT_PORT}"$'\n'
+      optional_container_ports+="              hostPort: ${INGRESS_SPLUNKMGMT_PORT}"$'\n'
+    fi
+  fi
+
+  # fips140=off is the default. fips140=on requires a customer-supplied image;
+  # image validation/attestation remains the customer's compliance control.
+  log "Deploying Traefik DaemonSet (image=${TRAEFIK_IMAGE}, fips=${INGRESS_FIPS})..."
+  cat <<YAML | kubectl -n "${ingress_ns}" apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: traefik
+  namespace: ${ingress_ns}
+  labels:
+    app: traefik
+    app.kubernetes.io/name: traefik
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: splunk-ai-ingress
+  template:
+    metadata:
+      labels:
+        app: traefik
+        app.kubernetes.io/name: traefik
+        app.kubernetes.io/instance: splunk-ai-ingress
+        app.kubernetes.io/managed-by: splunk-ai-platform-installer
+    spec:
+      serviceAccountName: traefik
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+${image_pull_secrets_yaml}      volumes:
+        - name: tmp
+          emptyDir: {}
+      # ClusterFirst (not ClusterFirstWithHostNet) — the pod uses hostPort,
+      # not hostNetwork, so it still needs normal cluster DNS to resolve the
+      # in-cluster Services it routes to (design doc §13 bug #1).
+      dnsPolicy: ClusterFirst
+      # This installer-owned label covers every worker and the worker-enabled
+      # controller in supported single-node mode.
+      nodeSelector:
+        splunk.ai/ingress-node: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: traefik
+          image: ${TRAEFIK_IMAGE}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --global.checknewversion=false
+            - --global.sendanonymoususage=false
+            - --providers.kubernetescrd
+            - --providers.kubernetescrd.namespaces=${AI_NS}
+            - --providers.kubernetescrd.allowCrossNamespace=false
+            - --providers.kubernetescrd.disableClusterScopeResources=true
+            - --entrypoints.websecure.address=:${INGRESS_SAIA_PORT}
+            - --entrypoints.websecure.http.tls=true
+            - --entrypoints.traefik.address=:9000
+            - --ping=true
+            - --ping.entrypoint=traefik
+${optional_entrypoint_args}          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          env:
+            - name: GODEBUG
+              value: fips140=${INGRESS_FIPS}
+          ports:
+            - name: websecure
+              containerPort: ${INGRESS_SAIA_PORT}
+              hostPort: ${INGRESS_SAIA_PORT}
+            - name: traefik
+              containerPort: 9000
+${optional_container_ports}          startupProbe:
+            httpGet:
+              path: /ping
+              port: traefik
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: traefik
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: traefik
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+YAML
+
+  if ! kubectl rollout status daemonset/traefik -n "${ingress_ns}" --timeout=180s; then
+    kubectl describe daemonset traefik -n "${ingress_ns}" >&2 || true
+    kubectl logs -n "${ingress_ns}" -l app.kubernetes.io/instance=splunk-ai-ingress --all-containers --tail=200 >&2 || true
+    err "Traefik DaemonSet failed to become Ready"
+  fi
+
+  # DaemonSet rollout reports success when its selector matches zero Nodes.
+  # Compare the live scheduler counts with the exact reconciled target set so
+  # an unlabelled/missing node cannot produce a false-positive installation.
+  local daemonset_status_json desired_scheduled updated_scheduled ready_scheduled
+  daemonset_status_json="$(kubectl -n "${ingress_ns}" get daemonset traefik -o json)" || \
+    err "Unable to inspect Traefik DaemonSet scheduling status"
+  desired_scheduled="$(jq -r '.status.desiredNumberScheduled // 0' <<< "${daemonset_status_json}")"
+  updated_scheduled="$(jq -r '.status.updatedNumberScheduled // 0' <<< "${daemonset_status_json}")"
+  ready_scheduled="$(jq -r '.status.numberReady // 0' <<< "${daemonset_status_json}")"
+  if (( TRAEFIK_EXPECTED_NODE_COUNT <= 0 )) || \
+      (( desired_scheduled != TRAEFIK_EXPECTED_NODE_COUNT )) || \
+      (( updated_scheduled != TRAEFIK_EXPECTED_NODE_COUNT )) || \
+      (( ready_scheduled != TRAEFIK_EXPECTED_NODE_COUNT )); then
+    kubectl -n "${ingress_ns}" describe daemonset traefik >&2 || true
+    err "Traefik scheduling mismatch: expected=${TRAEFIK_EXPECTED_NODE_COUNT}, desired=${desired_scheduled}, updated=${updated_scheduled}, ready=${ready_scheduled}"
+  fi
+
+  local provider_errors=""
+  provider_errors="$(kubectl logs -n "${ingress_ns}" -l app.kubernetes.io/instance=splunk-ai-ingress --all-containers --tail=300 2>/dev/null \
+    | grep -Ei 'forbidden|failed to list|could not find the requested resource|timed out waiting for controller caches' || true)"
+  if [[ -n "${provider_errors}" ]]; then
+    printf '%s\n' "${provider_errors}" >&2
+    err "Traefik KubernetesCRD provider reported informer/RBAC errors"
+  fi
+
+  local saia_svc="${CLUSTER_NAME}-ai-platform-saia-saia-service"
+  local splunkweb_svc="splunk-${AI_STANDALONE_NAME}-standalone-service"
+
+  log "Applying IngressRoute for SAIA (${saia_svc}:8080) on entryPoint websecure..."
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: saia-websecure
+  namespace: ${AI_NS}
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: PathPrefix(\`/\`)
+      kind: Rule
+      services:
+        - name: ${saia_svc}
+          port: 8080
+  tls:
+    secretName: internal-domain-tls
+YAML
+
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    local splunk_server_name="${splunkweb_svc}.${AI_NS}.svc.${CLUSTER_DOMAIN}"
+    log "Applying verified-HTTPS route for Splunk Web (${splunkweb_svc}:8000)..."
+    cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-web-tls
+  namespace: ${AI_NS}
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  serverName: ${splunk_server_name}
+  rootCAs:
+    - configMap: ai-splunk-ca-public
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunkweb-splunkweb
+  namespace: ${AI_NS}
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  entryPoints:
+    - splunkweb
+  routes:
+    - match: PathPrefix(\`/\`)
+      kind: Rule
+      services:
+        - name: ${splunkweb_svc}
+          port: 8000
+          scheme: https
+          serversTransport: splunk-web-tls
+  tls:
+    secretName: internal-domain-tls
+YAML
+
+    if [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]]; then
+      log "Applying IngressRouteTCP for Splunk mgmt (${splunkweb_svc}:8089, TLS passthrough)..."
+      cat <<YAML | kubectl -n "${AI_NS}" apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: splunkmgmt-passthrough
+  namespace: ${AI_NS}
+  labels:
+    app.kubernetes.io/instance: splunk-ai-ingress
+    app.kubernetes.io/managed-by: splunk-ai-platform-installer
+spec:
+  entryPoints:
+    - splunkmgmt
+  routes:
+    - match: HostSNI(\`*\`)
+      services:
+        - name: ${splunkweb_svc}
+          port: 8089
+  tls:
+    passthrough: true
+YAML
+    else
+      kubectl -n "${AI_NS}" delete ingressroutetcp splunkmgmt-passthrough --ignore-not-found >/dev/null || \
+        err "Unable to remove stale ${AI_NS}/IngressRouteTCP/splunkmgmt-passthrough"
+      log "Splunk management ingress disabled; route and hostPort ${INGRESS_SPLUNKMGMT_PORT} are absent"
+    fi
+  else
+    kubectl -n "${AI_NS}" delete ingressroute splunkweb-splunkweb --ignore-not-found >/dev/null || \
+      err "Unable to remove stale ${AI_NS}/IngressRoute/splunkweb-splunkweb"
+    kubectl -n "${AI_NS}" delete ingressroutetcp splunkmgmt-passthrough --ignore-not-found >/dev/null || \
+      err "Unable to remove stale ${AI_NS}/IngressRouteTCP/splunkmgmt-passthrough"
+    kubectl -n "${AI_NS}" delete serverstransport splunk-web-tls --ignore-not-found >/dev/null || \
+      err "Unable to remove stale ${AI_NS}/ServersTransport/splunk-web-tls"
+    log "Splunk mode=${SPLUNK_MODE}; internal Splunk Web and management routes are absent"
+  fi
+
+  log "✓ Traefik HTTPS ingress installed."
+  local url_host="${INGRESS_HOSTNAME:-${ingress_node_ips[0]}}"
+  [[ "${url_host}" == *:* ]] && url_host="[${url_host}]"
+  log "  SAIA / AI Assistant URL: https://${url_host}:${INGRESS_SAIA_PORT}"
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    log "  Splunk Web URL:         https://${url_host}:${INGRESS_SPLUNKWEB_PORT}"
+    [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]] && \
+      log "  Splunk mgmt (passthrough): https://${url_host}:${INGRESS_SPLUNKMGMT_PORT}"
+  fi
+  log "  Any ingress-node IP works equally (ClusterIP Service backends route cross-node)."
+  log "  Self-signed CA secret: ${AI_NS}/ai-platform-ingress-ca-tls (import tls.crt to trust the cert)."
 }
 
 # Disable kube-proxy NodePort allocation on the rendered SAIA Service so
@@ -5390,16 +7246,16 @@ install_ai_platform_stack() {
   install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("nvidia-drivers")
 
-  # Track which phase-1 tasks failed. nvidia-drivers failures are fatal:
-  # without them the device-plugin crash-loops and the whole GPU stack
-  # silently fails. Every other phase-1 task is merely warned on failure.
+  # Track which phase-1 tasks failed. cert-manager and nvidia-drivers are
+  # fatal: the former is required for TLS Secrets and operator webhooks; the
+  # latter is required for every GPU workload.
   local phase1_fatal_failures=0
   for i in "${!phase1_pids[@]}"; do
     if wait "${phase1_pids[$i]}"; then
       log "  ✓ ${phase1_names[$i]} completed"
     else
       warn "  ✗ ${phase1_names[$i]} had issues"
-      if [[ "${phase1_names[$i]}" == "nvidia-drivers" ]]; then
+      if [[ "${phase1_names[$i]}" == "nvidia-drivers" || "${phase1_names[$i]}" == "cert-manager" ]]; then
         phase1_fatal_failures=$((phase1_fatal_failures + 1))
       fi
     fi
@@ -5410,10 +7266,16 @@ install_ai_platform_stack() {
   rm -rf "${phase1_logdir}"
 
   if [[ ${phase1_fatal_failures} -gt 0 ]]; then
-    err "NVIDIA driver install failed on at least one GPU node; aborting install.
-    Device-plugin pods would otherwise crash-loop with NVML: ERROR_LIBRARY_NOT_FOUND
-    and model pods would stay Pending forever. Fix the errors above and re-run."
+    err "A required phase-1 component (cert-manager or NVIDIA host drivers) failed; aborting install.
+    cert-manager must issue TLS Secrets and NVIDIA drivers must be healthy
+    before dependent workloads are installed. Fix the errors above and re-run."
   fi
+
+  # cert-manager CRDs are ready now. Check every existing fixed-name internal
+  # Splunk object before Phase 2 can install/reconcile the Splunk Operator; an
+  # absent Standalone CRD is safely treated as no Standalone object yet.
+  preflight_internal_splunk_resource_ownership || \
+    err "Internal Splunk resource ownership preflight failed"
 
   ensure_s3compat_credentials
 
@@ -5446,8 +7308,17 @@ install_ai_platform_stack() {
   done
   rm -rf "${phase2_logdir}"
 
+  # Fail before the first internal Splunk instance mutation if any fixed-name
+  # certificate, Secret, ConfigMap, or Standalone belongs to somebody else.
+  preflight_internal_splunk_resource_ownership || \
+    err "Internal Splunk resource ownership preflight failed"
+
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
+
+  # Provision the Splunk server TLS cert (AIP-4614) before the Standalone CR so
+  # the cert volume/secret already exists when install_splunk_standalone mounts it.
+  provision_splunk_cert
 
   # Apply Splunk Standalone CR (non-blocking — pod boots in background)
   install_splunk_standalone
@@ -5462,6 +7333,10 @@ install_ai_platform_stack() {
 
   # Install AI Platform operator and CR while Splunk Standalone boots
   install_splunk_ai_operator
+  # Reconcile optional Traefik HTTPS ingress. The enabled path installs it here
+  # after cert-manager is ready; the disabled path removes stale listener and
+  # routing resources from a previous enabled run.
+  install_traefik_ingress
   install_ai_platform_cr
   patch_k0s_saia_public_service_workaround
   # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
@@ -6509,18 +8384,39 @@ show_platform_access_info() {
   log "  "
   log "  Check AIServices:"
   log "     kubectl get aiservice -n ${AI_NS}"
+  if ingress_enabled_k0s; then
+    local -a ingress_access_ips=()
+    local ingress_access_host
+    mapfile -t ingress_access_ips < <(ingress_node_ips_k0s)
+    ingress_access_host="${INGRESS_HOSTNAME:-${ingress_access_ips[0]:-<ingress-node-ip>}}"
+    [[ "${ingress_access_host}" == *:* ]] && ingress_access_host="[${ingress_access_host}]"
+    log "  "
+    log "  🔒 HTTPS ingress:"
+    log "     SAIA: https://${ingress_access_host}:${INGRESS_SAIA_PORT}"
+    log "     Trust CA: kubectl -n ${AI_NS} get secret ai-platform-ingress-ca-tls -o jsonpath='{.data.tls\.crt}' | base64 --decode"
+  fi
   log ""
 
   # Splunk information
-  log "📊 Splunk Enterprise:"
-  log "  Check Status:"
-  log "     kubectl get standalone -n ${AI_NS}"
-  log "     kubectl get pods -n ${AI_NS} -l app.kubernetes.io/instance=splunk-standalone"
-  log "  "
-  log "  💡 Access Splunk Web (once ready):"
-  log "     kubectl port-forward -n ${AI_NS} svc/splunk-${AI_STANDALONE_NAME}-standalone-service 8000:8000"
-  log "     Open: http://localhost:8000"
-  log ""
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    log "📊 Splunk Enterprise:"
+    log "  Check Status:"
+    log "     kubectl get standalone -n ${AI_NS}"
+    log "     kubectl get pod -n ${AI_NS} splunk-${AI_STANDALONE_NAME}-standalone-0"
+    log "  "
+    if ingress_enabled_k0s; then
+      log "  🔒 Splunk Web: https://${ingress_access_host}:${INGRESS_SPLUNKWEB_PORT}"
+      if [[ "${INGRESS_SPLUNKMGMT_ENABLED}" == "true" ]]; then
+        log "  🔒 Splunk management (passthrough): https://${ingress_access_host}:${INGRESS_SPLUNKMGMT_PORT}"
+        log "     Management uses the separate ${AI_NS}/ai-splunk-ca-tls trust anchor."
+      fi
+    else
+      log "  💡 Access Splunk Web (once ready):"
+      log "     kubectl port-forward -n ${AI_NS} svc/splunk-${AI_STANDALONE_NAME}-standalone-service 8000:8000"
+      log "     Open: https://localhost:8000 (trust the Splunk CA)"
+    fi
+    log ""
+  fi
 
   # Monitoring information
   log "📈 Monitoring & Observability:"
@@ -6808,6 +8704,11 @@ main_install() {
     log "  ✓ GPU nodes labeled with 'nvidia.com/gpu=true' (if running GPU workloads)"
     log "  ✓ If using on-prem/private cluster, ensure ports 6443, 8080, 30000-32767 are accessible"
     log ""
+  fi
+
+  if [[ "${use_existing_cluster}" == "true" ]]; then
+    sync_airgap_images_to_existing_cluster || \
+      err "Unable to synchronize bundled images to the existing air-gapped k0s cluster"
   fi
 
   # Install AI Platform stack
@@ -7534,7 +9435,7 @@ join_workers() {
     # Thorough cleanup before rejoining (handles stale configurations)
     cleanup_worker_k0s "${worker_ip}"
 
-    # RHEL/Fedora compatibility (firewalld, kernel modules, python3-pyyaml, k0s binary).
+    # RHEL/Fedora compatibility (firewalld, kernel modules, pinned k0s binary).
     # Handles both online (curl get.k0s.sh) and air-gap (file:// scp) install paths.
     prepare_nodes_for_k0s "${worker_ip}"
 
@@ -7548,12 +9449,13 @@ join_workers() {
     fi
 
     # Air-gap: stage k0s system + add-on images now — after `k0s install`
-    # (which recreated /var/lib/k0s) and BEFORE the worker is started below.
+    # (which recreated /var/lib/k0s) and before the worker is started below.
     # Without this a worker joined via this subcommand starts with an empty
     # /var/lib/k0s/images/, so its calico/kube-proxy pods try to pull from the
     # (blocked) internet and the node never becomes Ready. No-op when
     # AIRGAP_K0S_IMAGE_DIR is unset (i.e. not an air-gap install).
-    stage_k0s_image_bundle "${worker_ip}"
+    stage_k0s_image_bundle "${worker_ip}" || \
+      err "Unable to stage air-gap images on worker ${worker_ip}"
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."

@@ -2,7 +2,8 @@
 # Dry-run test for Splunk-optional installer modes.
 #
 # Tests the splunk_config_yaml block generation that install_ai_platform_cr()
-# emits into the AIPlatform CR, for all 5 Splunk mode combinations.
+# emits into the AIPlatform CR, including split external management/HEC URLs
+# and the deprecated single-endpoint compatibility path.
 # No cluster, no kubectl, no artifacts files needed.
 #
 # Usage: bash test_installer_dry_run.sh
@@ -30,17 +31,30 @@ render_splunk_block() {
   [[ -n "${hec}" ]] && export SPLUNK_HEC_TOKEN="${hec}"
 
   # Derive SPLUNK_MODE the same way load_config() does
-  local SPLUNK_ENABLED SPLUNK_EXTERNAL_ENDPOINT SPLUNK_EXTERNAL_SECRET_NAME SPLUNK_MODE AI_NS
+  local SPLUNK_ENABLED SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT SPLUNK_EXTERNAL_HEC_ENDPOINT
+  local SPLUNK_EXTERNAL_LEGACY_ENDPOINT SPLUNK_EXTERNAL_SECRET_NAME SPLUNK_MODE AI_NS
   SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${cfg}" 2>/dev/null || echo "false")"
-  SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${cfg}" 2>/dev/null || echo "")"
-  [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
+  SPLUNK_EXTERNAL_LEGACY_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${cfg}" 2>/dev/null || echo "")"
+  SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT="$(yq eval '.splunk.external.managementEndpoint // ""' "${cfg}" 2>/dev/null || echo "")"
+  SPLUNK_EXTERNAL_HEC_ENDPOINT="$(yq eval '.splunk.external.hecEndpoint // ""' "${cfg}" 2>/dev/null || echo "")"
+  if [[ "${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}" =~ ^(https?://[^/]+):8088/?$ ]]; then
+    local external_base="${BASH_REMATCH[1]}"
+    [[ -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]] && SPLUNK_EXTERNAL_HEC_ENDPOINT="${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}"
+    [[ -z "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" ]] && SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT="${external_base}:8089"
+  elif [[ "${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}" =~ ^(https?://[^/]+):8089/?$ ]]; then
+    local external_base="${BASH_REMATCH[1]}"
+    [[ -z "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" ]] && SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT="${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}"
+    [[ -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]] && SPLUNK_EXTERNAL_HEC_ENDPOINT="${external_base}:8088"
+  elif [[ -n "${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}" && -z "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" ]]; then
+    SPLUNK_EXTERNAL_HEC_ENDPOINT="${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}"
+  fi
   SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "${cfg}" 2>/dev/null || echo "splunk-hec-external")"
   AI_NS="$(yq eval '.kubernetes.namespace // "ai-platform"' "${cfg}" 2>/dev/null || echo "ai-platform")"
   AI_STANDALONE_NAME="${standalone}"
 
   if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
     SPLUNK_MODE="disabled"
-  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+  elif [[ -n "${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}" || -n "${SPLUNK_EXTERNAL_HEC_ENDPOINT}" || -n "${SPLUNK_EXTERNAL_LEGACY_ENDPOINT}" ]]; then
     SPLUNK_MODE="external"
   else
     SPLUNK_MODE="internal"
@@ -70,7 +84,8 @@ render_splunk_block() {
 
   # Splunk configuration (internal — in-cluster Standalone)
   splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
@@ -83,7 +98,8 @@ EOF
 
   # Splunk configuration (external — customer-managed Splunk)
   splunkConfiguration:
-    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
+    endpoint: ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}
+    hecEndpoint: ${SPLUNK_EXTERNAL_HEC_ENDPOINT}
     secretRef:
       name: ${SPLUNK_EXTERNAL_SECRET_NAME}
       namespace: ${AI_NS}
@@ -174,18 +190,20 @@ check_contains "${OUT}" "https://external.splunk:8089"       "External issuer pr
 rm -f "${CFG}"
 
 # ═════════════════════════════════════════════════════════════════════════════
-echo -e "\n${BOLD}Case 5: EXTERNAL — splunk.enabled: true + external.endpoint${RESET}"
+echo -e "\n${BOLD}Case 5: EXTERNAL — explicit management and HEC endpoints${RESET}"
 CFG=$(make_config "splunk:
   enabled: true
   external:
-    endpoint: https://splunk.example.com:8088
+    managementEndpoint: https://splunk.example.com:8089
+    hecEndpoint: https://splunk.example.com:8088
     secretName: splunk-hec-external
   trustedIssuers:
     - https://splunk.example.com:8089")
 OUT=$(render_splunk_block "${CFG}" "dummy-hec-token")
 info "SPLUNK_MODE=external → external HEC endpoint, no in-cluster Splunk"
 check_contains     "${OUT}" "splunkConfiguration"                         "splunkConfiguration block present"
-check_contains     "${OUT}" "endpoint: https://splunk.example.com:8088"   "External HEC endpoint"
+check_contains     "${OUT}" "endpoint: https://splunk.example.com:8089"   "External management/JWKS endpoint"
+check_contains     "${OUT}" "hecEndpoint: https://splunk.example.com:8088" "External HEC endpoint"
 check_contains     "${OUT}" "splunk-hec-external"                         "External secret name"
 check_contains     "${OUT}" "trustedIssuers"                              "trustedIssuers key present"
 check_contains     "${OUT}" "https://splunk.example.com:8089"             "Issuer present"
@@ -193,9 +211,20 @@ check_not_contains "${OUT}" "standalone-service"                          "No in
 rm -f "${CFG}"
 
 # ═════════════════════════════════════════════════════════════════════════════
+echo -e "\n${BOLD}Case 6: EXTERNAL — deprecated HEC endpoint alias on :8088${RESET}"
+CFG=$(make_config "splunk:
+  enabled: true
+  external:
+    endpoint: https://legacy.splunk.example:8088")
+OUT=$(render_splunk_block "${CFG}" "dummy-hec-token")
+check_contains "${OUT}" "endpoint: https://legacy.splunk.example:8089"     "Legacy alias derives management port"
+check_contains "${OUT}" "hecEndpoint: https://legacy.splunk.example:8088" "Legacy alias remains the HEC endpoint"
+rm -f "${CFG}"
+
+# ═════════════════════════════════════════════════════════════════════════════
 echo ""
 if [[ "${FAILURES}" -eq 0 ]]; then
-  echo -e "${GREEN}${BOLD}All dry-run checks passed (5 cases).${RESET}"
+  echo -e "${GREEN}${BOLD}All dry-run checks passed (6 cases).${RESET}"
 else
   echo -e "${RED}${BOLD}${FAILURES} check(s) failed.${RESET}"
   exit 1

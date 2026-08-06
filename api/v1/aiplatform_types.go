@@ -83,7 +83,8 @@ type AIPlatformSpec struct {
 	// +kubebuilder:validation:Optional
 	Sidecars SidecarSpec `json:"sidecars,omitempty"`
 
-	// CertificateRef references a cert-manager Certificate or Issuer for mTLS
+	// CertificateRef references the cert-manager issuer used for the legacy
+	// mtls field's server-authentication TLS certificate.
 	// +kubebuilder:validation:Optional
 	CertificateRef string `json:"certificateRef,omitempty"`
 
@@ -122,7 +123,9 @@ type AIPlatformSpec struct {
 	// +kubebuilder:validation:Optional
 	Ingress *IngressSpec `json:"ingress,omitempty"`
 
-	// MTLS defines the mTLS configuration for secure communication
+	// MTLS is the legacy API field that configures one-way, server-authentication
+	// TLS for each AIService's nginx listener. Client certificates are not
+	// requested or validated; mutual TLS is not currently implemented.
 	// +kubebuilder:validation:Optional
 	MTLS MTLSConfig `json:"mtls,omitempty"`
 
@@ -297,20 +300,40 @@ type SplunkConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	SplunkCustomResourceRef corev1.ObjectReference `json:"splunkCustomResourceRef,omitempty"`
 
-	// SecretRef references a Secret containing Splunk credentials
+	// SecretRef references a Secret containing Splunk credentials. It is
+	// required for every non-empty Splunk telemetry configuration when
+	// sidecars.otel is enabled because the OTel collector reads the HEC token
+	// from this Secret. Namespace must be empty or match the AIPlatform or
+	// AIService namespace; Kubernetes pod Secret references cannot cross
+	// namespaces.
 	// +kubebuilder:validation:Optional
 	SecretRef corev1.SecretReference `json:"secretRef,omitempty"`
 
-	// Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-	// Either Endpoint or SplunkCustomResourceRef must be provided
+	// Endpoint is the Splunk management/JWKS URL (typically port 8089), used as
+	// the JWT issuer for SAIA token validation (mutually exclusive with
+	// SplunkCustomResourceRef). Either Endpoint or SplunkCustomResourceRef must
+	// be provided for management/JWKS access. Endpoint is never used as a
+	// fallback HEC ingestion URL; set HECEndpoint explicitly when OTel telemetry
+	// is enabled.
 	// +kubebuilder:validation:Optional
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// HECEndpoint is the Splunk HTTP Event Collector base URL (typically port
+	// 8088) used by the OTel sidecar to ship telemetry. Distinct from Endpoint,
+	// which is the management/JWKS URL used for JWT issuer validation — HEC
+	// and management are different ports on most Splunk deployments. There is
+	// no fallback to Endpoint. HECEndpoint is required when sidecars.otel is
+	// enabled and Splunk telemetry is configured.
+	// +kubebuilder:validation:Optional
+	HECEndpoint string `json:"hecEndpoint,omitempty"`
 
 	// Token is the Splunk HEC token (consider using SecretRef instead)
 	// +kubebuilder:validation:Optional
 	Token string `json:"token,omitempty"`
 
-	// SecretSource indicates whether token comes from Kubernetes Secret or Vault Agent
+	// SecretSource indicates whether the token comes from a Kubernetes Secret or
+	// Vault Agent. Vault-only credentials are not supported when sidecars.otel is
+	// enabled.
 	// +kubebuilder:validation:Optional
 	SecretSource SecretSourceType `json:"secretSource,omitempty"`
 
@@ -325,6 +348,32 @@ type SplunkConfigurationSpec struct {
 	// In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
 	// +optional
 	TrustedIssuers []string `json:"trustedIssuers,omitempty"`
+
+	// CACertRef references a Secret key holding the PEM CA bundle that signs the
+	// Splunk server certificate, so SAIA and SLIM can verify management/JWKS
+	// calls and the OTel sidecar can verify HEC delivery when it is enabled.
+	// Required whenever Splunk's cert chains to a CA not already in the image's
+	// system trust store — always true for the installer's self-signed internal
+	// chain, and common for external Splunk behind a private/internal CA.
+	// +kubebuilder:validation:Optional
+	CACertRef *CABundleRef `json:"caCertRef,omitempty"`
+}
+
+// CABundleRef references a Kubernetes Secret key holding a PEM-encoded CA bundle.
+type CABundleRef struct {
+	// Name is the Secret name containing the CA bundle
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Namespace is the Secret's namespace. Defaults to the AIPlatform/AIService's
+	// own namespace when omitted.
+	// +kubebuilder:validation:Optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Key is the data key within the Secret holding the PEM CA bundle
+	// +kubebuilder:default:="ca.crt"
+	// +kubebuilder:validation:Optional
+	Key string `json:"key,omitempty"`
 }
 
 // ReplicasSpec sets min/max worker replicas

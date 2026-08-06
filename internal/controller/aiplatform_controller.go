@@ -36,7 +36,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const ownerKey = ".metadata.controller"
@@ -176,7 +179,19 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("aiplatform").
-		For(&aiv1.AIPlatform{}).
+		// Predicates scoped to the primary resource via For()'s own
+		// WithPredicates, NOT WithEventFilter — WithEventFilter populates
+		// globalPredicates, which controller-runtime ANDs onto every Watches()/
+		// Owns() too (see doWatch() in controller-runtime's builder package). That
+		// would silently defeat the CACertRef Secret watch below: Secrets never
+		// bump metadata.generation, and a pure .data rotation touches neither
+		// annotations nor labels, so a global filter requiring one of those AND
+		// SecretChangedPredicate never fires (AIP-4614 Part D — found in review).
+		For(&aiv1.AIPlatform{}, builder.WithPredicates(predicate.Or(
+			common.GenerationChangedPredicate(),
+			common.AnnotationChangedPredicate(),
+			common.LabelChangedPredicate(),
+		))).
 		// AIPlatform owns its AIService children - reconcile on generation changes
 		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Or(
 			common.GenerationChangedPredicate(),
@@ -196,17 +211,48 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// RBAC resources for Ray autoscaler
 		Owns(&rbacv1.Role{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&rbacv1.RoleBinding{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		// Keep platform predicates light and scoped to the primary resource
-		WithEventFilter(predicate.Or(
-			common.GenerationChangedPredicate(),
-			common.AnnotationChangedPredicate(),
-			common.LabelChangedPredicate(),
-		)).
+		// Watch CACertRef Secrets (not owned by AIPlatform - customer/installer
+		// pre-creates them) so rotating the CA bundle's content in place triggers
+		// a reconcile. Without this, splunkCACertChecksum's annotation update
+		// only takes effect on the next reconcile triggered by something else
+		// (AIP-4614 Tier 1 item 4).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findAIPlatformsForCACertSecret),
+			builder.WithPredicates(common.SecretChangedPredicate()),
+		).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,
 		})
 
 	return b.Complete(r)
+}
+
+// findAIPlatformsForCACertSecret maps a Secret to the AIPlatforms in the same
+// namespace whose splunkConfiguration.caCertRef references it by name, so
+// rotating the CA bundle's content (without renaming the Secret) triggers a
+// reconcile instead of only being picked up on some unrelated trigger.
+func (r *AIPlatformReconciler) findAIPlatformsForCACertSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+
+	var platforms aiv1.AIPlatformList
+	if err := r.List(ctx, &platforms, client.InNamespace(secret.GetNamespace())); err != nil {
+		log.Error(err, "failed to list AIPlatforms for CACertRef Secret", "secret", secret.GetName())
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range platforms.Items {
+		p := &platforms.Items[i]
+		ref := p.Spec.SplunkConfiguration.CACertRef
+		if ref == nil || ref.Name != secret.GetName() {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKeyFromObject(p),
+		})
+	}
+	return requests
 }
 
 // finalizePlatform deletes platform‑owned children and waits until they are gone.

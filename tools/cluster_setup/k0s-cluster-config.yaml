@@ -151,6 +151,12 @@ images:
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
 
+  # Traefik HTTPS ingress (see the "ingress" block below). Only pulled/used
+  # when ingress.enabled: true. The default image is NOT FIPS-certified — if
+  # ingress.fips: "on", point this at your own approved FIPS-capable build.
+  ingress:
+    traefikImage: "docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"
+
 # ---------- Operator Versions ----------
 operators:
   ray:
@@ -167,6 +173,7 @@ operators:
 # ---------- Kubernetes ----------
 kubernetes:
   namespace: ai-platform
+  # clusterDomain: cluster.local  # UNCOMMENT to override if the cluster uses a non-default DNS domain
 
 # ---------- File Paths ----------
 files:
@@ -185,17 +192,17 @@ splunk:
   # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
   standaloneName: splunk-standalone
 
-  # ----- Telemetry mode is derived from whether external.endpoint is set -----
+  # ----- Telemetry mode is derived from whether either external URL is set -----
   #
-  #   INTERNAL (enabled: true, external.endpoint unset):
+  #   INTERNAL (enabled: true, external URLs unset):
   #     The installer deploys the Splunk Operator + a Splunk Standalone inside
   #     the cluster and wires the AIPlatform CR at it. Requires
   #     images.splunk.image and images.splunk.operatorImage.
   #
-  #   EXTERNAL (enabled: true, external.endpoint set):
+  #   EXTERNAL (enabled: true, external URLs set):
   #     Use a Splunk running OUTSIDE the cluster. The installer does NOT deploy
   #     any in-cluster Splunk. It creates a Kubernetes Secret holding the HEC
-  #     token and points the AIPlatform CR at your external HEC endpoint.
+  #     token and configures the management/JWKS and HEC endpoints separately.
   #
   #     The HEC token is supplied ONLY via the SPLUNK_HEC_TOKEN environment
   #     variable (never this file), so no live credential is committed or
@@ -209,8 +216,21 @@ splunk:
   #     SPLUNK_HEC_TOKEN is missing in external mode.
   #
   # external:
-  #   endpoint: https://splunk.example.com:8088   # base HEC URL (operator appends /services/collector)
+  #   managementEndpoint: https://splunk.example.com:8089  # splunkd/JWKS URL and JWT issuer
+  #   hecEndpoint: https://splunk.example.com:8088         # base HEC URL (operator appends /services/collector)
   #   secretName: splunk-hec-external             # optional; k8s Secret name the script creates (key: hec_token)
+  #   caCertSecretName: splunk-external-ca        # optional; only needed if your Splunk cert is
+  #                                                # signed by a private/internal CA. Pre-create the
+  #                                                # Secret yourself (key: ca.crt) before running the
+  #                                                # installer — it is never generated or modified here:
+  #                                                #   kubectl create secret generic splunk-external-ca \
+  #                                                #     --from-file=ca.crt=<path> -n ai-platform
+  #                                                # Leave unset if your Splunk cert is publicly trusted;
+  #                                                # SAIA falls back to its image's system trust store.
+  #
+  # `external.endpoint` is a deprecated compatibility alias. For standard
+  # :8088/:8089 URLs the installer derives the other port and emits a warning;
+  # custom ports must use both explicit keys above.
 
 # ---------- AI Platform Configuration ----------
 aiPlatform:
@@ -325,6 +345,37 @@ metallb:
     # - peerAddress: "10.0.0.1"
     #   peerASN: 65001
     #   myASN: 65000
+
+# ---------- Traefik HTTPS Ingress ----------
+# OPT-IN, defaults to DISABLED. When false (or absent): none of this runs —
+# your install behaves exactly as it does today (NodePort/tunnel access
+# only). See TRAEFIK_HTTPS_DESIGN.md and TRAEFIK_HTTPS_SETUP.md.
+#
+# When enabled, the installer deploys Traefik v3 as a DaemonSet (one
+# independent pod per worker node, hostPort-bound to that worker's own IP —
+# there is no single shared controller address) terminating HTTPS for SAIA
+# (:8443) and Splunk Web (:8000), plus an optional TCP-passthrough route for
+# Splunk's management port (:8089). This is purely additive: existing
+# NodePort/tunnel access keeps working unchanged either way.
+ingress:
+  enabled: false                 # master gate — set true to turn this on
+  hostname: ""                   # optional DNS SAN for the cert; leave blank to
+                                  # access via worker IP instead (any worker IP
+                                  # works — see TRAEFIK_HTTPS_SETUP.md)
+  fips: "off"                    # off | on — "on" requires you to also set
+                                  # images.ingress.traefikImage to a FIPS-capable build
+  tls:
+    mode: selfsigned             # selfsigned is the only mode implemented today
+  entryPoints:
+    # Ports must be unique; 9000 is reserved for the controller health probe.
+    saia:
+      port: 8443
+    splunkWeb:
+      port: 8000
+    splunkMgmt:
+      port: 8089
+      enabled: false              # opt in only when an external system needs direct
+                                   # access to Splunk's management port
 
 # ---------- Image Pull Secrets ----------
 imagePullSecrets:

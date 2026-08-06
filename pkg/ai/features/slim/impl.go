@@ -208,6 +208,114 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 	return nil
 }
 
+// systemCABundlePath is the system trust store location in SAIA/SLIM's
+// Debian-based base images.
+const systemCABundlePath = "/etc/ssl/certs/ca-certificates.crt"
+
+// splunkCACombinedMountPath/File hold the merged (system + private CA) bundle
+// produced by the splunk-ca-merge initContainer (AIP-4614 Tier 1 item 5).
+const splunkCACombinedMountPath = "/etc/splunk-ca-combined"
+const splunkCACombinedFile = "ca-certificates.crt"
+
+// buildSlimCABundleEnv appends the Splunk CA-trust volume/mount/env/initContainer
+// when SplunkConfiguration.CACertRef is set, so slim-api's outbound HTTPS calls to
+// Splunk (JWKS fetch, token validation) can verify Splunk's TLS cert chain
+// (AIP-4614 Part C.4 — mirrors saia.buildSAIACABundleEnv byte-for-byte; kept
+// as its own copy so the two feature packages stay decoupled, same rationale
+// as buildSplunkIssuersVal above).
+//
+// SSL_CERT_FILE/REQUESTS_CA_BUNDLE replace rather than augment the process's
+// default trust store, so a splunk-ca-merge initContainer (running the main
+// container's own image) concatenates the system bundle with the private CA
+// onto a shared emptyDir, and the env vars point at that combined file instead
+// (AIP-4614 Tier 1 item 5).
+func buildSlimCABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount, initContainers []corev1.Container) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount, []corev1.Container) {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return env, volumes, mounts, initContainers
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	privateCAPath := "/etc/splunk-ca/" + key
+	combinedPath := splunkCACombinedMountPath + "/" + splunkCACombinedFile
+
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "splunk-ca",
+			VolumeSource: corev1.VolumeSource{
+				// Project only the CA key, not the whole Secret — CACertRef may
+				// point at a leaf-cert Secret (e.g. the installer's
+				// ai-splunk-server-tls) that also holds tls.key, which must
+				// never land in this container's filesystem.
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: ref.Name,
+					Items:      []corev1.KeyToPath{{Key: key, Path: key}},
+				},
+			},
+		},
+		corev1.Volume{
+			Name:         "splunk-ca-combined",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	)
+	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath, ReadOnly: true})
+	env = append(env,
+		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: combinedPath},
+		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: combinedPath},
+	)
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "splunk-ca-merge",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		// Paths derived from ref.Key (a CRD-settable field) are passed as env
+		// vars rather than interpolated into the script string, so a key value
+		// containing shell metacharacters can't be re-parsed as command syntax.
+		Env: []corev1.EnvVar{
+			{Name: "SYSTEM_CA_PATH", Value: systemCABundlePath},
+			{Name: "PRIVATE_CA_PATH", Value: privateCAPath},
+			{Name: "COMBINED_PATH", Value: combinedPath},
+		},
+		Command: []string{"/bin/sh", "-c"},
+		Args:    []string{caMergeScript},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true},
+			{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath},
+		},
+	})
+	return env, volumes, mounts, initContainers
+}
+
+// caMergeScript is a static shell script (no string interpolation of
+// CRD-controlled values) — the paths it operates on arrive via env vars
+// set on the initContainer, never substituted into the script text itself.
+const caMergeScript = `if [ -f "$SYSTEM_CA_PATH" ]; then cat "$SYSTEM_CA_PATH" "$PRIVATE_CA_PATH" > "$COMBINED_PATH"; else cp "$PRIVATE_CA_PATH" "$COMBINED_PATH"; fi`
+
+// splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
+// roll when the CA bundle's content changes in place — not just when the
+// reference itself changes. Returns "" (no annotation) when CACertRef is
+// unset or the Secret can't be read yet. Mirrors saia.splunkCACertChecksum.
+func splunkCACertChecksum(ctx context.Context, c client.Client, ai *aiv1.AIService) string {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return ""
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ai.Namespace}, secret); err != nil {
+		return ""
+	}
+	caData, exists := secret.Data[key]
+	if !exists {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(caData))
+}
+
 // buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
 // The JWT issuer is the Splunk management endpoint (port 8089).
 // Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
@@ -380,6 +488,9 @@ func hasOwnerReference(obj metav1.Object, owner metav1.Object) bool {
 	return false
 }
 
+// reconcileCertificate manages server TLS for the legacy mtls API field.
+// Kubernetes Event reason identifiers retain their MTLS prefix for backward
+// compatibility; their messages describe the current server-TLS behavior.
 func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AIService) error {
 	if !ai.Spec.MTLS.Enabled || ai.Spec.MTLS.Termination != "operator" {
 		return nil
@@ -391,7 +502,7 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 	if err := r.Get(ctx, certKey, existingCert); err != nil {
 		if apierrors.IsNotFound(err) {
 			certExists = false
-			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating mTLS certificate")
+			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating server TLS certificate")
 		}
 	}
 
@@ -411,7 +522,7 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 		},
 	}
 	if err := controllerutil.SetControllerReference(ai, cert, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on Certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on server TLS Certificate")
 		return fmt.Errorf("ownerref on Certificate: %w", err)
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
@@ -426,12 +537,12 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 		}
 		return nil
 	}); err != nil {
-		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update Certificate: %v", err)
+		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update server TLS Certificate: %v", err)
 		return fmt.Errorf("create/update Certificate: %w", err)
 	}
 
 	if !certExists {
-		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "mTLS Certificate created successfully")
+		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "Server TLS Certificate created successfully")
 	}
 
 	certReady := false
@@ -443,11 +554,11 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 	}
 
 	if !certReady {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue the server TLS certificate")
 		return fmt.Errorf("waiting for Certificate %q to become Ready", cert.Name)
 	}
 
-	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "mTLS certificate issued successfully")
+	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "Server TLS certificate issued successfully")
 	return nil
 }
 
@@ -503,6 +614,11 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		env = append(env, corev1.EnvVar{Name: "TLS_DISABLED", Value: "true"})
 	}
 
+	// Splunk CA trust (AIP-4614 Part C.4) — no-op unless SplunkConfiguration.CACertRef is set.
+	slimImage := os.Getenv("RELATED_IMAGE_SLIM_API")
+	var initContainers []corev1.Container
+	env, volumes, mounts, initContainers = buildSlimCABundleEnv(ai, slimImage, env, volumes, mounts, initContainers)
+
 	envFrom := []corev1.EnvFromSource{
 		{
 			ConfigMapRef: &corev1.ConfigMapEnvSource{
@@ -544,6 +660,11 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	}
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
+	}
+	// Set the operator-owned rollout hash after propagating user annotations so
+	// a stale or malicious AIService annotation cannot suppress CA rotation.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
 	}
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
@@ -602,6 +723,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     initContainers,
 				Containers:         containers,
 				Volumes:            volumes,
 				Affinity:           &ai.Spec.Affinity,

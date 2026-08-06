@@ -111,7 +111,7 @@ graph TB
 | Splunk AI Operator | your build | Manages `AIPlatform` CR lifecycle |
 | Splunk Operator | 3.0.0 | Manages Splunk Enterprise |
 | KubeRay | 1.2.2 | Manages Ray clusters for AI inference |
-| cert-manager | v1.13.0 | TLS certificate management |
+| cert-manager | v1.21.1 | TLS certificate management |
 | OTel Operator | latest | Observability |
 | NVIDIA Device Plugin | v0.17.3 | Exposes GPUs to Kubernetes |
 
@@ -278,6 +278,20 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 The installer shows an install plan and asks for confirmation before making any changes.
 
+For internal Splunk, the installer also refuses to overwrite a fixed-name TLS or workload object
+unless it has both installer labels and the exact
+`ai.splunk.com/owner-id=<cluster.name>/<splunk.standaloneName>` annotation. This protects shared
+namespaces and separate installer instances. The first transaction preflight runs after
+cert-manager Phase 1 but before Phase 2 installs or can reconcile the Splunk Operator. It checks
+the configured Standalone when its CRD exists; an absent CRD safely means no Standalone object can
+exist yet, while a discovery failure is fatal. The complete fixed-name footprint is checked again
+after Phase 2 and before AI-namespace image-pull Secret reconciliation or any internal Splunk
+certificate/workload mutation. On an upgrade from an older unlabelled installation, inspect the exact object named by
+the error and use the printed `kubectl label` **and**
+`kubectl annotate` commands only after proving it belongs to this installation. Foreign objects
+must be resolved through their owner or isolated in another namespace; they are never adopted
+automatically.
+
 **4. Monitor progress**
 
 The installer prints timestamped progress to the terminal and to a log file:
@@ -351,17 +365,17 @@ graph TD
     SCRIPT["prepare_airgap_bundle.sh"]
 
     subgraph BIN["📁 binaries/"]
-        K0S["k0s binary\nlatest or --k0s-version"]
+        K0S["k0s binary\ncompatibility pin or --k0s-version"]
         YQ["yq v4.44.1\nYAML processor"]
     end
 
     subgraph IMG["📁 images/  ⭐ pre-loaded OCI image bundles"]
         K0SIMG["k0s-images.tar\nk0s control-plane images:\npause · calico · kube-proxy\ncoredns · metrics-server"]
-        ADDIMG["addon-images.tar\nadd-on component images:\ncert-manager · prometheus\nkuberay · metallb · otel\nnvidia-device-plugin · busybox"]
+        ADDIMG["addon-images.tar\nadd-on component images:\ncert-manager · prometheus\nkuberay · metallb · otel\nnvidia-device-plugin\nlocal-path helper (digest only)"]
     end
 
     subgraph MAN["📁 manifests/"]
-        CERT["cert-manager v1.13.0"]
+        CERT["cert-manager v1.21.1"]
         LP["local-path-provisioner v0.0.24"]
         NDP["nvidia-device-plugin v0.17.3"]
     end
@@ -377,7 +391,6 @@ graph TD
         EPEL["epel-release-latest-9.noarch.rpm"]
         CUDA["cuda-rhel9.repo"]
         CTK["nvidia-container-toolkit.repo"]
-        PYYAML["PyYAML wheel\n(all nodes)"]
     end
 
     subgraph META["📄 Metadata"]
@@ -417,16 +430,32 @@ internet at cluster-bring-up time — and neither set is covered by the
 
 | Tarball | Built by (in `prepare_airgap_bundle.sh`) | Covers | Why it can't come from your registry |
 |---|---|---|---|
-| `k0s-images.tar` | `k0s airgap list-images --all` → `k0s airgap bundle-artifacts` | k0s control-plane images: `pause`, Calico, kube-proxy, CoreDNS, metrics-server | k0s pulls these itself at kubelet startup (from quay.io/k0sproject) — they never pass through the installer's config |
-| `addon-images.tar` | renders every Helm chart + static manifest, collects each `image:` ref, then `bundle-artifacts` | add-on components: cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, **NVIDIA device plugin**, busybox | their image refs live *inside* the charts/manifests (quay.io, ghcr.io, registry.k8s.io, nvcr.io, docker.io) — the `images.registry` rewrite only touches the platform CR images, not these |
+| `k0s-images.tar` | `k0s airgap list-images --all` → `k0s airgap bundle-artifacts` | k0s control-plane images: `pause`, Calico, kube-proxy, CoreDNS, metrics-server | k0s manages these itself (from quay.io/k0sproject) — they never pass through the installer's config |
+| `addon-images.tar` | renders every installed Helm chart profile with `--skip-tests`, reads required static manifests, validates every runtime reference, then runs `bundle-artifacts` | add-on components: cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, **NVIDIA device plugin**, the digest-only local-path BusyBox helper | their image refs live *inside* the charts/manifests (quay.io, ghcr.io, registry.k8s.io, nvcr.io, docker.io) — the `images.registry` rewrite only touches the platform CR images, not these |
+
+The builder fails closed if a required chart/manifest is missing, Helm cannot render with the
+install-equivalent image settings, no image is found, or any reference is unrendered, untagged, or
+uses `:latest`. Helm test hooks are excluded because `helm upgrade --install` does not deploy them.
+The embedded untagged local-path helper is rewritten to the digest-only
+`docker.io/library/busybox@sha256:...` reference recorded as
+`local_path_helper_image` in `bundle-versions.txt`.
 
 **How they get used (fully automatic):** `install_from_airgap_bundle.sh` detects
-`images/*.tar` and the installer copies **every** tarball to
-`/var/lib/k0s/images/` on each node — *after* `k0s install` (which recreates
-`/var/lib/k0s`) and *before* `k0s start`. k0s auto-imports every tarball in that
-directory into containerd at kubelet startup, so the infra pods start with
-`IfNotPresent` and never reach for the internet. Workers added later with
-`join-workers` get the same treatment.
+`images/*.tar`. For a new node, the installer places every archive in
+`/var/lib/k0s/images/` before k0s starts. When a running k0s cluster is reused, it maps every live
+Kubernetes `Node` to a configured SSH endpoint using the Node name/addresses and the endpoint's
+hostname, FQDN, and IPs. Configured controller-only endpoints have no `Node` and are skipped; any
+actual `Node` without a mapping aborts installation.
+
+On the installer host, the installer derives exact image-reference/SHA-256 pairs from every local
+OCI archive's `index.json`. On each mapped node, verification requires the same name and digest in
+`k0s ctr images list` with `io.cri-containerd.pinned=pinned`; a matching name alone is
+insufficient. Changed archives are copied through a separate staging directory and moved
+atomically into `/var/lib/k0s/images/`. If the archive hash already matches but a required pinned digest is absent
+or stale, the current archive is touched to retrigger the running k0s importer without a network
+retransfer. Mapping, copy, checksum, import, and digest-verification failures stop installation.
+New-node startup is gated by the normal node/workload readiness checks, and workers added later
+with `join-workers` receive the archives before their first start.
 
 > **This is distinct from [Phase 2 — Mirror Container Images](#phase-2--mirror-container-images).**
 > The `images/` bundles cover **infrastructure** images (k0s + add-ons) and are
@@ -571,11 +600,13 @@ flowchart TD
     E --> F["5. Register local Helm repo\n(best-effort; charts install by path)"]
     F --> G["6. Export env-var overrides\nincl. AIRGAP_K0S_IMAGE_DIR\n→ points at images/*.tar"]
     G --> H["7. Run k0s_cluster_with_stack.sh install"]
-    H --> I["During install: copy k0s-images.tar\n+ addon-images.tar to each node's\n/var/lib/k0s/images/ (after k0s install,\nbefore k0s start) → auto-imported\ninto containerd"]
+    H --> I["During install: map every Kubernetes Node\nto a configured SSH endpoint; skip\ncontroller-only endpoints, fail unmapped Nodes"]
+    I --> J["Hash-sync OCI archives; retrigger same-hash\narchives when inventory is incomplete; verify\nOCI name+digest with k0s pinned label"]
 
     style C fill:#c6f6d5,color:#1a202c
     style G fill:#bee3f8,color:#1a202c
     style I fill:#fef3c7,color:#1a202c
+    style J fill:#c6f6d5,color:#1a202c
 ```
 
 The install plan shown before any changes are made will display:
@@ -588,12 +619,22 @@ Image bundles   : k0s-images.tar, addon-images.tar  → staged to /var/lib/k0s/i
 ...
 ```
 
-During install, watch the log for lines confirming the bundles reached each node:
+During a new-node install, watch for staging messages. A reused running k0s cluster additionally
+prints the verification result:
 
 ```
 Staging image bundle k0s-images.tar on <node-ip> (/var/lib/k0s/images/)...
 Staging image bundle addon-images.tar on <node-ip> (/var/lib/k0s/images/)...
+Verified <count> pinned bundle image digests on <node-ip>
 ```
+
+On a rerun where an archive has not changed and the pinned digest inventory is complete, the
+installer logs `Image bundle <name> is already current on <node-ip>` instead of transferring it.
+If inventory is missing or stale, it logs
+`Retriggered import of current image bundle <name> on <node-ip>` after touching the existing
+archive; no network retransmission is needed. The
+installer-host bundled `yq` also builds and validates `/etc/k0s/k0s.yaml`; cluster nodes do not
+need Python or PyYAML.
 
 > If you instead see `No pre-loaded image bundles in air-gap bundle (images/*.tar)`,
 > your bundle was built before this feature — rebuild it with the current
@@ -901,6 +942,13 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
   --subcommand upgrade
 ```
 
+When the existing k0s cluster is reused, this command synchronizes changed OCI archives onto all
+live Kubernetes `Node` objects that map to configured SSH endpoints and verifies their exact
+OCI-index name/digest records plus the k0s pinned label before upgrading the stack. Controller-only
+endpoints are skipped; an unmapped actual `Node` is fatal. It does not restart k0s. A same-hash
+archive with complete inventory is skipped, while incomplete inventory retriggers import by
+touching the archive without retransferring it.
+
 ### Collect a support bundle
 
 ```bash
@@ -966,7 +1014,7 @@ flowchart TD
 |---|---|---|
 | "SSH connection refused" | `ssh -i key user@node-ip hostname` | Check firewall / security groups on port 22 |
 | "Refusing to wipe — Ready nodes" | `kubectl get nodes` | Set `useExisting: auto` in config or run `clean-all` first |
-| "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
+| "Unable to apply installer settings to the generated k0s configuration" | `yq --version` on the install machine and the preceding installer log | Use the current bundled `yq`, confirm the generated YAML is readable, and rerun. Do not install PyYAML on cluster nodes. |
 | "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | Re-transfer the bundle | `sha256sum airgap-bundle-<date>.tar.gz` and compare |
 | "Expected chart not found" | `ls /opt/airgap/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
@@ -975,6 +1023,9 @@ flowchart TD
 | All models reported MISSING after a successful upload | `mc ls myminio/<bucket>/staging_state/` | Bucket name has uppercase letters — the upload scripts normalize to lowercase; use a lowercase `storage.objectStore.bucket` value. See [Model Staging Issues](K0S_README.md#model-staging-issues) |
 | All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](K0S_README.md#switching-defaultacceleratortype-from-l40s-to-h100-shows-models-as-missing) |
 | Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in your bundle (rebuild with current `prepare_airgap_bundle.sh` if not); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
+| Air-gap install times out waiting for pinned bundle image digests | `ssh <node> 'sudo k0s status && sudo k0s ctr images list'` | Check that each OCI-index name has the exact digest and `io.cri-containerd.pinned=pinned`; inspect disk and k0s logs. Same-hash archives are touched automatically when records are missing. Increase the timeout only for a healthy slow import. |
+| Air-gap install reports an unmapped Kubernetes `Node` | Compare `kubectl get nodes -o wide` with `nodes.existingIPs` and SSH `hostname`, `hostname -f`, and `hostname -I` | Add/correct the SSH endpoint for every actual `Node`. Controller-only configured endpoints with no `Node` are skipped normally. |
+| Installer refuses to adopt or overwrite an internal Splunk object | Inspect the object named by the error and compare `app.kubernetes.io/*` labels plus `ai.splunk.com/owner-id` | Use both one-time adoption commands printed by the installer only for a proven legacy object from the same cluster/Standalone. Otherwise resolve the collision through its owner or use another namespace. |
 | SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
 

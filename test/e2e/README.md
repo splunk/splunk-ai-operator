@@ -7,7 +7,7 @@ Comprehensive end-to-end tests for the Splunk AI Operator covering all features 
 The E2E test suite validates:
 - ✅ **Storage Configuration** - Persistent volumes for Weaviate vector database
 - ✅ **Ingress Configuration** - External access via HTTP/HTTPS
-- ✅ **MTLS Configuration** - Certificate management for secure communication
+- ✅ **Server TLS Configuration** - Server certificate management through the legacy `mtls` field
 - ✅ **Status Conditions** - Component readiness tracking
 - ✅ **Event Tracking** - Kubernetes event generation
 - ✅ **Component Health** - Ray cluster, Weaviate, and service endpoints
@@ -118,9 +118,10 @@ spec:
         secretName: ai-platform-tls
 ```
 
-### MTLS Configuration Tests
+### Server TLS Configuration Tests
 
-Tests certificate management:
+Tests server certificate management. The command-line flag retains its legacy
+`--mtls-only` name; client-certificate authentication is not implemented.
 
 **Scenarios:**
 - ✅ Certificate issuer reference
@@ -201,7 +202,7 @@ TEST_NAMESPACE=e2e-test               # Test namespace
 ```bash
 RUN_STORAGE_TESTS=true                # Run storage tests
 RUN_INGRESS_TESTS=true                # Run ingress tests
-RUN_MTLS_TESTS=true                   # Run MTLS tests
+RUN_MTLS_TESTS=true                   # Run server TLS tests (legacy variable name)
 RUN_STATUS_TESTS=true                 # Run status tests
 RUN_EVENT_TESTS=true                  # Run event tests
 ```
@@ -505,7 +506,7 @@ Current test coverage:
 |---------|------------|-------------------|-----------|
 | Storage | ✅ | ✅ | ✅ |
 | Ingress | ✅ | ✅ | ✅ |
-| MTLS | ✅ | ✅ | ✅ |
+| Server TLS (`mtls` field) | ✅ | ✅ | ✅ |
 | Status Conditions | ✅ | ✅ | ✅ |
 | Event Tracking | ✅ | ✅ | ✅ |
 | Ray Cluster | ✅ | ✅ | ✅ |

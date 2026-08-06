@@ -736,6 +736,129 @@ func Test_reconcileNginxDeployment_imageOverride(t *testing.T) {
 		dep.Spec.Template.Spec.Containers[0].Image)
 }
 
+func Test_reconcileNginxConfigMap_NoTLSServerBlockByDefault(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+
+	conf := cm.Data["nginx.conf"]
+	assert.NotContains(t, conf, "listen 8443",
+		"no TLS server block should be generated when MTLS is disabled")
+	assert.NotContains(t, conf, "ssl_certificate")
+}
+
+func Test_reconcileNginxConfigMap_TLSServerBlockWhenMTLSEnabled(t *testing.T) {
+	// Regression: the public "<name>-saia-service" Service conditionally adds
+	// an https:8443 ServicePort when MTLS.Enabled && Termination=="operator"
+	// (reconcileSAIAService), but nothing behind the nginx selector ever
+	// listened on 8443 — nginx only had "listen 8080" with no TLS directives.
+	// nginx must terminate TLS on 8443 too, so that Service port has a live
+	// listener behind it.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.MTLS = aiv1.MTLSConfig{
+		Enabled:     true,
+		Termination: "operator",
+		SecretName:  "test-tls",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+
+	conf := cm.Data["nginx.conf"]
+	assert.Contains(t, conf, "listen 8443 ssl;")
+	assert.Contains(t, conf, "ssl_certificate     /etc/nginx-tls/tls.crt;")
+	assert.Contains(t, conf, "ssl_certificate_key /etc/nginx-tls/tls.key;")
+
+	// Both the plain-HTTP and TLS server blocks must carry the same routing
+	// and CORS behavior — otherwise clients hitting 8443 vs 8080 would see
+	// different behavior depending on which port they used.
+	assert.Equal(t, 2, strings.Count(conf, "location ~ /saia-api-v2/"),
+		"v2 routing must exist in both the 8080 and 8443 server blocks")
+	assert.Equal(t, 2, strings.Count(conf, "proxy_pass http://saia_v1"),
+		"v1 routing must exist in both the 8080 and 8443 server blocks")
+	assert.Equal(t, 4, strings.Count(conf, "if ($request_method = OPTIONS)"),
+		"CORS preflight short-circuit must exist in both v1/v2 locations, on both server blocks")
+}
+
+func Test_reconcileNginxDeployment_MTLSDisabled_No8443(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	assert.Len(t, container.Ports, 1)
+	assert.Equal(t, int32(8080), container.Ports[0].ContainerPort)
+	assert.Len(t, container.VolumeMounts, 1, "no TLS secret mount expected when MTLS is disabled")
+}
+
+func Test_reconcileNginxDeployment_MTLSEnabled_MountsTLSSecretAnd8443(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.MTLS = aiv1.MTLSConfig{
+		Enabled:     true,
+		Termination: "operator",
+		SecretName:  "test-tls",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileNginxDeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	require.Len(t, container.Ports, 2)
+	assert.Equal(t, int32(8080), container.Ports[0].ContainerPort)
+	assert.Equal(t, "https", container.Ports[1].Name)
+	assert.Equal(t, int32(8443), container.Ports[1].ContainerPort)
+
+	var tlsMount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == "nginx-tls" {
+			tlsMount = &container.VolumeMounts[i]
+		}
+	}
+	require.NotNil(t, tlsMount, "expected an nginx-tls VolumeMount")
+	assert.Equal(t, "/etc/nginx-tls", tlsMount.MountPath)
+	assert.True(t, tlsMount.ReadOnly)
+
+	var tlsVolume *corev1.Volume
+	for i := range dep.Spec.Template.Spec.Volumes {
+		if dep.Spec.Template.Spec.Volumes[i].Name == "nginx-tls" {
+			tlsVolume = &dep.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	require.NotNil(t, tlsVolume, "expected an nginx-tls Volume")
+	require.NotNil(t, tlsVolume.Secret)
+	assert.Equal(t, "test-tls", tlsVolume.Secret.SecretName)
+}
+
 func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 	// Regression: the pre-existing code did not initialize svc.Annotations, so
 	// any user-provided annotation on the AIService caused a "assignment to
@@ -1111,6 +1234,274 @@ func Test_extractBucketName(t *testing.T) {
 			assert.Equal(t, tt.want, extractBucketName(tt.input))
 		})
 	}
+}
+
+// findVolume returns the named volume, or nil if absent.
+func findVolume(volumes []corev1.Volume, name string) *corev1.Volume {
+	for i := range volumes {
+		if volumes[i].Name == name {
+			return &volumes[i]
+		}
+	}
+	return nil
+}
+
+func Test_reconcileSAIADeployment_CABundle_NotSetByDefault(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService() // no SplunkConfiguration.CACertRef
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.NotContains(t, envMap, "REQUESTS_CA_BUNDLE")
+	assert.NotContains(t, envMap, "SSL_CERT_FILE")
+	assert.Nil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSAIADeployment_CABundle_WiresEnvVolumeAndHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+	ai.Annotations = map[string]string{
+		"example.com/preserved":                  "kept",
+		"splunk-ai-operator/splunk-ca-hash":      "stale-user-supplied-hash",
+		"splunk-ai-operator/splunk-issuers-hash": "stale-user-supplied-issuers-hash",
+	}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem-1")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["SSL_CERT_FILE"])
+
+	vol := findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca")
+	require.NotNil(t, vol)
+	require.NotNil(t, vol.Secret)
+	assert.Equal(t, "ai-splunk-server-tls", vol.Secret.SecretName)
+	// ai-splunk-server-tls is a leaf-cert Secret that also holds tls.key;
+	// the volume must project only ca.crt, never the whole Secret, or the
+	// private key ends up in this container's filesystem.
+	require.Len(t, vol.Secret.Items, 1)
+	assert.Equal(t, "ca.crt", vol.Secret.Items[0].Key)
+	assert.Equal(t, "ca.crt", vol.Secret.Items[0].Path)
+	require.NotNil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca-combined"))
+
+	// A splunk-ca-merge initContainer combines the system trust store with the
+	// private CA so REQUESTS_CA_BUNDLE/SSL_CERT_FILE don't drop public CA trust
+	// (AIP-4614 Tier 1 item 5).
+	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
+	initC := dep.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, "splunk-ca-merge", initC.Name)
+	assert.Equal(t, container.Image, initC.Image)
+
+	hash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
+	assert.NotEmpty(t, hash1)
+	assert.NotEqual(t, "stale-user-supplied-hash", hash1, "operator CA hash must override propagated user annotations")
+	assert.NotEqual(t, "stale-user-supplied-issuers-hash", dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"], "operator issuer hash must override propagated user annotations")
+	assert.Equal(t, "kept", dep.Spec.Template.Annotations["example.com/preserved"])
+
+	// Rotating the Secret's content in place (same name) must change the hash,
+	// so the pod rolls even though CACertRef itself didn't change (AIP-4614 Part G.2).
+	caSecret.Data["ca.crt"] = []byte("fake-ca-pem-2-rotated")
+	require.NoError(t, fakeClient.Update(context.Background(), caSecret))
+
+	err = r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep2 := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep2))
+	hash2 := dep2.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"]
+	assert.NotEmpty(t, hash2)
+	assert.NotEqual(t, hash1, hash2)
+}
+
+func Test_reconcileSAIADeployment_CABundle_MissingSecretOmitsHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "does-not-exist"}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	// Env/volume are wired regardless (the Secret is expected to appear later);
+	// only the hash annotation is skipped until the Secret can actually be read.
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSAIADeployment_CABundle_MissingKeyOmitsHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ca-with-wrong-key"}
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ca-with-wrong-key", Namespace: "default"},
+		Data:       map[string][]byte{"other.crt": []byte("not-the-referenced-key")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+	assert.NotContains(t, dep.Spec.Template.Annotations, "splunk-ai-operator/splunk-ca-hash")
+}
+
+func Test_reconcileSAIADeployment_CABundle_CustomKey(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "external-ca", Key: "bundle.pem"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-ca", Namespace: "default"},
+		Data:       map[string][]byte{"bundle.pem": []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+}
+
+// Test_reconcileSAIADeployment_CABundle_KeyWithShellMetacharacters guards
+// against command injection via CACertRef.Key: the splunk-ca-merge
+// initContainer must never string-interpolate the key into its shell
+// script — paths are passed as env vars, so a key containing shell
+// metacharacters is inert.
+func Test_reconcileSAIADeployment_CABundle_KeyWithShellMetacharacters(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	maliciousKey := `ca.crt"; rm -rf / #`
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "external-ca", Key: maliciousKey}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-ca", Namespace: "default"},
+		Data:       map[string][]byte{maliciousKey: []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIADeployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
+	initC := dep.Spec.Template.Spec.InitContainers[0]
+	require.Len(t, initC.Args, 1)
+	assert.NotContains(t, initC.Args[0], maliciousKey, "the key must never be interpolated into the shell script text")
+
+	initEnvMap := envToMap(initC.Env)
+	assert.Contains(t, initEnvMap["PRIVATE_CA_PATH"], maliciousKey, "the key-derived path is carried via env var, not script interpolation")
+}
+
+func Test_reconcileSAIAv2Deployment_CABundle_WiresEnvAndHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-one.example.test:8089"
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Deployment(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-deployment", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["SSL_CERT_FILE"])
+	assert.NotNil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
+	assert.Equal(t, "splunk-ca-merge", dep.Spec.Template.Spec.InitContainers[0].Name)
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+	issuerHash1 := dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"]
+	assert.NotEmpty(t, issuerHash1)
+
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-two.example.test:8089"
+	require.NoError(t, r.reconcileSAIAv2Deployment(context.Background(), ai))
+	dep2 := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-deployment", Namespace: "default"}, dep2))
+	assert.NotEqual(t, issuerHash1, dep2.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"], "issuer changes must roll SAIA v2 pods that consume the ConfigMap through envFrom")
+}
+
+func Test_reconcileSAIAv2Worker_CABundle_WiresEnvAndHash(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.CACertRef = &aiv1.CABundleRef{Name: "ai-splunk-server-tls"}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-splunk-server-tls", Namespace: "default"},
+		Data:       map[string][]byte{"ca.crt": []byte("fake-ca-pem")},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, caSecret).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	err := r.reconcileSAIAv2Worker(context.Background(), ai)
+	require.NoError(t, err)
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-saia-v2-worker", Namespace: "default"}, dep))
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := envToMap(container.Env)
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["REQUESTS_CA_BUNDLE"])
+	assert.Equal(t, "/etc/splunk-ca-combined/ca-certificates.crt", envMap["SSL_CERT_FILE"])
+	assert.NotNil(t, findVolume(dep.Spec.Template.Spec.Volumes, "splunk-ca"))
+	require.Len(t, dep.Spec.Template.Spec.InitContainers, 1)
+	assert.Equal(t, "splunk-ca-merge", dep.Spec.Template.Spec.InitContainers[0].Name)
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-ca-hash"])
+	assert.NotEmpty(t, dep.Spec.Template.Annotations["splunk-ai-operator/splunk-issuers-hash"])
 }
 
 // envToMap converts a slice of EnvVar to a map for easy assertion.

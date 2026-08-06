@@ -7,29 +7,41 @@
 #
 # Usage:
 #   ./prepare_airgap_bundle.sh [--output-dir DIR] [--k0s-version VERSION]
+#                              [--config k0s-cluster-config.yaml]
 #
 # Requirements on this machine:
-#   curl, helm, tar, gzip, sha256sum (or shasum on macOS)
+#   Linux/amd64, curl, helm, tar, gzip, sha256sum
+#   yq v4 when --config is supplied
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ── Versions (keep in sync with k0s_cluster_with_stack.sh) ─────────────────
 YQ_VERSION="v4.44.1"
-CERT_MANAGER_VERSION="v1.13.0"
+CERT_MANAGER_VERSION="v1.21.1"
 LOCAL_PATH_PROVISIONER_VERSION="v0.0.24"
+# local-path-provisioner v0.0.24 embeds an untagged helper image in its
+# ConfigMap. Rewrite that runtime manifest to an immutable digest before it is
+# bundled so an offline install never resolves the mutable implicit :latest.
+LOCAL_PATH_HELPER_IMAGE="docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
 NVIDIA_DEVICE_PLUGIN_VERSION="v0.17.3"
 METALLB_CHART_VERSION="0.14.8"
 KUBERAY_CHART_VERSION="1.2.2"
+DEFAULT_TRAEFIK_IMAGE="docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"
 
-# k0s does not pin a version in the install script (it installs latest stable).
-# Override with --k0s-version if you need a specific release.
-K0S_VERSION="${K0S_VERSION:-latest}"
+# Keep the default aligned with k0s_cluster_with_stack.sh and cert-manager's
+# tested Kubernetes range. An explicit override is accepted only when it still
+# embeds Kubernetes 1.33-1.36.
+DEFAULT_K0S_VERSION="v1.33.13+k0s.1"
+K0S_VERSION="${K0S_VERSION:-${DEFAULT_K0S_VERSION}}"
 
 # Target OS for GPU node RPM packages. Only rhel9 is tested and supported.
 # rhel10 and amzn2023 code paths are kept for internal testing only.
 GPU_NODE_OS="${GPU_NODE_OS:-rhel9}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
+BUNDLE_CONFIG_FILE="${BUNDLE_CONFIG_FILE:-}"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -37,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
     --k0s-version) K0S_VERSION="$2"; shift 2 ;;
     --gpu-os)      GPU_NODE_OS="$2"; shift 2 ;;
+    --config)      BUNDLE_CONFIG_FILE="$2"; shift 2 ;;
     -h|--help)
       cat <<'HELP'
 prepare_airgap_bundle.sh — download all Splunk AI Platform install artifacts
@@ -45,13 +58,19 @@ into a self-contained tar.gz bundle for air-gapped deployments.
 USAGE
   ./prepare_airgap_bundle.sh [OPTIONS]
 
+BUILD HOST
+  Linux/amd64 is required. The script executes the downloaded k0s Linux/amd64
+  binary while constructing the offline image archives.
+
 OPTIONS
   --output-dir DIR      Directory where the bundle is written.
                         Default: ./airgap-bundle
                         Env: OUTPUT_DIR
 
-  --k0s-version VER     Specific k0s release to download (e.g. v1.31.2+k0s.0).
-                        Default: latest stable release
+  --k0s-version VER     Specific supported k0s release to download
+                        (e.g. v1.35.2+k0s.0).
+                        Default: v1.33.13+k0s.1 (compatibility pin)
+                        The embedded Kubernetes minor must be 1.33-1.36.
                         Env: K0S_VERSION
 
   --gpu-os OS           Target OS for GPU node package files.
@@ -59,6 +78,13 @@ OPTIONS
                         Env: GPU_NODE_OS
                         Only RHEL 9 is tested and supported.
                         Any other value will error.
+
+  --config FILE         Cluster config that will be used for the offline install.
+                        When ingress.enabled is true, the configured
+                        images.ingress.traefikImage is added to both the k0s
+                        add-on image tar and container-images.txt.
+                        Requires mikefarah/yq v4 on the bundle-building host.
+                        Env: BUNDLE_CONFIG_FILE
 
   -h, --help            Show this help text.
 
@@ -71,6 +97,7 @@ WHAT IS BUNDLED
     cert-manager.yaml          — cert-manager CRDs + controller
     local-path-storage.yaml    — Rancher local-path provisioner
     nvidia-device-plugin.yml   — NVIDIA GPU device plugin DaemonSet
+    traefik/                   — pinned Traefik CRDs + installer RBAC template
 
   charts/
     kube-prometheus-stack-*.tgz   — Prometheus + Grafana (version resolved at bundle time)
@@ -82,10 +109,10 @@ WHAT IS BUNDLED
     epel-release-latest-<N>.noarch.rpm  — EPEL RPM for RHEL/AL2023
     cuda-<os>.repo                      — CUDA package repository definition
     nvidia-container-toolkit.repo       — nvidia-container-toolkit RPM repo definition
-    pyyaml-*.whl                        — PyYAML pure-Python wheel (all nodes)
 
   airgap-env.sh         — Source this to set env-var overrides before a manual install
   container-images.txt  — List of container images to mirror to your internal registry
+                          (includes Traefik when --config enables ingress)
   bundle-versions.txt   — Records all component versions for reproducibility
   checksums.sha256      — SHA-256 checksums for every file in the bundle
 
@@ -98,6 +125,7 @@ ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   CERT_MANAGER_MANIFEST_URL         URL/path to cert-manager.yaml
   LOCAL_PATH_MANIFEST_URL           URL/path to local-path-storage.yaml
   NVIDIA_DEVICE_PLUGIN_MANIFEST_URL URL/path to nvidia-device-plugin.yml
+  TRAEFIK_MANIFEST_DIR              Directory containing pinned Traefik CRDs/RBAC
   PROMETHEUS_CHART_PATH             Local path to kube-prometheus-stack .tgz
   OTEL_CHART_PATH                   Local path to opentelemetry-operator .tgz
   KUBERAY_CHART_PATH                Local path to kuberay-operator .tgz
@@ -105,14 +133,22 @@ ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   EPEL_RPM_URL_OVERRIDE             URL/path to EPEL release RPM (GPU nodes)
   CUDA_REPO_URL_OVERRIDE            URL/path to CUDA .repo file (GPU nodes)
   NVIDIA_CTK_REPO_URL_OVERRIDE      URL/path to nvidia-container-toolkit .repo (GPU nodes)
-  AIRGAP_PYYAML_WHEEL_PATH          Path to PyYAML .whl file (all nodes, optional)
+  AIRGAP_K0S_IMAGE_DIR              Directory containing offline OCI image archives
+  AIRGAP_BUNDLE_VERSION_FILE        Verified bundle-versions.txt path
+  BUNDLE_CERT_MANAGER_VERSION       Verified cert-manager version metadata
+  BUNDLE_INGRESS_ENABLED            Verified ingress-enabled metadata
+  BUNDLE_TRAEFIK_IMAGE              Verified Traefik image metadata
+  AIRGAP_MODE                       Always true for a sourced air-gap environment
 
 EXAMPLES
   # Basic bundle (RHEL 9 GPU nodes — only supported target)
   ./prepare_airgap_bundle.sh
 
   # Custom output directory and pinned k0s version
-  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
+  ./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.35.2+k0s.0
+
+  # Include the configured Traefik image when HTTPS ingress is enabled
+  ./prepare_airgap_bundle.sh --config ./k0s-cluster-config.yaml
 
   # Using env vars instead of flags
   OUTPUT_DIR=/mnt/transfer ./prepare_airgap_bundle.sh
@@ -133,7 +169,6 @@ GPU NODE PACKAGES (packages/ directory)
     - EPEL release RPM (installs EPEL repo for DKMS)
     - CUDA .repo file (redirects dnf to the bundled content if served via HTTP)
     - nvidia-container-toolkit .repo file
-    - PyYAML wheel (pure Python, installed via pip3 --no-index)
 
   NOTE: The CUDA and nvidia-container-toolkit .repo files redirect dnf to
   developer.download.nvidia.com. For a truly offline install you still need
@@ -188,14 +223,183 @@ download() {
   fi
 }
 
+pin_local_path_helper_image() {
+  local manifest="$1"
+  local temp_manifest="${manifest}.tmp"
+
+  # The helperPod.yaml is embedded inside a ConfigMap, so a Kubernetes-aware
+  # YAML rewrite cannot address it as a normal Pod field. Require exactly one
+  # replacement; a changed upstream manifest must fail the bundle build rather
+  # than silently reintroduce an untagged helper image.
+  if ! awk -v replacement="${LOCAL_PATH_HELPER_IMAGE}" '
+    BEGIN { replacements = 0 }
+    /^[[:space:]]*image:[[:space:]]*busybox[[:space:]]*$/ {
+      sub(/busybox[[:space:]]*$/, replacement)
+      replacements++
+    }
+    { print }
+    END { if (replacements != 1) exit 42 }
+  ' "${manifest}" > "${temp_manifest}"; then
+    rm -f -- "${temp_manifest}"
+    err "Expected exactly one untagged local-path helper image in ${manifest}; upstream manifest format may have changed."
+  fi
+
+  mv -- "${temp_manifest}" "${manifest}"
+}
+
+extract_image_references() {
+  local manifest="$1"
+  local references
+
+  # Operators often carry images for workloads they create later in command
+  # arguments (for example --collector-image=... or
+  # --prometheus-config-reloader=...), not in their own Pod's `image:` field.
+  # Those deferred images are just as necessary offline as directly rendered
+  # containers, so enumerate both forms from the final rendered manifest.
+  references="$({
+    grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"'[:space:]]+' "${manifest}" \
+      | sed -E 's/^image:[[:space:]]*["'"'"']?//' || true
+    grep -hoE -- '--[[:alnum:]_.-]+=([[:alnum:]_.-]+(:[0-9]+)?/)+([[:alnum:]_.-]+:[[:alnum:]_][[:alnum:]_.-]*(@sha256:[[:xdigit:]]{64})?|[[:alnum:]_.-]+@sha256:[[:xdigit:]]{64})' "${manifest}" \
+      | sed -E 's/^--[[:alnum:]_.-]+=//' || true
+  } | sed '/^$/d')"
+  [[ -n "${references}" ]] || return 1
+  printf '%s\n' "${references}"
+}
+
+render_chart_for_image_inventory() {
+  local chart_path="$1" output_path="$2" chart_file release_name namespace
+  local -a install_values=()
+
+  chart_file="$(basename "${chart_path}")"
+  case "${chart_file}" in
+    kube-prometheus-stack-*.tgz)
+      release_name="kube-prometheus-stack"
+      namespace="monitoring"
+      install_values=(
+        --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+        --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false
+      )
+      ;;
+    opentelemetry-operator-*.tgz)
+      release_name="opentelemetry-operator"
+      namespace="opentelemetry-operator-system"
+      # Keep these values identical to install_otel_operator_and_contrib_collector.
+      install_values=(
+        --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib
+        --set admissionWebhooks.certManager.enabled=true
+      )
+      ;;
+    kuberay-operator-*.tgz)
+      release_name="kuberay-operator"
+      namespace="ray-system"
+      install_values=(
+        --set image.repository=quay.io/kuberay/operator
+        --set image.tag=v1.2.2
+      )
+      ;;
+    metallb-*.tgz)
+      release_name="metallb"
+      namespace="metallb-system"
+      ;;
+    *)
+      err "No install-equivalent image-rendering profile exists for chart: ${chart_file}"
+      ;;
+  esac
+
+  # Helm test hooks are not installed by `helm upgrade --install`; including
+  # them adds mutable helper images that are irrelevant to runtime and
+  # breaks deterministic offline inventory validation.
+  if ! helm template "${release_name}" "${chart_path}" \
+    --namespace "${namespace}" \
+    --skip-tests \
+    "${install_values[@]}" > "${output_path}"; then
+    err "Failed to render ${chart_file} while enumerating add-on images."
+  fi
+  [[ -s "${output_path}" ]] \
+    || err "Helm rendered no manifests for ${chart_file}; refusing an incomplete add-on image bundle."
+}
+
+validate_addon_image_reference() {
+  local image="$1" name_part leaf tag digest
+
+  [[ -n "${image}" ]] || err "Add-on image inventory contains an empty reference."
+  [[ "${image}" != *[[:space:]]* ]] \
+    || err "Add-on image reference contains whitespace: ${image}"
+  [[ "${image}" != *'{{'* && "${image}" != *'}}'* ]] \
+    || err "Add-on image reference was not fully rendered: ${image}"
+
+  name_part="${image%@*}"
+  [[ "${name_part}" != *@* ]] \
+    || err "Add-on image reference contains multiple digest separators: ${image}"
+  leaf="${name_part##*/}"
+  if [[ "${leaf}" == *:* ]]; then
+    tag="${leaf##*:}"
+    [[ -n "${tag}" ]] || err "Add-on image reference has an empty tag: ${image}"
+    [[ "${tag}" != "latest" ]] \
+      || err "Mutable :latest image is not allowed in the add-on bundle: ${image}"
+  elif [[ "${image}" != *@* ]]; then
+    err "Untagged image is not allowed in the add-on bundle: ${image}"
+  fi
+
+  if [[ "${image}" == *@* ]]; then
+    digest="${image##*@}"
+    [[ "${digest}" =~ ^sha256:[[:xdigit:]]{64}$ ]] \
+      || err "Add-on image has an invalid or unsupported digest: ${image}"
+  fi
+}
+
+validate_addon_image_list() {
+  local image image_count=0
+
+  while IFS= read -r image || [[ -n "${image}" ]]; do
+    image="${image%$'\r'}"
+    validate_addon_image_reference "${image}"
+    ((image_count += 1))
+  done < "$1"
+
+  (( image_count > 0 )) \
+    || err "Could not enumerate any add-on images from the staged charts and manifests."
+}
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 require_cmd curl
 require_cmd helm
 require_cmd tar
+[[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || \
+  err "Bundle preparation requires a Linux/amd64 host because it executes the downloaded k0s Linux/amd64 binary"
+
+if [[ -n "${BUNDLE_CONFIG_FILE}" ]]; then
+  [[ -f "${BUNDLE_CONFIG_FILE}" ]] \
+    || err "Cluster config not found: ${BUNDLE_CONFIG_FILE}"
+  # The staged yq binary targets the offline nodes. Use the build host's yq to
+  # resolve the supplied configuration.
+  require_cmd yq
+fi
+
+INGRESS_ENABLED="false"
+TRAEFIK_IMAGE=""
+if [[ -n "${BUNDLE_CONFIG_FILE}" ]]; then
+  ingress_value="$(yq eval -r '.ingress.enabled // false' "${BUNDLE_CONFIG_FILE}")" \
+    || err "Could not read ingress.enabled from ${BUNDLE_CONFIG_FILE}"
+  if [[ "${ingress_value}" == "true" ]]; then
+    INGRESS_ENABLED="true"
+    TRAEFIK_IMAGE="$(yq eval -r ".images.ingress.traefikImage // \"${DEFAULT_TRAEFIK_IMAGE}\"" "${BUNDLE_CONFIG_FILE}")" \
+      || err "Could not read images.ingress.traefikImage from ${BUNDLE_CONFIG_FILE}"
+    [[ -n "${TRAEFIK_IMAGE}" && "${TRAEFIK_IMAGE}" != "null" ]] \
+      || err "ingress.enabled=true requires a non-empty images.ingress.traefikImage"
+  fi
+fi
 
 log "=== Splunk AI Platform — Air-Gap Bundle Preparation ==="
 log "Output directory : ${OUTPUT_DIR}"
 log "Bundle name      : ${BUNDLE_NAME}"
+if [[ -n "${BUNDLE_CONFIG_FILE}" ]]; then
+  log "Cluster config   : ${BUNDLE_CONFIG_FILE}"
+  log "HTTPS ingress    : ${INGRESS_ENABLED}"
+  [[ "${INGRESS_ENABLED}" == "true" ]] && log "Traefik image    : ${TRAEFIK_IMAGE}"
+else
+  log "Cluster config   : not supplied (Traefik image will not be bundled)"
+fi
 log ""
 log "Component versions:"
 log "  k0s                   : ${K0S_VERSION}"
@@ -210,16 +414,30 @@ log ""
 
 mkdir -p \
   "${STAGE_DIR}/binaries" \
-  "${STAGE_DIR}/manifests" \
+  "${STAGE_DIR}/manifests/traefik" \
   "${STAGE_DIR}/charts" \
   "${STAGE_DIR}/packages"
+
+# These manifests are vendored with the installer rather than downloaded at
+# bundle-build time. Include them so a bundle remains self-contained even when
+# the operator copied only the top-level installer scripts to the offline host.
+for traefik_manifest in traefik-crds.yaml traefik-rbac.yaml; do
+  [[ -f "${SCRIPT_DIR}/traefik/${traefik_manifest}" ]] \
+    || err "Required Traefik manifest is missing: ${SCRIPT_DIR}/traefik/${traefik_manifest}"
+  cp "${SCRIPT_DIR}/traefik/${traefik_manifest}" \
+    "${STAGE_DIR}/manifests/traefik/${traefik_manifest}"
+done
 
 # ── 1. k0s binary ─────────────────────────────────────────────────────────────
 log "--- Downloading k0s binary ---"
 if [[ "${K0S_VERSION}" == "latest" ]]; then
   K0S_VERSION="$(curl -fsSL https://api.github.com/repos/k0sproject/k0s/releases/latest \
     | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')"
-  log "Resolved latest k0s version: ${K0S_VERSION}"
+  log "Resolved explicitly requested latest k0s version: ${K0S_VERSION}"
+fi
+if [[ ! "${K0S_VERSION}" =~ ^v1\.([0-9]+)\.[0-9]+\+k0s\.[0-9]+$ ]] || \
+    (( 10#${BASH_REMATCH[1]:-0} < 33 || 10#${BASH_REMATCH[1]:-0} > 36 )); then
+  err "k0s ${K0S_VERSION} is outside cert-manager ${CERT_MANAGER_VERSION}'s supported Kubernetes 1.33-1.36 range"
 fi
 
 K0S_URL="https://github.com/k0sproject/k0s/releases/download/${K0S_VERSION}/k0s-${K0S_VERSION}-amd64"
@@ -231,7 +449,7 @@ echo "${K0S_VERSION}" > "${STAGE_DIR}/binaries/k0s.version"
 # k0s pulls its OWN control-plane images (quay.io/k0sproject/*) at startup; in an
 # air-gapped cluster those pulls time out. k0s solves this natively: any OCI image
 # bundle dropped at /var/lib/k0s/images/ is auto-imported into containerd before
-# the kubelet starts. We build that bundle here (M1 has internet) using the exact
+# the kubelet starts. We build that bundle on this connected Linux host using the exact
 # k0s binary we just downloaded, and stage it for the installer to scp to every
 # node. --all includes images for every bundled component (both calico AND
 # kube-router network providers, metrics-server, etc.) so the bundle is correct
@@ -268,6 +486,7 @@ download \
 download \
   "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml" \
   "${STAGE_DIR}/manifests/local-path-storage.yaml"
+pin_local_path_helper_image "${STAGE_DIR}/manifests/local-path-storage.yaml"
 
 download \
   "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${NVIDIA_DEVICE_PLUGIN_VERSION}/deployments/static/nvidia-device-plugin.yml" \
@@ -315,57 +534,68 @@ helm pull metallb/metallb \
 
 # ── 4b. Add-on component image bundle ──────────────────────────────────────────
 # The add-on components (cert-manager, local-path, kube-prometheus-stack, otel,
-# kuberay, metallb) reference their images inside their HELM CHARTS and STATIC
-# MANIFESTS — NOT in the cluster config — so the installer's registry-rewrite
-# never touches them, and on an air-gapped node those pulls (quay.io, ghcr.io,
-# rancher, registry.k8s.io, docker.io) time out. We enumerate every image those
-# charts+manifests render to, then build a SECOND k0s image bundle (addon-images
-# .tar) that the installer drops at /var/lib/k0s/images/ alongside k0s-images.tar.
-# k0s imports every tarball in that dir at startup, so containerd already has the
-# exact image refs and pods pull them with IfNotPresent — no registry needed.
+# kuberay, metallb, and optionally Traefik) reference images outside the normal
+# application-image rewrite path. Charts and static manifests carry most of
+# those references; Traefik is read from the supplied cluster config.
+# The installer's application-image registry rewrite does not cover these
+# references, so on an air-gapped node their pulls would time out. We enumerate
+# every image those charts/manifests render plus the configured Traefik image,
+# then build a SECOND k0s image bundle (addon-images.tar) that the installer
+# drops at /var/lib/k0s/images/ alongside k0s-images.tar.
+# k0s imports every tarball in that directory before first start or through its
+# live image-directory watcher, so containerd has the exact image refs before
+# add-on installation continues — no registry needed.
 log "--- Enumerating add-on component images (rendering charts + manifests) ---"
 ADDON_LIST="${STAGE_DIR}/images/addon-images.list"
-{
-  # Static manifests: grep image: refs (skip the bare 'busybox' with no tag — we
-  # pin busybox:latest explicitly below so containerd has a concrete ref).
-  # Match BOTH *.yaml and *.yml — nvidia-device-plugin.yml uses the .yml
-  # extension, so a bare *.yaml glob silently skipped it and its image
-  # (nvcr.io/nvidia/k8s-device-plugin) never made it into the bundle, leaving
-  # the device-plugin DaemonSet in ImagePullBackOff on air-gapped GPU nodes.
-  # `|| true` on each grep pipeline: a no-match returns exit 1, which under
-  # `set -euo pipefail` would otherwise abort the whole bundle build before the
-  # `[[ -s "${ADDON_LIST}" ]] ... else warn` best-effort fallback below could
-  # run. Same guard the PyYAML URL resolution above already uses.
-  grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
-    "${STAGE_DIR}"/manifests/*.yaml "${STAGE_DIR}"/manifests/*.yml 2>/dev/null \
-    | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
-  # Helm charts: render with default values and grep image: refs. Guard the glob
-  # with compgen so an empty charts/ dir doesn't run the loop once with a literal
-  # unexpanded "*.tgz" path (which makes `helm template` fail and, under set -e,
-  # abort the build).
-  if compgen -G "${STAGE_DIR}/charts/*.tgz" >/dev/null 2>&1; then
-    for _tgz in "${STAGE_DIR}"/charts/*.tgz; do
-      helm template "${_tgz}" 2>/dev/null \
-        | grep -oE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
-        | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
-    done
-  fi
-  # busybox:latest (otel init) — pin a concrete tag so it resolves offline.
-  echo "busybox:latest"
-} | grep -E '[:/]' | grep -vE '^busybox$' | sort -u > "${ADDON_LIST}"
+ADDON_CANDIDATES="${STAGE_DIR}/images/.addon-images.candidates"
+: > "${ADDON_CANDIDATES}"
 
-if [[ -s "${ADDON_LIST}" ]]; then
-  log "Add-on images to bundle ($(wc -l < "${ADDON_LIST}")):"
-  while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
-  log "Building add-on image bundle (pulls the images above, may take several minutes)..."
-  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
-    -o "${STAGE_DIR}/images/addon-images.tar" \
-    < "${ADDON_LIST}" \
-    || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
-  log "Add-on image bundle written: ${STAGE_DIR}/images/addon-images.tar ($(du -h "${STAGE_DIR}/images/addon-images.tar" | cut -f1))"
-else
-  warn "Could not enumerate any add-on images from charts/manifests — add-on pods may fail to pull on air-gapped nodes."
+# Static manifests are installation inputs too. Require every expected manifest
+# to exist and contain at least one image rather than treating a missing glob or
+# parser mismatch as an empty, apparently successful inventory.
+for _manifest in \
+  "${STAGE_DIR}/manifests/cert-manager.yaml" \
+  "${STAGE_DIR}/manifests/local-path-storage.yaml" \
+  "${STAGE_DIR}/manifests/nvidia-device-plugin.yml"; do
+  [[ -s "${_manifest}" ]] || err "Required add-on manifest is missing or empty: ${_manifest}"
+  if ! extract_image_references "${_manifest}" >> "${ADDON_CANDIDATES}"; then
+    err "Could not enumerate an image from required add-on manifest: ${_manifest}"
+  fi
+done
+
+# Render the exact four charts that were staged. Each profile mirrors the
+# installer's values, and any Helm error or empty render aborts the build.
+for _tgz in \
+  "${STAGE_DIR}/charts/kube-prometheus-stack-${PROMETHEUS_CHART_VERSION}.tgz" \
+  "${STAGE_DIR}/charts/opentelemetry-operator-${OTEL_CHART_VERSION}.tgz" \
+  "${STAGE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION}.tgz" \
+  "${STAGE_DIR}/charts/metallb-${METALLB_CHART_VERSION}.tgz"; do
+  [[ -s "${_tgz}" ]] || err "Required add-on chart is missing or empty: ${_tgz}"
+  _rendered_manifest="${STAGE_DIR}/images/.rendered-$(basename "${_tgz}").yaml"
+  render_chart_for_image_inventory "${_tgz}" "${_rendered_manifest}"
+  if ! extract_image_references "${_rendered_manifest}" >> "${ADDON_CANDIDATES}"; then
+    err "Rendered chart contains no image references: ${_tgz}"
+  fi
+  rm -f -- "${_rendered_manifest}"
+done
+
+# Traefik is configured directly rather than rendered from a chart/manifest.
+if [[ "${INGRESS_ENABLED}" == "true" ]]; then
+  printf '%s\n' "${TRAEFIK_IMAGE}" >> "${ADDON_CANDIDATES}"
 fi
+
+sort -u "${ADDON_CANDIDATES}" > "${ADDON_LIST}"
+rm -f -- "${ADDON_CANDIDATES}"
+validate_addon_image_list "${ADDON_LIST}"
+
+log "Add-on images to bundle ($(wc -l < "${ADDON_LIST}")):"
+while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
+log "Building add-on image bundle (pulls the images above, may take several minutes)..."
+"${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+  -o "${STAGE_DIR}/images/addon-images.tar" \
+  < "${ADDON_LIST}" \
+  || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
+log "Add-on image bundle written: ${STAGE_DIR}/images/addon-images.tar ($(du -h "${STAGE_DIR}/images/addon-images.tar" | cut -f1))"
 
 # ── 5. GPU node OS packages ───────────────────────────────────────────────────
 # These files are SCPed to GPU nodes by install_from_airgap_bundle.sh before
@@ -378,7 +608,6 @@ fi
 #    local HTTP mirror and redirect CUDA_REPO_URL_OVERRIDE to it.
 #    Without a local mirror, the .repo file still points at NVIDIA's servers.
 #  - nvidia-container-toolkit .repo: same pattern.
-#  - PyYAML wheel: pure-Python, installed offline via pip3 --no-index.
 log "--- Downloading GPU node OS packages (target OS: ${GPU_NODE_OS}) ---"
 
 # Resolve EPEL major from GPU_NODE_OS
@@ -413,41 +642,6 @@ download "${CUDA_REPO_FILE_URL}" "${STAGE_DIR}/packages/${CUDA_REPO_FILENAME}"
 CTK_REPO_URL="https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo"
 download "${CTK_REPO_URL}" "${STAGE_DIR}/packages/nvidia-container-toolkit.repo"
 
-# PyYAML — fetched from PyPI so the nodes can install it without pip's network
-# access (avoids requiring pip on the bundle machine). PyYAML does NOT publish a
-# pure-Python (none-any) wheel — every wheel is platform-specific (cp3x, manylinux,
-# win) — so we resolve the real download URL from PyPI's per-version JSON metadata
-# rather than guessing a path. The per-version endpoint (.../PyYAML/<ver>/json)
-# lists only that release's files in `urls[]`, so the source sdist is matched
-# reliably and the modern hash-based pythonhosted URL is used verbatim.
-#
-# Each grep is guarded with `|| true`: a no-match returns exit 1, which under
-# `set -euo pipefail` would otherwise abort the whole script mid-resolution.
-log "Resolving PyYAML download URL from PyPI..."
-PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
-  | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
-[[ -z "${PYYAML_VERSION}" ]] && err "Could not resolve latest PyYAML version from PyPI."
-
-PYYAML_META="$(curl -fsSL "https://pypi.org/pypi/PyYAML/${PYYAML_VERSION}/json")" \
-  || err "Could not fetch PyPI metadata for PyYAML ${PYYAML_VERSION}."
-
-# Prefer a pure-Python wheel if one is ever published (future-proofing); the
-# urls[] array here contains only this version's artifacts.
-PYYAML_WHEEL_URL="$(echo "${PYYAML_META}" \
-  | grep -o '"url":"[^"]*none-any\.whl"' | head -1 | cut -d'"' -f4 || true)"
-if [[ -z "${PYYAML_WHEEL_URL}" ]]; then
-  # No pure-Python wheel: fall back to the source sdist (pip3 install builds it
-  # in-place on the node — the on-node installer already handles this).
-  PYYAML_WHEEL_URL="$(echo "${PYYAML_META}" \
-    | grep -o '"url":"[^"]*\.tar\.gz"' | head -1 | cut -d'"' -f4 || true)"
-  warn "No pure-Python PyYAML wheel published; using source sdist for ${PYYAML_VERSION}."
-fi
-[[ -z "${PYYAML_WHEEL_URL}" ]] && err "Could not resolve a PyYAML download URL for ${PYYAML_VERSION}."
-PYYAML_FILENAME="$(basename "${PYYAML_WHEEL_URL}")"
-
-download "${PYYAML_WHEEL_URL}" "${STAGE_DIR}/packages/${PYYAML_FILENAME}"
-echo "${PYYAML_FILENAME}" > "${STAGE_DIR}/packages/pyyaml.filename"
-
 log "GPU node packages downloaded to ${STAGE_DIR}/packages/"
 
 # ── 6. Env-var override manifest ──────────────────────────────────────────────
@@ -464,30 +658,148 @@ cat > "${STAGE_DIR}/airgap-env.sh" <<'ENVEOF'
 
 # Set by install_from_airgap_bundle.sh to the extraction directory.
 # Override here only if you extracted the bundle manually.
-: "${AIRGAP_BUNDLE_DIR:?AIRGAP_BUNDLE_DIR must be set to the bundle extraction path}"
 
-export K0S_INSTALL_URL="file://${AIRGAP_BUNDLE_DIR}/binaries/k0s"
-export YQ_DOWNLOAD_URL="file://${AIRGAP_BUNDLE_DIR}/binaries/yq"
+_airgap_env_error() {
+  printf 'ERROR: %s\n' "$*" >&2
+}
 
-export CERT_MANAGER_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/cert-manager.yaml"
-export LOCAL_PATH_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/local-path-storage.yaml"
-export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
+_airgap_env_read_value() {
+  local key="$1" version_file="$2" occurrences
+  occurrences="$(grep -c "^${key}=" "${version_file}" || true)"
+  if [[ "${occurrences}" != "1" ]]; then
+    _airgap_env_error "${version_file} must contain exactly one ${key}= entry (found ${occurrences})"
+    return 1
+  fi
+  awk -F= -v key="${key}" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "${version_file}"
+}
 
-export PROMETHEUS_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack-$(cat "${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack.version").tgz"
-export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-$(cat "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version").tgz"
-export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION:-1.2.2}.tgz"
-export METALLB_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/metallb-${METALLB_CHART_VERSION:-0.14.8}.tgz"
+_airgap_env_read_required_value() {
+  local key="$1" version_file="$2" value
+  value="$(_airgap_env_read_value "${key}" "${version_file}")" || return 1
+  if [[ -z "${value}" ]]; then
+    _airgap_env_error "${version_file} contains an empty ${key}= value"
+    return 1
+  fi
+  printf '%s\n' "${value}"
+}
 
-# GPU node OS packages — used by install_from_airgap_bundle.sh to SCP packages
-# to each GPU node before the main installer runs.
-# The installer reads AIRGAP_PYYAML_WHEEL_PATH to install pyyaml without internet.
-# EPEL, CUDA, and CTK packages are distributed as files on the node, then the
-# installer uses EPEL_RPM_URL_OVERRIDE / CUDA_REPO_URL_OVERRIDE /
-# NVIDIA_CTK_REPO_URL_OVERRIDE to reference those local copies.
-PYYAML_FNAME="$(cat "${AIRGAP_BUNDLE_DIR}/packages/pyyaml.filename" 2>/dev/null || echo "")"
-if [[ -n "${PYYAML_FNAME}" ]]; then
-  export AIRGAP_PYYAML_WHEEL_PATH="${AIRGAP_BUNDLE_DIR}/packages/${PYYAML_FNAME}"
+_airgap_env_configure() {
+  local version_file binary_version_file binary_k0s_version
+  local bundle_k0s_version bundle_cert_manager_version
+  local bundle_ingress_enabled bundle_traefik_image
+  local bundle_prometheus_version bundle_otel_version
+  local bundle_kuberay_version bundle_metallb_version
+  local marker_version _airgap_binary _airgap_marker
+
+  if [[ -z "${AIRGAP_BUNDLE_DIR:-}" ]]; then
+    _airgap_env_error "AIRGAP_BUNDLE_DIR must be set to the bundle extraction path"
+    return 1
+  fi
+
+  version_file="${AIRGAP_BUNDLE_DIR}/bundle-versions.txt"
+  binary_version_file="${AIRGAP_BUNDLE_DIR}/binaries/k0s.version"
+  if [[ ! -f "${version_file}" ]]; then
+    _airgap_env_error "bundle-versions.txt is missing from ${AIRGAP_BUNDLE_DIR}"
+    return 1
+  fi
+  if [[ ! -s "${binary_version_file}" ]]; then
+    _airgap_env_error "binaries/k0s.version is missing or empty in ${AIRGAP_BUNDLE_DIR}"
+    return 1
+  fi
+
+  bundle_k0s_version="$(_airgap_env_read_required_value k0s_version "${version_file}")" || return 1
+  bundle_cert_manager_version="$(_airgap_env_read_required_value cert_manager_version "${version_file}")" || return 1
+  bundle_ingress_enabled="$(_airgap_env_read_required_value ingress_enabled "${version_file}")" || return 1
+  bundle_traefik_image="$(_airgap_env_read_value traefik_image "${version_file}")" || return 1
+  bundle_prometheus_version="$(_airgap_env_read_required_value prometheus_chart_version "${version_file}")" || return 1
+  bundle_otel_version="$(_airgap_env_read_required_value otel_chart_version "${version_file}")" || return 1
+  bundle_kuberay_version="$(_airgap_env_read_required_value kuberay_chart_version "${version_file}")" || return 1
+  bundle_metallb_version="$(_airgap_env_read_required_value metallb_chart_version "${version_file}")" || return 1
+
+  binary_k0s_version="$(tr -d '\r\n' < "${binary_version_file}")"
+  if [[ "${binary_k0s_version}" != "${bundle_k0s_version}" ]]; then
+    _airgap_env_error "k0s version mismatch: bundle-versions.txt says ${bundle_k0s_version}, binaries/k0s.version says ${binary_k0s_version:-empty}"
+    return 1
+  fi
+  if [[ "${bundle_cert_manager_version}" != "v1.21.1" ]]; then
+    _airgap_env_error "bundle cert-manager version ${bundle_cert_manager_version} does not match installer requirement v1.21.1"
+    return 1
+  fi
+  if [[ "${bundle_ingress_enabled}" != "true" && "${bundle_ingress_enabled}" != "false" ]]; then
+    _airgap_env_error "ingress_enabled must be true or false, got ${bundle_ingress_enabled}"
+    return 1
+  fi
+  if [[ "${bundle_ingress_enabled}" == "true" && -z "${bundle_traefik_image}" ]]; then
+    _airgap_env_error "bundle enables ingress but traefik_image is empty"
+    return 1
+  fi
+
+  for _airgap_binary in k0s yq; do
+    if [[ ! -f "${AIRGAP_BUNDLE_DIR}/binaries/${_airgap_binary}" ]]; then
+      _airgap_env_error "bundled binary is missing: binaries/${_airgap_binary}"
+      return 1
+    fi
+  done
+  if [[ ! -d "${AIRGAP_BUNDLE_DIR}/images" ]] || \
+      ! compgen -G "${AIRGAP_BUNDLE_DIR}/images/*.tar" >/dev/null 2>&1; then
+    _airgap_env_error "bundle has no pre-loaded k0s image archives under images/*.tar"
+    return 1
+  fi
+
+  for _airgap_marker in kube-prometheus-stack.version opentelemetry-operator.version; do
+    if [[ ! -s "${AIRGAP_BUNDLE_DIR}/charts/${_airgap_marker}" ]]; then
+      _airgap_env_error "chart version marker is missing or empty: charts/${_airgap_marker}"
+      return 1
+    fi
+  done
+  marker_version="$(tr -d '\r\n' < "${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack.version")"
+  if [[ "${marker_version}" != "${bundle_prometheus_version}" ]]; then
+    _airgap_env_error "Prometheus chart version marker does not match bundle-versions.txt"
+    return 1
+  fi
+  marker_version="$(tr -d '\r\n' < "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version")"
+  if [[ "${marker_version}" != "${bundle_otel_version}" ]]; then
+    _airgap_env_error "OpenTelemetry chart version marker does not match bundle-versions.txt"
+    return 1
+  fi
+
+  export AIRGAP_MODE="true"
+  export AIRGAP_K0S_IMAGE_DIR="${AIRGAP_BUNDLE_DIR}/images"
+  export AIRGAP_BUNDLE_VERSION_FILE="${version_file}"
+  export BUNDLE_K0S_VERSION="${bundle_k0s_version}"
+  export BUNDLE_CERT_MANAGER_VERSION="${bundle_cert_manager_version}"
+  export BUNDLE_INGRESS_ENABLED="${bundle_ingress_enabled}"
+  export BUNDLE_TRAEFIK_IMAGE="${bundle_traefik_image}"
+
+  export K0S_INSTALL_URL="file://${AIRGAP_BUNDLE_DIR}/binaries/k0s"
+  export K0S_VERSION="${bundle_k0s_version}"
+  export YQ_DOWNLOAD_URL="file://${AIRGAP_BUNDLE_DIR}/binaries/yq"
+
+  export CERT_MANAGER_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/cert-manager.yaml"
+  export LOCAL_PATH_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/local-path-storage.yaml"
+  export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
+  export TRAEFIK_MANIFEST_DIR="${AIRGAP_BUNDLE_DIR}/manifests/traefik"
+
+  export PROMETHEUS_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack-${bundle_prometheus_version}.tgz"
+  export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-${bundle_otel_version}.tgz"
+  export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${bundle_kuberay_version}.tgz"
+  export METALLB_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/metallb-${bundle_metallb_version}.tgz"
+
+}
+
+_airgap_env_status=0
+_airgap_env_configure || _airgap_env_status=$?
+unset -f _airgap_env_configure _airgap_env_read_required_value \
+  _airgap_env_read_value _airgap_env_error
+if (( _airgap_env_status != 0 )); then
+  _airgap_env_failed_status="${_airgap_env_status}"
+  unset _airgap_env_status
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return "${_airgap_env_failed_status}"
+  fi
+  exit "${_airgap_env_failed_status}"
 fi
+unset _airgap_env_status _airgap_env_failed_status
 ENVEOF
 
 # ── 7. Container image list ───────────────────────────────────────────────────
@@ -508,8 +820,9 @@ cat > "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 # How to mirror using docker:
 #   docker pull IMAGE && docker tag IMAGE INTERNAL_REGISTRY/IMAGE && docker push INTERNAL_REGISTRY/IMAGE
 #
-# After mirroring, set images.registry in your k0s-cluster-config.yaml to
-# your internal registry prefix.
+# After mirroring application images, set images.registry in your config.
+# Traefik is intentionally an exact, independently pinned reference: set
+# images.ingress.traefikImage to its mirrored tag/digest explicitly.
 
 # ── Splunk ──────────────────────────────────────────────────────────────────
 splunk/splunk:10.2.0
@@ -554,18 +867,28 @@ docker.io/library/nginx:1.27-alpine
 #         pii-classifier, uae-large, xlm-roberta-language-classifier
 IMGEOF
 
+if [[ "${INGRESS_ENABLED}" == "true" ]]; then
+  {
+    printf '\n# ── Traefik HTTPS ingress (from bundle-build config) ──\n'
+    printf '%s\n' "${TRAEFIK_IMAGE}"
+  } >> "${STAGE_DIR}/container-images.txt"
+fi
+
 # ── 8. Write version manifest ─────────────────────────────────────────────────
 cat > "${STAGE_DIR}/bundle-versions.txt" <<VEOF
 k0s_version=${K0S_VERSION}
 yq_version=${YQ_VERSION}
 cert_manager_version=${CERT_MANAGER_VERSION}
 local_path_provisioner_version=${LOCAL_PATH_PROVISIONER_VERSION}
+local_path_helper_image=${LOCAL_PATH_HELPER_IMAGE}
 nvidia_device_plugin_version=${NVIDIA_DEVICE_PLUGIN_VERSION}
 metallb_chart_version=${METALLB_CHART_VERSION}
 kuberay_chart_version=${KUBERAY_CHART_VERSION}
 prometheus_chart_version=${PROMETHEUS_CHART_VERSION}
 otel_chart_version=${OTEL_CHART_VERSION}
 gpu_node_os=${GPU_NODE_OS}
+ingress_enabled=${INGRESS_ENABLED}
+traefik_image=${TRAEFIK_IMAGE}
 epel_major=${EPEL_MAJOR}
 bundle_timestamp=${BUNDLE_TIMESTAMP}
 VEOF

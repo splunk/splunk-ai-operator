@@ -89,7 +89,9 @@ image: ghcr.io/splunk/splunk-ai-operator:latest
 - Enable Kubernetes Network Policies
 - Restrict ingress/egress traffic
 - Use private registries for sensitive deployments
-- Enable mTLS for service-to-service communication
+- Use a service mesh or gateway that validates client certificates when mutual
+  TLS is required. The legacy `spec.mtls` field currently enables one-way
+  server TLS only.
 
 ### 4. Secrets Management
 - Never commit secrets to version control

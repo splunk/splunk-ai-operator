@@ -509,7 +509,7 @@ assert_eq "immutable semver-style tag produces no warning" \
 
 # ── Tests: k0s config path ────────────────────────────────────────────────────
 # Verify that the install script uses /etc/k0s/k0s.yaml (not /tmp/k0s.yaml)
-# everywhere — config generation, python update script, install command, verify.
+# everywhere — config generation, yq update, install command, and verification.
 
 suite "k0s config path"
 
@@ -519,11 +519,11 @@ assert_eq "config create writes to /etc/k0s/k0s.yaml" \
 assert_eq "k0s install controller uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'k0s install controller.*--config /etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "python update script reads /etc/k0s/k0s.yaml" \
-  "1" "$(grep -c "open('/etc/k0s/k0s.yaml', 'r')" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "generated config is installed atomically at /etc/k0s/k0s.yaml" \
+  "1" "$(grep -c 'mv -f.*remote_staged_config.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "python update script writes /etc/k0s/k0s.yaml" \
-  "1" "$(grep -c "open('/etc/k0s/k0s.yaml', 'w')" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "remote config generation no longer depends on PyYAML" \
+  "0" "$(grep -cE 'import yaml|python3-pyyaml|k0s-config-update.py' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "verify step uses /etc/k0s/k0s.yaml" \
   "1" "$(grep -c 'grep.*api.*etc/k0s/k0s.yaml' "${SCRIPT}" | tr -d '[:space:]')"
@@ -536,10 +536,10 @@ assert_eq "optional external API address is loaded from config" \
   "1" "$(grep -c 'K0S_API_EXTERNAL_ADDRESS=.*cluster.apiExternalAddress' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "configured external API address is included in certificate SANs" \
-  "1" "$(grep -c '_configured_external_addr not in.*sans' "${SCRIPT}" | tr -d '[:space:]')"
+  "2" "$(grep -c 'strenv(K0S_EFFECTIVE_EXTERNAL_ADDRESS)' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "configured external API address takes precedence over the private address" \
-  "1" "$(grep -c '_external_addr = _configured_external_addr or _internal_addr' "${SCRIPT}" | tr -d '[:space:]')"
+  "1" "$(grep -c 'effective_external_address=.*K0S_API_EXTERNAL_ADDRESS:-.*internal_address' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: kine compaction ─────────────────────────────────────────────────────
 # Verify that the generated k0s config passes --compact-interval to kine via
@@ -550,17 +550,17 @@ suite "kine compaction"
 assert_eq "kine compact-interval passed via extraArgs" \
   "1" "$(grep -c "extraArgs.*compact-interval\|compact-interval.*5m" "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "extraArgs dict is initialised before setting compact-interval" \
-  "1" "$(grep -c "'extraArgs' not in config\['spec'\]\['storage'\]\['kine'\]" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "yq writes compact-interval through the kine extraArgs map" \
+  "1" "$(grep -c 'storage.kine.extraArgs."compact-interval" = "5m"' "${SCRIPT}" | tr -d '[:space:]')"
 
-assert_eq "kine dict is initialised before setting extraArgs" \
-  "1" "$(grep -c "'kine' not in config\['spec'\]\['storage'\]" "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "network provider is still set to calico" \
+  "1" "$(grep -c 'spec.network.provider = "calico"' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "storage type is still set to kine" \
-  "1" "$(grep -c "config\['spec'\]\['storage'\]\['type'\] = 'kine'" "${SCRIPT}" | tr -d '[:space:]')"
+  "1" "$(grep -c 'spec.storage.type = "kine"' "${SCRIPT}" | tr -d '[:space:]')"
 
 assert_eq "no bare compactInterval field (would be silently ignored by k0s)" \
-  "0" "$(grep -c "kine\]\['compactInterval'\]" "${SCRIPT}" | tr -d '[:space:]')"
+  "0" "$(grep -c 'compactInterval' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: configure_insecure_registry_on_node ────────────────────────────────
 # Verify the function exists, is gated behind IMAGE_REGISTRY_INSECURE, uses
@@ -832,7 +832,854 @@ assert_eq "allows only one automatic NVIDIA recovery reboot" \
 assert_eq "waits for the node to return after the recovery reboot" \
   "1" "$(grep -c 'did not return after the NVIDIA recovery reboot' "${SCRIPT}" | tr -d '[:space:]')"
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ── Tests: AIP-4614 Splunk TLS cert provisioning (provision_splunk_cert) ──────
+# Covers the cert-manager selfSigned→CA→CA-Issuer→leaf chain that provisions a
+# hostname-correct Splunk server cert, and the caCertRef wiring that lets SAIA
+# trust it instead of skipping TLS verification.
+
+suite "provision_splunk_cert"
+
+assert_eq "gated on SPLUNK_MODE != internal (early return)" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -A2 'SPLUNK_MODE.*!= .internal.' | grep -c 'return 0')"
+
+assert_eq "waits for cert-manager webhook before applying the chain" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'wait_for_cert_manager_webhook')"
+
+assert_eq "derives the Standalone service name from AI_STANDALONE_NAME (operator's GetSplunkServiceName)" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'svc="splunk-\${AI_STANDALONE_NAME}-standalone-service"')"
+
+assert_eq "derives the headless service name from AI_STANDALONE_NAME" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'headless="splunk-\${AI_STANDALONE_NAME}-standalone-headless"')"
+
+assert_eq "selfSigned root Issuer is defined and referenced by the CA cert's issuerRef" \
+  "2" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'name: ai-splunk-selfsigned')"
+
+assert_eq "CA Certificate is isCA and stored in ai-splunk-ca-tls" \
+  "1" "$(awk '/name: ai-splunk-ca$/{f=1} f && /secretName: ai-splunk-ca-tls/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-ca-tls')"
+
+assert_eq "root CA has a conservative ten-year duration and one-year renewal window" \
+  "2" "$(awk '/name: ai-splunk-ca$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -cE 'duration: 87600h|renewBefore: 8760h')"
+
+assert_eq "root CA keeps its ECDSA key across renewal" \
+  "1" "$(awk '/name: ai-splunk-ca$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -c 'rotationPolicy: Never')"
+
+assert_eq "CA Issuer chains off the ai-splunk-ca-tls secret" \
+  "1" "$(awk '/name: ai-splunk-ca-issuer/{f=1} f && /secretName: ai-splunk-ca-tls/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-ca-tls')"
+
+assert_eq "leaf Certificate ai-splunk-server writes to ai-splunk-server-tls" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /secretName: ai-splunk-server-tls/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-server-tls')"
+
+assert_eq "leaf cert issued by the CA issuer (not the selfsigned root)" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /issuerRef:/{g=1} f && g && /name: ai-splunk-ca-issuer/{print; exit}' "${SCRIPT}" | grep -c 'ai-splunk-ca-issuer')"
+
+assert_eq "leaf cert SANs cover both the standalone service and headless service (short/ns/svc/cluster.local forms)" \
+  "8" "$(awk '/name: ai-splunk-server$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -cE '\$\{svc\}|\$\{headless\}')"
+
+assert_eq "leaf cert uses only cert-manager's standard Secret outputs" \
+  "0" "$(awk '/name: ai-splunk-server$/{f=1} f && /^YAML$/{exit} f' "${SCRIPT}" | grep -c 'additionalOutputFormats:')"
+
+assert_eq "leaf cert has an explicit 90d duration / 30d renewBefore (Part G.1)" \
+  "1" "$(awk '/name: ai-splunk-server$/{f=1} f && /^---/{exit} f' "${SCRIPT}" | grep -c 'duration: 2160h')"
+
+assert_eq "leaf uses a rotating Splunk-compatible RSA-2048 key" \
+  "3" "$(awk '/name: ai-splunk-server$/{f=1} f && /^YAML$/{exit} f' "${SCRIPT}" | grep -cE 'algorithm: RSA|size: 2048|rotationPolicy: Always')"
+
+assert_eq "leaf supports Splunk management and KV Store server/client roles" \
+  "4" "$(awk '/name: ai-splunk-server$/{f=1} f && /^YAML$/{exit} f' "${SCRIPT}" | grep -cE '^    - (digital signature|key encipherment|server auth|client auth)$')"
+
+assert_eq "installer warns that splunkd needs a controlled restart after renewal" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'rerun the installer after ai-splunk-server renews')"
+
+_WAIT_SPLUNK_BODY() { awk '/^wait_for_splunk_standalone\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+
+assert_eq "Splunk readiness waits for the operator's exact singleton pod name" \
+  "1" "$(_WAIT_SPLUNK_BODY | grep -c 'splunk-${AI_STANDALONE_NAME}-standalone-0')"
+
+assert_eq "Splunk readiness timeout is fatal rather than swallowed" \
+  "1" "$(_WAIT_SPLUNK_BODY | grep -A2 'condition=Ready' | grep -c 'err ' )"
+
+assert_eq "loaded TLS fingerprint is recorded only after the real readiness gate" \
+  "ready-before-hash" "$(_WAIT_SPLUNK_BODY | awk '
+    /condition=Ready/{ready=NR}
+    /loaded-tls-sha256/{hash=NR}
+    END {print (ready > 0 && hash > ready) ? "ready-before-hash" : "wrong-order"}
+  ')"
+
+assert_eq "waits for the leaf cert to reach Ready before returning" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c -e 'kubectl wait --for=condition=Ready certificate/ai-splunk-server')"
+
+assert_eq "orchestrator provisions the cert before the Standalone CR is applied (cert must exist first)" \
+  "1" "$(awk '/provision_splunk_cert$/{p=NR} /install_splunk_standalone$/{s=NR} END{print(p > 0 && s > 0 && p < s)}' "${SCRIPT}")"
+
+assert_eq "orchestrator provisions the cert after image pull secrets exist (SA needs ECR creds first)" \
+  "1" "$(awk '/create_image_pull_secrets "\$\{AI_NS\}"/{c=NR} /provision_splunk_cert$/{p=NR} END{print(c > 0 && p > 0 && c < p)}' "${SCRIPT}")"
+
+# ── Tests: Splunk certificate-first PEM and HTTPS listeners ───────────────────
+
+suite "Splunk Standalone TLS defaults"
+
+_SPLUNK_STANDALONE_BODY() { awk '/^install_splunk_standalone\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+
+assert_eq "registers the supported Splunk-Ansible PEM assembly pre-task" \
+  "1" "$(_SPLUNK_STANDALONE_BODY | grep -c 'file:///mnt/defaults/prepare-server-pem.yml')"
+
+assert_eq "assembles server.pem in certificate-then-private-key order" \
+  "1" "$(_SPLUNK_STANDALONE_BODY | grep -c 'cat /mnt/splunk-cert-source/tls.crt /mnt/splunk-cert-source/tls.key > /mnt/splunk-certs/server.pem.tmp')"
+
+assert_eq "atomically installs server.pem with restrictive permissions" \
+  "2" "$(_SPLUNK_STANDALONE_BODY | grep -cE 'chmod 0600 .*server.pem.tmp|mv -f .*server.pem.tmp .*server.pem')"
+
+assert_eq "suppresses private PEM task output" \
+  "1" "$(_SPLUNK_STANDALONE_BODY | grep -c 'no_log: true')"
+
+assert_eq "splunkd, HEC explicit config, and OAuth use the prepared certificate-first PEM" \
+  "3" "$(_SPLUNK_STANDALONE_BODY | grep -cE '(serverCert|certFile): /mnt/splunk-certs/server.pem')"
+
+assert_eq "Splunk Web uses separate projected certificate and key files" \
+  "2" "$(_SPLUNK_STANDALONE_BODY | grep -cE '(serverCert: /mnt/splunk-cert-source/tls.crt|privKeyPath: /mnt/splunk-cert-source/tls.key)')"
+
+assert_eq "Splunk and Web trust the projected CA" \
+  "2" "$(_SPLUNK_STANDALONE_BODY | grep -cE '(sslRootCAPath|caCertPath): /mnt/splunk-cert-source/ca.crt')"
+
+assert_eq "Splunk-Ansible management TLS fields preserve the prepared PEM and CA" \
+  $'      ssl:\n        enable: true\n        cert: /mnt/splunk-certs/server.pem\n        password: ""\n        ca: /mnt/splunk-cert-source/ca.crt' \
+  "$(_SPLUNK_STANDALONE_BODY | sed -n '/^      ssl:$/,/^      hec:$/p' | sed '$d')"
+
+assert_eq "Splunk-Ansible HEC fields preserve HTTPS and the prepared PEM" \
+  $'      hec:\n        enable: true\n        ssl: true\n        port: 8088\n        cert: /mnt/splunk-certs/server.pem\n        password: ""' \
+  "$(_SPLUNK_STANDALONE_BODY | sed -n '/^      hec:$/,/^      http_enableSSL:/p' | sed '$d')"
+
+assert_eq "does not mix in the deprecated HEC TLS input" \
+  "0" "$(_SPLUNK_STANDALONE_BODY | grep -c 'hec_enableSSL:')"
+
+assert_eq "Splunk-Ansible Web fields preserve the separate certificate and key" \
+  "4" "$(_SPLUNK_STANDALONE_BODY | grep -cE '^      http_enableSSL(:|_cert:|_privKey:|_privKey_password:)')"
+
+assert_eq "HEC uses the same prepared server certificate" \
+  "1" "$(_SPLUNK_STANDALONE_BODY | awk '/key: inputs/{f=1} f && /key: authentication/{exit} f' | grep -c 'serverCert: /mnt/splunk-certs/server.pem')"
+
+assert_eq "explicit HEC inputs config also enables TLS" \
+  "1" "$(_SPLUNK_STANDALONE_BODY | awk '/key: inputs/{f=1} f && /key: authentication/{exit} f' | grep -c 'enableSSL: 1')"
+
+assert_eq "projects exactly tls.crt, tls.key, and ca.crt from the leaf Secret" \
+  "3" "$(_SPLUNK_STANDALONE_BODY | awk '/^    - name: splunk-cert-source$/{f=1; next} f && /^    - name: splunk-certs$/{exit} f' | grep -c '^          - key:')"
+
+assert_eq "prepared PEM is written to a bounded, memory-backed emptyDir" \
+  "2" "$(_SPLUNK_STANDALONE_BODY | grep -A3 '^    - name: splunk-certs$' | grep -cE 'medium: Memory|sizeLimit: 1Mi')"
+
+# ── Tests: caCertRef wiring into the AIPlatform CR (internal Splunk mode) ────
+# So SAIA/SLIM trust the cert-manager-issued CA instead of skipping TLS
+# verification against Splunk's HEC/management endpoints (AIP-4614 Part C).
+
+suite "caCertRef wiring (install_ai_platform_cr, internal mode)"
+
+# Scope to install_ai_platform_cr's body — "internal)"/"external)" also appear
+# as case labels in validate_image_config() earlier in the file.
+_AIPC_BODY() { awk '/^install_ai_platform_cr\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+
+assert_eq "internal-mode splunkConfiguration includes a caCertRef" \
+  "1" "$(_AIPC_BODY | awk '/^ *internal\)$/{f=1} f && /;;/{exit} f' | grep -c 'caCertRef:')"
+
+assert_eq "caCertRef points at the cert provisioned by provision_splunk_cert (ai-splunk-server-tls)" \
+  "1" "$(_AIPC_BODY | awk '/^ *internal\)$/{f=1} f && /;;/{exit} f' | grep -c 'name: ai-splunk-server-tls')"
+
+assert_eq "caCertRef key matches the leaf Certificate's default CA output key (ca.crt)" \
+  "1" "$(_AIPC_BODY | awk '/^ *internal\)$/{f=1} f && /;;/{exit} f' | grep -c 'key: ca.crt')"
+
+assert_eq "disabled mode does not set caCertRef (no Splunk to trust at all)" \
+  "0" "$(_AIPC_BODY | awk '/^ *\*\)$/{f=1} /;;/{f=0} f' | grep -c 'caCertRef:')"
+
+# ── Tests: caCertRef wiring into the AIPlatform CR (external Splunk mode) ────
+# Part E — a customer-supplied CA for a private/internal external Splunk, only
+# emitted when splunk.external.caCertSecretName is set. Left unset, SAIA falls
+# back to its image's system trust store (correct for publicly-trusted certs).
+
+suite "caCertRef wiring (install_ai_platform_cr, external mode)"
+
+_AIPC_EXTERNAL_BODY() { _AIPC_BODY | awk '/^ *external\)$/{f=1} f && /;;/{exit} f'; }
+
+assert_eq "config parser reads splunk.external.caCertSecretName via yq" \
+  "1" "$(grep -c 'yq eval .\.splunk\.external\.caCertSecretName' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "external-mode caCertRef emission is gated on SPLUNK_EXTERNAL_CA_SECRET_NAME being set" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'if \[\[ -n \"\${SPLUNK_EXTERNAL_CA_SECRET_NAME}\" \]\]')"
+
+assert_eq "external-mode caCertRef uses the customer-supplied secret name (not a hardcoded one)" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'name: \${SPLUNK_EXTERNAL_CA_SECRET_NAME}')"
+
+assert_eq "external-mode caCertRef key matches the documented convention (ca.crt)" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'key: ca.crt')"
+
+assert_eq "external-mode caCertRef fragment is interpolated into splunk_config_yaml (not dropped)" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'external_ca_cert_yaml}\${trusted_issuers_yaml}')"
+
+# ── Tests: cert-manager installation/readiness ───────────────────────────────
+
+suite "cert-manager installation readiness"
+
+_CM_INSTALL_BODY() { awk '/^install_cert_manager\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+_CM_WEBHOOK_BODY() { awk '/^wait_for_cert_manager_webhook\(\)/{f=1} f{print} f && /^}/{exit}' "${SCRIPT}"; }
+
+assert_eq "installs the pinned cert-manager manifest" \
+  "1" "$(_CM_INSTALL_BODY | grep -c 'releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml')"
+
+assert_eq "cert-manager is pinned to a supported patch release" \
+  "1" "$(grep -c '^CERT_MANAGER_VERSION="v1.21.1"$' "${SCRIPT}")"
+
+assert_eq "k0s is pinned instead of floating to latest" \
+  "1" "$(grep -c '^DEFAULT_K0S_VERSION="v1.33.13+k0s.1"$' "${SCRIPT}")"
+
+assert_eq "cert-manager install gates the supported Kubernetes minor range" \
+  "1" "$(_CM_INSTALL_BODY | grep -c 'kubernetes_minor} < 33.*kubernetes_minor} > 36')"
+
+assert_eq "cert-manager refuses automatic takeover or multi-minor upgrades" \
+  "1" "$(_CM_INSTALL_BODY | grep -c 'automatic takeover is disabled')"
+
+assert_eq "waits for the Certificate CRD" \
+  "1" "$(_CM_INSTALL_BODY | grep -c 'wait_for_crd certificates.cert-manager.io 300')"
+
+assert_eq "waits for all three cert-manager Deployment rollouts" \
+  "3" "$(_CM_INSTALL_BODY | grep -c 'kubectl rollout status deployment/cert-manager')"
+
+assert_eq "waits for cert-manager and webhook pods to become ready" \
+  "2" "$(_CM_INSTALL_BODY | grep -c 'kubectl wait --for=condition=ready pod')"
+
+assert_eq "does not mutate cert-manager Deployment arguments" \
+  "0" "$(_CM_INSTALL_BODY | grep -c 'kubectl patch deployment')"
+
+assert_eq "webhook readiness uses a server-side Certificate admission check" \
+  "1" "$(_CM_WEBHOOK_BODY | grep -c 'kubectl apply --dry-run=server')"
+
+assert_eq "webhook admission check uses the standard Certificate fields" \
+  "0" "$(_CM_WEBHOOK_BODY | grep -c 'additionalOutputFormats:')"
+
+assert_eq "phase 1 treats cert-manager failure as fatal" \
+  "1" "$(grep -c 'phase1_names\[\$i\].*cert-manager' "${SCRIPT}" | tr -d '[:space:]')"
+
+_cert_manager_install_case() {
+  local mode="$1" mock_kubernetes_minor="$2" existing_version="${3:-}"
+  (
+    mock_cm_applied="false"
+    log() { :; }
+    warn() { :; }
+    err() { exit 97; }
+    wait_for_crd() { :; }
+    kubectl() {
+      local args="$*"
+      case "${args}" in
+        "version -o json")
+          printf '{"serverVersion":{"major":"1","minor":"%s"}}\n' "${mock_kubernetes_minor}"
+          ;;
+        "-n cert-manager get deployment "*" --ignore-not-found -o json")
+          if [[ "${mode}" == "existing" || "${mode}" == "mixed" || \
+                "${mock_cm_applied}" == "true" ]]; then
+            local deployment container component_version="${existing_version:-${CERT_MANAGER_VERSION}}"
+            deployment="${args#-n cert-manager get deployment }"
+            deployment="${deployment% --ignore-not-found -o json}"
+            case "${deployment}" in
+              cert-manager) container=cert-manager-controller ;;
+              cert-manager-webhook) container=cert-manager-webhook ;;
+              cert-manager-cainjector)
+                container=cert-manager-cainjector
+                [[ "${mode}" == "mixed" ]] && component_version=v1.20.0
+                ;;
+            esac
+            [[ "${mode}" == "manifest-old" ]] && component_version=v1.13.0
+            printf '{"spec":{"template":{"spec":{"containers":[{"name":"%s","image":"quay.io/jetstack/%s:%s"}]}}}}\n' \
+              "${container}" "${container}" "${component_version}"
+          fi
+          ;;
+        create\ --dry-run=client\ --validate=false\ -f\ *\ -o\ json)
+          local manifest_version="${CERT_MANAGER_VERSION}"
+          [[ "${mode}" == "manifest-old" ]] && manifest_version=v1.13.0
+          printf '{"kind":"List","items":['
+          printf '{"kind":"Deployment","metadata":{"name":"cert-manager","namespace":"cert-manager"},"spec":{"template":{"spec":{"containers":[{"name":"cert-manager-controller","image":"quay.io/jetstack/cert-manager-controller:%s"}]}}}},' "${manifest_version}"
+          printf '{"kind":"Deployment","metadata":{"name":"cert-manager-webhook","namespace":"cert-manager"},"spec":{"template":{"spec":{"containers":[{"name":"cert-manager-webhook","image":"quay.io/jetstack/cert-manager-webhook:%s"}]}}}},' "${manifest_version}"
+          printf '{"kind":"Deployment","metadata":{"name":"cert-manager-cainjector","namespace":"cert-manager"},"spec":{"template":{"spec":{"containers":[{"name":"cert-manager-cainjector","image":"quay.io/jetstack/cert-manager-cainjector:%s"}]}}}},' "${manifest_version}"
+          printf '{"kind":"CustomResourceDefinition","metadata":{"name":"certificates.cert-manager.io"}},'
+          printf '{"kind":"ValidatingWebhookConfiguration","metadata":{"name":"cert-manager-webhook"}}]}'
+          ;;
+        "get CustomResourceDefinition certificates.cert-manager.io --ignore-not-found -o name")
+          [[ "${mode}" == "partial" ]] && \
+            printf '%s\n' 'customresourcedefinition.apiextensions.k8s.io/certificates.cert-manager.io'
+          ;;
+        "get ValidatingWebhookConfiguration cert-manager-webhook --ignore-not-found -o name")
+          [[ "${mode}" == "partial-other" ]] && \
+            printf '%s\n' 'validatingwebhookconfiguration.admissionregistration.k8s.io/cert-manager-webhook'
+          ;;
+        apply\ -f\ *)
+          mock_cm_applied="true"
+          printf '%s\n' APPLY
+          ;;
+        "-n cert-manager get endpoints cert-manager-webhook -o jsonpath={.subsets[0].addresses[0].ip}")
+          printf '%s\n' 10.0.0.2
+          ;;
+      esac
+      return 0
+    }
+    CERT_MANAGER_VERSION="v1.21.1"
+    eval "$(_extract_fn install_cert_manager)"
+    install_cert_manager
+  )
+}
+
+assert_eq "fresh supported clusters apply the pinned cert-manager manifest" \
+  "1" "$(_cert_manager_install_case fresh 33 | grep -c '^APPLY$')"
+
+assert_rc "fresh supported cert-manager install completes successfully" \
+  0 _cert_manager_install_case fresh 33
+
+assert_eq "an exact existing cert-manager is reused without takeover" \
+  "0" "$(_cert_manager_install_case existing 33 v1.21.1 | grep -c '^APPLY$')"
+
+assert_rc "an exact existing cert-manager reuse completes successfully" \
+  0 _cert_manager_install_case existing 33 v1.21.1
+
+assert_rc "unsupported Kubernetes versions are rejected before cert-manager apply" \
+  97 _cert_manager_install_case fresh 32
+
+assert_rc "old cert-manager installations require an explicit sequential upgrade" \
+  97 _cert_manager_install_case existing 33 v1.13.0
+
+assert_rc "mixed-version cert-manager components are rejected" \
+  97 _cert_manager_install_case mixed 33 v1.21.1
+
+assert_rc "a stale supplied cert-manager manifest cannot bypass the live-image gate" \
+  97 _cert_manager_install_case manifest-old 33
+
+assert_eq "a stale supplied cert-manager manifest is rejected before apply" \
+  "0" "$(_cert_manager_install_case manifest-old 33 | grep -c '^APPLY$')"
+
+assert_rc "partial cert-manager installations are not adopted" \
+  97 _cert_manager_install_case partial 33
+
+assert_rc "partial cert-manager webhook/RBAC-era objects are not adopted" \
+  97 _cert_manager_install_case partial-other 33
+
+# ── Tests: air-gap bundle contract ───────────────────────────────────────────
+
+suite "air-gap bundle compatibility contract"
+
+AIRGAP_WRAPPER="${SCRIPT_DIR}/install_from_airgap_bundle.sh"
+AIRGAP_BUILDER="${SCRIPT_DIR}/prepare_airgap_bundle.sh"
+airgap_config_guard_line="$(grep -n '^EFFECTIVE_CONFIG_FILE=' "${AIRGAP_WRAPPER}" | head -1 | cut -d: -f1)"
+airgap_host_mutation_line="$(grep -n '^# No bundle/config incompatibility remains' "${AIRGAP_WRAPPER}" | head -1 | cut -d: -f1)"
+
+assert_eq "air-gap config/image rejection runs before host binary mutation" \
+  "true" "$([[ -n "${airgap_config_guard_line}" && -n "${airgap_host_mutation_line}" && \
+    ${airgap_config_guard_line} -lt ${airgap_host_mutation_line} ]] && echo true || echo false)"
+assert_eq "wrapper requires the exact cert-manager compatibility pin" \
+  "1" "$(grep -c '^EXPECTED_CERT_MANAGER_VERSION="v1.21.1"$' "${AIRGAP_WRAPPER}")"
+assert_eq "generated manual environment enables air-gap image staging" \
+  "2" "$(grep -Ec 'export (AIRGAP_MODE="true"|AIRGAP_K0S_IMAGE_DIR=)' "${AIRGAP_BUILDER}")"
+assert_eq "generated manual environment exports verified ingress image metadata" \
+  "2" "$(grep -Ec 'export BUNDLE_(INGRESS_ENABLED|TRAEFIK_IMAGE)=' "${AIRGAP_BUILDER}")"
+assert_eq "main installer rechecks a sourced bundle contract" \
+  "1" "$(awk '/^load_config\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'AIRGAP_MODE.*AIRGAP_BUNDLE_VERSION_FILE')"
+
+assert_eq "Splunk certificate readiness failure is fatal instead of warning-only" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -A3 'condition=Ready certificate/ai-splunk-server' | grep -c 'err ' )"
+
+assert_eq "Splunk TLS Secret readiness checks exactly the three source keys" \
+  "1" "$(awk '/^provision_splunk_cert\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c '\["tls.crt", "tls.key", "ca.crt"\]')"
+
+assert_eq "Splunk TLS restart recovers when its OnDelete pod is already absent" \
+  "1" "$(awk '/^install_splunk_standalone\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep 'delete "pod/\${splunk_pod}"' | grep -c -- '--ignore-not-found')"
+
+# ── Tests: external Splunk management/HEC endpoint split ───────────────────────
+
+suite "external Splunk endpoint split"
+
+assert_eq "config parser reads explicit external management endpoint" \
+  "1" "$(grep -c "yq eval '.splunk.external.managementEndpoint" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "config parser reads explicit external HEC endpoint" \
+  "1" "$(grep -c "yq eval '.splunk.external.hecEndpoint" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "legacy external.endpoint is retained only as a deprecated parser alias" \
+  "1" "$(grep -c "yq eval '.splunk.external.endpoint" "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "external CR endpoint is management/JWKS URL" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c '^    endpoint: ${SPLUNK_EXTERNAL_MANAGEMENT_ENDPOINT}')"
+
+assert_eq "external CR hecEndpoint is distinct HEC URL" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'hecEndpoint: ${SPLUNK_EXTERNAL_HEC_ENDPOINT}')"
+
+assert_eq "external rendering fails if either required endpoint is absent" \
+  "1" "$(_AIPC_EXTERNAL_BODY | grep -c 'requires both splunk.external.managementEndpoint and splunk.external.hecEndpoint')"
+
+
+# ── Tests: Traefik HTTPS ingress (rendered contract) ──────────────────────────
+# TRAEFIK_HTTPS_DESIGN.md / TRAEFIK_HTTPS_SETUP.md — additive, opt-in HTTPS
+# access to SAIA/Splunk Web via a Traefik v3 DaemonSet.
+
+suite "Traefik rendered contract"
+
+TRAEFIK_TEST_TMP="$(mktemp -d)"
+trap 'rm -rf "${TRAEFIK_TEST_TMP}"' EXIT
+
+_traefik_parse_mgmt_flag() {
+  local raw_value="$1" value_tag="${2:-!!bool}" parser_body
+  parser_body="$(awk '
+    /^  INGRESS_SPLUNKMGMT_ENABLED=/ { capture=1 }
+    capture {
+      done = ($0 == "  fi")
+      sub(/^  /, "")
+      print
+      if (done) exit
+    }
+  ' "${SCRIPT}")"
+
+  (
+    yq() {
+      if [[ "$*" == *"| tag"* ]]; then
+        printf '%s\n' "${value_tag}"
+      else
+        printf '%s\n' "${raw_value}"
+      fi
+    }
+    err() { exit 97; }
+    CONFIG_FILE="unused-by-yq-stub"
+    INGRESS_ENABLED="true"
+    eval "${parser_body}"
+    printf '%s\n' "${INGRESS_SPLUNKMGMT_ENABLED}"
+  )
+}
+
+_traefik_validate_port_fragment() {
+  local saia_port="$1" splunkweb_port="$2" splunkmgmt_port="$3"
+  local splunk_mode="${4:-internal}" mgmt_enabled="${5:-false}"
+
+  (
+    err() { exit 97; }
+    eval "$(_extract_fn validate_ingress_entrypoint_ports_k0s)"
+    INGRESS_SAIA_PORT="${saia_port}"
+    INGRESS_SPLUNKWEB_PORT="${splunkweb_port}"
+    INGRESS_SPLUNKMGMT_PORT="${splunkmgmt_port}"
+    SPLUNK_MODE="${splunk_mode}"
+    INGRESS_SPLUNKMGMT_ENABLED="${mgmt_enabled}"
+    validate_ingress_entrypoint_ports_k0s
+  )
+}
+
+assert_eq "explicit splunkMgmt.enabled=false remains false" \
+  "false" "$(_traefik_parse_mgmt_flag false)"
+
+assert_eq "missing splunkMgmt.enabled defaults to false" \
+  "false" "$(_traefik_parse_mgmt_flag null '!!null')"
+
+assert_rc "config parser rejects Traefik's reserved health port 9000" \
+  97 _traefik_validate_port_fragment 9443 9000 9089
+
+assert_rc "disabled management listener ignores an inert reserved port" \
+  0 _traefik_validate_port_fragment 9443 9001 9000 internal false
+
+assert_rc "external Splunk mode ignores inert Splunk listener ports" \
+  0 _traefik_validate_port_fragment 9443 9000 9000 external false
+
+assert_rc "active listener ports must remain unique" \
+  97 _traefik_validate_port_fragment 9443 9443 9089 internal false
+
+assert_rc "management listener cannot be enabled without internal Splunk" \
+  97 _traefik_validate_port_fragment 9443 9001 9089 external true
+
+_traefik_validate_ip_literal() {
+  (
+    eval "$(_extract_fn ingress_ip_literal_k0s)"
+    ingress_ip_literal_k0s "$1"
+  )
+}
+
+assert_rc "IPv4 ingress targets are accepted" 0 \
+  _traefik_validate_ip_literal 10.0.0.11
+assert_rc "IPv6 ingress targets are accepted" 0 \
+  _traefik_validate_ip_literal 2001:db8::11
+assert_rc "hostname values cannot be interpolated as Certificate IP SANs" 1 \
+  _traefik_validate_ip_literal worker.example.test
+assert_rc "YAML-like node values cannot reach Certificate interpolation" 1 \
+  _traefik_validate_ip_literal $'10.0.0.11\n  dnsNames: [attacker.test]'
+
+_traefik_render_case() {
+  local output_dir="$1" ingress_enabled="$2" splunk_mode="$3"
+  local mgmt_enabled="$4" failure="${5:-none}"
+  mkdir -p "${output_dir}"
+
+  (
+    log() { :; }
+    warn() { :; }
+    err() { exit 97; }
+    ensure_namespace() { :; }
+    wait_for_cert_manager_webhook() { [[ "${failure}" != "webhook" ]]; }
+    wait_for_crd() { :; }
+    create_image_pull_secrets() { :; }
+    wait_rollout() { [[ "${failure}" != "rollout" ]]; }
+    resolve_node_name() { printf 'node-%s\n' "${1//./-}"; }
+    yq() {
+      if [[ "$*" == *'.imagePullSecrets.secrets[]'* ]]; then
+        [[ "${failure}" == "pull-secret" ]] && printf '%s\n' private-registry
+        return 0
+      fi
+      if [[ "$*" == *'.imagePullSecrets.custom.name'* ]]; then
+        printf '%s\n' custom-registry-secret
+        return 0
+      fi
+      printf '%s\n' null
+    }
+    kubectl() {
+      local args="$*" capture_file
+      printf '%s\n' "${args}" >> "${output_dir}/kubectl.calls"
+      if [[ "${failure}" == "ownership" && \
+            "${args}" == "-n ingress get serviceaccount traefik --ignore-not-found -o json" ]]; then
+        printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"someone-else"}}}'
+        return 0
+      fi
+      if [[ "${failure}" == "provider" && "${args}" == logs\ -n\ ingress\ * ]]; then
+        printf '%s\n' 'failed to list *v1.Secret: forbidden'
+        return 0
+      fi
+      if [[ "${failure}" == "cleanup-delete" && \
+            "${args}" == *"delete daemonset -l app.kubernetes.io/managed-by=splunk-ai-platform-installer"* ]]; then
+        return 1
+      fi
+      if [[ "${args}" == "-n ai-platform get certificate internal-domain-tls -o json" ]]; then
+        printf '%s\n' '{"metadata":{"generation":1},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}}'
+        return 0
+      fi
+      if [[ "${args}" == "get secret ai-splunk-server-tls -n ai-platform -o json" ]]; then
+        printf '%s\n' '{"data":{"ca.crt":"Q0E="}}'
+        return 0
+      fi
+      if [[ "${args}" == get\ node\ node-*" --ignore-not-found -o json" ]]; then
+        printf '%s\n' '{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+        return 0
+      fi
+      if [[ "${args}" == "get nodes -l splunk.ai/ingress-node=true -o json" ]]; then
+        printf '%s\n' '{"items":[]}'
+        return 0
+      fi
+      if [[ "${args}" == "-n ingress get daemonset traefik -o json" ]]; then
+        if [[ "${failure}" == "schedule-zero" ]]; then
+          printf '%s\n' '{"status":{"desiredNumberScheduled":0,"updatedNumberScheduled":0,"numberReady":0}}'
+        elif [[ "${failure}" == "schedule-partial" ]]; then
+          printf '%s\n' '{"status":{"desiredNumberScheduled":2,"updatedNumberScheduled":2,"numberReady":1}}'
+        else
+          printf '%s\n' '{"status":{"desiredNumberScheduled":2,"updatedNumberScheduled":2,"numberReady":2}}'
+        fi
+        return 0
+      fi
+      if [[ "${failure}" == "pull-secret" && \
+            "${args}" == "-n ai-platform get secret private-registry --ignore-not-found -o json" ]]; then
+        printf '%s\n' '{"metadata":{"name":"private-registry"},"type":"kubernetes.io/dockerconfigjson","data":{".dockerconfigjson":"e30="}}'
+        return 0
+      fi
+      if [[ "${args}" == get\ crd\ *" --ignore-not-found -o name" ]]; then
+        printf 'customresourcedefinition.apiextensions.k8s.io/%s\n' "${args#get crd }" | sed 's/ --ignore-not-found -o name$//'
+        return 0
+      fi
+      if [[ "${args}" == get\ secret\ * ]]; then
+        return 1
+      fi
+      if [[ "${args}" == "get clusterrolebinding traefik-ingress-controller -o json" ]]; then
+        printf '%s\n' '{"subjects":[]}'
+        return 0
+      fi
+      if [[ " ${args} " == *" -f - "* ]]; then
+        capture_file="$(mktemp "${output_dir}/apply.XXXXXX")"
+        printf '# kubectl %s\n' "${args}" > "${capture_file}"
+        command cat >> "${capture_file}"
+      fi
+      if [[ "${failure}" == "certificate" && "${args}" == *"wait --for=condition=Ready certificate/internal-domain-tls"* ]]; then
+        return 1
+      fi
+      if [[ "${failure}" == "rollout" && "${args}" == *"rollout status daemonset/traefik"* ]]; then
+        return 1
+      fi
+      return 0
+    }
+
+    eval "$(_extract_fn ingress_enabled_k0s)"
+    eval "$(_extract_fn ingress_ip_literal_k0s)"
+    eval "$(_extract_fn ingress_node_ips_k0s)"
+    eval "$(_extract_fn reconcile_traefik_ingress_nodes_k0s)"
+    eval "$(_extract_fn wait_for_certificate_current_generation)"
+    eval "$(_extract_fn traefik_assert_owned_or_absent)"
+    if grep -q '^remove_traefik_ingress()' "${SCRIPT}"; then
+      eval "$(_extract_fn remove_traefik_ingress)"
+    fi
+    eval "$(_extract_fn install_traefik_ingress)"
+
+    INGRESS_ENABLED="${ingress_enabled}"
+    INGRESS_HOSTNAME="ai.example.test"
+    INGRESS_FIPS="off"
+    INGRESS_TLS_MODE="selfsigned"
+    INGRESS_SAIA_PORT="9443"
+    INGRESS_SPLUNKWEB_PORT="9001"
+    INGRESS_SPLUNKMGMT_PORT="9089"
+    INGRESS_SPLUNKMGMT_ENABLED="${mgmt_enabled}"
+    TRAEFIK_IMAGE="docker.io/library/traefik:test"
+    TRAEFIK_MANIFEST_DIR="${SCRIPT_DIR}/traefik"
+    CONFIG_FILE="unused-by-yq-stub"
+    AI_NS="ai-platform"
+    CLUSTER_NAME="test"
+    AI_STANDALONE_NAME="standalone"
+    CLUSTER_DOMAIN="cluster.local"
+    SPLUNK_MODE="${splunk_mode}"
+    SPLUNK_ENABLED="true"
+    EXISTING_CONTROLLER_IPS="10.0.0.10"
+    EXISTING_WORKER_IPS="10.0.0.11 10.0.0.12"
+    CONTROLLER_IPS=("10.0.0.10")
+    WORKER_IPS=("10.0.0.11" "10.0.0.12")
+    TRAEFIK_EXPECTED_NODE_COUNT=0
+
+    install_traefik_ingress
+  )
+}
+
+_traefik_capture_file() {
+  local output_dir="$1" needle="$2" file
+  for file in "${output_dir}"/apply.*; do
+    [[ -f "${file}" ]] || continue
+    if grep -Fq -- "${needle}" "${file}"; then
+      printf '%s\n' "${file}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_traefik_capture_text() {
+  local file
+  file="$(_traefik_capture_file "$1" "$2")" || return 0
+  command cat "${file}"
+}
+
+_traefik_all_capture_text() {
+  local output_dir="$1" file
+  for file in "${output_dir}"/apply.*; do
+    [[ -f "${file}" ]] && command cat "${file}"
+  done
+}
+
+_traefik_all_yaml_valid() {
+  local output_dir="$1" file found=0
+  for file in "${output_dir}"/apply.*; do
+    [[ -f "${file}" ]] || continue
+    found=1
+    command yq eval-all '.' "${file}" >/dev/null 2>&1 || return 1
+  done
+  [[ ${found} -eq 1 ]]
+}
+
+_traefik_object_count() {
+  local output_dir="$1" kind="$2" name="$3" file count=0 match
+  for file in "${output_dir}"/apply.*; do
+    [[ -f "${file}" ]] || continue
+    while IFS= read -r match; do
+      [[ "${match}" == "${name}" ]] && count=$((count + 1))
+    done < <(command yq eval-all \
+      "select(.kind == \"${kind}\" and .metadata.name == \"${name}\") | .metadata.name" \
+      "${file}" 2>/dev/null)
+  done
+  printf '%s\n' "${count}"
+}
+
+_traefik_daemonset_value() {
+  local manifest="$1" expression="$2"
+  [[ -n "${manifest}" ]] || { printf 'missing\n'; return 0; }
+  printf '%s\n' "${manifest}" | command yq eval "${expression}" - 2>/dev/null
+}
+
+internal_dir="${TRAEFIK_TEST_TMP}/internal"
+mgmt_off_dir="${TRAEFIK_TEST_TMP}/mgmt-off"
+external_dir="${TRAEFIK_TEST_TMP}/external"
+splunk_disabled_dir="${TRAEFIK_TEST_TMP}/splunk-disabled"
+ingress_disabled_dir="${TRAEFIK_TEST_TMP}/ingress-disabled"
+
+internal_rc=0
+_traefik_render_case "${internal_dir}" true internal true || internal_rc=$?
+mgmt_off_rc=0
+_traefik_render_case "${mgmt_off_dir}" true internal false || mgmt_off_rc=$?
+external_rc=0
+_traefik_render_case "${external_dir}" true external false || external_rc=$?
+splunk_disabled_rc=0
+_traefik_render_case "${splunk_disabled_dir}" true disabled false || splunk_disabled_rc=$?
+pull_secret_dir="${TRAEFIK_TEST_TMP}/pull-secret"
+pull_secret_rc=0
+_traefik_render_case "${pull_secret_dir}" true internal false pull-secret || pull_secret_rc=$?
+ingress_disabled_rc=0
+_traefik_render_case "${ingress_disabled_dir}" false internal false || ingress_disabled_rc=$?
+
+assert_eq "internal Traefik manifests render successfully" "0" "${internal_rc}"
+assert_eq "management-disabled Traefik manifests render successfully" "0" "${mgmt_off_rc}"
+assert_eq "external-Splunk Traefik manifests render successfully" "0" "${external_rc}"
+assert_eq "Splunk-disabled Traefik manifests render successfully" "0" "${splunk_disabled_rc}"
+assert_eq "configured Traefik pull Secret copy renders successfully" "0" "${pull_secret_rc}"
+assert_eq "ingress-disabled cleanup runs successfully" "0" "${ingress_disabled_rc}"
+
+assert_rc "internal rendered resources are valid YAML" 0 _traefik_all_yaml_valid "${internal_dir}"
+assert_rc "management-disabled rendered resources are valid YAML" 0 _traefik_all_yaml_valid "${mgmt_off_dir}"
+assert_rc "external-Splunk rendered resources are valid YAML" 0 _traefik_all_yaml_valid "${external_dir}"
+assert_rc "Splunk-disabled rendered resources are valid YAML" 0 _traefik_all_yaml_valid "${splunk_disabled_dir}"
+
+internal_daemonset="$(_traefik_capture_text "${internal_dir}" 'kind: DaemonSet')"
+internal_certificates="$(_traefik_capture_text "${internal_dir}" 'name: internal-domain-tls')"
+internal_saia_route="$(_traefik_capture_text "${internal_dir}" 'name: saia-websecure')"
+internal_splunk_route="$(_traefik_capture_text "${internal_dir}" 'name: splunkweb-splunkweb')"
+internal_transport="$(_traefik_capture_text "${internal_dir}" 'name: splunk-web-tls')"
+mgmt_off_daemonset="$(_traefik_capture_text "${mgmt_off_dir}" 'kind: DaemonSet')"
+mgmt_off_all="$(_traefik_all_capture_text "${mgmt_off_dir}")"
+external_all="$(_traefik_all_capture_text "${external_dir}")"
+splunk_disabled_all="$(_traefik_all_capture_text "${splunk_disabled_dir}")"
+pull_secret_daemonset="$(_traefik_capture_text "${pull_secret_dir}" 'kind: DaemonSet')"
+pull_secret_manifest="$(_traefik_capture_text "${pull_secret_dir}" '"type": "kubernetes.io/dockerconfigjson"')"
+
+assert_eq "configured SAIA port drives the entryPoint address" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c -- '--entrypoints.websecure.address=:9443')"
+assert_eq "configured SAIA port drives hostPort" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c 'hostPort: 9443')"
+assert_eq "configured Splunk Web port drives the entryPoint address" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c -- '--entrypoints.splunkweb.address=:9001')"
+assert_eq "configured Splunk Web port drives hostPort" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c 'hostPort: 9001')"
+assert_eq "configured management port drives the enabled entryPoint address" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c -- '--entrypoints.splunkmgmt.address=:9089')"
+assert_eq "configured management port drives enabled hostPort" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c 'hostPort: 9089')"
+
+assert_eq "certificate chain is applied in the AI namespace" \
+  "1" "$(printf '%s\n' "${internal_certificates}" | grep -c '^# kubectl -n ai-platform .*apply')"
+assert_eq "SAIA route is rendered in the AI namespace" \
+  "ai-platform" "$(printf '%s\n' "${internal_saia_route}" | command yq eval-all \
+    'select(.kind == "IngressRoute" and .metadata.name == "saia-websecure") | .metadata.namespace' -)"
+assert_eq "Splunk Web route is rendered in the AI namespace" \
+  "ai-platform" "$(printf '%s\n' "${internal_splunk_route}" | command yq eval-all \
+    'select(.kind == "IngressRoute" and .metadata.name == "splunkweb-splunkweb") | .metadata.namespace' -)"
+assert_eq "all dynamic TLS resources avoid the ingress namespace" \
+  "0" "$(printf '%s\n' "${internal_certificates}${internal_saia_route}${internal_splunk_route}${internal_transport}" | grep -c 'namespace: ingress')"
+
+traefik_crd_file="${SCRIPT_DIR}/traefik/traefik-crds.yaml"
+traefik_rbac_file="${SCRIPT_DIR}/traefik/traefik-rbac.yaml"
+traefik_resource_kinds=(
+  ingressroutes ingressroutetcps ingressrouteudps middlewares middlewaretcps
+  traefikservices tlsoptions tlsstores serverstransports serverstransporttcps
+)
+missing_crds=0
+missing_rbac_resources=0
+for resource in "${traefik_resource_kinds[@]}"; do
+  grep -q "name: ${resource}.traefik.io" "${traefik_crd_file}" || missing_crds=$((missing_crds + 1))
+  grep -q "\"${resource}\"" "${traefik_rbac_file}" || missing_rbac_resources=$((missing_rbac_resources + 1))
+done
+assert_eq "vendored CRDs cover every Traefik v3.6 informer resource" "0" "${missing_crds}"
+assert_eq "RBAC covers every Traefik v3.6 CRD informer resource" "0" "${missing_rbac_resources}"
+assert_eq "RBAC permits the ConfigMap informer" \
+  "1" "$(grep -c 'resources: \["services", "secrets", "configmaps"\]' "${traefik_rbac_file}")"
+assert_eq "cluster-scoped node discovery is explicitly disabled" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c -- '--providers.kubernetescrd.disableClusterScopeResources=true')"
+assert_eq "Traefik release is pinned by tag and digest in the config parser" \
+  "1" "$(grep -c 'default_traefik_image="docker.io/library/traefik:v3.6.25@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d"' "${SCRIPT}")"
+assert_eq "Traefik update and anonymous-usage checks are disabled" \
+  "2" "$(printf '%s\n' "${internal_daemonset}" | grep -Ec -- '--global\.(checknewversion|sendanonymoususage)=false')"
+assert_eq "Traefik pod is selected only onto installer-labelled ingress nodes" \
+  'true' "$(_traefik_daemonset_value "${internal_daemonset}" \
+    '.spec.template.spec.nodeSelector."splunk.ai/ingress-node" == "true"')"
+assert_eq "every configured ingress target is reconciled to a live node label" \
+  "2" "$(grep -c '^label node node-10-0-0-1[12] splunk.ai/ingress-node=true --overwrite$' "${internal_dir}/kubectl.calls")"
+assert_eq "successful install verifies live DaemonSet scheduler counts" \
+  "1" "$(grep -c '^-n ingress get daemonset traefik -o json$' "${internal_dir}/kubectl.calls")"
+assert_eq "Traefik container cannot escalate and has a read-only root filesystem" \
+  'true' "$(_traefik_daemonset_value "${internal_daemonset}" \
+    '[.spec.template.spec.containers[] | select(.name == "traefik") | .securityContext | ((.allowPrivilegeEscalation == false) and (.readOnlyRootFilesystem == true))] | all')"
+assert_eq "Traefik container drops every Linux capability" \
+  'true' "$(_traefik_daemonset_value "${internal_daemonset}" \
+    '.spec.template.spec.containers[] | select(.name == "traefik") | .securityContext.capabilities.drop | ((length == 1) and (.[0] == "ALL"))')"
+assert_eq "Traefik DaemonSet declares resource requests and limits" \
+  'true' "$(_traefik_daemonset_value "${internal_daemonset}" \
+    '.spec.template.spec.containers[] | select(.name == "traefik") | (.resources.requests.cpu != null and .resources.requests.memory != null and .resources.limits.cpu != null and .resources.limits.memory != null)')"
+
+assert_eq "Splunk Web backend explicitly uses HTTPS" \
+  "1" "$(printf '%s\n' "${internal_splunk_route}" | grep -c 'scheme: https')"
+assert_eq "Splunk Web backend attaches its validating ServersTransport" \
+  "1" "$(printf '%s\n' "${internal_splunk_route}" | grep -c 'serversTransport: splunk-web-tls')"
+assert_eq "Splunk Web ServersTransport is rendered" \
+  "1" "$(printf '%s\n' "${internal_transport}" | grep -c 'kind: ServersTransport')"
+assert_eq "ServersTransport trusts a CA-only ConfigMap projection" \
+  "1" "$(printf '%s\n' "${internal_transport}" | grep -A2 'rootCAs:' | grep -c 'configMap: ai-splunk-ca-public')"
+assert_eq "ServersTransport never references Splunk's private-key-bearing Secret" \
+  "0" "$(printf '%s\n' "${internal_transport}" | grep -A2 'rootCAs:' | grep -c 'secret: ai-splunk-server-tls')"
+
+assert_eq "external Splunk mode omits internal Splunk Web resources" \
+  "0" "$(printf '%s\n' "${external_all}" | grep -Ec 'name: (splunkweb-splunkweb|splunk-web-tls|splunkmgmt-passthrough)')"
+assert_eq "disabled Splunk mode omits internal Splunk Web resources" \
+  "0" "$(printf '%s\n' "${splunk_disabled_all}" | grep -Ec 'name: (splunkweb-splunkweb|splunk-web-tls|splunkmgmt-passthrough)')"
+assert_eq "external Splunk mode omits the Splunk Web listener" \
+  "0" "$(printf '%s\n' "${external_all}" | grep -c 'entrypoints.splunkweb')"
+assert_eq "disabled Splunk mode omits the Splunk Web listener" \
+  "0" "$(printf '%s\n' "${splunk_disabled_all}" | grep -c 'entrypoints.splunkweb')"
+
+assert_eq "Traefik never invokes the generic fixed-name Secret creator in ingress" \
+  "0" "$(awk '/^install_traefik_ingress\(\)/{f=1} f && /^}/{exit} f' "${SCRIPT}" | grep -c 'create_image_pull_secrets.*ingress_ns')"
+assert_eq "configured pull credentials are copied with installer ownership labels" \
+  "2" "$(printf '%s\n' "${pull_secret_manifest}" | grep -Ec 'app.kubernetes.io/(instance|managed-by)')"
+assert_eq "copied pull credentials are attached to the Traefik pod" \
+  "1" "$(printf '%s\n' "${pull_secret_daemonset}" | grep -A2 'imagePullSecrets:' | grep -c 'name: private-registry')"
+
+assert_eq "management=false omits its parsed DaemonSet entryPoint" \
+  "0" "$(_traefik_daemonset_value "${mgmt_off_daemonset}" \
+    '[.spec.template.spec.containers[] | select(.name == "traefik") | .args[]? | select(test("entrypoints\\.splunkmgmt"))] | length')"
+assert_eq "management=false omits its parsed DaemonSet hostPort" \
+  "0" "$(_traefik_daemonset_value "${mgmt_off_daemonset}" \
+    '[.spec.template.spec.containers[] | select(.name == "traefik") | .ports[]?.hostPort | select(. == 9089)] | length')"
+assert_eq "management=false omits its parsed TCP route" \
+  "0" "$(_traefik_object_count "${mgmt_off_dir}" IngressRouteTCP splunkmgmt-passthrough)"
+assert_eq "management=false removes a stale TCP route" \
+  "1" "$(grep -c 'delete ingressroutetcp splunkmgmt-passthrough' "${mgmt_off_dir}/kubectl.calls")"
+
+assert_eq "Traefik DaemonSet exposes the ping endpoint" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c -- '--ping=true')"
+assert_eq "Traefik DaemonSet has a readiness probe" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c 'readinessProbe:')"
+assert_eq "Traefik DaemonSet has a liveness probe" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | grep -c 'livenessProbe:')"
+assert_eq "Traefik DaemonSet liveness probe has exactly one port key" \
+  "1" "$(printf '%s\n' "${internal_daemonset}" | awk '/livenessProbe:/{f=1} f && /resources:/{exit} f' | grep -c '^              port: traefik$')"
+
+certificate_failure_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/certificate-failure" true internal false certificate >/dev/null 2>&1 || certificate_failure_rc=$?
+rollout_failure_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/rollout-failure" true internal false rollout >/dev/null 2>&1 || rollout_failure_rc=$?
+ownership_failure_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/ownership-failure" true internal false ownership >/dev/null 2>&1 || ownership_failure_rc=$?
+provider_failure_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/provider-failure" true internal false provider >/dev/null 2>&1 || provider_failure_rc=$?
+schedule_zero_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/schedule-zero" true internal false schedule-zero >/dev/null 2>&1 || schedule_zero_rc=$?
+schedule_partial_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/schedule-partial" true internal false schedule-partial >/dev/null 2>&1 || schedule_partial_rc=$?
+cleanup_failure_rc=0
+_traefik_render_case "${TRAEFIK_TEST_TMP}/cleanup-failure" false internal false cleanup-delete >/dev/null 2>&1 || cleanup_failure_rc=$?
+assert_eq "certificate readiness failure aborts installation" \
+  "nonzero" "$([[ ${certificate_failure_rc} -ne 0 ]] && echo nonzero || echo zero)"
+assert_eq "DaemonSet rollout failure aborts installation" \
+  "nonzero" "$([[ ${rollout_failure_rc} -ne 0 ]] && echo nonzero || echo zero)"
+assert_eq "fixed-name ownership collisions abort installation" \
+  "nonzero" "$([[ ${ownership_failure_rc} -ne 0 ]] && echo nonzero || echo zero)"
+assert_eq "provider informer or RBAC errors abort installation" \
+  "nonzero" "$([[ ${provider_failure_rc} -ne 0 ]] && echo nonzero || echo zero)"
+assert_eq "a zero-target DaemonSet cannot report ingress success" \
+  "nonzero" "$([[ ${schedule_zero_rc} -ne 0 ]] && echo nonzero || echo zero)"
+assert_eq "a partially Ready Traefik target set cannot report success" \
+  "nonzero" "$([[ ${schedule_partial_rc} -ne 0 ]] && echo nonzero || echo zero)"
+assert_eq "cleanup deletion failures cannot report ingress disabled" \
+  "nonzero" "$([[ ${cleanup_failure_rc} -ne 0 ]] && echo nonzero || echo zero)"
+
+assert_eq "ingress-disabled cleanup removes only labelled Traefik DaemonSets" \
+  "1" "$(grep -c 'delete daemonset -l app.kubernetes.io/managed-by=splunk-ai-platform-installer,app.kubernetes.io/instance=splunk-ai-ingress' "${ingress_disabled_dir}/kubectl.calls")"
+assert_eq "ingress-disabled cleanup removes labelled dynamic routes" \
+  "1" "$(grep -c 'delete ingressroutes.traefik.io -l app.kubernetes.io/managed-by=splunk-ai-platform-installer,app.kubernetes.io/instance=splunk-ai-ingress' "${ingress_disabled_dir}/kubectl.calls")"
+assert_eq "ingress-disabled cleanup removes labelled leaf and CA Certificates" \
+  "1" "$(grep -c 'delete certificates.cert-manager.io -l app.kubernetes.io/managed-by=splunk-ai-platform-installer,app.kubernetes.io/instance=splunk-ai-ingress' "${ingress_disabled_dir}/kubectl.calls")"
+assert_eq "ingress-disabled cleanup removes installer-owned pull Secret copies" \
+  "1" "$(grep -c -- '-n ingress delete secrets -l app.kubernetes.io/managed-by=splunk-ai-platform-installer,app.kubernetes.io/instance=splunk-ai-ingress' "${ingress_disabled_dir}/kubectl.calls")"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"

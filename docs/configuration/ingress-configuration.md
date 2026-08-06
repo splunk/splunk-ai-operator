@@ -455,12 +455,19 @@ spec:
         secretName: prod-inference-tls
 ```
 
-## Integration with MTLSConfig
+## Integration with the legacy `mtls` field
 
-The Ingress feature works alongside MTLSConfig for comprehensive security:
+The `mtls` field currently creates a one-way, server-authentication TLS
+listener on the AIService nginx deployment. Despite its legacy name, it does
+not request or validate client certificates and therefore does not implement
+mutual TLS.
 
 - **Ingress** handles external TLS termination (client → Ingress)
-- **MTLSConfig** handles internal mTLS (Ingress → services)
+- **`mtls`** provisions the AIService nginx server certificate and TLS listener
+
+Ingress-to-service HTTPS routing must be configured separately. Use a service
+mesh or gateway that validates client certificates when true mutual TLS is
+required.
 
 ```yaml
 spec:
@@ -472,7 +479,7 @@ spec:
           - ai.example.com
         secretName: external-tls
 
-  # Internal mTLS between services
+  # One-way server TLS on the AIService nginx listener (legacy field name)
   mtls:
     enabled: true
     termination: operator
