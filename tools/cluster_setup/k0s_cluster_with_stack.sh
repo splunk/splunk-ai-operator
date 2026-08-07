@@ -4556,6 +4556,189 @@ create_ecr_secret() {
   log "✓ Secret will be referenced in AIPlatform CR spec.imagePullSecrets"
 }
 
+# The internal JWT issuer and the endpoint propagated to SAIA/Slim must be
+# identical. Keep this in one helper so their scheme or service name cannot
+# drift independently again (AIP-4614).
+internal_splunk_management_url() {
+  printf 'http://splunk-%s-standalone-service.%s.svc.cluster.local:8089' \
+    "${AI_STANDALONE_NAME}" "${AI_NS}"
+}
+
+internal_splunk_pod_name() {
+  printf 'splunk-%s-standalone-0' "${AI_STANDALONE_NAME}"
+}
+
+# Read the Standalone once and distinguish a confirmed NotFound (fresh install)
+# from API, RBAC, transport, or decoding failures. Callers use the globals below
+# so command-substitution subshells cannot hide err() exits.
+_read_internal_splunk_state() {
+  local response
+  _SPLUNK_STANDALONE_EXISTS="false"
+  _SPLUNK_STANDALONE_JSON=""
+
+  if response=$(kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o json 2>&1); then
+    if ! printf '%s\n' "${response}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      err "Kubernetes returned invalid JSON for Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to overwrite its configuration."
+    fi
+    _SPLUNK_STANDALONE_EXISTS="true"
+    _SPLUNK_STANDALONE_JSON="${response}"
+    return 0
+  fi
+
+  if printf '%s\n' "${response}" | grep -q '(NotFound)'; then
+    return 0
+  fi
+
+  err "Failed to read Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to treat an API/RBAC error as a fresh install: ${response}"
+}
+
+_apply_internal_splunk_standalone_cr() {
+  local minio_endpoint="$1"
+  local management_mode="$2"
+  local existing_extra_env_json="${3:-[]}"
+  local desired_extra_env_json
+
+  case "${management_mode}" in
+    bootstrap)
+      # Splunk Operator 3.0.0 installs its telemetry app with a hard-coded
+      # https://localhost:8089 request. Let that one-time bootstrap finish on a
+      # fresh cluster before switching the final workload to HTTP.
+      if ! desired_extra_env_json=$(printf '%s\n' "${existing_extra_env_json}" | \
+          jq -c 'map(select(.name != "SPLUNKD_SSL_ENABLE"))'); then
+        err "Failed to preserve Splunk extraEnv while rendering bootstrap mode"
+      fi
+      ;;
+    http)
+      # SPLUNKD_SSL_ENABLE is the supported splunk-ansible switch. Besides
+      # writing enableSplunkdSSL=false, it makes the container and probes use
+      # http:// for the management API.
+      if ! desired_extra_env_json=$(printf '%s\n' "${existing_extra_env_json}" | \
+          jq -c '(map(select(.name != "SPLUNKD_SSL_ENABLE"))) + [{"name":"SPLUNKD_SSL_ENABLE","value":"false"}]'); then
+        err "Failed to preserve Splunk extraEnv while rendering HTTP mode"
+      fi
+      ;;
+    *)
+      err "Unsupported internal Splunk management mode: ${management_mode}"
+      ;;
+  esac
+  [[ -n "${desired_extra_env_json}" ]] || err "Failed to render Splunk extraEnv for management mode ${management_mode}"
+
+  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: ${AI_STANDALONE_NAME}
+  namespace: ${AI_NS}
+spec:
+  replicas: 1
+  # Compact JSON is valid YAML. Preserve every existing extraEnv entry while
+  # owning only the SPLUNKD_SSL_ENABLE value needed by this installer.
+  extraEnv: ${desired_extra_env_json}
+  etcVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  varVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  volumes:
+    - name: defaults
+      configMap:
+        name: splunk-defaults
+  defaultsUrl: /mnt/defaults/default.yml
+  appRepo:
+    appInstallPeriodSeconds: 90
+    appSources:
+      - name: apps
+        scope: local
+        location: apps
+    appsRepoPollIntervalSeconds: 60
+    defaults:
+      scope: local
+      volumeName: volume_app_repo
+    installMaxRetries: 2
+    volumes:
+      - name: volume_app_repo
+        provider: aws
+        storageType: s3
+        endpoint: ${minio_endpoint}
+        path: ${MINIO_BUCKET}
+        secretRef: minio-credentials
+YAML
+}
+
+_wait_for_splunk_telemetry_bootstrap() {
+  local timeout="${1:-600}"
+  local elapsed=0
+  local installed=""
+
+  log "Waiting for the Splunk Operator telemetry bootstrap to complete..."
+  while (( elapsed < timeout )); do
+    installed=$(kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+      -o jsonpath='{.status.telAppInstalled}' 2>/dev/null || true)
+    if [[ "${installed}" == "true" ]]; then
+      log "✓ Splunk Operator telemetry bootstrap completed"
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+    -o jsonpath='phase={.status.phase}{"\n"}message={.status.message}{"\n"}' || true
+  err "Timed out waiting for Splunk Operator telemetry bootstrap; refusing to disable management TLS before its one-time HTTPS initialization finishes."
+}
+
+_wait_for_internal_splunk_http() {
+  local old_pod_uid="$1"
+  local timeout="${2:-600}"
+  local deadline=$((SECONDS + timeout))
+  local pod_name
+  local current_uid=""
+  local ready=""
+  local standalone_json=""
+  local standalone_phase=""
+  local standalone_message=""
+  pod_name="$(internal_splunk_pod_name)"
+
+  log "Waiting for Splunk Standalone to roll to plain HTTP management mode..."
+  while (( SECONDS < deadline )); do
+    current_uid=$(kubectl get pod "${pod_name}" -n "${AI_NS}" \
+      -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+    if [[ -n "${current_uid}" && ( -z "${old_pod_uid}" || "${current_uid}" != "${old_pod_uid}" ) ]]; then
+      ready=$(kubectl get pod "${pod_name}" -n "${AI_NS}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+      if [[ "${ready}" == "True" ]]; then
+        standalone_json=$(kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+          -o json 2>/dev/null || true)
+        standalone_phase=$(printf '%s\n' "${standalone_json}" | \
+          jq -r '.status.phase // ""' 2>/dev/null || true)
+        standalone_message=$(printf '%s\n' "${standalone_json}" | \
+          jq -r '.status.message // ""' 2>/dev/null || true)
+        local splunkd_ssl
+        splunkd_ssl=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+          /opt/splunk/bin/splunk btool server list sslConfig 2>/dev/null \
+          | awk '$1 == "enableSplunkdSSL" { print tolower($3); exit }' || true)
+        if [[ "${standalone_phase}" == "Ready" && -z "${standalone_message}" && \
+              "${splunkd_ssl}" == "false" ]] && \
+           kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+             curl --silent --show-error --output /dev/null --max-time 10 \
+             http://localhost:8089/ >/dev/null 2>&1; then
+          log "✓ Splunk management/JWKS endpoint is ready over HTTP on port 8089"
+          return 0
+        fi
+      fi
+    fi
+    sleep 5
+  done
+
+  kubectl get pod "${pod_name}" -n "${AI_NS}" -o wide || true
+  kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+    -o jsonpath='phase={.status.phase}{"\n"}message={.status.message}{"\n"}' || true
+  warn "Recent Splunk container logs (current attempt):"
+  kubectl logs "${pod_name}" -n "${AI_NS}" --tail=120 2>&1 || true
+  warn "Recent Splunk container logs (previous attempt, when available):"
+  kubectl logs "${pod_name}" -n "${AI_NS}" --previous --tail=120 2>&1 || true
+  err "Splunk did not become ready with enableSplunkdSSL=false and HTTP port 8089 within ${timeout}s."
+}
+
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
   if [[ "${SPLUNK_MODE}" != "internal" ]]; then
@@ -4587,8 +4770,11 @@ install_splunk_standalone() {
   # It MUST byte-for-byte match splunkConfiguration.endpoint below (which feeds
   # SPLUNK_ISSUERS on saia/slim) or CMP auth rejects every token with
   # "Issuer '<iss>' is not allowed". Keep both in the
-  # https://splunk-<name>-standalone-service.<ns>.svc.<domain>:8089 form used by
-  # the operator's own SplunkCustomResourceRef path (buildSplunkIssuersVal).
+  # http://splunk-<name>-standalone-service.<ns>.svc.<domain>:8089 form. This
+  # k0s compatibility path intentionally disables transport TLS on the internal
+  # Splunk management/JWKS port; external Splunk configuration is unaffected.
+  local internal_splunk_url
+  internal_splunk_url="$(internal_splunk_management_url)"
   cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -4596,6 +4782,15 @@ metadata:
   name: splunk-defaults
 data:
   default.yml: |
+    # Compatibility migration for installations that were previously managed
+    # by the TLS-preview installer. Those releases persisted certificate paths
+    # under /mnt/splunk-cert* in the Splunk PVC. The no-TLS manifest does not
+    # mount those paths, and Splunk refuses to start even when
+    # enableSplunkdSSL=false if the stale options remain. Run the cleanup from
+    # inside splunk-ansible before it starts Splunk; the task is idempotent and
+    # only acts on files that still contain the installer-owned mount prefix.
+    ansible_pre_tasks:
+      - file:///mnt/defaults/remove-stale-installer-tls.yml
     splunk:
       conf:
         - key: authentication
@@ -4603,9 +4798,47 @@ data:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+                issuer_uri: ${internal_splunk_url}
                 certFile: \$SPLUNK_HOME/etc/auth/server.pem
                 sslPassword: password
+  remove-stale-installer-tls.yml: |
+    ---
+    - name: Disable listeners configured by the TLS-preview installer
+      ini_file:
+        path: "{{ item.path }}"
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        state: present
+      loop:
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: enableSplunkdSSL, value: "false" }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: enableSplunkWebSSL, value: "false" }
+      when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
+
+    - name: Remove stale installer-managed TLS options
+      ini_file:
+        path: "{{ item.path }}"
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        state: absent
+      loop:
+        # Keep password entries before path entries. The when condition is
+        # evaluated for every item, so a legacy path remains present until all
+        # options belonging to that file have been removed.
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: sslPassword }
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: serverCert }
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: sslRootCAPath }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: sslPassword }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: serverCert }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: privKeyPath }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: caCertPath }
+        # HEC transport is outside AIP-4614's management/JWKS change. Remove
+        # only the preview installer's custom certificate material; retain its
+        # enableSSL setting so HEC remains on the independently configured
+        # protocol (the standard splunk-ansible default is HTTPS).
+        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: sslPassword }
+        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: serverCert }
+      when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
 YAML
 
   # Ensure default ServiceAccount has imagePullSecrets for ECR
@@ -4647,58 +4880,76 @@ YAML
     err "Splunk Standalone needs a non-empty S3 endpoint; check storage.objectStore.endpoint (or storage.objectStore.type)."
     return 1
   fi
-  local endpoint_line="        endpoint: ${minio_endpoint}"
+  # A fresh Splunk Operator 3.0.0 installation has one HTTPS-only telemetry-app
+  # bootstrap call. Existing installations have status.telAppInstalled=true and
+  # can go directly to the desired HTTP mode. Fresh installations bootstrap
+  # once with the image default, then receive the same final HTTP manifest.
+  local telemetry_bootstrapped="false"
+  local existing_extra_env_json="[]"
+  _read_internal_splunk_state
+  if [[ "${_SPLUNK_STANDALONE_EXISTS}" == "true" ]]; then
+    if ! telemetry_bootstrapped=$(printf '%s\n' "${_SPLUNK_STANDALONE_JSON}" | jq -er '
+        .status.telAppInstalled as $installed
+        | if $installed == null then "false"
+          elif ($installed | type) == "boolean" then ($installed | tostring)
+          else error("telAppInstalled is not boolean") end'); then
+      err "Invalid status.telAppInstalled on Standalone ${AI_NS}/${AI_STANDALONE_NAME}"
+    fi
+    if ! existing_extra_env_json=$(printf '%s\n' "${_SPLUNK_STANDALONE_JSON}" | \
+        jq -ec '(.spec.extraEnv // []) | if type == "array" then . else error("extraEnv is not an array") end'); then
+      err "Invalid spec.extraEnv on Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to overwrite it."
+    fi
+  fi
 
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
-apiVersion: enterprise.splunk.com/v4
-kind: Standalone
-metadata:
-  name: ${AI_STANDALONE_NAME}
-  namespace: ${AI_NS}
-spec:
-  replicas: 1
-  etcVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  varVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  volumes:
-    - name: defaults
-      configMap:
-        name: splunk-defaults
-  defaultsUrl: /mnt/defaults/default.yml
-  appRepo:
-    appInstallPeriodSeconds: 90
-    appSources:
-      - name: apps
-        scope: local
-        location: apps
-    appsRepoPollIntervalSeconds: 60
-    defaults:
-      scope: local
-      volumeName: volume_app_repo
-    installMaxRetries: 2
-    volumes:
-      - name: volume_app_repo
-        provider: aws
-        storageType: s3
-${endpoint_line}
-        path: ${MINIO_BUCKET}
-        secretRef: minio-credentials
-YAML
+  if [[ "${telemetry_bootstrapped}" != "true" ]]; then
+    _apply_internal_splunk_standalone_cr "${minio_endpoint}" bootstrap "${existing_extra_env_json}"
+    _wait_for_splunk_telemetry_bootstrap 600
+  fi
 
-  log "Splunk Standalone CR applied (pod starts in background)"
+  # Re-read after the potentially long bootstrap so a concurrent extraEnv
+  # update is preserved in the final manifest.
+  _read_internal_splunk_state
+  [[ "${_SPLUNK_STANDALONE_EXISTS}" == "true" ]] || \
+    err "Standalone ${AI_NS}/${AI_STANDALONE_NAME} disappeared during installation"
+  if ! existing_extra_env_json=$(printf '%s\n' "${_SPLUNK_STANDALONE_JSON}" | \
+      jq -ec '(.spec.extraEnv // []) | if type == "array" then . else error("extraEnv is not an array") end'); then
+    err "Invalid spec.extraEnv on Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to overwrite it."
+  fi
+
+  local old_pod_uid=""
+  local splunk_pod_name
+  splunk_pod_name="$(internal_splunk_pod_name)"
+  old_pod_uid=$(kubectl get pod "${splunk_pod_name}" -n "${AI_NS}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+
+  # Reapplying an already-disabled spec is intentionally idempotent. In that
+  # case the pod will not roll, so do not require a UID change.
+  if printf '%s\n' "${existing_extra_env_json}" \
+      | jq -e 'any(.[]?; .name == "SPLUNKD_SSL_ENABLE" and ((.value // "") | ascii_downcase) == "false")' \
+        >/dev/null 2>&1; then
+    old_pod_uid=""
+  fi
+
+  _apply_internal_splunk_standalone_cr "${minio_endpoint}" http "${existing_extra_env_json}"
+  _wait_for_internal_splunk_http "${old_pod_uid}" 600
+  log "Splunk Standalone CR applied with internal management TLS disabled"
 }
 
-# Blocks until Splunk Standalone pod is ready. Called at the end of the
-# install flow so the operator and CR can deploy while Splunk boots.
+# Final readiness postcondition for the Splunk Standalone pod.
 wait_for_splunk_standalone() {
   if [[ "${SPLUNK_MODE}" != "internal" ]]; then
     return 0
   fi
 
   log "Waiting for Splunk Standalone to be ready..."
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
-  log "Splunk Standalone is ready"
+  local splunk_pod_name
+  splunk_pod_name="$(internal_splunk_pod_name)"
+  if ! kubectl wait --for=condition=ready "pod/${splunk_pod_name}" \
+      -n "${AI_NS}" --timeout=600s; then
+    kubectl get pod "${splunk_pod_name}" -n "${AI_NS}" -o wide || true
+    err "Timed out waiting for Splunk Standalone to become ready"
+  fi
+  log "✓ Splunk Standalone is ready"
 }
 
 # ====== INSTALL AI PLATFORM CR ======
@@ -4746,6 +4997,8 @@ install_ai_platform_cr() {
   case "${SPLUNK_MODE}" in
     internal)
       local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
+      local internal_splunk_url
+      internal_splunk_url="$(internal_splunk_management_url)"
       log "Using Splunk secret: ${splunk_secret}"
       splunk_config_yaml=$(cat <<EOF
 
@@ -4754,7 +5007,7 @@ install_ai_platform_cr() {
   # set in the splunk-defaults ConfigMap above (install_splunk_standalone) —
   # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
-    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: ${internal_splunk_url}
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
@@ -5449,7 +5702,10 @@ install_ai_platform_stack() {
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
 
-  # Apply Splunk Standalone CR (non-blocking — pod boots in background)
+  # Install and finalize Splunk before AIPlatform. Fresh Splunk Operator 3.0.0
+  # needs one TLS bootstrap, after which this function rolls port 8089 to the
+  # final HTTP mode and verifies it. This prevents SAIA from observing a
+  # temporary scheme mismatch.
   install_splunk_standalone
 
   # MetalLB must be installed BEFORE the AIPlatform CR is reconciled — the
@@ -5460,14 +5716,16 @@ install_ai_platform_stack() {
   # ClusterIP only).
   install_metallb
 
-  # Install AI Platform operator and CR while Splunk Standalone boots
+  # Install AI Platform only after the internal management/JWKS endpoint is in
+  # its final HTTP mode.
   install_splunk_ai_operator
   install_ai_platform_cr
   patch_k0s_saia_public_service_workaround
   # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
   patch_k0s_slim_public_service_workaround
 
-  # Now wait for Splunk Standalone to be ready (likely already done by now)
+  # Final postcondition (normally immediate because installation already
+  # verified the replacement pod).
   wait_for_splunk_standalone
 
   log "AI Platform stack installation complete!"
