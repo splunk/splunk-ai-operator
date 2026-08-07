@@ -82,7 +82,7 @@ graph TB
 
     subgraph GPU["🔥  GPU Worker(s)"]
         RAY_GPU[Ray GPU Workers\nAI Inference]
-        MODELS[(Model Weights\ngemma-4-31b-it\ngpt-oss-20b\n+ 8 more)]
+        MODELS[(Model Weights\nGemma — GPU-specific\ngpt-oss-20b\n+ 9 more)]
     end
 
     subgraph OBJ["🗄️  Object Storage\n(Customer-managed)"]
@@ -128,6 +128,23 @@ graph TB
 
 > **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are access-controlled through your private registry. Contact your Splunk account team to confirm entitlements before deployment.
 
+### Scaling Deployment Capacity
+
+Use `aiPlatform.scaleFactor` to increase or decrease AI workload capacity:
+
+```yaml
+aiPlatform:
+  scaleFactor: 2
+```
+
+Use a whole number of `1` or higher. The default is `1`; for example, `2`
+doubles the standard capacity. Increasing this value does not add GPU nodes, so
+ask your cluster administrator to add the required GPU capacity first.
+
+> **Downscaling notice:** Reducing `scaleFactor` causes temporary service
+> downtime while workloads are resized. Plan downscaling during a maintenance
+> window.
+
 ---
 
 ## Standard Deployment (Internet-Connected)
@@ -163,7 +180,7 @@ flowchart LR
 
 | Data | Minimum size | Notes |
 |---|---|---|
-| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 10 models + headroom for re-staging |
+| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 11 models + headroom for re-staging |
 | Runtime data (conversations, queues, config) | 100 GB | Grows with usage; monitor and expand as needed |
 | **Total recommended bucket** | **500 GB+** | Plan for growth if running multiple tenants |
 
@@ -192,7 +209,7 @@ flowchart TD
 
     subgraph P1["📦 Phase 1 — Model Staging  (if enabled)"]
         direction LR
-        M1["Download >120 GB\nfrom HuggingFace"] --> M2["gemma-4-31b-it · gpt-oss-20b\n+ 8 more models"]
+        M1["Download >120 GB\nfrom HuggingFace"] --> M2["Gemma — GPU-specific · gpt-oss-20b\n+ 9 more models"]
         M2 --> M3["Upload model_artifacts/\nto Object Store"]
     end
 
@@ -493,7 +510,7 @@ Model weights (>120 GB) must be staged to your object store. Do this on the conn
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run on a flaky connection — already-staged models are skipped automatically |
 | CPU | 4 cores | Recommended for parallel upload scripts |

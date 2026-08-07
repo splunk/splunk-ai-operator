@@ -240,6 +240,11 @@ aiPlatform:
   #   L40S     → instanceType: g6e.12xlarge
   defaultAcceleratorType: "L40S"
 
+  # Optional platform-wide capacity multiplier. It scales model replicas and
+  # Ray worker-pool base sizes together. Use an unquoted integer >= 1 and make
+  # sure the GPU node group has proportional capacity before increasing it.
+  scaleFactor: 1
+
   # Features to enable
   features: # no change
     - name: "saia"
