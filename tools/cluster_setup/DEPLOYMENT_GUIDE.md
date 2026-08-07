@@ -140,6 +140,10 @@ service URL:
 http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
 ```
 
+OTel telemetry uses the separate `splunkConfiguration.hecEndpoint` on Splunk's
+HEC listener (`https://...:8088`). HEC is used only for telemetry and is never
+treated as the JWT issuer.
+
 This is the AIP-4614 compatibility behavior for SAIA/Slim interactive-token
 validation. The installer disables `enableSplunkdSSL`, rolls the Splunk pod, and
 tests the HTTP endpoint before deploying `AIPlatform`. Current SAIA images work

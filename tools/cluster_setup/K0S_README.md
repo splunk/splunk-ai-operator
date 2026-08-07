@@ -1617,6 +1617,10 @@ are the same canonical URL:
 http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
 ```
 
+The OTel exporter receives a separate `splunkConfiguration.hecEndpoint` for
+Splunk HEC (`https://...:8088`). That listener is used only for telemetry and
+is not added to the SAIA/Slim JWT issuer allowlist.
+
 The installer verifies `enableSplunkdSSL=false` and an HTTP response before it
 creates the `AIPlatform` resource. On a fresh deployment, Splunk Operator 3.0.0
 first completes one internal HTTPS-only telemetry bootstrap; the installer then

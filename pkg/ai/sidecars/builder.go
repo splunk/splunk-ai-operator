@@ -204,13 +204,19 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
-		if _, exists := cm.Data["otel-config.yaml"]; !exists {
+		if existing, exists := cm.Data["otel-config.yaml"]; !exists {
 			content := s.renderOtelConf(ctx, p)
 			yamlBytes, err := syaml.Marshal(content)
 			if err != nil {
 				return fmt.Errorf("marshaling otel config: %w", err)
 			}
 			cm.Data["otel-config.yaml"] = string(yamlBytes)
+		} else if p.Spec.SplunkConfiguration.HECEndpoint != "" {
+			updated, err := updateOtelHECEndpoint(existing, p.Spec.SplunkConfiguration.HECEndpoint)
+			if err != nil {
+				return err
+			}
+			cm.Data["otel-config.yaml"] = updated
 		}
 		return controllerutil.SetOwnerReference(p, cm, s.Scheme)
 	})
@@ -218,6 +224,35 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 		return fmt.Errorf("create/update otel-config ConfigMap: %w", err)
 	}
 	return nil
+}
+
+// updateOtelHECEndpoint migrates only the managed Splunk HEC exporter URL.
+// Existing ConfigMaps may contain user customizations, so the rest of the
+// collector configuration is preserved. When the endpoint is already current,
+// the original bytes are returned to avoid needless updates.
+func updateOtelHECEndpoint(configYAML, hecBase string) (string, error) {
+	var config map[string]interface{}
+	if err := syaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return "", fmt.Errorf("parsing existing otel config: %w", err)
+	}
+	exporters, ok := config["exporters"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("existing otel config has no exporters map")
+	}
+	splunkHEC, ok := exporters["splunk_hec"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("existing otel config has no splunk_hec exporter")
+	}
+	desired := fmt.Sprintf("%s/services/collector", hecBase)
+	if current, _ := splunkHEC["endpoint"].(string); current == desired {
+		return configYAML, nil
+	}
+	splunkHEC["endpoint"] = desired
+	yamlBytes, err := syaml.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("marshaling migrated otel config: %w", err)
+	}
+	return string(yamlBytes), nil
 }
 
 // renderOtelConf builds the OpenTelemetry Collector config map data.
@@ -233,7 +268,14 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 		return map[string]interface{}{"error": "hec_token field not found in secret"}
 	}
 
-	endpoint := fmt.Sprintf("%s/services/collector", cr.Spec.SplunkConfiguration.Endpoint)
+	// HEC ingestion and management/JWKS are separate Splunk listeners. Keep
+	// HECEndpoint scoped to OTel; Endpoint remains the JWT issuer used by
+	// SAIA/Slim. The fallback preserves pre-existing custom resources.
+	hecBase := cr.Spec.SplunkConfiguration.HECEndpoint
+	if hecBase == "" {
+		hecBase = cr.Spec.SplunkConfiguration.Endpoint
+	}
+	endpoint := fmt.Sprintf("%s/services/collector", hecBase)
 	metricsIndexName, exists := os.LookupEnv("SPLUNK_METRICS_INDEX_NAME")
 	if !exists {
 		metricsIndexName = "_metrics"

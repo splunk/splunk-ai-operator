@@ -2819,8 +2819,15 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
+                      SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
+                      Either Endpoint or SplunkCustomResourceRef must be provided.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL used only by the
+                      OTel sidecar to export telemetry. It falls back to Endpoint when unset for
+                      backward compatibility with configurations that predate this field.
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials
@@ -4815,8 +4822,15 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
+                      SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
+                      Either Endpoint or SplunkCustomResourceRef must be provided.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL used only by the
+                      OTel sidecar to export telemetry. It falls back to Endpoint when unset for
+                      backward compatibility with configurations that predate this field.
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials

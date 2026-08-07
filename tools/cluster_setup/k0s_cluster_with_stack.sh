@@ -4564,6 +4564,14 @@ internal_splunk_management_url() {
     "${AI_STANDALONE_NAME}" "${AI_NS}"
 }
 
+# HEC is consumed only by the OTel telemetry exporter. Splunk's standard HEC
+# listener remains on HTTPS 8088 and is deliberately independent of the HTTP
+# management/JWKS compatibility endpoint above.
+internal_splunk_hec_url() {
+  printf 'https://splunk-%s-standalone-service.%s.svc.cluster.local:8088' \
+    "${AI_STANDALONE_NAME}" "${AI_NS}"
+}
+
 internal_splunk_pod_name() {
   printf 'splunk-%s-standalone-0' "${AI_STANDALONE_NAME}"
 }
@@ -4998,7 +5006,9 @@ install_ai_platform_cr() {
     internal)
       local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
       local internal_splunk_url
+      local internal_splunk_hec_url_value
       internal_splunk_url="$(internal_splunk_management_url)"
+      internal_splunk_hec_url_value="$(internal_splunk_hec_url)"
       log "Using Splunk secret: ${splunk_secret}"
       splunk_config_yaml=$(cat <<EOF
 
@@ -5008,6 +5018,9 @@ install_ai_platform_cr() {
   # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
     endpoint: ${internal_splunk_url}
+    # Used only by the OTel exporter for telemetry ingestion. HEC remains on
+    # its independent, standard HTTPS listener and is not a JWT issuer.
+    hecEndpoint: ${internal_splunk_hec_url_value}
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}

@@ -301,10 +301,17 @@ type SplunkConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	SecretRef corev1.SecretReference `json:"secretRef,omitempty"`
 
-	// Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-	// Either Endpoint or SplunkCustomResourceRef must be provided
+	// Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
+	// SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
+	// Either Endpoint or SplunkCustomResourceRef must be provided.
 	// +kubebuilder:validation:Optional
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// HECEndpoint is the Splunk HTTP Event Collector base URL used only by the
+	// OTel sidecar to export telemetry. It falls back to Endpoint when unset for
+	// backward compatibility with configurations that predate this field.
+	// +kubebuilder:validation:Optional
+	HECEndpoint string `json:"hecEndpoint,omitempty"`
 
 	// Token is the Splunk HEC token (consider using SecretRef instead)
 	// +kubebuilder:validation:Optional

@@ -843,6 +843,7 @@ echo "▶ AIP-4614 internal Splunk HTTP compatibility"
 _render_internal_splunk_http_manifests() (
   local capture_dir="$1"
   eval "$(_extract_fn internal_splunk_management_url)"
+  eval "$(_extract_fn internal_splunk_hec_url)"
   eval "$(_extract_fn internal_splunk_pod_name)"
   eval "$(_extract_fn _read_internal_splunk_state)"
   eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
@@ -959,12 +960,19 @@ for _manifest in splunk-defaults standalone aiplatform; do
 done
 
 _expected_internal_url='http://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8089'
+_expected_internal_hec_url='https://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088'
 _rendered_issuer=$(awk -F'issuer_uri: ' '/issuer_uri:/{print $2; exit}' \
   "${_AIP4614_TMPDIR}/splunk-defaults.yaml")
 _rendered_endpoint=$(awk '
   /^[[:space:]]*splunkConfiguration:/ { in_splunk=1; next }
   in_splunk && /^[[:space:]]*endpoint:/ {
     sub(/^[[:space:]]*endpoint:[[:space:]]*/, ""); print; exit
+  }
+' "${_AIP4614_TMPDIR}/aiplatform.yaml")
+_rendered_hec_endpoint=$(awk '
+  /^[[:space:]]*splunkConfiguration:/ { in_splunk=1; next }
+  in_splunk && /^[[:space:]]*hecEndpoint:/ {
+    sub(/^[[:space:]]*hecEndpoint:[[:space:]]*/, ""); print; exit
   }
 ' "${_AIP4614_TMPDIR}/aiplatform.yaml")
 
@@ -974,10 +982,10 @@ assert_eq "AIPlatform endpoint renders the canonical HTTP service URL" \
   "${_expected_internal_url}" "${_rendered_endpoint}"
 assert_eq "oauth issuer and AIPlatform endpoint are byte-identical" \
   "${_rendered_issuer}" "${_rendered_endpoint}"
-assert_eq "internal rendered manifests contain no HTTPS form of the issuer" "0" \
-  "$(grep -h -c 'https://splunk-fixture-splunk-standalone-service' \
-    "${_AIP4614_TMPDIR}/splunk-defaults.yaml" "${_AIP4614_TMPDIR}/aiplatform.yaml" \
-    | awk '{sum += $1} END {print sum + 0}')"
+assert_eq "OTel HEC endpoint renders separately on HTTPS port 8088" \
+  "${_expected_internal_hec_url}" "${_rendered_hec_endpoint}"
+assert_eq "Splunk OAuth issuer contains no HTTPS form" "0" \
+  "$(grep -c 'issuer_uri: https://' "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
 assert_eq "Standalone final manifest disables splunkd management TLS exactly once" "1" \
   "$(grep 'extraEnv:' "${_AIP4614_TMPDIR}/standalone.yaml" \
     | grep -c '"name":"SPLUNKD_SSL_ENABLE","value":"false"')"

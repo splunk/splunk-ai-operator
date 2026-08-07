@@ -71,6 +71,7 @@ render_splunk_block() {
   # Splunk configuration (internal — in-cluster Standalone)
   splunkConfiguration:
     endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
@@ -152,12 +153,13 @@ CFG=$(make_config "splunk:
   enabled: true")
 OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
 EXPECTED_INTERNAL_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+EXPECTED_INTERNAL_HEC_URL="https://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8088"
 info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + secretRef"
 check_contains     "${OUT}" "splunkConfiguration"                              "splunkConfiguration block present"
 check_contains     "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}"               "Canonical HTTP management/JWKS endpoint"
+check_contains     "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}"         "Distinct OTel-only HEC endpoint"
 check_contains     "${OUT}" "splunk-my-standalone-standalone-secret-v1"        "Operator-managed secret"
 check_contains     "${OUT}" "secretRef"                                        "secretRef present"
-check_not_contains "${OUT}" "https://splunk-my-standalone-standalone-service"   "Internal endpoint does not use TLS"
 check_not_contains "${OUT}" "trustedIssuers"                                   "No trustedIssuers when not set"
 rm -f "${CFG}"
 
@@ -171,6 +173,7 @@ OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
 info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + external issuer appended"
 check_contains "${OUT}" "splunkConfiguration"                "splunkConfiguration block present"
 check_contains "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}" "Canonical HTTP management/JWKS endpoint"
+check_contains "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}" "Distinct OTel-only HEC endpoint"
 check_contains "${OUT}" "trustedIssuers"                     "trustedIssuers key present"
 check_contains "${OUT}" "https://external.splunk:8089"       "External issuer present"
 rm -f "${CFG}"

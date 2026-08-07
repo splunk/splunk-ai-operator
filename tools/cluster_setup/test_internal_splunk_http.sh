@@ -80,6 +80,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
 SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
 EXPECTED_URL="http://${SPLUNK_SERVICE}.${NAMESPACE}.svc.cluster.local:8089"
+EXPECTED_HEC_URL="https://${SPLUNK_SERVICE}.${NAMESPACE}.svc.cluster.local:8088"
 
 kubectl get namespace "${NAMESPACE}" >/dev/null
 kubectl get standalone "${STANDALONE_NAME}" -n "${NAMESPACE}" >/dev/null
@@ -200,6 +201,8 @@ issuer_uri=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   | awk '$1 == "issuer_uri" { print $3; exit }')
 platform_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
   -o jsonpath='{.spec.splunkConfiguration.endpoint}')
+platform_hec_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.splunkConfiguration.hecEndpoint}')
 
 [[ "${issuer_uri}" == "${EXPECTED_URL}" ]] || \
   fail "issuer_uri=${issuer_uri:-unset}, expected ${EXPECTED_URL}"
@@ -208,6 +211,23 @@ platform_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}
 [[ "${issuer_uri}" == "${platform_endpoint}" ]] || \
   fail "issuer_uri and AIPlatform endpoint differ"
 pass "issuer_uri and AIPlatform endpoint are byte-identical canonical HTTP URLs"
+[[ "${platform_hec_endpoint}" == "${EXPECTED_HEC_URL}" ]] || \
+  fail "AIPlatform hecEndpoint=${platform_hec_endpoint:-unset}, expected ${EXPECTED_HEC_URL}"
+pass "AIPlatform keeps the OTel-only HEC endpoint separate on port 8088"
+
+otel_enabled=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.sidecars.otel}')
+if [[ "${otel_enabled}" == "true" ]]; then
+  otel_config=$(kubectl get configmap "${AIPLATFORM_NAME}-otel-config" -n "${NAMESPACE}" \
+    -o jsonpath='{.data.otel-config\.yaml}' 2>/dev/null) || \
+    fail "OTel is enabled but ${AIPLATFORM_NAME}-otel-config is missing"
+  grep -Fq "${EXPECTED_HEC_URL}/services/collector" <<<"${otel_config}" || \
+    fail "OTel exporter is not configured for ${EXPECTED_HEC_URL}/services/collector"
+  if grep -Fq "${EXPECTED_URL}/services/collector" <<<"${otel_config}"; then
+    fail "OTel exporter incorrectly uses the management/JWKS endpoint"
+  fi
+  pass "OTel telemetry exporter targets HEC rather than management/JWKS"
+fi
 
 platform_uid=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
   -o jsonpath='{.metadata.uid}')
