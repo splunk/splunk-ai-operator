@@ -1288,23 +1288,12 @@ nodeLabelStrategy: manual and list nodes explicitly under openshift.nodes in the
 install_cert_manager() {
   log "Installing cert-manager..."
 
-  if oc get namespace cert-manager &>/dev/null; then
-    log "  cert-manager namespace already exists, checking if running..."
-    if oc get deployment cert-manager -n cert-manager &>/dev/null; then
-      log "  ✓ cert-manager already installed, skipping"
-      return 0
-    fi
-  fi
-
   local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
   # oc apply -f does not understand file:// — strip it to a bare path
   [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
   oc apply -f "${_cm_url}"
 
-  log "Waiting for cert-manager to be ready..."
-  oc wait --for=condition=ready pod \
-    -l app.kubernetes.io/instance=cert-manager \
-    -n cert-manager --timeout=300s
+  wait_for_crd certificates.cert-manager.io 300
 
   # On OpenShift, cert-manager pods may need anyuid SCC
   oc adm policy add-scc-to-user anyuid \
@@ -1314,37 +1303,19 @@ install_cert_manager() {
   oc adm policy add-scc-to-user anyuid \
     -z cert-manager-webhook -n cert-manager 2>/dev/null || true
 
-  log "Waiting for cert-manager webhook to be reachable with a valid TLS certificate..."
-  # The webhook endpoint being ready is not enough — the TLS cert has a notBefore
-  # timestamp ~30s in the future right after issuance. Probe by applying a test
-  # Issuer and retrying until the x509 clock-skew error clears.
-  # NOTE: heredoc inside $(...) is unreliable under set -euo pipefail; use a temp file.
-  local probe_file
-  probe_file=$(mktemp /tmp/cert-manager-probe-XXXXXX.yaml)
-  cat > "${probe_file}" <<'EOF'
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: cert-manager-webhook-probe
-  namespace: cert-manager
-spec:
-  selfSigned: {}
-EOF
-  local retries=0
-  while (( retries < 60 )); do
-    local out
-    out=$(oc apply -f "${probe_file}" 2>&1) || true
-    if echo "${out}" | grep -q "x509: certificate\|failed to call webhook\|i/o timeout"; then
-      sleep 5
-      retries=$((retries + 1))
-      (( retries % 6 == 0 )) && log "  Still waiting for cert-manager webhook TLS... (${retries}/60)"
-      continue
-    fi
-    oc delete issuer cert-manager-webhook-probe -n cert-manager --ignore-not-found=true 2>/dev/null || true
-    rm -f "${probe_file}"
-    break
-  done
-  rm -f "${probe_file}" 2>/dev/null || true
+  # The raw manifest is used as supplied. Splunk's pre-task constructs its PEM
+  # directly from the standard tls.crt and tls.key Secret entries.
+  oc rollout status deployment/cert-manager -n cert-manager --timeout=120s
+  oc rollout status deployment/cert-manager-webhook -n cert-manager --timeout=120s
+
+  log "Waiting for cert-manager to be ready..."
+  oc wait --for=condition=ready pod \
+    -l app.kubernetes.io/instance=cert-manager \
+    -n cert-manager --timeout=300s
+  oc wait --for=condition=ready pod \
+    -l app.kubernetes.io/component=webhook \
+    -n cert-manager --timeout=120s
+
   log "  ✓ cert-manager installed"
 }
 
@@ -1813,12 +1784,141 @@ install_splunk_operator() {
   log "  ✓ Splunk Operator installed"
 }
 
+# ====== PROVISION SPLUNK SERVER TLS CERT ======
+# The Splunk Operator's generated certificate does not contain the Kubernetes
+# service FQDN used by SAIA for management/JWKS calls. Issue a dedicated CA and
+# hostname-correct leaf before creating the Standalone. cert-manager rotates
+# the leaf Secret, but this installer does not implement a supported splunkd
+# hot reload or automatic pod restart; operators must perform a controlled
+# restart after renewal so Splunk begins serving the renewed certificate.
+provision_splunk_cert() {
+  log "Provisioning Splunk server TLS certificate via cert-manager..."
+
+  ensure_namespace "${AI_NS}"
+  local svc="splunk-${AI_STANDALONE_NAME}-standalone-service"
+  local headless="splunk-${AI_STANDALONE_NAME}-standalone-headless"
+
+  oc apply --server-side --force-conflicts -f - <<YAML
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-selfsigned
+  namespace: ${AI_NS}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-ca
+  namespace: ${AI_NS}
+spec:
+  isCA: true
+  commonName: ai-splunk-ca
+  secretName: ai-splunk-ca-tls
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: ai-splunk-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-ca-issuer
+  namespace: ${AI_NS}
+spec:
+  ca:
+    secretName: ai-splunk-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-server
+  namespace: ${AI_NS}
+spec:
+  secretName: ai-splunk-server-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    # Splunk Enterprise server TLS requires an RSA private key.
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  issuerRef:
+    name: ai-splunk-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  # splunkd serves the management endpoint while KV Store also uses this
+  # material as a TLS client, so the leaf needs both server and client EKUs.
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+  dnsNames:
+    - ${svc}
+    - ${svc}.${AI_NS}
+    - ${svc}.${AI_NS}.svc
+    - ${svc}.${AI_NS}.svc.cluster.local
+    - ${headless}
+    - ${headless}.${AI_NS}
+    - ${headless}.${AI_NS}.svc
+    - ${headless}.${AI_NS}.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+YAML
+
+  log "Waiting for Splunk CA certificate to be Ready..."
+  if ! oc wait --for=condition=Ready certificate/ai-splunk-ca -n "${AI_NS}" --timeout=180s; then
+    oc describe certificate ai-splunk-ca -n "${AI_NS}" >&2 || true
+    err "ai-splunk-ca Certificate did not become Ready; refusing to create a TLS-dependent Splunk Standalone."
+  fi
+
+  log "Waiting for Splunk server certificate to be Ready..."
+  if ! oc wait --for=condition=Ready certificate/ai-splunk-server -n "${AI_NS}" --timeout=180s; then
+    oc describe certificate ai-splunk-server -n "${AI_NS}" >&2 || true
+    err "ai-splunk-server Certificate did not become Ready; refusing to create a TLS-dependent Splunk Standalone."
+  fi
+
+  # Validate every source file consumed by Splunk and the AI workloads. The
+  # Splunk pod assembles server.pem in certificate-first order before startup;
+  # AI workloads receive only ca.crt through caCertRef's key projection.
+  local secret_ready="false" attempt
+  for attempt in $(seq 1 60); do
+    if oc get secret ai-splunk-server-tls -n "${AI_NS}" -o json 2>/dev/null \
+      | jq -e '
+          .data as $data
+          | ["tls.crt", "tls.key", "ca.crt"]
+          | all(.[]; ($data[.] // "") != "")
+        ' >/dev/null; then
+      secret_ready="true"
+      break
+    fi
+    sleep 2
+  done
+  if [[ "${secret_ready}" != "true" ]]; then
+    oc describe certificate ai-splunk-server -n "${AI_NS}" >&2 || true
+    err "Secret ai-splunk-server-tls is missing tls.crt, tls.key, or ca.crt; refusing to start Splunk with incomplete TLS material."
+  fi
+
+  warn "cert-manager renews the Splunk leaf Secret automatically, but splunkd needs a supported controlled restart after renewal; automatic reload/restart is not implemented."
+  log "  ✓ Splunk server certificate provisioned (Secret: ai-splunk-server-tls)"
+}
+
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
 
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
+  provision_splunk_cert
 
   # Wait for object store endpoint to be reachable before creating credentials secret
   if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
@@ -1846,28 +1946,85 @@ install_splunk_standalone() {
   fi
   [[ -z "${minio_endpoint}" ]] && err "storage.objectStore.endpoint must be set for type=${OBJ_STORE_TYPE}"
 
-  # Configure Splunk to use the service URL as the token issuer so that JWT
-  # tokens have iss=https://splunk-splunk-standalone-standalone-service:8089,
-  # matching SAIA's SPLUNK_ISSUERS. Without this, Splunk uses the pod hostname
-  # as issuer (e.g. splunk-splunk-standalone-standalone-0) and SAIA rejects
-  # tokens with "Issuer not allowed".
-  cat <<'YAML' | oc -n "${AI_NS}" apply -f -
+  # The issuer_uri MUST byte-for-byte match splunkConfiguration.endpoint below.
+  # The server/web stanzas configure splunkd and Splunk Web to serve the
+  # hostname-correct cert mounted by the Standalone CR.
+  cat <<YAML | oc -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: splunk-defaults
 data:
   default.yml: |
+    ansible_pre_tasks:
+      - file:///mnt/defaults/prepare-server-pem.yml
     splunk:
+      # Use Splunk-Ansible's supported TLS inputs as well as the explicit conf
+      # stanzas below. The nested HEC settings override the operator Secret's
+      # deprecated plaintext default and preserve these paths in later API tasks.
+      ssl:
+        enable: true
+        cert: /mnt/splunk-certs/server.pem
+        password: ""
+        ca: /mnt/splunk-cert-source/ca.crt
+      hec:
+        enable: true
+        ssl: true
+        port: 8088
+        cert: /mnt/splunk-certs/server.pem
+        password: ""
+      http_enableSSL: 1
+      http_enableSSL_cert: /mnt/splunk-cert-source/tls.crt
+      http_enableSSL_privKey: /mnt/splunk-cert-source/tls.key
+      http_enableSSL_privKey_password: ""
       conf:
+        - key: server
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              sslConfig:
+                serverCert: /mnt/splunk-certs/server.pem
+                sslRootCAPath: /mnt/splunk-cert-source/ca.crt
+                sslPassword: ""
+        - key: web
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              settings:
+                enableSplunkWebSSL: true
+                serverCert: /mnt/splunk-cert-source/tls.crt
+                privKeyPath: /mnt/splunk-cert-source/tls.key
+                caCertPath: /mnt/splunk-cert-source/ca.crt
+                sslPassword: ""
+        - key: inputs
+          value:
+            directory: /opt/splunk/etc/apps/splunk_httpinput/local
+            content:
+              http:
+                enableSSL: 1
+                serverCert: /mnt/splunk-certs/server.pem
+                sslPassword: ""
         - key: authentication
           value:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
-                certFile: $SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
+                issuer_uri: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+                certFile: /mnt/splunk-certs/server.pem
+                sslPassword: ""
+  prepare-server-pem.yml: |
+    ---
+    - name: Assemble Splunk server PEM in certificate-first order
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          umask 077
+          cat /mnt/splunk-cert-source/tls.crt /mnt/splunk-cert-source/tls.key > /mnt/splunk-certs/server.pem.tmp
+          chmod 0600 /mnt/splunk-certs/server.pem.tmp
+          mv -f /mnt/splunk-certs/server.pem.tmp /mnt/splunk-certs/server.pem
+        executable: /bin/sh
+      changed_when: false
+      no_log: true
 YAML
 
   oc apply --server-side --force-conflicts -f - <<YAML
@@ -1895,6 +2052,21 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-cert-source
+      secret:
+        secretName: ai-splunk-server-tls
+        defaultMode: 0440
+        items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+          - key: ca.crt
+            path: ca.crt
+    - name: splunk-certs
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Mi
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appSources:
@@ -1948,10 +2120,19 @@ ${svc_template_yaml}${storage_yaml}
     nodeSelector:
       splunk.ai/ai-tier-node: "true"
   splunkConfiguration:
-    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    # Management/JWKS endpoint; this exact URL is also oauth2_settings.issuer_uri.
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    # HEC ingestion is a distinct TLS listener.
+    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_ns_secret}
       namespace: ${AI_NS}
+    # The operator projects only this public CA key into AI workloads; it does
+    # not mount tls.key from the leaf Secret.
+    caCertRef:
+      name: ai-splunk-server-tls
+      namespace: ${AI_NS}
+      key: ca.crt
 YAML
 }
 

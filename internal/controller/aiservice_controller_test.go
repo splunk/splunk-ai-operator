@@ -414,4 +414,44 @@ var _ = Describe("AIService Controller", func() {
 			Expect(err).ToNot(BeNil())
 		})
 	})
+
+	Context("findAIServicesForCACertSecret (AIP-4614 Tier 1 item 4)", func() {
+		It("should map a Secret to AIServices in the same namespace that reference it via caCertRef", func() {
+			referencing := &aiv1.AIService{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc-with-ca-ref", Namespace: namespace},
+				Spec: aiv1.AIServiceSpec{
+					SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+						CACertRef: &aiv1.CABundleRef{Name: "splunk-ca-bundle"},
+					},
+				},
+			}
+			Expect(fakeClient.Create(ctx, referencing)).To(Succeed())
+
+			nonReferencing := &aiv1.AIService{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc-without-ca-ref", Namespace: namespace},
+				Spec:       aiv1.AIServiceSpec{},
+			}
+			Expect(fakeClient.Create(ctx, nonReferencing)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "splunk-ca-bundle", Namespace: namespace},
+			}
+
+			requests := reconciler.findAIServicesForCACertSecret(ctx, secret)
+
+			Expect(requests).To(HaveLen(1))
+			Expect(requests[0].Name).To(Equal("svc-with-ca-ref"))
+			Expect(requests[0].Namespace).To(Equal(namespace))
+		})
+
+		It("should return no requests when no AIService references the Secret", func() {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "unreferenced-secret", Namespace: namespace},
+			}
+
+			requests := reconciler.findAIServicesForCACertSecret(ctx, secret)
+
+			Expect(requests).To(BeEmpty())
+		})
+	})
 })

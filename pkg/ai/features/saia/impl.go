@@ -512,7 +512,10 @@ func hasOwnerReference(obj metav1.Object, owner metav1.Object) bool {
 	return false
 }
 
-// reconcileCertificate manages cert-manager Certificate for mTLS.
+// reconcileCertificate manages the cert-manager server TLS Certificate for the
+// legacy mtls API field. nginx does not authenticate client certificates.
+// Kubernetes Event reason identifiers retain their MTLS prefix for backward
+// compatibility; their messages describe the current server-TLS behavior.
 func (r *SaiaReconciler) reconcileCertificate(
 	ctx context.Context,
 	ai *aiv1.AIService,
@@ -528,7 +531,7 @@ func (r *SaiaReconciler) reconcileCertificate(
 	if err := r.Get(ctx, certKey, existingCert); err != nil {
 		if apierrors.IsNotFound(err) {
 			certExists = false
-			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating mTLS certificate")
+			r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreating", "Creating server TLS certificate")
 		}
 	}
 
@@ -548,7 +551,7 @@ func (r *SaiaReconciler) reconcileCertificate(
 		},
 	}
 	if err := controllerutil.SetControllerReference(ai, cert, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on Certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on server TLS Certificate")
 		return fmt.Errorf("ownerref on Certificate: %w", err)
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
@@ -564,12 +567,12 @@ func (r *SaiaReconciler) reconcileCertificate(
 		}
 		return nil
 	}); err != nil {
-		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update Certificate: %v", err)
+		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update server TLS Certificate: %v", err)
 		return fmt.Errorf("create/update Certificate: %w", err)
 	}
 
 	if !certExists {
-		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "mTLS Certificate created successfully")
+		r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateCreated", "Server TLS Certificate created successfully")
 	}
 
 	// Wait until Certificate is Ready
@@ -582,12 +585,12 @@ func (r *SaiaReconciler) reconcileCertificate(
 	}
 
 	if !certReady {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue certificate")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateNotReady", "Waiting for cert-manager to issue the server TLS certificate")
 		return fmt.Errorf("waiting for Certificate %q to become Ready", cert.Name)
 	}
 
 	// Emit success event when certificate becomes ready
-	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "mTLS certificate issued successfully")
+	r.Recorder.Event(ai, corev1.EventTypeNormal, "MTLSCertificateReady", "Server TLS certificate issued successfully")
 	return nil
 }
 
@@ -910,6 +913,123 @@ func buildSAIATLSEnv(ai *aiv1.AIService, env []corev1.EnvVar, volumes []corev1.V
 	return env, volumes, mounts, ports
 }
 
+// systemCABundlePath is the system trust store location in SAIA/SLIM's
+// Debian-based base images.
+const systemCABundlePath = "/etc/ssl/certs/ca-certificates.crt"
+
+// splunkCACombinedMountPath/File hold the merged (system + private CA) bundle
+// produced by the splunk-ca-merge initContainer (AIP-4614 Tier 1 item 5).
+const splunkCACombinedMountPath = "/etc/splunk-ca-combined"
+const splunkCACombinedFile = "ca-certificates.crt"
+
+// buildSAIACABundleEnv appends the Splunk CA-trust volume/mount/env/initContainer
+// when SplunkConfiguration.CACertRef is set, so SAIA's outbound HTTPS calls to
+// Splunk (JWKS fetch, token validation) can verify Splunk's TLS cert chain
+// (AIP-4614 Part C). Mirrors buildSAIATLSEnv's volume/mount/env pattern.
+//
+// SSL_CERT_FILE/REQUESTS_CA_BUNDLE replace rather than augment the process's
+// default trust store, so pointing them at the private CA alone would drop
+// trust for all public CAs SAIA's other outbound HTTPS calls rely on. A
+// splunk-ca-merge initContainer (running the main container's own image, which
+// already has the system bundle) concatenates the system bundle with the
+// private CA onto a shared emptyDir, and the env vars point at that combined
+// file instead (AIP-4614 Tier 1 item 5).
+//
+// The Secret must live in the same namespace as the AIService — Kubernetes
+// Secret volumes cannot reference a different namespace, so CACertRef.Namespace
+// is not used here (it exists on the CRD field for documentation/validation
+// symmetry with SecretRef, but callers are expected to keep it same-namespace).
+func buildSAIACABundleEnv(ai *aiv1.AIService, image string, env []corev1.EnvVar, volumes []corev1.Volume, mounts []corev1.VolumeMount, initContainers []corev1.Container) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount, []corev1.Container) {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return env, volumes, mounts, initContainers
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	privateCAPath := "/etc/splunk-ca/" + key
+	combinedPath := splunkCACombinedMountPath + "/" + splunkCACombinedFile
+
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "splunk-ca",
+			VolumeSource: corev1.VolumeSource{
+				// Project only the CA key, not the whole Secret — CACertRef may
+				// point at a leaf-cert Secret (e.g. the installer's
+				// ai-splunk-server-tls) that also holds tls.key, which must
+				// never land in this container's filesystem.
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: ref.Name,
+					Items:      []corev1.KeyToPath{{Key: key, Path: key}},
+				},
+			},
+		},
+		corev1.Volume{
+			Name:         "splunk-ca-combined",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	)
+	mounts = append(mounts, corev1.VolumeMount{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath, ReadOnly: true})
+	env = append(env,
+		corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: combinedPath},
+		corev1.EnvVar{Name: "SSL_CERT_FILE", Value: combinedPath},
+	)
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "splunk-ca-merge",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		// Paths derived from ref.Key (a CRD-settable field) are passed as env
+		// vars rather than interpolated into the script string, so a key value
+		// containing shell metacharacters can't be re-parsed as command syntax.
+		Env: []corev1.EnvVar{
+			{Name: "SYSTEM_CA_PATH", Value: systemCABundlePath},
+			{Name: "PRIVATE_CA_PATH", Value: privateCAPath},
+			{Name: "COMBINED_PATH", Value: combinedPath},
+		},
+		Command: []string{"/bin/sh", "-c"},
+		Args:    []string{caMergeScript},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "splunk-ca", MountPath: "/etc/splunk-ca", ReadOnly: true},
+			{Name: "splunk-ca-combined", MountPath: splunkCACombinedMountPath},
+		},
+	})
+	return env, volumes, mounts, initContainers
+}
+
+// caMergeScript is a static shell script (no string interpolation of
+// CRD-controlled values) — the paths it operates on arrive via env vars
+// set on the initContainer, never substituted into the script text itself.
+const caMergeScript = `if [ -f "$SYSTEM_CA_PATH" ]; then cat "$SYSTEM_CA_PATH" "$PRIVATE_CA_PATH" > "$COMBINED_PATH"; else cp "$PRIVATE_CA_PATH" "$COMBINED_PATH"; fi`
+
+// splunkCACertChecksum hashes the referenced CA Secret's actual data so pods
+// roll when the CA bundle's content changes in place (e.g. the customer
+// rotates their external Splunk CA and updates the Secret referenced by
+// CACertRef without renaming it) — not just when the reference itself
+// changes. Returns "" (no annotation) when CACertRef is unset or the Secret
+// can't be read yet (e.g. not created before the first reconcile); the
+// reconcile is not blocked on this — a later reconcile will pick it up once
+// the Secret exists.
+func splunkCACertChecksum(ctx context.Context, c client.Client, ai *aiv1.AIService) string {
+	ref := ai.Spec.SplunkConfiguration.CACertRef
+	if ref == nil || ref.Name == "" {
+		return ""
+	}
+	key := ref.Key
+	if key == "" {
+		key = "ca.crt"
+	}
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ai.Namespace}, secret); err != nil {
+		return ""
+	}
+	caData, exists := secret.Data[key]
+	if !exists {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(caData))
+}
+
 // saiaEnvFrom returns the EnvFromSource for the SAIA ConfigMap.
 func saiaEnvFrom(ai *aiv1.AIService) []corev1.EnvFromSource {
 	return []corev1.EnvFromSource{
@@ -994,7 +1114,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 
 	env := buildSAIABaseEnv(ai)
 
-	// mTLS handling (dynamic)
+	// Server TLS handling for the legacy mtls field (dynamic).
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		volumes = append(volumes, corev1.Volume{
 			Name: "tls",
@@ -1011,6 +1131,11 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	} else {
 		env = append(env, corev1.EnvVar{Name: "TLS_DISABLED", Value: "true"})
 	}
+
+	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
+	saiaImage := os.Getenv("RELATED_IMAGE_SAIA_API")
+	var initContainers []corev1.Container
+	env, volumes, mounts, initContainers = buildSAIACABundleEnv(ai, saiaImage, env, volumes, mounts, initContainers)
 
 	// Import ALL static keys from the SAIA ConfigMap as env vars.
 	envFrom := []corev1.EnvFromSource{
@@ -1056,6 +1181,13 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
+	// Set the operator-owned CA rollout hash after propagating user annotations so a
+	// stale or malicious AIService annotation cannot suppress CA rotation.
+	// Absent (not just empty) when CACertRef is unset, so pods with no CA-trust
+	// config never carry this annotation.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
+	}
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
@@ -1083,6 +1215,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     initContainers,
 				Containers: []corev1.Container{{
 					Name:            ai.Name,
 					Image:           os.Getenv("RELATED_IMAGE_SAIA_API"),
@@ -1147,10 +1280,22 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 	env = append(env, buildV2ExtraEnv(ai)...)
 	env = append(env, corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"})
 	env, volumes, mounts, ports = buildSAIATLSEnv(ai, env, volumes, mounts, ports)
+	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
+	var v2InitContainers []corev1.Container
+	env, volumes, mounts, v2InitContainers = buildSAIACABundleEnv(ai, ai.Spec.V2.Image, env, volumes, mounts, v2InitContainers)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-api"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	// SPLUNK_ISSUERS comes from an envFrom ConfigMap, so changing that ConfigMap
+	// alone does not restart an existing pod. Hash the derived value into the
+	// template just as the v1 and SLIM deployments do.
+	annotations["splunk-ai-operator/splunk-issuers-hash"] = fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
+	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
+	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1197,6 +1342,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     v2InitContainers,
 				Containers: []corev1.Container{{
 					Name:            "saia-v2-api",
 					Image:           ai.Spec.V2.Image,
@@ -1274,10 +1420,19 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 		corev1.EnvVar{Name: "WORKER_HEARTBEAT_PATH", Value: "/tmp/ingestion_worker_heartbeat"},
 	)
 	env, volumes, mounts, _ = buildSAIATLSEnv(ai, env, volumes, mounts, nil)
+	// Splunk CA trust (AIP-4614 Part C) — no-op unless SplunkConfiguration.CACertRef is set.
+	var workerInitContainers []corev1.Container
+	env, volumes, mounts, workerInitContainers = buildSAIACABundleEnv(ai, ai.Spec.V2.Image, env, volumes, mounts, workerInitContainers)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-worker"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	annotations["splunk-ai-operator/splunk-issuers-hash"] = fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
+	// Rolls the pod on CA rotation (AIP-4614 Part G.2) — same mechanism as
+	// splunk-issuers-hash, but keyed on the CA Secret's actual content.
+	if caChecksum := splunkCACertChecksum(ctx, r.Client, ai); caChecksum != "" {
+		annotations["splunk-ai-operator/splunk-ca-hash"] = caChecksum
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1324,6 +1479,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ai.Spec.ServiceAccountName,
+				InitContainers:     workerInitContainers,
 				Containers: []corev1.Container{{
 					Name:            "saia-v2-worker",
 					Image:           ai.Spec.V2.Image,
@@ -1376,41 +1532,11 @@ func (r *SaiaReconciler) reconcileNginxConfigMap(
 	v1ServiceName := ai.Name + "-saia-v1-service"
 	v2ServiceName := ai.Name + "-saia-v2-service"
 
-	nginxConf := fmt.Sprintf(`worker_processes auto;
-error_log /dev/stderr warn;
-pid /tmp/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    log_format routing '$remote_addr - [$time_local] "$request" '
-                       'status=$status upstream=$upstream_addr '
-                       'rt=$request_time uct=$upstream_connect_time urt=$upstream_response_time';
-
-    access_log /dev/stdout routing;
-
-    upstream saia_v1 {
-        server %s:8080;
-    }
-
-    upstream saia_v2 {
-        server %s:8000;
-    }
-
-    # Reflect Access-Control-Request-Headers back on preflight. If the browser
-    # didn't send any (rare), fall back to a broad default. Safer than a
-    # hardcoded allowlist because spl-copilot (and future clients) may add
-    # custom headers like x-requested-with, x-csrf-token, x-splunk-*, etc.
-    map $http_access_control_request_headers $cors_allow_headers {
-        default $http_access_control_request_headers;
-        ""      "authorization, content-type, x-ec-token, x-es-tenant-bearer, x-stack-url, x-stack-url-legacy, splunk-client, x-conversation-key, x-request-id, x-admin-preferences-filename, x-requested-with";
-    }
-
-    server {
-        listen 8080;
-
+	// Shared between the plain-HTTP (8080) and, when the legacy mtls field is
+	// enabled with
+	// operator-managed termination, the TLS (8443) server blocks so routing
+	// and CORS behavior can never drift between the two listeners.
+	locationsConf := `
         # Nginx health/status endpoints MUST be declared before the v2 regex
         # match; otherwise nginx's longest-prefix-before-regex rule would let
         # exact matches win only if explicitly marked with "^~" or "=", and we
@@ -1497,9 +1623,65 @@ http {
             proxy_send_timeout 300s;
             proxy_buffering off;
         }
-    }
+`
+
+	// Terminate client-facing, server-authentication TLS at nginx itself when
+	// the legacy mtls field is enabled with
+	// operator-managed termination, using the same cert-manager Secret
+	// (ai.Spec.MTLS.SecretName) mounted into the nginx pod by
+	// reconcileNginxDeployment. Without this, the public Service's
+	// https:8443 port has no listening container behind it (see
+	// reconcileSAIAService, which adds that ServicePort under the same
+	// condition).
+	tlsServerBlock := ""
+	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
+		tlsServerBlock = fmt.Sprintf(`
+    server {
+        listen 8443 ssl;
+
+        ssl_certificate     /etc/nginx-tls/tls.crt;
+        ssl_certificate_key /etc/nginx-tls/tls.key;
+%s    }
+`, locationsConf)
+	}
+
+	nginxConf := fmt.Sprintf(`worker_processes auto;
+error_log /dev/stderr warn;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
 }
-`, v1ServiceName, v2ServiceName)
+
+http {
+    log_format routing '$remote_addr - [$time_local] "$request" '
+                       'status=$status upstream=$upstream_addr '
+                       'rt=$request_time uct=$upstream_connect_time urt=$upstream_response_time';
+
+    access_log /dev/stdout routing;
+
+    upstream saia_v1 {
+        server %s:8080;
+    }
+
+    upstream saia_v2 {
+        server %s:8000;
+    }
+
+    # Reflect Access-Control-Request-Headers back on preflight. If the browser
+    # didn't send any (rare), fall back to a broad default. Safer than a
+    # hardcoded allowlist because spl-copilot (and future clients) may add
+    # custom headers like x-requested-with, x-csrf-token, x-splunk-*, etc.
+    map $http_access_control_request_headers $cors_allow_headers {
+        default $http_access_control_request_headers;
+        ""      "authorization, content-type, x-ec-token, x-es-tenant-bearer, x-stack-url, x-stack-url-legacy, splunk-client, x-conversation-key, x-request-id, x-admin-preferences-filename, x-requested-with";
+    }
+
+    server {
+        listen 8080;
+%s    }
+%s}
+`, v1ServiceName, v2ServiceName, locationsConf, tlsServerBlock)
 
 	cmName := ai.Name + "-saia-nginx-config"
 	cm := &corev1.ConfigMap{
@@ -1551,6 +1733,35 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 		nginxImage = "nginx:1.27-alpine"
 	}
 
+	ports := []corev1.ContainerPort{
+		{Name: "http", ContainerPort: 8080},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{Name: "nginx-config", MountPath: "/etc/nginx/nginx.conf", SubPath: "nginx.conf"},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "nginx-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: ai.Name + "-saia-nginx-config",
+					},
+				},
+			},
+		},
+	}
+	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
+		ports = append(ports, corev1.ContainerPort{Name: "https", ContainerPort: 8443})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "nginx-tls", MountPath: "/etc/nginx-tls", ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{
+			Name: "nginx-tls",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: ai.Spec.MTLS.SecretName},
+			},
+		})
+	}
+
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
 		deployment.ObjectMeta.Annotations = annotations
@@ -1572,12 +1783,8 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 					Name:            "nginx",
 					Image:           nginxImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
-					Ports: []corev1.ContainerPort{
-						{Name: "http", ContainerPort: 8080},
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "nginx-config", MountPath: "/etc/nginx/nginx.conf", SubPath: "nginx.conf"},
-					},
+					Ports:           ports,
+					VolumeMounts:    volumeMounts,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("100m"),
@@ -1603,18 +1810,7 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 						FailureThreshold: 3,
 					},
 				}},
-				Volumes: []corev1.Volume{
-					{
-						Name: "nginx-config",
-						VolumeSource: corev1.VolumeSource{
-							ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: ai.Name + "-saia-nginx-config",
-								},
-							},
-						},
-					},
-				},
+				Volumes:          volumes,
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}

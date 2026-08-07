@@ -361,6 +361,10 @@ Update relevant documentation:
 - CRD fields must have `+kubebuilder:` markers
 - Include validation rules
 - Add examples in CRD comments
+- After an API change, run `make sync-crd-artifacts` so the canonical CRDs,
+  Helm CRDs, and the CRD documents embedded in the cluster-setup bundle remain
+  synchronized. Run `make check-crd-artifacts` to verify the distribution
+  copies without changing them.
 
 ## Community
 

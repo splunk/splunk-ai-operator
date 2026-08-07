@@ -29,6 +29,7 @@ load_config() {
     CLUSTER_NAME="$(yq eval '.cluster.name' "$cfg")"
     REGION="$(yq eval '.cluster.region' "$cfg")"
     K8S_VERSION="$(yq eval '.cluster.k8sVersion' "$cfg")"
+    CLUSTER_DOMAIN="$(yq eval '.cluster.clusterDomain // "cluster.local"' "$cfg")"
     USE_EXISTING_CLUSTER="$(yq eval '.cluster.useExisting // false' "$cfg")"
 
     # Node groups
@@ -166,6 +167,7 @@ load_config() {
     CLUSTER_NAME="$(grep 'name:' "$cfg" | head -1 | sed 's/.*name: *"\(.*\)".*/\1/')"
     REGION="$(grep 'region:' "$cfg" | head -1 | sed 's/.*region: *"\(.*\)".*/\1/')"
     K8S_VERSION="$(grep 'k8sVersion:' "$cfg" | sed 's/.*k8sVersion: *"\(.*\)".*/\1/')"
+    CLUSTER_DOMAIN="cluster.local"
     USE_EXISTING_CLUSTER="false"
     PRESERVE_VPC_ON_DELETE="false"
     S3_BUCKET="$(grep 's3Bucket:' "$cfg" | sed 's/.*s3Bucket: *"\(.*\)".*/\1/')"
@@ -232,6 +234,11 @@ load_config() {
   fi
 
   # Derived values
+  [[ -z "${CLUSTER_DOMAIN}" || "${CLUSTER_DOMAIN}" == "null" ]] && CLUSTER_DOMAIN="cluster.local"
+  SPLUNK_SERVICE_NAME="splunk-${AI_STANDALONE_NAME}-standalone-service"
+  SPLUNK_SERVICE_FQDN="${SPLUNK_SERVICE_NAME}.${AI_NS}.svc.${CLUSTER_DOMAIN}"
+  SPLUNK_MANAGEMENT_ENDPOINT="https://${SPLUNK_SERVICE_FQDN}:8089"
+  SPLUNK_HEC_ENDPOINT="https://${SPLUNK_SERVICE_FQDN}:8088"
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
   S3_PREFIXES=("artifacts/" "apps/" "tasks/")
   AI_BUCKET_POLICY_NAME="S3Access-${CLUSTER_NAME}-ai-platform"
@@ -1455,12 +1462,19 @@ install_kube_prometheus() {
 }
 
 install_cert_manager() {
-  log "Installing cert-manager..."
+  # Keep this in lock-step with the chart dependency. Pinning the chart avoids
+  # silently changing the installed API/controller contract through a mutable
+  # latest chart.
+  local cert_manager_chart_version="v1.18.0"
+  log "Installing cert-manager ${cert_manager_chart_version}..."
   helm repo add jetstack https://charts.jetstack.io; helm repo update
   helm_retry 5 upgrade --install cert-manager jetstack/cert-manager \
-    --namespace cert-manager --create-namespace --set installCRDs=true \
+    --version "${cert_manager_chart_version}" \
+    --namespace cert-manager --create-namespace --set crds.enabled=true \
     --wait --timeout 15m
-  check_ready cert-manager "app.kubernetes.io/instance=cert-manager,app.kubernetes.io/component=controller"
+  wait_rollout cert-manager deploy cert-manager
+  wait_rollout cert-manager deploy cert-manager-webhook
+  wait_rollout cert-manager deploy cert-manager-cainjector
 }
 
 # ---------- AWS Load Balancer Controller (LBC) ----------
@@ -2042,6 +2056,123 @@ resolve_aws_creds_for_secret() {
   err "AWS credentials not set. Either set env vars or use AWS_PROFILE with a logged-in profile."
 }
 
+# Issue the hostname-valid certificate consumed by splunkd, Splunk Web and the
+# OAuth signer. The CA is deliberately long-lived and keeps its key when
+# renewed; short-lived leaf renewals rotate their key. cert-manager updates the
+# Secret automatically, but Splunk does not hot-reload these files. A supported,
+# controlled Standalone restart is still required after renewal; this installer
+# does not attempt to automate that restart.
+provision_splunk_cert() {
+  log "Provisioning Splunk server TLS certificate for ${SPLUNK_SERVICE_FQDN}..."
+  ensure_namespace "${AI_NS}"
+  wait_for_crd certificates.cert-manager.io 300
+  wait_for_crd issuers.cert-manager.io 300
+
+  local headless="splunk-${AI_STANDALONE_NAME}-standalone-headless"
+
+  cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-ca
+spec:
+  isCA: true
+  commonName: ai-splunk-ca
+  secretName: ai-splunk-ca-tls
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: ai-splunk-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ai-splunk-ca-issuer
+spec:
+  ca:
+    secretName: ai-splunk-ca-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ai-splunk-server
+spec:
+  secretName: ai-splunk-server-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    # Splunk Enterprise server TLS requires an RSA private key.
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  issuerRef:
+    name: ai-splunk-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  # Splunk's management listener and KV Store use this same certificate.
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+  dnsNames:
+    - ${SPLUNK_SERVICE_NAME}
+    - ${SPLUNK_SERVICE_NAME}.${AI_NS}
+    - ${SPLUNK_SERVICE_NAME}.${AI_NS}.svc
+    - ${SPLUNK_SERVICE_FQDN}
+    - ${headless}
+    - ${headless}.${AI_NS}
+    - ${headless}.${AI_NS}.svc
+    - ${headless}.${AI_NS}.svc.${CLUSTER_DOMAIN}
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+YAML
+
+  log "Waiting for the Splunk server Certificate to become Ready..."
+  if ! kubectl -n "${AI_NS}" wait --for=condition=Ready certificate/ai-splunk-server --timeout=180s; then
+    kubectl -n "${AI_NS}" describe certificate/ai-splunk-ca >&2 || true
+    kubectl -n "${AI_NS}" describe certificate/ai-splunk-server >&2 || true
+    err "ai-splunk-server Certificate did not become Ready; refusing to start a TLS-dependent Splunk Standalone"
+  fi
+
+  # A Ready condition alone is not enough: verify every source file used by
+  # the Splunk-Ansible PEM assembly pre-task is present and non-empty.
+  local secret_ready="false" _attempt
+  for _attempt in $(seq 1 60); do
+    if kubectl -n "${AI_NS}" get secret/ai-splunk-server-tls -o json 2>/dev/null \
+      | jq -e '
+          .data as $data
+          | ["tls.crt", "tls.key", "ca.crt"]
+          | all(.[]; ($data[.] // "") != "")
+        ' >/dev/null; then
+      secret_ready="true"
+      break
+    fi
+    sleep 2
+  done
+  if [[ "${secret_ready}" != "true" ]]; then
+    kubectl -n "${AI_NS}" describe certificate/ai-splunk-server >&2 || true
+    err "Secret ai-splunk-server-tls is missing tls.crt, tls.key, or ca.crt; refusing to start Splunk"
+  fi
+
+  log "Splunk server TLS Secret is complete: ${AI_NS}/ai-splunk-server-tls"
+  warn "Certificate renewal updates the Secret, but splunkd does not hot-reload it; perform a supported controlled Standalone restart after renewal"
+}
+
 install_splunk_standalone() {
   log "Creating/ensuring Splunk Standalone (${AI_STANDALONE_NAME}) in ${AI_NS}"
   ensure_namespace "${AI_NS}"
@@ -2077,23 +2208,84 @@ install_splunk_standalone() {
     fi
   fi
 
-  cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
+  # issuer_uri is the JWT "iss" claim and must be byte-identical to the
+  # AIPlatform management/JWKS endpoint. The same hostname is on the leaf SAN.
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: splunk-defaults
 data:
   default.yml: |
+    ansible_pre_tasks:
+      - file:///mnt/defaults/prepare-server-pem.yml
     splunk:
+      # Use Splunk-Ansible's supported TLS inputs as well as the explicit conf
+      # stanzas below. The nested HEC settings override the operator Secret's
+      # deprecated plaintext default and preserve these paths in later API tasks.
+      ssl:
+        enable: true
+        cert: /mnt/splunk-certs/server.pem
+        password: ""
+        ca: /mnt/splunk-cert-source/ca.crt
+      hec:
+        enable: true
+        ssl: true
+        port: 8088
+        cert: /mnt/splunk-certs/server.pem
+        password: ""
+      http_enableSSL: 1
+      http_enableSSL_cert: /mnt/splunk-cert-source/tls.crt
+      http_enableSSL_privKey: /mnt/splunk-cert-source/tls.key
+      http_enableSSL_privKey_password: ""
       conf:
+        - key: server
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              sslConfig:
+                serverCert: /mnt/splunk-certs/server.pem
+                sslRootCAPath: /mnt/splunk-cert-source/ca.crt
+                sslPassword: ""
+        - key: web
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              settings:
+                enableSplunkWebSSL: true
+                serverCert: /mnt/splunk-cert-source/tls.crt
+                privKeyPath: /mnt/splunk-cert-source/tls.key
+                caCertPath: /mnt/splunk-cert-source/ca.crt
+                sslPassword: ""
+        - key: inputs
+          value:
+            directory: /opt/splunk/etc/apps/splunk_httpinput/local
+            content:
+              http:
+                enableSSL: 1
+                serverCert: /mnt/splunk-certs/server.pem
+                sslPassword: ""
         - key: authentication
           value:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
-                certFile: $SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
+                issuer_uri: ${SPLUNK_MANAGEMENT_ENDPOINT}
+                certFile: /mnt/splunk-certs/server.pem
+                sslPassword: ""
+  prepare-server-pem.yml: |
+    ---
+    - name: Assemble Splunk server PEM in certificate-first order
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          umask 077
+          cat /mnt/splunk-cert-source/tls.crt /mnt/splunk-cert-source/tls.key > /mnt/splunk-certs/server.pem.tmp
+          chmod 0600 /mnt/splunk-certs/server.pem.tmp
+          mv -f /mnt/splunk-certs/server.pem.tmp /mnt/splunk-certs/server.pem
+        executable: /bin/sh
+      changed_when: false
+      no_log: true
 YAML
 
   # Standalone app repo: external S3-compatible when objectStore.type is s3compat/minio/seaweedfs, else S3
@@ -2115,6 +2307,21 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-cert-source
+      secret:
+        secretName: ai-splunk-server-tls
+        defaultMode: 0440
+        items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+          - key: ca.crt
+            path: ca.crt
+    - name: splunk-certs
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Mi
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appInstallPeriodSeconds: 90
@@ -2152,6 +2359,21 @@ spec:
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: splunk-cert-source
+      secret:
+        secretName: ai-splunk-server-tls
+        defaultMode: 0440
+        items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+          - key: ca.crt
+            path: ca.crt
+    - name: splunk-certs
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Mi
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appInstallPeriodSeconds: 90
@@ -2807,10 +3029,17 @@ ${svc_template_yaml}
       - hosts: [ ${INGRESS_HOST} ]
         secretName: ${INGRESS_TLS_SECRET}
   splunkConfiguration:
-    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    endpoint: ${SPLUNK_MANAGEMENT_ENDPOINT}
+    hecEndpoint: ${SPLUNK_HEC_ENDPOINT}
     secretRef:
       name: ${secret_name}
       namespace: ${AI_NS}
+    # The operator projects only this key into SAIA/SLIM; tls.key from the leaf
+    # Secret is intentionally not exposed to AI workloads.
+    caCertRef:
+      name: ai-splunk-server-tls
+      namespace: ${AI_NS}
+      key: ca.crt
   certificateRef: ${CERT_ISSUER}
 YAML
 
@@ -3644,6 +3873,7 @@ install_ai_platform_stack() {
   add_ecr_permissions_to_role "IRSA-${CLUSTER_NAME}-${RAY_WORKER_SA}"
   add_ecr_permissions_to_role "IRSA-${CLUSTER_NAME}-${SAIA_SERVICE_SA}"
 
+  provision_splunk_cert
   install_splunk_standalone
 
   local splunk_secret

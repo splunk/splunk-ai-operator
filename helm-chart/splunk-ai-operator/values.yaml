@@ -4,7 +4,7 @@
 # These operators are required by the Splunk AI Operator and are installed
 # automatically as dependencies. Set to false if already installed in your cluster.
 
-# cert-manager - Required for webhook certificates and mTLS
+# cert-manager - Required for webhook and operator-managed server TLS certificates
 cert-manager:
   enabled: true
   crds:

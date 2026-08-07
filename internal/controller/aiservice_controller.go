@@ -205,7 +205,19 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&aiv1.AIService{}).
+		// Predicates scoped to the primary resource via For()'s own
+		// WithPredicates, NOT WithEventFilter — WithEventFilter populates
+		// globalPredicates, which controller-runtime ANDs onto every Watches()/
+		// Owns() too (see doWatch() in controller-runtime's builder package). That
+		// would silently defeat the CACertRef Secret watch below: Secrets never
+		// bump metadata.generation, and a pure .data rotation touches neither
+		// annotations nor labels, so a global filter requiring one of those AND
+		// SecretChangedPredicate never fires (AIP-4614 Part D — found in review).
+		For(&aiv1.AIService{}, builder.WithPredicates(predicate.Or(
+			common.GenerationChangedPredicate(),
+			common.AnnotationChangedPredicate(),
+			common.LabelChangedPredicate(),
+		))).
 		Named("aiservice").
 		// Owned resources with specific predicates to avoid reconciliation loops
 		Owns(&corev1.ServiceAccount{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
@@ -225,12 +237,14 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				common.AnnotationChangedPredicate(),
 			)),
 		).
-		// Add predicates to filter events and avoid unnecessary reconciliations
-		WithEventFilter(predicate.Or(
-			common.GenerationChangedPredicate(),
-			common.AnnotationChangedPredicate(),
-			common.LabelChangedPredicate(),
-		)).
+		// Watch CACertRef Secrets (not owned by AIService - customer/installer
+		// pre-creates them) so rotating the CA bundle's content in place
+		// triggers a reconcile (AIP-4614 Tier 1 item 4).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForCACertSecret),
+			builder.WithPredicates(common.SecretChangedPredicate()),
+		).
 		// Configure concurrency control
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,
@@ -320,6 +334,33 @@ func (r *AIServiceReconciler) findAIServicesForPlatform(ctx context.Context, pla
 		}
 	}
 
+	return requests
+}
+
+// findAIServicesForCACertSecret maps a Secret to the AIServices in the same
+// namespace whose splunkConfiguration.caCertRef references it by name, so
+// rotating the CA bundle's content (without renaming the Secret) triggers a
+// reconcile instead of only being picked up on some unrelated trigger.
+func (r *AIServiceReconciler) findAIServicesForCACertSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+
+	var services aiv1.AIServiceList
+	if err := r.List(ctx, &services, client.InNamespace(secret.GetNamespace())); err != nil {
+		log.Error(err, "failed to list AIServices for CACertRef Secret", "secret", secret.GetName())
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range services.Items {
+		svc := &services.Items[i]
+		ref := svc.Spec.SplunkConfiguration.CACertRef
+		if ref == nil || ref.Name != secret.GetName() {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKeyFromObject(svc),
+		})
+	}
 	return requests
 }
 

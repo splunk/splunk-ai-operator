@@ -142,7 +142,7 @@ e2e-ai:
 
 # Comprehensive E2E tests for all AIPlatform features
 .PHONY: e2e-comprehensive
-e2e-comprehensive: ## Run comprehensive E2E tests (storage, ingress, MTLS, status, events)
+e2e-comprehensive: ## Run comprehensive E2E tests (storage, ingress, server TLS, status, events)
 	IMG=$(IMG) go test ./test/e2e/specs -run "AIPlatform Comprehensive" -v -ginkgo.v -ginkgo.progress
 
 # Run specific feature tests
@@ -155,8 +155,8 @@ e2e-ingress: ## Run ingress configuration E2E tests
 	IMG=$(IMG) go test ./test/e2e/specs -run "Ingress Configuration" -v -ginkgo.v -ginkgo.progress
 
 .PHONY: e2e-mtls
-e2e-mtls: ## Run MTLS configuration E2E tests
-	IMG=$(IMG) go test ./test/e2e/specs -run "MTLS Configuration" -v -ginkgo.v -ginkgo.progress
+e2e-mtls: ## Run server TLS configuration E2E tests (legacy target name)
+	IMG=$(IMG) go test ./test/e2e/specs -run "Server TLS Configuration" -v -ginkgo.v -ginkgo.progress
 
 .PHONY: e2e-status
 e2e-status: ## Run status condition E2E tests
@@ -282,8 +282,26 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: generate-artifacts
-generate-artifacts: manifests kustomize ## Generate artifacts for the K8s cluster specified in ~/.kube/config.
+generate-artifacts: sync-crd-artifacts kustomize ## Generate artifacts for the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/default > artifacts.yaml
+
+.PHONY: sync-crd-artifacts
+sync-crd-artifacts: manifests ## Sync canonical CRDs to Helm and the cluster-setup bundle without changing its image overrides.
+	@echo "Syncing generated CRDs to distribution copies..."
+	@cp config/crd/bases/*.yaml helm-chart/splunk-ai-operator/crds/
+	@bash hack/sync-crd-artifacts.sh sync
+
+.PHONY: check-crd-artifacts
+check-crd-artifacts: ## Verify that all distributed CRD copies match config/crd/bases/.
+	@for crd in config/crd/bases/*.yaml; do \
+		name=$$(basename "$$crd"); \
+		if ! cmp -s "$$crd" "helm-chart/splunk-ai-operator/crds/$$name"; then \
+			echo "helm-chart/splunk-ai-operator/crds/$$name is stale; run 'make sync-crd-artifacts'." >&2; \
+			diff -u "helm-chart/splunk-ai-operator/crds/$$name" "$$crd" || true; \
+			exit 1; \
+		fi; \
+	done
+	@bash hack/sync-crd-artifacts.sh check
 
 ##@ Dependencies
 
@@ -442,10 +460,9 @@ HELM_CHART_PLATFORM_DIR = helm-chart/splunk-ai-platform
 HELM_OUTPUT_DIR ?= dist/helm
 
 .PHONY: helm-sync
-helm-sync: manifests ## Sync CRDs and RBAC from config/ to helm charts
+helm-sync: sync-crd-artifacts kustomize ## Sync CRDs and RBAC from config/ to helm charts
 	@echo "Syncing CRDs and RBAC to Helm charts..."
-	@echo "  Copying CRDs..."
-	@cp config/crd/bases/*.yaml $(HELM_CHART_OPERATOR_DIR)/crds/
+	@echo "  CRDs copied by sync-crd-artifacts."
 	@echo "  Extracting RBAC from kustomize build..."
 	@mkdir -p dist
 	@$(KUSTOMIZE) build config/default > dist/install.yaml

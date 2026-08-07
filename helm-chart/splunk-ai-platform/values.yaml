@@ -107,7 +107,7 @@ sidecars:
   # Enables the Prometheus Operator sidecar
   prometheusOperator: true
 
-# cert-manager Certificate for mTLS
+# cert-manager issuer reference for the legacy mtls field's server TLS certificate
 certificateRef: ""
 # Internal cluster DNS suffix
 clusterDomain: "cluster.local"
@@ -144,11 +144,15 @@ splunkConfiguration: {}
 #     namespace: "default"
 #     name: "splunk-standalone-stdln-0"
 #     apiVersion: "enterprise.splunk.com/v4"
-#   # Splunk secret reference
+#   # Splunk credential Secret. Required whenever sidecars.otel is true and
+#   # Splunk telemetry is configured; the collector cannot use Vault-only credentials.
 #   secretRef:
 #     name: "splunk-secret"
 #     namespace: "default"
+#   # Management/JWKS URL. This is not used as a HEC fallback.
 #   endpoint: "https://splunk.default.svc.cluster.local:8089"
+#   # Required when sidecars.otel is true and Splunk telemetry is configured.
+#   hecEndpoint: "https://splunk.default.svc.cluster.local:8088"
 #   # Optional, if not using secretRef
 #   token: ""
 #   # Whether token comes from Kubernetes Secret or Vault Agent, e.g. "kubernetes" or "vault"
@@ -218,9 +222,10 @@ ingress: {}
 #       hosts:
 #         - ai-platform.example.com
 
-# mTLS configuration for the AIPlatform
+# One-way server TLS configuration for the AIPlatform. The key remains `mtls`
+# for API compatibility; client certificates are not requested or validated.
 mtls:
-  # Enable or disable mTLS on the SAIA service
+  # Enable or disable one-way server TLS on the SAIA service
   enabled: false
   # If Enabled, how to request the cert
   issuerRef:
@@ -230,7 +235,7 @@ mtls:
     kind: ""
     # Group of the resource being referred to
     group: ""
-  # mTLS secret reference
+  # Server TLS certificate Secret reference
   secretName: ""
   dnsNames: []
   # Let users declare “I don’t want operator-managed TLS” even if Enabled=true, e.g. "operator" or "mesh"

@@ -503,4 +503,44 @@ var _ = Describe("AIPlatform Requeue Scenarios", func() {
 			Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Minute))
 		}
 	})
+
+	Context("findAIPlatformsForCACertSecret (AIP-4614 Tier 1 item 4)", func() {
+		It("should map a Secret to AIPlatforms in the same namespace that reference it via caCertRef", func() {
+			referencing := &aiv1.AIPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "platform-with-ca-ref", Namespace: namespace},
+				Spec: aiv1.AIPlatformSpec{
+					SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+						CACertRef: &aiv1.CABundleRef{Name: "splunk-ca-bundle"},
+					},
+				},
+			}
+			Expect(fakeClient.Create(ctx, referencing)).To(Succeed())
+
+			nonReferencing := &aiv1.AIPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "platform-without-ca-ref", Namespace: namespace},
+				Spec:       aiv1.AIPlatformSpec{},
+			}
+			Expect(fakeClient.Create(ctx, nonReferencing)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "splunk-ca-bundle", Namespace: namespace},
+			}
+
+			requests := reconciler.findAIPlatformsForCACertSecret(ctx, secret)
+
+			Expect(requests).To(HaveLen(1))
+			Expect(requests[0].Name).To(Equal("platform-with-ca-ref"))
+			Expect(requests[0].Namespace).To(Equal(namespace))
+		})
+
+		It("should return no requests when no AIPlatform references the Secret", func() {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "unreferenced-secret", Namespace: namespace},
+			}
+
+			requests := reconciler.findAIPlatformsForCACertSecret(ctx, secret)
+
+			Expect(requests).To(BeEmpty())
+		})
+	})
 })

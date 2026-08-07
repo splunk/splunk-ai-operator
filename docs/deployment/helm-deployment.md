@@ -455,10 +455,13 @@ images:
 
 # Splunk configuration (for observability)
 splunkConfiguration:
-  endpoint: "https://splunk.splunk.svc.cluster.local:8089"
+  endpoint: "https://splunk.splunk.svc.cluster.local:8089" # management/JWKS
+  # Required when sidecars.otel is enabled; there is no endpoint fallback.
+  hecEndpoint: "https://splunk.splunk.svc.cluster.local:8088"
   secretRef:
     name: "splunk-secret"
-    namespace: "splunk"
+    # Secret references must remain in the AIPlatform namespace.
+    namespace: "ai-platform"
   secretSource: "kubernetes"
 
 # Storage configuration
@@ -492,7 +495,7 @@ cpuScheduler:
       value: cpu
       effect: NoSchedule
 
-# mTLS configuration (optional)
+# One-way server TLS configuration (optional; `mtls` is the legacy key name)
 mtls:
   enabled: false
   issuerRef:
