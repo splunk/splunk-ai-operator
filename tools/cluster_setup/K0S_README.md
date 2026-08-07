@@ -1625,7 +1625,11 @@ The installer verifies `enableSplunkdSSL=false` and an HTTP response before it
 creates the `AIPlatform` resource. On a fresh deployment, Splunk Operator 3.0.0
 first completes one internal HTTPS-only telemetry bootstrap; the installer then
 rolls the Splunk pod to its final HTTP mode. No SAIA image downgrade or CA
-installation is required.
+installation is required. The pinned Splunk 10.2 image still performs its
+bounded initial HTTPS scheme probe before selecting HTTP. The installer extends
+only the Standalone startup-probe allowance so that fallback can complete
+without reducing splunk-ansible's global retry policy; a Splunk pod start can
+therefore take several additional minutes.
 
 Rerunning this installer on a PVC from an earlier TLS-preview install performs
 an idempotent compatibility migration before Splunk starts. The migration acts

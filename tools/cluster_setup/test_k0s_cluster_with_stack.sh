@@ -995,6 +995,14 @@ assert_eq "Standalone final manifest preserves unrelated extraEnv entries" "1" \
 assert_eq "OAuth signing certificate remains configured independently of transport TLS" "1" \
   "$(grep -c 'certFile: \$SPLUNK_HOME/etc/auth/server.pem' \
     "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "HTTP mode preserves the global splunk-ansible retry policy" "0" \
+  "$(grep -c '^[[:space:]]*retry_num:' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "HTTP mode allows the pinned image scheme probe to finish" "1" \
+  "$(grep -c '^[[:space:]]*failureThreshold: 40$' \
+    "${_AIP4614_TMPDIR}/standalone.yaml")"
+assert_eq "installer HTTP wait covers the extended startup allowance" "1" \
+  "$(grep -c '_wait_for_internal_splunk_http "\${old_pod_uid}" 1500' "${SCRIPT}")"
 assert_eq "defaults register the idempotent stale-TLS migration pre-task" "1" \
   "$(grep -c 'file:///mnt/defaults/remove-stale-installer-tls.yml' \
     "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
@@ -1012,6 +1020,9 @@ assert_eq "migration is limited to the installer-owned legacy mount prefix" "2" 
     "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
 
 _render_splunk_bootstrap_manifest "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml"
+assert_eq "fresh-install bootstrap keeps the operator's default startup probe" "0" \
+  "$(grep -c '^[[:space:]]*failureThreshold: 40$' \
+    "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml")"
 assert_eq "fresh-install bootstrap preserves unrelated extraEnv entries" "1" \
   "$(grep 'extraEnv:' "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml" \
     | grep -c '"name":"KEEP_ME","value":"kept"')"

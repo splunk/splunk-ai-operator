@@ -4605,6 +4605,7 @@ _apply_internal_splunk_standalone_cr() {
   local management_mode="$2"
   local existing_extra_env_json="${3:-[]}"
   local desired_extra_env_json
+  local startup_probe_yaml=""
 
   case "${management_mode}" in
     bootstrap)
@@ -4624,6 +4625,9 @@ _apply_internal_splunk_standalone_cr() {
           jq -c '(map(select(.name != "SPLUNKD_SSL_ENABLE"))) + [{"name":"SPLUNKD_SSL_ENABLE","value":"false"}]'); then
         err "Failed to preserve Splunk extraEnv while rendering HTTP mode"
       fi
+      # Only HTTP mode needs extra time for the pinned image's HTTPS detection
+      # fallback. Leave bootstrap-mode probe behavior at the operator default.
+      startup_probe_yaml=$'  startupProbe:\n    failureThreshold: 40'
       ;;
     *)
       err "Unsupported internal Splunk management mode: ${management_mode}"
@@ -4639,6 +4643,7 @@ metadata:
   namespace: ${AI_NS}
 spec:
   replicas: 1
+${startup_probe_yaml}
   # Compact JSON is valid YAML. Preserve every existing extraEnv entry while
   # owning only the SPLUNKD_SSL_ENABLE value needed by this installer.
   extraEnv: ${desired_extra_env_json}
@@ -4939,7 +4944,10 @@ YAML
   fi
 
   _apply_internal_splunk_standalone_cr "${minio_endpoint}" http "${existing_extra_env_json}"
-  _wait_for_internal_splunk_http "${old_pod_uid}" 600
+  # The pinned Splunk 10.2 image may exhaust its 60 HTTPS-detection attempts
+  # before selecting HTTP. Keep this timeout above the startup-probe allowance
+  # so the installer reports the container's own outcome rather than racing it.
+  _wait_for_internal_splunk_http "${old_pod_uid}" 1500
   log "Splunk Standalone CR applied with internal management TLS disabled"
 }
 

@@ -149,7 +149,11 @@ validation. The installer disables `enableSplunkdSSL`, rolls the Splunk pod, and
 tests the HTTP endpoint before deploying `AIPlatform`. Current SAIA images work
 with this URL; no image rollback or certificate mount is needed. The Splunk
 OAuth certificate remains configured because it signs JWTs rather than securing
-the HTTP transport.
+the HTTP transport. Splunk 10.2 still performs its bounded initial HTTPS scheme
+probe before falling back to HTTP. The installer extends only the Standalone
+startup-probe allowance so the image can finish that fallback without weakening
+splunk-ansible's global retry policy; this can add several minutes to a Splunk
+pod start.
 
 Rerunning the installer against a PVC created by an earlier TLS-preview install
 performs an idempotent compatibility migration before Splunk starts. It removes
