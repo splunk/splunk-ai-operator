@@ -71,7 +71,9 @@ render_splunk_block() {
   # Splunk configuration (internal — in-cluster Standalone)
   splunkConfiguration:
     endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
-    hecEndpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    # Fresh Splunk Operator installs report enableSSL=0. The production
+    # installer reads btool after readiness rather than assuming this scheme.
+    hecEndpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
@@ -153,7 +155,7 @@ CFG=$(make_config "splunk:
   enabled: true")
 OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
 EXPECTED_INTERNAL_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
-EXPECTED_INTERNAL_HEC_URL="https://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8088"
+EXPECTED_INTERNAL_HEC_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8088"
 info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + secretRef"
 check_contains     "${OUT}" "splunkConfiguration"                              "splunkConfiguration block present"
 check_contains     "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}"               "Canonical HTTP management/JWKS endpoint"

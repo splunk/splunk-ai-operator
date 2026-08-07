@@ -4564,16 +4564,115 @@ internal_splunk_management_url() {
     "${AI_STANDALONE_NAME}" "${AI_NS}"
 }
 
-# HEC is consumed only by the OTel telemetry exporter. Splunk's standard HEC
-# listener remains on HTTPS 8088 and is deliberately independent of the HTTP
-# management/JWKS compatibility endpoint above.
-internal_splunk_hec_url() {
-  printf 'https://splunk-%s-standalone-service.%s.svc.cluster.local:8088' \
-    "${AI_STANDALONE_NAME}" "${AI_NS}"
-}
-
 internal_splunk_pod_name() {
   printf 'splunk-%s-standalone-0' "${AI_STANDALONE_NAME}"
+}
+
+# Read one effective setting from btool's global [http] stanza. btool has
+# already merged every inputs.conf layer, so exactly one value is expected.
+# Ambiguous or missing values are rejected instead of guessing a HEC protocol.
+_internal_splunk_btool_http_value() {
+  local option="$1"
+  awk -v wanted="${option}" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      in_http = (section == "http")
+      next
+    }
+    in_http && $1 == wanted && $2 == "=" {
+      value = $3
+      sub(/\r$/, "", value)
+      count++
+    }
+    END {
+      if (count != 1) exit 1
+      print tolower(value)
+    }
+  '
+}
+
+# HEC is consumed only by the OTel telemetry exporter. Do not change its TLS
+# setting here: fresh Splunk Operator installs commonly use HTTP while an
+# upgraded/customer-configured instance may use HTTPS. Detect the effective
+# listener after Splunk is Ready, validate it, and expose the result through a
+# global so an err() exit cannot be swallowed by command substitution.
+_detect_internal_splunk_hec_url() {
+  local pod_name
+  local btool_output
+  local hec_disabled
+  local hec_enable_ssl
+  local hec_port
+  local hec_scheme
+  local health_url
+  _INTERNAL_SPLUNK_HEC_URL=""
+
+  pod_name="$(internal_splunk_pod_name)"
+  if ! btool_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool inputs list http 2>/dev/null); then
+    err "Failed to read effective HEC settings from ${AI_NS}/${pod_name}; refusing to guess the OTel endpoint protocol."
+    return 1
+  fi
+
+  if ! hec_disabled=$(printf '%s\n' "${btool_output}" | \
+      _internal_splunk_btool_http_value disabled); then
+    err "Effective Splunk HEC setting [http]/disabled is missing or ambiguous."
+    return 1
+  fi
+  case "${hec_disabled}" in
+    0|false|no|off) ;;
+    1|true|yes|on)
+      err "Splunk HEC is disabled; OTel telemetry requires the internal HEC listener."
+      return 1
+      ;;
+    *)
+      err "Unsupported effective Splunk HEC disabled value: ${hec_disabled}"
+      return 1
+      ;;
+  esac
+
+  if ! hec_enable_ssl=$(printf '%s\n' "${btool_output}" | \
+      _internal_splunk_btool_http_value enableSSL); then
+    err "Effective Splunk HEC setting [http]/enableSSL is missing or ambiguous."
+    return 1
+  fi
+  case "${hec_enable_ssl}" in
+    0|false|no|off) hec_scheme="http" ;;
+    1|true|yes|on) hec_scheme="https" ;;
+    *)
+      err "Unsupported effective Splunk HEC enableSSL value: ${hec_enable_ssl}"
+      return 1
+      ;;
+  esac
+
+  if ! hec_port=$(printf '%s\n' "${btool_output}" | \
+      _internal_splunk_btool_http_value port); then
+    err "Effective Splunk HEC setting [http]/port is missing or ambiguous."
+    return 1
+  fi
+  if [[ "${hec_port}" != "8088" ]]; then
+    err "Effective Splunk HEC port is ${hec_port}; the operator-managed Service exposes only port 8088."
+    return 1
+  fi
+
+  health_url="${hec_scheme}://localhost:${hec_port}/services/collector/health"
+  if [[ "${hec_scheme}" == "https" ]]; then
+    if ! kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+        curl --insecure --silent --show-error --fail --output /dev/null \
+          --max-time 10 "${health_url}" >/dev/null 2>&1; then
+      err "Splunk HEC reports enableSSL=${hec_enable_ssl}, but its HTTPS health endpoint is not ready."
+      return 1
+    fi
+  elif ! kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      curl --silent --show-error --fail --output /dev/null \
+        --max-time 10 "${health_url}" >/dev/null 2>&1; then
+    err "Splunk HEC reports enableSSL=${hec_enable_ssl}, but its HTTP health endpoint is not ready."
+    return 1
+  fi
+
+  _INTERNAL_SPLUNK_HEC_URL="${hec_scheme}://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:${hec_port}"
+  log "✓ Detected healthy internal Splunk HEC listener for OTel: ${_INTERNAL_SPLUNK_HEC_URL}"
 }
 
 # Read the Standalone once and distinguish a confirmed NotFound (fresh install)
@@ -4846,9 +4945,9 @@ data:
         - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: privKeyPath }
         - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: caCertPath }
         # HEC transport is outside AIP-4614's management/JWKS change. Remove
-        # only the preview installer's custom certificate material; retain its
-        # enableSSL setting so HEC remains on the independently configured
-        # protocol (the standard splunk-ansible default is HTTPS).
+        # only the preview installer's custom certificate material; do not
+        # mutate enableSSL. The installer detects the resulting effective HEC
+        # protocol after Splunk becomes Ready and gives that URL only to OTel.
         - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: sslPassword }
         - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: serverCert }
       when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
@@ -4948,6 +5047,7 @@ YAML
   # before selecting HTTP. Keep this timeout above the startup-probe allowance
   # so the installer reports the container's own outcome rather than racing it.
   _wait_for_internal_splunk_http "${old_pod_uid}" 1500
+  _detect_internal_splunk_hec_url
   log "Splunk Standalone CR applied with internal management TLS disabled"
 }
 
@@ -5016,7 +5116,9 @@ install_ai_platform_cr() {
       local internal_splunk_url
       local internal_splunk_hec_url_value
       internal_splunk_url="$(internal_splunk_management_url)"
-      internal_splunk_hec_url_value="$(internal_splunk_hec_url)"
+      internal_splunk_hec_url_value="${_INTERNAL_SPLUNK_HEC_URL:-}"
+      [[ -n "${internal_splunk_hec_url_value}" ]] || \
+        err "Internal Splunk HEC protocol was not detected before rendering AIPlatform."
       log "Using Splunk secret: ${splunk_secret}"
       splunk_config_yaml=$(cat <<EOF
 
@@ -5026,8 +5128,8 @@ install_ai_platform_cr() {
   # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
   splunkConfiguration:
     endpoint: ${internal_splunk_url}
-    # Used only by the OTel exporter for telemetry ingestion. HEC remains on
-    # its independent, standard HTTPS listener and is not a JWT issuer.
+    # Used only by the OTel exporter for telemetry ingestion. Its scheme comes
+    # from Splunk's effective HEC listener and it is never a JWT issuer.
     hecEndpoint: ${internal_splunk_hec_url_value}
     secretRef:
       name: ${splunk_secret}

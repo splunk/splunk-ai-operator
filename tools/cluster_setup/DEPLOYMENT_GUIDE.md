@@ -140,9 +140,13 @@ service URL:
 http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
 ```
 
-OTel telemetry uses the separate `splunkConfiguration.hecEndpoint` on Splunk's
-HEC listener (`https://...:8088`). HEC is used only for telemetry and is never
-treated as the JWT issuer.
+OTel telemetry uses the separate `splunkConfiguration.hecEndpoint` on port
+8088. HEC is used only for telemetry and is never treated as the JWT issuer.
+After Splunk is Ready, the installer reads the effective `[http]` stanza with
+`btool`, verifies that HEC is enabled and healthy, and renders `http://` or
+`https://` to match `enableSSL`. It does not change the HEC TLS setting. A fresh
+Splunk Operator 3.0.0 install normally reports HTTP; an upgraded or customized
+instance may report HTTPS.
 
 This is the AIP-4614 compatibility behavior for SAIA/Slim interactive-token
 validation. The installer disables `enableSplunkdSSL`, rolls the Splunk pod, and
@@ -161,7 +165,14 @@ only persisted TLS options from configuration files that still reference the
 installer-owned `/mnt/splunk-cert*` paths, restores Splunk Web to HTTP, and
 removes the stale custom HEC certificate path. It does not delete the PVC or
 indexed data. HEC's `enableSSL` setting is deliberately unchanged, so HEC keeps
-using its independently configured HTTP or HTTPS protocol.
+using its independently configured HTTP or HTTPS protocol. Installation fails
+closed if the effective HEC setting cannot be read, HEC is disabled, its port is
+not the operator Service's port 8088, or the matching health URL is unavailable.
+During an operator upgrade, the OTel ConfigMap migration also removes the exact
+legacy operator-managed `tls.ca_file: /etc/splunk-ca/ca.crt` reference when
+that CA mount is no longer configured. HTTPS then retains the existing
+no-CA `insecure_skip_verify` behavior; HTTP carries no generated TLS settings.
+Other exporter, processor, and custom CA settings are preserved.
 
 Keep the Kubernetes pod/service network private. Management credentials and
 JWKS requests on port 8089 are unencrypted within that network, so production

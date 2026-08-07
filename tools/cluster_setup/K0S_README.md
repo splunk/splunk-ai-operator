@@ -1618,8 +1618,12 @@ http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:
 ```
 
 The OTel exporter receives a separate `splunkConfiguration.hecEndpoint` for
-Splunk HEC (`https://...:8088`). That listener is used only for telemetry and
-is not added to the SAIA/Slim JWT issuer allowlist.
+Splunk HEC on port 8088. That listener is used only for telemetry and is not
+added to the SAIA/Slim JWT issuer allowlist. After Splunk is Ready, the
+installer reads the effective `[http]` stanza with `btool`, checks that HEC is
+enabled and healthy, and selects `http://` or `https://` to match `enableSSL`.
+It does not modify the HEC TLS setting. A fresh Splunk Operator 3.0.0 install
+normally reports HTTP; an upgraded or customized instance may report HTTPS.
 
 The installer verifies `enableSplunkdSSL=false` and an HTTP response before it
 creates the `AIPlatform` resource. On a fresh deployment, Splunk Operator 3.0.0
@@ -1638,6 +1642,15 @@ installer-owned `/mnt/splunk-cert*` paths: it restores Splunk Web to HTTP and
 removes the stale custom HEC certificate path without deleting the PVC or
 indexed data. It deliberately leaves HEC's `enableSSL` setting unchanged, so
 HEC continues to use its independently configured HTTP or HTTPS protocol.
+Installation stops rather than guessing if the effective setting cannot be
+read, HEC is disabled, the effective port is not 8088, or the matching health
+URL is unavailable.
+
+On upgrade, OTel reconciliation removes only the obsolete operator-managed
+`tls.ca_file: /etc/splunk-ca/ca.crt` reference when that mount is absent. It
+uses `insecure_skip_verify` for HTTPS without a configured CA and emits no
+generated TLS block for HTTP. Unrelated exporter, processor, and custom CA
+settings remain intact.
 
 The `certFile` and `sslPassword` entries in `authentication.conf` remain in
 place: that certificate signs interactive JWTs and is independent of transport
