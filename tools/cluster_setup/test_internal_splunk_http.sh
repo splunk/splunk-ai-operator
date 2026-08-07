@@ -154,7 +154,7 @@ pass "replacement pod received SPLUNKD_SSL_ENABLE=false"
 
 effective_tls_value=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk btool server list sslConfig 2>/dev/null \
-  | awk '$1 == "enableSplunkdSSL" { print tolower($3); exit }')
+  | awk '$1 == "enableSplunkdSSL" { value = tolower($3) } END { if (value != "") print value }')
 [[ "${effective_tls_value}" == "false" ]] || \
   fail "btool enableSplunkdSSL=${effective_tls_value:-unset}, expected false"
 pass "effective Splunk configuration has enableSplunkdSSL=false"
@@ -169,7 +169,7 @@ pass "server.conf contains no stale installer TLS mount paths"
 
 web_tls_value=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk btool web list settings 2>/dev/null \
-  | awk '$1 == "enableSplunkWebSSL" { print tolower($3); exit }')
+  | awk '$1 == "enableSplunkWebSSL" { value = tolower($3) } END { if (value != "") print value }')
 [[ "${web_tls_value}" == "false" || "${web_tls_value}" == "0" ]] || \
   fail "btool enableSplunkWebSSL=${web_tls_value:-unset}, expected false/0"
 web_tls_debug=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
@@ -255,7 +255,7 @@ pass "management service remains internal (ClusterIP)"
 
 issuer_uri=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null \
-  | awk '$1 == "issuer_uri" { print $3; exit }')
+  | awk '$1 == "issuer_uri" { value = $3 } END { if (value != "") print value }')
 platform_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
   -o jsonpath='{.spec.splunkConfiguration.endpoint}')
 platform_hec_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
@@ -405,7 +405,7 @@ with urllib.request.urlopen(sys.argv[1], timeout=15) as response:
     payload = json.load(response)
 encoded = json.dumps(payload)
 assert "RSA" in encoded or "RS256" in encoded, "response has no RSA signing key"
-' "${EXPECTED_URL}/services/authorization/tokens-keys" >/dev/null 2>&1; then
+' "${EXPECTED_URL}/services/authorization/tokens-keys?output_mode=json" >/dev/null 2>&1; then
         jwks_service_checked=true
         pass "consumer pod reaches an RSA JWKS response through the ClusterIP service"
       fi
