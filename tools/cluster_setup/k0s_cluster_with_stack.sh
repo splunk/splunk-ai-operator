@@ -2916,6 +2916,105 @@ _nvidia_runtime_is_healthy() {
   "
 }
 
+# Fabric Manager is required only for the currently supported H100 NVSwitch
+# platform (AWS P5/HGX H100). Gate on both the requested accelerator and the
+# GH100 NVSwitch PCI device so H100 PCIe, L40S, and RTX Pro nodes retain their
+# existing driver path.
+_nvidia_fabric_manager_required() {
+  local gpu_ip="$1"
+
+  [[ "${DEFAULT_ACCELERATOR:-}" == "H100" ]] || return 1
+  ssh_exec "${gpu_ip}" \
+    "grep -ql '^0x22a3$' /sys/bus/pci/devices/*/device 2>/dev/null"
+}
+
+_nvidia_fabric_manager_is_healthy() {
+  local gpu_ip="$1"
+
+  ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+
+    command -v nv-fabricmanager >/dev/null
+    systemctl is-enabled --quiet nvidia-fabricmanager
+    systemctl is-active --quiet nvidia-fabricmanager
+
+    driver_version=\$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d '[:space:]')
+    fm_version=\$(nv-fabricmanager -v 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -n \"\${driver_version}\" ]
+    [ \"\${fm_version}\" = \"\${driver_version}\" ]
+
+    gpu_count=\$(nvidia-smi --query-gpu=index --format=csv,noheader | sed '/^[[:space:]]*\$/d' | wc -l)
+    fabric_states=\$(nvidia-smi -q | awk '
+      /^[[:space:]]+Fabric[[:space:]]*\$/ { in_fabric=1; next }
+      in_fabric && /^[[:space:]]+State[[:space:]]*:/ {
+        sub(/^[^:]*:[[:space:]]*/, \"\", \$0)
+        print \$0
+        in_fabric=0
+      }
+    ')
+    state_count=\$(printf '%s\n' \"\${fabric_states}\" | sed '/^[[:space:]]*\$/d' | wc -l)
+    [ \"\${gpu_count}\" -gt 0 ]
+    [ \"\${state_count}\" -eq \"\${gpu_count}\" ]
+    ! printf '%s\n' \"\${fabric_states}\" | grep -qv '^Completed\$'
+  "
+}
+
+_ensure_nvidia_fabric_manager() {
+  local gpu_ip="$1"
+
+  if ! _nvidia_fabric_manager_required "${gpu_ip}"; then
+    return 0
+  fi
+
+  if _nvidia_fabric_manager_is_healthy "${gpu_ip}"; then
+    echo "✓ NVIDIA Fabric Manager already healthy on ${gpu_ip} — skipping installation"
+    return 0
+  fi
+
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo "ERROR: H100 NVSwitch detected on ${gpu_ip}, but NVIDIA Fabric Manager is not healthy." >&2
+    echo "  AIRGAP_MODE=true: pre-install the Fabric Manager package matching the NVIDIA driver," >&2
+    echo "  enable nvidia-fabricmanager.service, and re-run the installer." >&2
+    return 1
+  fi
+
+  local driver_version
+  driver_version=$(ssh_exec "${gpu_ip}" \
+    "nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d '[:space:]'") || driver_version=""
+  if [[ ! "${driver_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: could not determine the NVIDIA driver version on ${gpu_ip}; refusing to install Fabric Manager." >&2
+    return 1
+  fi
+
+  echo "Installing NVIDIA Fabric Manager for driver ${driver_version} on H100 NVSwitch node ${gpu_ip}..."
+  if ! ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+    # Pin Fabric Manager to the full loaded-driver version. Installing the
+    # generic latest/fm profile here could upgrade the driver during a later
+    # installer rerun, leaving the loaded kernel module and FM mismatched.
+    sudo dnf install -y 'nvidia-fabricmanager-${driver_version}'
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now nvidia-fabricmanager
+  "; then
+    echo "ERROR: NVIDIA Fabric Manager installation failed on ${gpu_ip}." >&2
+    return 1
+  fi
+
+  local waited=0
+  until _nvidia_fabric_manager_is_healthy "${gpu_ip}"; do
+    if (( waited >= 180 )); then
+      echo "ERROR: NVIDIA Fabric Manager did not initialize all H100 GPUs on ${gpu_ip} within 180 seconds." >&2
+      ssh_exec "${gpu_ip}" \
+        "sudo journalctl -u nvidia-fabricmanager --no-pager -n 80 2>/dev/null || true" >&2 || true
+      return 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  echo "✓ NVIDIA Fabric Manager ${driver_version} initialized the H100 NVSwitch fabric on ${gpu_ip}"
+}
+
 _install_nvidia_on_node() {
   local gpu_ip="$1"
   local recovery_reboots="${2:-0}"
@@ -3390,6 +3489,11 @@ _install_nvidia_on_node() {
     fi
     echo "✓ NVIDIA driver v${ver_check} running on ${gpu_ip}"
   fi
+
+  # H100 NVSwitch systems cannot initialize CUDA until the matching Fabric
+  # Manager service has initialized every GPU. This runs before the healthy
+  # container-runtime fast path so a missing FM installation cannot be skipped.
+  _ensure_nvidia_fabric_manager "${gpu_ip}" || return 1
 
   # ---- Phase C.5: persist nvidia kmod autoload across reboots -----------
   # `modprobe nvidia` (Step 5) only loads the module for the CURRENT boot, and
