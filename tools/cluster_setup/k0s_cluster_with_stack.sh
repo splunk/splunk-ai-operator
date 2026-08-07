@@ -474,6 +474,7 @@ show_install_plan() {
 ensure_yq() {
   command -v yq >/dev/null 2>&1 && return 0
   local os arch url
+  local -a _yq_fetch
   # Pinned version — matches download_from_huggingface.sh; update both together.
   local YQ_VERSION="v4.44.1"
   os="$(uname -s)"
@@ -487,7 +488,13 @@ ensure_yq() {
     Linux)
       url="${YQ_DOWNLOAD_URL:-https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}}"
       log "Installing yq ${YQ_VERSION} (linux-${arch})..."
-      if curl -fsSL -o /tmp/yq "${url}"; then
+      # file:// is a URI — curl rejects a relative path in it, so copy instead.
+      if [[ "${url}" == file://* ]]; then
+        _yq_fetch=( cp -- "${url#file://}" /tmp/yq )
+      else
+        _yq_fetch=( curl -fsSL -o /tmp/yq "${url}" )
+      fi
+      if "${_yq_fetch[@]}"; then
         chmod +x /tmp/yq
         if [[ "$(id -u)" -eq 0 ]]; then
           mv /tmp/yq /usr/local/bin/yq
@@ -558,7 +565,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   fi
 
   # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
-  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically; customers
+  # airgap_install.sh sets AIRGAP_MODE=true automatically; customers
   # running the installer directly should set cluster.airgap: true in their config.
   local _yaml_airgap
   _yaml_airgap=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
@@ -1237,7 +1244,7 @@ scp_file() {
 # MUST be called AFTER `k0s install` (which, together with the stale-state cleanup,
 # recreates /var/lib/k0s) and BEFORE `k0s start` (k0s scans /var/lib/k0s/images/
 # only at kubelet startup). No-op unless AIRGAP_K0S_IMAGE_DIR points at a dir with
-# at least one *.tar (set only by install_from_airgap_bundle.sh).
+# at least one *.tar (set only by airgap_install.sh).
 stage_k0s_image_bundle() {
   local node_ip="$1"
   [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 0
@@ -1566,6 +1573,16 @@ prepare_nodes_for_k0s() {
       fi
     fi
 
+    # Same reasoning as the k0s binary above: AIRGAP_PYYAML_WHEEL_PATH is a path on
+    # the installer host and does not cross into the heredoc below, so the file has
+    # to be copied to a fixed location the remote script can find.
+    if [[ "${AIRGAP_MODE}" == "true" && -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
+      log "    Copying bundled PyYAML to ${node_ip}:/tmp/pyyaml-airgap ..."
+      scp_file "${AIRGAP_PYYAML_WHEEL_PATH}" "${node_ip}" \
+        "/tmp/pyyaml-airgap$([[ "${AIRGAP_PYYAML_WHEEL_PATH}" == *.whl ]] && echo .whl || echo .tar.gz)" \
+        || warn "    Failed to copy PyYAML to ${node_ip} — k0s config generation may fail"
+    fi
+
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
       bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
@@ -1591,18 +1608,21 @@ prepare_nodes_for_k0s() {
         echo "python3+pyyaml already present"
       else
         echo "Installing python3-pyyaml..."
-        # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
-        # back to the OS package manager (which will succeed if a local repo
-        # mirror is configured on the node).  Internet-only paths are guarded
-        # by the AIRGAP_PYYAML_WHEEL_PATH check so we never silently skip them.
-        if [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
-          echo "Installing pyyaml from bundled wheel ${AIRGAP_PYYAML_WHEEL_PATH}..."
-          sudo pip3 install --no-index --find-links="$(dirname "${AIRGAP_PYYAML_WHEEL_PATH}")" pyyaml 2>/dev/null \
-            || sudo pip3 install "${AIRGAP_PYYAML_WHEEL_PATH}" 2>/dev/null \
-            || echo "WARN: pip3 wheel install failed — python3-pyyaml may be missing"
+        # Air-gap: the installer host scp'd the bundled wheel/sdist to
+        # /tmp/pyyaml-airgap.* before this heredoc ran (the env var itself does not
+        # cross the SSH boundary, so the fixed path is how the file is found).
+        # Prefer it over any network path so an air-gapped node never reaches out.
+        _pyyaml_local="$(ls /tmp/pyyaml-airgap.whl /tmp/pyyaml-airgap.tar.gz 2>/dev/null | head -1)"
+        if [ -n "${_pyyaml_local}" ]; then
+          echo "Installing pyyaml from air-gap bundle (${_pyyaml_local})..."
+          sudo pip3 install --no-index "${_pyyaml_local}" 2>/dev/null \
+            || sudo dnf install -y python3-pyyaml 2>/dev/null \
+            || echo "WARN: pyyaml install from bundle failed — k0s config generation may fail"
+          rm -f "${_pyyaml_local}"
         elif command -v dnf >/dev/null 2>&1; then
           sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
         elif command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update -qq 2>/dev/null || true
           sudo apt-get install -y python3-yaml 2>/dev/null || true
         else
           echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
@@ -2916,6 +2936,158 @@ _nvidia_runtime_is_healthy() {
   "
 }
 
+# ====== AIR-GAP: INSTALL NVIDIA DRIVER FROM THE BUNDLED OFFLINE REPO ======
+# Pushes the closure built by airgap_install.sh to a GPU node and installs
+# the driver, DKMS, build toolchain, container toolkit and matching kernel-devel
+# entirely from it. The node never contacts developer.download.nvidia.com.
+#
+# The closure must be scp'd rather than referenced by path: AIRGAP_NVIDIA_CLOSURE_DIR
+# is a path on the INSTALLER host, and env vars do not cross the SSH boundary.
+# Same reason prepare_nodes_for_k0s() scp's the k0s binary.
+_install_nvidia_from_closure() {
+  local gpu_ip="$1"
+  local closure="${AIRGAP_NVIDIA_CLOSURE_DIR:-}"
+
+  if [[ -z "${closure}" || ! -d "${closure}" ]]; then
+    echo "ERROR: AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found on ${gpu_ip}," >&2
+    echo "  and no offline driver repo was provided (AIRGAP_NVIDIA_CLOSURE_DIR is unset)." >&2
+    echo "" >&2
+    echo "  Fix by either:" >&2
+    echo "    a) Running the air-gap installer, which builds the driver closure and" >&2
+    echo "       exports this path automatically:" >&2
+    echo "         ./airgap_install.sh --config <your-config>.yaml" >&2
+    echo "    b) Pre-installing the NVIDIA driver + nvidia-container-toolkit on" >&2
+    echo "       ${gpu_ip} yourself. The installer skips driver install when" >&2
+    echo "       nvidia-smi is already present." >&2
+    return 1
+  fi
+  if [[ ! -f "${closure}/repodata/repomd.xml" ]]; then
+    echo "ERROR: ${closure} has no repodata/repomd.xml — it is not a valid dnf repo." >&2
+    echo "  Re-run ./airgap_install.sh; createrepo_c must run over the closure directory." >&2
+    return 1
+  fi
+
+  # Verify the closure actually covers this node's running kernel BEFORE pushing
+  # ~500 MB. DKMS needs kernel-devel matching `uname -r` exactly; without it the
+  # module cannot build and there is no way to recover offline.
+  local node_krel
+  node_krel=$(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null | tr -d '[:space:]') || node_krel=""
+  [[ -n "${node_krel}" ]] || { echo "ERROR: could not read 'uname -r' from ${gpu_ip}" >&2; return 1; }
+
+  if ! compgen -G "${closure}/kernel-devel-${node_krel%.x86_64}*.rpm" >/dev/null 2>&1; then
+    echo "ERROR: the offline NVIDIA repo has no kernel-devel for ${gpu_ip}'s running kernel." >&2
+    echo "  Node kernel     : ${node_krel}" >&2
+    echo "  Closure covers  : $(cat "${closure}/.target-kernels" 2>/dev/null || echo unknown)" >&2
+    echo "" >&2
+    echo "  NVIDIA ships DKMS-only packages for RHEL 9, so the kernel module is" >&2
+    echo "  compiled on the node and needs headers for that exact kernel." >&2
+    echo "  Re-stage the closure including this kernel:" >&2
+    echo "    ./airgap_install.sh --config <your-config>.yaml --gpu-kernels ${node_krel}" >&2
+    return 1
+  fi
+
+  echo "Installing NVIDIA driver on ${gpu_ip} from offline repo (kernel ${node_krel})..."
+
+  # Stage the closure as a tarball: one scp of ~500 MB beats several hundred
+  # round-trips, and scp has no recursive-with-progress equivalent worth using here.
+  # Per-node path. GPU nodes are installed concurrently and `$$` stays the parent
+  # shell's PID inside the background subshells, so a shared name meant one node
+  # deleted the tarball while another was still packing or copying it.
+  local tarball="/tmp/nvidia-closure-$$-${gpu_ip//[^0-9]/_}.tar"
+  echo "  Packing closure..."
+  tar -cf "${tarball}" -C "$(dirname "${closure}")" "$(basename "${closure}")" \
+    || { echo "ERROR: failed to pack ${closure}" >&2; rm -f "${tarball}"; return 1; }
+
+  echo "  Copying $(du -h "${tarball}" | cut -f1) to ${gpu_ip}..."
+  if ! scp_file "${tarball}" "${gpu_ip}" "/tmp/nvidia-closure.tar"; then
+    echo "ERROR: failed to copy the NVIDIA closure to ${gpu_ip}" >&2
+    rm -f "${tarball}"
+    return 1
+  fi
+  rm -f "${tarball}"
+
+  ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+    PKGDIR=/opt/airgap-nvidia
+    sudo rm -rf \"\${PKGDIR}\"
+    sudo mkdir -p \"\${PKGDIR}\"
+    sudo tar -xf /tmp/nvidia-closure.tar -C \"\${PKGDIR}\" --strip-components=1
+    rm -f /tmp/nvidia-closure.tar
+    echo \"Offline repo staged: \$(find \"\${PKGDIR}\" -name '*.rpm' | wc -l) RPMs\"
+
+    KREL=\$(uname -r)
+
+    # A leftover /etc/dnf/modules.d/nvidia-driver.module (from a previous online
+    # install) makes dnf hide every NVIDIA package with 'All matches were filtered
+    # out by modular filtering', because createrepo_c generates no modules.yaml.
+    # Resetting the stream clears that state. No-op if the module was never enabled.
+    sudo dnf module reset -y nvidia-driver >/dev/null 2>&1 || true
+
+    # Blacklist nouveau before installing so the nvidia module can load.
+    if lsmod | grep -q '^nouveau'; then
+      echo '--- Blacklisting nouveau + unloading ---'
+      printf 'blacklist nouveau\\noptions nouveau modeset=0\\n' \\
+        | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
+      sudo rmmod nouveau 2>/dev/null || true
+      sudo dracut --force 2>/dev/null || true
+    fi
+
+    # Install ONLY from the staged repo. --disablerepo='*' guarantees no network
+    # access is attempted even if the node has stale repo files pointing upstream.
+    # Named packages (not 'dnf install *.rpm'): installing every file force-installs
+    # unrelated arch/version duplicates and fails on file conflicts.
+    echo '--- Installing NVIDIA driver + DKMS + toolkit from offline repo ---'
+    sudo dnf install -y --refresh \\
+      --disablerepo='*' \\
+      --repofrompath=\"airgap-nvidia,\${PKGDIR}\" \\
+      --setopt=airgap-nvidia.gpgcheck=0 \\
+      --setopt=install_weak_deps=False \\
+      kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \\
+      nvidia-kmod-common nvidia-modprobe nvidia-persistenced \\
+      nvidia-container-toolkit \\
+      dkms gcc make elfutils-libelf-devel \\
+      \"kernel-devel-\${KREL}\"
+
+    # DKMS builds the module in the RPM %post scriptlet. Verify it actually
+    # succeeded and built for the RUNNING kernel — a mismatch here is the
+    # difference between a working GPU node and a silent failure at pod start.
+    echo '--- Verifying DKMS build ---'
+    DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
+    if [ -z \"\${DKMS_OUT}\" ]; then
+      echo 'ERROR: dkms status shows no nvidia entry — the kmod did not register' >&2
+      exit 1
+    fi
+    echo \"DKMS: \${DKMS_OUT}\"
+    if ! echo \"\${DKMS_OUT}\" | grep -qE 'installed|built'; then
+      echo 'ERROR: nvidia DKMS module not built. Diagnose: sudo dkms status; cat /var/lib/dkms/nvidia/*/build/make.log' >&2
+      exit 1
+    fi
+    if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
+      echo \"ERROR: DKMS built for a different kernel than the running \${KREL}: \${DKMS_OUT}\" >&2
+      exit 1
+    fi
+
+    sudo modprobe nvidia || {
+      echo 'ERROR: modprobe nvidia failed after DKMS build succeeded.' >&2
+      echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
+      exit 1
+    }
+  " || {
+    echo "❌ Offline NVIDIA driver install failed on ${gpu_ip}" >&2
+    return 1
+  }
+
+  # Hard-verify from the installer side rather than trusting the remote exit code.
+  local ver_check
+  ver_check=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1" || echo "")
+  if [[ -z "${ver_check}" ]] || ! [[ "${ver_check}" =~ ^[0-9]+\.[0-9]+ ]]; then
+    echo "❌ nvidia-smi verification failed on ${gpu_ip} after offline install (got: '${ver_check}')" >&2
+    return 1
+  fi
+  echo "✓ NVIDIA driver v${ver_check} installed offline on ${gpu_ip}"
+  return 0
+}
+
 _install_nvidia_on_node() {
   local gpu_ip="$1"
   local recovery_reboots="${2:-0}"
@@ -2932,15 +3104,11 @@ _install_nvidia_on_node() {
   if [[ -n "${driver_ver}" ]]; then
     echo "✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
   elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    # In air-gap mode the node must have NVIDIA drivers pre-installed.
-    # The Phase A check above already looked for nvidia-smi; if we reach
-    # here it wasn't found.  Fail clearly rather than attempting internet
-    # package downloads that will time out or silently fail.
-    echo "ERROR: AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found on ${gpu_ip}." >&2
-    echo "  Pre-install the NVIDIA driver on this node using a local RPM/DEB mirror" >&2
-    echo "  or the bundled package directory, then re-run the installer." >&2
-    echo "  See AIRGAP.md → 'GPU Node OS Packages' for step-by-step instructions." >&2
-    return 1
+    # Air-gap: install from the bundled offline closure. Only if no closure was
+    # bundled do we fail — the node cannot reach NVIDIA's servers.
+    if ! _install_nvidia_from_closure "${gpu_ip}"; then
+      return 1
+    fi
   else
     echo "Installing NVIDIA driver on ${gpu_ip}..."
 
@@ -3034,12 +3202,11 @@ _install_nvidia_on_node() {
         sudo dnf install -y dnf-plugins-core
 
         # EPEL: provides DKMS on RHEL (RHEL's own repos don't ship DKMS).
-        # EPEL_RPM_URL_OVERRIDE lets air-gap customers redirect to a local mirror:
-        #   export EPEL_RPM_URL_OVERRIDE="http://mirror.internal/epel/epel-release-latest-9.noarch.rpm"
+        # This is the ONLINE path only — air-gapped nodes are handled earlier by
+        # _install_nvidia_from_closure(), which installs DKMS from the bundled repo.
         if ! rpm -q epel-release >/dev/null 2>&1; then
           echo \"--- Installing EPEL for DKMS (major \${EPEL_MAJOR}) ---\"
-          _EPEL_URL=\"\${EPEL_RPM_URL_OVERRIDE:-https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm}\"
-          sudo dnf install -y \"\${_EPEL_URL}\"
+          sudo dnf install -y \"https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm\"
         fi
         # CRB (formerly PowerTools on RHEL 8) hosts a few EPEL build deps on
         # RHEL. AL2023 doesn't have a CRB repo (its core packages are in
@@ -3062,21 +3229,15 @@ _install_nvidia_on_node() {
       # Clean cross-major repos so dnf doesn't try to install from the wrong
       # CUDA metadata (common failure mode on in-place RHEL 9 → 10 upgrades,
       # and on re-runs of this script where the target OS may have changed).
-      #
-      # CUDA_REPO_URL_OVERRIDE: set to a local mirror .repo/.deb URL to redirect
-      # away from developer.download.nvidia.com:
-      #   export CUDA_REPO_URL_OVERRIDE="http://mirror.internal/cuda/cuda-rhel9.repo"
+      # ONLINE path only — see the EPEL note above.
       if [ \"\${OS_FAMILY}\" = 'amzn' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-amzn*.repo
-        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo}\"
-        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
+        sudo dnf config-manager --add-repo \"https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo\"
       elif [ \"\${OS_FAMILY}\" = 'rhel' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-rhel*.repo
-        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo}\"
-        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
+        sudo dnf config-manager --add-repo \"https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo\"
       elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        _CUDA_DEB=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb}\"
-        curl -fsSL \"\${_CUDA_DEB}\" -o /tmp/cuda-keyring.deb
+        curl -fsSL \"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb\" -o /tmp/cuda-keyring.deb
         sudo dpkg -i /tmp/cuda-keyring.deb
         sudo apt-get update -qq
       fi
@@ -3432,24 +3593,36 @@ _install_nvidia_on_node() {
     set -euo pipefail
     if command -v nvidia-ctk >/dev/null 2>&1; then
       echo '✓ nvidia-ctk already installed (version: '\"\$(nvidia-ctk --version 2>/dev/null | head -1)\"')'
+    elif [ -f /opt/airgap-nvidia/repodata/repomd.xml ]; then
+      # Air-gap: the driver closure staged by _install_nvidia_from_closure also
+      # carries the container toolkit. Reached when the driver was pre-installed
+      # on the node (so the closure install was skipped) but CTK was not.
+      echo '--- Installing nvidia-container-toolkit from offline repo ---'
+      sudo dnf install -y --refresh \\
+        --disablerepo='*' \\
+        --repofrompath='airgap-nvidia,/opt/airgap-nvidia' \\
+        --setopt=airgap-nvidia.gpgcheck=0 \\
+        --setopt=install_weak_deps=False \\
+        nvidia-container-toolkit
+    elif [ \"${AIRGAP_MODE:-false}\" = 'true' ]; then
+      echo 'ERROR: AIRGAP_MODE=true, nvidia-ctk is missing, and no offline repo is staged' >&2
+      echo '  at /opt/airgap-nvidia. Re-run ./airgap_install.sh --config <cfg>.yaml' >&2
+      echo '  so the NVIDIA closure is staged, or install' >&2
+      echo '  nvidia-container-toolkit on this node manually.' >&2
+      exit 1
     else
       echo '--- Adding NVIDIA container-toolkit repo ---'
-      # NVIDIA_CTK_REPO_URL_OVERRIDE: set to a local mirror repo URL to redirect
-      # away from nvidia.github.io (partial air-gap or local mirror scenario):
-      #   export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-container-toolkit.repo"
       if [ -f /etc/debian_version ]; then
-        _CTK_BASE=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container}\"
-        curl -fsSL \"\${_CTK_BASE}/gpgkey\" | \
+        curl -fsSL 'https://nvidia.github.io/libnvidia-container/gpgkey' | \
           sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-        curl -fsSL \"\${_CTK_BASE}/stable/deb/nvidia-container-toolkit.list\" | \
+        curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list' | \
           sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
         sudo apt-get update -qq
         sudo apt-get install -y nvidia-container-toolkit
       else
         # RHEL 9 and 10 both use the same libnvidia-container stable RPM repo.
-        _CTK_REPO=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo}\"
-        curl -fsSL \"\${_CTK_REPO}\" | \
+        curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo' | \
           sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
         sudo dnf install -y nvidia-container-toolkit
       fi
@@ -3858,7 +4031,14 @@ RTEOF
   local manifest
   manifest=$(mktemp)
   local nvidia_manifest_url="${NVIDIA_DEVICE_PLUGIN_MANIFEST_URL:-https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml}"
-  if ! curl -fsSL "${nvidia_manifest_url}" -o "${manifest}"; then
+  # file:// is a URI, so curl rejects a relative path in it. Copy the bare path
+  # instead, which works whether the bundle dir is absolute or relative.
+  if [[ "${nvidia_manifest_url}" == file://* ]]; then
+    if ! cp "${nvidia_manifest_url#file://}" "${manifest}" 2>/dev/null; then
+      rm -f "${manifest}"
+      err "Air-gap NVIDIA device-plugin manifest not found: ${nvidia_manifest_url#file://}"
+    fi
+  elif ! curl -fsSL "${nvidia_manifest_url}" -o "${manifest}"; then
     rm -f "${manifest}"
     err "Failed to fetch NVIDIA device-plugin manifest (version ${ver}).
     URL: ${nvidia_manifest_url}
@@ -7999,6 +8179,61 @@ join_workers() {
 # Parse install-specific flags before handing off to subcommands.
 _CMD="${1:-install}"
 shift 2>/dev/null || true
+
+# ====== AIR-GAP DELEGATION ======
+# One command serves both modes: with cluster.airgap: true the artifacts must be
+# downloaded before anything can be pushed to the sealed nodes, so hand off to
+# airgap_install.sh, which stages them and then re-invokes this script with the
+# file:// overrides exported.
+#
+# AIRGAP_STAGED is the recursion guard — airgap_install.sh sets it before calling
+# back, so this branch is skipped on the second pass.
+#
+# Only install/join-workers stage: they are the two subcommands that touch nodes.
+# validate/diagnose/delete/clean-all must stay instant, and needing a 15-minute
+# download to run a read-only config check would be absurd.
+if [[ "${AIRGAP_STAGED:-false}" != "true" ]]; then
+  case "${_CMD}" in
+    install|join-workers)
+      _sd="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      _ag="false"
+      if [[ -f "${CONFIG_FILE}" ]]; then
+        if command -v yq >/dev/null 2>&1; then
+          _ag="$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo false)"
+          [[ "${_ag}" == "null" ]] && _ag="false"
+        else
+          # yq is often absent on a sealed host — the bundle is what provides it.
+          # Falling through as "online" here would run the whole install against
+          # unreachable registries, so parse the one key we need with grep.
+          grep -qE '^[[:space:]]*airgap:[[:space:]]*true([[:space:]]|#|$)' "${CONFIG_FILE}" && _ag="true"
+        fi
+      fi
+      # AIRGAP_MODE=true is an equally valid trigger: it is the documented way to
+      # request air-gap for one run without editing the config.
+      if [[ "${_ag}" == "true" || "${AIRGAP_MODE:-false}" == "true" ]]; then
+        if [[ ! -x "${_sd}/airgap_install.sh" ]]; then
+          echo "ERROR: cluster.airgap is true but ${_sd}/airgap_install.sh is missing." >&2
+          echo "  That script downloads the artifacts a sealed cluster cannot fetch itself." >&2
+          exit 1
+        fi
+        echo "[LOG] Air-gap mode — staging artifacts before ${_CMD} (see airgap_install.sh)."
+        # exec: replace this process so there is exactly one installer in the
+        # tree and the staged run's exit status surfaces directly to the caller.
+        # No pass-through for staging flags (--driver-version, --gpu-kernels, …):
+        # run airgap_install.sh directly when you need them.
+        #
+        # --installer names THIS file explicitly. Without it airgap_install.sh
+        # defaults to the literal name k0s_cluster_with_stack.sh, so a renamed
+        # copy would stage and then call back into the original instead of itself.
+        exec "${_sd}/airgap_install.sh" \
+          --config "${CONFIG_FILE}" \
+          --installer "${_sd}/$(basename "${BASH_SOURCE[0]}")" \
+          --subcommand "${_CMD}"
+      fi
+      ;;
+  esac
+fi
+
 case "${_CMD}" in
   install)
     while [[ $# -gt 0 ]]; do

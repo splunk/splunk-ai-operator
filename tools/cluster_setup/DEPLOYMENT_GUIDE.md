@@ -18,11 +18,10 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [Step-by-Step](#step-by-step-standard)
 - [Air-Gapped Deployment (No Internet on Cluster)](#air-gapped-deployment-no-internet-on-cluster)
   - [Air-Gap Concepts](#air-gap-concepts)
-  - [Phase 1 — Prepare the Bundle (Connected Machine)](#phase-1--prepare-the-bundle-connected-machine)
+  - [Phase 1 — Stage the Artifacts](#phase-1--stage-the-artifacts)
   - [Phase 2 — Mirror Container Images](#phase-2--mirror-container-images)
   - [Phase 3 — Stage Model Weights](#phase-3--stage-model-weights)
-  - [Phase 4 — Transfer to Air-Gapped Environment](#phase-4--transfer-to-air-gapped-environment)
-  - [Phase 5 — Install from the Bundle](#phase-5--install-from-the-bundle)
+  - [Phase 4 — Install](#phase-4--install)
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
 - [Post-Install Verification](#post-install-verification)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
@@ -38,26 +37,20 @@ flowchart TD
     START([Start: Deploy Splunk AI Platform]) --> Q1
 
     Q1{Can your cluster nodes\nreach the internet?}
-    Q1 -->|Yes| STANDARD[Standard Deployment\nAll downloads happen automatically]
-    Q1 -->|No| Q2
-
-    Q2{Does your install\nmachine have internet?}
-    Q2 -->|Yes| AIRGAP[Air-Gapped Deployment\nBundle on connected machine,\ninstall offline]
-    Q2 -->|No| AIRGAP2[Air-Gapped Deployment\nPrepare bundle on any\nconnected machine,\ntransfer physically]
+    Q1 -->|Yes| STANDARD[Standard Deployment\nairgap: false\nAll downloads happen automatically]
+    Q1 -->|No| AIRGAP[Air-Gapped Deployment\nairgap: true\nSame command: it stages artifacts first,\nthen pushes them to the sealed\nnodes over SSH]
 
     STANDARD --> SDOC[📄 See Standard Deployment section]
     AIRGAP --> ADOC[📄 See Air-Gapped Deployment section]
-    AIRGAP2 --> ADOC
 
     style STANDARD fill:#276749,color:#fff
     style AIRGAP fill:#c05621,color:#fff
-    style AIRGAP2 fill:#c05621,color:#fff
 ```
 
-| Scenario | Install machine has internet | Cluster nodes have internet | Use |
+| Scenario | Installer machine has internet | Cluster nodes have internet | Use |
 |---|---|---|---|
 | Typical cloud / on-prem | ✅ | ✅ | [Standard deployment](#standard-deployment-internet-connected) |
-| Cluster isolated (with or without internet on install machine) | ✅ / ❌ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) — run `prepare_airgap_bundle.sh` on any connected machine, then transfer the bundle |
+| Cluster isolated | ✅ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) — the **same** `k0s_cluster_with_stack.sh install` command, with `cluster.airgap: true` in the config |
 
 ---
 
@@ -374,51 +367,104 @@ kubectl get aiplatform -n ai-platform      # AIPlatform Ready
 
 ```mermaid
 flowchart LR
-    subgraph CONNECTED["🌐 Internet-Connected Zone"]
-        BNDMACHINE["Bundle Machine\n(laptop / jump host)"]
-        INTERNET[("Internet\nGitHub · NVIDIA\nHuggingFace\nHelm repos")]
+    subgraph INTERNETZONE["🌐 Internet"]
+        INTERNET[("GitHub · NVIDIA\nHuggingFace\nHelm repos")]
     end
 
-    subgraph TRANSFER["📦 Transfer Mechanism"]
-        TARBALL["airgap-bundle.tar.gz\n~2–4 GB\n(binaries · charts · manifests\n+ k0s & add-on image bundles)\n+\nmodel weights\n>120 GB\n+\nplatform images\nmirrored to your registry"]
+    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9)\ninternet + SSH to the nodes"]
+        ENTRY["k0s_cluster_with_stack.sh install\nconfig has cluster.airgap: true"]
+        AGI["airgap_install.sh\ninvoked automatically\nto stage the artifacts"]
+        STAGE["./airgap-bundle/airgap-bundle-<ts>/\nbinaries · charts · manifests\nimage tarballs · NVIDIA closure"]
+        ENTRY --> AGI
     end
 
-    subgraph AIRGAP["🔒 Air-Gapped Zone"]
-        INSTALLMACHINE["Install Machine\n(kubectl · helm · ssh)"]
+    subgraph AIRGAP["🔒 Air-Gapped Zone (no outbound internet)"]
         REGISTRY["Internal\nContainer Registry"]
         OBJSTORE["Internal\nObject Store\n(MinIO / SeaweedFS)"]
-        CLUSTER["k0s Cluster"]
+        CLUSTER["k0s Cluster nodes"]
     end
 
-    INTERNET -->|prepare_airgap_bundle.sh| BNDMACHINE
-    BNDMACHINE -->|scp / USB / courier| TARBALL
-    TARBALL --> INSTALLMACHINE
-    INSTALLMACHINE -->|install_from_airgap_bundle.sh| CLUSTER
+    INTERNET -->|download| AGI
+    AGI --> STAGE
+    STAGE -->|scp / ssh| CLUSTER
     REGISTRY --> CLUSTER
     OBJSTORE --> CLUSTER
 ```
 
-**Key principle:** The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. `install_from_airgap_bundle.sh` sets all of them automatically from the bundle.
+**Key principle:** the air-gap boundary sits between the installer machine and the
+cluster nodes — not between two machines. Only the installer machine needs
+internet; the nodes never make an outbound connection. There is no tarball to
+copy and no separate command to learn: `k0s_cluster_with_stack.sh install`
+detects air-gap mode, stages everything into a staging directory via
+`airgap_install.sh`, and then pushes it to the nodes over SSH.
 
-### Phase 1 — Prepare the Bundle (Connected Machine)
+**One entry point, two modes.** The command is identical either way — the config
+selects the mode:
 
-Run this on any machine with internet access. You do not need the cluster nodes reachable from this machine.
+```yaml
+cluster:
+  airgap: false   # standard install — proceeds directly to the nodes
+  airgap: true    # stages ~2.2 GB of artifacts first (~15 min), then installs
+```
+
+```bash
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+`AIRGAP_MODE=true` in the environment is an equally valid trigger, for a one-off
+air-gap run without editing the config:
+
+```bash
+AIRGAP_MODE=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+**Only `install` and `join-workers` stage artifacts.** `validate`, `diagnose`,
+`delete`, `clean-all`, `verify-pods`, and `stage-artifacts` never trigger
+staging, so they stay instant even with `airgap: true` — a read-only config check
+must not require a 15-minute download.
+
+The main installer has no hardcoded download URLs — every internet address is
+overridable via environment variables, and the staging step sets all of them
+automatically from the staged artifacts.
+
+> **Advanced / direct path.** `airgap_install.sh` remains available as the
+> lower-level command and is unchanged: use it to pre-stage with
+> `--download-only`, or to drive staging with non-default flags
+> (`--k0s-version`, `--gpu-hosts`, `--driver-version`, …). The unified command
+> calls it for you with defaults.
+
+### Phase 1 — Stage the Artifacts
+
+Phases 1–3 are preparation you do before installing. If your container images
+are already mirrored and your model weights already staged, skip straight to
+[Phase 4](#phase-4--install) — the single command there does Phase 1 for you.
+
+Stage explicitly only if you want the artifacts on disk *before* the install
+window — to inspect them, to check their size, or to work through Phase 2's
+image list. `--download-only` has no equivalent on the unified command, so this
+is the way to pre-stage. Run it on the internet-connected RHEL 9 installer
+machine — the same machine that can SSH to the cluster nodes.
 
 ```bash
 cd tools/cluster_setup
 
-# Build the bundle (RHEL 9 GPU nodes — only supported target)
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer
+# Stage everything and stop, without installing
+./airgap_install.sh --download-only --config my-cluster-config.yaml
 
 # Pin a specific k0s version
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
+./airgap_install.sh --download-only --config my-cluster-config.yaml \
+  --k0s-version v1.31.2+k0s.0
+
+# Stage somewhere other than ./airgap-bundle
+./airgap_install.sh --download-only --config my-cluster-config.yaml \
+  --output-dir /mnt/staging
 ```
 
-**What gets downloaded into the bundle:**
+**What gets downloaded:**
 
 ```mermaid
 graph TD
-    SCRIPT["prepare_airgap_bundle.sh"]
+    SCRIPT["Staging step\n(airgap_install.sh)"]
 
     subgraph BIN["📁 binaries/"]
         K0S["k0s binary\nlatest or --k0s-version"]
@@ -460,37 +506,39 @@ graph TD
     SCRIPT --> BIN & IMG & MAN & CHARTS & PKGS & META
 ```
 
-> **⭐ The `images/` bundles are the part customers most often miss.** A single
-> `prepare_airgap_bundle.sh` run produces **both** image tarballs automatically —
+> **⭐ The `images/` tarballs are the part customers most often miss.** The
+> staging step produces **both** image tarballs automatically —
 > you do **not** run a separate command for them. They are essential: without
 > them, an air-gapped cluster's own infrastructure pods (Calico, CoreDNS,
 > cert-manager, the NVIDIA device plugin, …) try to pull from quay.io / ghcr.io /
 > registry.k8s.io over the blocked link and the cluster never becomes Ready.
 > See [Why two image bundles?](#why-two-image-bundles) below.
 
-Output: a single timestamped `.tar.gz`:
+Output: a timestamped staging directory, consumed in place:
 
 ```
-/mnt/transfer/airgap-bundle-20260612-103000.tar.gz   (~2–4 GB)
+./airgap-bundle/airgap-bundle-20260612-103000/   (~2–4 GB)
 ```
 
-> **Bundle size:** the image tarballs are the bulk of the bundle — expect a few
-> GB (the binaries, charts, and manifests alone are ~500 MB; the k0s and add-on
-> images add the rest). Size scales with the resolved image set.
+> **Staging size:** the image tarballs are the bulk — expect a few GB (the
+> binaries, charts, and manifests alone are ~500 MB; the k0s and add-on images
+> add the rest). Size scales with the resolved image set. After a successful
+> install the staged tree is deleted to reclaim disk unless you pass
+> `--keep-staging`.
 
 #### Why two image bundles?
 
-The bundle carries container images in two separate OCI tarballs under `images/`
+Container images are staged as two separate OCI tarballs under `images/`
 because two *different* sets of images would otherwise be pulled from the
 internet at cluster-bring-up time — and neither set is covered by the
 `images.registry` rewrite you configure for the platform's own images:
 
-| Tarball | Built by (in `prepare_airgap_bundle.sh`) | Covers | Why it can't come from your registry |
+| Tarball | Built by (during staging, in `airgap_install.sh`) | Covers | Why it can't come from your registry |
 |---|---|---|---|
 | `k0s-images.tar` | `k0s airgap list-images --all` → `k0s airgap bundle-artifacts` | k0s control-plane images: `pause`, Calico, kube-proxy, CoreDNS, metrics-server | k0s pulls these itself at kubelet startup (from quay.io/k0sproject) — they never pass through the installer's config |
 | `addon-images.tar` | renders every Helm chart + static manifest, collects each `image:` ref, then `bundle-artifacts` | add-on components: cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, **NVIDIA device plugin**, busybox | their image refs live *inside* the charts/manifests (quay.io, ghcr.io, registry.k8s.io, nvcr.io, docker.io) — the `images.registry` rewrite only touches the platform CR images, not these |
 
-**How they get used (fully automatic):** `install_from_airgap_bundle.sh` detects
+**How they get used (fully automatic):** the staging step detects
 `images/*.tar` and the installer copies **every** tarball to
 `/var/lib/k0s/images/` on each node — *after* `k0s install` (which recreates
 `/var/lib/k0s`) and *before* `k0s start`. k0s auto-imports every tarball in that
@@ -506,12 +554,12 @@ directory into containerd at kubelet startup, so the infra pods start with
 
 ### Phase 2 — Mirror Container Images
 
-Container images are **not** in the bundle (they would add many GB). Mirror them separately to your internal registry.
+Platform application images are **not** staged (they would add many GB). Mirror them separately to your internal registry. `--download-only` in Phase 1 gives you the list to work from.
 
 ```mermaid
 flowchart LR
-    subgraph CONN["Connected Machine"]
-        LIST["container-images.txt\nfrom the bundle"]
+    subgraph CONN["Installer Machine"]
+        LIST["container-images.txt\nfrom the staged bundle"]
         CRANE["crane copy\nor\ndocker pull+tag+push"]
     end
     subgraph NET["Internet"]
@@ -557,7 +605,7 @@ imagePullSecrets:
 
 ### Phase 3 — Stage Model Weights
 
-Model weights (>120 GB) must be staged to your object store. Do this on the connected machine.
+Model weights (>120 GB) must be staged to your object store. Do this on the installer machine, or any other machine with internet and reach to the object store.
 
 **System requirements for the staging machine**
 
@@ -588,72 +636,69 @@ storage:
     enabled: false
 ```
 
-### Phase 4 — Transfer to Air-Gapped Environment
+### Phase 4 — Install
 
-```bash
-# Copy bundle
-scp /mnt/transfer/airgap-bundle-<timestamp>.tar.gz \
-    admin@install-machine:/opt/splunk-ai/
+**4a. Add `cluster.airgap: true` to your config**
 
-# Copy installer scripts (if not already on the machine)
-scp tools/cluster_setup/k0s_cluster_with_stack.sh \
-    tools/cluster_setup/install_from_airgap_bundle.sh \
-    tools/cluster_setup/k0s-cluster-config.yaml \
-    admin@install-machine:/opt/splunk-ai/
-
-# Copy your edited cluster config
-scp my-cluster-config.yaml admin@install-machine:/opt/splunk-ai/
-```
-
-### Phase 5 — Install from the Bundle
-
-**5a. Add `cluster.airgap: true` to your config**
+This is the mode switch — it is what makes the install command below stage
+artifacts instead of going straight at the nodes.
 
 ```yaml
 cluster:
   name: my-cluster
-  airgap: true        # skips internet connectivity checks immediately
+  airgap: true        # stage artifacts first; skip internet connectivity checks
   sshKeyPath: ~/.ssh/id_rsa
   sshUser: ec2-user
 ```
 
-**5b. Run the installer**
+**4b. Run the install**
+
+The same command as a standard install, on the internet-connected installer
+machine:
 
 ```bash
-cd /opt/splunk-ai
-chmod +x install_from_airgap_bundle.sh k0s_cluster_with_stack.sh
+cd tools/cluster_setup
+chmod +x airgap_install.sh k0s_cluster_with_stack.sh
 
-./install_from_airgap_bundle.sh \
-  --bundle /opt/splunk-ai/airgap-bundle-<timestamp>.tar.gz \
-  --config /opt/splunk-ai/my-cluster-config.yaml
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
-**What `install_from_airgap_bundle.sh` does automatically:**
+That is the whole thing. GPU node IPs and the SSH user/key are read from the
+config, so no GPU flags are normally needed. Expect roughly 15 extra minutes up
+front for the ~2.2 GB of artifacts.
+
+> **Air-gap staging requirements (installer host only):** `createrepo_c`,
+> `sudo`, and ~5 GB free — the NVIDIA RPM closure is built there. A standard
+> (`airgap: false`) install needs none of these.
+
+**What the install does automatically in air-gap mode:**
 
 ```mermaid
 flowchart TD
-    A["install_from_airgap_bundle.sh --bundle ..."] --> B
+    A["CONFIG_FILE=./my-cluster-config.yaml\n./k0s_cluster_with_stack.sh install"] --> A2
 
-    B["1. Extract bundle\n/opt/airgap/airgap-bundle-<date>/"]
-    B --> C["2. Verify SHA-256 checksums\nof every bundled file"]
-    C --> D["3. Install k0s binary\nto /usr/local/bin/k0s"]
-    D --> E["4. Install yq binary\nto /usr/local/bin/yq"]
-    E --> F["5. Register local Helm repo\n(best-effort; charts install by path)"]
-    F --> G["6. Export env-var overrides\nincl. AIRGAP_K0S_IMAGE_DIR\n→ points at images/*.tar"]
-    G --> H["7. Run k0s_cluster_with_stack.sh install"]
-    H --> I["During install: copy k0s-images.tar\n+ addon-images.tar to each node's\n/var/lib/k0s/images/ (after k0s install,\nbefore k0s start) → auto-imported\ninto containerd"]
+    A2["0. cluster.airgap: true detected\n→ hands off to airgap_install.sh\nto stage the artifacts"]
+    A2 --> B
 
-    style C fill:#c6f6d5,color:#1a202c
-    style G fill:#bee3f8,color:#1a202c
-    style I fill:#fef3c7,color:#1a202c
+    B["1. Preflight: config, installer,\nbuild host, GPU nodes derived\nfrom the config"]
+    B --> C["2. Download binaries, manifests, charts,\nimage tarballs + NVIDIA closure into\n./airgap-bundle/airgap-bundle-<date>/"]
+    C --> D["3. Verify SHA-256 checksums\nof every staged file"]
+    D --> E["4. Install k0s and yq binaries\nto /usr/local/bin/"]
+    E --> F["5. Export env-var overrides\nincl. AIRGAP_K0S_IMAGE_DIR\n→ points at images/*.tar"]
+    F --> G["6. Call k0s_cluster_with_stack.sh install back\nwith AIRGAP_STAGED=true, so this pass\ninstalls instead of staging again"]
+    G --> H["During install: copy k0s-images.tar\n+ addon-images.tar to each node's\n/var/lib/k0s/images/ (after k0s install,\nbefore k0s start) → auto-imported\ninto containerd"]
+
+    style D fill:#c6f6d5,color:#1a202c
+    style F fill:#bee3f8,color:#1a202c
+    style H fill:#fef3c7,color:#1a202c
 ```
 
 The install plan shown before any changes are made will display:
 
 ```
 Air-gap mode    : true
-k0s install URL : file:///opt/airgap/.../binaries/k0s
-Helm charts     : local (file:///opt/airgap/.../charts/)
+k0s install URL : file://./airgap-bundle/airgap-bundle-<date>/binaries/k0s
+Helm charts     : local (file://./airgap-bundle/airgap-bundle-<date>/charts/)
 Image bundles   : k0s-images.tar, addon-images.tar  → staged to /var/lib/k0s/images/
 ...
 ```
@@ -666,101 +711,129 @@ Staging image bundle addon-images.tar on <node-ip> (/var/lib/k0s/images/)...
 ```
 
 > If you instead see `No pre-loaded image bundles in air-gap bundle (images/*.tar)`,
-> your bundle was built before this feature — rebuild it with the current
-> `prepare_airgap_bundle.sh`. Without the bundles, infra pods will sit in
-> `ImagePullBackOff` and nodes will stay `NotReady`.
+> the image tarballs were not staged — re-run the install with the current
+> scripts. Without the bundles, infra pods will sit in `ImagePullBackOff` and
+> nodes will stay `NotReady`.
 
 Confirm to proceed.
 
+> **If the install fails partway**, the staged artifacts are deliberately kept so
+> a retry needs no re-download. The script prints the exact `source airgap-env.sh`
+> and `CONFIG_FILE=... ./k0s_cluster_with_stack.sh <subcommand>` commands to
+> resume from where it stopped.
+
 ### GPU Nodes in Air-Gapped Environments
 
-GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that normally download from the internet. In air-gap mode the installer detects missing `nvidia-smi` and fails clearly rather than timing out.
+GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that
+normally download from the internet. The air-gap staging step builds a complete
+offline **RPM closure** for them, and the installer pushes it to each GPU node — so
+a sealed node never contacts `developer.download.nvidia.com`.
 
 ```mermaid
 flowchart TD
-    INSTALLER["Installer reaches GPU node\ninstall_nvidia_on_node()"]
+    INSTALLER["Installer reaches GPU node\n_install_nvidia_on_node()"]
     CHECK{"nvidia-smi\nalready present?"}
     SKIP["✅ Skip driver install\nDriver already installed"]
     AIRGAP_CHECK{"AIRGAP_MODE\n= true?"}
-    FAIL["❌ Clear error message:\nnvidia-smi not found\nin AIRGAP_MODE\n→ see K0S_README.md"]
-    INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nNVIDIA repo → nvidia-driver:latest-dkms\nnvidia-container-toolkit"]
+    CLOSURE{"Staged\nnvidia-closure?"}
+    KCHECK{"Closure covers\nnode's kernel?"}
+    OFFLINE["scp closure to node\ndnf --disablerepo='*'\n--repofrompath=airgap-nvidia\nDKMS compiles module"]
+    FAIL["❌ Clear error:\nno closure staged\n→ re-run without\n--skip-nvidia-closure"]
+    KFAIL["❌ Clear error naming\nthe node's kernel and\nthe kernels covered"]
+    INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nNVIDIA repo → nvidia-driver:latest-dkms"]
     CTK["Install nvidia-container-toolkit"]
     VERIFY["Verify: nvidia-smi returns\ndriver version number"]
 
     INSTALLER --> CHECK
     CHECK -->|yes| SKIP
     CHECK -->|no| AIRGAP_CHECK
-    AIRGAP_CHECK -->|yes| FAIL
+    AIRGAP_CHECK -->|yes| CLOSURE
     AIRGAP_CHECK -->|no| INSTALL
+    CLOSURE -->|no| FAIL
+    CLOSURE -->|yes| KCHECK
+    KCHECK -->|no| KFAIL
+    KCHECK -->|yes| OFFLINE
+    OFFLINE --> CTK
     INSTALL --> CTK
     CTK --> VERIFY
     SKIP --> CTK
 ```
 
-**Three strategies for GPU node packages in air-gap:**
+**Two strategies for GPU node packages in air-gap:**
 
 ```mermaid
 flowchart LR
-    subgraph S1["Strategy 1\n✅ Recommended"]
-        S1A["Pre-install NVIDIA driver\n+ nvidia-container-toolkit\non GPU nodes\nBEFORE running installer"]
-        S1B["Installer detects nvidia-smi\nand skips driver install"]
-        S1A --> S1B
+    subgraph S1["Strategy 1\n✅ Recommended — automatic"]
+        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9 host;\nGPU IPs read from the config"]
+        S1B["Script resolves a full RPM\nclosure incl. kernel-devel\nfor each node's kernel"]
+        S1C["Installer scp's the closure\nto each GPU node and installs\noffline; DKMS compiles"]
+        S1A --> S1B --> S1C
     end
 
-    subgraph S2["Strategy 2\nLocal RPM mirror"]
-        S2A["Set up internal\nRPM mirror\n(reposync)"]
-        S2B["Set env vars:\nEPEL_RPM_URL_OVERRIDE\nCUDA_REPO_URL_OVERRIDE\nNVIDIA_CTK_REPO_URL_OVERRIDE"]
+    subgraph S2["Strategy 2\nPre-install yourself"]
+        S2A["Install NVIDIA driver +\nnvidia-container-toolkit on\nGPU nodes beforehand"]
+        S2B["Stage with airgap_install.sh\n--skip-nvidia-closure; installer\ndetects nvidia-smi and skips\ndriver install"]
         S2A --> S2B
-    end
-
-    subgraph S3["Strategy 3\nPartial air-gap"]
-        S3A["GPU nodes have\ncontrolled access to\nnvidia.com only"]
-        S3B["Set cluster.airgap: true\nInstaller skips HuggingFace\nchecks but GPU driver\ninstall proceeds normally"]
-        S3A --> S3B
     end
 ```
 
-**Pre-installing the driver offline (Strategy 1):**
+**Strategy 1 — staging the driver closure:**
 
-A fully air-gapped GPU node can't reach NVIDIA's RPM repos. The bundle's
-`cuda-rhel9.repo` only points `dnf` at NVIDIA's servers, so on a disconnected
-node you supply the packages yourself: build a self-contained RPM **closure** on
-a connected RHEL 9 host, copy it to the node, and install from it as a local
-repo. Use the DKMS driver flavor `nvidia-driver:latest-dkms`
-(`kmod-nvidia-latest-dkms`) — the older `cuda-drivers` meta-package is no longer
-published.
+Run this on the internet-connected RHEL 9 installer machine. NVIDIA publishes
+**DKMS-only** packages for RHEL 9 (`kmod-nvidia-latest-dkms`; the older
+`cuda-drivers` meta-package is gone), so the kernel module is compiled on each GPU
+node and needs `kernel-devel` matching that node's exact `uname -r`.
+
+```bash
+# Nothing extra to do — the GPU node IPs are derived from your config and each
+# node's `uname -r` is surveyed over SSH.
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+To override the derived kernel or host list, drive the staging step directly —
+these flags live on `airgap_install.sh`, which then continues into the install
+just as the unified command would:
+
+```bash
+# Override the derived list only if needed (e.g. non-standard node layout)
+./airgap_install.sh --config my-cluster-config.yaml \
+  --gpu-hosts 10.0.38.138,10.0.38.139
+
+# …or name the kernels explicitly if the nodes aren't reachable over SSH yet
+./airgap_install.sh --config my-cluster-config.yaml \
+  --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64
+```
+
+> GPU node IPs come from your config: the workers listed in
+> `nodes.existingIPs.workers` after the first `nodes.cpuWorkers` entries are
+> treated as the GPU workers. `--gpu-hosts` is only an override.
+
+Installer-host requirements: RHEL 9 x86_64 Linux with `dnf`, `rpm`, and `createrepo_c`
+(`sudo dnf install -y createrepo_c`). The host's RHEL **minor** version and running
+kernel do *not* need to match the GPU nodes — `$releasever` resolves to `9`, so a
+9.6 build host can supply `kernel-devel` for a 9.8 node. All of this is validated in
+preflight, before any downloads.
 
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the
 > same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only
-> `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's
-> `uname -r`).
+> `kernel-devel` is node-specific.
 
-The recipe is three steps:
+**The closure is valid only for the kernels it was built for.** If a GPU node runs an
+uncovered kernel, the installer fails before copying anything and names both the
+node's kernel and the kernels the closure covers — re-run with that kernel included.
+For the same reason, don't let an air-gapped GPU node upgrade or reboot into a
+different kernel afterward; the DKMS module is built only against the one it saw.
 
-1. **Build the closure** on a connected RHEL 9 host — enable
-   `nvidia-driver:latest-dkms`, then `dnf download --resolve --alldeps` the
-   driver, container toolkit, and DKMS build chain, pinned to the *GPU node's*
-   kernel release and RHEL minor (not the build host's).
-2. **Fix three gotchas** before publishing the repo: delete the too-new `glibc`
-   RPMs `--alldeps` drags in and re-pull them at the node's version (you can't
-   upgrade a core lib offline); add `kernel-devel-matched-<KREL>` (a `dkms`
-   rich-dep); run `createrepo_c` to build the repo index.
-3. **Install on the node** from the local repo with
-   `dnf install --refresh --disablerepo='*' --repofrompath=...` (named packages,
-   not `*.rpm`), then verify with `dkms status`, `nvidia-smi`, and `nvidia-ctk
-   --version`.
-
-> **Full copy-paste recipe** — the exact commands for all three steps, including
-> the kernel/glibc pinning and the `--repofrompath` install line, are in
+> **Full reference** — flags, kernel-coverage rules, and troubleshooting rows for
+> each failure mode are in
 > [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments).
-> Don't reboot an air-gapped GPU node into a different kernel afterward — the
-> DKMS kmod is built only against the running one.
 
-After the driver is in place on every GPU node, run
-`install_from_airgap_bundle.sh` normally. The installer detects `nvidia-smi`
-(skips driver install) and `nvidia-ctk` (skips Container Toolkit install), then
-configures the containerd runtime, generates the CDI spec, and applies the
-device-plugin DaemonSet — all offline.
+The same run then continues into the install. It exports
+`AIRGAP_NVIDIA_CLOSURE_DIR`, and the installer copies the closure to each GPU node,
+installs the driver, DKMS, build toolchain, container toolkit, and matching
+`kernel-devel` with `dnf --disablerepo='*' --repofrompath=airgap-nvidia,<dir>`,
+verifies the DKMS build, then configures the containerd runtime, generates the CDI
+spec, and applies the device-plugin DaemonSet — all offline.
 
 **What the installer handles for you (k0s ≥ 1.33 / containerd 2.x):**
 
@@ -769,12 +842,11 @@ device-plugin DaemonSet — all offline.
   rejects (crash-looping the worker). The installer rewrites the drop-in to the
   new `io.containerd.cri.v1.runtime` key automatically when the node's k0s base
   config uses it — no manual edit needed.
-- **device-plugin image.** The bundle includes
-  `nvcr.io/nvidia/k8s-device-plugin` in `addon-images.tar`, staged to
-  `/var/lib/k0s/images/` on every worker, so the DaemonSet starts without
-  pulling from `nvcr.io`. (If you see the device-plugin in `ImagePullBackOff`,
-  you are on a bundle built before this fix — rebuild with the current
-  `prepare_airgap_bundle.sh`.)
+- **device-plugin image.** `nvcr.io/nvidia/k8s-device-plugin` is included in
+  `addon-images.tar`, staged to `/var/lib/k0s/images/` on every worker, so the
+  DaemonSet starts without pulling from `nvcr.io`. (If you see the device-plugin
+  in `ImagePullBackOff`, the tarballs did not reach the node — check
+  `ls /var/lib/k0s/images/` there.)
 - **worker image staging on rejoin.** Workers joined into an existing cluster
   also receive the image tarballs, so a GPU node added later still comes up
   Ready offline.
@@ -958,17 +1030,12 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 > The safety gate prevents `install` from wiping a cluster with Ready nodes — it upgrades the stack only. If you also need to upgrade k0s itself, run `clean-all` + `install` (destructive — back up etcd first).
 
-**Air-gap upgrade:**
+**Air-gap upgrade:** re-run the same command on the installer machine — with
+`airgap: true` still in the config it re-downloads the current artifacts before
+upgrading the stack.
 
 ```bash
-# Build a new bundle on a connected machine
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer
-
-# Then on the install machine
-./install_from_airgap_bundle.sh \
-  --bundle /opt/airgap-bundle-<new-timestamp>.tar.gz \
-  --config my-cluster-config.yaml \
-  --subcommand upgrade
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ### Collect a support bundle
@@ -1038,13 +1105,13 @@ flowchart TD
 | "Refusing to wipe — Ready nodes" | `kubectl get nodes` | Set `useExisting: auto` in config or run `clean-all` first |
 | "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
 | "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
-| "Checksum verification failed" | Re-transfer the bundle | `sha256sum airgap-bundle-<date>.tar.gz` and compare |
-| "Expected chart not found" | `ls /opt/airgap/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
+| "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging dir and re-run the install (staging repeats automatically) |
+| "Expected chart not found" | `ls ./airgap-bundle/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
 | `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](K0S_README.md#insecure-registry-support-containerd-v2) |
 | All models reported MISSING after a successful upload | `mc ls myminio/<bucket>/staging_state/` | Bucket name has uppercase letters — the upload scripts normalize to lowercase; use a lowercase `storage.objectStore.bucket` value. See [Model Staging Issues](K0S_README.md#model-staging-issues) |
 | All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](K0S_README.md#switching-defaultacceleratortype-from-l40s-to-h100-shows-models-as-missing) |
-| Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in your bundle (rebuild with current `prepare_airgap_bundle.sh` if not); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
+| Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in the staged tree (`--download-only` to inspect); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
 | SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
 
