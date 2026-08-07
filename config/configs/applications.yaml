@@ -753,6 +753,13 @@ applications:
       custom_deployment_import_path: fm_timeseries.main:FMTimeseriesDeployment
       deployment_configs:
         FMTimeseriesDeployment:
+          gpu_type_options_override:
+            RTX_PRO_6000_BLACKWELL:
+              ray_actor_options:
+                num_gpus: 0.1
+                resources:
+                  "gpu_count:2": 0.001
+                  "accelerator_type:RTX_PRO_6000_BLACKWELL": 0.001
           options:
             autoscaling_config:
               max_replicas: 1

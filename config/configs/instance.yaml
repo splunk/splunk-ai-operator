@@ -96,5 +96,5 @@ RTX_PRO_6000_BLACKWELL:
       limits:
         cpu: "8"
         memory: "96Gi"
-        ephemeral-storage: "350Gi"
+        ephemeral-storage: "300Gi"
         nvidia.com/gpu: "2"
