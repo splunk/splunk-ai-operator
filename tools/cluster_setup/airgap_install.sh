@@ -28,9 +28,12 @@ KUBERAY_CHART_VERSION="1.2.2"
 # Override with --k0s-version if you need a specific release.
 K0S_VERSION="${K0S_VERSION:-latest}"
 
-# Target OS for GPU node RPM packages. Only rhel9 is tested and supported.
-# rhel10 and amzn2023 code paths are kept for internal testing only.
-GPU_NODE_OS="${GPU_NODE_OS:-rhel9}"
+# Target OS for GPU node driver packages. Supported: rhel9 (RPM closure) and
+# ubuntu24 (deb closure). Default 'auto' detects it from the GPU nodes over SSH,
+# because the installer delegates here without passing --gpu-os and there is no
+# cluster-config key for it — so a hardcoded default silently builds the wrong
+# package format. rhel10/amzn2023 code paths remain for internal testing only.
+GPU_NODE_OS="${GPU_NODE_OS:-auto}"
 
 # GPU driver closure inputs. The NVIDIA kernel module is DKMS-only (NVIDIA
 # publishes no precompiled kmod for RHEL 9), so it must compile on each GPU
@@ -114,10 +117,14 @@ OPTIONS
                         Env: K0S_VERSION
 
   --gpu-os OS           Target OS for GPU node package files.
-                        Supported: rhel9 (default — only tested/supported value)
+                        Supported: auto (default), rhel9, ubuntu24
+                        'auto' SSHes to the first GPU node and reads
+                        /etc/os-release, then builds an RPM closure for RHEL 9 or
+                        a .deb closure for Ubuntu 24.04. Set it explicitly only
+                        when the nodes are not reachable yet.
                         Env: GPU_NODE_OS
-                        Only RHEL 9 is tested and supported.
-                        Any other value will error.
+                        A .deb closure is resolved inside an ubuntu:24.04
+                        container, so podman or docker is required for it.
 
   --gpu-hosts LIST      Comma-separated GPU node IPs/hostnames. This machine
                         SSHes to each and reads `uname -r`. Normally NOT needed:
@@ -279,15 +286,21 @@ BUNDLE_NAME="airgap-bundle-${BUNDLE_TIMESTAMP}"
 STAGE_DIR="${OUTPUT_DIR}/${BUNDLE_NAME}"
 
 # ── OS validation ─────────────────────────────────────────────────────────────
-if [[ "${GPU_NODE_OS}" != "rhel9" ]]; then
-  echo "ERROR: --gpu-os '${GPU_NODE_OS}' is not supported." >&2
-  echo "  Only 'rhel9' is tested and supported for GPU node packages." >&2
-  echo "  rhel10 and amzn2023 paths exist in the code for internal testing" >&2
-  echo "  but are not validated for production use." >&2
-  echo "  To use an untested OS path, set GPU_NODE_OS directly and accept the risk:" >&2
-  echo "    GPU_NODE_OS=rhel10 ./airgap_install.sh ..." >&2
-  exit 1
-fi
+# Only the explicitly-named values are rejected here. 'auto' is resolved further
+# down, once the GPU node IPs have been derived from the config and can be
+# probed over SSH.
+case "${GPU_NODE_OS}" in
+  auto|rhel9|ubuntu24) ;;
+  *)
+    echo "ERROR: --gpu-os '${GPU_NODE_OS}' is not supported." >&2
+    echo "  Supported: 'rhel9', 'ubuntu24', or 'auto' (detect over SSH)." >&2
+    echo "  rhel10 and amzn2023 paths exist in the code for internal testing" >&2
+    echo "  but are not validated for production use." >&2
+    echo "  To use an untested OS path, set GPU_NODE_OS directly and accept the risk:" >&2
+    echo "    GPU_NODE_OS=rhel10 ./airgap_install.sh ..." >&2
+    exit 1
+    ;;
+esac
 
 # ── Install-target validation ─────────────────────────────────────────────────
 # Resolved before any downloading: a missing config or installer is a certain
@@ -342,6 +355,49 @@ if [[ -n "${CONFIG_FILE}" ]] && command -v yq >/dev/null 2>&1; then
   fi
 fi
 
+# ── Resolve --gpu-os auto ─────────────────────────────────────────────────────
+# Probing the node is the only reliable source: the installer delegates here with
+# just --config, and the cluster config has no OS field. Detect before preflight
+# so the capability checks below test for the right toolchain.
+if [[ "${GPU_NODE_OS}" == "auto" ]]; then
+  if [[ "${SKIP_NVIDIA_CLOSURE}" == "true" ]]; then
+    # Nothing OS-specific is built, so the value only labels the manifest.
+    GPU_NODE_OS="rhel9"
+  else
+    _os_probe_host="$(echo "${GPU_HOSTS}" | cut -d, -f1 | tr -d '[:space:]')"
+    if [[ -z "${_os_probe_host}" ]]; then
+      echo "ERROR: --gpu-os is 'auto' but no GPU node is known to probe." >&2
+      echo "  Pass --gpu-os rhel9|ubuntu24 explicitly, or --gpu-hosts <ip>," >&2
+      echo "  or a --config that lists nodes.existingIPs.workers." >&2
+      exit 1
+    fi
+    _os_probe="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 \
+                  ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} \
+                  "${SSH_USER:-ec2-user}@${_os_probe_host}" \
+                  '. /etc/os-release 2>/dev/null; echo "${ID}:${VERSION_ID}"' 2>/dev/null || true)"
+    case "${_os_probe}" in
+      ubuntu:24*)                      GPU_NODE_OS="ubuntu24" ;;
+      rhel:9*|centos:9*|rocky:9*|almalinux:9*) GPU_NODE_OS="rhel9" ;;
+      *)
+        echo "ERROR: could not determine the GPU node OS from ${_os_probe_host}." >&2
+        echo "  Probe returned: '${_os_probe:-<no response>}'" >&2
+        echo "  Check SSH_USER/SSH_KEY_PATH reachability, or pass --gpu-os explicitly." >&2
+        exit 1
+        ;;
+    esac
+    echo "Detected GPU node OS from ${_os_probe_host}: ${GPU_NODE_OS}"
+  fi
+fi
+
+# Package format the closure will be built in. Every format-specific branch below
+# switches on this rather than re-testing GPU_NODE_OS.
+if [[ "${GPU_NODE_OS}" == "ubuntu24" ]]; then
+  CLOSURE_PKG_FORMAT="deb"
+else
+  CLOSURE_PKG_FORMAT="rpm"
+fi
+
 # ── Closure preflight ─────────────────────────────────────────────────────────
 # Validated up front, before the ~15 minutes of image pulls and chart downloads
 # below: a missing kernel list or a macOS build host is a certain failure, and
@@ -372,22 +428,44 @@ if [[ "${SKIP_NVIDIA_CLOSURE}" != "true" ]]; then
     echo "  pass --skip-nvidia-closure to build a bundle without GPU driver packages." >&2
     exit 1
   fi
-  for _cmd in dnf rpm createrepo_c; do
-    if ! command -v "${_cmd}" >/dev/null 2>&1; then
-      echo "ERROR: ${_cmd} not found — required to build the offline NVIDIA driver repo." >&2
-      echo "  Install it with: sudo dnf install -y ${_cmd}" >&2
-      echo "  Or pass --skip-nvidia-closure to build a bundle without GPU driver packages." >&2
+  if [[ "${CLOSURE_PKG_FORMAT}" == "deb" ]]; then
+    # A .deb closure needs apt to resolve dependencies against Ubuntu's archive.
+    # The build host is normally RHEL, which has no apt, so resolution runs inside
+    # an ubuntu:24.04 container instead. That is also the more correct approach
+    # even on an Ubuntu host: apt skips packages already installed locally, so
+    # resolving in a pristine rootfs is what makes the closure complete.
+    CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
+    if [[ -z "${CONTAINER_RUNTIME}" ]]; then
+      for _rt in podman docker; do
+        command -v "${_rt}" >/dev/null 2>&1 && { CONTAINER_RUNTIME="${_rt}"; break; }
+      done
+    fi
+    if [[ -z "${CONTAINER_RUNTIME}" ]]; then
+      echo "ERROR: neither podman nor docker found — required to build a .deb driver closure." >&2
+      echo "  Ubuntu driver packages are resolved inside an ubuntu:24.04 container so the" >&2
+      echo "  closure is complete and independent of this host's own package state." >&2
+      echo "  Install one with: sudo dnf install -y podman" >&2
+      echo "  Or pass --skip-nvidia-closure and pre-install drivers on the GPU nodes." >&2
       exit 1
     fi
-  done
-  _host_major="$(rpm -E %{rhel} 2>/dev/null || echo "")"
-  if [[ "${_host_major}" != "9" ]]; then
-    echo "ERROR: this host reports RHEL major '${_host_major}' but --gpu-os is rhel9." >&2
-    echo "  The closure must be built on the same major OS family as the GPU nodes so" >&2
-    echo "  dnf resolves the right dependency versions. Minor version and running" >&2
-    echo "  kernel need NOT match — \$releasever resolves to '9' and DKMS compiles on" >&2
-    echo "  the target node." >&2
-    exit 1
+  else
+    for _cmd in dnf rpm createrepo_c; do
+      if ! command -v "${_cmd}" >/dev/null 2>&1; then
+        echo "ERROR: ${_cmd} not found — required to build the offline NVIDIA driver repo." >&2
+        echo "  Install it with: sudo dnf install -y ${_cmd}" >&2
+        echo "  Or pass --skip-nvidia-closure to build a bundle without GPU driver packages." >&2
+        exit 1
+      fi
+    done
+    _host_major="$(rpm -E %{rhel} 2>/dev/null || echo "")"
+    if [[ "${_host_major}" != "9" ]]; then
+      echo "ERROR: this host reports RHEL major '${_host_major}' but --gpu-os is rhel9." >&2
+      echo "  The closure must be built on the same major OS family as the GPU nodes so" >&2
+      echo "  dnf resolves the right dependency versions. Minor version and running" >&2
+      echo "  kernel need NOT match — \$releasever resolves to '9' and DKMS compiles on" >&2
+      echo "  the target node." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -621,14 +699,20 @@ fi
 # never contact developer.download.nvidia.com.
 log "--- Building GPU node package closure (target OS: ${GPU_NODE_OS}) ---"
 
-# Resolve EPEL major from GPU_NODE_OS
-case "${GPU_NODE_OS}" in
-  rhel9|amzn2023) EPEL_MAJOR=9 ;;
-  rhel10)         EPEL_MAJOR=10 ;;
-  *)
-    warn "Unknown GPU_NODE_OS '${GPU_NODE_OS}'; defaulting EPEL major to 9"
-    EPEL_MAJOR=9 ;;
-esac
+# Resolve EPEL major from GPU_NODE_OS. Only the rpm closure needs EPEL (it is
+# where `dkms` lives on RHEL); on Debian dkms is in the main archive, so warning
+# about an "unknown" OS here would be noise on a perfectly supported target.
+if [[ "${CLOSURE_PKG_FORMAT}" == "deb" ]]; then
+  EPEL_MAJOR=9
+else
+  case "${GPU_NODE_OS}" in
+    rhel9|amzn2023) EPEL_MAJOR=9 ;;
+    rhel10)         EPEL_MAJOR=10 ;;
+    *)
+      warn "Unknown GPU_NODE_OS '${GPU_NODE_OS}'; defaulting EPEL major to 9"
+      EPEL_MAJOR=9 ;;
+  esac
+fi
 
 CLOSURE_DIR="${STAGE_DIR}/packages/nvidia-closure"
 
@@ -648,17 +732,31 @@ if [[ "${SKIP_NVIDIA_CLOSURE}" != "true" && -z "${GPU_KERNELS}" && -n "${GPU_HOS
   for _h in "${_hosts[@]}"; do
     _h="$(echo "${_h}" | tr -d '[:space:]')"
     [[ -z "${_h}" ]] && continue
+    # Same three facts on both families, different tools. Line 1: running kernel.
+    # Line 2: the libc version other packages pin to exactly. Then every kernel
+    # INSTALLED on the node — on Debian that is /lib/modules, which is exactly the
+    # set dkms iterates over when it auto-builds on install.
+    if [[ "${CLOSURE_PKG_FORMAT}" == "deb" ]]; then
+      _probe_cmd='uname -r; dpkg-query -W -f="\${Version}\n" libc6 2>/dev/null | head -1; echo "--cores--"; ls -1 /lib/modules 2>/dev/null'
+    else
+      _probe_cmd='uname -r; rpm -q glibc --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null; echo "--cores--"; rpm -q kernel-core --qf "%{VERSION}-%{RELEASE}.%{ARCH}\n" 2>/dev/null'
+    fi
     _probe="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 \
                ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} \
                "${_ssh_user}@${_h}" \
-               'uname -r; rpm -q glibc --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null; echo "--cores--"; rpm -q kernel-core --qf "%{VERSION}-%{RELEASE}.%{ARCH}\n" 2>/dev/null' 2>/dev/null || true)"
+               "${_probe_cmd}" 2>/dev/null || true)"
     _krel="$(echo "${_probe}" | sed -n 1p | tr -d '[:space:]')"
     _glibc="$(echo "${_probe}" | sed -n 2p | tr -d '[:space:]')"
     _cores="$(echo "${_probe}" | sed -n '/^--cores--$/,$p' | tail -n +2)"
     [[ -z "${_krel}" ]] && err "Could not read 'uname -r' from GPU host ${_h}. Check SSH_USER/SSH_KEY_PATH, or pass --gpu-kernels explicitly."
     log "  ${_h} -> ${_krel}${_glibc:+ (glibc ${_glibc})}"
-    _surveyed="${_surveyed}${_surveyed:+,}${_krel}"
+    # Dedupe: a homogeneous fleet reports the same kernel from every host, and a
+    # repeated entry means the closure builder asks for the same
+    # linux-headers/kernel-devel package once per node.
+    if [[ ",${_surveyed}," != *",${_krel},"* ]]; then
+      _surveyed="${_surveyed}${_surveyed:+,}${_krel}"
+    fi
     if [[ -n "${_glibc}" && ",${GPU_GLIBC_VERSIONS}," != *",${_glibc},"* ]]; then
       GPU_GLIBC_VERSIONS="${GPU_GLIBC_VERSIONS}${GPU_GLIBC_VERSIONS:+,}${_glibc}"
     fi
@@ -684,6 +782,173 @@ elif [[ -z "${GPU_KERNELS}" ]]; then
   err "Could not determine any GPU node kernel from --gpu-hosts '${GPU_HOSTS}'.
   Every SSH survey failed. Check reachability and SSH_KEY_PATH, or name the
   kernels explicitly with --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64"
+elif [[ "${CLOSURE_PKG_FORMAT}" == "deb" ]]; then
+  # ── 5b-deb. Build the Ubuntu .deb closure ──────────────────────────────────
+  # Resolution runs inside an ubuntu:24.04 container, for two reasons. The build
+  # host is normally RHEL and has no apt at all; and even on an Ubuntu host, apt
+  # silently omits any dependency already installed locally, which offline turns
+  # into a missing package on the node. A pristine minimal rootfs has strictly
+  # FEWER packages preinstalled than a real Ubuntu Server node, so resolving
+  # there errs toward over-collecting — the safe direction for an air-gap bundle.
+  mkdir -p "${CLOSURE_DIR}"
+
+  IFS=',' read -ra _kernels <<< "${GPU_KERNELS}"
+  _hdr_pkgs=()
+  for _k in "${_kernels[@]}"; do
+    _k="$(echo "${_k}" | tr -d '[:space:]')"
+    [[ -z "${_k}" ]] && continue
+    _hdr_pkgs+=( "linux-headers-${_k}" )
+  done
+  [[ ${#_hdr_pkgs[@]} -gt 0 ]] || err "Could not parse any kernel version out of '${GPU_KERNELS}'."
+
+  # Kernels installed on a node but not running. Debian's dkms ships
+  # /etc/kernel/postinst.d/dkms and builds the module for every kernel in
+  # /lib/modules — and a build for a spare kernel fails as a postinst WARNING,
+  # not an install error. So unlike RHEL (where the transaction aborts loudly)
+  # omitting these yields a node that looks fine until it reboots into the spare
+  # kernel with no nvidia module.
+  for _c in $(echo "${GPU_INSTALLED_KERNELS}" | tr ',' ' '); do
+    _c="$(echo "${_c}" | tr -d '[:space:]')"
+    [[ -z "${_c}" ]] && continue
+    [[ ",${GPU_KERNELS}," == *",${_c},"* ]] && continue
+    log "  also staging headers for installed-but-not-running kernel: ${_c}"
+    _hdr_pkgs+=( "linux-headers-${_c}" )
+  done
+
+  # Driver package set. Unlike the rhel9 repo (where `cuda-drivers` does not
+  # exist), the Ubuntu CUDA repo does publish it and resolving it is how the
+  # concrete DKMS driver packages get picked — the same meta-package the
+  # non-air-gap Ubuntu path installs, so both paths converge on one driver set.
+  _deb_pkgs=( cuda-drivers nvidia-container-toolkit dkms build-essential libelf-dev )
+
+  # libc6 is handled the opposite way from RHEL's glibc. There, shipping a newer
+  # glibc-devel made dnf try to upgrade glibc and collide with glibc-langpack-en,
+  # so the fix was to DROP glibc and pin devel/headers to the node. apt has no
+  # equivalent collision: it upgrades libc6 + libc-bin + libc6-dev + linux-libc-dev
+  # atomically as long as all four are present. So the fix here is the inverse —
+  # ship the whole consistent set rather than removing it, and let apt do the
+  # coordinated upgrade offline.
+  _deb_pkgs+=( libc6 libc-bin libc6-dev linux-libc-dev )
+
+  _node_libc="$(echo "${GPU_GLIBC_VERSIONS}" | cut -d, -f1)"
+  if [[ -n "${_node_libc}" ]]; then
+    log "  GPU node libc6 : ${_node_libc} (closure ships a consistent libc set)"
+  else
+    warn "GPU node libc6 version unknown (kernels were passed via --gpu-kernels)."
+    warn "  Prefer --gpu-hosts so the closure can be checked against the node."
+  fi
+
+  log "Resolving NVIDIA driver closure in a ${CONTAINER_RUNTIME} ubuntu:24.04 container..."
+  log "  driver package : cuda-drivers (meta)"
+  log "  target kernels : ${GPU_KERNELS}"
+
+  # The whole resolve is one container run so a failure leaves nothing behind.
+  # `set -e` inside matters: apt-get failures must fail the container, not get
+  # masked by a later successful command.
+  if ! "${CONTAINER_RUNTIME}" run --rm \
+        -v "${CLOSURE_DIR}:/closure:z" \
+        docker.io/library/ubuntu:24.04 \
+        bash -euo pipefail -c "
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg dpkg-dev >/dev/null
+
+          # Same CUDA repo the non-air-gap path adds on the node itself.
+          curl -fsSL 'https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb' -o /tmp/k.deb
+          dpkg -i /tmp/k.deb >/dev/null
+
+          # nvidia-container-toolkit lives in its own repo, not the CUDA one.
+          curl -fsSL 'https://nvidia.github.io/libnvidia-container/gpgkey' \
+            | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+          curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list' \
+            | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+            > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+          apt-get update -qq
+
+          # Walk the dependency graph explicitly rather than using
+          # \`apt-get install --download-only\`. That command omits anything already
+          # installed in this container — measured: it silently skipped libc6,
+          # libc-bin, make and perl-base, so offline the node had no installable
+          # 'make' and build-essential (hence DKMS) could not install. Recursing
+          # the graph and downloading each package individually is immune to the
+          # local package state, which is the whole point of a closure.
+          apt-cache depends --recurse --no-recommends --no-suggests \
+            --no-conflicts --no-breaks --no-replaces --no-enhances \
+            ${_deb_pkgs[*]} ${_hdr_pkgs[*]} 2>/dev/null \
+            | grep -v '^ ' | grep -v '^<' | sed 's/:i386$//' | sort -u > /tmp/pkgs.txt
+
+          cd /closure
+          _missing=0
+          while read -r _p; do
+            [ -z \"\${_p}\" ] && continue
+            # Virtual packages have no downloadable file; a real provider is
+            # already in the list, so a miss here is expected and harmless.
+            apt-get download \"\${_p}\" >/dev/null 2>&1 || {
+              echo \"  note: no downloadable file for '\${_p}' (virtual or unavailable)\"
+              _missing=\$((_missing + 1))
+            }
+          done < /tmp/pkgs.txt
+          echo \"resolved \$(wc -l < /tmp/pkgs.txt) graph nodes, \${_missing} without a file\"
+
+          # Multiarch i386 variants are dead weight offline (the RHEL closure
+          # excludes *.i686 for the same reason).
+          rm -f /closure/*_i386.deb
+
+          dpkg-scanpackages --multiversion . /dev/null > Packages 2>/dev/null
+          gzip -9c Packages > Packages.gz
+          chmod -R a+rX /closure
+        "; then
+    err "Failed to resolve the Ubuntu NVIDIA driver closure.
+  Common causes:
+    - A requested linux-headers version is not in the Ubuntu archive. AWS/HWE
+      kernels age out of -updates; check with
+        apt-cache madison linux-headers-<kernel>
+      inside an ubuntu:24.04 container.
+    - No outbound access to developer.download.nvidia.com or nvidia.github.io
+      from this build host.
+    - ${CONTAINER_RUNTIME} could not pull docker.io/library/ubuntu:24.04."
+  fi
+
+  _pkg_count="$(find "${CLOSURE_DIR}" -name '*.deb' -type f | wc -l | tr -d ' ')"
+  [[ "${_pkg_count}" -gt 0 ]] || err "Closure resolution produced no .deb files — nothing to bundle."
+  log "Closure resolved: ${_pkg_count} debs"
+
+  # Headers are the one package DKMS cannot work around, so assert per kernel
+  # rather than trusting the resolve.
+  for _k in "${_kernels[@]}"; do
+    _k="$(echo "${_k}" | tr -d '[:space:]')"
+    [[ -z "${_k}" ]] && continue
+    compgen -G "${CLOSURE_DIR}/linux-headers-${_k}_*.deb" >/dev/null 2>&1 \
+      || err "linux-headers for '${_k}' is missing from the closure — DKMS could not build on that node.
+  That kernel is probably no longer in the Ubuntu archive. Either boot the node
+  onto a current kernel, or name an available one with --gpu-kernels."
+  done
+
+  [[ -f "${CLOSURE_DIR}/Packages.gz" ]] \
+    || err "dpkg-scanpackages produced no Packages.gz — the offline repo would be unusable on the nodes."
+
+  {
+    echo "# NVIDIA offline closure manifest"
+    echo "built_on_os=$(. /etc/os-release; echo "${PRETTY_NAME}")"
+    echo "built_on_kernel=$(uname -r)"
+    echo "built_via=${CONTAINER_RUNTIME} ubuntu:24.04"
+    echo "gpu_node_os=${GPU_NODE_OS}"
+    echo "pkg_format=deb"
+    echo "target_kernels=${GPU_KERNELS}"
+    echo "node_libc6=${_node_libc:-unknown}"
+    echo "deb_count=${_pkg_count}"
+    echo "size=$(du -sh "${CLOSURE_DIR}" | cut -f1)"
+    echo ""
+    echo "# deb inventory"
+    find "${CLOSURE_DIR}" -name '*.deb' -type f -exec basename {} \; | sort
+  } > "${STAGE_DIR}/packages/nvidia-closure.manifest"
+
+  echo "${GPU_KERNELS}" > "${CLOSURE_DIR}/.target-kernels"
+  # Explicit format marker so the installer dispatches on a recorded value
+  # instead of sniffing for repodata/ vs Packages.gz.
+  echo "deb" > "${CLOSURE_DIR}/.pkg-format"
+  log "NVIDIA closure ready: ${CLOSURE_DIR} ($(du -sh "${CLOSURE_DIR}" | cut -f1), ${_pkg_count} debs)"
 else
   # ── 5b. Build the closure ──────────────────────────────────────────────────
   # Build-host capability (Linux, dnf/rpm/createrepo_c, RHEL major 9) was already
@@ -910,6 +1175,7 @@ else
   } > "${STAGE_DIR}/packages/nvidia-closure.manifest"
 
   echo "${GPU_KERNELS}" > "${CLOSURE_DIR}/.target-kernels"
+  echo "rpm" > "${CLOSURE_DIR}/.pkg-format"
   log "NVIDIA closure ready: ${CLOSURE_DIR} ($(du -sh "${CLOSURE_DIR}" | cut -f1), ${_rpm_count} RPMs)"
 fi
 
@@ -1158,9 +1424,10 @@ fi
 
 # NVIDIA driver closure: the installer scp's this to each GPU node and installs
 # with --disablerepo='*', so the node never reaches NVIDIA's servers.
-if [[ -f "${CLOSURE_DIR}/repodata/repomd.xml" ]]; then
+if [[ -f "${CLOSURE_DIR}/repodata/repomd.xml" || -f "${CLOSURE_DIR}/Packages.gz" ]]; then
   export AIRGAP_NVIDIA_CLOSURE_DIR="${CLOSURE_DIR}"
-  log "NVIDIA closure: $(find "${CLOSURE_DIR}" -name '*.rpm' | wc -l | tr -d ' ') RPMs for kernels $(cat "${CLOSURE_DIR}/.target-kernels" 2>/dev/null || echo unknown)"
+  _cl_fmt="$(cat "${CLOSURE_DIR}/.pkg-format" 2>/dev/null || echo rpm)"
+  log "NVIDIA closure (${_cl_fmt}): $(find "${CLOSURE_DIR}" -name "*.${_cl_fmt}" | wc -l | tr -d ' ') packages for kernels $(cat "${CLOSURE_DIR}/.target-kernels" 2>/dev/null || echo unknown)"
 elif [[ "${SKIP_NVIDIA_CLOSURE}" == "true" ]]; then
   warn "No NVIDIA closure (--skip-nvidia-closure) — GPU nodes must already have"
   warn "  the driver and nvidia-container-toolkit installed."

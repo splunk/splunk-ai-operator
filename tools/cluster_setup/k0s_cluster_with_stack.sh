@@ -287,9 +287,9 @@ wait_for_dependency() {
 }
 
 # ====== NODE OS GATE ======
-# Only RHEL 9 is tested and supported. All other OS families (RHEL 10,
-# Amazon Linux, Debian/Ubuntu) stop the script with a clear error.
-# Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
+# Supported: RHEL 9 and Ubuntu 24.04. All other OS families (RHEL 10,
+# Amazon Linux, other Ubuntu/Debian releases) stop the script with a clear
+# error. Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
 # continue at your own risk (useful for internal testing).
 _check_node_os() {
   local node_ip="$1" role="${2:-node}"
@@ -302,15 +302,20 @@ _check_node_os() {
   os_pretty=$(ssh_exec "${node_ip}" \
     ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
 
-  # Supported: RHEL 9 only. Other family members kept for internal testing.
+  # Supported: RHEL 9 and Ubuntu 24.04. Other family members kept for
+  # internal testing.
   if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
+    log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+    return 0
+  fi
+  if [[ "${os_id}" == "ubuntu" ]] && [[ "${os_version_id}" == "24" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
   fi
 
   local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
-  Only RHEL 9 is tested and supported. Installation on other OS versions
-  is not validated and may fail in unexpected ways.
+  Only RHEL 9 and Ubuntu 24.04 are tested and supported. Installation on
+  other OS versions is not validated and may fail in unexpected ways.
   To skip this check and continue at your own risk, set:
     FORCE_UNSUPPORTED_OS=1"
 
@@ -1586,11 +1591,23 @@ prepare_nodes_for_k0s() {
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
       bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
-      # Disable firewalld if active (blocks k0s ports: 6443, 10250, 8472, etc.)
-      if systemctl is-active firewalld >/dev/null 2>&1; then
-        echo 'Disabling firewalld...'
-        sudo systemctl stop firewalld
-        sudo systemctl disable firewalld
+      # Disable host firewalls if active (they block k0s ports: 6443, 10250,
+      # 8472, 179, etc.). Each family ships a different one, and on-prem images
+      # differ from cloud images: AWS Ubuntu AMIs leave ufw inactive, but a
+      # stock Ubuntu Server install commonly has it enabled, in which case the
+      # cluster silently fails to form rather than erroring out.
+      for _fw in firewalld ufw nftables; do
+        if systemctl is-active "${_fw}" >/dev/null 2>&1; then
+          echo "Disabling ${_fw}..."
+          sudo systemctl stop "${_fw}" || true
+          sudo systemctl disable "${_fw}" || true
+        fi
+      done
+      # ufw can be enabled without its unit being reported active; the CLI is
+      # the authoritative check on Debian-family hosts.
+      if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        echo 'Disabling ufw (via CLI)...'
+        sudo ufw --force disable || true
       fi
 
       # Load kernel modules required by Calico and kube-proxy
@@ -1615,15 +1632,19 @@ prepare_nodes_for_k0s() {
         _pyyaml_local="$(ls /tmp/pyyaml-airgap.whl /tmp/pyyaml-airgap.tar.gz 2>/dev/null | head -1)"
         if [ -n "${_pyyaml_local}" ]; then
           echo "Installing pyyaml from air-gap bundle (${_pyyaml_local})..."
+          # Ubuntu 24.04 marks the system Python externally-managed (PEP 668), so
+          # a plain pip3 install fails there; --break-system-packages is the
+          # documented opt-out and is a no-op on pip versions that predate it.
           sudo pip3 install --no-index "${_pyyaml_local}" 2>/dev/null \
+            || sudo pip3 install --no-index --break-system-packages "${_pyyaml_local}" 2>/dev/null \
             || sudo dnf install -y python3-pyyaml 2>/dev/null \
             || echo "WARN: pyyaml install from bundle failed — k0s config generation may fail"
           rm -f "${_pyyaml_local}"
         elif command -v dnf >/dev/null 2>&1; then
           sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
         elif command -v apt-get >/dev/null 2>&1; then
-          sudo apt-get update -qq 2>/dev/null || true
-          sudo apt-get install -y python3-yaml 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y python3-yaml 2>/dev/null || true
         else
           echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
         fi
@@ -2961,7 +2982,21 @@ _install_nvidia_from_closure() {
     echo "       nvidia-smi is already present." >&2
     return 1
   fi
-  if [[ ! -f "${closure}/repodata/repomd.xml" ]]; then
+  # Package format is recorded by the builder. Fall back to sniffing the index
+  # file so a closure staged by an older bundle still works.
+  local pkg_format
+  pkg_format="$(cat "${closure}/.pkg-format" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "${pkg_format}" ]]; then
+    if [[ -f "${closure}/Packages.gz" ]]; then pkg_format="deb"; else pkg_format="rpm"; fi
+  fi
+
+  if [[ "${pkg_format}" == "deb" ]]; then
+    if [[ ! -f "${closure}/Packages.gz" ]]; then
+      echo "ERROR: ${closure} has no Packages.gz — it is not a valid apt repo." >&2
+      echo "  Re-run ./airgap_install.sh; dpkg-scanpackages must run over the closure directory." >&2
+      return 1
+    fi
+  elif [[ ! -f "${closure}/repodata/repomd.xml" ]]; then
     echo "ERROR: ${closure} has no repodata/repomd.xml — it is not a valid dnf repo." >&2
     echo "  Re-run ./airgap_install.sh; createrepo_c must run over the closure directory." >&2
     return 1
@@ -2974,13 +3009,20 @@ _install_nvidia_from_closure() {
   node_krel=$(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null | tr -d '[:space:]') || node_krel=""
   [[ -n "${node_krel}" ]] || { echo "ERROR: could not read 'uname -r' from ${gpu_ip}" >&2; return 1; }
 
-  if ! compgen -G "${closure}/kernel-devel-${node_krel%.x86_64}*.rpm" >/dev/null 2>&1; then
-    echo "ERROR: the offline NVIDIA repo has no kernel-devel for ${gpu_ip}'s running kernel." >&2
+  local _hdr_glob
+  if [[ "${pkg_format}" == "deb" ]]; then
+    _hdr_glob="${closure}/linux-headers-${node_krel}_*.deb"
+  else
+    _hdr_glob="${closure}/kernel-devel-${node_krel%.x86_64}*.rpm"
+  fi
+  if ! compgen -G "${_hdr_glob}" >/dev/null 2>&1; then
+    echo "ERROR: the offline NVIDIA repo has no kernel headers for ${gpu_ip}'s running kernel." >&2
     echo "  Node kernel     : ${node_krel}" >&2
+    echo "  Package format  : ${pkg_format}" >&2
     echo "  Closure covers  : $(cat "${closure}/.target-kernels" 2>/dev/null || echo unknown)" >&2
     echo "" >&2
-    echo "  NVIDIA ships DKMS-only packages for RHEL 9, so the kernel module is" >&2
-    echo "  compiled on the node and needs headers for that exact kernel." >&2
+    echo "  NVIDIA ships DKMS-only packages, so the kernel module is compiled on" >&2
+    echo "  the node and needs headers for that exact kernel." >&2
     echo "  Re-stage the closure including this kernel:" >&2
     echo "    ./airgap_install.sh --config <your-config>.yaml --gpu-kernels ${node_krel}" >&2
     return 1
@@ -3008,12 +3050,13 @@ _install_nvidia_from_closure() {
 
   ssh_exec "${gpu_ip}" "
     set -euo pipefail
+    PKGFMT='${pkg_format}'
     PKGDIR=/opt/airgap-nvidia
     sudo rm -rf \"\${PKGDIR}\"
     sudo mkdir -p \"\${PKGDIR}\"
     sudo tar -xf /tmp/nvidia-closure.tar -C \"\${PKGDIR}\" --strip-components=1
     rm -f /tmp/nvidia-closure.tar
-    echo \"Offline repo staged: \$(find \"\${PKGDIR}\" -name '*.rpm' | wc -l) RPMs\"
+    echo \"Offline repo staged: \$(find \"\${PKGDIR}\" -name \"*.\${PKGFMT}\" | wc -l) \${PKGFMT} packages\"
 
     KREL=\$(uname -r)
 
@@ -3021,7 +3064,9 @@ _install_nvidia_from_closure() {
     # install) makes dnf hide every NVIDIA package with 'All matches were filtered
     # out by modular filtering', because createrepo_c generates no modules.yaml.
     # Resetting the stream clears that state. No-op if the module was never enabled.
-    sudo dnf module reset -y nvidia-driver >/dev/null 2>&1 || true
+    if [ \"\${PKGFMT}\" != 'deb' ]; then
+      sudo dnf module reset -y nvidia-driver >/dev/null 2>&1 || true
+    fi
 
     # Blacklist nouveau before installing so the nvidia module can load.
     if lsmod | grep -q '^nouveau'; then
@@ -3029,24 +3074,66 @@ _install_nvidia_from_closure() {
       printf 'blacklist nouveau\\noptions nouveau modeset=0\\n' \\
         | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
       sudo rmmod nouveau 2>/dev/null || true
-      sudo dracut --force 2>/dev/null || true
+      # Regenerate the initramfs so the blacklist survives a reboot. The online
+      # path branches on OS family here; this one must too, or an Ubuntu node
+      # silently keeps nouveau in its initramfs and can reclaim the GPU.
+      if [ \"\${PKGFMT}\" = 'deb' ]; then
+        sudo update-initramfs -u 2>/dev/null || true
+      else
+        sudo dracut --force 2>/dev/null || true
+      fi
     fi
 
-    # Install ONLY from the staged repo. --disablerepo='*' guarantees no network
-    # access is attempted even if the node has stale repo files pointing upstream.
-    # Named packages (not 'dnf install *.rpm'): installing every file force-installs
-    # unrelated arch/version duplicates and fails on file conflicts.
     echo '--- Installing NVIDIA driver + DKMS + toolkit from offline repo ---'
-    sudo dnf install -y --refresh \\
-      --disablerepo='*' \\
-      --repofrompath=\"airgap-nvidia,\${PKGDIR}\" \\
-      --setopt=airgap-nvidia.gpgcheck=0 \\
-      --setopt=install_weak_deps=False \\
-      kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \\
-      nvidia-kmod-common nvidia-modprobe nvidia-persistenced \\
-      nvidia-container-toolkit \\
-      dkms gcc make elfutils-libelf-devel \\
-      \"kernel-devel-\${KREL}\"
+    if [ \"\${PKGFMT}\" = 'deb' ]; then
+      # Confine apt to the staged repo. There is no single --disablerepo
+      # equivalent, so all four options are needed: a dedicated sources.list
+      # holding only the file:// repo, sourceparts pointed at /dev/null to
+      # ignore /etc/apt/sources.list.d/*, and List-Cleanup off so the node's
+      # normal apt state is not damaged. Without these, apt tries (and slowly
+      # times out on) the archive URLs the node cannot reach.
+      echo \"deb [trusted=yes] file://\${PKGDIR} ./\" \\
+        | sudo tee /etc/apt/sources.list.d/airgap-nvidia.list >/dev/null
+      APT_OFFLINE=\"-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/airgap-nvidia.list
+                   -o Dir::Etc::sourceparts=/dev/null
+                   -o APT::Get::List-Cleanup=0
+                   -o Acquire::Languages=none\"
+
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${APT_OFFLINE} \\
+        -o DPkg::Lock::Timeout=300 update
+
+      # cuda-drivers is the meta-package the non-air-gap Ubuntu path installs, so
+      # both paths land on the same driver set. Headers are named explicitly for
+      # the running kernel; the closure also carries headers for any spare kernel
+      # so dkms's per-kernel postinst build does not fail silently.
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${APT_OFFLINE} \\
+        -o DPkg::Lock::Timeout=300 \\
+        -o Dpkg::Options::=--force-confdef \\
+        -o Dpkg::Options::=--force-confold \\
+        install -y --no-install-recommends \\
+        cuda-drivers nvidia-container-toolkit \\
+        dkms build-essential libelf-dev \\
+        \"linux-headers-\${KREL}\"
+
+      # Leaving the file:// repo in place would break every later apt run once
+      # /opt/airgap-nvidia is cleaned up.
+      sudo rm -f /etc/apt/sources.list.d/airgap-nvidia.list
+    else
+      # Install ONLY from the staged repo. --disablerepo='*' guarantees no network
+      # access is attempted even if the node has stale repo files pointing upstream.
+      # Named packages (not 'dnf install *.rpm'): installing every file force-installs
+      # unrelated arch/version duplicates and fails on file conflicts.
+      sudo dnf install -y --refresh \\
+        --disablerepo='*' \\
+        --repofrompath=\"airgap-nvidia,\${PKGDIR}\" \\
+        --setopt=airgap-nvidia.gpgcheck=0 \\
+        --setopt=install_weak_deps=False \\
+        kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \\
+        nvidia-kmod-common nvidia-modprobe nvidia-persistenced \\
+        nvidia-container-toolkit \\
+        dkms gcc make elfutils-libelf-devel \\
+        \"kernel-devel-\${KREL}\"
+    fi
 
     # DKMS builds the module in the RPM %post scriptlet. Verify it actually
     # succeeded and built for the RUNNING kernel — a mismatch here is the
@@ -3065,6 +3152,24 @@ _install_nvidia_from_closure() {
     if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
       echo \"ERROR: DKMS built for a different kernel than the running \${KREL}: \${DKMS_OUT}\" >&2
       exit 1
+    fi
+
+    # Debian's dkms auto-builds for every kernel in /lib/modules via
+    # /etc/kernel/postinst.d/dkms, and a failure there is a postinst WARNING that
+    # does not fail the apt transaction. So a spare kernel with no module passes
+    # every check above and only shows up after the node reboots into it. Warn
+    # rather than fail: the running kernel is verified working, and a node is not
+    # expected to reboot mid-install.
+    if [ \"\${PKGFMT}\" = 'deb' ]; then
+      for _km in /lib/modules/*; do
+        _kv=\$(basename \"\${_km}\")
+        [ \"\${_kv}\" = \"\${KREL}\" ] && continue
+        if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${_kv}\"; then
+          echo \"WARN: no nvidia DKMS module for installed kernel \${_kv} (running \${KREL} is OK).\" >&2
+          echo \"WARN:   If this node reboots into \${_kv}, the GPU will not be available.\" >&2
+          echo \"WARN:   Remove that kernel, or re-stage the closure with headers for it.\" >&2
+        fi
+      done
     fi
 
     sudo modprobe nvidia || {
@@ -3143,6 +3248,8 @@ _install_nvidia_on_node() {
         OS_VERSION=\$(rpm -E %{rhel})
       elif [ -f /etc/debian_version ]; then
         OS_FAMILY=debian
+        # CUDA repo paths use the version with no dot: 24.04 -> 2404.
+        OS_VERSION=\$(. /etc/os-release; echo \"\${VERSION_ID}\" | tr -d '.')
       fi
       if [ -z \"\${OS_FAMILY}\" ]; then
         echo 'ERROR: unsupported OS (not amzn/rhel/debian)' >&2
@@ -3151,12 +3258,31 @@ _install_nvidia_on_node() {
       fi
       echo \"OS_FAMILY=\${OS_FAMILY}  OS_VERSION=\${OS_VERSION:-n/a}\"
 
+      # Every apt-get below goes through this wrapper. Two flags matter on a
+      # freshly booted node: DEBIAN_FRONTEND stops any package's postinst from
+      # blocking on a whiptail prompt (needrestart does this), and the lock
+      # timeout waits out apt-daily/unattended-upgrades instead of failing with
+      # \"Could not get lock\" — those timers hold the dpkg lock for minutes after
+      # boot, so without it node prep is a coin flip.
+      apt_get() {
+        sudo DEBIAN_FRONTEND=noninteractive apt-get \\
+          -o DPkg::Lock::Timeout=300 \\
+          -o Dpkg::Options::=--force-confdef \\
+          -o Dpkg::Options::=--force-confold \\
+          \"\$@\"
+      }
+
       # --- Step 1: kernel headers (required for DKMS to build nvidia kmod) ---
       KREL=\$(uname -r)
       echo \"--- Installing kernel headers for kernel \${KREL} ---\"
       if [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        sudo apt-get update -qq
-        sudo apt-get install -y \"linux-headers-\${KREL}\"
+        apt_get update -qq
+        # Exact headers for the running kernel are required for DKMS. If the
+        # AMI's kernel is older than what the archive still carries, fall back
+        # to the generic metapackage rather than failing outright — the DKMS
+        # verification in Step 5 catches a resulting kernel mismatch.
+        apt_get install -y \"linux-headers-\${KREL}\" \\
+          || apt_get install -y linux-headers-generic
       else
         # Exact-match: every historical kernel-devel is usually in RHUI for
         # RHEL 9/10. When absent (e.g. AMI has an older kernel than current
@@ -3223,6 +3349,13 @@ _install_nvidia_on_node() {
         # with different weak-deps don't silently miss a needed package.
         echo '--- Installing DKMS + build toolchain (gcc, make, elfutils-libelf-devel) ---'
         sudo dnf install -y dkms gcc make elfutils-libelf-devel
+      elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        # Ubuntu ships dkms in main, so no third-party repo is needed. The
+        # equivalent of elfutils-libelf-devel is libelf-dev; build-essential
+        # covers gcc/make. Without these the driver package's DKMS build in
+        # %post silently has no toolchain and the kmod never gets built.
+        echo '--- Installing DKMS + build toolchain (build-essential, libelf-dev) ---'
+        apt_get install -y dkms build-essential libelf-dev
       fi
 
       # --- Step 3: CUDA repo for the right OS family + version --------------
@@ -3237,9 +3370,12 @@ _install_nvidia_on_node() {
         sudo rm -f /etc/yum.repos.d/cuda-rhel*.repo
         sudo dnf config-manager --add-repo \"https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo\"
       elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        curl -fsSL \"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb\" -o /tmp/cuda-keyring.deb
+        # OS_VERSION is the dotless release (24.04 -> 2404). Falling back to
+        # 2204 would install a keyring for the wrong release and silently pull
+        # mismatched driver packages.
+        curl -fsSL \"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu\${OS_VERSION}/x86_64/cuda-keyring_1.1-1_all.deb\" -o /tmp/cuda-keyring.deb
         sudo dpkg -i /tmp/cuda-keyring.deb
-        sudo apt-get update -qq
+        apt_get update -qq
       fi
 
       # --- Step 4: install the driver -------------------------------------
@@ -3263,19 +3399,43 @@ _install_nvidia_on_node() {
       # a no-op on RHEL 9/AL2023 where there's nothing to erase.
       echo '--- Installing NVIDIA driver (meta package: cuda-drivers) ---'
       REQUIRE_OPEN_MODULE=0
-      if [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        sudo apt-get install -y nvidia-driver-550
-      else
-        # Blacklist nouveau so the new nvidia driver can load without fighting it.
-        # Harmless if nouveau isn't loaded (grep returns nothing).
-        if lsmod | grep -q '^nouveau'; then
-          echo '--- Blacklisting nouveau + unloading ---'
-          echo -e 'blacklist nouveau\\noptions nouveau modeset=0' \\
-            | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
-          sudo rmmod nouveau 2>/dev/null || true
-          # Regenerate initramfs so nouveau doesn't come back on reboot.
+      # Blacklist nouveau so the new nvidia driver can load without fighting it.
+      # Harmless if nouveau isn't loaded (grep returns nothing). Both families
+      # need this; only the initramfs regeneration tool differs.
+      if lsmod | grep -q '^nouveau'; then
+        echo '--- Blacklisting nouveau + unloading ---'
+        echo -e 'blacklist nouveau\\noptions nouveau modeset=0' \\
+          | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
+        sudo rmmod nouveau 2>/dev/null || true
+        # Regenerate initramfs so nouveau doesn't come back on reboot.
+        if [ \"\${OS_FAMILY}\" = 'debian' ]; then
+          sudo update-initramfs -u 2>/dev/null || true
+        else
           sudo dracut --force 2>/dev/null || true
         fi
+      fi
+
+      if [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        # cuda-drivers is the same meta-package name in the Ubuntu CUDA repo as
+        # on RHEL, and tracks the current driver branch — so it supports newer
+        # GPUs (L40S etc.) that an older pinned branch does not. The
+        # -server fallbacks are the datacenter-flavour metapackages in Ubuntu's
+        # own archive, used when the NVIDIA repo is unreachable.
+        if apt_get install -y cuda-drivers; then
+          echo '✓ Installed cuda-drivers meta-package'
+        elif apt_get install -y nvidia-driver-580-server; then
+          echo '✓ Installed nvidia-driver-580-server (ubuntu archive fallback)'
+        elif apt_get install -y nvidia-driver-570-server; then
+          echo '✓ Installed nvidia-driver-570-server (ubuntu archive fallback)'
+        else
+          echo 'ERROR: all NVIDIA driver install strategies failed (debian)' >&2
+          echo '  Tried: cuda-drivers, nvidia-driver-580-server, nvidia-driver-570-server' >&2
+          echo '  Possible causes:' >&2
+          echo \"    - CUDA repo keyring wrong for ubuntu\${OS_VERSION}\" >&2
+          echo '    - Network blocked to developer.download.nvidia.com' >&2
+          exit 1
+        fi
+      else
 
         # Driver-module variant depends on the GPU architecture:
         #
@@ -3350,8 +3510,11 @@ _install_nvidia_on_node() {
       # --- Step 5: verify DKMS built + load kmod ---------------------------
       # Before modprobe: check dkms status so we catch kernel-mismatch cases
       # early with a clear error instead of the cryptic 'Module not found'.
+      # The checks below are distro-neutral (dkms is dkms), so they run on
+      # debian too — skipping them there allowed a driver that never built to
+      # look like a success until pods failed to see a GPU.
       echo '--- Verifying DKMS status + loading nvidia kmod ---'
-      if [ \"\${OS_FAMILY}\" != 'debian' ]; then
+      if true; then
         DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
         if [ -z \"\${DKMS_OUT}\" ]; then
           echo 'ERROR: dkms status shows no nvidia entry — driver install did not register with DKMS' >&2
@@ -3573,9 +3736,16 @@ _install_nvidia_on_node() {
   local _ctk_present
   _ctk_present=$(ssh_exec "${gpu_ip}" "command -v nvidia-ctk >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo no)
   if [[ "${_ctk_present}" != "yes" ]] && [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+    # Probe the same repo flavour the install below will actually use: the rpm
+    # and deb trees are separate paths, so probing rpm on Ubuntu can report a
+    # reachable repo the node cannot install from (or vice versa).
+    local _ctk_probe_path='stable/rpm/nvidia-container-toolkit.repo'
+    if ssh_exec "${gpu_ip}" "[ -f /etc/debian_version ]" 2>/dev/null; then
+      _ctk_probe_path='stable/deb/nvidia-container-toolkit.list'
+    fi
     wait_for_dependency \
       "NVIDIA package repo (nvidia.github.io) — required for container-toolkit install on ${gpu_ip}" \
-      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo >/dev/null 2>&1'" \
+      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io/libnvidia-container/${_ctk_probe_path} >/dev/null 2>&1'" \
       180
   elif [[ "${_ctk_present}" == "yes" ]]; then
     log "nvidia-ctk already installed on ${gpu_ip} — skipping repo check"
@@ -3604,6 +3774,19 @@ _install_nvidia_on_node() {
         --setopt=airgap-nvidia.gpgcheck=0 \\
         --setopt=install_weak_deps=False \\
         nvidia-container-toolkit
+    elif [ -f /opt/airgap-nvidia/Packages.gz ]; then
+      # Same case on Ubuntu: the deb closure carries CTK too.
+      echo '--- Installing nvidia-container-toolkit from offline apt repo ---'
+      echo 'deb [trusted=yes] file:///opt/airgap-nvidia ./' \\
+        | sudo tee /etc/apt/sources.list.d/airgap-nvidia.list >/dev/null
+      _APT_OFF=\"-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/airgap-nvidia.list
+                -o Dir::Etc::sourceparts=/dev/null
+                -o APT::Get::List-Cleanup=0
+                -o Acquire::Languages=none\"
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${_APT_OFF} -o DPkg::Lock::Timeout=300 update
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${_APT_OFF} -o DPkg::Lock::Timeout=300 \\
+        install -y --no-install-recommends nvidia-container-toolkit
+      sudo rm -f /etc/apt/sources.list.d/airgap-nvidia.list
     elif [ \"${AIRGAP_MODE:-false}\" = 'true' ]; then
       echo 'ERROR: AIRGAP_MODE=true, nvidia-ctk is missing, and no offline repo is staged' >&2
       echo '  at /opt/airgap-nvidia. Re-run ./airgap_install.sh --config <cfg>.yaml' >&2
@@ -3618,8 +3801,8 @@ _install_nvidia_on_node() {
         curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list' | \
           sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
-        sudo apt-get update -qq
-        sudo apt-get install -y nvidia-container-toolkit
+        sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y nvidia-container-toolkit
       else
         # RHEL 9 and 10 both use the same libnvidia-container stable RPM repo.
         curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo' | \
