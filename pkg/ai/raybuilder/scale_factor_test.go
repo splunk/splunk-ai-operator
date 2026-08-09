@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"text/template"
@@ -172,10 +173,9 @@ func TestBuildClusterConfig_GlobalScaleFactor(t *testing.T) {
 	require.True(t, found, "expected l40s-1-gpu worker group to be present")
 }
 
-// TestApplicationsTemplate_ReferencesEveryModelScaleEntry prevents a model
-// from silently falling back to Ray Serve's default replica count. Every key
-// in model-scale.yaml must be consumed by the production applications
-// template so scaleFactor applies uniformly.
+// TestApplicationsTemplate_ReferencesEveryModelScaleEntry keeps the global
+// model catalog and production applications template in sync in both
+// directions so scaleFactor applies uniformly to every rendered model.
 func TestApplicationsTemplate_ReferencesEveryModelScaleEntry(t *testing.T) {
 	modelScaleFile, err := filepath.Abs("../../../config/configs/model-scale.yaml")
 	require.NoError(t, err)
@@ -190,6 +190,12 @@ func TestApplicationsTemplate_ReferencesEveryModelScaleEntry(t *testing.T) {
 	applicationsData, err := os.ReadFile(applicationsFile)
 	require.NoError(t, err)
 	templateText := string(applicationsData)
+	replicaReference := regexp.MustCompile(`\.Replicas\.([A-Za-z0-9_]+)`)
+	for _, match := range replicaReference.FindAllStringSubmatch(templateText, -1) {
+		modelName := match[1]
+		require.Contains(t, modelScale.ApplicationScale, modelName,
+			"applications.yaml references %s, which is missing from model-scale.yaml", modelName)
+	}
 
 	for modelName := range modelScale.ApplicationScale {
 		require.True(t,
@@ -297,6 +303,7 @@ func TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides(t *t
 
 	expectedScaledDeployment := map[string]string{
 		"Entrypoint":                   "Entrypoint",
+		"FmTimeseries":                 "FMTimeseriesDeployment",
 		"Gemma431bIt":                  "LLMDeploymentL40S",
 		"GptOss20b":                    "LLMDeploymentL40S",
 		"UaeLarge":                     "EmbeddingModelDeployment",
@@ -344,8 +351,7 @@ func TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides(t *t
 }
 
 // TestScaleFactor_DefaultsToOne_Parity asserts that when spec.scaleFactor is
-// unset, replicas and worker counts equal the migrated base values (guarding
-// the migration from features/saia.yaml to the two global files).
+// unset, replicas and worker counts equal the global base values.
 func TestScaleFactor_DefaultsToOne_Parity(t *testing.T) {
 	os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
 	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")

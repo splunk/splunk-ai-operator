@@ -398,7 +398,7 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 | Directory | Owner | Description |
 |---|---|---|
 | `model_artifacts/<id>/` | Admin (pre-staged) | Pre-trained model weights loaded by Ray workers at startup |
-| `staging_state/<id>/.staging_complete` | Installer | Completion marker; its content includes `accel=<type>` written by the download script. The pre-check validates both presence and `accel=` field so switching `defaultAcceleratorType` forces re-download and re-upload of models that differ between GPU configs (e.g. `gemma-4-31b-it`). |
+| `staging_state/<id>/.staging_complete` | Installer | Completion marker written by the download script. The pre-check validates its `hf_url` against the selected artifact profile, so stale or mismatched weights are staged again. |
 
 **Created at runtime by SAIA services:**
 
@@ -477,7 +477,8 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `aiPlatform.name` | No | `${CLUSTER_NAME}-ai-platform` | Base name for the AIPlatform CR |
-| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type — `L40S` or `H100` |
+| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type — `L40S`, `H100`, or `RTX_PRO_6000_BLACKWELL` |
+| `aiPlatform.scaleFactor` | No | `1` | AI workload capacity multiplier; use a whole number of 1 or higher |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
@@ -489,6 +490,29 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.gpuScheduling.tolerations` | No | GPU toleration | Tolerations for GPU workloads |
 | `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
 | `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
+
+#### Scaling Deployment Capacity
+
+Set `scaleFactor` under `aiPlatform` to change AI workload capacity:
+
+```yaml
+aiPlatform:
+  scaleFactor: 2
+```
+
+Use a whole number of `1` or higher. The default is `1`; for example, `2`
+doubles the standard capacity. Increasing this value does not add GPU nodes, so
+ask your cluster administrator to add the required GPU capacity first.
+
+Save the configuration and run the installer in interactive mode:
+
+```bash
+CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+> **Downscaling notice:** Reducing `scaleFactor` causes temporary service
+> downtime while workloads are resized. Plan downscaling during a maintenance
+> window.
 
 #### Image Pull Secrets Section
 
@@ -634,11 +658,12 @@ The `install` command executes these steps in order:
 4. **Preflight checks** — Validate tools, SSH connectivity, disk space, config
 5. **Model staging** *(when `storage.modelStaging.enabled: true`, the default)* — Download models from Hugging Face for the configured GPU type (`aiPlatform.defaultAcceleratorType`) and upload them to the object store. The staging pipeline is **resumable**: each model gets a per-model completion marker; re-runs skip already-staged models and cleanly retry only incomplete ones. The installer passes `SKIP_IF_STAGED=1` by default so previously staged models are never re-downloaded or re-uploaded. Skipped entirely when `enabled: false`.
 
-   **Models staged (from `model_artifacts_configs.yaml`):**
+   **Models staged (from the accelerator-selected artifact profile):**
 
    | Model artifact ID | Purpose |
    |---|---|
-   | `gemma-4-31b-it` | Primary LLM for chat, SPL generation, reasoning |
+   | `gemma-4-31b-it` | Unquantized Gemma model for L40S |
+   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 and RTX Pro |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
    | `bi-encoder` | BGE small encoder |
@@ -654,7 +679,7 @@ The `install` command executes these steps in order:
 
    | Resource | Minimum | Notes |
    |---|---|---|
-   | Disk (free) | 250 GB | >120 GB for 10 model weight files + buffer for download staging and upload temp files |
+   | Disk (free) | 250 GB | >120 GB for 11 model artifacts + buffer for download staging and upload temp files |
    | RAM | 16 GB | Needed to stream large files without swapping |
    | Internet | Stable broadband | Downloads >120 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
    | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -671,12 +696,11 @@ The `install` command executes these steps in order:
    SKIP_IF_STAGED=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
    ```
 
-   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the GPU-specific artifact config, verifies each model's `staging_state/<id>/.staging_complete` marker in the object store, and validates that the marker's `accel=` field matches the configured accelerator type. If all models are present and match, it exits immediately (no download, no upload). If some are missing or have a mismatched accelerator it logs each one:
+   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the selected artifact profile and verifies that each model's `staging_state/<id>/.staging_complete` marker contains the expected `hf_url`. If every marker matches, it exits immediately without downloading or uploading. Otherwise, it lists the artifacts that need staging:
 
    ```
-   [LOG] Model staging needed: 2/10 model(s) not yet staged.
-   [LOG]   MISSING: gpt-oss-20b  (bucket/staging_state/gpt-oss-20b/.staging_complete not found or accel mismatch)
-   [LOG]   MISSING: gemma-4-31b-it  (bucket/staging_state/gemma-4-31b-it/.staging_complete not found or accel mismatch)
+   [LOG] Model staging needed: 1/11 model(s) not yet staged.
+   [LOG]   MISSING: gemma-4-31b-it-qat-w4a16-ct  (bucket/staging_state/gemma-4-31b-it-qat-w4a16-ct/.staging_complete not found or hf_url changed)
    ```
 
    After upload completes, a post-stage verification pass re-checks all store markers and fails with a clear per-model error list if any are still absent — preventing an install from proceeding with an incomplete model set.
@@ -687,7 +711,7 @@ The `install` command executes these steps in order:
    cd tools/artifacts_download_upload_scripts
 
    # Explicit GPU type
-   ./download_from_huggingface.sh --accelerator l40s   # or h100
+   ./download_from_huggingface.sh --accelerator l40s   # or h100 / rtx_pro_6000_blackwell
 
    # Interactive — prompted when no flag or ACCELERATOR env var is set:
    #   Select GPU type:
@@ -1315,7 +1339,7 @@ Model weights (>120 GB total) are not included in the binary bundle. Stage them 
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 10 model weight files + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 11 model artifacts + buffer for download staging and upload temp files |
 | RAM | 16 GB | Needed to stream and process large files without swapping |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; resume with `SKIP_IF_EXISTS=1` |
 | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -2003,7 +2027,7 @@ aws s3 ls
 
 #### Switching `defaultAcceleratorType` from L40S to H100 shows models as MISSING
 
-This is expected and correct. L40S and H100 share some `artifact-id` values (e.g. `gemma-4-31b-it`) but point to different HuggingFace repositories. The staging marker at `staging_state/<id>/.staging_complete` contains an `accel=<type>` field. The pre-check validates this field, so an existing L40S marker is treated as missing when H100 is requested, forcing a fresh download and upload.
+This is expected and correct. L40S selects `model_artifacts_configs_unquantized.yaml`; H100 and RTX Pro select `model_artifacts_configs_quantized.yaml`. Gemma uses distinct artifact IDs and object-store prefixes in the two profiles. Staging checks validate each marker's `hf_url`, so a mismatched artifact is downloaded and uploaded rather than reused.
 
 ```bash
 # Force re-stage for H100 after changing defaultAcceleratorType to h100
@@ -2012,9 +2036,9 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
 #### `stage-artifacts` exits success with no models downloaded (`yq` failure)
 
-If `yq` is not installed or returns an error parsing `model_artifacts_configs.yaml`, the download script now exits non-zero immediately with:
+If `yq` is not installed or cannot parse the selected artifact profile, the download script exits non-zero immediately with, for example:
 ```
-ERROR: yq failed to parse 'model_artifacts_configs.yaml' — check that yq is installed and the file is valid YAML.
+ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
 ```
 
 Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`

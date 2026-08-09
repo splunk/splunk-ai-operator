@@ -2508,24 +2508,23 @@ ensure_s3compat_credentials() {
 
 # ====== MODEL ARTIFACT STAGING ======
 
-# Return the model-artifact manifest used by an accelerator. RTX Pro 6000
-# Blackwell uses the same quantized model set as H100. Keep this selection in
-# one place so pre-staging and post-upload verification cannot drift apart.
+# Return the model-artifact profile used by an accelerator. Keep this selection
+# in one place so pre-staging and post-upload verification cannot drift apart.
 model_artifacts_config_name() {
   local accel
   accel=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
   case "${accel}" in
-    h100|rtx_pro_6000_blackwell) echo "model_artifacts_configs_h100.yaml" ;;
-    *)                           echo "model_artifacts_configs.yaml" ;;
+    l40s|"")                    echo "model_artifacts_configs_unquantized.yaml" ;;
+    h100|rtx_pro_6000_blackwell) echo "model_artifacts_configs_quantized.yaml" ;;
+    *)                           return 1 ;;
   esac
 }
 
 # all_models_staged <staging_dir> <accel>
-# Checks whether every artifact in the GPU-specific model config already has a
-# staging_state/<id>/.staging_complete marker in the object store AND that the
-# marker's accel= field matches the requested accelerator. A marker with a
-# mismatched accel (e.g. l40s marker found when h100 is requested) is treated as
-# missing so the correct model weights are downloaded and uploaded.
+# Checks whether every artifact in the selected model profile already has a
+# staging_state/<id>/.staging_complete marker in the object store and that its
+# hf_url= field matches the selected profile. This permits H100 and RTX Pro to
+# reuse identical quantized artifacts while keeping L40S weights separate.
 # Returns 0 (all staged) or 1 (one or more missing / check unavailable).
 # Fails open: if the store is unreachable or a required tool is missing, returns 1
 # so staging proceeds normally.
@@ -2633,8 +2632,8 @@ all_models_staged() {
 
 # Downloads model artifacts from Hugging Face and uploads them to the configured
 # object store. Runs before k0s cluster work so models are available when Ray
-# workers start. Reads HF credentials from model_artifacts_configs.yaml (in the
-# same directory as the upload/download scripts — no extra env vars needed for HF).
+# workers start. Reads HF credentials from the selected model-artifact profile
+# in the upload/download scripts directory.
 stage_model_artifacts() {
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
@@ -7720,7 +7719,7 @@ Notes:
     storage.modelStaging.enabled: false to skip auto-staging during 'install'
     while still being able to run it manually via this subcommand.
     HF credentials (hf-token, hf-username) are read from
-    ../artifacts_download_upload_scripts/model_artifacts_configs.yaml.
+    the selected model_artifacts_configs_{unquantized,quantized}.yaml file.
   - 'verify-pods' runs the same pod-health audit that 'install' triggers at
     the end. Useful for re-checking a cluster, gathering remediation hints
     after a partial failure, or verifying a manual fix.
