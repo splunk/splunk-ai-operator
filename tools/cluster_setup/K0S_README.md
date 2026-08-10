@@ -1630,6 +1630,77 @@ The **Splunk AI Assistant** app (`Splunk_AI_Assistant_Cloud.tgz`) is a Splunk
 application that provides the AI chat UI. It must be installed on the Splunk
 Enterprise instance after the cluster is fully healthy.
 
+### Internal Splunk management transport (AIP-4614 compatibility mode)
+
+When `splunk.enabled: true` and `splunk.external.endpoint` is unset, this k0s
+installer runs the final in-cluster Splunk management and JWT-key endpoint on
+plain HTTP port 8089. Both the OAuth issuer and the endpoint passed to SAIA/Slim
+are the same canonical URL:
+
+```text
+http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
+```
+
+The OTel exporter receives a separate `splunkConfiguration.hecEndpoint` for
+Splunk HEC on port 8088. That listener is used only for telemetry and is not
+added to the SAIA/Slim JWT issuer allowlist. After Splunk is Ready, the
+installer reads the effective `[http]` stanza with `btool`, checks that HEC is
+enabled and healthy, and selects `http://` or `https://` to match `enableSSL`.
+It does not modify the HEC TLS setting. A fresh Splunk Operator 3.0.0 install
+normally reports HTTP; an upgraded or customized instance may report HTTPS.
+
+The installer verifies `enableSplunkdSSL=false` and an HTTP response before it
+creates the `AIPlatform` resource. On a fresh deployment, Splunk Operator 3.0.0
+first completes one internal HTTPS-only telemetry bootstrap; the installer then
+rolls the Splunk pod to its final HTTP mode. No SAIA image downgrade or CA
+installation is required. The pinned Splunk 10.2 image still performs its
+bounded initial HTTPS scheme probe before selecting HTTP. The installer extends
+only the Standalone startup-probe allowance so that fallback can complete
+without reducing splunk-ansible's global retry policy; a Splunk pod start can
+therefore take several additional minutes.
+
+Rerunning this installer on a PVC from an earlier TLS-preview install performs
+an idempotent compatibility migration before Splunk starts. The migration acts
+only on persisted TLS options in configuration files that still reference the
+installer-owned `/mnt/splunk-cert*` paths: it restores Splunk Web to HTTP and
+removes the stale custom HEC certificate path without deleting the PVC or
+indexed data. It deliberately leaves HEC's `enableSSL` setting unchanged, so
+HEC continues to use its independently configured HTTP or HTTPS protocol.
+Installation stops rather than guessing if the effective setting cannot be
+read, HEC is disabled, the effective port is not 8088, or the matching health
+URL is unavailable.
+
+On upgrade, OTel reconciliation removes only the obsolete operator-managed
+`tls.ca_file: /etc/splunk-ca/ca.crt` reference when that mount is absent. It
+uses `insecure_skip_verify` for HTTPS without a configured CA and emits no
+generated TLS block for HTTP. Unrelated exporter, processor, and custom CA
+settings remain intact.
+
+The `certFile` and `sslPassword` entries in `authentication.conf` remain in
+place: that certificate signs interactive JWTs and is independent of transport
+TLS. This setting affects only the installer-managed internal Splunk instance;
+an external Splunk continues to use the URL and TLS policy supplied by the
+customer.
+
+> **Security boundary:** port 8089 is a ClusterIP service and is not exposed by
+> the installer, but its traffic is unencrypted inside the cluster network.
+> Keep the pod/service network private and use Kubernetes NetworkPolicy to
+> restrict untrusted workloads. This is not a cluster-wide TLS switch:
+> cert-manager webhooks, registries, external Splunk, and customer ingress TLS
+> retain their own settings.
+
+Run the reusable, read-only acceptance check after installation:
+
+```bash
+./test_internal_splunk_http.sh \
+  --namespace ai-platform \
+  --standalone splunk-standalone \
+  --aiplatform <cluster-name>-ai-platform
+```
+
+Add `--expected-saia-tag build-v2.0.35` when a test must also prove that the
+current SAIA images were retained.
+
 ### Prerequisites
 
 - All pods are Running: `kubectl get pods -A | grep -v "Running\|Completed"`
@@ -1666,7 +1737,10 @@ Access URL: `http://<EXTERNAL-IP>`
 **kubectl port-forward (quick access, no external exposure)**
 
 ```bash
-kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 ```
 
 Open `http://localhost:8000` in your browser.
@@ -1674,7 +1748,10 @@ Open `http://localhost:8000` in your browser.
 **Retrieve the admin password**
 
 ```bash
-kubectl get secret splunk-standalone-secret -n ai-platform \
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+kubectl get secret "${SPLUNK_SECRET}" -n "${NAMESPACE}" \
   -o jsonpath='{.data.password}' | base64 --decode && echo
 ```
 
@@ -1702,7 +1779,8 @@ the pod using `kubectl`:
 ```bash
 APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
 NAMESPACE="ai-platform"
-POD="splunk-standalone-0"
+STANDALONE_NAME="splunk-standalone"
+POD="splunk-${STANDALONE_NAME}-standalone-0"
 
 # 1. Copy the archive into the pod
 kubectl cp "${APP_TGZ}" "${NAMESPACE}/${POD}:/tmp/${APP_TGZ}"
@@ -1743,10 +1821,15 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 **Via Splunk REST API (from inside the pod)**
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
-  curl -sku admin:"$(kubectl get secret splunk-standalone-secret \
-    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)" \
-  https://localhost:8089/services/apps/local/Splunk_AI_Assistant_Cloud \
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+SPLUNK_PASSWORD="$(kubectl get secret "${SPLUNK_SECRET}" \
+  -n "${NAMESPACE}" -o jsonpath='{.data.password}' | base64 --decode)"
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
+  curl -su admin:"${SPLUNK_PASSWORD}" \
+  http://localhost:8089/services/apps/local/Splunk_AI_Assistant_Cloud \
   | grep -E "<title>|disabled|version"
 ```
 
@@ -1789,8 +1872,14 @@ In Splunk Web: **Splunk AI Assistant → Configuration** (or navigate to `/en-US
 ```bash
 # Replace <worker-node-ip> and <nodePort> with values from Step 1
 SAIA_URL="http://<worker-node-ip>:<nodePort>"
+NAMESPACE="ai-platform"
+STANDALONE_NAME="splunk-standalone"
+SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+SPLUNK_PASSWORD="$(kubectl get secret "${SPLUNK_SECRET}" \
+  -n "${NAMESPACE}" -o jsonpath='{.data.password}' | base64 --decode)"
 
-kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- bash -c "
   mkdir -p /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local
   cat > /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf <<EOF
 [splunk_ai_assistant]
@@ -1801,11 +1890,10 @@ saia_endpoint = ${SAIA_URL}
 EOF"
 
 # Reload app config without a full Splunk restart
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk _internal call \
   /apps/local/Splunk_AI_Assistant_Cloud/_reload \
-  -auth admin:"\$(kubectl get secret splunk-standalone-secret \
-    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)"
+  -auth admin:"${SPLUNK_PASSWORD}"
 ```
 
 **Step 3 — smoke test**
@@ -1819,7 +1907,8 @@ Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm a
 **App does not appear after upload**
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   tail -50 /opt/splunk/var/log/splunk/splunkd.log | grep -iE "install|app|error"
 ```
 
@@ -1830,7 +1919,8 @@ kubectl exec -n ai-platform splunk-standalone-0 -- \
 kubectl get pods,svc -n ai-platform | grep saia
 
 # Test API reachability from inside the Splunk pod
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   curl -sv http://<worker-ip>:<nodePort>/health
 # Expected: HTTP 200
 ```
@@ -1847,9 +1937,10 @@ kubectl logs -n splunk-operator deploy/splunk-operator-controller-manager \
 A malformed `splunkaiassistant.conf` is the most common cause. Remove and restart:
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   rm -f /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk restart
 ```
 

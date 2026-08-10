@@ -70,7 +70,10 @@ render_splunk_block() {
 
   # Splunk configuration (internal — in-cluster Standalone)
   splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    # Fresh Splunk Operator installs report enableSSL=0. The production
+    # installer reads btool after readiness rather than assuming this scheme.
+    hecEndpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
     secretRef:
       name: ${splunk_secret}
       namespace: ${AI_NS}
@@ -127,7 +130,7 @@ CFG=$(make_config "splunk:
 OUT=$(render_splunk_block "${CFG}")
 info "SPLUNK_MODE=disabled → splunkConfiguration block must be absent"
 check_not_contains "${OUT}" "splunkConfiguration" "No splunkConfiguration block"
-check_not_contains "${OUT}" "endpoint:"           "No HEC endpoint"
+check_not_contains "${OUT}" "endpoint:"           "No Splunk endpoint"
 rm -f "${CFG}"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -143,7 +146,7 @@ check_contains     "${OUT}" "splunkConfiguration"              "splunkConfigurat
 check_contains     "${OUT}" "trustedIssuers"                   "trustedIssuers key present"
 check_contains     "${OUT}" "https://43.203.164.228:8089"      "First issuer"
 check_contains     "${OUT}" "https://splunk.example.com:8089"  "Second issuer"
-check_not_contains "${OUT}" "endpoint:"                        "No HEC endpoint"
+check_not_contains "${OUT}" "endpoint:"                        "No Splunk endpoint"
 rm -f "${CFG}"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -151,9 +154,12 @@ echo -e "\n${BOLD}Case 3: INTERNAL — splunk.enabled: true, no external.endpoin
 CFG=$(make_config "splunk:
   enabled: true")
 OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
-info "SPLUNK_MODE=internal → in-cluster HEC endpoint + secretRef"
+EXPECTED_INTERNAL_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+EXPECTED_INTERNAL_HEC_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8088"
+info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + secretRef"
 check_contains     "${OUT}" "splunkConfiguration"                              "splunkConfiguration block present"
-check_contains     "${OUT}" "my-standalone-standalone-service"                 "In-cluster HEC endpoint"
+check_contains     "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}"               "Canonical HTTP management/JWKS endpoint"
+check_contains     "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}"         "Distinct OTel-only HEC endpoint"
 check_contains     "${OUT}" "splunk-my-standalone-standalone-secret-v1"        "Operator-managed secret"
 check_contains     "${OUT}" "secretRef"                                        "secretRef present"
 check_not_contains "${OUT}" "trustedIssuers"                                   "No trustedIssuers when not set"
@@ -166,9 +172,10 @@ CFG=$(make_config "splunk:
   trustedIssuers:
     - https://external.splunk:8089")
 OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
-info "SPLUNK_MODE=internal → in-cluster HEC + external issuer appended"
+info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + external issuer appended"
 check_contains "${OUT}" "splunkConfiguration"                "splunkConfiguration block present"
-check_contains "${OUT}" "my-standalone-standalone-service"   "In-cluster HEC endpoint"
+check_contains "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}" "Canonical HTTP management/JWKS endpoint"
+check_contains "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}" "Distinct OTel-only HEC endpoint"
 check_contains "${OUT}" "trustedIssuers"                     "trustedIssuers key present"
 check_contains "${OUT}" "https://external.splunk:8089"       "External issuer present"
 rm -f "${CFG}"

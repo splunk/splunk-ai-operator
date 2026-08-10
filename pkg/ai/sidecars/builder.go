@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -204,13 +205,19 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
-		if _, exists := cm.Data["otel-config.yaml"]; !exists {
+		if existing, exists := cm.Data["otel-config.yaml"]; !exists {
 			content := s.renderOtelConf(ctx, p)
 			yamlBytes, err := syaml.Marshal(content)
 			if err != nil {
 				return fmt.Errorf("marshaling otel config: %w", err)
 			}
 			cm.Data["otel-config.yaml"] = string(yamlBytes)
+		} else if p.Spec.SplunkConfiguration.HECEndpoint != "" {
+			updated, err := updateOtelHECEndpoint(existing, p.Spec.SplunkConfiguration.HECEndpoint)
+			if err != nil {
+				return err
+			}
+			cm.Data["otel-config.yaml"] = updated
 		}
 		return controllerutil.SetOwnerReference(p, cm, s.Scheme)
 	})
@@ -218,6 +225,86 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 		return fmt.Errorf("create/update otel-config ConfigMap: %w", err)
 	}
 	return nil
+}
+
+const operatorManagedSplunkCAFile = "/etc/splunk-ca/ca.crt"
+
+// updateOtelHECEndpoint migrates only operator-managed fields on the Splunk HEC
+// exporter. Existing ConfigMaps may contain user customizations, so the rest of
+// the collector configuration is preserved. The legacy CA path is removed only
+// when it exactly matches the mount previously managed by this operator. With
+// no desired CA reference in this API version, HTTPS uses explicit opt-in
+// verification bypass while HTTP carries no operator-generated TLS settings.
+func updateOtelHECEndpoint(configYAML, hecBase string) (string, error) {
+	var config map[string]interface{}
+	if err := syaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return "", fmt.Errorf("parsing existing otel config: %w", err)
+	}
+	exporters, ok := config["exporters"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("existing otel config has no exporters map")
+	}
+	splunkHEC, ok := exporters["splunk_hec"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("existing otel config has no splunk_hec exporter")
+	}
+	changed := false
+	desired := fmt.Sprintf("%s/services/collector", hecBase)
+	if current, _ := splunkHEC["endpoint"].(string); current != desired {
+		splunkHEC["endpoint"] = desired
+		changed = true
+	}
+
+	isHTTPS := strings.HasPrefix(strings.ToLower(hecBase), "https://")
+	tlsConfig, hasTLS := splunkHEC["tls"].(map[string]interface{})
+	if hasTLS {
+		removedManagedCA := false
+		if caFile, _ := tlsConfig["ca_file"].(string); caFile == operatorManagedSplunkCAFile {
+			delete(tlsConfig, "ca_file")
+			removedManagedCA = true
+			changed = true
+		}
+
+		if isHTTPS {
+			// If a custom CA remains, preserve its verification policy. Otherwise
+			// keep the historical no-CA behavior explicitly fail-open for TLS.
+			if _, hasCAFile := tlsConfig["ca_file"]; !hasCAFile {
+				if skipVerify, ok := tlsConfig["insecure_skip_verify"].(bool); !ok || !skipVerify {
+					tlsConfig["insecure_skip_verify"] = true
+					changed = true
+				}
+			}
+		} else if _, ok := tlsConfig["insecure_skip_verify"].(bool); removedManagedCA && ok {
+			// The legacy operator emitted ca_file and insecure_skip_verify as a
+			// pair. Remove that paired policy for HTTP regardless of its boolean
+			// value; there is no TLS handshake to configure.
+			delete(tlsConfig, "insecure_skip_verify")
+			changed = true
+		} else if skipVerify, ok := tlsConfig["insecure_skip_verify"].(bool); ok && skipVerify {
+			// This key is emitted by renderOtelConf for HTTPS without a CA. It is
+			// meaningless on an effective HTTP listener, so remove only that
+			// known generated value and retain all other custom TLS fields.
+			delete(tlsConfig, "insecure_skip_verify")
+			changed = true
+		}
+
+		if len(tlsConfig) == 0 {
+			delete(splunkHEC, "tls")
+			changed = true
+		}
+	} else if isHTTPS {
+		splunkHEC["tls"] = map[string]interface{}{"insecure_skip_verify": true}
+		changed = true
+	}
+
+	if !changed {
+		return configYAML, nil
+	}
+	yamlBytes, err := syaml.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("marshaling migrated otel config: %w", err)
+	}
+	return string(yamlBytes), nil
 }
 
 // renderOtelConf builds the OpenTelemetry Collector config map data.
@@ -233,37 +320,47 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 		return map[string]interface{}{"error": "hec_token field not found in secret"}
 	}
 
-	endpoint := fmt.Sprintf("%s/services/collector", cr.Spec.SplunkConfiguration.Endpoint)
+	// HEC ingestion and management/JWKS are separate Splunk listeners. Keep
+	// HECEndpoint scoped to OTel; Endpoint remains the JWT issuer used by
+	// SAIA/Slim. The fallback preserves pre-existing custom resources.
+	hecBase := cr.Spec.SplunkConfiguration.HECEndpoint
+	if hecBase == "" {
+		hecBase = cr.Spec.SplunkConfiguration.Endpoint
+	}
+	endpoint := fmt.Sprintf("%s/services/collector", hecBase)
 	metricsIndexName, exists := os.LookupEnv("SPLUNK_METRICS_INDEX_NAME")
 	if !exists {
 		metricsIndexName = "_metrics"
 	}
+	splunkHECExporter := map[string]interface{}{
+		"token":               string(token),
+		"endpoint":            endpoint,
+		"source":              "otel",
+		"sourcetype":          "otel",
+		"index":               metricsIndexName,
+		"disable_compression": false,
+		"timeout":             "10s",
+		"splunk_app_name":     "OpenTelemetry-Collector Splunk Exporter",
+		"splunk_app_version":  "v0.0.1",
+		"heartbeat":           map[string]interface{}{"interval": "30s"},
+		"telemetry": map[string]interface{}{
+			"enabled": true,
+			"extra_attributes": map[string]interface{}{
+				"custom_key":   "custom_value",
+				"dataset_name": "SplunkCloudBeaverStack",
+			},
+			"override_metrics_names": map[string]interface{}{
+				"otelcol_exporter_splunkhec_heartbeats_failed": "app_heartbeats_failed_total",
+				"otelcol_exporter_splunkhec_heartbeats_sent":   "app_heartbeats_success_total",
+			},
+		},
+	}
+	if strings.HasPrefix(strings.ToLower(hecBase), "https://") {
+		splunkHECExporter["tls"] = map[string]interface{}{"insecure_skip_verify": true}
+	}
 	return map[string]interface{}{
 		"exporters": map[string]interface{}{
-			"splunk_hec": map[string]interface{}{
-				"token":               string(token),
-				"endpoint":            endpoint,
-				"source":              "otel",
-				"sourcetype":          "otel",
-				"index":               metricsIndexName,
-				"disable_compression": false,
-				"timeout":             "10s",
-				"tls":                 map[string]interface{}{"insecure_skip_verify": true},
-				"splunk_app_name":     "OpenTelemetry-Collector Splunk Exporter",
-				"splunk_app_version":  "v0.0.1",
-				"heartbeat":           map[string]interface{}{"interval": "30s"},
-				"telemetry": map[string]interface{}{
-					"enabled": true,
-					"extra_attributes": map[string]interface{}{
-						"custom_key":   "custom_value",
-						"dataset_name": "SplunkCloudBeaverStack",
-					},
-					"override_metrics_names": map[string]interface{}{
-						"otelcol_exporter_splunkhec_heartbeats_failed": "app_heartbeats_failed_total",
-						"otelcol_exporter_splunkhec_heartbeats_sent":   "app_heartbeats_success_total",
-					},
-				},
-			},
+			"splunk_hec": splunkHECExporter,
 		},
 		"processors": map[string]interface{}{"batch": map[string]interface{}{}},
 		"receivers": map[string]interface{}{

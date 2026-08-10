@@ -192,6 +192,13 @@ splunk:
   #     the cluster and wires the AIPlatform CR at it. Requires
   #     images.splunk.image and images.splunk.operatorImage.
   #
+  #     Compatibility transport: the final in-cluster Splunk management/JWKS
+  #     endpoint is plain HTTP on ClusterIP port 8089. The installer keeps the
+  #     OAuth signing certificate, but SAIA fetches its public signing keys over
+  #     http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089.
+  #     Keep the pod/service network private and restrict workload access with
+  #     NetworkPolicy where required. This does not change external Splunk URLs.
+  #
   #   EXTERNAL (enabled: true, external.endpoint set):
   #     Use a Splunk running OUTSIDE the cluster. The installer does NOT deploy
   #     any in-cluster Splunk. It creates a Kubernetes Secret holding the HEC

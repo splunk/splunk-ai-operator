@@ -10,6 +10,8 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
 
 - [Which Path Is Right for You?](#which-path-is-right-for-you)
 - [What Gets Deployed](#what-gets-deployed)
+  - [Internal Splunk Transport](#internal-splunk-transport)
+  - [Scaling Deployment Capacity](#scaling-deployment-capacity)
 - [Standard Deployment (Internet-Connected)](#standard-deployment-internet-connected)
   - [What You Need Before Starting](#what-you-need-before-starting)
   - [Install Flow](#install-flow)
@@ -127,6 +129,57 @@ graph TB
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
 
 > **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are access-controlled through your private registry. Contact your Splunk account team to confirm entitlements before deployment.
+
+### Internal Splunk Transport
+
+For the k0s **internal Splunk** mode, the final management/JWKS endpoint on
+port 8089 intentionally uses HTTP. The installer sets both Splunk's OAuth
+`issuer_uri` and `AIPlatform.spec.splunkConfiguration.endpoint` to the same
+service URL:
+
+```text
+http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
+```
+
+OTel telemetry uses the separate `splunkConfiguration.hecEndpoint` on port
+8088. HEC is used only for telemetry and is never treated as the JWT issuer.
+After Splunk is Ready, the installer reads the effective `[http]` stanza with
+`btool`, verifies that HEC is enabled and healthy, and renders `http://` or
+`https://` to match `enableSSL`. It does not change the HEC TLS setting. A fresh
+Splunk Operator 3.0.0 install normally reports HTTP; an upgraded or customized
+instance may report HTTPS.
+
+This is the AIP-4614 compatibility behavior for SAIA/Slim interactive-token
+validation. The installer disables `enableSplunkdSSL`, rolls the Splunk pod, and
+tests the HTTP endpoint before deploying `AIPlatform`. Current SAIA images work
+with this URL; no image rollback or certificate mount is needed. The Splunk
+OAuth certificate remains configured because it signs JWTs rather than securing
+the HTTP transport. Splunk 10.2 still performs its bounded initial HTTPS scheme
+probe before falling back to HTTP. The installer extends only the Standalone
+startup-probe allowance so the image can finish that fallback without weakening
+splunk-ansible's global retry policy; this can add several minutes to a Splunk
+pod start.
+
+Rerunning the installer against a PVC created by an earlier TLS-preview install
+performs an idempotent compatibility migration before Splunk starts. It removes
+only persisted TLS options from configuration files that still reference the
+installer-owned `/mnt/splunk-cert*` paths, restores Splunk Web to HTTP, and
+removes the stale custom HEC certificate path. It does not delete the PVC or
+indexed data. HEC's `enableSSL` setting is deliberately unchanged, so HEC keeps
+using its independently configured HTTP or HTTPS protocol. Installation fails
+closed if the effective HEC setting cannot be read, HEC is disabled, its port is
+not the operator Service's port 8088, or the matching health URL is unavailable.
+During an operator upgrade, the OTel ConfigMap migration also removes the exact
+legacy operator-managed `tls.ca_file: /etc/splunk-ca/ca.crt` reference when
+that CA mount is no longer configured. HTTPS then retains the existing
+no-CA `insecure_skip_verify` behavior; HTTP carries no generated TLS settings.
+Other exporter, processor, and custom CA settings are preserved.
+
+Keep the Kubernetes pod/service network private. Management credentials and
+JWKS requests on port 8089 are unencrypted within that network, so production
+clusters should restrict untrusted workloads with NetworkPolicy. External
+Splunk, image registries, cert-manager webhooks, and customer-managed ingress
+retain their independent TLS settings.
 
 ### Scaling Deployment Capacity
 

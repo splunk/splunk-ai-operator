@@ -835,6 +835,397 @@ assert_eq "allows only one automatic NVIDIA recovery reboot" \
 assert_eq "waits for the node to return after the recovery reboot" \
   "1" "$(grep -c 'did not return after the NVIDIA recovery reboot' "${SCRIPT}" | tr -d '[:space:]')"
 
+# ── Tests: AIP-4614 internal Splunk HTTP compatibility ───────────────────────
+# Execute the production installer functions with kubectl/yq mocked and inspect
+# the YAML they actually render. This catches scheme, service-name, and YAML
+# placement regressions that source-grep-only tests miss.
+
+suite "AIP-4614 internal Splunk HTTP compatibility"
+echo "▶ AIP-4614 internal Splunk HTTP compatibility"
+
+_render_internal_splunk_http_manifests() (
+  local capture_dir="$1"
+  eval "$(_extract_fn internal_splunk_management_url)"
+  eval "$(_extract_fn internal_splunk_pod_name)"
+  eval "$(_extract_fn _internal_splunk_btool_http_value)"
+  eval "$(_extract_fn _detect_internal_splunk_hec_url)"
+  eval "$(_extract_fn _read_internal_splunk_state)"
+  eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
+  eval "$(_extract_fn install_splunk_standalone)"
+  eval "$(_extract_fn install_ai_platform_cr)"
+
+  log() { :; }
+  warn() { :; }
+  err() { echo "ERROR: $*" >&2; exit 1; }
+  ensure_namespace() { :; }
+  wait_for_crd() { :; }
+  _wait_for_splunk_telemetry_bootstrap() { :; }
+  _wait_for_internal_splunk_http() { :; }
+  object_store_auth_looks_like_placeholder() { return 0; }
+  sleep() { :; }
+
+  yq() {
+    case "$*" in
+      *'.splunk.trustedIssuers | length'*|*'.aiPlatform.features | length'*) echo 0 ;;
+      *) echo '' ;;
+    esac
+  }
+
+  kubectl() {
+    local args=" $* " body
+    if [[ "${args}" == *' btool inputs list http '* ]]; then
+      cat <<'EOF'
+[http]
+disabled = 0
+enableSSL = 0
+port = 8088
+EOF
+      return 0
+    fi
+    if [[ "${args}" == *'/services/collector/health'* ]]; then
+      return 0
+    fi
+    if [[ "${args}" == *' get standalone '* && "${args}" == *' -o json '* ]]; then
+      echo '{"status":{"telAppInstalled":true,"phase":"Ready","message":""},"spec":{"extraEnv":[{"name":"KEEP_ME","value":"kept"}]}}'
+      return 0
+    fi
+    if [[ "${args}" == *' get pods '* && "${args}" == *' -o json '* ]]; then
+      echo '{"items":[]}'
+      return 0
+    fi
+    if [[ "${args}" == *' get pod '* && "${args}" == *'metadata.uid'* ]]; then
+      echo old-pod-uid
+      return 0
+    fi
+    if [[ "${args}" == *' get secret minio-credentials '* ]]; then
+      return 0
+    fi
+    if [[ "${args}" == *' get secret '* ]]; then
+      return 1
+    fi
+    if [[ "${args}" == *' get aiplatform '* ]]; then
+      return 0
+    fi
+    if [[ "${args}" == *' apply '* && "${args}" == *' -f - '* ]]; then
+      body="$(cat)"
+      case "${body}" in
+        *'kind: ConfigMap'*'name: splunk-defaults'*)
+          printf '%s\n' "${body}" >"${capture_dir}/splunk-defaults.yaml"
+          ;;
+        *'kind: Standalone'*)
+          printf '%s\n' "${body}" >"${capture_dir}/standalone.yaml"
+          ;;
+        *'kind: AIPlatform'*)
+          printf '%s\n' "${body}" >"${capture_dir}/aiplatform.yaml"
+          ;;
+      esac
+      return 0
+    fi
+    return 0
+  }
+
+  SPLUNK_MODE=internal
+  AI_STANDALONE_NAME=fixture-splunk
+  AI_NS=fixture-ns
+  CLUSTER_NAME=fixture
+  CONFIG_FILE=unused
+  STORAGE_CLASS=local-path
+  MINIO_ROOT_USER=fixture-user
+  MINIO_ROOT_PASSWORD=fixture-password
+  OBJ_STORE_TYPE=minio
+  MINIO_ENDPOINT=http://minio.fixture:9000
+  OBJ_STORE_ENDPOINT="${MINIO_ENDPOINT}"
+  MINIO_BUCKET=fixture-bucket
+  OBJ_STORE_BUCKET=fixture-bucket
+  REGION=us-east-2
+  ECR_REGION=us-east-2
+  DEFAULT_ACCELERATOR=L40S
+  VECTORDB_SIZE=50Gi
+  WORKER_IMAGE_REGISTRY=''
+
+  install_splunk_standalone
+  install_ai_platform_cr
+)
+
+_render_splunk_bootstrap_manifest() (
+  local output_file="$1"
+  eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
+  log() { :; }
+  err() { echo "ERROR: $*" >&2; exit 1; }
+  kubectl() { cat >"${output_file}"; }
+  AI_STANDALONE_NAME=fixture-splunk
+  AI_NS=fixture-ns
+  STORAGE_CLASS=local-path
+  MINIO_BUCKET=fixture-bucket
+  _apply_internal_splunk_standalone_cr \
+    http://minio.fixture:9000 bootstrap \
+    '[{"name":"KEEP_ME","value":"kept"},{"name":"SPLUNKD_SSL_ENABLE","value":"false"}]'
+)
+
+_AIP4614_TMPDIR="$(mktemp -d)"
+if _render_internal_splunk_http_manifests "${_AIP4614_TMPDIR}"; then
+  _aip4614_render_rc=0
+else
+  _aip4614_render_rc=$?
+fi
+assert_eq "production installer functions render successfully" "0" "${_aip4614_render_rc}"
+
+for _manifest in splunk-defaults standalone aiplatform; do
+  assert_eq "rendered ${_manifest} manifest is non-empty" "1" \
+    "$([[ -s "${_AIP4614_TMPDIR}/${_manifest}.yaml" ]] && echo 1 || echo 0)"
+done
+
+_expected_internal_url='http://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8089'
+_expected_internal_hec_url='http://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088'
+_rendered_issuer=$(awk -F'issuer_uri: ' '/issuer_uri:/{print $2; exit}' \
+  "${_AIP4614_TMPDIR}/splunk-defaults.yaml")
+_rendered_endpoint=$(awk '
+  /^[[:space:]]*splunkConfiguration:/ { in_splunk=1; next }
+  in_splunk && /^[[:space:]]*endpoint:/ {
+    sub(/^[[:space:]]*endpoint:[[:space:]]*/, ""); print; exit
+  }
+' "${_AIP4614_TMPDIR}/aiplatform.yaml")
+_rendered_hec_endpoint=$(awk '
+  /^[[:space:]]*splunkConfiguration:/ { in_splunk=1; next }
+  in_splunk && /^[[:space:]]*hecEndpoint:/ {
+    sub(/^[[:space:]]*hecEndpoint:[[:space:]]*/, ""); print; exit
+  }
+' "${_AIP4614_TMPDIR}/aiplatform.yaml")
+
+assert_eq "oauth issuer renders the canonical HTTP service URL" \
+  "${_expected_internal_url}" "${_rendered_issuer}"
+assert_eq "AIPlatform endpoint renders the canonical HTTP service URL" \
+  "${_expected_internal_url}" "${_rendered_endpoint}"
+assert_eq "oauth issuer and AIPlatform endpoint are byte-identical" \
+  "${_rendered_issuer}" "${_rendered_endpoint}"
+assert_eq "OTel HEC endpoint follows the effective HTTP listener on port 8088" \
+  "${_expected_internal_hec_url}" "${_rendered_hec_endpoint}"
+assert_eq "Splunk OAuth issuer contains no HTTPS form" "0" \
+  "$(grep -c 'issuer_uri: https://' "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "Standalone final manifest disables splunkd management TLS exactly once" "1" \
+  "$(grep 'extraEnv:' "${_AIP4614_TMPDIR}/standalone.yaml" \
+    | grep -c '"name":"SPLUNKD_SSL_ENABLE","value":"false"')"
+assert_eq "Standalone final manifest preserves unrelated extraEnv entries" "1" \
+  "$(grep 'extraEnv:' "${_AIP4614_TMPDIR}/standalone.yaml" \
+    | grep -c '"name":"KEEP_ME","value":"kept"')"
+assert_eq "OAuth signing certificate remains configured independently of transport TLS" "1" \
+  "$(grep -c 'certFile: \$SPLUNK_HOME/etc/auth/server.pem' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "HTTP mode preserves the global splunk-ansible retry policy" "0" \
+  "$(grep -c '^[[:space:]]*retry_num:' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "HTTP mode allows the pinned image scheme probe to finish" "1" \
+  "$(grep -c '^[[:space:]]*failureThreshold: 40$' \
+    "${_AIP4614_TMPDIR}/standalone.yaml")"
+assert_eq "installer HTTP wait covers the extended startup allowance" "1" \
+  "$(grep -c '_wait_for_internal_splunk_http "\${old_pod_uid}" 1500' "${SCRIPT}")"
+assert_eq "defaults register the idempotent stale-TLS migration pre-task" "1" \
+  "$(grep -c 'file:///mnt/defaults/remove-stale-installer-tls.yml' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "migration disables persisted Splunk management TLS" "1" \
+  "$(grep -c 'section: sslConfig, option: enableSplunkdSSL, value: "false"' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "migration restores Splunk Web HTTP when preview TLS paths are present" "1" \
+  "$(grep -c 'section: settings, option: enableSplunkWebSSL, value: "false"' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "migration does not change the independent HEC TLS switch" "0" \
+  "$(grep -c 'section: http, option: enableSSL' \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "migration is limited to the installer-owned legacy mount prefix" "2" \
+  "$(grep -c "lookup('file', item.path, errors='ignore') | default('', true)" \
+    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+
+_exercise_internal_splunk_hec_detection() (
+  local scenario="$1"
+  eval "$(_extract_fn internal_splunk_pod_name)"
+  eval "$(_extract_fn _internal_splunk_btool_http_value)"
+  eval "$(_extract_fn _detect_internal_splunk_hec_url)"
+
+  log() { :; }
+  err() { return 1; }
+  kubectl() {
+    local args=" $* "
+    if [[ "${args}" == *' btool inputs list http '* ]]; then
+      case "${scenario}" in
+        http|health-failure)
+          printf '[http]\ndisabled = 0\nenableSSL = 0\nport = 8088\n'
+          ;;
+        https)
+          printf '[http]\ndisabled = 0\nenableSSL = 1\nport = 8088\n'
+          ;;
+        disabled)
+          printf '[http]\ndisabled = 1\nenableSSL = 0\nport = 8088\n'
+          ;;
+        missing-scheme)
+          printf '[http]\ndisabled = 0\nport = 8088\n'
+          ;;
+        ambiguous-scheme)
+          printf '[http]\ndisabled = 0\nenableSSL = 0\nenableSSL = 1\nport = 8088\n'
+          ;;
+        bad-port)
+          printf '[http]\ndisabled = 0\nenableSSL = 0\nport = 18088\n'
+          ;;
+        exec-failure)
+          return 1
+          ;;
+      esac
+      return 0
+    fi
+    if [[ "${args}" == *'/services/collector/health'* ]]; then
+      [[ "${scenario}" != "health-failure" ]]
+      return
+    fi
+    return 1
+  }
+
+  AI_STANDALONE_NAME=fixture-splunk
+  AI_NS=fixture-ns
+  _detect_internal_splunk_hec_url || return 1
+  printf '%s\n' "${_INTERNAL_SPLUNK_HEC_URL}"
+)
+
+assert_eq "effective HEC enableSSL=0 selects HTTP for OTel" \
+  'http://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088' \
+  "$(_exercise_internal_splunk_hec_detection http)"
+assert_eq "effective HEC enableSSL=1 selects HTTPS for OTel" \
+  'https://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088' \
+  "$(_exercise_internal_splunk_hec_detection https)"
+
+for _hec_failure in disabled missing-scheme ambiguous-scheme bad-port exec-failure health-failure; do
+  if _exercise_internal_splunk_hec_detection "${_hec_failure}" >/dev/null 2>&1; then
+    _hec_failure_rc=0
+  else
+    _hec_failure_rc=$?
+  fi
+  assert_eq "HEC detection fails closed for ${_hec_failure}" "1" "${_hec_failure_rc}"
+done
+
+_render_splunk_bootstrap_manifest "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml"
+assert_eq "fresh-install bootstrap keeps the operator's default startup probe" "0" \
+  "$(grep -c '^[[:space:]]*failureThreshold: 40$' \
+    "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml")"
+assert_eq "fresh-install bootstrap preserves unrelated extraEnv entries" "1" \
+  "$(grep 'extraEnv:' "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml" \
+    | grep -c '"name":"KEEP_ME","value":"kept"')"
+assert_eq "fresh-install bootstrap temporarily removes only the splunkd HTTP override" "0" \
+  "$(grep 'extraEnv:' "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml" \
+    | grep -c 'SPLUNKD_SSL_ENABLE')"
+assert_eq "telemetry bootstrap wait precedes the final HTTP apply" "1" \
+  "$(awk '
+    /_wait_for_splunk_telemetry_bootstrap 600/ { waited=NR }
+    /_apply_internal_splunk_standalone_cr.*http/ { applied=NR }
+    END { print (waited > 0 && applied > waited) ? 1 : 0 }
+  ' "${SCRIPT}")"
+
+_exercise_internal_splunk_install_flow() (
+  local scenario="$1"
+  local event_file="$2"
+  local state="${scenario}"
+  : >"${event_file}"
+
+  eval "$(_extract_fn internal_splunk_management_url)"
+  eval "$(_extract_fn internal_splunk_pod_name)"
+  eval "$(_extract_fn _read_internal_splunk_state)"
+  eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
+  eval "$(_extract_fn install_splunk_standalone)"
+
+  log() { :; }
+  warn() { :; }
+  err() { exit 1; }
+  ensure_namespace() { :; }
+  wait_for_crd() { :; }
+  _wait_for_splunk_telemetry_bootstrap() {
+    printf 'wait-telemetry\n' >>"${event_file}"
+    state="existing"
+  }
+  _wait_for_internal_splunk_http() {
+    printf 'wait-http:%s\n' "$1" >>"${event_file}"
+  }
+  _detect_internal_splunk_hec_url() { :; }
+
+  kubectl() {
+    local args=" $* " body
+    if [[ "${args}" == *' get secret minio-credentials '* ]]; then return 0; fi
+    if [[ "${args}" == *' get secret '* ]]; then return 1; fi
+    if [[ "${args}" == *' get standalone '* && "${args}" == *' -o json '* ]]; then
+      case "${state}" in
+        fresh)
+          echo 'Error from server (NotFound): standalones.enterprise.splunk.com "fixture" not found' >&2
+          return 1
+          ;;
+        forbidden)
+          echo 'Error from server (Forbidden): standalones.enterprise.splunk.com is forbidden' >&2
+          return 1
+          ;;
+        idempotent)
+          echo '{"status":{"telAppInstalled":true},"spec":{"extraEnv":[{"name":"SPLUNKD_SSL_ENABLE","value":"false"}]}}'
+          return 0
+          ;;
+        *)
+          echo '{"status":{"telAppInstalled":true},"spec":{"extraEnv":[{"name":"KEEP_ME","value":"kept"}]}}'
+          return 0
+          ;;
+      esac
+    fi
+    if [[ "${args}" == *' get pod '* && "${args}" == *'metadata.uid'* ]]; then
+      echo old-pod-uid
+      return 0
+    fi
+    if [[ "${args}" == *' apply '* && "${args}" == *' -f - '* ]]; then
+      body="$(cat)"
+      if [[ "${body}" == *'kind: Standalone'* ]]; then
+        if [[ "${body}" == *'"name":"SPLUNKD_SSL_ENABLE","value":"false"'* ]]; then
+          printf 'http\n' >>"${event_file}"
+        else
+          printf 'bootstrap\n' >>"${event_file}"
+        fi
+      fi
+      return 0
+    fi
+    return 0
+  }
+
+  SPLUNK_MODE=internal
+  AI_STANDALONE_NAME=fixture
+  AI_NS=fixture-ns
+  STORAGE_CLASS=local-path
+  MINIO_ROOT_USER=user
+  MINIO_ROOT_PASSWORD=password
+  OBJ_STORE_TYPE=minio
+  MINIO_ENDPOINT=http://minio:9000
+  OBJ_STORE_ENDPOINT="${MINIO_ENDPOINT}"
+  MINIO_BUCKET=bucket
+
+  install_splunk_standalone
+)
+
+_fresh_events="${_AIP4614_TMPDIR}/fresh.events"
+assert_rc "fresh install executes bootstrap then final HTTP state" 0 \
+  _exercise_internal_splunk_install_flow fresh "${_fresh_events}"
+assert_eq "fresh install ordering is bootstrap, telemetry wait, HTTP, rollout wait" \
+  $'bootstrap\nwait-telemetry\nhttp\nwait-http:old-pod-uid' \
+  "$(cat "${_fresh_events}")"
+
+_upgrade_events="${_AIP4614_TMPDIR}/upgrade.events"
+assert_rc "existing TLS upgrade goes directly to final HTTP state" 0 \
+  _exercise_internal_splunk_install_flow existing "${_upgrade_events}"
+assert_eq "existing TLS upgrade requires replacement pod UID" \
+  $'http\nwait-http:old-pod-uid' "$(cat "${_upgrade_events}")"
+
+_idempotent_events="${_AIP4614_TMPDIR}/idempotent.events"
+assert_rc "already-HTTP rerun remains idempotent" 0 \
+  _exercise_internal_splunk_install_flow idempotent "${_idempotent_events}"
+assert_eq "already-HTTP rerun does not require a pod UID change" \
+  $'http\nwait-http:' "$(cat "${_idempotent_events}")"
+
+_forbidden_events="${_AIP4614_TMPDIR}/forbidden.events"
+assert_rc "Standalone API/RBAC read failure aborts the installer" 1 \
+  _exercise_internal_splunk_install_flow forbidden "${_forbidden_events}"
+assert_eq "read failure never applies a Standalone manifest" "" \
+  "$(cat "${_forbidden_events}")"
+
+rm -rf "${_AIP4614_TMPDIR}"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""

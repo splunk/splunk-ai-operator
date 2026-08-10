@@ -193,7 +193,8 @@ func TestReconcileOtelConfigMap(t *testing.T) {
 				SecretRef: corev1.SecretReference{
 					Name: "splunk-secret",
 				},
-				Endpoint: "https://splunk.example.com",
+				Endpoint:    "http://splunk.example.com:8089",
+				HECEndpoint: "https://splunk.example.com:8088",
 			},
 		},
 	}
@@ -227,6 +228,112 @@ func TestReconcileOtelConfigMap(t *testing.T) {
 	assert.NotEmpty(t, cm.Data["otel-config.yaml"])
 }
 
+func TestReconcileOtelConfigMap_MigratesOnlyHECEndpoint(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+			Endpoint:    "http://splunk:8089",
+			HECEndpoint: "https://splunk:8088",
+		}},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token")},
+	}
+	platform.Spec.SplunkConfiguration.SecretRef = corev1.SecretReference{Name: secret.Name}
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform-otel-config", Namespace: "default"},
+		Data: map[string]string{"otel-config.yaml": `exporters:
+  splunk_hec:
+    endpoint: http://splunk:8089/services/collector
+    custom_setting: keep-me
+processors:
+  custom: {}
+`},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, existing).Build()
+	builder := New(fakeClient, scheme, record.NewFakeRecorder(100), platform)
+
+	require.NoError(t, builder.reconcileOtelConfigMap(ctx, platform))
+	updated := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(ctx, clientKey("default", existing.Name), updated))
+	assert.Contains(t, updated.Data["otel-config.yaml"], "endpoint: https://splunk:8088/services/collector")
+	assert.Contains(t, updated.Data["otel-config.yaml"], "insecure_skip_verify: true")
+	assert.Contains(t, updated.Data["otel-config.yaml"], "custom_setting: keep-me")
+	assert.Contains(t, updated.Data["otel-config.yaml"], "custom: {}")
+}
+
+func TestUpdateOtelHECEndpoint_RemovesOnlyLegacyManagedCA(t *testing.T) {
+	existing := `exporters:
+  splunk_hec:
+    endpoint: https://splunk:8088/services/collector
+    custom_setting: keep-me
+    tls:
+      ca_file: /etc/splunk-ca/ca.crt
+      insecure_skip_verify: false
+      min_version: "1.2"
+processors:
+  custom: {}
+`
+
+	updated, err := updateOtelHECEndpoint(existing, "http://splunk:8088")
+	require.NoError(t, err)
+	assert.Contains(t, updated, "endpoint: http://splunk:8088/services/collector")
+	assert.NotContains(t, updated, "ca_file: /etc/splunk-ca/ca.crt")
+	assert.NotContains(t, updated, "insecure_skip_verify")
+	assert.Contains(t, updated, "min_version: \"1.2\"")
+	assert.Contains(t, updated, "custom_setting: keep-me")
+	assert.Contains(t, updated, "custom: {}")
+}
+
+func TestUpdateOtelHECEndpoint_HTTPDropsLegacyTLSBlock(t *testing.T) {
+	existing := `exporters:
+  splunk_hec:
+    endpoint: https://splunk:8088/services/collector
+    tls:
+      ca_file: /etc/splunk-ca/ca.crt
+      insecure_skip_verify: false
+`
+
+	updated, err := updateOtelHECEndpoint(existing, "http://splunk:8088")
+	require.NoError(t, err)
+	assert.Contains(t, updated, "endpoint: http://splunk:8088/services/collector")
+	assert.NotContains(t, updated, "ca_file")
+	assert.NotContains(t, updated, "insecure_skip_verify")
+	assert.NotContains(t, updated, "tls:")
+}
+
+func TestUpdateOtelHECEndpoint_CleansCurrentHTTPSLegacyCA(t *testing.T) {
+	existing := `exporters:
+  splunk_hec:
+    endpoint: https://splunk:8088/services/collector
+    tls:
+      ca_file: /etc/splunk-ca/ca.crt
+      insecure_skip_verify: false
+`
+
+	updated, err := updateOtelHECEndpoint(existing, "https://splunk:8088")
+	require.NoError(t, err)
+	assert.NotContains(t, updated, "ca_file: /etc/splunk-ca/ca.crt")
+	assert.Contains(t, updated, "insecure_skip_verify: true")
+}
+
+func TestUpdateOtelHECEndpoint_PreservesCustomCA(t *testing.T) {
+	existing := `exporters:
+  splunk_hec:
+    endpoint: https://splunk:8088/services/collector
+    tls:
+      ca_file: /etc/customer-ca/custom.crt
+      insecure_skip_verify: false
+`
+
+	updated, err := updateOtelHECEndpoint(existing, "https://splunk:8088")
+	require.NoError(t, err)
+	assert.Equal(t, existing, updated, "an already-current custom CA configuration must be byte-preserved")
+}
+
 func TestRenderOtelConf(t *testing.T) {
 	ctx := context.Background()
 	scheme := setupFakeScheme()
@@ -256,7 +363,8 @@ func TestRenderOtelConf(t *testing.T) {
 				SecretRef: corev1.SecretReference{
 					Name: "splunk-secret",
 				},
-				Endpoint: "https://splunk.example.com",
+				Endpoint:    "http://splunk.example.com:8089",
+				HECEndpoint: "https://splunk.example.com:8088",
 			},
 		},
 	}
@@ -276,7 +384,17 @@ func TestRenderOtelConf(t *testing.T) {
 	require.True(t, ok, "splunk_hec exporter should be present")
 
 	assert.Equal(t, "test-token-123", splunkHec["token"])
-	assert.Equal(t, "https://splunk.example.com/services/collector", splunkHec["endpoint"])
+	assert.Equal(t, "https://splunk.example.com:8088/services/collector", splunkHec["endpoint"])
+	tlsConfig, ok := splunkHec["tls"].(map[string]interface{})
+	require.True(t, ok, "HTTPS without a configured CA should emit TLS policy")
+	assert.Equal(t, true, tlsConfig["insecure_skip_verify"])
+
+	platform.Spec.SplunkConfiguration.HECEndpoint = "http://splunk.example.com:8088"
+	httpConf := builder.renderOtelConf(ctx, platform)
+	httpExporters := httpConf["exporters"].(map[string]interface{})
+	httpSplunkHEC := httpExporters["splunk_hec"].(map[string]interface{})
+	assert.Equal(t, "http://splunk.example.com:8088/services/collector", httpSplunkHEC["endpoint"])
+	assert.NotContains(t, httpSplunkHEC, "tls", "HTTP HEC must not emit operator-generated TLS settings")
 
 	// Verify receivers
 	receivers, ok := conf["receivers"].(map[string]interface{})
@@ -292,6 +410,31 @@ func TestRenderOtelConf(t *testing.T) {
 	service, ok := conf["service"].(map[string]interface{})
 	require.True(t, ok, "service should be present")
 	assert.Contains(t, service, "pipelines")
+}
+
+func TestRenderOtelConf_FallsBackToEndpointWhenHECEndpointUnset(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "splunk-secret", Namespace: "default"},
+		Data:       map[string][]byte{"hec_token": []byte("test-token-123")},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				SecretRef: corev1.SecretReference{Name: "splunk-secret"},
+				Endpoint:  "https://legacy-splunk.example.com:8088",
+			},
+		},
+	}
+	builder := New(fakeClient, scheme, record.NewFakeRecorder(100), platform)
+	conf := builder.renderOtelConf(ctx, platform)
+	exporters := conf["exporters"].(map[string]interface{})
+	splunkHec := exporters["splunk_hec"].(map[string]interface{})
+
+	assert.Equal(t, "https://legacy-splunk.example.com:8088/services/collector", splunkHec["endpoint"])
 }
 
 func TestRenderOtelConf_SecretMissing(t *testing.T) {
