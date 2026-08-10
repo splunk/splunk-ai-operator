@@ -95,7 +95,7 @@ done
 
 | Node Type | Min CPU | Min RAM | Min Disk | Count | Notes |
 |---|---|---|---|---|---|
-| Controller | 4 cores | 8 GB | 100 GB | 1 (3 for HA) | API server, etcd, scheduler |
+| Controller | 4 cores | 8 GB | 100 GB | 1 | API server, etcd, scheduler — the installer joins only the first controller IP; additional controller IPs are not joined and are not HA |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
 | GPU Worker (L40S / `g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
 | GPU Worker (H100 / `p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
@@ -142,8 +142,8 @@ vi my-cluster.yaml
 | `cluster.sshKeyPath` | Path to your SSH private key |
 | `cluster.sshUser` | SSH user for remote nodes |
 | `cluster.region` | Your region — required only if `storage.objectStore.type: aws` |
-| `nodes.existingIPs.controllers` | Controller node IP(s) |
-| `nodes.existingIPs.workers` | CPU + GPU worker node IPs |
+| `nodes.existingIPs.controllers` | Controller node IP (only 1 is supported — see Hardware Requirements) |
+| `nodes.existingIPs.workers` | CPU + GPU worker node IPs, **CPU workers first**: the installer treats the first `nodes.cpuWorkers` entries as CPU nodes and every remaining entry as GPU — set `nodes.cpuWorkers` to match, or the wrong machines get GPU driver/workload setup |
 | `storage.objectStore.type` | `aws` \| `minio` \| `seaweedfs` |
 | `storage.objectStore.endpoint` | Object store API endpoint (not needed for `type: aws`) |
 | `storage.objectStore.auth.rootUser` / `rootPassword` | Access key / secret (never commit real values) |
@@ -280,18 +280,28 @@ One entry point, same install command as the standard path — the config's
 cd tools/cluster_setup
 
 # 1. Mirror platform application images to your internal registry
-#    (container-images.txt comes from a staging run — see Model Setup above,
-#    or pre-stage with --download-only first to get the list)
+#    (the list is generated during staging at
+#    ./airgap-bundle/airgap-bundle-<timestamp>/container-images.txt —
+#    pre-stage with --download-only first, or use the path printed at the
+#    end of a staging run, to get the exact file)
+IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 while IFS= read -r img; do
   [[ "$img" =~ ^# || -z "$img" ]] && continue
   crane copy "$img" "registry.airgap.local/${img##*/}"
-done < container-images.txt
+done < "${IMAGE_LIST}"
 
 # 2. In your config, on top of the mandatory fields in Config Setup, set:
 #    storage.modelStaging.enabled: false     (models already staged — see Model Setup above)
 #    cluster.airgap: true
 #    imagePullSecrets.autoCreateECR: false
 #    images.registry: "registry.airgap.local"   (+ point every image at it)
+#
+#    registry.airgap.local requires authentication (Harbor, etc.)? autoCreateECR: false
+#    alone creates no pull secret — also set:
+#    imagePullSecrets.custom.enabled: true
+#    imagePullSecrets.custom.name: "custom-registry-secret"
+#    imagePullSecrets.custom.server: "registry.airgap.local"
+#    imagePullSecrets.custom.username / .password: your registry credentials
 
 # 3. Run the install — stages ~2.2 GB of artifacts (~15 min) then installs
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
@@ -346,8 +356,9 @@ Applies to both deployment paths — same commands for standard and air-gapped c
 | Add worker nodes | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers` |
 | Re-stage models only | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts` |
 | Upgrade platform | bump image tags in config, then re-run `install` (Helm upgrades in place; same command works for air-gap) |
+| Upgrade platform (air-gapped) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
 | Collect support bundle | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose` |
-| Wipe and start clean (destructive) | `./k0s_cluster_with_stack.sh clean-all` then `install` |
+| Wipe and start clean (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
 
 ---
 
@@ -358,7 +369,7 @@ Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup
 | Symptom | Fix |
 |---|---|
 | SSH connection refused | Check firewall/security group on port 22 |
-| "Refusing to wipe — Ready nodes" | Set `useExisting: auto` or run `clean-all` first |
+| "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | Set `cluster.useExisting: auto` or run `clean-all` first |
 | `python3+pyyaml missing` on nodes | RHEL: `dnf install -y python3-pyyaml`; Ubuntu: `apt-get install -y python3-yaml`; or set `AIRGAP_PYYAML_WHEEL_PATH` for air-gap |
 | `nvidia-smi not found` in AIRGAP_MODE, no closure staged | Re-run without `--skip-nvidia-closure`, or pre-install the driver manually (see [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)) |
 | Closure doesn't cover a GPU node's kernel | Re-run `airgap_install.sh` with `--gpu-kernels` including that node's `uname -r` |

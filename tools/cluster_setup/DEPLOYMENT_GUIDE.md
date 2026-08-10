@@ -215,11 +215,13 @@ flowchart LR
 
 | Node Type | Min CPU | Min RAM | Min Disk | Count |
 |---|---|---|---|---|
-| Controller | 4 cores | 8 GB | 100 GB | 1 (or 3 for HA) |
+| Controller | 4 cores | 8 GB | 100 GB | 1 |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ |
 | GPU Worker | 48 vCPUs | 384 GiB | 500 GB | **2 nodes required** · 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **8 × L40S total, 384 GB total GPU memory** · 100 Gbps · equivalent to g6e.12xlarge |
 
 > **Minimum viable topology:** The platform requires at least 1 controller + 1 CPU worker + 2 GPU workers. The controller and CPU worker roles can coexist on a single machine for lab/testing use, but this is not supported for production. A single GPU worker is not sufficient — the AI inference stack distributes work across both nodes.
+>
+> **Only one controller is supported.** `install_k0s_cluster` joins a k0s controller on `nodes.existingIPs.controllers[0]` only — it never issues a controller-join token to the remaining entries. Listing additional controller IPs does not produce an HA control plane; those addresses are unused (or cause node-label verification to fail). Set `nodes.controllers: 1` and list exactly one controller IP.
 
 **Ports to open between nodes:** 22 (SSH), 6443 (k8s API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN/Calico), 179 (Calico BGP).
 
@@ -339,7 +341,7 @@ The config sections to fill in:
 | Section | What to set |
 |---|---|
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
-| `nodes.existingIPs` | IP addresses of your controller and worker nodes |
+| `nodes.existingIPs` | IP addresses of your controller and worker nodes — list workers **CPU workers first**: the installer treats the first `nodes.cpuWorkers` entries as CPU nodes and every remaining entry as GPU |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
 | `images.registry` | Your registry hostname, e.g. `123456789.dkr.ecr.us-east-2.amazonaws.com` or `registry.internal:5000` |
 | `images.registryInsecure` | `true` only for plain-HTTP (no-TLS) registries; leave `false` (default) for ECR, Harbor, or any HTTPS registry |
@@ -604,6 +606,7 @@ flowchart LR
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
+IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
@@ -611,7 +614,7 @@ while IFS= read -r img; do
   dest="${INTERNAL_REGISTRY}/${img##*/}"
   echo "Copying $img → $dest"
   crane copy "$img" "$dest"
-done < container-images.txt
+done < "${IMAGE_LIST}"
 ```
 
 After mirroring, update your config:
@@ -626,6 +629,23 @@ images:
 imagePullSecrets:
   autoCreateECR: false   # disable automatic ECR token refresh
 ```
+
+> **`registry.airgap.local` requires authentication** (Harbor or similar)?
+> `autoCreateECR: false` plus `images.registry` alone creates no pull secret —
+> the installer only creates one when `imagePullSecrets.custom` is configured:
+>
+> ```yaml
+> imagePullSecrets:
+>   autoCreateECR: false
+>   custom:
+>     enabled: true
+>     name: "custom-registry-secret"
+>     server: "registry.airgap.local"
+>     username: "<registry-username>"
+>     password: "<registry-password>"
+> ```
+>
+> Leave `custom.enabled: false` only if your registry accepts unauthenticated pulls.
 
 ### Phase 3 — Stage Model Weights
 
@@ -1081,10 +1101,21 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 > The safety gate prevents `install` from wiping a cluster with Ready nodes — it upgrades the stack only. If you also need to upgrade k0s itself, run `clean-all` + `install` (destructive — back up etcd first).
 
 **Air-gap upgrade:** re-run the same command on the installer machine — with
-`airgap: true` still in the config it re-downloads the current artifacts before
-upgrading the stack.
+`airgap: true` still in the config it re-stages the k0s and add-on infrastructure
+image bundles before upgrading the stack. It does **not** mirror the platform
+application image at the new tag — that's always a manual step
+([Phase 2 — Mirror Container Images](#phase-2--mirror-container-images)), and
+skipping it leaves the sealed nodes unable to pull the new tag
+(`ImagePullBackOff`). For each changed image:
 
 ```bash
+# 1. Mirror the new tag to your internal registry BEFORE bumping the config
+crane copy "docker.io/splunk/<image>:<new-tag>" "registry.airgap.local/<image>:<new-tag>"
+
+# 2. Update the tag in your config to point at the mirrored image
+vi my-cluster-config.yaml
+
+# 3. Re-run install
 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
@@ -1152,7 +1183,7 @@ flowchart TD
 | Symptom | First check | Fix |
 |---|---|---|
 | "SSH connection refused" | `ssh -i key user@node-ip hostname` | Check firewall / security groups on port 22 |
-| "Refusing to wipe — Ready nodes" | `kubectl get nodes` | Set `useExisting: auto` in config or run `clean-all` first |
+| "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | `kubectl get nodes` | Set `cluster.useExisting: auto` in config or run `clean-all` first |
 | "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
 | "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging dir and re-run the install (staging repeats automatically) |
