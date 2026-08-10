@@ -214,15 +214,18 @@ Same node checks as the standard path (OS, sudo, Python, SSH — see
 [Hardware Setup (Standard Path)](#hardware-setup-standard-path)).
 
 **GPU worker nodes** — no manual driver install needed.
-`k0s_cluster_with_stack.sh install` derives each GPU node's kernel over SSH
-and builds/pushes a complete offline NVIDIA driver RPM closure automatically
-as part of the same run. You can still pre-install the driver yourself (same
+`k0s_cluster_with_stack.sh install` derives each GPU node's kernel and OS over
+SSH and builds/pushes a complete offline NVIDIA driver closure automatically
+as part of the same run — an RPM closure for RHEL 9 GPU nodes, a .deb closure
+for Ubuntu 24.04 GPU nodes. You can still pre-install the driver yourself (same
 commands as the standard path) if you prefer, but it isn't required. See
 [K0S_README.md — GPU Nodes in Air-Gapped Environments](../../tools/cluster_setup/K0S_README.md#gpu-nodes-in-air-gapped-environments)
 for the closure mechanics and manual overrides.
 
 **Installer machine requirements:** RHEL 9 x86_64, curl, helm, kubectl,
-tar/ssh/rpm/dnf/sha256sum, `createrepo_c`, sudo, ~5 GB free disk.
+tar/ssh/rpm/dnf/sha256sum, `createrepo_c`, sudo, ~5 GB free disk. Building a
+.deb closure for Ubuntu 24.04 GPU nodes additionally requires `podman` or
+`docker` on the installer machine.
 
 ### Model Setup (Air-Gapped Path)
 
