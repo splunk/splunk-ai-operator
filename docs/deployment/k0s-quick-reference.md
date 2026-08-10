@@ -59,9 +59,12 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 (3 for HA) | API server, etcd, scheduler |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
-| GPU Worker | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node (8× total, 384 GB GPU mem) · equivalent to g6e.12xlarge |
+| GPU Worker (L40S) | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node (8× total, 384 GB GPU mem) · equivalent to g6e.12xlarge |
+| GPU Worker (H100) | 16 vCPU | 256 GiB | 500 GB | **2 minimum** | 1× NVIDIA H100/node (2× total, 160 GB GPU mem) · equivalent to p5.4xlarge |
 
-> A single GPU worker is not sufficient — inference is distributed across both nodes. Controller + CPU worker can share a machine for lab/test only, not production.
+Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
+
+> A single GPU worker is not sufficient — inference is distributed across both nodes. 2× p5.4xlarge is a valid minimum for H100. Controller + CPU worker can share a machine for lab/test only, not production.
 
 **Ports to open between nodes:**
 
@@ -82,7 +85,7 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 |---|---|---|
 | Model weights | 250 GB | >120 GB for 11 models + re-staging headroom |
 | Runtime data | 100 GB | Grows with usage |
-| **Total bucket** | **500 GB+** | More for multi-tenant |
+| **Total bucket** | **500 GB+** | Sufficient for now |
 
 ---
 
@@ -105,12 +108,11 @@ vi my-cluster.yaml
 | `cluster.region` | Your region — required only if `storage.objectStore.type: aws` |
 | `nodes.existingIPs.controllers` | Controller node IP(s) |
 | `nodes.existingIPs.workers` | CPU + GPU worker node IPs |
-| `storage.objectStore.type` | `aws` \| `s3compat` \| `minio` \| `seaweedfs` |
+| `storage.objectStore.type` | `aws` \| `minio` \| `seaweedfs` |
 | `storage.objectStore.endpoint` | Object store API endpoint (not needed for `type: aws`) |
 | `storage.objectStore.auth.rootUser` / `rootPassword` | Access key / secret (never commit real values) |
 | `images.registry` | Your registry host, e.g. `123456789012.dkr.ecr.us-east-2.amazonaws.com` |
 | `aiPlatform.defaultAcceleratorType` | `L40S` or `H100` |
-| `metallb.pool.addresses` | A free IP range on your LAN — **only if** `aiPlatform.serviceTemplate.type: LoadBalancer` |
 | `ecr.account` / `ecr.region` | Your AWS account ID / region — **only if** `imagePullSecrets.autoCreateECR: true` (default) |
 
 Validate before installing — catches most config mistakes without touching any node:
@@ -145,27 +147,10 @@ python3 --version                # 3.8+
 ssh -i <key> <user>@<node-ip> hostname
 ```
 
-**GPU worker nodes** — the installer installs the driver automatically on
-internet-connected nodes: EPEL → `nvidia-driver:latest-dkms` (DKMS) →
-`nvidia-container-toolkit`, then verifies with `nvidia-smi`. To pre-install
-yourself instead:
-
-```bash
-sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-sudo dnf module enable -y nvidia-driver:latest-dkms
-sudo dnf install -y kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
-  nvidia-container-toolkit dkms gcc make elfutils-libelf-devel \
-  kernel-devel-$(uname -r) kernel-headers-$(uname -r)
-
-# Verify
-nvidia-smi
-dkms status | grep -i nvidia
-nvidia-ctk --version
-```
-
-> Use the DKMS flavor `nvidia-driver:latest-dkms` — the older `cuda-drivers` meta-package is no longer published. Driver RPMs are not GPU-model-specific (same RPM for L40S, H100, etc.); only `kernel-devel`/`kernel-headers` are node-specific. Don't reboot a GPU node into a different kernel afterward — the DKMS module is built only for the running kernel.
-
-Node labeling (`splunk.ai/node-role`, `splunk.ai/workload-type`, etc.) is applied automatically by the installer — no manual step needed.
+**GPU worker nodes** — no manual steps needed. The installer installs the
+driver automatically on internet-connected nodes (EPEL →
+`nvidia-driver:latest-dkms` (DKMS) → `nvidia-container-toolkit`) and verifies
+with `nvidia-smi` as part of `install`.
 
 ### Model Setup (Standard Path)
 
@@ -186,17 +171,7 @@ AI platform can serve inference.
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
-To pre-stage manually instead (optional on this path):
-
-```bash
-cd ../artifacts_download_upload_scripts
-./download_from_huggingface.sh --accelerator l40s   # or --accelerator h100
-./upload_to_minio.sh                                 # or upload_to_s3.sh / upload_to_seaweedfs.sh
-```
-
-Then set `storage.modelStaging.enabled: false` since models are already present.
-
-**Staging machine requirements:** 250 GB free disk, 16 GB RAM, 4 cores, stable broadband. Can be the same machine that runs the installer.
+**Staging requirements:** 250 GB free disk, 16 GB RAM, 4 cores, stable broadband on the installer machine.
 
 > Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
 
