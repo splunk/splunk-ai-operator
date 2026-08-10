@@ -1,29 +1,14 @@
 # External Splunk Integration with Splunk AI Platform
 
 Runbook for connecting an **externally-hosted Splunk Enterprise instance** (outside the
-k0s cluster) to the Splunk AI Platform backend (SAIA). The required actions,
-files, and values are presented first. Failure modes encountered in practice are
-covered after testing.
+k0s cluster) to the Splunk AI Platform backend (SAIA). What the customer should do,
+which files to edit, and what values to provide are covered first. Failure modes
+encountered in practice are covered at the end.
 
 Use this when:
 - Splunk Enterprise runs on a separate host (bare-metal, EC2, VM) — not the bundled
   in-cluster Splunk standalone deployed by the installer.
 - The SAIA backend (`AIService`) must validate JWT tokens issued by that external Splunk.
-
----
-
-## Table of Contents
-
-- [1. Problem Statement](#1-problem-statement)
-- [2. What the Customer Should Do](#2-what-the-customer-should-do)
-- [3. Files and Resources to Edit](#3-files-and-resources-to-edit)
-- [4. Values to Provide](#4-values-to-provide)
-- [5. Testing](#5-testing)
-- [6. If Testing Fails](#6-if-testing-fails)
-
----
-
-## 1. Problem Statement
 
 ### Architecture Overview
 
@@ -59,7 +44,16 @@ ConfigMap key — patched directly as described in
 
 ---
 
-## 2. What the Customer Should Do
+## Table of Contents
+
+- [1. What the Customer Should Do](#1-what-the-customer-should-do)
+- [2. Files and Resources to Edit](#2-files-and-resources-to-edit)
+- [3. Values to Provide](#3-values-to-provide)
+- [4. If Testing Fails](#4-if-testing-fails)
+
+---
+
+## 1. What the Customer Should Do
 
 ### Prerequisites
 
@@ -124,9 +118,48 @@ Complete the integration in this order:
     grep -E "oauth2|JWT|signing" $SPLUNK_HOME/var/log/splunk/splunkd.log | tail -10
     ```
 
+### Verify the Fix
+
+1. **Verify issuer reachability.** Confirm port 8089 is reachable **from the
+   k0s cluster** (this is the path that actually performs JWT validation — a
+   check from your laptop can pass while SAIA pods are still blocked by a
+   security group or firewall):
+
+    ```bash
+    # Run from any k0s cluster node (e.g. the installer or controller)
+    nc -zv <public-ip> 8089
+    # or
+    curl -sk https://<public-ip>:8089/services/server/info | grep -c "<title>"
+    ```
+
+2. **Confirm a fresh token uses the correct issuer:**
+
+    ```bash
+    # Grab a fresh token from Splunk AI Assistant log
+    grep "Successfully retrieved interactive token" \
+      $SPLUNK_HOME/var/log/splunk/splunk_ai_assistant.log | tail -3
+    ```
+
+3. **Get a fresh browser token.** Old tokens signed before the real restart
+   still carry the stale issuer and will fail even after the fix. Log out and
+   back in to the Splunk AI Assistant to force a new token.
+
+4. **Test end-to-end:**
+
+    ```bash
+    # From the browser, send a prompt in Splunk AI Assistant
+    # Expected: response returned without error
+    ```
+
+5. **Confirm SAIA accepted the token** (check SAIA v1 pod logs):
+
+    ```bash
+    kubectl logs -n <namespace> <saia-v1-pod> --tail=20 | grep -E "200|401|issuer|token"
+    ```
+
 ---
 
-## 3. Files and Resources to Edit
+## 2. Files and Resources to Edit
 
 | File or resource | Customer change |
 |---|---|
@@ -139,7 +172,7 @@ Complete the integration in this order:
 
 ---
 
-## 4. Values to Provide
+## 3. Values to Provide
 
 ### Splunk JWT Values
 
@@ -315,53 +348,7 @@ truth and leave only its issuer in `SPLUNK_ISSUERS`.
 
 ---
 
-## 5. Testing
-
-### Verify Issuer Reachability
-
-Verify port 8089 is reachable **from the k0s cluster** (this is the path that
-actually performs JWT validation — a check from your laptop can pass while
-SAIA pods are still blocked by a security group or firewall):
-
-```bash
-# Run from any k0s cluster node (e.g. the installer or controller)
-nc -zv <public-ip> 8089
-# or
-curl -sk https://<public-ip>:8089/services/server/info | grep -c "<title>"
-```
-
-### Confirm a Fresh Token Uses the Correct Issuer
-
-Confirm a new token carries the correct issuer:
-
-```bash
-# Grab a fresh token from Splunk AI Assistant log
-grep "Successfully retrieved interactive token" \
-  $SPLUNK_HOME/var/log/splunk/splunk_ai_assistant.log | tail -3
-```
-
-### End-to-End Verification
-
-1. **Get a fresh token.** Old tokens signed before the real restart still carry
-   the stale issuer and will fail even after the fix. Log out and back in to
-   the Splunk AI Assistant to force a new token.
-
-2. **Test end-to-end:**
-
-    ```bash
-    # From the browser, send a prompt in Splunk AI Assistant
-    # Expected: response returned without error
-    ```
-
-3. **Confirm SAIA accepted the token** (check SAIA v1 pod logs):
-
-    ```bash
-    kubectl logs -n <namespace> <saia-v1-pod> --tail=20 | grep -E "200|401|issuer|token"
-    ```
-
----
-
-## 6. If Testing Fails
+## 4. If Testing Fails
 
 ### JWT Signing Key Error
 
@@ -373,7 +360,6 @@ Unable to load keys for signing interactive JWT
 
 **Root cause:** The `[oauth2_settings]` stanza in `authentication.conf` is missing
 or empty — `AuthenticationRSAKeysManager` has no certificate to sign tokens with.
-
 
 Confirm the error:
 
@@ -499,6 +485,17 @@ owned by another user. The command exits without touching the running process.
 
 Follow [Restart Splunk Correctly](#restart-splunk-correctly), then repeat the restart and effective-configuration checks.
 
+### Fresh Fix Works but Old Browser Session Still Fails
+
+**Symptom:** The values above are all correct and verified, but the browser
+still gets a `401` or an "issuer not allowed" error.
+
+**Root cause:** A stale JWT issued before the fix (or before the real restart)
+is still cached in the browser session.
+
+Log out and back in to the Splunk AI Assistant to force a new token, then
+repeat [Verify the Fix](#verify-the-fix).
+
 ### Troubleshooting Quick Reference
 
 | Symptom | Most likely cause | Section |
@@ -508,5 +505,5 @@ Follow [Restart Splunk Correctly](#restart-splunk-correctly), then repeat the re
 | Browser `blocked:mixed-content`, request never sent | Splunk HTTPS + SAIA HTTP | [Mixed content](#browser-mixed-content-block) |
 | `{"detail":"Issuer '...' is not allowed"}` | External issuer not in `SPLUNK_ISSUERS` allowlist | [Issuer not allowed](#issuer-not-allowed-from-saia-backend) |
 | Config change has no effect after restart | Restarted with `sudo` but Splunk owned by another user | [Restart did not apply](#splunk-restart-did-not-apply) |
-| Fresh fix works but old browser session still fails | Stale JWT from before the restart — log out and back in | [End-to-end verification](#end-to-end-verification) |
+| Fresh fix works but old browser session still fails | Stale JWT from before the restart — log out and back in | [Stale browser session](#fresh-fix-works-but-old-browser-session-still-fails) |
 | Patching `AIPlatform.splunkConfiguration.endpoint` doesn't fix issuer | That field is the HEC endpoint, not the issuer — patch `SPLUNK_ISSUERS` in the ConfigMap directly | [Issuer not allowed](#issuer-not-allowed-from-saia-backend) |
