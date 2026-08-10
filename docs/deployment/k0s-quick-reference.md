@@ -33,6 +33,17 @@ All commands run from `tools/cluster_setup/` unless noted otherwise.
 [Air-Gapped Deployment](#5-air-gapped-deployment)). It needs SSH reach to every
 cluster node plus the CLI tools below; it is not itself a cluster node.
 
+If this machine also handles model staging (downloading from HuggingFace and
+uploading to MinIO/SeaweedFS/S3 — automatic during `install`, or run
+standalone via `stage-artifacts`), it additionally needs:
+
+| Resource | Minimum | Why |
+|---|---|---|
+| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
+| CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
+| Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
+
 **Admin workstation tools:**
 
 ```bash
@@ -56,6 +67,28 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 - [ ] Splunk account team has provided image entitlements / registry access
 - [ ] Decide your path now: [Standard Deployment](#4-standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#5-air-gapped-deployment) (sealed nodes, no outbound internet)
 
+**Mirror platform images to your internal registry.** Pull each image from
+Docker Hub and push it to the registry configured under `images.registry` in
+your cluster config (required for both paths — air-gap additionally needs
+every node to resolve that registry with no outbound internet):
+
+```bash
+for repo in \
+  splunk/ai-tier-slim-service \
+  splunk/ai-tier-saia-data-loader \
+  splunk/ai-tier-saia-api-v2 \
+  splunk/ai-tier-saia-api \
+  splunk/ai-tier-ray-head \
+  splunk/ai-tier-ray-worker \
+  splunk/splunk-ai-operator; do
+  docker pull "docker.io/${repo}:<tag>"
+  docker tag "docker.io/${repo}:<tag>" "<your-registry>/${repo}:<tag>"
+  docker push "<your-registry>/${repo}:<tag>"
+done
+```
+
+> Image tags come from your Splunk account team along with your entitlements. `crane copy` (see [Air-Gapped Deployment](#5-air-gapped-deployment)) is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
+
 ---
 
 ## 2. Hardware Requirements
@@ -64,8 +97,8 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 (3 for HA) | API server, etcd, scheduler |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
-| GPU Worker (L40S) | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
-| GPU Worker (H100) | 16 vCPU | 256 GiB | 500 GB | **2 minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
+| GPU Worker (L40S / `g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
+| GPU Worker (H100 / `p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
 
 Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
 
@@ -140,28 +173,10 @@ For clusters where every node has outbound internet access.
 
 ### Hardware Setup (Standard Path)
 
-Prepare every node (controller, CPU worker, GPU worker) before running the installer:
-
-```bash
-# On each node — confirm OS, passwordless sudo, and Python
-cat /etc/os-release               # must be RHEL 9 or Ubuntu 24.04
-sudo -n true && echo "passwordless sudo OK"
-python3 --version                 # 3.8+
-
-# From admin workstation — confirm SSH access to each node
-ssh -i <key> <user>@<node-ip> hostname
-```
-
-> RHEL 9 and Ubuntu 24.04 are the only supported node OSes — mix and match
-> freely across controllers/workers, the installer detects each node's OS
-> over SSH. Any other OS is rejected at preflight (`FORCE_UNSUPPORTED_OS=1`
-> bypasses this at your own risk).
-
-**GPU worker nodes** — no manual steps needed. The installer installs the
-driver automatically on internet-connected nodes — RHEL: EPEL →
-`nvidia-driver:latest-dkms` (DKMS) → `nvidia-container-toolkit`; Ubuntu: CUDA
-repo → `cuda-drivers` (DKMS) → `nvidia-container-toolkit` — and verifies with
-`nvidia-smi` as part of `install`.
+Confirm every node's OS (RHEL 9 or Ubuntu 24.04), passwordless sudo, Python
+3.8+, and SSH access before running the installer — GPU driver install is
+fully automatic, no manual steps needed. Full commands and details:
+[DEPLOYMENT_GUIDE.md — Step-by-Step (Standard)](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#step-by-step-standard).
 
 ### Model Setup (Standard Path)
 
@@ -182,7 +197,7 @@ AI platform can serve inference.
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
-**Staging requirements:** 250 GB free disk, 16 GB RAM, 4 cores, stable broadband on the installer machine.
+**Staging machine requirements:** see [Prerequisites](#1-prerequisites) — same machine as the admin workstation, sized for model staging.
 
 > Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
 
@@ -240,7 +255,7 @@ uploads them to your object store automatically as part of the same run
 (models + images + NVIDIA driver closure, all in one pass). Safe to re-run;
 already-staged artifacts are skipped.
 
-**Staging machine requirements:** 250 GB free disk, 16 GB RAM, 4 cores, stable broadband. Can be the same machine that runs the installer.
+**Staging machine requirements:** see [Prerequisites](#1-prerequisites) — can be the same machine that runs the installer.
 
 > Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
 
@@ -302,6 +317,17 @@ kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia # EXTERNAL-IP
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 # → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
 ```
+
+**Reach the in-cluster Splunk instance** via NodePort (default), LoadBalancer
+(MetalLB), or `kubectl port-forward` for quick access with no external
+exposure: [DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#internal-splunk-access).
+
+Once the cluster is healthy, install and onboard the **Splunk AI Assistant**
+app: [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+
+> **Using an external Splunk Enterprise/Cloud instance instead of the
+> in-cluster one?** See
+> [EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
 
 ---
 

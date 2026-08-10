@@ -24,6 +24,7 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [Phase 4 — Install](#phase-4--install)
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
 - [Post-Install Verification](#post-install-verification)
+- [Internal Splunk Access](#internal-splunk-access)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
 - [Common Operations](#common-operations)
 - [Troubleshooting](#troubleshooting)
@@ -302,7 +303,30 @@ flowchart TD
 
 ### Step-by-Step (Standard)
 
-**1. Configure your cluster**
+**1. Confirm every node is ready**
+
+```bash
+# On each node (controller, CPU worker, GPU worker) — confirm OS, passwordless sudo, and Python
+cat /etc/os-release               # must be RHEL 9 or Ubuntu 24.04
+sudo -n true && echo "passwordless sudo OK"
+python3 --version                 # 3.8+
+
+# From the admin workstation — confirm SSH access to each node
+ssh -i <key> <user>@<node-ip> hostname
+```
+
+RHEL 9 and Ubuntu 24.04 are the only supported node OSes — mix and match
+freely across controllers/workers, the installer detects each node's OS over
+SSH. Any other OS is rejected at preflight (`FORCE_UNSUPPORTED_OS=1` bypasses
+this at your own risk).
+
+**GPU worker nodes** need no manual driver install. The installer installs
+the driver automatically on internet-connected nodes — RHEL: EPEL →
+`nvidia-driver:latest-dkms` (DKMS) → `nvidia-container-toolkit`; Ubuntu: CUDA
+repo → `cuda-drivers` (DKMS) → `nvidia-container-toolkit` — and verifies with
+`nvidia-smi` as part of `install`.
+
+**2. Configure your cluster**
 
 ```bash
 cd tools/cluster_setup
@@ -325,7 +349,7 @@ The config sections to fill in:
 
 > For full field descriptions, secure vs insecure registry guidance, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#images-section).
 
-**2. Validate your config before installing**
+**3. Validate your config before installing**
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
@@ -333,7 +357,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 
 This runs a read-only config check and prints a ✔/✖ checklist. Fix any ✖ items before proceeding.
 
-**3. Run the installer**
+**4. Run the installer**
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
@@ -341,7 +365,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 The installer shows an install plan and asks for confirmation before making any changes.
 
-**4. Monitor progress**
+**5. Monitor progress**
 
 The installer prints timestamped progress to the terminal and to a log file:
 
@@ -350,7 +374,7 @@ The installer prints timestamped progress to the terminal and to a log file:
 tail -f tools/cluster_setup/logs/k0s-install-*.log
 ```
 
-**5. Verify the result**
+**6. Verify the result**
 
 ```bash
 export KUBECONFIG=~/.kube/k0s-<your-cluster-name>
@@ -938,6 +962,16 @@ my-cluster-ai-platform  Ready    8m
 ```
 
 If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 10 minutes, check the session log and see [Troubleshooting](#troubleshooting).
+
+---
+
+## Internal Splunk Access
+
+The in-cluster Splunk Enterprise instance is reachable via NodePort (default),
+LoadBalancer (MetalLB), or `kubectl port-forward` for quick access from your
+admin workstation with no external exposure. See
+[K0S_README.md — Finding the Splunk Web URL](K0S_README.md#finding-the-splunk-web-url)
+for the commands for each method, plus how to retrieve the admin password.
 
 ---
 
