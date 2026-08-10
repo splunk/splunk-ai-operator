@@ -211,7 +211,11 @@ reach to the cluster nodes — there is no separate transfer/bundle step.
 ### Hardware Setup (Air-Gapped Path)
 
 Same node checks as the standard path (OS, sudo, Python, SSH — see
-[Hardware Setup (Standard Path)](#hardware-setup-standard-path)).
+[Hardware Setup (Standard Path)](#hardware-setup-standard-path)) apply to the
+**cluster nodes** (controllers, CPU workers, GPU workers) — those can be RHEL 9
+or Ubuntu 24.04. The **installer machine itself must be RHEL 9 x86_64** — it
+builds the offline RPM/.deb NVIDIA driver closures using its own `dnf`, and
+that only works from RHEL.
 
 **GPU worker nodes** — no manual driver install needed.
 `k0s_cluster_with_stack.sh install` derives each GPU node's kernel and OS over

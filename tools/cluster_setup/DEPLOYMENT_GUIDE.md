@@ -115,7 +115,7 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| Node OS | RHEL 9 or Ubuntu 24.04 | Only tested/supported OSes for cluster nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk |
+| Node OS | RHEL 9 or Ubuntu 24.04 | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. For air-gapped installs, the **installer machine** itself must be RHEL 9 x86_64 regardless of the target nodes' OS — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
 | NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
