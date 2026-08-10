@@ -49,15 +49,29 @@ standalone via `stage-artifacts`), it additionally needs:
 ```bash
 # macOS
 brew install kubectl helm git jq yq
-
-# Ubuntu/Debian
-sudo apt-get update && sudo apt-get install -y kubectl helm git jq
-wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-chmod +x /usr/local/bin/yq
-
-# Verify
-kubectl version --client && helm version && git --version && jq --version && yq --version
 ```
+
+**RHEL 9** — none of `kubectl`, `helm`, `docker`, or `yq` are in the default
+`dnf` repos; `git` and `jq` are. Install each via its own supported method
+(standalone binary, install script, or vendor repo, per each tool's docs)
+rather than a single `dnf install`:
+
+- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+- `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
+- `yq` — [binary release](https://github.com/mikefarah/yq#install)
+- `git`, `jq` — `sudo dnf install -y git jq`
+- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/) (needed for the image-mirroring commands below)
+
+Verify:
+
+```bash
+kubectl version --client && helm version && git --version && jq --version && yq --version && docker version
+```
+
+The image-mirroring commands below use `docker pull`/`tag`/`push` — no
+extra tool needed beyond Docker. (If you already have `crane` installed,
+`crane copy SRC DST` is a drop-in replacement for the
+`docker pull SRC && docker tag SRC DST && docker push DST` sequence.)
 
 **Access and services checklist:**
 
