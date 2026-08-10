@@ -87,7 +87,7 @@ for repo in \
 done
 ```
 
-> Image tags come from your Splunk account team along with your entitlements. `crane copy` (see [Air-Gapped Deployment](#5-air-gapped-deployment)) is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
+> Image tags can be used as v1.0 for the current release. `crane copy` (see [Air-Gapped Deployment](#5-air-gapped-deployment)) is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
 
 ---
 
@@ -97,12 +97,10 @@ done
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 (3 for HA) | API server, etcd, scheduler |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
-| GPU Worker (L40S / `g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
-| GPU Worker (H100 / `p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
+| GPU Worker (L40S / `g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
+| GPU Worker (H100 / `p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
 
 Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
-
-> A single GPU worker is not sufficient — inference is distributed across both nodes. 2× `p5.4xlarge` is a valid minimum for H100. Controller + CPU worker can share a machine for lab/test only, not production.
 
 **Ports to open between nodes:**
 
@@ -255,7 +253,14 @@ uploads them to your object store automatically as part of the same run
 (models + images + NVIDIA driver closure, all in one pass). Safe to re-run;
 already-staged artifacts are skipped.
 
-**Staging machine requirements:** see [Prerequisites](#1-prerequisites) — can be the same machine that runs the installer.
+**Staging machine requirements** (downloading from HuggingFace + uploading to MinIO/SeaweedFS/S3) — can be the same machine that runs the installer:
+
+| Resource | Minimum | Why |
+|---|---|---|
+| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
+| CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
+| Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
 
 > Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
 
@@ -354,7 +359,7 @@ Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup
 |---|---|
 | SSH connection refused | Check firewall/security group on port 22 |
 | "Refusing to wipe — Ready nodes" | Set `useExisting: auto` or run `clean-all` first |
-| `python3+pyyaml missing` on nodes | `dnf install -y python3-pyyaml` or set `AIRGAP_PYYAML_WHEEL_PATH` |
+| `python3+pyyaml missing` on nodes | RHEL: `dnf install -y python3-pyyaml`; Ubuntu: `apt-get install -y python3-yaml`; or set `AIRGAP_PYYAML_WHEEL_PATH` for air-gap |
 | `nvidia-smi not found` in AIRGAP_MODE, no closure staged | Re-run without `--skip-nvidia-closure`, or pre-install the driver manually (see [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)) |
 | Closure doesn't cover a GPU node's kernel | Re-run `airgap_install.sh` with `--gpu-kernels` including that node's `uname -r` |
 | Checksum verification failed during staging | Re-run staging; check disk space and network stability |
