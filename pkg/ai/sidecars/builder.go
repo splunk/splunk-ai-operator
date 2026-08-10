@@ -200,6 +200,7 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 
 	cmName := fmt.Sprintf("%s-otel-config", p.Name)
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: p.Namespace}}
+	hecBase := effectiveHECEndpoint(p.Spec.SplunkConfiguration)
 
 	_, err := controllerutil.CreateOrUpdate(ctx, s.Client, cm, func() error {
 		if cm.Data == nil {
@@ -212,8 +213,8 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 				return fmt.Errorf("marshaling otel config: %w", err)
 			}
 			cm.Data["otel-config.yaml"] = string(yamlBytes)
-		} else if p.Spec.SplunkConfiguration.HECEndpoint != "" {
-			updated, err := updateOtelHECEndpoint(existing, p.Spec.SplunkConfiguration.HECEndpoint)
+		} else if hecBase != "" {
+			updated, err := updateOtelHECEndpoint(existing, hecBase)
 			if err != nil {
 				return err
 			}
@@ -227,26 +228,42 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 	return nil
 }
 
+func effectiveHECEndpoint(sc aiApi.SplunkConfigurationSpec) string {
+	if sc.HECEndpoint != "" {
+		return sc.HECEndpoint
+	}
+	return sc.Endpoint
+}
+
 const operatorManagedSplunkCAFile = "/etc/splunk-ca/ca.crt"
 
 // updateOtelHECEndpoint migrates only operator-managed fields on the Splunk HEC
 // exporter. Existing ConfigMaps may contain user customizations, so the rest of
 // the collector configuration is preserved. The legacy CA path is removed only
 // when it exactly matches the mount previously managed by this operator. With
-// no desired CA reference in this API version, HTTPS uses explicit opt-in
-// verification bypass while HTTP carries no operator-generated TLS settings.
+// no desired CA reference in this API version, newly generated HTTPS settings
+// opt into verification bypass while existing explicit policy is preserved.
+// HTTP carries no operator-generated TLS settings.
 func updateOtelHECEndpoint(configYAML, hecBase string) (string, error) {
 	var config map[string]interface{}
 	if err := syaml.Unmarshal([]byte(configYAML), &config); err != nil {
 		return "", fmt.Errorf("parsing existing otel config: %w", err)
 	}
-	exporters, ok := config["exporters"].(map[string]interface{})
-	if !ok {
-		return "", fmt.Errorf("existing otel config has no exporters map")
+	exportersValue, exists := config["exporters"]
+	if !exists {
+		return configYAML, nil
 	}
-	splunkHEC, ok := exporters["splunk_hec"].(map[string]interface{})
+	exporters, ok := exportersValue.(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("existing otel config has no splunk_hec exporter")
+		return "", fmt.Errorf("existing otel config has malformed exporters map")
+	}
+	splunkHECValue, exists := exporters["splunk_hec"]
+	if !exists {
+		return configYAML, nil
+	}
+	splunkHEC, ok := splunkHECValue.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("existing otel config has malformed splunk_hec exporter")
 	}
 	changed := false
 	desired := fmt.Sprintf("%s/services/collector", hecBase)
@@ -266,10 +283,17 @@ func updateOtelHECEndpoint(configYAML, hecBase string) (string, error) {
 		}
 
 		if isHTTPS {
-			// If a custom CA remains, preserve its verification policy. Otherwise
-			// keep the historical no-CA behavior explicitly fail-open for TLS.
+			// If a custom CA remains, preserve its verification policy. When the
+			// operator-managed CA is removed, restore the historical no-CA
+			// fail-open behavior because its paired false value was also generated
+			// by the operator. Otherwise preserve any explicit policy (including
+			// false) and default only when the key is absent.
 			if _, hasCAFile := tlsConfig["ca_file"]; !hasCAFile {
-				if skipVerify, ok := tlsConfig["insecure_skip_verify"].(bool); !ok || !skipVerify {
+				_, hasSkipVerify := tlsConfig["insecure_skip_verify"]
+				if skipVerify, _ := tlsConfig["insecure_skip_verify"].(bool); removedManagedCA && !skipVerify {
+					tlsConfig["insecure_skip_verify"] = true
+					changed = true
+				} else if !removedManagedCA && !hasSkipVerify {
 					tlsConfig["insecure_skip_verify"] = true
 					changed = true
 				}
@@ -323,10 +347,7 @@ func (s *Builder) renderOtelConf(ctx context.Context, cr *aiApi.AIPlatform) map[
 	// HEC ingestion and management/JWKS are separate Splunk listeners. Keep
 	// HECEndpoint scoped to OTel; Endpoint remains the JWT issuer used by
 	// SAIA/Slim. The fallback preserves pre-existing custom resources.
-	hecBase := cr.Spec.SplunkConfiguration.HECEndpoint
-	if hecBase == "" {
-		hecBase = cr.Spec.SplunkConfiguration.Endpoint
-	}
+	hecBase := effectiveHECEndpoint(cr.Spec.SplunkConfiguration)
 	endpoint := fmt.Sprintf("%s/services/collector", hecBase)
 	metricsIndexName, exists := os.LookupEnv("SPLUNK_METRICS_INDEX_NAME")
 	if !exists {

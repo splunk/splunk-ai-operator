@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Read-only AIP-4614 integration check for k0s internal Splunk mode.
+# Read-only AIP-4614 integration check for native-HTTPS internal Splunk.
+# The historical filename is retained for CI compatibility; management port
+# 8089 is expected to use native HTTPS, while Splunk Web remains HTTP.
 #
 # The script validates the deployed state; it does not create, patch, restart,
 # or delete resources and does not read the Splunk admin password.
@@ -101,7 +103,7 @@ btool_http_value() {
 
 SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
 SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
-EXPECTED_URL="http://${SPLUNK_SERVICE}.${NAMESPACE}.svc.cluster.local:8089"
+EXPECTED_URL="https://${SPLUNK_SERVICE}:8089"
 EXPECTED_HEC_URL=""
 
 kubectl get namespace "${NAMESPACE}" >/dev/null
@@ -142,22 +144,22 @@ pass "Splunk pod is Ready"
 
 spec_tls_value=$(kubectl get standalone "${STANDALONE_NAME}" -n "${NAMESPACE}" -o json \
   | jq -r '[.spec.extraEnv[]? | select(.name == "SPLUNKD_SSL_ENABLE") | .value] | last // ""')
-[[ "${spec_tls_value}" == "false" ]] || \
-  fail "Standalone.spec.extraEnv SPLUNKD_SSL_ENABLE=${spec_tls_value:-unset}, expected false"
-pass "Standalone declares SPLUNKD_SSL_ENABLE=false"
+[[ "${spec_tls_value}" == "true" ]] || \
+  fail "Standalone.spec.extraEnv SPLUNKD_SSL_ENABLE=${spec_tls_value:-unset}, expected true"
+pass "Standalone declares SPLUNKD_SSL_ENABLE=true for the bundled Splunk app"
 
 container_tls_value=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   printenv SPLUNKD_SSL_ENABLE)
-[[ "${container_tls_value}" == "false" ]] || \
-  fail "pod SPLUNKD_SSL_ENABLE=${container_tls_value:-unset}, expected false"
-pass "replacement pod received SPLUNKD_SSL_ENABLE=false"
+[[ "${container_tls_value}" == "true" ]] || \
+  fail "pod SPLUNKD_SSL_ENABLE=${container_tls_value:-unset}, expected true"
+pass "replacement pod received SPLUNKD_SSL_ENABLE=true"
 
 effective_tls_value=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk btool server list sslConfig 2>/dev/null \
   | awk '$1 == "enableSplunkdSSL" { value = tolower($3) } END { if (value != "") print value }')
-[[ "${effective_tls_value}" == "false" ]] || \
-  fail "btool enableSplunkdSSL=${effective_tls_value:-unset}, expected false"
-pass "effective Splunk configuration has enableSplunkdSSL=false"
+[[ "${effective_tls_value}" == "true" || "${effective_tls_value}" == "1" ]] || \
+  fail "btool enableSplunkdSSL=${effective_tls_value:-unset}, expected true/1"
+pass "effective Splunk configuration keeps native management HTTPS enabled"
 
 server_ssl_debug=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk btool server list sslConfig --debug 2>/dev/null) || \
@@ -235,23 +237,23 @@ fi
 pass "Splunk Web responds over HTTP rather than the removed preview TLS configuration"
 
 kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-  curl --silent --show-error --fail --max-time 15 \
-  http://localhost:8089/services/authorization/tokens-keys >/dev/null || \
-  fail "Splunk JWKS endpoint did not respond successfully over HTTP"
-pass "Splunk JWKS endpoint responds over HTTP"
+  curl --insecure --silent --show-error --fail --max-time 15 \
+  https://127.0.0.1:8089/services/authorization/tokens-keys >/dev/null || \
+  fail "Splunk JWKS endpoint did not respond successfully over native HTTPS"
+pass "native Splunkd HTTPS works locally for the bundled Splunk app"
 
 if kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-    curl --insecure --silent --show-error --max-time 5 \
-    https://localhost:8089/ >/dev/null 2>&1; then
-  fail "HTTPS unexpectedly succeeded on the TLS-disabled management port"
+    curl --silent --show-error --fail --max-time 5 \
+    http://127.0.0.1:8089/services/authorization/tokens-keys >/dev/null 2>&1; then
+  fail "plaintext HTTP unexpectedly succeeded on native Splunk management port 8089"
 fi
-pass "HTTPS is not active on Splunk management port 8089"
+pass "native Splunk management port rejects plaintext HTTP"
 
 service_type=$(kubectl get service "${SPLUNK_SERVICE}" -n "${NAMESPACE}" \
   -o jsonpath='{.spec.type}')
 [[ "${service_type}" == "ClusterIP" ]] || \
   fail "${SPLUNK_SERVICE} type=${service_type}, expected ClusterIP"
-pass "management service remains internal (ClusterIP)"
+pass "native HTTPS management service remains internal (ClusterIP)"
 
 issuer_uri=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null \
@@ -267,7 +269,7 @@ platform_hec_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESP
   fail "AIPlatform endpoint=${platform_endpoint:-unset}, expected ${EXPECTED_URL}"
 [[ "${issuer_uri}" == "${platform_endpoint}" ]] || \
   fail "issuer_uri and AIPlatform endpoint differ"
-pass "issuer_uri and AIPlatform endpoint are byte-identical canonical HTTP URLs"
+pass "issuer_uri and AIPlatform endpoint are byte-identical short HTTPS URLs"
 [[ "${platform_hec_endpoint}" == "${EXPECTED_HEC_URL}" ]] || \
   fail "AIPlatform hecEndpoint=${platform_hec_endpoint:-unset}, expected ${EXPECTED_HEC_URL}"
 pass "AIPlatform OTel-only HEC endpoint matches Splunk's effective ${hec_scheme} listener"
@@ -283,7 +285,44 @@ if [[ "${otel_enabled}" == "true" ]]; then
   if grep -Fq "${EXPECTED_URL}/services/collector" <<<"${otel_config}"; then
     fail "OTel exporter incorrectly uses the management/JWKS endpoint"
   fi
-  pass "OTel telemetry exporter targets HEC rather than management/JWKS"
+  pass "OTel exporter configuration targets HEC rather than management/JWKS (runtime delivery not asserted)"
+
+  # The OTel operator injects its collector as a restartable init container and
+  # embeds OTEL_CONFIG at pod admission time. Require at least one Running/Ready
+  # injected pod and verify every such collector uses the current HEC endpoint.
+  # The jq result contains only pod names and booleans; it never prints the
+  # embedded config, which also contains the HEC token.
+  otel_runtime_deadline=$((SECONDS + WAIT_TIMEOUT))
+  otel_runtime_rows=''
+  while (( SECONDS < otel_runtime_deadline )); do
+    otel_runtime_rows=$(kubectl get pods -n "${NAMESPACE}" -o json | jq -r \
+      --arg expected "${EXPECTED_HEC_URL}/services/collector" '
+        .items[]
+        | select(.status.phase == "Running")
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+        | . as $pod
+        | [
+            .spec.initContainers[]?
+            | select(.restartPolicy == "Always")
+            | [.env[]? | select(.name == "OTEL_CONFIG") | .value][0] // empty
+          ] as $configs
+        | select(($configs | length) > 0)
+        | [
+            $pod.metadata.name,
+            (($configs | all(.[]; contains($expected))) | tostring)
+          ]
+        | @tsv
+      ')
+    if [[ -n "${otel_runtime_rows}" ]] && \
+       ! awk -F '\t' '$2 != "true" { bad=1 } END { exit bad }' <<<"${otel_runtime_rows}"; then
+      otel_runtime_rows=''
+    fi
+    [[ -n "${otel_runtime_rows}" ]] && break
+    sleep 5
+  done
+  [[ -n "${otel_runtime_rows}" ]] || \
+    fail "no Running/Ready injected OTel collector uses the configured HEC endpoint after ${WAIT_TIMEOUT}s"
+  pass "all Running/Ready injected OTel collectors use the configured HEC endpoint (delivery not asserted)"
 fi
 
 platform_uid=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
@@ -335,7 +374,7 @@ for issuer_row in "${issuer_configmaps[@]}"; do
     *,"${EXPECTED_URL}",*) ;;
     *) fail "ConfigMap ${configmap_name} does not include ${EXPECTED_URL}" ;;
   esac
-  pass "ConfigMap ${configmap_name} trusts the canonical HTTP issuer"
+  pass "ConfigMap ${configmap_name} trusts the short native-HTTPS issuer"
 done
 
 deployments_json=$(kubectl get deployment -n "${NAMESPACE}" -o json)
@@ -357,7 +396,7 @@ deployment_rows=$(printf '%s\n' "${deployments_json}" | jq -r \
 
 consumer_env_count=0
 saia_image_count=0
-jwks_service_checked=false
+jwks_endpoint_checked=false
 while IFS=$'\t' read -r deployment_name desired_replicas ready_replicas pod_selector; do
   [[ -n "${deployment_name}" ]] || continue
   (( ready_replicas >= desired_replicas )) || \
@@ -395,19 +434,29 @@ while IFS=$'\t' read -r deployment_name desired_replicas ready_replicas pod_sele
         *) fail "${pod_name}/${container_name} has stale SPLUNK_ISSUERS=${effective_issuers}" ;;
       esac
       consumer_env_count=$((consumer_env_count + 1))
-      pass "${pod_name}/${container_name} has the effective canonical HTTP issuer"
+      pass "${pod_name}/${container_name} has the effective native HTTPS issuer"
 
-      if [[ "${jwks_service_checked}" != "true" ]] && \
+      # Main does not install a CA bundle for SAIA/Slim. This probe deliberately
+      # validates DNS/routing and native Splunk token-key payload availability
+      # only; authenticated service tests must determine the selected image's
+      # own TLS policy. Splunk's native management API does not provide the
+      # proxy-specific /.well-known/oauth2_keys alias.
+      if [[ "${jwks_endpoint_checked}" != "true" ]] && \
           kubectl exec -n "${NAMESPACE}" "${pod_name}" -c "${container_name}" -- \
             python -c '
-import json, sys, urllib.request
-with urllib.request.urlopen(sys.argv[1], timeout=15) as response:
+import json, ssl, sys, urllib.request
+
+base_url = sys.argv[1]
+context = ssl._create_unverified_context()
+path = "/services/authorization/tokens-keys?output_mode=json"
+with urllib.request.urlopen(base_url + path, timeout=15, context=context) as response:
+    assert response.status == 200, "token-key route did not return HTTP 200"
     payload = json.load(response)
 encoded = json.dumps(payload)
 assert "RSA" in encoded or "RS256" in encoded, "response has no RSA signing key"
-' "${EXPECTED_URL}/services/authorization/tokens-keys?output_mode=json" >/dev/null 2>&1; then
-        jwks_service_checked=true
-        pass "consumer pod reaches an RSA JWKS response through the ClusterIP service"
+' "${EXPECTED_URL}" >/dev/null 2>&1; then
+        jwks_endpoint_checked=true
+        pass "consumer pod reaches the native HTTPS token-key route"
       fi
     fi
   done <<<"${container_rows}"
@@ -415,8 +464,8 @@ done <<<"${deployment_rows}"
 
 (( consumer_env_count > 0 )) || fail "no active consumer container exposes SPLUNK_ISSUERS"
 (( saia_image_count > 0 )) || fail "no active SAIA image reference found"
-[[ "${jwks_service_checked}" == "true" ]] || \
-  fail "no consumer container could fetch JWKS through ${EXPECTED_URL}"
+[[ "${jwks_endpoint_checked}" == "true" ]] || \
+  fail "no consumer container could reach the native HTTPS token-key route through ${EXPECTED_URL}"
 [[ -z "${EXPECTED_SAIA_TAG}" ]] || pass "all active SAIA images use ${EXPECTED_SAIA_TAG}"
 
-printf '\nAIP-4614 internal Splunk HTTP validation passed.\n'
+printf '\nAIP-4614 native-HTTPS internal Splunk validation passed.\n'

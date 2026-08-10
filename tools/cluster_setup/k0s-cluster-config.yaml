@@ -192,12 +192,25 @@ splunk:
   #     the cluster and wires the AIPlatform CR at it. Requires
   #     images.splunk.image and images.splunk.operatorImage.
   #
-  #     Compatibility transport: the final in-cluster Splunk management/JWKS
-  #     endpoint is plain HTTP on ClusterIP port 8089. The installer keeps the
-  #     OAuth signing certificate, but SAIA fetches its public signing keys over
-  #     http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089.
-  #     Keep the pod/service network private and restrict workload access with
-  #     NetworkPolicy where required. This does not change external Splunk URLs.
+  #     Compatibility transport for Splunk AI Assistant app 2.0.4:
+  #       * Native splunkd stays HTTPS on 127.0.0.1:8089 because the immutable
+  #         app's Splunk SDK requires that local contract.
+  #       * Splunk issuer_uri, SAIA, and Slim use the same short HTTPS URL:
+  #           https://splunk-<standaloneName>-standalone-service:8089
+  #       * No JWKS proxy, certificate, CA bundle, or CA mount is installed by
+  #         this compatibility path.
+  #       * OTel exporter configuration remains separate on
+  #         splunkConfiguration.hecEndpoint (port 8088) and never uses the
+  #         management/JWT issuer endpoint. This field is consumed only when
+  #         an OTel collector is actually injected and running.
+  #
+  #     This restores main's native splunkd HTTPS and short issuer contract,
+  #     while aligning the AIPlatform endpoint for SAIA and Slim. It does not
+  #     solve trust/hostname validation for Splunk's built-in certificate.
+  #     Strict-verification environments require the separate hostname-valid
+  #     certificate/CA design.
+  #     After an issuer change, users must sign in again or repeat onboarding.
+  #     External Splunk URLs and their customer-managed TLS are unaffected.
   #
   #   EXTERNAL (enabled: true, external.endpoint set):
   #     Use a Splunk running OUTSIDE the cluster. The installer does NOT deploy

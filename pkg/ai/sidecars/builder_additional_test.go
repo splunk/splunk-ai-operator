@@ -265,6 +265,31 @@ processors:
 	assert.Contains(t, updated.Data["otel-config.yaml"], "custom: {}")
 }
 
+func TestReconcileOtelConfigMap_FallsBackToEndpointWhenHECEndpointCleared(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupFakeScheme()
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+			Endpoint: "https://legacy-splunk:8088",
+		}},
+	}
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform-otel-config", Namespace: "default"},
+		Data: map[string]string{"otel-config.yaml": `exporters:
+  splunk_hec:
+    endpoint: https://new-splunk:8088/services/collector
+`},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	builder := New(fakeClient, scheme, record.NewFakeRecorder(100), platform)
+
+	require.NoError(t, builder.reconcileOtelConfigMap(ctx, platform))
+	updated := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(ctx, clientKey("default", existing.Name), updated))
+	assert.Contains(t, updated.Data["otel-config.yaml"], "endpoint: https://legacy-splunk:8088/services/collector")
+}
+
 func TestUpdateOtelHECEndpoint_RemovesOnlyLegacyManagedCA(t *testing.T) {
 	existing := `exporters:
   splunk_hec:
@@ -305,7 +330,7 @@ func TestUpdateOtelHECEndpoint_HTTPDropsLegacyTLSBlock(t *testing.T) {
 	assert.NotContains(t, updated, "tls:")
 }
 
-func TestUpdateOtelHECEndpoint_CleansCurrentHTTPSLegacyCA(t *testing.T) {
+func TestUpdateOtelHECEndpoint_RemovesLegacyCAAndRestoresGeneratedFailOpenPolicy(t *testing.T) {
 	existing := `exporters:
   splunk_hec:
     endpoint: https://splunk:8088/services/collector
@@ -318,6 +343,44 @@ func TestUpdateOtelHECEndpoint_CleansCurrentHTTPSLegacyCA(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, updated, "ca_file: /etc/splunk-ca/ca.crt")
 	assert.Contains(t, updated, "insecure_skip_verify: true")
+}
+
+func TestUpdateOtelHECEndpoint_PreservesExplicitVerification(t *testing.T) {
+	existing := `exporters:
+  splunk_hec:
+    endpoint: https://old-splunk:8088/services/collector
+    tls:
+      insecure_skip_verify: false
+`
+
+	updated, err := updateOtelHECEndpoint(existing, "https://new-splunk:8088")
+	require.NoError(t, err)
+	assert.Contains(t, updated, "endpoint: https://new-splunk:8088/services/collector")
+	assert.Contains(t, updated, "insecure_skip_verify: false")
+	assert.NotContains(t, updated, "insecure_skip_verify: true")
+}
+
+func TestUpdateOtelHECEndpoint_SkipsConfigWithoutExactExporter(t *testing.T) {
+	existing := `exporters:
+  splunk_hec/custom:
+    endpoint: https://custom-splunk:8088/services/collector
+processors:
+  batch: {}
+`
+
+	updated, err := updateOtelHECEndpoint(existing, "https://new-splunk:8088")
+	require.NoError(t, err)
+	assert.Equal(t, existing, updated)
+}
+
+func TestUpdateOtelHECEndpoint_ErrorsForMalformedExactExporter(t *testing.T) {
+	existing := `exporters:
+  splunk_hec: not-an-exporter-map
+`
+
+	_, err := updateOtelHECEndpoint(existing, "https://new-splunk:8088")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "malformed splunk_hec exporter")
 }
 
 func TestUpdateOtelHECEndpoint_PreservesCustomCA(t *testing.T) {
