@@ -115,8 +115,8 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| RHEL | 9 | Only supported OS for cluster nodes |
-| NVIDIA driver | `nvidia-driver:latest-dkms` (DKMS module) | Installed via NVIDIA repo on GPU nodes; the older `cuda-drivers` meta-package is no longer published |
+| Node OS | RHEL 9 or Ubuntu 24.04 | Only tested/supported OSes for cluster nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk |
+| NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
@@ -371,10 +371,10 @@ flowchart LR
         INTERNET[("GitHub · NVIDIA\nHuggingFace\nHelm repos")]
     end
 
-    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9)\ninternet + SSH to the nodes"]
+    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9 x86_64)\ninternet + SSH to the nodes"]
         ENTRY["k0s_cluster_with_stack.sh install\nconfig has cluster.airgap: true"]
         AGI["airgap_install.sh\ninvoked automatically\nto stage the artifacts"]
-        STAGE["./airgap-bundle/airgap-bundle-<ts>/\nbinaries · charts · manifests\nimage tarballs · NVIDIA closure"]
+        STAGE["./airgap-bundle/airgap-bundle-<ts>/\nbinaries · charts · manifests\nimage tarballs · NVIDIA closure\n(RPM for RHEL 9 / .deb for Ubuntu 24.04\nGPU nodes — auto-detected over SSH)"]
         ENTRY --> AGI
     end
 
@@ -724,10 +724,14 @@ Confirm to proceed.
 
 ### GPU Nodes in Air-Gapped Environments
 
-GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that
-normally download from the internet. The air-gap staging step builds a complete
-offline **RPM closure** for them, and the installer pushes it to each GPU node — so
-a sealed node never contacts `developer.download.nvidia.com`.
+GPU nodes require OS packages (DKMS, CUDA, nvidia-container-toolkit, plus EPEL
+on RHEL) that normally download from the internet. The air-gap staging step
+builds a complete offline closure for them — an **RPM closure** for RHEL 9 GPU
+nodes, or a **.deb closure** for Ubuntu 24.04 GPU nodes — and the installer
+pushes it to each GPU node, so a sealed node never contacts
+`developer.download.nvidia.com`. The staging step auto-detects which format to
+build by SSHing to a GPU node and reading `/etc/os-release`; you never choose
+the format yourself unless overriding with `--gpu-os`.
 
 ```mermaid
 flowchart TD
@@ -737,10 +741,10 @@ flowchart TD
     AIRGAP_CHECK{"AIRGAP_MODE\n= true?"}
     CLOSURE{"Staged\nnvidia-closure?"}
     KCHECK{"Closure covers\nnode's kernel?"}
-    OFFLINE["scp closure to node\ndnf --disablerepo='*'\n--repofrompath=airgap-nvidia\nDKMS compiles module"]
+    OFFLINE["scp closure to node\nRHEL: dnf --disablerepo='*'\n--repofrompath=airgap-nvidia\nUbuntu: apt against a file://\nrepo built from the closure\nDKMS compiles module"]
     FAIL["❌ Clear error:\nno closure staged\n→ re-run without\n--skip-nvidia-closure"]
     KFAIL["❌ Clear error naming\nthe node's kernel and\nthe kernels covered"]
-    INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nNVIDIA repo → nvidia-driver:latest-dkms"]
+    INSTALL["Install driver from internet:\nRHEL: EPEL → DKMS → NVIDIA repo\n→ nvidia-driver:latest-dkms\nUbuntu: CUDA repo → DKMS\n→ cuda-drivers"]
     CTK["Install nvidia-container-toolkit"]
     VERIFY["Verify: nvidia-smi returns\ndriver version number"]
 
@@ -764,8 +768,8 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph S1["Strategy 1\n✅ Recommended — automatic"]
-        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9 host;\nGPU IPs read from the config"]
-        S1B["Script resolves a full RPM\nclosure incl. kernel-devel\nfor each node's kernel"]
+        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9 x86_64 host;\nGPU IPs + OS (RHEL 9 or Ubuntu 24.04)\nread/detected from the config"]
+        S1B["Script resolves a full RPM or .deb\nclosure incl. kernel headers\nfor each node's kernel"]
         S1C["Installer scp's the closure\nto each GPU node and installs\noffline; DKMS compiles"]
         S1A --> S1B --> S1C
     end
@@ -779,20 +783,22 @@ flowchart LR
 
 **Strategy 1 — staging the driver closure:**
 
-Run this on the internet-connected RHEL 9 installer machine. NVIDIA publishes
-**DKMS-only** packages for RHEL 9 (`kmod-nvidia-latest-dkms`; the older
-`cuda-drivers` meta-package is gone), so the kernel module is compiled on each GPU
-node and needs `kernel-devel` matching that node's exact `uname -r`.
+Run this on the internet-connected RHEL 9 x86_64 installer machine. NVIDIA
+publishes **DKMS-only** packages for both target OSes — `kmod-nvidia-latest-dkms`
+on RHEL 9 (the older `cuda-drivers` meta-package is gone there), and
+`cuda-drivers` on Ubuntu 24.04 (current and used as-is) — so the kernel module
+is compiled on each GPU node and needs kernel headers matching that node's exact
+`uname -r`.
 
 ```bash
-# Nothing extra to do — the GPU node IPs are derived from your config and each
-# node's `uname -r` is surveyed over SSH.
+# Nothing extra to do — the GPU node IPs and OS are derived from your config
+# and each node's `uname -r` / OS is surveyed over SSH.
 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
-To override the derived kernel or host list, drive the staging step directly —
-these flags live on `airgap_install.sh`, which then continues into the install
-just as the unified command would:
+To override the derived kernel, host list, or OS, drive the staging step
+directly — these flags live on `airgap_install.sh`, which then continues into
+the install just as the unified command would:
 
 ```bash
 # Override the derived list only if needed (e.g. non-standard node layout)
@@ -802,21 +808,29 @@ just as the unified command would:
 # …or name the kernels explicitly if the nodes aren't reachable over SSH yet
 ./airgap_install.sh --config my-cluster-config.yaml \
   --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64
+
+# …or force the GPU node OS/package format instead of auto-detecting it
+./airgap_install.sh --config my-cluster-config.yaml --gpu-os ubuntu24
 ```
 
 > GPU node IPs come from your config: the workers listed in
 > `nodes.existingIPs.workers` after the first `nodes.cpuWorkers` entries are
-> treated as the GPU workers. `--gpu-hosts` is only an override.
+> treated as the GPU workers. `--gpu-hosts` is only an override. `--gpu-os`
+> defaults to `auto`, which SSHes to the first GPU node and reads
+> `/etc/os-release` to pick `rhel9` (RPM closure) or `ubuntu24` (.deb closure).
 
-Installer-host requirements: RHEL 9 x86_64 Linux with `dnf`, `rpm`, and `createrepo_c`
-(`sudo dnf install -y createrepo_c`). The host's RHEL **minor** version and running
-kernel do *not* need to match the GPU nodes — `$releasever` resolves to `9`, so a
-9.6 build host can supply `kernel-devel` for a 9.8 node. All of this is validated in
-preflight, before any downloads.
+Installer-host requirements: RHEL 9 x86_64 Linux with `dnf`, `rpm`, and
+`createrepo_c` (`sudo dnf install -y createrepo_c`) for an RPM closure; add
+`podman` or `docker` if any GPU node is Ubuntu 24.04, since the .deb closure is
+resolved inside an `ubuntu:24.04` container regardless of the build host's own
+OS. The host's RHEL **minor** version and running kernel do *not* need to match
+RHEL 9 GPU nodes — `$releasever` resolves to `9`, so a 9.6 build host can supply
+`kernel-devel` for a 9.8 node. All of this is validated in preflight, before any
+downloads.
 
-> **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the
-> same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only
-> `kernel-devel` is node-specific.
+> **Driver vs. GPU model:** the driver packages are **not** GPU-model-specific —
+> the same `kmod-nvidia-latest-dkms` (RHEL) or `cuda-drivers` (Ubuntu) covers T4,
+> A10G, **L40S**, A100, H100. Only the kernel headers are node-specific.
 
 **The closure is valid only for the kernels it was built for.** If a GPU node runs an
 uncovered kernel, the installer fails before copying anything and names both the

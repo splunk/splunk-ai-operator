@@ -28,6 +28,11 @@ All commands run from `tools/cluster_setup/` unless noted otherwise.
 
 ## 1. Prerequisites
 
+**Admin workstation** — the machine you run `k0s_cluster_with_stack.sh` from
+(your laptop, a bastion host, or the installer machine described in
+[Air-Gapped Deployment](#5-air-gapped-deployment)). It needs SSH reach to every
+cluster node plus the CLI tools below; it is not itself a cluster node.
+
 **Admin workstation tools:**
 
 ```bash
@@ -59,12 +64,12 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 (3 for HA) | API server, etcd, scheduler |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
-| GPU Worker (L40S) | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node (8× total, 384 GB GPU mem) · equivalent to g6e.12xlarge |
-| GPU Worker (H100) | 16 vCPU | 256 GiB | 500 GB | **2 minimum** | 1× NVIDIA H100/node (2× total, 160 GB GPU mem) · equivalent to p5.4xlarge |
+| GPU Worker (L40S) | 48 vCPU | 384 GiB | 500 GB | **2 minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
+| GPU Worker (H100) | 16 vCPU | 256 GiB | 500 GB | **2 minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
 
 Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
 
-> A single GPU worker is not sufficient — inference is distributed across both nodes. 2× p5.4xlarge is a valid minimum for H100. Controller + CPU worker can share a machine for lab/test only, not production.
+> A single GPU worker is not sufficient — inference is distributed across both nodes. 2× `p5.4xlarge` is a valid minimum for H100. Controller + CPU worker can share a machine for lab/test only, not production.
 
 **Ports to open between nodes:**
 
@@ -139,18 +144,24 @@ Prepare every node (controller, CPU worker, GPU worker) before running the insta
 
 ```bash
 # On each node — confirm OS, passwordless sudo, and Python
-cat /etc/redhat-release          # must be RHEL 9
+cat /etc/os-release               # must be RHEL 9 or Ubuntu 24.04
 sudo -n true && echo "passwordless sudo OK"
-python3 --version                # 3.8+
+python3 --version                 # 3.8+
 
 # From admin workstation — confirm SSH access to each node
 ssh -i <key> <user>@<node-ip> hostname
 ```
 
+> RHEL 9 and Ubuntu 24.04 are the only supported node OSes — mix and match
+> freely across controllers/workers, the installer detects each node's OS
+> over SSH. Any other OS is rejected at preflight (`FORCE_UNSUPPORTED_OS=1`
+> bypasses this at your own risk).
+
 **GPU worker nodes** — no manual steps needed. The installer installs the
-driver automatically on internet-connected nodes (EPEL →
-`nvidia-driver:latest-dkms` (DKMS) → `nvidia-container-toolkit`) and verifies
-with `nvidia-smi` as part of `install`.
+driver automatically on internet-connected nodes — RHEL: EPEL →
+`nvidia-driver:latest-dkms` (DKMS) → `nvidia-container-toolkit`; Ubuntu: CUDA
+repo → `cuda-drivers` (DKMS) → `nvidia-container-toolkit` — and verifies with
+`nvidia-smi` as part of `install`.
 
 ### Model Setup (Standard Path)
 
