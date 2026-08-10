@@ -904,6 +904,8 @@ kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
 
 # GPU nodes must show available GPUs
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
+# → nvidia.com/gpu: "<count>" appears twice per GPU node (status.capacity and
+#   status.allocatable) once the NVIDIA device plugin has registered the GPUs
 ```
 
 **Expected state after a successful install:**

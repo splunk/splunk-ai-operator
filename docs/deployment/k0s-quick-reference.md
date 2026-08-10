@@ -227,24 +227,22 @@ tar/ssh/rpm/dnf/sha256sum, `createrepo_c`, sudo, ~5 GB free disk.
 ### Model Setup (Air-Gapped Path)
 
 Air-gapped clusters cannot reach HuggingFace from the cluster nodes, so model
-staging is always done from the installer machine, either automatically
-during install or manually ahead of time:
-
-```bash
-cd ../artifacts_download_upload_scripts
-./download_from_huggingface.sh --accelerator l40s   # or --accelerator h100
-./upload_to_minio.sh                                 # or upload_to_s3.sh / upload_to_seaweedfs.sh
-```
-
-Or pre-stage everything (models + images + driver closure) in one pass without installing:
-
-```bash
-./airgap_install.sh --download-only --config my-cluster.yaml
-```
+staging is always done from the installer machine. No manual steps needed —
+`k0s_cluster_with_stack.sh install` downloads models from HuggingFace and
+uploads them to your object store automatically as part of the same run
+(models + images + NVIDIA driver closure, all in one pass). Safe to re-run;
+already-staged artifacts are skipped.
 
 **Staging machine requirements:** 250 GB free disk, 16 GB RAM, 4 cores, stable broadband. Can be the same machine that runs the installer.
 
 > Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
+
+> To pre-stage manually ahead of install instead — e.g. to inspect artifacts
+> or size them before the install window — see
+> [K0S_README.md — Step 3: Stage Model Weights](../../tools/cluster_setup/K0S_README.md#step-3--stage-model-weights)
+> and [DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) for
+> the manual `download_from_huggingface.sh` / `upload_to_*.sh` and
+> `airgap_install.sh --download-only` workflows.
 
 ### Install (Air-Gapped Path)
 
@@ -295,6 +293,7 @@ kubectl get pods -A --sort-by=.metadata.namespace                  # all Running
 kubectl get aiplatform -n ai-platform -o wide                      # Ready
 kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia # EXTERNAL-IP assigned
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
+# → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
 ```
 
 ---
