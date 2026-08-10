@@ -249,9 +249,9 @@ storage:
     cpuWorker: 200
     gpuWorker: 500
   objectStore:
-    type: "seaweedfs"             # aws | s3compat | minio | seaweedfs
+    type: "seaweedfs"             # aws | minio | seaweedfs
     bucket: "ai-platform-data"
-    endpoint: "http://10.0.1.50:8333"   # REQUIRED for s3compat/minio/seaweedfs
+    endpoint: "http://10.0.1.50:8333"   # REQUIRED for minio/seaweedfs
     auth:
       rootUser: "admin"
       rootPassword: "Change-This-Strong-Password!"
@@ -367,7 +367,7 @@ ecr:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `nodes.controllers` | No | `1` | Number of controller nodes (1 or 3 for HA) |
+| `nodes.controllers` | No | `1` | Number of controller nodes. Only `1` is actually supported — `install_k0s_cluster` joins a controller on `nodes.existingIPs.controllers[0]` only and never issues a controller-join token to additional entries, so listing more IPs does not produce HA |
 | `nodes.cpuWorkers` | No | `2` | First N workers in the list are labeled as CPU |
 | `nodes.gpuWorkers` | No | `1` | Remaining workers after cpuWorkers are labeled as GPU |
 | `nodes.existingIPs.controllers` | **Yes** | — | List of controller node IPs |
@@ -1335,6 +1335,7 @@ cat ./airgap-bundle/airgap-bundle-*/container-images.txt
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
+IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
@@ -1342,7 +1343,7 @@ while IFS= read -r img; do
   dest="${INTERNAL_REGISTRY}/${img##*/}"
   echo "Copying $img → $dest"
   crane copy "$img" "$dest"
-done < container-images.txt
+done < "${IMAGE_LIST}"
 ```
 
 **Mirror with Docker:**
@@ -1367,6 +1368,23 @@ images:
 imagePullSecrets:
   autoCreateECR: false   # disable automatic ECR token refresh
 ```
+
+> **Authenticated registry** (Harbor or similar)? `autoCreateECR: false` plus
+> `images.registry` alone creates no pull secret. The installer only creates
+> credentials for a generic internal registry when
+> `imagePullSecrets.custom.enabled` and its `server`/`username`/`password`
+> fields are set:
+>
+> ```yaml
+> imagePullSecrets:
+>   autoCreateECR: false
+>   custom:
+>     enabled: true
+>     name: "custom-registry-secret"
+>     server: "registry.airgap.local"
+>     username: "<registry-username>"
+>     password: "<registry-password>"
+> ```
 
 ---
 

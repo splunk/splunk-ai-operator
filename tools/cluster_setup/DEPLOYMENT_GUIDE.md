@@ -24,6 +24,7 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [Phase 4 — Install](#phase-4--install)
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
 - [Post-Install Verification](#post-install-verification)
+- [Internal Splunk Access](#internal-splunk-access)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
 - [Common Operations](#common-operations)
 - [Troubleshooting](#troubleshooting)
@@ -115,8 +116,8 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| RHEL | 9 | Only supported OS for cluster nodes |
-| NVIDIA driver | `nvidia-driver:latest-dkms` (DKMS module) | Installed via NVIDIA repo on GPU nodes; the older `cuda-drivers` meta-package is no longer published |
+| Node OS | RHEL 9 or Ubuntu 24.04 | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. For air-gapped installs, the **installer machine** itself must be RHEL 9 x86_64 regardless of the target nodes' OS — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
+| NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
@@ -214,11 +215,13 @@ flowchart LR
 
 | Node Type | Min CPU | Min RAM | Min Disk | Count |
 |---|---|---|---|---|
-| Controller | 4 cores | 8 GB | 100 GB | 1 (or 3 for HA) |
+| Controller | 4 cores | 8 GB | 100 GB | 1 |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ |
 | GPU Worker | 48 vCPUs | 384 GiB | 500 GB | **2 nodes required** · 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **8 × L40S total, 384 GB total GPU memory** · 100 Gbps · equivalent to g6e.12xlarge |
 
 > **Minimum viable topology:** The platform requires at least 1 controller + 1 CPU worker + 2 GPU workers. The controller and CPU worker roles can coexist on a single machine for lab/testing use, but this is not supported for production. A single GPU worker is not sufficient — the AI inference stack distributes work across both nodes.
+>
+> **Only one controller is supported.** `install_k0s_cluster` joins a k0s controller on `nodes.existingIPs.controllers[0]` only — it never issues a controller-join token to the remaining entries. Listing additional controller IPs does not produce an HA control plane; those addresses are unused (or cause node-label verification to fail). Set `nodes.controllers: 1` and list exactly one controller IP.
 
 **Ports to open between nodes:** 22 (SSH), 6443 (k8s API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN/Calico), 179 (Calico BGP).
 
@@ -302,7 +305,30 @@ flowchart TD
 
 ### Step-by-Step (Standard)
 
-**1. Configure your cluster**
+**1. Confirm every node is ready**
+
+```bash
+# On each node (controller, CPU worker, GPU worker) — confirm OS, passwordless sudo, and Python
+cat /etc/os-release               # must be RHEL 9 or Ubuntu 24.04
+sudo -n true && echo "passwordless sudo OK"
+python3 --version                 # 3.8+
+
+# From the admin workstation — confirm SSH access to each node
+ssh -i <key> <user>@<node-ip> hostname
+```
+
+RHEL 9 and Ubuntu 24.04 are the only supported node OSes — mix and match
+freely across controllers/workers, the installer detects each node's OS over
+SSH. Any other OS is rejected at preflight (`FORCE_UNSUPPORTED_OS=1` bypasses
+this at your own risk).
+
+**GPU worker nodes** need no manual driver install. The installer installs
+the driver automatically on internet-connected nodes — RHEL: EPEL →
+`nvidia-driver:latest-dkms` (DKMS) → `nvidia-container-toolkit`; Ubuntu: CUDA
+repo → `cuda-drivers` (DKMS) → `nvidia-container-toolkit` — and verifies with
+`nvidia-smi` as part of `install`.
+
+**2. Configure your cluster**
 
 ```bash
 cd tools/cluster_setup
@@ -315,7 +341,7 @@ The config sections to fill in:
 | Section | What to set |
 |---|---|
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
-| `nodes.existingIPs` | IP addresses of your controller and worker nodes |
+| `nodes.existingIPs` | IP addresses of your controller and worker nodes — list workers **CPU workers first**: the installer treats the first `nodes.cpuWorkers` entries as CPU nodes and every remaining entry as GPU |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
 | `images.registry` | Your registry hostname, e.g. `123456789.dkr.ecr.us-east-2.amazonaws.com` or `registry.internal:5000` |
 | `images.registryInsecure` | `true` only for plain-HTTP (no-TLS) registries; leave `false` (default) for ECR, Harbor, or any HTTPS registry |
@@ -325,7 +351,7 @@ The config sections to fill in:
 
 > For full field descriptions, secure vs insecure registry guidance, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#images-section).
 
-**2. Validate your config before installing**
+**3. Validate your config before installing**
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
@@ -333,7 +359,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 
 This runs a read-only config check and prints a ✔/✖ checklist. Fix any ✖ items before proceeding.
 
-**3. Run the installer**
+**4. Run the installer**
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
@@ -341,7 +367,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 The installer shows an install plan and asks for confirmation before making any changes.
 
-**4. Monitor progress**
+**5. Monitor progress**
 
 The installer prints timestamped progress to the terminal and to a log file:
 
@@ -350,7 +376,7 @@ The installer prints timestamped progress to the terminal and to a log file:
 tail -f tools/cluster_setup/logs/k0s-install-*.log
 ```
 
-**5. Verify the result**
+**6. Verify the result**
 
 ```bash
 export KUBECONFIG=~/.kube/k0s-<your-cluster-name>
@@ -371,10 +397,10 @@ flowchart LR
         INTERNET[("GitHub · NVIDIA\nHuggingFace\nHelm repos")]
     end
 
-    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9)\ninternet + SSH to the nodes"]
+    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9 x86_64)\ninternet + SSH to the nodes"]
         ENTRY["k0s_cluster_with_stack.sh install\nconfig has cluster.airgap: true"]
         AGI["airgap_install.sh\ninvoked automatically\nto stage the artifacts"]
-        STAGE["./airgap-bundle/airgap-bundle-<ts>/\nbinaries · charts · manifests\nimage tarballs · NVIDIA closure"]
+        STAGE["./airgap-bundle/airgap-bundle-<ts>/\nbinaries · charts · manifests\nimage tarballs · NVIDIA closure\n(RPM for RHEL 9 / .deb for Ubuntu 24.04\nGPU nodes — auto-detected over SSH)"]
         ENTRY --> AGI
     end
 
@@ -580,6 +606,7 @@ flowchart LR
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
+IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
@@ -587,7 +614,7 @@ while IFS= read -r img; do
   dest="${INTERNAL_REGISTRY}/${img##*/}"
   echo "Copying $img → $dest"
   crane copy "$img" "$dest"
-done < container-images.txt
+done < "${IMAGE_LIST}"
 ```
 
 After mirroring, update your config:
@@ -602,6 +629,23 @@ images:
 imagePullSecrets:
   autoCreateECR: false   # disable automatic ECR token refresh
 ```
+
+> **`registry.airgap.local` requires authentication** (Harbor or similar)?
+> `autoCreateECR: false` plus `images.registry` alone creates no pull secret —
+> the installer only creates one when `imagePullSecrets.custom` is configured:
+>
+> ```yaml
+> imagePullSecrets:
+>   autoCreateECR: false
+>   custom:
+>     enabled: true
+>     name: "custom-registry-secret"
+>     server: "registry.airgap.local"
+>     username: "<registry-username>"
+>     password: "<registry-password>"
+> ```
+>
+> Leave `custom.enabled: false` only if your registry accepts unauthenticated pulls.
 
 ### Phase 3 — Stage Model Weights
 
@@ -724,10 +768,14 @@ Confirm to proceed.
 
 ### GPU Nodes in Air-Gapped Environments
 
-GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that
-normally download from the internet. The air-gap staging step builds a complete
-offline **RPM closure** for them, and the installer pushes it to each GPU node — so
-a sealed node never contacts `developer.download.nvidia.com`.
+GPU nodes require OS packages (DKMS, CUDA, nvidia-container-toolkit, plus EPEL
+on RHEL) that normally download from the internet. The air-gap staging step
+builds a complete offline closure for them — an **RPM closure** for RHEL 9 GPU
+nodes, or a **.deb closure** for Ubuntu 24.04 GPU nodes — and the installer
+pushes it to each GPU node, so a sealed node never contacts
+`developer.download.nvidia.com`. The staging step auto-detects which format to
+build by SSHing to a GPU node and reading `/etc/os-release`; you never choose
+the format yourself unless overriding with `--gpu-os`.
 
 ```mermaid
 flowchart TD
@@ -737,10 +785,10 @@ flowchart TD
     AIRGAP_CHECK{"AIRGAP_MODE\n= true?"}
     CLOSURE{"Staged\nnvidia-closure?"}
     KCHECK{"Closure covers\nnode's kernel?"}
-    OFFLINE["scp closure to node\ndnf --disablerepo='*'\n--repofrompath=airgap-nvidia\nDKMS compiles module"]
+    OFFLINE["scp closure to node\nRHEL: dnf --disablerepo='*'\n--repofrompath=airgap-nvidia\nUbuntu: apt against a file://\nrepo built from the closure\nDKMS compiles module"]
     FAIL["❌ Clear error:\nno closure staged\n→ re-run without\n--skip-nvidia-closure"]
     KFAIL["❌ Clear error naming\nthe node's kernel and\nthe kernels covered"]
-    INSTALL["Install driver\nfrom internet:\nEPEL → DKMS\nNVIDIA repo → nvidia-driver:latest-dkms"]
+    INSTALL["Install driver from internet:\nRHEL: EPEL → DKMS → NVIDIA repo\n→ nvidia-driver:latest-dkms\nUbuntu: CUDA repo → DKMS\n→ cuda-drivers"]
     CTK["Install nvidia-container-toolkit"]
     VERIFY["Verify: nvidia-smi returns\ndriver version number"]
 
@@ -764,8 +812,8 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph S1["Strategy 1\n✅ Recommended — automatic"]
-        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9 host;\nGPU IPs read from the config"]
-        S1B["Script resolves a full RPM\nclosure incl. kernel-devel\nfor each node's kernel"]
+        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9 x86_64 host;\nGPU IPs + OS (RHEL 9 or Ubuntu 24.04)\nread/detected from the config"]
+        S1B["Script resolves a full RPM or .deb\nclosure incl. kernel headers\nfor each node's kernel"]
         S1C["Installer scp's the closure\nto each GPU node and installs\noffline; DKMS compiles"]
         S1A --> S1B --> S1C
     end
@@ -779,20 +827,22 @@ flowchart LR
 
 **Strategy 1 — staging the driver closure:**
 
-Run this on the internet-connected RHEL 9 installer machine. NVIDIA publishes
-**DKMS-only** packages for RHEL 9 (`kmod-nvidia-latest-dkms`; the older
-`cuda-drivers` meta-package is gone), so the kernel module is compiled on each GPU
-node and needs `kernel-devel` matching that node's exact `uname -r`.
+Run this on the internet-connected RHEL 9 x86_64 installer machine. NVIDIA
+publishes **DKMS-only** packages for both target OSes — `kmod-nvidia-latest-dkms`
+on RHEL 9 (the older `cuda-drivers` meta-package is gone there), and
+`cuda-drivers` on Ubuntu 24.04 (current and used as-is) — so the kernel module
+is compiled on each GPU node and needs kernel headers matching that node's exact
+`uname -r`.
 
 ```bash
-# Nothing extra to do — the GPU node IPs are derived from your config and each
-# node's `uname -r` is surveyed over SSH.
+# Nothing extra to do — the GPU node IPs and OS are derived from your config
+# and each node's `uname -r` / OS is surveyed over SSH.
 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
-To override the derived kernel or host list, drive the staging step directly —
-these flags live on `airgap_install.sh`, which then continues into the install
-just as the unified command would:
+To override the derived kernel, host list, or OS, drive the staging step
+directly — these flags live on `airgap_install.sh`, which then continues into
+the install just as the unified command would:
 
 ```bash
 # Override the derived list only if needed (e.g. non-standard node layout)
@@ -802,21 +852,29 @@ just as the unified command would:
 # …or name the kernels explicitly if the nodes aren't reachable over SSH yet
 ./airgap_install.sh --config my-cluster-config.yaml \
   --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64
+
+# …or force the GPU node OS/package format instead of auto-detecting it
+./airgap_install.sh --config my-cluster-config.yaml --gpu-os ubuntu24
 ```
 
 > GPU node IPs come from your config: the workers listed in
 > `nodes.existingIPs.workers` after the first `nodes.cpuWorkers` entries are
-> treated as the GPU workers. `--gpu-hosts` is only an override.
+> treated as the GPU workers. `--gpu-hosts` is only an override. `--gpu-os`
+> defaults to `auto`, which SSHes to the first GPU node and reads
+> `/etc/os-release` to pick `rhel9` (RPM closure) or `ubuntu24` (.deb closure).
 
-Installer-host requirements: RHEL 9 x86_64 Linux with `dnf`, `rpm`, and `createrepo_c`
-(`sudo dnf install -y createrepo_c`). The host's RHEL **minor** version and running
-kernel do *not* need to match the GPU nodes — `$releasever` resolves to `9`, so a
-9.6 build host can supply `kernel-devel` for a 9.8 node. All of this is validated in
-preflight, before any downloads.
+Installer-host requirements: RHEL 9 x86_64 Linux with `dnf`, `rpm`, and
+`createrepo_c` (`sudo dnf install -y createrepo_c`) for an RPM closure; add
+`podman` or `docker` if any GPU node is Ubuntu 24.04, since the .deb closure is
+resolved inside an `ubuntu:24.04` container regardless of the build host's own
+OS. The host's RHEL **minor** version and running kernel do *not* need to match
+RHEL 9 GPU nodes — `$releasever` resolves to `9`, so a 9.6 build host can supply
+`kernel-devel` for a 9.8 node. All of this is validated in preflight, before any
+downloads.
 
-> **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the
-> same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only
-> `kernel-devel` is node-specific.
+> **Driver vs. GPU model:** the driver packages are **not** GPU-model-specific —
+> the same `kmod-nvidia-latest-dkms` (RHEL) or `cuda-drivers` (Ubuntu) covers T4,
+> A10G, **L40S**, A100, H100. Only the kernel headers are node-specific.
 
 **The closure is valid only for the kernels it was built for.** If a GPU node runs an
 uncovered kernel, the installer fails before copying anything and names both the
@@ -890,6 +948,8 @@ kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
 
 # GPU nodes must show available GPUs
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
+# → nvidia.com/gpu: "<count>" appears twice per GPU node (status.capacity and
+#   status.allocatable) once the NVIDIA device plugin has registered the GPUs
 ```
 
 **Expected state after a successful install:**
@@ -922,6 +982,16 @@ my-cluster-ai-platform  Ready    8m
 ```
 
 If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 10 minutes, check the session log and see [Troubleshooting](#troubleshooting).
+
+---
+
+## Internal Splunk Access
+
+The in-cluster Splunk Enterprise instance is reachable via NodePort (default),
+LoadBalancer (MetalLB), or `kubectl port-forward` for quick access from your
+admin workstation with no external exposure. See
+[K0S_README.md — Finding the Splunk Web URL](K0S_README.md#finding-the-splunk-web-url)
+for the commands for each method, plus how to retrieve the admin password.
 
 ---
 
@@ -1031,10 +1101,21 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 > The safety gate prevents `install` from wiping a cluster with Ready nodes — it upgrades the stack only. If you also need to upgrade k0s itself, run `clean-all` + `install` (destructive — back up etcd first).
 
 **Air-gap upgrade:** re-run the same command on the installer machine — with
-`airgap: true` still in the config it re-downloads the current artifacts before
-upgrading the stack.
+`airgap: true` still in the config it re-stages the k0s and add-on infrastructure
+image bundles before upgrading the stack. It does **not** mirror the platform
+application image at the new tag — that's always a manual step
+([Phase 2 — Mirror Container Images](#phase-2--mirror-container-images)), and
+skipping it leaves the sealed nodes unable to pull the new tag
+(`ImagePullBackOff`). For each changed image:
 
 ```bash
+# 1. Mirror the new tag to your internal registry BEFORE bumping the config
+crane copy "docker.io/splunk/<image>:<new-tag>" "registry.airgap.local/<image>:<new-tag>"
+
+# 2. Update the tag in your config to point at the mirrored image
+vi my-cluster-config.yaml
+
+# 3. Re-run install
 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
@@ -1102,7 +1183,7 @@ flowchart TD
 | Symptom | First check | Fix |
 |---|---|---|
 | "SSH connection refused" | `ssh -i key user@node-ip hostname` | Check firewall / security groups on port 22 |
-| "Refusing to wipe — Ready nodes" | `kubectl get nodes` | Set `useExisting: auto` in config or run `clean-all` first |
+| "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | `kubectl get nodes` | Set `cluster.useExisting: auto` in config or run `clean-all` first |
 | "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
 | "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging dir and re-run the install (staging repeats automatically) |
