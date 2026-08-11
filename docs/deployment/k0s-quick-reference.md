@@ -7,6 +7,18 @@ explanations, diagrams, and edge cases see
 
 All commands run from `tools/cluster_setup/` unless noted otherwise.
 
+Clone or download the **complete repository** to the admin workstation first;
+do not copy only `k0s_cluster_with_stack.sh`. The installer also needs its
+adjacent library, version lock, configuration templates, and helper scripts.
+
+```bash
+git clone https://github.com/splunk/splunk-ai-operator.git
+cd splunk-ai-operator/tools/cluster_setup
+```
+
+If Git is unavailable, use GitHub's **Code → Download ZIP** action, extract the
+archive locally, and change into its `tools/cluster_setup` directory.
+
 ## Table of Contents
 
 1. [Prerequisites](#1-prerequisites)
