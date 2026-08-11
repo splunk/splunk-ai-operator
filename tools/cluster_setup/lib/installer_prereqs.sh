@@ -149,6 +149,11 @@ prereq_activate_local_tools() {
     *":${runtime_dir}:"*) ;;
     *) export PATH="${runtime_dir}:${PATH}" ;;
   esac
+
+  # A long-lived Bash process may have cached an earlier command location.
+  # Clear that cache so subsequent tool invocations use the verified runtime
+  # links that were just placed first in PATH.
+  hash -r 2>/dev/null || true
 }
 
 prereq_read_linux_identity() {

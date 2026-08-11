@@ -528,10 +528,11 @@ test_check_mode_preserves_path() (
 )
 
 test_verified_local_binary_is_reused_across_process_path() (
-  local test_dir install_dir calls original_path
+  local test_dir install_dir runtime_dir calls original_path version_output
   test_dir="$(mktemp -d)" || return
   trap 'rm -rf "${test_dir}"' EXIT
   install_dir="${test_dir}/bin"
+  runtime_dir="${install_dir}/.splunk-ai-prereq-bin"
   calls="${test_dir}/downloads"
   mkdir -p "${install_dir}"
   : > "${calls}"
@@ -542,12 +543,20 @@ test_verified_local_binary_is_reused_across_process_path() (
   PREREQ_INSTALL_DIR="${install_dir}"
   original_path="${PATH}"
   PATH="/usr/bin:/bin"
+  prereq_command_exists() {
+    [[ "$1" == "curl" ]] && return 0
+    command -v "$1" >/dev/null 2>&1
+  }
   prereq_download() { echo "$*" >> "${calls}"; return 1; }
 
   prereq_ensure_profile bootstrap noninteractive >/dev/null 2>&1 || return
   assert_empty_file "${calls}" || return
-  [[ "$(command -v yq)" == "${install_dir}/.splunk-ai-prereq-bin/yq" ]] \
-    || fail "verified off-PATH yq was not activated" || return
+  [[ "${PATH%%:*}" == "${runtime_dir}" ]] \
+    || fail "verified prerequisite runtime directory was not activated" || return
+  [[ -L "${runtime_dir}/yq" && "$(readlink "${runtime_dir}/yq")" == "${install_dir}/yq" ]] \
+    || fail "verified off-PATH yq runtime link was not created" || return
+  version_output="$(yq --version)" || fail "activated yq could not be executed" || return
+  assert_contains "${version_output}" "version v4.53.3" || return
   PATH="${original_path}"
 )
 
