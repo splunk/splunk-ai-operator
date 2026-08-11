@@ -192,7 +192,9 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 }
 
 // reconcileOtelConfigMap bootstraps a `<CR>-otel-config` ConfigMap on first create.
-// If the user edits the ConfigMap later, those changes are preserved.
+// Endpoint remains a backward-compatible HEC fallback for that initial render.
+// Existing ConfigMaps are migrated only when HECEndpoint is explicit; Endpoint
+// is now the management/JWKS URL and must not overwrite a user-managed HEC URL.
 func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatform) error {
 	logger := log.FromContext(ctx)
 	// Use V(1) for verbose logging - reduces noise
@@ -200,7 +202,6 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 
 	cmName := fmt.Sprintf("%s-otel-config", p.Name)
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: p.Namespace}}
-	hecBase := effectiveHECEndpoint(p.Spec.SplunkConfiguration)
 
 	_, err := controllerutil.CreateOrUpdate(ctx, s.Client, cm, func() error {
 		if cm.Data == nil {
@@ -213,8 +214,8 @@ func (s *Builder) reconcileOtelConfigMap(ctx context.Context, p *aiApi.AIPlatfor
 				return fmt.Errorf("marshaling otel config: %w", err)
 			}
 			cm.Data["otel-config.yaml"] = string(yamlBytes)
-		} else if hecBase != "" {
-			updated, err := updateOtelHECEndpoint(existing, hecBase)
+		} else if p.Spec.SplunkConfiguration.HECEndpoint != "" {
+			updated, err := updateOtelHECEndpoint(existing, p.Spec.SplunkConfiguration.HECEndpoint)
 			if err != nil {
 				return err
 			}

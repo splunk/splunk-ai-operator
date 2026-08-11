@@ -265,29 +265,34 @@ processors:
 	assert.Contains(t, updated.Data["otel-config.yaml"], "custom: {}")
 }
 
-func TestReconcileOtelConfigMap_FallsBackToEndpointWhenHECEndpointCleared(t *testing.T) {
+func TestReconcileOtelConfigMap_PreservesCustomHECEndpointWhenHECEndpointUnset(t *testing.T) {
 	ctx := context.Background()
 	scheme := setupFakeScheme()
 	platform := &aiApi.AIPlatform{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
 		Spec: aiApi.AIPlatformSpec{SplunkConfiguration: aiApi.SplunkConfigurationSpec{
-			Endpoint: "https://legacy-splunk:8088",
+			Endpoint: "https://splunk-management:8089",
 		}},
 	}
 	existing := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-platform-otel-config", Namespace: "default"},
 		Data: map[string]string{"otel-config.yaml": `exporters:
   splunk_hec:
-    endpoint: https://new-splunk:8088/services/collector
+    endpoint: https://custom-hec:8088/services/collector
+    custom_setting: keep-me
+processors:
+  custom: {}
 `},
 	}
+	original := existing.Data["otel-config.yaml"]
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
 	builder := New(fakeClient, scheme, record.NewFakeRecorder(100), platform)
 
 	require.NoError(t, builder.reconcileOtelConfigMap(ctx, platform))
 	updated := &corev1.ConfigMap{}
 	require.NoError(t, fakeClient.Get(ctx, clientKey("default", existing.Name), updated))
-	assert.Contains(t, updated.Data["otel-config.yaml"], "endpoint: https://legacy-splunk:8088/services/collector")
+	assert.Equal(t, original, updated.Data["otel-config.yaml"],
+		"an unset hecEndpoint must not redirect a customized exporter to the management endpoint")
 }
 
 func TestUpdateOtelHECEndpoint_RemovesOnlyLegacyManagedCA(t *testing.T) {
