@@ -478,7 +478,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
 	// via the cluster installer rather than via SplunkCustomResourceRef.
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
-	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service:8089"
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
 	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
@@ -490,7 +490,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089",
+		"https://splunk-splunk-standalone-standalone-service:8089",
 		cm.Data["SPLUNK_ISSUERS"],
 		"endpoint mode: endpoint must be used as the JWT issuer")
 }
