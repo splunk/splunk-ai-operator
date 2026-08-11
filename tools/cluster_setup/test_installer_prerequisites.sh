@@ -544,8 +544,15 @@ test_verified_local_binary_is_reused_across_process_path() (
   original_path="${PATH}"
   PATH="/usr/bin:/bin"
   prereq_command_exists() {
-    [[ "$1" == "curl" ]] && return 0
-    command -v "$1" >/dev/null 2>&1
+    # GitHub runners may provide /usr/bin/yq. This case intentionally treats
+    # only the managed runtime link as present so activation is deterministic.
+    case "$1" in
+      curl) return 0 ;;
+      yq)
+        [[ "$(command -v yq 2>/dev/null || true)" == "${runtime_dir}/yq" ]]
+        ;;
+      *) command -v "$1" >/dev/null 2>&1 ;;
+    esac
   }
   prereq_download() { echo "$*" >> "${calls}"; return 1; }
 
