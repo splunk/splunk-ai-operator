@@ -1054,6 +1054,10 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 
 Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end connectivity.
 
+For a reusable pass/fail sequence covering installer completion, Pods, workload
+resources, direct model inference, trusted SAIA reachability, and the browser
+flow, use the [Post-Install Sanity Checklist](SANITY_TEST_CHECKLIST.md).
+
 ---
 
 ## Common Operations
