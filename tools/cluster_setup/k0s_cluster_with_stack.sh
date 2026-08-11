@@ -1,4 +1,11 @@
 #!/bin/bash
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "ERROR: k0s_cluster_with_stack.sh requires Bash 4.4 or newer (Bash 5 is recommended)." >&2
+  echo "On macOS, install Homebrew Bash and invoke this script with that binary." >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 # =============================================================================
@@ -80,6 +87,40 @@ err()   {
   echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Log file: ${LOG_FILE}" >&2
   echo -e "\033[1;31m[$(_ts) ERROR]\033[0m Run '$0 diagnose' to collect a full support bundle." >&2
   exit 1
+}
+
+# ====== INSTALLER PREREQUISITES ======
+# Source-only module: defining these functions has no package, network, or PATH
+# side effects. The install dispatcher opts into check/install/recheck below.
+_INSTALLER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_PREREQ_LIBRARY="${_INSTALLER_SCRIPT_DIR}/lib/installer_prereqs.sh"
+[[ -r "${_PREREQ_LIBRARY}" ]] || err "Prerequisite module not found: ${_PREREQ_LIBRARY}"
+# shellcheck source=lib/installer_prereqs.sh
+# shellcheck disable=SC1090,SC1091
+source "${_PREREQ_LIBRARY}"
+
+ensure_installer_prerequisites() {
+  local profile="$1" interaction="interactive" rc=0
+  [[ "${SILENT_INSTALL:-false}" == "true" || "${AUTO_APPROVE:-false}" == "true" || ! -t 0 ]] \
+    && interaction="noninteractive"
+
+  if [[ "${INSTALL_PREREQS:-true}" == "true" ]]; then
+    prereq_ensure_profile "${profile}" "${interaction}" || rc=$?
+  else
+    prereq_check_profile "${profile}" || rc=$?
+  fi
+
+  if (( rc != 0 )); then
+    if [[ "${INSTALL_PREREQS:-true}" == "true" ]]; then
+      err "Unable to prepare installer prerequisites (${profile} profile, status ${rc}):
+  ${PREREQ_LAST_ERROR}
+Run '$0 prereqs install' after fixing the reported host issue, then retry."
+    else
+      err "Required installer tools are unavailable and automatic installation is disabled:
+  ${PREREQ_LAST_ERROR}
+Run '$0 prereqs install', or omit --no-install-prereqs, then retry."
+    fi
+  fi
 }
 
 # ====== TOOL CHECKER ======
@@ -476,63 +517,8 @@ show_install_plan() {
 
 # ====== LOAD CONFIGURATION ======
 
-ensure_yq() {
-  command -v yq >/dev/null 2>&1 && return 0
-  local os arch url
-  local -a _yq_fetch
-  # Pinned version — matches download_from_huggingface.sh; update both together.
-  local YQ_VERSION="v4.44.1"
-  os="$(uname -s)"
-  arch="$(uname -m)"
-  case "${arch}" in
-    x86_64|amd64)   arch="amd64" ;;
-    aarch64|arm64)  arch="arm64" ;;
-    *) warn "yq auto-install: unsupported arch ${arch}, skipping"; return 1 ;;
-  esac
-  case "${os}" in
-    Linux)
-      url="${YQ_DOWNLOAD_URL:-https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}}"
-      log "Installing yq ${YQ_VERSION} (linux-${arch})..."
-      # file:// is a URI — curl rejects a relative path in it, so copy instead.
-      if [[ "${url}" == file://* ]]; then
-        _yq_fetch=( cp -- "${url#file://}" /tmp/yq )
-      else
-        _yq_fetch=( curl -fsSL -o /tmp/yq "${url}" )
-      fi
-      if "${_yq_fetch[@]}"; then
-        chmod +x /tmp/yq
-        if [[ "$(id -u)" -eq 0 ]]; then
-          mv /tmp/yq /usr/local/bin/yq
-        else
-          sudo mv /tmp/yq /usr/local/bin/yq 2>/dev/null || { mkdir -p ~/.local/bin; mv /tmp/yq ~/.local/bin/yq; export PATH="$PATH:$HOME/.local/bin"; }
-        fi
-      else
-        warn "yq download failed — config parsing may be unreliable"; return 1
-      fi
-      ;;
-    Darwin)
-      if command -v brew >/dev/null 2>&1; then
-        log "Installing yq via brew..."
-        brew install yq
-      else
-        url="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_darwin_${arch}"
-        log "Installing yq ${YQ_VERSION} (darwin-${arch})..."
-        if curl -fsSL -o /tmp/yq "${url}"; then
-          chmod +x /tmp/yq
-          sudo mv /tmp/yq /usr/local/bin/yq 2>/dev/null || { mkdir -p ~/.local/bin; mv /tmp/yq ~/.local/bin/yq; export PATH="$PATH:$HOME/.local/bin"; }
-        else
-          warn "yq download failed — config parsing may be unreliable"; return 1
-        fi
-      fi
-      ;;
-    *) warn "yq auto-install: unsupported OS ${os}, skipping"; return 1 ;;
-  esac
-  command -v yq >/dev/null 2>&1 && log "yq installed: $(yq --version 2>/dev/null)" || warn "yq install succeeded but binary not found in PATH"
-}
-
 load_config() {
-  ensure_yq || true
-  command -v yq >/dev/null 2>&1 || err "yq is required to parse ${CONFIG_FILE}. Install it (brew install yq / snap install yq) and retry."
+  command -v yq >/dev/null 2>&1 || err "yq is required to parse ${CONFIG_FILE}. Run '$0 prereqs install' and retry."
   log "Loading configuration from: ${CONFIG_FILE}"
   [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
 
@@ -1077,12 +1063,11 @@ preflight_checks() {
     fi
   done
 
-  # yq is strongly recommended — without it, config parsing falls back to
-  # grep/awk which cannot handle arrays or nested structures reliably.
+  # yq is mandatory: load_config uses structure-aware v4 expressions.
   if command -v yq >/dev/null 2>&1; then
     pf_ok "yq found"
   else
-    pf_warn "yq not found — install it for reliable config parsing (brew install yq / snap install yq). Falling back to grep/awk which may miss complex config values."
+    pf_fail "yq not found in PATH"
   fi
 
   # python3 is used by preflight_check_registry() to parse Bearer token JSON.
@@ -1444,9 +1429,11 @@ preflight_check_registry() {
 
     _www_auth=$(curl "${_basic_opts[@]}" -o /dev/null -D - "${_murl}" 2>/dev/null \
                 | grep -i '^Www-Authenticate:' | head -1)
-    _realm=$(echo "${_www_auth}"   | grep -oP 'realm="[^"]+"'   | cut -d'"' -f2)
-    _service=$(echo "${_www_auth}" | grep -oP 'service="[^"]+"' | cut -d'"' -f2)
-    _scope=$(echo "${_www_auth}"   | grep -oP 'scope="[^"]+"'   | cut -d'"' -f2)
+    # BSD grep on macOS has no -P; these POSIX sed expressions extract the
+    # quoted Bearer challenge attributes on every supported installer host.
+    _realm=$(printf '%s\n' "${_www_auth}"   | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+    _service=$(printf '%s\n' "${_www_auth}" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+    _scope=$(printf '%s\n' "${_www_auth}"   | sed -n 's/.*scope="\([^"]*\)".*/\1/p')
 
     [[ -z "${_realm}" ]] && { echo "401"; return; }
 
@@ -5462,13 +5449,21 @@ install_ai_platform_cr() {
   log "Cleaning up failed jobs and ImagePullBackOff pods from previous runs..."
   kubectl delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
   kubectl delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
-  # Delete pods stuck in ImagePullBackOff or ErrImagePull (use jq to avoid bash 3.x jsonpath parsing issues)
-  kubectl get pods -n "${AI_NS}" -o json 2>/dev/null | \
-    jq -r '.items[] | select(.status.containerStatuses[]? | .state.waiting?.reason? == "ImagePullBackOff") | .metadata.name' 2>/dev/null | \
-    xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
-  kubectl get pods -n "${AI_NS}" -o json 2>/dev/null | \
-    jq -r '.items[] | select(.status.containerStatuses[]? | .state.waiting?.reason? == "ErrImagePull") | .metadata.name' 2>/dev/null | \
-    xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
+  # Delete pods stuck in ImagePullBackOff or ErrImagePull. Use a shell loop
+  # instead of GNU-specific `xargs -r` so this also works on macOS.
+  local image_pull_reason image_pull_pod
+  for image_pull_reason in ImagePullBackOff ErrImagePull; do
+    while IFS= read -r image_pull_pod; do
+      [[ -n "${image_pull_pod}" ]] || continue
+      kubectl delete pod "${image_pull_pod}" -n "${AI_NS}" \
+        --wait=false --grace-period=0 --force 2>/dev/null || true
+    done < <(
+      kubectl get pods -n "${AI_NS}" -o json 2>/dev/null | \
+        jq -r --arg reason "${image_pull_reason}" \
+          '.items[] | select(.status.containerStatuses[]? | .state.waiting?.reason? == $reason) | .metadata.name' \
+          2>/dev/null
+    )
+  done
   log "✓ Cleanup complete"
 
   # Build trustedIssuers YAML fragment from config (splunk.trustedIssuers[]).
@@ -7399,6 +7394,10 @@ main_install() {
 
   show_install_plan
 
+  # The normal install path is check -> install missing -> recheck. Prepared
+  # hosts take the no-op path, so the deployment phases below remain unchanged.
+  ensure_installer_prerequisites cluster
+
   phase_start "Preflight"
   step_start "Preflight checks"
   preflight_checks
@@ -7999,14 +7998,17 @@ validate_config() {
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $0 [install|validate|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
+Usage: $0 [install|prereqs|validate|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
 
 Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
 
 Commands:
-  install [--silent|-s]
+  install [--silent|-s] [--no-install-prereqs]
                    - Install k0s cluster and AI Platform stack.
+                     By default, checks local prerequisites, installs anything
+                     missing for the detected OS, rechecks, then continues.
+                     Use --no-install-prereqs for check-only host management.
                      Two flows are supported:
 
                      Full install (default, no flag):
@@ -8018,6 +8020,8 @@ Commands:
                        Non-interactive. Uses config values as-is. Assumes the config
                        has been reviewed. Displays the install plan, waits 5 s, then
                        proceeds automatically without any prompts.
+  prereqs check    - Report missing local installer tools without installing.
+  prereqs install  - Install missing local tools and verify the result.
   validate         - Check config file completeness before a full install.
                      Catches missing IPs, unset credentials, missing manifest files.
                      Safe to run any time — makes no changes.
@@ -8046,6 +8050,12 @@ Environment:
   SILENT_INSTALL           - Set to true to run install non-interactively (same as --silent).
   AUTO_APPROVE             - Set to true to skip all confirmation prompts (implies SILENT_INSTALL
                              for install; also skips delete/clean-all confirmations).
+  INSTALL_PREREQS          - true (default) automatically installs missing tools during install.
+                             Set false for the same behavior as --no-install-prereqs.
+  PREREQ_INSTALL_DIR       - User-local binary directory (default: XDG_BIN_HOME or ~/.local/bin).
+  PREREQ_KUBECTL_VERSION   - Optional kubectl version override; when different from
+                             prerequisites.lock, PREREQ_KUBECTL_SHA256 is required.
+  PREREQ_KUBECTL_SHA256    - SHA-256 for an overridden kubectl version or mirror asset.
   POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
                              RayService, Splunk Standalone, AIPlatform/AIService) to
                              reach Ready during verify (default: 600 = 10 minutes).
@@ -8063,6 +8073,13 @@ Examples:
   CONFIG_FILE=./my-config.yaml $0 install --silent
   # Equivalent:
   AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml $0 install
+
+  # Check or install workstation prerequisites without starting a deployment
+  $0 prereqs check
+  $0 prereqs install
+
+  # Require a pre-managed workstation; fail instead of installing missing tools
+  CONFIG_FILE=./my-config.yaml $0 install --no-install-prereqs
 
   # Stage model artifacts only (no cluster install; always runs regardless of config)
   CONFIG_FILE=./my-config.yaml $0 stage-artifacts
@@ -8383,6 +8400,23 @@ join_workers() {
 _CMD="${1:-install}"
 shift 2>/dev/null || true
 
+# Automatic prerequisite installation is the install default. Parse these flags
+# before air-gap delegation so the wrapper and its callback inherit the same
+# silent/opt-out policy through exported environment variables.
+INSTALL_PREREQS="${INSTALL_PREREQS:-true}"
+if [[ "${_CMD}" == "install" ]]; then
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --silent|-s) SILENT_INSTALL=true; shift ;;
+      --no-install-prereqs) INSTALL_PREREQS=false; shift ;;
+      *) echo "Unknown install option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+  done
+  export SILENT_INSTALL="${SILENT_INSTALL:-false}" INSTALL_PREREQS
+  [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
+  ensure_installer_prerequisites bootstrap
+fi
+
 # ====== AIR-GAP DELEGATION ======
 # One command serves both modes: with cluster.airgap: true the artifacts must be
 # downloaded before anything can be pushed to the sealed nodes, so hand off to
@@ -8414,6 +8448,9 @@ if [[ "${AIRGAP_STAGED:-false}" != "true" ]]; then
       # AIRGAP_MODE=true is an equally valid trigger: it is the documented way to
       # request air-gap for one run without editing the config.
       if [[ "${_ag}" == "true" || "${AIRGAP_MODE:-false}" == "true" ]]; then
+        # airgap_install.sh itself needs Helm/tar/curl on the connected installer
+        # host, so prepare the complete local profile before handing off.
+        [[ "${_CMD}" == "install" ]] && ensure_installer_prerequisites cluster
         if [[ ! -x "${_sd}/airgap_install.sh" ]]; then
           echo "ERROR: cluster.airgap is true but ${_sd}/airgap_install.sh is missing." >&2
           echo "  That script downloads the artifacts a sealed cluster cannot fetch itself." >&2
@@ -8439,13 +8476,31 @@ fi
 
 case "${_CMD}" in
   install)
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --silent|-s) SILENT_INSTALL=true; shift ;;
-        *) echo "Unknown install option: $1" >&2; usage >&2; exit 1 ;;
-      esac
-    done
     main_install
+    ;;
+  prereqs)
+    [[ $# -eq 1 ]] || { echo "Usage: $0 prereqs check|install" >&2; exit 2; }
+    case "$1" in
+      check)
+        _prereq_rc=0
+        prereq_check_profile cluster || _prereq_rc=$?
+        if (( _prereq_rc != 0 )); then
+          echo "Prerequisite check failed: ${PREREQ_LAST_ERROR}" >&2
+        fi
+        exit "${_prereq_rc}"
+        ;;
+      install)
+        _prereq_interaction="interactive"
+        [[ "${AUTO_APPROVE:-false}" == "true" || ! -t 0 ]] && _prereq_interaction="noninteractive"
+        _prereq_rc=0
+        prereq_ensure_profile cluster "${_prereq_interaction}" || _prereq_rc=$?
+        if (( _prereq_rc != 0 )); then
+          echo "Prerequisite installation failed: ${PREREQ_LAST_ERROR}" >&2
+        fi
+        exit "${_prereq_rc}"
+        ;;
+      *) echo "Usage: $0 prereqs check|install" >&2; exit 2 ;;
+    esac
     ;;
   validate)
     validate_config

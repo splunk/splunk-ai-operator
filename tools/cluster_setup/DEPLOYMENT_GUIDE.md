@@ -502,7 +502,7 @@ graph TD
 
     subgraph BIN["📁 binaries/"]
         K0S["k0s binary\nlatest or --k0s-version"]
-        YQ["yq v4.44.1\nYAML processor"]
+        YQ["yq v4.53.3\nYAML processor"]
     end
 
     subgraph IMG["📁 images/  ⭐ pre-loaded OCI image bundles"]

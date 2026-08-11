@@ -833,33 +833,32 @@ AWSCLI
     log "AWS CLI ready on installer"
   fi
 
-  log "Installing prerequisites on installer (yq, kubectl, helm, jq)..."
-  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'PREREQ'
-set -e
-export PATH="$PATH:/usr/local/bin"
-sudo dnf install -y git jq curl unzip 2>/dev/null || sudo yum install -y git jq curl unzip
-command -v yq &>/dev/null || {
-  sudo curl -sSL -o /usr/local/bin/yq \
-    "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
-  sudo chmod +x /usr/local/bin/yq
-}
-command -v kubectl &>/dev/null || {
-  K8S_VER=$(curl -sSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.32.0)
-  sudo curl -sSL -o /usr/local/bin/kubectl \
-    "https://dl.k8s.io/release/${K8S_VER}/bin/linux/amd64/kubectl"
-  sudo chmod +x /usr/local/bin/kubectl
-}
-command -v helm &>/dev/null || \
-  curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-echo "Prerequisites ready."
-PREREQ
-
   log "Copying k0s cluster scripts to installer..."
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
-    'mkdir -p ~/cluster_setup'
+    'mkdir -p ~/cluster_setup/lib'
   scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
     "${SCRIPT_DIR}/"*.sh "${SCRIPT_DIR}/"*.yaml \
     "ec2-user@${eip}:~/cluster_setup/" 2>/dev/null || true
+  scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
+    "${SCRIPT_DIR}/prerequisites.lock" \
+    "ec2-user@${eip}:~/cluster_setup/" \
+    || err "Failed to copy prerequisites.lock to installer"
+  scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
+    "${SCRIPT_DIR}/lib/installer_prereqs.sh" \
+    "ec2-user@${eip}:~/cluster_setup/lib/" \
+    || err "Failed to copy installer_prereqs.sh to installer"
+
+  log "Installing verified prerequisites on installer..."
+  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
+    'sudo bash -s' <<'PREREQ'
+set -euo pipefail
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PREREQ_INSTALL_DIR="/usr/local/bin"
+source /home/ec2-user/cluster_setup/lib/installer_prereqs.sh
+prereq_ensure_profile cluster noninteractive
+echo "Verified prerequisites ready."
+PREREQ
+
   # Copy artifacts_download_upload_scripts (sibling of cluster_setup) — required by model staging step
   local artifacts_dir="${SCRIPT_DIR}/../artifacts_download_upload_scripts"
   if [[ -d "${artifacts_dir}" ]]; then

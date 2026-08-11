@@ -64,16 +64,82 @@ that has Ready nodes.
 
 ### "Required tool not found: \<tool\>"
 
-The install machine is missing a required binary.
+The install machine is missing a required binary. A normal `install` first
+checks prerequisites, attempts to install anything missing, and checks again.
+This message therefore means either automatic installation was disabled with
+`--no-install-prereqs` or the installation/recheck did not succeed.
+
+Inspect the workstation without making changes, or retry only the prerequisite
+step:
+
+```bash
+./k0s_cluster_with_stack.sh prereqs check
+./k0s_cluster_with_stack.sh prereqs install
+```
 
 | Tool | Install |
 |---|---|
 | `kubectl` | `brew install kubectl` / [kubernetes.io/docs/tasks/tools](https://kubernetes.io/docs/tasks/tools/) |
 | `helm` | `brew install helm` / [helm.sh/docs/intro/install](https://helm.sh/docs/intro/install/) |
-| `yq` | `brew install yq` / `wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq` |
+| `yq` | Prefer `./k0s_cluster_with_stack.sh prereqs install` (pinned and checksummed) / `brew install yq` on a manually managed Mac |
 | `jq` | `brew install jq` / `apt-get install jq` / `dnf install jq` |
 | `ssh` | `apt-get install openssh-client` / `brew install openssh` |
 | `curl` | `apt-get install curl` / `brew install curl` |
+| `tar` | Normally provided by the base OS; `apt-get install tar` / `dnf install tar` |
+| `timeout` | `apt-get install coreutils` / `dnf install coreutils` / `brew install coreutils` |
+
+---
+
+### "Unsupported installer host" or no supported package manager
+
+Automatic prerequisite installation is supported on Ubuntu/Debian (`apt`),
+RHEL/Rocky Linux/AlmaLinux/Fedora/Amazon Linux (`dnf` or `yum`), and macOS with
+Homebrew already installed. This support matrix applies to the admin
+workstation, not the remote cluster nodes.
+
+On another host, install the tools listed by `prereqs check` manually and run:
+
+```bash
+./k0s_cluster_with_stack.sh prereqs check
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install --no-install-prereqs
+```
+
+On macOS, install Homebrew yourself before using `prereqs install`; the script
+does not bootstrap a package manager.
+
+---
+
+### Bash is older than version 4.4
+
+The installer requires Bash 4.4 or newer before prerequisite management can
+start, so it cannot upgrade Bash for itself. macOS's system `/bin/bash` is too
+old. Install a current Bash manually, then invoke the installer with it:
+
+```bash
+brew install bash
+"$(brew --prefix)/bin/bash" ./k0s_cluster_with_stack.sh prereqs check
+"$(brew --prefix)/bin/bash" ./k0s_cluster_with_stack.sh install
+```
+
+---
+
+### Prerequisite installation cannot obtain sudo
+
+Linux package installation may require local `sudo`. An interactive install
+may display the normal sudo password prompt. A silent/non-interactive install
+(`--silent`, `-s`, or `AUTO_APPROVE=true`) uses non-interactive sudo and never
+waits for a password; it fails promptly when passwordless authorization is not
+available.
+
+Choose one of these fixes:
+
+1. Run `prereqs install` interactively from a terminal and authorize sudo.
+2. Have an administrator install the tools reported by `prereqs check`.
+3. Configure appropriately scoped passwordless sudo for automation, then retry.
+
+After a manual fix, run `prereqs check` again. Use
+`install --no-install-prereqs` only when you intentionally want missing tools
+to fail preflight without an installation attempt.
 
 ---
 

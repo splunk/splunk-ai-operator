@@ -70,7 +70,7 @@ The script installs everything needed for the AI Platform:
 
 - **Two-phase parallel installation** — Independent components install concurrently for faster deployments
 - **Helm retry with exponential backoff** — Automatic retries on transient errors (timeouts, TLS handshake failures)
-- **Preflight validation** — Checks tools, config, SSH connectivity, and disk space before starting
+- **Prerequisite bootstrap and preflight validation** — Installs missing admin-workstation tools on supported hosts, then checks config, SSH connectivity, and disk space before starting
 - **Safety gate** — Refuses to wipe a cluster that has Ready nodes (prevents accidental data loss)
 - **Session logging** — All stdout/stderr captured to `tools/cluster_setup/logs/k0s-install-YYYY-MM-DD_HH-MM-SS.log`
 - **Existing cluster detection** — `useExisting` flag (auto/force/never) to skip k0s install and deploy stack only
@@ -95,23 +95,60 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ### Required Tools (on Admin Workstation)
 
+The `install` command manages its local tool prerequisites automatically. It
+checks the admin workstation, installs any missing tools, checks again, and
+then continues with the existing configuration and cluster preflight flow.
+Tools that are already available are left unchanged.
+
+The managed tools are `curl`, `ssh`/`scp`, `git`, `jq`, `yq`, `kubectl`, Helm,
+`tar`, and the GNU `timeout` utility used by the installer. On macOS, Homebrew
+`coreutils` supplies `gtimeout`; the prerequisite module exposes it as
+`timeout` from the user-local tool directory.
+Model-staging and storage-provider helpers have additional conditional tools
+such as Python, `wget`, Git LFS, the AWS CLI, or `mc`; those helpers validate
+their own requirements only when the related workflow is enabled.
+Downloaded `kubectl`, Helm, `jq`, and `yq` assets are pinned and checksummed in
+`prerequisites.lock`. A custom `PREREQ_KUBECTL_VERSION` must be paired with the
+matching `PREREQ_KUBECTL_SHA256`.
+Automatic installation is supported on these **installer hosts** (this is
+separate from the operating-system requirements for cluster nodes):
+
+| Installer host | Installation method |
+|---|---|
+| Ubuntu / Debian | `apt` |
+| RHEL / Rocky Linux / AlmaLinux / Fedora / Amazon Linux | `dnf` or `yum` |
+| macOS | An existing Homebrew installation; the installer does not install Homebrew |
+
+The script itself requires **Bash 4.4 or newer**. Bash cannot be bootstrapped by
+the prerequisite installer because the script must start before that installer
+can run. In particular, macOS ships an older `/bin/bash`; install a current
+Bash manually and use it to launch the script:
+
 ```bash
-# Install required tools on macOS
-brew install kubectl helm git jq yq
-
-# Install required tools on Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y kubectl helm git jq
-wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-chmod +x /usr/local/bin/yq
-
-# Verify installations
-kubectl version --client
-helm version
-git --version
-jq --version
-yq --version
+# macOS only: one-time bootstrap
+brew install bash
+"$(brew --prefix)/bin/bash" ./k0s_cluster_with_stack.sh prereqs check
 ```
+
+Because this repository keeps the portable `/bin/bash` shebang used by existing
+Linux automation, use the Homebrew Bash prefix shown above for every installer
+invocation on macOS.
+
+You can inspect or prepare a workstation before an install:
+
+```bash
+# Report missing prerequisites without changing the host
+./k0s_cluster_with_stack.sh prereqs check
+
+# Install missing prerequisites and verify them
+./k0s_cluster_with_stack.sh prereqs install
+```
+
+Interactive runs may prompt for local `sudo` when the package manager needs
+elevated privileges. Silent/non-interactive runs use non-interactive sudo and
+fail with remediation instructions if passwordless sudo is unavailable; they
+never wait for a password prompt. If host packages are managed separately, use
+`install --no-install-prereqs` to retain the fail-on-missing-tools behavior.
 
 ### Hardware Requirements
 
@@ -158,10 +195,21 @@ You must provide an external S3-compatible object storage endpoint:
 
 ### 1. Clone the Repository
 
+Download the **complete repository** to the admin workstation before running
+the installer. Do not copy only `k0s_cluster_with_stack.sh`: it uses the
+adjacent prerequisite library, version lock, configuration templates, and
+helper scripts from this repository.
+
+If Git is already available:
+
 ```bash
 git clone https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
 ```
+
+Otherwise, use GitHub's **Code → Download ZIP** action, extract the archive
+locally, and change into its `tools/cluster_setup` directory. Run the remaining
+quick-start commands from that directory.
 
 ### 2. Create Configuration File
 
@@ -177,6 +225,13 @@ vi my-cluster.yaml
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+```
+
+This checks, installs, and rechecks local prerequisites before continuing. To
+disable host changes on a centrally managed workstation:
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install --no-install-prereqs
 ```
 
 ### 4. Verify Installation
@@ -566,6 +621,15 @@ imagePullSecrets:
 # Install cluster and full AI Platform stack
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
 
+# Check prerequisites only (does not install anything)
+./k0s_cluster_with_stack.sh prereqs check
+
+# Install any missing prerequisites, then verify them
+./k0s_cluster_with_stack.sh prereqs install
+
+# Install without changing workstation prerequisites
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install --no-install-prereqs
+
 # Stage model artifacts only (download from HF + upload to object store)
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
@@ -583,6 +647,13 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 > **Air-gap uses these same commands.** With `cluster.airgap: true` in the config, `install` and `join-workers` stage the offline artifacts first and then continue; every other subcommand runs immediately, unchanged. See [Air-Gapped Deployment](#air-gapped-deployment).
+
+For a normal `install`, prerequisite handling is `check` → install only what is
+missing → `check` again. A failure to install or verify a tool stops the run
+before cluster changes begin. `validate` and other read-only commands do not
+install host packages. `--silent`, `-s`, and `AUTO_APPROVE=true` keep the
+prerequisite step non-interactive as well: any required `sudo` is attempted
+without a password prompt and fails promptly if authorization is unavailable.
 
 ### Environment Variables
 
@@ -1309,7 +1380,7 @@ cd tools/cluster_setup
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.53.3` |
 | **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
