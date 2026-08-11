@@ -80,9 +80,9 @@ storage:
   # The installer checks these thresholds at preflight and fails if not met.
   # Override to lower values only if you know your workload footprint is smaller.
   # minimumDiskSpace:
-  #   controller: 100    # k0s control plane, kine/etcd, container images
-  #   cpuWorker: 200     # weaviate, saia-api, data-loader, fluent-bit
-  #   gpuWorker: 500     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
+  #   controller: 50    # k0s control plane, kine/etcd, container images
+  #   cpuWorker: 150     # weaviate, saia-api, data-loader, fluent-bit
+  #   gpuWorker: 300     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
 
   # Model staging: download model artifacts from Hugging Face and upload them to
   # the object store during 'install' (before the cluster pulls them).
