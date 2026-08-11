@@ -82,26 +82,36 @@ extra tool needed beyond Docker. (If you already have `crane` installed,
 - [ ] Decide your path now: [Standard Deployment](#4-standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#5-air-gapped-deployment) (sealed nodes, no outbound internet)
 
 **Mirror platform images to your internal registry.** Pull each image from
-Docker Hub and push it to the registry configured under `images.registry` in
-your cluster config (required for both paths — air-gap additionally needs
-every node to resolve that registry with no outbound internet):
+Docker Hub, push it to your mirror, and then set the corresponding image fields
+in the cluster config to those mirrored paths (required for both paths —
+air-gap additionally needs every node to resolve that registry with no outbound
+internet):
+
+The default Ray and SAIA images currently use the `preview` tag:
 
 ```bash
 for repo in \
-  splunk/ai-tier-slim-service \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
   splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker \
-  splunk/splunk-ai-operator; do
-  docker pull "docker.io/${repo}:<tag>"
-  docker tag "docker.io/${repo}:<tag>" "<your-registry>/${repo}:<tag>"
-  docker push "<your-registry>/${repo}:<tag>"
+  splunk/ai-tier-ray-worker; do
+  docker pull "docker.io/${repo}:preview"
+  docker tag "docker.io/${repo}:preview" "<your-registry>/${repo}:preview"
+  docker push "<your-registry>/${repo}:preview"
 done
 ```
 
-> Image tags can be used as v1.0 for the current release. `crane copy` (see [Air-Gapped Deployment](#5-air-gapped-deployment)) is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
+After mirroring, replace the five fully qualified `images.ray.*` and
+`images.saia.*` values in the cluster config with the corresponding
+`<your-registry>/splunk/...:preview` paths. Mirror the Slim and operator images
+separately when those components are enabled, using the tags configured for
+your release. `crane copy` (see [Air-Gapped Deployment](#5-air-gapped-deployment))
+is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
+
+> `preview` is a mutable tag and the workloads use `imagePullPolicy:
+> IfNotPresent`. Use a new immutable tag or digest for controlled upgrades;
+> rerunning the installer with the same tag may keep the cached image.
 
 ---
 

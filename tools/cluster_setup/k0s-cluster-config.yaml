@@ -123,16 +123,19 @@ images:
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   ray:
-    headImage: "splunk/ray-head-build-preview:latest"
-    workerImage: "splunk/ray-worker-gpu-build-preview:latest"
+    # These Docker Hub defaults are fully qualified and therefore are not
+    # rewritten by images.registry. Replace them with your mirrored image paths
+    # for private-registry or air-gapped installations.
+    headImage: "docker.io/splunk/ai-tier-ray-head:preview"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:preview"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
   saia:
-    apiImage: "splunk/saia-api-build-preview:latest"
-    apiV2Image: "splunk/saia-api-v2-build-preview:latest"
-    dataLoaderImage: "splunk/saia-data-loader-build-preview:latest"
+    apiImage: "docker.io/splunk/ai-tier-saia-api:preview"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:preview"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:preview"
 
   # slim-api service image (consumed via RELATED_IMAGE_SLIM_API). Only needed
   # when the "slim" feature is enabled under aiPlatform.features[].

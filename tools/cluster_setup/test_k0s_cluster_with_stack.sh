@@ -126,6 +126,24 @@ assert_eq "returns bare path when registry is null" \
   "splunk/operator:1.0" \
   "$(build_image_url "null" "splunk/operator:1.0")"
 
+# ── Tests: shipped image defaults ─────────────────────────────────────────────
+
+suite "shipped image defaults"
+echo "▶ shipped image defaults"
+
+_expected_platform_images=$'docker.io/splunk/ai-tier-ray-head:preview\ndocker.io/splunk/ai-tier-ray-worker:preview\ndocker.io/splunk/ai-tier-saia-api:preview\ndocker.io/splunk/ai-tier-saia-api-v2:preview\ndocker.io/splunk/ai-tier-saia-data-loader:preview'
+for _config_name in k0s-cluster-config.yaml cluster-config.yaml; do
+  _actual_platform_images=$("${YQ_BIN}" eval '
+    .images.ray.headImage,
+    .images.ray.workerImage,
+    .images.saia.apiImage,
+    .images.saia.apiV2Image,
+    .images.saia.dataLoaderImage
+  ' "${SCRIPT_DIR}/${_config_name}")
+  assert_eq "${_config_name} uses the published preview image defaults" \
+    "${_expected_platform_images}" "${_actual_platform_images}"
+done
+
 # ── Tests: validate_scale_factor_config ──────────────────────────────────────
 
 suite "validate_scale_factor_config"
