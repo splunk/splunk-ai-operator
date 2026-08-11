@@ -202,7 +202,7 @@ splunk:
   # The HEC token itself is supplied ONLY via the SPLUNK_HEC_TOKEN environment
   # variable, never this file:
   #   export SPLUNK_HEC_TOKEN='<your-hec-token>'
-  #   ./k0s_cluster_with_stack.sh --config k0s-cluster-config.yaml
+  #   CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 
   # Additional JWT issuers SAIA/Slim should trust besides the primary endpoint
   # above — e.g. to keep an internal and an external Splunk both trusted at
