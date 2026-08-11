@@ -423,7 +423,15 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 
 #### Images Section
 
-Short image paths (without a FQDN) are automatically prefixed with `images.registry`.
+Short image paths (without a FQDN) are automatically prefixed with
+`images.registry`. Fully qualified defaults such as `docker.io/...` are left
+unchanged. For a private registry or air-gapped installation, mirror the images
+and replace the corresponding fields with the mirrored paths; setting only
+`images.registry` does not rewrite a fully qualified Docker Hub reference.
+
+> The `preview` defaults are mutable and workloads use `imagePullPolicy:
+> IfNotPresent`. Re-running the installer with the same tag may reuse a cached
+> image; use a new immutable tag or digest when performing a controlled upgrade.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -432,12 +440,12 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.operator.image` | **Yes** | — | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | — | Ray head node image |
-| `images.ray.workerImage` | **Yes** | — | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:preview` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:preview` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
-| `images.saia.apiImage` | **Yes** | — | SAIA API v1 image |
-| `images.saia.apiV2Image` | **Yes** | — | SAIA API v2 image |
-| `images.saia.dataLoaderImage` | **Yes** | — | SAIA data loader / post-install hook image |
+| `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
+| `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
+| `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:preview` | SAIA data loader / post-install hook image |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
