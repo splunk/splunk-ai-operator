@@ -12,11 +12,11 @@
 # Prerequisites (must be satisfied BEFORE running the installer):
 #
 # Local machine:
-#   ssh, kubectl, helm, git, jq, yq — install via brew or your package manager
-#   Example (macOS):  brew install kubectl helm git jq yq
-#   Example (Linux):  apt-get install -y kubectl helm git jq && \
-#                     wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && \
-#                     chmod +x /usr/local/bin/yq
+#   ssh, kubectl, helm, git, jq, yq, docker — see the Prerequisites section of
+#   docs/deployment/k0s-quick-reference.md for install instructions per OS.
+#   macOS: brew install kubectl helm git jq yq
+#   RHEL 9: none of kubectl/helm/docker/yq are in the default dnf repos —
+#     install each via its own official method (git/jq ARE available via dnf).
 #
 # All remote nodes (controllers + workers):
 #   - SSH access using the key at cluster.sshKeyPath as cluster.sshUser
@@ -51,14 +51,14 @@ cluster:
 
 # ---------- Node Configuration ----------
 nodes:
-  controllers: 1
-  cpuWorkers: 1                           # Not used with existingIPs
-  gpuWorkers: 2                           # Not used with existingIPs
+  controllers: 1                          # one node for controller
+  cpuWorkers: 1                           # Number of CPU workers listed FIRST in existingIPs.workers below
+  gpuWorkers: 2                           # Number of GPU workers listed AFTER the CPU workers below
 
   existingIPs:
     controllers:
       - 10.0.0.1                          # CHANGE THIS: Your controller server IP
-    workers:
+    workers:                              # List CPU workers first, then GPU workers (order must match cpuWorkers/gpuWorkers above)
       - 10.0.0.2                          # CHANGE THIS: CPU worker 1
       - 10.0.0.3                          # CHANGE THIS: GPU worker 1
       - 10.0.0.4                          # CHANGE THIS: GPU worker 2
@@ -116,7 +116,7 @@ images:
   registryInsecure: false
 
   operator:
-    image: "docker.io/splunk/splunk-ai-operator:0.2.0"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v2.2"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
@@ -178,62 +178,37 @@ files:
 
 # ---------- Splunk Configuration ----------
 splunk:
-  # Splunk telemetry is OPT-IN and defaults to DISABLED.
-  # When false (or absent): the Splunk Operator and Splunk Standalone are NOT
-  # installed, and the AIPlatform CR is created WITHOUT a splunkConfiguration
-  # block — the operator treats that as "no telemetry" and runs cleanly.
-  # Set to true to enable telemetry (internal or external mode below).
-  enabled: false
+  # Opt-in Splunk integration (JWT/auth issuer for SAIA/Slim, plus optional
+  # HEC telemetry export); defaults to disabled, enabled here. When false (or
+  # absent), no Splunk Operator/Standalone is installed and the AIPlatform CR
+  # omits splunkConfiguration.
+  enabled: true
 
   # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
   standaloneName: splunk-standalone
 
-  # ----- Telemetry mode is derived from whether external.endpoint is set -----
-  #
-  #   INTERNAL (enabled: true, external.endpoint unset):
-  #     The installer deploys the Splunk Operator + a Splunk Standalone inside
-  #     the cluster and wires the AIPlatform CR at it. Requires
-  #     images.splunk.image and images.splunk.operatorImage.
-  #
-  #     Compatibility transport for Splunk AI Assistant app 2.0.4:
-  #       * Native splunkd stays HTTPS on 127.0.0.1:8089 because the immutable
-  #         app's Splunk SDK requires that local contract.
-  #       * Splunk issuer_uri, SAIA, and Slim use the same short HTTPS URL:
-  #           https://splunk-<standaloneName>-standalone-service:8089
-  #       * No JWKS proxy, certificate, CA bundle, or CA mount is installed by
-  #         this compatibility path.
-  #       * OTel exporter configuration remains separate on
-  #         splunkConfiguration.hecEndpoint (port 8088) and never uses the
-  #         management/JWT issuer endpoint. This field is consumed only when
-  #         an OTel collector is actually injected and running.
-  #
-  #     This restores main's native splunkd HTTPS and short issuer contract,
-  #     while aligning the AIPlatform endpoint for SAIA and Slim. It does not
-  #     solve trust/hostname validation for Splunk's built-in certificate.
-  #     Strict-verification environments require the separate hostname-valid
-  #     certificate/CA design.
-  #     After an issuer change, users must sign in again or repeat onboarding.
-  #     External Splunk URLs and their customer-managed TLS are unaffected.
-  #
-  #   EXTERNAL (enabled: true, external.endpoint set):
-  #     Use a Splunk running OUTSIDE the cluster. The installer does NOT deploy
-  #     any in-cluster Splunk. It creates a Kubernetes Secret holding the HEC
-  #     token and points the AIPlatform CR at your external HEC endpoint.
-  #
-  #     The HEC token is supplied ONLY via the SPLUNK_HEC_TOKEN environment
-  #     variable (never this file), so no live credential is committed or
-  #     logged. Example:
-  #
-  #         export SPLUNK_HEC_TOKEN='<your-hec-token>'
-  #         ./k0s_cluster_with_stack.sh --config k0s-cluster-config.yaml
-  #
-  #     The script creates the Secret AFTER the cluster/namespace exist, so
-  #     there is no bootstrap ordering problem. Preflight fails fast if
-  #     SPLUNK_HEC_TOKEN is missing in external mode.
+  # Mode is derived from external.endpoint below, not a separate flag:
+  #   unset -> INTERNAL: deploys Splunk Operator + Standalone in-cluster
+  #            (requires images.splunk.image / images.splunk.operatorImage).
+  #   set   -> EXTERNAL: skips in-cluster Splunk, points the AIPlatform CR at
+  #            your external HEC endpoint instead.
+  # See K0S_README.md's "Internal Splunk management transport" section for
+  # the native-HTTPS compatibility details behind the INTERNAL path.
   #
   # external:
   #   endpoint: https://splunk.example.com:8088   # base HEC URL (operator appends /services/collector)
   #   secretName: splunk-hec-external             # optional; k8s Secret name the script creates (key: hec_token)
+  #
+  # The HEC token itself is supplied ONLY via the SPLUNK_HEC_TOKEN environment
+  # variable, never this file:
+  #   export SPLUNK_HEC_TOKEN='<your-hec-token>'
+  #   CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+
+  # Additional JWT issuers SAIA/Slim should trust besides the primary endpoint
+  # above — e.g. to keep an internal and an external Splunk both trusted at
+  # once. Optional.
+  # trustedIssuers:
+  #   - https://splunk.example.com:8089
 
 # ---------- AI Platform Configuration ----------
 aiPlatform:
@@ -354,6 +329,17 @@ imagePullSecrets:
   secrets:
     - ecr-registry-secret
   autoCreateECR: true
+
+  # Authenticated non-ECR registry (e.g. Docker Hub, Harbor). Only used when
+  # enabled: true and server/username/password are all set — otherwise no
+  # pull secret is created for images.registry beyond autoCreateECR above.
+  # custom:
+  #   enabled: true
+  #   name: custom-registry-secret
+  #   server: https://index.docker.io/v1/
+  #   username: <registry-username>
+  #   password: <registry-password-or-token>
+  #   email: <registry-account-email>
 
 ecr:
   account: ""                                        # CHANGE THIS: Your AWS account ID (e.g. 123456789012)
