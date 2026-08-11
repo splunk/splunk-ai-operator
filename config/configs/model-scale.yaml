@@ -4,7 +4,7 @@ applicationScale:
   CrossEncoder: 1
   E5LanguageClassifier: 1
   Entrypoint: 1
-  FmTimeseries: 0
+  FmTimeseries: 1
   Gemma431bIt: 1
   GptOss20b: 1
   MbartTranslator: 1

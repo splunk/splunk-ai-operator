@@ -51,7 +51,7 @@ cluster:
 
 # ---------- Node Configuration ----------
 nodes:
-  controllers: 1                          # Only 1 is supported — installer joins existingIPs.controllers[0] only
+  controllers: 1                          # one node for controller
   cpuWorkers: 1                           # Number of CPU workers listed FIRST in existingIPs.workers below
   gpuWorkers: 2                           # Number of GPU workers listed AFTER the CPU workers below
 
