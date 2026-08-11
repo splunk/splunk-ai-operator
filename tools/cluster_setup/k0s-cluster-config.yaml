@@ -178,7 +178,8 @@ files:
 
 # ---------- Splunk Configuration ----------
 splunk:
-  # Opt-in telemetry; defaults to disabled, enabled here. When false (or
+  # Opt-in Splunk integration (JWT/auth issuer for SAIA/Slim, plus optional
+  # HEC telemetry export); defaults to disabled, enabled here. When false (or
   # absent), no Splunk Operator/Standalone is installed and the AIPlatform CR
   # omits splunkConfiguration.
   enabled: true

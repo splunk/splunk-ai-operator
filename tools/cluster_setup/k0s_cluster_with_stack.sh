@@ -421,9 +421,9 @@ show_install_plan() {
   echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
   if [[ "${SPLUNK_MODE}" == "external" ]]; then
-    echo -e "  \033[1mSplunk telemetry :\033[0m external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
+    echo -e "  \033[1mSplunk           :\033[0m external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
   else
-    echo -e "  \033[1mSplunk telemetry :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
+    echo -e "  \033[1mSplunk           :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
   fi
   echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
@@ -641,17 +641,19 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
-  # Splunk telemetry is OPT-IN and defaults to DISABLED. It only turns on when
+  # Splunk integration (JWT/auth issuer for SAIA/Slim, plus optional HEC
+  # telemetry export) is OPT-IN and defaults to DISABLED. It only turns on when
   # splunk.enabled: true is explicitly set AND the required Splunk images are
   # present (enforced in validate_image_config). When disabled the script skips
   # the Splunk Operator, the Standalone CR, and omits splunkConfiguration from
-  # the AIPlatform CR — the operator treats an empty config as "no telemetry".
+  # the AIPlatform CR — the operator treats an empty config as "no Splunk".
   # yq returns "null" for an absent key, which we treat as false. yq also mishandles
   # boolean false, so we normalise explicitly.
   SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
   [[ "${SPLUNK_ENABLED}" != "true" ]] && SPLUNK_ENABLED="false"
 
-  # External Splunk: point telemetry at a Splunk running OUTSIDE the cluster.
+  # External Splunk: use a Splunk running OUTSIDE the cluster as the JWT/auth
+  # issuer for SAIA/Slim (and, optionally, the HEC telemetry destination).
   # When splunk.external.endpoint is set (and splunk.enabled is true), the
   # script does NOT install the in-cluster Splunk Operator/Standalone — it only
   # wires the AIPlatform CR at the external HEC endpoint + a Secret holding the
@@ -666,9 +668,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
 
   # Derive a single mode so downstream logic is unambiguous:
-  #   disabled  — splunk.enabled=false: no Splunk, no telemetry
+  #   disabled  — splunk.enabled=false: no Splunk integration at all
   #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
-  #               in-cluster Splunk, use customer's external HEC
+  #               in-cluster Splunk, use customer's external Splunk
   #   internal  — splunk.enabled=true, no external endpoint: install SOK +
   #               Standalone in-cluster (legacy behavior)
   if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
@@ -732,7 +734,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
-  log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
+  log "Splunk integration: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -934,8 +936,8 @@ configure_images() {
   TMP_FILES+=("$ai_rendered")
   SPLUNK_AI_FILE="$ai_rendered"
 
-  # Only render the Splunk Operator manifest when telemetry is internal mode
-  # only. External/disabled modes never apply the manifest, so touching it
+  # Only render the Splunk Operator manifest in internal mode. External/
+  # disabled modes never apply the manifest, so touching it
   # (which also requires the file to exist) is pointless and would break
   # Splunk-free installs that don't ship splunk-operator-cluster.yaml.
   if [[ "${SPLUNK_MODE}" == "internal" ]]; then
@@ -1119,7 +1121,7 @@ preflight_checks() {
       [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
       ;;
     external)
-      pf_ok "Splunk telemetry: external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME}, in-cluster Splunk skipped)"
+      pf_ok "Splunk: external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME}, in-cluster Splunk skipped)"
       # The HEC token must be supplied via env; fail fast here rather than
       # discovering it at CR-apply time after the cluster is already up.
       [[ -n "${SPLUNK_HEC_TOKEN}" ]] && pf_ok "SPLUNK_HEC_TOKEN is set (external HEC token)" || pf_fail "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
@@ -1127,7 +1129,7 @@ preflight_checks() {
       [[ "${SPLUNK_EXTERNAL_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External HEC endpoint scheme OK" || pf_warn "splunk.external.endpoint should start with http:// or https:// (got: ${SPLUNK_EXTERNAL_ENDPOINT})"
       ;;
     *)
-      pf_ok "Splunk telemetry disabled (splunk.enabled=false) — Splunk Operator/Standalone will be skipped"
+      pf_ok "Splunk disabled (splunk.enabled=false) — Splunk Operator/Standalone will be skipped"
       ;;
   esac
   [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "AI platform file: ${SPLUNK_AI_FILE}" || pf_warn "AI platform file not found: ${SPLUNK_AI_FILE}"
@@ -5485,11 +5487,11 @@ install_ai_platform_cr() {
     done
   fi
 
-  # Splunk telemetry block for the AIPlatform CR. Rendered by mode:
-  #   disabled — omits telemetry fields; trustedIssuers still written if set.
-  #   internal — point at the in-cluster Standalone HEC + operator-managed secret.
+  # Splunk configuration block for the AIPlatform CR. Rendered by mode:
+  #   disabled — omits splunkConfiguration; trustedIssuers still written if set.
+  #   internal — point at the in-cluster Standalone as JWT issuer + HEC + operator-managed secret.
   #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
-  #              var and point at the customer's external HEC endpoint.
+  #              var and point at the customer's external Splunk as JWT issuer/HEC endpoint.
   local splunk_config_yaml=""
   case "${SPLUNK_MODE}" in
     internal)
@@ -5551,7 +5553,7 @@ EOF
       ;;
     *)
       if [[ -n "${trusted_issuers_yaml}" ]]; then
-        log "Splunk telemetry disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
+        log "Splunk disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
         splunk_config_yaml=$(cat <<EOF
 
   # Splunk configuration (disabled — trustedIssuers only for JWT validation)
@@ -5560,7 +5562,7 @@ ${trusted_issuers_yaml}
 EOF
 )
       else
-        log "Splunk telemetry disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+        log "Splunk disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
       fi
       ;;
   esac
