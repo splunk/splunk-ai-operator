@@ -6407,7 +6407,7 @@ check_platform_health() {
 #     after Job-level retries succeed.
 #
 # Tunables (env vars):
-#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 600).
+#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 1200).
 #   POD_HEALTH_PENDING_GRACE  How long Pending pods are tolerated (default 300).
 #   POD_HEALTH_POLL_INTERVAL  Re-check interval while waiting (default 15).
 #
@@ -6420,13 +6420,13 @@ verify_all_pods_healthy() {
   log "============================================"
   log ""
 
-  # The default budget (10 minutes) is sized for the typical case: KubeRay
+  # The default budget (20 minutes) is sized for the typical case: KubeRay
   # creates worker pods only AFTER the head pod becomes Running+Ready, and
   # each worker then has to pull a multi-GB image and register with the
   # head. Splunk Standalone has a similar 2–5 min init.
-  # On slow networks or fresh clusters where Ray Serve has lots to download,
-  # bump this with POD_HEALTH_STABLE_WAIT (e.g. 1200 for 20 minutes).
-  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-600}"
+  # Override this with POD_HEALTH_STABLE_WAIT when a different settle budget
+  # is appropriate for the deployment environment.
+  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-1200}"
   local pending_grace_secs="${POD_HEALTH_PENDING_GRACE:-300}"
   local poll_interval="${POD_HEALTH_POLL_INTERVAL:-15}"
   # Clamp grace ≤ wait. Without this, configuring a short STABLE_WAIT (e.g.
@@ -8048,9 +8048,9 @@ Environment:
                              for install; also skips delete/clean-all confirmations).
   POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
                              RayService, Splunk Standalone, AIPlatform/AIService) to
-                             reach Ready during verify (default: 600 = 10 minutes).
-                             Bump to 1200 (20 min) on slow networks or fresh clusters
-                             where Ray Serve has lots of model artifacts to download.
+                             reach Ready during verify (default: 1200 = 20 minutes).
+                             Override it when the deployment environment needs a
+                             different settle budget.
   POD_HEALTH_PENDING_GRACE - Seconds to ignore Pending pods younger than this
                              (default: 300)
   POD_HEALTH_POLL_INTERVAL - Seconds between checks while waiting (default: 15)
