@@ -21,6 +21,7 @@ All commands run from `tools/cluster_setup/` unless noted otherwise.
    - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
    - [Install (Air-Gapped Path)](#install-air-gapped-path)
 6. [Verify](#6-verify)
+   - [Access Private Splunk and SAIA Through a SOCKS Proxy](#access-private-splunk-and-saia-through-a-socks-proxy)
 7. [Common Operations](#7-common-operations)
 8. [Troubleshooting](#8-troubleshooting)
 
@@ -357,6 +358,93 @@ exposure: [DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_s
 
 Once the cluster is healthy, install and onboard the **Splunk AI Assistant**
 app: [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+
+### Access Private Splunk and SAIA Through a SOCKS Proxy
+
+Use this workflow when the local browser cannot directly reach the private
+cluster network, but the local machine can SSH to the remote admin workstation
+or installer machine. Keep both tunnel commands running while using the app.
+
+1. On the remote admin workstation, start a Splunk Web port-forward. The
+   cluster name, namespace, and standalone name are read from the deployment
+   configuration.
+
+   **Environment/read-only** — connects to the cluster and opens a local
+   listener; it does not change cluster resources.
+
+   ```bash
+   CONFIG_FILE="<absolute-path-to-cluster-config.yaml>"
+   CLUSTER_NAME="$(yq eval '.cluster.name' "${CONFIG_FILE}")"
+   NAMESPACE="$(yq eval '.kubernetes.namespace // "ai-platform"' "${CONFIG_FILE}")"
+   STANDALONE_NAME="$(yq eval '.splunk.standaloneName // "splunk-standalone"' "${CONFIG_FILE}")"
+
+   kubectl \
+     --kubeconfig "${HOME}/.kube/k0s-${CLUSTER_NAME}" \
+     -n "${NAMESPACE}" port-forward \
+     "svc/splunk-${STANDALONE_NAME}-standalone-service" \
+     18002:8000 \
+     --address=127.0.0.1
+   ```
+
+2. In another terminal on the local machine, create one SSH connection for
+   both Splunk Web forwarding and the SOCKS proxy. Set `ADMIN_SSH_USER` to the
+   user configured for the remote machine—for example, `ubuntu` on Ubuntu or
+   commonly `ec2-user` on RHEL 9.
+
+   **Local/read-only** — opens SSH forwarding listeners and does not modify the
+   remote machine.
+
+   ```bash
+   ADMIN_HOST="<admin-host-public-ip-or-dns>"
+   ADMIN_SSH_USER="<admin-ssh-user>"
+   SSH_KEY="<absolute-path-to-private-key.pem>"
+
+   ssh -N \
+     -o ExitOnForwardFailure=yes \
+     -o ServerAliveInterval=30 \
+     -L 18002:127.0.0.1:18002 \
+     -D 127.0.0.1:1080 \
+     -i "${SSH_KEY}" \
+     "${ADMIN_SSH_USER}@${ADMIN_HOST}"
+   ```
+
+3. From another local terminal, verify that the private SAIA NodePort is
+   reachable through the proxy. Use a worker-node private IP and the NodePort
+   configured under `aiPlatform.serviceTemplate.nodePort`.
+
+   **Environment/read-only** — sends an HTTP preflight request through the
+   proxy and does not modify the deployment.
+
+   ```bash
+   WORKER_PRIVATE_IP="<worker-node-private-ip>"
+   SAIA_NODEPORT="<saia-nodeport>"
+
+   curl --socks5-hostname 127.0.0.1:1080 \
+     -i -X OPTIONS \
+     "http://${WORKER_PRIVATE_IP}:${SAIA_NODEPORT}/tenant-id-sok/saia-api-v2/v2alpha1/metadata" \
+     -H 'Access-Control-Request-Headers: authorization,splunk-client,x-requested-with,x-stack-url' \
+     -H 'Access-Control-Request-Method: GET' \
+     -H 'Origin: http://localhost:18002'
+   ```
+
+   The expected response is `HTTP/1.1 204 No Content`.
+
+4. Start an isolated browser profile on the local machine with a SOCKS5 proxy
+   at `127.0.0.1:1080`. Pass these arguments to Chrome using the launch method
+   for the local operating system:
+
+   ```text
+   --user-data-dir=<temporary-profile-directory>
+   --proxy-server=socks5://127.0.0.1:1080
+   --proxy-bypass-list=localhost;127.0.0.1
+   ```
+
+   Open `http://localhost:18002` in that browser. Install the Splunk AI
+   Assistant app, select **AI Tier** during setup, and enter
+   `http://<worker-node-private-ip>:<saia-nodeport>` as the AI Tier endpoint.
+   The localhost bypass keeps Splunk Web on the port-forward while private SAIA
+   requests use the SOCKS proxy. Press **Ctrl+C** in the first two terminals to
+   stop both tunnels after testing.
 
 > **Using an external Splunk Enterprise/Cloud instance instead of the
 > in-cluster one?** See
