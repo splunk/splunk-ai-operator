@@ -39,6 +39,16 @@ type SaiaReconciler struct {
 	Recorder record.EventRecorder
 }
 
+const (
+	saiaQueueEnvName = "S3_QUEUE_ENABLED"
+
+	// Bump this value whenever the queue-related environment contract changes.
+	// The annotation forces existing SAIA pods to restart after legacy values
+	// are removed from the shared ConfigMap-backed EnvFrom source.
+	saiaQueueEnvContractAnnotation = "splunk-ai-operator/saia-queue-env-contract"
+	saiaQueueEnvContractVersion    = "v1-s3-only"
+)
+
 // Reconcile runs reconciliation stages for the CR.
 func (r *SaiaReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
 	log := log.FromContext(ctx)
@@ -407,6 +417,14 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 		found.Data = map[string]string{}
 	}
 	needsUpdate := false
+	// S3_QUEUE_ENABLED is a v1 workload-specific switch, not shared SAIA
+	// configuration. Older/manual ConfigMaps may contain it; leaving it here
+	// causes the v2 API and worker to inherit the v1 flag through EnvFrom.
+	// The v1 Deployment owns its desired value explicitly below.
+	if _, exists := found.Data[saiaQueueEnvName]; exists {
+		delete(found.Data, saiaQueueEnvName)
+		needsUpdate = true
+	}
 	for k, v := range defaults {
 		if k == "SPLUNK_ISSUERS" {
 			if found.Data[k] != v {
@@ -756,6 +774,23 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 	return appendSAIABoto3Env(ai, env)
 }
 
+// usesS3PersonalizationQueue reports whether SAIA's S3/boto3-backed durable
+// ingestion queue can use the configured task-volume scheme. Native GCS and
+// Azure paths require provider-specific queue adapters and therefore retain
+// the image's existing behavior.
+func usesS3PersonalizationQueue(path string) bool {
+	scheme, _, ok := strings.Cut(strings.TrimSpace(path), "://")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(scheme) {
+	case "s3", "s3compat", "minio", "seaweedfs":
+		return true
+	default:
+		return false
+	}
+}
+
 // appendSAIABoto3Env adds boto3-canonical AWS_* env vars for all SAIA pods (v1 and v2).
 // SAIA v1 calls boto3 directly and does not read S3COMPAT_OBJECT_STORE_*; without
 // AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY k0s deployments with static keys fail with
@@ -993,6 +1028,15 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	}
 
 	env := buildSAIABaseEnv(ai)
+	// Personalization uploads arrive through the v1 API, while the v2
+	// ingestion worker consumes them. Use the shared object-storage queue so
+	// accepted uploads survive API pod restarts and are visible to the worker.
+	// Keep this as an explicit env var: explicit values take precedence over
+	// EnvFrom and prevent an old ConfigMap value from restoring the lossy
+	// process-local queue during an upgrade.
+	if usesS3PersonalizationQueue(ai.Spec.TaskVolume.Path) {
+		env = append(env, corev1.EnvVar{Name: saiaQueueEnvName, Value: "true"})
+	}
 
 	// mTLS handling (dynamic)
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
@@ -1056,6 +1100,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
+	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
@@ -1151,6 +1196,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	component := ai.Name + "-v2-api"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1278,6 +1324,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 
 	component := ai.Name + "-v2-worker"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1368,15 +1415,14 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	return nil
 }
 
-// reconcileNginxConfigMap creates the ConfigMap with nginx.conf for path-based routing.
-func (r *SaiaReconciler) reconcileNginxConfigMap(
-	ctx context.Context,
-	ai *aiv1.AIService,
-) error {
+// renderNginxConfig returns the complete nginx configuration. The same
+// rendered value is stored in the ConfigMap and hashed into the nginx pod
+// template so subPath-mounted configuration changes trigger a rollout.
+func renderNginxConfig(ai *aiv1.AIService) string {
 	v1ServiceName := ai.Name + "-saia-v1-service"
 	v2ServiceName := ai.Name + "-saia-v2-service"
 
-	nginxConf := fmt.Sprintf(`worker_processes auto;
+	return fmt.Sprintf(`worker_processes auto;
 error_log /dev/stderr warn;
 pid /tmp/nginx.pid;
 
@@ -1472,6 +1518,11 @@ http {
 
         # v1: everything else (including /health, /{tenant}/saia-api/v1alpha1/...)
         location / {
+            # Splunk personalization metadata, especially dashboard exports, can
+            # exceed nginx's 1 MiB default. Keep a bounded v1 limit so legitimate
+            # uploads reach SAIA without widening the v2 request-body allowance.
+            client_max_body_size 100m;
+
             # Mirror the CORS preflight short-circuit for v1 routes; spl-copilot's
             # Pattern B (direct browser fetch) may hit v1 admin endpoints too. Same
             # rationale as v2: SAIA v1 middlewares authenticate on OPTIONS and would
@@ -1500,6 +1551,14 @@ http {
     }
 }
 `, v1ServiceName, v2ServiceName)
+}
+
+// reconcileNginxConfigMap creates the ConfigMap with nginx.conf for path-based routing.
+func (r *SaiaReconciler) reconcileNginxConfigMap(
+	ctx context.Context,
+	ai *aiv1.AIService,
+) error {
+	nginxConf := renderNginxConfig(ai)
 
 	cmName := ai.Name + "-saia-nginx-config"
 	cm := &corev1.ConfigMap{
@@ -1529,6 +1588,8 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 ) error {
 	component := ai.Name + "-nginx"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	nginxConfigChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(renderNginxConfig(ai))))
+	annotations["splunk-ai-operator/nginx-config-hash"] = nginxConfigChecksum
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
