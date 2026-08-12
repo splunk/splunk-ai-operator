@@ -268,13 +268,25 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 	var allErrs field.ErrorList
 
 	hasEndpoint := splunkConfig.Endpoint != ""
+	hasHECEndpoint := splunkConfig.HECEndpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
 	hasSecretRef := splunkConfig.SecretRef.Name != ""
+
+	// hecEndpoint configures telemetry ingestion only; it cannot provide the
+	// management/JWKS issuer required by SAIA and Slim. Reject this partial
+	// configuration instead of treating it as Splunk being disabled.
+	if hasHECEndpoint && !hasEndpoint && !hasCRRef {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("hecEndpoint"),
+			splunkConfig.HECEndpoint,
+			"hecEndpoint requires endpoint or splunkCustomResourceRef.name",
+		))
+	}
 
 	// Completely empty config means Splunk disabled — no telemetry.
 	// A partial config (e.g. only vaultFilePath set) is a misconfiguration
 	// and must fail validation below rather than silently disabling telemetry.
-	if !hasEndpoint && !hasCRRef && !hasSecretRef && splunkConfig.VaultFilePath == "" {
+	if !hasEndpoint && !hasHECEndpoint && !hasCRRef && !hasSecretRef && splunkConfig.VaultFilePath == "" {
 		return allErrs
 	}
 

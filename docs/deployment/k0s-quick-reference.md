@@ -76,12 +76,38 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 - [ ] Splunk account team has provided image entitlements / registry access
 - [ ] Decide your path now: [Standard Deployment](#4-standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#5-air-gapped-deployment) (sealed nodes, no outbound internet)
 
-**Mirror platform images to your internal registry** — push every platform
-image to the registry configured under `images.registry` in your cluster
-config (required for both paths — air-gap additionally needs every node to
-resolve that registry with no outbound internet). See
-[DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images)
-for the image list and mirroring commands.
+**Mirror platform images to your internal registry.** Pull each image from
+Docker Hub, push it to your mirror, and then set the corresponding image fields
+in the cluster config to those mirrored paths (required for both paths —
+air-gap additionally needs every node to resolve that registry with no outbound
+internet):
+
+The default Ray and SAIA images currently use the `preview` tag:
+
+```bash
+for repo in \
+  splunk/ai-tier-saia-data-loader \
+  splunk/ai-tier-saia-api-v2 \
+  splunk/ai-tier-saia-api \
+  splunk/ai-tier-ray-head \
+  splunk/ai-tier-ray-worker; do
+  docker pull "docker.io/${repo}:preview"
+  docker tag "docker.io/${repo}:preview" "<your-registry>/${repo}:preview"
+  docker push "<your-registry>/${repo}:preview"
+done
+```
+
+After mirroring, replace the five fully qualified `images.ray.*` and
+`images.saia.*` values in the cluster config with the corresponding
+`<your-registry>/splunk/...:preview` paths. Mirror the Slim and operator images
+separately when those components are enabled, using the tags configured for
+your release. For the complete air-gap image list and the bulk `crane copy`
+alternative, see
+[DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
+
+> `preview` is a mutable tag and the workloads use `imagePullPolicy:
+> IfNotPresent`. Use a new immutable tag or digest for controlled upgrades;
+> rerunning the installer with the same tag may keep the cached image.
 
 ---
 

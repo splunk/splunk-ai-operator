@@ -70,7 +70,7 @@ render_splunk_block() {
 
   # Splunk configuration (internal — in-cluster Standalone)
   splunkConfiguration:
-    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
+    endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service:8089
     # Fresh Splunk Operator installs report enableSSL=0. The production
     # installer reads btool after readiness rather than assuming this scheme.
     hecEndpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
@@ -154,11 +154,11 @@ echo -e "\n${BOLD}Case 3: INTERNAL — splunk.enabled: true, no external.endpoin
 CFG=$(make_config "splunk:
   enabled: true")
 OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
-EXPECTED_INTERNAL_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+EXPECTED_INTERNAL_URL="https://splunk-my-standalone-standalone-service:8089"
 EXPECTED_INTERNAL_HEC_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8088"
-info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + secretRef"
+info "SPLUNK_MODE=internal → short native HTTPS issuer + secretRef"
 check_contains     "${OUT}" "splunkConfiguration"                              "splunkConfiguration block present"
-check_contains     "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}"               "Canonical HTTP management/JWKS endpoint"
+check_contains     "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}"               "Short native HTTPS issuer endpoint"
 check_contains     "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}"         "Distinct OTel-only HEC endpoint"
 check_contains     "${OUT}" "splunk-my-standalone-standalone-secret-v1"        "Operator-managed secret"
 check_contains     "${OUT}" "secretRef"                                        "secretRef present"
@@ -172,9 +172,9 @@ CFG=$(make_config "splunk:
   trustedIssuers:
     - https://external.splunk:8089")
 OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
-info "SPLUNK_MODE=internal → in-cluster management/JWKS endpoint + external issuer appended"
+info "SPLUNK_MODE=internal → native HTTPS issuer + external issuer appended"
 check_contains "${OUT}" "splunkConfiguration"                "splunkConfiguration block present"
-check_contains "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}" "Canonical HTTP management/JWKS endpoint"
+check_contains "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}" "Short native HTTPS issuer endpoint"
 check_contains "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}" "Distinct OTel-only HEC endpoint"
 check_contains "${OUT}" "trustedIssuers"                     "trustedIssuers key present"
 check_contains "${OUT}" "https://external.splunk:8089"       "External issuer present"

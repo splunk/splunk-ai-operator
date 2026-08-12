@@ -423,7 +423,15 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 
 #### Images Section
 
-Short image paths (without a FQDN) are automatically prefixed with `images.registry`.
+Short image paths (without a FQDN) are automatically prefixed with
+`images.registry`. Fully qualified defaults such as `docker.io/...` are left
+unchanged. For a private registry or air-gapped installation, mirror the images
+and replace the corresponding fields with the mirrored paths; setting only
+`images.registry` does not rewrite a fully qualified Docker Hub reference.
+
+> The `preview` defaults are mutable and workloads use `imagePullPolicy:
+> IfNotPresent`. Re-running the installer with the same tag may reuse a cached
+> image; use a new immutable tag or digest when performing a controlled upgrade.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -432,12 +440,12 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.operator.image` | **Yes** | — | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | — | Ray head node image |
-| `images.ray.workerImage` | **Yes** | — | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:preview` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:preview` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
-| `images.saia.apiImage` | **Yes** | — | SAIA API v1 image |
-| `images.saia.apiV2Image` | **Yes** | — | SAIA API v2 image |
-| `images.saia.dataLoaderImage` | **Yes** | — | SAIA data loader / post-install hook image |
+| `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
+| `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
+| `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:preview` | SAIA data loader / post-install hook image |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -1711,76 +1719,99 @@ The **Splunk AI Assistant** app (`Splunk_AI_Assistant_Cloud.tgz`) is a Splunk
 application that provides the AI chat UI. It must be installed on the Splunk
 Enterprise instance after the cluster is fully healthy.
 
-### Internal Splunk management transport (AIP-4614 compatibility mode)
+### Internal Splunk management transport (native-HTTPS compatibility mode)
 
-When `splunk.enabled: true` and `splunk.external.endpoint` is unset, this k0s
-installer runs the final in-cluster Splunk management and JWT-key endpoint on
-plain HTTP port 8089. Both the OAuth issuer and the endpoint passed to SAIA/Slim
-are the same canonical URL:
+When `splunk.enabled: true` and `splunk.external.endpoint` is unset, the
+installer preserves native splunkd HTTPS on port 8089. The immutable Splunk AI
+Assistant app 2.0.4 depends on `https://127.0.0.1:8089` for its local SDK,
+capability, KV Store, onboarding, and scheduled-job calls.
+
+The installer uses the same short internal URL for Splunk's OAuth issuer and
+the AIPlatform endpoint:
 
 ```text
-http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
+https://splunk-<standaloneName>-standalone-service:8089
 ```
 
-The OTel exporter receives a separate `splunkConfiguration.hecEndpoint` for
-Splunk HEC on port 8088. That listener is used only for telemetry and is not
-added to the SAIA/Slim JWT issuer allowlist. After Splunk is Ready, the
-installer reads the effective `[http]` stanza with `btool`, checks that HEC is
-enabled and healthy, and selects `http://` or `https://` to match `enableSSL`.
-It does not modify the HEC TLS setting. A fresh Splunk Operator 3.0.0 install
-normally reports HTTP; an upgraded or customized instance may report HTTPS.
+SAIA and Slim both derive `SPLUNK_ISSUERS` from that endpoint. No additional
+nginx/JWKS proxy is deployed, and this path creates no TLS Secret, Certificate,
+CA ConfigMap, or CA mount. HEC configuration remains separate on port 8088
+through `splunkConfiguration.hecEndpoint`; the installer detects its effective
+`enableSSL` value and does not change it. A configured HEC endpoint is consumed
+only when an OTel collector is actually injected and running; it is not proof
+that telemetry has been delivered.
 
-The installer verifies `enableSplunkdSSL=false` and an HTTP response before it
-creates the `AIPlatform` resource. On a fresh deployment, Splunk Operator 3.0.0
-first completes one internal HTTPS-only telemetry bootstrap; the installer then
-rolls the Splunk pod to its final HTTP mode. No SAIA image downgrade or CA
-installation is required. The pinned Splunk 10.2 image still performs its
-bounded initial HTTPS scheme probe before selecting HTTP. The installer extends
-only the Standalone startup-probe allowance so that fallback can complete
-without reducing splunk-ansible's global retry policy; a Splunk pod start can
-therefore take several additional minutes.
+Because OTel sidecar configuration is injected when a Ray pod is created,
+changing the HEC URL or scheme updates the Collector configuration but does not
+automatically replace Ray pods. This avoids an unrequested replacement
+RayCluster on fully allocated GPU installations. Existing Ray pods retain their
+injected configuration until they are recreated. Plan a controlled RayService
+rollout during a maintenance window with sufficient spare capacity when an
+existing installation must consume a changed HEC destination.
 
-Rerunning this installer on a PVC from an earlier TLS-preview install performs
-an idempotent compatibility migration before Splunk starts. The migration acts
-only on persisted TLS options in configuration files that still reference the
-installer-owned `/mnt/splunk-cert*` paths: it restores Splunk Web to HTTP and
-removes the stale custom HEC certificate path without deleting the PVC or
-indexed data. It deliberately leaves HEC's `enableSSL` setting unchanged, so
-HEC continues to use its independently configured HTTP or HTTPS protocol.
-Installation stops rather than guessing if the effective setting cannot be
-read, HEC is disabled, the effective port is not 8088, or the matching health
-URL is unavailable.
+> **Compatibility boundary:** this restores `main`'s native splunkd HTTPS and
+> short issuer contract while aligning the AIPlatform endpoint for SAIA and
+> Slim. It does not solve trust or hostname verification for Splunk's built-in
+> certificate. An SAIA or Slim image that strictly verifies outbound TLS may
+> reject that certificate because its CA is not trusted or its SAN does not
+> match the Service hostname. Verified end-to-end TLS requires the separate
+> hostname-valid certificate and CA-trust design.
 
-On upgrade, OTel reconciliation removes only the obsolete operator-managed
-`tls.ca_file: /etc/splunk-ca/ca.crt` reference when that mount is absent. It
-uses `insecure_skip_verify` for HTTPS without a configured CA and emits no
-generated TLS block for HTTP. Unrelated exporter, processor, and custom CA
-settings remain intact.
+Upgrades from the earlier HTTP-management preview explicitly restore
+`SPLUNKD_SSL_ENABLE=true`, remove stale installer-owned
+`/mnt/splunk-cert*` paths, keep Splunk Web on HTTP, and preserve the PVC and
+indexed data. Because the issuer changes back to the short HTTPS URL, users
+must sign in again or repeat onboarding to receive tokens with the new `iss`
+claim.
 
-The `certFile` and `sslPassword` entries in `authentication.conf` remain in
-place: that certificate signs interactive JWTs and is independent of transport
-TLS. This setting affects only the installer-managed internal Splunk instance;
-an external Splunk continues to use the URL and TLS policy supplied by the
-customer.
-
-> **Security boundary:** port 8089 is a ClusterIP service and is not exposed by
-> the installer, but its traffic is unencrypted inside the cluster network.
-> Keep the pod/service network private and use Kubernetes NetworkPolicy to
-> restrict untrusted workloads. This is not a cluster-wide TLS switch:
-> cert-manager webhooks, registries, external Splunk, and customer ingress TLS
-> retain their own settings.
-
-Run the reusable, read-only acceptance check after installation:
+Check the resulting configuration:
 
 ```bash
-./test_internal_splunk_http.sh \
+kubectl -n ai-platform exec splunk-splunk-standalone-0 -- \
+  /opt/splunk/bin/splunk btool server list sslConfig \
+  | grep enableSplunkdSSL
+
+kubectl -n ai-platform exec splunk-splunk-standalone-0 -- \
+  /opt/splunk/bin/splunk btool authentication list oauth2_settings \
+  | grep issuer_uri
+
+kubectl -n ai-platform get aiplatform <cluster-name>-ai-platform \
+  -o jsonpath='{.spec.splunkConfiguration.endpoint}{"\n"}{.spec.splunkConfiguration.hecEndpoint}{"\n"}'
+```
+
+Expect `enableSplunkdSSL = true`, the short HTTPS Service URL as
+`issuer_uri` and `endpoint`, and the independently detected port-8088 URL as
+`hecEndpoint`.
+
+Run the reusable read-only validation after installation or upgrade:
+
+```bash
+KUBECONFIG=/path/to/kubeconfig \
+  ./tools/cluster_setup/test_internal_splunk_http.sh \
   --namespace ai-platform \
   --standalone splunk-standalone \
   --aiplatform <cluster-name>-ai-platform
 ```
 
-Add `--expected-saia-tag build-v2.0.35` when a test must also prove that the
-current SAIA images were retained.
+This validates the effective transport, issuer propagation, HEC exporter
+configuration, running injected collectors, and SAIA/Slim readiness. It does
+not read the Splunk admin password or assert that telemetry reached an index.
+
+For an opt-in end-to-end authentication check, run:
+
+```bash
+KUBECONFIG=/path/to/kubeconfig \
+  ./tools/cluster_setup/test_internal_splunk_authenticated.sh \
+  --namespace ai-platform \
+  --standalone splunk-standalone \
+  --aiplatform <cluster-name>-ai-platform
+```
+
+This second test reads the operator-managed Splunk admin Secret, uses the
+bundled Splunk AI Assistant SDK over its default local HTTPS connection, mints
+a short-lived interactive JWT, and requires authenticated HTTP 200 responses
+from both SAIA and Slim. The decoded password and JWT remain inside one in-pod
+process and are never printed or written to files.
 
 ### Prerequisites
 

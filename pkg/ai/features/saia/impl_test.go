@@ -2,6 +2,7 @@ package saia
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strings"
@@ -478,7 +479,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
 	// via the cluster installer rather than via SplunkCustomResourceRef.
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
-	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service:8089"
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
 	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
@@ -490,7 +491,7 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089",
+		"https://splunk-splunk-standalone-standalone-service:8089",
 		cm.Data["SPLUNK_ISSUERS"],
 		"endpoint mode: endpoint must be used as the JWT issuer")
 }
@@ -522,6 +523,9 @@ func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])
 	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
 	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])
+	_, v2APIUsesV1QueueFlag := envMap["S3_QUEUE_ENABLED"]
+	assert.False(t, v2APIUsesV1QueueFlag,
+		"S3_QUEUE_ENABLED is a v1 producer flag and must not leak into the v2 API")
 
 	// SAIA V2 FieldDescription backend is REQUIRED (worker and API both call
 	// FieldDescriptionRepositoryFactory.get() which raises ValueError on empty
@@ -534,6 +538,116 @@ func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	// S3COMPAT_OBJECT_STORE_ENDPOINT_URL). Only set when the AIService has
 	// an explicit endpoint — e.g. for SeaweedFS/MinIO.
 	assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
+}
+
+func Test_reconcileSAIADeployment_DurablePersonalizationQueueByStorageScheme(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_SAIA_API", "saia-v1:latest")
+
+	testCases := []struct {
+		name          string
+		path          string
+		enableS3Queue bool
+	}{
+		{name: "AWS S3", path: "s3://bucket/tasks", enableS3Queue: true},
+		{name: "generic S3 compatible", path: "s3compat://bucket/tasks", enableS3Queue: true},
+		{name: "MinIO", path: "minio://bucket/tasks", enableS3Queue: true},
+		{name: "SeaweedFS", path: "seaweedfs://bucket/tasks", enableS3Queue: true},
+		{name: "GCS", path: "gs://bucket/tasks", enableS3Queue: false},
+		{name: "Azure", path: "azure://container/tasks", enableS3Queue: false},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := buildFullTestScheme(t)
+			ai := newTestAIService()
+			ai.Spec.TaskVolume.Path = testCase.path
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+			r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+			require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+
+			dep := &appsv1.Deployment{}
+			require.NoError(t, fakeClient.Get(context.Background(),
+				types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+			require.Len(t, dep.Spec.Template.Spec.Containers, 1)
+			envMap := envToMap(dep.Spec.Template.Spec.Containers[0].Env)
+			queueValue, queueEnabled := envMap[saiaQueueEnvName]
+			assert.Equal(t, testCase.enableS3Queue, queueEnabled,
+				"the S3-backed queue flag must follow the task-volume scheme")
+			if testCase.enableS3Queue {
+				assert.Equal(t, "true", queueValue)
+			}
+			_, runsWorkerInAPI := envMap["WORKER_MODE"]
+			assert.False(t, runsWorkerInAPI,
+				"the v1 API must remain API-only; the dedicated v2 worker consumes the shared queue")
+			assert.Equal(t, saiaQueueEnvContractVersion,
+				dep.Spec.Template.Annotations[saiaQueueEnvContractAnnotation])
+		})
+	}
+}
+
+func Test_reconcileSAIAQueueEnvironmentMigration(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_SAIA_API", "saia-v1:latest")
+
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	legacyConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
+		Data: map[string]string{
+			saiaQueueEnvName: "true",
+			"CUSTOM_KEY":     "preserved",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, legacyConfig).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+	require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+	require.NoError(t, r.reconcileSAIAv2Deployment(context.Background(), ai))
+	require.NoError(t, r.reconcileSAIAv2Worker(context.Background(), ai))
+
+	config := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, config))
+	assert.NotContains(t, config.Data, saiaQueueEnvName,
+		"legacy workload-specific queue flag must be removed from shared EnvFrom configuration")
+	assert.Equal(t, "preserved", config.Data["CUSTOM_KEY"],
+		"unrelated user-managed ConfigMap values must survive the migration")
+
+	testCases := []struct {
+		name       string
+		deployment string
+		wantQueue  bool
+	}{
+		{name: "v1 API", deployment: "test-saia-deployment", wantQueue: true},
+		{name: "v2 API", deployment: "test-saia-v2-deployment", wantQueue: false},
+		{name: "v2 worker", deployment: "test-saia-v2-worker", wantQueue: false},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			deployment := &appsv1.Deployment{}
+			require.NoError(t, fakeClient.Get(context.Background(),
+				types.NamespacedName{Name: testCase.deployment, Namespace: "default"}, deployment))
+			require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
+			container := deployment.Spec.Template.Spec.Containers[0]
+			require.Len(t, container.EnvFrom, 1)
+			require.NotNil(t, container.EnvFrom[0].ConfigMapRef)
+			assert.Equal(t, config.Name, container.EnvFrom[0].ConfigMapRef.Name)
+
+			effectiveEnv := effectiveEnvMap(config.Data, container.Env)
+			queueValue, hasQueue := effectiveEnv[saiaQueueEnvName]
+			assert.Equal(t, testCase.wantQueue, hasQueue)
+			if testCase.wantQueue {
+				assert.Equal(t, "true", queueValue)
+			}
+			assert.Equal(t, "preserved", effectiveEnv["CUSTOM_KEY"])
+			assert.Equal(t, saiaQueueEnvContractVersion,
+				deployment.Spec.Template.Annotations[saiaQueueEnvContractAnnotation],
+				"environment-contract annotation must force existing pods to reload the cleaned ConfigMap")
+		})
+	}
 }
 
 func Test_reconcileSAIAv2Worker(t *testing.T) {
@@ -557,6 +671,9 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	assert.Contains(t, container.Args[0], "app.workers.ingestion_worker")
 
 	envMap := envToMap(container.Env)
+	_, v2WorkerUsesV1QueueFlag := envMap["S3_QUEUE_ENABLED"]
+	assert.False(t, v2WorkerUsesV1QueueFlag,
+		"the v2 worker natively consumes the storage queue and must not inherit the v1 flag")
 	// RUN_TASKS_DELAY_S controls the v2 worker's poll sleep (saia-v2
 	// IngestionWorker.run). The value MUST stay well under the liveness probe
 	// threshold (1200s) because the heartbeat file is only refreshed at the top
@@ -622,6 +739,18 @@ func Test_reconcileNginxConfigMap(t *testing.T) {
 	// SSE/streaming friendliness
 	assert.Contains(t, conf, "proxy_buffering off")
 	assert.Contains(t, conf, "proxy_http_version 1.1")
+
+	// Personalization bundles can exceed nginx's 1 MiB default (dashboard
+	// metadata was observed at ~6.7 MiB). Keep the production limit bounded.
+	assert.Equal(t, 1, strings.Count(conf, "client_max_body_size 100m;"))
+	v2LocationStart := strings.Index(conf, "location ~ /saia-api-v2/")
+	v1LocationStart := strings.Index(conf, "location / {")
+	require.Greater(t, v2LocationStart, -1)
+	require.Greater(t, v1LocationStart, v2LocationStart)
+	assert.NotContains(t, conf[v2LocationStart:v1LocationStart], "client_max_body_size",
+		"the raised request-body limit must not widen v2 routes")
+	assert.Contains(t, conf[v1LocationStart:], "client_max_body_size 100m;",
+		"the raised request-body limit must apply to v1 personalization uploads")
 
 	// Health and status endpoints — stub_status must be loopback-only.
 	assert.Contains(t, conf, "location = /nginx_health")
@@ -694,6 +823,7 @@ func Test_reconcileNginxDeployment(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
 	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
 
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
 	err := r.reconcileNginxDeployment(context.Background(), ai)
 	require.NoError(t, err)
 
@@ -713,6 +843,14 @@ func Test_reconcileNginxDeployment(t *testing.T) {
 	// Health probes use nginx_health
 	assert.Equal(t, "/nginx_health", container.LivenessProbe.HTTPGet.Path)
 	assert.Equal(t, "/nginx_health", container.ReadinessProbe.HTTPGet.Path)
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+	expectedConfigHash := fmt.Sprintf("%x", sha256.Sum256([]byte(cm.Data["nginx.conf"])))
+	assert.Equal(t, expectedConfigHash,
+		dep.Spec.Template.Annotations["splunk-ai-operator/nginx-config-hash"],
+		"subPath-mounted nginx config changes must roll the Deployment")
 }
 
 func Test_reconcileNginxDeployment_imageOverride(t *testing.T) {
@@ -1123,6 +1261,19 @@ func envToMap(envs []corev1.EnvVar) map[string]string {
 		}
 	}
 	return m
+}
+
+// effectiveEnvMap applies Kubernetes' EnvFrom-before-Env precedence for the
+// direct-value variables used by these tests.
+func effectiveEnvMap(configMapData map[string]string, envs []corev1.EnvVar) map[string]string {
+	effective := make(map[string]string, len(configMapData)+len(envs))
+	for name, value := range configMapData {
+		effective[name] = value
+	}
+	for name, value := range envToMap(envs) {
+		effective[name] = value
+	}
+	return effective
 }
 
 // Suppress unused import warnings

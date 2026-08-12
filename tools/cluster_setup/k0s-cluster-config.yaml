@@ -12,11 +12,11 @@
 # Prerequisites (must be satisfied BEFORE running the installer):
 #
 # Local machine:
-#   ssh, kubectl, helm, git, jq, yq — install via brew or your package manager
-#   Example (macOS):  brew install kubectl helm git jq yq
-#   Example (Linux):  apt-get install -y kubectl helm git jq && \
-#                     wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && \
-#                     chmod +x /usr/local/bin/yq
+#   ssh, kubectl, helm, git, jq, yq, docker — see the Prerequisites section of
+#   docs/deployment/k0s-quick-reference.md for install instructions per OS.
+#   macOS: brew install kubectl helm git jq yq
+#   RHEL 9: none of kubectl/helm/docker/yq are in the default dnf repos —
+#     install each via its own official method (git/jq ARE available via dnf).
 #
 # All remote nodes (controllers + workers):
 #   - SSH access using the key at cluster.sshKeyPath as cluster.sshUser
@@ -51,14 +51,14 @@ cluster:
 
 # ---------- Node Configuration ----------
 nodes:
-  controllers: 1
-  cpuWorkers: 1                           # Not used with existingIPs
-  gpuWorkers: 2                           # Not used with existingIPs
+  controllers: 1                          # one node for controller
+  cpuWorkers: 1                           # Number of CPU workers listed FIRST in existingIPs.workers below
+  gpuWorkers: 2                           # Number of GPU workers listed AFTER the CPU workers below
 
   existingIPs:
     controllers:
       - 10.0.0.1                          # CHANGE THIS: Your controller server IP
-    workers:
+    workers:                              # List CPU workers first, then GPU workers (order must match cpuWorkers/gpuWorkers above)
       - 10.0.0.2                          # CHANGE THIS: CPU worker 1
       - 10.0.0.3                          # CHANGE THIS: GPU worker 1
       - 10.0.0.4                          # CHANGE THIS: GPU worker 2
@@ -80,9 +80,9 @@ storage:
   # The installer checks these thresholds at preflight and fails if not met.
   # Override to lower values only if you know your workload footprint is smaller.
   # minimumDiskSpace:
-  #   controller: 100    # k0s control plane, kine/etcd, container images
-  #   cpuWorker: 200     # weaviate, saia-api, data-loader, fluent-bit
-  #   gpuWorker: 500     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
+  #   controller: 50    # k0s control plane, kine/etcd, container images
+  #   cpuWorker: 150     # weaviate, saia-api, data-loader, fluent-bit
+  #   gpuWorker: 300     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
 
   # Model staging: download model artifacts from Hugging Face and upload them to
   # the object store during 'install' (before the cluster pulls them).
@@ -116,28 +116,26 @@ images:
   registryInsecure: false
 
   operator:
-    image: "docker.io/splunk/splunk-ai-operator:0.2.0"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v2.3"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   ray:
-    headImage: "splunk/ray-head-build-preview:latest"
-    workerImage: "splunk/ray-worker-gpu-build-preview:latest"
+    # These Docker Hub defaults are fully qualified and therefore are not
+    # rewritten by images.registry. Replace them with your mirrored image paths
+    # for private-registry or air-gapped installations.
+    headImage: "docker.io/splunk/ai-tier-ray-head:preview"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:preview"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
   saia:
-    apiImage: "splunk/saia-api-build-preview:latest"
-    apiV2Image: "splunk/saia-api-v2-build-preview:latest"
-    dataLoaderImage: "splunk/saia-data-loader-build-preview:latest"
-
-  # slim-api service image (consumed via RELATED_IMAGE_SLIM_API). Only needed
-  # when the "slim" feature is enabled under aiPlatform.features[].
-  slim:
-    apiImage: "splunk/slim/slim-api:latest"
+    apiImage: "docker.io/splunk/ai-tier-saia-api:preview"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:preview"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:preview"
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
@@ -175,49 +173,37 @@ files:
 
 # ---------- Splunk Configuration ----------
 splunk:
-  # Splunk telemetry is OPT-IN and defaults to DISABLED.
-  # When false (or absent): the Splunk Operator and Splunk Standalone are NOT
-  # installed, and the AIPlatform CR is created WITHOUT a splunkConfiguration
-  # block — the operator treats that as "no telemetry" and runs cleanly.
-  # Set to true to enable telemetry (internal or external mode below).
-  enabled: false
+  # Opt-in Splunk integration (JWT/auth issuer for SAIA, plus optional
+  # HEC telemetry export); defaults to disabled, enabled here. When false (or
+  # absent), no Splunk Operator/Standalone is installed and the AIPlatform CR
+  # omits splunkConfiguration.
+  enabled: true
 
   # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
   standaloneName: splunk-standalone
 
-  # ----- Telemetry mode is derived from whether external.endpoint is set -----
-  #
-  #   INTERNAL (enabled: true, external.endpoint unset):
-  #     The installer deploys the Splunk Operator + a Splunk Standalone inside
-  #     the cluster and wires the AIPlatform CR at it. Requires
-  #     images.splunk.image and images.splunk.operatorImage.
-  #
-  #     Compatibility transport: the final in-cluster Splunk management/JWKS
-  #     endpoint is plain HTTP on ClusterIP port 8089. The installer keeps the
-  #     OAuth signing certificate, but SAIA fetches its public signing keys over
-  #     http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089.
-  #     Keep the pod/service network private and restrict workload access with
-  #     NetworkPolicy where required. This does not change external Splunk URLs.
-  #
-  #   EXTERNAL (enabled: true, external.endpoint set):
-  #     Use a Splunk running OUTSIDE the cluster. The installer does NOT deploy
-  #     any in-cluster Splunk. It creates a Kubernetes Secret holding the HEC
-  #     token and points the AIPlatform CR at your external HEC endpoint.
-  #
-  #     The HEC token is supplied ONLY via the SPLUNK_HEC_TOKEN environment
-  #     variable (never this file), so no live credential is committed or
-  #     logged. Example:
-  #
-  #         export SPLUNK_HEC_TOKEN='<your-hec-token>'
-  #         ./k0s_cluster_with_stack.sh --config k0s-cluster-config.yaml
-  #
-  #     The script creates the Secret AFTER the cluster/namespace exist, so
-  #     there is no bootstrap ordering problem. Preflight fails fast if
-  #     SPLUNK_HEC_TOKEN is missing in external mode.
+  # Mode is derived from external.endpoint below, not a separate flag:
+  #   unset -> INTERNAL: deploys Splunk Operator + Standalone in-cluster
+  #            (requires images.splunk.image / images.splunk.operatorImage).
+  #   set   -> EXTERNAL: skips in-cluster Splunk, points the AIPlatform CR at
+  #            your external HEC endpoint instead.
+  # See K0S_README.md's "Internal Splunk management transport" section for
+  # the native-HTTPS compatibility details behind the INTERNAL path.
   #
   # external:
   #   endpoint: https://splunk.example.com:8088   # base HEC URL (operator appends /services/collector)
   #   secretName: splunk-hec-external             # optional; k8s Secret name the script creates (key: hec_token)
+  #
+  # The HEC token itself is supplied ONLY via the SPLUNK_HEC_TOKEN environment
+  # variable, never this file:
+  #   export SPLUNK_HEC_TOKEN='<your-hec-token>'
+  #   CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+
+  # Additional JWT issuers SAIA should trust besides the primary endpoint
+  # above — e.g. to keep an internal and an external Splunk both trusted at
+  # once. Optional.
+  # trustedIssuers:
+  #   - https://splunk.example.com:8089
 
 # ---------- AI Platform Configuration ----------
 aiPlatform:
@@ -272,19 +258,10 @@ aiPlatform:
   serviceTemplate:
     type: NodePort          # ClusterIP | NodePort | LoadBalancer
     nodePort: 30080         # Fixed NodePort (30000-32767) for the SAIA public service. Required only for NodePort.
-    # AIPlatform.serviceTemplate propagates identically to EVERY feature's
-    # AIService, so slim would otherwise inherit the same 30080 and collide with
-    # SAIA (a NodePort can back only one Service). When the "slim" feature is
-    # enabled under NodePort, the installer patches slim's public Service to this
-    # DISTINCT port instead. Reach slim at http://<any-worker-ip>:<slimNodePort>.
-    slimNodePort: 30081     # Fixed NodePort for the slim public service. Only used when slim is enabled + type=NodePort.
 
   features:
     - name: "saia"
       version: "1.1.0"
-    # Enable the slim-api service (no v1/v2 routing). Exposed on slimNodePort above.
-    - name: "slim"
-      version: "1.0.0"
 
   cpuScheduling:
     nodeSelector: {}
@@ -338,6 +315,17 @@ imagePullSecrets:
   secrets:
     - ecr-registry-secret
   autoCreateECR: true
+
+  # Authenticated non-ECR registry (e.g. Docker Hub, Harbor). Only used when
+  # enabled: true and server/username/password are all set — otherwise no
+  # pull secret is created for images.registry beyond autoCreateECR above.
+  # custom:
+  #   enabled: true
+  #   name: custom-registry-secret
+  #   server: https://index.docker.io/v1/
+  #   username: <registry-username>
+  #   password: <registry-password-or-token>
+  #   email: <registry-account-email>
 
 ecr:
   account: ""                                        # CHANGE THIS: Your AWS account ID (e.g. 123456789012)

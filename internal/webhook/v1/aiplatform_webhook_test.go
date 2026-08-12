@@ -157,6 +157,51 @@ var _ = Describe("AIPlatform Webhook", func() {
 			})
 		})
 
+		Describe("hecEndpoint validation", func() {
+			fldPath := field.NewPath("spec").Child("splunkConfiguration")
+
+			for _, withSecret := range []bool{false, true} {
+				withSecret := withSecret
+				description := " without secretRef"
+				if withSecret {
+					description = " with secretRef"
+				}
+				It("should reject hecEndpoint without a management/JWKS source"+description, func() {
+					splunkConfig := &aiv1.SplunkConfigurationSpec{
+						HECEndpoint: "http://splunk:8088",
+					}
+					if withSecret {
+						splunkConfig.SecretRef.Name = "splunk-hec"
+					}
+
+					errs := validator.validateSplunkConfiguration(splunkConfig, true, fldPath)
+
+					Expect(errs).To(HaveLen(1))
+					Expect(errs[0].Field).To(Equal("spec.splunkConfiguration.hecEndpoint"))
+					Expect(errs[0].Detail).To(ContainSubstring("endpoint or splunkCustomResourceRef.name"))
+				})
+			}
+
+			It("should accept hecEndpoint with endpoint and secretRef", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:    "https://splunk:8089",
+					HECEndpoint: "https://splunk:8088",
+				}
+				splunkConfig.SecretRef.Name = "splunk-hec"
+
+				Expect(validator.validateSplunkConfiguration(splunkConfig, true, fldPath)).To(BeEmpty())
+			})
+
+			It("should accept hecEndpoint with a Splunk CR reference", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					HECEndpoint: "https://splunk:8088",
+				}
+				splunkConfig.SplunkCustomResourceRef.Name = "splunk-standalone"
+
+				Expect(validator.validateSplunkConfiguration(splunkConfig, true, fldPath)).To(BeEmpty())
+			})
+		})
+
 		Describe("scaleFactor validation", func() {
 			sfPath := field.NewPath("spec").Child("scaleFactor")
 

@@ -126,54 +126,62 @@ graph TB
 
 ### Internal Splunk Transport
 
-For the k0s **internal Splunk** mode, the final management/JWKS endpoint on
-port 8089 intentionally uses HTTP. The installer sets both Splunk's OAuth
-`issuer_uri` and `AIPlatform.spec.splunkConfiguration.endpoint` to the same
-service URL:
+For k0s **internal Splunk** mode, this branch restores `main`'s native splunkd
+HTTPS and short-issuer contract rather than installing certificates or another
+proxy. It also aligns the AIPlatform endpoint with that issuer for both SAIA
+and Slim. Splunkd keeps its native HTTPS listener on port 8089. This is required
+by the immutable Splunk AI Assistant app 2.0.4, whose local Splunk SDK connects
+to `https://127.0.0.1:8089`.
+
+Splunk's OAuth `issuer_uri` and
+`AIPlatform.spec.splunkConfiguration.endpoint` use the same short,
+namespace-local Service URL:
 
 ```text
-http://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
+https://splunk-<standaloneName>-standalone-service:8089
 ```
 
-OTel telemetry uses the separate `splunkConfiguration.hecEndpoint` on port
-8088. HEC is used only for telemetry and is never treated as the JWT issuer.
-After Splunk is Ready, the installer reads the effective `[http]` stanza with
-`btool`, verifies that HEC is enabled and healthy, and renders `http://` or
-`https://` to match `enableSSL`. It does not change the HEC TLS setting. A fresh
-Splunk Operator 3.0.0 install normally reports HTTP; an upgraded or customized
-instance may report HTTPS.
+The operator propagates that endpoint to both SAIA and Slim as
+`SPLUNK_ISSUERS`, so the JWT `iss` claim and both feature allowlists remain
+byte-identical. The installer does not create a JWKS proxy, TLS Secret,
+Certificate, CA ConfigMap, or CA mount for this path.
 
-This is the AIP-4614 compatibility behavior for SAIA/Slim interactive-token
-validation. The installer disables `enableSplunkdSSL`, rolls the Splunk pod, and
-tests the HTTP endpoint before deploying `AIPlatform`. Current SAIA images work
-with this URL; no image rollback or certificate mount is needed. The Splunk
-OAuth certificate remains configured because it signs JWTs rather than securing
-the HTTP transport. Splunk 10.2 still performs its bounded initial HTTPS scheme
-probe before falling back to HTTP. The installer extends only the Standalone
-startup-probe allowance so the image can finish that fallback without weakening
-splunk-ansible's global retry policy; this can add several minutes to a Splunk
-pod start.
+This compatibility choice has an explicit limitation. Splunk's built-in
+certificate may not be trusted by an image that strictly verifies outbound TLS,
+and it may not contain a SAN matching the Kubernetes Service hostname. That
+certificate-validation problem is not solved in this branch. Environments
+which require verified end-to-end TLS must use the separate hostname-valid
+certificate and CA-trust design. Do not disable verification globally to work
+around a failed certificate check.
 
-Rerunning the installer against a PVC created by an earlier TLS-preview install
-performs an idempotent compatibility migration before Splunk starts. It removes
-only persisted TLS options from configuration files that still reference the
-installer-owned `/mnt/splunk-cert*` paths, restores Splunk Web to HTTP, and
-removes the stale custom HEC certificate path. It does not delete the PVC or
-indexed data. HEC's `enableSSL` setting is deliberately unchanged, so HEC keeps
-using its independently configured HTTP or HTTPS protocol. Installation fails
-closed if the effective HEC setting cannot be read, HEC is disabled, its port is
-not the operator Service's port 8088, or the matching health URL is unavailable.
-During an operator upgrade, the OTel ConfigMap migration also removes the exact
-legacy operator-managed `tls.ca_file: /etc/splunk-ca/ca.crt` reference when
-that CA mount is no longer configured. HTTPS then retains the existing
-no-CA `insecure_skip_verify` behavior; HTTP carries no generated TLS settings.
-Other exporter, processor, and custom CA settings are preserved.
+OTel telemetry configuration remains independent. When an OTel collector is
+actually injected and running, it receives `splunkConfiguration.hecEndpoint`
+for port 8088 and never treats HEC as a JWT issuer. After Splunk is Ready, the
+installer reads the effective HEC `[http]` stanza with `btool`, verifies that
+HEC is enabled and healthy, and renders `http://` or `https://` to match
+`enableSSL`; it does not change the HEC TLS setting. This configuration check
+does not by itself prove that a collector was deployed or that telemetry was
+delivered.
 
-Keep the Kubernetes pod/service network private. Management credentials and
-JWKS requests on port 8089 are unencrypted within that network, so production
-clusters should restrict untrusted workloads with NetworkPolicy. External
-Splunk, image registries, cert-manager webhooks, and customer-managed ingress
-retain their independent TLS settings.
+The OTel sidecar receives its collector configuration when each Ray pod is
+created. Updating the HEC URL or scheme reconciles the Collector configuration,
+but it deliberately does not force a RayService rollout because a fully
+allocated GPU cluster may not have capacity for a replacement RayCluster.
+Existing Ray pods keep their injected configuration until they are recreated.
+Schedule a controlled RayService rollout during a capacity-approved maintenance
+window when an existing installation must consume a changed HEC destination.
+
+On upgrade from the earlier HTTP-management preview, the installer explicitly
+reconciles `SPLUNKD_SSL_ENABLE=true` so AI Assistant 2.0.4 can again use its
+local HTTPS management and KV Store connections. It removes only stale
+installer-owned certificate paths under `/mnt/splunk-cert*`, keeps Splunk Web
+on HTTP, preserves the PVC and indexed data, and leaves HEC's independent
+`enableSSL` value unchanged.
+
+Changing from an FQDN or HTTP issuer to the short native-HTTPS issuer
+changes the JWT `iss` value. Users must sign in again or repeat onboarding so
+Splunk mints fresh interactive tokens. Tokens containing the previous issuer
+are expected to be rejected.
 
 ### Scaling Deployment Capacity
 
@@ -1045,6 +1053,10 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 ```
 
 Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end connectivity.
+
+For a reusable pass/fail sequence covering installer completion, Pods, workload
+resources, direct model inference, trusted SAIA reachability, and the browser
+flow, use the [Post-Install Sanity Checklist](SANITY_TEST_CHECKLIST.md).
 
 ---
 
