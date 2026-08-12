@@ -336,14 +336,14 @@ resolve_model_staging() {
     log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
   fi
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "Air-gap mode: model staging skipped (models must be pre-staged in object store); no prompt."
-    MODEL_STAGING_ENABLED=false
-    return 0
-  fi
-  # Full/interactive: prompt always overrides config value
+  # Full/interactive: prompt always overrides config value. Air-gap means the
+  # CLUSTER NODES have no internet, not necessarily this installer machine —
+  # so staging from here is still valid and must still be offered.
   echo "" >&2
   echo -e "  \033[1mModel Download\033[0m" >&2
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo "  Air-gap mode: models must be staged from THIS machine (the cluster nodes have no internet)." >&2
+  fi
   echo "  Do you want to download and stage model artifacts from HuggingFace now?" >&2
   echo "  (Required for a first install unless models are already in your object store.)" >&2
   local ans
@@ -431,11 +431,7 @@ show_install_plan() {
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
   echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
-    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-      echo -e "    2. Model artifact staging  [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
-    else
-      echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2
-    fi
+    echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2
   else
     echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
   fi
@@ -2222,7 +2218,7 @@ resolve_node_name() {
   local ip="$1"
   # SSH to the node and get the hostname that k0s registered it with
   local node_name
-  node_name=$(ssh_exec "${ip}" "hostname -f 2>/dev/null || hostname" 2>/dev/null || echo "")
+  node_name=$(ssh_exec "${ip}" "hostname -s 2>/dev/null || hostname" 2>/dev/null || echo "")
   echo "${node_name}"
 }
 
@@ -2704,15 +2700,14 @@ stage_model_artifacts() {
     return 0
   fi
 
-  # ---- Check HuggingFace reachability (skip in air-gap mode) ----
-  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
-    wait_for_dependency \
-      "HuggingFace (huggingface.co) — required for model weight download" \
-      "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
-      300
-  else
-    log "AIRGAP_MODE=true — skipping HuggingFace connectivity check (models must be pre-staged in object store)"
-  fi
+  # ---- Check HuggingFace reachability ----
+  # This function only runs when staging is actually about to happen (from
+  # THIS machine), regardless of AIRGAP_MODE — air-gap only means the cluster
+  # nodes lack internet, not necessarily this installer machine.
+  wait_for_dependency \
+    "HuggingFace (huggingface.co) — required for model weight download" \
+    "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+    300
 
   # ---- Download from Hugging Face ----
   log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
