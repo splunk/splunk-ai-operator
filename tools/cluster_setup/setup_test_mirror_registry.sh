@@ -13,7 +13,15 @@
 # images.registryInsecure in k0s-cluster-config.yaml.
 set -uo pipefail
 
-REG_IP="${REG_IP:-10.0.39.244}"
+# Must be the installer host's address as the SEALED NODES see it — they pull
+# from images.registry over the VPC, so a loopback or public IP will not work.
+REG_IP="${REG_IP:-${1:-}}"
+if [[ -z "${REG_IP}" ]]; then
+  echo "usage: $0 <installer-private-ip>   (or REG_IP=<ip> $0)" >&2
+  self_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  [[ -n "${self_ip}" ]] && echo "       this host's private IP: ${self_ip}" >&2
+  exit 1
+fi
 REG_PORT="${REG_PORT:-5000}"
 REG="${REG_IP}:${REG_PORT}"
 # Keep registry data off the 49 GB root volume — the mirrored set (splunk
