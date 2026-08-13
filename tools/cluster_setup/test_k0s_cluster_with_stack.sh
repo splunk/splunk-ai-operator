@@ -14,6 +14,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SCRIPT_DIR}/k0s_cluster_with_stack.sh"
+AIRGAP_SCRIPT="${SCRIPT_DIR}/airgap_install.sh"
 YQ_BIN="$(command -v yq || true)"
 
 VERBOSE=0
@@ -638,6 +639,269 @@ assert_eq "worker registry config called after k0s start succeeds" \
 
 assert_eq "returns early when IMAGE_REGISTRY is empty" \
   "1" "$(grep -A8 '^configure_insecure_registry_on_node()' "${SCRIPT}" | grep -c '\[\[ -z.*registry.*\]\] && return 0' | tr -d '[:space:]')"
+
+# ── Tests: air-gap OCI import sequencing ─────────────────────────────────────
+# The first k0s start imports image bundles while containerd is still coming up.
+# Registry drop-ins must not be written until that import completes because the
+# config watcher restarts containerd. After the drop-in is written, the script
+# deliberately restarts k0s and verifies every image before installing add-ons.
+
+suite "air-gap OCI import sequencing"
+
+assert_eq "bundle import waiter is defined" \
+  "1" "$(grep -c '^wait_for_k0s_image_bundles()' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "bundle waiter covers every staged tar archive" \
+  "1" "$(grep -A18 '^wait_for_k0s_image_bundles()' "${SCRIPT}" | grep -c 'AIRGAP_K0S_IMAGE_DIR.*\.tar' | tr -d '[:space:]')"
+
+assert_eq "bundle waiter recognizes successful OCIBundleReconciler completion" \
+  "1" "$(grep -A45 '^wait_for_k0s_image_bundles()' "${SCRIPT}" | grep -c 'OCI bundle /var/lib/k0s/images/.* loaded' | tr -d '[:space:]')"
+
+assert_eq "bundle waiter fails on explicit OCI import failure" \
+  "1" "$(grep -A45 '^wait_for_k0s_image_bundles()' "${SCRIPT}" | grep -c 'Failed to load OCI bundle /var/lib/k0s/images/' | tr -d '[:space:]')"
+
+assert_eq "image verifier checks bundle lists against k8s.io containerd namespace" \
+  "1" "$(grep -A25 '^verify_airgap_bundle_images_on_node()' "${SCRIPT}" | grep -c 'k0s ctr -n k8s.io images list -q' | tr -d '[:space:]')"
+
+assert_eq "registry configuration is followed by explicit k0s service restart" \
+  "1" "$(grep -A18 '^restart_k0s_after_registry_configuration()' "${SCRIPT}" | grep -c 'systemctl restart.*service_name' | tr -d '[:space:]')"
+
+assert_eq "controller waits for initial bundle import before registry configuration" \
+  "1" "$(awk '
+    /wait_for_k0s_image_bundles.*controller_ip.*k0scontroller.*controller_start_epoch/ { waited=1 }
+    waited && /configure_insecure_registry_on_node.*controller_ip/ { print 1; exit }
+  ' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "worker waits for initial bundle import before registry configuration" \
+  "1" "$(awk '
+    /wait_for_k0s_image_bundles.*worker_ip.*k0sworker.*worker_start_epoch/ { waited=1 }
+    waited && /configure_insecure_registry_on_node.*worker_ip/ { print 1; exit }
+  ' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "all-node image verification runs before AI Platform stack installation" \
+  "1" "$(awk '
+    /^[[:space:]]+verify_airgap_bundle_images_on_all_nodes$/ { verified=1 }
+    verified && /phase_start "AI Platform Stack"/ { print 1; exit }
+  ' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "existing-cluster reruns refresh changed bundles before all-node verification" \
+  "1" "$(awk '
+    /refresh_airgap_image_bundles_on_existing_nodes/ { refreshed=1 }
+    refreshed && /^[[:space:]]+verify_airgap_bundle_images_on_all_nodes$/ { print 1; exit }
+  ' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "existing-cluster refresh compares local and remote archive checksums" \
+  "2" "$(grep -A35 '^refresh_airgap_image_bundles_on_running_node()' "${SCRIPT}" | grep -c 'sha256sum' | tr -d '[:space:]')"
+
+assert_eq "existing-cluster refresh stops k0s before replacing archives" \
+  "1" "$(awk '
+    /^refresh_airgap_image_bundles_on_running_node\(\)/ { in_fn=1 }
+    in_fn && /systemctl stop.*service_name/ { stopped=1 }
+    stopped && /sudo mv -f.*staged_paths/ { print 1; exit }
+    in_fn && /^}/ { exit }
+  ' "${SCRIPT}" | tr -d '[:space:]')"
+
+assert_eq "existing-cluster refresh waits for import after restarting k0s" \
+  "1" "$(awk '
+    /^refresh_airgap_image_bundles_on_running_node\(\)/ { in_fn=1 }
+    in_fn && /systemctl start.*service_name/ { started=1 }
+    started && /wait_for_k0s_image_bundles/ { print 1; exit }
+    in_fn && /^}/ { exit }
+  ' "${SCRIPT}" | tr -d '[:space:]')"
+
+_exercise_existing_bundle_refresh() (
+  local mode="$1" fixture_dir trace_file fixture_sha
+  fixture_dir=$(mktemp -d)
+  trace_file="${fixture_dir}/trace"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+
+  printf 'archive-content\n' > "${fixture_dir}/k0s-images.tar"
+  printf '%s\n' 'quay.io/k0sproject/pause:3.10' > "${fixture_dir}/k0s-images.list"
+  fixture_sha=$(sha256sum "${fixture_dir}/k0s-images.tar" | awk '{print $1}')
+
+  eval "$(_extract_fn airgap_k0s_image_bundles_enabled)"
+  eval "$(_extract_fn wait_for_k0s_image_bundles)"
+  eval "$(_extract_fn verify_airgap_bundle_images_on_node)"
+  eval "$(_extract_fn refresh_airgap_image_bundles_on_running_node)"
+
+  AIRGAP_K0S_IMAGE_DIR="${fixture_dir}"
+  AIRGAP_IMAGE_IMPORT_TIMEOUT=10
+  log() { :; }
+  warn() { :; }
+  scp_file() { echo scp >> "${trace_file}"; }
+  ssh_exec() {
+    local args="$*"
+    case "${args}" in
+      *'sha256sum /var/lib/k0s/images/'*)
+        [[ "${mode}" == "current" ]] && echo "${fixture_sha}"
+        ;;
+      *'systemctl stop'*) echo stop >> "${trace_file}" ;;
+      *'sudo mv -f'*) echo move >> "${trace_file}" ;;
+      *'date +%s'*) echo 100 ;;
+      *'systemctl start'*) echo start >> "${trace_file}" ;;
+      *'systemctl is-active'*) return 0 ;;
+      *'systemctl show'*) echo 4242 ;;
+      *'journalctl'*) echo 'OCI bundle /var/lib/k0s/images/k0s-images.tar loaded' ;;
+      *'images list -q'*) echo 'quay.io/k0sproject/pause:3.10' ;;
+      *) return 0 ;;
+    esac
+  }
+
+  refresh_airgap_image_bundles_on_running_node 192.0.2.10 k0sworker || return
+  if [[ "${mode}" == "changed" ]]; then
+    [[ "$(cat "${trace_file}")" == $'scp\nstop\nmove\nstart' ]]
+  else
+    [[ ! -s "${trace_file}" ]]
+  fi
+)
+
+assert_rc "existing-cluster refresh atomically replaces a changed archive and restarts once" 0 \
+  _exercise_existing_bundle_refresh changed
+
+assert_rc "existing-cluster refresh skips copying and restarting a matching archive" 0 \
+  _exercise_existing_bundle_refresh current
+
+assert_eq "reruns recycle cert-manager pods stuck in image pull backoff" \
+  "1" "$(_extract_fn install_cert_manager | grep -c 'cert_manager_image_pull_backoff_pods' | tr -d '[:space:]')"
+
+_exercise_cert_manager_backoff_selector() (
+  eval "$(_extract_fn cert_manager_image_pull_backoff_pods)"
+  kubectl() {
+    printf '%s\n' '{
+      "items": [
+        {
+          "metadata": {"name": "cert-manager-cainjector-stale"},
+          "status": {"containerStatuses": [
+            {"state": {"waiting": {"reason": "ImagePullBackOff"}}}
+          ]}
+        },
+        {
+          "metadata": {"name": "cert-manager-healthy"},
+          "status": {"containerStatuses": [
+            {"state": {"running": {"startedAt": "2026-08-12T00:00:00Z"}}}
+          ]}
+        },
+        {
+          "metadata": {"name": "cert-manager-init-stale"},
+          "status": {"initContainerStatuses": [
+            {"state": {"waiting": {"reason": "ErrImagePull"}}}
+          ]}
+        }
+      ]
+    }'
+  }
+  cert_manager_image_pull_backoff_pods
+)
+
+assert_eq "cert-manager selector handles status arrays and returns only pull failures" \
+  $'cert-manager-cainjector-stale\ncert-manager-init-stale' \
+  "$(_exercise_cert_manager_backoff_selector)"
+
+assert_eq "cert-manager install requires a functional admission request" \
+  "1" "$(_extract_fn install_cert_manager | grep -c 'wait_for_cert_manager_webhook 30 10' | tr -d '[:space:]')"
+
+assert_eq "cert-manager recovery waits on deployments instead of obsolete pod UIDs" \
+  "1" "$(_extract_fn install_cert_manager | grep -c 'kubectl rollout status.*deployment/' | tr -d '[:space:]')"
+
+assert_eq "cert-manager admission probe is a non-persistent server dry run" \
+  "1" "$(_extract_fn wait_for_cert_manager_webhook | grep -c 'kubectl create --dry-run=server' | tr -d '[:space:]')"
+
+assert_eq "cert-manager phase-one failure is fatal" \
+  "1" "$(grep -A50 'Track required phase-1 tasks' "${SCRIPT}" | grep -c 'cert-manager|nvidia-drivers' | tr -d '[:space:]')"
+
+# ── Tests: air-gap model staging contract ─────────────────────────────────────
+
+suite "air-gap model staging contract"
+
+_exercise_airgap_model_staging_resolution() (
+  eval "$(_extract_fn resolve_model_staging)"
+  SILENT_INSTALL=false
+  AIRGAP_MODE=true
+  MODEL_STAGING_ENABLED=true
+  resolve_model_staging <<< "y"
+  printf '%s' "${MODEL_STAGING_ENABLED}"
+)
+
+assert_eq "air-gap mode honours enabled model staging on the connected installer" \
+  "true" "$(_exercise_airgap_model_staging_resolution)"
+
+assert_eq "air-gap staging checks installer-host HuggingFace reachability" \
+  "1" "$(_extract_fn stage_model_artifacts | grep -c 'wait_for_dependency' | tr -d '[:space:]')"
+
+assert_eq "air-gap install verifies markers when automatic model staging is disabled" \
+  "1" "$(grep -A25 'phase_start "Model Staging"' "${SCRIPT}" | grep -c 'verify_pre_staged_model_artifacts' | tr -d '[:space:]')"
+
+assert_eq "pre-staged model verification uses the selected accelerator profile" \
+  "1" "$(_extract_fn verify_pre_staged_model_artifacts | grep -c 'all_models_staged.*staging_dir.*_accel' | tr -d '[:space:]')"
+
+assert_eq "air-gap OCI builder retries transient registry failures" \
+  "1" "$(grep -A45 '^build_k0s_airgap_bundle()' "${AIRGAP_SCRIPT}" | grep -c 'attempt < max_attempts' | tr -d '[:space:]')"
+
+assert_eq "air-gap OCI builder writes an atomic partial archive" \
+  "1" "$(grep -A45 '^build_k0s_airgap_bundle()' "${AIRGAP_SCRIPT}" | grep -c 'partial_tar=.*\.partial\.tar' | tr -d '[:space:]')"
+
+assert_eq "k0s system image bundle uses retry helper" \
+  "1" "$(grep -A15 'k0s system images to bundle:' "${AIRGAP_SCRIPT}" | grep -c 'build_k0s_airgap_bundle' | tr -d '[:space:]')"
+
+assert_eq "add-on image bundle uses retry helper" \
+  "1" "$(grep -A12 'Building add-on image bundle (pulls' "${AIRGAP_SCRIPT}" | grep -c 'build_k0s_airgap_bundle' | tr -d '[:space:]')"
+
+_exercise_airgap_bundle_helpers() (
+  local mode="$1" fixture_dir
+  fixture_dir=$(mktemp -d)
+  trap 'rm -rf "${fixture_dir}"' EXIT
+
+  : > "${fixture_dir}/addon-images.tar"
+  : > "${fixture_dir}/k0s-images.tar"
+  printf '%s\n' \
+    'quay.io/jetstack/cert-manager-cainjector:v1.13.0' \
+    'busybox:latest' \
+    > "${fixture_dir}/addon-images.list"
+  printf '%s\n' 'quay.io/k0sproject/pause:3.10' > "${fixture_dir}/k0s-images.list"
+
+  eval "$(_extract_fn airgap_k0s_image_bundles_enabled)"
+  eval "$(_extract_fn wait_for_k0s_image_bundles)"
+  eval "$(_extract_fn verify_airgap_bundle_images_on_node)"
+
+  AIRGAP_K0S_IMAGE_DIR="${fixture_dir}"
+  AIRGAP_IMAGE_IMPORT_TIMEOUT=10
+  ssh_exec() {
+    local args="$*"
+    if [[ "${args}" == *'systemctl show'* ]]; then
+      echo 4242
+    elif [[ "${args}" == *'journalctl'* ]]; then
+      if [[ "${mode}" == "import-failure" ]]; then
+        echo 'Failed to load OCI bundle /var/lib/k0s/images/addon-images.tar'
+      else
+        echo 'OCI bundle /var/lib/k0s/images/addon-images.tar loaded'
+        echo 'OCI bundle /var/lib/k0s/images/k0s-images.tar loaded'
+      fi
+    elif [[ "${args}" == *'images list -q'* ]]; then
+      echo 'quay.io/k0sproject/pause:3.10'
+      echo 'docker.io/library/busybox:latest'
+      [[ "${mode}" == "missing-image" ]] || \
+        echo 'quay.io/jetstack/cert-manager-cainjector:v1.13.0'
+    fi
+  }
+
+  case "${mode}" in
+    import-success) wait_for_k0s_image_bundles 192.0.2.10 k0sworker 100 ;;
+    import-failure) wait_for_k0s_image_bundles 192.0.2.10 k0sworker 100 ;;
+    verify-success|missing-image) verify_airgap_bundle_images_on_node 192.0.2.10 ;;
+  esac
+)
+
+assert_rc "bundle waiter accepts both successful imports from current service PID" 0 \
+  _exercise_airgap_bundle_helpers import-success
+
+assert_rc "bundle waiter rejects an explicit importer EOF/failure" 1 \
+  _exercise_airgap_bundle_helpers import-failure
+
+assert_rc "image verifier accepts exact and Docker-normalized references" 0 \
+  _exercise_airgap_bundle_helpers verify-success
+
+assert_rc "image verifier rejects a partially imported bundle" 1 \
+  _exercise_airgap_bundle_helpers missing-image
 
 # ── Codex review fixes ────────────────────────────────────────────────────────
 # Tests verifying the five logic bugs fixed in the Codex P1/P2 review pass.
