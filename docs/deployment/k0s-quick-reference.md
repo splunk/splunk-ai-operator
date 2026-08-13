@@ -267,6 +267,45 @@ tar/ssh/rpm/dnf/sha256sum, `createrepo_c`, sudo, ~5 GB free disk. Building a
 .deb closure for Ubuntu 24.04 GPU nodes additionally requires `podman` or
 `docker` on the installer machine.
 
+**Set up the installer machine — copy/paste these, in order.** Run on the
+RHEL 9 installer machine. `curl`, `tar`, `ssh`, `rpm`, `dnf`, `sha256sum`, and
+`sudo` already ship with RHEL 9, so there's nothing to install for those.
+
+```bash
+# 1. createrepo_c — builds the offline NVIDIA driver repo
+sudo dnf install -y createrepo_c
+
+# 2. helm
+curl -fsSLo /tmp/get_helm.sh \
+  https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 /tmp/get_helm.sh
+sudo /tmp/get_helm.sh
+
+# 3. kubectl
+KUBECTL_VERSION="$(curl -Ls https://dl.k8s.io/release/stable.txt)"
+curl -fsSLo /tmp/kubectl \
+  "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+# 4. Only if any GPU worker node runs Ubuntu 24.04 — skip this if every
+#    GPU node is RHEL 9
+sudo dnf install -y podman
+```
+
+Also install `yq`, `git`, and `jq` from
+[Admin workstation tools](#1-prerequisites) above — the installer machine is
+the same admin workstation described there.
+
+Verify everything is in place:
+
+```bash
+curl --version && helm version && kubectl version --client \
+  && tar --version && ssh -V && rpm --version && dnf --version \
+  && sha256sum --version && createrepo_c --version
+
+df -h /   # confirm ~5 GB free
+```
+
 ### Model Setup (Air-Gapped Path)
 
 Cluster nodes can't reach HuggingFace, but the installer machine usually can
