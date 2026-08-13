@@ -494,6 +494,43 @@ download() {
   fi
 }
 
+# k0s pulls each image and writes an OCI archive. Public registries can
+# occasionally close a blob transfer early, which k0s reports as
+# "failed to perform Push on destination: unexpected EOF". Treat that as a
+# transient build failure: retry the complete bundle a bounded number of times
+# and never expose a partially-written tar as a valid staged artifact.
+build_k0s_airgap_bundle() {
+  local image_list="$1" output_tar="$2" description="$3"
+  local max_attempts="${AIRGAP_BUNDLE_BUILD_ATTEMPTS:-3}"
+  local retry_delay="${AIRGAP_BUNDLE_RETRY_DELAY_SECONDS:-10}"
+
+  [[ "${max_attempts}" =~ ^[1-9][0-9]*$ ]] \
+    || err "AIRGAP_BUNDLE_BUILD_ATTEMPTS must be a positive integer (got: ${max_attempts})"
+  [[ "${retry_delay}" =~ ^[0-9]+$ ]] \
+    || err "AIRGAP_BUNDLE_RETRY_DELAY_SECONDS must be a non-negative integer (got: ${retry_delay})"
+
+  local attempt=1 partial_tar="${output_tar}.partial.tar"
+  while (( attempt <= max_attempts )); do
+    rm -f "${partial_tar}" "${output_tar}"
+    log "Building ${description} (attempt ${attempt}/${max_attempts})..."
+
+    if "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+         -o "${partial_tar}" < "${image_list}"; then
+      mv -f "${partial_tar}" "${output_tar}"
+      return 0
+    fi
+
+    rm -f "${partial_tar}" "${output_tar}"
+    if (( attempt < max_attempts )); then
+      warn "${description} build failed on attempt ${attempt}/${max_attempts}; retrying in ${retry_delay}s..."
+      sleep "${retry_delay}"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 require_cmd curl
 require_cmd helm
@@ -559,10 +596,11 @@ if "${STAGE_DIR}/binaries/k0s" airgap list-images --all > "${STAGE_DIR}/images/k
    && [[ -s "${STAGE_DIR}/images/k0s-images.list" ]]; then
   log "k0s system images to bundle:"
   while IFS= read -r _img; do log "    ${_img}"; done < "${STAGE_DIR}/images/k0s-images.list"
-  # --concurrency=1 makes the tarball reproducible (deterministic image order).
-  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
-    -o "${STAGE_DIR}/images/k0s-images.tar" \
-    < "${STAGE_DIR}/images/k0s-images.list" \
+  # --concurrency=1 inside the helper makes the tarball reproducible.
+  build_k0s_airgap_bundle \
+    "${STAGE_DIR}/images/k0s-images.list" \
+    "${STAGE_DIR}/images/k0s-images.tar" \
+    "k0s system-image bundle" \
     || err "Failed to build k0s system-image bundle (k0s airgap bundle-artifacts)."
   log "k0s system-image bundle written: ${STAGE_DIR}/images/k0s-images.tar ($(du -h "${STAGE_DIR}/images/k0s-images.tar" | cut -f1))"
 else
@@ -684,9 +722,10 @@ if [[ -s "${ADDON_LIST}" ]]; then
   log "Add-on images to bundle ($(wc -l < "${ADDON_LIST}")):"
   while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
   log "Building add-on image bundle (pulls the images above, may take several minutes)..."
-  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
-    -o "${STAGE_DIR}/images/addon-images.tar" \
-    < "${ADDON_LIST}" \
+  build_k0s_airgap_bundle \
+    "${ADDON_LIST}" \
+    "${STAGE_DIR}/images/addon-images.tar" \
+    "add-on image bundle" \
     || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
   log "Add-on image bundle written: ${STAGE_DIR}/images/addon-images.tar ($(du -h "${STAGE_DIR}/images/addon-images.tar" | cut -f1))"
 else

@@ -14,6 +14,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SCRIPT_DIR}/k0s_cluster_with_stack.sh"
+AIRGAP_SCRIPT="${SCRIPT_DIR}/airgap_install.sh"
 YQ_BIN="$(command -v yq || true)"
 
 VERBOSE=0
@@ -832,6 +833,18 @@ assert_eq "air-gap install verifies markers when automatic model staging is disa
 
 assert_eq "pre-staged model verification uses the selected accelerator profile" \
   "1" "$(_extract_fn verify_pre_staged_model_artifacts | grep -c 'all_models_staged.*staging_dir.*_accel' | tr -d '[:space:]')"
+
+assert_eq "air-gap OCI builder retries transient registry failures" \
+  "1" "$(grep -A45 '^build_k0s_airgap_bundle()' "${AIRGAP_SCRIPT}" | grep -c 'attempt < max_attempts' | tr -d '[:space:]')"
+
+assert_eq "air-gap OCI builder writes an atomic partial archive" \
+  "1" "$(grep -A45 '^build_k0s_airgap_bundle()' "${AIRGAP_SCRIPT}" | grep -c 'partial_tar=.*\.partial\.tar' | tr -d '[:space:]')"
+
+assert_eq "k0s system image bundle uses retry helper" \
+  "1" "$(grep -A15 'k0s system images to bundle:' "${AIRGAP_SCRIPT}" | grep -c 'build_k0s_airgap_bundle' | tr -d '[:space:]')"
+
+assert_eq "add-on image bundle uses retry helper" \
+  "1" "$(grep -A12 'Building add-on image bundle (pulls' "${AIRGAP_SCRIPT}" | grep -c 'build_k0s_airgap_bundle' | tr -d '[:space:]')"
 
 _exercise_airgap_bundle_helpers() (
   local mode="$1" fixture_dir
