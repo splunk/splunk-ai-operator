@@ -46,11 +46,6 @@ standalone via `stage-artifacts`), it additionally needs:
 
 **Admin workstation tools:**
 
-```bash
-# macOS
-brew install kubectl helm git jq yq
-```
-
 **RHEL 9** — none of `kubectl`, `helm`, `docker`, or `yq` are in the default
 `dnf` repos; `git` and `jq` are. Install each via its own supported method
 (standalone binary, install script, or vendor repo, per each tool's docs)
@@ -117,12 +112,18 @@ is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
 
 ## 2. Hardware Requirements
 
+Pick **one** GPU accelerator type for the cluster — `L40S` or `H100`, set via
+`aiPlatform.defaultAcceleratorType` — and provision only the matching GPU
+worker row below. The two GPU rows are alternatives, not additive; do not
+provision both.
+
 | Node Type | Min CPU | Min RAM | Min Disk | Count | Notes |
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 | API server, etcd, scheduler — the installer joins only the first controller IP; additional controller IPs are not joined and are not HA |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
-| GPU Worker (L40S / `g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
-| GPU Worker (H100 / `p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
+| GPU Worker — choose **either** L40S **or** H100, not both: | | | | | |
+| ↳ L40S (`g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
+| ↳ H100 (`p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
 
 Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
 
@@ -156,7 +157,9 @@ else has a working default. Full field-by-field reference:
 [K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
 
 ```bash
-cd tools/cluster_setup
+git clone https://github.com/splunk/splunk-ai-operator.git
+cd splunk-ai-operator/tools/cluster_setup
+
 cp k0s-cluster-config.yaml my-cluster.yaml
 vi my-cluster.yaml
 ```
