@@ -336,14 +336,14 @@ resolve_model_staging() {
     log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
   fi
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "Air-gap mode: model staging skipped (models must be pre-staged in object store); no prompt."
-    MODEL_STAGING_ENABLED=false
-    return 0
-  fi
-  # Full/interactive: prompt always overrides config value
+  # Full/interactive: prompt always overrides config value. Air-gap means the
+  # CLUSTER NODES have no internet, not necessarily this installer machine —
+  # so staging from here is still valid and must still be offered.
   echo "" >&2
   echo -e "  \033[1mModel Download\033[0m" >&2
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo "  Air-gap mode: models must be staged from THIS machine (the cluster nodes have no internet)." >&2
+  fi
   echo "  Do you want to download and stage model artifacts from HuggingFace now?" >&2
   echo "  (Required for a first install unless models are already in your object store.)" >&2
   local ans
