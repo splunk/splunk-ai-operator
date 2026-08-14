@@ -153,10 +153,25 @@ Copy the template and fill in only the **mandatory** fields below — everything
 else has a working default. Full field-by-field reference:
 [K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
 
+If Git is installed:
+
 ```bash
 git clone https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
+```
 
+If Git is not installed, download the repository as a ZIP instead:
+
+1. [Download the ZIP directly](https://github.com/splunk/splunk-ai-operator/archive/refs/heads/main.zip),
+   or open the [repository on GitHub](https://github.com/splunk/splunk-ai-operator),
+   select **Code**, and then select **Download ZIP**.
+2. Extract the ZIP. The extracted directory is normally named
+   `splunk-ai-operator-main`.
+3. `cd` into `tools/cluster_setup` inside that directory.
+
+Then create your config from the template:
+
+```bash
 cp k0s-cluster-config.yaml my-cluster.yaml
 vi my-cluster.yaml
 ```
