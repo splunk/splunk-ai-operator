@@ -43,7 +43,7 @@ docker.io/splunk/ai-tier-ray-head:preview
 docker.io/splunk/ai-tier-saia-api:preview
 docker.io/splunk/ai-tier-saia-api-v2:preview
 docker.io/splunk/ai-tier-saia-data-loader:preview
-docker.io/kpratyush775/splunk-ai-operator:v2.3
+docker.io/kpratyush775/splunk-ai-operator:v2.4
 "
 
 log() { printf '\n=== %s ===\n' "$1"; }
