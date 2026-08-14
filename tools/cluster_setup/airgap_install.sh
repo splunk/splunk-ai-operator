@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Versions (keep in sync with k0s_cluster_with_stack.sh) ─────────────────
-YQ_VERSION="v4.44.1"
+YQ_VERSION="v4.53.3"
 CERT_MANAGER_VERSION="v1.13.0"
 LOCAL_PATH_PROVISIONER_VERSION="v0.0.24"
 NVIDIA_DEVICE_PLUGIN_VERSION="v0.17.3"

@@ -9,14 +9,23 @@
 #   3. Replace all values marked with "CHANGE THIS"
 #   4. Run: CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
 #
-# Prerequisites (must be satisfied BEFORE running the installer):
+# Prerequisites:
 #
 # Local machine:
-#   ssh, kubectl, helm, git, jq, yq, docker — see the Prerequisites section of
-#   docs/deployment/k0s-quick-reference.md for install instructions per OS.
-#   macOS: brew install kubectl helm git jq yq
-#   RHEL 9: none of kubectl/helm/docker/yq are in the default dnf repos —
-#     install each via its own official method (git/jq ARE available via dnf).
+#   - Bash 4.4+ must be installed before this script can run. macOS's /bin/bash
+#     is too old; install a current Bash manually (for example, brew install bash).
+#   - During 'install', missing ssh/scp/curl/git/jq/yq/kubectl/helm/tar/timeout
+#     prerequisites are installed on supported installer hosts, then verified again.
+#   - Supported installer hosts: Ubuntu/Debian (apt), RHEL/Rocky/Alma/Fedora/
+#     Amazon Linux (dnf/yum), and macOS with Homebrew already installed.
+#   - Check or install them separately with:
+#       ./k0s_cluster_with_stack.sh prereqs check
+#       ./k0s_cluster_with_stack.sh prereqs install
+#   - Use 'install --no-install-prereqs' when the workstation is managed manually.
+#   - Interactive package installs may prompt for local sudo. Silent installs use
+#     non-interactive sudo and fail instead of waiting for a password prompt.
+#   - Docker is needed only for workflows that manually mirror container images;
+#     see docs/deployment/k0s-quick-reference.md for OS-specific instructions.
 #
 # All remote nodes (controllers + workers):
 #   - SSH access using the key at cluster.sshKeyPath as cluster.sshUser

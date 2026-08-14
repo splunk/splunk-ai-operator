@@ -20,5 +20,8 @@ jobs:
       - name: Run cluster_setup unit tests
         run: bash tools/cluster_setup/test_k0s_cluster_with_stack.sh
 
+      - name: Run prerequisite installer unit tests
+        run: bash tools/cluster_setup/test_installer_prerequisites.sh
+
       - name: Run Splunk-optional installer dry-run tests
         run: bash tools/cluster_setup/test_installer_dry_run.sh
