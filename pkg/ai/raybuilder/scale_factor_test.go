@@ -131,6 +131,73 @@ func TestReconcileRayService_GlobalScaleFactor(t *testing.T) {
 	require.NotEqual(t, createdRayService.Spec, updatedRayService.Spec)
 }
 
+// TestReconcileRayService_NoOpWhenUnchanged asserts that reconciling the same
+// AIPlatform spec twice in a row does not issue a second Update() against the
+// RayService object. KubeRay's own controller already rewrites .status on this
+// object every ~2-4s; if ReconcileRayService also wrote unconditionally on
+// every AIPlatform pass, it would compound onto that churn with a second,
+// redundant full-object (spec) rewrite. ResourceVersion is unchanged by a
+// fake-client Get unless a write actually occurred, so an unchanged
+// ResourceVersion across two reconciles proves the second reconcile issued no
+// write.
+func TestReconcileRayService_NoOpWhenUnchanged(t *testing.T) {
+	os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
+	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
+	os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
+
+	instanceFile, err := filepath.Abs("../../../config/configs/instance.yaml")
+	require.NoError(t, err)
+
+	dir := writeScaleFixtures(t, modelScaleFixture, workerScaleFixture)
+	t.Chdir(dir)
+
+	applicationFile := filepath.Join(dir, "applications.yaml")
+	require.NoError(t, os.WriteFile(applicationFile,
+		[]byte("modelA_replicas: {{.Replicas.ModelA}}\nmodelB_replicas: {{.Replicas.ModelB}}\n"), 0o644))
+	os.Setenv("APPLICATION_FILE", applicationFile)
+	os.Setenv("INSTANCE_FILE", instanceFile)
+	os.Setenv("MODEL_SCALE_FILE", filepath.Join(dir, "model-scale.yaml"))
+	os.Setenv("WORKER_SCALE_FILE", filepath.Join(dir, "worker-scale.yaml"))
+
+	s := scheme.Scheme
+	_ = aiv1.AddToScheme(s)
+	_ = rayv1.AddToScheme(s)
+	fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
+	recorder := record.NewFakeRecorder(100)
+
+	platform := newScaleFactorTestPlatform(int32PtrForTest(3))
+
+	ctx := context.Background()
+	builder := New(platform, fakeClient, s, recorder)
+	require.NoError(t, builder.ReconcileRayService(ctx, platform))
+	require.NotNil(t, builder.reconciledRayService)
+
+	var afterCreate rayv1.RayService
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-platform"}, &afterCreate))
+	rvAfterCreate := afterCreate.ResourceVersion
+
+	// Reconcile again with an identical platform spec - nothing this
+	// controller owns has changed.
+	require.NoError(t, builder.ReconcileRayService(ctx, platform))
+	require.NotNil(t, builder.reconciledRayService)
+
+	var afterSecondReconcile rayv1.RayService
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-platform"}, &afterSecondReconcile))
+
+	require.Equal(t, rvAfterCreate, afterSecondReconcile.ResourceVersion,
+		"second reconcile with unchanged desired state must not write to the RayService object")
+	require.Equal(t, rvAfterCreate, builder.reconciledRayService.ResourceVersion)
+
+	// A genuine change (scaleFactor bump) must still produce a write.
+	platform.Spec.ScaleFactor = int32PtrForTest(5)
+	require.NoError(t, builder.ReconcileRayService(ctx, platform))
+
+	var afterRealChange rayv1.RayService
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-platform"}, &afterRealChange))
+	require.NotEqual(t, rvAfterCreate, afterRealChange.ResourceVersion,
+		"a genuine spec change must still produce a write")
+}
+
 // TestBuildClusterConfig_GlobalScaleFactor asserts each GPU worker tier's
 // base pod count is multiplied by the platform-wide spec.scaleFactor.
 func TestBuildClusterConfig_GlobalScaleFactor(t *testing.T) {

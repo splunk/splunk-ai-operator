@@ -20,6 +20,7 @@ import (
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -394,14 +395,27 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 			return err
 		}
 
-		// mutate current.Spec to match desired svc.Spec
-		current.Spec = rs.Spec
-		// now try update
-		controllerutil.SetOwnerReference(p, &current, b.Scheme)
-		if err := b.Client.Update(ctx, &current); err != nil {
+		// Build the desired object on a copy so we can compare against what's
+		// actually stored before writing. KubeRay's own controller rewrites
+		// .status on this object every ~2-4s; if we also issue an unconditional
+		// spec Update() every AIPlatform reconcile regardless of whether our
+		// owned fields (spec, owner refs) actually changed, we compound onto
+		// that churn. Skipping the write when nothing we own has changed avoids
+		// adding a second, redundant full-object rewrite on top of KubeRay's.
+		desired := current.DeepCopy()
+		desired.Spec = rs.Spec
+		controllerutil.SetOwnerReference(p, desired, b.Scheme)
+
+		if apiequality.Semantic.DeepEqual(current.Spec, desired.Spec) &&
+			apiequality.Semantic.DeepEqual(current.OwnerReferences, desired.OwnerReferences) {
+			b.reconciledRayService = current.DeepCopy()
+			return nil
+		}
+
+		if err := b.Client.Update(ctx, desired); err != nil {
 			return err
 		}
-		b.reconciledRayService = current.DeepCopy()
+		b.reconciledRayService = desired.DeepCopy()
 		return nil
 	})
 }
