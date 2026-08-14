@@ -518,6 +518,13 @@ func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	assert.Equal(t, int32(8000), container.Ports[0].ContainerPort)
 	assert.Equal(t, "/health", container.ReadinessProbe.HTTPGet.Path)
 	assert.Equal(t, 8000, container.ReadinessProbe.HTTPGet.Port.IntValue())
+	assert.NotNil(t, container.StartupProbe)
+	assert.Equal(t, "/health", container.StartupProbe.HTTPGet.Path)
+	assert.Equal(t, 8000, container.StartupProbe.HTTPGet.Port.IntValue())
+	assert.Equal(t, int32(10), container.StartupProbe.InitialDelaySeconds)
+	assert.Equal(t, int32(30), container.StartupProbe.PeriodSeconds)
+	assert.Equal(t, int32(10), container.StartupProbe.FailureThreshold,
+		"SAIA v2 startup must tolerate slow Weaviate initialization")
 
 	envMap := envToMap(container.Env)
 	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])

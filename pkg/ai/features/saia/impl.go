@@ -1272,9 +1272,13 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 						ProbeHandler: corev1.ProbeHandler{
 							HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8000)},
 						},
+						// Initializing the synchronous and asynchronous Weaviate clients can
+						// take more than two minutes on a freshly installed or air-gapped
+						// cluster. Keep liveness/readiness strict after startup, but allow up
+						// to five minutes for the API to begin serving its health endpoint.
 						InitialDelaySeconds: 10,
 						PeriodSeconds:       30,
-						FailureThreshold:    5,
+						FailureThreshold:    10,
 					},
 				}},
 				Volumes:          volumes,

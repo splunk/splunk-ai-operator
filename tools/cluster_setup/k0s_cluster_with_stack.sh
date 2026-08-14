@@ -336,14 +336,14 @@ resolve_model_staging() {
     log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
   fi
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "Air-gap mode: model staging skipped (models must be pre-staged in object store); no prompt."
-    MODEL_STAGING_ENABLED=false
-    return 0
-  fi
-  # Full/interactive: prompt always overrides config value
+  # Full/interactive: prompt always overrides config value. Air-gap means the
+  # CLUSTER NODES have no internet, not necessarily this installer machine —
+  # so staging from here is still valid and must still be offered.
   echo "" >&2
   echo -e "  \033[1mModel Download\033[0m" >&2
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo "  Air-gap mode: models must be staged from THIS machine (the cluster nodes have no internet)." >&2
+  fi
   echo "  Do you want to download and stage model artifacts from HuggingFace now?" >&2
   echo "  (Required for a first install unless models are already in your object store.)" >&2
   local ans
@@ -431,11 +431,9 @@ show_install_plan() {
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
   echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
-    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-      echo -e "    2. Model artifact staging  [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
-    else
-      echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2
-    fi
+    echo -e "    2. Model artifact staging (installer host: HuggingFace → object store)" >&2
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo -e "    2. Verify pre-staged model artifacts in object store" >&2
   else
     echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
   fi
@@ -1272,6 +1270,306 @@ stage_k0s_image_bundle() {
   done
 }
 
+# Return success when this invocation has staged one or more k0s OCI image
+# bundles. Keeping this check in one place prevents the online path from paying
+# for journal/containerd probes that are meaningful only for air-gap installs.
+airgap_k0s_image_bundles_enabled() {
+  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 1
+  compgen -G "${AIRGAP_K0S_IMAGE_DIR}/*.tar" >/dev/null 2>&1
+}
+
+# Wait for the current k0s service invocation to finish importing every staged
+# OCI bundle. k0s starts its managed containerd and the OCIBundleReconciler in
+# parallel. Changing /etc/k0s/containerd.d while that first import is active
+# restarts containerd and aborts the import with "error reading from server:
+# EOF". Call this immediately after k0s starts and BEFORE writing containerd
+# registry configuration.
+wait_for_k0s_image_bundles() {
+  local node_ip="$1" service_name="$2" since_epoch="$3"
+  airgap_k0s_image_bundles_enabled || return 0
+
+  local timeout_seconds="${AIRGAP_IMAGE_IMPORT_TIMEOUT:-600}"
+  local elapsed=0 poll_seconds=5 journal_output=""
+  local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  local service_pid journal_query
+
+  # Include the second before systemctl start/restart so logs emitted in the
+  # same wall-clock second are not missed by journalctl's timestamp boundary.
+  (( since_epoch > 0 )) && since_epoch=$((since_epoch - 1))
+  service_pid=$(ssh_exec "${node_ip}" \
+    "sudo systemctl show --property=MainPID --value ${service_name} 2>/dev/null" \
+    2>/dev/null | tr -d '[:space:]' || true)
+  if [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]]; then
+    # _PID scopes the search to this exact k0s invocation. Timestamp-only
+    # filtering can accidentally accept a success emitted by the containerd
+    # config watcher's transient restart immediately before systemctl restart.
+    journal_query="sudo journalctl _PID=${service_pid} --no-pager -o cat 2>/dev/null"
+  else
+    journal_query="sudo journalctl -u ${service_name} --since='@${since_epoch}' --no-pager -o cat 2>/dev/null"
+  fi
+  log "  Waiting for ${#_tars[@]} air-gap image bundle(s) to import on ${node_ip}..."
+
+  while (( elapsed < timeout_seconds )); do
+    journal_output=$(ssh_exec "${node_ip}" \
+      "${journal_query} | grep -E 'OCI bundle|Failed to load OCI bundle' || true" \
+      2>/dev/null || true)
+
+    local all_loaded=true _tar _name
+    for _tar in "${_tars[@]}"; do
+      _name="$(basename "${_tar}")"
+      if grep -Fq "OCI bundle /var/lib/k0s/images/${_name} loaded" <<<"${journal_output}"; then
+        continue
+      fi
+      if grep -Fq "Failed to load OCI bundle /var/lib/k0s/images/${_name}" <<<"${journal_output}"; then
+        warn "  k0s failed to import ${_name} on ${node_ip}."
+        warn "  Refusing to configure/restart containerd while the offline image set is incomplete."
+        return 1
+      fi
+      all_loaded=false
+    done
+
+    if [[ "${all_loaded}" == "true" ]]; then
+      log "  ✓ All air-gap image bundles imported on ${node_ip}"
+      return 0
+    fi
+
+    sleep "${poll_seconds}"
+    elapsed=$((elapsed + poll_seconds))
+  done
+
+  warn "  Timed out after ${timeout_seconds}s waiting for air-gap image imports on ${node_ip}."
+  return 1
+}
+
+# Verify that every reference used to build the offline bundles is registered
+# in the node's k8s.io containerd namespace. A successful tar read alone is not
+# enough: this catches partial imports before cert-manager or any other add-on
+# creates pods that would otherwise fall back to a blocked public registry.
+verify_airgap_bundle_images_on_node() {
+  local node_ip="$1"
+  airgap_k0s_image_bundles_enabled || return 0
+
+  local _lists=( "${AIRGAP_K0S_IMAGE_DIR}"/*.list )
+  if [[ ! -f "${_lists[0]}" ]]; then
+    warn "  No *.list files found next to the air-gap image bundles in ${AIRGAP_K0S_IMAGE_DIR}."
+    return 1
+  fi
+
+  local present_images
+  if ! present_images=$(ssh_exec "${node_ip}" "sudo k0s ctr -n k8s.io images list -q 2>/dev/null"); then
+    warn "  Could not query containerd images on ${node_ip}."
+    return 1
+  fi
+
+  local missing=() _list image docker_normalized index_normalized
+  for _list in "${_lists[@]}"; do
+    [[ -f "${_list}" ]] || continue
+    while IFS= read -r image || [[ -n "${image}" ]]; do
+      image="${image%$'\r'}"
+      [[ -z "${image}" || "${image}" == \#* ]] && continue
+
+      if grep -Fqx "${image}" <<<"${present_images}"; then
+        continue
+      fi
+
+      docker_normalized=""
+      if [[ "${image}" != */* ]]; then
+        docker_normalized="docker.io/library/${image}"
+      elif [[ "${image%%/*}" != *.* && "${image%%/*}" != *:* && "${image%%/*}" != "localhost" ]]; then
+        docker_normalized="docker.io/${image}"
+      fi
+      index_normalized="${docker_normalized/docker.io\//index.docker.io/}"
+
+      if [[ -n "${docker_normalized}" ]] && \
+         { grep -Fqx "${docker_normalized}" <<<"${present_images}" || \
+           grep -Fqx "${index_normalized}" <<<"${present_images}"; }; then
+        continue
+      fi
+      missing+=("${image}")
+    done < "${_list}"
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    warn "  ${node_ip} is missing ${#missing[@]} image(s) from the air-gap bundles:"
+    local _missing
+    for _missing in "${missing[@]:0:20}"; do warn "    - ${_missing}"; done
+    (( ${#missing[@]} > 20 )) && warn "    ... and $((${#missing[@]} - 20)) more"
+    return 1
+  fi
+
+  log "  ✓ Verified all bundled image references on ${node_ip}"
+}
+
+# Registry drop-ins are written only after the first OCI import completes. The
+# k0s containerd config watcher may restart containerd when those files change,
+# so follow that change with one explicit full k0s restart and verify the second
+# bundle reconciliation before continuing.
+restart_k0s_after_registry_configuration() {
+  local node_ip="$1" service_name="$2"
+  [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] || return 0
+
+  local restart_epoch
+  restart_epoch=$(ssh_exec "${node_ip}" "date +%s")
+  log "  Restarting ${service_name} on ${node_ip} after registry configuration..."
+  ssh_exec "${node_ip}" "sudo systemctl restart ${service_name}"
+
+  local elapsed=0
+  until ssh_exec "${node_ip}" "sudo systemctl is-active --quiet ${service_name}" &>/dev/null; do
+    if (( elapsed >= 120 )); then
+      warn "  ${service_name} did not become active on ${node_ip} after registry configuration."
+      return 1
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  wait_for_k0s_image_bundles "${node_ip}" "${service_name}" "${restart_epoch}" || return 1
+  verify_airgap_bundle_images_on_node "${node_ip}"
+}
+
+# Refresh changed OCI bundles on a node whose k0s service is already running.
+# The normal bootstrap path stages bundles before the first start, but a rerun
+# can point at a newer bundle (for example after k0s adds system images).  Copy
+# changed archives to /tmp while k0s stays available, stop the service only for
+# the atomic replacement, then start it once and wait for reconciliation.  This
+# avoids both stale archives and an in-flight import being cut off by a restart.
+refresh_airgap_image_bundles_on_running_node() {
+  local node_ip="$1" service_name="$2"
+  airgap_k0s_image_bundles_enabled || return 0
+
+  local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  local changed_names=() staged_paths=()
+  local _tar _name _local_sha _remote_sha _remote_tmp
+
+  for _tar in "${_tars[@]}"; do
+    _name="$(basename "${_tar}")"
+    _local_sha="$(sha256sum "${_tar}" | awk '{print $1}')"
+    _remote_sha="$(ssh_exec "${node_ip}" \
+      "sudo sha256sum /var/lib/k0s/images/${_name} 2>/dev/null | awk '{print \$1}'" \
+      2>/dev/null | tr -d '[:space:]' || true)"
+
+    if [[ -n "${_remote_sha}" && "${_remote_sha}" == "${_local_sha}" ]]; then
+      log "  ✓ ${node_ip}: ${_name} already matches the staged bundle"
+      continue
+    fi
+
+    _remote_tmp="/tmp/k0s-airgap-${$}-${_name}"
+    log "  Staging updated ${_name} on ${node_ip} before ${service_name} restart..."
+    if ! scp_file "${_tar}" "${node_ip}" "${_remote_tmp}"; then
+      warn "  Failed to copy updated ${_name} to ${node_ip}."
+      local _cleanup_path
+      for _cleanup_path in "${staged_paths[@]}"; do
+        ssh_exec "${node_ip}" "rm -f ${_cleanup_path}" >/dev/null 2>&1 || true
+      done
+      return 1
+    fi
+    changed_names+=("${_name}")
+    staged_paths+=("${_remote_tmp}")
+  done
+
+  if (( ${#changed_names[@]} == 0 )); then
+    log "  ✓ ${node_ip}: all on-node air-gap archives are current"
+    verify_airgap_bundle_images_on_node "${node_ip}"
+    return
+  fi
+
+  log "  Replacing ${#changed_names[@]} changed archive(s) and restarting ${service_name} on ${node_ip}..."
+  if ! ssh_exec "${node_ip}" "sudo systemctl stop ${service_name}"; then
+    warn "  Could not stop ${service_name} on ${node_ip}; updated archives remain in /tmp."
+    return 1
+  fi
+
+  local move_failed=0 i
+  for i in "${!changed_names[@]}"; do
+    if ! ssh_exec "${node_ip}" \
+      "sudo mv -f ${staged_paths[$i]} /var/lib/k0s/images/${changed_names[$i]} && sudo chown root:root /var/lib/k0s/images/${changed_names[$i]} && sudo chmod 600 /var/lib/k0s/images/${changed_names[$i]}"; then
+      warn "  Failed to replace ${changed_names[$i]} on ${node_ip}."
+      move_failed=1
+    fi
+  done
+
+  local start_epoch
+  start_epoch="$(ssh_exec "${node_ip}" "date +%s")"
+  if ! ssh_exec "${node_ip}" "sudo systemctl start ${service_name}"; then
+    warn "  ${service_name} failed to start on ${node_ip} after refreshing air-gap archives."
+    return 1
+  fi
+  (( move_failed == 0 )) || return 1
+
+  local elapsed=0
+  until ssh_exec "${node_ip}" "sudo systemctl is-active --quiet ${service_name}" &>/dev/null; do
+    if (( elapsed >= 120 )); then
+      warn "  ${service_name} did not become active on ${node_ip} after refreshing air-gap archives."
+      return 1
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  wait_for_k0s_image_bundles "${node_ip}" "${service_name}" "${start_epoch}" || return 1
+  verify_airgap_bundle_images_on_node "${node_ip}" || return 1
+
+  if [[ "${service_name}" == "k0scontroller" ]]; then
+    elapsed=0
+    until ssh_exec "${node_ip}" "sudo k0s kubectl get --raw /healthz 2>/dev/null" &>/dev/null; do
+      if (( elapsed >= 120 )); then
+        warn "  Controller API did not recover on ${node_ip} after refreshing air-gap archives."
+        return 1
+      fi
+      sleep 5
+      elapsed=$((elapsed + 5))
+    done
+  fi
+}
+
+# Existing-cluster installs must refresh the on-node archives before the final
+# image gate.  Without this, a new staging run can verify a new *.list against
+# an older /var/lib/k0s/images/*.tar and report every newly-added k0s image as
+# missing even though the new archive was built correctly.
+refresh_airgap_image_bundles_on_existing_nodes() {
+  airgap_k0s_image_bundles_enabled || return 0
+
+  log "Refreshing air-gap image bundles on the existing cluster..."
+  local failed_nodes=() node_ip
+  for node_ip in "${CONTROLLER_IPS[@]}"; do
+    refresh_airgap_image_bundles_on_running_node "${node_ip}" "k0scontroller" \
+      || failed_nodes+=("${node_ip}")
+  done
+  for node_ip in "${WORKER_IPS[@]}"; do
+    refresh_airgap_image_bundles_on_running_node "${node_ip}" "k0sworker" \
+      || failed_nodes+=("${node_ip}")
+  done
+
+  if (( ${#failed_nodes[@]} > 0 )); then
+    err "Failed to refresh air-gap image bundles on: ${failed_nodes[*]}
+    The retained bundle is safe to reuse after fixing the node-level error."
+  fi
+}
+
+# Final pre-stack gate. It also protects the useExisting/rerun path, where k0s
+# bootstrap is intentionally skipped but the installer must still prove that
+# sealed nodes can launch every infrastructure image without public egress.
+verify_airgap_bundle_images_on_all_nodes() {
+  airgap_k0s_image_bundles_enabled || return 0
+
+  log "Verifying air-gap image bundles on every cluster node..."
+  local all_node_ips=()
+  declare -p CONTROLLER_IPS &>/dev/null && all_node_ips+=( "${CONTROLLER_IPS[@]}" )
+  declare -p WORKER_IPS &>/dev/null && all_node_ips+=( "${WORKER_IPS[@]}" )
+  (( ${#all_node_ips[@]} > 0 )) \
+    || err "Air-gap image verification could not determine any cluster node IPs."
+  local failed_nodes=() node_ip
+  for node_ip in "${all_node_ips[@]}"; do
+    verify_airgap_bundle_images_on_node "${node_ip}" || failed_nodes+=("${node_ip}")
+  done
+
+  if (( ${#failed_nodes[@]} > 0 )); then
+    err "Air-gap image verification failed on: ${failed_nodes[*]}
+    k0s add-ons were not installed because they would attempt public-registry pulls.
+    Check the k0s service journal for OCIBundleReconciler errors, then rerun install."
+  fi
+}
+
 # ====== PREFLIGHT: REGISTRY REACHABILITY CHECK ======
 # Verifies the configured image registry is reachable and credentials work
 # BEFORE any install work begins, so a bad registry config fails fast with a
@@ -2023,7 +2321,15 @@ PYSCRIPT"
   # plugin key at preflight, crashing k0s before configure_insecure_registry_on_node
   # can execute its own cleanup.
   ssh_exec "${controller_ip}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
+  local controller_start_epoch
+  controller_start_epoch=$(ssh_exec "${controller_ip}" "date +%s")
   ssh_exec "${controller_ip}" "sudo k0s start"
+
+  # Do not write any containerd drop-ins until k0s has finished its first OCI
+  # reconciliation. The containerd config watcher restarts the runtime and
+  # would otherwise sever an in-flight bundle import with an EOF.
+  wait_for_k0s_image_bundles "${controller_ip}" "k0scontroller" "${controller_start_epoch}" \
+    || err "Offline image bundle import failed on controller ${controller_ip}."
 
   log "Waiting for controller API server to be ready..."
   local ctrl_retries=0
@@ -2040,6 +2346,27 @@ PYSCRIPT"
   # Configure insecure registry after k0s start so that containerd has written
   # /etc/k0s/containerd.toml — required for correct containerd v1/v2 detection.
   configure_insecure_registry_on_node "${controller_ip}"
+
+  if [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]]; then
+    restart_k0s_after_registry_configuration "${controller_ip}" "k0scontroller" \
+      || err "Controller ${controller_ip} did not recover cleanly after registry configuration."
+
+    log "Waiting for controller API server after registry restart..."
+    local ctrl_restart_retries=0
+    while (( ctrl_restart_retries < 60 )); do
+      if ssh_exec "${controller_ip}" "sudo k0s kubectl get --raw /healthz 2>/dev/null" &>/dev/null; then
+        log "  ✓ Controller API server is ready after registry restart (${ctrl_restart_retries}s)"
+        break
+      fi
+      sleep 5
+      ctrl_restart_retries=$((ctrl_restart_retries + 5))
+    done
+    (( ctrl_restart_retries < 60 )) \
+      || err "Controller API server did not recover after registry configuration restart."
+  else
+    verify_airgap_bundle_images_on_node "${controller_ip}" \
+      || err "Offline image verification failed on controller ${controller_ip}."
+  fi
 
   # Generate worker token
   log "Generating worker join token..."
@@ -2098,11 +2425,31 @@ PYSCRIPT"
     # plugin key at preflight, crashing k0sworker before configure_insecure_registry_on_node
     # can execute its own cleanup.
     ssh_exec "${worker_ip}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
+    local worker_start_epoch
+    worker_start_epoch=$(ssh_exec "${worker_ip}" "date +%s")
     if ssh_exec "${worker_ip}" "sudo k0s start"; then
       log "  ✓ k0s started on ${worker_ip}"
-      # Configure insecure registry after k0s start so containerd is running
-      # and the v1/v2 detection against the containerd binary is reliable.
+
+      if ! wait_for_k0s_image_bundles "${worker_ip}" "k0sworker" "${worker_start_epoch}"; then
+        warn "  ✗ Offline image bundle import failed on ${worker_ip}"
+        failed_workers+=("${worker_ip}")
+        continue
+      fi
+
+      # Configure the registry only after the initial bundle import is done,
+      # then perform one deliberate full restart and verify the second import.
       configure_insecure_registry_on_node "${worker_ip}"
+      if [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]]; then
+        if ! restart_k0s_after_registry_configuration "${worker_ip}" "k0sworker"; then
+          warn "  ✗ k0sworker did not recover cleanly on ${worker_ip} after registry configuration"
+          failed_workers+=("${worker_ip}")
+          continue
+        fi
+      elif ! verify_airgap_bundle_images_on_node "${worker_ip}"; then
+        warn "  ✗ Offline image verification failed on ${worker_ip}"
+        failed_workers+=("${worker_ip}")
+        continue
+      fi
     else
       warn "  ✗ Failed to start k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
@@ -2503,7 +2850,7 @@ ensure_s3compat_credentials() {
   # may still be starting up, or its VIP may not be routable yet.
   local _endpoint=""
   case "${OBJ_STORE_TYPE}" in
-    minio|seaweedfs)
+    minio|seaweedfs|s3compat)
       _endpoint="${OBJ_STORE_ENDPOINT:-${MINIO_ENDPOINT:-}}"
       ;;
     aws)
@@ -2832,6 +3179,49 @@ stage_model_artifacts() {
   log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
 }
 
+# When automatic staging is disabled for an air-gap install, do not merely
+# trust that models were staged out-of-band. Verify the per-model completion
+# markers before touching the cluster; otherwise the installer can finish while
+# SAIA and Ray Serve immediately fail with NoSuchBucket/404 errors.
+verify_pre_staged_model_artifacts() {
+  local staging_dir
+  staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
+    || { err "Cannot locate artifacts_download_upload_scripts directory"; return 1; }
+
+  local _accel
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
+
+  if all_models_staged "${staging_dir}" "${_accel}"; then
+    log "✓ Verified pre-staged model artifacts in ${OBJ_STORE_BUCKET}"
+    return 0
+  fi
+
+  err "Air-gap model verification failed for bucket '${OBJ_STORE_BUCKET}'.
+    storage.modelStaging.enabled=false means every required model must already
+    exist in that bucket with a matching staging_state marker. Either correct
+    storage.objectStore.bucket, or set storage.modelStaging.enabled=true on an
+    internet-connected installer and rerun."
+}
+
+# Return the names of cert-manager pods whose current pod UID is stuck in
+# kubelet's image-pull backoff.  The explicit []? iterator matters here:
+# any(array; condition) evaluates the condition against the array itself,
+# which makes `.state.waiting.reason` fail with "Cannot index array with
+# string state" and silently prevents rerun recovery.
+cert_manager_image_pull_backoff_pods() {
+  kubectl get pods -n cert-manager \
+    -l app.kubernetes.io/instance=cert-manager -o json 2>/dev/null \
+    | jq -r '
+        .items[]
+        | select(any(
+            (((.status.initContainerStatuses // [])
+              + (.status.containerStatuses // []))[]?);
+            ((.state.waiting.reason // "") == "ImagePullBackOff"
+             or (.state.waiting.reason // "") == "ErrImagePull")
+          ))
+        | .metadata.name'
+}
+
 # ====== INSTALL CERT-MANAGER ======
 install_cert_manager() {
   log "Installing cert-manager..."
@@ -2843,8 +3233,30 @@ install_cert_manager() {
   [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
   kubectl apply -f "${_cm_url}"
 
+  # A previous run may have created cert-manager pods before the offline image
+  # import completed. Kubelet retains exponential pull backoff for those pod
+  # UIDs even after the image becomes available locally. Recreate only pods
+  # currently stuck on an image pull; healthy cert-manager pods are untouched.
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    local _failed_cm_pods=()
+    mapfile -t _failed_cm_pods < <(cert_manager_image_pull_backoff_pods)
+    if (( ${#_failed_cm_pods[@]} > 0 )); then
+      log "Recreating ${#_failed_cm_pods[@]} cert-manager pod(s) left in image-pull backoff by an earlier run..."
+      kubectl delete pod -n cert-manager --wait=false "${_failed_cm_pods[@]}"
+    fi
+  fi
+
   wait_for_crd certificates.cert-manager.io 300
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
+
+  # Do not wait on a pod-label snapshot here. After deleting a stale pod with
+  # --wait=false, `kubectl wait pod -l ...` can retain that deleted pod's name
+  # and spend the entire timeout waiting for an obsolete UID. Deployment
+  # rollout status follows the replacement ReplicaSet/pod instead.
+  local _cm_deployment
+  for _cm_deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
+    kubectl rollout status "deployment/${_cm_deployment}" \
+      -n cert-manager --timeout=300s
+  done
 
   # Wait for webhook to be fully operational
   log "Waiting for cert-manager webhooks to be ready..."
@@ -2868,26 +3280,16 @@ install_cert_manager() {
 
   if (( retries >= max_retries )); then
     warn "cert-manager webhook endpoint not found after ${max_retries} retries"
+    return 1
   fi
 
-  # Brief pause for webhook registration with API server
-  log "Waiting for webhooks to stabilize (10s)..."
-  sleep 10
-
-  # Test webhook by creating a test Certificate resource
-  log "Testing cert-manager webhook functionality..."
-  cat <<EOF | kubectl apply -f - || warn "Webhook test failed, but continuing..."
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: test-selfsigned
-  namespace: cert-manager
-spec:
-  selfSigned: {}
-EOF
-
-  # Clean up test issuer
-  kubectl delete issuer test-selfsigned -n cert-manager --ignore-not-found=true 2>/dev/null || true
+  # A populated Service endpoint only proves that the webhook pod is Ready.
+  # Require an actual admission request to succeed as well; this verifies that
+  # cainjector has populated the webhook caBundle and the API server trusts it.
+  if ! wait_for_cert_manager_webhook 30 10; then
+    warn "cert-manager admission webhook is not functional; refusing to install dependent components"
+    return 1
+  fi
 
   log "cert-manager installed successfully"
 }
@@ -4449,10 +4851,12 @@ wait_for_cert_manager_webhook() {
     return 1
   fi
 
-  # 3. Functional test: create and delete a test Issuer
+  # 3. Functional test: submit a server-side dry-run Issuer. This exercises
+  # admission (including webhook TLS/CA validation) without persisting a test
+  # resource in the cluster.
   local test_ok=false
   for i in $(seq 1 "${max_attempts}"); do
-    if kubectl apply -f - <<'TESTEOF' 2>/dev/null
+    if kubectl create --dry-run=server -f - <<'TESTEOF' 2>/dev/null
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -4462,8 +4866,6 @@ spec:
   selfSigned: {}
 TESTEOF
     then
-      kubectl delete issuer cert-manager-webhook-test -n cert-manager \
-        --ignore-not-found=true 2>/dev/null || true
       test_ok=true
       log "✓ cert-manager webhook is responsive"
       break
@@ -6151,18 +6553,22 @@ install_ai_platform_stack() {
   install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("nvidia-drivers")
 
-  # Track which phase-1 tasks failed. nvidia-drivers failures are fatal:
-  # without them the device-plugin crash-loops and the whole GPU stack
-  # silently fails. Every other phase-1 task is merely warned on failure.
+  # Track required phase-1 tasks. cert-manager must be functional before any
+  # operator manifests containing Certificate/Issuer resources are applied;
+  # NVIDIA host drivers are required before the device plugin can start.
   local phase1_fatal_failures=0
+  local phase1_fatal_names=()
   for i in "${!phase1_pids[@]}"; do
     if wait "${phase1_pids[$i]}"; then
       log "  ✓ ${phase1_names[$i]} completed"
     else
       warn "  ✗ ${phase1_names[$i]} had issues"
-      if [[ "${phase1_names[$i]}" == "nvidia-drivers" ]]; then
-        phase1_fatal_failures=$((phase1_fatal_failures + 1))
-      fi
+      case "${phase1_names[$i]}" in
+        cert-manager|nvidia-drivers)
+          phase1_fatal_failures=$((phase1_fatal_failures + 1))
+          phase1_fatal_names+=("${phase1_names[$i]}")
+          ;;
+      esac
     fi
     while IFS= read -r line; do
       log "    [${phase1_names[$i]}] ${line}"
@@ -6171,9 +6577,7 @@ install_ai_platform_stack() {
   rm -rf "${phase1_logdir}"
 
   if [[ ${phase1_fatal_failures} -gt 0 ]]; then
-    err "NVIDIA driver install failed on at least one GPU node; aborting install.
-    Device-plugin pods would otherwise crash-loop with NVML: ERROR_LIBRARY_NOT_FOUND
-    and model pods would stay Pending forever. Fix the errors above and re-run."
+    err "Required Phase 1 component(s) failed: ${phase1_fatal_names[*]}. Aborting before dependent operators are installed. Fix the errors above and re-run."
   fi
 
   ensure_s3compat_credentials
@@ -7411,6 +7815,11 @@ main_install() {
     log "Model staging enabled — downloading from Hugging Face and uploading to object store…"
     stage_model_artifacts
     step_ok
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    step_start "Verify pre-staged model artifacts"
+    log "Model staging disabled — verifying required models already exist in the configured object store..."
+    verify_pre_staged_model_artifacts
+    step_ok
   else
     step_start "Model artifact staging"
     log "Model staging disabled (storage.modelStaging.enabled=false) — skipping HF download + upload"
@@ -7572,6 +7981,17 @@ main_install() {
     log "  ✓ If using on-prem/private cluster, ensure ports 6443, 8080, 30000-32767 are accessible"
     log ""
   fi
+
+  # A rerun may have staged a newer archive than the one left on the nodes by a
+  # previous install. Refresh changed archives before checking their image lists.
+  if [[ "${use_existing_cluster}" == "true" ]]; then
+    refresh_airgap_image_bundles_on_existing_nodes
+  fi
+
+  # This runs for both fresh bootstrap and useExisting/rerun installs. Do not
+  # create cert-manager or other add-on pods until every sealed node has the
+  # complete offline image set registered in containerd.
+  verify_airgap_bundle_images_on_all_nodes
 
   # Install AI Platform stack
   phase_start "AI Platform Stack"
@@ -8320,12 +8740,26 @@ join_workers() {
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."
+    local worker_start_epoch
+    worker_start_epoch=$(ssh_exec "${worker_ip}" "date +%s")
     if ssh_exec "${worker_ip}" "sudo systemctl start k0sworker"; then
       log "  ✓ Worker service started"
     else
       warn "  Failed to start k0s worker on ${worker_ip}"
       # Try fallback
       ssh_exec "${worker_ip}" "sudo k0s start" || continue
+    fi
+
+    if ! wait_for_k0s_image_bundles "${worker_ip}" "k0sworker" "${worker_start_epoch}"; then
+      warn "  Offline image bundle import failed on ${worker_ip}; worker will not be joined."
+      continue
+    fi
+
+    configure_insecure_registry_on_node "${worker_ip}"
+    if [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]]; then
+      restart_k0s_after_registry_configuration "${worker_ip}" "k0sworker" || continue
+    else
+      verify_airgap_bundle_images_on_node "${worker_ip}" || continue
     fi
 
     # Wait briefly and verify
