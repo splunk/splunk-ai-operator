@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -46,7 +47,7 @@ const aiPlatformFinalizer = "ai.splunk.com/aiplatform-protect"
 // +kubebuilder:rbac:groups=ai.splunk.com,resources=aiplatforms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ai.splunk.com,resources=aiplatforms/finalizers,verbs=update
 // +kubebuilder:rbac:groups=ai.splunk.com,resources=aiservices,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheusrules,verbs=get;list;watch;create;update;patch;delete
@@ -177,11 +178,15 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("aiplatform").
 		For(&aiv1.AIPlatform{}).
-		// AIPlatform owns its AIService children - reconcile on generation changes
-		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Or(
-			common.GenerationChangedPredicate(),
-			common.AnnotationChangedPredicate(),
-		))).
+		// AIPlatform is the source of truth for AIService spec, so child updates
+		// must not wake the parent into a spec-write loop. Reconcile on delete so
+		// missing children are recreated; primary AIPlatform changes still flow
+		// through the .For(AIPlatform) watch above.
+		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc: func(e event.CreateEvent) bool { return false },
+			UpdateFunc: func(e event.UpdateEvent) bool { return false },
+			DeleteFunc: func(e event.DeleteEvent) bool { return !e.DeleteStateUnknown },
+		})).
 		// Infra owned by AIPlatform itself - with specific predicates
 		// Ray resources - only reconcile on generation changes
 		Owns(&rayv1.RayService{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

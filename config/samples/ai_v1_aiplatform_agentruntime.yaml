@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mltk-postgres-conn
+type: Opaque
+stringData:
+  DATABASE_URL: postgresql://user:password@postgres.default.svc.cluster.local:5432/checkpoints
+---
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: agentruntime-sample
+spec:
+  objectStorage:
+    path: s3://ai-platform-dev
+    region: us-west-2
+
+  features:
+    - name: agentruntime
+      provider: mltk
+      version: "0.1.0"
+      runtimeVersion: "v2.0.0"
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilization: 60
+      checkpointDbSecretRef: mltk-postgres-conn

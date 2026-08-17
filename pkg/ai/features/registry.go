@@ -1,6 +1,7 @@
 package features
 
 import (
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/saia"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/seca"
@@ -8,7 +9,8 @@ import (
 )
 
 var FeatureFactories = map[string]common.FeatureFactory{
-	"saia": &saia.SaiaFactory{},
-	"seca": &seca.SecaFactory{},
-	"slim": &slim.SlimFactory{},
+	"saia":         &saia.SaiaFactory{},
+	"seca":         &seca.SecaFactory{},
+	"slim":         &slim.SlimFactory{},
+	"agentruntime": &agentruntime.AgentRuntimeFactory{},
 }

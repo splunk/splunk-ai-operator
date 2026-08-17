@@ -1,5 +1,6 @@
 ## Append samples of your project ##
 resources:
 - ai_v1_aiplatform.yaml
+- ai_v1_aiplatform_agentruntime.yaml
 - ai_v1_aiservice.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

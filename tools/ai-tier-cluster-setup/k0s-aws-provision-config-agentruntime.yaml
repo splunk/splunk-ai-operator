@@ -1,0 +1,60 @@
+# ===================================================================
+# k0s AWS Provisioner Configuration: Agent Runtime Dev Profile
+# ===================================================================
+# Creates a small, non-airgapped k0s environment for validating the
+# agentruntime CR path without GPU workers, model staging, SAIA, SLIM, or
+# in-cluster Splunk.
+# ===================================================================
+
+stackName: agentruntime-dev
+region: us-west-2
+availabilityZone: us-west-2a
+sshAllowedCidr: "0.0.0.0/0" # CHANGE THIS: use your-ip/32
+install:
+  clusterConfigTemplate: "k0s-cluster-config-agentruntime.yaml"
+  modelStaging:
+    enabled: false
+network:
+  # Shared ai-platform VPC in splunkcloud-ai-dev us-west-2. Set to your VPC ID,
+  # or set "" to let the provisioner create a new VPC/NAT stack.
+  vpcId: vpc-09b191e89c83d588e
+  subnetId: ""
+  installerSubnetId: ""
+  vpcCidr: "10.0.0.0/16"
+  publicSubnetCidr: "10.0.1.0/24"
+  privateSubnetCidr: "10.0.2.0/24"
+keyPair:
+  name: ""
+  localPath: ""
+nodes:
+  controller:
+    count: 1
+    instanceType: t3.large
+    diskGb: 80
+  cpuWorker:
+    count: 1
+    instanceType: m6i.xlarge
+    diskGb: 120
+  gpuWorker:
+    count: 0
+    instanceType: g6e.xlarge
+    diskGb: 80
+    dataDiskGb: 1
+installer:
+  instanceType: t3.large
+  diskGb: 50
+minio:
+  enabled: true
+  dataDiskGb: 40
+  bucket: ai-platform
+  rootUser: minioadmin
+  rootPassword: ""
+  port: 9000
+ecr:
+  account: "658391232643"
+  region: us-west-2
+seaweedfs:
+  endpoint: ""
+  bucket: ai-platform-bucket
+  rootUser: minioadmin
+  rootPassword: minioadmin
