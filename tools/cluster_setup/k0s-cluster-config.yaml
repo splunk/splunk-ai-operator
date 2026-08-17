@@ -116,7 +116,7 @@ images:
   registryInsecure: false
 
   operator:
-    image: "docker.io/kpratyush775/splunk-ai-operator:v2.3"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v2.5"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
@@ -136,6 +136,11 @@ images:
     apiImage: "docker.io/splunk/ai-tier-saia-api:preview"
     apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:preview"
     dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:preview"
+
+  # slim-api service image (consumed via RELATED_IMAGE_SLIM_API). Only needed
+  # when the "slim" feature is enabled under aiPlatform.features[].
+  slim:
+    apiImage: "splunk/slim/slim-api:latest"
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
@@ -173,7 +178,7 @@ files:
 
 # ---------- Splunk Configuration ----------
 splunk:
-  # Opt-in Splunk integration (JWT/auth issuer for SAIA, plus optional
+  # Opt-in Splunk integration (JWT/auth issuer for SAIA/Slim, plus optional
   # HEC telemetry export); defaults to disabled, enabled here. When false (or
   # absent), no Splunk Operator/Standalone is installed and the AIPlatform CR
   # omits splunkConfiguration.
@@ -199,7 +204,7 @@ splunk:
   #   export SPLUNK_HEC_TOKEN='<your-hec-token>'
   #   CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 
-  # Additional JWT issuers SAIA should trust besides the primary endpoint
+  # Additional JWT issuers SAIA/Slim should trust besides the primary endpoint
   # above — e.g. to keep an internal and an external Splunk both trusted at
   # once. Optional.
   # trustedIssuers:
@@ -258,10 +263,19 @@ aiPlatform:
   serviceTemplate:
     type: NodePort          # ClusterIP | NodePort | LoadBalancer
     nodePort: 30080         # Fixed NodePort (30000-32767) for the SAIA public service. Required only for NodePort.
+    # AIPlatform.serviceTemplate propagates identically to EVERY feature's
+    # AIService, so slim would otherwise inherit the same 30080 and collide with
+    # SAIA (a NodePort can back only one Service). When the "slim" feature is
+    # enabled under NodePort, the installer patches slim's public Service to this
+    # DISTINCT port instead. Reach slim at http://<any-worker-ip>:<slimNodePort>.
+    slimNodePort: 30081     # Fixed NodePort for the slim public service. Only used when slim is enabled + type=NodePort.
 
   features:
     - name: "saia"
       version: "1.1.0"
+    # Enable the slim-api service (no v1/v2 routing). Exposed on slimNodePort above.
+    - name: "slim"
+      version: "1.0.0"
 
   cpuScheduling:
     nodeSelector: {}
