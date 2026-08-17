@@ -18,6 +18,7 @@
 #   ./k0s_aws_provision.sh provision [--config FILE]
 #   ./k0s_aws_provision.sh output    [--config FILE]
 #   ./k0s_aws_provision.sh status    [--config FILE]
+#   ./k0s_aws_provision.sh resume-setup [--config FILE]
 #   ./k0s_aws_provision.sh destroy   [--config FILE] [--yes]
 #   ./k0s_aws_provision.sh dry-run   [--config FILE]
 # =============================================================================
@@ -36,7 +37,7 @@ err()  { echo "[k0s-provision] ERROR: $*" >&2; exit 1; }
 
 # -- Arg parsing --
 COMMAND="${1:-}"
-[[ -z "$COMMAND" ]] && { echo "Usage: $0 <provision|output|status|destroy|dry-run> [--config FILE]"; exit 1; }
+[[ -z "$COMMAND" ]] && { echo "Usage: $0 <provision|output|status|resume-setup|destroy|dry-run> [--config FILE]"; exit 1; }
 shift
 FORCE_DESTROY=false
 while [[ $# -gt 0 ]]; do
@@ -118,6 +119,11 @@ load_config() {
   MINIO_PASS="$(cfg_default '.minio.rootPassword' '')"
   MINIO_PORT="$(cfg_default '.minio.port' '9000')"
   [[ "$MINIO_PASS" == "null" || -z "$MINIO_PASS" ]] && MINIO_PASS=""
+
+  CLUSTER_CONFIG_TEMPLATE="$(cfg_default '.install.clusterConfigTemplate' 'k0s-cluster-config.yaml')"
+  [[ "$CLUSTER_CONFIG_TEMPLATE" == "null" || -z "$CLUSTER_CONFIG_TEMPLATE" ]] && CLUSTER_CONFIG_TEMPLATE="k0s-cluster-config.yaml"
+  INSTALL_MODEL_STAGING_ENABLED="$(cfg '.install.modelStaging.enabled' 2>/dev/null || echo "null")"
+  [[ "$INSTALL_MODEL_STAGING_ENABLED" == "null" || -z "$INSTALL_MODEL_STAGING_ENABLED" ]] && INSTALL_MODEL_STAGING_ENABLED=""
 
   # ECR configuration
   ECR_ACCOUNT="$(cfg_default '.ecr.account' '')"
@@ -662,6 +668,10 @@ mount_disk_via_ssh() {
   log "Mounting ${mp} on ${host}..."
   ssh "${ssh_opts[@]}" "ec2-user@${host}" "sudo bash -s" <<MOUNTSCRIPT
 set -e
+if mountpoint -q "${mp}"; then
+  echo "${mp} is already mounted"
+  exit 0
+fi
 # Find the data disk: any block device not currently mounted and not the root disk.
 # Checks nvme*n1 devices in order; skips nvme0n1 (root on AWS RHEL AMIs).
 # Falls back to xvdb/sdb for non-NVMe instances.
@@ -718,9 +728,9 @@ wait_for_ssh_via_jump() {
 
 # -- Verify outbound internet access from a private node via NAT --
 # Usage: check_nat_connectivity <private_ip> <label> <jump_eip>
-# Checks three endpoints that k0s install actually needs:
+# Checks endpoints that k0s install actually needs:
 #   get.k0s.sh  — k0s binary download
-#   developer.download.nvidia.com — NVIDIA driver repo
+#   developer.download.nvidia.com — NVIDIA driver repo, only when GPU workers exist
 #   registry-1.docker.io — container image pulls
 check_nat_connectivity() {
   local host="$1" label="$2" jump="$3"
@@ -729,13 +739,16 @@ check_nat_connectivity() {
 
   log "Checking NAT outbound connectivity on ${label} (${host})..."
   local failed=0
-  local endpoints=("https://get.k0s.sh" "https://developer.download.nvidia.com" "https://registry-1.docker.io")
+  local endpoints=("https://get.k0s.sh" "https://registry-1.docker.io/v2/")
+  if [[ "${GPU_COUNT:-0}" =~ ^[0-9]+$ ]] && (( GPU_COUNT > 0 )); then
+    endpoints+=("https://developer.download.nvidia.com")
+  fi
   for url in "${endpoints[@]}"; do
     local result
     result=$(ssh "${ssh_base[@]}" \
-      "curl -sSf --max-time 10 -o /dev/null -w '%{http_code}' '${url}' 2>/dev/null || echo FAIL" \
+      "curl -sS --max-time 10 -o /dev/null -w '%{http_code}' '${url}' 2>/dev/null || echo FAIL" \
       2>/dev/null || echo "FAIL")
-    if [[ "$result" == "FAIL" || "$result" == "000" ]]; then
+    if [[ "$result" == "FAIL" || "$result" == "000" || ! "$result" =~ ^[0-9]{3}$ ]]; then
       warn "  ${label}: UNREACHABLE — ${url}"
       failed=1
     else
@@ -758,6 +771,27 @@ setup_installer() {
     "${KEY_LOCAL}" "ec2-user@${eip}:~/.ssh/id_rsa"
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
     'chmod 600 ~/.ssh/id_rsa'
+
+  log "Installing prerequisites on installer (git, jq, curl, unzip, yq, kubectl, helm)..."
+  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'PREREQ'
+set -e
+export PATH="$PATH:/usr/local/bin"
+sudo dnf install -y git jq curl unzip 2>/dev/null || sudo yum install -y git jq curl unzip
+command -v yq &>/dev/null || {
+  sudo curl -sSL -o /usr/local/bin/yq \
+    "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+  sudo chmod +x /usr/local/bin/yq
+}
+command -v kubectl &>/dev/null || {
+  K8S_VER=$(curl -sSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.32.0)
+  sudo curl -sSL -o /usr/local/bin/kubectl \
+    "https://dl.k8s.io/release/${K8S_VER}/bin/linux/amd64/kubectl"
+  sudo chmod +x /usr/local/bin/kubectl
+}
+command -v helm &>/dev/null || \
+  curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+echo "Prerequisites ready."
+PREREQ
 
   # Forward AWS credentials to installer so ECR auth works during k0s install.
   # Priority: 1) long-lived keys from config (ecr.accessKeyId/secretAccessKey)
@@ -832,27 +866,6 @@ fi
 AWSCLI
     log "AWS CLI ready on installer"
   fi
-
-  log "Installing prerequisites on installer (yq, kubectl, helm, jq)..."
-  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" 'bash -s' <<'PREREQ'
-set -e
-export PATH="$PATH:/usr/local/bin"
-sudo dnf install -y git jq curl unzip 2>/dev/null || sudo yum install -y git jq curl unzip
-command -v yq &>/dev/null || {
-  sudo curl -sSL -o /usr/local/bin/yq \
-    "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
-  sudo chmod +x /usr/local/bin/yq
-}
-command -v kubectl &>/dev/null || {
-  K8S_VER=$(curl -sSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.32.0)
-  sudo curl -sSL -o /usr/local/bin/kubectl \
-    "https://dl.k8s.io/release/${K8S_VER}/bin/linux/amd64/kubectl"
-  sudo chmod +x /usr/local/bin/kubectl
-}
-command -v helm &>/dev/null || \
-  curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-echo "Prerequisites ready."
-PREREQ
 
   log "Copying k0s cluster scripts to installer..."
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
@@ -982,10 +995,12 @@ AUTHSCRIPT
 # -- Patch infra fields into my-k0s-config.yaml on the installer --
 # Behaviour:
 #   1. If ~/cluster_setup/my-k0s-config.yaml exists  → back it up, then patch in-place.
-#   2. If it doesn't exist                            → copy k0s-cluster-config.yaml as
+#   2. If it doesn't exist                            → copy install.clusterConfigTemplate as
 #                                                        the base (already in ~/cluster_setup/
 #                                                        via setup_installer), then patch.
-# Only infrastructure fields are written — everything else in the file is preserved.
+# Infrastructure fields are patched from AWS state. Deployment-intent sections
+# that are owned by the selected cluster config template, such as images and
+# Splunk/sidecar settings, are refreshed so resume-setup picks up local edits.
 push_k0s_config() {
   local eip="$1" installer_priv_ip="$2"
   load_state
@@ -1001,12 +1016,22 @@ push_k0s_config() {
   ctrl_json=$(printf '%s\n' "${ctrl_ips[@]}" | jq -Rsc 'split("\n") | map(select(length>0))')
   worker_json=$(printf '%s\n' "${worker_ips[@]}" | jq -Rsc 'split("\n") | map(select(length>0))')
 
-  local ts; ts=$(date -Iseconds 2>/dev/null || date)
+  local ts ecr_registry cluster_template_path min_disk_controller min_disk_cpu min_disk_gpu template_images_json template_splunk_json template_sidecars_json
+  ts=$(date -Iseconds 2>/dev/null || date)
+  ecr_registry=""
+  [[ -n "${ECR_ACCOUNT}" ]] && ecr_registry="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
+  cluster_template_path="${SCRIPT_DIR}/${CLUSTER_CONFIG_TEMPLATE}"
+  min_disk_controller="$(yq eval '.storage.minimumDiskSpace.controller // ""' "${cluster_template_path}" 2>/dev/null || echo "")"
+  min_disk_cpu="$(yq eval '.storage.minimumDiskSpace.cpuWorker // ""' "${cluster_template_path}" 2>/dev/null || echo "")"
+  min_disk_gpu="$(yq eval '.storage.minimumDiskSpace.gpuWorker // ""' "${cluster_template_path}" 2>/dev/null || echo "")"
+  template_images_json="$(yq eval -o=json -I=0 '.images // {}' "${cluster_template_path}" 2>/dev/null || echo '{}')"
+  template_splunk_json="$(yq eval -o=json -I=0 '.splunk // {}' "${cluster_template_path}" 2>/dev/null || echo '{}')"
+  template_sidecars_json="$(yq eval -o=json -I=0 '.aiPlatform.sidecars // {}' "${cluster_template_path}" 2>/dev/null || echo '{}')"
 
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" "bash -s" <<PATCHSCRIPT
 set -e
 TARGET="\$HOME/cluster_setup/my-k0s-config.yaml"
-BASE="\$HOME/cluster_setup/k0s-cluster-config.yaml"
+BASE="\$HOME/cluster_setup/${CLUSTER_CONFIG_TEMPLATE}"
 
 # Step 1 — ensure the file exists (use template as base if not)
 if [[ -f "\$TARGET" ]]; then
@@ -1015,11 +1040,11 @@ if [[ -f "\$TARGET" ]]; then
   echo "[k0s-provision] Backed up existing my-k0s-config.yaml → \$(basename \$BACKUP)"
 else
   if [[ ! -f "\$BASE" ]]; then
-    echo "[k0s-provision] ERROR: neither my-k0s-config.yaml nor k0s-cluster-config.yaml found in ~/cluster_setup/" >&2
+    echo "[k0s-provision] ERROR: neither my-k0s-config.yaml nor ${CLUSTER_CONFIG_TEMPLATE} found in ~/cluster_setup/" >&2
     exit 1
   fi
   cp "\$BASE" "\$TARGET"
-  echo "[k0s-provision] Created my-k0s-config.yaml from k0s-cluster-config.yaml template"
+  echo "[k0s-provision] Created my-k0s-config.yaml from ${CLUSTER_CONFIG_TEMPLATE} template"
 fi
 
 # Step 2 — patch infrastructure fields only
@@ -1027,19 +1052,41 @@ fi
 # Kubernetes object names within the 63-byte label limit. The AIPlatform CR and
 # its child Jobs are named "<cluster.name>-ai-platform[-<suffix>]" — adding
 # "-cluster" pushes the longest job name (saia-vector-db-setup-posthook) to 65
-# chars. minimumDiskSpace thresholds are set conservatively below real usage on
-# g6e.12xlarge (controller ~81 GB, CPU worker ~185 GB on 100/200 GB volumes).
+# chars. Disk-space thresholds are preserved from the selected cluster config
+# template so lean profiles can lower or disable individual preflight checks.
 yq eval -i '
   .cluster.name         = "${STACK_NAME}" |
   .cluster.region       = "${REGION}" |
   .cluster.sshKeyPath   = "/home/ec2-user/.ssh/id_rsa" |
   .cluster.sshUser      = "ec2-user" |
   .nodes.existingIPs.controllers = ${ctrl_json} |
-  .nodes.existingIPs.workers     = ${worker_json} |
-  .storage.modelStaging.enabled  = true |
-  .storage.minimumDiskSpace.controller = 75 |
-  .storage.minimumDiskSpace.cpuWorker  = 175
+  .nodes.existingIPs.workers     = ${worker_json}
 ' "\$TARGET"
+
+[[ -n "${min_disk_controller}" ]] && yq eval -i '.storage.minimumDiskSpace.controller = "'"${min_disk_controller}"'"' "\$TARGET"
+[[ -n "${min_disk_cpu}" ]] && yq eval -i '.storage.minimumDiskSpace.cpuWorker = "'"${min_disk_cpu}"'"' "\$TARGET"
+[[ -n "${min_disk_gpu}" ]] && yq eval -i '.storage.minimumDiskSpace.gpuWorker = "'"${min_disk_gpu}"'"' "\$TARGET"
+echo "[k0s-provision] Preserved storage.minimumDiskSpace from ${CLUSTER_CONFIG_TEMPLATE}"
+
+if [[ '${template_images_json}' != '{}' ]]; then
+  yq eval -i '.images = ${template_images_json}' "\$TARGET"
+  echo "[k0s-provision] Refreshed images config from ${CLUSTER_CONFIG_TEMPLATE}"
+fi
+if [[ '${template_splunk_json}' != '{}' ]]; then
+  yq eval -i '.splunk = ${template_splunk_json}' "\$TARGET"
+  echo "[k0s-provision] Refreshed splunk config from ${CLUSTER_CONFIG_TEMPLATE}"
+fi
+if [[ '${template_sidecars_json}' != '{}' ]]; then
+  yq eval -i '.aiPlatform.sidecars = ${template_sidecars_json}' "\$TARGET"
+  echo "[k0s-provision] Refreshed aiPlatform.sidecars from ${CLUSTER_CONFIG_TEMPLATE}"
+fi
+
+if [[ -n "${INSTALL_MODEL_STAGING_ENABLED}" ]]; then
+  yq eval -i '.storage.modelStaging.enabled = ${INSTALL_MODEL_STAGING_ENABLED}' "\$TARGET"
+  echo "[k0s-provision] Patched storage.modelStaging.enabled=${INSTALL_MODEL_STAGING_ENABLED} from provision config"
+else
+  echo "[k0s-provision] Preserved storage.modelStaging.enabled from ${CLUSTER_CONFIG_TEMPLATE}"
+fi
 
 # Step 2b — patch ECR account/region/imagePullSecrets if ECR account is configured.
 # Image tags (operator, splunk, ray, saia) are intentionally NOT set here — they
@@ -1047,14 +1094,13 @@ yq eval -i '
 # by the provisioner.  Only the registry prefix and ECR metadata are patched so
 # the install script can locate the private registry without touching image tags.
 if [[ -n "${ECR_ACCOUNT}" ]]; then
-  ECR_REGISTRY="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
   yq eval -i '
-    .images.registry                    = "'"${ECR_REGISTRY}"'" |
+    .images.registry                    = "'"${ecr_registry}"'" |
     .ecr.account                        = "'"${ECR_ACCOUNT}"'" |
     .ecr.region                         = "'"${ECR_REGION}"'" |
     .imagePullSecrets.autoCreateECR     = true
   ' "\$TARGET"
-  echo "[k0s-provision] Patched ECR registry: ${ECR_REGISTRY}"
+  echo "[k0s-provision] Patched ECR registry: ${ecr_registry}"
 fi
 
 # Step 3 — patch object store fields
@@ -1407,6 +1453,49 @@ cmd_status() {
 }
 
 # ============================================================
+# RESUME SETUP
+# ============================================================
+cmd_resume_setup() {
+  load_config
+  check_aws_auth
+  [[ ! -f "${STATE_FILE}" ]] && err "No state file found for '${STACK_NAME}'. Run 'provision' first."
+  load_state
+
+  [[ -n "${EIP:-}" ]] || err "State file is missing EIP; cannot SSH to installer."
+  [[ -n "${INSTALLER_PRIV_IP:-}" ]] || err "State file is missing INSTALLER_PRIV_IP; cannot patch object store endpoint."
+
+  log "=== Resuming installer setup for ${STACK_NAME} ==="
+  log "Installer EIP: ${EIP}"
+
+  wait_for_ssh_direct "${EIP}" "installer"
+
+  if [[ "$MINIO_ENABLED" == "true" ]]; then
+    mount_disk_via_ssh "${EIP}" "/data/minio"
+  fi
+
+  setup_installer "${EIP}"
+
+  if [[ "$MINIO_ENABLED" == "true" ]]; then
+    load_state
+    install_minio "${EIP}" "${INSTALLER_PRIV_IP}"
+    save_state "MINIO_PASS" "${MINIO_PASS}"
+  fi
+
+  load_state
+  push_k0s_config "${EIP}" "${INSTALLER_PRIV_IP}"
+
+  load_state
+  setup_ecr_containerd_auth "${EIP}"
+
+  log "Resume setup complete."
+  echo ""
+  echo "Run install from the installer:"
+  echo "  ssh -i ${KEY_LOCAL} ec2-user@${EIP}"
+  echo "  cd ~/cluster_setup"
+  echo "  CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml ./k0s_cluster_with_stack.sh install --silent"
+}
+
+# ============================================================
 # DESTROY
 # ============================================================
 cmd_destroy() {
@@ -1528,6 +1617,12 @@ cmd_dryrun() {
   echo "  ${GPU_COUNT} GPU Worker(s)  : ${GPU_TYPE}, ${GPU_DISK}GB root (encrypted) + ${GPU_DATA_DISK}GB /var/lib/k0s"
   [[ "$MINIO_ENABLED" == "true" ]] && \
     echo "  MinIO on installer: ${MINIO_DATA_DISK}GB /data/minio"
+  echo "  Cluster config template: ${CLUSTER_CONFIG_TEMPLATE}"
+  if [[ -n "${INSTALL_MODEL_STAGING_ENABLED}" ]]; then
+    echo "  Model staging override: storage.modelStaging.enabled=${INSTALL_MODEL_STAGING_ENABLED}"
+  else
+    echo "  Model staging override: none (template value preserved)"
+  fi
   echo "  All instances: IMDSv2 required, EBS encrypted"
   echo "  State file: ${STATE_FILE}"
   echo ""
@@ -1540,7 +1635,8 @@ case "$COMMAND" in
   provision) cmd_provision ;;
   output)    load_config; load_state; cmd_output ;;
   status)    cmd_status ;;
+  resume-setup) cmd_resume_setup ;;
   destroy)   cmd_destroy ;;
   dry-run)   cmd_dryrun ;;
-  *) err "Unknown command: ${COMMAND}. Valid: provision output status destroy dry-run" ;;
+  *) err "Unknown command: ${COMMAND}. Valid: provision output status resume-setup destroy dry-run" ;;
 esac

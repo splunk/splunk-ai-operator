@@ -432,6 +432,44 @@ assert_eq "upgrade run: no stale v1 Splunk Operator image remains" \
 assert_eq "upgrade run: RELATED_IMAGE_RAY_HEAD still updates on every run" \
   "1" "$(grep -A1 'RELATED_IMAGE_RAY_HEAD' "${_CI_TMPDIR}/rendered-artifacts.yaml" | grep -c 'value: ray-head:v1')"
 
+cat > "${_CI_TMPDIR}/artifacts.yaml" <<'EOF'
+      containers:
+      - name: manager
+        env:
+        - name: RELATED_IMAGE_RAY_HEAD
+          value: placeholder
+        - name: RELATED_IMAGE_RAY_WORKER
+          value: placeholder
+        - name: RELATED_IMAGE_WEAVIATE
+          value: placeholder
+        - name: RELATED_IMAGE_SAIA_API
+          value: placeholder
+        - name: RELATED_IMAGE_SAIA_API_V2
+          value: placeholder
+        - name: RELATED_IMAGE_POST_INSTALL_HOOK
+          value: placeholder
+        - name: RELATED_IMAGE_FLUENT_BIT
+          value: placeholder
+        - name: RELATED_IMAGE_OTEL_COLLECTOR
+          value: placeholder
+        - name: MODEL_VERSION
+          value: placeholder
+        - name: RAY_VERSION
+          value: placeholder
+        image: ghcr.io/splunk/splunk-ai-operator:v0.1.0
+EOF
+
+_run_configure_images "registry.example.com/team/platform:v3" "registry.example.com/team/splunk-op:v3" >/dev/null 2>&1
+
+assert_eq "missing RELATED_IMAGE_NGINX is inserted before MODEL_VERSION" \
+  "1" "$(awk '
+    /name: RELATED_IMAGE_NGINX$/ { nginx = NR }
+    /name: MODEL_VERSION$/ { model = NR }
+    END { print (nginx > 0 && model > 0 && nginx < model) ? 1 : 0 }
+  ' "${_CI_TMPDIR}/rendered-artifacts.yaml")"
+assert_eq "inserted RELATED_IMAGE_NGINX gets configured value" \
+  "1" "$(grep -A1 'RELATED_IMAGE_NGINX' "${_CI_TMPDIR}/rendered-artifacts.yaml" | grep -c 'value: nginx:v1')"
+
 rm -rf "${_CI_TMPDIR}"
 trap - EXIT
 
@@ -466,7 +504,10 @@ _run_validate_image_config() {
     err()  { echo \"ERR: \$*\"; exit 1; }
     warn() { echo \"WARN: \$*\"; }
     validate_scale_factor_config() { return 0; }
+    component_enabled() { return 0; }
+    k0s_saia_feature_enabled() { return 0; }
     k0s_slim_feature_enabled() { return 1; }
+    k0s_agentruntime_feature_enabled() { return 0; }
     validate_image_config
   "
 }

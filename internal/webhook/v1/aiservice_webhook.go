@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	apivalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -202,11 +203,71 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 		allErrs = append(allErrs, errs...)
 	}
 
+	if errs := v.validateAgentRuntimeFields(aiservice, field.NewPath("spec")); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+
 	if len(allErrs) > 0 {
 		return warnings, allErrs.ToAggregate()
 	}
 
 	return warnings, nil
+}
+
+func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AIService, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if aiservice.Spec.Feature.Name != "agentruntime" {
+		if aiservice.Spec.Feature.Provider != "" {
+			allErrs = append(allErrs, field.Forbidden(
+				fldPath.Child("features").Child("provider"),
+				"provider is only supported for agentruntime",
+			))
+		}
+		return allErrs
+	}
+
+	if aiservice.Spec.Feature.Provider == "" {
+		allErrs = append(allErrs, field.Required(
+			fldPath.Child("features").Child("provider"),
+			"provider must be specified when feature name is agentruntime",
+		))
+	} else {
+		for _, msg := range apivalidation.IsDNS1123Label(aiservice.Spec.Feature.Provider) {
+			allErrs = append(allErrs, field.Invalid(
+				fldPath.Child("features").Child("provider"),
+				aiservice.Spec.Feature.Provider,
+				msg,
+			))
+		}
+	}
+
+	if aiservice.Spec.CheckpointDbSecretRef == "" {
+		allErrs = append(allErrs, field.Required(
+			fldPath.Child("checkpointDbSecretRef"),
+			"checkpointDbSecretRef must be specified for agentruntime",
+		))
+	}
+
+	if aiservice.Spec.MinReplicas != nil && aiservice.Spec.MaxReplicas != nil &&
+		*aiservice.Spec.MinReplicas > *aiservice.Spec.MaxReplicas {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("maxReplicas"),
+			*aiservice.Spec.MaxReplicas,
+			"maxReplicas must be greater than or equal to minReplicas",
+		))
+	}
+
+	if aiservice.Spec.TargetCPUUtilization != nil &&
+		(*aiservice.Spec.TargetCPUUtilization < 1 || *aiservice.Spec.TargetCPUUtilization > 100) {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("targetCPUUtilization"),
+			*aiservice.Spec.TargetCPUUtilization,
+			"targetCPUUtilization must be between 1 and 100 when set",
+		))
+	}
+
+	return allErrs
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type AIService.

@@ -1061,17 +1061,53 @@ spec:
                 items:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
+                    checkpointDbSecretRef:
+                      description: CheckpointDbSecretRef references a Secret containing
+                        Postgres checkpoint connection settings.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    maxReplicas:
+                      description: MaxReplicas is the HPA ceiling for this feature.
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    minReplicas:
+                      description: MinReplicas is the HPA floor for this feature.
+                      format: int32
+                      minimum: 1
+                      type: integer
                     name:
-                      description: Name of the feature, e.g. "saia", "seca" or "slim"
+                      description: Name of the feature, e.g. "saia", "seca", "slim",
+                        or "agentruntime"
                       enum:
                       - saia
                       - seca
                       - slim
+                      - agentruntime
+                      type: string
+                    provider:
+                      description: Provider identifies the product team for multi-provider
+                        features such as agentruntime.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    runtimeVersion:
+                      description: RuntimeVersion optionally pins the shared agent-runtime
+                        base image version.
                       type: string
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
                         to use for the feature
                       type: string
+                    targetCPUUtilization:
+                      description: TargetCPUUtilization is the target average CPU
+                        utilization percentage for HPA.
+                      format: int32
+                      maximum: 100
+                      minimum: 1
+                      type: integer
                     version:
                       description: Version of the feature, e.g. "1.0.0"
                       type: string
@@ -2887,6 +2923,16 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
@@ -4103,6 +4149,12 @@ spec:
                 description: AIPlatformUrl specifies the URL for the AI Platform (deprecated,
                   use AIPlatformRef)
                 type: string
+              checkpointDbSecretRef:
+                description: CheckpointDbSecretRef references a Secret containing
+                  Postgres checkpoint connection settings.
+                maxLength: 253
+                minLength: 1
+                type: string
               clusterDomain:
                 default: cluster.local
                 description: ClusterDomain is the cluster domain for service DNS
@@ -4116,17 +4168,53 @@ spec:
               features:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
+                  checkpointDbSecretRef:
+                    description: CheckpointDbSecretRef references a Secret containing
+                      Postgres checkpoint connection settings.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  maxReplicas:
+                    description: MaxReplicas is the HPA ceiling for this feature.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minReplicas:
+                    description: MinReplicas is the HPA floor for this feature.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   name:
-                    description: Name of the feature, e.g. "saia", "seca" or "slim"
+                    description: Name of the feature, e.g. "saia", "seca", "slim",
+                      or "agentruntime"
                     enum:
                     - saia
                     - seca
                     - slim
+                    - agentruntime
+                    type: string
+                  provider:
+                    description: Provider identifies the product team for multi-provider
+                      features such as agentruntime.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  runtimeVersion:
+                    description: RuntimeVersion optionally pins the shared agent-runtime
+                      base image version.
                     type: string
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
                     type: string
+                  targetCPUUtilization:
+                    description: TargetCPUUtilization is the target average CPU utilization
+                      percentage for HPA.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
                   version:
                     description: Version of the feature, e.g. "1.0.0"
                     type: string
@@ -4153,6 +4241,12 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
+              maxReplicas:
+                description: MaxReplicas is the HPA ceiling for features that manage
+                  pod-level autoscaling.
+                format: int32
+                minimum: 1
+                type: integer
               metrics:
                 description: Metrics configuration for monitoring
                 properties:
@@ -4173,6 +4267,12 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              minReplicas:
+                description: MinReplicas is the HPA floor for features that manage
+                  pod-level autoscaling.
+                format: int32
+                minimum: 1
+                type: integer
               mtls:
                 description: MTLS configuration for secure communication
                 properties:
@@ -4290,6 +4390,10 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              runtimeVersion:
+                description: RuntimeVersion optionally pins the shared runtime image
+                  version for the feature.
+                type: string
               serviceAccountName:
                 description: ServiceAccountName specifies the service account to be
                   used by the AIService
@@ -4883,11 +4987,28 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
                     type: string
                 type: object
+              targetCPUUtilization:
+                description: TargetCPUUtilization is the target average CPU utilization
+                  percentage for pod-level HPA.
+                format: int32
+                maximum: 100
+                minimum: 1
+                type: integer
               taskVolume:
                 description: TaskVolume specifies the object storage volume for tasks
                 properties:
@@ -5459,6 +5580,18 @@ rules:
   - update
   - watch
 - apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - batch
   resources:
   - jobs
@@ -5709,32 +5842,32 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-head:build-v2-010
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17
         - name: RELATED_IMAGE_RAY_WORKER
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-v2-010
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17
         - name: RELATED_IMAGE_WEAVIATE
-          value: docker.io/semitechnologies/weaviate:stable-v1.28-007846a
+          value: semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api:build-v2-012
-        - name: RELATED_IMAGE_SAIA_API_V2
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-012
-        - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-012
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1
         - name: RELATED_IMAGE_SLIM_API
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/slim/slim-api:build-1
-        - name: SPLUNK_METRICS_INDEX_NAME
-          value: _metrics
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim/slim-api:build-1
+        - name: RELATED_IMAGE_AGENT_RUNTIME_BASE
+          value: docker.io/splunk/agent-runtime:latest
+        - name: RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK
+          value: docker.io/splunk/agent-runtime-provider-mltk:latest
+        - name: RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK
+          value: agentcore_operations.loader:MLTKAgentLoader
+        - name: RELATED_IMAGE_POST_INSTALL_HOOK
+          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
         - name: RELATED_IMAGE_FLUENT_BIT
-          value: docker.io/fluent/fluent-bit:1.9.6
+          value: fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR
-          value: docker.io/otel/opentelemetry-collector-contrib:0.122.1
-        - name: RELATED_IMAGE_NGINX
-          value: docker.io/library/nginx:1.27-alpine
+          value: otel/opentelemetry-collector-contrib:0.122.1
         - name: MODEL_VERSION
           value: v0.3.14-36-g1549f5a
         - name: RAY_VERSION
-          value: 2.53.0
-        image: 658391232643.dkr.ecr.us-east-2.amazonaws.com/arif/splunk/splunk-ai-operator:v0.1.29
+          value: 2.44.0
+        image: docker.io/splunk/splunk-ai-operator:v0.0.1
         livenessProbe:
           httpGet:
             path: /healthz

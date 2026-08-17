@@ -24,6 +24,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	apivalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -489,7 +490,7 @@ func (v *AIPlatformCustomValidator) validateScaleFactor(scaleFactor *int32, fldP
 func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
-	featureNames := make(map[string]bool)
+	featureIdentities := make(map[string]bool)
 
 	for i, feature := range features {
 		featurePath := fldPath.Index(i)
@@ -502,14 +503,61 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 			))
 		}
 
-		// Check for duplicate feature names
-		if featureNames[feature.Name] {
-			allErrs = append(allErrs, field.Duplicate(
-				featurePath.Child("name"),
-				feature.Name,
+		identity := feature.Name
+		if feature.Name == "agentruntime" {
+			if feature.Provider == "" {
+				allErrs = append(allErrs, field.Required(
+					featurePath.Child("provider"),
+					"provider must be specified when feature name is agentruntime",
+				))
+			} else {
+				for _, msg := range apivalidation.IsDNS1123Label(feature.Provider) {
+					allErrs = append(allErrs, field.Invalid(
+						featurePath.Child("provider"),
+						feature.Provider,
+						msg,
+					))
+				}
+				identity = feature.Name + "/" + feature.Provider
+			}
+			if feature.CheckpointDbSecretRef == "" {
+				allErrs = append(allErrs, field.Required(
+					featurePath.Child("checkpointDbSecretRef"),
+					"checkpointDbSecretRef must be specified for agentruntime",
+				))
+			}
+			if feature.MinReplicas != nil && feature.MaxReplicas != nil && *feature.MinReplicas > *feature.MaxReplicas {
+				allErrs = append(allErrs, field.Invalid(
+					featurePath.Child("maxReplicas"),
+					*feature.MaxReplicas,
+					"maxReplicas must be greater than or equal to minReplicas",
+				))
+			}
+			if feature.TargetCPUUtilization != nil &&
+				(*feature.TargetCPUUtilization < 1 || *feature.TargetCPUUtilization > 100) {
+				allErrs = append(allErrs, field.Invalid(
+					featurePath.Child("targetCPUUtilization"),
+					*feature.TargetCPUUtilization,
+					"targetCPUUtilization must be between 1 and 100 when set",
+				))
+			}
+		} else if feature.Provider != "" {
+			allErrs = append(allErrs, field.Forbidden(
+				featurePath.Child("provider"),
+				"provider is only supported for agentruntime",
 			))
 		}
-		featureNames[feature.Name] = true
+
+		// Check for duplicate feature identities. agentruntime uses provider as
+		// part of the identity so multiple product teams can use the same feature
+		// handler without colliding.
+		if featureIdentities[identity] {
+			allErrs = append(allErrs, field.Duplicate(
+				featurePath.Child("name"),
+				identity,
+			))
+		}
+		featureIdentities[identity] = true
 	}
 
 	return allErrs

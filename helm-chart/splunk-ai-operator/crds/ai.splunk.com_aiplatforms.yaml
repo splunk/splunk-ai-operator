@@ -1053,17 +1053,53 @@ spec:
                 items:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
+                    checkpointDbSecretRef:
+                      description: CheckpointDbSecretRef references a Secret containing
+                        Postgres checkpoint connection settings.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    maxReplicas:
+                      description: MaxReplicas is the HPA ceiling for this feature.
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    minReplicas:
+                      description: MinReplicas is the HPA floor for this feature.
+                      format: int32
+                      minimum: 1
+                      type: integer
                     name:
-                      description: Name of the feature, e.g. "saia", "seca" or "slim"
+                      description: Name of the feature, e.g. "saia", "seca", "slim",
+                        or "agentruntime"
                       enum:
                       - saia
                       - seca
                       - slim
+                      - agentruntime
+                      type: string
+                    provider:
+                      description: Provider identifies the product team for multi-provider
+                        features such as agentruntime.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    runtimeVersion:
+                      description: RuntimeVersion optionally pins the shared agent-runtime
+                        base image version.
                       type: string
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
                         to use for the feature
                       type: string
+                    targetCPUUtilization:
+                      description: TargetCPUUtilization is the target average CPU
+                        utilization percentage for HPA.
+                      format: int32
+                      maximum: 100
+                      minimum: 1
+                      type: integer
                     version:
                       description: Version of the feature, e.g. "1.0.0"
                       type: string

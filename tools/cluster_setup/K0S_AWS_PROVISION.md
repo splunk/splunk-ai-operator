@@ -5,8 +5,40 @@
 `k0s_aws_provision.sh` creates EC2 infrastructure in an existing VPC for use by
 `k0s_cluster_with_stack.sh`. It is a standalone helper: it launches instances,
 attaches EBS data volumes, installs MinIO, copies cluster scripts, and
-auto-patches `my-k0s-config.yaml` on the installer. No changes to the k0s
-installer script itself.
+auto-patches `my-k0s-config.yaml` on the installer. The generated config is
+then consumed by `k0s_cluster_with_stack.sh`.
+
+## Agent Runtime Dev Profile
+
+For testing the agent-runtime CR path without the full model/SAIA stack, use:
+
+- `k0s-aws-provision-config-agentruntime.yaml`
+- `k0s-cluster-config-agentruntime.yaml`
+
+This profile is non-airgapped, provisions no GPU workers, disables model
+staging, disables in-cluster Splunk/SAIA/SLIM/OTel/MetalLB, and keeps the
+minimum dependencies the current operator still needs: cert-manager, KubeRay,
+kube-prometheus-stack, the Splunk AI Operator, and the AIPlatform CR. It uses
+external-Splunk compatibility mode with a dummy HEC endpoint so older deployed
+webhooks still accept the AIPlatform CR without creating Splunk pods.
+
+Before a real run, update:
+
+- `sshAllowedCidr` to your public IP CIDR.
+- `network.vpcId`, `subnetId`, and `installerSubnetId` if the defaults do not
+  match your AWS account/region.
+- `images.operator.image` in `k0s-cluster-config-agentruntime.yaml` to an image
+  built from this branch.
+- `images.agentRuntime.*` to reachable base/provider images.
+- `SPLUNK_HEC_TOKEN` to any non-empty value before install. It is only used to
+  create the compatibility Secret for the dummy external Splunk endpoint.
+- `AGENT_RUNTIME_CHECKPOINT_DB_URL` if you want the script to create the
+  `mltk-postgres-conn` checkpoint secret.
+
+The provisioner copies the selected cluster config template to the installer and
+creates `~/cluster_setup/my-k0s-config.yaml` from it. It patches only infra and
+object-store fields; `storage.modelStaging.enabled` is preserved unless
+`install.modelStaging.enabled` is explicitly set in the AWS provision config.
 
 ---
 
@@ -228,6 +260,9 @@ All API calls satisfy SCP `p-m68tib3s` on account `658391232643`:
 # Show instance states and MinIO health
 ./k0s_aws_provision.sh status    [--config FILE]
 
+# Resume installer setup after EC2 instances already exist
+./k0s_aws_provision.sh resume-setup [--config FILE]
+
 # Tear down everything (interactive)
 ./k0s_aws_provision.sh destroy   [--config FILE]
 
@@ -259,6 +294,15 @@ region: us-east-2
 # GPU workers use AZ fallback — they try all private subnets until one has capacity.
 availabilityZone: us-east-2a
 sshAllowedCidr: "0.0.0.0/0"
+
+install:
+  # Template copied to ~/cluster_setup/my-k0s-config.yaml before infra fields
+  # are patched. Use k0s-cluster-config-agentruntime.yaml for the lean dev path.
+  clusterConfigTemplate: "k0s-cluster-config.yaml"
+  # Optional. When omitted, the template's storage.modelStaging.enabled value is
+  # preserved.
+  modelStaging:
+    enabled: false
 
 network:
   vpcId: vpc-0dff3bdadac92320c   # ai-platform-us-east-2-vpc
@@ -607,6 +651,46 @@ aws sts get-caller-identity   # verify
 The provisioner calls `aws sts get-caller-identity` at startup and exits with a
 clear error if credentials are missing or expired. Sessions expire after ~1 hr —
 re-run the `okta-aws-login` command if you see `ExpiredToken`.
+
+---
+
+## Resuming After Installer Setup Failure
+
+If `provision` created the EC2 instances but failed while configuring the
+installer, do not rerun `provision` for the same stack. Use the saved state file
+to continue the setup phase:
+
+```bash
+./k0s_aws_provision.sh resume-setup --config k0s-aws-provision-config-agentruntime.yaml
+```
+
+`resume-setup` reconnects to the installer EIP from the state file, reinstalls
+installer prerequisites, refreshes forwarded AWS credentials, copies the latest
+cluster setup scripts and YAML files, recreates the generated
+`my-k0s-config.yaml`, and refreshes ECR containerd auth on the k0s nodes.
+
+### AWS CLI install failed because `unzip` is missing
+
+**Symptom:**
+
+```text
+Installing AWS CLI v2...
+bash: line 5: unzip: command not found
+```
+
+**Fix:** current `resume-setup` installs `git`, `jq`, `curl`, and `unzip`
+before attempting the AWS CLI install, so rerunning `resume-setup` is enough.
+
+### Config patch failed with `ECR_REGISTRY: unbound variable`
+
+**Symptom:**
+
+```text
+./k0s_aws_provision.sh: line 1019: ECR_REGISTRY: unbound variable
+```
+
+**Fix:** current `resume-setup` computes the optional ECR registry before
+rendering the remote config patch, so rerunning `resume-setup` is enough.
 
 ---
 

@@ -38,11 +38,29 @@ spec:
 {{- range .Values.features }}
 {{- if .name }}
     - name: {{ .name | quote }}
+{{- if .provider }}
+      provider: {{ .provider | quote }}
+{{- end }}
 {{- if .serviceAccountName }}
       serviceAccountName: {{ .serviceAccountName | quote }}
 {{- end }}
 {{- if .version }}
       version: {{ .version | quote }}
+{{- end }}
+{{- if .runtimeVersion }}
+      runtimeVersion: {{ .runtimeVersion | quote }}
+{{- end }}
+{{- if hasKey . "minReplicas" }}
+      minReplicas: {{ .minReplicas }}
+{{- end }}
+{{- if hasKey . "maxReplicas" }}
+      maxReplicas: {{ .maxReplicas }}
+{{- end }}
+{{- if hasKey . "targetCPUUtilization" }}
+      targetCPUUtilization: {{ .targetCPUUtilization }}
+{{- end }}
+{{- if .checkpointDbSecretRef }}
+      checkpointDbSecretRef: {{ .checkpointDbSecretRef | quote }}
 {{- end }}
 {{- end }}
 {{- end }}

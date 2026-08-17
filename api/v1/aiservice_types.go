@@ -106,6 +106,32 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
+	// MinReplicas is the HPA floor for features that manage pod-level autoscaling.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+
+	// MaxReplicas is the HPA ceiling for features that manage pod-level autoscaling.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+
+	// TargetCPUUtilization is the target average CPU utilization percentage for pod-level HPA.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	TargetCPUUtilization *int32 `json:"targetCPUUtilization,omitempty"`
+
+	// CheckpointDbSecretRef references a Secret containing Postgres checkpoint connection settings.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
+
+	// RuntimeVersion optionally pins the shared runtime image version for the feature.
+	// +kubebuilder:validation:Optional
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+
 	// Metrics configuration for monitoring
 	// +kubebuilder:validation:Optional
 	Metrics MetricsConfig `json:"metrics,omitempty"`

@@ -139,6 +139,18 @@ images:
   slim:
     apiImage: "splunk/slim/slim-api:latest"
 
+  # Agent Runtime images. Only needed when an "agentruntime" feature is enabled
+  # under aiPlatform.features[]. baseImages lets a feature runtimeVersion select
+  # a pinned base image; providerImages are keyed by feature.provider.
+  agentRuntime:
+    baseImage: "docker.io/splunk/agent-runtime:latest"
+    baseImages:
+      # v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
+    providerImages:
+      # mltk: "docker.io/splunk/agent-runtime-provider-mltk:0.1.0"
+    providerModules:
+      # mltk: "agentcore_operations.loader:MLTKAgentLoader"
+
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
 
@@ -163,6 +175,21 @@ operators:
 
   nvidia:
     devicePluginVersion: "v0.17.3"
+
+# ---------- Optional Component Gates ----------
+# Defaults preserve the historical full-stack install. Dev profiles can disable
+# heavyweight components without forking the installer.
+components:
+  certManager: true
+  monitoring: true       # Prometheus CRDs are needed by AIService ServiceMonitors
+  otel: true
+  kuberay: true
+  nvidia: true           # Also auto-skips when nodes.gpuWorkers is 0
+  splunkOperator: true   # Also skipped unless splunk.enabled=true in internal mode
+  splunkStandalone: true # Also skipped unless splunk.enabled=true in internal mode
+  metallb: true          # Also requires metallb.install=true
+  aiOperator: true
+  aiPlatformCR: true
 
 # ---------- Kubernetes ----------
 kubernetes:

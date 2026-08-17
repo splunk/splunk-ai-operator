@@ -1,0 +1,146 @@
+# ===================================================================
+# k0s Cluster Configuration: Agent Runtime Dev Profile
+# ===================================================================
+# Lean, non-airgapped profile for validating the agentruntime CR path.
+# The AWS provisioner patches cluster/node/object-store fields into a
+# generated my-k0s-config.yaml on the installer.
+# ===================================================================
+
+cluster:
+  name: agentruntime-dev
+  region: us-west-2
+  sshKeyPath: ~/.ssh/id_rsa
+  sshUser: ec2-user
+  airgap: false
+nodes:
+  controllers: 1
+  cpuWorkers: 1
+  gpuWorkers: 0
+  existingIPs:
+    controllers:
+      - 10.0.0.1
+    workers:
+      - 10.0.0.2
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "20Gi"
+  minimumDiskSpace:
+    controller: 30
+    # Agent-runtime smoke tests do not stage large model artifacts locally.
+    # Set to 0 to skip the CPU-worker /var/lib/k0s free-space preflight.
+    cpuWorker: 0
+    gpuWorker: 1
+  modelStaging:
+    enabled: false
+  objectStore:
+    type: "minio"
+    bucket: "ai-platform"
+    endpoint: "http://10.0.0.5:9000"
+    auth:
+      rootUser: "minioadmin"
+      rootPassword: "CHANGEME"
+images:
+  registry: ""
+  registryInsecure: false
+  operator:
+    image: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/splunk-ai-operator:agentruntime-ai-tier-2fbd9ef-stable-spec-202608171633"
+  ray:
+    headImage: "docker.io/rayproject/ray:2.44.0"
+    workerImage: "docker.io/rayproject/ray:2.44.0"
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+  agentRuntime:
+    baseImage: "docker.io/splunk/agent-runtime:latest"
+    baseImages:
+      v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
+    providerImages:
+      mltk: "docker.io/splunk/agent-runtime-provider-mltk:latest"
+    providerModules:
+      mltk: "agentcore_operations.loader:MLTKAgentLoader"
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+operators:
+  ray:
+    version: "v1.2.2"
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.44.0"
+  certManager:
+    installCRDs: true
+  nvidia:
+    devicePluginVersion: "v0.17.3"
+components:
+  certManager: true
+  monitoring: true
+  otel: false
+  kuberay: true
+  nvidia: false
+  splunkOperator: false
+  splunkStandalone: false
+  metallb: false
+  aiOperator: true
+  aiPlatformCR: true
+kubernetes:
+  namespace: ai-platform
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"
+splunk:
+  # Compatibility shim for older deployed webhooks that still require a
+  # splunkConfiguration block. This uses external mode, so in-cluster Splunk
+  # Operator/Standalone remain disabled by the components section above.
+  enabled: true
+  external:
+    endpoint: "https://splunk-webhook-compat.invalid:8088"
+    secretName: "splunk-hec-compat"
+  standaloneName: splunk-standalone
+  trustedIssuers: []
+aiPlatform:
+  name: "agentruntime-dev"
+  defaultAcceleratorType: "L40S"
+  scaleFactor: 1
+  workerGroupConfig:
+    imageRegistry: ""
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  features:
+    - name: "agentruntime"
+      provider: "mltk"
+      version: "0.1.0"
+      runtimeVersion: "v2.0.0"
+      minReplicas: 1
+      maxReplicas: 2
+      targetCPUUtilization: 60
+      checkpointDbSecretRef: "mltk-postgres-conn"
+  agentRuntime:
+    checkpointSecrets:
+      - name: "mltk-postgres-conn"
+        create: true
+        databaseUrlEnv: "AGENT_RUNTIME_CHECKPOINT_DB_URL"
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+metallb:
+  install: false
+  chartVersion: "0.14.8"
+  namespace: "metallb-system"
+  pool:
+    name: "agentruntime-dev-pool"
+    addresses: []
+  mode: "layer2"
+  bgpPeers: []
+imagePullSecrets:
+  secrets:
+    - ecr-registry-secret
+  autoCreateECR: false
+ecr:
+  account: ""
+  region: us-west-2

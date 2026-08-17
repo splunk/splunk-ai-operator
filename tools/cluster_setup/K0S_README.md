@@ -438,6 +438,10 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.saia.apiImage` | **Yes** | — | SAIA API v1 image |
 | `images.saia.apiV2Image` | **Yes** | — | SAIA API v2 image |
 | `images.saia.dataLoaderImage` | **Yes** | — | SAIA data loader / post-install hook image |
+| `images.agentRuntime.baseImage` | When `agentruntime` enabled | — | Shared agent-runtime base image |
+| `images.agentRuntime.baseImages.<runtimeVersion>` | No | — | Optional runtime-version-specific base image override |
+| `images.agentRuntime.providerImages.<provider>` | When `agentruntime` enabled | — | Provider package image for each agent-runtime provider |
+| `images.agentRuntime.providerModules.<provider>` | No | provider default | Python loader module for each provider |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -466,6 +470,10 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.saia.apiImage` | `RELATED_IMAGE_SAIA_API` | `artifacts.yaml` |
 | `images.saia.apiV2Image` | `RELATED_IMAGE_SAIA_API_V2` | `artifacts.yaml` |
 | `images.saia.dataLoaderImage` | `RELATED_IMAGE_POST_INSTALL_HOOK` | `artifacts.yaml` |
+| `images.agentRuntime.baseImage` | `RELATED_IMAGE_AGENT_RUNTIME_BASE` | `artifacts.yaml` |
+| `images.agentRuntime.baseImages.<runtimeVersion>` | `RELATED_IMAGE_AGENT_RUNTIME_BASE_<RUNTIME_VERSION>` | `artifacts.yaml` |
+| `images.agentRuntime.providerImages.<provider>` | `RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_<PROVIDER>` | `artifacts.yaml` |
+| `images.agentRuntime.providerModules.<provider>` | `RELATED_AGENT_RUNTIME_MODULE_PROVIDER_<PROVIDER>` | `artifacts.yaml` |
 | `images.nginx.image` | `RELATED_IMAGE_NGINX` | `artifacts.yaml` |
 | `images.fluentBit.image` | `RELATED_IMAGE_FLUENT_BIT` | `artifacts.yaml` |
 | `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
@@ -482,6 +490,12 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
 | `aiPlatform.features[].version` | Yes | — | Feature version |
+| `aiPlatform.features[].provider` | Agent Runtime | — | Provider key for multi-provider features, e.g. `mltk` |
+| `aiPlatform.features[].runtimeVersion` | No | — | Agent-runtime base image selector |
+| `aiPlatform.features[].minReplicas` | No | operator default | Minimum feature replicas |
+| `aiPlatform.features[].maxReplicas` | No | operator default | Maximum feature replicas |
+| `aiPlatform.features[].targetCPUUtilization` | No | operator default | HPA target CPU utilization |
+| `aiPlatform.features[].checkpointDbSecretRef` | Agent Runtime | — | Secret name containing checkpoint DB connection details |
 | `aiPlatform.features[].serviceAccountName` | No | `""` | Service account override |
 | `aiPlatform.cpuScheduling.nodeSelector` | No | auto-generated | Node selector for CPU workloads |
 | `aiPlatform.cpuScheduling.tolerations` | No | `[]` | Tolerations for CPU workloads |
@@ -489,6 +503,30 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.gpuScheduling.tolerations` | No | GPU toleration | Tolerations for GPU workloads |
 | `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
 | `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
+
+#### Optional Component Gates
+
+The `components` section controls which add-ons the installer deploys. Omitted
+fields default to the historical full-stack behavior.
+
+| Field | Default | Notes |
+|---|---|---|
+| `components.certManager` | `true` | Required by the operator webhooks and feature certificates unless pre-installed |
+| `components.monitoring` | `true` | Installs kube-prometheus-stack and ServiceMonitor CRDs |
+| `components.otel` | `true` | Installs OpenTelemetry Operator; can be disabled when sidecar OTel is not used |
+| `components.kuberay` | `true` | Keep enabled for current AIPlatform reconciliation |
+| `components.nvidia` | `true` | Also auto-skips when `nodes.gpuWorkers: 0` |
+| `components.splunkOperator` | `true` | Also skipped unless Splunk telemetry is internal |
+| `components.splunkStandalone` | `true` | Also skipped unless Splunk telemetry is internal |
+| `components.metallb` | `true` | Also requires `metallb.install: true` |
+| `components.aiOperator` | `true` | Applies the Splunk AI Operator manifest |
+| `components.aiPlatformCR` | `true` | Applies the AIPlatform CR |
+
+For the lightweight agent-runtime test path, start from
+`k0s-cluster-config-agentruntime.yaml`. That profile uses external-Splunk
+compatibility mode with a dummy endpoint to satisfy older webhook validation
+without deploying in-cluster Splunk; export any non-empty `SPLUNK_HEC_TOKEN`
+before running `install`.
 
 #### Image Pull Secrets Section
 
