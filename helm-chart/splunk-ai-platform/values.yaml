@@ -60,12 +60,20 @@ gpuInstanceType: "g6.24xlarge"
 scaleFactor: 1
 
 # List of defined features to enable in the AI platform
-# Options include: saia, seca, slim
+# Options include: saia, seca, slim, agentruntime
 features: []
 # Example:
 # - name: "saia"
 #   serviceAccountName: "saia-service-sa"
 #   version: "1.1.0"
+# - name: "agentruntime"
+#   provider: "mltk"
+#   version: "0.1.0"
+#   runtimeVersion: "v2.0.0"
+#   minReplicas: 1
+#   maxReplicas: 4
+#   targetCPUUtilization: 60
+#   checkpointDbSecretRef: "mltk-postgres-conn"
 
 # headGroupSpec:
 #   # Service account name for the Ray head group

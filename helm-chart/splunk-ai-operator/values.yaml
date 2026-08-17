@@ -113,6 +113,19 @@ saiaSchemaImage: "docker.io/splunk/saia-data-loader:1.1.0"
 # SLIM API image
 slimApiImage: "docker.io/splunk/slim-api:1.0.0"
 
+# Agent Runtime images. The base image is shared; provider images are carrier
+# payloads keyed by feature.provider.
+agentRuntimeBaseImage: "docker.io/splunk/agent-runtime:latest"
+agentRuntimeBaseImages: {}
+# Example:
+#   v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
+agentRuntimeProviderImages: {}
+# Example:
+#   mltk: "docker.io/splunk/agent-runtime-provider-mltk:0.1.0"
+agentRuntimeProviderModules: {}
+# Example:
+#   mltk: "agentcore_operations.loader:MLTKAgentLoader"
+
 # OpenTelemetry Collector sidecar image
 otelCollectorImage: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
 

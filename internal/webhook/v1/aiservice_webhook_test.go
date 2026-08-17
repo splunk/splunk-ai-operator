@@ -157,5 +157,58 @@ var _ = Describe("AIService Webhook", func() {
 				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
 			})
 		})
+
+		Describe("agentruntime feature validation", func() {
+			fldPath := field.NewPath("spec")
+
+			It("should accept agentruntime fields when provider and checkpoint secret are set", func() {
+				aiservice := &aiv1.AIService{
+					Spec: aiv1.AIServiceSpec{
+						Feature: aiv1.FeatureSpec{
+							Name:     "agentruntime",
+							Provider: "mltk",
+						},
+						CheckpointDbSecretRef: "mltk-postgres",
+						MinReplicas:           int32PtrForWebhookTest(1),
+						MaxReplicas:           int32PtrForWebhookTest(4),
+						TargetCPUUtilization:  int32PtrForWebhookTest(60),
+					},
+				}
+
+				errs := validator.validateAgentRuntimeFields(aiservice, fldPath)
+				Expect(errs).To(BeEmpty())
+			})
+
+			It("should require provider and checkpoint secret for agentruntime", func() {
+				aiservice := &aiv1.AIService{
+					Spec: aiv1.AIServiceSpec{
+						Feature: aiv1.FeatureSpec{Name: "agentruntime"},
+					},
+				}
+
+				errs := validator.validateAgentRuntimeFields(aiservice, fldPath)
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("spec.features.provider"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("checkpointDbSecretRef"))
+			})
+
+			It("should reject provider on non-agentruntime features", func() {
+				aiservice := &aiv1.AIService{
+					Spec: aiv1.AIServiceSpec{
+						Feature: aiv1.FeatureSpec{
+							Name:     "saia",
+							Provider: "mltk",
+						},
+					},
+				}
+
+				errs := validator.validateAgentRuntimeFields(aiservice, fldPath)
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("spec.features.provider"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("Forbidden"))
+			})
+		})
 	})
 })
+
+func int32PtrForWebhookTest(value int32) *int32 {
+	return &value
+}

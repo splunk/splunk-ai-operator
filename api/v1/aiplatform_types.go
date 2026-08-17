@@ -187,13 +187,40 @@ type VectorDBStorageSpec struct {
 
 // FeatureSpec defines the features to enable in the AIPlatform
 type FeatureSpec struct {
-	// Name of the feature, e.g. "saia", "seca" or "slim"
-	// +kubebuilder:validation:Enum=saia;seca;slim
+	// Name of the feature, e.g. "saia", "seca", "slim", or "agentruntime"
+	// +kubebuilder:validation:Enum=saia;seca;slim;agentruntime
 	Name string `json:"name,omitempty"`
+	// Provider identifies the product team for multi-provider features such as agentruntime.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Provider string `json:"provider,omitempty"`
 	// ServiceAccountName is the name of the service account to use for the feature
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
 	Version string `json:"version,omitempty"`
+	// RuntimeVersion optionally pins the shared agent-runtime base image version.
+	// +kubebuilder:validation:Optional
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	// MinReplicas is the HPA floor for this feature.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+	// MaxReplicas is the HPA ceiling for this feature.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+	// TargetCPUUtilization is the target average CPU utilization percentage for HPA.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	TargetCPUUtilization *int32 `json:"targetCPUUtilization,omitempty"`
+	// CheckpointDbSecretRef references a Secret containing Postgres checkpoint connection settings.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
 }
 
 // WeaviateSpec defines the configuration for the Weaviate vector database

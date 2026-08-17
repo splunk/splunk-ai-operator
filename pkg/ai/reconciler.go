@@ -3,16 +3,17 @@ package ai_platform
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"os"
+	"strings"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
-	//"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	//"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -20,7 +21,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const ownerKey = ".metadata.controller"
+const (
+	agentRuntimeFeatureName = "agentruntime"
+	maxDNSLabelLength       = 63
+	ownerKey                = ".metadata.controller"
+)
 
 type AIPlatformReconciler struct {
 	p *aiApi.AIPlatform
@@ -129,7 +134,7 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 	desired := make(map[string]struct{}, len(platform.Spec.Features))
 
 	for _, feature := range platform.Spec.Features {
-		serviceName := fmt.Sprintf("%s-%s", platform.Name, feature.Name)
+		serviceName := featureServiceName(platform.Name, feature)
 		desired[serviceName] = struct{}{}
 
 		// Prepare object with identity for CreateOrUpdate
@@ -137,7 +142,7 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 		svc.Name = serviceName
 		svc.Namespace = platform.Namespace
 
-		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &svc, func() error {
+		op, err := controllerutil.CreateOrUpdate(ctx, r.Client, &svc, func() error {
 			// After client Get, svc holds the live AIService (empty on first create).
 			preservedResources := svc.Spec.Resources
 			// Preserve any direct `kubectl patch aiservice` edit of ServiceTemplate.
@@ -191,6 +196,9 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 		if err != nil {
 			return err
 		}
+		if op == controllerutil.OperationResultUpdated {
+			log.Info("updated AIService child spec", "name", svc.Name, "feature", feature.Name, "provider", feature.Provider)
+		}
 	}
 
 	// Prune services for features that no longer exist
@@ -221,8 +229,71 @@ func resourceRequirementsNonEmpty(r corev1.ResourceRequirements) bool {
 	return len(r.Requests) > 0 || len(r.Limits) > 0
 }
 
+func featureServiceName(platformName string, feature aiApi.FeatureSpec) string {
+	name := fmt.Sprintf("%s-%s", platformName, feature.Name)
+	if feature.Name == agentRuntimeFeatureName && feature.Provider != "" {
+		name = fmt.Sprintf("%s-%s", name, feature.Provider)
+		return boundedDNSLabel(name)
+	}
+	return name
+}
+
+func boundedDNSLabel(name string) string {
+	if len(name) <= maxDNSLabelLength {
+		return name
+	}
+	hash := shortHash(name)
+	maxPrefixLength := maxDNSLabelLength - len(hash) - 1
+	prefix := strings.TrimRight(name[:maxPrefixLength], "-")
+	if prefix == "" {
+		prefix = name[:maxPrefixLength]
+	}
+	return prefix + "-" + hash
+}
+
+func shortHash(value string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(value))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+func cloneStringMap(value map[string]string) map[string]string {
+	if value == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(value))
+	for k, v := range value {
+		cloned[k] = v
+	}
+	return cloned
+}
+
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {
 	vectorDbUrl := platform.Status.VectorDbServiceName
+	clusterDomain := platform.Spec.ClusterDomain
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	aiPlatformScheme := "http"
+	aiPlatformURL := ""
+	replicas := int32(1)
+	if feature.Name == agentRuntimeFeatureName && feature.MinReplicas != nil {
+		replicas = *feature.MinReplicas
+	}
+	serviceAccountName := feature.ServiceAccountName
+	if feature.Name == agentRuntimeFeatureName && serviceAccountName == "" {
+		serviceAccountName = name + "-sa"
+	}
+	resources := corev1.ResourceRequirements{}
+	if feature.Name == agentRuntimeFeatureName {
+		resources = defaultAgentRuntimeResources()
+		if platform.Status.RayServiceName != "" {
+			aiPlatformURL = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
+				aiPlatformScheme, platform.Status.RayServiceName, platform.Namespace, clusterDomain)
+		}
+	}
+	serviceTemplate := *platform.Spec.ServiceTemplate.DeepCopy()
+	cleanServiceTemplate(&serviceTemplate)
 
 	// Pass the bucket path as-is to the AIService
 	// The feature implementation is responsible for creating its own subdirectories
@@ -230,12 +301,17 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	taskObjectStorage := platform.Spec.ObjectStorage
 	// Don't append feature name - just pass the bucket path directly
 	// taskObjectStorage.Path is already set from platform.Spec.ObjectStorage
+	v2 := aiApi.SAIAv2Config{Replicas: 1}
+	if v2Image := os.Getenv("RELATED_IMAGE_SAIA_API_V2"); v2Image != "" {
+		v2.Image = v2Image
+	}
+
 	svc := &aiApi.AIService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: platform.Namespace,
 			Labels: map[string]string{
-				"aiplatform": platform.Name,
+				"aiplatform": boundedDNSLabel(platform.Name),
 				"feature":    feature.Name,
 			},
 		},
@@ -248,11 +324,20 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				Name:       platform.Name,
 				Namespace:  platform.Namespace,
 			},
-			ServiceAccountName:  feature.ServiceAccountName,
-			TaskVolume:          taskObjectStorage,
-			SplunkConfiguration: platform.Spec.SplunkConfiguration,
-			VectorDbUrl:         vectorDbUrl,
-			Replicas:            1,
+			ServiceAccountName:    serviceAccountName,
+			TaskVolume:            taskObjectStorage,
+			SplunkConfiguration:   platform.Spec.SplunkConfiguration,
+			VectorDbUrl:           vectorDbUrl,
+			AIPlatformUrl:         aiPlatformURL,
+			AIPlatformScheme:      aiPlatformScheme,
+			Replicas:              replicas,
+			Port:                  80,
+			Resources:             resources,
+			MinReplicas:           cloneInt32Ptr(feature.MinReplicas),
+			MaxReplicas:           cloneInt32Ptr(feature.MaxReplicas),
+			TargetCPUUtilization:  cloneInt32Ptr(feature.TargetCPUUtilization),
+			CheckpointDbSecretRef: feature.CheckpointDbSecretRef,
+			RuntimeVersion:        feature.RuntimeVersion,
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
 				Port:    8080,
@@ -265,18 +350,59 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			// this copy, the spec lands on AIPlatform and is silently ignored.
 			// Deep-copy because corev1.Service is a value type with nested
 			// slices/maps; a shallow copy would share state across children.
-			ServiceTemplate:  *platform.Spec.ServiceTemplate.DeepCopy(),
+			ServiceTemplate:  serviceTemplate,
+			ClusterDomain:    clusterDomain,
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
+			V2:               v2,
+			V2Worker:         aiApi.SAIAWorkerConfig{Replicas: 1},
 		},
 	}
 
-	// SAIA v2: populate from operator env var if set
-	if v2Image := os.Getenv("RELATED_IMAGE_SAIA_API_V2"); v2Image != "" {
-		svc.Spec.V2 = aiApi.SAIAv2Config{Image: v2Image, Replicas: 1}
-		svc.Spec.V2Worker = aiApi.SAIAWorkerConfig{Replicas: 1}
+	if feature.Provider != "" {
+		svc.Labels["provider"] = feature.Provider
+	}
+
+	if feature.Name == agentRuntimeFeatureName && platform.Spec.CPUSchedulingSpec != nil {
+		svc.Spec.NodeSelector = cloneStringMap(platform.Spec.CPUSchedulingSpec.NodeSelector)
+		svc.Spec.Tolerations = append([]corev1.Toleration(nil), platform.Spec.CPUSchedulingSpec.Tolerations...)
+		if platform.Spec.CPUSchedulingSpec.Affinity != nil {
+			svc.Spec.Affinity = *platform.Spec.CPUSchedulingSpec.Affinity.DeepCopy()
+		}
 	}
 
 	return svc
+}
+
+func defaultAgentRuntimeResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("500m"),
+			corev1.ResourceMemory:           resource.MustParse("512Mi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("1"),
+			corev1.ResourceMemory:           resource.MustParse("1Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+		},
+	}
+}
+
+func cloneInt32Ptr(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cleanServiceTemplate(svc *corev1.Service) {
+	if svc == nil {
+		return
+	}
+	svc.TypeMeta = metav1.TypeMeta{}
+	svc.ObjectMeta = metav1.ObjectMeta{}
+	svc.Status = corev1.ServiceStatus{}
 }
 
 // CheckAIServiceStatus verifies that all AIService children have successful conditions.

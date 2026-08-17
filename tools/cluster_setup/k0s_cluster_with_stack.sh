@@ -59,9 +59,11 @@ echo "[LOG] Session log: ${LOG_FILE}"
 # ====== LOG ROTATION (keep last 10 logs) ======
 _rotate_logs() {
   local keep=10
-  local logs
+  local logs=() line
   # Newest-first; tail of the array is the oldest — delete those.
-  mapfile -t logs < <(ls -1t "${LOG_DIR}"/k0s-install-*.log 2>/dev/null)
+  while IFS= read -r line; do
+    logs+=("${line}")
+  done < <(ls -1t "${LOG_DIR}"/k0s-install-*.log 2>/dev/null)
   local excess=$(( ${#logs[@]} - keep ))
   if (( excess > 0 )); then
     for (( i=${#logs[@]}-1; i>=${#logs[@]}-excess; i-- )); do
@@ -100,6 +102,65 @@ need() {
   esac
   err "Required tool not found: $1
   Install: ${install_hint}"
+}
+
+config_bool() {
+  local path="$1" default="$2" value
+  value="$(yq eval "${path}" "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  [[ -z "${value}" || "${value}" == "null" ]] && value="${default}"
+  [[ "${value}" == "true" ]] && echo "true" || echo "false"
+}
+
+normalize_env_key_segment() {
+  local value="$1" upper out="" char last_underscore=false i
+  upper="$(printf '%s' "${value}" | tr '[:lower:]' '[:upper:]')"
+  for ((i=0; i<${#upper}; i++)); do
+    char="${upper:i:1}"
+    if [[ "${char}" =~ [A-Z0-9] ]]; then
+      out+="${char}"
+      last_underscore=false
+    elif [[ "${last_underscore}" != "true" ]]; then
+      out+="_"
+      last_underscore=true
+    fi
+  done
+  out="${out##_}"
+  out="${out%%_}"
+  printf '%s' "${out}"
+}
+
+k0s_feature_enabled() {
+  local feature="$1" names
+  names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  while IFS= read -r n; do
+    [[ "${n}" == "${feature}" ]] && return 0
+  done <<< "${names}"
+  return 1
+}
+
+k0s_saia_feature_enabled() { k0s_feature_enabled "saia"; }
+k0s_slim_feature_enabled() { k0s_feature_enabled "slim"; }
+k0s_agentruntime_feature_enabled() { k0s_feature_enabled "agentruntime"; }
+
+component_enabled() {
+  local component="$1"
+  case "${component}" in
+    cert-manager)       [[ "${COMPONENT_CERT_MANAGER:-true}" == "true" ]] ;;
+    monitoring)         [[ "${COMPONENT_MONITORING:-true}" == "true" ]] ;;
+    otel)               [[ "${COMPONENT_OTEL:-true}" == "true" ]] ;;
+    kuberay)            [[ "${COMPONENT_KUBERAY:-true}" == "true" ]] ;;
+    nvidia)
+      [[ "${COMPONENT_NVIDIA:-true}" == "true" ]] && \
+      [[ "${GPU_WORKER_COUNT:-0}" =~ ^[0-9]+$ ]] && \
+      (( GPU_WORKER_COUNT > 0 ))
+      ;;
+    splunk-operator)    [[ "${COMPONENT_SPLUNK_OPERATOR:-true}" == "true" && "${SPLUNK_MODE:-disabled}" == "internal" ]] ;;
+    splunk-standalone)  [[ "${COMPONENT_SPLUNK_STANDALONE:-true}" == "true" && "${SPLUNK_MODE:-disabled}" == "internal" ]] ;;
+    metallb)            [[ "${COMPONENT_METALLB:-true}" == "true" ]] ;;
+    ai-operator)        [[ "${COMPONENT_AI_OPERATOR:-true}" == "true" ]] ;;
+    ai-platform-cr)     [[ "${COMPONENT_AI_PLATFORM_CR:-true}" == "true" ]] ;;
+    *)                  return 1 ;;
+  esac
 }
 
 # ====== HELM RETRY LOGIC ======
@@ -366,7 +427,9 @@ resolve_accelerator_type() {
   local _cur
   _cur=$(printf '%s' "${DEFAULT_ACCELERATOR:-}" | tr '[:upper:]' '[:lower:]')
   for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
-    if [[ "${_cur}" == "${_t,,}" ]]; then
+    local _t_lower
+    _t_lower=$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]')
+    if [[ "${_cur}" == "${_t_lower}" ]]; then
       DEFAULT_ACCELERATOR="${_t}"
       return 0
     fi
@@ -422,6 +485,7 @@ show_install_plan() {
   fi
   echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
+  echo -e "  \033[1mComponents       :\033[0m cert-manager=${COMPONENT_CERT_MANAGER}, monitoring=${COMPONENT_MONITORING}, otel=${COMPONENT_OTEL}, kuberay=${COMPONENT_KUBERAY}, nvidia=${COMPONENT_NVIDIA}, splunkOperator=${COMPONENT_SPLUNK_OPERATOR}, splunkStandalone=${COMPONENT_SPLUNK_STANDALONE}, metallb=${COMPONENT_METALLB}, aiOperator=${COMPONENT_AI_OPERATOR}, aiPlatformCR=${COMPONENT_AI_PLATFORM_CR}" >&2
   echo "" >&2
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
   echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
@@ -435,19 +499,35 @@ show_install_plan() {
     echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
   fi
   echo -e "    3. k0s cluster installation" >&2
-  echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
-  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  local phase1_components=()
+  component_enabled cert-manager && phase1_components+=("cert-manager") || phase1_components+=("cert-manager[skip]")
+  component_enabled monitoring && phase1_components+=("prometheus") || phase1_components+=("prometheus[skip]")
+  component_enabled nvidia && phase1_components+=("NVIDIA drivers") || phase1_components+=("NVIDIA drivers[skip]")
+  echo -e "    4. Phase 1 (parallel): ${phase1_components[*]}" >&2
+  local phase2_components=()
+  component_enabled otel && phase2_components+=("OTel") || phase2_components+=("OTel[skip]")
+  component_enabled kuberay && phase2_components+=("KubeRay") || phase2_components+=("KubeRay[skip]")
+  component_enabled splunk-operator && phase2_components+=("Splunk operator") || phase2_components+=("Splunk operator[skip]")
+  component_enabled nvidia && phase2_components+=("NVIDIA device-plugin") || phase2_components+=("NVIDIA device-plugin[skip]")
+  echo -e "    5. Phase 2 (parallel): ${phase2_components[*]}" >&2
+  if component_enabled metallb && metallb_enabled_k0s; then
+    echo -e "    6. MetalLB load-balancer" >&2
   else
-    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, NVIDIA device-plugin  [Splunk operator SKIPPED — mode=${SPLUNK_MODE}]" >&2
+    echo -e "    6. MetalLB load-balancer  [SKIPPED]" >&2
   fi
-  echo -e "    6. MetalLB load-balancer" >&2
   if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+    local step7="Splunk Standalone + AI Platform operator + CR"
+    component_enabled splunk-standalone || step7="${step7} [Splunk Standalone SKIPPED]"
+    component_enabled ai-operator || step7="${step7} [AI operator SKIPPED]"
+    component_enabled ai-platform-cr || step7="${step7} [AIPlatform CR SKIPPED]"
+    echo -e "    7. ${step7}" >&2
   elif [[ "${SPLUNK_MODE}" == "external" ]]; then
     echo -e "    7. AI Platform operator + CR (external Splunk HEC)  [Splunk Standalone SKIPPED — external mode]" >&2
   else
-    echo -e "    7. AI Platform operator + CR  [Splunk Standalone SKIPPED — mode=disabled]" >&2
+    local step7="AI Platform operator + CR"
+    component_enabled ai-operator || step7="${step7} [AI operator SKIPPED]"
+    component_enabled ai-platform-cr || step7="${step7} [AIPlatform CR SKIPPED]"
+    echo -e "    7. ${step7}  [Splunk Standalone SKIPPED — mode=disabled]" >&2
   fi
   echo -e "    8. Health check + pod verification" >&2
   echo "" >&2
@@ -667,6 +747,23 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
     SPLUNK_MODE="internal"
   fi
 
+  # Optional component gates. Defaults preserve the legacy full-stack install;
+  # lean dev configs can turn off heavyweight pieces without forking this script.
+  COMPONENT_CERT_MANAGER="$(config_bool '.components.certManager' 'true')"
+  COMPONENT_MONITORING="$(config_bool '.components.monitoring' 'true')"
+  COMPONENT_OTEL="$(config_bool '.components.otel' 'true')"
+  COMPONENT_KUBERAY="$(config_bool '.components.kuberay' 'true')"
+  COMPONENT_NVIDIA="$(config_bool '.components.nvidia' 'true')"
+  COMPONENT_SPLUNK_OPERATOR="$(config_bool '.components.splunkOperator' 'true')"
+  COMPONENT_SPLUNK_STANDALONE="$(config_bool '.components.splunkStandalone' 'true')"
+  COMPONENT_METALLB="$(config_bool '.components.metallb' 'true')"
+  COMPONENT_AI_OPERATOR="$(config_bool '.components.aiOperator' 'true')"
+  COMPONENT_AI_PLATFORM_CR="$(config_bool '.components.aiPlatformCR' 'true')"
+
+  AI_SIDECAR_ENVOY="$(config_bool '.aiPlatform.sidecars.envoy' 'false')"
+  AI_SIDECAR_OTEL="$(config_bool '.aiPlatform.sidecars.otel' "${COMPONENT_OTEL}")"
+  AI_SIDECAR_PROMETHEUS="$(config_bool '.aiPlatform.sidecars.prometheusOperator' "${COMPONENT_MONITORING}")"
+
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
@@ -682,6 +779,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  AGENT_RUNTIME_BASE_IMAGE="$(yq eval '.images.agentRuntime.baseImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   NGINX_IMAGE="$(yq eval '.images.nginx.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -721,6 +819,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
   log "Splunk telemetry: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
+  log "Components: cert-manager=${COMPONENT_CERT_MANAGER}, monitoring=${COMPONENT_MONITORING}, otel=${COMPONENT_OTEL}, kuberay=${COMPONENT_KUBERAY}, nvidia=${COMPONENT_NVIDIA}, splunkOperator=${COMPONENT_SPLUNK_OPERATOR}, splunkStandalone=${COMPONENT_SPLUNK_STANDALONE}, metallb=${COMPONENT_METALLB}, aiOperator=${COMPONENT_AI_OPERATOR}, aiPlatformCR=${COMPONENT_AI_PLATFORM_CR}"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -804,23 +903,29 @@ validate_image_config() {
       err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml when splunk.enabled is true (internal mode)"
     fi
   fi
-  if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.ray.headImage must be specified in k0s-cluster-config.yaml"
+  if component_enabled kuberay; then
+    if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.ray.headImage must be specified in k0s-cluster-config.yaml when components.kuberay=true"
+    fi
+    if [[ -z "$RAY_WORKER_IMAGE" || "$RAY_WORKER_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.ray.workerImage must be specified in k0s-cluster-config.yaml when components.kuberay=true"
+    fi
   fi
-  if [[ -z "$RAY_WORKER_IMAGE" || "$RAY_WORKER_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.ray.workerImage must be specified in k0s-cluster-config.yaml"
+  if component_enabled ai-platform-cr; then
+    if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.weaviate.image must be specified in k0s-cluster-config.yaml when components.aiPlatformCR=true"
+    fi
   fi
-  if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.weaviate.image must be specified in k0s-cluster-config.yaml"
-  fi
-  if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.saia.apiImage must be specified in k0s-cluster-config.yaml"
-  fi
-  if [[ -z "$SAIA_API_V2_IMAGE" || "$SAIA_API_V2_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.saia.apiV2Image must be specified in k0s-cluster-config.yaml"
-  fi
-  if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
+  if k0s_saia_feature_enabled; then
+    if [[ -z "$SAIA_API_IMAGE" || "$SAIA_API_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.saia.apiImage must be specified in k0s-cluster-config.yaml when the 'saia' feature is enabled"
+    fi
+    if [[ -z "$SAIA_API_V2_IMAGE" || "$SAIA_API_V2_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.saia.apiV2Image must be specified in k0s-cluster-config.yaml when the 'saia' feature is enabled"
+    fi
+    if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml when the 'saia' feature is enabled"
+    fi
   fi
   # slim-api is only deployed when the "slim" feature is enabled, so require its
   # image only in that case (mirrors the feature-gated Splunk image handling).
@@ -828,6 +933,26 @@ validate_image_config() {
     if [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]]; then
       err "REQUIRED: images.slim.apiImage must be specified in k0s-cluster-config.yaml when the 'slim' feature is enabled"
     fi
+  fi
+  if k0s_agentruntime_feature_enabled; then
+    if [[ -z "$AGENT_RUNTIME_BASE_IMAGE" || "$AGENT_RUNTIME_BASE_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.agentRuntime.baseImage must be specified in k0s-cluster-config.yaml when the 'agentruntime' feature is enabled"
+    fi
+    local agent_feature_count agent_i agent_provider agent_provider_image
+    agent_feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+    for ((agent_i=0; agent_i<agent_feature_count; agent_i++)); do
+      if [[ "$(yq eval ".aiPlatform.features[${agent_i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")" != "agentruntime" ]]; then
+        continue
+      fi
+      agent_provider="$(yq eval ".aiPlatform.features[${agent_i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+      if [[ -z "${agent_provider}" || "${agent_provider}" == "null" ]]; then
+        err "REQUIRED: aiPlatform.features[${agent_i}].provider must be specified when name=agentruntime"
+      fi
+      agent_provider_image="$(yq eval ".images.agentRuntime.providerImages.\"${agent_provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+      if [[ -z "${agent_provider_image}" || "${agent_provider_image}" == "null" ]]; then
+        err "REQUIRED: images.agentRuntime.providerImages.${agent_provider} must be specified for agentruntime provider '${agent_provider}'"
+      fi
+    done
   fi
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
@@ -863,16 +988,30 @@ validate_image_config() {
   # first-time installs.
   local mutable_tag_images=(
     "images.operator.image:${OPERATOR_IMAGE}"
+    "images.fluentBit.image:${FLUENT_BIT_IMAGE}"
+    "images.nginx.image:${NGINX_IMAGE}"
+  )
+  component_enabled kuberay && mutable_tag_images+=(
     "images.ray.headImage:${RAY_HEAD_IMAGE}"
     "images.ray.workerImage:${RAY_WORKER_IMAGE}"
-    "images.weaviate.image:${WEAVIATE_IMAGE}"
+  )
+  component_enabled ai-platform-cr && mutable_tag_images+=("images.weaviate.image:${WEAVIATE_IMAGE}")
+  k0s_saia_feature_enabled && mutable_tag_images+=(
     "images.saia.apiImage:${SAIA_API_IMAGE}"
     "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
     "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
-    "images.fluentBit.image:${FLUENT_BIT_IMAGE}"
-    "images.nginx.image:${NGINX_IMAGE}"
-    "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}"
   )
+  component_enabled otel && mutable_tag_images+=("images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}")
+  k0s_agentruntime_feature_enabled && mutable_tag_images+=("images.agentRuntime.baseImage:${AGENT_RUNTIME_BASE_IMAGE}")
+  if k0s_agentruntime_feature_enabled; then
+    local _provider_keys _provider_key _provider_image
+    _provider_keys="$(yq eval '.images.agentRuntime.providerImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+    while IFS= read -r _provider_key; do
+      [[ -z "${_provider_key}" || "${_provider_key}" == "null" ]] && continue
+      _provider_image="$(yq eval ".images.agentRuntime.providerImages.\"${_provider_key}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+      mutable_tag_images+=("images.agentRuntime.providerImages.${_provider_key}:${_provider_image}")
+    done <<< "${_provider_keys}"
+  fi
   # images.splunk.image and images.splunk.operatorImage are only patched into
   # the manifest (and only actually deployed) in internal mode — disabled/
   # external modes never run them.
@@ -936,12 +1075,24 @@ configure_images() {
   log "Updating $SPLUNK_AI_FILE..."
 
   local operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
-  local ray_head_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_HEAD_IMAGE")
-  local ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
-  local weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
-  local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
-  local saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
-  local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  local ray_head_full=""
+  [[ -n "$RAY_HEAD_IMAGE" && "$RAY_HEAD_IMAGE" != "null" ]] && \
+    ray_head_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_HEAD_IMAGE")
+  local ray_worker_full=""
+  [[ -n "$RAY_WORKER_IMAGE" && "$RAY_WORKER_IMAGE" != "null" ]] && \
+    ray_worker_full=$(build_image_url "$IMAGE_REGISTRY" "$RAY_WORKER_IMAGE")
+  local weaviate_full=""
+  [[ -n "$WEAVIATE_IMAGE" && "$WEAVIATE_IMAGE" != "null" ]] && \
+    weaviate_full=$(build_image_url "$IMAGE_REGISTRY" "$WEAVIATE_IMAGE")
+  local saia_api_full=""
+  [[ -n "$SAIA_API_IMAGE" && "$SAIA_API_IMAGE" != "null" ]] && \
+    saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
+  local saia_api_v2_full=""
+  [[ -n "$SAIA_API_V2_IMAGE" && "$SAIA_API_V2_IMAGE" != "null" ]] && \
+    saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
+  local saia_dataloader_full=""
+  [[ -n "$SAIA_DATALOADER_IMAGE" && "$SAIA_DATALOADER_IMAGE" != "null" ]] && \
+    saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
   # slim-api is optional (feature-gated); only build a URL when configured.
   local slim_api_full=""
   [[ -n "$SLIM_API_IMAGE" && "$SLIM_API_IMAGE" != "null" ]] && \
@@ -978,12 +1129,39 @@ configure_images() {
     SED_INPLACE=(sed -i)
   fi
 
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_escaped}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  upsert_ai_operator_env() {
+    local env_name="$1" env_value="$2" escaped_value tmp
+    escaped_value=$(echo "$env_value" | sed 's/[\/&]/\\&/g')
+    if grep -q "name: ${env_name}$" "$SPLUNK_AI_FILE"; then
+      "${SED_INPLACE[@]}" "/name: ${env_name}$/,/value:/ s|value:.*|value: ${escaped_value}|" "$SPLUNK_AI_FILE"
+      return 0
+    fi
+
+    tmp=$(mktemp) || err "failed to create temp manifest"
+    if awk -v name="${env_name}" -v value="${env_value}" '
+      !inserted && $0 ~ /^[[:space:]]*- name: (SPLUNK_METRICS_INDEX_NAME|MODEL_VERSION|RAY_VERSION)$/ {
+        match($0, /^[[:space:]]*/)
+        indent = substr($0, RSTART, RLENGTH)
+        print indent "- name: " name
+        print indent "  value: " value
+        inserted = 1
+      }
+      { print }
+      END { if (!inserted) exit 42 }
+    ' "$SPLUNK_AI_FILE" > "$tmp"; then
+      mv "$tmp" "$SPLUNK_AI_FILE"
+    else
+      rm -f "$tmp"
+      err "Unable to inject ${env_name} into Splunk AI operator Deployment env list"
+    fi
+  }
+
+  [[ -n "$ray_head_full" ]] && "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_HEAD/,/value:/ s|value:.*|value: ${ray_head_escaped}|" "$SPLUNK_AI_FILE"
+  [[ -n "$ray_worker_full" ]] && "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_RAY_WORKER/,/value:/ s|value:.*|value: ${ray_worker_escaped}|" "$SPLUNK_AI_FILE"
+  [[ -n "$weaviate_full" ]] && "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_WEAVIATE/,/value:/ s|value:.*|value: ${weaviate_escaped}|" "$SPLUNK_AI_FILE"
+  [[ -n "$saia_api_full" ]] && "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
+  [[ -n "$saia_api_v2_full" ]] && "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_escaped}|" "$SPLUNK_AI_FILE"
+  [[ -n "$saia_dataloader_full" ]] && "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
   # slim-api is feature-gated; only rewrite when an image was configured so the
   # manifest's default value survives untouched on saia-only installs.
   if [[ -n "$slim_api_full" ]]; then
@@ -991,7 +1169,7 @@ configure_images() {
   fi
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
+  upsert_ai_operator_env "RELATED_IMAGE_NGINX" "$nginx_full"
   "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
   # Anchor on the RAY_VERSION env entry (unique, always immediately precedes
@@ -1003,12 +1181,54 @@ configure_images() {
   # leave the stale image in place.
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^        image:/ s|^        image:.*|        image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
 
-  log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
-  log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
-  log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
-  log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
-  log "  ✓ Updated RELATED_IMAGE_SAIA_API_V2: $saia_api_v2_full"
-  log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  if [[ -n "$AGENT_RUNTIME_BASE_IMAGE" && "$AGENT_RUNTIME_BASE_IMAGE" != "null" ]]; then
+    local agent_runtime_base_full
+    agent_runtime_base_full=$(build_image_url "$IMAGE_REGISTRY" "$AGENT_RUNTIME_BASE_IMAGE")
+    upsert_ai_operator_env "RELATED_IMAGE_AGENT_RUNTIME_BASE" "$agent_runtime_base_full"
+    log "  ✓ Updated RELATED_IMAGE_AGENT_RUNTIME_BASE: $agent_runtime_base_full"
+  fi
+
+  local agent_runtime_versions agent_runtime_version agent_runtime_version_image agent_runtime_version_full agent_runtime_env
+  agent_runtime_versions="$(yq eval '.images.agentRuntime.baseImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+  while IFS= read -r agent_runtime_version; do
+    [[ -z "${agent_runtime_version}" || "${agent_runtime_version}" == "null" ]] && continue
+    agent_runtime_version_image="$(yq eval ".images.agentRuntime.baseImages.\"${agent_runtime_version}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -z "${agent_runtime_version_image}" || "${agent_runtime_version_image}" == "null" ]] && continue
+    agent_runtime_version_full=$(build_image_url "$IMAGE_REGISTRY" "$agent_runtime_version_image")
+    agent_runtime_env="RELATED_IMAGE_AGENT_RUNTIME_BASE_$(normalize_env_key_segment "${agent_runtime_version}")"
+    upsert_ai_operator_env "${agent_runtime_env}" "${agent_runtime_version_full}"
+    log "  ✓ Updated ${agent_runtime_env}: ${agent_runtime_version_full}"
+  done <<< "${agent_runtime_versions}"
+
+  local agent_runtime_providers agent_runtime_provider agent_runtime_provider_image agent_runtime_provider_full agent_runtime_provider_env
+  agent_runtime_providers="$(yq eval '.images.agentRuntime.providerImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+  while IFS= read -r agent_runtime_provider; do
+    [[ -z "${agent_runtime_provider}" || "${agent_runtime_provider}" == "null" ]] && continue
+    agent_runtime_provider_image="$(yq eval ".images.agentRuntime.providerImages.\"${agent_runtime_provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -z "${agent_runtime_provider_image}" || "${agent_runtime_provider_image}" == "null" ]] && continue
+    agent_runtime_provider_full=$(build_image_url "$IMAGE_REGISTRY" "$agent_runtime_provider_image")
+    agent_runtime_provider_env="RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_$(normalize_env_key_segment "${agent_runtime_provider}")"
+    upsert_ai_operator_env "${agent_runtime_provider_env}" "${agent_runtime_provider_full}"
+    log "  ✓ Updated ${agent_runtime_provider_env}: ${agent_runtime_provider_full}"
+  done <<< "${agent_runtime_providers}"
+
+  local agent_runtime_module_providers agent_runtime_module_provider agent_runtime_module agent_runtime_module_env
+  agent_runtime_module_providers="$(yq eval '.images.agentRuntime.providerModules // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
+  while IFS= read -r agent_runtime_module_provider; do
+    [[ -z "${agent_runtime_module_provider}" || "${agent_runtime_module_provider}" == "null" ]] && continue
+    agent_runtime_module="$(yq eval ".images.agentRuntime.providerModules.\"${agent_runtime_module_provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -z "${agent_runtime_module}" || "${agent_runtime_module}" == "null" ]] && continue
+    agent_runtime_module_env="RELATED_AGENT_RUNTIME_MODULE_PROVIDER_$(normalize_env_key_segment "${agent_runtime_module_provider}")"
+    upsert_ai_operator_env "${agent_runtime_module_env}" "${agent_runtime_module}"
+    log "  ✓ Updated ${agent_runtime_module_env}: ${agent_runtime_module}"
+  done <<< "${agent_runtime_module_providers}"
+
+  [[ -n "$ray_head_full" ]] && log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
+  [[ -n "$ray_worker_full" ]] && log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
+  [[ -n "$weaviate_full" ]] && log "  ✓ Updated RELATED_IMAGE_WEAVIATE: $weaviate_full"
+  [[ -n "$saia_api_full" ]] && log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
+  [[ -n "$saia_api_v2_full" ]] && log "  ✓ Updated RELATED_IMAGE_SAIA_API_V2: $saia_api_v2_full"
+  [[ -n "$saia_dataloader_full" ]] && log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
   [[ -n "$slim_api_full" ]] && log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
@@ -1645,6 +1865,7 @@ REMOTE_SCRIPT
 #   Controller : 100 GB (k0s control plane, kine/etcd, container images)
 #   CPU worker : 200 GB (weaviate, saia-api, data-loader, fluent-bit, etc.)
 #   GPU worker : 500 GB (model weights 60-240 GB each, ray-worker-gpu image ~30 GB)
+# Set a role threshold to 0 to skip that role's disk-space preflight.
 #
 # If a dedicated disk is available, the customer should mount it at
 # /var/lib/k0s before running this script.
@@ -1704,6 +1925,12 @@ preflight_check_node_storage() {
   _check_node_disk() {
     local ip="$1" role="$2" min_required="$3"
     local stdout stderr_file stderr avail ssh_err
+    min_required="${min_required//[!0-9]/}"
+    if [[ -z "${min_required}" ]] || (( 10#${min_required} == 0 )); then
+      pf_ok "${role} ${ip}: storage threshold skipped (minimumDiskSpace=0)"
+      return
+    fi
+
     # Capture stdout and stderr separately via a temp file (avoids the fd-3
     # redirection trick that leaked stdout "0" lines to the terminal).
     stderr_file=$(mktemp)
@@ -4702,6 +4929,43 @@ wait_for_splunk_standalone() {
 }
 
 # ====== INSTALL AI PLATFORM CR ======
+create_agentruntime_checkpoint_secrets() {
+  k0s_agentruntime_feature_enabled || return 0
+
+  local count
+  count=$(yq eval '.aiPlatform.agentRuntime.checkpointSecrets // [] | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${count}" == "0" ]]; then
+    warn "agentruntime feature enabled but aiPlatform.agentRuntime.checkpointSecrets is empty. The referenced checkpointDbSecretRef must already exist."
+    return 0
+  fi
+
+  local i name database_url env_var create_flag
+  for ((i=0; i<count; i++)); do
+    create_flag="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].create" "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+    [[ -z "${create_flag}" || "${create_flag}" == "null" ]] && create_flag="true"
+    [[ "${create_flag}" == "false" ]] && continue
+
+    name="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    database_url="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrl // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    env_var="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrlEnv // \"AGENT_RUNTIME_CHECKPOINT_DB_URL\"" "${CONFIG_FILE}" 2>/dev/null || echo "AGENT_RUNTIME_CHECKPOINT_DB_URL")"
+
+    [[ -z "${name}" || "${name}" == "null" ]] && err "aiPlatform.agentRuntime.checkpointSecrets[${i}].name is required"
+    if [[ -z "${database_url}" || "${database_url}" == "null" ]]; then
+      database_url="${!env_var:-}"
+    fi
+    if [[ -z "${database_url}" ]]; then
+      warn "Skipping checkpoint DB Secret/${name}: set aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrl or export ${env_var}."
+      continue
+    fi
+
+    log "Creating/updating agent-runtime checkpoint DB secret '${name}' in ${AI_NS} (value from config/env, not logged)..."
+    kubectl -n "${AI_NS}" create secret generic "${name}" \
+      --from-literal=DATABASE_URL="${database_url}" \
+      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+    log "✓ Agent-runtime checkpoint DB secret ready: ${name}"
+  done
+}
+
 install_ai_platform_cr() {
   log "============================================"
   log "Creating AIPlatform Custom Resource"
@@ -4770,6 +5034,7 @@ EOF
       if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
         err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
       fi
+      local splunk_namespace_secret="splunk-${AI_NS}-secret"
       log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
       # --dry-run|apply keeps this idempotent across re-runs. The token value is
       # never echoed; only the secret name is logged.
@@ -4777,6 +5042,12 @@ EOF
         --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
         --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
       log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
+      if [[ "${splunk_namespace_secret}" != "${SPLUNK_EXTERNAL_SECRET_NAME}" ]]; then
+        kubectl -n "${AI_NS}" create secret generic "${splunk_namespace_secret}" \
+          --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
+          --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+        log "✓ Namespace-scoped Splunk HEC compatibility secret ready: ${splunk_namespace_secret}"
+      fi
       log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
       splunk_config_yaml=$(cat <<EOF
 
@@ -4825,6 +5096,8 @@ EOF
       --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
     log "✓ Object storage credentials secret ready"
   fi
+
+  create_agentruntime_checkpoint_secrets
 
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
@@ -4915,13 +5188,25 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa
+      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fprovider=$(yq eval ".aiPlatform.features[$i].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fruntime=$(yq eval ".aiPlatform.features[$i].runtimeVersion // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fmin=$(yq eval ".aiPlatform.features[$i].minReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fmax=$(yq eval ".aiPlatform.features[$i].maxReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      ftarget=$(yq eval ".aiPlatform.features[$i].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fcheckpoint=$(yq eval ".aiPlatform.features[$i].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
+        [[ -n "$fprovider" && "$fprovider" != "null" ]] && features_yaml+="      provider: \"${fprovider}\""$'\n'
+        [[ -n "$fruntime" && "$fruntime" != "null" ]] && features_yaml+="      runtimeVersion: \"${fruntime}\""$'\n'
+        [[ -n "$fmin" && "$fmin" != "null" ]] && features_yaml+="      minReplicas: ${fmin}"$'\n'
+        [[ -n "$fmax" && "$fmax" != "null" ]] && features_yaml+="      maxReplicas: ${fmax}"$'\n'
+        [[ -n "$ftarget" && "$ftarget" != "null" ]] && features_yaml+="      targetCPUUtilization: ${ftarget}"$'\n'
+        [[ -n "$fcheckpoint" && "$fcheckpoint" != "null" ]] && features_yaml+="      checkpointDbSecretRef: \"${fcheckpoint}\""$'\n'
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: ${fsa}"$'\n'
         log "  Feature: ${fname} v${fver}"
       fi
@@ -4955,6 +5240,12 @@ ${image_pull_secrets}
 
   # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
 ${scale_factor_yaml}
+  # Sidecar injection configuration
+  sidecars:
+    envoy: ${AI_SIDECAR_ENVOY}
+    otel: ${AI_SIDECAR_OTEL}
+    prometheusOperator: ${AI_SIDECAR_PROMETHEUS}
+
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}
@@ -5061,11 +5352,11 @@ apply_k0s_saia_service_annotations() {
 metallb_enabled_k0s() {
   local v
   v="$(yq eval '.metallb.install // false' "${CONFIG_FILE}" 2>/dev/null || echo false)"
-  [[ "${v}" == "true" ]]
+  [[ "${v}" == "true" ]] && component_enabled metallb
 }
 
 install_metallb() {
-  metallb_enabled_k0s || { log "metallb.install != true — skipping MetalLB install"; return 0; }
+  metallb_enabled_k0s || { log "MetalLB disabled (components.metallb=${COMPONENT_METALLB}, metallb.install=$(yq eval '.metallb.install // false' "${CONFIG_FILE}" 2>/dev/null || echo false)) — skipping MetalLB install"; return 0; }
 
   if k0s_saia_service_template_is_nodeport; then
     log "Skipping MetalLB install: aiPlatform.serviceTemplate.type=NodePort (LoadBalancer provider not used for SAIA)."
@@ -5215,6 +5506,8 @@ patch_k0s_saia_service_disable_nodeport() {
 }
 
 patch_k0s_saia_public_service_workaround() {
+  k0s_saia_feature_enabled || return 0
+
   local platform_name="${CLUSTER_NAME}-ai-platform"
   local aiservice_name="${platform_name}-saia"
   local public_svc_name="${aiservice_name}-saia-service"
@@ -5370,9 +5663,9 @@ patch_k0s_slim_public_service_workaround() {
   fi
 }
 
-# ====== INSTALL FULL STACK ======
+# ====== INSTALL SELECTED STACK COMPONENTS ======
 install_ai_platform_stack() {
-  log "Installing complete AI Platform stack..."
+  log "Installing selected AI Platform stack components..."
 
   ensure_namespace "${AI_NS}"
 
@@ -5381,14 +5674,26 @@ install_ai_platform_stack() {
   local phase1_pids=() phase1_names=() phase1_logdir
   phase1_logdir=$(mktemp -d)
 
-  install_cert_manager > "${phase1_logdir}/cert-manager.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("cert-manager")
+  if component_enabled cert-manager; then
+    install_cert_manager > "${phase1_logdir}/cert-manager.log" 2>&1 &
+    phase1_pids+=($!); phase1_names+=("cert-manager")
+  else
+    log "  - cert-manager skipped (components.certManager=false)"
+  fi
 
-  install_kube_prometheus > "${phase1_logdir}/kube-prometheus.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("kube-prometheus")
+  if component_enabled monitoring; then
+    install_kube_prometheus > "${phase1_logdir}/kube-prometheus.log" 2>&1 &
+    phase1_pids+=($!); phase1_names+=("kube-prometheus")
+  else
+    log "  - kube-prometheus skipped (components.monitoring=false)"
+  fi
 
-  install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("nvidia-drivers")
+  if component_enabled nvidia; then
+    install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
+    phase1_pids+=($!); phase1_names+=("nvidia-drivers")
+  else
+    log "  - NVIDIA host drivers skipped (components.nvidia=${COMPONENT_NVIDIA}, gpuWorkers=${GPU_WORKER_COUNT})"
+  fi
 
   # Track which phase-1 tasks failed. nvidia-drivers failures are fatal:
   # without them the device-plugin crash-loops and the whole GPU stack
@@ -5415,24 +5720,44 @@ install_ai_platform_stack() {
     and model pods would stay Pending forever. Fix the errors above and re-run."
   fi
 
-  ensure_s3compat_credentials
+  if component_enabled ai-platform-cr; then
+    ensure_s3compat_credentials
+  else
+    log "Skipping object-store credential validation (components.aiPlatformCR=false)"
+  fi
 
   # --- Phase 2: cert-manager-dependent components (parallel) ---
   log "Phase 2: Installing cert-manager-dependent components in parallel..."
   local phase2_pids=() phase2_names=() phase2_logdir
   phase2_logdir=$(mktemp -d)
 
-  install_otel_operator_and_contrib_collector > "${phase2_logdir}/otel-operator.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("otel-operator")
+  if component_enabled otel; then
+    install_otel_operator_and_contrib_collector > "${phase2_logdir}/otel-operator.log" 2>&1 &
+    phase2_pids+=($!); phase2_names+=("otel-operator")
+  else
+    log "  - OpenTelemetry operator skipped (components.otel=false)"
+  fi
 
-  install_ray_operator > "${phase2_logdir}/ray-operator.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("ray-operator")
+  if component_enabled kuberay; then
+    install_ray_operator > "${phase2_logdir}/ray-operator.log" 2>&1 &
+    phase2_pids+=($!); phase2_names+=("ray-operator")
+  else
+    log "  - KubeRay operator skipped (components.kuberay=false)"
+  fi
 
-  install_splunk_operator > "${phase2_logdir}/splunk-operator.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("splunk-operator")
+  if component_enabled splunk-operator; then
+    install_splunk_operator > "${phase2_logdir}/splunk-operator.log" 2>&1 &
+    phase2_pids+=($!); phase2_names+=("splunk-operator")
+  else
+    log "  - Splunk operator skipped (mode=${SPLUNK_MODE}, components.splunkOperator=${COMPONENT_SPLUNK_OPERATOR})"
+  fi
 
-  install_nvidia_device_plugin > "${phase2_logdir}/nvidia-device-plugin.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("nvidia-device-plugin")
+  if component_enabled nvidia; then
+    install_nvidia_device_plugin > "${phase2_logdir}/nvidia-device-plugin.log" 2>&1 &
+    phase2_pids+=($!); phase2_names+=("nvidia-device-plugin")
+  else
+    log "  - NVIDIA device plugin skipped (components.nvidia=${COMPONENT_NVIDIA}, gpuWorkers=${GPU_WORKER_COUNT})"
+  fi
 
   for i in "${!phase2_pids[@]}"; do
     if wait "${phase2_pids[$i]}"; then
@@ -5450,7 +5775,11 @@ install_ai_platform_stack() {
   create_image_pull_secrets "${AI_NS}"
 
   # Apply Splunk Standalone CR (non-blocking — pod boots in background)
-  install_splunk_standalone
+  if component_enabled splunk-standalone; then
+    install_splunk_standalone
+  else
+    log "Splunk Standalone skipped (mode=${SPLUNK_MODE}, components.splunkStandalone=${COMPONENT_SPLUNK_STANDALONE})"
+  fi
 
   # MetalLB must be installed BEFORE the AIPlatform CR is reconciled — the
   # operator renders a Service.type=LoadBalancer for SAIA and we need a
@@ -5461,16 +5790,26 @@ install_ai_platform_stack() {
   install_metallb
 
   # Install AI Platform operator and CR while Splunk Standalone boots
-  install_splunk_ai_operator
-  install_ai_platform_cr
-  patch_k0s_saia_public_service_workaround
-  # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
-  patch_k0s_slim_public_service_workaround
+  if component_enabled ai-operator; then
+    install_splunk_ai_operator
+  else
+    log "Splunk AI Operator skipped (components.aiOperator=false)"
+  fi
+  if component_enabled ai-platform-cr; then
+    install_ai_platform_cr
+    patch_k0s_saia_public_service_workaround
+    # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
+    patch_k0s_slim_public_service_workaround
+  else
+    log "AIPlatform CR skipped (components.aiPlatformCR=false)"
+  fi
 
   # Now wait for Splunk Standalone to be ready (likely already done by now)
-  wait_for_splunk_standalone
+  if component_enabled splunk-standalone; then
+    wait_for_splunk_standalone
+  fi
 
-  log "AI Platform stack installation complete!"
+  log "AI Platform component installation complete!"
 }
 
 # ====== ADVANCED HEALTH CHECKS ======
@@ -5511,8 +5850,12 @@ check_platform_health() {
 
   # Check 3: Object Storage
   log "Checking object storage configuration..."
-  if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
+  if ! component_enabled ai-platform-cr; then
+    log "Object storage check skipped (components.aiPlatformCR=false)"
+  elif [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
     log "✅ Object storage configured: ${OBJ_STORE_TYPE} at ${OBJ_STORE_ENDPOINT} (customer-managed)"
+  elif [[ "${OBJ_STORE_TYPE}" == "aws" ]]; then
+    log "✅ Object storage configured: AWS S3 bucket=${OBJ_STORE_BUCKET} (regional endpoint derived by SDK)"
   else
     warn "Object storage endpoint not configured"
     ((health_issues++))
@@ -5521,60 +5864,80 @@ check_platform_health() {
 
   # Check 4: cert-manager
   log "Checking cert-manager..."
-  local cert_manager_ready
-  cert_manager_ready=$(kubectl get pods -n cert-manager --no-headers 2>/dev/null | grep -c "Running" || echo "0")
-  if [[ "${cert_manager_ready}" -ge 3 ]]; then
-    log "✅ cert-manager is running (${cert_manager_ready} pods)"
+  if ! component_enabled cert-manager; then
+    log "cert-manager check skipped (components.certManager=false)"
   else
-    warn "cert-manager not fully ready (${cert_manager_ready}/3 pods)"
-    kubectl get pods -n cert-manager
-    ((health_issues++))
+    local cert_manager_ready
+    cert_manager_ready=$(kubectl get pods -n cert-manager --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+    if [[ "${cert_manager_ready}" -ge 3 ]]; then
+      log "✅ cert-manager is running (${cert_manager_ready} pods)"
+    else
+      warn "cert-manager not fully ready (${cert_manager_ready}/3 pods)"
+      kubectl get pods -n cert-manager
+      ((health_issues++))
+    fi
   fi
   log ""
 
   # Check 5: Prometheus stack
   log "Checking kube-prometheus-stack..."
-  if kubectl get pods -n monitoring 2>/dev/null | grep -q "Running"; then
-    local prom_pods
-    prom_pods=$(kubectl get pods -n monitoring --no-headers 2>/dev/null | grep -c "Running" || echo "0")
-    log "✅ Prometheus stack is running (${prom_pods} pods)"
+  if ! component_enabled monitoring; then
+    log "Prometheus stack check skipped (components.monitoring=false)"
   else
-    warn "Prometheus stack not fully ready"
-    kubectl get pods -n monitoring
-    ((health_issues++))
+    if kubectl get pods -n monitoring 2>/dev/null | grep -q "Running"; then
+      local prom_pods
+      prom_pods=$(kubectl get pods -n monitoring --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+      log "✅ Prometheus stack is running (${prom_pods} pods)"
+    else
+      warn "Prometheus stack not fully ready"
+      kubectl get pods -n monitoring
+      ((health_issues++))
+    fi
   fi
   log ""
 
   # Check 6: OpenTelemetry Operator
   log "Checking OpenTelemetry Operator..."
-  if kubectl get pods -n opentelemetry-operator-system 2>/dev/null | grep -q "Running"; then
-    log "✅ OpenTelemetry Operator is running"
+  if ! component_enabled otel; then
+    log "OpenTelemetry Operator check skipped (components.otel=false)"
   else
-    warn "OpenTelemetry Operator not ready"
-    kubectl get pods -n opentelemetry-operator-system
-    ((health_issues++))
+    if kubectl get pods -n opentelemetry-operator-system 2>/dev/null | grep -q "Running"; then
+      log "✅ OpenTelemetry Operator is running"
+    else
+      warn "OpenTelemetry Operator not ready"
+      kubectl get pods -n opentelemetry-operator-system
+      ((health_issues++))
+    fi
   fi
   log ""
 
   # Check 7: Ray Operator
   log "Checking KubeRay Operator..."
-  if kubectl get pods -n ray-system 2>/dev/null | grep -q "Running"; then
-    log "✅ KubeRay Operator is running"
+  if ! component_enabled kuberay; then
+    log "KubeRay Operator check skipped (components.kuberay=false)"
   else
-    warn "KubeRay Operator not ready"
-    kubectl get pods -n ray-system
-    ((health_issues++))
+    if kubectl get pods -n ray-system 2>/dev/null | grep -q "Running"; then
+      log "✅ KubeRay Operator is running"
+    else
+      warn "KubeRay Operator not ready"
+      kubectl get pods -n ray-system
+      ((health_issues++))
+    fi
   fi
   log ""
 
   # Check 8: Splunk AI Operator
   log "Checking Splunk AI Operator..."
-  if kubectl get pods -n splunk-ai-operator-system 2>/dev/null | grep -q "Running"; then
-    log "✅ Splunk AI Operator is running"
+  if ! component_enabled ai-operator; then
+    log "Splunk AI Operator check skipped (components.aiOperator=false)"
   else
-    warn "Splunk AI Operator not ready"
-    kubectl get pods -n splunk-ai-operator-system
-    ((health_issues++))
+    if kubectl get pods -n splunk-ai-operator-system 2>/dev/null | grep -q "Running"; then
+      log "✅ Splunk AI Operator is running"
+    else
+      warn "Splunk AI Operator not ready"
+      kubectl get pods -n splunk-ai-operator-system
+      ((health_issues++))
+    fi
   fi
   log ""
 
@@ -7193,7 +7556,9 @@ validate_config() {
   if [[ -n "${_accel_val}" ]]; then
     local _valid=false
     for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
-      [[ "${_accel_val}" == "${_t,,}" ]] && _valid=true && break
+      local _t_lower
+      _t_lower=$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]')
+      [[ "${_accel_val}" == "${_t_lower}" ]] && _valid=true && break
     done
     if ! ${_valid}; then
       echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
@@ -7217,10 +7582,38 @@ validate_config() {
   local splunk_file ai_file
   splunk_file=$(yq eval '.files.splunkOperator // ""' "${CONFIG_FILE}" 2>/dev/null)
   ai_file=$(yq eval     '.files.aiPlatform     // ""' "${CONFIG_FILE}" 2>/dev/null)
-  [[ -f "${splunk_file}" ]] && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${splunk_file}" >&2 \
-    || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${splunk_file}" >&2; errors=$(( errors+1 )); }
-  [[ -f "${ai_file}" ]]     && echo -e "  \033[1;32m✔\033[0m files.aiPlatform exists: ${ai_file}" >&2 \
-    || { echo -e "  \033[1;31m✖\033[0m files.aiPlatform not found: ${ai_file}" >&2; errors=$(( errors+1 )); }
+  if component_enabled splunk-operator; then
+    [[ -f "${splunk_file}" ]] && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${splunk_file}" >&2 \
+      || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${splunk_file}" >&2; errors=$(( errors+1 )); }
+  else
+    echo -e "  \033[1;32m✔\033[0m files.splunkOperator skipped (mode=${SPLUNK_MODE}, components.splunkOperator=${COMPONENT_SPLUNK_OPERATOR})" >&2
+  fi
+  if component_enabled ai-operator; then
+    [[ -f "${ai_file}" ]]     && echo -e "  \033[1;32m✔\033[0m files.aiPlatform exists: ${ai_file}" >&2 \
+      || { echo -e "  \033[1;31m✖\033[0m files.aiPlatform not found: ${ai_file}" >&2; errors=$(( errors+1 )); }
+  else
+    echo -e "  \033[1;32m✔\033[0m files.aiPlatform skipped (components.aiOperator=false)" >&2
+  fi
+
+  echo -e "  \033[1;32m✔\033[0m components: cert-manager=${COMPONENT_CERT_MANAGER}, monitoring=${COMPONENT_MONITORING}, otel=${COMPONENT_OTEL}, kuberay=${COMPONENT_KUBERAY}, nvidia=${COMPONENT_NVIDIA}, splunkOperator=${COMPONENT_SPLUNK_OPERATOR}, splunkStandalone=${COMPONENT_SPLUNK_STANDALONE}, metallb=${COMPONENT_METALLB}, aiOperator=${COMPONENT_AI_OPERATOR}, aiPlatformCR=${COMPONENT_AI_PLATFORM_CR}" >&2
+
+  if k0s_agentruntime_feature_enabled; then
+    local feature_count i fname provider provider_image
+    feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+    for ((i=0; i<feature_count; i++)); do
+      fname=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      [[ "${fname}" != "agentruntime" ]] && continue
+      provider=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      if [[ -z "${provider}" || "${provider}" == "null" ]]; then
+        echo -e "  \033[1;31m✖\033[0m aiPlatform.features[${i}].provider missing for agentruntime" >&2
+        errors=$(( errors+1 ))
+        continue
+      fi
+      provider_image=$(yq eval ".images.agentRuntime.providerImages.\"${provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      [[ -n "${provider_image}" && "${provider_image}" != "null" ]] && echo -e "  \033[1;32m✔\033[0m agentruntime provider image: ${provider}" >&2 \
+        || { echo -e "  \033[1;31m✖\033[0m images.agentRuntime.providerImages.${provider} missing" >&2; errors=$(( errors+1 )); }
+    done
+  fi
 
   echo "" >&2
   if (( errors == 0 && warnings == 0 )); then
