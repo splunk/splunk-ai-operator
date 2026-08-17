@@ -4316,6 +4316,12 @@ spec:
                 required:
                 - enabled
                 type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector is a map of key-value pairs for selecting
+                  nodes for AIService pods
+                type: object
               port:
                 default: 80
                 description: Port specifies the service port
@@ -5608,8 +5614,12 @@ rules:
   resources:
   - certificates
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - monitoring

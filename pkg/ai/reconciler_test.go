@@ -220,6 +220,9 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 				},
 			},
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			CPUSchedulingSpec: &aiApi.SchedulingSpec{
+				NodeSelector: map[string]string{"splunk.ai/workload-type": "cpu"},
+			},
 		},
 		Status: aiApi.AIPlatformStatus{
 			RayServiceName:      "ray-head",
@@ -263,6 +266,7 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 	assert.Equal(t, "http://ray-head.default.svc.cluster.local:8000", mltk.Spec.AIPlatformUrl)
 	assert.Equal(t, "cluster.local", mltk.Spec.ClusterDomain)
 	assert.Equal(t, "mltk-sa", mltk.Spec.ServiceAccountName)
+	assert.Equal(t, map[string]string{"splunk.ai/workload-type": "cpu"}, mltk.Spec.NodeSelector)
 	assert.True(t, resourceRequirementsNonEmpty(mltk.Spec.Resources))
 	assert.Equal(t, int32(1), mltk.Spec.V2.Replicas)
 	assert.Equal(t, int32(1), mltk.Spec.V2Worker.Replicas)
@@ -273,6 +277,36 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 	assert.Equal(t, int32(2), seca.Spec.Replicas)
 	assert.Equal(t, "seca-postgres", seca.Spec.CheckpointDbSecretRef)
 	assert.Equal(t, "my-ai-agentruntime-seca-sa", seca.Spec.ServiceAccountName)
+}
+
+func TestFeatureServiceName_BoundsLongAgentRuntimeName(t *testing.T) {
+	shortName := featureServiceName("my-ai", aiApi.FeatureSpec{Name: "agentruntime", Provider: "mltk"})
+	assert.Equal(t, "my-ai-agentruntime-mltk", shortName)
+
+	longPlatformName := "very-long-ai-platform-name-for-agent-runtime-provider-name-bounds"
+	longName := featureServiceName(longPlatformName, aiApi.FeatureSpec{Name: "agentruntime", Provider: "mltk"})
+	require.LessOrEqual(t, len(longName), maxDNSLabelLength)
+	assert.NotEqual(t, longPlatformName+"-agentruntime-mltk", longName)
+}
+
+func TestBuildAIService_BoundsLongAIPlatformLabel(t *testing.T) {
+	scheme := buildTestScheme(t)
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "very-long-ai-platform-name-for-agent-runtime-provider-name-bounds",
+			Namespace: "default",
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+		},
+	}
+	feature := aiApi.FeatureSpec{Name: "agentruntime", Provider: "mltk"}
+	r := &AIPlatformReconciler{Scheme: scheme}
+
+	service := r.buildAIService(context.Background(), platform, feature, featureServiceName(platform.Name, feature))
+
+	require.LessOrEqual(t, len(service.Labels["aiplatform"]), maxDNSLabelLength)
+	assert.NotEqual(t, platform.Name, service.Labels["aiplatform"])
 }
 
 func int32PtrForReconcilerTest(value int32) *int32 {

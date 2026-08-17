@@ -58,6 +58,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 			MaxReplicas:           int32PtrForAgentRuntimeTest(4),
 			TargetCPUUtilization:  int32PtrForAgentRuntimeTest(60),
 			Replicas:              1,
+			NodeSelector:          map[string]string{"splunk.ai/workload-type": "cpu"},
 			Metrics:               aiv1.MetricsConfig{Enabled: true, Path: "/metrics"},
 		},
 	}
@@ -83,6 +84,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
 	container := deployment.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, "docker.io/splunk/agent-runtime:test", container.Image)
+	assert.Equal(t, map[string]string{"splunk.ai/workload-type": "cpu"}, deployment.Spec.Template.Spec.NodeSelector)
 	assertEnv(t, container.Env, "AGENT_MODULE", "agentcore_operations.loader:MLTKAgentLoader")
 	assertEnv(t, container.Env, "PYTHONPATH", sharedPackagesPath)
 	assertEnv(t, container.Env, "PLATFORM_URL", "http://ray-head.default.svc.cluster.local:8000")
@@ -160,6 +162,74 @@ func TestAgentRuntimeServiceName_StaysWithinDNSLabelLimit(t *testing.T) {
 	require.LessOrEqual(t, len(serviceName), 63)
 	assert.True(t, strings.HasSuffix(serviceName, "-agentruntime-service"))
 	assert.NotEqual(t, longName+"-agentruntime-service", serviceName)
+}
+
+func TestAgentRuntimeReconciler_BoundsSelectorsForLongAIServiceName(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
+
+	scheme := buildAgentRuntimeTestScheme(t)
+	longName := "very-long-ai-platform-name-for-agent-runtime-provider-name-bounds-agentruntime-mltk"
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      longName,
+			Namespace: "default",
+			UID:       types.UID("ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature: aiv1.FeatureSpec{
+				Name:     "agentruntime",
+				Provider: "mltk",
+			},
+			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
+			CheckpointDbSecretRef: "mltk-postgres",
+			Replicas:              1,
+		},
+	}
+	defaultAgentRuntimeSpec(ai)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	reconciler := &AgentRuntimeReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	require.NoError(t, reconciler.reconcileDeployment(context.Background(), ai))
+	require.NoError(t, reconciler.reconcileService(context.Background(), ai))
+
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: longName + "-agentruntime-deployment", Namespace: "default"}, deployment))
+	selectorLabels := deployment.Spec.Selector.MatchLabels
+	require.LessOrEqual(t, len(selectorLabels["app"]), maxDNSLabelLength)
+	require.LessOrEqual(t, len(selectorLabels["component"]), maxDNSLabelLength)
+	assert.Equal(t, selectorLabels["app"], deployment.Labels["app"])
+	assert.Equal(t, selectorLabels["component"], deployment.Labels["component"])
+	assert.Equal(t, selectorLabels, deployment.Spec.Template.Labels)
+	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
+	assert.LessOrEqual(t, len(deployment.Spec.Template.Spec.Containers[0].Name), maxDNSLabelLength)
+
+	svc := &corev1.Service{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: agentRuntimeServiceName(longName), Namespace: "default"}, svc))
+	assert.Equal(t, selectorLabels, svc.Spec.Selector)
+	assert.Equal(t, selectorLabels["app"], svc.Labels["app"])
+	assert.Equal(t, selectorLabels["component"], svc.Labels["component"])
+}
+
+func TestResolveBaseImageRequiresRequestedRuntimeVersion(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:latest")
+
+	ai := &aiv1.AIService{Spec: aiv1.AIServiceSpec{RuntimeVersion: "v2.0.0"}}
+	_, err := resolveBaseImage(ai)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0")
+
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0", "docker.io/splunk/agent-runtime:v2.0.0")
+	image, err := resolveBaseImage(ai)
+	require.NoError(t, err)
+	assert.Equal(t, "docker.io/splunk/agent-runtime:v2.0.0", image)
 }
 
 func int32PtrForAgentRuntimeTest(value int32) *int32 {

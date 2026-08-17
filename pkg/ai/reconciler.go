@@ -3,17 +3,17 @@ package ai_platform
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"os"
+	"strings"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	//"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	//"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -21,7 +21,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const ownerKey = ".metadata.controller"
+const (
+	agentRuntimeFeatureName = "agentruntime"
+	maxDNSLabelLength       = 63
+	ownerKey                = ".metadata.controller"
+)
 
 type AIPlatformReconciler struct {
 	p *aiApi.AIPlatform
@@ -226,10 +230,42 @@ func resourceRequirementsNonEmpty(r corev1.ResourceRequirements) bool {
 }
 
 func featureServiceName(platformName string, feature aiApi.FeatureSpec) string {
-	if feature.Name == "agentruntime" && feature.Provider != "" {
-		return fmt.Sprintf("%s-%s-%s", platformName, feature.Name, feature.Provider)
+	name := fmt.Sprintf("%s-%s", platformName, feature.Name)
+	if feature.Name == agentRuntimeFeatureName && feature.Provider != "" {
+		name = fmt.Sprintf("%s-%s", name, feature.Provider)
+		return boundedDNSLabel(name)
 	}
-	return fmt.Sprintf("%s-%s", platformName, feature.Name)
+	return name
+}
+
+func boundedDNSLabel(name string) string {
+	if len(name) <= maxDNSLabelLength {
+		return name
+	}
+	hash := shortHash(name)
+	maxPrefixLength := maxDNSLabelLength - len(hash) - 1
+	prefix := strings.TrimRight(name[:maxPrefixLength], "-")
+	if prefix == "" {
+		prefix = name[:maxPrefixLength]
+	}
+	return prefix + "-" + hash
+}
+
+func shortHash(value string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(value))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+func cloneStringMap(value map[string]string) map[string]string {
+	if value == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(value))
+	for k, v := range value {
+		cloned[k] = v
+	}
+	return cloned
 }
 
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {
@@ -241,15 +277,15 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	aiPlatformScheme := "http"
 	aiPlatformURL := ""
 	replicas := int32(1)
-	if feature.Name == "agentruntime" && feature.MinReplicas != nil {
+	if feature.Name == agentRuntimeFeatureName && feature.MinReplicas != nil {
 		replicas = *feature.MinReplicas
 	}
 	serviceAccountName := feature.ServiceAccountName
-	if feature.Name == "agentruntime" && serviceAccountName == "" {
+	if feature.Name == agentRuntimeFeatureName && serviceAccountName == "" {
 		serviceAccountName = name + "-sa"
 	}
 	resources := corev1.ResourceRequirements{}
-	if feature.Name == "agentruntime" {
+	if feature.Name == agentRuntimeFeatureName {
 		resources = defaultAgentRuntimeResources()
 		if platform.Status.RayServiceName != "" {
 			aiPlatformURL = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
@@ -275,7 +311,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			Name:      name,
 			Namespace: platform.Namespace,
 			Labels: map[string]string{
-				"aiplatform": platform.Name,
+				"aiplatform": boundedDNSLabel(platform.Name),
 				"feature":    feature.Name,
 			},
 		},
@@ -326,7 +362,8 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 		svc.Labels["provider"] = feature.Provider
 	}
 
-	if feature.Name == "agentruntime" && platform.Spec.CPUSchedulingSpec != nil {
+	if feature.Name == agentRuntimeFeatureName && platform.Spec.CPUSchedulingSpec != nil {
+		svc.Spec.NodeSelector = cloneStringMap(platform.Spec.CPUSchedulingSpec.NodeSelector)
 		svc.Spec.Tolerations = append([]corev1.Toleration(nil), platform.Spec.CPUSchedulingSpec.Tolerations...)
 		if platform.Spec.CPUSchedulingSpec.Affinity != nil {
 			svc.Spec.Affinity = *platform.Spec.CPUSchedulingSpec.Affinity.DeepCopy()
