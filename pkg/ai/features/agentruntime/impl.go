@@ -34,6 +34,7 @@ const (
 	defaultAgentRuntimeHTTPPort int32 = 8080
 	defaultAgentRuntimeMetrics  int32 = 9090
 	maxDNSLabelLength                 = 63
+	mtlsTerminationOperator           = "operator"
 	sharedPackagesPath                = "/shared-packages"
 )
 
@@ -251,7 +252,7 @@ func (r *AgentRuntimeReconciler) reconcileConfigMap(ctx context.Context, ai *aiv
 }
 
 func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AIService) error {
-	if !ai.Spec.MTLS.Enabled || ai.Spec.MTLS.Termination != "operator" {
+	if !ai.Spec.MTLS.Enabled || ai.Spec.MTLS.Termination != mtlsTerminationOperator {
 		return nil
 	}
 
@@ -259,6 +260,7 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 	if secretName == "" {
 		secretName = ai.Name + "-tls"
 	}
+	workloadName := agentRuntimeWorkloadName(ai.Name)
 	serviceName := agentRuntimeServiceName(ai.Name)
 
 	cert := &certmanagerv1.Certificate{
@@ -274,7 +276,7 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 		cert.Spec = certmanagerv1.CertificateSpec{
 			SecretName: secretName,
 			DNSNames: []string{
-				ai.Name,
+				workloadName,
 				serviceName,
 				fmt.Sprintf("%s.%s.svc", serviceName, ai.Namespace),
 			},
@@ -300,6 +302,8 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 	}
 
 	labels, annotations := labelsAndAnnotations(ai)
+	selectorLabels := agentRuntimeSelectorLabels(ai)
+	containerName := agentRuntimeWorkloadName(ai.Name)
 	env := buildAgentRuntimeEnv(ai)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 	volumes := []corev1.Volume{{
@@ -311,7 +315,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 	mounts := []corev1.VolumeMount{
 		{Name: "provider-packages", MountPath: sharedPackagesPath, ReadOnly: true},
 	}
-	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
+	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == mtlsTerminationOperator {
 		secretName := ai.Spec.MTLS.SecretName
 		if secretName == "" {
 			secretName = ai.Name + "-tls"
@@ -343,13 +347,13 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 
 		if deployment.Spec.Selector == nil {
 			deployment.Spec.Selector = &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": ai.Name, "component": ai.Name},
+				MatchLabels: selectorLabels,
 			}
 		}
 
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      map[string]string{"app": ai.Name, "component": ai.Name},
+				Labels:      selectorLabels,
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
@@ -365,7 +369,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 					},
 				}},
 				Containers: []corev1.Container{{
-					Name:            ai.Name,
+					Name:            containerName,
 					Image:           baseImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					Ports: []corev1.ContainerPort{
@@ -387,6 +391,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 				Volumes:          volumes,
 				Affinity:         &ai.Spec.Affinity,
 				Tolerations:      ai.Spec.Tolerations,
+				NodeSelector:     ai.Spec.NodeSelector,
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
@@ -423,6 +428,7 @@ func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.
 	}
 
 	labels, _ := labelsAndAnnotations(ai)
+	selectorLabels := agentRuntimeSelectorLabels(ai)
 	annotations := common.FilterPropagatedAnnotations(ai.Annotations)
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -437,7 +443,7 @@ func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.ObjectMeta.Labels = labels
 		svc.ObjectMeta.Annotations = annotations
-		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
+		svc.Spec.Selector = selectorLabels
 		svc.Spec.Ports = ports
 		svc.Spec.Type = svcType
 		return nil
@@ -534,7 +540,7 @@ func (r *AgentRuntimeReconciler) reconcileServiceMonitor(ctx context.Context, ai
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sm, func() error {
 		sm.Spec = monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": ai.Name, "component": ai.Name},
+				MatchLabels: agentRuntimeSelectorLabels(ai),
 			},
 			Endpoints: []monitoringv1.Endpoint{
 				{Port: "metrics", Path: ai.Spec.Metrics.Path, Scheme: "http"},
@@ -545,8 +551,30 @@ func (r *AgentRuntimeReconciler) reconcileServiceMonitor(ctx context.Context, ai
 	return err
 }
 
+func agentRuntimeWorkloadName(aiServiceName string) string {
+	return boundedDNSLabel(aiServiceName)
+}
+
+func agentRuntimeSelectorLabels(ai *aiv1.AIService) map[string]string {
+	workloadName := agentRuntimeWorkloadName(ai.Name)
+	return map[string]string{"app": workloadName, "component": workloadName}
+}
+
 func agentRuntimeServiceName(aiServiceName string) string {
 	return dnsLabelName(aiServiceName, "agentruntime-service")
+}
+
+func boundedDNSLabel(name string) string {
+	if len(name) <= maxDNSLabelLength {
+		return name
+	}
+	hash := shortHash(name)
+	maxPrefixLength := maxDNSLabelLength - len(hash) - 1
+	truncated := strings.TrimRight(name[:maxPrefixLength], "-")
+	if truncated == "" {
+		truncated = name[:maxPrefixLength]
+	}
+	return truncated + "-" + hash
 }
 
 func dnsLabelName(base, suffix string) string {
@@ -581,7 +609,7 @@ func buildAgentRuntimeEnv(ai *aiv1.AIService) []corev1.EnvVar {
 		{Name: "PLATFORM_URL", Value: platformURL},
 		{Name: "PYTHONPATH", Value: sharedPackagesPath},
 	}
-	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
+	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == mtlsTerminationOperator {
 		env = append(env,
 			corev1.EnvVar{Name: "TLS_CERT_FILE", Value: "/etc/tls/tls.crt"},
 			corev1.EnvVar{Name: "TLS_KEY_FILE", Value: "/etc/tls/tls.key"},
@@ -596,9 +624,10 @@ func buildAgentRuntimeEnv(ai *aiv1.AIService) []corev1.EnvVar {
 }
 
 func labelsAndAnnotations(ai *aiv1.AIService) (map[string]string, map[string]string) {
+	workloadName := agentRuntimeWorkloadName(ai.Name)
 	labels := map[string]string{
-		"app":       ai.Name,
-		"component": ai.Name,
+		"app":       workloadName,
+		"component": workloadName,
 		"feature":   "agentruntime",
 		"provider":  ai.Spec.Feature.Provider,
 		"area":      "ml",
@@ -635,9 +664,11 @@ func httpProbe(path string, port int32) *corev1.Probe {
 
 func resolveBaseImage(ai *aiv1.AIService) (string, error) {
 	if ai.Spec.RuntimeVersion != "" {
-		if image := os.Getenv("RELATED_IMAGE_AGENT_RUNTIME_BASE_" + normalizeEnvKeySegment(ai.Spec.RuntimeVersion)); image != "" {
+		envName := "RELATED_IMAGE_AGENT_RUNTIME_BASE_" + normalizeEnvKeySegment(ai.Spec.RuntimeVersion)
+		if image := os.Getenv(envName); image != "" {
 			return image, nil
 		}
+		return "", fmt.Errorf("%s must be set when runtimeVersion %q is requested", envName, ai.Spec.RuntimeVersion)
 	}
 	if image := os.Getenv("RELATED_IMAGE_AGENT_RUNTIME_BASE"); image != "" {
 		return image, nil

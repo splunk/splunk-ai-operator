@@ -94,6 +94,10 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Optional
 	Env map[string]string `json:"env,omitempty"`
 
+	// NodeSelector is a map of key-value pairs for selecting nodes for AIService pods
+	// +kubebuilder:validation:Optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
 	// Tolerations specifies the tolerations for the AIService pods
 	// +kubebuilder:validation:Optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
