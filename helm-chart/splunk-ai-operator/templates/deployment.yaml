@@ -80,6 +80,20 @@ spec:
             value: {{ .Values.saiaApiV2Image }}
           - name: RELATED_IMAGE_SLIM_API
             value: {{ .Values.slimApiImage }}
+          - name: RELATED_IMAGE_AGENT_RUNTIME_BASE
+            value: {{ .Values.agentRuntimeBaseImage | quote }}
+{{- range $version, $image := .Values.agentRuntimeBaseImages }}
+          - name: RELATED_IMAGE_AGENT_RUNTIME_BASE_{{ $version | upper | replace "." "_" | replace "-" "_" }}
+            value: {{ $image | quote }}
+{{- end }}
+{{- range $provider, $image := .Values.agentRuntimeProviderImages }}
+          - name: RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_{{ $provider | upper | replace "-" "_" }}
+            value: {{ $image | quote }}
+{{- end }}
+{{- range $provider, $module := .Values.agentRuntimeProviderModules }}
+          - name: RELATED_AGENT_RUNTIME_MODULE_PROVIDER_{{ $provider | upper | replace "-" "_" }}
+            value: {{ $module | quote }}
+{{- end }}
           - name: RELATED_IMAGE_POST_INSTALL_HOOK
             value: {{ .Values.saiaSchemaImage }}
           - name: RELATED_IMAGE_OTEL_COLLECTOR

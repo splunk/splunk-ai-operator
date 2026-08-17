@@ -47,6 +47,7 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 			MTLS: aiApi.MTLSConfig{Enabled: true, Termination: "operator"},
 		},
 		Status: aiApi.AIPlatformStatus{
+			RayServiceName:      "ray-head",
 			VectorDbServiceName: "weaviate-db",
 		},
 	}
@@ -134,6 +135,7 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
 		},
 		Status: aiApi.AIPlatformStatus{
+			RayServiceName:      "ray-head",
 			VectorDbServiceName: "weaviate-db",
 		},
 	}
@@ -178,6 +180,103 @@ func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 	assert.Equal(t, "feature1", created.Spec.Feature.Name)
 	assert.Equal(t, "my-ai", created.Spec.AIPlatformRef.Name)
 	assert.Equal(t, "weaviate-db", created.Spec.VectorDbUrl)
+}
+
+func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildTestScheme(t)
+
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(aiApi.AddToScheme(scheme))
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-ai",
+			Namespace: "default",
+			UID:       types.UID("test-ai-uid"),
+		},
+		Spec: aiApi.AIPlatformSpec{
+			Features: []aiApi.FeatureSpec{
+				{
+					Name:                  "agentruntime",
+					Provider:              "mltk",
+					Version:               "0.1.0",
+					RuntimeVersion:        "v2.0.0",
+					MinReplicas:           int32PtrForReconcilerTest(1),
+					MaxReplicas:           int32PtrForReconcilerTest(4),
+					TargetCPUUtilization:  int32PtrForReconcilerTest(60),
+					CheckpointDbSecretRef: "mltk-postgres",
+					ServiceAccountName:    "mltk-sa",
+				},
+				{
+					Name:                  "agentruntime",
+					Provider:              "seca",
+					Version:               "0.2.0",
+					MinReplicas:           int32PtrForReconcilerTest(2),
+					MaxReplicas:           int32PtrForReconcilerTest(5),
+					TargetCPUUtilization:  int32PtrForReconcilerTest(70),
+					CheckpointDbSecretRef: "seca-postgres",
+				},
+			},
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+		},
+		Status: aiApi.AIPlatformStatus{
+			RayServiceName:      "ray-head",
+			VectorDbServiceName: "weaviate-db",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(platform).
+		WithStatusSubresource(&aiApi.AIService{}).
+		WithIndex(&aiApi.AIService{}, ".metadata.controller", func(obj client.Object) []string {
+			if owner := metav1.GetControllerOfNoCopy(obj); owner != nil {
+				if owner.Controller != nil && *owner.Controller {
+					return []string{string(owner.UID)}
+				}
+			}
+			return nil
+		}).
+		Build()
+
+	reconciler := &AIPlatformReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+
+	mltk := &aiApi.AIService{}
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "my-ai-agentruntime-mltk", Namespace: "default"}, mltk))
+	assert.Equal(t, "agentruntime", mltk.Spec.Feature.Name)
+	assert.Equal(t, "mltk", mltk.Spec.Feature.Provider)
+	assert.Equal(t, "mltk", mltk.Labels["provider"])
+	assert.Equal(t, "v2.0.0", mltk.Spec.RuntimeVersion)
+	assert.Equal(t, "mltk-postgres", mltk.Spec.CheckpointDbSecretRef)
+	require.NotNil(t, mltk.Spec.TargetCPUUtilization)
+	assert.Equal(t, int32(60), *mltk.Spec.TargetCPUUtilization)
+	assert.Equal(t, int32(1), mltk.Spec.Replicas)
+	assert.Equal(t, int32(80), mltk.Spec.Port)
+	assert.Equal(t, "http", mltk.Spec.AIPlatformScheme)
+	assert.Equal(t, "http://ray-head.default.svc.cluster.local:8000", mltk.Spec.AIPlatformUrl)
+	assert.Equal(t, "cluster.local", mltk.Spec.ClusterDomain)
+	assert.Equal(t, "mltk-sa", mltk.Spec.ServiceAccountName)
+	assert.True(t, resourceRequirementsNonEmpty(mltk.Spec.Resources))
+	assert.Equal(t, int32(1), mltk.Spec.V2.Replicas)
+	assert.Equal(t, int32(1), mltk.Spec.V2Worker.Replicas)
+
+	seca := &aiApi.AIService{}
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "my-ai-agentruntime-seca", Namespace: "default"}, seca))
+	assert.Equal(t, "seca", seca.Spec.Feature.Provider)
+	assert.Equal(t, int32(2), seca.Spec.Replicas)
+	assert.Equal(t, "seca-postgres", seca.Spec.CheckpointDbSecretRef)
+	assert.Equal(t, "my-ai-agentruntime-seca-sa", seca.Spec.ServiceAccountName)
+}
+
+func int32PtrForReconcilerTest(value int32) *int32 {
+	return &value
 }
 
 func TestReconcileFeatures_DoesNotRecreateExistingAIService(t *testing.T) {
