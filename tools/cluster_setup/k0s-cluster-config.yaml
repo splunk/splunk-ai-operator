@@ -116,7 +116,7 @@ images:
   registryInsecure: false
 
   operator:
-    image: "docker.io/kpratyush775/splunk-ai-operator:v2.2"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v2.5"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"

@@ -299,13 +299,13 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 	ai *aiv1.AIService,
 ) error {
 	if ai.Spec.ServiceAccountName == "" {
-		// Clean ServiceTemplate before updating the spec
-		cleanServiceTemplate(&ai.Spec.ServiceTemplate)
-
+		// Resolve the default name in memory only. Do not persist it back onto
+		// ai.Spec: AIPlatform's ReconcileFeatures rebuilds this AIService's spec
+		// from AIPlatform.Spec.Features[].ServiceAccountName on every reconcile,
+		// so persisting a generated name here just gets it wiped back to "" on
+		// the next AIPlatform pass, which re-triggers this branch — an
+		// unbounded generation-bump loop between the two controllers.
 		ai.Spec.ServiceAccountName = ai.Name + "-sa"
-		if err := r.Update(ctx, ai); err != nil {
-			return fmt.Errorf("updating SA name in spec: %w", err)
-		}
 		sa := &corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      ai.Spec.ServiceAccountName,

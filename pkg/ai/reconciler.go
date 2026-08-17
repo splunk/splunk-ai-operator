@@ -221,6 +221,13 @@ func resourceRequirementsNonEmpty(r corev1.ResourceRequirements) bool {
 	return len(r.Requests) > 0 || len(r.Limits) > 0
 }
 
+func clusterDomainOrDefault(domain string) string {
+	if domain == "" {
+		return "cluster.local"
+	}
+	return domain
+}
+
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {
 	vectorDbUrl := platform.Status.VectorDbServiceName
 
@@ -253,6 +260,14 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			SplunkConfiguration: platform.Spec.SplunkConfiguration,
 			VectorDbUrl:         vectorDbUrl,
 			Replicas:            1,
+			// Match the webhook/CRD defaults for these fields exactly. If left
+			// zero-value here, every reconcile wipes the persisted defaulted
+			// value back to "", CreateOrUpdate sees a spurious diff against the
+			// live object, and issues an Update() on every single pass even
+			// when nothing meaningful changed.
+			Port:             80,
+			ClusterDomain:    clusterDomainOrDefault(platform.Spec.ClusterDomain),
+			AIPlatformScheme: "http",
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
 				Port:    8080,
