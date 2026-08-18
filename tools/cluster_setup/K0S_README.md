@@ -1269,16 +1269,20 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 | Tool | Install |
 |---|---|
-| RHEL 9 x86_64 | Required — the NVIDIA driver closure is resolved with the host's own `dnf` |
+| RHEL 9 x86_64 (RHEL 10 x86_64 if the cluster is RHEL 10 — see note below) | Required — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
 | `curl` | `dnf install -y curl` |
 | `helm` | https://helm.sh/docs/intro/install/ |
 | `kubectl` | https://kubernetes.io/docs/tasks/tools/ |
-| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9 |
+| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9 / RHEL 10 |
 | `createrepo_c` | `sudo dnf install -y createrepo_c` |
 | `sudo` + ~5 GB free disk | Required for staging — the NVIDIA RPM closure is built on this host |
 | `k0s`, `yq` | Downloaded for you — the staging step installs both to `/usr/local/bin/` |
 
 > These requirements apply only to the air-gap path. A standard (`airgap: false`) install needs none of them.
+
+> **Installer machine OS must match the cluster's OS family for RHEL targets.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa). Match the installer machine to the cluster nodes' RHEL major version:
+> - Cluster nodes are **RHEL 10** (air-gapped *or* non-air-gapped) → installer machine must be **RHEL 10 x86_64**. A RHEL 9 installer machine cannot build the RHEL 10 package closure the air-gapped path needs.
+> - Cluster nodes are **RHEL 9** or **Ubuntu 24.04** → installer machine stays **RHEL 9 x86_64**, as above.
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
