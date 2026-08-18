@@ -287,8 +287,8 @@ wait_for_dependency() {
 }
 
 # ====== NODE OS GATE ======
-# Supported: RHEL 9 and Ubuntu 24.04. All other OS families (RHEL 10,
-# Amazon Linux, other Ubuntu/Debian releases) stop the script with a clear
+# Supported: RHEL 9, RHEL 10 and Ubuntu 24.04. All other OS families (Amazon
+# Linux, other Ubuntu/Debian releases) stop the script with a clear
 # error. Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
 # continue at your own risk (useful for internal testing).
 _check_node_os() {
@@ -302,9 +302,9 @@ _check_node_os() {
   os_pretty=$(ssh_exec "${node_ip}" \
     ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
 
-  # Supported: RHEL 9 and Ubuntu 24.04. Other family members kept for
+  # Supported: RHEL 9, RHEL 10 and Ubuntu 24.04. Other family members kept for
   # internal testing.
-  if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
+  if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" =~ ^(9|10)$ ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
   fi
@@ -314,7 +314,7 @@ _check_node_os() {
   fi
 
   local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
-  Only RHEL 9 and Ubuntu 24.04 are tested and supported. Installation on
+  Only RHEL 9, RHEL 10 and Ubuntu 24.04 are tested and supported. Installation on
   other OS versions is not validated and may fail in unexpected ways.
   To skip this check and continue at your own risk, set:
     FORCE_UNSUPPORTED_OS=1"
@@ -1908,6 +1908,25 @@ prepare_nodes_for_k0s() {
       if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
         echo 'Disabling ufw (via CLI)...'
         sudo ufw --force disable || true
+      fi
+
+      # RHEL 10 moved the legacy netfilter modules kube-proxy and Calico depend on
+      # (xt_conntrack, iptable_nat, ip_tables, br_netfilter, nft_compat) out of
+      # kernel-modules into kernel-modules-extra, which the stock AMI does not
+      # install. Without them the iptables proxier cannot program a single rule
+      # ("Extension conntrack revision 0 not supported, missing kernel module?"),
+      # so every ClusterIP — including the API's 10.96.0.1 — is unreachable,
+      # calico's install-cni init container dies on a token request, and all nodes
+      # stay NotReady. Gated on the module actually being missing so RHEL 9 and
+      # Ubuntu 24.04, which ship it in the base kernel package, are untouched.
+      if ! modinfo xt_conntrack >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
+        echo "xt_conntrack missing — installing kernel-modules-extra for $(uname -r)..."
+        # Exact-version first: modules must match the running kernel, and a newer
+        # kernel-modules-extra would install into a directory modprobe never
+        # searches.
+        sudo dnf install -y "kernel-modules-extra-$(uname -r)" \
+          || sudo dnf install -y kernel-modules-extra \
+          || echo "WARN: kernel-modules-extra install failed — kube-proxy will not be able to program iptables rules"
       fi
 
       # Load kernel modules required by Calico and kube-proxy
