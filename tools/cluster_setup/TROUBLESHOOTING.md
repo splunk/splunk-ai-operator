@@ -151,6 +151,8 @@ RHEL 10 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs
 
 Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters. `FORCE_UNSUPPORTED_OS=1` bypasses the check, but the install will then stop later at "xt_conntrack still unavailable" unless you have installed `kernel-modules-extra` on every node yourself.
 
+If you are staging a RHEL 10 closure on purpose, run the installer itself from a **RHEL 10 x86_64** installer machine, not RHEL 9 — `dnf`'s `$releasever` comes from the installer host's own OS, so a RHEL 9 installer machine resolves RHEL 9 packages even when targeting RHEL 10 nodes. RHEL 9 and Ubuntu 24.04 targets are unaffected and keep using a RHEL 9 installer machine.
+
 ### "xt_conntrack still unavailable for kernel \<version\>"
 
 Node preparation could not install `kernel-modules-extra` matching the node's running kernel, so kube-proxy would be unable to program a single iptables rule and every ClusterIP — including the API server's `10.96.0.1` — would be unreachable. The installer stops here rather than letting the node come up broken.

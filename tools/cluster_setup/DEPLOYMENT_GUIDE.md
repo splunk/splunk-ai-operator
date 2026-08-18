@@ -116,7 +116,7 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| Node OS | RHEL 9, RHEL 10 (non-air-gapped only), or Ubuntu 24.04 | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. RHEL 10 is rejected when `cluster.airgap` is true — the offline bundle does not stage the `kernel-modules-extra` package el10 needs for kube-proxy's netfilter modules. For air-gapped installs, the **installer machine** itself must be RHEL 9 x86_64 regardless of the target nodes' OS — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
+| Node OS | RHEL 9, RHEL 10 (non-air-gapped only), or Ubuntu 24.04 | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. RHEL 10 is rejected when `cluster.airgap` is true — the offline bundle does not stage the `kernel-modules-extra` package el10 needs for kube-proxy's netfilter modules. The **installer machine's** RHEL major version must match the cluster nodes' — RHEL 9 nodes (or Ubuntu 24.04 nodes) need a RHEL 9 x86_64 installer machine; RHEL 10 nodes need a RHEL 10 x86_64 installer machine (a RHEL 9 installer machine cannot build the RHEL 10 package closure air-gapped RHEL 10 installs need) — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
 | NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
@@ -882,6 +882,14 @@ OS. The host's RHEL **minor** version and running kernel do *not* need to match
 RHEL 9 GPU nodes — `$releasever` resolves to `9`, so a 9.6 build host can supply
 `kernel-devel` for a 9.8 node. All of this is validated in preflight, before any
 downloads.
+
+> **RHEL 10 clusters need a RHEL 10 installer machine.** The RHEL major version
+> is not just a minor detail here — `dnf`'s `$releasever` is derived from the
+> *installer host's* own `/etc/os-release`, so a RHEL 9 installer machine
+> resolves RHEL 9 packages even when targeting RHEL 10 nodes, and vice versa.
+> For RHEL 10 cluster nodes — air-gapped or not — run the installer from a
+> RHEL 10 x86_64 host. RHEL 9 and Ubuntu 24.04 clusters keep using a RHEL 9
+> x86_64 installer machine as documented above.
 
 > **Driver vs. GPU model:** the driver packages are **not** GPU-model-specific —
 > the same `kmod-nvidia-latest-dkms` (RHEL) or `cuda-drivers` (Ubuntu) covers T4,
