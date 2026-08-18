@@ -287,10 +287,11 @@ wait_for_dependency() {
 }
 
 # ====== NODE OS GATE ======
-# Supported: RHEL 9, RHEL 10 and Ubuntu 24.04. All other OS families (Amazon
-# Linux, other Ubuntu/Debian releases) stop the script with a clear
-# error. Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
-# continue at your own risk (useful for internal testing).
+# Supported: RHEL 9, RHEL 10 and Ubuntu 24.04 — air-gapped RHEL 10 also needs a
+# staged node package closure (see below). All other OS families (Amazon Linux,
+# other Ubuntu/Debian releases) stop the script with a clear error. Set
+# FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and continue at
+# your own risk (useful for internal testing).
 _check_node_os() {
   local node_ip="$1" role="${2:-node}"
   local os_id="" os_version_id="" os_pretty=""
@@ -302,22 +303,41 @@ _check_node_os() {
   os_pretty=$(ssh_exec "${node_ip}" \
     ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
 
-  # Supported: RHEL 9, RHEL 10 and Ubuntu 24.04. Other family members kept for
-  # internal testing.
-  if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" =~ ^(9|10)$ ]]; then
+  if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
+  fi
+  # RHEL 10 proper only — the rebuilds are untested and the el10 path below
+  # installs from RHEL repos. Air-gapped el10 additionally needs the bundle to
+  # stage kernel-modules-extra, since a sealed node cannot fetch it itself.
+  local msg=""
+  if [[ "${os_id}" == "rhel" ]] && [[ "${os_version_id}" == "10" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" != "true" ]] \
+      || [[ -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]]; then
+      log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+      return 0
+    fi
+    msg="RHEL 10 needs an offline package closure for air-gapped installs on ${role} ${node_ip}: ${os_pretty}
+  el10 keeps xt_conntrack (which kube-proxy and Calico require) in
+  kernel-modules-extra rather than the base kernel package, and a sealed node
+  cannot fetch it, so it would come up NotReady. AIRGAP_NODE_RPM_CLOSURE_DIR is
+  unset or missing, meaning the bundle staged no such closure.
+  Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters, re-build the bundle with a
+  node package closure, or set:
+    FORCE_UNSUPPORTED_OS=1"
   fi
   if [[ "${os_id}" == "ubuntu" ]] && [[ "${os_version_id}" == "24" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
   fi
 
-  local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
-  Only RHEL 9, RHEL 10 and Ubuntu 24.04 are tested and supported. Installation on
-  other OS versions is not validated and may fail in unexpected ways.
+  if [[ -z "${msg}" ]]; then
+    msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
+  Only RHEL 9, RHEL 10 and Ubuntu 24.04 are tested and supported. Installation
+  on other OS versions is not validated and may fail in unexpected ways.
   To skip this check and continue at your own risk, set:
     FORCE_UNSUPPORTED_OS=1"
+  fi
 
   if [[ "${FORCE_UNSUPPORTED_OS:-0}" == "1" ]]; then
     warn "${msg}"
@@ -1888,9 +1908,10 @@ prepare_nodes_for_k0s() {
         || warn "    Failed to copy PyYAML to ${node_ip} — k0s config generation may fail"
     fi
 
+    local _prep_rc=0
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
-      bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
+      bash -s <<'REMOTE_SCRIPT' || _prep_rc=$?
       # Disable host firewalls if active (they block k0s ports: 6443, 10250,
       # 8472, 179, etc.). Each family ships a different one, and on-prem images
       # differ from cloud images: AWS Ubuntu AMIs leave ufw inactive, but a
@@ -1910,23 +1931,28 @@ prepare_nodes_for_k0s() {
         sudo ufw --force disable || true
       fi
 
-      # RHEL 10 moved the legacy netfilter modules kube-proxy and Calico depend on
-      # (xt_conntrack, iptable_nat, ip_tables, br_netfilter, nft_compat) out of
-      # kernel-modules into kernel-modules-extra, which the stock AMI does not
-      # install. Without them the iptables proxier cannot program a single rule
-      # ("Extension conntrack revision 0 not supported, missing kernel module?"),
-      # so every ClusterIP — including the API's 10.96.0.1 — is unreachable,
-      # calico's install-cni init container dies on a token request, and all nodes
-      # stay NotReady. Gated on the module actually being missing so RHEL 9 and
-      # Ubuntu 24.04, which ship it in the base kernel package, are untouched.
-      if ! modinfo xt_conntrack >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
-        echo "xt_conntrack missing — installing kernel-modules-extra for $(uname -r)..."
-        # Exact-version first: modules must match the running kernel, and a newer
-        # kernel-modules-extra would install into a directory modprobe never
-        # searches.
-        sudo dnf install -y "kernel-modules-extra-$(uname -r)" \
-          || sudo dnf install -y kernel-modules-extra \
-          || echo "WARN: kernel-modules-extra install failed — kube-proxy will not be able to program iptables rules"
+      # RHEL 10 ships the netfilter modules kube-proxy and Calico need (xt_conntrack
+      # et al) in kernel-modules-extra, not the base kernel package, and the stock
+      # AMI omits it. Without them the iptables proxier programs no rules, so every
+      # ClusterIP is unreachable and nodes stay NotReady. Probing the module rather
+      # than the OS version leaves RHEL 9 and Ubuntu 24.04 untouched.
+      # Via sudo so the probe cannot false-negative on a login shell whose PATH
+      # omits /usr/sbin, which would wrongly fail an otherwise fine RHEL 9 node.
+      if ! sudo modinfo xt_conntrack >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
+        echo "xt_conntrack missing — installing kernel-modules-extra-$(uname -r)..."
+        # Pinned to the running kernel, with no fall back to the repo's current
+        # version: modules for a different kernel land in a /lib/modules directory
+        # modprobe never searches, so that "success" would leave the node broken.
+        sudo dnf install -y "kernel-modules-extra-$(uname -r)" || true
+        if ! sudo modinfo xt_conntrack >/dev/null 2>&1; then
+          echo "ERROR: xt_conntrack still unavailable for kernel $(uname -r)."
+          echo "  kube-proxy cannot program iptables rules, so this node would stay NotReady."
+          echo "  Install kernel-modules-extra-$(uname -r), or boot a kernel that has a"
+          echo "  matching package in your repos, then re-run the installer."
+          # 78 tells the caller this node can never join, as opposed to the
+          # best-effort steps elsewhere in this script that only warn.
+          exit 78
+        fi
       fi
 
       # Load kernel modules required by Calico and kube-proxy
@@ -1993,6 +2019,11 @@ prepare_nodes_for_k0s() {
         sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s
       fi
 REMOTE_SCRIPT
+    if [[ ${_prep_rc} -eq 78 ]]; then
+      err "Node preparation failed on ${node_ip}: the netfilter kernel modules kube-proxy requires are unavailable (details above)."
+    elif [[ ${_prep_rc} -ne 0 ]]; then
+      warn "  Preparation had issues on ${node_ip}"
+    fi
   done
 }
 

@@ -133,17 +133,29 @@ again at the start of every `install` invocation.
 
 ### "Unsupported OS on \<role\> \<ip\>: \<pretty-name\>"
 
-The node is not running RHEL 9.
+The node is not running a supported OS.
 
-**Supported:** RHEL 9 only. Other Linux distributions are not tested or supported for cluster nodes.
+**Supported:** RHEL 9, RHEL 10 (non-air-gapped installs only), and Ubuntu 24.04. Other Linux distributions are not tested or supported for cluster nodes.
 
 **Options:**
 
-1. Re-provision the node with RHEL 9.
+1. Re-provision the node with a supported OS.
 2. For internal testing only — bypass the check at your own risk:
    ```bash
    FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
    ```
+
+### "RHEL 10 needs an offline package closure for air-gapped installs on \<role\> \<ip\>"
+
+RHEL 10 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs iptables with in `kernel-modules-extra` rather than the base kernel package. A sealed node cannot fetch that package itself, and the offline bundle does not stage it yet, so the node would join and then sit NotReady with no way to recover offline.
+
+Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters. `FORCE_UNSUPPORTED_OS=1` bypasses the check, but the install will then stop later at "xt_conntrack still unavailable" unless you have installed `kernel-modules-extra` on every node yourself.
+
+### "xt_conntrack still unavailable for kernel \<version\>"
+
+Node preparation could not install `kernel-modules-extra` matching the node's running kernel, so kube-proxy would be unable to program a single iptables rule and every ClusterIP — including the API server's `10.96.0.1` — would be unreachable. The installer stops here rather than letting the node come up broken.
+
+The package must match `uname -r` exactly; a build for any other kernel installs into a directory `modprobe` never searches. Either install `kernel-modules-extra-$(uname -r)` on the node from a repo that carries it, or boot a kernel that has a matching package available, then re-run the installer.
 
 ---
 
