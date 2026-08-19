@@ -1261,7 +1261,7 @@ The air-gap boundary is between the installer machine and the nodes, not between
 
 The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. The staging step sets all of them automatically from the staged artifacts.
 
-**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--driver-version`, `--skip-nvidia-closure`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
+**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--node-hosts`, `--node-kernels`, `--driver-version`, `--skip-nvidia-closure`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
 
 ### Prerequisites
 
@@ -1269,7 +1269,7 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 | Tool | Install |
 |---|---|
-| RHEL 9 x86_64 (RHEL 10 x86_64 if the cluster is RHEL 10 — see note below) | Required — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
+| RHEL 9 x86_64 (RHEL 10 x86_64 if the cluster nodes are RHEL 10 — see note below) | Required for air-gap only — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
 | `curl` | `dnf install -y curl` |
 | `helm` | https://helm.sh/docs/intro/install/ |
 | `kubectl` | https://kubernetes.io/docs/tasks/tools/ |
@@ -1280,9 +1280,11 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 > These requirements apply only to the air-gap path. A standard (`airgap: false`) install needs none of them.
 
-> **Installer machine OS must match the cluster's OS family for RHEL targets.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa). Match the installer machine to the cluster nodes' RHEL major version:
-> - Cluster nodes are **RHEL 10** (air-gapped *or* non-air-gapped) → installer machine must be **RHEL 10 x86_64**. A RHEL 9 installer machine cannot build the RHEL 10 package closure the air-gapped path needs.
-> - Cluster nodes are **RHEL 9** or **Ubuntu 24.04** → installer machine stays **RHEL 9 x86_64**, as above.
+> **For air-gap builds, the installer machine's RHEL major must match the cluster's.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa) — and the air-gap path builds both closures (NVIDIA driver, node packages) on this host:
+> - Cluster nodes are **RHEL 10** → installer machine must be **RHEL 10 x86_64**.
+> - Cluster nodes are **RHEL 9** or **Ubuntu 24.04** → installer machine stays **RHEL 9 x86_64** (the Ubuntu `.deb` closure resolves inside an `ubuntu:24.04` container).
+>
+> A standard (`airgap: false`) install builds no closure — every node installs from its own repos — so the installer machine's OS does not have to match.
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
@@ -1318,6 +1320,7 @@ cd tools/cluster_setup
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
 | GPU packages | `packages/nvidia-closure/` — a complete offline dnf repo (driver, DKMS, gcc/make toolchain, container toolkit, `kernel-devel`/`kernel-headers` per GPU node kernel); PyYAML wheel (all nodes) |
+| Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
 Output: `./airgap-bundle/airgap-bundle-<timestamp>/` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB). The artifacts are consumed in place; there is no tarball. After a successful install the staged tree is deleted to reclaim disk unless you pass `--keep-staging`.

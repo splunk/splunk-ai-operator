@@ -41,6 +41,7 @@ GPU_NODE_OS="${GPU_NODE_OS:-auto}"
 GPU_KERNELS="${GPU_KERNELS:-}"        # comma-separated `uname -r` values
 GPU_HOSTS="${GPU_HOSTS:-}"            # comma-separated IPs to survey over SSH
 NODE_HOSTS="${NODE_HOSTS:-}"          # every node IP (controllers + workers)
+NODE_KERNELS="${NODE_KERNELS:-}"      # `uname -r` values to stage node packages for
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-}"  # empty = latest in repo
 SKIP_NVIDIA_CLOSURE="${SKIP_NVIDIA_CLOSURE:-false}"
 
@@ -70,6 +71,8 @@ while [[ $# -gt 0 ]]; do
     --gpu-os)      GPU_NODE_OS="$2"; shift 2 ;;
     --gpu-kernels) GPU_KERNELS="$2"; shift 2 ;;
     --gpu-hosts)   GPU_HOSTS="$2"; shift 2 ;;
+    --node-hosts)  NODE_HOSTS="$2"; shift 2 ;;
+    --node-kernels) NODE_KERNELS="$2"; shift 2 ;;
     --driver-version) NVIDIA_DRIVER_VERSION="$2"; shift 2 ;;
     --skip-nvidia-closure) SKIP_NVIDIA_CLOSURE="true"; shift ;;
     -h|--help)
@@ -141,6 +144,20 @@ OPTIONS
                         nodes are not reachable over SSH yet.
                         Env: GPU_KERNELS
 
+  --node-hosts LIST     Comma-separated IPs of EVERY node (controllers included).
+                        Each is probed for xt_conntrack; nodes missing it get a
+                        kernel-modules-extra closure staged (RHEL 10 needs this).
+                        Derived from --config when present; with --download-only
+                        and no config it defaults to --gpu-hosts, so pass this to
+                        cover controllers and CPU workers too.
+                        Env: NODE_HOSTS
+
+  --node-kernels LIST   Comma-separated `uname -r` values to stage
+                        kernel-modules-extra for, skipping the SSH probe. Use when
+                        the nodes are not reachable yet but you know they are
+                        RHEL 10.
+                        Env: NODE_KERNELS
+
   --driver-version VER  Pin the NVIDIA driver, e.g. 610.57.04. Default: whatever
                         is newest in NVIDIA's repo at bundle time. Pin this for
                         reproducible rebuilds.
@@ -193,7 +210,9 @@ WHAT IS STAGED
                           kube-proxy and Calico need (RHEL 10 does; RHEL 9 and
                           Ubuntu 24.04 do not, so those bundles have no such
                           directory). Pinned per kernel: modules for any other
-                          kernel land where modprobe never looks.
+                          kernel land where modprobe never looks. Which nodes get
+                          probed comes from --config, --node-hosts, or
+                          --node-kernels.
     node-closure.manifest   — kernels covered, RPM inventory
     pyyaml-*.whl        — PyYAML wheel/sdist (all nodes)
 
@@ -377,6 +396,13 @@ if [[ -n "${CONFIG_FILE}" ]] && command -v yq >/dev/null 2>&1; then
     done < <(yq eval '.nodes.existingIPs.controllers[], .nodes.existingIPs.workers[]' \
                "${CONFIG_FILE}" 2>/dev/null || true)
   fi
+fi
+
+# Configless staging (--download-only --gpu-hosts ...) has no node list, which
+# would silently produce a bundle with no node closure. The GPU hosts are the
+# nodes we do know about; --node-hosts covers the rest.
+if [[ -z "${NODE_HOSTS}" && -n "${GPU_HOSTS}" ]]; then
+  NODE_HOSTS="${GPU_HOSTS}"
 fi
 
 # ── Resolve --gpu-os auto ─────────────────────────────────────────────────────
@@ -1305,8 +1331,10 @@ fi
 # a fleet that already has the module gets no closure and this is a no-op. Probed
 # per node because the package is kernel-pinned and fleets need not be uniform.
 NODE_CLOSURE_DIR="${STAGE_DIR}/packages/node-closure"
-_node_extra_kernels=""
-if [[ -n "${NODE_HOSTS}" ]]; then
+_node_extra_kernels="${NODE_KERNELS}"
+_node_probed=false
+[[ -n "${NODE_KERNELS}" ]] && log "Staging node packages for --node-kernels: ${NODE_KERNELS}"
+if [[ -n "${NODE_HOSTS}" && -z "${NODE_KERNELS}" ]]; then
   log "--- Checking nodes for netfilter modules missing from the base kernel ---"
   _ssh_user="${SSH_USER:-ec2-user}"
   IFS=',' read -ra _nhosts <<< "${NODE_HOSTS}"
@@ -1329,6 +1357,7 @@ if [[ -n "${NODE_HOSTS}" ]]; then
       warn "    If this node is missing xt_conntrack it will stay NotReady offline."
       continue
     fi
+    _node_probed=true
     if [[ "${_nstate}" == "present" ]]; then
       log "  ${_nh} (${_nkrel}): xt_conntrack present in the running kernel"
       continue
@@ -1342,6 +1371,26 @@ if [[ -n "${NODE_HOSTS}" ]]; then
       _node_extra_kernels="${_node_extra_kernels}${_node_extra_kernels:+,}${_nkrel}"
     fi
   done
+fi
+
+# Nothing probed and nothing named: an el10 bundle would be one the installer's
+# own preflight rejects, so say so here where it is cheap to fix.
+if [[ -z "${_node_extra_kernels}" && "${_node_probed}" != "true" ]]; then
+  if [[ -n "${NODE_HOSTS}" ]]; then
+    _nc_hint="No node answered the SSH probe (tried: ${NODE_HOSTS}).
+  Fix SSH access (SSH_USER, SSH_KEY_PATH) or pass --node-kernels <uname -r,...>."
+  else
+    _nc_hint="No node list was available to probe.
+  Pass --node-hosts <ip,...>, --config, or --node-kernels <uname -r,...>."
+  fi
+  if [[ "${GPU_NODE_OS}" == "rhel10" ]]; then
+    err "Cannot confirm the netfilter modules RHEL 10 needs on any cluster node.
+  el10 keeps xt_conntrack in kernel-modules-extra; a sealed node without it comes
+  up NotReady, and the installer rejects a bundle that staged no closure.
+  ${_nc_hint}"
+  fi
+  warn "No node was probed for netfilter modules — no node closure staged."
+  warn "  ${_nc_hint}"
 fi
 
 if [[ -n "${_node_extra_kernels}" ]]; then
@@ -1384,8 +1433,8 @@ if [[ -n "${_node_extra_kernels}" ]]; then
     find "${NODE_CLOSURE_DIR}" -name '*.rpm' -type f -exec basename {} \; | sort
   } > "${STAGE_DIR}/packages/node-closure.manifest"
   log "Node closure ready: ${NODE_CLOSURE_DIR} ($(du -sh "${NODE_CLOSURE_DIR}" | cut -f1))"
-else
-  log "No node needs a package closure (every node's kernel already has xt_conntrack)."
+elif [[ "${_node_probed}" == "true" ]]; then
+  log "No node needs a package closure (every probed node's kernel has xt_conntrack)."
 fi
 
 # PyYAML — fetched from PyPI so the nodes can install it without pip's network
