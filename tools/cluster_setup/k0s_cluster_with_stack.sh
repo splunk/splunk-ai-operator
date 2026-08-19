@@ -313,15 +313,17 @@ _check_node_os() {
   local msg=""
   if [[ "${os_id}" == "rhel" ]] && [[ "${os_version_id}" == "10" ]]; then
     if [[ "${AIRGAP_MODE:-false}" != "true" ]] \
-      || [[ -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]]; then
+      || [[ -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]] \
+      || ssh_exec "${node_ip}" "sudo modinfo xt_conntrack >/dev/null 2>&1"; then
       log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
       return 0
     fi
     msg="RHEL 10 needs an offline package closure for air-gapped installs on ${role} ${node_ip}: ${os_pretty}
   el10 keeps xt_conntrack (which kube-proxy and Calico require) in
   kernel-modules-extra rather than the base kernel package, and a sealed node
-  cannot fetch it, so it would come up NotReady. AIRGAP_NODE_RPM_CLOSURE_DIR is
-  unset or missing, meaning the bundle staged no such closure.
+  cannot fetch it, so it would come up NotReady. This node does not have the
+  module, and AIRGAP_NODE_RPM_CLOSURE_DIR is unset or missing, meaning the bundle
+  staged no such closure.
   Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters, re-build the bundle with a
   node package closure, or set:
     FORCE_UNSUPPORTED_OS=1"
@@ -1908,6 +1910,22 @@ prepare_nodes_for_k0s() {
         || warn "    Failed to copy PyYAML to ${node_ip} — k0s config generation may fail"
     fi
 
+    # Netfilter modules for kernels that omit them (el10 keeps xt_conntrack in
+    # kernel-modules-extra). Copied to a fixed path because the closure path does
+    # not cross into the heredoc below. Absent on RHEL 9 / Ubuntu bundles.
+    if [[ "${AIRGAP_MODE}" == "true" && -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]]; then
+      local _nc_tar="/tmp/node-closure-$$-${node_ip//[^0-9]/_}.tar"
+      if tar -cf "${_nc_tar}" -C "$(dirname "${AIRGAP_NODE_RPM_CLOSURE_DIR}")" \
+           "$(basename "${AIRGAP_NODE_RPM_CLOSURE_DIR}")"; then
+        log "    Copying node package closure to ${node_ip}:/tmp/node-closure.tar ..."
+        scp_file "${_nc_tar}" "${node_ip}" "/tmp/node-closure.tar" \
+          || warn "    Failed to copy the node package closure to ${node_ip} — node prep may fail"
+      else
+        warn "    Failed to pack ${AIRGAP_NODE_RPM_CLOSURE_DIR} — node prep may fail"
+      fi
+      rm -f "${_nc_tar}"
+    fi
+
     local _prep_rc=0
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
@@ -1943,7 +1961,22 @@ prepare_nodes_for_k0s() {
         # Pinned to the running kernel, with no fall back to the repo's current
         # version: modules for a different kernel land in a /lib/modules directory
         # modprobe never searches, so that "success" would leave the node broken.
-        sudo dnf install -y "kernel-modules-extra-$(uname -r)" || true
+        if [ -f /tmp/node-closure.tar ]; then
+          # --disablerepo='*' keeps the node offline and stops dnf spending
+          # minutes timing out against RHUI mirrors it cannot reach.
+          echo "  installing from the air-gap node package closure"
+          sudo rm -rf /opt/airgap-node-rpms
+          sudo mkdir -p /opt/airgap-node-rpms
+          sudo tar -xf /tmp/node-closure.tar -C /opt/airgap-node-rpms --strip-components=1
+          rm -f /tmp/node-closure.tar
+          sudo dnf install -y \
+            --disablerepo='*' \
+            --repofrompath="airgap-node,/opt/airgap-node-rpms" \
+            --setopt=airgap-node.gpgcheck=0 \
+            "kernel-modules-extra-$(uname -r)" || true
+        else
+          sudo dnf install -y "kernel-modules-extra-$(uname -r)" || true
+        fi
         if ! sudo modinfo xt_conntrack >/dev/null 2>&1; then
           echo "ERROR: xt_conntrack still unavailable for kernel $(uname -r)."
           echo "  kube-proxy cannot program iptables rules, so this node would stay NotReady."
