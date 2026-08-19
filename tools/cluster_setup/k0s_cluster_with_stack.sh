@@ -7397,14 +7397,16 @@ _check_workload_readiness() {
   done <<<"${_wl_rows}"
 
   # ---- KubeRay: RayServices ---------------------------------------------------
-  # A RayService is Ready when its 'Ready' condition is True. KubeRay also
-  # reports 'numServeEndpoints' once the serve apps are reachable.
+  # Prefer the Kubernetes-style Ready condition when KubeRay exposes it. Older
+  # KubeRay versions (including v1.2.2) expose only serviceStatus=Running.
+  # KubeRay also reports 'numServeEndpoints' once the serve apps are reachable.
   _wl_query_crd rayservices.ray.io rayservices '
       .items[]
       | [
           .metadata.namespace,
           .metadata.name,
           ([(.status.conditions // [])[] | select(.type=="Ready") | .status] | first // ""),
+          (.status.serviceStatus // ""),
           ([(.status.conditions // [])[] | select(.type=="UpgradeInProgress") | .status] | first // ""),
           (.status.numServeEndpoints // 0 | tostring)
         ]
@@ -7412,10 +7414,17 @@ _check_workload_readiness() {
     '
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
-    local rs_ns rs_name rs_ready rs_upgrading rs_endpoints
-    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_upgrading rs_endpoints <<<"${line}"
-    if [[ "${rs_ready}" != "True" ]]; then
+    local rs_ns rs_name rs_ready rs_service_status rs_upgrading rs_endpoints
+    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_service_status rs_upgrading rs_endpoints <<<"${line}"
+    local rs_is_ready=0
+    if [[ -n "${rs_ready}" ]]; then
+      [[ "${rs_ready}" == "True" ]] && rs_is_ready=1
+    elif [[ "${rs_service_status}" == "Running" ]]; then
+      rs_is_ready=1
+    fi
+    if (( rs_is_ready == 0 )); then
       local why="RayService ${rs_ns}/${rs_name}: Ready=${rs_ready:-Unknown}"
+      why+=" serviceStatus=${rs_service_status:-Unknown}"
       [[ "${rs_upgrading}" == "True" ]] && why+=" (upgrade in progress)"
       why+=" serveEndpoints=${rs_endpoints}"
       missing+=("${why}")
