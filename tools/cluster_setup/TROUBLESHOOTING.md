@@ -147,9 +147,26 @@ The node is not running a supported OS.
 
 ### "RHEL 10 needs an offline package closure for air-gapped installs on \<role\> \<ip\>"
 
-RHEL 10 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs iptables with in `kernel-modules-extra` rather than the base kernel package. A sealed node cannot fetch that package itself, and the offline bundle does not stage it yet, so the node would join and then sit NotReady with no way to recover offline.
+RHEL 10 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs iptables with in `kernel-modules-extra` rather than the base kernel package. A sealed node cannot fetch that package itself, so a node without it joins and then sits NotReady with no way to recover offline.
 
-Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters. `FORCE_UNSUPPORTED_OS=1` bypasses the check, but the install will then stop later at "xt_conntrack still unavailable" unless you have installed `kernel-modules-extra` on every node yourself.
+Staging normally handles this: each node is probed over SSH and, for every kernel missing the module, `kernel-modules-extra` is downloaded into `packages/node-closure/`. This error means the node has neither the module nor a staged closure — usually because the bundle was pre-staged with `--download-only` and no node list, so nothing was probed. Re-stage with the node IPs, e.g.:
+
+```bash
+# Simplest: pass the cluster config — every node IP is derived from it
+./airgap_install.sh --download-only --config ./my-cluster.yaml
+
+# Configless staging: name the nodes explicitly (controllers included)
+./airgap_install.sh --download-only --gpu-os rhel10 \
+  --gpu-hosts <gpu-worker-ip> \
+  --node-hosts <controller-ip>,<cpu-worker-ip>,<gpu-worker-ip>
+
+# Nodes not reachable from the build host: name the kernels instead
+./airgap_install.sh --download-only --gpu-os rhel10 \
+  --gpu-kernels 6.12.0-124.8.1.el10_1.x86_64 \
+  --node-kernels 6.12.0-124.8.1.el10_1.x86_64
+```
+
+`FORCE_UNSUPPORTED_OS=1` bypasses the check, but the install will then stop later at "xt_conntrack still unavailable" unless you have installed `kernel-modules-extra` on every node yourself.
 
 If you are staging a RHEL 10 closure on purpose, run the installer itself from a **RHEL 10 x86_64** installer machine, not RHEL 9 — `dnf`'s `$releasever` comes from the installer host's own OS, so a RHEL 9 installer machine resolves RHEL 9 packages even when targeting RHEL 10 nodes. RHEL 9 and Ubuntu 24.04 targets are unaffected and keep using a RHEL 9 installer machine.
 
