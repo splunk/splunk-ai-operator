@@ -1550,6 +1550,12 @@ To build the closure by hand for this path, the manual recipe follows.
 
 The driver flavor that succeeds on RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
 
+The unified air-gap installer checks whether that RPM is visible and, on RHEL 9
+only, resets any conflicting/default NVIDIA stream and enables
+`nvidia-driver:latest-dkms` before resolving the closure. RHEL 10 uses ordinary
+RPMs without this module-stream step, and Ubuntu follows its independent APT
+path.
+
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
 
 **Step 1 — build the closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the installer machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
@@ -1565,6 +1571,7 @@ sudo dnf config-manager --add-repo \
   https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
   | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+sudo dnf module reset -y nvidia-driver
 sudo dnf module enable -y nvidia-driver:latest-dkms
 
 mkdir -p "$DEST"

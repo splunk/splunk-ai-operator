@@ -537,6 +537,38 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || err "Required tool not found: $1 — install it before running this script."
 }
 
+_rhel9_nvidia_driver_rpm_visible() {
+  sudo dnf -q repoquery --available --qf '%{name}' \
+    kmod-nvidia-latest-dkms 2>/dev/null \
+    | grep -qx 'kmod-nvidia-latest-dkms'
+}
+
+ensure_rhel9_nvidia_driver_stream() {
+  # RHEL 9 still uses DNF modularity for NVIDIA drivers. NVIDIA currently marks
+  # open-dkms as the default stream, which modular-filters the proprietary
+  # kmod-nvidia-latest-dkms RPM requested by the established L40S air-gap flow.
+  # RHEL 10 publishes both variants as ordinary RPMs, while Ubuntu uses apt, so
+  # selecting a stream anywhere except RHEL 9 would either be unnecessary or
+  # break an otherwise independent package path.
+  [[ "${GPU_NODE_OS}" == "rhel9" ]] || return 0
+
+  # Preserve a caller-selected latest-dkms stream and avoid needless writes to
+  # the build host when the desired package is already visible.
+  if _rhel9_nvidia_driver_rpm_visible; then
+    log "RHEL 9 NVIDIA latest-dkms module stream already selected."
+    return 0
+  fi
+
+  log "Selecting RHEL 9 NVIDIA module stream: nvidia-driver:latest-dkms"
+  sudo dnf -y module reset nvidia-driver >/dev/null \
+    || err "Could not reset the RHEL 9 nvidia-driver module before building the air-gap closure."
+  sudo dnf -y module enable nvidia-driver:latest-dkms >/dev/null \
+    || err "Could not enable the RHEL 9 nvidia-driver:latest-dkms module stream."
+
+  _rhel9_nvidia_driver_rpm_visible \
+    || err "The RHEL 9 latest-dkms stream was enabled, but kmod-nvidia-latest-dkms is still unavailable."
+}
+
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -1089,6 +1121,11 @@ else
   fi
   # CRB provides a few EPEL build deps on RHEL. Best-effort (absent on AL2023).
   sudo dnf config-manager --set-enabled crb >/dev/null 2>&1 || true
+
+  # RHEL 9 hides this RPM behind a non-default DNF module stream. Select it
+  # before resolving the closure; this is a no-op for RHEL 10 and cannot run on
+  # the separate Ubuntu apt path.
+  ensure_rhel9_nvidia_driver_stream
 
   # Driver package set. Deliberately NOT the `cuda-drivers` meta-package: NVIDIA
   # split its rhel9 repo and `cuda-drivers` no longer exists there. These are the

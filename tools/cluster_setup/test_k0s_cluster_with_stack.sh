@@ -77,6 +77,18 @@ _extract_fn() {
   sed -n "${start},${end}p" "${SCRIPT}"
 }
 
+_extract_airgap_fn() {
+  local name="$1"
+  local start end
+  start=$(grep -n "^${name}()" "${AIRGAP_SCRIPT}" | cut -d: -f1)
+  if [[ -z "${start}" ]]; then
+    echo "ERROR: function '${name}' not found in ${AIRGAP_SCRIPT}" >&2
+    return 1
+  fi
+  end=$(awk -v s="${start}" 'NR>s && /^}$/{print NR; exit}' "${AIRGAP_SCRIPT}")
+  sed -n "${start},${end}p" "${AIRGAP_SCRIPT}"
+}
+
 _load_functions() {
   log()  { :; }
   warn() { :; }
@@ -1062,6 +1074,66 @@ _clean_all_propagates_aggressive_failure() (
 
 assert_rc "clean-all returns failure when aggressive node cleanup failed" \
   "1" _clean_all_propagates_aggressive_failure
+
+# ── Tests: RHEL 9 air-gap NVIDIA module stream ───────────────────────────────
+# NVIDIA's RHEL 9 repository defaults to open-dkms, so the established
+# kmod-nvidia-latest-dkms package is hidden by modular filtering until its stream
+# is selected. RHEL 10 has no DNF modularity, and Ubuntu uses apt; neither path
+# may run a RHEL 9 module command.
+
+suite "RHEL 9 air-gap NVIDIA module stream"
+echo "▶ RHEL 9 air-gap NVIDIA module stream"
+
+_simulate_airgap_nvidia_stream() (
+  local target_os="$1" initially_visible="$2"
+  local trace_file
+  trace_file=$(mktemp /tmp/airgap-nvidia-stream.XXXXXX)
+  trap 'rm -f "${trace_file}"' EXIT
+
+  eval "$(_extract_airgap_fn _rhel9_nvidia_driver_rpm_visible)"
+  eval "$(_extract_airgap_fn ensure_rhel9_nvidia_driver_stream)"
+
+  GPU_NODE_OS="${target_os}"
+  _test_nvidia_rpm_visible="${initially_visible}"
+  log() { :; }
+  err() { printf 'err %s\n' "$*" >>"${trace_file}"; return 1; }
+  sudo() {
+    printf '%s\n' "$*" >>"${trace_file}"
+    if [[ "$*" == *"repoquery"* ]]; then
+      [[ "${_test_nvidia_rpm_visible}" == "true" ]] \
+        && printf '%s\n' 'kmod-nvidia-latest-dkms'
+      return 0
+    fi
+    if [[ "$*" == *"module enable nvidia-driver:latest-dkms"* ]]; then
+      _test_nvidia_rpm_visible="true"
+    fi
+    return 0
+  }
+
+  ensure_rhel9_nvidia_driver_stream || true
+  cat "${trace_file}"
+)
+
+_rhel9_hidden_trace="$(_simulate_airgap_nvidia_stream rhel9 false)"
+assert_eq "RHEL 9 checks package visibility before and after stream selection" \
+  "2" "$(grep -c 'repoquery.*kmod-nvidia-latest-dkms' <<<"${_rhel9_hidden_trace}" | tr -d '[:space:]')"
+assert_eq "RHEL 9 resets a conflicting/default NVIDIA stream" \
+  "1" "$(grep -c 'module reset nvidia-driver' <<<"${_rhel9_hidden_trace}" | tr -d '[:space:]')"
+assert_eq "RHEL 9 enables latest-dkms when its RPM is hidden" \
+  "1" "$(grep -c 'module enable nvidia-driver:latest-dkms' <<<"${_rhel9_hidden_trace}" | tr -d '[:space:]')"
+
+_rhel9_visible_trace="$(_simulate_airgap_nvidia_stream rhel9 true)"
+assert_eq "RHEL 9 preserves an already-selected compatible stream" \
+  "0" "$(grep -c 'module reset\|module enable' <<<"${_rhel9_visible_trace}" | tr -d '[:space:]')"
+
+_rhel10_trace="$(_simulate_airgap_nvidia_stream rhel10 false)"
+assert_eq "RHEL 10 never runs RHEL 9 module commands" "" "${_rhel10_trace}"
+
+_ubuntu24_trace="$(_simulate_airgap_nvidia_stream ubuntu24 false)"
+assert_eq "Ubuntu 24.04 never runs RHEL 9 module commands" "" "${_ubuntu24_trace}"
+
+assert_eq "the non-air-gap installer does not call the air-gap stream helper" \
+  "0" "$(grep -c 'ensure_rhel9_nvidia_driver_stream' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: Blackwell NVIDIA open-module switch ───────────────────────────────
 # A package change alone does not replace a proprietary NVIDIA module already

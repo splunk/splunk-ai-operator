@@ -845,6 +845,10 @@ on RHEL 9 (the older `cuda-drivers` meta-package is gone there), and
 is compiled on each GPU node and needs kernel headers matching that node's exact
 `uname -r`.
 
+On RHEL 9, the installer selects the `nvidia-driver:latest-dkms` DNF module
+stream before resolving that RPM. This RHEL 9-only step does not run for RHEL 10
+or Ubuntu 24.04.
+
 ```bash
 # Nothing extra to do — the GPU node IPs and OS are derived from your config
 # and each node's `uname -r` / OS is surveyed over SSH.
