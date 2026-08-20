@@ -348,6 +348,7 @@ ${yq_err}"
   SAIA_API_IMAGE=$(yq eval '.images.saia.apiImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   SAIA_API_V2_IMAGE=$(yq eval '.images.saia.apiV2Image // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   SAIA_DATALOADER_IMAGE=$(yq eval '.images.saia.dataLoaderImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  SLIM_API_IMAGE=$(yq eval '.images.slim.apiImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   SPLUNK_IMAGE=$(yq eval '.images.splunk.image // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   SPLUNK_OPERATOR_IMAGE=$(yq eval '.images.splunk.operatorImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   FLUENT_BIT_IMAGE=$(yq eval '.images.fluentBit.image // "fluent/fluent-bit:1.9.6"' "${CONFIG_FILE}" 2>/dev/null || echo "fluent/fluent-bit:1.9.6")
@@ -503,6 +504,62 @@ validate_scale_factor_config() {
   return 0
 }
 
+# True when the optional SLIM service is requested in aiPlatform.features[].
+# Keep image validation feature-gated so existing SAIA-only configurations do
+# not need to define an image for a workload they never deploy.
+openshift_slim_feature_enabled() {
+  local names
+  names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  while IFS= read -r name; do
+    [[ "${name}" == "slim" ]] && return 0
+  done <<< "${names}"
+  return 1
+}
+
+warn_on_mutable_image_tags() {
+  # Workload images use imagePullPolicy: IfNotPresent. Re-running install with
+  # an unchanged mutable tag therefore does not guarantee that a newly pushed
+  # image is pulled or that a rollout is triggered. Keep this as a warning so
+  # first-time development installs can still use mutable tags deliberately.
+  local mutable_tag_images=(
+    "images.operator.image:${OPERATOR_IMAGE:-}"
+    "images.ray.headImage:${RAY_HEAD_IMAGE:-}"
+    "images.ray.workerImage:${RAY_WORKER_IMAGE:-}"
+    "images.weaviate.image:${WEAVIATE_IMAGE:-}"
+    "images.saia.apiImage:${SAIA_API_IMAGE:-}"
+    "images.saia.apiV2Image:${SAIA_API_V2_IMAGE:-}"
+    "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE:-}"
+    "images.slim.apiImage:${SLIM_API_IMAGE:-}"
+    "images.splunk.image:${SPLUNK_IMAGE:-}"
+    "images.splunk.operatorImage:${SPLUNK_OPERATOR_IMAGE:-}"
+    "images.fluentBit.image:${FLUENT_BIT_IMAGE:-}"
+    "images.nginx.image:${NGINX_IMAGE:-}"
+    "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE:-}"
+  )
+
+  local entry key image last_segment tag
+  for entry in "${mutable_tag_images[@]}"; do
+    key="${entry%%:*}"
+    image="${entry#*:}"
+    [[ -z "${image}" || "${image}" == "null" ]] && continue
+
+    # Inspect the final path segment so a registry port such as :5000 is not
+    # mistaken for an image tag.
+    last_segment="${image##*/}"
+    if [[ "${last_segment}" == *:* ]]; then
+      tag="${last_segment##*:}"
+    else
+      tag=""
+    fi
+
+    if [[ -z "${tag}" ]]; then
+      warn "${key} (${image}) has no explicit tag and will not reliably upgrade on a same-tag reinstall (imagePullPolicy: IfNotPresent). Use a distinct immutable tag."
+    elif [[ "${tag}" =~ ^(latest|preview|stable.*|dev|nightly)$ ]]; then
+      warn "${key} uses mutable tag ':${tag}' and will not reliably upgrade on a same-tag reinstall (imagePullPolicy: IfNotPresent). Use a distinct immutable tag."
+    fi
+  done
+}
+
 validate_image_config() {
   log "Validating image configuration..."
   local scale_factor_error
@@ -516,8 +573,13 @@ validate_image_config() {
   [[ -z "$SAIA_API_IMAGE"        || "$SAIA_API_IMAGE"        == "null" ]] && err "REQUIRED: images.saia.apiImage must be set in config"
   [[ -z "$SAIA_API_V2_IMAGE"     || "$SAIA_API_V2_IMAGE"     == "null" ]] && err "REQUIRED: images.saia.apiV2Image must be set in config"
   [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]] && err "REQUIRED: images.saia.dataLoaderImage must be set in config"
+  if openshift_slim_feature_enabled; then
+    [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]] && \
+      err "REQUIRED: images.slim.apiImage must be set in config when the 'slim' feature is enabled"
+  fi
   [[ -z "$SPLUNK_IMAGE"          || "$SPLUNK_IMAGE"          == "null" ]] && err "REQUIRED: images.splunk.image must be set in config"
   [[ -z "$MODEL_VERSION"         || "$MODEL_VERSION"         == "null" ]] && { MODEL_VERSION="v0.3.14-36-g1549f5a"; log "Using default MODEL_VERSION: $MODEL_VERSION"; }
+  warn_on_mutable_image_tags
   log "✓ Image configuration validated"
 }
 
@@ -546,7 +608,7 @@ configure_images() {
   fi
 
   local operator_full ray_head_full ray_worker_full weaviate_full
-  local saia_api_full saia_api_v2_full saia_dataloader_full
+  local saia_api_full saia_api_v2_full saia_dataloader_full slim_api_full
   local fluent_bit_full otel_collector_full nginx_full
 
   operator_full=$(build_image_url "$IMAGE_REGISTRY" "$OPERATOR_IMAGE")
@@ -556,6 +618,9 @@ configure_images() {
   saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
   saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  slim_api_full=""
+  [[ -n "$SLIM_API_IMAGE" && "$SLIM_API_IMAGE" != "null" ]] && \
+    slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
   fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
   nginx_full=$(build_image_url "$IMAGE_REGISTRY" "$NGINX_IMAGE")
@@ -569,7 +634,7 @@ configure_images() {
   fi
 
   local ray_head_esc ray_worker_esc weaviate_esc saia_api_esc saia_api_v2_esc
-  local saia_dl_esc fluent_esc otel_esc nginx_esc operator_esc
+  local saia_dl_esc slim_api_esc fluent_esc otel_esc nginx_esc operator_esc
 
   ray_head_esc=$(echo "$ray_head_full"       | sed 's/[\/&]/\\&/g')
   ray_worker_esc=$(echo "$ray_worker_full"   | sed 's/[\/&]/\\&/g')
@@ -577,6 +642,7 @@ configure_images() {
   saia_api_esc=$(echo "$saia_api_full"       | sed 's/[\/&]/\\&/g')
   saia_api_v2_esc=$(echo "$saia_api_v2_full" | sed 's/[\/&]/\\&/g')
   saia_dl_esc=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  slim_api_esc=$(echo "$slim_api_full"       | sed 's/[\/&]/\\&/g')
   fluent_esc=$(echo "$fluent_bit_full"       | sed 's/[\/&]/\\&/g')
   otel_esc=$(echo "$otel_collector_full"     | sed 's/[\/&]/\\&/g')
   nginx_esc=$(echo "$nginx_full"             | sed 's/[\/&]/\\&/g')
@@ -588,6 +654,9 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_esc}|"            "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_esc}|"       "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dl_esc}|"     "$SPLUNK_AI_FILE"
+  if [[ -n "$slim_api_full" ]]; then
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_esc}|"          "$SPLUNK_AI_FILE"
+  fi
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_esc}|"             "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_esc}|"           "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_esc}|"                   "$SPLUNK_AI_FILE"
@@ -614,6 +683,7 @@ configure_images() {
   log "  ✓ RELATED_IMAGE_SAIA_API:          $saia_api_full"
   log "  ✓ RELATED_IMAGE_SAIA_API_V2:       $saia_api_v2_full"
   log "  ✓ RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  [[ -n "$slim_api_full" ]] && log "  ✓ RELATED_IMAGE_SLIM_API:          $slim_api_full"
   log "  ✓ RELATED_IMAGE_FLUENT_BIT:        $fluent_bit_full"
   log "  ✓ RELATED_IMAGE_OTEL_COLLECTOR:    $otel_collector_full"
   log "  ✓ RELATED_IMAGE_NGINX:             $nginx_full"
@@ -718,7 +788,7 @@ preflight_check_registry() {
 
   local probe_ref=""
   local probe_source=""
-  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE SLIM_API_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
     local _val="${!_candidate_var:-}"
     local _ref
     if _ref=$(_image_targets_registry "${_val}"); then
@@ -1813,6 +1883,44 @@ install_splunk_operator() {
   log "  ✓ Splunk Operator installed"
 }
 
+# Keep Splunk's interactive-token issuer and the value propagated to
+# SAIA/SLIM byte-identical. The short namespace-local Service name matches the
+# issuer emitted by the bundled Splunk configuration and is reachable from all
+# consumers in the AI Platform namespace.
+internal_splunk_management_url() {
+  printf 'https://splunk-%s-standalone-service:8089' \
+    "${AI_STANDALONE_NAME}"
+}
+
+# HEC is consumed only by the OpenTelemetry exporter. It is not a JWT issuer.
+internal_splunk_hec_url() {
+  printf 'http://splunk-%s-standalone-service.%s.svc.cluster.local:8088' \
+    "${AI_STANDALONE_NAME}" "${AI_NS}"
+}
+
+render_splunk_defaults_manifest() {
+  local internal_splunk_url
+  internal_splunk_url="$(internal_splunk_management_url)"
+  cat <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-defaults
+data:
+  default.yml: |
+    splunk:
+      conf:
+        - key: authentication
+          value:
+            directory: /opt/splunk/etc/system/local
+            content:
+              oauth2_settings:
+                issuer_uri: ${internal_splunk_url}
+                certFile: \$SPLUNK_HOME/etc/auth/server.pem
+                sslPassword: password
+YAML
+}
+
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
@@ -1846,29 +1954,9 @@ install_splunk_standalone() {
   fi
   [[ -z "${minio_endpoint}" ]] && err "storage.objectStore.endpoint must be set for type=${OBJ_STORE_TYPE}"
 
-  # Configure Splunk to use the service URL as the token issuer so that JWT
-  # tokens have iss=https://splunk-splunk-standalone-standalone-service:8089,
-  # matching SAIA's SPLUNK_ISSUERS. Without this, Splunk uses the pod hostname
-  # as issuer (e.g. splunk-splunk-standalone-standalone-0) and SAIA rejects
-  # tokens with "Issuer not allowed".
-  cat <<'YAML' | oc -n "${AI_NS}" apply -f -
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: splunk-defaults
-data:
-  default.yml: |
-    splunk:
-      conf:
-        - key: authentication
-          value:
-            directory: /opt/splunk/etc/system/local
-            content:
-              oauth2_settings:
-                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
-                certFile: $SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
-YAML
+  # This issuer becomes the JWT "iss" claim and must match
+  # AIPlatform.spec.splunkConfiguration.endpoint exactly.
+  render_splunk_defaults_manifest | oc -n "${AI_NS}" apply -f -
 
   oc apply --server-side --force-conflicts -f - <<YAML
 apiVersion: enterprise.splunk.com/v4
@@ -1921,6 +2009,9 @@ YAML
 # renderer side-effect free makes the exact manifest testable without an
 # OpenShift cluster.
 render_ai_platform_manifest() {
+  local internal_splunk_url internal_splunk_hec_url_value
+  internal_splunk_url="$(internal_splunk_management_url)"
+  internal_splunk_hec_url_value="$(internal_splunk_hec_url)"
   cat <<YAML
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -1948,10 +2039,12 @@ ${svc_template_yaml}${storage_yaml}
     nodeSelector:
       splunk.ai/ai-tier-node: "true"
   splunkConfiguration:
-    endpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
+    endpoint: ${internal_splunk_url}
+    hecEndpoint: ${internal_splunk_hec_url_value}
     secretRef:
       name: ${splunk_ns_secret}
       namespace: ${AI_NS}
+${trusted_issuers_yaml:-}
 YAML
 }
 
@@ -2052,6 +2145,24 @@ install_ai_platform_cr() {
   done
   if (( retries >= 60 )); then
     warn "Splunk secret not ready after 10m — AIPlatform reconcile will retry automatically"
+  fi
+
+  # Optional additional JWT issuers. The in-cluster issuer remains first via
+  # splunkConfiguration.endpoint; configured issuers are appended by the
+  # SAIA/SLIM reconcilers.
+  local trusted_issuers_yaml=""
+  local trusted_issuers_count
+  trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${trusted_issuers_count}" =~ ^[0-9]+$ ]] && (( trusted_issuers_count > 0 )); then
+    trusted_issuers_yaml="    trustedIssuers:"$'\n'
+    local trusted_issuer_index=0 trusted_issuer_url
+    while (( trusted_issuer_index < trusted_issuers_count )); do
+      trusted_issuer_url=$(yq eval ".splunk.trustedIssuers[${trusted_issuer_index}]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      if [[ -n "${trusted_issuer_url}" && "${trusted_issuer_url}" != "null" ]]; then
+        trusted_issuers_yaml+="      - \"${trusted_issuer_url}\""$'\n'
+      fi
+      trusted_issuer_index=$((trusted_issuer_index + 1))
+    done
   fi
 
   local storage_yaml=""

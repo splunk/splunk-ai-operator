@@ -207,6 +207,8 @@ images:
     apiImage:        "ml-platform/saia/saia-api:build-v2-main-c3b489d"
     apiV2Image:      "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
     dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
+  slim:
+    apiImage: "ml-platform/slim/slim-api:build-1"
   splunk:
     image:         ".../splunk/splunk:10-2-ai-custom"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
@@ -215,7 +217,8 @@ images:
   nginx:         { image: "docker.io/library/nginx:1.27-alpine" }
 ```
 The `registry` prefix is prepended to any image that is not fully qualified
-(e.g. the `ml-platform/...` Ray and SAIA paths).
+(e.g. the `ml-platform/...` Ray, SAIA, and SLIM paths). `images.slim.apiImage`
+is required only when `slim` is enabled under `aiPlatform.features`.
 
 
 ### `storage`
@@ -244,7 +247,15 @@ Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 ```yaml
 splunk:
   standaloneName: splunk-standalone
+  # Optional additional management/JWT issuer URLs (normally HTTPS port 8089).
+  # The in-cluster Standalone issuer is included automatically.
+  trustedIssuers: []
 ```
+
+The installer keeps the management/JWT issuer separate from the HEC telemetry
+endpoint. `splunkConfiguration.endpoint` must match the Standalone
+`oauth2_settings.issuer_uri` exactly; `hecEndpoint` is used only by the
+OpenTelemetry exporter.
 
 ### `aiPlatform`
 ```yaml
@@ -257,6 +268,8 @@ aiPlatform:
   features:
     - name: "saia"
       version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
 ```
 > **`serviceTemplate` is optional** and omitted here. Leave it out and SAIA's
 > service defaults to `ClusterIP` — external clients reach SAIA through the
@@ -556,7 +569,7 @@ Air-gap uses two scripts plus a separate image-mirroring step:
 
    `container-images.txt` in the bundle lists the publicly available images
    (Weaviate, KubeRay, OTel, Fluent Bit, nginx, cert-manager, Splunk,
-   Splunk Operator). **Three image groups are built internally and are not
+   Splunk Operator). **Four image groups are built internally and are not
    listed as real entries** — they must be mirrored separately from your source
    registry:
 
@@ -565,8 +578,9 @@ Air-gap uses two scripts plus a separate image-mirroring step:
    | `images.operator.image` | Splunk AI Operator image |
    | `images.ray.headImage`, `images.ray.workerImage` | Ray head + worker GPU images |
    | `images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage` | SAIA API v1/v2 + data loader images |
+   | `images.slim.apiImage` | SLIM API image (when the `slim` feature is enabled) |
 
-   Mirror all three groups in addition to the images in `container-images.txt`,
+   Mirror all four groups in addition to the images in `container-images.txt`,
    or the install will hit `ImagePullBackOff` on those pods.
 
 3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
