@@ -26,55 +26,6 @@ func TestResolveSplunkEndpoint_DirectEndpoint(t *testing.T) {
 	assert.Equal(t, "https://custom-endpoint:8089", got, "should return direct endpoint if provided")
 }
 
-func TestExpandInClusterIssuerAliases(t *testing.T) {
-	tests := []struct {
-		name          string
-		endpoint      string
-		namespace     string
-		clusterDomain string
-		want          []string
-	}{
-		{
-			name:      "short service URL adds FQDN",
-			endpoint:  "https://splunk-splunk-standalone-standalone-service:8089",
-			namespace: "ai-platform",
-			want: []string{
-				"https://splunk-splunk-standalone-standalone-service:8089",
-				"https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089",
-			},
-		},
-		{
-			name:          "FQDN adds short service URL",
-			endpoint:      "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.example:8089",
-			namespace:     "ai-platform",
-			clusterDomain: "example",
-			want: []string{
-				"https://splunk-splunk-standalone-standalone-service.ai-platform.svc.example:8089",
-				"https://splunk-splunk-standalone-standalone-service:8089",
-			},
-		},
-		{
-			name:      "external endpoint is unchanged",
-			endpoint:  "https://splunk.example.com:8089",
-			namespace: "ai-platform",
-			want:      []string{"https://splunk.example.com:8089"},
-		},
-		{
-			name:      "unrelated short endpoint is unchanged",
-			endpoint:  "https://gateway:8089",
-			namespace: "ai-platform",
-			want:      []string{"https://gateway:8089"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, ExpandInClusterIssuerAliases(
-				tt.endpoint, tt.namespace, tt.clusterDomain))
-		})
-	}
-}
-
 func TestResolveSplunkEndpoint_NoEndpointOrRef(t *testing.T) {
 	cfg := aiApi.SplunkConfigurationSpec{}
 

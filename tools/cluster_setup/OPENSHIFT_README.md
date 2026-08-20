@@ -247,13 +247,18 @@ Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 ```yaml
 splunk:
   standaloneName: splunk-standalone
+  # Additional management/JWT issuer URLs appended for SAIA and SLIM.
+  trustedIssuers:
+    - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 ```
 
 The installer keeps the management/JWT issuer separate from the HEC telemetry
 endpoint. `splunkConfiguration.endpoint` must match the Standalone
 `oauth2_settings.issuer_uri` exactly; `hecEndpoint` is used only by the
-OpenTelemetry exporter. For the in-cluster management Service, the operator
-places both equivalent DNS spellings in SAIA and SLIM's `SPLUNK_ISSUERS`:
+OpenTelemetry exporter. Following the k0s installer design, the primary short
+management URL is rendered as `splunkConfiguration.endpoint`, and each
+`splunk.trustedIssuers` entry is appended to SAIA and SLIM's `SPLUNK_ISSUERS`.
+With the example above, the resulting issuer list is:
 
 ```text
 https://splunk-<standaloneName>-standalone-service:8089,

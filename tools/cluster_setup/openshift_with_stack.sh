@@ -2044,6 +2044,7 @@ ${svc_template_yaml}${storage_yaml}
     secretRef:
       name: ${splunk_ns_secret}
       namespace: ${AI_NS}
+${trusted_issuers_yaml:-}
 YAML
 }
 
@@ -2144,6 +2145,24 @@ install_ai_platform_cr() {
   done
   if (( retries >= 60 )); then
     warn "Splunk secret not ready after 10m — AIPlatform reconcile will retry automatically"
+  fi
+
+  # Optional additional JWT issuers. The in-cluster issuer remains first via
+  # splunkConfiguration.endpoint; configured issuers are appended by the
+  # SAIA/SLIM reconcilers. This matches the k0s installer design.
+  local trusted_issuers_yaml=""
+  local trusted_issuers_count
+  trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${trusted_issuers_count}" =~ ^[0-9]+$ ]] && (( trusted_issuers_count > 0 )); then
+    trusted_issuers_yaml="    trustedIssuers:"$'\n'
+    local trusted_issuer_index=0 trusted_issuer_url
+    while (( trusted_issuer_index < trusted_issuers_count )); do
+      trusted_issuer_url=$(yq eval ".splunk.trustedIssuers[${trusted_issuer_index}]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      if [[ -n "${trusted_issuer_url}" && "${trusted_issuer_url}" != "null" ]]; then
+        trusted_issuers_yaml+="      - \"${trusted_issuer_url}\""$'\n'
+      fi
+      trusted_issuer_index=$((trusted_issuer_index + 1))
+    done
   fi
 
   local storage_yaml=""

@@ -77,6 +77,10 @@ storage:
 
 splunk:
   standaloneName: splunk-standalone
+  # Additional management/JWT issuers appended to the primary endpoint for
+  # both SAIA and SLIM.
+  trustedIssuers:
+    - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 
 aiPlatform:
   name: "openshift-ai-platform"

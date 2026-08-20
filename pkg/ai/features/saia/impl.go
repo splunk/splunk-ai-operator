@@ -328,8 +328,7 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 
 // buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
 // The JWT issuer is the Splunk management endpoint (port 8089).
-// Priority: CRRef-derived service FQDN → explicit Endpoint and its in-cluster
-// DNS alias → TrustedIssuers only.
+// Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
 func buildSplunkIssuersVal(ai *aiv1.AIService) string {
 	var issuers []string
 	sc := ai.Spec.SplunkConfiguration
@@ -354,8 +353,7 @@ func buildSplunkIssuersVal(ai *aiv1.AIService) string {
 		svc := fmt.Sprintf("splunk-%s-%s-service.%s.svc.%s", sc.SplunkCustomResourceRef.Name, instanceType, refNS, clusterDomain)
 		issuers = append(issuers, fmt.Sprintf("https://%s:%d", svc, splunkutils.SplunkMgmtPort))
 	case sc.Endpoint != "":
-		issuers = append(issuers, splunkutils.ExpandInClusterIssuerAliases(
-			sc.Endpoint, ai.Namespace, ai.Spec.ClusterDomain)...)
+		issuers = append(issuers, sc.Endpoint)
 	}
 	issuers = append(issuers, sc.TrustedIssuers...)
 	return strings.Join(issuers, ",")

@@ -135,7 +135,6 @@ func Test_reconcileSlimService_ServiceTypeVariations(t *testing.T) {
 func Test_reconcileSlimConfigMap_MainCompatibleEndpointMode(t *testing.T) {
 	scheme := buildTestScheme(t)
 	const issuer = "https://splunk-splunk-standalone-standalone-service:8089"
-	const issuerFQDN = "https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089"
 	ai := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-slim",
@@ -156,8 +155,8 @@ func Test_reconcileSlimConfigMap_MainCompatibleEndpointMode(t *testing.T) {
 	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: "test-slim-slim-config", Namespace: "default",
 	}, cm))
-	assert.Equal(t, issuer+","+issuerFQDN, cm.Data["SPLUNK_ISSUERS"],
-		"Slim must trust the same short and namespace-qualified endpoints as SAIA")
+	assert.Equal(t, issuer, cm.Data["SPLUNK_ISSUERS"],
+		"Slim must consume the same short native-HTTPS endpoint as SAIA")
 }
 
 // sanitize turns a free-form subtest name into a valid k8s resource name.
