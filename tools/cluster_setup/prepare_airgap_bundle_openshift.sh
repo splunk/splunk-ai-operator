@@ -269,6 +269,12 @@ docker.io/splunk/splunk-operator:3.0.0
 #   <your-ecr>/ml-platform/saia/saia-api-v2:build-v2-main-c3b489d
 #   <your-ecr>/ml-platform/saia/saia-data-loader:build-v2-main-c3b489d
 
+# ── SLIM ─────────────────────────────────────────────────────────────────────
+# Built internally — set images.slim.apiImage in cluster config when the
+# "slim" feature is enabled.
+# Example:
+#   <your-ecr>/ml-platform/slim/slim-api:build-1
+
 # ── Weaviate ──────────────────────────────────────────────────────────────────
 docker.io/semitechnologies/weaviate:stable-v1.28-007846a
 
