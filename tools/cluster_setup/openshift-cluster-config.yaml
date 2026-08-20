@@ -90,8 +90,13 @@ aiPlatform:
   scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
-  # Keep feature services as ClusterIP on OpenShift. A single serviceTemplate
-  # is inherited by both SAIA and SLIM, so a fixed NodePort would collide.
+  serviceTemplate:
+    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
+    nodePort: 30080         # Fixed NodePort for the SAIA public service.
+    # AIPlatform.serviceTemplate is initially inherited by every feature. The
+    # installer patches SLIM's AIService to this distinct port to avoid a
+    # collision with SAIA.
+    slimNodePort: 30081
   features:
     - name: "saia"
       version: "1.1.0"

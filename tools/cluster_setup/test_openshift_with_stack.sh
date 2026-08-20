@@ -50,6 +50,7 @@ eval "$(extract_function internal_splunk_management_url)"
 eval "$(extract_function internal_splunk_hec_url)"
 eval "$(extract_function render_splunk_defaults_manifest)"
 eval "$(extract_function render_ai_platform_manifest)"
+eval "$(extract_function patch_openshift_slim_public_service_workaround)"
 eval "$(extract_function model_artifacts_config_name)"
 eval "$(extract_function resolve_accelerator_type)"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
@@ -124,6 +125,36 @@ immutable_output=$(_mutable_image_warnings "slim-api:v0.0.4")
 assert_eq "does not warn for an immutable SLIM image tag" "0" \
   "$(grep -c 'images.slim.apiImage' <<<"${immutable_output}" || true)"
 
+_run_slim_nodeport_patch() (
+  AI_NS="ai-platform"
+  AI_PLATFORM_NAME="test-platform"
+  CONFIG_FILE="test-config.yaml"
+  local oc_call_log
+  oc_call_log=$(mktemp)
+  openshift_slim_feature_enabled() { return 0; }
+  yq() {
+    case "${2:-}" in
+      '.aiPlatform.serviceTemplate.type // ""') echo "NodePort" ;;
+      '.aiPlatform.serviceTemplate.nodePort // ""') echo "30080" ;;
+      '.aiPlatform.serviceTemplate.slimNodePort // ""') echo "30081" ;;
+      *) echo "" ;;
+    esac
+  }
+  oc() { printf 'oc %s\n' "$*" >> "${oc_call_log}"; }
+  patch_openshift_slim_public_service_workaround
+  cat "${oc_call_log}"
+  rm -f "${oc_call_log}"
+)
+
+echo "OpenShift SLIM NodePort patch"
+slim_patch_output=$(_run_slim_nodeport_patch)
+assert_eq "patches the generated SLIM AIService" "1" \
+  "$(grep -c 'patch aiservice test-platform-slim' <<<"${slim_patch_output}" || true)"
+assert_eq "uses the configured distinct SLIM NodePort" "1" \
+  "$(grep -c '\"nodePort\": 30081' <<<"${slim_patch_output}" || true)"
+assert_eq "recreates only the SLIM public Service" "1" \
+  "$(grep -c 'delete svc test-platform-slim-slim-service' <<<"${slim_patch_output}" || true)"
+
 echo "OpenShift model artifact config selection"
 assert_eq "RTX Pro 6000 uses the quantized artifact manifest" \
   "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
@@ -192,7 +223,7 @@ obj_path="s3://test-bucket"
 obj_endpoint=""
 image_pull_secrets=""
 features_yaml=$'    - name: saia\n      version: "1.1.0"\n'
-svc_template_yaml=""
+svc_template_yaml=$'  serviceTemplate:\n    spec:\n      type: NodePort\n      ports:\n      - name: http\n        port: 8080\n        targetPort: 8080\n        nodePort: 30080\n'
 storage_yaml=""
 cpu_tolerations_inline="[]"
 splunk_ns_secret="splunk-ai-platform-secret"
@@ -238,6 +269,10 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.scaleFactor' - 2>/dev/null)"
   assert_eq "rendered feature objects contain no scaleFactor" "0" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '[.spec.features[]? | select(has("scaleFactor"))] | length' - 2>/dev/null)"
+  assert_eq "rendered AIPlatform uses the SAIA NodePort" "30080" \
+    "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.serviceTemplate.spec.ports[0].nodePort' - 2>/dev/null)"
+  assert_eq "installer-only slimNodePort is not rendered into the AIPlatform CR" "false" \
+    "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.serviceTemplate | has("slimNodePort")' - 2>/dev/null)"
   assert_eq "rendered manifest preserves the HEC endpoint" \
     "http://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8088" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration.hecEndpoint' - 2>/dev/null)"
@@ -255,6 +290,10 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$([[ -n "${repository_slim_image}" ]] && echo 1 || echo 0)"
   assert_eq "repository OpenShift config enables the SLIM feature" "1" \
     "$("${REAL_YQ}" eval '[.aiPlatform.features[] | select(.name == "slim")] | length' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config exposes SAIA on NodePort 30080" "30080" \
+    "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.nodePort' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config exposes SLIM on NodePort 30081" "30081" \
+    "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.slimNodePort' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config defines one additional trusted issuer" "1" \
     "$("${REAL_YQ}" eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config defines the AITK FQDN issuer" \

@@ -273,17 +273,24 @@ aiPlatform:
   scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
+  serviceTemplate:
+    type: NodePort
+    nodePort: 30080       # SAIA
+    slimNodePort: 30081   # SLIM; must differ from nodePort
   features:
     - name: "saia"
       version: "1.1.0"
     - name: "slim"
       version: "1.0.0"
 ```
-> **`serviceTemplate` is optional** and omitted here. Leave it out and SAIA's
-> service defaults to `ClusterIP` — external clients reach SAIA through the
-> **OpenShift Route** regardless (bare-metal node IPs are usually not externally
-> routable). Only add a `serviceTemplate` block (e.g. `type: NodePort`,
-> `nodePort: 30080`) if you specifically need the service exposed as NodePort.
+
+`serviceTemplate` is optional; omit it to keep feature services on `ClusterIP`.
+For `NodePort`, `nodePort` exposes SAIA and `slimNodePort` exposes SLIM. The
+AIPlatform API has one shared Kubernetes Service template, so the installer
+follows the k0s design: it renders the SAIA port into the AIPlatform CR, then
+patches SLIM's generated AIService to the distinct SLIM port. Do not reuse the
+same port for both services. The OpenShift Route remains the preferred SAIA
+endpoint when worker-node IPs are not externally routable.
 
 #### Scaling Deployment Capacity
 

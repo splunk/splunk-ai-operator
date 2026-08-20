@@ -2224,6 +2224,80 @@ PROBE_EOF
   log "  ✓ AIPlatform CR installed"
 }
 
+# Expose SLIM on a NodePort distinct from SAIA, following the k0s installer
+# design. AIPlatform.spec.serviceTemplate is copied to every feature's
+# AIService, so both features initially inherit the SAIA NodePort. Patch SLIM's
+# generated AIService and recreate only its public Service to avoid the port
+# collision. The AIPlatform reconciler preserves this explicit AIService
+# serviceTemplate override on subsequent reconciles.
+patch_openshift_slim_public_service_workaround() {
+  openshift_slim_feature_enabled || return 0
+
+  local svc_type svc_node_port slim_node_port
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${svc_type}" == "NodePort" ]] || return 0
+
+  svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ ( -z "${slim_node_port}" || "${slim_node_port}" == "null" ) && "${svc_node_port}" =~ ^[0-9]+$ ]]; then
+    slim_node_port=$((svc_node_port + 1))
+  fi
+
+  [[ "${svc_node_port}" =~ ^[0-9]+$ ]] || \
+    err "aiPlatform.serviceTemplate.nodePort must be set to an integer for NodePort exposure"
+  [[ "${slim_node_port}" =~ ^[0-9]+$ ]] || \
+    err "aiPlatform.serviceTemplate.slimNodePort must be set to an integer for SLIM NodePort exposure"
+  (( svc_node_port >= 30000 && svc_node_port <= 32767 )) || \
+    err "aiPlatform.serviceTemplate.nodePort must be between 30000 and 32767"
+  (( slim_node_port >= 30000 && slim_node_port <= 32767 )) || \
+    err "aiPlatform.serviceTemplate.slimNodePort must be between 30000 and 32767"
+  [[ "${slim_node_port}" != "${svc_node_port}" ]] || \
+    err "aiPlatform.serviceTemplate.slimNodePort must differ from nodePort"
+
+  local aiservice_name="${AI_PLATFORM_NAME}-slim"
+  local public_svc_name="${aiservice_name}-slim-service"
+  local waited=0 timeout=600
+  log "Waiting for AIService ${AI_NS}/${aiservice_name} before assigning SLIM NodePort..."
+  while ! oc -n "${AI_NS}" get aiservice "${aiservice_name}" >/dev/null 2>&1; do
+    (( waited >= timeout )) && err "Timed out waiting for AIService ${AI_NS}/${aiservice_name}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  log "Patching AIService/${aiservice_name}: SLIM NodePort ${slim_node_port} (SAIA uses ${svc_node_port})..."
+  oc -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${slim_node_port}
+          }
+        ]
+      }
+    }
+  }
+}"
+
+  log "Recreating Service ${AI_NS}/${public_svc_name} with SLIM NodePort ${slim_node_port}..."
+  oc -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+
+  waited=0
+  while ! oc -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
+    if (( waited >= 300 )); then
+      warn "Service ${AI_NS}/${public_svc_name} was not recreated within 300s; the operator will retry reconciliation"
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  log "  ✓ SLIM exposed on NodePort ${slim_node_port}"
+}
+
 # ====== CREATE SAIA ROUTE ======
 # Creates an OpenShift Route so SAIA is reachable via a stable external hostname.
 # The URL must be reachable from both the browser and from within the cluster
@@ -2740,6 +2814,10 @@ main_install() {
 
   step_start "AIPlatform CR"
   install_ai_platform_cr
+  step_ok
+
+  step_start "SLIM NodePort"
+  patch_openshift_slim_public_service_workaround
   step_ok
 
   step_start "SAIA Route"
