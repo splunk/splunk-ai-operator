@@ -3,6 +3,9 @@ package splunkutils
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
+	"strings"
 
 	splunkv1 "github.com/splunk/splunk-operator/api/v4" // adjust import path
 	//corev1 "k8s.io/api/core/v1"
@@ -16,6 +19,54 @@ const (
 	SplunkMgmtPort       = 8089
 	defaultClusterDomain = "cluster.local"
 )
+
+// ExpandInClusterIssuerAliases returns endpoint plus its equivalent short or
+// namespace-qualified Kubernetes Service URL. Splunk interactive tokens can be
+// minted with either spelling depending on whether the caller is SAIA or AITK,
+// so both aliases must be present in SPLUNK_ISSUERS. External endpoints are
+// returned unchanged.
+func ExpandInClusterIssuerAliases(endpoint, namespace, clusterDomain string) []string {
+	issuers := []string{endpoint}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" || namespace == "" {
+		return issuers
+	}
+
+	if clusterDomain == "" {
+		clusterDomain = defaultClusterDomain
+	}
+	hostname := parsed.Hostname()
+	fqdnSuffix := fmt.Sprintf(".%s.svc.%s", namespace, clusterDomain)
+
+	var aliasHost string
+	switch {
+	case !strings.Contains(hostname, "."):
+		if !strings.HasPrefix(hostname, "splunk-") || !strings.HasSuffix(hostname, "-service") {
+			return issuers
+		}
+		aliasHost = hostname + fqdnSuffix
+	case strings.HasSuffix(hostname, fqdnSuffix):
+		serviceName := strings.TrimSuffix(hostname, fqdnSuffix)
+		if strings.Contains(serviceName, ".") || !strings.HasPrefix(serviceName, "splunk-") || !strings.HasSuffix(serviceName, "-service") {
+			return issuers
+		}
+		aliasHost = serviceName
+	default:
+		return issuers
+	}
+
+	alias := *parsed
+	if port := parsed.Port(); port != "" {
+		alias.Host = net.JoinHostPort(aliasHost, port)
+	} else {
+		alias.Host = aliasHost
+	}
+	aliasValue := alias.String()
+	if aliasValue != endpoint {
+		issuers = append(issuers, aliasValue)
+	}
+	return issuers
+}
 
 // buildSplunkServiceName returns the DNS service name
 func buildSplunkServiceName(identifier string, instanceType string) string {

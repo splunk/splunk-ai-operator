@@ -196,7 +196,6 @@ svc_template_yaml=""
 storage_yaml=""
 cpu_tolerations_inline="[]"
 splunk_ns_secret="splunk-ai-platform-secret"
-trusted_issuers_yaml=$'    trustedIssuers:\n      - "https://external-splunk.example:8089"\n'
 
 splunk_defaults_manifest=$(render_splunk_defaults_manifest)
 manifest=$(render_ai_platform_manifest)
@@ -230,8 +229,8 @@ assert_eq "renders the short HTTPS management issuer" \
 assert_eq "renders a separate HEC telemetry endpoint" \
   "http://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8088" \
   "${rendered_hec_endpoint}"
-assert_eq "renders configured trusted issuers" "1" \
-  "$(grep -c '^    trustedIssuers:$' <<<"${manifest}" || true)"
+assert_eq "does not render a trustedIssuers field" "0" \
+  "$(grep -c '^[[:space:]]*trustedIssuers:' <<<"${manifest}" || true)"
 
 if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "rendered manifest is valid YAML" "3" \
@@ -241,8 +240,6 @@ if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "rendered manifest preserves the HEC endpoint" \
     "http://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8088" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration.hecEndpoint' - 2>/dev/null)"
-  assert_eq "rendered manifest preserves trusted issuers" "1" \
-    "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration.trustedIssuers | length' - 2>/dev/null)"
 
   unset -f yq
   CONFIG_FILE="${SCRIPT_DIR}/openshift-cluster-config.yaml"
@@ -252,11 +249,6 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$([[ -n "${repository_slim_image}" ]] && echo 1 || echo 0)"
   assert_eq "repository OpenShift config enables the SLIM feature" "1" \
     "$("${REAL_YQ}" eval '[.aiPlatform.features[] | select(.name == "slim")] | length' "${CONFIG_FILE}" 2>/dev/null)"
-
-  assert_eq "bundled AIPlatform CRD accepts trustedIssuers" "array" \
-    "$("${REAL_YQ}" eval 'select(.kind == "CustomResourceDefinition" and .metadata.name == "aiplatforms.ai.splunk.com") | .spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.splunkConfiguration.properties.trustedIssuers.type' "${SCRIPT_DIR}/artifacts.yaml" 2>/dev/null)"
-  assert_eq "bundled AIService CRD accepts trustedIssuers" "array" \
-    "$("${REAL_YQ}" eval 'select(.kind == "CustomResourceDefinition" and .metadata.name == "aiservices.ai.splunk.com") | .spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.splunkConfiguration.properties.trustedIssuers.type' "${SCRIPT_DIR}/artifacts.yaml" 2>/dev/null)"
 
   TMP_FILES=()
   SPLUNK_AI_FILE="${SCRIPT_DIR}/artifacts.yaml"

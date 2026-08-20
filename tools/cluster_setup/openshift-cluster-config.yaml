@@ -77,9 +77,6 @@ storage:
 
 splunk:
   standaloneName: splunk-standalone
-  # Optional additional Splunk JWT issuers trusted by SAIA and SLIM. The
-  # installer always includes the in-cluster Standalone issuer automatically.
-  trustedIssuers: []
 
 aiPlatform:
   name: "openshift-ai-platform"

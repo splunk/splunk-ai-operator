@@ -2894,16 +2894,6 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
-                  trustedIssuers:
-                    description: |-
-                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
-                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
-                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
-                      its issuer is included automatically and TrustedIssuers are appended.
-                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
-                    items:
-                      type: string
-                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
@@ -4907,16 +4897,6 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
-                  trustedIssuers:
-                    description: |-
-                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
-                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
-                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
-                      its issuer is included automatically and TrustedIssuers are appended.
-                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
-                    items:
-                      type: string
-                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token

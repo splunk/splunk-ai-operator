@@ -473,10 +473,10 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_ClearedWhenSpecEmpty(t *testing.
 		"empty spec: stale SPLUNK_ISSUERS must be cleared to prevent orphaned issuer trust")
 }
 
-func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
-	// When splunkConfiguration.endpoint is set (no CRRef), the endpoint itself is used
-	// as the JWT issuer — this covers in-cluster installs that set the endpoint directly
-	// via the cluster installer rather than via SplunkCustomResourceRef.
+func Test_reconcileSAIAConfigMap_EndpointAliases(t *testing.T) {
+	// When the cluster installer supplies the short in-cluster management URL,
+	// trust both that spelling and its namespace-qualified DNS alias. SAIA uses
+	// the short issuer while AITK can present the FQDN issuer.
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
 	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service:8089"
@@ -491,9 +491,10 @@ func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
 		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
 
 	assert.Equal(t,
-		"https://splunk-splunk-standalone-standalone-service:8089",
+		"https://splunk-splunk-standalone-standalone-service:8089,"+
+			"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089",
 		cm.Data["SPLUNK_ISSUERS"],
-		"endpoint mode: endpoint must be used as the JWT issuer")
+		"endpoint mode: short and namespace-qualified issuer aliases must both be trusted")
 }
 
 func Test_reconcileSAIAv2Deployment(t *testing.T) {
