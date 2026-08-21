@@ -60,18 +60,13 @@ rather than a single `dnf install`:
 - `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
 - `yq` — [binary release](https://github.com/mikefarah/yq#install)
 - `git`, `jq` — `sudo dnf install -y git jq`
-- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/) (needed for the image-mirroring commands below)
+- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/) (needed to mirror platform images to your registry, and to build the offline GPU driver closure for air-gapped Ubuntu nodes)
 
 Verify:
 
 ```bash
 kubectl version --client && helm version && git --version && jq --version && yq --version && docker version
 ```
-
-The image-mirroring commands below use `docker pull`/`tag`/`push` — no
-extra tool needed beyond Docker. (If you already have `crane` installed,
-`crane copy SRC DST` is a drop-in replacement for the
-`docker pull SRC && docker tag SRC DST && docker push DST` sequence.)
 
 **Access and services checklist:**
 
@@ -106,8 +101,9 @@ After mirroring, replace the five fully qualified `images.ray.*` and
 `images.saia.*` values in the cluster config with the corresponding
 `<your-registry>/splunk/...:preview` paths. Mirror the Slim and operator images
 separately when those components are enabled, using the tags configured for
-your release. `crane copy` (see [Air-Gapped Deployment](#5-air-gapped-deployment))
-is an alternative to `docker pull`/`tag`/`push` for bulk mirroring.
+your release. For the complete air-gap image list and the bulk `crane copy`
+alternative, see
+[DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
 
 > `preview` is a mutable tag and the workloads use `imagePullPolicy:
 > IfNotPresent`. Use a new immutable tag or digest for controlled upgrades;
@@ -182,8 +178,10 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 > **Air-gapped clusters need a few additional fields** (`cluster.airgap: true`,
-> `storage.modelStaging.enabled: false`, `imagePullSecrets.autoCreateECR: false`,
-> an internal `images.registry`) — see [Air-Gapped Deployment](#5-air-gapped-deployment).
+> `imagePullSecrets.autoCreateECR: false`, an internal `images.registry`, and
+> `storage.modelStaging.enabled` set to `true` or `false` depending on
+> whether you're staging models from the installer machine or already have
+> them in your object store) — see [Air-Gapped Deployment](#5-air-gapped-deployment).
 > Everything above still applies to air-gapped installs; pick your path below
 > once this base config is filled in.
 
@@ -268,16 +266,55 @@ tar/ssh/rpm/dnf/sha256sum, `createrepo_c`, sudo, ~5 GB free disk. Building a
 .deb closure for Ubuntu 24.04 GPU nodes additionally requires `podman` or
 `docker` on the installer machine.
 
+**Set up the installer machine — copy/paste these, in order.** Run on the
+RHEL 9 installer machine. `curl`, `tar`, `ssh`, `rpm`, `dnf`, `sha256sum`, and
+`sudo` already ship with RHEL 9, so there's nothing to install for those.
+
+```bash
+# 1. createrepo_c — builds the offline NVIDIA driver repo
+sudo dnf install -y createrepo_c
+
+# 2. helm
+curl -fsSLo /tmp/get_helm.sh \
+  https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 /tmp/get_helm.sh
+sudo /tmp/get_helm.sh
+
+# 3. kubectl
+KUBECTL_VERSION="$(curl -Ls https://dl.k8s.io/release/stable.txt)"
+curl -fsSLo /tmp/kubectl \
+  "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+# 4. Only if any GPU worker node runs Ubuntu 24.04 — skip this if every
+#    GPU node is RHEL 9
+sudo dnf install -y podman
+```
+
+Also install `yq`, `git`, and `jq` from
+[Admin workstation tools](#1-prerequisites) above — the installer machine is
+the same admin workstation described there.
+
+Verify everything is in place:
+
+```bash
+curl --version && helm version && kubectl version --client \
+  && tar --version && ssh -V && rpm --version && dnf --version \
+  && sha256sum --version && createrepo_c --version
+
+df -h /   # confirm ~5 GB free
+```
+
 ### Model Setup (Air-Gapped Path)
 
-Air-gapped clusters cannot reach HuggingFace from the cluster nodes, so model
-staging is always done from the installer machine. No manual steps needed —
-`k0s_cluster_with_stack.sh install` downloads models from HuggingFace and
-uploads them to your object store automatically as part of the same run
-(models + images + NVIDIA driver closure, all in one pass). Safe to re-run;
-already-staged artifacts are skipped.
+Cluster nodes can't reach HuggingFace, but the installer machine usually can
+— set `storage.modelStaging.enabled: true` to stage models from the
+installer machine during `install`, or `false` if models are already staged
+in your object store. Same choice and prompt behavior as the standard path.
 
-**Staging machine requirements** (downloading from HuggingFace + uploading to MinIO/SeaweedFS/S3) — can be the same machine that runs the installer:
+**Staging machine requirements** (only applies when staging, i.e.
+`enabled: true` — downloading from HuggingFace + uploading to
+MinIO/SeaweedFS/S3) — can be the same machine that runs the installer:
 
 | Resource | Minimum | Why |
 |---|---|---|
@@ -300,25 +337,20 @@ already-staged artifacts are skipped.
 One entry point, same install command as the standard path — the config's
 `cluster.airgap: true` (or `AIRGAP_MODE=true`) is what switches the mode.
 
+Before running install, mirror the platform application images to your
+internal registry — see
+[DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images)
+for the image list (generated during staging) and mirroring commands.
+
 ```bash
 cd tools/cluster_setup
 
-# 1. Mirror platform application images to your internal registry
-#    (the list is generated during staging at
-#    ./airgap-bundle/airgap-bundle-<timestamp>/container-images.txt —
-#    pre-stage with --download-only first, or use the path printed at the
-#    end of a staging run, to get the exact file)
-IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
-while IFS= read -r img; do
-  [[ "$img" =~ ^# || -z "$img" ]] && continue
-  crane copy "$img" "registry.airgap.local/${img##*/}"
-done < "${IMAGE_LIST}"
-
-# 2. In your config, on top of the mandatory fields in Config Setup, set:
-#    storage.modelStaging.enabled: false     (models already staged — see Model Setup above)
+# 1. In your config, on top of the mandatory fields in Config Setup, set:
 #    cluster.airgap: true
 #    imagePullSecrets.autoCreateECR: false
 #    images.registry: "registry.airgap.local"   (+ point every image at it)
+#    storage.modelStaging.enabled: true | false   (true = stage models from
+#      this machine during install; false = already staged — see Model Setup above)
 #
 #    registry.airgap.local requires authentication (Harbor, etc.)? autoCreateECR: false
 #    alone creates no pull secret — also set:
@@ -327,7 +359,8 @@ done < "${IMAGE_LIST}"
 #    imagePullSecrets.custom.server: "registry.airgap.local"
 #    imagePullSecrets.custom.username / .password: your registry credentials
 
-# 3. Run the install — stages ~2.2 GB of artifacts (~15 min) then installs
+# 2. Run the install — stages ~2.2 GB of artifacts (~15 min, plus model
+#    staging time if storage.modelStaging.enabled: true) then installs
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
