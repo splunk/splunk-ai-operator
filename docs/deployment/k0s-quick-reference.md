@@ -46,21 +46,40 @@ standalone via `stage-artifacts`), it additionally needs:
 
 **Admin workstation tools:**
 
-**macOS / Ubuntu** — `brew install kubectl helm git jq yq` or the `apt-get`
-equivalent; see
+**macOS** — `brew install kubectl helm git jq yq`.
+
+**Ubuntu** — none of `kubectl`, `helm`, or `yq` are in the default `apt`
+repos; `git` and `jq` are. See
 [K0S_README.md — Required Tools](../../tools/cluster_setup/K0S_README.md#required-tools-on-admin-workstation)
-for exact commands.
+for the exact repo/install-script commands for each.
 
 **RHEL 9** — none of `kubectl`, `helm`, `docker`, or `yq` are in the default
 `dnf` repos; `git` and `jq` are. Install each via its own supported method
 (standalone binary, install script, or vendor repo, per each tool's docs)
 rather than a single `dnf install`:
 
-- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
-- `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
-- `yq` — [binary release](https://github.com/mikefarah/yq#install)
-- `git`, `jq` — `sudo dnf install -y git jq`
-- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/) (needed for the image-mirroring commands below)
+```bash
+sudo dnf install -y git jq
+
+# kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+# pinned to the k0s minor version this doc targets (v1.31) — see Hardware Requirements
+curl -fsSLO "https://dl.k8s.io/release/v1.31.2/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+# helm — install script (https://helm.sh/docs/intro/install/)
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# yq — binary release (https://github.com/mikefarah/yq#install)
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# docker — Docker CE repo for RHEL (https://docs.docker.com/engine/install/rhel/), needed for the image-mirroring commands below
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out/in (or `newgrp docker`) for group change to take effect
+```
 
 Verify:
 
