@@ -97,13 +97,32 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ```bash
 # Install required tools on macOS
-brew install kubectl helm git jq yq
+brew install kubectl helm git jq yq crane
 
 # Install required tools on Ubuntu/Debian
+# git and jq are in the default apt repos; kubectl and helm are not — add their
+# upstream repos/install scripts, and yq/crane need sudo to write to /usr/local/bin
 sudo apt-get update
-sudo apt-get install -y kubectl helm git jq
-wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-chmod +x /usr/local/bin/yq
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
+
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubectl
+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
+sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below (see Step 2 — Mirror
+# Container Images); no Docker daemon/root/group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
 
 # Verify installations
 kubectl version --client
@@ -111,7 +130,56 @@ helm version
 git --version
 jq --version
 yq --version
+crane version
 ```
+
+**RHEL 9** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
+default `dnf` repos; `git` and `jq` are. Install each via its own supported
+method (standalone binary, install script, or vendor repo, per each tool's
+docs) rather than a single `dnf install`:
+
+```bash
+sudo dnf install -y git jq
+
+# kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
+# see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+# helm — install script (https://helm.sh/docs/intro/install/)
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# yq — binary release, pinned to match the version this repo already relies on
+# (k0s_cluster_with_stack.sh, airgap_install.sh) — https://github.com/mikefarah/yq#install
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below (see Step 2 — Mirror
+# Container Images); no Docker daemon/root/group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
+
+# docker (optional, only needed if you prefer `docker pull`/`tag`/`push` over
+# `crane copy` for the image-mirroring commands below) — Docker CE repo for
+# RHEL (https://docs.docker.com/engine/install/rhel/)
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out/in (or `newgrp docker`) for group change to take effect
+
+# Verify installations
+kubectl version --client && helm version && git --version && jq --version && yq --version && crane version
+```
+
+The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images))
+default to `crane copy`, which works on both Ubuntu and RHEL 9 with no
+Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
+there too as an equivalent alternative if you already run Docker.
 
 ### Hardware Requirements
 
@@ -159,9 +227,17 @@ You must provide an external S3-compatible object storage endpoint:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/splunk/splunk-ai-operator.git
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 ### 2. Create Configuration File
 
@@ -1315,7 +1391,7 @@ cd tools/cluster_setup
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| Binaries | `k0s v1.36.1+k0s.0` (default; override with `--k0s-version`), `yq v4.44.1` |
 | **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
@@ -1362,6 +1438,13 @@ done < "${IMAGE_LIST}"
 ```
 
 **Mirror with Docker:**
+
+Requires the Docker CE daemon on the workstation, and your user in the
+`docker` group so `docker` commands don't need `sudo`:
+
+```bash
+sudo usermod -aG docker "$USER"   # one-time; log out/in (or run `newgrp docker`) for it to take effect in the current shell
+```
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
@@ -2167,7 +2250,7 @@ If `yq` is not installed or cannot parse the selected artifact profile, the down
 ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
 ```
 
-Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
+Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
 
 #### Re-stage a single model without restarting from scratch
 

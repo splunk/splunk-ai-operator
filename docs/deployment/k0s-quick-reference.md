@@ -46,27 +46,32 @@ standalone via `stage-artifacts`), it additionally needs:
 
 **Admin workstation tools:**
 
-```bash
-# macOS
-brew install kubectl helm git jq yq
-```
+**macOS** — `brew install kubectl helm git jq yq`.
 
-**RHEL 9** — none of `kubectl`, `helm`, `docker`, or `yq` are in the default
-`dnf` repos; `git` and `jq` are. Install each via its own supported method
-(standalone binary, install script, or vendor repo, per each tool's docs)
-rather than a single `dnf install`:
+**Ubuntu / RHEL 9** — none of `kubectl`, `helm`, `yq`, or `crane` are in the
+default repos; `git` and `jq` are. Install each via its own supported method
+rather than a single package-manager command:
 
-- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/),
+  pinned to `v1.36.1` (matches the k0s version this repo installs by default)
 - `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
-- `yq` — [binary release](https://github.com/mikefarah/yq#install)
-- `git`, `jq` — `sudo dnf install -y git jq`
-- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/) (needed to mirror platform images to your registry, and to build the offline GPU driver closure for air-gapped Ubuntu nodes)
+- `yq` — [binary release](https://github.com/mikefarah/yq#install), pinned to
+  `v4.44.1` (matches the version this repo already relies on elsewhere)
+- `git`, `jq` — `sudo apt-get install -y git jq` (Ubuntu) or
+  `sudo dnf install -y git jq` (RHEL 9)
+- `crane` — [binary release](https://github.com/google/go-containerregistry/releases),
+  used by the image-mirroring commands below on **both** Ubuntu and RHEL 9;
+  no Docker daemon, root, or group setup required
+- `docker` (optional alternative to `crane` for mirroring; also needed to
+  build the offline GPU driver closure for air-gapped Ubuntu nodes) —
+  [Docker CE repo for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+  or [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/)
+  (RHEL 9 requires `sudo dnf install -y dnf-plugins-core` first for `dnf
+  config-manager`)
 
-Verify:
-
-```bash
-kubectl version --client && helm version && git --version && jq --version && yq --version && docker version
-```
+See
+[K0S_README.md — Required Tools](../../tools/cluster_setup/K0S_README.md#required-tools-on-admin-workstation)
+for the exact repo/install-script commands for each.
 
 **Access and services checklist:**
 
@@ -82,18 +87,36 @@ in the cluster config to those mirrored paths (required for both paths —
 air-gap additionally needs every node to resolve that registry with no outbound
 internet):
 
-The default Ray and SAIA images currently use the `preview` tag:
+The default Ray and SAIA images currently use the `preview` tag — set `TAG`
+to match whatever tag you're mirroring:
+
+With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
 
 ```bash
+TAG="preview"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
   splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
   splunk/ai-tier-ray-worker; do
-  docker pull "docker.io/${repo}:preview"
-  docker tag "docker.io/${repo}:preview" "<your-registry>/${repo}:preview"
-  docker push "<your-registry>/${repo}:preview"
+  crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
+done
+```
+
+With Docker instead:
+
+```bash
+TAG="preview"
+for repo in \
+  splunk/ai-tier-saia-data-loader \
+  splunk/ai-tier-saia-api-v2 \
+  splunk/ai-tier-saia-api \
+  splunk/ai-tier-ray-head \
+  splunk/ai-tier-ray-worker; do
+  docker pull "docker.io/${repo}:${TAG}"
+  docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
+  docker push "<your-registry>/${repo}:${TAG}"
 done
 ```
 
@@ -113,14 +136,21 @@ alternative, see
 
 ## 2. Hardware Requirements
 
-| Node Type | Min CPU | Min RAM | Min Disk | Count | Notes |
+Pick **one** GPU accelerator type for the cluster — `L40S` or `H100`, set via
+`aiPlatform.defaultAcceleratorType` — and provision only the matching GPU
+worker row below. The two GPU rows are alternatives, not additive; do not
+provision both.
+
+Min CPU/RAM/Disk below are **per node** — for GPU workers, multiply by the
+node count (2 minimum) to get the cluster total.
+
+| Node Type | Min CPU (per node) | Min RAM (per node) | Min Disk (per node) | Count | Notes |
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 | API server, etcd, scheduler — the installer joins only the first controller IP; additional controller IPs are not joined and are not HA |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
-| GPU Worker (L40S / `g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
-| GPU Worker (H100 / `p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
-
-Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
+| GPU Worker — choose **either** L40S **or** H100, not both: | | | | | |
+| ↳ L40S (`g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) **per node** |
+| ↳ H100 (`p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) **per node** |
 
 **Ports to open between nodes:**
 
@@ -152,10 +182,20 @@ else has a working default. Full field-by-field reference:
 [K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
 
 ```bash
-cd tools/cluster_setup
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
+cd splunk-ai-operator/tools/cluster_setup
+
 cp k0s-cluster-config.yaml my-cluster.yaml
 vi my-cluster.yaml
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 | Field | Set to |
 |---|---|
