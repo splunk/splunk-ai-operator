@@ -125,6 +125,45 @@ jq --version
 yq --version
 ```
 
+**RHEL 9** — none of `kubectl`, `helm`, `docker`, or `yq` are in the default
+`dnf` repos; `git` and `jq` are. Install each via its own supported method
+(standalone binary, install script, or vendor repo, per each tool's docs)
+rather than a single `dnf install`:
+
+```bash
+sudo dnf install -y git jq
+
+# kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
+# see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+# helm — install script (https://helm.sh/docs/intro/install/)
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# yq — binary release, pinned to match the version this repo already relies on
+# (k0s_cluster_with_stack.sh, airgap_install.sh) — https://github.com/mikefarah/yq#install
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# docker — Docker CE repo for RHEL (https://docs.docker.com/engine/install/rhel/), needed for the image-mirroring commands below
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out/in (or `newgrp docker`) for group change to take effect
+
+# Verify installations
+kubectl version --client && helm version && git --version && jq --version && yq --version && docker version
+```
+
+The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images)) use `docker pull`/`tag`/`push` —
+no extra tool needed beyond Docker. (If you already have `crane` installed,
+`crane copy SRC DST` is a drop-in replacement for the
+`docker pull SRC && docker tag SRC DST && docker push DST` sequence.)
+
 ### Hardware Requirements
 
 | Node Type | Min CPU | Min RAM | Min Disk | Notes |
