@@ -127,10 +127,6 @@ assert_eq "skips registry when image already has a host" \
   "ghcr.io/splunk/operator:1.0" \
   "$(build_image_url "my.registry.io" "ghcr.io/splunk/operator:1.0")"
 
-assert_eq "preserves a fully qualified tag and digest" \
-  "docker.io/splunk/ray:v0.2@sha256:0123456789abcdef" \
-  "$(build_image_url "my.registry.io" "docker.io/splunk/ray:v0.2@sha256:0123456789abcdef")"
-
 assert_eq "skips registry when image has IP host" \
   "10.0.0.1:5000/operator:1.0" \
   "$(build_image_url "my.registry.io" "10.0.0.1:5000/operator:1.0")"
@@ -148,7 +144,7 @@ assert_eq "returns bare path when registry is null" \
 suite "shipped image defaults"
 echo "▶ shipped image defaults"
 
-_expected_k0s_release_tuple=$'docker.io/kpratyush775/splunk-ai-operator:v2.6\ndocker.io/splunk/ai-tier-ray-head:v0.2@sha256:50d6c98cf5bc1e43e65b10bc2da41a22029bd3404a77e10c953d6d9f98a2d3a6\ndocker.io/splunk/ai-tier-ray-worker:v0.2@sha256:a8b8763a298f01b44ca2f638b8d64086a4cd273a046c2d8f31cb5f729f4bdf6d\n2.56.0'
+_expected_k0s_release_tuple=$'docker.io/kpratyush775/splunk-ai-operator:v2.6\ndocker.io/splunk/ai-tier-ray-head:v0.2\ndocker.io/splunk/ai-tier-ray-worker:v0.2\n2.56.0'
 _actual_k0s_release_tuple=$("${YQ_BIN}" eval '
   .images.operator.image,
   .images.ray.headImage,

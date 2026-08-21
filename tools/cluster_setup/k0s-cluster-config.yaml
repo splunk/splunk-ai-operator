@@ -126,8 +126,8 @@ images:
     # These Docker Hub defaults are fully qualified and therefore are not
     # rewritten by images.registry. Replace them with your mirrored image paths
     # for private-registry or air-gapped installations.
-    headImage: "docker.io/splunk/ai-tier-ray-head:v0.2@sha256:50d6c98cf5bc1e43e65b10bc2da41a22029bd3404a77e10c953d6d9f98a2d3a6"
-    workerImage: "docker.io/splunk/ai-tier-ray-worker:v0.2@sha256:a8b8763a298f01b44ca2f638b8d64086a4cd273a046c2d8f31cb5f729f4bdf6d"
+    headImage: "docker.io/splunk/ai-tier-ray-head:v0.2"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:v0.2"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
