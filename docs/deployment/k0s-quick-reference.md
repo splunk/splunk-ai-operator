@@ -87,31 +87,24 @@ in the cluster config to those mirrored paths (required for both paths —
 air-gap additionally needs every node to resolve that registry with no outbound
 internet):
 
-The default SAIA images use `preview`, the Ray images use `v0.2`, the SLIM
-service uses `v1.0`, and the Splunk AI Operator uses `v2.8`. Mirror those exact
-tags unless you deliberately override the corresponding config fields.
+The example below mirrors the SAIA, Ray, and SLIM release images with the common
+tag `v1.0`, and the Splunk AI Operator with `v2.8`. Set the corresponding image
+fields in the cluster config to the mirrored paths.
 
 With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
 
 ```bash
-SAIA_TAG="preview"
+TAG="v1.0"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api; do
-  crane copy "docker.io/${repo}:${SAIA_TAG}" "<your-registry>/${repo}:${SAIA_TAG}"
-done
-
-RAY_TAG="v0.2"
-for repo in \
+  splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
-  crane copy "docker.io/${repo}:${RAY_TAG}" "<your-registry>/${repo}:${RAY_TAG}"
+  splunk/ai-tier-ray-worker \
+  splunk/ai-tier-slim-service; do
+  crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
 done
 
-crane copy \
-  "docker.io/splunk/ai-tier-slim-service:v1.0" \
-  "<your-registry>/splunk/ai-tier-slim-service:v1.0"
 crane copy \
   "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
   "<your-registry>/splunk/splunk-ai-operator:v2.8"
@@ -120,29 +113,18 @@ crane copy \
 With Docker instead:
 
 ```bash
-SAIA_TAG="preview"
+TAG="v1.0"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api; do
-  docker pull "docker.io/${repo}:${SAIA_TAG}"
-  docker tag "docker.io/${repo}:${SAIA_TAG}" "<your-registry>/${repo}:${SAIA_TAG}"
-  docker push "<your-registry>/${repo}:${SAIA_TAG}"
-done
-
-RAY_TAG="v0.2"
-for repo in \
+  splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
-  docker pull "docker.io/${repo}:${RAY_TAG}"
-  docker tag "docker.io/${repo}:${RAY_TAG}" "<your-registry>/${repo}:${RAY_TAG}"
-  docker push "<your-registry>/${repo}:${RAY_TAG}"
+  splunk/ai-tier-ray-worker \
+  splunk/ai-tier-slim-service; do
+  docker pull "docker.io/${repo}:${TAG}"
+  docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
+  docker push "<your-registry>/${repo}:${TAG}"
 done
-
-docker pull "docker.io/splunk/ai-tier-slim-service:v1.0"
-docker tag "docker.io/splunk/ai-tier-slim-service:v1.0" \
-  "<your-registry>/splunk/ai-tier-slim-service:v1.0"
-docker push "<your-registry>/splunk/ai-tier-slim-service:v1.0"
 
 docker pull "docker.io/kpratyush775/splunk-ai-operator:v2.8"
 docker tag "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
@@ -156,9 +138,9 @@ config with the corresponding `<your-registry>/...` paths. For the complete
 air-gap image list and the bulk `crane copy` alternative, see
 [DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
 
-> The SAIA `preview` tag is mutable and the workloads use `imagePullPolicy:
-> IfNotPresent`. Use a new immutable tag or digest for controlled upgrades;
-> rerunning the installer with the same tag may keep the cached image.
+> Image tags can be mutable and the workloads use `imagePullPolicy:
+> IfNotPresent`. Use an immutable digest for controlled upgrades; rerunning the
+> installer with the same tag may keep the cached image.
 
 ---
 
