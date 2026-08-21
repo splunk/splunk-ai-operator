@@ -2650,38 +2650,53 @@ PYSCRIPT"
 # Maps a config IP to its Kubernetes node name. Prefer the name already
 # registered in the API for that InternalIP; otherwise try the node's full and
 # short hostnames, accepting only a candidate that exists in the API server.
-# Usage: node_name=$(resolve_node_name "1.2.3.4")
+# Optionally retry for up to timeout_seconds while the Node object registers.
+# Usage: node_name=$(resolve_node_name "1.2.3.4" [timeout_seconds])
 resolve_node_name() {
   local ip="$1"
+  local timeout="${2:-0}"
   local node_name full_name short_name candidate
+  local elapsed=0
 
-  node_name=$(kubectl get nodes -o json 2>/dev/null \
-    | jq -r --arg ip "${ip}" '
-        first(
-          .items[]
-          | select(any(.status.addresses[]?;
-              .type == "InternalIP" and .address == $ip))
-          | .metadata.name
-        ) // empty
-      ' 2>/dev/null \
-    || true)
-  if [[ -n "${node_name}" ]]; then
-    echo "${node_name}"
-    return 0
-  fi
-
-  full_name=$(ssh_exec "${ip}" "hostname -f" 2>/dev/null || true)
-  short_name=$(ssh_exec "${ip}" "hostname -s" 2>/dev/null || true)
-
-  # Some environments register the FQDN (notably EC2 private DNS names), while
-  # others register the short hostname. Never return a guessed/truncated name:
-  # verify each candidate against the API first.
-  for candidate in "${full_name}" "${short_name}"; do
-    [[ -z "${candidate}" ]] && continue
-    if kubectl get node "${candidate}" >/dev/null 2>&1; then
-      echo "${candidate}"
+  while :; do
+    node_name=$(kubectl get nodes -o json 2>/dev/null \
+      | jq -r --arg ip "${ip}" '
+          first(
+            .items[]
+            | select(any(.status.addresses[]?;
+                .type == "InternalIP" and .address == $ip))
+            | .metadata.name
+          ) // empty
+        ' 2>/dev/null \
+      || true)
+    if [[ -n "${node_name}" ]]; then
+      echo "${node_name}"
       return 0
     fi
+
+    # Cache successful SSH lookups, but retry either lookup if SSH was not ready
+    # when this function first ran.
+    [[ -n "${full_name:-}" ]] \
+      || full_name=$(ssh_exec "${ip}" "hostname -f" 2>/dev/null || true)
+    [[ -n "${short_name:-}" ]] \
+      || short_name=$(ssh_exec "${ip}" "hostname -s" 2>/dev/null || true)
+
+    # Some environments register the FQDN (notably EC2 private DNS names),
+    # while others register the short hostname. Never return a
+    # guessed/truncated name: verify each candidate against the API first.
+    for candidate in "${full_name:-}" "${short_name:-}"; do
+      [[ -z "${candidate}" ]] && continue
+      if kubectl get node "${candidate}" >/dev/null 2>&1; then
+        echo "${candidate}"
+        return 0
+      fi
+    done
+
+    if (( elapsed >= timeout )); then
+      break
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
   done
 
   return 1
@@ -2725,23 +2740,18 @@ label_nodes() {
     fi
   done
 
-  # Helper: wait up to 60s for a given node name to appear in the API server.
+  # Helper: wait up to 60s for a config IP to resolve to a visible Node.
   # This guards against the race where a worker joined the cluster just after
   # the top-of-function readiness check returned but its Node object is still
   # propagating to the API server we're talking to.
   _wait_for_node_visible() {
-    local node_name="$1"
-    local ip="$2"
-    local tries=0
-    local max_tries=12  # 12 * 5s = 60s
-    while (( tries < max_tries )); do
-      if kubectl get node "${node_name}" &>/dev/null; then
-        return 0
-      fi
-      sleep 5
-      tries=$((tries + 1))
-    done
-    warn "  Node '${node_name}' (from ${ip}) did not become visible in API server after 60s"
+    local ip="$1"
+    local node_name
+    if node_name=$(resolve_node_name "${ip}" 60); then
+      echo "${node_name}"
+      return 0
+    fi
+    warn "  Node from ${ip} did not become visible in API server after 60s"
     return 1
   }
 
@@ -2751,14 +2761,9 @@ label_nodes() {
   # Label controller nodes
   for controller_ip in "${CONTROLLER_IPS[@]}"; do
     local node_name
-    if ! node_name=$(resolve_node_name "${controller_ip}"); then
+    if ! node_name=$(_wait_for_node_visible "${controller_ip}"); then
       warn "  Could not resolve Kubernetes node for controller ${controller_ip}, skipping..."
-      labeling_failures+=("${controller_ip} (node unresolved)")
-      continue
-    fi
-
-    if ! _wait_for_node_visible "${node_name}" "${controller_ip}"; then
-      labeling_failures+=("${controller_ip} / ${node_name} (never visible)")
+      labeling_failures+=("${controller_ip} (never visible)")
       continue
     fi
 
@@ -2785,15 +2790,9 @@ label_nodes() {
   local worker_index=0
   for worker_ip in "${WORKER_IPS[@]}"; do
     local node_name
-    if ! node_name=$(resolve_node_name "${worker_ip}"); then
+    if ! node_name=$(_wait_for_node_visible "${worker_ip}"); then
       warn "  Could not resolve Kubernetes node for worker ${worker_ip}, skipping..."
-      labeling_failures+=("${worker_ip} (node unresolved)")
-      worker_index=$((worker_index + 1))
-      continue
-    fi
-
-    if ! _wait_for_node_visible "${node_name}" "${worker_ip}"; then
-      labeling_failures+=("${worker_ip} / ${node_name} (never visible)")
+      labeling_failures+=("${worker_ip} (never visible)")
       worker_index=$((worker_index + 1))
       continue
     fi
