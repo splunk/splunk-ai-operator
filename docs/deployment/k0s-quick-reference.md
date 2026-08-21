@@ -57,11 +57,13 @@ supported method rather than a single package-manager command:
 - `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
 - `yq` — [binary release](https://github.com/mikefarah/yq#install), pinned to
   `v4.44.1` (matches the version this repo already relies on elsewhere)
-- `git`, `jq` — `sudo dnf install -y git jq`
-- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/)
-  (needed to mirror platform images to your registry, and to build the
-  offline GPU driver closure for air-gapped Ubuntu nodes); requires
-  `dnf-plugins-core` first
+- `git`, `jq` — `sudo apt-get install -y git jq` (Ubuntu) or
+  `sudo dnf install -y git jq` (RHEL 9)
+- `docker` (RHEL 9 only, needed to mirror platform images to your registry
+  and to build the offline GPU driver closure for air-gapped Ubuntu nodes) —
+  [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/);
+  requires `sudo dnf install -y dnf-plugins-core` first for `dnf
+  config-manager` — not needed on Ubuntu, which uses `apt` instead
 
 See
 [K0S_README.md — Required Tools](../../tools/cluster_setup/K0S_README.md#required-tools-on-admin-workstation)
