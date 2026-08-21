@@ -100,10 +100,20 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 brew install kubectl helm git jq yq
 
 # Install required tools on Ubuntu/Debian
+# git and jq are in the default apt repos; kubectl and helm are not — add their
+# upstream repos/install scripts, and yq needs sudo to write to /usr/local/bin
 sudo apt-get update
-sudo apt-get install -y kubectl helm git jq
-wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-chmod +x /usr/local/bin/yq
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
+
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubectl
+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
 
 # Verify installations
 kubectl version --client
