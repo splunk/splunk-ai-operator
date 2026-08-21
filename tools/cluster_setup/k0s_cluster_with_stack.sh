@@ -2647,14 +2647,32 @@ PYSCRIPT"
 }
 
 # ====== RESOLVE NODE NAME ======
-# Maps a config IP to its Kubernetes node name by SSHing to the node
-# and reading its hostname (which is what k0s uses as the node name).
+# Maps a config IP to its Kubernetes node name. Prefer the name already
+# registered in the API for that InternalIP; if the Node object is not visible
+# yet, fall back to the node's exact system hostname (which k0s uses by default).
 # Usage: node_name=$(resolve_node_name "1.2.3.4")
 resolve_node_name() {
   local ip="$1"
-  # SSH to the node and get the hostname that k0s registered it with
   local node_name
-  node_name=$(ssh_exec "${ip}" "hostname -f 2>/dev/null || hostname" 2>/dev/null || echo "")
+
+  node_name=$(kubectl get nodes -o json 2>/dev/null \
+    | jq -r --arg ip "${ip}" '
+        first(
+          .items[]
+          | select(any(.status.addresses[]?;
+              .type == "InternalIP" and .address == $ip))
+          | .metadata.name
+        ) // empty
+      ' 2>/dev/null \
+    || true)
+  if [[ -n "${node_name}" ]]; then
+    echo "${node_name}"
+    return 0
+  fi
+
+  # Do not use `hostname -s`: k0s may register the full configured hostname
+  # (for example, an EC2 private DNS name) as the Kubernetes node name.
+  node_name=$(ssh_exec "${ip}" "hostname" 2>/dev/null || echo "")
   echo "${node_name}"
 }
 
