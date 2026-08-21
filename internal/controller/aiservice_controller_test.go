@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"os"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -415,3 +417,39 @@ var _ = Describe("AIService Controller", func() {
 		})
 	})
 })
+
+func TestAIServiceEventFilter(t *testing.T) {
+	oldConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default", ResourceVersion: "1"},
+		Data:       map[string]string{"EMBEDDING_MODEL": "uae_large"},
+	}
+
+	t.Run("allows data-only ConfigMap updates through the global filter", func(t *testing.T) {
+		newConfig := oldConfig.DeepCopy()
+		newConfig.ResourceVersion = "2"
+		newConfig.Data["EMBEDDING_MODEL"] = "custom_encoder"
+
+		if !aiServiceEventFilter().Update(event.UpdateEvent{ObjectOld: oldConfig, ObjectNew: newConfig}) {
+			t.Fatal("data-only ConfigMap update was filtered out")
+		}
+	})
+
+	t.Run("filters ConfigMap updates that do not change data or watched metadata", func(t *testing.T) {
+		newConfig := oldConfig.DeepCopy()
+		newConfig.ResourceVersion = "2"
+
+		if aiServiceEventFilter().Update(event.UpdateEvent{ObjectOld: oldConfig, ObjectNew: newConfig}) {
+			t.Fatal("resourceVersion-only ConfigMap update was admitted")
+		}
+	})
+
+	t.Run("preserves generation-change reconciliation for AIService resources", func(t *testing.T) {
+		oldService := &aiv1.AIService{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+		newService := oldService.DeepCopy()
+		newService.Generation = 2
+
+		if !aiServiceEventFilter().Update(event.UpdateEvent{ObjectOld: oldService, ObjectNew: newService}) {
+			t.Fatal("AIService generation update was filtered out")
+		}
+	})
+}
