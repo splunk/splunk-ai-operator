@@ -48,9 +48,9 @@ standalone via `stage-artifacts`), it additionally needs:
 
 **macOS** — `brew install kubectl helm git jq yq`.
 
-**Ubuntu / RHEL 9** — none of `kubectl`, `helm`, `yq`, or (on RHEL 9) `docker`
-are in the default repos; `git` and `jq` are. Install each via its own
-supported method rather than a single package-manager command:
+**Ubuntu / RHEL 9** — none of `kubectl`, `helm`, `yq`, or `crane` are in the
+default repos; `git` and `jq` are. Install each via its own supported method
+rather than a single package-manager command:
 
 - `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/),
   pinned to `v1.36.1` (matches the k0s version this repo installs by default)
@@ -59,11 +59,15 @@ supported method rather than a single package-manager command:
   `v4.44.1` (matches the version this repo already relies on elsewhere)
 - `git`, `jq` — `sudo apt-get install -y git jq` (Ubuntu) or
   `sudo dnf install -y git jq` (RHEL 9)
-- `docker` (RHEL 9 only, needed to mirror platform images to your registry
-  and to build the offline GPU driver closure for air-gapped Ubuntu nodes) —
-  [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/);
-  requires `sudo dnf install -y dnf-plugins-core` first for `dnf
-  config-manager` — not needed on Ubuntu, which uses `apt` instead
+- `crane` — [binary release](https://github.com/google/go-containerregistry/releases),
+  used by the image-mirroring commands below on **both** Ubuntu and RHEL 9;
+  no Docker daemon, root, or group setup required
+- `docker` (optional alternative to `crane` for mirroring; also needed to
+  build the offline GPU driver closure for air-gapped Ubuntu nodes) —
+  [Docker CE repo for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+  or [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/)
+  (RHEL 9 requires `sudo dnf install -y dnf-plugins-core` first for `dnf
+  config-manager`)
 
 See
 [K0S_README.md — Required Tools](../../tools/cluster_setup/K0S_README.md#required-tools-on-admin-workstation)
@@ -83,18 +87,36 @@ in the cluster config to those mirrored paths (required for both paths —
 air-gap additionally needs every node to resolve that registry with no outbound
 internet):
 
-The default Ray and SAIA images currently use the `preview` tag:
+The default Ray and SAIA images currently use the `preview` tag — set `TAG`
+to match whatever tag you're mirroring:
+
+With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
 
 ```bash
+TAG="preview"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
   splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
   splunk/ai-tier-ray-worker; do
-  docker pull "docker.io/${repo}:preview"
-  docker tag "docker.io/${repo}:preview" "<your-registry>/${repo}:preview"
-  docker push "<your-registry>/${repo}:preview"
+  crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
+done
+```
+
+With Docker instead:
+
+```bash
+TAG="preview"
+for repo in \
+  splunk/ai-tier-saia-data-loader \
+  splunk/ai-tier-saia-api-v2 \
+  splunk/ai-tier-saia-api \
+  splunk/ai-tier-ray-head \
+  splunk/ai-tier-ray-worker; do
+  docker pull "docker.io/${repo}:${TAG}"
+  docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
+  docker push "<your-registry>/${repo}:${TAG}"
 done
 ```
 
