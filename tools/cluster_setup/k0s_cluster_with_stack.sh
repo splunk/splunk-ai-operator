@@ -2654,7 +2654,7 @@ resolve_node_name() {
   local ip="$1"
   # SSH to the node and get the hostname that k0s registered it with
   local node_name
-  node_name=$(ssh_exec "${ip}" "hostname -f 2>/dev/null || hostname" 2>/dev/null || echo "")
+  node_name=$(ssh_exec "${ip}" "hostname -s 2>/dev/null || hostname" 2>/dev/null || echo "")
   echo "${node_name}"
 }
 
@@ -3136,15 +3136,14 @@ stage_model_artifacts() {
     return 0
   fi
 
-  # ---- Check HuggingFace reachability (skip in air-gap mode) ----
-  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
-    wait_for_dependency \
-      "HuggingFace (huggingface.co) — required for model weight download" \
-      "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
-      300
-  else
-    log "AIRGAP_MODE=true — skipping HuggingFace connectivity check (models must be pre-staged in object store)"
-  fi
+  # ---- Check HuggingFace reachability ----
+  # This function only runs when staging is actually about to happen (from
+  # THIS machine), regardless of AIRGAP_MODE — air-gap only means the cluster
+  # nodes lack internet, not necessarily this installer machine.
+  wait_for_dependency \
+    "HuggingFace (huggingface.co) — required for model weight download" \
+    "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+    300
 
   # ---- Download from Hugging Face ----
   log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
