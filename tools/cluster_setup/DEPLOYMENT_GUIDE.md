@@ -78,7 +78,7 @@ graph TB
 
     subgraph GPU["🔥  GPU Worker(s)"]
         RAY_GPU[Ray GPU Workers\nAI Inference]
-        MODELS[(Model Weights\nGemma — GPU-specific\ngpt-oss-20b\n+ 9 more)]
+        MODELS[(Model Weights\nGemma — GPU-specific\ngpt-oss-20b\n+ 8 more)]
     end
 
     subgraph OBJ["🗄️  Object Storage\n(Customer-managed)"]
@@ -237,7 +237,7 @@ flowchart LR
 
 | Data | Minimum size | Notes |
 |---|---|---|
-| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 11 models + headroom for re-staging |
+| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 10 models + headroom for re-staging |
 | Runtime data (conversations, queues, config) | 100 GB | Grows with usage; monitor and expand as needed |
 | **Total recommended bucket** | **500 GB+** | Plan for growth if running multiple tenants |
 
@@ -266,7 +266,7 @@ flowchart TD
 
     subgraph P1["📦 Phase 1 — Model Staging  (if enabled)"]
         direction LR
-        M1["Download >120 GB\nfrom HuggingFace"] --> M2["Gemma — GPU-specific · gpt-oss-20b\n+ 9 more models"]
+        M1["Download >120 GB\nfrom HuggingFace"] --> M2["Gemma — GPU-specific · gpt-oss-20b\n+ 8 more models"]
         M2 --> M3["Upload model_artifacts/\nto Object Store"]
     end
 
@@ -634,7 +634,7 @@ After mirroring, update your config:
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:latest"
+    image: "registry.airgap.local/splunk-ai-operator:v2.8"
   # ... all other images pointing at your internal registry
 
 imagePullSecrets:
@@ -666,7 +666,7 @@ Model weights (>120 GB) must be staged to your object store. Do this on the inst
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run on a flaky connection — already-staged models are skipped automatically |
 | CPU | 4 cores | Recommended for parallel upload scripts |

@@ -781,7 +781,6 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
    | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
-   | `bi-encoder` | BGE small encoder |
    | `cross-encoder` | MS MARCO cross-encoder |
    | `e5-language-classifier` | Multilingual language detection |
    | `fm_timeseries` | Cisco Time Series Model (CTSM) forecaster |

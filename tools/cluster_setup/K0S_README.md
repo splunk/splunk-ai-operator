@@ -283,7 +283,7 @@ The `k0s-cluster-config.yaml` file controls all aspects of the deployment:
 cluster:           # Cluster name, useExisting, SSH user/key, optional API external address
 nodes:             # Controller/worker counts and existingIPs
 storage:           # storageClass, vectorDbSize, objectStore, minimumDiskSpace
-images:            # registry prefix, operator, splunk, ray, weaviate, saia, nginx, fluentBit, otelCollector
+images:            # registry prefix, operator, splunk, ray, weaviate, saia, slim, nginx, fluentBit, otelCollector
 operators:         # ray (version/modelVersion/rayVersion), certManager, nvidia devicePluginVersion
 kubernetes:        # namespace
 files:             # splunkOperator, aiPlatform manifest paths
@@ -337,19 +337,21 @@ storage:
 images:
   registry: "registry.corp.com"
   operator:
-    image: "registry.corp.com/splunk/splunk-ai-operator:v0.1.5"
+    image: "registry.corp.com/splunk/splunk-ai-operator:v2.8"
   splunk:
     image: "registry.corp.com/splunk/splunk:latest"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   ray:
-    headImage: "registry.corp.com/ray/ray-head:build-v1alpha1"
-    workerImage: "registry.corp.com/ray/ray-worker-gpu:build-v1alpha1"
+    headImage: "registry.corp.com/splunk/ai-tier-ray-head:v0.2"
+    workerImage: "registry.corp.com/splunk/ai-tier-ray-worker:v0.2"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28"
   saia:
     apiImage: "registry.corp.com/saia/saia-api:build-v1alpha1"
     apiV2Image: "registry.corp.com/saia/saia-api-v2:build-v1alpha1"
     dataLoaderImage: "registry.corp.com/saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "registry.corp.com/splunk/ai-tier-slim-service:v1.0"
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
   fluentBit:
@@ -361,7 +363,7 @@ operators:
   ray:
     version: "v1.2.2"
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.44.0"
+    rayVersion: "2.56.0"
   certManager:
     installCRDs: true
   nvidia:
@@ -505,7 +507,7 @@ unchanged. For a private registry or air-gapped installation, mirror the images
 and replace the corresponding fields with the mirrored paths; setting only
 `images.registry` does not rewrite a fully qualified Docker Hub reference.
 
-> The `preview` defaults are mutable and workloads use `imagePullPolicy:
+> The SAIA `preview` defaults are mutable and workloads use `imagePullPolicy:
 > IfNotPresent`. Re-running the installer with the same tag may reuse a cached
 > image; use a new immutable tag or digest when performing a controlled upgrade.
 
@@ -513,15 +515,16 @@ and replace the corresponding fields with the mirrored paths; setting only
 |-------|----------|---------|-------------|
 | `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
 | `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
-| `images.operator.image` | **Yes** | — | Splunk AI Operator image |
+| `images.operator.image` | **Yes** | `docker.io/kpratyush775/splunk-ai-operator:v2.8` | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:preview` | Ray head node image |
-| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:preview` | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:v0.2` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:v0.2` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
 | `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
 | `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
 | `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:preview` | SAIA data loader / post-install hook image |
+| `images.slim.apiImage` | No | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API image (required when the `slim` feature is enabled) |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -550,6 +553,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `images.saia.apiImage` | `RELATED_IMAGE_SAIA_API` | `artifacts.yaml` |
 | `images.saia.apiV2Image` | `RELATED_IMAGE_SAIA_API_V2` | `artifacts.yaml` |
 | `images.saia.dataLoaderImage` | `RELATED_IMAGE_POST_INSTALL_HOOK` | `artifacts.yaml` |
+| `images.slim.apiImage` | `RELATED_IMAGE_SLIM_API` | `artifacts.yaml` |
 | `images.nginx.image` | `RELATED_IMAGE_NGINX` | `artifacts.yaml` |
 | `images.fluentBit.image` | `RELATED_IMAGE_FLUENT_BIT` | `artifacts.yaml` |
 | `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
@@ -754,7 +758,6 @@ The `install` command executes these steps in order:
    | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 and RTX Pro |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
-   | `bi-encoder` | BGE small encoder |
    | `cross-encoder` | MS MARCO cross-encoder |
    | `e5-language-classifier` | Multilingual language detection |
    | `fm_timeseries` | Cisco Time Series Model (CTSM) forecaster |
@@ -767,7 +770,7 @@ The `install` command executes these steps in order:
 
    | Resource | Minimum | Notes |
    |---|---|---|
-   | Disk (free) | 250 GB | >120 GB for 11 model artifacts + buffer for download staging and upload temp files |
+   | Disk (free) | 250 GB | >120 GB for 10 model artifacts + buffer for download staging and upload temp files |
    | RAM | 16 GB | Needed to stream large files without swapping |
    | Internet | Stable broadband | Downloads >120 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
    | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -787,7 +790,7 @@ The `install` command executes these steps in order:
    Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the selected artifact profile and verifies that each model's `staging_state/<id>/.staging_complete` marker contains the expected `hf_url`. If every marker matches, it exits immediately without downloading or uploading. Otherwise, it lists the artifacts that need staging:
 
    ```
-   [LOG] Model staging needed: 1/11 model(s) not yet staged.
+   [LOG] Model staging needed: 1/10 model(s) not yet staged.
    [LOG]   MISSING: gemma-4-31b-it-qat-w4a16-ct  (bucket/staging_state/gemma-4-31b-it-qat-w4a16-ct/.staging_complete not found or hf_url changed)
    ```
 
@@ -1460,7 +1463,7 @@ docker push "${INTERNAL_REGISTRY}/weaviate:stable-v1.28-007846a"
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:latest"
+    image: "registry.airgap.local/splunk-ai-operator:v2.8"
   # ... all other image fields pointing at your internal registry
 
 imagePullSecrets:
@@ -1494,7 +1497,7 @@ Model weights (>120 GB total) are not staged by the air-gap staging step. Stage 
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 model artifacts + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 model artifacts + buffer for download staging and upload temp files |
 | RAM | 16 GB | Needed to stream and process large files without swapping |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; resume with `SKIP_IF_EXISTS=1` |
 | CPU | 4 cores | Recommended for parallel upload scripts |

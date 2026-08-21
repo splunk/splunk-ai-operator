@@ -144,17 +144,38 @@ assert_eq "returns bare path when registry is null" \
 suite "shipped image defaults"
 echo "▶ shipped image defaults"
 
-_expected_platform_images=$'docker.io/splunk/ai-tier-ray-head:preview\ndocker.io/splunk/ai-tier-ray-worker:preview\ndocker.io/splunk/ai-tier-saia-api:preview\ndocker.io/splunk/ai-tier-saia-api-v2:preview\ndocker.io/splunk/ai-tier-saia-data-loader:preview'
-for _config_name in k0s-cluster-config.yaml cluster-config.yaml; do
-  _actual_platform_images=$("${YQ_BIN}" eval '
-    .images.ray.headImage,
-    .images.ray.workerImage,
-    .images.saia.apiImage,
-    .images.saia.apiV2Image,
-    .images.saia.dataLoaderImage
-  ' "${SCRIPT_DIR}/${_config_name}")
-  assert_eq "${_config_name} uses the published preview image defaults" \
-    "${_expected_platform_images}" "${_actual_platform_images}"
+_expected_k0s_release_tuple=$'docker.io/kpratyush775/splunk-ai-operator:v2.8\ndocker.io/splunk/ai-tier-ray-head:v0.2\ndocker.io/splunk/ai-tier-ray-worker:v0.2\ndocker.io/splunk/ai-tier-slim-service:v1.0\n2.56.0'
+_actual_k0s_release_tuple=$("${YQ_BIN}" eval '
+  .images.operator.image,
+  .images.ray.headImage,
+  .images.ray.workerImage,
+  .images.slim.apiImage,
+  .operators.ray.rayVersion
+' "${SCRIPT_DIR}/k0s-cluster-config.yaml")
+assert_eq "k0s config uses the requested operator, Ray, Slim, and Ray runtime defaults" \
+  "${_expected_k0s_release_tuple}" "${_actual_k0s_release_tuple}"
+
+_expected_eks_platform_images=$'docker.io/splunk/ai-tier-ray-head:preview\ndocker.io/splunk/ai-tier-ray-worker:preview\ndocker.io/splunk/ai-tier-saia-api:preview\ndocker.io/splunk/ai-tier-saia-api-v2:preview\ndocker.io/splunk/ai-tier-saia-data-loader:preview'
+_actual_eks_platform_images=$("${YQ_BIN}" eval '
+  .images.ray.headImage,
+  .images.ray.workerImage,
+  .images.saia.apiImage,
+  .images.saia.apiV2Image,
+  .images.saia.dataLoaderImage
+' "${SCRIPT_DIR}/cluster-config.yaml")
+assert_eq "EKS config keeps its existing published preview image defaults" \
+  "${_expected_eks_platform_images}" "${_actual_eks_platform_images}"
+
+for _profile in \
+  model_artifacts_configs_unquantized.yaml \
+  model_artifacts_configs_quantized.yaml; do
+  _profile_path="${SCRIPT_DIR}/../artifacts_download_upload_scripts/${_profile}"
+  assert_eq "${_profile} contains exactly 10 model artifacts" \
+    "10" "$("${YQ_BIN}" eval '.artifact-configs | length' "${_profile_path}")"
+  assert_eq "${_profile} excludes the disabled BiEncoder model" \
+    "0" "$("${YQ_BIN}" eval '[.artifact-configs[] | select(.artifact-id == "bi-encoder" or .hf-url == "https://huggingface.co/BAAI/bge-small-en-v1.5")] | length' "${_profile_path}")"
+  assert_eq "${_profile} retains the supported UAE embedding model" \
+    "1" "$("${YQ_BIN}" eval '[.artifact-configs[] | select(.artifact-id == "uae-large")] | length' "${_profile_path}")"
 done
 
 # ── Tests: validate_scale_factor_config ──────────────────────────────────────

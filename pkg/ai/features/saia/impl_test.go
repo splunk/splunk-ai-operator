@@ -20,7 +20,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func buildTestScheme(t *testing.T) *runtime.Scheme {
@@ -760,6 +762,162 @@ func Test_reconcileSAIAv2Workloads_RollWhenSplunkIssuersChange(t *testing.T) {
 				"issuer changes must alter the pod template and trigger a rollout")
 		})
 	}
+}
+
+func Test_reconcileSAIAv2Deployments_EmbeddingModelGuard(t *testing.T) {
+	tests := []struct {
+		name          string
+		configMapData map[string]string
+		want          string
+	}{
+		{
+			name: "missing config map defaults to UAE",
+			want: defaultV2EmbeddingModel,
+		},
+		{
+			name:          "empty value defaults to UAE",
+			configMapData: map[string]string{"EMBEDDING_MODEL": ""},
+			want:          defaultV2EmbeddingModel,
+		},
+		{
+			name:          "bi encoder defaults to UAE",
+			configMapData: map[string]string{"EMBEDDING_MODEL": "bi_encoder"},
+			want:          defaultV2EmbeddingModel,
+		},
+		{
+			name:          "bi encoder comparison ignores case and whitespace",
+			configMapData: map[string]string{"EMBEDDING_MODEL": "  BI_EnCoDeR  "},
+			want:          defaultV2EmbeddingModel,
+		},
+		{
+			name:          "other configured model is preserved",
+			configMapData: map[string]string{"EMBEDDING_MODEL": "  custom_encoder  "},
+			want:          "  custom_encoder  ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := buildFullTestScheme(t)
+			ai := newTestAIService()
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai)
+			if tt.configMapData != nil {
+				builder = builder.WithObjects(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-saia-config",
+						Namespace: "default",
+					},
+					Data: tt.configMapData,
+				})
+			}
+
+			fakeClient := builder.Build()
+			r := &SaiaReconciler{
+				Client:   fakeClient,
+				Scheme:   scheme,
+				Recorder: record.NewFakeRecorder(10),
+			}
+
+			require.NoError(t, r.reconcileSAIAv2Deployment(context.Background(), ai))
+			require.NoError(t, r.reconcileSAIAv2Worker(context.Background(), ai))
+
+			for _, deploymentName := range []string{
+				"test-saia-v2-deployment",
+				"test-saia-v2-worker",
+			} {
+				dep := &appsv1.Deployment{}
+				require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+					Name:      deploymentName,
+					Namespace: "default",
+				}, dep))
+
+				require.Len(t, dep.Spec.Template.Spec.Containers, 1)
+				container := dep.Spec.Template.Spec.Containers[0]
+				assert.Equal(t, tt.want, envToMap(container.Env)["EMBEDDING_MODEL"],
+					"%s must set EMBEDDING_MODEL explicitly", deploymentName)
+				require.Len(t, container.EnvFrom, 1)
+				require.NotNil(t, container.EnvFrom[0].ConfigMapRef)
+				assert.Equal(t, "test-saia-config", container.EnvFrom[0].ConfigMapRef.Name,
+					"the explicit env must override the shared ConfigMap imported through envFrom")
+			}
+
+			if tt.configMapData != nil {
+				cm := &corev1.ConfigMap{}
+				require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+					Name:      "test-saia-config",
+					Namespace: "default",
+				}, cm))
+				assert.Equal(t, tt.configMapData, cm.Data,
+					"the v2 guard must not rewrite the shared ConfigMap used by SAIA v1")
+			}
+		})
+	}
+}
+
+func Test_reconcileSAIAv2Deployments_EmbeddingModelConfigMapLookupError(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ai).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, intercepted client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == "test-saia-config" {
+					if _, isConfigMap := obj.(*corev1.ConfigMap); isConfigMap {
+						return fmt.Errorf("injected ConfigMap read failure")
+					}
+				}
+				return intercepted.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	for _, reconcile := range []struct {
+		name string
+		fn   func(context.Context, *aiv1.AIService) error
+	}{
+		{name: "v2 API", fn: r.reconcileSAIAv2Deployment},
+		{name: "v2 worker", fn: r.reconcileSAIAv2Worker},
+	} {
+		t.Run(reconcile.name, func(t *testing.T) {
+			err := reconcile.fn(context.Background(), ai)
+			require.ErrorContains(t, err, "fetching SAIA ConfigMap for v2 embedding model")
+			require.ErrorContains(t, err, "injected ConfigMap read failure")
+		})
+	}
+}
+
+func Test_reconcileSAIADeployment_DoesNotInjectV2EmbeddingModelGuard(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-saia-config",
+			Namespace: "default",
+		},
+		Data: map[string]string{"EMBEDDING_MODEL": "bi_encoder"},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, configMap).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "test-saia-deployment",
+		Namespace: "default",
+	}, dep))
+
+	require.Len(t, dep.Spec.Template.Spec.Containers, 1)
+	container := dep.Spec.Template.Spec.Containers[0]
+	_, hasExplicitEmbeddingModel := envToMap(container.Env)["EMBEDDING_MODEL"]
+	assert.False(t, hasExplicitEmbeddingModel,
+		"the operator-only v2 guard must not change SAIA v1's explicit environment")
+	require.Len(t, container.EnvFrom, 1)
+	require.NotNil(t, container.EnvFrom[0].ConfigMapRef)
+	assert.Equal(t, "test-saia-config", container.EnvFrom[0].ConfigMapRef.Name)
 }
 
 func Test_reconcileNginxConfigMap(t *testing.T) {
