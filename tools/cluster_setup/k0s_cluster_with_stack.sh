@@ -2648,12 +2648,12 @@ PYSCRIPT"
 
 # ====== RESOLVE NODE NAME ======
 # Maps a config IP to its Kubernetes node name. Prefer the name already
-# registered in the API for that InternalIP; if the Node object is not visible
-# yet, fall back to the node's exact system hostname (which k0s uses by default).
+# registered in the API for that InternalIP; otherwise try the node's full and
+# short hostnames, accepting only a candidate that exists in the API server.
 # Usage: node_name=$(resolve_node_name "1.2.3.4")
 resolve_node_name() {
   local ip="$1"
-  local node_name
+  local node_name full_name short_name candidate
 
   node_name=$(kubectl get nodes -o json 2>/dev/null \
     | jq -r --arg ip "${ip}" '
@@ -2670,10 +2670,21 @@ resolve_node_name() {
     return 0
   fi
 
-  # Do not use `hostname -s`: k0s may register the full configured hostname
-  # (for example, an EC2 private DNS name) as the Kubernetes node name.
-  node_name=$(ssh_exec "${ip}" "hostname" 2>/dev/null || echo "")
-  echo "${node_name}"
+  full_name=$(ssh_exec "${ip}" "hostname -f" 2>/dev/null || true)
+  short_name=$(ssh_exec "${ip}" "hostname -s" 2>/dev/null || true)
+
+  # Some environments register the FQDN (notably EC2 private DNS names), while
+  # others register the short hostname. Never return a guessed/truncated name:
+  # verify each candidate against the API first.
+  for candidate in "${full_name}" "${short_name}"; do
+    [[ -z "${candidate}" ]] && continue
+    if kubectl get node "${candidate}" >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 # ====== LABEL NODES FOR WORKLOAD SCHEDULING ======
@@ -2740,11 +2751,9 @@ label_nodes() {
   # Label controller nodes
   for controller_ip in "${CONTROLLER_IPS[@]}"; do
     local node_name
-    node_name=$(resolve_node_name "${controller_ip}")
-
-    if [[ -z "${node_name}" ]]; then
-      warn "  Could not resolve hostname for controller ${controller_ip}, skipping..."
-      labeling_failures+=("${controller_ip} (hostname unresolved)")
+    if ! node_name=$(resolve_node_name "${controller_ip}"); then
+      warn "  Could not resolve Kubernetes node for controller ${controller_ip}, skipping..."
+      labeling_failures+=("${controller_ip} (node unresolved)")
       continue
     fi
 
@@ -2776,11 +2785,9 @@ label_nodes() {
   local worker_index=0
   for worker_ip in "${WORKER_IPS[@]}"; do
     local node_name
-    node_name=$(resolve_node_name "${worker_ip}")
-
-    if [[ -z "${node_name}" ]]; then
-      warn "  Could not resolve hostname for worker ${worker_ip}, skipping..."
-      labeling_failures+=("${worker_ip} (hostname unresolved)")
+    if ! node_name=$(resolve_node_name "${worker_ip}"); then
+      warn "  Could not resolve Kubernetes node for worker ${worker_ip}, skipping..."
+      labeling_failures+=("${worker_ip} (node unresolved)")
       worker_index=$((worker_index + 1))
       continue
     fi
@@ -2838,8 +2845,7 @@ label_nodes() {
     done
     for ip in "${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}"; do
       local nn
-      nn=$(resolve_node_name "${ip}")
-      [[ -z "${nn}" ]] && continue
+      nn=$(resolve_node_name "${ip}") || continue
       if echo "${unlabeled}" | grep -qx "${nn}"; then
         # Best-effort: apply CPU labels to the controller, CPU labels to
         # any worker whose index is < CPU_WORKER_COUNT, else GPU labels.
@@ -4614,11 +4620,14 @@ install_nvidia_host_drivers() {
   while [[ ${gpu_wait_elapsed} -lt ${gpu_wait_timeout} ]]; do
     all_gpu_ready=true
     for gpu_ip in "${gpu_ips[@]}"; do
-      # Resolve GPU node name via SSH hostname lookup
+      # Resolve GPU node name via InternalIP or an API-validated hostname.
       local gpu_node
-      gpu_node=$(resolve_node_name "${gpu_ip}")
+      if ! gpu_node=$(resolve_node_name "${gpu_ip}"); then
+        all_gpu_ready=false
+        break
+      fi
 
-      if [[ -z "${gpu_node}" ]] || ! kubectl get node "${gpu_node}" &>/dev/null; then
+      if ! kubectl get node "${gpu_node}" &>/dev/null; then
         all_gpu_ready=false
         break
       fi
@@ -8730,9 +8739,9 @@ join_workers() {
   cluster_nodes_json=$(kubectl get nodes -o json 2>/dev/null || echo '{"items":[]}')
 
   for worker_ip in "${WORKER_IPS[@]}"; do
-    # Resolve the Kubernetes node name by SSHing to the worker and getting its hostname
+    # Resolve the Kubernetes node name by InternalIP or a validated hostname.
     local node_exists=""
-    node_exists=$(resolve_node_name "${worker_ip}")
+    node_exists=$(resolve_node_name "${worker_ip}") || node_exists=""
 
     # Verify this node actually exists in the cluster
     if [[ -n "${node_exists}" ]]; then
