@@ -15,7 +15,6 @@ import (
 
 func TestKubernetesSecretResolver_GetHECToken(t *testing.T) {
 	ns := "test-ns"
-	secretName := GetNamespaceScopedSecretName(ns)
 	ctx := context.Background()
 
 	// Register scheme
@@ -24,38 +23,89 @@ func TestKubernetesSecretResolver_GetHECToken(t *testing.T) {
 
 	tests := []struct {
 		name        string
+		namespace   string
+		cfg         *aiApi.SplunkConfigurationSpec
 		objects     []client.Object
 		expectedVal string
 		expectedErr string
 	}{
 		{
-			name: "Secret exists with hec_token",
+			name:      "uses the configured SecretRef name",
+			namespace: ns,
+			cfg: &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{
+				Name: "customer-hec-secret",
+			}},
 			objects: []client.Object{
 				&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      secretName,
+						Name:      "customer-hec-secret",
 						Namespace: ns,
 					},
 					Data: map[string][]byte{
-						"hec_token": []byte("supersecret-token"),
+						"hec_token": []byte("custom-secret-token"),
 					},
 				},
 			},
-			expectedVal: "supersecret-token",
+			expectedVal: "custom-secret-token",
 			expectedErr: "",
 		},
 		{
-			name:        "Secret not found",
-			objects:     []client.Object{}, // no secret in fake client
-			expectedVal: "",
-			expectedErr: "failed to get namespace-scoped Splunk secret",
+			name:      "accepts an explicit matching namespace",
+			namespace: ns,
+			cfg: &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{
+				Name:      "customer-hec-secret",
+				Namespace: ns,
+			}},
+			objects: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "customer-hec-secret", Namespace: ns},
+					Data:       map[string][]byte{"hec_token": []byte("matching-namespace-token")},
+				},
+			},
+			expectedVal: "matching-namespace-token",
 		},
 		{
-			name: "Secret exists but missing hec_token key",
+			name:      "falls back to the legacy namespace-scoped Secret when name is omitted",
+			namespace: ns,
+			cfg:       &aiApi.SplunkConfigurationSpec{},
+			objects: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: GetNamespaceScopedSecretName(ns), Namespace: ns},
+					Data:       map[string][]byte{"hec_token": []byte("legacy-token")},
+				},
+			},
+			expectedVal: "legacy-token",
+		},
+		{
+			name:      "does not fall back when an explicit SecretRef is missing",
+			namespace: ns,
+			cfg: &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{
+				Name: "missing-custom-secret",
+			}},
+			objects: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: GetNamespaceScopedSecretName(ns), Namespace: ns},
+					Data:       map[string][]byte{"hec_token": []byte("must-not-be-used")},
+				},
+			},
+			expectedErr: `failed to get Splunk secret "missing-custom-secret" in namespace "test-ns"`,
+		},
+		{
+			name:        "returns an error when the configured Secret is not found",
+			namespace:   ns,
+			cfg:         &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{Name: "not-found"}},
+			objects:     []client.Object{}, // no secret in fake client
+			expectedVal: "",
+			expectedErr: `failed to get Splunk secret "not-found" in namespace "test-ns"`,
+		},
+		{
+			name:      "returns an error when hec_token is missing",
+			namespace: ns,
+			cfg:       &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{Name: "incomplete-secret"}},
 			objects: []client.Object{
 				&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      secretName,
+						Name:      "incomplete-secret",
 						Namespace: ns,
 					},
 					Data: map[string][]byte{
@@ -64,7 +114,34 @@ func TestKubernetesSecretResolver_GetHECToken(t *testing.T) {
 				},
 			},
 			expectedVal: "",
-			expectedErr: "missing hec_token",
+			expectedErr: `secret "incomplete-secret" missing required key "hec_token"`,
+		},
+		{
+			name:      "rejects a cross-namespace SecretRef",
+			namespace: ns,
+			cfg: &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{
+				Name:      "other-secret",
+				Namespace: "other-ns",
+			}},
+			objects: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "other-secret", Namespace: "other-ns"},
+					Data:       map[string][]byte{"hec_token": []byte("must-not-cross-namespaces")},
+				},
+			},
+			expectedErr: "cross-namespace Secret references are not supported",
+		},
+		{
+			name:        "returns an error for a nil configuration",
+			namespace:   ns,
+			cfg:         nil,
+			expectedErr: "Splunk configuration is required",
+		},
+		{
+			name:        "returns an error for an empty AI resource namespace",
+			namespace:   "",
+			cfg:         &aiApi.SplunkConfigurationSpec{SecretRef: corev1.SecretReference{Name: "some-secret"}},
+			expectedErr: "AI resource namespace is required",
 		},
 	}
 
@@ -78,8 +155,7 @@ func TestKubernetesSecretResolver_GetHECToken(t *testing.T) {
 
 			resolver := &KubernetesSecretResolver{Client: fakeClient}
 
-			cfg := &aiApi.SplunkConfigurationSpec{}
-			got, err := resolver.GetHECToken(ctx, ns, cfg)
+			got, err := resolver.GetHECToken(ctx, tt.namespace, tt.cfg)
 
 			if tt.expectedErr == "" {
 				assert.NoError(t, err)

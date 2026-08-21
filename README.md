@@ -148,6 +148,8 @@ make uninstall
 - **[Helm Deployment](docs/deployment/helm-deployment.md)** - Helm chart installation
 - **[API Reference](docs/api-reference.md)** - Complete CRD specification
 - **[AWS EKS Deployment](docs/deployment/deployment-aws-eks.md)** - Production deployment on AWS
+- **[Splunk–SAIA Connectivity](docs/configuration/splunk-saia-connectivity.md)** - Customer network, TLS, JWT/JWKS, and HEC requirements
+- **[External Splunk Production Connectivity](docs/configuration/external-splunk-production-connectivity.md)** - Customer load balancer, DNS, certificate, firewall, and acceptance-test steps
 - **[Configuration Guides](docs/configuration/)** - Storage, ingress, and webhook configuration
 - **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
 
@@ -166,4 +168,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

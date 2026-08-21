@@ -958,6 +958,40 @@ func saiaEnvFrom(ai *aiv1.AIService) []corev1.EnvFromSource {
 	}
 }
 
+const (
+	defaultV2EmbeddingModel     = "uae_large"
+	unsupportedV2EmbeddingModel = "bi_encoder"
+)
+
+// resolveV2EmbeddingModel reads the optional user override from the shared
+// SAIA ConfigMap and returns the model that the v2 API and worker must use.
+//
+// EMBEDDING_MODEL is added to the containers' explicit env list rather than
+// relying on envFrom. Kubernetes gives explicit env entries precedence over
+// envFrom entries with the same name, so a legacy bi_encoder value cannot make
+// SAIA v2 call the unsupported AI-tier endpoint. Other configured models are
+// preserved. SAIA v1 continues to consume the ConfigMap exactly as before.
+func (r *SaiaReconciler) resolveV2EmbeddingModel(ctx context.Context, ai *aiv1.AIService) (string, error) {
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-saia-config", ai.Name),
+		Namespace: ai.Namespace,
+	}, cm)
+	if apierrors.IsNotFound(err) {
+		return defaultV2EmbeddingModel, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("fetching SAIA ConfigMap for v2 embedding model: %w", err)
+	}
+
+	configured := cm.Data["EMBEDDING_MODEL"]
+	trimmed := strings.TrimSpace(configured)
+	if trimmed == "" || strings.EqualFold(trimmed, unsupportedV2EmbeddingModel) {
+		return defaultV2EmbeddingModel, nil
+	}
+	return configured, nil
+}
+
 // saiaVolumes returns the standard config volume and mount for SAIA pods.
 func saiaVolumes(ai *aiv1.AIService) ([]corev1.Volume, []corev1.VolumeMount) {
 	featureConfigName := fmt.Sprintf("splunk-%s-feature-config", ai.Name)
@@ -1182,6 +1216,11 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 	ctx context.Context,
 	ai *aiv1.AIService,
 ) error {
+	embeddingModel, err := r.resolveV2EmbeddingModel(ctx, ai)
+	if err != nil {
+		return err
+	}
+
 	volumes, mounts := saiaVolumes(ai)
 	ports := []corev1.ContainerPort{
 		{Name: "http", ContainerPort: 8000},
@@ -1190,7 +1229,10 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	env := buildSAIABaseEnv(ai)
 	env = append(env, buildV2ExtraEnv(ai)...)
-	env = append(env, corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"})
+	env = append(env,
+		corev1.EnvVar{Name: "EMBEDDING_MODEL", Value: embeddingModel},
+		corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"},
+	)
 	env, volumes, mounts, ports = buildSAIATLSEnv(ai, env, volumes, mounts, ports)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
@@ -1299,6 +1341,11 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	ctx context.Context,
 	ai *aiv1.AIService,
 ) error {
+	embeddingModel, err := r.resolveV2EmbeddingModel(ctx, ai)
+	if err != nil {
+		return err
+	}
+
 	volumes, mounts := saiaVolumes(ai)
 	ports := []corev1.ContainerPort{
 		{Name: "metrics", ContainerPort: 8088},
@@ -1319,6 +1366,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	// conflate with the v1 worker APScheduler cron (which uses 600s for weekly
 	// jobs); v2 reuses the same env name for a different purpose.
 	env = append(env,
+		corev1.EnvVar{Name: "EMBEDDING_MODEL", Value: embeddingModel},
 		corev1.EnvVar{Name: "RUN_TASKS_DELAY_S", Value: "600"},
 		corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"},
 		corev1.EnvVar{Name: "WORKER_HEARTBEAT_PATH", Value: "/tmp/ingestion_worker_heartbeat"},

@@ -342,8 +342,8 @@ images:
     image: "registry.corp.com/splunk/splunk:latest"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   ray:
-    headImage: "registry.corp.com/ray/ray-head:build-v1alpha1"
-    workerImage: "registry.corp.com/ray/ray-worker-gpu:build-v1alpha1"
+    headImage: "registry.corp.com/splunk/ai-tier-ray-head:v0.2"
+    workerImage: "registry.corp.com/splunk/ai-tier-ray-worker:v0.2"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28"
   saia:
@@ -361,7 +361,7 @@ operators:
   ray:
     version: "v1.2.2"
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.44.0"
+    rayVersion: "2.56.0"           # Must match ray.__version__ in both Ray images
   certManager:
     installCRDs: true
   nvidia:
@@ -505,7 +505,7 @@ unchanged. For a private registry or air-gapped installation, mirror the images
 and replace the corresponding fields with the mirrored paths; setting only
 `images.registry` does not rewrite a fully qualified Docker Hub reference.
 
-> The `preview` defaults are mutable and workloads use `imagePullPolicy:
+> Some application defaults use the mutable `preview` tag and workloads use `imagePullPolicy:
 > IfNotPresent`. Re-running the installer with the same tag may reuse a cached
 > image; use a new immutable tag or digest when performing a controlled upgrade.
 
@@ -513,11 +513,11 @@ and replace the corresponding fields with the mirrored paths; setting only
 |-------|----------|---------|-------------|
 | `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
 | `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
-| `images.operator.image` | **Yes** | — | Splunk AI Operator image |
+| `images.operator.image` | **Yes** | `docker.io/kpratyush775/splunk-ai-operator:v2.6` | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:preview` | Ray head node image |
-| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:preview` | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:v0.2@sha256:50d6c98cf5bc1e43e65b10bc2da41a22029bd3404a77e10c953d6d9f98a2d3a6` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:v0.2@sha256:a8b8763a298f01b44ca2f638b8d64086a4cd273a046c2d8f31cb5f729f4bdf6d` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
 | `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
 | `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
@@ -525,6 +525,9 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
+
+The shipped Ray `v0.2` images contain Ray `2.56.0`; keep
+`operators.ray.rayVersion: "2.56.0"` when using this pair.
 
 **Secure vs insecure registry — which to use:**
 

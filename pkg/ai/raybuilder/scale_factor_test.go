@@ -349,6 +349,40 @@ func indexRenderedDeployments(deployments []renderedServeDeployment) map[string]
 	return indexed
 }
 
+// TestApplicationsTemplate_ProductionDefaultsDisableOnlyBiEncoder keeps the
+// BiEncoder application template available for rollback while ensuring the
+// production scale config does not deploy it. Every other configured
+// application must remain enabled and render at its existing base scale.
+func TestApplicationsTemplate_ProductionDefaultsDisableOnlyBiEncoder(t *testing.T) {
+	modelScaleData, err := os.ReadFile("../../../config/configs/model-scale.yaml")
+	require.NoError(t, err)
+	var modelScale ScaleConfig
+	require.NoError(t, yaml.UnmarshalStrict(modelScaleData, &modelScale))
+
+	require.Equal(t, int32(0), modelScale.ApplicationScale["BiEncoder"],
+		"BiEncoder must stay disabled in the production scale config")
+
+	productionApps := indexRenderedApplications(renderProductionApplications(t, 1, "L40S"))
+	require.NotContains(t, productionApps, "BiEncoder")
+	require.Len(t, productionApps, len(modelScale.ApplicationScale)-1,
+		"disabling BiEncoder must be the only production application removal")
+
+	for name, baseReplicas := range modelScale.ApplicationScale {
+		if name == "BiEncoder" {
+			continue
+		}
+		require.Greater(t, baseReplicas, int32(0), "%s must remain enabled", name)
+		require.Contains(t, productionApps, name, "%s disappeared with BiEncoder disabled", name)
+	}
+
+	// The conditional template is intentionally retained so rollback only
+	// requires restoring the scale entry to a positive value.
+	applicationsData, err := os.ReadFile("../../../config/configs/applications.yaml")
+	require.NoError(t, err)
+	require.Contains(t, string(applicationsData), "{{- if .Replicas.BiEncoder }}")
+	require.Contains(t, string(applicationsData), "route_prefix: /bi_encoder")
+}
+
 // TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides
 // protects the Ray Serve in-place scaling contract. Ray includes application
 // args in its code-version hash, so changing replica counts there rebuilds the
@@ -358,6 +392,8 @@ func TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides(t *t
 	atOne := indexRenderedApplications(renderProductionApplications(t, 1, "L40S"))
 	atTwo := indexRenderedApplications(renderProductionApplications(t, 2, "L40S"))
 	require.Equal(t, len(atOne), len(atTwo))
+	require.NotContains(t, atOne, "BiEncoder")
+	require.NotContains(t, atTwo, "BiEncoder")
 
 	for name, one := range atOne {
 		two, ok := atTwo[name]
@@ -375,7 +411,6 @@ func TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides(t *t
 		"GptOss20b":                    "LLMDeploymentL40S",
 		"UaeLarge":                     "EmbeddingModelDeployment",
 		"AllMinilmL6V2":                "EmbeddingModelDeployment",
-		"BiEncoder":                    "EmbeddingModelDeployment",
 		"MbartTranslator":              "MbartTranslatorDeployment",
 		"XlmRobertaLanguageClassifier": "ClassificationModelDeployment",
 		"PromptInjectionTfidf":         "PromptInjectionTfidfDeployment",

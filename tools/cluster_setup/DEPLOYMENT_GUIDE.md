@@ -1029,36 +1029,28 @@ onboard it to the AI tier.
 
 ### 1. Find your Splunk Web URL
 
-```bash
-# Retrieve the admin password
-kubectl get secret splunk-standalone-secret -n ai-platform \
-  -o jsonpath='{.data.password}' | base64 --decode && echo
-
-# NodePort (default) — open on any worker node IP
-kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
-# → http://<node-ip>:<nodePort>
-```
+Use the installer-managed HTTPS endpoint from
+[K0S_README.md — Finding the Splunk Web URL](K0S_README.md#finding-the-splunk-web-url).
+Do not downgrade internal Splunk Web to HTTP.
 
 ### 2. Install the app
 
-1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`)
+1. Log in to Splunk Web using its HTTPS URL
 2. **Apps → Manage Apps → Install app from file**
 3. Select `Splunk_AI_Assistant_Cloud.tgz`, check **Upgrade app** if updating, click **Upload**
 4. Restart Splunk if prompted
 
 ### 3. Onboard to the AI tier
 
-The app needs the SAIA API URL (`http://<node-ip>:<nodePort>`) to route prompts to the AI backend.
+The app needs a browser-reachable SAIA HTTPS URL. Use bundled Traefik, or a
+customer L7 load balancer with a trusted certificate; do not enter a raw HTTP
+NodePort when Splunk Web is HTTPS. In Splunk Web, open **Splunk AI Assistant →
+Configuration**, enter that HTTPS URL as the AI Tier Endpoint, and save.
 
-```bash
-# Find the SAIA NodePort
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-# PORT(S) column shows  8080:<nodePort>/TCP  — use that nodePort
-```
-
-In Splunk Web: **Splunk AI Assistant → Configuration** → enter `http://<worker-node-ip>:<nodePort>` as the AI Tier Endpoint and save.
-
-> **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
+> Review [Splunk–SAIA Connectivity and TLS Requirements](../../docs/configuration/splunk-saia-connectivity.md)
+> for the customer network contract, then see
+> [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app)
+> for scripted setup, air-gapped installation, verification, and troubleshooting.
 
 ### 4. Verify
 

@@ -116,7 +116,7 @@ images:
   registryInsecure: false
 
   operator:
-    image: "docker.io/kpratyush775/splunk-ai-operator:v2.5"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v2.6"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
@@ -126,8 +126,8 @@ images:
     # These Docker Hub defaults are fully qualified and therefore are not
     # rewritten by images.registry. Replace them with your mirrored image paths
     # for private-registry or air-gapped installations.
-    headImage: "docker.io/splunk/ai-tier-ray-head:preview"
-    workerImage: "docker.io/splunk/ai-tier-ray-worker:preview"
+    headImage: "docker.io/splunk/ai-tier-ray-head:v0.2@sha256:50d6c98cf5bc1e43e65b10bc2da41a22029bd3404a77e10c953d6d9f98a2d3a6"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:v0.2@sha256:a8b8763a298f01b44ca2f638b8d64086a4cd273a046c2d8f31cb5f729f4bdf6d"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
@@ -159,7 +159,7 @@ operators:
   ray:
     version: "v1.2.2"
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.53.0"
+    rayVersion: "2.56.0"
 
   certManager:
     installCRDs: true

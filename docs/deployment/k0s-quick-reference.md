@@ -87,8 +87,8 @@ in the cluster config to those mirrored paths (required for both paths —
 air-gap additionally needs every node to resolve that registry with no outbound
 internet):
 
-The default Ray and SAIA images currently use the `preview` tag — set `TAG`
-to match whatever tag you're mirroring:
+The SAIA images currently use the `preview` tag. The Ray `v0.2` images are
+digest-pinned and contain Ray `2.56.0`.
 
 With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
 
@@ -97,11 +97,16 @@ TAG="preview"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api \
-  splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
+  splunk/ai-tier-saia-api; do
   crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
 done
+
+crane copy \
+  "docker.io/splunk/ai-tier-ray-head:v0.2@sha256:50d6c98cf5bc1e43e65b10bc2da41a22029bd3404a77e10c953d6d9f98a2d3a6" \
+  "<your-registry>/splunk/ai-tier-ray-head:v0.2"
+crane copy \
+  "docker.io/splunk/ai-tier-ray-worker:v0.2@sha256:a8b8763a298f01b44ca2f638b8d64086a4cd273a046c2d8f31cb5f729f4bdf6d" \
+  "<your-registry>/splunk/ai-tier-ray-worker:v0.2"
 ```
 
 With Docker instead:
@@ -111,18 +116,24 @@ TAG="preview"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api \
-  splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
+  splunk/ai-tier-saia-api; do
   docker pull "docker.io/${repo}:${TAG}"
   docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
   docker push "<your-registry>/${repo}:${TAG}"
 done
+
+
+docker pull "docker.io/splunk/ai-tier-ray-head:v0.2@sha256:50d6c98cf5bc1e43e65b10bc2da41a22029bd3404a77e10c953d6d9f98a2d3a6"
+docker tag "docker.io/splunk/ai-tier-ray-head:v0.2" "<your-registry>/splunk/ai-tier-ray-head:v0.2"
+docker push "<your-registry>/splunk/ai-tier-ray-head:v0.2"
+docker pull "docker.io/splunk/ai-tier-ray-worker:v0.2@sha256:a8b8763a298f01b44ca2f638b8d64086a4cd273a046c2d8f31cb5f729f4bdf6d"
+docker tag "docker.io/splunk/ai-tier-ray-worker:v0.2" "<your-registry>/splunk/ai-tier-ray-worker:v0.2"
+docker push "<your-registry>/splunk/ai-tier-ray-worker:v0.2"
 ```
 
 After mirroring, replace the five fully qualified `images.ray.*` and
-`images.saia.*` values in the cluster config with the corresponding
-`<your-registry>/splunk/...:preview` paths. Mirror the Slim and operator images
+`images.saia.*` values in the cluster config with the corresponding mirror
+paths (`:v0.2` for Ray and `:preview` for SAIA). Mirror the Slim and operator images
 separately when those components are enabled, using the tags configured for
 your release. For the complete air-gap image list and the bulk `crane copy`
 alternative, see

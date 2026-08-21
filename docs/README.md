@@ -19,6 +19,9 @@ Welcome to the Splunk AI Operator documentation!
 - **[Storage Configuration](configuration/storage-configuration.md)** - Persistent storage for Weaviate vector database
 - **[Storage Artifacts](configuration/storage-artifacts.md)** - S3/GCS/Azure storage for AI models
 - **[Ingress Configuration](configuration/ingress-configuration.md)** - Expose AI services externally
+- **[Splunk–SAIA Connectivity](configuration/splunk-saia-connectivity.md)** - Customer network, TLS, JWT/JWKS, and HEC requirements for internal or external Splunk
+- **[External Splunk Production Connectivity](configuration/external-splunk-production-connectivity.md)** - Production load-balancer, DNS, trust, firewall, and validation procedure
+- **[Splunk TLS Trust](configuration/splunk-tls-trust.md)** - Configure private CA trust and certificate lifecycle
 - **[Webhook Certificates](configuration/webhook-certificates.md)** - Configure admission webhook TLS
 
 ## Project Documentation
