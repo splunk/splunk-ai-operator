@@ -105,14 +105,16 @@ brew install kubectl helm git jq yq
 sudo apt-get update
 sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update
 sudo apt-get install -y kubectl
 
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
-sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+# pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
+sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
 sudo chmod +x /usr/local/bin/yq
 
 # Verify installations
@@ -169,9 +171,17 @@ You must provide an external S3-compatible object storage endpoint:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/splunk/splunk-ai-operator.git
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 ### 2. Create Configuration File
 
@@ -1325,7 +1335,7 @@ cd tools/cluster_setup
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| Binaries | `k0s v1.36.1+k0s.0` (default; override with `--k0s-version`), `yq v4.44.1` |
 | **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
@@ -1372,6 +1382,13 @@ done < "${IMAGE_LIST}"
 ```
 
 **Mirror with Docker:**
+
+Requires the Docker CE daemon on the workstation, and your user in the
+`docker` group so `docker` commands don't need `sudo`:
+
+```bash
+sudo usermod -aG docker "$USER"   # one-time; log out/in (or run `newgrp docker`) for it to take effect in the current shell
+```
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
@@ -2177,7 +2194,7 @@ If `yq` is not installed or cannot parse the selected artifact profile, the down
 ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
 ```
 
-Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
+Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
 
 #### Re-stage a single model without restarting from scratch
 

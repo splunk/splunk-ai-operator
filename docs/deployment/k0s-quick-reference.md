@@ -62,19 +62,22 @@ rather than a single `dnf install`:
 sudo dnf install -y git jq
 
 # kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
-# pinned to the k0s minor version this doc targets (v1.31) — see Hardware Requirements
-curl -fsSLO "https://dl.k8s.io/release/v1.31.2/bin/linux/amd64/kubectl"
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
+# see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 rm -f kubectl
 
 # helm — install script (https://helm.sh/docs/intro/install/)
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
-# yq — binary release (https://github.com/mikefarah/yq#install)
-sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+# yq — binary release, pinned to match the version this repo already relies on
+# (k0s_cluster_with_stack.sh, airgap_install.sh) — https://github.com/mikefarah/yq#install
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
 sudo chmod +x /usr/local/bin/yq
 
 # docker — Docker CE repo for RHEL (https://docs.docker.com/engine/install/rhel/), needed for the image-mirroring commands below
+sudo dnf install -y dnf-plugins-core
 sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
 sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 sudo systemctl enable --now docker
@@ -182,12 +185,20 @@ else has a working default. Full field-by-field reference:
 [K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
 
 ```bash
-git clone https://github.com/splunk/splunk-ai-operator.git
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
 
 cp k0s-cluster-config.yaml my-cluster.yaml
 vi my-cluster.yaml
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 | Field | Set to |
 |---|---|

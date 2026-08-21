@@ -504,7 +504,7 @@ graph TD
     SCRIPT["Staging step\n(airgap_install.sh)"]
 
     subgraph BIN["📁 binaries/"]
-        K0S["k0s binary\nlatest or --k0s-version"]
+        K0S["k0s binary\nv1.36.1+k0s.0 (default) or --k0s-version"]
         YQ["yq v4.44.1\nYAML processor"]
     end
 
