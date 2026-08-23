@@ -430,12 +430,12 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 # → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
 ```
 
-**Reach the in-cluster Splunk instance** via NodePort (default), LoadBalancer
-(MetalLB), or `kubectl port-forward` for quick access with no external
-exposure: [DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#internal-splunk-access).
-
-Once the cluster is healthy, install and onboard the **Splunk AI Assistant**
-app: [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+**Access the in-cluster Splunk instance and set up the SAIA app:**
+[DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#internal-splunk-access)
+(NodePort, LoadBalancer, or `kubectl port-forward`; add
+[K0S_README.md — Remote workstation via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url)
+if your browser can't reach the cluster network directly), then
+[DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
 > **Using an external Splunk Enterprise/Cloud instance instead of the
 > in-cluster one?** See
