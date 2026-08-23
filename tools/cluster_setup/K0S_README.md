@@ -1954,6 +1954,99 @@ kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 
 Open `http://localhost:8000` in your browser.
 
+**Remote workstation via SSH bastion (SOCKS tunnel)**
+
+Use this when your browser doesn't run on the same host as `kubectl` — the
+cluster network is reachable only from the installer machine, and you're
+browsing from your laptop. The **installer machine** is the admin workstation
+from [Required Tools](#required-tools-on-admin-workstation): whatever host has
+SSH reach to every cluster node and holds the kubeconfig (often a bastion or
+EC2 instance, not your laptop) — it is not itself a cluster node. A plain
+`kubectl port-forward` only helps if your browser runs on that same host; the
+SOCKS proxy set up here also lets the browser reach other private cluster
+addresses directly, e.g. the SAIA API endpoint from
+[Onboarding to the AI Tier](#onboarding-to-the-ai-tier).
+
+Placeholders used below — replace with your own values:
+
+| Placeholder | Meaning |
+|---|---|
+| `<installer-ip>` | SSH-reachable address of the installer machine |
+| `<ssh-user>` | SSH login user on the installer machine |
+| `<ssh-key>` | Path to the SSH private key for the installer machine |
+| `<kubeconfig-path>` | Kubeconfig path on the installer machine |
+| `<saia-nodeport-addr>` | `<worker-node-ip>:<nodePort>` from [Onboarding to the AI Tier, Step 1](#onboarding-to-the-ai-tier) |
+| `<tenant-id>` | Your SAIA tenant ID |
+
+1. On the installer machine, start the port-forward and leave it running.
+   Reuse the `NAMESPACE`/`STANDALONE_NAME` from your cluster config if they
+   differ from the defaults shown here:
+
+   ```bash
+   NAMESPACE=ai-platform
+   STANDALONE_NAME=splunk-standalone
+   SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+   kubectl --kubeconfig <kubeconfig-path> -n "${NAMESPACE}" port-forward \
+     "svc/${SPLUNK_SERVICE}" 18002:8000 \
+     --address=127.0.0.1
+   ```
+
+2. From your workstation, open one SSH tunnel with both a local forward for
+   Splunk Web and a SOCKS proxy for everything else:
+
+   ```bash
+   ssh -N \
+     -o ExitOnForwardFailure=yes \
+     -o ServerAliveInterval=30 \
+     -L 18002:127.0.0.1:18002 \
+     -D 127.0.0.1:1080 \
+     -i <ssh-key> \
+     <ssh-user>@<installer-ip>
+   ```
+
+   Local port `18002` now reaches Splunk Web; local SOCKS port `1080` reaches
+   any other private cluster address.
+
+3. Verify SOCKS access to the SAIA endpoint before opening a browser:
+
+   ```bash
+   curl --socks5-hostname 127.0.0.1:1080 -i -X OPTIONS \
+     'http://<saia-nodeport-addr>/<tenant-id>/saia-api-v2/v2alpha1/metadata' \
+     -H 'Access-Control-Request-Headers: authorization,splunk-client,x-requested-with,x-stack-url' \
+     -H 'Access-Control-Request-Method: GET' \
+     -H 'Origin: http://localhost:18002'
+   ```
+
+   Expect `HTTP/1.1 204 No Content`.
+
+4. Launch an isolated Chrome profile routed through the SOCKS proxy, with
+   `localhost` traffic (Splunk Web) kept direct:
+
+   macOS:
+
+   ```bash
+   open -na "Google Chrome" --args \
+     --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+   Linux (Ubuntu/RHEL admin workstation):
+
+   ```bash
+   google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+5. In that Chrome instance, open `http://localhost:18002` (HTTP, not HTTPS)
+   — this is your Splunk Web session.
+
+6. When [onboarding the AI Tier](#onboarding-to-the-ai-tier), use
+   `http://<saia-nodeport-addr>` as the SAIA API URL — it works both from
+   inside the pod (onboarding checks) and from the browser via the SOCKS
+   tunnel.
+
 **Retrieve the admin password**
 
 ```bash
