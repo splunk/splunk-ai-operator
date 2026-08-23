@@ -106,10 +106,10 @@ graph TB
 |---|---|---|
 | Splunk AI Operator | your build | Manages `AIPlatform` CR lifecycle |
 | Splunk Operator | 3.0.0 | Manages Splunk Enterprise |
-| KubeRay | 1.2.2 | Manages Ray clusters for AI inference |
-| cert-manager | v1.13.0 | TLS certificate management |
+| KubeRay | 1.2.2 <!-- ver:K0S_KUBERAY_CHART_VERSION --> | Manages Ray clusters for AI inference |
+| cert-manager | v1.13.0 <!-- ver:K0S_CERT_MANAGER_VERSION --> | TLS certificate management |
 | OTel Operator | latest | Observability |
-| NVIDIA Device Plugin | v0.17.3 | Exposes GPUs to Kubernetes |
+| NVIDIA Device Plugin | v0.17.3 <!-- ver:K0S_NVIDIA_DEVICE_PLUGIN_VERSION --> | Exposes GPUs to Kubernetes |
 
 ### Version Compatibility
 
@@ -507,6 +507,8 @@ graph TD
         K0S["k0s binary\nv1.36.1+k0s.0 (default) or --k0s-version"]
         YQ["yq v4.44.1\nYAML processor"]
     end
+    %% v1.36.1+k0s.0 ver:K0S_VERSION
+    %% v4.44.1 ver:YQ_VERSION
 
     subgraph IMG["📁 images/  ⭐ pre-loaded OCI image bundles"]
         K0SIMG["k0s-images.tar\nk0s control-plane images:\npause · calico · kube-proxy\ncoredns · metrics-server"]
@@ -518,6 +520,9 @@ graph TD
         LP["local-path-provisioner v0.0.24"]
         NDP["nvidia-device-plugin v0.17.3"]
     end
+    %% v1.13.0 ver:K0S_CERT_MANAGER_VERSION
+    %% v0.0.24 ver:K0S_LOCAL_PATH_PROVISIONER_VERSION
+    %% v0.17.3 ver:K0S_NVIDIA_DEVICE_PLUGIN_VERSION
 
     subgraph CHARTS["📁 charts/"]
         PROM["kube-prometheus-stack\n(version resolved at bundle time)"]
@@ -525,6 +530,8 @@ graph TD
         KUBERAY["kuberay-operator 1.2.2"]
         METALLB["metallb 0.14.8"]
     end
+    %% 1.2.2 ver:K0S_KUBERAY_CHART_VERSION
+    %% 0.14.8 ver:K0S_METALLB_CHART_VERSION
 
     subgraph PKGS["📁 packages/  (GPU nodes)"]
         EPEL["epel-release-latest-9.noarch.rpm"]

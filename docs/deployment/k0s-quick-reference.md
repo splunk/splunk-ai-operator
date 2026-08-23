@@ -53,10 +53,10 @@ default repos; `git` and `jq` are. Install each via its own supported method
 rather than a single package-manager command:
 
 - `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/),
-  pinned to `v1.36.1` (matches the k0s version this repo installs by default)
+  pinned to `v1.36.1` <!-- ver:KUBECTL_VERSION --> (matches the k0s version this repo installs by default)
 - `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
 - `yq` — [binary release](https://github.com/mikefarah/yq#install), pinned to
-  `v4.44.1` (matches the version this repo already relies on elsewhere)
+  `v4.44.1` <!-- ver:YQ_VERSION --> (matches the version this repo already relies on elsewhere)
 - `git`, `jq` — `sudo apt-get install -y git jq` (Ubuntu) or
   `sudo dnf install -y git jq` (RHEL 9)
 - `crane` — [binary release](https://github.com/google/go-containerregistry/releases),

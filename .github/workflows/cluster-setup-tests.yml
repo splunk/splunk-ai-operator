@@ -17,6 +17,9 @@ jobs:
           fi
           yq --version
 
+      - name: Check version drift
+        run: bash tools/cluster_setup/check_versions.sh
+
       - name: Run cluster_setup unit tests
         run: bash tools/cluster_setup/test_k0s_cluster_with_stack.sh
 

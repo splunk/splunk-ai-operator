@@ -57,11 +57,11 @@ The script installs everything needed for the AI Platform:
 1. **k0s Kubernetes Cluster** — CNCF certified, single-binary Kubernetes
 2. **Calico CNI** — High-performance networking with VXLAN
 3. **local-path Storage Provisioner** — Default StorageClass for PVCs
-4. **Cert-Manager v1.13.0** — Automated certificate management
+4. **Cert-Manager v1.13.0** — Automated certificate management <!-- ver:K0S_CERT_MANAGER_VERSION -->
 5. **Kube-Prometheus Stack** — Monitoring with Prometheus + Grafana
 6. **OpenTelemetry Operator** — Distributed tracing and telemetry
 7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9)
-8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI
+8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI <!-- ver:K0S_KUBERAY_CHART_VERSION -->
 9. **Splunk Operator** — Splunk Enterprise management
 10. **Splunk AI Platform Operator** — AI platform orchestration (SAIA feature)
 11. **AIPlatform CR** — Complete AI deployment with features, scheduling, and secrets
@@ -105,7 +105,7 @@ brew install kubectl helm git jq yq crane
 sudo apt-get update
 sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
 
-# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version  # ver:K0S_VERSION
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update
@@ -114,12 +114,12 @@ sudo apt-get install -y kubectl
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 # pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
-sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq  # ver:YQ_VERSION
 sudo chmod +x /usr/local/bin/yq
 
 # crane — used by the image-mirroring commands below (see Step 2 — Mirror
 # Container Images); no Docker daemon/root/group setup required
-curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz  # ver:CRANE_VERSION
 tar -xzf /tmp/crane.tar.gz -C /tmp crane
 sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
 rm -f /tmp/crane.tar.gz /tmp/crane
@@ -144,7 +144,7 @@ sudo dnf install -y git jq
 # kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
 # pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
 # see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
-curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"  # ver:KUBECTL_VERSION
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 rm -f kubectl
 
@@ -153,12 +153,12 @@ curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
 
 # yq — binary release, pinned to match the version this repo already relies on
 # (k0s_cluster_with_stack.sh, airgap_install.sh) — https://github.com/mikefarah/yq#install
-sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq  # ver:YQ_VERSION
 sudo chmod +x /usr/local/bin/yq
 
 # crane — used by the image-mirroring commands below (see Step 2 — Mirror
 # Container Images); no Docker daemon/root/group setup required
-curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz  # ver:CRANE_VERSION
 tar -xzf /tmp/crane.tar.gz -C /tmp crane
 sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
 rm -f /tmp/crane.tar.gz /tmp/crane
@@ -359,13 +359,13 @@ images:
 
 operators:
   ray:
-    version: "v1.2.2"
+    version: "v1.2.2"  # ver:K0S_KUBERAY_CHART_VERSION
     modelVersion: "v0.3.14-36-g1549f5a"
     rayVersion: "2.44.0"
   certManager:
     installCRDs: true
   nvidia:
-    devicePluginVersion: "v0.17.3"
+    devicePluginVersion: "v0.17.3"  # ver:K0S_NVIDIA_DEVICE_PLUGIN_VERSION
 
 kubernetes:
   namespace: ai-platform
@@ -717,8 +717,8 @@ the staging directory, `./airgap-bundle/airgap-bundle-<timestamp>` by default.
 | `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA device plugin URL | `file://<staged>/manifests/nvidia-device-plugin.yml` |
 | `PROMETHEUS_CHART_PATH` | `prometheus-community/kube-prometheus-stack` | `<staged>/charts/kube-prometheus-stack-72.3.0.tgz` |
 | `OTEL_CHART_PATH` | `open-telemetry/opentelemetry-operator` | `<staged>/charts/opentelemetry-operator-0.80.0.tgz` |
-| `KUBERAY_CHART_PATH` | `kuberay/kuberay-operator` | `<staged>/charts/kuberay-operator-1.2.2.tgz` |
-| `METALLB_CHART_PATH` | `metallb/metallb` | `<staged>/charts/metallb-0.14.8.tgz` |
+| `KUBERAY_CHART_PATH` | `kuberay/kuberay-operator` | `<staged>/charts/kuberay-operator-1.2.2.tgz` <!-- ver:K0S_KUBERAY_CHART_VERSION --> |
+| `METALLB_CHART_PATH` | `metallb/metallb` | `<staged>/charts/metallb-0.14.8.tgz` <!-- ver:K0S_METALLB_CHART_VERSION --> |
 
 See [Air-Gapped Deployment](#air-gapped-deployment) for the full air-gap workflow.
 
@@ -1391,10 +1391,10 @@ cd tools/cluster_setup
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s v1.36.1+k0s.0` (default; override with `--k0s-version`), `yq v4.44.1` |
+| Binaries | `k0s v1.36.1+k0s.0` <!-- ver:K0S_VERSION --> (default; override with `--k0s-version`), `yq v4.44.1` <!-- ver:YQ_VERSION --> |
 | **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
-| Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
-| Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
+| Manifests | `cert-manager v1.13.0` <!-- ver:K0S_CERT_MANAGER_VERSION -->, `local-path-provisioner v0.0.24` <!-- ver:K0S_LOCAL_PATH_PROVISIONER_VERSION -->, `nvidia-device-plugin v0.17.3` <!-- ver:K0S_NVIDIA_DEVICE_PLUGIN_VERSION --> |
+| Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2` <!-- ver:K0S_KUBERAY_CHART_VERSION -->, `metallb 0.14.8` <!-- ver:K0S_METALLB_CHART_VERSION --> |
 | GPU packages | `packages/nvidia-closure/` — a complete offline dnf repo (driver, DKMS, gcc/make toolchain, container toolkit, `kernel-devel`/`kernel-headers` per GPU node kernel); PyYAML wheel (all nodes) |
 | Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
@@ -1760,8 +1760,8 @@ These variables are set automatically by the air-gap staging step. Set them manu
 |---|---|---|
 | `PROMETHEUS_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/kube-prometheus-stack-<ver>.tgz` |
 | `OTEL_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/opentelemetry-operator-<ver>.tgz` |
-| `KUBERAY_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/kuberay-operator-1.2.2.tgz` |
-| `METALLB_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/metallb-0.14.8.tgz` |
+| `KUBERAY_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/kuberay-operator-1.2.2.tgz` <!-- ver:K0S_KUBERAY_CHART_VERSION --> |
+| `METALLB_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/metallb-0.14.8.tgz` <!-- ver:K0S_METALLB_CHART_VERSION --> |
 
 **GPU Node OS Package URLs:**
 
@@ -1783,10 +1783,10 @@ These variables are set automatically by the air-gap staging step. Set them manu
 
 ```bash
 # Use an internal Helm chart mirror for metallb only
-export METALLB_CHART_PATH="/shared/charts/metallb-0.14.8.tgz"
+export METALLB_CHART_PATH="/shared/charts/metallb-0.14.8.tgz"  # ver:K0S_METALLB_CHART_VERSION
 
 # Use an internal mirror for NVIDIA device plugin manifest only
-export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="https://manifests.internal/nvidia-device-plugin-v0.17.3.yml"
+export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="https://manifests.internal/nvidia-device-plugin-v0.17.3.yml"  # ver:K0S_NVIDIA_DEVICE_PLUGIN_VERSION
 
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
 ```
@@ -2250,7 +2250,7 @@ If `yq` is not installed or cannot parse the selected artifact profile, the down
 ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
 ```
 
-Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
+Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq` <!-- ver:YQ_VERSION -->
 
 #### Re-stage a single model without restarting from scratch
 
@@ -2426,15 +2426,15 @@ The script downloads various binaries, manifests, Helm charts, OS packages, and 
 | What | URL / Source |
 |------|-------------|
 | Public IP detection | `https://checkip.amazonaws.com`, `https://ipinfo.io/ip`, `https://api.ipify.org` |
-| cert-manager manifest | `https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml` |
+| cert-manager manifest | `https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml` <!-- ver:K0S_CERT_MANAGER_VERSION --> |
 | NVIDIA k8s device plugin | `https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/<version>/deployments/static/nvidia-device-plugin.yml` |
-| local-path-provisioner | `https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml` |
+| local-path-provisioner | `https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml` <!-- ver:K0S_LOCAL_PATH_PROVISIONER_VERSION --> |
 | Prometheus Helm repo | `https://prometheus-community.github.io/helm-charts` |
 | kube-prometheus-stack chart | `prometheus-community/kube-prometheus-stack` (via `helm install`) |
 | OpenTelemetry Helm repo | `https://open-telemetry.github.io/opentelemetry-helm-charts` |
 | OpenTelemetry Operator chart | `open-telemetry/opentelemetry-operator` (via `helm install`) |
 | KubeRay Helm repo | `https://ray-project.github.io/kuberay-helm/` |
-| KubeRay Operator chart | `kuberay/kuberay-operator` version `1.2.2` (via `helm install`) |
+| KubeRay Operator chart | `kuberay/kuberay-operator` version `1.2.2` <!-- ver:K0S_KUBERAY_CHART_VERSION --> (via `helm install`) |
 
 ### Downloads on All Nodes via SSH
 
@@ -2469,7 +2469,7 @@ These images are pulled from registries when pods are scheduled. Pre-pull for ai
 | Splunk Enterprise | ECR or configured registry |
 | Splunk Operator | `docker.io/splunk/splunk-operator:3.0.0` |
 | Prometheus, Grafana, Alertmanager | Pulled by kube-prometheus-stack Helm chart |
-| KubeRay Operator | `quay.io/kuberay/operator:v1.2.2` |
+| KubeRay Operator | `quay.io/kuberay/operator:v1.2.2` <!-- ver:K0S_KUBERAY_CHART_VERSION --> |
 | OpenTelemetry Operator | Pulled by opentelemetry-operator Helm chart |
 | cert-manager (controller, webhook, cainjector) | Pulled by cert-manager manifest |
 | NVIDIA device plugin | Pulled by DaemonSet manifest |
