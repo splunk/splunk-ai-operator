@@ -711,6 +711,57 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	assert.Equal(t, int32(8088), container.Ports[0].ContainerPort)
 }
 
+func Test_reconcileSAIAv2Workloads_RollWhenSplunkIssuersChange(t *testing.T) {
+	testCases := []struct {
+		name           string
+		deploymentName string
+		reconcile      func(*SaiaReconciler, context.Context, *aiv1.AIService) error
+	}{
+		{
+			name:           "v2 API",
+			deploymentName: "test-saia-v2-deployment",
+			reconcile:      (*SaiaReconciler).reconcileSAIAv2Deployment,
+		},
+		{
+			name:           "v2 worker",
+			deploymentName: "test-saia-v2-worker",
+			reconcile:      (*SaiaReconciler).reconcileSAIAv2Worker,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := buildFullTestScheme(t)
+			ai := newTestAIService()
+			ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://first.splunk:8089"}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+			r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+			require.NoError(t, testCase.reconcile(r, context.Background(), ai))
+
+			deployment := &appsv1.Deployment{}
+			deploymentKey := types.NamespacedName{Name: testCase.deploymentName, Namespace: ai.Namespace}
+			require.NoError(t, fakeClient.Get(context.Background(), deploymentKey, deployment))
+
+			initialHash := fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
+			assert.Equal(t, initialHash,
+				deployment.Spec.Template.Annotations[splunkIssuersHashAnnotation],
+				"initial pod template must snapshot the configured SPLUNK_ISSUERS")
+
+			ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://second.splunk:8089"}
+			require.NoError(t, testCase.reconcile(r, context.Background(), ai))
+			require.NoError(t, fakeClient.Get(context.Background(), deploymentKey, deployment))
+
+			updatedHash := fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
+			assert.NotEqual(t, initialHash, updatedHash)
+			assert.Equal(t, updatedHash,
+				deployment.Spec.Template.Annotations[splunkIssuersHashAnnotation],
+				"issuer changes must alter the pod template and trigger a rollout")
+		})
+	}
+}
+
 func Test_reconcileNginxConfigMap(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()

@@ -42,6 +42,8 @@ type SaiaReconciler struct {
 const (
 	saiaQueueEnvName = "S3_QUEUE_ENABLED"
 
+	splunkIssuersHashAnnotation = "splunk-ai-operator/splunk-issuers-hash"
+
 	// Bump this value whenever the queue-related environment contract changes.
 	// The annotation forces existing SAIA pods to restart after legacy values
 	// are removed from the shared ConfigMap-backed EnvFrom source.
@@ -357,6 +359,15 @@ func buildSplunkIssuersVal(ai *aiv1.AIService) string {
 	}
 	issuers = append(issuers, sc.TrustedIssuers...)
 	return strings.Join(issuers, ",")
+}
+
+// addSplunkIssuersHash annotates a pod template with the desired issuer set.
+// SPLUNK_ISSUERS is consumed through EnvFrom, so changing the ConfigMap alone
+// does not restart existing pods. Including the spec-derived value in the pod
+// template ensures an issuer change creates a new ReplicaSet.
+func addSplunkIssuersHash(ai *aiv1.AIService, annotations map[string]string) {
+	issuersVal := buildSplunkIssuersVal(ai)
+	annotations[splunkIssuersHashAnnotation] = fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 }
 
 // reconcileSAIAConfigMap manages the SAIA config ConfigMap for SPLUNK_ISSUERS.
@@ -1196,6 +1207,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	component := ai.Name + "-v2-api"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	addSplunkIssuersHash(ai, annotations)
 	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	deployment := &appsv1.Deployment{
@@ -1328,6 +1340,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 
 	component := ai.Name + "-v2-worker"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	addSplunkIssuersHash(ai, annotations)
 	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	deployment := &appsv1.Deployment{
