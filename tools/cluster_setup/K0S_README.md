@@ -1978,11 +1978,16 @@ Placeholders used below — replace with your own values:
 | `<saia-nodeport-addr>` | `<worker-node-ip>:<nodePort>` from [Onboarding to the AI Tier, Step 1](#onboarding-to-the-ai-tier) |
 | `<tenant-id>` | Your SAIA tenant ID |
 
-1. On the installer machine, start the port-forward and leave it running:
+1. On the installer machine, start the port-forward and leave it running.
+   Reuse the `NAMESPACE`/`STANDALONE_NAME` from your cluster config if they
+   differ from the defaults shown here:
 
    ```bash
-   kubectl --kubeconfig <kubeconfig-path> -n ai-platform port-forward \
-     svc/splunk-splunk-standalone-standalone-service 18002:8000 \
+   NAMESPACE=ai-platform
+   STANDALONE_NAME=splunk-standalone
+   SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+   kubectl --kubeconfig <kubeconfig-path> -n "${NAMESPACE}" port-forward \
+     "svc/${SPLUNK_SERVICE}" 18002:8000 \
      --address=127.0.0.1
    ```
 
@@ -2017,9 +2022,19 @@ Placeholders used below — replace with your own values:
 4. Launch an isolated Chrome profile routed through the SOCKS proxy, with
    `localhost` traffic (Splunk Web) kept direct:
 
+   macOS:
+
    ```bash
    open -na "Google Chrome" --args \
      --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+   Linux (Ubuntu/RHEL admin workstation):
+
+   ```bash
+   google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
      --proxy-server=socks5://127.0.0.1:1080 \
      --proxy-bypass-list="localhost;127.0.0.1"
    ```
