@@ -107,7 +107,7 @@ images:
 operators:
   ray:
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.53.0"
+    rayVersion: "2.56.0 "
   nvidia:
     devicePluginVersion: "v0.17.3"
 
@@ -125,8 +125,7 @@ splunk:
   enabled: true
 
 aiPlatform:
-  # Supported values in the current installer: L40S, H100, and
-  # RTX_PRO_6000_BLACKWELL.
+  # Supported values in the current installer: L40S, H100
   defaultAcceleratorType: "L40S"
 
   # NodePort exposes the SAIA and Slim public services without MetalLB. The two
