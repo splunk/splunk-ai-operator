@@ -7,11 +7,10 @@
 # internet access.
 #
 # Quick start (run from tools/cluster_setup):
-#   1. cp k0s-airgapped-config.yaml k0s-config.local.yaml
-#   2. Replace every value marked CHANGE THIS in the local copy.
-#   3. Mirror every platform image below to the configured internal registry.
-#   4. CONFIG_FILE=./k0s-config.local.yaml ./k0s_cluster_with_stack.sh validate
-#   5. CONFIG_FILE=./k0s-config.local.yaml ./k0s_cluster_with_stack.sh install
+#   1. Replace every value marked CHANGE THIS in k0s-airgapped-config.yaml.
+#   2. Mirror every platform image below to the configured internal registry.
+#   3. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh validate
+#   4. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
 #
 # See the Air-Gapped Deployment section in K0S_README.md for staging options,
 # installer-host requirements, and the separate model-artifact workflow.
@@ -24,8 +23,7 @@ cluster:
   sshKeyPath: "/path/to/private/key" # CHANGE THIS; path on the installer host
 
 # The first cpuWorkers entries in existingIPs.workers are CPU workers; all
-# remaining entries are GPU workers. gpuWorkers must be 0 when no GPU workers
-# are configured because it controls NVIDIA setup.
+# remaining entries are GPU workers.
 nodes:
   cpuWorkers: 1
   gpuWorkers: 2
@@ -51,7 +49,7 @@ storage:
   # Interactive installs ask whether to stage models and use the answer instead
   # of this value. Silent installs use this value directly. In air-gap mode,
   # false requires all model artifacts to be present in the object store before
-  # installation; the installer verifies their staging markers.
+  # installation; 
   modelStaging:
     enabled: false
 
@@ -59,13 +57,13 @@ storage:
   # must be reachable by the installer host and the deployed workloads.
   objectStore:
     type: "minio"
-    bucket: "ai-platform-bucket" # CHANGE THIS
+    bucket: "ai-platform-bucket"                     # CHANGE THIS
     endpoint: "http://object-store.example.com:9000" # CHANGE THIS
     auth:
-      # Replace these placeholders only in the local copy. Do not commit real
-      # object-store credentials.
-      rootUser: "<paste-object-store-access-key-here>" # CHANGE THIS
-      rootPassword: "<paste-object-store-secret-key-here>" # CHANGE THIS
+      # Replace these placeholders before installing. Do not commit real
+      # object-store credentials to Git.
+      rootUser: "<paste-object-store-access-key-here>"          # CHANGE THIS
+      rootPassword: "<paste-object-store-secret-key-here>"      # CHANGE THIS
 
 # Platform images are not included in the staged k0s/add-on image bundles. Each
 # relative image path below is prefixed with images.registry by the installer,
