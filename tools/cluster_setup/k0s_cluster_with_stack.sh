@@ -501,7 +501,7 @@ ensure_yq() {
   local os arch url
   local -a _yq_fetch
   # Pinned version — matches download_from_huggingface.sh; update both together.
-  local YQ_VERSION="v4.44.1"
+  local YQ_VERSION="v4.44.1"  # ver:YQ_VERSION
   os="$(uname -s)"
   arch="$(uname -m)"
   case "${arch}" in
@@ -2606,7 +2606,7 @@ PYSCRIPT"
   # host), not the controller. So in air-gap mode we stream the manifest's bytes
   # from M2 into the controller's kubectl over ssh stdin (`apply -f -`).
   log "Installing local-path storage provisioner..."
-  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}"
+  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}"  # ver:K0S_LOCAL_PATH_PROVISIONER_VERSION
   if [[ "${_lp_url}" == file://* ]]; then
     ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f -" < "${_lp_url#file://}"
   else

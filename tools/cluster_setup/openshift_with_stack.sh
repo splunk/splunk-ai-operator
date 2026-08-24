@@ -1446,7 +1446,7 @@ install_local_path_provisioner() {
   fi
 
   log "Installing local-path-provisioner..."
-  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
+  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"  # ver:OPENSHIFT_LOCAL_PATH_PROVISIONER_VERSION
   [[ "${_lp_url}" == file://* ]] && _lp_url="${_lp_url#file://}"
   oc apply -f "${_lp_url}"
 
@@ -2931,8 +2931,7 @@ main_delete() {
 
   # ── 8. local-path-provisioner ──
   log "Removing local-path-provisioner..."
-  oc delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml \
-    --ignore-not-found=true 2>/dev/null || true
+  oc delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml --ignore-not-found=true 2>/dev/null || true  # ver:OPENSHIFT_LOCAL_PATH_PROVISIONER_VERSION
   force_delete_namespace local-path-storage 60
   oc delete storageclass local-path --ignore-not-found=true 2>/dev/null || true
 

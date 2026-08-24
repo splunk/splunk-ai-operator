@@ -20,10 +20,11 @@
 
 set -euo pipefail
 
-# ── Versions (keep in sync with openshift_with_stack.sh) ────────────────────
-CERT_MANAGER_VERSION="v1.13.0"
-LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
-KUBERAY_CHART_VERSION="1.2.2"
+# ── Versions (keep in sync with openshift_with_stack.sh; source of truth:
+#    tools/cluster_setup/versions.env — run check_versions.sh after bumping) ─
+CERT_MANAGER_VERSION="v1.13.0"              # ver:OPENSHIFT_CERT_MANAGER_VERSION
+LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"    # ver:OPENSHIFT_LOCAL_PATH_PROVISIONER_VERSION
+KUBERAY_CHART_VERSION="1.2.2"               # ver:OPENSHIFT_KUBERAY_CHART_VERSION
 
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle-openshift}"
 
