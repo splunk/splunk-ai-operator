@@ -636,7 +636,6 @@ Blackwell deployments (all models are non-gated):
 | artifact-id | source |
 |---|---|
 | all-minilm-l6-v2 | sentence-transformers/all-MiniLM-L6-v2 |
-| bi-encoder | BAAI/bge-small-en-v1.5 |
 | cross-encoder | cross-encoder/ms-marco-MiniLM-L-6-v2 |
 | e5-language-classifier | Mike0307/multilingual-e5-language-detection |
 | fm_timeseries | cisco-ai/cisco-time-series-model-1.0 |

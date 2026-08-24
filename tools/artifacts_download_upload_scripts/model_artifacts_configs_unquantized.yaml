@@ -11,10 +11,6 @@ artifact-configs:
     hf-url: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
     is-a-gated-model: false
 
-  - artifact-id: bi-encoder
-    hf-url: https://huggingface.co/BAAI/bge-small-en-v1.5
-    is-a-gated-model: false
-
   - artifact-id: cross-encoder
     hf-url: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2
     is-a-gated-model: false

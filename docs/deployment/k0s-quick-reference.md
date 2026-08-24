@@ -39,7 +39,7 @@ standalone via `stage-artifacts`), it additionally needs:
 
 | Resource | Minimum | Why |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
 | CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
@@ -87,50 +87,60 @@ in the cluster config to those mirrored paths (required for both paths —
 air-gap additionally needs every node to resolve that registry with no outbound
 internet):
 
-The default Ray and SAIA images currently use the `preview` tag — set `TAG`
-to match whatever tag you're mirroring:
+The example below mirrors the SAIA, Ray, and SLIM release images with the common
+tag `v1.0`, and the Splunk AI Operator with `v2.8`. Set the corresponding image
+fields in the cluster config to the mirrored paths.
 
 With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
 
 ```bash
-TAG="preview"
+TAG="v1.0"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
   splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
+  splunk/ai-tier-ray-worker \
+  splunk/ai-tier-slim-service; do
   crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
 done
+
+crane copy \
+  "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
+  "<your-registry>/splunk/splunk-ai-operator:v2.8"
 ```
 
 With Docker instead:
 
 ```bash
-TAG="preview"
+TAG="v1.0"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
   splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
+  splunk/ai-tier-ray-worker \
+  splunk/ai-tier-slim-service; do
   docker pull "docker.io/${repo}:${TAG}"
   docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
   docker push "<your-registry>/${repo}:${TAG}"
 done
+
+docker pull "docker.io/kpratyush775/splunk-ai-operator:v2.8"
+docker tag "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
+  "<your-registry>/splunk/splunk-ai-operator:v2.8"
+docker push "<your-registry>/splunk/splunk-ai-operator:v2.8"
 ```
 
-After mirroring, replace the five fully qualified `images.ray.*` and
-`images.saia.*` values in the cluster config with the corresponding
-`<your-registry>/splunk/...:preview` paths. Mirror the Slim and operator images
-separately when those components are enabled, using the tags configured for
-your release. For the complete air-gap image list and the bulk `crane copy`
-alternative, see
+After mirroring, replace the fully qualified `images.ray.*`, `images.saia.*`,
+`images.slim.apiImage`, and `images.operator.image` values in the cluster
+config with the corresponding `<your-registry>/...` paths. For the complete
+air-gap image list and the bulk `crane copy` alternative, see
 [DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
 
-> `preview` is a mutable tag and the workloads use `imagePullPolicy:
-> IfNotPresent`. Use a new immutable tag or digest for controlled upgrades;
-> rerunning the installer with the same tag may keep the cached image.
+> Image tags can be mutable and the workloads use `imagePullPolicy:
+> IfNotPresent`. Use an immutable digest for controlled upgrades; rerunning the
+> installer with the same tag may keep the cached image.
 
 ---
 
@@ -169,7 +179,7 @@ node count (2 minimum) to get the cluster total.
 
 | Data | Minimum | Notes |
 |---|---|---|
-| Model weights | 250 GB | >120 GB for 11 models + re-staging headroom |
+| Model weights | 250 GB | >120 GB for 10 models + re-staging headroom |
 | Runtime data | 100 GB | Grows with usage |
 | **Total bucket** | **500 GB+** | Sufficient for now |
 
@@ -240,7 +250,7 @@ fully automatic, no manual steps needed. Full commands and details:
 
 ### Model Setup (Standard Path)
 
-Model weights (>120 GB, 11 models) must land in your object store before the
+Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
 - **Full (interactive) install** — the installer always prompts whether to
@@ -358,7 +368,7 @@ MinIO/SeaweedFS/S3) — can be the same machine that runs the installer:
 
 | Resource | Minimum | Why |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
 | CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |

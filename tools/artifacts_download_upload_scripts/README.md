@@ -345,7 +345,6 @@ The following artifacts are pre-configured and ready to download:
 - `gemma-4-31b-it-qat-w4a16-ct` - Quantized Gemma model for H100 and RTX Pro
 - `gpt-oss-20b` - Secondary LLM
 - `all-minilm-l6-v2` - Sentence transformer model
-- `bi-encoder` - BGE small encoder
 - `cross-encoder` - MS MARCO cross-encoder
 - `e5-language-classifier` - Multilingual language detection
 - `fm_timeseries` - Cisco Time Series Model (CTSM) forecaster
