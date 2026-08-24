@@ -123,6 +123,7 @@ files:
 # and a Splunk Standalone instance inside the cluster.
 splunk:
   enabled: true
+  standaloneName: "splunk-standalone"
 
 aiPlatform:
   # Supported values in the current installer: L40S, H100
