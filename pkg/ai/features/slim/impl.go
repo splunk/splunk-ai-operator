@@ -184,10 +184,13 @@ func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.A
 	if ai.Spec.ServiceAccountName == "" {
 		cleanServiceTemplate(&ai.Spec.ServiceTemplate)
 
+		// Resolve the default name in memory only. Do not persist it back onto
+		// ai.Spec: AIPlatform's ReconcileFeatures rebuilds this AIService's spec
+		// from AIPlatform.Spec.Features[].ServiceAccountName on every reconcile,
+		// so persisting a generated name here just gets it wiped back to "" on
+		// the next AIPlatform pass, which re-triggers this branch — an
+		// unbounded generation-bump loop between the two controllers.
 		ai.Spec.ServiceAccountName = ai.Name + "-sa"
-		if err := r.Update(ctx, ai); err != nil {
-			return fmt.Errorf("updating SA name in spec: %w", err)
-		}
 		sa := &corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      ai.Spec.ServiceAccountName,

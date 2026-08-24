@@ -287,10 +287,11 @@ wait_for_dependency() {
 }
 
 # ====== NODE OS GATE ======
-# Supported: RHEL 9 and Ubuntu 24.04. All other OS families (RHEL 10,
-# Amazon Linux, other Ubuntu/Debian releases) stop the script with a clear
-# error. Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
-# continue at your own risk (useful for internal testing).
+# Supported: RHEL 9, RHEL 10 and Ubuntu 24.04 — air-gapped RHEL 10 also needs a
+# staged node package closure (see below). All other OS families (Amazon Linux,
+# other Ubuntu/Debian releases) stop the script with a clear error. Set
+# FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and continue at
+# your own risk (useful for internal testing).
 _check_node_os() {
   local node_ip="$1" role="${2:-node}"
   local os_id="" os_version_id="" os_pretty=""
@@ -302,22 +303,43 @@ _check_node_os() {
   os_pretty=$(ssh_exec "${node_ip}" \
     ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
 
-  # Supported: RHEL 9 and Ubuntu 24.04. Other family members kept for
-  # internal testing.
   if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
+  fi
+  # RHEL 10 proper only — the rebuilds are untested and the el10 path below
+  # installs from RHEL repos. Air-gapped el10 additionally needs the bundle to
+  # stage kernel-modules-extra, since a sealed node cannot fetch it itself.
+  local msg=""
+  if [[ "${os_id}" == "rhel" ]] && [[ "${os_version_id}" == "10" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" != "true" ]] \
+      || [[ -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]] \
+      || ssh_exec "${node_ip}" "sudo modinfo xt_conntrack >/dev/null 2>&1"; then
+      log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+      return 0
+    fi
+    msg="RHEL 10 needs an offline package closure for air-gapped installs on ${role} ${node_ip}: ${os_pretty}
+  el10 keeps xt_conntrack (which kube-proxy and Calico require) in
+  kernel-modules-extra rather than the base kernel package, and a sealed node
+  cannot fetch it, so it would come up NotReady. This node does not have the
+  module, and AIRGAP_NODE_RPM_CLOSURE_DIR is unset or missing, meaning the bundle
+  staged no such closure.
+  Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters, re-build the bundle with a
+  node package closure, or set:
+    FORCE_UNSUPPORTED_OS=1"
   fi
   if [[ "${os_id}" == "ubuntu" ]] && [[ "${os_version_id}" == "24" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
   fi
 
-  local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
-  Only RHEL 9 and Ubuntu 24.04 are tested and supported. Installation on
-  other OS versions is not validated and may fail in unexpected ways.
+  if [[ -z "${msg}" ]]; then
+    msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
+  Only RHEL 9, RHEL 10 and Ubuntu 24.04 are tested and supported. Installation
+  on other OS versions is not validated and may fail in unexpected ways.
   To skip this check and continue at your own risk, set:
     FORCE_UNSUPPORTED_OS=1"
+  fi
 
   if [[ "${FORCE_UNSUPPORTED_OS:-0}" == "1" ]]; then
     warn "${msg}"
@@ -1888,9 +1910,26 @@ prepare_nodes_for_k0s() {
         || warn "    Failed to copy PyYAML to ${node_ip} — k0s config generation may fail"
     fi
 
+    # Netfilter modules for kernels that omit them (el10 keeps xt_conntrack in
+    # kernel-modules-extra). Copied to a fixed path because the closure path does
+    # not cross into the heredoc below. Absent on RHEL 9 / Ubuntu bundles.
+    if [[ "${AIRGAP_MODE}" == "true" && -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]]; then
+      local _nc_tar="/tmp/node-closure-$$-${node_ip//[^0-9]/_}.tar"
+      if tar -cf "${_nc_tar}" -C "$(dirname "${AIRGAP_NODE_RPM_CLOSURE_DIR}")" \
+           "$(basename "${AIRGAP_NODE_RPM_CLOSURE_DIR}")"; then
+        log "    Copying node package closure to ${node_ip}:/tmp/node-closure.tar ..."
+        scp_file "${_nc_tar}" "${node_ip}" "/tmp/node-closure.tar" \
+          || warn "    Failed to copy the node package closure to ${node_ip} — node prep may fail"
+      else
+        warn "    Failed to pack ${AIRGAP_NODE_RPM_CLOSURE_DIR} — node prep may fail"
+      fi
+      rm -f "${_nc_tar}"
+    fi
+
+    local _prep_rc=0
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
-      bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
+      bash -s <<'REMOTE_SCRIPT' || _prep_rc=$?
       # Disable host firewalls if active (they block k0s ports: 6443, 10250,
       # 8472, 179, etc.). Each family ships a different one, and on-prem images
       # differ from cloud images: AWS Ubuntu AMIs leave ufw inactive, but a
@@ -1908,6 +1947,45 @@ prepare_nodes_for_k0s() {
       if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
         echo 'Disabling ufw (via CLI)...'
         sudo ufw --force disable || true
+      fi
+
+      # RHEL 10 ships the netfilter modules kube-proxy and Calico need (xt_conntrack
+      # et al) in kernel-modules-extra, not the base kernel package, and the stock
+      # AMI omits it. Without them the iptables proxier programs no rules, so every
+      # ClusterIP is unreachable and nodes stay NotReady. Probing the module rather
+      # than the OS version leaves RHEL 9 and Ubuntu 24.04 untouched.
+      # Via sudo so the probe cannot false-negative on a login shell whose PATH
+      # omits /usr/sbin, which would wrongly fail an otherwise fine RHEL 9 node.
+      if ! sudo modinfo xt_conntrack >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
+        echo "xt_conntrack missing — installing kernel-modules-extra-$(uname -r)..."
+        # Pinned to the running kernel, with no fall back to the repo's current
+        # version: modules for a different kernel land in a /lib/modules directory
+        # modprobe never searches, so that "success" would leave the node broken.
+        if [ -f /tmp/node-closure.tar ]; then
+          # --disablerepo='*' keeps the node offline and stops dnf spending
+          # minutes timing out against RHUI mirrors it cannot reach.
+          echo "  installing from the air-gap node package closure"
+          sudo rm -rf /opt/airgap-node-rpms
+          sudo mkdir -p /opt/airgap-node-rpms
+          sudo tar -xf /tmp/node-closure.tar -C /opt/airgap-node-rpms --strip-components=1
+          rm -f /tmp/node-closure.tar
+          sudo dnf install -y \
+            --disablerepo='*' \
+            --repofrompath="airgap-node,/opt/airgap-node-rpms" \
+            --setopt=airgap-node.gpgcheck=0 \
+            "kernel-modules-extra-$(uname -r)" || true
+        else
+          sudo dnf install -y "kernel-modules-extra-$(uname -r)" || true
+        fi
+        if ! sudo modinfo xt_conntrack >/dev/null 2>&1; then
+          echo "ERROR: xt_conntrack still unavailable for kernel $(uname -r)."
+          echo "  kube-proxy cannot program iptables rules, so this node would stay NotReady."
+          echo "  Install kernel-modules-extra-$(uname -r), or boot a kernel that has a"
+          echo "  matching package in your repos, then re-run the installer."
+          # 78 tells the caller this node can never join, as opposed to the
+          # best-effort steps elsewhere in this script that only warn.
+          exit 78
+        fi
       fi
 
       # Load kernel modules required by Calico and kube-proxy
@@ -1974,6 +2052,11 @@ prepare_nodes_for_k0s() {
         sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s
       fi
 REMOTE_SCRIPT
+    if [[ ${_prep_rc} -eq 78 ]]; then
+      err "Node preparation failed on ${node_ip}: the netfilter kernel modules kube-proxy requires are unavailable (details above)."
+    elif [[ ${_prep_rc} -ne 0 ]]; then
+      warn "  Preparation had issues on ${node_ip}"
+    fi
   done
 }
 
@@ -2564,15 +2647,59 @@ PYSCRIPT"
 }
 
 # ====== RESOLVE NODE NAME ======
-# Maps a config IP to its Kubernetes node name by SSHing to the node
-# and reading its hostname (which is what k0s uses as the node name).
-# Usage: node_name=$(resolve_node_name "1.2.3.4")
+# Maps a config IP to its Kubernetes node name. Prefer the name already
+# registered in the API for that InternalIP; otherwise try the node's full and
+# short hostnames, accepting only a candidate that exists in the API server.
+# Optionally retry for up to timeout_seconds while the Node object registers.
+# Usage: node_name=$(resolve_node_name "1.2.3.4" [timeout_seconds])
 resolve_node_name() {
   local ip="$1"
-  # SSH to the node and get the hostname that k0s registered it with
-  local node_name
-  node_name=$(ssh_exec "${ip}" "hostname -s 2>/dev/null || hostname" 2>/dev/null || echo "")
-  echo "${node_name}"
+  local timeout="${2:-0}"
+  local node_name full_name short_name candidate
+  local elapsed=0
+
+  while :; do
+    node_name=$(kubectl get nodes -o json 2>/dev/null \
+      | jq -r --arg ip "${ip}" '
+          first(
+            .items[]
+            | select(any(.status.addresses[]?;
+                .type == "InternalIP" and .address == $ip))
+            | .metadata.name
+          ) // empty
+        ' 2>/dev/null \
+      || true)
+    if [[ -n "${node_name}" ]]; then
+      echo "${node_name}"
+      return 0
+    fi
+
+    # Cache successful SSH lookups, but retry either lookup if SSH was not ready
+    # when this function first ran.
+    [[ -n "${full_name:-}" ]] \
+      || full_name=$(ssh_exec "${ip}" "hostname -f" 2>/dev/null || true)
+    [[ -n "${short_name:-}" ]] \
+      || short_name=$(ssh_exec "${ip}" "hostname -s" 2>/dev/null || true)
+
+    # Some environments register the FQDN (notably EC2 private DNS names),
+    # while others register the short hostname. Never return a
+    # guessed/truncated name: verify each candidate against the API first.
+    for candidate in "${full_name:-}" "${short_name:-}"; do
+      [[ -z "${candidate}" ]] && continue
+      if kubectl get node "${candidate}" >/dev/null 2>&1; then
+        echo "${candidate}"
+        return 0
+      fi
+    done
+
+    if (( elapsed >= timeout )); then
+      break
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  return 1
 }
 
 # ====== LABEL NODES FOR WORKLOAD SCHEDULING ======
@@ -2613,23 +2740,18 @@ label_nodes() {
     fi
   done
 
-  # Helper: wait up to 60s for a given node name to appear in the API server.
+  # Helper: wait up to 60s for a config IP to resolve to a visible Node.
   # This guards against the race where a worker joined the cluster just after
   # the top-of-function readiness check returned but its Node object is still
   # propagating to the API server we're talking to.
   _wait_for_node_visible() {
-    local node_name="$1"
-    local ip="$2"
-    local tries=0
-    local max_tries=12  # 12 * 5s = 60s
-    while (( tries < max_tries )); do
-      if kubectl get node "${node_name}" &>/dev/null; then
-        return 0
-      fi
-      sleep 5
-      tries=$((tries + 1))
-    done
-    warn "  Node '${node_name}' (from ${ip}) did not become visible in API server after 60s"
+    local ip="$1"
+    local node_name
+    if node_name=$(resolve_node_name "${ip}" 60); then
+      echo "${node_name}"
+      return 0
+    fi
+    warn "  Node from ${ip} did not become visible in API server after 60s"
     return 1
   }
 
@@ -2639,16 +2761,9 @@ label_nodes() {
   # Label controller nodes
   for controller_ip in "${CONTROLLER_IPS[@]}"; do
     local node_name
-    node_name=$(resolve_node_name "${controller_ip}")
-
-    if [[ -z "${node_name}" ]]; then
-      warn "  Could not resolve hostname for controller ${controller_ip}, skipping..."
-      labeling_failures+=("${controller_ip} (hostname unresolved)")
-      continue
-    fi
-
-    if ! _wait_for_node_visible "${node_name}" "${controller_ip}"; then
-      labeling_failures+=("${controller_ip} / ${node_name} (never visible)")
+    if ! node_name=$(_wait_for_node_visible "${controller_ip}"); then
+      warn "  Could not resolve Kubernetes node for controller ${controller_ip}, skipping..."
+      labeling_failures+=("${controller_ip} (never visible)")
       continue
     fi
 
@@ -2675,17 +2790,9 @@ label_nodes() {
   local worker_index=0
   for worker_ip in "${WORKER_IPS[@]}"; do
     local node_name
-    node_name=$(resolve_node_name "${worker_ip}")
-
-    if [[ -z "${node_name}" ]]; then
-      warn "  Could not resolve hostname for worker ${worker_ip}, skipping..."
-      labeling_failures+=("${worker_ip} (hostname unresolved)")
-      worker_index=$((worker_index + 1))
-      continue
-    fi
-
-    if ! _wait_for_node_visible "${node_name}" "${worker_ip}"; then
-      labeling_failures+=("${worker_ip} / ${node_name} (never visible)")
+    if ! node_name=$(_wait_for_node_visible "${worker_ip}"); then
+      warn "  Could not resolve Kubernetes node for worker ${worker_ip}, skipping..."
+      labeling_failures+=("${worker_ip} (never visible)")
       worker_index=$((worker_index + 1))
       continue
     fi
@@ -2737,8 +2844,7 @@ label_nodes() {
     done
     for ip in "${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}"; do
       local nn
-      nn=$(resolve_node_name "${ip}")
-      [[ -z "${nn}" ]] && continue
+      nn=$(resolve_node_name "${ip}") || continue
       if echo "${unlabeled}" | grep -qx "${nn}"; then
         # Best-effort: apply CPU labels to the controller, CPU labels to
         # any worker whose index is < CPU_WORKER_COUNT, else GPU labels.
@@ -4512,11 +4618,14 @@ install_nvidia_host_drivers() {
   while [[ ${gpu_wait_elapsed} -lt ${gpu_wait_timeout} ]]; do
     all_gpu_ready=true
     for gpu_ip in "${gpu_ips[@]}"; do
-      # Resolve GPU node name via SSH hostname lookup
+      # Resolve GPU node name via InternalIP or an API-validated hostname.
       local gpu_node
-      gpu_node=$(resolve_node_name "${gpu_ip}")
+      if ! gpu_node=$(resolve_node_name "${gpu_ip}"); then
+        all_gpu_ready=false
+        break
+      fi
 
-      if [[ -z "${gpu_node}" ]] || ! kubectl get node "${gpu_node}" &>/dev/null; then
+      if ! kubectl get node "${gpu_node}" &>/dev/null; then
         all_gpu_ready=false
         break
       fi
@@ -7346,14 +7455,16 @@ _check_workload_readiness() {
   done <<<"${_wl_rows}"
 
   # ---- KubeRay: RayServices ---------------------------------------------------
-  # A RayService is Ready when its 'Ready' condition is True. KubeRay also
-  # reports 'numServeEndpoints' once the serve apps are reachable.
+  # Prefer the Kubernetes-style Ready condition when KubeRay exposes it. Older
+  # KubeRay versions (including v1.2.2) expose only serviceStatus=Running.
+  # KubeRay also reports 'numServeEndpoints' once the serve apps are reachable.
   _wl_query_crd rayservices.ray.io rayservices '
       .items[]
       | [
           .metadata.namespace,
           .metadata.name,
           ([(.status.conditions // [])[] | select(.type=="Ready") | .status] | first // ""),
+          (.status.serviceStatus // ""),
           ([(.status.conditions // [])[] | select(.type=="UpgradeInProgress") | .status] | first // ""),
           (.status.numServeEndpoints // 0 | tostring)
         ]
@@ -7361,10 +7472,17 @@ _check_workload_readiness() {
     '
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
-    local rs_ns rs_name rs_ready rs_upgrading rs_endpoints
-    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_upgrading rs_endpoints <<<"${line}"
-    if [[ "${rs_ready}" != "True" ]]; then
+    local rs_ns rs_name rs_ready rs_service_status rs_upgrading rs_endpoints
+    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_service_status rs_upgrading rs_endpoints <<<"${line}"
+    local rs_is_ready=0
+    if [[ -n "${rs_ready}" ]]; then
+      [[ "${rs_ready}" == "True" ]] && rs_is_ready=1
+    elif [[ "${rs_service_status}" == "Running" ]]; then
+      rs_is_ready=1
+    fi
+    if (( rs_is_ready == 0 )); then
       local why="RayService ${rs_ns}/${rs_name}: Ready=${rs_ready:-Unknown}"
+      why+=" serviceStatus=${rs_service_status:-Unknown}"
       [[ "${rs_upgrading}" == "True" ]] && why+=" (upgrade in progress)"
       why+=" serveEndpoints=${rs_endpoints}"
       missing+=("${why}")
@@ -8619,9 +8737,9 @@ join_workers() {
   cluster_nodes_json=$(kubectl get nodes -o json 2>/dev/null || echo '{"items":[]}')
 
   for worker_ip in "${WORKER_IPS[@]}"; do
-    # Resolve the Kubernetes node name by SSHing to the worker and getting its hostname
+    # Resolve the Kubernetes node name by InternalIP or a validated hostname.
     local node_exists=""
-    node_exists=$(resolve_node_name "${worker_ip}")
+    node_exists=$(resolve_node_name "${worker_ip}") || node_exists=""
 
     # Verify this node actually exists in the cluster
     if [[ -n "${node_exists}" ]]; then

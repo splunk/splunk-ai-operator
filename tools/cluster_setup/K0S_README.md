@@ -97,13 +97,32 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ```bash
 # Install required tools on macOS
-brew install kubectl helm git jq yq
+brew install kubectl helm git jq yq crane
 
 # Install required tools on Ubuntu/Debian
+# git and jq are in the default apt repos; kubectl and helm are not — add their
+# upstream repos/install scripts, and yq/crane need sudo to write to /usr/local/bin
 sudo apt-get update
-sudo apt-get install -y kubectl helm git jq
-wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-chmod +x /usr/local/bin/yq
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
+
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubectl
+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
+sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below (see Step 2 — Mirror
+# Container Images); no Docker daemon/root/group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
 
 # Verify installations
 kubectl version --client
@@ -111,7 +130,56 @@ helm version
 git --version
 jq --version
 yq --version
+crane version
 ```
+
+**RHEL 9** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
+default `dnf` repos; `git` and `jq` are. Install each via its own supported
+method (standalone binary, install script, or vendor repo, per each tool's
+docs) rather than a single `dnf install`:
+
+```bash
+sudo dnf install -y git jq
+
+# kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
+# see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+# helm — install script (https://helm.sh/docs/intro/install/)
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# yq — binary release, pinned to match the version this repo already relies on
+# (k0s_cluster_with_stack.sh, airgap_install.sh) — https://github.com/mikefarah/yq#install
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below (see Step 2 — Mirror
+# Container Images); no Docker daemon/root/group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
+
+# docker (optional, only needed if you prefer `docker pull`/`tag`/`push` over
+# `crane copy` for the image-mirroring commands below) — Docker CE repo for
+# RHEL (https://docs.docker.com/engine/install/rhel/)
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out/in (or `newgrp docker`) for group change to take effect
+
+# Verify installations
+kubectl version --client && helm version && git --version && jq --version && yq --version && crane version
+```
+
+The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images))
+default to `crane copy`, which works on both Ubuntu and RHEL 9 with no
+Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
+there too as an equivalent alternative if you already run Docker.
 
 ### Hardware Requirements
 
@@ -159,9 +227,17 @@ You must provide an external S3-compatible object storage endpoint:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/splunk/splunk-ai-operator.git
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 ### 2. Create Configuration File
 
@@ -207,7 +283,7 @@ The `k0s-cluster-config.yaml` file controls all aspects of the deployment:
 cluster:           # Cluster name, useExisting, SSH user/key, optional API external address
 nodes:             # Controller/worker counts and existingIPs
 storage:           # storageClass, vectorDbSize, objectStore, minimumDiskSpace
-images:            # registry prefix, operator, splunk, ray, weaviate, saia, nginx, fluentBit, otelCollector
+images:            # registry prefix, operator, splunk, ray, weaviate, saia, slim, nginx, fluentBit, otelCollector
 operators:         # ray (version/modelVersion/rayVersion), certManager, nvidia devicePluginVersion
 kubernetes:        # namespace
 files:             # splunkOperator, aiPlatform manifest paths
@@ -261,19 +337,21 @@ storage:
 images:
   registry: "registry.corp.com"
   operator:
-    image: "registry.corp.com/splunk/splunk-ai-operator:v0.1.5"
+    image: "registry.corp.com/splunk/splunk-ai-operator:v2.8"
   splunk:
     image: "registry.corp.com/splunk/splunk:latest"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   ray:
-    headImage: "registry.corp.com/ray/ray-head:build-v1alpha1"
-    workerImage: "registry.corp.com/ray/ray-worker-gpu:build-v1alpha1"
+    headImage: "registry.corp.com/splunk/ai-tier-ray-head:v0.2"
+    workerImage: "registry.corp.com/splunk/ai-tier-ray-worker:v0.2"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28"
   saia:
     apiImage: "registry.corp.com/saia/saia-api:build-v1alpha1"
     apiV2Image: "registry.corp.com/saia/saia-api-v2:build-v1alpha1"
     dataLoaderImage: "registry.corp.com/saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "registry.corp.com/splunk/ai-tier-slim-service:v1.0"
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
   fluentBit:
@@ -285,7 +363,7 @@ operators:
   ray:
     version: "v1.2.2"
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.44.0"
+    rayVersion: "2.56.0"
   certManager:
     installCRDs: true
   nvidia:
@@ -429,7 +507,7 @@ unchanged. For a private registry or air-gapped installation, mirror the images
 and replace the corresponding fields with the mirrored paths; setting only
 `images.registry` does not rewrite a fully qualified Docker Hub reference.
 
-> The `preview` defaults are mutable and workloads use `imagePullPolicy:
+> The SAIA `preview` defaults are mutable and workloads use `imagePullPolicy:
 > IfNotPresent`. Re-running the installer with the same tag may reuse a cached
 > image; use a new immutable tag or digest when performing a controlled upgrade.
 
@@ -437,15 +515,16 @@ and replace the corresponding fields with the mirrored paths; setting only
 |-------|----------|---------|-------------|
 | `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
 | `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
-| `images.operator.image` | **Yes** | — | Splunk AI Operator image |
+| `images.operator.image` | **Yes** | `docker.io/kpratyush775/splunk-ai-operator:v2.8` | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:preview` | Ray head node image |
-| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:preview` | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:v0.2` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:v0.2` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
 | `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
 | `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
 | `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:preview` | SAIA data loader / post-install hook image |
+| `images.slim.apiImage` | No | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API image (required when the `slim` feature is enabled) |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -474,6 +553,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `images.saia.apiImage` | `RELATED_IMAGE_SAIA_API` | `artifacts.yaml` |
 | `images.saia.apiV2Image` | `RELATED_IMAGE_SAIA_API_V2` | `artifacts.yaml` |
 | `images.saia.dataLoaderImage` | `RELATED_IMAGE_POST_INSTALL_HOOK` | `artifacts.yaml` |
+| `images.slim.apiImage` | `RELATED_IMAGE_SLIM_API` | `artifacts.yaml` |
 | `images.nginx.image` | `RELATED_IMAGE_NGINX` | `artifacts.yaml` |
 | `images.fluentBit.image` | `RELATED_IMAGE_FLUENT_BIT` | `artifacts.yaml` |
 | `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
@@ -678,7 +758,6 @@ The `install` command executes these steps in order:
    | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 and RTX Pro |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
-   | `bi-encoder` | BGE small encoder |
    | `cross-encoder` | MS MARCO cross-encoder |
    | `e5-language-classifier` | Multilingual language detection |
    | `fm_timeseries` | Cisco Time Series Model (CTSM) forecaster |
@@ -691,7 +770,7 @@ The `install` command executes these steps in order:
 
    | Resource | Minimum | Notes |
    |---|---|---|
-   | Disk (free) | 250 GB | >120 GB for 11 model artifacts + buffer for download staging and upload temp files |
+   | Disk (free) | 250 GB | >120 GB for 10 model artifacts + buffer for download staging and upload temp files |
    | RAM | 16 GB | Needed to stream large files without swapping |
    | Internet | Stable broadband | Downloads >120 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
    | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -711,7 +790,7 @@ The `install` command executes these steps in order:
    Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the selected artifact profile and verifies that each model's `staging_state/<id>/.staging_complete` marker contains the expected `hf_url`. If every marker matches, it exits immediately without downloading or uploading. Otherwise, it lists the artifacts that need staging:
 
    ```
-   [LOG] Model staging needed: 1/11 model(s) not yet staged.
+   [LOG] Model staging needed: 1/10 model(s) not yet staged.
    [LOG]   MISSING: gemma-4-31b-it-qat-w4a16-ct  (bucket/staging_state/gemma-4-31b-it-qat-w4a16-ct/.staging_complete not found or hf_url changed)
    ```
 
@@ -1261,7 +1340,7 @@ The air-gap boundary is between the installer machine and the nodes, not between
 
 The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. The staging step sets all of them automatically from the staged artifacts.
 
-**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--driver-version`, `--skip-nvidia-closure`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
+**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--node-hosts`, `--node-kernels`, `--driver-version`, `--skip-nvidia-closure`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
 
 ### Prerequisites
 
@@ -1269,16 +1348,22 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 | Tool | Install |
 |---|---|
-| RHEL 9 x86_64 | Required — the NVIDIA driver closure is resolved with the host's own `dnf` |
+| RHEL 9 x86_64 (RHEL 10 x86_64 if the cluster nodes are RHEL 10 — see note below) | Required for air-gap only — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
 | `curl` | `dnf install -y curl` |
 | `helm` | https://helm.sh/docs/intro/install/ |
 | `kubectl` | https://kubernetes.io/docs/tasks/tools/ |
-| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9 |
+| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9 / RHEL 10 |
 | `createrepo_c` | `sudo dnf install -y createrepo_c` |
 | `sudo` + ~5 GB free disk | Required for staging — the NVIDIA RPM closure is built on this host |
 | `k0s`, `yq` | Downloaded for you — the staging step installs both to `/usr/local/bin/` |
 
 > These requirements apply only to the air-gap path. A standard (`airgap: false`) install needs none of them.
+
+> **For air-gap builds, the installer machine's RHEL major must match the cluster's.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa) — and the air-gap path builds both closures (NVIDIA driver, node packages) on this host:
+> - Cluster nodes are **RHEL 10** → installer machine must be **RHEL 10 x86_64**.
+> - Cluster nodes are **RHEL 9** or **Ubuntu 24.04** → installer machine stays **RHEL 9 x86_64** (the Ubuntu `.deb` closure resolves inside an `ubuntu:24.04` container).
+>
+> A standard (`airgap: false`) install builds no closure — every node installs from its own repos — so the installer machine's OS does not have to match.
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
@@ -1309,11 +1394,12 @@ cd tools/cluster_setup
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| Binaries | `k0s v1.36.1+k0s.0` (default; override with `--k0s-version`), `yq v4.44.1` |
 | **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
 | GPU packages | `packages/nvidia-closure/` — a complete offline dnf repo (driver, DKMS, gcc/make toolchain, container toolkit, `kernel-devel`/`kernel-headers` per GPU node kernel); PyYAML wheel (all nodes) |
+| Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
 Output: `./airgap-bundle/airgap-bundle-<timestamp>/` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB). The artifacts are consumed in place; there is no tarball. After a successful install the staged tree is deleted to reclaim disk unless you pass `--keep-staging`.
@@ -1356,6 +1442,13 @@ done < "${IMAGE_LIST}"
 
 **Mirror with Docker:**
 
+Requires the Docker CE daemon on the workstation, and your user in the
+`docker` group so `docker` commands don't need `sudo`:
+
+```bash
+sudo usermod -aG docker "$USER"   # one-time; log out/in (or run `newgrp docker`) for it to take effect in the current shell
+```
+
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
 IMAGE="docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
@@ -1370,7 +1463,7 @@ docker push "${INTERNAL_REGISTRY}/weaviate:stable-v1.28-007846a"
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:latest"
+    image: "registry.airgap.local/splunk-ai-operator:v2.8"
   # ... all other image fields pointing at your internal registry
 
 imagePullSecrets:
@@ -1404,7 +1497,7 @@ Model weights (>120 GB total) are not staged by the air-gap staging step. Stage 
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 model artifacts + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 model artifacts + buffer for download staging and upload temp files |
 | RAM | 16 GB | Needed to stream and process large files without swapping |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; resume with `SKIP_IF_EXISTS=1` |
 | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -1543,6 +1636,12 @@ To build the closure by hand for this path, the manual recipe follows.
 
 The driver flavor that succeeds on RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
 
+The unified air-gap installer checks whether that RPM is visible and, on RHEL 9
+only, resets any conflicting/default NVIDIA stream and enables
+`nvidia-driver:latest-dkms` before resolving the closure. RHEL 10 uses ordinary
+RPMs without this module-stream step, and Ubuntu follows its independent APT
+path.
+
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
 
 **Step 1 — build the closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the installer machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
@@ -1558,6 +1657,7 @@ sudo dnf config-manager --add-repo \
   https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
   | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+sudo dnf module reset -y nvidia-driver
 sudo dnf module enable -y nvidia-driver:latest-dkms
 
 mkdir -p "$DEST"
@@ -1857,6 +1957,99 @@ kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 
 Open `http://localhost:8000` in your browser.
 
+**Remote workstation via SSH bastion (SOCKS tunnel)**
+
+Use this when your browser doesn't run on the same host as `kubectl` — the
+cluster network is reachable only from the installer machine, and you're
+browsing from your laptop. The **installer machine** is the admin workstation
+from [Required Tools](#required-tools-on-admin-workstation): whatever host has
+SSH reach to every cluster node and holds the kubeconfig (often a bastion or
+EC2 instance, not your laptop) — it is not itself a cluster node. A plain
+`kubectl port-forward` only helps if your browser runs on that same host; the
+SOCKS proxy set up here also lets the browser reach other private cluster
+addresses directly, e.g. the SAIA API endpoint from
+[Onboarding to the AI Tier](#onboarding-to-the-ai-tier).
+
+Placeholders used below — replace with your own values:
+
+| Placeholder | Meaning |
+|---|---|
+| `<installer-ip>` | SSH-reachable address of the installer machine |
+| `<ssh-user>` | SSH login user on the installer machine |
+| `<ssh-key>` | Path to the SSH private key for the installer machine |
+| `<kubeconfig-path>` | Kubeconfig path on the installer machine |
+| `<saia-nodeport-addr>` | `<worker-node-ip>:<nodePort>` from [Onboarding to the AI Tier, Step 1](#onboarding-to-the-ai-tier) |
+| `<tenant-id>` | Your SAIA tenant ID |
+
+1. On the installer machine, start the port-forward and leave it running.
+   Reuse the `NAMESPACE`/`STANDALONE_NAME` from your cluster config if they
+   differ from the defaults shown here:
+
+   ```bash
+   NAMESPACE=ai-platform
+   STANDALONE_NAME=splunk-standalone
+   SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+   kubectl --kubeconfig <kubeconfig-path> -n "${NAMESPACE}" port-forward \
+     "svc/${SPLUNK_SERVICE}" 18002:8000 \
+     --address=127.0.0.1
+   ```
+
+2. From your workstation, open one SSH tunnel with both a local forward for
+   Splunk Web and a SOCKS proxy for everything else:
+
+   ```bash
+   ssh -N \
+     -o ExitOnForwardFailure=yes \
+     -o ServerAliveInterval=30 \
+     -L 18002:127.0.0.1:18002 \
+     -D 127.0.0.1:1080 \
+     -i <ssh-key> \
+     <ssh-user>@<installer-ip>
+   ```
+
+   Local port `18002` now reaches Splunk Web; local SOCKS port `1080` reaches
+   any other private cluster address.
+
+3. Verify SOCKS access to the SAIA endpoint before opening a browser:
+
+   ```bash
+   curl --socks5-hostname 127.0.0.1:1080 -i -X OPTIONS \
+     'http://<saia-nodeport-addr>/<tenant-id>/saia-api-v2/v2alpha1/metadata' \
+     -H 'Access-Control-Request-Headers: authorization,splunk-client,x-requested-with,x-stack-url' \
+     -H 'Access-Control-Request-Method: GET' \
+     -H 'Origin: http://localhost:18002'
+   ```
+
+   Expect `HTTP/1.1 204 No Content`.
+
+4. Launch an isolated Chrome profile routed through the SOCKS proxy, with
+   `localhost` traffic (Splunk Web) kept direct:
+
+   macOS:
+
+   ```bash
+   open -na "Google Chrome" --args \
+     --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+   Linux (Ubuntu/RHEL admin workstation):
+
+   ```bash
+   google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+5. In that Chrome instance, open `http://localhost:18002` (HTTP, not HTTPS)
+   — this is your Splunk Web session.
+
+6. When [onboarding the AI Tier](#onboarding-to-the-ai-tier), use
+   `http://<saia-nodeport-addr>` as the SAIA API URL — it works both from
+   inside the pod (onboarding checks) and from the browser via the SOCKS
+   tunnel.
+
 **Retrieve the admin password**
 
 ```bash
@@ -2153,7 +2346,7 @@ If `yq` is not installed or cannot parse the selected artifact profile, the down
 ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
 ```
 
-Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
+Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
 
 #### Re-stage a single model without restarting from scratch
 

@@ -78,7 +78,7 @@ graph TB
 
     subgraph GPU["🔥  GPU Worker(s)"]
         RAY_GPU[Ray GPU Workers\nAI Inference]
-        MODELS[(Model Weights\nGemma — GPU-specific\ngpt-oss-20b\n+ 9 more)]
+        MODELS[(Model Weights\nGemma — GPU-specific\ngpt-oss-20b\n+ 8 more)]
     end
 
     subgraph OBJ["🗄️  Object Storage\n(Customer-managed)"]
@@ -116,7 +116,7 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| Node OS | RHEL 9 or Ubuntu 24.04 | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. For air-gapped installs, the **installer machine** itself must be RHEL 9 x86_64 regardless of the target nodes' OS — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
+| Node OS | RHEL 9, RHEL 10, or Ubuntu 24.04 — all three air-gapped or non-air-gapped | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. Air-gapped RHEL 10 needs `kernel-modules-extra` staged in the bundle (el10 keeps kube-proxy's netfilter modules there rather than in the base kernel); the staging step does that automatically, and preflight rejects an el10 node only if it has neither the module nor that closure. Air-gap RPM closures are resolved with the **installer machine's** own `dnf`, so for air-gap its RHEL major must match the nodes' — RHEL 9 or Ubuntu 24.04 nodes → RHEL 9 x86_64 installer machine; RHEL 10 nodes → RHEL 10 x86_64 installer machine — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
 | NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
@@ -237,7 +237,7 @@ flowchart LR
 
 | Data | Minimum size | Notes |
 |---|---|---|
-| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 11 models + headroom for re-staging |
+| Model weights (`model_artifacts/`) | 250 GB | >120 GB for 10 models + headroom for re-staging |
 | Runtime data (conversations, queues, config) | 100 GB | Grows with usage; monitor and expand as needed |
 | **Total recommended bucket** | **500 GB+** | Plan for growth if running multiple tenants |
 
@@ -266,7 +266,7 @@ flowchart TD
 
     subgraph P1["📦 Phase 1 — Model Staging  (if enabled)"]
         direction LR
-        M1["Download >120 GB\nfrom HuggingFace"] --> M2["Gemma — GPU-specific · gpt-oss-20b\n+ 9 more models"]
+        M1["Download >120 GB\nfrom HuggingFace"] --> M2["Gemma — GPU-specific · gpt-oss-20b\n+ 8 more models"]
         M2 --> M3["Upload model_artifacts/\nto Object Store"]
     end
 
@@ -317,7 +317,7 @@ flowchart TD
 
 ```bash
 # On each node (controller, CPU worker, GPU worker) — confirm OS, passwordless sudo, and Python
-cat /etc/os-release               # must be RHEL 9 or Ubuntu 24.04
+cat /etc/os-release               # must be RHEL 9, RHEL 10, or Ubuntu 24.04
 sudo -n true && echo "passwordless sudo OK"
 python3 --version                 # 3.8+
 
@@ -325,10 +325,13 @@ python3 --version                 # 3.8+
 ssh -i <key> <user>@<node-ip> hostname
 ```
 
-RHEL 9 and Ubuntu 24.04 are the only supported node OSes — mix and match
-freely across controllers/workers, the installer detects each node's OS over
-SSH. Any other OS is rejected at preflight (`FORCE_UNSUPPORTED_OS=1` bypasses
-this at your own risk).
+RHEL 9, RHEL 10 and Ubuntu 24.04 are the only supported node OSes — mix and
+match freely across controllers/workers, the installer detects each node's OS
+over SSH. **RHEL 10 air-gapped** additionally needs `kernel-modules-extra` in the
+bundle — el10 keeps the netfilter modules kube-proxy needs there rather than in
+the base kernel — which the staging step stages automatically for each node's
+running kernel, from a RHEL 10 installer machine. Any other OS is rejected at
+preflight (`FORCE_UNSUPPORTED_OS=1` bypasses this at your own risk).
 
 **GPU worker nodes** need no manual driver install. The installer installs
 the driver automatically on internet-connected nodes — RHEL: EPEL →
@@ -501,7 +504,7 @@ graph TD
     SCRIPT["Staging step\n(airgap_install.sh)"]
 
     subgraph BIN["📁 binaries/"]
-        K0S["k0s binary\nlatest or --k0s-version"]
+        K0S["k0s binary\nv1.36.1+k0s.0 (default) or --k0s-version"]
         YQ["yq v4.44.1\nYAML processor"]
     end
 
@@ -631,7 +634,7 @@ After mirroring, update your config:
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:latest"
+    image: "registry.airgap.local/splunk-ai-operator:v2.8"
   # ... all other images pointing at your internal registry
 
 imagePullSecrets:
@@ -663,7 +666,7 @@ Model weights (>120 GB) must be staged to your object store. Do this on the inst
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts process and stream large files; less RAM causes swapping and slow uploads |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run on a flaky connection — already-staged models are skipped automatically |
 | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -842,6 +845,10 @@ on RHEL 9 (the older `cuda-drivers` meta-package is gone there), and
 is compiled on each GPU node and needs kernel headers matching that node's exact
 `uname -r`.
 
+On RHEL 9, the installer selects the `nvidia-driver:latest-dkms` DNF module
+stream before resolving that RPM. This RHEL 9-only step does not run for RHEL 10
+or Ubuntu 24.04.
+
 ```bash
 # Nothing extra to do — the GPU node IPs and OS are derived from your config
 # and each node's `uname -r` / OS is surveyed over SSH.
@@ -879,6 +886,15 @@ OS. The host's RHEL **minor** version and running kernel do *not* need to match
 RHEL 9 GPU nodes — `$releasever` resolves to `9`, so a 9.6 build host can supply
 `kernel-devel` for a 9.8 node. All of this is validated in preflight, before any
 downloads.
+
+> **Air-gapped RHEL 10 clusters need a RHEL 10 installer machine.** The RHEL major
+> version is not just a minor detail here — `dnf`'s `$releasever` is derived from
+> the *installer host's* own `/etc/os-release`, so a RHEL 9 installer machine
+> resolves RHEL 9 packages even when targeting RHEL 10 nodes, and vice versa.
+> Build RHEL 10 bundles on a RHEL 10 x86_64 host; RHEL 9 and Ubuntu 24.04 clusters
+> keep using a RHEL 9 x86_64 installer machine as documented above. Non-air-gapped
+> installs build no closure — the nodes use their own repos — so the installer
+> machine's OS is unconstrained there.
 
 > **Driver vs. GPU model:** the driver packages are **not** GPU-model-specific —
 > the same `kmod-nvidia-latest-dkms` (RHEL) or `cuda-drivers` (Ubuntu) covers T4,

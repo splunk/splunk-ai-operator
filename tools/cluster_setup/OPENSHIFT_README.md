@@ -207,6 +207,8 @@ images:
     apiImage:        "ml-platform/saia/saia-api:build-v2-main-c3b489d"
     apiV2Image:      "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
     dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
+  slim:
+    apiImage: "ml-platform/slim/slim-api:build-1"
   splunk:
     image:         ".../splunk/splunk:10-2-ai-custom"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
@@ -215,7 +217,8 @@ images:
   nginx:         { image: "docker.io/library/nginx:1.27-alpine" }
 ```
 The `registry` prefix is prepended to any image that is not fully qualified
-(e.g. the `ml-platform/...` Ray and SAIA paths).
+(e.g. the `ml-platform/...` Ray, SAIA, and SLIM paths). `images.slim.apiImage`
+is required only when `slim` is enabled under `aiPlatform.features`.
 
 
 ### `storage`
@@ -244,6 +247,22 @@ Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 ```yaml
 splunk:
   standaloneName: splunk-standalone
+  # Additional management/JWT issuer URLs appended for SAIA and SLIM.
+  trustedIssuers:
+    - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+```
+
+The installer keeps the management/JWT issuer separate from the HEC telemetry
+endpoint. `splunkConfiguration.endpoint` must match the Standalone
+`oauth2_settings.issuer_uri` exactly; `hecEndpoint` is used only by the
+OpenTelemetry exporter. Following the k0s installer design, the primary short
+management URL is rendered as `splunkConfiguration.endpoint`, and each
+`splunk.trustedIssuers` entry is appended to SAIA and SLIM's `SPLUNK_ISSUERS`.
+With the example above, the resulting issuer list is:
+
+```text
+https://splunk-<standaloneName>-standalone-service:8089,
+https://splunk-<standaloneName>-standalone-service.<namespace>.svc.cluster.local:8089
 ```
 
 ### `aiPlatform`
@@ -254,15 +273,24 @@ aiPlatform:
   scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
+  serviceTemplate:
+    type: NodePort
+    nodePort: 30080       # SAIA
+    slimNodePort: 30081   # SLIM; must differ from nodePort
   features:
     - name: "saia"
       version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
 ```
-> **`serviceTemplate` is optional** and omitted here. Leave it out and SAIA's
-> service defaults to `ClusterIP` — external clients reach SAIA through the
-> **OpenShift Route** regardless (bare-metal node IPs are usually not externally
-> routable). Only add a `serviceTemplate` block (e.g. `type: NodePort`,
-> `nodePort: 30080`) if you specifically need the service exposed as NodePort.
+
+`serviceTemplate` is optional; omit it to keep feature services on `ClusterIP`.
+For `NodePort`, `nodePort` exposes SAIA and `slimNodePort` exposes SLIM. The
+AIPlatform API has one shared Kubernetes Service template, so the installer
+follows the k0s design: it renders the SAIA port into the AIPlatform CR, then
+patches SLIM's generated AIService to the distinct SLIM port. Do not reuse the
+same port for both services. The OpenShift Route remains the preferred SAIA
+endpoint when worker-node IPs are not externally routable.
 
 #### Scaling Deployment Capacity
 
@@ -556,7 +584,7 @@ Air-gap uses two scripts plus a separate image-mirroring step:
 
    `container-images.txt` in the bundle lists the publicly available images
    (Weaviate, KubeRay, OTel, Fluent Bit, nginx, cert-manager, Splunk,
-   Splunk Operator). **Three image groups are built internally and are not
+   Splunk Operator). **Four image groups are built internally and are not
    listed as real entries** — they must be mirrored separately from your source
    registry:
 
@@ -565,8 +593,9 @@ Air-gap uses two scripts plus a separate image-mirroring step:
    | `images.operator.image` | Splunk AI Operator image |
    | `images.ray.headImage`, `images.ray.workerImage` | Ray head + worker GPU images |
    | `images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage` | SAIA API v1/v2 + data loader images |
+   | `images.slim.apiImage` | SLIM API image (when the `slim` feature is enabled) |
 
-   Mirror all three groups in addition to the images in `container-images.txt`,
+   Mirror all four groups in addition to the images in `container-images.txt`,
    or the install will hit `ImagePullBackOff` on those pods.
 
 3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
@@ -607,7 +636,6 @@ Blackwell deployments (all models are non-gated):
 | artifact-id | source |
 |---|---|
 | all-minilm-l6-v2 | sentence-transformers/all-MiniLM-L6-v2 |
-| bi-encoder | BAAI/bge-small-en-v1.5 |
 | cross-encoder | cross-encoder/ms-marco-MiniLM-L-6-v2 |
 | e5-language-classifier | Mike0307/multilingual-e5-language-detection |
 | fm_timeseries | cisco-ai/cisco-time-series-model-1.0 |

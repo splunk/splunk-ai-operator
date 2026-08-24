@@ -202,6 +202,19 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
+// aiServiceEventFilter is the controller-wide event filter. Owned-resource
+// predicates are combined with this filter, so ConfigMap data changes must be
+// admitted here as well as by the ConfigMap-specific Owns predicate. This is
+// required for values snapshotted into pod templates, such as EMBEDDING_MODEL.
+func aiServiceEventFilter() predicate.Predicate {
+	return predicate.Or(
+		common.GenerationChangedPredicate(),
+		common.AnnotationChangedPredicate(),
+		common.LabelChangedPredicate(),
+		common.ConfigMapChangedPredicate(),
+	)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -226,11 +239,7 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			)),
 		).
 		// Add predicates to filter events and avoid unnecessary reconciliations
-		WithEventFilter(predicate.Or(
-			common.GenerationChangedPredicate(),
-			common.AnnotationChangedPredicate(),
-			common.LabelChangedPredicate(),
-		)).
+		WithEventFilter(aiServiceEventFilter()).
 		// Configure concurrency control
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,

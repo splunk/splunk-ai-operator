@@ -269,6 +269,12 @@ docker.io/splunk/splunk-operator:3.0.0
 #   <your-ecr>/ml-platform/saia/saia-api-v2:build-v2-main-c3b489d
 #   <your-ecr>/ml-platform/saia/saia-data-loader:build-v2-main-c3b489d
 
+# ── SLIM ─────────────────────────────────────────────────────────────────────
+# Built internally — set images.slim.apiImage in cluster config when the
+# "slim" feature is enabled.
+# Example:
+#   <your-ecr>/ml-platform/slim/slim-api:build-1
+
 # ── Weaviate ──────────────────────────────────────────────────────────────────
 docker.io/semitechnologies/weaviate:stable-v1.28-007846a
 
@@ -351,7 +357,7 @@ cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 # Model weights (~60 GB total) are NOT container images.
 # Use tools/artifacts_download_upload_scripts/ to stage them separately to S3/MinIO.
 # Models: gemma-4-31b-it-qat-w4a16-ct, gpt-oss-20b, all-minilm-l6-v2,
-#         bi-encoder, cross-encoder, e5-language-classifier, fm_timeseries,
+#         cross-encoder, e5-language-classifier, fm_timeseries,
 #         mbart-translator, pii-classifier, uae-large,
 #         xlm-roberta-language-classifier
 IMGEOF

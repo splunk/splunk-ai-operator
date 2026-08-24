@@ -116,7 +116,7 @@ images:
   registryInsecure: false
 
   operator:
-    image: "docker.io/kpratyush775/splunk-ai-operator:v2.4"
+    image: "docker.io/kpratyush775/splunk-ai-operator:v3.0"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
@@ -126,8 +126,8 @@ images:
     # These Docker Hub defaults are fully qualified and therefore are not
     # rewritten by images.registry. Replace them with your mirrored image paths
     # for private-registry or air-gapped installations.
-    headImage: "docker.io/splunk/ai-tier-ray-head:preview"
-    workerImage: "docker.io/splunk/ai-tier-ray-worker:preview"
+    headImage: "docker.io/splunk/ai-tier-ray-head:v0.2"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:v0.2"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
@@ -136,6 +136,11 @@ images:
     apiImage: "docker.io/splunk/ai-tier-saia-api:preview"
     apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:preview"
     dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:preview"
+
+  # slim-api service image (consumed via RELATED_IMAGE_SLIM_API). Only needed
+  # when the "slim" feature is enabled under aiPlatform.features[].
+  slim:
+    apiImage: "docker.io/splunk/ai-tier-slim-service:v1.0"
 
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
@@ -154,7 +159,7 @@ operators:
   ray:
     version: "v1.2.2"
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.53.0"
+    rayVersion: "2.56.0"
 
   certManager:
     installCRDs: true
@@ -173,35 +178,32 @@ files:
 
 # ---------- Splunk Configuration ----------
 splunk:
-  # Opt-in Splunk integration (JWT/auth issuer for SAIA, plus optional
-  # HEC telemetry export); defaults to disabled, enabled here. When false (or
-  # absent), no Splunk Operator/Standalone is installed and the AIPlatform CR
-  # omits splunkConfiguration.
+  # Opt in to the bundled in-cluster Splunk deployment; defaults to disabled,
+  # enabled here. When false (or absent), no Splunk Operator/Standalone is
+  # installed. A JWT-only external integration can still render
+  # splunkConfiguration by setting trustedIssuers below.
   enabled: true
 
   # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
   standaloneName: splunk-standalone
 
-  # Mode is derived from external.endpoint below, not a separate flag:
-  #   unset -> INTERNAL: deploys Splunk Operator + Standalone in-cluster
-  #            (requires images.splunk.image / images.splunk.operatorImage).
-  #   set   -> EXTERNAL: skips in-cluster Splunk, points the AIPlatform CR at
-  #            your external HEC endpoint instead.
+  # With enabled=true and no external.endpoint, the installer deploys Splunk
+  # Operator + Standalone in-cluster (requires images.splunk.image and
+  # images.splunk.operatorImage).
   # See K0S_README.md's "Internal Splunk management transport" section for
   # the native-HTTPS compatibility details behind the INTERNAL path.
   #
-  # external:
-  #   endpoint: https://splunk.example.com:8088   # base HEC URL (operator appends /services/collector)
-  #   secretName: splunk-hec-external             # optional; k8s Secret name the script creates (key: hec_token)
-  #
-  # The HEC token itself is supplied ONLY via the SPLUNK_HEC_TOKEN environment
-  # variable, never this file:
-  #   export SPLUNK_HEC_TOKEN='<your-hec-token>'
-  #   CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+  # External HEC ingestion is out of scope for this release workflow. Do not
+  # set splunk.external.endpoint or SPLUNK_HEC_TOKEN just to enable external
+  # JWT authentication; external.endpoint selects the legacy external HEC mode.
 
-  # Additional JWT issuers SAIA should trust besides the primary endpoint
-  # above — e.g. to keep an internal and an external Splunk both trusted at
-  # once. Optional.
+  # Exact Splunk management/JWKS issuers that SAIA and Slim should trust. Each
+  # value must match Splunk's oauth2_settings.issuer_uri character-for-character
+  # and normally uses management port 8089, never HEC port 8088.
+  #
+  # External Splunk only: set enabled=false and list the external issuer here.
+  # Bundled + external Splunk: keep enabled=true and list only the additional
+  # external issuer here; the bundled issuer is included automatically.
   # trustedIssuers:
   #   - https://splunk.example.com:8089
 
@@ -258,10 +260,19 @@ aiPlatform:
   serviceTemplate:
     type: NodePort          # ClusterIP | NodePort | LoadBalancer
     nodePort: 30080         # Fixed NodePort (30000-32767) for the SAIA public service. Required only for NodePort.
+    # AIPlatform.serviceTemplate propagates identically to EVERY feature's
+    # AIService, so slim would otherwise inherit the same 30080 and collide with
+    # SAIA (a NodePort can back only one Service). When the "slim" feature is
+    # enabled under NodePort, the installer patches slim's public Service to this
+    # DISTINCT port instead. Reach slim at http://<any-worker-ip>:<slimNodePort>.
+    slimNodePort: 30081     # Fixed NodePort for the slim public service. Only used when slim is enabled + type=NodePort.
 
   features:
     - name: "saia"
       version: "1.1.0"
+    # Enable the slim-api service (no v1/v2 routing). Exposed on slimNodePort above.
+    - name: "slim"
+      version: "1.0.0"
 
   cpuScheduling:
     nodeSelector: {}

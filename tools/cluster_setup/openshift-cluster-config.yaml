@@ -48,6 +48,9 @@ images:
     apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
     dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
 
+  slim:
+    apiImage: "arif/slim-api:v0.0.4"
+
   splunk:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
@@ -74,6 +77,10 @@ storage:
 
 splunk:
   standaloneName: splunk-standalone
+  # Additional management/JWT issuers appended to the primary endpoint for
+  # both SAIA and SLIM.
+  trustedIssuers:
+    - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 
 aiPlatform:
   name: "openshift-ai-platform"
@@ -84,11 +91,17 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    type: NodePort
-    nodePort: 30080
+    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
+    nodePort: 30080         # Fixed NodePort for the SAIA public service.
+    # AIPlatform.serviceTemplate is initially inherited by every feature. The
+    # installer patches SLIM's AIService to this distinct port to avoid a
+    # collision with SAIA.
+    slimNodePort: 30081
   features:
     - name: "saia"
       version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
   cpuScheduling:
     tolerations:
       - key: "node-role.kubernetes.io/master"

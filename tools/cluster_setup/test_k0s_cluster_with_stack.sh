@@ -77,6 +77,18 @@ _extract_fn() {
   sed -n "${start},${end}p" "${SCRIPT}"
 }
 
+_extract_airgap_fn() {
+  local name="$1"
+  local start end
+  start=$(grep -n "^${name}()" "${AIRGAP_SCRIPT}" | cut -d: -f1)
+  if [[ -z "${start}" ]]; then
+    echo "ERROR: function '${name}' not found in ${AIRGAP_SCRIPT}" >&2
+    return 1
+  fi
+  end=$(awk -v s="${start}" 'NR>s && /^}$/{print NR; exit}' "${AIRGAP_SCRIPT}")
+  sed -n "${start},${end}p" "${AIRGAP_SCRIPT}"
+}
+
 _load_functions() {
   log()  { :; }
   warn() { :; }
@@ -132,17 +144,38 @@ assert_eq "returns bare path when registry is null" \
 suite "shipped image defaults"
 echo "▶ shipped image defaults"
 
-_expected_platform_images=$'docker.io/splunk/ai-tier-ray-head:preview\ndocker.io/splunk/ai-tier-ray-worker:preview\ndocker.io/splunk/ai-tier-saia-api:preview\ndocker.io/splunk/ai-tier-saia-api-v2:preview\ndocker.io/splunk/ai-tier-saia-data-loader:preview'
-for _config_name in k0s-cluster-config.yaml cluster-config.yaml; do
-  _actual_platform_images=$("${YQ_BIN}" eval '
-    .images.ray.headImage,
-    .images.ray.workerImage,
-    .images.saia.apiImage,
-    .images.saia.apiV2Image,
-    .images.saia.dataLoaderImage
-  ' "${SCRIPT_DIR}/${_config_name}")
-  assert_eq "${_config_name} uses the published preview image defaults" \
-    "${_expected_platform_images}" "${_actual_platform_images}"
+_expected_k0s_release_tuple=$'docker.io/kpratyush775/splunk-ai-operator:v2.8\ndocker.io/splunk/ai-tier-ray-head:v0.2\ndocker.io/splunk/ai-tier-ray-worker:v0.2\ndocker.io/splunk/ai-tier-slim-service:v1.0\n2.56.0'
+_actual_k0s_release_tuple=$("${YQ_BIN}" eval '
+  .images.operator.image,
+  .images.ray.headImage,
+  .images.ray.workerImage,
+  .images.slim.apiImage,
+  .operators.ray.rayVersion
+' "${SCRIPT_DIR}/k0s-cluster-config.yaml")
+assert_eq "k0s config uses the requested operator, Ray, Slim, and Ray runtime defaults" \
+  "${_expected_k0s_release_tuple}" "${_actual_k0s_release_tuple}"
+
+_expected_eks_platform_images=$'docker.io/splunk/ai-tier-ray-head:preview\ndocker.io/splunk/ai-tier-ray-worker:preview\ndocker.io/splunk/ai-tier-saia-api:preview\ndocker.io/splunk/ai-tier-saia-api-v2:preview\ndocker.io/splunk/ai-tier-saia-data-loader:preview'
+_actual_eks_platform_images=$("${YQ_BIN}" eval '
+  .images.ray.headImage,
+  .images.ray.workerImage,
+  .images.saia.apiImage,
+  .images.saia.apiV2Image,
+  .images.saia.dataLoaderImage
+' "${SCRIPT_DIR}/cluster-config.yaml")
+assert_eq "EKS config keeps its existing published preview image defaults" \
+  "${_expected_eks_platform_images}" "${_actual_eks_platform_images}"
+
+for _profile in \
+  model_artifacts_configs_unquantized.yaml \
+  model_artifacts_configs_quantized.yaml; do
+  _profile_path="${SCRIPT_DIR}/../artifacts_download_upload_scripts/${_profile}"
+  assert_eq "${_profile} contains exactly 10 model artifacts" \
+    "10" "$("${YQ_BIN}" eval '.artifact-configs | length' "${_profile_path}")"
+  assert_eq "${_profile} excludes the disabled BiEncoder model" \
+    "0" "$("${YQ_BIN}" eval '[.artifact-configs[] | select(.artifact-id == "bi-encoder" or .hf-url == "https://huggingface.co/BAAI/bge-small-en-v1.5")] | length' "${_profile_path}")"
+  assert_eq "${_profile} retains the supported UAE embedding model" \
+    "1" "$("${YQ_BIN}" eval '[.artifact-configs[] | select(.artifact-id == "uae-large")] | length' "${_profile_path}")"
 done
 
 # ── Tests: validate_scale_factor_config ──────────────────────────────────────
@@ -1062,6 +1095,66 @@ _clean_all_propagates_aggressive_failure() (
 
 assert_rc "clean-all returns failure when aggressive node cleanup failed" \
   "1" _clean_all_propagates_aggressive_failure
+
+# ── Tests: RHEL 9 air-gap NVIDIA module stream ───────────────────────────────
+# NVIDIA's RHEL 9 repository defaults to open-dkms, so the established
+# kmod-nvidia-latest-dkms package is hidden by modular filtering until its stream
+# is selected. RHEL 10 has no DNF modularity, and Ubuntu uses apt; neither path
+# may run a RHEL 9 module command.
+
+suite "RHEL 9 air-gap NVIDIA module stream"
+echo "▶ RHEL 9 air-gap NVIDIA module stream"
+
+_simulate_airgap_nvidia_stream() (
+  local target_os="$1" initially_visible="$2"
+  local trace_file
+  trace_file=$(mktemp /tmp/airgap-nvidia-stream.XXXXXX)
+  trap 'rm -f "${trace_file}"' EXIT
+
+  eval "$(_extract_airgap_fn _rhel9_nvidia_driver_rpm_visible)"
+  eval "$(_extract_airgap_fn ensure_rhel9_nvidia_driver_stream)"
+
+  GPU_NODE_OS="${target_os}"
+  _test_nvidia_rpm_visible="${initially_visible}"
+  log() { :; }
+  err() { printf 'err %s\n' "$*" >>"${trace_file}"; return 1; }
+  sudo() {
+    printf '%s\n' "$*" >>"${trace_file}"
+    if [[ "$*" == *"repoquery"* ]]; then
+      [[ "${_test_nvidia_rpm_visible}" == "true" ]] \
+        && printf '%s\n' 'kmod-nvidia-latest-dkms'
+      return 0
+    fi
+    if [[ "$*" == *"module enable nvidia-driver:latest-dkms"* ]]; then
+      _test_nvidia_rpm_visible="true"
+    fi
+    return 0
+  }
+
+  ensure_rhel9_nvidia_driver_stream || true
+  cat "${trace_file}"
+)
+
+_rhel9_hidden_trace="$(_simulate_airgap_nvidia_stream rhel9 false)"
+assert_eq "RHEL 9 checks package visibility before and after stream selection" \
+  "2" "$(grep -c 'repoquery.*kmod-nvidia-latest-dkms' <<<"${_rhel9_hidden_trace}" | tr -d '[:space:]')"
+assert_eq "RHEL 9 resets a conflicting/default NVIDIA stream" \
+  "1" "$(grep -c 'module reset nvidia-driver' <<<"${_rhel9_hidden_trace}" | tr -d '[:space:]')"
+assert_eq "RHEL 9 enables latest-dkms when its RPM is hidden" \
+  "1" "$(grep -c 'module enable nvidia-driver:latest-dkms' <<<"${_rhel9_hidden_trace}" | tr -d '[:space:]')"
+
+_rhel9_visible_trace="$(_simulate_airgap_nvidia_stream rhel9 true)"
+assert_eq "RHEL 9 preserves an already-selected compatible stream" \
+  "0" "$(grep -c 'module reset\|module enable' <<<"${_rhel9_visible_trace}" | tr -d '[:space:]')"
+
+_rhel10_trace="$(_simulate_airgap_nvidia_stream rhel10 false)"
+assert_eq "RHEL 10 never runs RHEL 9 module commands" "" "${_rhel10_trace}"
+
+_ubuntu24_trace="$(_simulate_airgap_nvidia_stream ubuntu24 false)"
+assert_eq "Ubuntu 24.04 never runs RHEL 9 module commands" "" "${_ubuntu24_trace}"
+
+assert_eq "the non-air-gap installer does not call the air-gap stream helper" \
+  "0" "$(grep -c 'ensure_rhel9_nvidia_driver_stream' "${SCRIPT}" | tr -d '[:space:]')"
 
 # ── Tests: Blackwell NVIDIA open-module switch ───────────────────────────────
 # A package change alone does not replace a proprietary NVIDIA module already

@@ -40,29 +40,39 @@ standalone via `stage-artifacts`), it additionally needs:
 
 | Resource | Minimum | Why |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
 | CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
 
 **Admin workstation tools:**
 
-**RHEL 9** — none of `kubectl`, `helm`, `docker`, or `yq` are in the default
-`dnf` repos; `git` and `jq` are. Install each via its own supported method
-(standalone binary, install script, or vendor repo, per each tool's docs)
-rather than a single `dnf install`:
+**macOS** — `brew install kubectl helm git jq yq`.
 
-- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+**Ubuntu / RHEL 9** — none of `kubectl`, `helm`, `yq`, or `crane` are in the
+default repos; `git` and `jq` are. Install each via its own supported method
+rather than a single package-manager command:
+
+- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/),
+  pinned to `v1.36.1` (matches the k0s version this repo installs by default)
 - `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
-- `yq` — [binary release](https://github.com/mikefarah/yq#install)
-- `git`, `jq` — `sudo dnf install -y git jq`
-- `docker` — [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/) (needed to mirror platform images to your registry, and to build the offline GPU driver closure for air-gapped Ubuntu nodes)
+- `yq` — [binary release](https://github.com/mikefarah/yq#install), pinned to
+  `v4.44.1` (matches the version this repo already relies on elsewhere)
+- `git`, `jq` — `sudo apt-get install -y git jq` (Ubuntu) or
+  `sudo dnf install -y git jq` (RHEL 9)
+- `crane` — [binary release](https://github.com/google/go-containerregistry/releases),
+  used by the image-mirroring commands below on **both** Ubuntu and RHEL 9;
+  no Docker daemon, root, or group setup required
+- `docker` (optional alternative to `crane` for mirroring; also needed to
+  build the offline GPU driver closure for air-gapped Ubuntu nodes) —
+  [Docker CE repo for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+  or [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/)
+  (RHEL 9 requires `sudo dnf install -y dnf-plugins-core` first for `dnf
+  config-manager`)
 
-Verify:
-
-```bash
-kubectl version --client && helm version && git --version && jq --version && yq --version && docker version
-```
+See
+[K0S_README.md — Required Tools](../../tools/cluster_setup/K0S_README.md#required-tools-on-admin-workstation)
+for the exact repo/install-script commands for each.
 
 **Access and services checklist:**
 
@@ -78,32 +88,60 @@ in the cluster config to those mirrored paths (required for both paths —
 air-gap additionally needs every node to resolve that registry with no outbound
 internet):
 
-The default Ray and SAIA images currently use the `preview` tag:
+The example below mirrors the SAIA, Ray, and SLIM release images with the common
+tag `v1.0`, and the Splunk AI Operator with `v2.8`. Set the corresponding image
+fields in the cluster config to the mirrored paths.
+
+With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
 
 ```bash
+TAG="v1.0"
 for repo in \
   splunk/ai-tier-saia-data-loader \
   splunk/ai-tier-saia-api-v2 \
   splunk/ai-tier-saia-api \
   splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker; do
-  docker pull "docker.io/${repo}:preview"
-  docker tag "docker.io/${repo}:preview" "<your-registry>/${repo}:preview"
-  docker push "<your-registry>/${repo}:preview"
+  splunk/ai-tier-ray-worker \
+  splunk/ai-tier-slim-service; do
+  crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
 done
+
+crane copy \
+  "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
+  "<your-registry>/splunk/splunk-ai-operator:v2.8"
 ```
 
-After mirroring, replace the five fully qualified `images.ray.*` and
-`images.saia.*` values in the cluster config with the corresponding
-`<your-registry>/splunk/...:preview` paths. Mirror the Slim and operator images
-separately when those components are enabled, using the tags configured for
-your release. For the complete air-gap image list and the bulk `crane copy`
-alternative, see
+With Docker instead:
+
+```bash
+TAG="v1.0"
+for repo in \
+  splunk/ai-tier-saia-data-loader \
+  splunk/ai-tier-saia-api-v2 \
+  splunk/ai-tier-saia-api \
+  splunk/ai-tier-ray-head \
+  splunk/ai-tier-ray-worker \
+  splunk/ai-tier-slim-service; do
+  docker pull "docker.io/${repo}:${TAG}"
+  docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
+  docker push "<your-registry>/${repo}:${TAG}"
+done
+
+docker pull "docker.io/kpratyush775/splunk-ai-operator:v2.8"
+docker tag "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
+  "<your-registry>/splunk/splunk-ai-operator:v2.8"
+docker push "<your-registry>/splunk/splunk-ai-operator:v2.8"
+```
+
+After mirroring, replace the fully qualified `images.ray.*`, `images.saia.*`,
+`images.slim.apiImage`, and `images.operator.image` values in the cluster
+config with the corresponding `<your-registry>/...` paths. For the complete
+air-gap image list and the bulk `crane copy` alternative, see
 [DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
 
-> `preview` is a mutable tag and the workloads use `imagePullPolicy:
-> IfNotPresent`. Use a new immutable tag or digest for controlled upgrades;
-> rerunning the installer with the same tag may keep the cached image.
+> Image tags can be mutable and the workloads use `imagePullPolicy:
+> IfNotPresent`. Use an immutable digest for controlled upgrades; rerunning the
+> installer with the same tag may keep the cached image.
 
 ---
 
@@ -114,15 +152,16 @@ Pick **one** GPU accelerator type for the cluster — `L40S` or `H100`, set via
 worker row below. The two GPU rows are alternatives, not additive; do not
 provision both.
 
-| Node Type | Min CPU | Min RAM | Min Disk | Count | Notes |
+Min CPU/RAM/Disk below are **per node** — for GPU workers, multiply by the
+node count (2 minimum) to get the cluster total.
+
+| Node Type | Min CPU (per node) | Min RAM (per node) | Min Disk (per node) | Count | Notes |
 |---|---|---|---|---|---|
 | Controller | 4 cores | 8 GB | 100 GB | 1 | API server, etcd, scheduler — the installer joins only the first controller IP; additional controller IPs are not joined and are not HA |
 | CPU Worker | 8 cores | 32 GB | 200 GB | 1+ | Weaviate, Ray head, Splunk, SAIA API, Data Loader |
 | GPU Worker — choose **either** L40S **or** H100, not both: | | | | | |
-| ↳ L40S (`g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) |
-| ↳ H100 (`p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) |
-
-Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` — pick one accelerator type per cluster, sized per the matching row above.
+| ↳ L40S (`g6e.12xlarge`) | 48 vCPU | 384 GiB | 500 GB | **2 nodes minimum** | 4× NVIDIA L40S/node, 48 GB VRAM/GPU (192 GB/node, 384 GB total across 2 nodes) · equivalent to AWS EC2 `g6e.12xlarge` (48 vCPUs, 384 GiB RAM, 4× L40S) **per node** |
+| ↳ H100 (`p5.4xlarge`) | 16 vCPU | 256 GiB | 500 GB | **2 nodes minimum** | 1× NVIDIA H100/node, 80 GB HBM3/GPU (160 GB total across 2 nodes) · equivalent to AWS EC2 `p5.4xlarge` (16 vCPUs, 256 GiB RAM, 1× H100) **per node** |
 
 **Ports to open between nodes:**
 
@@ -141,7 +180,7 @@ Both `L40S` and `H100` are supported via `aiPlatform.defaultAcceleratorType` —
 
 | Data | Minimum | Notes |
 |---|---|---|
-| Model weights | 250 GB | >120 GB for 11 models + re-staging headroom |
+| Model weights | 250 GB | >120 GB for 10 models + re-staging headroom |
 | Runtime data | 100 GB | Grows with usage |
 | **Total bucket** | **500 GB+** | Sufficient for now |
 
@@ -172,9 +211,20 @@ If Git is not installed, download the repository as a ZIP instead:
 Then create your config from the template:
 
 ```bash
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
+cd splunk-ai-operator/tools/cluster_setup
+
 cp k0s-cluster-config.yaml my-cluster.yaml
 vi my-cluster.yaml
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 | Field | Set to |
 |---|---|
@@ -219,7 +269,7 @@ fully automatic, no manual steps needed. Full commands and details:
 
 ### Model Setup (Standard Path)
 
-Model weights (>120 GB, 11 models) must land in your object store before the
+Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
 - **Full (interactive) install** — the installer always prompts whether to
@@ -337,7 +387,7 @@ MinIO/SeaweedFS/S3) — can be the same machine that runs the installer:
 
 | Resource | Minimum | Why |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 11 models + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
 | RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
 | CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
@@ -409,12 +459,12 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 # → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
 ```
 
-**Reach the in-cluster Splunk instance** via NodePort (default), LoadBalancer
-(MetalLB), or `kubectl port-forward` for quick access with no external
-exposure: [DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#internal-splunk-access).
-
-Once the cluster is healthy, install and onboard the **Splunk AI Assistant**
-app: [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+**Access the in-cluster Splunk instance and set up the SAIA app:**
+[DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#internal-splunk-access)
+(NodePort, LoadBalancer, or `kubectl port-forward`; add
+[K0S_README.md — Remote workstation via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url)
+if your browser can't reach the cluster network directly), then
+[DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
 ### Access Private Splunk and SAIA Through a SOCKS Proxy
 

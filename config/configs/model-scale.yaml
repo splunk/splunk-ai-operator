@@ -1,6 +1,6 @@
 applicationScale:
   AllMinilmL6V2: 1
-  BiEncoder: 1
+  BiEncoder: 0
   CrossEncoder: 1
   E5LanguageClassifier: 1
   Entrypoint: 1
