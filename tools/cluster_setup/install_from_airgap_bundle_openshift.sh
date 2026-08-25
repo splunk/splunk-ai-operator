@@ -84,9 +84,13 @@ PREREQUISITES
 
   Required network access from the install machine:
     - The target OpenShift API.
-    - The configured object store and any registry endpoints accessed directly
-      by installer-side verification or credential setup.
-    - Internal DNS, registry mirrors, and catalog sources used by the cluster.
+    - The configured object store used by installer-side model-marker checks.
+    - Any registry or cloud API used directly for credential setup, such as
+      the AWS ECR API when ecr.enabled=true.
+
+  Required network access from the OpenShift nodes:
+    - Internal registry mirrors and mirrored OLM catalog sources.
+    - The configured object store and any other runtime service endpoints.
 
   Public internet is not required only when every installation artifact,
   container image, OLM catalog/operator operand, NVIDIA driver/Driver Toolkit

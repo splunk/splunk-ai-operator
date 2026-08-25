@@ -618,10 +618,12 @@ Air-gap uses two scripts plus a separate image-mirroring step:
 
 An air-gapped install host does not require public internet after all content is
 transferred or mirrored, but it is not isolated from the deployment network. It
-must reach the OpenShift API and the configured private object store and
-registry endpoints. If the configuration uses public AWS S3, ECR, or another
-external service, provide outbound access through an approved proxy or use the
-corresponding private endpoints.
+must reach the OpenShift API, the object store used for model-marker checks, and
+any cloud or registry API used for credential setup. OpenShift nodes must reach
+the private registry/catalog mirrors, object store, and other configured runtime
+services. If any of these are public AWS S3, ECR, or other external endpoints,
+provide outbound access through an approved proxy or use the corresponding
+private endpoints.
 
 1. **On an internet-connected machine**, build the bundle:
    ```bash
