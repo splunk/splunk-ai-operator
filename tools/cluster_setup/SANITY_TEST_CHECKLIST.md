@@ -286,7 +286,8 @@ Overall sanity testing passes only when all applicable cases pass. A successful
 `/health` response alone is not sufficient evidence of model inference or the
 end-to-end SAIA user flow.
 
-For deployments using the bundled Traefik ingress, the read-only
-`tools/cluster_setup/validate_live_integration.sh` provides an optional extended
-TLS, routing, RBAC, JWKS/HEC, OTel, and workload check. Require exit code `0` and
-a final summary with `fail=0`; it does not replace SAN-04 or SAN-06.
+For fresh deployments using the bundled Splunk instance, run the read-only
+`tools/cluster_setup/test_internal_splunk_http.sh` check. Require exit code `0`;
+it verifies JWT issuer propagation and proves HEC, workload OTel, and workload
+mTLS remain fenced. OTel operator infrastructure is reported diagnostically but
+does not gate this release. This check does not replace SAN-04 or SAN-06.

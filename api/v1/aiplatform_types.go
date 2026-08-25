@@ -373,7 +373,7 @@ type SidecarSpec struct {
 
 	// Otel enables OpenTelemetry sidecar injection
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:default=true
+	// +kubebuilder:default=false
 	Otel bool `json:"otel,omitempty"`
 
 	// PrometheusOperator enables Prometheus Operator sidecar

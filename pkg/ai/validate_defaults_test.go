@@ -73,6 +73,7 @@ func TestValidate_DefaultsSchedulingSpecs(t *testing.T) {
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			Sidecars:      aiApi.SidecarSpec{Otel: true},
 			// CPUSchedulingSpec and GPUSchedulingSpec are nil → should be defaulted
 			SplunkConfiguration: aiApi.SplunkConfigurationSpec{Endpoint: "https://splunk:8088"},
 		},
@@ -124,6 +125,7 @@ func TestValidate_ResolverSelection(t *testing.T) {
 			p := &aiApi.AIPlatform{
 				Spec: aiApi.AIPlatformSpec{
 					ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+					Sidecars:      aiApi.SidecarSpec{Otel: true},
 					SplunkConfiguration: aiApi.SplunkConfigurationSpec{
 						// Endpoint set so we exercise the enrich path (resolver
 						// selection), not the empty-config skip branch.
@@ -165,6 +167,7 @@ func TestValidate_PropagatesErrorFromValidateAndEnrich(t *testing.T) {
 	p := &aiApi.AIPlatform{
 		Spec: aiApi.AIPlatformSpec{
 			ObjectStorage:       aiApi.ObjectStorageSpec{Path: "/data"},
+			Sidecars:            aiApi.SidecarSpec{Otel: true},
 			SplunkConfiguration: aiApi.SplunkConfigurationSpec{},
 		},
 	}
@@ -186,6 +189,45 @@ func TestValidate_PropagatesErrorFromValidateAndEnrich(t *testing.T) {
 	err := r.validate(context.Background(), p)
 	assert.Error(t, err)
 	assert.Equal(t, expectedErr, err, "should propagate the error from ValidateAndEnrichSplunkConfig")
+}
+
+func TestValidate_IssuerOnlyDoesNotRequireHECSecret(t *testing.T) {
+	r := newFakeReconciler()
+	p := &aiApi.AIPlatform{
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			Sidecars:      aiApi.SidecarSpec{Otel: false},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				Endpoint: "https://splunk:8089",
+			},
+		},
+	}
+
+	err := r.validate(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, "https://splunk:8089", p.Spec.SplunkConfiguration.Endpoint)
+}
+
+func TestValidate_TrustedIssuersOnlyDoesNotRequireHECConfig(t *testing.T) {
+	r := newFakeReconciler()
+	p := &aiApi.AIPlatform{
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			SplunkConfiguration: aiApi.SplunkConfigurationSpec{
+				TrustedIssuers: []string{"https://external.splunk:8089"},
+			},
+		},
+	}
+
+	err := r.validate(context.Background(), p)
+	require.NoError(t, err)
+
+	rec := r.Recorder.(*record.FakeRecorder)
+	select {
+	case ev := <-rec.Events:
+		t.Fatalf("trustedIssuers-only config emitted an unexpected event: %s", ev)
+	default:
+	}
 }
 
 // 5️⃣ Empty Splunk config ⇒ skip enrichment (Splunk disabled), no error.

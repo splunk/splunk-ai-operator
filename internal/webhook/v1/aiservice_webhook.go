@@ -341,16 +341,9 @@ func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkC
 		}
 	*/
 
-	// Vault source supplies its token via a file; it does not use a k8s SecretRef.
-	// All other sources require SecretRef when an explicit endpoint is set.
-	if splunkConfig.SecretSource != aiv1.SecretSourceVault {
-		if hasEndpoint && splunkConfig.SecretRef.Name == "" {
-			allErrs = append(allErrs, field.Required(
-				fldPath.Child("secretRef").Child("name"),
-				"secretRef.name is required when using endpoint",
-			))
-		}
-	}
+	// AIService consumes the management/JWKS endpoint for JWT issuer discovery.
+	// It does not export HEC telemetry, so an endpoint does not require a token
+	// secret here.
 
 	// Guard against path traversal: vaultFilePath must be under /vault/secrets/.
 	// The admission webhook cannot call EvalSymlinks (the file need not exist yet),

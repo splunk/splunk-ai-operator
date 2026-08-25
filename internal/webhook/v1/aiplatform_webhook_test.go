@@ -146,14 +146,23 @@ var _ = Describe("AIPlatform Webhook", func() {
 				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
 			})
 
-			It("should still require secretRef when endpoint is set (partial config)", func() {
+			It("should accept an issuer endpoint without secretRef when OTel is disabled", func() {
 				splunkConfig := &aiv1.SplunkConfigurationSpec{
-					Endpoint:     "http://splunk:8088",
+					Endpoint:     "https://splunk:8089",
 					SecretSource: aiv1.SecretSourceKubernetes,
 				}
 				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
+				Expect(errs).To(BeEmpty())
+			})
+
+			It("should require secretRef when OTel is enabled", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:     "https://splunk:8089",
+					SecretSource: aiv1.SecretSourceKubernetes,
+				}
+				errs := validator.validateSplunkConfiguration(splunkConfig, true, fldPath)
 				e := findErr(errs, "secretRef")
-				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
+				Expect(e).NotTo(BeNil(), "OTel endpoint without secretRef must error")
 			})
 		})
 

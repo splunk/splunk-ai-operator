@@ -149,34 +149,17 @@ Certificate, CA ConfigMap, or CA mount for this path.
 This compatibility choice has an explicit limitation. Splunk's built-in
 certificate may not be trusted by an image that strictly verifies outbound TLS,
 and it may not contain a SAN matching the Kubernetes Service hostname. That
-certificate-validation problem is not solved in this branch. Environments
-which require verified end-to-end TLS must use the separate hostname-valid
-certificate and CA-trust design. Do not disable verification globally to work
-around a failed certificate check.
+certificate-validation problem is not solved in this release. Verified
+end-to-end workload TLS is not supported. Do not disable verification globally
+to work around a failed certificate check.
 
-OTel telemetry configuration remains independent. When an OTel collector is
-actually injected and running, it receives `splunkConfiguration.hecEndpoint`
-for port 8088 and never treats HEC as a JWT issuer. After Splunk is Ready, the
-installer reads the effective HEC `[http]` stanza with `btool`, verifies that
-HEC is enabled and healthy, and renders `http://` or `https://` to match
-`enableSSL`; it does not change the HEC TLS setting. This configuration check
-does not by itself prove that a collector was deployed or that telemetry was
-delivered.
-
-The OTel sidecar receives its collector configuration when each Ray pod is
-created. Updating the HEC URL or scheme reconciles the Collector configuration,
-but it deliberately does not force a RayService rollout because a fully
-allocated GPU cluster may not have capacity for a replacement RayCluster.
-Existing Ray pods keep their injected configuration until they are recreated.
-Schedule a controlled RayService rollout during a capacity-approved maintenance
-window when an existing installation must consume a changed HEC destination.
-
-On upgrade from the earlier HTTP-management preview, the installer explicitly
-reconciles `SPLUNKD_SSL_ENABLE=true` so AI Assistant 2.0.4 can again use its
-local HTTPS management and KV Store connections. It removes only stale
-installer-owned certificate paths under `/mnt/splunk-cert*`, keeps Splunk Web
-on HTTP, preserves the PVC and indexed data, and leaves HEC's independent
-`enableSSL` value unchanged.
+HEC export, workload OTel integration, and workload mTLS are outside this
+release's support scope. The k0s installer rejects external HEC configuration,
+omits HEC endpoint and secret fields, and explicitly stores
+`sidecars.otel: false` and `mtls.enabled: false`. It still installs the OTel
+operator infrastructure, but no AIPlatform collector or workload injection is
+configured. Upgrade behavior is also outside this release's support scope;
+release qualification covers fresh installations only.
 
 Changing from an FQDN or HTTP issuer to the short native-HTTPS issuer
 changes the JWT `iss` value. Users must sign in again or repeat onboarding so
@@ -1116,36 +1099,10 @@ The command is resumable — it checks which models are already staged in the ob
 
 ### Upgrade the platform
 
-Update your config YAML with new image tags, then re-run install. The installer upgrades existing Helm releases in place:
-
-```bash
-# 1. Update image tags in your config
-vi my-cluster.yaml   # bump operator, ray, saia, splunk image versions
-
-# 2. Run install — Helm upgrades existing releases, does not wipe the cluster
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
-```
-
-> The safety gate prevents `install` from wiping a cluster with Ready nodes — it upgrades the stack only. If you also need to upgrade k0s itself, run `clean-all` + `install` (destructive — back up etcd first).
-
-**Air-gap upgrade:** re-run the same command on the installer machine — with
-`airgap: true` still in the config it re-stages the k0s and add-on infrastructure
-image bundles before upgrading the stack. It does **not** mirror the platform
-application image at the new tag — that's always a manual step
-([Phase 2 — Mirror Container Images](#phase-2--mirror-container-images)), and
-skipping it leaves the sealed nodes unable to pull the new tag
-(`ImagePullBackOff`). For each changed image:
-
-```bash
-# 1. Mirror the new tag to your internal registry BEFORE bumping the config
-crane copy "docker.io/splunk/<image>:<new-tag>" "registry.airgap.local/<image>:<new-tag>"
-
-# 2. Update the tag in your config to point at the mirrored image
-vi my-cluster-config.yaml
-
-# 3. Re-run install
-CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
-```
+Upgrading an existing platform from an earlier release is not supported in this
+release. The idempotent re-run guidance above applies only to completing or
+retrying the same fresh-install candidate. Use a fresh cluster for release
+qualification; do not change image versions and treat a re-run as an upgrade.
 
 ### Collect a support bundle
 

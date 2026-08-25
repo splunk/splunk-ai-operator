@@ -147,14 +147,13 @@ var _ = Describe("AIService Webhook", func() {
 				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
 			})
 
-			It("should still require secretRef when endpoint is set (partial config)", func() {
+			It("should accept an issuer endpoint without a HEC secret", func() {
 				splunkConfig := &aiv1.SplunkConfigurationSpec{
-					Endpoint:     "http://splunk:8088",
+					Endpoint:     "https://splunk:8089",
 					SecretSource: aiv1.SecretSourceKubernetes,
 				}
 				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
-				e := findErr(errs, "secretRef")
-				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
+				Expect(errs).To(BeEmpty())
 			})
 		})
 

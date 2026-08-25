@@ -442,11 +442,7 @@ show_install_plan() {
   echo -e "  \033[1mObject store     :\033[0m type=$(yq eval '.storage.objectStore.type // "?"' "${CONFIG_FILE}" 2>/dev/null)  bucket=$(yq eval '.storage.objectStore.bucket // "?"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
-  if [[ "${SPLUNK_MODE}" == "external" ]]; then
-    echo -e "  \033[1mSplunk           :\033[0m external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
-  else
-    echo -e "  \033[1mSplunk           :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
-  fi
+  echo -e "  \033[1mSplunk           :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
   echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
   echo "" >&2
@@ -462,15 +458,13 @@ show_install_plan() {
   echo -e "    3. k0s cluster installation" >&2
   echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
   if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+    echo -e "    5. Phase 2 (parallel): OTel operator (integration disabled), KubeRay, Splunk operator, NVIDIA device-plugin" >&2
   else
-    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, NVIDIA device-plugin  [Splunk operator SKIPPED — mode=${SPLUNK_MODE}]" >&2
+    echo -e "    5. Phase 2 (parallel): OTel operator (integration disabled), KubeRay, NVIDIA device-plugin  [Splunk operator SKIPPED — mode=${SPLUNK_MODE}]" >&2
   fi
   echo -e "    6. MetalLB load-balancer" >&2
   if [[ "${SPLUNK_MODE}" == "internal" ]]; then
     echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
-  elif [[ "${SPLUNK_MODE}" == "external" ]]; then
-    echo -e "    7. AI Platform operator + CR (external Splunk HEC)  [Splunk Standalone SKIPPED — external mode]" >&2
   else
     echo -e "    7. AI Platform operator + CR  [Splunk Standalone SKIPPED — mode=disabled]" >&2
   fi
@@ -661,8 +655,8 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
-  # Splunk integration (JWT/auth issuer for SAIA/Slim, plus optional HEC
-  # telemetry export) is OPT-IN and defaults to DISABLED. It only turns on when
+  # Splunk JWT/auth issuer integration for SAIA/Slim is OPT-IN and defaults to
+  # DISABLED. It only turns on when
   # splunk.enabled: true is explicitly set AND the required Splunk images are
   # present (enforced in validate_image_config). When disabled the script skips
   # the Splunk Operator, the Standalone CR, and omits splunkConfiguration from
@@ -672,31 +666,17 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
   [[ "${SPLUNK_ENABLED}" != "true" ]] && SPLUNK_ENABLED="false"
 
-  # External Splunk: use a Splunk running OUTSIDE the cluster as the JWT/auth
-  # issuer for SAIA/Slim (and, optionally, the HEC telemetry destination).
-  # When splunk.external.endpoint is set (and splunk.enabled is true), the
-  # script does NOT install the in-cluster Splunk Operator/Standalone — it only
-  # wires the AIPlatform CR at the external HEC endpoint + a Secret holding the
-  # HEC token. The token is supplied via the SPLUNK_HEC_TOKEN env var (never the
-  # config file), mirroring how MINIO_ROOT_PASSWORD works; the script creates
-  # the Secret post-cluster-bootstrap so there is no chicken-and-egg ordering.
+  # External HEC integration is intentionally fenced for this release. Fail
+  # before provisioning anything instead of accepting a configuration that the
+  # supported JWT-only path cannot honor.
   SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
   [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
-  SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-hec-external")"
-  [[ -z "${SPLUNK_EXTERNAL_SECRET_NAME}" || "${SPLUNK_EXTERNAL_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
-  # HEC token: env var only (keep it out of the config file and logs).
-  SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
 
   # Derive a single mode so downstream logic is unambiguous:
   #   disabled  — splunk.enabled=false: no Splunk integration at all
-  #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
-  #               in-cluster Splunk, use customer's external Splunk
-  #   internal  — splunk.enabled=true, no external endpoint: install SOK +
-  #               Standalone in-cluster (legacy behavior)
+  #   internal  — splunk.enabled=true: install SOK + Standalone in-cluster
   if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
     SPLUNK_MODE="disabled"
-  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
-    SPLUNK_MODE="external"
   else
     SPLUNK_MODE="internal"
   fi
@@ -754,7 +734,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
-  log "Splunk integration: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
+  log "Splunk integration: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -769,6 +749,15 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 
   if [[ ${#enabled_registries[@]} -gt 0 ]]; then
     log "ImagePullSecrets enabled for: ${enabled_registries[*]}"
+  fi
+}
+
+# Reject release-fenced settings only for commands that create or validate a
+# deployment. Recovery and diagnostics commands must remain usable even when a
+# legacy config file still contains one of these fields.
+reject_unsupported_feature_config() {
+  if [[ -n "${SPLUNK_EXTERNAL_ENDPOINT:-}" ]]; then
+    err "splunk.external.endpoint configures external HEC integration, which is not supported in this release. Remove it; use splunk.trustedIssuers with the management/JWKS URL for JWT-only external issuers."
   fi
 }
 
@@ -1139,14 +1128,6 @@ preflight_checks() {
   case "${SPLUNK_MODE}" in
     internal)
       [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
-      ;;
-    external)
-      pf_ok "Splunk: external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME}, in-cluster Splunk skipped)"
-      # The HEC token must be supplied via env; fail fast here rather than
-      # discovering it at CR-apply time after the cluster is already up.
-      [[ -n "${SPLUNK_HEC_TOKEN}" ]] && pf_ok "SPLUNK_HEC_TOKEN is set (external HEC token)" || pf_fail "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
-      # Endpoint should be a base HEC URL; the operator appends /services/collector.
-      [[ "${SPLUNK_EXTERNAL_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External HEC endpoint scheme OK" || pf_warn "splunk.external.endpoint should start with http:// or https:// (got: ${SPLUNK_EXTERNAL_ENDPOINT})"
       ;;
     *)
       pf_ok "Splunk disabled (splunk.enabled=false) — Splunk Operator/Standalone will be skipped"
@@ -5441,113 +5422,6 @@ internal_splunk_pod_name() {
   printf 'splunk-%s-standalone-0' "${AI_STANDALONE_NAME}"
 }
 
-# Read one effective setting from btool's global [http] stanza. btool has
-# already merged every inputs.conf layer, so exactly one value is expected.
-# Ambiguous or missing values are rejected instead of guessing a HEC protocol.
-_internal_splunk_btool_http_value() {
-  local option="$1"
-  awk -v wanted="${option}" '
-    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
-      section = $0
-      sub(/^[[:space:]]*\[/, "", section)
-      sub(/\][[:space:]]*$/, "", section)
-      in_http = (section == "http")
-      next
-    }
-    in_http && $1 == wanted && $2 == "=" {
-      value = $3
-      sub(/\r$/, "", value)
-      count++
-    }
-    END {
-      if (count != 1) exit 1
-      print tolower(value)
-    }
-  '
-}
-
-# HEC is consumed only by the OTel telemetry exporter. Do not change its TLS
-# setting here: fresh Splunk Operator installs commonly use HTTP while an
-# upgraded/customer-configured instance may use HTTPS. Detect the effective
-# listener after Splunk is Ready, validate it, and expose the result through a
-# global so an err() exit cannot be swallowed by command substitution.
-_detect_internal_splunk_hec_url() {
-  local pod_name
-  local btool_output
-  local hec_disabled
-  local hec_enable_ssl
-  local hec_port
-  local hec_scheme
-  local health_url
-  _INTERNAL_SPLUNK_HEC_URL=""
-
-  pod_name="$(internal_splunk_pod_name)"
-  if ! btool_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
-      /opt/splunk/bin/splunk btool inputs list http 2>/dev/null); then
-    err "Failed to read effective HEC settings from ${AI_NS}/${pod_name}; refusing to guess the OTel endpoint protocol."
-    return 1
-  fi
-
-  if ! hec_disabled=$(printf '%s\n' "${btool_output}" | \
-      _internal_splunk_btool_http_value disabled); then
-    err "Effective Splunk HEC setting [http]/disabled is missing or ambiguous."
-    return 1
-  fi
-  case "${hec_disabled}" in
-    0|false|no|off) ;;
-    1|true|yes|on)
-      err "Splunk HEC is disabled; OTel telemetry requires the internal HEC listener."
-      return 1
-      ;;
-    *)
-      err "Unsupported effective Splunk HEC disabled value: ${hec_disabled}"
-      return 1
-      ;;
-  esac
-
-  if ! hec_enable_ssl=$(printf '%s\n' "${btool_output}" | \
-      _internal_splunk_btool_http_value enableSSL); then
-    err "Effective Splunk HEC setting [http]/enableSSL is missing or ambiguous."
-    return 1
-  fi
-  case "${hec_enable_ssl}" in
-    0|false|no|off) hec_scheme="http" ;;
-    1|true|yes|on) hec_scheme="https" ;;
-    *)
-      err "Unsupported effective Splunk HEC enableSSL value: ${hec_enable_ssl}"
-      return 1
-      ;;
-  esac
-
-  if ! hec_port=$(printf '%s\n' "${btool_output}" | \
-      _internal_splunk_btool_http_value port); then
-    err "Effective Splunk HEC setting [http]/port is missing or ambiguous."
-    return 1
-  fi
-  if [[ "${hec_port}" != "8088" ]]; then
-    err "Effective Splunk HEC port is ${hec_port}; the operator-managed Service exposes only port 8088."
-    return 1
-  fi
-
-  health_url="${hec_scheme}://localhost:${hec_port}/services/collector/health"
-  if [[ "${hec_scheme}" == "https" ]]; then
-    if ! kubectl exec -n "${AI_NS}" "${pod_name}" -- \
-        curl --insecure --silent --show-error --fail --output /dev/null \
-          --max-time 10 "${health_url}" >/dev/null 2>&1; then
-      err "Splunk HEC reports enableSSL=${hec_enable_ssl}, but its HTTPS health endpoint is not ready."
-      return 1
-    fi
-  elif ! kubectl exec -n "${AI_NS}" "${pod_name}" -- \
-      curl --silent --show-error --fail --output /dev/null \
-        --max-time 10 "${health_url}" >/dev/null 2>&1; then
-    err "Splunk HEC reports enableSSL=${hec_enable_ssl}, but its HTTP health endpoint is not ready."
-    return 1
-  fi
-
-  _INTERNAL_SPLUNK_HEC_URL="${hec_scheme}://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:${hec_port}"
-  log "✓ Detected healthy internal Splunk HEC listener for OTel: ${_INTERNAL_SPLUNK_HEC_URL}"
-}
-
 # Read the Standalone once and distinguish a confirmed NotFound (fresh install)
 # from API, RBAC, transport, or decoding failures. Callers use the globals below
 # so command-substitution subshells cannot hide err() exits.
@@ -5713,11 +5587,6 @@ _internal_splunk_runtime_matches_desired() {
   fi
   ! grep -q '/mnt/splunk-cert' <<<"${debug_output}" || return 1
 
-  if ! debug_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
-      /opt/splunk/bin/splunk btool inputs list http --debug 2>/dev/null); then
-    return 1
-  fi
-  ! grep -q '/mnt/splunk-cert' <<<"${debug_output}" || return 1
 }
 
 _wait_for_internal_splunk_https() {
@@ -5855,12 +5724,6 @@ data:
         - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: serverCert }
         - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: privKeyPath }
         - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: caCertPath }
-        # HEC transport is outside AIP-4614's management/JWKS change. Remove
-        # only the preview installer's custom certificate material; do not
-        # mutate enableSSL. The installer detects the resulting effective HEC
-        # protocol after Splunk becomes Ready and gives that URL only to OTel.
-        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: sslPassword }
-        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: serverCert }
       when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
 YAML
 
@@ -5940,7 +5803,6 @@ YAML
 
   _apply_internal_splunk_standalone_cr "${minio_endpoint}" https "${existing_extra_env_json}"
   _wait_for_internal_splunk_https 900
-  _detect_internal_splunk_hec_url
   log "Splunk Standalone is using native management HTTPS"
 }
 
@@ -5982,7 +5844,8 @@ install_ai_platform_cr() {
   log "✓ Cleanup complete"
 
   # Build trustedIssuers YAML fragment from config (splunk.trustedIssuers[]).
-  # Used in all modes: appended to in-cluster issuer (internal) or sole source (external/disabled).
+  # Used in all modes: appended to the in-cluster issuer (internal) or used as
+  # the sole source when Splunk is disabled.
   local trusted_issuers_yaml=""
   local trusted_issuers_count
   trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
@@ -5999,20 +5862,12 @@ install_ai_platform_cr() {
 
   # Splunk configuration block for the AIPlatform CR. Rendered by mode:
   #   disabled — omits splunkConfiguration; trustedIssuers still written if set.
-  #   internal — point at the in-cluster Standalone as JWT issuer + HEC + operator-managed secret.
-  #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
-  #              var and point at the customer's external Splunk as JWT issuer/HEC endpoint.
+  #   internal — point at the in-cluster Standalone as the JWT issuer.
   local splunk_config_yaml=""
   case "${SPLUNK_MODE}" in
     internal)
-      local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
       local internal_splunk_url
-      local internal_splunk_hec_url_value
       internal_splunk_url="$(internal_splunk_management_url)"
-      internal_splunk_hec_url_value="${_INTERNAL_SPLUNK_HEC_URL:-}"
-      [[ -n "${internal_splunk_hec_url_value}" ]] || \
-        err "Internal Splunk HEC protocol was not detected before rendering AIPlatform."
-      log "Using Splunk secret: ${splunk_secret}"
       splunk_config_yaml=$(cat <<EOF
 
   # Splunk configuration (internal — in-cluster Standalone)
@@ -6023,40 +5878,6 @@ install_ai_platform_cr() {
   # provisioned or mounted by this compatibility path.
   splunkConfiguration:
     endpoint: ${internal_splunk_url}
-    # Used only by the OTel exporter for telemetry ingestion. Its scheme comes
-    # from Splunk's effective HEC listener and it is never a JWT issuer.
-    hecEndpoint: ${internal_splunk_hec_url_value}
-    secretRef:
-      name: ${splunk_secret}
-      namespace: ${AI_NS}
-${trusted_issuers_yaml}
-EOF
-)
-      ;;
-    external)
-      # The HEC token comes from the env var only (never the config file). The
-      # namespace is guaranteed here (internal mode created it via the Standalone
-      # install; external mode skips that, so ensure it now before the Secret).
-      ensure_namespace "${AI_NS}"
-      if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
-        err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
-      fi
-      log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
-      # --dry-run|apply keeps this idempotent across re-runs. The token value is
-      # never echoed; only the secret name is logged.
-      kubectl -n "${AI_NS}" create secret generic "${SPLUNK_EXTERNAL_SECRET_NAME}" \
-        --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
-        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
-      log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
-      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
-      splunk_config_yaml=$(cat <<EOF
-
-  # Splunk configuration (external — customer-managed Splunk)
-  splunkConfiguration:
-    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
-    secretRef:
-      name: ${SPLUNK_EXTERNAL_SECRET_NAME}
-      namespace: ${AI_NS}
 ${trusted_issuers_yaml}
 EOF
 )
@@ -6226,6 +6047,13 @@ ${image_pull_secrets}
 
   # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
 ${scale_factor_yaml}
+  # Feature fence for this release. The OTel operator may be installed as
+  # infrastructure, but workload injection/telemetry and mTLS are unsupported.
+  sidecars:
+    otel: false
+  mtls:
+    enabled: false
+
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}
@@ -6825,9 +6653,8 @@ check_platform_health() {
   if kubectl get pods -n opentelemetry-operator-system 2>/dev/null | grep -q "Running"; then
     log "✅ OpenTelemetry Operator is running"
   else
-    warn "OpenTelemetry Operator not ready"
-    kubectl get pods -n opentelemetry-operator-system
-    ((health_issues++))
+    warn "OpenTelemetry Operator not ready (optional; workload OTel is disabled)"
+    kubectl get pods -n opentelemetry-operator-system || true
   fi
   log ""
 
@@ -7578,6 +7405,7 @@ _collect_pod_summary() {
   raw=$(kubectl get pods --all-namespaces -o json 2>&1 \
         | jq -r --arg FS "${_POD_FS}" '
             .items[]
+            | select(.metadata.namespace != "opentelemetry-operator-system")
             | (.status.containerStatuses // []) as $cs
             | [
                 .metadata.namespace,
@@ -7911,6 +7739,7 @@ main_install() {
   [[ "${SILENT_INSTALL}" == "true" ]] && AUTO_APPROVE=true
 
   load_config
+  reject_unsupported_feature_config
 
   validate_image_config
   resolve_accelerator_type
@@ -8447,6 +8276,7 @@ diagnose() {
 # Config completeness check — catches problems before a 40-min install run.
 validate_config() {
   load_config
+  reject_unsupported_feature_config
 
   echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
   local errors=0 warnings=0

@@ -195,6 +195,21 @@ func Test_validateAIService_missingV2Image(t *testing.T) {
 	assert.ErrorContains(t, err, "v2.image must be set")
 }
 
+func Test_validateAIService_IssuerEndpointDoesNotRequireHECSecret(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_POST_INSTALL_HOOK", "dummy")
+	r := &SaiaReconciler{
+		Recorder: record.NewFakeRecorder(10),
+		Client:   fake.NewClientBuilder().WithScheme(buildTestScheme(t)).Build(),
+	}
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk:8089"
+
+	err := r.validateAIService(context.Background(), ai)
+
+	require.NoError(t, err)
+	assert.Empty(t, ai.Spec.SplunkConfiguration.SecretRef.Name)
+}
+
 // buildFullTestScheme creates a scheme that includes apps/v1 for Deployment testing.
 func buildFullTestScheme(t *testing.T) *runtime.Scheme {
 	s := buildTestScheme(t)

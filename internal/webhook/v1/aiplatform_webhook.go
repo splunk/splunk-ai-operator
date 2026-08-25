@@ -290,18 +290,13 @@ func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *ai
 		return allErrs
 	}
 
-	// All sources require secretRef when an endpoint is set, EXCEPT vault when
-	// the OTel sidecar is disabled. The OTel collector path (renderOtelConf and
-	// the collector env) has not been ported to vault: it still emits a
-	// secretKeyRef and does a Kubernetes Secret Get, so vault-only configs with
-	// otel enabled would write a broken collector. Require secretRef in that case.
-	if splunkConfig.SecretSource != aiv1.SecretSourceVault || otelEnabled {
-		if hasEndpoint && !hasSecretRef {
-			allErrs = append(allErrs, field.Required(
-				fldPath.Child("secretRef").Child("name"),
-				"secretRef.name is required when using endpoint",
-			))
-		}
+	// A secret is required only for the OTel telemetry exporter. JWT issuer
+	// discovery uses the management endpoint and does not consume a HEC token.
+	if otelEnabled && hasEndpoint && !hasSecretRef {
+		allErrs = append(allErrs, field.Required(
+			fldPath.Child("secretRef").Child("name"),
+			"secretRef.name is required when OpenTelemetry is enabled",
+		))
 	}
 
 	// Guard against path traversal: vaultFilePath must be under /vault/secrets/.

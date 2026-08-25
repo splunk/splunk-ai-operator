@@ -1214,7 +1214,25 @@ assert_eq "waits for the node to return after the recovery reboot" \
 # ── Tests: AIP-4614 native-HTTPS internal Splunk ──────────────────────
 # Execute the production installer functions with kubectl/yq mocked and inspect
 # the YAML they actually render. The internal issuer follows main's short
-# namespace-local HTTPS Service URL, while HEC remains a distinct OTel endpoint.
+# namespace-local HTTPS Service URL, while unsupported HEC/OTel and mTLS
+# workload features remain explicitly disabled.
+
+_exercise_unsupported_feature_fence() (
+  local endpoint="${1:-}"
+  eval "$(_extract_fn reject_unsupported_feature_config)"
+  err() { return 1; }
+  SPLUNK_EXTERNAL_ENDPOINT="${endpoint}"
+  reject_unsupported_feature_config
+)
+
+assert_rc "JWT-only supported config passes the feature fence" 0 \
+  _exercise_unsupported_feature_fence ""
+assert_rc "external HEC endpoint is rejected before installation" 1 \
+  _exercise_unsupported_feature_fence "https://splunk.example.com:8088"
+assert_eq "OTel operator infrastructure remains installed in phase 2" "1" \
+  "$(grep -c 'install_otel_operator_and_contrib_collector >.*otel-operator.log' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "optional OTel namespace is excluded from the hard pod gate" "1" \
+  "$(grep -c 'select(.metadata.namespace != "opentelemetry-operator-system")' "${SCRIPT}" | tr -d '[:space:]')"
 
 suite "AIP-4614 native-HTTPS internal Splunk"
 echo "▶ AIP-4614 native-HTTPS internal Splunk"
@@ -1223,8 +1241,6 @@ _render_internal_splunk_https_manifests() (
   local capture_dir="$1"
   eval "$(_extract_fn internal_splunk_management_url)"
   eval "$(_extract_fn internal_splunk_pod_name)"
-  eval "$(_extract_fn _internal_splunk_btool_http_value)"
-  eval "$(_extract_fn _detect_internal_splunk_hec_url)"
   eval "$(_extract_fn _read_internal_splunk_state)"
   eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
   eval "$(_extract_fn install_splunk_standalone)"
@@ -1250,16 +1266,12 @@ _render_internal_splunk_https_manifests() (
   kubectl() {
     local args=" $* " body
     if [[ "${args}" == *' btool inputs list http '* ]]; then
-      cat <<'EOF'
-[http]
-disabled = 0
-enableSSL = 0
-port = 8088
-EOF
-      return 0
+      printf 'unexpected HEC btool probe\n' >>"${capture_dir}/unsupported-calls"
+      return 97
     fi
     if [[ "${args}" == *'/services/collector/health'* ]]; then
-      return 0
+      printf 'unexpected HEC health probe\n' >>"${capture_dir}/unsupported-calls"
+      return 97
     fi
     if [[ "${args}" == *' get standalone '* && "${args}" == *' -o json '* ]]; then
       echo '{"status":{"telAppInstalled":true,"phase":"Ready","message":""},"spec":{"extraEnv":[{"name":"KEEP_ME","value":"kept"}]}}'
@@ -1351,7 +1363,6 @@ for _manifest in splunk-defaults standalone aiplatform; do
 done
 
 _expected_internal_url='https://splunk-fixture-splunk-standalone-service:8089'
-_expected_internal_hec_url='http://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088'
 _rendered_issuer=$(awk -F'issuer_uri: ' '/issuer_uri:/{print $2; exit}' \
   "${_AIP4614_TMPDIR}/splunk-defaults.yaml")
 _rendered_endpoint=$(awk '
@@ -1360,24 +1371,22 @@ _rendered_endpoint=$(awk '
     sub(/^[[:space:]]*endpoint:[[:space:]]*/, ""); print; exit
   }
 ' "${_AIP4614_TMPDIR}/aiplatform.yaml")
-_rendered_hec_endpoint=$(awk '
-  /^[[:space:]]*splunkConfiguration:/ { in_splunk=1; next }
-  in_splunk && /^[[:space:]]*hecEndpoint:/ {
-    sub(/^[[:space:]]*hecEndpoint:[[:space:]]*/, ""); print; exit
-  }
-' "${_AIP4614_TMPDIR}/aiplatform.yaml")
-
 assert_eq "oauth issuer renders main's short internal HTTPS Service URL" \
   "${_expected_internal_url}" "${_rendered_issuer}"
 assert_eq "AIPlatform endpoint renders the same internal HTTPS Service URL" \
   "${_expected_internal_url}" "${_rendered_endpoint}"
 assert_eq "oauth issuer and AIPlatform endpoint are byte-identical" \
   "${_rendered_issuer}" "${_rendered_endpoint}"
-assert_eq "OTel HEC endpoint follows the effective HTTP listener on port 8088" \
-  "${_expected_internal_hec_url}" "${_rendered_hec_endpoint}"
-assert_eq "HEC endpoint is never used as a JWT issuer" "0" \
-  "$(grep -c "issuer_uri: ${_expected_internal_hec_url}" \
-    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
+assert_eq "workload OTel is explicitly disabled" "false" \
+  "$("${YQ_BIN}" eval '.spec.sidecars.otel' "${_AIP4614_TMPDIR}/aiplatform.yaml")"
+assert_eq "workload mTLS is explicitly disabled" "false" \
+  "$("${YQ_BIN}" eval '.spec.mtls.enabled' "${_AIP4614_TMPDIR}/aiplatform.yaml")"
+assert_eq "AIPlatform omits the unsupported HEC endpoint" "false" \
+  "$("${YQ_BIN}" eval '.spec.splunkConfiguration | has("hecEndpoint")' "${_AIP4614_TMPDIR}/aiplatform.yaml")"
+assert_eq "AIPlatform issuer-only config omits a HEC secretRef" "false" \
+  "$("${YQ_BIN}" eval '.spec.splunkConfiguration | has("secretRef")' "${_AIP4614_TMPDIR}/aiplatform.yaml")"
+assert_eq "installer performs no HEC probe while rendering supported config" "0" \
+  "$([[ -s "${_AIP4614_TMPDIR}/unsupported-calls" ]] && echo 1 || echo 0)"
 assert_eq "installer renders no JWKS proxy resource" "0" \
   "$(grep -c 'jwks-proxy' "${_AIP4614_TMPDIR}/all-applies.yaml" || true)"
 assert_eq "Standalone final manifest enables splunkd management TLS exactly once" "1" \
@@ -1401,74 +1410,6 @@ assert_eq "migration restores built-in Splunk management TLS" "1" \
 assert_eq "migration keeps Splunk Web on HTTP when preview paths are present" "1" \
   "$(grep -c 'section: settings, option: enableSplunkWebSSL, value: "false"' \
     "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
-assert_eq "migration does not change the independent HEC TLS switch" "0" \
-  "$(grep -c 'section: http, option: enableSSL' \
-    "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"
-
-_exercise_internal_splunk_hec_detection() (
-  local scenario="$1"
-  eval "$(_extract_fn internal_splunk_pod_name)"
-  eval "$(_extract_fn _internal_splunk_btool_http_value)"
-  eval "$(_extract_fn _detect_internal_splunk_hec_url)"
-
-  log() { :; }
-  err() { return 1; }
-  kubectl() {
-    local args=" $* "
-    if [[ "${args}" == *' btool inputs list http '* ]]; then
-      case "${scenario}" in
-        http|health-failure)
-          printf '[http]\ndisabled = 0\nenableSSL = 0\nport = 8088\n'
-          ;;
-        https)
-          printf '[http]\ndisabled = 0\nenableSSL = 1\nport = 8088\n'
-          ;;
-        disabled)
-          printf '[http]\ndisabled = 1\nenableSSL = 0\nport = 8088\n'
-          ;;
-        missing-scheme)
-          printf '[http]\ndisabled = 0\nport = 8088\n'
-          ;;
-        ambiguous-scheme)
-          printf '[http]\ndisabled = 0\nenableSSL = 0\nenableSSL = 1\nport = 8088\n'
-          ;;
-        bad-port)
-          printf '[http]\ndisabled = 0\nenableSSL = 0\nport = 18088\n'
-          ;;
-        exec-failure)
-          return 1
-          ;;
-      esac
-      return 0
-    fi
-    if [[ "${args}" == *'/services/collector/health'* ]]; then
-      [[ "${scenario}" != "health-failure" ]]
-      return
-    fi
-    return 1
-  }
-
-  AI_STANDALONE_NAME=fixture-splunk
-  AI_NS=fixture-ns
-  _detect_internal_splunk_hec_url || return 1
-  printf '%s\n' "${_INTERNAL_SPLUNK_HEC_URL}"
-)
-
-assert_eq "effective HEC enableSSL=0 selects HTTP for OTel" \
-  'http://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088' \
-  "$(_exercise_internal_splunk_hec_detection http)"
-assert_eq "effective HEC enableSSL=1 selects HTTPS for OTel" \
-  'https://splunk-fixture-splunk-standalone-service.fixture-ns.svc.cluster.local:8088' \
-  "$(_exercise_internal_splunk_hec_detection https)"
-
-for _hec_failure in disabled missing-scheme ambiguous-scheme bad-port exec-failure health-failure; do
-  if _exercise_internal_splunk_hec_detection "${_hec_failure}" >/dev/null 2>&1; then
-    _hec_failure_rc=0
-  else
-    _hec_failure_rc=$?
-  fi
-  assert_eq "HEC detection fails closed for ${_hec_failure}" "1" "${_hec_failure_rc}"
-done
 
 _render_splunk_bootstrap_manifest "${_AIP4614_TMPDIR}/bootstrap-standalone.yaml"
 assert_eq "fresh-install bootstrap keeps the operator's default startup probe" "0" \
@@ -1512,14 +1453,6 @@ _exercise_internal_splunk_runtime_state() (
       fi
       return 0
     fi
-    if [[ "${args}" == *' btool inputs list http --debug '* ]]; then
-      if [[ "${scenario}" == "stale-hec-path" ]]; then
-        printf '/opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf serverCert = /mnt/splunk-cert/server.pem\n'
-      else
-        printf '/opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf enableSSL = true\n'
-      fi
-      return 0
-    fi
     if [[ "${args}" == *' btool server list sslConfig '* ]]; then
       case "${scenario}" in
         tls-false) printf '[sslConfig]\nenableSplunkdSSL = false\n' ;;
@@ -1547,7 +1480,7 @@ _exercise_internal_splunk_runtime_state() (
 assert_rc "effective native-HTTPS runtime state is accepted" 0 \
   _exercise_internal_splunk_runtime_state desired
 for _runtime_failure in tls-false ambiguous-tls wrong-issuer ambiguous-issuer \
-    stale-server-path stale-web-path stale-hec-path exec-failure; do
+    stale-server-path stale-web-path exec-failure; do
   assert_rc "runtime readiness rejects ${_runtime_failure}" 1 \
     _exercise_internal_splunk_runtime_state "${_runtime_failure}"
 done
@@ -1582,8 +1515,6 @@ _exercise_internal_splunk_install_flow() (
   _wait_for_internal_splunk_https() {
     printf 'wait-https\n' >>"${event_file}"
   }
-  _detect_internal_splunk_hec_url() { :; }
-
   kubectl() {
     local args=" $* " body
     if [[ "${args}" == *' get secret minio-credentials '* ]]; then return 0; fi

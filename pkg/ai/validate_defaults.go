@@ -36,6 +36,10 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 	}
 
 	sc := p.Spec.SplunkConfiguration
+	if sc.Endpoint == "" && sc.SplunkCustomResourceRef.Name == "" && len(sc.TrustedIssuers) > 0 {
+		// External JWT-only issuers do not need endpoint resolution or a HEC token.
+		return nil
+	}
 	if sc.Endpoint == "" &&
 		sc.SplunkCustomResourceRef.Name == "" &&
 		sc.SecretRef.Name == "" &&
@@ -43,6 +47,15 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 		r.Recorder.Event(p, corev1.EventTypeWarning, "SplunkConfigMissing",
 			"Splunk configuration is missing; assuming no telemetry")
 		return nil
+	}
+	if !p.Spec.Sidecars.Otel {
+		return splunkutils.ValidateAndEnrichSplunkIssuer(
+			ctx,
+			r.Client,
+			p.Namespace,
+			p.Spec.ClusterDomain,
+			&p.Spec.SplunkConfiguration,
+		)
 	}
 
 	var resolver splunkutils.SplunkSecretResolver

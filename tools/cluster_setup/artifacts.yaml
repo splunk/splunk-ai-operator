@@ -2806,7 +2806,7 @@ spec:
                     description: Envoy enables Envoy sidecar injection
                     type: boolean
                   otel:
-                    default: true
+                    default: false
                     description: Otel enables OpenTelemetry sidecar injection
                     type: boolean
                   prometheusOperator:

@@ -8,6 +8,7 @@ import (
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -127,6 +128,42 @@ func TestValidateAndEnrichSplunkConfig(t *testing.T) {
 		err := ValidateAndEnrichSplunkConfig(ctx, fc, ns, "", cfg, resolver)
 
 		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "must have either Endpoint or SplunkCustomResourceRef")
+	})
+}
+
+func TestValidateAndEnrichSplunkIssuer(t *testing.T) {
+	ctx := context.Background()
+	fc := fake.NewClientBuilder().Build()
+
+	t.Run("explicit management endpoint does not require a HEC resolver", func(t *testing.T) {
+		cfg := &aiApi.SplunkConfigurationSpec{Endpoint: "https://splunk:8089"}
+
+		err := ValidateAndEnrichSplunkIssuer(ctx, fc, "test-ns", "", cfg)
+
+		require.NoError(t, err)
+		assert.Equal(t, "https://splunk:8089", cfg.Endpoint)
+	})
+
+	t.Run("custom resource reference resolves management endpoint", func(t *testing.T) {
+		cfg := &aiApi.SplunkConfigurationSpec{
+			SplunkCustomResourceRef: corev1.ObjectReference{Name: "splunk", Kind: "Standalone"},
+		}
+		patchResolveSplunkEndpoint(func(context.Context, client.Client, string, aiApi.SplunkConfigurationSpec, string) (string, error) {
+			return "https://resolved-splunk:8089", nil
+		})
+		defer restoreResolveSplunkEndpoint()
+
+		err := ValidateAndEnrichSplunkIssuer(ctx, fc, "test-ns", "cluster.local", cfg)
+
+		require.NoError(t, err)
+		assert.Equal(t, "https://resolved-splunk:8089", cfg.Endpoint)
+	})
+
+	t.Run("missing issuer source fails", func(t *testing.T) {
+		err := ValidateAndEnrichSplunkIssuer(ctx, fc, "test-ns", "", &aiApi.SplunkConfigurationSpec{})
+
+		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must have either Endpoint or SplunkCustomResourceRef")
 	})
 }

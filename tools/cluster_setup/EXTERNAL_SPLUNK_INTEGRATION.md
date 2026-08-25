@@ -367,8 +367,7 @@ manual edit.
     ```
 
    In this release, do **not** set `splunk.external.endpoint` for JWT-only
-   integration. That setting selects the installer's external HEC mode, which
-   requires a HEC token and is outside the scope of this workflow. Port `8088`
+   integration. The installer rejects that external HEC setting. Port `8088`
    is not a JWT issuer.
 
 2. Rerun the supported installer flow. Do not patch the generated AIPlatform,
@@ -565,5 +564,5 @@ the allowlist; `trustedIssuers` contains only the additional external issuers.
 | Config change has no effect after restart | Restarted with `sudo` but Splunk owned by another user | [Step 5](#step-5--restart-splunk-correctly) |
 | Fresh fix works but old browser session still fails | Stale JWT from before the restart — log out and back in | [Step 6](#step-6--final-verification) |
 | Request works from laptop but times out from cluster or Splunk host | Missing route or firewall/SG rule for that specific network path | [Network Requirements](#network-requirements) |
-| External JWT issuer and HEC destination are conflated | Put the exact management/JWKS `:8089` URL in `splunk.trustedIssuers`; do not use external HEC mode for JWT-only integration | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
+| External JWT issuer and HEC destination are conflated | Put the exact management/JWKS `:8089` URL in `splunk.trustedIssuers`; the installer rejects external HEC configuration | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
 | AIPlatform issuer configuration changed but v2 pods use the old issuer | Operator version does not roll both v2 Deployments for spec-derived `SPLUNK_ISSUERS` changes | [Fresh Install and Issuer Updates](#fresh-install-and-issuer-updates) |

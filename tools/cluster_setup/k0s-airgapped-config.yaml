@@ -119,8 +119,8 @@ files:
   splunkOperator: "./splunk-operator-cluster.yaml"
   aiPlatform: "./artifacts.yaml"
 
-# With no splunk.external.endpoint, enabled=true installs the Splunk Operator
-# and a Splunk Standalone instance inside the cluster.
+# enabled=true installs the Splunk Operator and a Splunk Standalone instance
+# inside the cluster. External HEC configuration is rejected in this release.
 splunk:
   enabled: true
   standaloneName: "splunk-standalone"

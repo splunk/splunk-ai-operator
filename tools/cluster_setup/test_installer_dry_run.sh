@@ -2,7 +2,7 @@
 # Dry-run test for Splunk-optional installer modes.
 #
 # Tests the splunk_config_yaml block generation that install_ai_platform_cr()
-# emits into the AIPlatform CR, for all 5 Splunk mode combinations.
+# emits into the AIPlatform CR, including unsupported-feature fences.
 # No cluster, no kubectl, no artifacts files needed.
 #
 # Usage: bash test_installer_dry_run.sh
@@ -24,24 +24,22 @@ check_not_contains() { echo "${OUT}" | grep -qF "$2" && fail "$3 (unexpected: '$
 # We exercise it by setting the same variables the installer would set.
 render_splunk_block() {
   local cfg="$1"
-  local hec="${2:-}"
-  local standalone="${3:-splunk-standalone}"
-
-  [[ -n "${hec}" ]] && export SPLUNK_HEC_TOKEN="${hec}"
+  local standalone="${2:-splunk-standalone}"
 
   # Derive SPLUNK_MODE the same way load_config() does
-  local SPLUNK_ENABLED SPLUNK_EXTERNAL_ENDPOINT SPLUNK_EXTERNAL_SECRET_NAME SPLUNK_MODE AI_NS
+  local SPLUNK_ENABLED SPLUNK_EXTERNAL_ENDPOINT SPLUNK_MODE
   SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${cfg}" 2>/dev/null || echo "false")"
   SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${cfg}" 2>/dev/null || echo "")"
   [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
-  SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "${cfg}" 2>/dev/null || echo "splunk-hec-external")"
-  AI_NS="$(yq eval '.kubernetes.namespace // "ai-platform"' "${cfg}" 2>/dev/null || echo "ai-platform")"
   AI_STANDALONE_NAME="${standalone}"
+
+  if [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+    echo "splunk.external.endpoint configures external HEC integration, which is not supported in this release" >&2
+    return 1
+  fi
 
   if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
     SPLUNK_MODE="disabled"
-  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
-    SPLUNK_MODE="external"
   else
     SPLUNK_MODE="internal"
   fi
@@ -65,31 +63,11 @@ render_splunk_block() {
   local splunk_config_yaml=""
   case "${SPLUNK_MODE}" in
     internal)
-      local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
       splunk_config_yaml=$(cat <<EOF
 
   # Splunk configuration (internal — in-cluster Standalone)
   splunkConfiguration:
     endpoint: https://splunk-${AI_STANDALONE_NAME}-standalone-service:8089
-    # Fresh Splunk Operator installs report enableSSL=0. The production
-    # installer reads btool after readiness rather than assuming this scheme.
-    hecEndpoint: http://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8088
-    secretRef:
-      name: ${splunk_secret}
-      namespace: ${AI_NS}
-${trusted_issuers_yaml}
-EOF
-)
-      ;;
-    external)
-      splunk_config_yaml=$(cat <<EOF
-
-  # Splunk configuration (external — customer-managed Splunk)
-  splunkConfiguration:
-    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
-    secretRef:
-      name: ${SPLUNK_EXTERNAL_SECRET_NAME}
-      namespace: ${AI_NS}
 ${trusted_issuers_yaml}
 EOF
 )
@@ -107,7 +85,13 @@ EOF
       ;;
   esac
 
-  echo "${splunk_config_yaml}"
+  cat <<EOF
+  sidecars:
+    otel: false
+  mtls:
+    enabled: false
+${splunk_config_yaml}
+EOF
 }
 
 # ── Config writer ─────────────────────────────────────────────────────────────
@@ -131,6 +115,8 @@ OUT=$(render_splunk_block "${CFG}")
 info "SPLUNK_MODE=disabled → splunkConfiguration block must be absent"
 check_not_contains "${OUT}" "splunkConfiguration" "No splunkConfiguration block"
 check_not_contains "${OUT}" "endpoint:"           "No Splunk endpoint"
+check_contains     "${OUT}" "otel: false"          "Workload OTel explicitly disabled"
+check_contains     "${OUT}" "enabled: false"       "mTLS explicitly disabled"
 rm -f "${CFG}"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -153,15 +139,14 @@ rm -f "${CFG}"
 echo -e "\n${BOLD}Case 3: INTERNAL — splunk.enabled: true, no external.endpoint${RESET}"
 CFG=$(make_config "splunk:
   enabled: true")
-OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
+OUT=$(render_splunk_block "${CFG}" "my-standalone")
 EXPECTED_INTERNAL_URL="https://splunk-my-standalone-standalone-service:8089"
-EXPECTED_INTERNAL_HEC_URL="http://splunk-my-standalone-standalone-service.ai-platform.svc.cluster.local:8088"
-info "SPLUNK_MODE=internal → short native HTTPS issuer + secretRef"
+info "SPLUNK_MODE=internal → short native HTTPS JWT issuer only"
 check_contains     "${OUT}" "splunkConfiguration"                              "splunkConfiguration block present"
 check_contains     "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}"               "Short native HTTPS issuer endpoint"
-check_contains     "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}"         "Distinct OTel-only HEC endpoint"
-check_contains     "${OUT}" "splunk-my-standalone-standalone-secret-v1"        "Operator-managed secret"
-check_contains     "${OUT}" "secretRef"                                        "secretRef present"
+check_not_contains "${OUT}" "hecEndpoint"                                      "No HEC endpoint"
+check_not_contains "${OUT}" "secretRef"                                        "No HEC secret reference"
+check_not_contains "${OUT}" ":8088"                                            "No HEC port"
 check_not_contains "${OUT}" "trustedIssuers"                                   "No trustedIssuers when not set"
 rm -f "${CFG}"
 
@@ -171,11 +156,12 @@ CFG=$(make_config "splunk:
   enabled: true
   trustedIssuers:
     - https://external.splunk:8089")
-OUT=$(render_splunk_block "${CFG}" "" "my-standalone")
+OUT=$(render_splunk_block "${CFG}" "my-standalone")
 info "SPLUNK_MODE=internal → native HTTPS issuer + external issuer appended"
 check_contains "${OUT}" "splunkConfiguration"                "splunkConfiguration block present"
 check_contains "${OUT}" "endpoint: ${EXPECTED_INTERNAL_URL}" "Short native HTTPS issuer endpoint"
-check_contains "${OUT}" "hecEndpoint: ${EXPECTED_INTERNAL_HEC_URL}" "Distinct OTel-only HEC endpoint"
+check_not_contains "${OUT}" "hecEndpoint"                    "No HEC endpoint"
+check_not_contains "${OUT}" "secretRef"                      "No HEC secret reference"
 check_contains "${OUT}" "trustedIssuers"                     "trustedIssuers key present"
 check_contains "${OUT}" "https://external.splunk:8089"       "External issuer present"
 rm -f "${CFG}"
@@ -189,14 +175,13 @@ CFG=$(make_config "splunk:
     secretName: splunk-hec-external
   trustedIssuers:
     - https://splunk.example.com:8089")
-OUT=$(render_splunk_block "${CFG}" "dummy-hec-token")
-info "SPLUNK_MODE=external → external HEC endpoint, no in-cluster Splunk"
-check_contains     "${OUT}" "splunkConfiguration"                         "splunkConfiguration block present"
-check_contains     "${OUT}" "endpoint: https://splunk.example.com:8088"   "External HEC endpoint"
-check_contains     "${OUT}" "splunk-hec-external"                         "External secret name"
-check_contains     "${OUT}" "trustedIssuers"                              "trustedIssuers key present"
-check_contains     "${OUT}" "https://splunk.example.com:8089"             "Issuer present"
-check_not_contains "${OUT}" "standalone-service"                          "No in-cluster endpoint"
+if OUT=$(render_splunk_block "${CFG}" 2>&1); then
+  fail "External HEC configuration must be rejected"
+else
+  pass "External HEC configuration is rejected"
+fi
+check_contains "${OUT}" "not supported in this release" "Clear unsupported-feature error"
+check_not_contains "${OUT}" "dummy-hec-token" "Error output does not expose token material"
 rm -f "${CFG}"
 
 # ═════════════════════════════════════════════════════════════════════════════

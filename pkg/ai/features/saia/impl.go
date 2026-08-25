@@ -220,26 +220,20 @@ func (r *SaiaReconciler) validateAIService(
 	}
 
 	if ai.Spec.SplunkConfiguration.Endpoint == "" && ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name == "" {
+		if len(ai.Spec.SplunkConfiguration.TrustedIssuers) > 0 {
+			// JWT-only external issuers do not require a management endpoint or HEC token.
+			return nil
+		}
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "SplunkConfigMissing", "Splunk configuration is missing assuming no logging")
 		return nil
 	}
 
-	var resolver splunkutils.SplunkSecretResolver
-
-	switch ai.Spec.SplunkConfiguration.SecretSource {
-	case aiv1.SecretSourceVault:
-		resolver = &splunkutils.VaultFileResolver{} // Read from /vault/secrets/splunk
-	default:
-		resolver = &splunkutils.KubernetesSecretResolver{Client: r.Client} // Default
-	}
-
-	return splunkutils.ValidateAndEnrichSplunkConfig(
+	return splunkutils.ValidateAndEnrichSplunkIssuer(
 		ctx,
 		r.Client,
 		ai.Namespace,
 		ai.Spec.ClusterDomain,
 		&ai.Spec.SplunkConfiguration,
-		resolver,
 	)
 }
 

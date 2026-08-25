@@ -14,12 +14,40 @@ type SplunkSecretResolver interface {
 	GetHECToken(ctx context.Context, namespace string, cfg *aiApi.SplunkConfigurationSpec) (string, error)
 }
 
-// ValidateAndEnrichSplunkConfig validates a SplunkConfiguration.
-// - If Endpoint is provided, it's valid.
-// - If Endpoint is empty but SplunkCustomResourceRef is set → resolve endpoint from Splunk CR.
-// - Ensures SecretRef is populated with namespace-scoped secret if missing.
+func validateAndEnrichSplunkEndpoint(
+	ctx context.Context,
+	c client.Client,
+	namespace string,
+	clusterDomain string,
+	cfg *aiApi.SplunkConfigurationSpec,
+) error {
+	if cfg.Endpoint != "" {
+		return nil
+	}
+
+	if cfg.SplunkCustomResourceRef.Name != "" {
+		endpoint, err := ResolveSplunkEndpoint(ctx, c, namespace, *cfg, clusterDomain)
+		if err != nil {
+			return fmt.Errorf("failed to resolve Splunk endpoint: %w", err)
+		}
+		cfg.Endpoint = endpoint
+		return nil
+	}
+
+	return fmt.Errorf("SplunkConfiguration must have either Endpoint or SplunkCustomResourceRef set")
+}
+
+// ValidateAndEnrichSplunkIssuer validates and resolves the management/JWKS
+// endpoint used for JWT issuer discovery. It deliberately does not require a
+// HEC token because issuer validation and telemetry export are independent.
 //
-// clusterDomain can be empty → defaults to "cluster.local".
+// clusterDomain can be empty and defaults to "cluster.local" during endpoint
+// resolution.
+var ValidateAndEnrichSplunkIssuer = validateAndEnrichSplunkEndpoint
+
+// ValidateAndEnrichSplunkConfig validates a telemetry-enabled Splunk
+// configuration. In addition to resolving the management endpoint, it verifies
+// that the configured secret source can supply a HEC token.
 var ValidateAndEnrichSplunkConfig = func(
 	ctx context.Context,
 	c client.Client,
@@ -28,24 +56,10 @@ var ValidateAndEnrichSplunkConfig = func(
 	cfg *aiApi.SplunkConfigurationSpec,
 	resolver SplunkSecretResolver,
 ) error {
-	// ✅ 1: Check if endpoint explicitly provided
-	if cfg.Endpoint != "" {
-		return ensureToken(ctx, namespace, cfg, resolver)
+	if err := validateAndEnrichSplunkEndpoint(ctx, c, namespace, clusterDomain, cfg); err != nil {
+		return err
 	}
-
-	// ✅ 2: Derive endpoint from SplunkCustomResourceRef
-	if cfg.SplunkCustomResourceRef.Name != "" {
-		endpoint, err := ResolveSplunkEndpoint(ctx, c, namespace, *cfg, clusterDomain)
-		if err != nil {
-			return fmt.Errorf("failed to resolve Splunk endpoint: %w", err)
-		}
-		cfg.Endpoint = endpoint
-
-		return ensureToken(ctx, namespace, cfg, resolver)
-	}
-
-	// ✅ 3: Neither endpoint nor CR ref → invalid
-	return fmt.Errorf("SplunkConfiguration must have either Endpoint or SplunkCustomResourceRef set")
+	return ensureToken(ctx, namespace, cfg, resolver)
 }
 
 func ensureToken(ctx context.Context, namespace string, cfg *aiApi.SplunkConfigurationSpec, resolver SplunkSecretResolver) error {

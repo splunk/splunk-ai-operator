@@ -79,32 +79,9 @@ done
 pass() { printf 'PASS: %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
-btool_http_value() {
-  local option="$1"
-  awk -v wanted="${option}" '
-    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
-      section = $0
-      sub(/^[[:space:]]*\[/, "", section)
-      sub(/\][[:space:]]*$/, "", section)
-      in_http = (section == "http")
-      next
-    }
-    in_http && $1 == wanted && $2 == "=" {
-      value = $3
-      sub(/\r$/, "", value)
-      count++
-    }
-    END {
-      if (count != 1) exit 1
-      print tolower(value)
-    }
-  '
-}
-
 SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
 SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
 EXPECTED_URL="https://${SPLUNK_SERVICE}:8089"
-EXPECTED_HEC_URL=""
 
 kubectl get namespace "${NAMESPACE}" >/dev/null
 kubectl get standalone "${STANDALONE_NAME}" -n "${NAMESPACE}" >/dev/null
@@ -182,49 +159,6 @@ if grep -q '/mnt/splunk-cert' <<<"${web_tls_debug}"; then
 fi
 pass "Splunk Web reverted to HTTP with no stale installer TLS mount paths"
 
-hec_tls_debug=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-  /opt/splunk/bin/splunk btool inputs list http --debug 2>/dev/null) || \
-  fail "could not read effective HEC settings"
-if grep -q '/mnt/splunk-cert' <<<"${hec_tls_debug}"; then
-  fail "HEC configuration still references the removed installer TLS mounts"
-fi
-pass "HEC contains no stale installer TLS mount paths (its protocol remains independently configured)"
-
-hec_effective=$(kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-  /opt/splunk/bin/splunk btool inputs list http 2>/dev/null) || \
-  fail "could not read effective HEC listener configuration"
-hec_disabled=$(printf '%s\n' "${hec_effective}" | btool_http_value disabled) || \
-  fail "effective HEC disabled setting is missing or ambiguous"
-case "${hec_disabled}" in
-  0|false|no|off) ;;
-  *) fail "effective HEC listener is disabled or invalid: ${hec_disabled}" ;;
-esac
-hec_enable_ssl=$(printf '%s\n' "${hec_effective}" | btool_http_value enableSSL) || \
-  fail "effective HEC enableSSL setting is missing or ambiguous"
-case "${hec_enable_ssl}" in
-  0|false|no|off) hec_scheme="http" ;;
-  1|true|yes|on) hec_scheme="https" ;;
-  *) fail "effective HEC enableSSL value is invalid: ${hec_enable_ssl}" ;;
-esac
-hec_port=$(printf '%s\n' "${hec_effective}" | btool_http_value port) || \
-  fail "effective HEC port setting is missing or ambiguous"
-[[ "${hec_port}" == "8088" ]] || \
-  fail "effective HEC port=${hec_port}, expected operator Service port 8088"
-EXPECTED_HEC_URL="${hec_scheme}://${SPLUNK_SERVICE}.${NAMESPACE}.svc.cluster.local:${hec_port}"
-
-if [[ "${hec_scheme}" == "https" ]]; then
-  kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-    curl --insecure --silent --show-error --fail --output /dev/null --max-time 15 \
-      "https://localhost:${hec_port}/services/collector/health" >/dev/null || \
-    fail "effective HTTPS HEC health endpoint is not ready"
-else
-  kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-    curl --silent --show-error --fail --output /dev/null --max-time 15 \
-      "http://localhost:${hec_port}/services/collector/health" >/dev/null || \
-    fail "effective HTTP HEC health endpoint is not ready"
-fi
-pass "effective HEC ${hec_scheme} listener is enabled and healthy on port ${hec_port}"
-
 kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   curl --silent --show-error --fail --max-time 15 \
   http://localhost:8000/ >/dev/null || \
@@ -262,6 +196,12 @@ platform_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}
   -o jsonpath='{.spec.splunkConfiguration.endpoint}')
 platform_hec_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
   -o jsonpath='{.spec.splunkConfiguration.hecEndpoint}')
+platform_secret_ref=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.splunkConfiguration.secretRef.name}')
+otel_enabled=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.sidecars.otel}')
+mtls_enabled=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.mtls.enabled}')
 
 [[ "${issuer_uri}" == "${EXPECTED_URL}" ]] || \
   fail "issuer_uri=${issuer_uri:-unset}, expected ${EXPECTED_URL}"
@@ -270,59 +210,42 @@ platform_hec_endpoint=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESP
 [[ "${issuer_uri}" == "${platform_endpoint}" ]] || \
   fail "issuer_uri and AIPlatform endpoint differ"
 pass "issuer_uri and AIPlatform endpoint are byte-identical short HTTPS URLs"
-[[ "${platform_hec_endpoint}" == "${EXPECTED_HEC_URL}" ]] || \
-  fail "AIPlatform hecEndpoint=${platform_hec_endpoint:-unset}, expected ${EXPECTED_HEC_URL}"
-pass "AIPlatform OTel-only HEC endpoint matches Splunk's effective ${hec_scheme} listener"
+[[ -z "${platform_hec_endpoint}" ]] || \
+  fail "AIPlatform unexpectedly contains unsupported hecEndpoint=${platform_hec_endpoint}"
+[[ -z "${platform_secret_ref}" ]] || \
+  fail "AIPlatform issuer-only config unexpectedly contains HEC secretRef=${platform_secret_ref}"
+[[ "${otel_enabled}" == "false" ]] || \
+  fail "AIPlatform sidecars.otel=${otel_enabled:-unset}, expected false"
+[[ "${mtls_enabled}" == "false" ]] || \
+  fail "AIPlatform mtls.enabled=${mtls_enabled:-unset}, expected false"
+pass "AIPlatform explicitly fences HEC, workload OTel, and mTLS"
 
-otel_enabled=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \
-  -o jsonpath='{.spec.sidecars.otel}')
-if [[ "${otel_enabled}" == "true" ]]; then
-  otel_config=$(kubectl get configmap "${AIPLATFORM_NAME}-otel-config" -n "${NAMESPACE}" \
-    -o jsonpath='{.data.otel-config\.yaml}' 2>/dev/null) || \
-    fail "OTel is enabled but ${AIPLATFORM_NAME}-otel-config is missing"
-  grep -Fq "${EXPECTED_HEC_URL}/services/collector" <<<"${otel_config}" || \
-    fail "OTel exporter is not configured for ${EXPECTED_HEC_URL}/services/collector"
-  if grep -Fq "${EXPECTED_URL}/services/collector" <<<"${otel_config}"; then
-    fail "OTel exporter incorrectly uses the management/JWKS endpoint"
-  fi
-  pass "OTel exporter configuration targets HEC rather than management/JWKS (runtime delivery not asserted)"
+if kubectl get opentelemetrycollector "${AIPLATFORM_NAME}-otel-coll" \
+    -n "${NAMESPACE}" >/dev/null 2>&1; then
+  fail "unsupported AIPlatform OpenTelemetryCollector still exists"
+fi
+if kubectl get configmap "${AIPLATFORM_NAME}-otel-config" \
+    -n "${NAMESPACE}" >/dev/null 2>&1; then
+  fail "unsupported AIPlatform OTel configuration still exists"
+fi
+if kubectl get pods -n "${NAMESPACE}" -o json | jq -e '
+    any(.items[];
+      .metadata.annotations["sidecar.opentelemetry.io/inject"] != null
+      or any(.spec.initContainers[]?; any(.env[]?; .name == "OTEL_CONFIG")))
+  ' >/dev/null; then
+  fail "an AI workload pod still requests or contains OTel injection"
+fi
+pass "AI workloads contain no OTel collector or injection configuration"
 
-  # The OTel operator injects its collector as a restartable init container and
-  # embeds OTEL_CONFIG at pod admission time. Require at least one Running/Ready
-  # injected pod and verify every such collector uses the current HEC endpoint.
-  # The jq result contains only pod names and booleans; it never prints the
-  # embedded config, which also contains the HEC token.
-  otel_runtime_deadline=$((SECONDS + WAIT_TIMEOUT))
-  otel_runtime_rows=''
-  while (( SECONDS < otel_runtime_deadline )); do
-    otel_runtime_rows=$(kubectl get pods -n "${NAMESPACE}" -o json | jq -r \
-      --arg expected "${EXPECTED_HEC_URL}/services/collector" '
-        .items[]
-        | select(.status.phase == "Running")
-        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
-        | . as $pod
-        | [
-            .spec.initContainers[]?
-            | select(.restartPolicy == "Always")
-            | [.env[]? | select(.name == "OTEL_CONFIG") | .value][0] // empty
-          ] as $configs
-        | select(($configs | length) > 0)
-        | [
-            $pod.metadata.name,
-            (($configs | all(.[]; contains($expected))) | tostring)
-          ]
-        | @tsv
-      ')
-    if [[ -n "${otel_runtime_rows}" ]] && \
-       ! awk -F '\t' '$2 != "true" { bad=1 } END { exit bad }' <<<"${otel_runtime_rows}"; then
-      otel_runtime_rows=''
-    fi
-    [[ -n "${otel_runtime_rows}" ]] && break
-    sleep 5
-  done
-  [[ -n "${otel_runtime_rows}" ]] || \
-    fail "no Running/Ready injected OTel collector uses the configured HEC endpoint after ${WAIT_TIMEOUT}s"
-  pass "all Running/Ready injected OTel collectors use the configured HEC endpoint (delivery not asserted)"
+if kubectl get crd opentelemetrycollectors.opentelemetry.io >/dev/null 2>&1 && \
+   kubectl get pods -n opentelemetry-operator-system -o json 2>/dev/null | jq -e '
+     any(.items[];
+       .status.phase == "Running"
+       and any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+   ' >/dev/null; then
+  pass "optional OTel operator infrastructure is installed and Ready"
+else
+  printf 'WARN: optional OTel operator infrastructure is not Ready; workload OTel remains disabled\n' >&2
 fi
 
 platform_uid=$(kubectl get aiplatform "${AIPLATFORM_NAME}" -n "${NAMESPACE}" \

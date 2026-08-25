@@ -187,15 +187,15 @@ splunk:
   # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
   standaloneName: splunk-standalone
 
-  # With enabled=true and no external.endpoint, the installer deploys Splunk
-  # Operator + Standalone in-cluster (requires images.splunk.image and
+  # With enabled=true, the installer deploys Splunk Operator + Standalone
+  # in-cluster (requires images.splunk.image and
   # images.splunk.operatorImage).
   # See K0S_README.md's "Internal Splunk management transport" section for
   # the native-HTTPS compatibility details behind the INTERNAL path.
   #
-  # External HEC ingestion is out of scope for this release workflow. Do not
-  # set splunk.external.endpoint or SPLUNK_HEC_TOKEN just to enable external
-  # JWT authentication; external.endpoint selects the legacy external HEC mode.
+  # External HEC ingestion is out of scope for this release workflow.
+  # splunk.external.endpoint is rejected by install and validate. Use
+  # trustedIssuers below for JWT-only external authentication.
 
   # Exact Splunk management/JWKS issuers that SAIA and Slim should trust. Each
   # value must match Splunk's oauth2_settings.issuer_uri character-for-character
