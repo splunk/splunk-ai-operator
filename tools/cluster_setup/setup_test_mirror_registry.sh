@@ -38,12 +38,13 @@ docker.io/semitechnologies/weaviate:stable-v1.28-007846a
 docker.io/fluent/fluent-bit:1.9.6
 docker.io/otel/opentelemetry-collector-contrib:0.122.1
 docker.io/library/nginx:1.27-alpine
-docker.io/splunk/ai-tier-ray-worker:preview
-docker.io/splunk/ai-tier-ray-head:preview
-docker.io/splunk/ai-tier-saia-api:preview
-docker.io/splunk/ai-tier-saia-api-v2:preview
-docker.io/splunk/ai-tier-saia-data-loader:preview
-docker.io/kpratyush775/splunk-ai-operator:v2.4
+docker.io/splunk/ai-tier-ray-worker:v0.3
+docker.io/splunk/ai-tier-ray-head:v0.3
+docker.io/splunk/ai-tier-saia-api:v0.2
+docker.io/splunk/ai-tier-saia-api-v2:v0.2
+docker.io/splunk/ai-tier-saia-data-loader:v0.2
+docker.io/kpratyush775/splunk-ai-operator:v3.0
+docker.io/splunk/ai-tier-slim-service:v1.0
 "
 
 log() { printf '\n=== %s ===\n' "$1"; }
