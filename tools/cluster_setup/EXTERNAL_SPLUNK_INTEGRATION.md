@@ -15,9 +15,9 @@ Use this when:
 > using the management/JWKS issuer on port **8089**. HEC ingestion on port
 > **8088** and OTel export to external Splunk are unsupported and were not
 > release-qualified. The installer still contains the legacy external HEC path;
-> setting `splunk.external.endpoint` selects it and may create or update a
-> HEC-token Secret. That path is unsupported, so do not configure it or
-> `SPLUNK_HEC_TOKEN`. This boundary does not change the existing
+> when `splunk.enabled: true`, setting `splunk.external.endpoint` selects it and
+> may create or update a HEC-token Secret. That path is unsupported, so do not
+> configure it or `SPLUNK_HEC_TOKEN`. This boundary does not change the existing
 > bundled/internal Splunk HEC and OTel behavior.
 
 ---

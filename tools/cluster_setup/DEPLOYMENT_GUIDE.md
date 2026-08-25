@@ -1124,9 +1124,9 @@ The command is resumable — it checks which models are already staged in the ob
 
 ### Image-tag refresh observed in testing
 
-This is the initial release, so no version-to-version platform upgrade contract
-is defined. Engineering validation confirmed that updating image tags and
-rerunning the installer refreshes existing Helm releases in place:
+For this initial k0s release, no version-to-version platform upgrade support
+contract is defined. Engineering validation confirmed that updating image tags
+and rerunning the installer refreshes existing Helm releases in place:
 
 ```bash
 # 1. Update image tags in your config
@@ -1137,8 +1137,8 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 > The safety gate prevents `install` from wiping a cluster with Ready nodes and
-> updates the stack in place. This records tested image-refresh behavior; it
-> does not define version-to-version compatibility.
+> updates the stack in place. This is the engineering-tested image-refresh
+> behavior.
 
 **Air-gap image refresh:** re-run the same command on the installer machine — with
 `airgap: true` still in the config it re-stages the k0s and add-on infrastructure
