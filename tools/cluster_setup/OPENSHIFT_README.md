@@ -82,22 +82,61 @@ The AI Platform workload namespace defaults to **`ai-platform`**.
 
 **Cluster**
 - A running **OpenShift Container Platform 4.21** cluster. The installer is
-  validated on OCP 4.21.
+  validated on OCP 4.21 and fails preflight on another minor version.
+- This installer is qualified on **RHCOS amd64** control-plane and compute
+  nodes. OpenShift itself requires RHCOS on the control plane and permits
+  supported RHEL compute nodes, but this AI/GPU deployment path has not been
+  validated on RHEL workers and therefore fails preflight for them. RHEL 9/10
+  and Ubuntu 24 may be used as the client/install workstation when the listed
+  GNU tools are installed (these client distributions are not currently covered
+  by repository CI). Ubuntu is not an OpenShift node operating system.
 - 3 control-plane nodes (etcd HA quorum).
 - `cluster-admin` privileges (required for SCC grants, OLM installs, and the
   `oc debug node/` SELinux relabel).
 
-**Reference hardware** (tested deployment):
+**Minimum shared-node sizing** (`scaleFactor: 1`):
 
-| Role | Sizing |
-|---|---|
-| CPU | 1 node, 32 cores / 128 Gi RAM |
-| GPU | 2 × RTX PRO 6000 Blackwell, 96 GB VRAM each |
+- **RAM requirement:** 256 GiB
+- **Disk requirement:** 1 TB+ nominal, providing at least 800 GiB usable capacity
+- **GPU memory:** 2 × 96 GB VRAM, separate from system RAM
+- **CPU:** 64 allocatable vCPU
+
+CPU means Kubernetes-allocatable logical CPUs, after OpenShift node reservations.
+The scale-factor-1 platform can use approximately 47 vCPU at configured limits;
+64 vCPU leaves capacity for OpenShift system services and workload bursts. Increase
+CPU, memory, GPU, and storage capacity together when raising `scaleFactor`.
+
+**Reference Cisco hardware configuration** (`scaleFactor: 1`):
+
+Shared AI-tier worker — 1 &times; Cisco UCS C845A M8 AI Server:
+
+- **Memory:** 8 &times; `CAI-MRX64G2RE5` — 512 GB installed
+- **CPU:** 2 &times; `CAI-CPU-A9375F` — 64 physical cores / 128 threads
+- **GPU:** 2 &times; `CAI-GPU-RTXP6000` — 192 GB total VRAM
+- **Boot storage:** 2 &times; `CAI-M2-960G` with 1 &times;
+  `CAI-M2-HWRAID`, configured as RAID 1 — 1.92 TB raw / 960 GB usable
+
+OpenShift control plane — 3 &times; dedicated Cisco UCS C225 M8 SFF
+servers, each configured with:
+
+- **Memory:** 8 &times; `UCS-MRX32G1RE3` — 256 GB installed
+- **CPU:** 1 &times; `UCS-CPU-A9224` — 24 physical cores / 48 threads
+  with SMT enabled
+- **Boot storage:** 2 &times; `UCS-M2-480G`, configured as RAID 1 —
+  960 GB raw / 480 GB usable
+
+The three control-plane servers are separate physical hosts and are not AI-tier
+worker nodes. The C845A M.2 devices are boot-optimized; this minimum reference
+configuration assumes its RAID-1 root filesystem also backs
+`/var/lib/containers` and `/opt/local-path-provisioner` and retains at least
+800 GiB of usable capacity. For greater model, image, log, and upgrade headroom,
+use dedicated enterprise NVMe storage for those paths.
 
 **Client tools** on the install machine:
-`oc` (logged in via `oc login`), `yq`, `helm` (v3+), `curl`, `jq`, `base64`,
-`tar`. `aws` CLI is required when using ECR or an AWS S3 object store.
-`python3` / `mc` are optional (model staging helpers).
+`oc` (logged in via `oc login`), Mike Farah `yq` v4, `helm` (v3+), `curl`,
+`jq`, `base64`, `timeout`, `python3`, and `tar`. `aws` CLI is required when
+using ECR or AWS S3. `mc` is required for MinIO, SeaweedFS, and other
+S3-compatible model-marker verification.
 
 **External dependencies**
 - An image registry holding the platform images. Any registry works — AWS ECR,
@@ -226,6 +265,8 @@ is required only when `slim` is enabled under `aiPlatform.features`.
 storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
+  minimumDiskSpace:
+    aiTierNode: 500
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
@@ -237,11 +278,15 @@ storage:
 Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 `minio://` (minio **and** seaweedfs).
 
-> **`stage-artifacts` supports only `aws`, `minio`, and `seaweedfs`.** All four
-> types work at runtime, but the automated staging command has no uploader for
-> `s3compat` and will error out. If you use `s3compat`, **pre-stage the model
-> weights into the bucket manually** (see [Model Staging](#model-staging)) before
-> running `install` — the automated `stage-artifacts` step will not populate it.
+`aiTierNode` is the minimum currently available GiB that the installer checks on
+the filesystem backing `/var/lib/containers`; it is not the total disk-size
+recommendation. OpenShift uses a shared AI-tier node pool, so the same free-space
+gate applies to every configured node. The hardware must still provide 1 TB+ of
+nominal disk and at least 800 GiB of usable filesystem capacity, as specified in
+the requirements above. This accounts for the 350 GiB scale-factor-1 Ray worker
+footprint, 160 GiB of configured local PVC capacity, container images, platform
+services, logs, image extraction, and operational headroom. Increase capacity
+further when using a higher scale factor.
 
 ### `splunk`
 ```yaml
@@ -357,15 +402,20 @@ non-ECR registries and use the `imagePullSecrets.*` blocks instead — see
 
 1. **Pre-config** — load & validate config, resolve images, resolve accelerator
    type, resolve model staging, print the install plan.
-2. **Model Staging** — stage weights to object storage (skipped in air-gap mode
-   or when disabled).
-3. **Preflight** — verify `oc whoami`, `cluster-admin`, and required tools.
+2. **Preflight** — verify tools, cluster-admin, OCP/RHCOS compatibility,
+   registry policy, storage capacity, object-store config, and disconnected
+   catalog/mirror prerequisites.
+3. **Model Staging/Verification** — stage weights when enabled; otherwise prove
+   every required pre-staged model marker exists. Air-gap is verification-only.
 4. **Infrastructure** — NFD Operator → GPU Operator → node labeling →
    local-path provisioner + SELinux relabel.
 5. **Operators** — cert-manager → OpenTelemetry Operator → KubeRay Operator →
    ECR/image pull secrets → Splunk AI Operator → Splunk Operator.
-6. **AI Platform Stack** — Splunk Standalone CR → AIPlatform CR → SAIA Route.
-7. **Summary** — prints access info, including the SAIA URL.
+6. **AI Platform Stack** — converge Splunk TLS/issuer/HEC → AIPlatform CR →
+   service exposure → SAIA Route.
+7. **Readiness gate** — wait for pods, AIPlatform/AIService, RayCluster, and
+   RayService readiness before reporting success.
+8. **Summary** — prints access info, including the SAIA URL.
 
 ---
 
@@ -377,13 +427,11 @@ flowchart TB
     subgraph CP["Control-plane nodes (x3)"]
       etcd["etcd HA quorum"]
     end
-    subgraph CPUW["CPU worker(s)"]
+    subgraph AIW["Shared AI-tier worker node"]
       RH["Ray head"]
       WV["Weaviate (vector DB)"]
       SAIA["SAIA API (v1/v2 + nginx)"]
       SPL["Splunk Standalone"]
-    end
-    subgraph GPUW["GPU worker(s) — RTX PRO 6000 Blackwell"]
       RW["Ray workers (GPU)"]
     end
     RT["OpenShift Route: saia.<ingress-domain>"]
@@ -399,8 +447,9 @@ flowchart TB
   OCP -.pull images.-> ECR
 ```
 
-- **Ray (KubeRay)** runs the model-serving cluster: a head pod on a CPU node and
-  GPU worker pods pinned to GPU nodes by their `nvidia.com/gpu` resource request.
+- **Ray (KubeRay)** runs the model-serving cluster: the head and GPU worker pods
+  share the AI-tier node, with GPU workers additionally requesting
+  `nvidia.com/gpu`.
 - **Weaviate** is the vector database (CPU workload); a `vector-db-setup` job
   populates it after install.
 - **SAIA** is the RAG API fronted by nginx and exposed via the Route.
@@ -600,7 +649,11 @@ Air-gap uses two scripts plus a separate image-mirroring step:
 
 3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
    (`certified-operators`) via `oc mirror`, and apply the generated
-   `ImageContentSourcePolicy` + `CatalogSource`.
+   `ImageDigestMirrorSet`/`ImageTagMirrorSet` (or legacy
+   `ImageContentSourcePolicy`) plus `CatalogSource`. Mirror the complete package
+   closure, including every GPU Operator related image, and preserve the
+   matching OpenShift 4.21 release/Driver Toolkit images in the disconnected
+   registry.
 
 4. **Stage model weights** separately (~60 GB) via
    `tools/artifacts_download_upload_scripts/`.
@@ -617,10 +670,18 @@ Air-gap uses two scripts plus a separate image-mirroring step:
    `openshift_with_stack.sh install`.
 
 **Not bundled** (and why): container images (`oc mirror`), NFD/GPU Operator (OLM
-catalog mirror), the k0s binary/yq (OpenShift is a pre-existing cluster), MetalLB
-(OpenShift uses Routes), kube-prometheus-stack (OpenShift ships its own
-monitoring), the NVIDIA device-plugin manifest and GPU host OS packages (the GPU
-Operator manages the driver lifecycle), and model weights (staged separately).
+catalog mirror), NVIDIA driver/operand containers and the OpenShift Driver
+Toolkit image (the disconnected mirror must provide them), the k0s binary/yq
+(OpenShift is a pre-existing cluster), MetalLB (OpenShift uses Routes),
+kube-prometheus-stack (OpenShift ships its own monitoring), and model weights
+(staged separately). Unlike the k0s air-gap workflow, this bundle does **not**
+download NVIDIA RPM/DEB driver packages. The GPU Operator builds/loads the node
+driver from mirrored container content, and the installer proves success by
+waiting for allocatable `nvidia.com/gpu` capacity.
+
+Follow NVIDIA's [disconnected GPU Operator guide](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/mirror-gpu-ocp-disconnected.html)
+and Red Hat's [OpenShift 4.21 disconnected-environment guide](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/disconnected_environments/index)
+to create and transfer that mirror content before running the offline installer.
 
 ---
 
@@ -709,11 +770,9 @@ your AIPlatform CR uses a different `name`, substitute the matching
 
 **Weaviate or Splunk Standalone stuck `Pending`**
 Usually a PV node-affinity mismatch. The `local-path` provisioner pins a PV to
-the first node it lands on; if that is a GPU node, a CPU-only workload whose
-scheduler selector cannot reach it will stay Pending. Prefer letting the PVC
-reprovision on a CPU node (delete the PVC and pod so the operator recreates
-them) rather than relabeling the GPU node — overwriting a GPU node's
-`splunk.ai/workload-type` would break GPU scheduling.
+the node where it was provisioned. If `openshift.nodes` is later changed, a
+replacement pod might not be able to reach that node. Keep the original node in
+the AI-tier pool or deliberately reprovision/migrate the PVC onto a listed node.
 
 **Do not patch operator-owned resources directly**
 The Weaviate StatefulSet and other stack resources are owned by the AIPlatform

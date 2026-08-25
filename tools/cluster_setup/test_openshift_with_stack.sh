@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local unit and render-smoke tests for OpenShift installer scaleFactor wiring.
+# Local unit, contract, and render-smoke tests for the OpenShift installer.
 # No OpenShift cluster, oc login, or network access is required.
 
 set -uo pipefail
@@ -48,9 +48,11 @@ eval "$(extract_function build_image_url)"
 eval "$(extract_function configure_images)"
 eval "$(extract_function internal_splunk_management_url)"
 eval "$(extract_function internal_splunk_hec_url)"
+eval "$(extract_function _internal_splunk_btool_http_value)"
 eval "$(extract_function render_splunk_defaults_manifest)"
 eval "$(extract_function render_ai_platform_manifest)"
 eval "$(extract_function patch_openshift_slim_public_service_workaround)"
+eval "$(extract_function platform_readiness_snapshot)"
 eval "$(extract_function model_artifacts_config_name)"
 eval "$(extract_function resolve_accelerator_type)"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
@@ -161,6 +163,82 @@ assert_eq "RTX Pro 6000 uses the quantized artifact manifest" \
 assert_eq "defaultAcceleratorType values are normalized" \
   "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name RTX_PRO_6000_BLACKWELL)"
 assert_rc "unsupported artifact accelerator is rejected" 1 model_artifacts_config_name A100
+
+echo "OpenShift Splunk HEC parsing"
+hec_btool_output=$'[http]\ndisabled = 0\nenableSSL = true\nport = 8088\n'
+assert_eq "reads effective HEC TLS from the global http stanza" "true" \
+  "$(printf '%s' "${hec_btool_output}" | _internal_splunk_btool_http_value enableSSL)"
+assert_eq "reads effective HEC port" "8088" \
+  "$(printf '%s' "${hec_btool_output}" | _internal_splunk_btool_http_value port)"
+ambiguous_hec_output=$'[http]\nport = 8088\n[http]\nport = 8089\n'
+_parse_ambiguous_hec() { printf '%s' "${ambiguous_hec_output}" | _internal_splunk_btool_http_value port; }
+assert_rc "rejects ambiguous effective HEC values" 1 _parse_ambiguous_hec
+
+echo "OpenShift installer safety contracts"
+preflight_line=$(grep -n '^[[:space:]]*preflight_checks$' "${SCRIPT}" | head -1 | cut -d: -f1)
+staging_line=$(grep -n '^[[:space:]]*stage_model_artifacts$' "${SCRIPT}" | head -1 | cut -d: -f1)
+assert_eq "main install runs preflight before model downloads" "1" \
+  "$(( preflight_line < staging_line ))"
+assert_eq "preflight has a fatal summary gate" "1" \
+  "$(awk '/^preflight_checks\(\)/,/^}/' "${SCRIPT}" | grep -c '^[[:space:]]*pf_summary$' | tr -d '[:space:]')"
+assert_eq "air-gap install verifies pre-staged model markers" "1" \
+  "$(awk '/^main_install\(\)/,/^}/' "${SCRIPT}" | grep -c 'verify_pre_staged_model_artifacts' | tr -d '[:space:]')"
+assert_eq "AWS model checks use object-store region" "0" \
+  "$(grep -F -e 'S3_REGION="${REGION' -e '--region "${REGION' "${SCRIPT}" | wc -l | tr -d '[:space:]')"
+assert_eq "normal install gates completion on platform readiness" "1" \
+  "$(awk '/^main_install\(\)/,/^}/' "${SCRIPT}" | grep -c 'verify_all_pods_healthy' | tr -d '[:space:]')"
+assert_eq "missing derived Splunk HEC secret is fatal" "1" \
+  "$(awk '/^install_ai_platform_cr\(\)/,/^}/' "${SCRIPT}" | grep -c 'derived.*Secret cannot be created' | tr -d '[:space:]')"
+assert_eq "NFD and GPU reruns validate their exact OLM subscriptions" "2" \
+  "$(grep -c '^[[:space:]]*wait_for_subscription_csv .*\(nfd\|gpu-operator-certified\)' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "node-storage preflight applies one shared AI-tier threshold" "3" \
+  "$(awk '/^preflight_check_node_storage\(\)/,/^}/' "${SCRIPT}" | grep -c 'MIN_DISK_AI_TIER_NODE' | tr -d '[:space:]')"
+assert_eq "node-storage preflight does not invent exclusive CPU/GPU roles" "0" \
+  "$(awk '/^preflight_check_node_storage\(\)/,/^}/' "${SCRIPT}" | grep -c '0x10de' | tr -d '[:space:]')"
+assert_eq "delete protects shared components with ownership checks" "1" \
+  "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -c 'component_is_owned cert_manager' | tr -d '[:space:]')"
+assert_eq "delete targets only this stack's named platform resources" "0" \
+  "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -Ec 'delete (aiplatform|standalone) --all' | tr -d '[:space:]')"
+assert_eq "Splunk Operator restart does not delete all ReplicaSets" "0" \
+  "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -Ec 'delete replicaset .*--all' | tr -d '[:space:]')"
+assert_eq "Splunk Standalone explicitly configures both PVC storage classes" "2" \
+  "$(awk '/^install_splunk_standalone\(\)/,/^}/' "${SCRIPT}" | grep -o 'storageClassName:' | wc -l | tr -d '[:space:]')"
+assert_eq "Splunk Standalone readiness detects the live HEC endpoint" "1" \
+  "$(awk '/^wait_for_internal_splunk_ready\(\)/,/^}/' "${SCRIPT}" | grep -c '_detect_internal_splunk_hec_url' | tr -d '[:space:]')"
+
+_exercise_platform_snapshot() (
+  local mode="$1"
+  AI_NS="ai-platform"
+  AI_PLATFORM_NAME="test-platform"
+  CONFIG_FILE="test-config.yaml"
+  PLATFORM_PENDING_REASON=""
+  yq() {
+    case "${2:-}" in
+      '.aiPlatform.features | length') echo 1 ;;
+      '.aiPlatform.features[].name // ""') echo saia ;;
+      *) echo "" ;;
+    esac
+  }
+  oc() {
+    case "${2:-}" in
+      pods)
+        if [[ "${mode}" == "ready" ]]; then
+          printf '%s\n' '{"items":[{"metadata":{"name":"ready-pod"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]}'
+        else
+          printf '%s\n' '{"items":[{"metadata":{"name":"pending-pod"},"status":{"phase":"Pending","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}]}'
+        fi
+        ;;
+      aiplatform) printf '%s\n' '{"metadata":{"name":"test-platform"},"status":{"phase":"Ready"}}' ;;
+      aiservice) printf '%s\n' '{"items":[{"metadata":{"name":"test-platform-saia"},"status":{"phase":"Ready"}}]}' ;;
+      raycluster) printf '%s\n' '{"items":[{"metadata":{"name":"ray"},"status":{"state":"ready","desiredWorkerReplicas":1,"readyWorkerReplicas":1}}]}' ;;
+      rayservice) printf '%s\n' '{"items":[{"metadata":{"name":"serve"},"status":{"serviceStatus":"Running"}}]}' ;;
+      *) return 1 ;;
+    esac
+  }
+  platform_readiness_snapshot
+)
+assert_rc "accepts a fully Ready platform snapshot" 0 _exercise_platform_snapshot ready
+assert_rc "rejects a Pending pod despite Ready CRs" 1 _exercise_platform_snapshot pending
 
 echo "OpenShift accelerator validation"
 DEFAULT_ACCELERATOR=""
@@ -294,6 +372,12 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.nodePort' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config exposes SLIM on NodePort 30081" "30081" \
     "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.slimNodePort' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config pins the qualified cluster minor" "4.21" \
+    "$("${REAL_YQ}" eval '.openshift.requiredVersion' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config explicitly verifies pre-staged models" "false" \
+    "$("${REAL_YQ}" eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config requires 500 GiB on shared AI-tier nodes" "500" \
+    "$("${REAL_YQ}" eval '.storage.minimumDiskSpace.aiTierNode' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config defines one additional trusted issuer" "1" \
     "$("${REAL_YQ}" eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config defines the AITK FQDN issuer" \

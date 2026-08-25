@@ -5,7 +5,8 @@
 # can be copied to an air-gapped OpenShift cluster and consumed by
 # install_from_airgap_bundle_openshift.sh.
 #
-# NOTE: This script does NOT bundle container images or OLM catalog content.
+# NOTE: This script does NOT bundle container images, OLM catalog content, or
+# NVIDIA driver/Driver Toolkit images.
 #   - Container images: mirror them using `oc mirror` + your internal registry.
 #     See container-images.txt in the output bundle for the full image list.
 #   - NFD / GPU Operator: install via OLM from a mirrored catalog
@@ -73,6 +74,14 @@ WHAT IS NOT BUNDLED (and why)
       oc mirror --config=imageset-config.yaml file:///path/to/mirror
     Apply the resulting ImageContentSourcePolicy + CatalogSource, then create
     Subscription objects as normal.
+
+  NVIDIA GPU driver and OpenShift Driver Toolkit images
+    The GPU Operator installs the driver through containers; this bundle does
+    not contain host RPM/DEB packages or those driver containers. Mirror the
+    complete gpu-operator-certified package closure (all related images) and
+    retain the matching OpenShift 4.21 release/Driver Toolkit images in the
+    disconnected registry. The installer fails if the CatalogSources or image
+    mirror policies are missing, and later waits for allocatable GPUs.
 
   k0s binary / yq — not applicable (OpenShift provides its own cluster)
   MetalLB — not applicable (OpenShift uses Routes; MetalLB is k0s-only)
@@ -343,15 +352,18 @@ cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 #     apiVersion: mirror.openshift.io/v1alpha2
 #     mirror:
 #       operators:
-#         - catalog: registry.redhat.io/redhat/certified-operator-index:v4.14
+#         - catalog: registry.redhat.io/redhat/certified-operator-index:v4.21
 #           packages:
 #             - name: gpu-operator-certified
-#         - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.14
+#         - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.21
 #           packages:
 #             - name: nfd
 #
-#   Then apply the generated ImageContentSourcePolicy and CatalogSource.
-#   See: https://docs.openshift.com/container-platform/4.14/installing/disconnected_install/
+#   Then apply the generated ImageDigestMirrorSet/ImageTagMirrorSet (or legacy
+#   ImageContentSourcePolicy) and CatalogSource resources.
+#   Mirror every related image reported for these packages and preserve the
+#   OpenShift 4.21 release/Driver Toolkit mirror used by the GPU driver build.
+#   See: https://docs.openshift.com/container-platform/4.21/installing/disconnected_install/
 
 # ── NOTE: Model weights (HuggingFace) ─────────────────────────────────────────
 # Model weights (~60 GB total) are NOT container images.

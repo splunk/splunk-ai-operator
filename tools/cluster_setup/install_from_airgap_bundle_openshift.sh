@@ -76,13 +76,18 @@ PREREQUISITES
   On this machine (no internet needed):
     oc      — logged in to the target OpenShift cluster (oc login ... done)
     helm    — v3+
-    tar
+    yq v4, jq, curl, timeout, python3, tar
+    mc      — MinIO client for MinIO/SeaweedFS/S3-compatible model-marker checks
+    aws     — AWS CLI when using AWS S3 or ECR
 
   Before running this script:
     - Mirror container images to your internal registry and update images.*
       in your cluster config.
     - For NFD / GPU Operator: apply the oc mirror ImageContentSourcePolicy and
-      CatalogSource so OLM can pull from your mirrored catalog.
+      CatalogSource so OLM can pull the complete mirrored package closure.
+      This bundle does not contain NVIDIA drivers: the GPU Operator related
+      images and matching OpenShift release/Driver Toolkit image must already
+      be available through the cluster mirror configuration.
     - Stage model weights via tools/artifacts_download_upload_scripts/.
 
 MANUAL USE (advanced)
