@@ -614,6 +614,7 @@ CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
 | `operators.ray.rayVersion` | Ray runtime version | ⚙️ Optional: default `2.44.0` |
 | `aiPlatform` | AI Platform configuration | ⚙️ Optional: customize features |
 | `aiPlatform.defaultAcceleratorType` | GPU type: `L40S`, `H100` | ⚙️ Optional: default `L40S` |
+| `aiPlatform.scaleFactor` | AI workload capacity multiplier | ⚙️ Optional: whole number of 1 or higher; default `1` |
 
 ### 5. Configure Container Images ⚠️ CRITICAL
 
@@ -772,16 +773,17 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
    - ✓ Stages model artifacts to S3 (when `storage.modelStaging.enabled: true`, the default)
    - ✓ Sets up IRSA roles for Ray head, Ray worker, SAIA service
 
-   **Models staged (from `model_artifacts_configs.yaml`):**
+   **Models staged (from the accelerator-selected artifact profile):**
 
    | Model artifact ID | Purpose |
    |---|---|
-   | `gemma-4-31b-it` | Primary LLM for chat, SPL generation, reasoning |
+   | `gemma-4-31b-it` | Unquantized Gemma model for L40S |
+   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
-   | `bi-encoder` | BGE small encoder |
    | `cross-encoder` | MS MARCO cross-encoder |
    | `e5-language-classifier` | Multilingual language detection |
+   | `fm_timeseries` | Cisco Time Series Model (CTSM) forecaster |
    | `mbart-translator` | Multilingual translation |
    | `pii-classifier` | PII detection |
    | `uae-large` | Embedding model |
@@ -1011,6 +1013,7 @@ aiPlatform:
     rayWorker: "ray-worker-sa"
     saiaService: "saia-service-sa"
   defaultAcceleratorType: "L40S"     # Default GPU type (L40S, H100)
+  scaleFactor: 1                     # Increase only after adding proportional GPU capacity
   workerGroupConfig:
     serviceAccountName: "ray-worker-sa"
     imageRegistry: ""                # Leave empty for default
@@ -1042,6 +1045,29 @@ CONFIG_FILE=./my-custom-config.yaml ./eks_cluster_with_stack.sh install
 export CONFIG_FILE=./my-custom-config.yaml
 ./eks_cluster_with_stack.sh install
 ```
+
+#### Scaling Deployment Capacity
+
+Set `scaleFactor` under `aiPlatform` to change AI workload capacity:
+
+```yaml
+aiPlatform:
+  scaleFactor: 2
+```
+
+Use a whole number of `1` or higher. The default is `1`; for example, `2`
+doubles the standard capacity. Increasing this value does not add GPU nodes, so
+ask your cluster administrator to add the required GPU capacity first.
+
+Save the configuration and run the installer again:
+
+```bash
+CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
+```
+
+> **Downscaling notice:** Reducing `scaleFactor` causes temporary service
+> downtime while workloads are resized. Plan downscaling during a maintenance
+> window.
 
 ### Configuration Examples
 

@@ -170,8 +170,11 @@ images:
     # Option 2: Full path with different registry
     #   headImage: "docker.io/rayproject/ray:2.44.0"
     #   Result: "docker.io/rayproject/ray:2.44.0"
-    headImage: "splunk/ray-head-build-preview:latest"
-    workerImage: "splunk/ray-worker-gpu-build-preview:latest"
+    # The Docker Hub defaults are fully qualified, so images.registry does not
+    # rewrite them. Replace these values with mirrored image paths when using a
+    # private registry or an air-gapped environment.
+    headImage: "docker.io/splunk/ai-tier-ray-head:preview"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:preview"
 
   # Weaviate Vector Database
   weaviate:
@@ -182,15 +185,16 @@ images:
 
   # SAIA (Splunk AI Assistant) Images
   saia:
-    # Relative paths - registry prefix auto-applied
+    # Fully qualified Docker Hub defaults. Replace these values with short or
+    # fully qualified mirror paths when using images.registry.
     # NOTE: keep dataLoaderImage in sync with apiImage/apiV2Image. Tags older than
     # v2-008 (specifically pre v2.0.4-13-g3b677604) ship a broken URL-compat shim
     # that ignores VECTOR_DB_GRPC_* env vars and falls back to grpc.<host>:443 TLS,
     # causing the vector-db-setup posthook Job to fail with a Weaviate gRPC health
     # check error. See pkg/ai/features/saia/impl.go (reconcilePostInstallHook).
-    apiImage: "splunk/saia-api-build-preview:latest"
-    apiV2Image: "splunk/saia-api-v2-build-preview:latest"
-    dataLoaderImage: "splunk/saia-data-loader-build-preview:latest"
+    apiImage: "docker.io/splunk/ai-tier-saia-api:preview"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:preview"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:preview"
   # Supporting Images
   fluentBit:
     # Docker Hub public image (has full path, registry prefix ignored)
@@ -239,6 +243,11 @@ aiPlatform:
   # Must be changed in sync with nodeGroups.gpu.instanceType (see GPU TYPE QUICK REFERENCE above).
   #   L40S     → instanceType: g6e.12xlarge
   defaultAcceleratorType: "L40S"
+
+  # Optional platform-wide capacity multiplier. It scales model replicas and
+  # Ray worker-pool base sizes together. Use an unquoted integer >= 1 and make
+  # sure the GPU node group has proportional capacity before increasing it.
+  scaleFactor: 1
 
   # Features to enable
   features: # no change

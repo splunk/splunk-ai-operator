@@ -28,11 +28,20 @@ func readApplicationsYAMLFromRepo(t *testing.T) string {
 	return string(raw)
 }
 
-// maskGoTemplates replaces `{{ ... }}` tokens with a plain string so the
-// result parses as valid YAML. applications.yaml interpolates Go template
-// variables at runtime (see Builder.ReconcileApplicationsConfigMap) — during
-// unit testing we never render them, so a syntactic mask is sufficient.
+// maskGoTemplates rewrites the Go template so the result parses as valid YAML.
+// applications.yaml interpolates Go template variables at runtime (see
+// Builder.ReconcileApplicationsConfigMap) — during unit testing we never render
+// them, so a syntactic mask is sufficient. Two kinds of directive exist:
+//
+//   - Standalone control-flow lines (`{{- if ... }}`, `{{- end }}`, `{{ range }}`,
+//     `{{ else }}`) occupy a whole line and would become a bare `PLACEHOLDER`
+//     scalar at column 0, which is invalid YAML. These lines are dropped
+//     entirely — since we never render, keeping both branches' bodies is fine.
+//   - Inline value interpolations (`{{.Replicas.X}}`) are replaced with a plain
+//     scalar so the surrounding key/value stays well formed.
 func maskGoTemplates(s string) string {
+	controlLine := regexp.MustCompile(`(?m)^[ \t]*\{\{-?\s*(if|else|end|range|with)\b[^}]*\}\}[ \t]*\n`)
+	s = controlLine.ReplaceAllString(s, "")
 	return regexp.MustCompile(`\{\{[^}]+\}\}`).ReplaceAllString(s, "PLACEHOLDER")
 }
 
@@ -203,6 +212,51 @@ func Test_ApplicationsYAML_BiEncoderRTXMemoryMatchesRayAllocation(t *testing.T) 
 		return
 	}
 	t.Fatal("BiEncoder application not found")
+}
+
+// Test_ApplicationsYAML_FmTimeseriesRTXUsesTwoGPUWorkers prevents the
+// fractional-GPU deployment from requesting the absent gpu_count:1 worker
+// tier. RTX clusters run this application on the existing 2-GPU workers.
+func Test_ApplicationsYAML_FmTimeseriesRTXUsesTwoGPUWorkers(t *testing.T) {
+	type rayActorOptions struct {
+		NumGPUs   float64            `yaml:"num_gpus"`
+		Resources map[string]float64 `yaml:"resources"`
+	}
+	type gpuTypeOptions struct {
+		RayActorOptions rayActorOptions `yaml:"ray_actor_options"`
+	}
+	type deploymentConfig struct {
+		GPUTypeOptionsOverride map[string]gpuTypeOptions `yaml:"gpu_type_options_override"`
+	}
+	type app struct {
+		Name string `yaml:"name"`
+		Args struct {
+			DeploymentConfigs map[string]deploymentConfig `yaml:"deployment_configs"`
+		} `yaml:"args"`
+	}
+	var doc struct {
+		Applications []app `yaml:"applications"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(maskGoTemplates(readApplicationsYAMLFromRepo(t))), &doc))
+
+	const accelerator = "RTX_PRO_6000_BLACKWELL"
+	for _, application := range doc.Applications {
+		if application.Name != "FmTimeseries" {
+			continue
+		}
+		deployment, ok := application.Args.DeploymentConfigs["FMTimeseriesDeployment"]
+		require.True(t, ok, "FmTimeseries is missing FMTimeseriesDeployment")
+		rtxOptions, ok := deployment.GPUTypeOptionsOverride[accelerator]
+		require.True(t, ok, "FmTimeseries is missing the %s placement override", accelerator)
+
+		require.InDelta(t, 0.1, rtxOptions.RayActorOptions.NumGPUs, 0.000001)
+		require.InDelta(t, 0.001, rtxOptions.RayActorOptions.Resources["gpu_count:2"], 0.000001)
+		require.InDelta(t, 0.001,
+			rtxOptions.RayActorOptions.Resources["accelerator_type:"+accelerator], 0.000001)
+		require.NotContains(t, rtxOptions.RayActorOptions.Resources, "gpu_count:1")
+		return
+	}
+	t.Fatal("FmTimeseries application not found")
 }
 
 func keys(m map[string]any) []string {

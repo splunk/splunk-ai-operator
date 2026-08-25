@@ -4,8 +4,11 @@ import (
 	"context"
 	"testing"
 
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	kuberayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -200,6 +203,65 @@ func TestReconcileIngress_MultipleHosts(t *testing.T) {
 	assert.Len(t, ingress.Spec.Rules, 2)
 	assert.Equal(t, "ai-api.example.com", ingress.Spec.Rules[0].Host)
 	assert.Equal(t, "ai-dashboard.example.com", ingress.Spec.Rules[1].Host)
+
+	dashboardBackend := ingress.Spec.Rules[1].HTTP.Paths[0].Backend.Service
+	assert.Equal(t, instance.Status.RayServiceName, dashboardBackend.Name)
+	assert.Equal(t, int32(8265), dashboardBackend.Port.Number)
+}
+
+func TestReconcileIngress_CleanInstallDerivesNormalizedRayServiceName(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+	// Long enough that "<name>-head-svc" would be truncated by KubeRay's CheckName.
+	platformName := "a-very-long-aiplatform-name-that-exceeds-limit"
+
+	instance := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformName,
+			Namespace: ns,
+			UID:       types.UID("test-uid"),
+		},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{
+				Path:   "s3://test-bucket/models",
+				Region: "us-west-2",
+			},
+			Ingress: &aiApi.IngressSpec{
+				Enabled:   true,
+				ClassName: "nginx",
+				Hosts: []aiApi.IngressHost{
+					{
+						Host: "ai-api.example.com",
+						Paths: []aiApi.IngressPath{
+							{Path: "/", PathType: "Prefix"},
+						},
+					},
+				},
+			},
+		},
+		// Status.RayServiceName intentionally left empty (clean install).
+	}
+
+	s := setupSchemeForTests()
+	_ = networkingv1.AddToScheme(s)
+
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(instance).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &AIPlatformReconciler{Client: fc, Scheme: s, Recorder: recorder}
+
+	err := r.ReconcileIngress(ctx, instance)
+	require.NoError(t, err)
+
+	ingress := &networkingv1.Ingress{}
+	err = fc.Get(ctx, types.NamespacedName{Name: platformName, Namespace: ns}, ingress)
+	require.NoError(t, err)
+
+	wantName, err := kuberayutils.GenerateHeadServiceName(kuberayutils.RayServiceCRD, rayv1.RayClusterSpec{}, platformName)
+	require.NoError(t, err)
+
+	require.Len(t, ingress.Spec.Rules, 1)
+	require.Len(t, ingress.Spec.Rules[0].HTTP.Paths, 1)
+	assert.Equal(t, wantName, ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Name)
 }
 
 func TestUpdateIngressStatus_NotEnabled(t *testing.T) {

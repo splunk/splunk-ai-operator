@@ -90,6 +90,7 @@ load_config() {
     RAY_WORKER_SA="$(yq eval '.aiPlatform.serviceAccounts.rayWorker' "$cfg")"
     SAIA_SERVICE_SA="$(yq eval '.aiPlatform.serviceAccounts.saiaService' "$cfg")"
     DEFAULT_ACCELERATOR="$(yq eval '.aiPlatform.defaultAcceleratorType' "$cfg")"
+    AI_SCALE_FACTOR="$(yq eval '.aiPlatform.scaleFactor // 1' "$cfg")"
     WORKER_IMAGE_REGISTRY="$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry' "$cfg")"
     SAIA_SERVICE_TYPE="$(yq eval '.aiPlatform.serviceTemplate.type // ""' "$cfg")"
     SAIA_SERVICE_NODE_PORT="$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "$cfg")"
@@ -187,6 +188,7 @@ load_config() {
     RAY_WORKER_SA="ray-worker-sa"
     SAIA_SERVICE_SA="saia-service-sa"
     DEFAULT_ACCELERATOR="L40S"
+    AI_SCALE_FACTOR=1
     WORKER_IMAGE_REGISTRY=""
     SAIA_SERVICE_TYPE=""
     SAIA_SERVICE_NODE_PORT=""
@@ -278,9 +280,40 @@ need()  { command -v "$1" >/dev/null 2>&1 || err "Missing $1 in PATH"; }
 need_file(){ [[ -f "$1" ]] || err "Missing file: $1"; }
 all_ok(){ return 0; }
 
+# An omitted scaleFactor uses the CRD default of 1. Explicit values must be
+# top-level YAML integers >= 1; legacy feature-level values are rejected.
+validate_scale_factor_config() {
+  local legacy_count present value value_tag
+
+  # The legacy fallback parser cannot inspect YAML types and always uses the
+  # safe default of 1 when yq is unavailable.
+  command -v yq >/dev/null 2>&1 || return 0
+
+  legacy_count=$(yq eval '[.aiPlatform.features[]? | select(has("scaleFactor"))] | length' "${CONFIG_FILE}" 2>/dev/null) || return 1
+  if [[ ! "${legacy_count}" =~ ^[0-9]+$ ]] || (( legacy_count > 0 )); then
+    echo "aiPlatform.features[].scaleFactor is no longer supported; use aiPlatform.scaleFactor"
+    return 1
+  fi
+
+  present=$(yq eval '(.aiPlatform // {}) | has("scaleFactor")' "${CONFIG_FILE}" 2>/dev/null) || return 1
+  [[ "${present}" == "true" ]] || return 0
+
+  value=$(yq eval '.aiPlatform.scaleFactor' "${CONFIG_FILE}" 2>/dev/null) || return 1
+  value_tag=$(yq eval '.aiPlatform.scaleFactor | tag' "${CONFIG_FILE}" 2>/dev/null) || return 1
+  if [[ "${value_tag}" != "!!int" || ! "${value}" =~ ^-?[0-9]+$ ]] || (( value < 1 )); then
+    echo "aiPlatform.scaleFactor must be a YAML integer greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+}
+
 # ---- Image configuration validation ----
 validate_image_config() {
   log "Validating image configuration..."
+
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    err "${scale_factor_error:-Unable to validate aiPlatform.scaleFactor in ${CONFIG_FILE}}"
+  fi
 
   local errors=0
 
@@ -398,21 +431,22 @@ replace_image_in_manifest() {
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  # Make backups only if they don't exist (preserve original clean versions)
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_AI_FILE}.original"
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
-    cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-  fi
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, kubectl apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
 
-  # Always restore from clean original before applying changes
-  # This ensures idempotent behavior - script can be run multiple times safely
-  log "Restoring from clean originals to ensure idempotent updates..."
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
-  cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+  operator_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_OPERATOR_FILE" "$operator_rendered"
+  TMP_FILES+=("$operator_rendered")
+  SPLUNK_OPERATOR_FILE="$operator_rendered"
 
   # artifacts.yaml - RELATED_IMAGE_* environment variables
   log "Updating $SPLUNK_AI_FILE..."
@@ -2740,6 +2774,7 @@ spec:
     $( [[ -n "$obj_secret" ]] && echo "secretRef: ${obj_secret}" )
   serviceAccountName: ${RAY_HEAD_SA}
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
+  scaleFactor: ${AI_SCALE_FACTOR}
   features:
     - name: saia
       version: "1.1.0"

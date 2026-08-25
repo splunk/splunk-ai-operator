@@ -1019,6 +1019,14 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              aiPlatformScheme:
+                default: http
+                description: AIPlatformScheme specifies the URL scheme for the AI
+                  Platform service ("http" or "https")
+                enum:
+                - http
+                - https
+                type: string
               aiPlatformUrl:
                 description: AIPlatformUrl specifies the URL for the AI Platform (deprecated,
                   use AIPlatformRef)
@@ -1037,17 +1045,12 @@ spec:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
                   name:
-                    description: Name of the feature, e.g. "saia" or "seca"
+                    description: Name of the feature, e.g. "saia", "seca" or "slim"
                     enum:
                     - saia
                     - seca
+                    - slim
                     type: string
-                  scaleFactor:
-                    description: ScaleFactor is the desired fixed number of replicas
-                      for the feature.
-                    format: int32
-                    minimum: 1
-                    type: integer
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
@@ -1740,8 +1743,15 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
+                      SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
+                      Either Endpoint or SplunkCustomResourceRef must be provided.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL used only by the
+                      OTel sidecar to export telemetry. It falls back to Endpoint when unset for
+                      backward compatibility with configurations that predate this field.
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials
@@ -1808,6 +1818,16 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token

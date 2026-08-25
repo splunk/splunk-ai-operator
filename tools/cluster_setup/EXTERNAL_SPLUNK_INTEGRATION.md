@@ -1,19 +1,27 @@
 # External Splunk Integration with Splunk AI Platform
 
-Runbook for connecting an **externally-hosted Splunk Enterprise instance** (outside the
-k0s cluster) to the Splunk AI Platform backend (SAIA). Covers every failure mode
-encountered in practice, in the order you are likely to hit them.
+Runbook for connecting an **externally hosted Splunk Enterprise instance** to
+Splunk AI Platform for JWT-authenticated SAIA and AI Toolkit (AITK) requests.
+The Splunk instance may run in a different VPC or network from the k0s cluster;
+what matters is routable, firewall-approved connectivity for each flow described
+below.
 
 Use this when:
 - Splunk Enterprise runs on a separate host (bare-metal, EC2, VM) — not the bundled
   in-cluster Splunk standalone deployed by the installer.
 - The SAIA backend (`AIService`) must validate JWT tokens issued by that external Splunk.
 
+> **Release scope:** this workflow configures the external Splunk management/JWKS
+> issuer on port **8089**. HEC ingestion on port **8088** is not part of this
+> workflow. Do not supply a HEC URL or token just to enable external JWT
+> authentication.
+
 ---
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
+- [Network Requirements](#network-requirements)
 - [Prerequisites](#prerequisites)
 - [Step 1 — Fix JWT Signing Key Error](#step-1--fix-jwt-signing-key-error)
 - [Step 2 — Fix 401 Unauthorized from SAIA Backend](#step-2--fix-401-unauthorized-from-saia-backend)
@@ -23,6 +31,7 @@ Use this when:
 - [Step 4 — Fix "Issuer Not Allowed" from SAIA Backend](#step-4--fix-issuer-not-allowed-from-saia-backend)
 - [Step 5 — Restart Splunk Correctly](#step-5--restart-splunk-correctly)
 - [Step 6 — Final Verification](#step-6--final-verification)
+- [Fresh Install and Issuer Updates](#fresh-install-and-issuer-updates)
 - [Cleanup](#cleanup)
 - [Troubleshooting Quick Reference](#troubleshooting-quick-reference)
 
@@ -30,34 +39,65 @@ Use this when:
 
 ## Architecture Overview
 
-```
-Browser (Splunk AI Assistant)
+```text
+Browser
+  ├── HTTP/HTTPS :8000 ───────────────► External Splunk Enterprise
+  │                                      └── issues JWT with
+  │                                          iss=https://<issuer-host>:8089
   │
-  ├─── HTTP/HTTPS :8000 ──────────────────────────────────────────────────────►
-  │                                                                Splunk Enterprise
-  │                                                          (external host, e.g. 43.203.164.228)
-  │◄── JWT token (issuer = https://<issuer_uri>:8089) ─────────────────────────
-  │
-  │  XHR / EventSource — SAIA API calls with Bearer token
-  │  (browser calls SAIA directly — NOT through Splunk)
-  ▼
-SAIA Backend (k0s cluster, e.g. 15.164.171.171)
-  │  1. Validates JWT: issuer must be in SPLUNK_ISSUERS (ConfigMap <name>-saia-config)
-  │  2. Fetches JWKS from https://<issuer_uri>:8089/.well-known/oauth2_keys
-  │     → port 8089 must be reachable from k0s cluster nodes
-  ▼
-Ray inference / LLM
+  └── HTTPS/HTTP SAIA URL ─────────────► SAIA ingress/NodePort
+                                         └── Ray inference / LLM
+
+External Splunk server
+  └── HTTPS/HTTP Slim/SAIA URL ────────► AI Toolkit and server-side setup calls
+
+SAIA and Slim workloads
+  └── HTTPS :8089 ─────────────────────► External Splunk management/JWKS
 ```
 
-**Important:** The browser calls SAIA directly using the URL in `saia_sok_url`. Splunk
-only issues the JWT token — it is not a proxy for SAIA requests. Firewall/SG rules must
-allow access from the **browser's network** (not just from the Splunk host) to the SAIA
-endpoint.
+**Important:** The browser calls SAIA directly using the URL in `saia_sok_url`.
+Splunk issues the JWT; it is not a proxy for those browser requests. Firewall or
+security-group rules must therefore allow the **browser's network**, not only the
+external Splunk host, to reach the published SAIA endpoint. AITK requests run by
+Splunk are server-side, so the external Splunk host must separately be able to
+reach the published Slim endpoint.
 
-Key constraint: the SAIA backend fetches the public signing keys from
-`<issuer_uri>/.well-known/oauth2_keys` at JWT validation time. The `issuer_uri`
-in the token must exactly match an entry in the SAIA backend's `SPLUNK_ISSUERS`
-ConfigMap key — patched directly as described in Step 4.
+Key constraint: the SAIA backend fetches public signing keys from the issuer at
+JWT validation time. The current in-cluster SAIA and Slim images use Splunk's
+native `<issuer_uri>/services/authorization/tokens-keys` route. Other client
+versions or a customer-managed identity proxy may use a standard
+`/.well-known/oauth2_keys` alias instead, so verify the route required by the
+deployed image. In every case, the token's `issuer_uri` must exactly match an
+entry derived from `spec.splunkConfiguration.trustedIssuers` in the managed
+SAIA and Slim `SPLUNK_ISSUERS` ConfigMaps. Do not patch those ConfigMaps
+directly.
+
+## Network Requirements
+
+External Splunk and the k0s cluster do **not** have to be in the same VPC. They
+can be connected through routed VPCs, peering, a VPN, a private network, or
+appropriately secured public endpoints. Validate each direction independently:
+
+| Source | Destination | Purpose |
+|---|---|---|
+| User's browser | External Splunk Web `:8000` | Load and use the Splunk apps |
+| User's browser | Published SAIA URL (NodePort `30080` in the tested k0s setup) | Splunk AI Assistant requests |
+| External Splunk host | Published SAIA URL (NodePort `30080` in the tested k0s setup) | App onboarding and health checks |
+| External Splunk host | Published Slim URL (NodePort `30081` in the tested k0s setup) | AITK model discovery and inference, including CDTSM |
+| SAIA and Slim workloads | Exact external issuer `https://<host>:8089` | Fetch signing keys and validate JWTs |
+
+A laptop VPN proves only that the laptop can reach a destination; it does not
+provide a route for the cluster or external Splunk host. An SSH SOCKS tunnel is
+useful for browser testing when the browser cannot directly reach a private
+SAIA address, but it does not solve persistent workload-to-workload
+connectivity. For production, publish the required services through a routed
+private path or a secured ingress/load balancer. For the tested browser setup,
+follow [K0S_README.md — Remote workstation via SSH bastion (SOCKS tunnel)](K0S_README.md#finding-the-splunk-web-url).
+
+Opening a security-group rule permits traffic only when a route already exists.
+It cannot create routing between unrelated VPCs. If the networks are separate,
+establish the route or expose a secured public endpoint before adjusting the
+security groups.
 
 ---
 
@@ -65,8 +105,11 @@ ConfigMap key — patched directly as described in Step 4.
 
 - SSH access to the external Splunk host
 - `kubectl` access to the k0s cluster running SAIA
-- The external Splunk host's public IP or FQDN (used as `issuer_uri`)
-- Port **8089** (Splunk management) open from the k0s cluster nodes to the Splunk host
+- A DNS name or IP that the cluster can reach, used in the exact management
+  issuer `https://<host>:8089`
+- Port **8089** (Splunk management/JWKS) open from SAIA and Slim to the Splunk host
+- A published SAIA URL reachable from the user's browser
+- For AITK, a published Slim URL reachable from the external Splunk host
 
 ---
 
@@ -96,7 +139,7 @@ or empty — `AuthenticationRSAKeysManager` has no certificate to sign tokens wi
 
     ```ini
     [oauth2_settings]
-    issuer_uri = https://<PUBLIC_IP_OR_FQDN>:8089
+    issuer_uri = https://<ROUTABLE_IP_OR_FQDN>:8089
     certFile = $SPLUNK_HOME/etc/auth/server.pem
     sslPassword = <passphrase>
     ```
@@ -130,11 +173,12 @@ loopback. The JWT validation (JWKS fetch) fails.
 
 **Fix:**
 
-1. Change `issuer_uri` in `authentication.conf` to the public IP or FQDN:
+1. Change `issuer_uri` in `authentication.conf` to a DNS name or IP that SAIA
+   and Slim can reach:
 
     ```ini
     [oauth2_settings]
-    issuer_uri = https://<YOUR_PUBLIC_IP>:8089
+    issuer_uri = https://<ROUTABLE_HOST>:8089
     certFile = $SPLUNK_HOME/etc/auth/server.pem
     sslPassword = <passphrase>
     ```
@@ -145,14 +189,17 @@ loopback. The JWT validation (JWKS fetch) fails.
 
     ```bash
     # Run from any k0s cluster node (e.g. the installer or controller)
-    nc -zv <public-ip> 8089
+    nc -zv <routable-host> 8089
     # or
-    curl -sk https://<public-ip>:8089/services/server/info | grep -c "<title>"
+    curl -skS -o /dev/null -w '%{http_code}\n' \
+      'https://<routable-host>:8089/services/authorization/tokens-keys?output_mode=json'
+    # Expected: 200
     ```
 
-    If the check passes from your laptop but fails from the cluster, update the
-    Splunk host's security-group inbound rules to allow port 8089 from the
-    cluster nodes' IP range.
+    If the check passes from your laptop but fails from the cluster, first
+    confirm there is a route between the networks. Then update the Splunk
+    host's security-group inbound rules to allow port 8089 from the cluster's
+    source CIDR or security group.
 
 3. Restart Splunk (see [Step 5](#step-5--restart-splunk-correctly)).
 
@@ -285,69 +332,89 @@ SAIA service (in-cluster HTTP)
 
 (or whatever the old issuer was)
 
-**Root cause:** `SPLUNK_ISSUERS` is a key in the SAIA config `ConfigMap`. The
-operator sets it to the hardcoded default (`https://splunk-splunk-standalone-standalone-service:8089`)
-when the key is absent or empty. Importantly:
+**Root cause:** the JWT `iss` claim must match an allowed management/JWKS
+endpoint character-for-character. For the JWT-only external integration, the
+k0s installer reads `splunk.trustedIssuers` and writes those values to the
+AIPlatform custom resource. The operator then derives SAIA and Slim's
+`SPLUNK_ISSUERS` values from that field.
 
-- `AIService.spec.splunkConfiguration.endpoint` is the **HEC telemetry endpoint**
-  (used by the log-forwarding sidecar as `<endpoint>/services/collector`) — it is
-  **not** used to populate `SPLUNK_ISSUERS`. Patching `AIPlatform.spec.splunkConfiguration`
-  will not update the issuer allowlist and will redirect telemetry to the wrong endpoint.
-- The reconciler only fills **missing or empty** ConfigMap keys — once `SPLUNK_ISSUERS`
-  is set, the operator will not overwrite it. Editing the ConfigMap directly is safe
-  and is the correct fix.
+Do not patch the generated SAIA or Slim ConfigMaps directly. The operator
+recomputes `SPLUNK_ISSUERS` from the custom resource and will overwrite such a
+manual edit.
 
-**Fix — edit the SAIA ConfigMap directly:**
+**Fix — update the k0s config and rerun the installer:**
 
-1. Find the SAIA config ConfigMap:
+1. Choose the applicable configuration pattern.
 
-    ```bash
-    kubectl get configmap -n <namespace> | grep saia-config
+   For **external Splunk only**, disable the bundled Splunk deployment and use
+   the exact external management issuer:
+
+    ```yaml
+    splunk:
+      enabled: false
+      trustedIssuers:
+        - https://<EXACT_MANAGEMENT_HOST>:8089
     ```
 
-2. Patch `SPLUNK_ISSUERS` with the **exact** `issuer_uri` value from
-   `authentication.conf` — this must be a character-for-character match (IP or
-   FQDN, same scheme and port) because SAIA compares it literally against the
-   `iss` claim in each JWT:
+   To retain the **bundled Splunk and also trust an external Splunk**, keep
+   internal mode enabled and add the external issuer:
 
-    ```bash
-    # Use the exact issuer_uri value from Step 1/2, e.g.:
-    #   https://43.203.164.228:8089   (if configured as IP)
-    #   https://splunk.example.com:8089  (if configured as FQDN)
-    kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
-      -p '{"data":{"SPLUNK_ISSUERS":"https://<EXACT_ISSUER_URI>:8089"}}'
+    ```yaml
+    splunk:
+      enabled: true
+      trustedIssuers:
+        - https://<EXACT_EXTERNAL_MANAGEMENT_HOST>:8089
     ```
 
-    To allow **both** the in-cluster Splunk and the external Splunk simultaneously,
-    separate the URLs with a space:
+   In this release, do **not** set `splunk.external.endpoint` for JWT-only
+   integration. That setting selects the installer's external HEC mode, which
+   requires a HEC token and is outside the scope of this workflow. Port `8088`
+   is not a JWT issuer.
+
+2. Rerun the supported installer flow. Do not patch the generated AIPlatform,
+   AIService, SAIA ConfigMap, or Slim ConfigMap as the installation method:
 
     ```bash
-    kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
-      -p '{"data":{"SPLUNK_ISSUERS":"https://splunk-splunk-standalone-standalone-service:8089 https://<EXACT_ISSUER_URI>:8089"}}'
+    cd tools/cluster_setup
+    CONFIG_FILE=./k0s-cluster-config.yaml \
+      ./k0s_cluster_with_stack.sh install
     ```
 
-3. Confirm the value is set:
+3. Confirm the installer rendered the configured issuer on AIPlatform:
 
     ```bash
-    kubectl get configmap <name>-saia-config -n <namespace> \
-      -o jsonpath='{.data.SPLUNK_ISSUERS}'
+    kubectl get aiplatform -n <namespace> <platform-name> \
+      -o jsonpath='{.spec.splunkConfiguration.trustedIssuers}{"\n"}'
     ```
 
-4. Force SAIA pods to restart so they pick up the updated `ConfigMap`.
-
-    > **Why not `kubectl rollout restart`?** The operator's reconcile loop can
-    > race with a rollout restart. Deleting pods directly is more reliable — the
-    > operator recreates them with the current ConfigMap value.
+4. Confirm the operator propagated the exact management URL to both SAIA
+   and Slim. Issuers are comma-separated when more than one is configured:
 
     ```bash
-    # Find the SAIA v1 and v2 pods
-    kubectl get pods -n <namespace> | grep saia
-
-    # Delete them — operator recreates with updated env
-    kubectl delete pod <saia-v1-pod> <saia-v2-pod> -n <namespace>
+    kubectl get configmap -n <namespace> -o json \
+      | jq -r '.items[] | select(.data.SPLUNK_ISSUERS != null) |
+          [.metadata.name, .data.SPLUNK_ISSUERS] | @tsv'
     ```
 
-5. Wait for pods to reach `1/1 Running`, then re-test.
+5. Wait for the AIService to return to Ready and both v2 SAIA Deployments to
+   finish rolling out, then obtain a fresh interactive token and retest:
+
+    ```bash
+    kubectl rollout status deployment/<aiservice-name>-saia-v2-deployment \
+      -n <namespace> --timeout=10m
+    kubectl rollout status deployment/<aiservice-name>-saia-v2-worker \
+      -n <namespace> --timeout=10m
+
+    kubectl exec -n <namespace> \
+      deployment/<aiservice-name>-saia-v2-deployment -c saia-v2-api -- \
+      python3 -c 'import os; print(os.environ.get("SPLUNK_ISSUERS", ""))'
+    kubectl exec -n <namespace> \
+      deployment/<aiservice-name>-saia-v2-worker -c saia-v2-worker -- \
+      python3 -c 'import os; print(os.environ.get("SPLUNK_ISSUERS", ""))'
+    ```
+
+Both commands must print the newly configured issuer. No SAIA-service image or
+source-code change is needed for this configuration.
 
 ---
 
@@ -395,7 +462,7 @@ owned by another user. The command exits without touching the running process.
 
     ```bash
     $SPLUNK_HOME/bin/splunk btool authentication list oauth2_settings
-    # issuer_uri must show your public IP, not 127.0.0.1
+    # issuer_uri must show the routable host, not 127.0.0.1
     ```
 
 ---
@@ -413,11 +480,40 @@ owned by another user. The command exits without touching the running process.
     # Expected: response returned without error
     ```
 
-3. **Confirm SAIA accepted the token** (check SAIA v1 pod logs):
+3. **Confirm SAIA accepted the token** (check the API Deployment handling the
+   request):
 
     ```bash
-    kubectl logs -n <namespace> <saia-v1-pod> --tail=20 | grep -E "200|401|issuer|token"
+    kubectl logs -n <namespace> deployment/<aiservice-name>-saia-v2-deployment \
+      --tail=50 | grep -E "200|401|issuer|token"
     ```
+
+---
+
+## Fresh Install and Issuer Updates
+
+On a fresh installation, configuration is sufficient: the installer renders
+`trustedIssuers` into AIPlatform before SAIA and Slim start, so their first pods
+receive the correct allowlist.
+
+For an existing installation, edit the same k0s config and rerun the installer.
+A reliable post-install update also requires an operator version that
+hashes the desired spec-derived `SPLUNK_ISSUERS` value into both v2 Deployment
+pod templates during AIService reconciliation. Without that operator behavior,
+the ConfigMap may be correct while the running v2 API and worker processes
+retain the old value until an unrelated rollout occurs.
+
+Upgrading an existing installation to the fixed operator adds this annotation
+to both v2 pod templates. Expect one controlled rollout of the v2 API and v2
+worker even when the configured issuer list itself has not changed.
+
+The functional fix belongs in the operator, not SAIA-service. Extra installer
+verification is optional hardening: installer success confirms that resources
+were applied, but operators should still run the ConfigMap and rollout checks
+in Step 4 to prove that the live workloads adopted the issuer.
+
+These lifecycle statements apply only to JWT issuers. External HEC ingestion
+remains out of scope.
 
 ---
 
@@ -437,32 +533,24 @@ After testing is complete, revert the temporary workaround from Step 3:
 3. Update the SAIA URL in the Splunk AI Assistant app config to use `https://`
    once Splunk Web is back on HTTPS.
 
-**Check for side-effects on the k0s cluster:**
+**Remove an issuer when it is no longer trusted:**
 
-If the k0s cluster previously had its own bundled Splunk standalone, the
-ConfigMap patch in Step 4 may have replaced the in-cluster issuer with the
-external one. Verify nothing else on the cluster depended on the bundled
-instance:
-
-```bash
-# Check if the in-cluster Splunk standalone still exists and is healthy
-kubectl get standalone -n ai-platform
-kubectl get pods -n ai-platform | grep splunk
-
-# Check current SPLUNK_ISSUERS value in the ConfigMap
-kubectl get configmap -n ai-platform -o json | jq -r '.items[].data | select(has("SPLUNK_ISSUERS")) | .SPLUNK_ISSUERS'
-```
-
-If the in-cluster Splunk is still deployed and needs to be trusted alongside
-the external one, patch `SPLUNK_ISSUERS` with both URLs as shown in Step 4:
+Delete it from `splunk.trustedIssuers` in the k0s config and rerun the installer.
+Do not remove it only from the generated ConfigMap. Verify the resulting
+allowlist:
 
 ```bash
-kubectl patch configmap <name>-saia-config -n <namespace> --type merge \
-  -p '{"data":{"SPLUNK_ISSUERS":"https://splunk-splunk-standalone-standalone-service:8089 https://<PUBLIC_IP>:8089"}}'
+cd tools/cluster_setup
+CONFIG_FILE=./k0s-cluster-config.yaml \
+  ./k0s_cluster_with_stack.sh install
+
+kubectl get configmap -n <namespace> -o json \
+  | jq -r '.items[] | select(.data.SPLUNK_ISSUERS != null) |
+      [.metadata.name, .data.SPLUNK_ISSUERS] | @tsv'
 ```
 
-Otherwise, decommission whichever Splunk instance is no longer the source of
-truth and leave only its issuer in `SPLUNK_ISSUERS`.
+When bundled Splunk remains enabled, its internally derived issuer remains in
+the allowlist; `trustedIssuers` contains only the additional external issuers.
 
 ---
 
@@ -476,4 +564,6 @@ truth and leave only its issuer in `SPLUNK_ISSUERS`.
 | `{"detail":"Issuer '...' is not allowed"}` | External issuer not in `SPLUNK_ISSUERS` allowlist | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
 | Config change has no effect after restart | Restarted with `sudo` but Splunk owned by another user | [Step 5](#step-5--restart-splunk-correctly) |
 | Fresh fix works but old browser session still fails | Stale JWT from before the restart — log out and back in | [Step 6](#step-6--final-verification) |
-| Patching `AIPlatform.splunkConfiguration.endpoint` doesn't fix issuer | That field is the HEC endpoint, not the issuer — patch `SPLUNK_ISSUERS` in the ConfigMap directly | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
+| Request works from laptop but times out from cluster or Splunk host | Missing route or firewall/SG rule for that specific network path | [Network Requirements](#network-requirements) |
+| External JWT issuer and HEC destination are conflated | Put the exact management/JWKS `:8089` URL in `splunk.trustedIssuers`; do not use external HEC mode for JWT-only integration | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
+| AIPlatform issuer configuration changed but v2 pods use the old issuer | Operator version does not roll both v2 Deployments for spec-derived `SPLUNK_ISSUERS` changes | [Fresh Install and Issuer Updates](#fresh-install-and-issuer-updates) |

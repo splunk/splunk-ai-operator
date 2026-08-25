@@ -55,14 +55,17 @@ serviceAccountName: ""
 # e.g. "g6.24xlarge" or "p4d.24xlarge"
 gpuInstanceType: "g6.24xlarge"
 
+# Platform-wide capacity multiplier for both model replicas and worker pods.
+# Must be an integer greater than or equal to 1.
+scaleFactor: 1
+
 # List of defined features to enable in the AI platform
-# Options include: saia, seca
+# Options include: saia, seca, slim
 features: []
 # Example:
 # - name: "saia"
 #   serviceAccountName: "saia-service-sa"
 #   version: "1.1.0"
-#   scaleFactor: 1  # Optional: fixed number of replicas
 
 # headGroupSpec:
 #   # Service account name for the Ray head group

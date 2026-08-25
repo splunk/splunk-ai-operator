@@ -383,13 +383,13 @@ serviceAccountName: "ray-worker-sa"
 # GPU configuration
 gpuInstanceType: "g6e.12xlarge"
 defaultAcceleratorType: "L40S"
+scaleFactor: 1  # Platform-wide model and worker capacity
 
 # AI Features (REQUIRED)
 features:
   - name: "saia"
     serviceAccountName: "saia-service-sa"
     version: "1.1.0"
-    scaleFactor: 1  # Fixed number of replicas
 
 # Worker group configuration
 workerGroupConfig:
@@ -643,12 +643,12 @@ objectStorage:
   secretRef: "s3-credentials"
 
 serviceAccountName: "ray-worker-prod-sa"
+scaleFactor: 3  # Three times the base model and worker capacity
 
 features:
   - name: "saia"
     version: "1.1.0"
     serviceAccountName: "saia-prod-sa"
-    scaleFactor: 3  # Multiple replicas
 
 workerGroupConfig:
   serviceAccountName: "ray-worker-prod-sa"
@@ -728,13 +728,15 @@ helm upgrade my-platform \
 ### Modify Configuration
 
 ```bash
-# Update feature scale factor
+# Update platform-wide model and worker capacity
 helm upgrade my-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
   --namespace ai-platform \
-  --set features[0].scaleFactor=5 \
+  --set scaleFactor=5 \
   --reuse-values
 ```
+
+`scaleFactor` must be an integer greater than or equal to `1`. If omitted, it defaults to `1`.
 
 ## Uninstalling
 

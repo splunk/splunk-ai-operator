@@ -179,7 +179,7 @@ func TestVaultPathValidation_AIPlatform(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			errs := v.validateSplunkConfiguration(&tc.cfg, fldPath)
+			errs := v.validateSplunkConfiguration(&tc.cfg, false, fldPath)
 
 			if tc.wantErrField == "" {
 				for _, e := range errs {

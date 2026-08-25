@@ -1062,17 +1062,12 @@ spec:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
                     name:
-                      description: Name of the feature, e.g. "saia" or "seca"
+                      description: Name of the feature, e.g. "saia", "seca" or "slim"
                       enum:
                       - saia
                       - seca
+                      - slim
                       type: string
-                    scaleFactor:
-                      description: ScaleFactor is the desired fixed number of replicas
-                        for the feature.
-                      format: int32
-                      minimum: 1
-                      type: integer
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
                         to use for the feature
@@ -2085,6 +2080,11 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                     type: array
+                  otelImage:
+                    default: otel/opentelemetry-collector-contrib:0.122.1
+                    description: OTelImage is the OpenTelemetry Collector sidecar
+                      image
+                    type: string
                   rayHeadGroupImage:
                     description: Ray head group image, e.g. "rayproject/ray-head:latest"
                     type: string
@@ -2230,15 +2230,27 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Optional override endpoint (only needed for S3-compatible services like MinIO)
-                      Must be a valid HTTP/HTTPS URL
+                      Optional override endpoint (only needed for S3-compatible services like MinIO, SeaweedFS)
+                      Must be a valid HTTP/HTTPS URL. When set with s3:// path, backend is treated as S3-compatible (MinIO, SeaweedFS, etc.)
                     pattern: ^https?://.*$
                     type: string
                   path:
                     description: |-
                       Remote volume URI in the format s3://bucketname/<path prefix>, gs://bucketname/<path prefix>,
-                      azure://containername/<path prefix>, minio://bucketname/<path prefix>, seaweedfs://bucketname/<path prefix>, or s3compat://bucketname/<path prefix>
+                      azure://containername/<path prefix>, s3compat://bucketname/<path prefix> (generic S3-compatible), minio://, or seaweedfs://
                     pattern: ^(s3|gs|azure|minio|seaweedfs|s3compat)://[a-zA-Z0-9.\-_]+(/.*)?$
+                    type: string
+                  provider:
+                    description: |-
+                      Provider is an optional hint for documentation and tooling. Operator derives behavior from path scheme and endpoint.
+                      Values: aws, minio, seaweedfs, s3compat, gcs, azure
+                    enum:
+                    - aws
+                    - minio
+                    - seaweedfs
+                    - s3compat
+                    - gcs
+                    - azure
                     type: string
                   region:
                     description: Region of the remote storage volume. Required for
@@ -2246,7 +2258,8 @@ spec:
                     minLength: 1
                     type: string
                   secretRef:
-                    description: Secret name containing storage credentials
+                    description: Secret name containing storage credentials (e.g.
+                      s3_access_key, s3_secret_key for S3-compatible backends)
                     maxLength: 253
                     minLength: 1
                     type: string
@@ -2254,6 +2267,17 @@ spec:
                 - path
                 - region
                 type: object
+              scaleFactor:
+                default: 1
+                description: |-
+                  ScaleFactor is a platform-wide capacity multiplier. It uniformly scales
+                  BOTH the model (Serve) replicas AND the GPU worker-pool pod counts, so a
+                  single knob grows capacity without needing to know which models exist or
+                  how many GPUs each uses. The cluster must have proportionally more GPUs
+                  available before raising it. Defaults to 1 (single-capacity deployment).
+                format: int32
+                minimum: 1
+                type: integer
               serviceAccountName:
                 description: |-
                   ServiceAccountName is the name of the service account to use for the AIPlatform
@@ -2795,8 +2819,15 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
+                      SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
+                      Either Endpoint or SplunkCustomResourceRef must be provided.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL used only by the
+                      OTel sidecar to export telemetry. It falls back to Endpoint when unset for
+                      backward compatibility with configurations that predate this field.
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials
@@ -2863,6 +2894,16 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
@@ -4067,6 +4108,14 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              aiPlatformScheme:
+                default: http
+                description: AIPlatformScheme specifies the URL scheme for the AI
+                  Platform service ("http" or "https")
+                enum:
+                - http
+                - https
+                type: string
               aiPlatformUrl:
                 description: AIPlatformUrl specifies the URL for the AI Platform (deprecated,
                   use AIPlatformRef)
@@ -4085,17 +4134,12 @@ spec:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
                   name:
-                    description: Name of the feature, e.g. "saia" or "seca"
+                    description: Name of the feature, e.g. "saia", "seca" or "slim"
                     enum:
                     - saia
                     - seca
+                    - slim
                     type: string
-                  scaleFactor:
-                    description: ScaleFactor is the desired fixed number of replicas
-                      for the feature.
-                    format: int32
-                    minimum: 1
-                    type: integer
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
@@ -4788,8 +4832,15 @@ spec:
                 properties:
                   endpoint:
                     description: |-
-                      Endpoint is the Splunk HEC endpoint URL or service name (mutually exclusive with SplunkCustomResourceRef)
-                      Either Endpoint or SplunkCustomResourceRef must be provided
+                      Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
+                      SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
+                      Either Endpoint or SplunkCustomResourceRef must be provided.
+                    type: string
+                  hecEndpoint:
+                    description: |-
+                      HECEndpoint is the Splunk HTTP Event Collector base URL used only by the
+                      OTel sidecar to export telemetry. It falls back to Endpoint when unset for
+                      backward compatibility with configurations that predate this field.
                     type: string
                   secretRef:
                     description: SecretRef references a Secret containing Splunk credentials
@@ -4856,6 +4907,16 @@ spec:
                     description: Token is the Splunk HEC token (consider using SecretRef
                       instead)
                     type: string
+                  trustedIssuers:
+                    description: |-
+                      TrustedIssuers is a list of Splunk JWT issuer URLs (management port,
+                      e.g. https://<splunk-host>:8089) that SAIA will trust for token validation.
+                      When the in-cluster Splunk Standalone is deployed (SplunkCustomResourceRef is set),
+                      its issuer is included automatically and TrustedIssuers are appended.
+                      In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
+                    items:
+                      type: string
+                    type: array
                   vaultFilePath:
                     description: VaultFilePath is the path where Vault Agent injects
                       the Splunk HEC token
@@ -5693,6 +5754,8 @@ spec:
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-api-v2:build-v2-012
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
           value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-v2-012
+        - name: RELATED_IMAGE_SLIM_API
+          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/ml-platform/slim/slim-api:build-1
         - name: SPLUNK_METRICS_INDEX_NAME
           value: _metrics
         - name: RELATED_IMAGE_FLUENT_BIT

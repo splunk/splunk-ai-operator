@@ -140,6 +140,67 @@ var _ = Describe("AIService Webhook", func() {
 					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
 				}
 			})
+
+			It("should accept an empty Splunk config (Splunk disabled)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
+			})
+
+			It("should still require secretRef when endpoint is set (partial config)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:     "http://splunk:8088",
+					SecretSource: aiv1.SecretSourceKubernetes,
+				}
+				errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+				e := findErr(errs, "secretRef")
+				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
+			})
+		})
+
+		Describe("hecEndpoint validation", func() {
+			fldPath := field.NewPath("spec").Child("splunkConfiguration")
+
+			for _, withSecret := range []bool{false, true} {
+				withSecret := withSecret
+				description := " without secretRef"
+				if withSecret {
+					description = " with secretRef"
+				}
+				It("should reject hecEndpoint without a management/JWKS source"+description, func() {
+					splunkConfig := &aiv1.SplunkConfigurationSpec{
+						HECEndpoint: "http://splunk:8088",
+					}
+					if withSecret {
+						splunkConfig.SecretRef.Name = "splunk-hec"
+					}
+
+					errs := validator.validateSplunkConfigurationForService(splunkConfig, fldPath)
+
+					Expect(errs).To(HaveLen(1))
+					Expect(errs[0].Field).To(Equal("spec.splunkConfiguration.hecEndpoint"))
+					Expect(errs[0].Detail).To(ContainSubstring("endpoint or splunkCustomResourceRef.name"))
+				})
+			}
+
+			It("should accept hecEndpoint with endpoint and secretRef", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:    "https://splunk:8089",
+					HECEndpoint: "https://splunk:8088",
+				}
+				splunkConfig.SecretRef.Name = "splunk-hec"
+
+				Expect(validator.validateSplunkConfigurationForService(splunkConfig, fldPath)).To(BeEmpty())
+			})
+
+			It("should accept hecEndpoint with a Splunk CR reference", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					HECEndpoint: "https://splunk:8088",
+				}
+				splunkConfig.SplunkCustomResourceRef.Name = "splunk-standalone"
+
+				Expect(validator.validateSplunkConfigurationForService(splunkConfig, fldPath)).To(BeEmpty())
+			})
 		})
 	})
 })

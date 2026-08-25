@@ -1,0 +1,143 @@
+# k0s configuration for Splunk AI Platform on pre-provisioned,
+# air-gapped cluster nodes.
+#
+# In the standard one-command flow, the installer host must have internet
+# access and SSH access to every node. The installer stages the offline
+# artifacts and copies them to the nodes; the nodes do not need outbound
+# internet access.
+#
+# Quick start (run from tools/cluster_setup):
+#   1. Replace every value marked CHANGE THIS in k0s-airgapped-config.yaml.
+#   2. Mirror every platform image below to the configured internal registry.
+#   3. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh validate
+#   4. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
+#
+# See the Air-Gapped Deployment section in K0S_README.md for staging options,
+# installer-host requirements, and the separate model-artifact workflow.
+
+# Cluster access
+cluster:
+  name: "airgap-cluster"
+  airgap: true
+  sshUser: "<ssh-user>" # CHANGE THIS
+  sshKeyPath: "/path/to/private/key" # CHANGE THIS; path on the installer host
+
+# The first cpuWorkers entries in existingIPs.workers are CPU workers; all
+# remaining entries are GPU workers.
+nodes:
+  cpuWorkers: 1
+  gpuWorkers: 2
+  existingIPs:
+    controllers:
+      - "192.0.2.10" # CHANGE THIS; at least one controller is required
+    workers:
+      - "192.0.2.20" # CHANGE THIS; CPU worker 1
+      - "192.0.2.30" # CHANGE THIS; GPU worker 1
+      - "192.0.2.31" # CHANGE THIS; GPU worker 2
+
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "50Gi"
+
+  # Minimum available space, in GB, on /var/lib/k0s. The installer checks each
+  # node before installation.
+  minimumDiskSpace:
+    controller: 100
+    cpuWorker: 200
+    gpuWorker: 500
+
+  # Interactive installs ask whether to stage models and use the answer instead
+  # of this value. Silent installs use this value directly. In air-gap mode,
+  # false requires all model artifacts to be present in the object store before
+  # installation; 
+  modelStaging:
+    enabled: false
+
+  # This template uses an external MinIO deployment. The endpoint and bucket
+  # must be reachable by the installer host and the deployed workloads.
+  objectStore:
+    type: "minio"
+    bucket: "ai-platform-bucket"                     # CHANGE THIS
+    endpoint: "http://object-store.example.com:9000" # CHANGE THIS
+    auth:
+      # Replace these placeholders before installing. Do not commit real
+      # object-store credentials to Git.
+      rootUser: "<paste-object-store-access-key-here>"          # CHANGE THIS
+      rootPassword: "<paste-object-store-secret-key-here>"      # CHANGE THIS
+
+# Platform images are not included in the staged k0s/add-on image bundles. Each
+# relative image path below is prefixed with images.registry by the installer,
+# so the resulting image must already exist in that internal registry.
+images:
+  registry: "registry.example.com" # CHANGE THIS; registry host[:port]
+  registryInsecure: false # Set true only for a plain-HTTP registry.
+
+  operator:
+    image: "kpratyush775/splunk-ai-operator:v3.0"
+
+  splunk:
+    image: "splunk/splunk:10-2-ai-custom"
+    operatorImage: "splunk/splunk-operator:3.0.0"
+
+  ray:
+    headImage: "splunk/ai-tier-ray-head:v0.3"
+    workerImage: "splunk/ai-tier-ray-worker:v0.3"
+
+  weaviate:
+    image: "semitechnologies/weaviate:stable-v1.28-007846a"
+
+  saia:
+    apiImage: "splunk/ai-tier-saia-api:v0.2"
+    apiV2Image: "splunk/ai-tier-saia-api-v2:v0.2"
+    dataLoaderImage: "splunk/ai-tier-saia-data-loader:v0.2"
+
+  slim:
+    apiImage: "splunk/ai-tier-slim-service:v0.3"
+
+  fluentBit:
+    image: "fluent/fluent-bit:1.9.6"
+
+  otelCollector:
+    image: "otel/opentelemetry-collector-contrib:0.122.1"
+
+  nginx:
+    image: "library/nginx:1.27-alpine"
+
+# Version pins consumed by the installer.
+operators:
+  ray:
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.56.0 "
+  nvidia:
+    devicePluginVersion: "v0.17.3"
+
+kubernetes:
+  namespace: "ai-platform"
+
+# Paths are resolved from the directory where the installer command is run.
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"
+
+# With no splunk.external.endpoint, enabled=true installs the Splunk Operator
+# and a Splunk Standalone instance inside the cluster.
+splunk:
+  enabled: true
+  standaloneName: "splunk-standalone"
+
+aiPlatform:
+  # Supported values in the current installer: L40S, H100
+  defaultAcceleratorType: "L40S"
+
+  # NodePort exposes the SAIA and Slim public services without MetalLB. The two
+  # enabled features require distinct NodePorts.
+  serviceTemplate:
+    type: "NodePort"
+    nodePort: 30080
+    slimNodePort: 30081
+
+  features:
+    - name: "saia"
+      version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"

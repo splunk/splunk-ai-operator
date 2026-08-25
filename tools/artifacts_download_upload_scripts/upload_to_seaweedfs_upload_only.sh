@@ -83,7 +83,7 @@ echo ""
 
 # ---- Source dir and count ----
 [[ ! -d "$SOURCE_DIR" ]] && { echo "Error: $SOURCE_DIR not found. Run ./download_from_huggingface.sh first."; exit 1; }
-artifact_count=$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+artifact_count=$(find -L "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
 [[ "$artifact_count" -eq 0 ]] && { echo "No artifacts in $SOURCE_DIR."; exit 1; }
 echo "Found $artifact_count artifacts to upload."
 echo ""
@@ -174,7 +174,7 @@ while [[ $idx -lt $total ]]; do
     # verification step finds a current marker.
     if [[ "$SKIP_IF_STAGED" == "1" ]]; then
       local_hf_url=$(grep "^hf_url=" "${artifact_path}/.staging_complete" 2>/dev/null | cut -d= -f2-)
-      remote_hf_url=$(mc cat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-)
+      remote_hf_url=$(mc cat "${MC_ALIAS}/${OBJECT_STORE_BUCKET}/staging_state/${id}/.staging_complete" 2>/dev/null | grep "^hf_url=" | cut -d= -f2-) || remote_hf_url=""
       if [[ -n "$local_hf_url" && "$local_hf_url" == "$remote_hf_url" ]]; then
         echo "✓ $id already staged (hf_url matches) — skipping."
         idx=$((idx + 1))

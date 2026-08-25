@@ -2,6 +2,7 @@ package saia
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strings"
@@ -19,7 +20,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func buildTestScheme(t *testing.T) *runtime.Scheme {
@@ -353,6 +356,148 @@ func Test_reconcileSAIAConfigMap_PreservesUserOverride(t *testing.T) {
 		"user-set ENABLE_AUTHZ=false must be preserved across reconciles")
 }
 
+func Test_reconcileSAIAConfigMap_TrustedIssuers_DisabledMode(t *testing.T) {
+	// splunk.enabled=false (no SplunkCustomResourceRef): SPLUNK_ISSUERS must be
+	// populated solely from TrustedIssuers — the in-cluster issuer must NOT appear.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.TrustedIssuers = []string{
+		"https://43.203.164.228:8089",
+		"https://splunk.example.com:8089",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://43.203.164.228:8089,https://splunk.example.com:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"disabled mode: SPLUNK_ISSUERS must be exactly the TrustedIssuers list")
+	assert.NotContains(t, cm.Data["SPLUNK_ISSUERS"], "splunk-splunk-standalone",
+		"disabled mode: in-cluster issuer must not be auto-included")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalMode(t *testing.T) {
+	// splunk.enabled=true (internal): in-cluster issuer is auto-prepended,
+	// TrustedIssuers are appended (supports simultaneous internal + external Splunk).
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name = "splunk-standalone"
+	ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://external.splunk:8089"}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089,https://external.splunk:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"internal mode: in-cluster issuer must be prepended, TrustedIssuers appended")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_InternalModeNoExtra(t *testing.T) {
+	// internal mode with no TrustedIssuers: only the in-cluster issuer.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name = "splunk-standalone"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://splunk-splunk-standalone-standalone-service.default.svc.cluster.local:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"internal mode with no TrustedIssuers: only the in-cluster issuer")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_AlwaysRecomputed(t *testing.T) {
+	// When TrustedIssuers is set, a subsequent reconcile must update SPLUNK_ISSUERS
+	// even if the ConfigMap already exists with a stale value (spec-driven, not fill-if-missing).
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://new.splunk:8089"}
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
+		Data:       map[string]string{"SPLUNK_ISSUERS": "https://old.splunk:8089"},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t, "https://new.splunk:8089", cm.Data["SPLUNK_ISSUERS"],
+		"spec-driven SPLUNK_ISSUERS must be recomputed on every reconcile, not preserved from old value")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_ClearedWhenSpecEmpty(t *testing.T) {
+	// When spec has no SplunkConfiguration (CRRef, Endpoint, TrustedIssuers all empty),
+	// SPLUNK_ISSUERS must be cleared to empty string so stale issuers from a previous
+	// configuration do not persist in the ConfigMap.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService() // no SplunkConfiguration set
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
+		Data:       map[string]string{"SPLUNK_ISSUERS": "https://old-stale.splunk:8089"},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t, "", cm.Data["SPLUNK_ISSUERS"],
+		"empty spec: stale SPLUNK_ISSUERS must be cleared to prevent orphaned issuer trust")
+}
+
+func Test_reconcileSAIAConfigMap_TrustedIssuers_EndpointMode(t *testing.T) {
+	// When splunkConfiguration.endpoint is set (no CRRef), the endpoint itself is used
+	// as the JWT issuer — this covers in-cluster installs that set the endpoint directly
+	// via the cluster installer rather than via SplunkCustomResourceRef.
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.SplunkConfiguration.Endpoint = "https://splunk-splunk-standalone-standalone-service:8089"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, cm))
+
+	assert.Equal(t,
+		"https://splunk-splunk-standalone-standalone-service:8089",
+		cm.Data["SPLUNK_ISSUERS"],
+		"endpoint mode: endpoint must be used as the JWT issuer")
+}
+
 func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	scheme := buildFullTestScheme(t)
 	ai := newTestAIService()
@@ -375,11 +520,21 @@ func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	assert.Equal(t, int32(8000), container.Ports[0].ContainerPort)
 	assert.Equal(t, "/health", container.ReadinessProbe.HTTPGet.Path)
 	assert.Equal(t, 8000, container.ReadinessProbe.HTTPGet.Port.IntValue())
+	assert.NotNil(t, container.StartupProbe)
+	assert.Equal(t, "/health", container.StartupProbe.HTTPGet.Path)
+	assert.Equal(t, 8000, container.StartupProbe.HTTPGet.Port.IntValue())
+	assert.Equal(t, int32(10), container.StartupProbe.InitialDelaySeconds)
+	assert.Equal(t, int32(30), container.StartupProbe.PeriodSeconds)
+	assert.Equal(t, int32(10), container.StartupProbe.FailureThreshold,
+		"SAIA v2 startup must tolerate slow Weaviate initialization")
 
 	envMap := envToMap(container.Env)
 	assert.Equal(t, "http://platform:8000", envMap["PLATFORM_URL"])
 	assert.Equal(t, "test-bucket", envMap["S3_BUCKET"])
 	assert.Equal(t, "true", envMap["VAULT_TEMPLATE_DISABLED"])
+	_, v2APIUsesV1QueueFlag := envMap["S3_QUEUE_ENABLED"]
+	assert.False(t, v2APIUsesV1QueueFlag,
+		"S3_QUEUE_ENABLED is a v1 producer flag and must not leak into the v2 API")
 
 	// SAIA V2 FieldDescription backend is REQUIRED (worker and API both call
 	// FieldDescriptionRepositoryFactory.get() which raises ValueError on empty
@@ -392,6 +547,116 @@ func Test_reconcileSAIAv2Deployment(t *testing.T) {
 	// S3COMPAT_OBJECT_STORE_ENDPOINT_URL). Only set when the AIService has
 	// an explicit endpoint — e.g. for SeaweedFS/MinIO.
 	assert.Equal(t, "http://seaweedfs:8333", envMap["AWS_ENDPOINT_URL"])
+}
+
+func Test_reconcileSAIADeployment_DurablePersonalizationQueueByStorageScheme(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_SAIA_API", "saia-v1:latest")
+
+	testCases := []struct {
+		name          string
+		path          string
+		enableS3Queue bool
+	}{
+		{name: "AWS S3", path: "s3://bucket/tasks", enableS3Queue: true},
+		{name: "generic S3 compatible", path: "s3compat://bucket/tasks", enableS3Queue: true},
+		{name: "MinIO", path: "minio://bucket/tasks", enableS3Queue: true},
+		{name: "SeaweedFS", path: "seaweedfs://bucket/tasks", enableS3Queue: true},
+		{name: "GCS", path: "gs://bucket/tasks", enableS3Queue: false},
+		{name: "Azure", path: "azure://container/tasks", enableS3Queue: false},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := buildFullTestScheme(t)
+			ai := newTestAIService()
+			ai.Spec.TaskVolume.Path = testCase.path
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+			r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+			require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+
+			dep := &appsv1.Deployment{}
+			require.NoError(t, fakeClient.Get(context.Background(),
+				types.NamespacedName{Name: "test-saia-deployment", Namespace: "default"}, dep))
+
+			require.Len(t, dep.Spec.Template.Spec.Containers, 1)
+			envMap := envToMap(dep.Spec.Template.Spec.Containers[0].Env)
+			queueValue, queueEnabled := envMap[saiaQueueEnvName]
+			assert.Equal(t, testCase.enableS3Queue, queueEnabled,
+				"the S3-backed queue flag must follow the task-volume scheme")
+			if testCase.enableS3Queue {
+				assert.Equal(t, "true", queueValue)
+			}
+			_, runsWorkerInAPI := envMap["WORKER_MODE"]
+			assert.False(t, runsWorkerInAPI,
+				"the v1 API must remain API-only; the dedicated v2 worker consumes the shared queue")
+			assert.Equal(t, saiaQueueEnvContractVersion,
+				dep.Spec.Template.Annotations[saiaQueueEnvContractAnnotation])
+		})
+	}
+}
+
+func Test_reconcileSAIAQueueEnvironmentMigration(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_SAIA_API", "saia-v1:latest")
+
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	legacyConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saia-config", Namespace: "default"},
+		Data: map[string]string{
+			saiaQueueEnvName: "true",
+			"CUSTOM_KEY":     "preserved",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, legacyConfig).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIAConfigMap(context.Background(), ai))
+	require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+	require.NoError(t, r.reconcileSAIAv2Deployment(context.Background(), ai))
+	require.NoError(t, r.reconcileSAIAv2Worker(context.Background(), ai))
+
+	config := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-config", Namespace: "default"}, config))
+	assert.NotContains(t, config.Data, saiaQueueEnvName,
+		"legacy workload-specific queue flag must be removed from shared EnvFrom configuration")
+	assert.Equal(t, "preserved", config.Data["CUSTOM_KEY"],
+		"unrelated user-managed ConfigMap values must survive the migration")
+
+	testCases := []struct {
+		name       string
+		deployment string
+		wantQueue  bool
+	}{
+		{name: "v1 API", deployment: "test-saia-deployment", wantQueue: true},
+		{name: "v2 API", deployment: "test-saia-v2-deployment", wantQueue: false},
+		{name: "v2 worker", deployment: "test-saia-v2-worker", wantQueue: false},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			deployment := &appsv1.Deployment{}
+			require.NoError(t, fakeClient.Get(context.Background(),
+				types.NamespacedName{Name: testCase.deployment, Namespace: "default"}, deployment))
+			require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
+			container := deployment.Spec.Template.Spec.Containers[0]
+			require.Len(t, container.EnvFrom, 1)
+			require.NotNil(t, container.EnvFrom[0].ConfigMapRef)
+			assert.Equal(t, config.Name, container.EnvFrom[0].ConfigMapRef.Name)
+
+			effectiveEnv := effectiveEnvMap(config.Data, container.Env)
+			queueValue, hasQueue := effectiveEnv[saiaQueueEnvName]
+			assert.Equal(t, testCase.wantQueue, hasQueue)
+			if testCase.wantQueue {
+				assert.Equal(t, "true", queueValue)
+			}
+			assert.Equal(t, "preserved", effectiveEnv["CUSTOM_KEY"])
+			assert.Equal(t, saiaQueueEnvContractVersion,
+				deployment.Spec.Template.Annotations[saiaQueueEnvContractAnnotation],
+				"environment-contract annotation must force existing pods to reload the cleaned ConfigMap")
+		})
+	}
 }
 
 func Test_reconcileSAIAv2Worker(t *testing.T) {
@@ -415,6 +680,9 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	assert.Contains(t, container.Args[0], "app.workers.ingestion_worker")
 
 	envMap := envToMap(container.Env)
+	_, v2WorkerUsesV1QueueFlag := envMap["S3_QUEUE_ENABLED"]
+	assert.False(t, v2WorkerUsesV1QueueFlag,
+		"the v2 worker natively consumes the storage queue and must not inherit the v1 flag")
 	// RUN_TASKS_DELAY_S controls the v2 worker's poll sleep (saia-v2
 	// IngestionWorker.run). The value MUST stay well under the liveness probe
 	// threshold (1200s) because the heartbeat file is only refreshed at the top
@@ -443,6 +711,213 @@ func Test_reconcileSAIAv2Worker(t *testing.T) {
 	// Only metrics port, no HTTP API port
 	assert.Len(t, container.Ports, 1)
 	assert.Equal(t, int32(8088), container.Ports[0].ContainerPort)
+}
+
+func Test_reconcileSAIAv2Workloads_RollWhenSplunkIssuersChange(t *testing.T) {
+	testCases := []struct {
+		name           string
+		deploymentName string
+		reconcile      func(*SaiaReconciler, context.Context, *aiv1.AIService) error
+	}{
+		{
+			name:           "v2 API",
+			deploymentName: "test-saia-v2-deployment",
+			reconcile:      (*SaiaReconciler).reconcileSAIAv2Deployment,
+		},
+		{
+			name:           "v2 worker",
+			deploymentName: "test-saia-v2-worker",
+			reconcile:      (*SaiaReconciler).reconcileSAIAv2Worker,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := buildFullTestScheme(t)
+			ai := newTestAIService()
+			ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://first.splunk:8089"}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+			r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+			require.NoError(t, testCase.reconcile(r, context.Background(), ai))
+
+			deployment := &appsv1.Deployment{}
+			deploymentKey := types.NamespacedName{Name: testCase.deploymentName, Namespace: ai.Namespace}
+			require.NoError(t, fakeClient.Get(context.Background(), deploymentKey, deployment))
+
+			initialHash := fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
+			assert.Equal(t, initialHash,
+				deployment.Spec.Template.Annotations[splunkIssuersHashAnnotation],
+				"initial pod template must snapshot the configured SPLUNK_ISSUERS")
+
+			ai.Spec.SplunkConfiguration.TrustedIssuers = []string{"https://second.splunk:8089"}
+			require.NoError(t, testCase.reconcile(r, context.Background(), ai))
+			require.NoError(t, fakeClient.Get(context.Background(), deploymentKey, deployment))
+
+			updatedHash := fmt.Sprintf("%x", sha256.Sum256([]byte(buildSplunkIssuersVal(ai))))
+			assert.NotEqual(t, initialHash, updatedHash)
+			assert.Equal(t, updatedHash,
+				deployment.Spec.Template.Annotations[splunkIssuersHashAnnotation],
+				"issuer changes must alter the pod template and trigger a rollout")
+		})
+	}
+}
+
+func Test_reconcileSAIAv2Deployments_EmbeddingModelGuard(t *testing.T) {
+	tests := []struct {
+		name          string
+		configMapData map[string]string
+		want          string
+	}{
+		{
+			name: "missing config map defaults to UAE",
+			want: defaultV2EmbeddingModel,
+		},
+		{
+			name:          "empty value defaults to UAE",
+			configMapData: map[string]string{"EMBEDDING_MODEL": ""},
+			want:          defaultV2EmbeddingModel,
+		},
+		{
+			name:          "bi encoder defaults to UAE",
+			configMapData: map[string]string{"EMBEDDING_MODEL": "bi_encoder"},
+			want:          defaultV2EmbeddingModel,
+		},
+		{
+			name:          "bi encoder comparison ignores case and whitespace",
+			configMapData: map[string]string{"EMBEDDING_MODEL": "  BI_EnCoDeR  "},
+			want:          defaultV2EmbeddingModel,
+		},
+		{
+			name:          "other configured model is preserved",
+			configMapData: map[string]string{"EMBEDDING_MODEL": "  custom_encoder  "},
+			want:          "  custom_encoder  ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := buildFullTestScheme(t)
+			ai := newTestAIService()
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai)
+			if tt.configMapData != nil {
+				builder = builder.WithObjects(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-saia-config",
+						Namespace: "default",
+					},
+					Data: tt.configMapData,
+				})
+			}
+
+			fakeClient := builder.Build()
+			r := &SaiaReconciler{
+				Client:   fakeClient,
+				Scheme:   scheme,
+				Recorder: record.NewFakeRecorder(10),
+			}
+
+			require.NoError(t, r.reconcileSAIAv2Deployment(context.Background(), ai))
+			require.NoError(t, r.reconcileSAIAv2Worker(context.Background(), ai))
+
+			for _, deploymentName := range []string{
+				"test-saia-v2-deployment",
+				"test-saia-v2-worker",
+			} {
+				dep := &appsv1.Deployment{}
+				require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+					Name:      deploymentName,
+					Namespace: "default",
+				}, dep))
+
+				require.Len(t, dep.Spec.Template.Spec.Containers, 1)
+				container := dep.Spec.Template.Spec.Containers[0]
+				assert.Equal(t, tt.want, envToMap(container.Env)["EMBEDDING_MODEL"],
+					"%s must set EMBEDDING_MODEL explicitly", deploymentName)
+				require.Len(t, container.EnvFrom, 1)
+				require.NotNil(t, container.EnvFrom[0].ConfigMapRef)
+				assert.Equal(t, "test-saia-config", container.EnvFrom[0].ConfigMapRef.Name,
+					"the explicit env must override the shared ConfigMap imported through envFrom")
+			}
+
+			if tt.configMapData != nil {
+				cm := &corev1.ConfigMap{}
+				require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+					Name:      "test-saia-config",
+					Namespace: "default",
+				}, cm))
+				assert.Equal(t, tt.configMapData, cm.Data,
+					"the v2 guard must not rewrite the shared ConfigMap used by SAIA v1")
+			}
+		})
+	}
+}
+
+func Test_reconcileSAIAv2Deployments_EmbeddingModelConfigMapLookupError(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ai).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, intercepted client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == "test-saia-config" {
+					if _, isConfigMap := obj.(*corev1.ConfigMap); isConfigMap {
+						return fmt.Errorf("injected ConfigMap read failure")
+					}
+				}
+				return intercepted.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	for _, reconcile := range []struct {
+		name string
+		fn   func(context.Context, *aiv1.AIService) error
+	}{
+		{name: "v2 API", fn: r.reconcileSAIAv2Deployment},
+		{name: "v2 worker", fn: r.reconcileSAIAv2Worker},
+	} {
+		t.Run(reconcile.name, func(t *testing.T) {
+			err := reconcile.fn(context.Background(), ai)
+			require.ErrorContains(t, err, "fetching SAIA ConfigMap for v2 embedding model")
+			require.ErrorContains(t, err, "injected ConfigMap read failure")
+		})
+	}
+}
+
+func Test_reconcileSAIADeployment_DoesNotInjectV2EmbeddingModelGuard(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-saia-config",
+			Namespace: "default",
+		},
+		Data: map[string]string{"EMBEDDING_MODEL": "bi_encoder"},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, configMap).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileSAIADeployment(context.Background(), ai))
+
+	dep := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "test-saia-deployment",
+		Namespace: "default",
+	}, dep))
+
+	require.Len(t, dep.Spec.Template.Spec.Containers, 1)
+	container := dep.Spec.Template.Spec.Containers[0]
+	_, hasExplicitEmbeddingModel := envToMap(container.Env)["EMBEDDING_MODEL"]
+	assert.False(t, hasExplicitEmbeddingModel,
+		"the operator-only v2 guard must not change SAIA v1's explicit environment")
+	require.Len(t, container.EnvFrom, 1)
+	require.NotNil(t, container.EnvFrom[0].ConfigMapRef)
+	assert.Equal(t, "test-saia-config", container.EnvFrom[0].ConfigMapRef.Name)
 }
 
 func Test_reconcileNginxConfigMap(t *testing.T) {
@@ -480,6 +955,18 @@ func Test_reconcileNginxConfigMap(t *testing.T) {
 	// SSE/streaming friendliness
 	assert.Contains(t, conf, "proxy_buffering off")
 	assert.Contains(t, conf, "proxy_http_version 1.1")
+
+	// Personalization bundles can exceed nginx's 1 MiB default (dashboard
+	// metadata was observed at ~6.7 MiB). Keep the production limit bounded.
+	assert.Equal(t, 1, strings.Count(conf, "client_max_body_size 100m;"))
+	v2LocationStart := strings.Index(conf, "location ~ /saia-api-v2/")
+	v1LocationStart := strings.Index(conf, "location / {")
+	require.Greater(t, v2LocationStart, -1)
+	require.Greater(t, v1LocationStart, v2LocationStart)
+	assert.NotContains(t, conf[v2LocationStart:v1LocationStart], "client_max_body_size",
+		"the raised request-body limit must not widen v2 routes")
+	assert.Contains(t, conf[v1LocationStart:], "client_max_body_size 100m;",
+		"the raised request-body limit must apply to v1 personalization uploads")
 
 	// Health and status endpoints — stub_status must be loopback-only.
 	assert.Contains(t, conf, "location = /nginx_health")
@@ -552,6 +1039,7 @@ func Test_reconcileNginxDeployment(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
 	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
 
+	require.NoError(t, r.reconcileNginxConfigMap(context.Background(), ai))
 	err := r.reconcileNginxDeployment(context.Background(), ai)
 	require.NoError(t, err)
 
@@ -571,6 +1059,14 @@ func Test_reconcileNginxDeployment(t *testing.T) {
 	// Health probes use nginx_health
 	assert.Equal(t, "/nginx_health", container.LivenessProbe.HTTPGet.Path)
 	assert.Equal(t, "/nginx_health", container.ReadinessProbe.HTTPGet.Path)
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: "test-saia-nginx-config", Namespace: "default"}, cm))
+	expectedConfigHash := fmt.Sprintf("%x", sha256.Sum256([]byte(cm.Data["nginx.conf"])))
+	assert.Equal(t, expectedConfigHash,
+		dep.Spec.Template.Annotations["splunk-ai-operator/nginx-config-hash"],
+		"subPath-mounted nginx config changes must roll the Deployment")
 }
 
 func Test_reconcileNginxDeployment_imageOverride(t *testing.T) {
@@ -604,6 +1100,7 @@ func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 		"operator.splunk.com/example":                      "v1",
 		"kubectl.kubernetes.io/restartedAt":                "should-be-skipped",
 		"kubectl.kubernetes.io/last-applied-configuration": "should-be-skipped",
+		"script-reconcile-ts":                              "should-be-skipped",
 	}
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
@@ -621,6 +1118,7 @@ func Test_reconcileSAIAService_handlesAnnotationsWithoutPanic(t *testing.T) {
 	assert.Equal(t, "v1", svc.Annotations["operator.splunk.com/example"])
 	assert.NotContains(t, svc.Annotations, "kubectl.kubernetes.io/restartedAt")
 	assert.NotContains(t, svc.Annotations, "kubectl.kubernetes.io/last-applied-configuration")
+	assert.NotContains(t, svc.Annotations, "script-reconcile-ts")
 }
 
 func Test_reconcileSAIAv1Service(t *testing.T) {
@@ -979,6 +1477,19 @@ func envToMap(envs []corev1.EnvVar) map[string]string {
 		}
 	}
 	return m
+}
+
+// effectiveEnvMap applies Kubernetes' EnvFrom-before-Env precedence for the
+// direct-value variables used by these tests.
+func effectiveEnvMap(configMapData map[string]string, envs []corev1.EnvVar) map[string]string {
+	effective := make(map[string]string, len(configMapData)+len(envs))
+	for name, value := range configMapData {
+		effective[name] = value
+	}
+	for name, value := range envToMap(envs) {
+		effective[name] = value
+	}
+	return effective
 }
 
 // Suppress unused import warnings

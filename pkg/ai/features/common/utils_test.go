@@ -25,6 +25,24 @@ func TestIsConditionTrue(t *testing.T) {
 	}
 }
 
+func TestFilterPropagatedAnnotations(t *testing.T) {
+	src := map[string]string{
+		"custom": "kept",
+		"kubectl.kubernetes.io/last-applied-configuration": "drop",
+		"example.com/last-applied-configuration":           "kept",
+		"kubectl.kubernetes.io/restartedAt":                "drop",
+		"script-reconcile-ts":                              "drop",
+	}
+
+	filtered := FilterPropagatedAnnotations(src)
+	if len(filtered) != 2 || filtered["custom"] != "kept" || filtered["example.com/last-applied-configuration"] != "kept" {
+		t.Fatalf("unexpected filtered annotations: %#v", filtered)
+	}
+	if src["script-reconcile-ts"] != "drop" {
+		t.Fatal("source annotations were mutated")
+	}
+}
+
 func TestCheckRayHeadService_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

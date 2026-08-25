@@ -17,8 +17,8 @@ Usage: $(basename "$0") [--accelerator <type>] [--skip-if-staged] [--help]
 Options:
   -a, --accelerator <type>  GPU accelerator type for which to download models.
                             Supported: l40s (default), h100, rtx_pro_6000_blackwell
-                            (rtx_pro_6000_blackwell uses the same quantized
-                            artifacts as h100 — i.e. the w4a16 Gemma variant)
+                            (h100 and rtx_pro_6000_blackwell select the quantized
+                            profile containing the w4a16 Gemma variant)
   --skip-if-staged          Check the configured object store first; skip
                             downloading (and uploading) any artifact that is
                             already fully staged there.
@@ -69,20 +69,23 @@ if [[ -z "$ACCEL_FLAG" && -z "$ACCELERATOR" ]]; then
   echo "  1) l40s"
   echo "  2) h100"
   echo "  3) rtx_pro_6000_blackwell"
-  read -rp "Enter 1, 2 or 3: " GPU_CHOICE
+  read -rp "Enter 1, 2, or 3: " GPU_CHOICE
   case "$GPU_CHOICE" in
     1) ACCEL_FLAG="l40s" ;;
     2) ACCEL_FLAG="h100" ;;
     3) ACCEL_FLAG="rtx_pro_6000_blackwell" ;;
-    *) echo "Error: invalid choice '${GPU_CHOICE}'. Please enter 1, 2 or 3." >&2; exit 1 ;;
+    *) echo "Error: invalid choice '${GPU_CHOICE}'. Please enter 1, 2, or 3." >&2; exit 1 ;;
   esac
 fi
 
 ACCEL="$(printf '%s' "${ACCEL_FLAG:-${ACCELERATOR}}" | tr '[:upper:]' '[:lower:]')"
 
+# Select the artifact profile from the normalized accelerator type. H100 and
+# RTX Pro currently share the quantized profile, while L40S uses unquantized
+# weights. Profile names describe the artifacts rather than a particular GPU.
 case "${ACCEL}" in
-  l40s|"") CONFIG_FILE="./model_artifacts_configs.yaml" ;;
-  h100|rtx_pro_6000_blackwell) CONFIG_FILE="./model_artifacts_configs_h100.yaml" ;;
+  l40s|"") CONFIG_FILE="./model_artifacts_configs_unquantized.yaml" ;;
+  h100|rtx_pro_6000_blackwell) CONFIG_FILE="./model_artifacts_configs_quantized.yaml" ;;
   *)
     echo "Error: unsupported accelerator '${ACCEL}'. Supported values: l40s, h100, rtx_pro_6000_blackwell" >&2
     exit 1
@@ -197,7 +200,7 @@ else
     fi
 fi
 
-# HF_TOKEN and HF_USERNAME are set in the model_artifacts_configs.yaml file
+# HF_TOKEN and HF_USERNAME are read from the selected artifact profile.
 HF_TOKEN=$("$YQ_CMD" -r '.hf-token' "$CONFIG_FILE")
 HF_USERNAME=$("$YQ_CMD" -r '.hf-username' "$CONFIG_FILE")
 

@@ -58,6 +58,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	}()
 	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
 	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
+	var scaleResult reconcile.Result
 
 	stages := []struct {
 		name string
@@ -70,6 +71,11 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		{"Sidecars", sidecarBuilder.Reconcile},
 		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
 		{"RayService", raybuilder.ReconcileRayService},
+		{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
+			var err error
+			scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
+			return err
+		}},
 		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
 		{"Ingress", r.ReconcileIngress},
 		// collect status of each stage
@@ -112,7 +118,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		LastTransitionTime: metav1.Now(),
 	})
 
-	return reconcile.Result{}, nil
+	return scaleResult, nil
 }
 
 // ReconcileFeatures ensures each feature's AIService exists and is up to date.
@@ -215,6 +221,13 @@ func resourceRequirementsNonEmpty(r corev1.ResourceRequirements) bool {
 	return len(r.Requests) > 0 || len(r.Limits) > 0
 }
 
+func clusterDomainOrDefault(domain string) string {
+	if domain == "" {
+		return "cluster.local"
+	}
+	return domain
+}
+
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {
 	vectorDbUrl := platform.Status.VectorDbServiceName
 
@@ -247,6 +260,14 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			SplunkConfiguration: platform.Spec.SplunkConfiguration,
 			VectorDbUrl:         vectorDbUrl,
 			Replicas:            1,
+			// Match the webhook/CRD defaults for these fields exactly. If left
+			// zero-value here, every reconcile wipes the persisted defaulted
+			// value back to "", CreateOrUpdate sees a spurious diff against the
+			// live object, and issues an Update() on every single pass even
+			// when nothing meaningful changed.
+			Port:             80,
+			ClusterDomain:    clusterDomainOrDefault(platform.Spec.ClusterDomain),
+			AIPlatformScheme: "http",
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
 				Port:    8080,

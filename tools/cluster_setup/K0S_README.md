@@ -97,13 +97,32 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ```bash
 # Install required tools on macOS
-brew install kubectl helm git jq yq
+brew install kubectl helm git jq yq crane
 
 # Install required tools on Ubuntu/Debian
+# git and jq are in the default apt repos; kubectl and helm are not — add their
+# upstream repos/install scripts, and yq/crane need sudo to write to /usr/local/bin
 sudo apt-get update
-sudo apt-get install -y kubectl helm git jq
-wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-chmod +x /usr/local/bin/yq
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
+
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubectl
+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
+sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below (see Step 2 — Mirror
+# Container Images); no Docker daemon/root/group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
 
 # Verify installations
 kubectl version --client
@@ -111,7 +130,56 @@ helm version
 git --version
 jq --version
 yq --version
+crane version
 ```
+
+**RHEL 9** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
+default `dnf` repos; `git` and `jq` are. Install each via its own supported
+method (standalone binary, install script, or vendor repo, per each tool's
+docs) rather than a single `dnf install`:
+
+```bash
+sudo dnf install -y git jq
+
+# kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
+# see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+# helm — install script (https://helm.sh/docs/intro/install/)
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# yq — binary release, pinned to match the version this repo already relies on
+# (k0s_cluster_with_stack.sh, airgap_install.sh) — https://github.com/mikefarah/yq#install
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below (see Step 2 — Mirror
+# Container Images); no Docker daemon/root/group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
+
+# docker (optional, only needed if you prefer `docker pull`/`tag`/`push` over
+# `crane copy` for the image-mirroring commands below) — Docker CE repo for
+# RHEL (https://docs.docker.com/engine/install/rhel/)
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out/in (or `newgrp docker`) for group change to take effect
+
+# Verify installations
+kubectl version --client && helm version && git --version && jq --version && yq --version && crane version
+```
+
+The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images))
+default to `crane copy`, which works on both Ubuntu and RHEL 9 with no
+Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
+there too as an equivalent alternative if you already run Docker.
 
 ### Hardware Requirements
 
@@ -159,9 +227,17 @@ You must provide an external S3-compatible object storage endpoint:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/splunk/splunk-ai-operator.git
+# Replace <branch-name> with the branch you were given
+git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/cluster_setup
 ```
+
+**No git / downloading a ZIP from the browser instead:** GitHub's branch
+dropdown (top-left of the repo page, next to the branch icon) defaults to
+`main` — switch it to `<branch-name>` *before* clicking **Code → Download
+ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
+directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
+not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 ### 2. Create Configuration File
 
@@ -207,7 +283,7 @@ The `k0s-cluster-config.yaml` file controls all aspects of the deployment:
 cluster:           # Cluster name, useExisting, SSH user/key, optional API external address
 nodes:             # Controller/worker counts and existingIPs
 storage:           # storageClass, vectorDbSize, objectStore, minimumDiskSpace
-images:            # registry prefix, operator, splunk, ray, weaviate, saia, nginx, fluentBit, otelCollector
+images:            # registry prefix, operator, splunk, ray, weaviate, saia, slim, nginx, fluentBit, otelCollector
 operators:         # ray (version/modelVersion/rayVersion), certManager, nvidia devicePluginVersion
 kubernetes:        # namespace
 files:             # splunkOperator, aiPlatform manifest paths
@@ -249,9 +325,9 @@ storage:
     cpuWorker: 200
     gpuWorker: 500
   objectStore:
-    type: "seaweedfs"             # aws | s3compat | minio | seaweedfs
+    type: "seaweedfs"             # aws | minio | seaweedfs
     bucket: "ai-platform-data"
-    endpoint: "http://10.0.1.50:8333"   # REQUIRED for s3compat/minio/seaweedfs
+    endpoint: "http://10.0.1.50:8333"   # REQUIRED for minio/seaweedfs
     auth:
       rootUser: "admin"
       rootPassword: "Change-This-Strong-Password!"
@@ -261,19 +337,21 @@ storage:
 images:
   registry: "registry.corp.com"
   operator:
-    image: "registry.corp.com/splunk/splunk-ai-operator:v0.1.5"
+    image: "registry.corp.com/splunk/splunk-ai-operator:v2.8"
   splunk:
     image: "registry.corp.com/splunk/splunk:latest"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   ray:
-    headImage: "registry.corp.com/ray/ray-head:build-v1alpha1"
-    workerImage: "registry.corp.com/ray/ray-worker-gpu:build-v1alpha1"
+    headImage: "registry.corp.com/splunk/ai-tier-ray-head:v0.2"
+    workerImage: "registry.corp.com/splunk/ai-tier-ray-worker:v0.2"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28"
   saia:
     apiImage: "registry.corp.com/saia/saia-api:build-v1alpha1"
     apiV2Image: "registry.corp.com/saia/saia-api-v2:build-v1alpha1"
     dataLoaderImage: "registry.corp.com/saia/saia-data-loader:build-v1alpha1"
+  slim:
+    apiImage: "registry.corp.com/splunk/ai-tier-slim-service:v1.0"
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
   fluentBit:
@@ -285,7 +363,7 @@ operators:
   ray:
     version: "v1.2.2"
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.44.0"
+    rayVersion: "2.56.0"
   certManager:
     installCRDs: true
   nvidia:
@@ -367,7 +445,7 @@ ecr:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `nodes.controllers` | No | `1` | Number of controller nodes (1 or 3 for HA) |
+| `nodes.controllers` | No | `1` | Number of controller nodes. Only `1` is actually supported — `install_k0s_cluster` joins a controller on `nodes.existingIPs.controllers[0]` only and never issues a controller-join token to additional entries, so listing more IPs does not produce HA |
 | `nodes.cpuWorkers` | No | `2` | First N workers in the list are labeled as CPU |
 | `nodes.gpuWorkers` | No | `1` | Remaining workers after cpuWorkers are labeled as GPU |
 | `nodes.existingIPs.controllers` | **Yes** | — | List of controller node IPs |
@@ -398,7 +476,7 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 | Directory | Owner | Description |
 |---|---|---|
 | `model_artifacts/<id>/` | Admin (pre-staged) | Pre-trained model weights loaded by Ray workers at startup |
-| `staging_state/<id>/.staging_complete` | Installer | Completion marker; its content includes `accel=<type>` written by the download script. The pre-check validates both presence and `accel=` field so switching `defaultAcceleratorType` forces re-download and re-upload of models that differ between GPU configs (e.g. `gemma-4-31b-it`). |
+| `staging_state/<id>/.staging_complete` | Installer | Completion marker written by the download script. The pre-check validates its `hf_url` against the selected artifact profile, so stale or mismatched weights are staged again. |
 
 **Created at runtime by SAIA services:**
 
@@ -423,21 +501,30 @@ The S3 bucket serves as the shared storage layer for both pre-staged artifacts a
 
 #### Images Section
 
-Short image paths (without a FQDN) are automatically prefixed with `images.registry`.
+Short image paths (without a FQDN) are automatically prefixed with
+`images.registry`. Fully qualified defaults such as `docker.io/...` are left
+unchanged. For a private registry or air-gapped installation, mirror the images
+and replace the corresponding fields with the mirrored paths; setting only
+`images.registry` does not rewrite a fully qualified Docker Hub reference.
+
+> The SAIA `preview` defaults are mutable and workloads use `imagePullPolicy:
+> IfNotPresent`. Re-running the installer with the same tag may reuse a cached
+> image; use a new immutable tag or digest when performing a controlled upgrade.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
 | `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
-| `images.operator.image` | **Yes** | — | Splunk AI Operator image |
+| `images.operator.image` | **Yes** | `docker.io/kpratyush775/splunk-ai-operator:v2.8` | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | — | Ray head node image |
-| `images.ray.workerImage` | **Yes** | — | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:v0.2` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:v0.2` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
-| `images.saia.apiImage` | **Yes** | — | SAIA API v1 image |
-| `images.saia.apiV2Image` | **Yes** | — | SAIA API v2 image |
-| `images.saia.dataLoaderImage` | **Yes** | — | SAIA data loader / post-install hook image |
+| `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
+| `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
+| `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:preview` | SAIA data loader / post-install hook image |
+| `images.slim.apiImage` | No | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API image (required when the `slim` feature is enabled) |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -466,6 +553,7 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.saia.apiImage` | `RELATED_IMAGE_SAIA_API` | `artifacts.yaml` |
 | `images.saia.apiV2Image` | `RELATED_IMAGE_SAIA_API_V2` | `artifacts.yaml` |
 | `images.saia.dataLoaderImage` | `RELATED_IMAGE_POST_INSTALL_HOOK` | `artifacts.yaml` |
+| `images.slim.apiImage` | `RELATED_IMAGE_SLIM_API` | `artifacts.yaml` |
 | `images.nginx.image` | `RELATED_IMAGE_NGINX` | `artifacts.yaml` |
 | `images.fluentBit.image` | `RELATED_IMAGE_FLUENT_BIT` | `artifacts.yaml` |
 | `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
@@ -477,7 +565,8 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `aiPlatform.name` | No | `${CLUSTER_NAME}-ai-platform` | Base name for the AIPlatform CR |
-| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type — `L40S` or `H100` |
+| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type — `L40S`, `H100`, or `RTX_PRO_6000_BLACKWELL` |
+| `aiPlatform.scaleFactor` | No | `1` | AI workload capacity multiplier; use a whole number of 1 or higher |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
@@ -489,6 +578,29 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.gpuScheduling.tolerations` | No | GPU toleration | Tolerations for GPU workloads |
 | `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
 | `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
+
+#### Scaling Deployment Capacity
+
+Set `scaleFactor` under `aiPlatform` to change AI workload capacity:
+
+```yaml
+aiPlatform:
+  scaleFactor: 2
+```
+
+Use a whole number of `1` or higher. The default is `1`; for example, `2`
+doubles the standard capacity. Increasing this value does not add GPU nodes, so
+ask your cluster administrator to add the required GPU capacity first.
+
+Save the configuration and run the installer in interactive mode:
+
+```bash
+CONFIG_FILE=./k0s-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+> **Downscaling notice:** Reducing `scaleFactor` causes temporary service
+> downtime while workloads are resized. Plan downscaling during a maintenance
+> window.
 
 #### Image Pull Secrets Section
 
@@ -550,6 +662,8 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh clean-all
 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
+> **Air-gap uses these same commands.** With `cluster.airgap: true` in the config, `install` and `join-workers` stage the offline artifacts first and then continue; every other subcommand runs immediately, unchanged. See [Air-Gapped Deployment](#air-gapped-deployment).
+
 ### Environment Variables
 
 #### General
@@ -582,7 +696,7 @@ cluster:
 - Object store connectivity is still checked — it lives on your local network and must be reachable
 - The install plan banner shows `Air-gap mode: true` so customers can confirm it was picked up
 
-**Precedence:** `AIRGAP_MODE=true` env var overrides the YAML value — useful for a one-off run without editing the file. `install_from_airgap_bundle.sh` sets `AIRGAP_MODE=true` automatically; no manual config change needed when using the bundle workflow.
+**Precedence:** `AIRGAP_MODE=true` env var overrides the YAML value — useful for a one-off run without editing the file. Either one also makes `install` and `join-workers` stage the artifacts before touching the nodes; see [Air-Gapped Deployment](#air-gapped-deployment).
 
 | Setting | How to set | When to use |
 |---|---|---|
@@ -594,20 +708,21 @@ cluster:
 
 Every internet URL in the installer can be redirected to a local file or
 internal mirror by setting the corresponding variable. Unset variables fall
-back to the default public URL. These are set automatically by
-`install_from_airgap_bundle.sh`; set them manually only for partial overrides.
+back to the default public URL. These are set automatically by the air-gap
+staging step; set them manually only for partial overrides. `<staged>` is
+the staging directory, `./airgap-bundle/airgap-bundle-<timestamp>` by default.
 
 | Variable | Replaces | Example value |
 |----------|----------|---------------|
-| `K0S_INSTALL_URL` | `https://get.k0s.sh` | `file:///opt/airgap/bundle/binaries/k0s` |
-| `YQ_DOWNLOAD_URL` | GitHub yq release URL | `file:///opt/airgap/bundle/binaries/yq` |
-| `CERT_MANAGER_MANIFEST_URL` | GitHub cert-manager release URL | `file:///opt/airgap/bundle/manifests/cert-manager.yaml` |
-| `LOCAL_PATH_MANIFEST_URL` | GitHub local-path-provisioner URL | `file:///opt/airgap/bundle/manifests/local-path-storage.yaml` |
-| `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA device plugin URL | `file:///opt/airgap/bundle/manifests/nvidia-device-plugin.yml` |
-| `PROMETHEUS_CHART_PATH` | `prometheus-community/kube-prometheus-stack` | `/opt/airgap/bundle/charts/kube-prometheus-stack-72.3.0.tgz` |
-| `OTEL_CHART_PATH` | `open-telemetry/opentelemetry-operator` | `/opt/airgap/bundle/charts/opentelemetry-operator-0.80.0.tgz` |
-| `KUBERAY_CHART_PATH` | `kuberay/kuberay-operator` | `/opt/airgap/bundle/charts/kuberay-operator-1.2.2.tgz` |
-| `METALLB_CHART_PATH` | `metallb/metallb` | `/opt/airgap/bundle/charts/metallb-0.14.8.tgz` |
+| `K0S_INSTALL_URL` | `https://get.k0s.sh` | `file://<staged>/binaries/k0s` |
+| `YQ_DOWNLOAD_URL` | GitHub yq release URL | `file://<staged>/binaries/yq` |
+| `CERT_MANAGER_MANIFEST_URL` | GitHub cert-manager release URL | `file://<staged>/manifests/cert-manager.yaml` |
+| `LOCAL_PATH_MANIFEST_URL` | GitHub local-path-provisioner URL | `file://<staged>/manifests/local-path-storage.yaml` |
+| `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA device plugin URL | `file://<staged>/manifests/nvidia-device-plugin.yml` |
+| `PROMETHEUS_CHART_PATH` | `prometheus-community/kube-prometheus-stack` | `<staged>/charts/kube-prometheus-stack-72.3.0.tgz` |
+| `OTEL_CHART_PATH` | `open-telemetry/opentelemetry-operator` | `<staged>/charts/opentelemetry-operator-0.80.0.tgz` |
+| `KUBERAY_CHART_PATH` | `kuberay/kuberay-operator` | `<staged>/charts/kuberay-operator-1.2.2.tgz` |
+| `METALLB_CHART_PATH` | `metallb/metallb` | `<staged>/charts/metallb-0.14.8.tgz` |
 
 See [Air-Gapped Deployment](#air-gapped-deployment) for the full air-gap workflow.
 
@@ -628,22 +743,24 @@ LOG_DIR=/var/log/k0s CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh in
 
 The `install` command executes these steps in order:
 
+0. **Air-gap check** *(air-gap only)* — if `cluster.airgap: true` (or `AIRGAP_MODE=true`), the run first hands off to `airgap_install.sh` to stage ~2.2 GB of offline artifacts, which then calls this script back to continue from step 1. With `airgap: false` this step is a no-op. See [Air-Gapped Deployment](#air-gapped-deployment).
 1. **Load config** — Parse YAML, validate existingIPs
 2. **Validate images** — Ensure all required image fields are set
 3. **Configure images** — Patch `RELATED_IMAGE_*` env vars in manifest files
 4. **Preflight checks** — Validate tools, SSH connectivity, disk space, config
 5. **Model staging** *(when `storage.modelStaging.enabled: true`, the default)* — Download models from Hugging Face for the configured GPU type (`aiPlatform.defaultAcceleratorType`) and upload them to the object store. The staging pipeline is **resumable**: each model gets a per-model completion marker; re-runs skip already-staged models and cleanly retry only incomplete ones. The installer passes `SKIP_IF_STAGED=1` by default so previously staged models are never re-downloaded or re-uploaded. Skipped entirely when `enabled: false`.
 
-   **Models staged (from `model_artifacts_configs.yaml`):**
+   **Models staged (from the accelerator-selected artifact profile):**
 
    | Model artifact ID | Purpose |
    |---|---|
-   | `gemma-4-31b-it` | Primary LLM for chat, SPL generation, reasoning |
+   | `gemma-4-31b-it` | Unquantized Gemma model for L40S |
+   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 and RTX Pro |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
-   | `bi-encoder` | BGE small encoder |
    | `cross-encoder` | MS MARCO cross-encoder |
    | `e5-language-classifier` | Multilingual language detection |
+   | `fm_timeseries` | Cisco Time Series Model (CTSM) forecaster |
    | `mbart-translator` | Multilingual translation |
    | `pii-classifier` | PII detection |
    | `uae-large` | Embedding model |
@@ -653,7 +770,7 @@ The `install` command executes these steps in order:
 
    | Resource | Minimum | Notes |
    |---|---|---|
-   | Disk (free) | 250 GB | >120 GB for 10 model weight files + buffer for download staging and upload temp files |
+   | Disk (free) | 250 GB | >120 GB for 10 model artifacts + buffer for download staging and upload temp files |
    | RAM | 16 GB | Needed to stream large files without swapping |
    | Internet | Stable broadband | Downloads >120 GB from HuggingFace; re-run with `SKIP_IF_EXISTS=1` to resume interrupted downloads |
    | CPU | 4 cores | Recommended for parallel upload scripts |
@@ -670,12 +787,11 @@ The `install` command executes these steps in order:
    SKIP_IF_STAGED=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
    ```
 
-   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the GPU-specific artifact config, verifies each model's `staging_state/<id>/.staging_complete` marker in the object store, and validates that the marker's `accel=` field matches the configured accelerator type. If all models are present and match, it exits immediately (no download, no upload). If some are missing or have a mismatched accelerator it logs each one:
+   Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the selected artifact profile and verifies that each model's `staging_state/<id>/.staging_complete` marker contains the expected `hf_url`. If every marker matches, it exits immediately without downloading or uploading. Otherwise, it lists the artifacts that need staging:
 
    ```
-   [LOG] Model staging needed: 2/10 model(s) not yet staged.
-   [LOG]   MISSING: gpt-oss-20b  (bucket/staging_state/gpt-oss-20b/.staging_complete not found or accel mismatch)
-   [LOG]   MISSING: gemma-4-31b-it  (bucket/staging_state/gemma-4-31b-it/.staging_complete not found or accel mismatch)
+   [LOG] Model staging needed: 1/10 model(s) not yet staged.
+   [LOG]   MISSING: gemma-4-31b-it-qat-w4a16-ct  (bucket/staging_state/gemma-4-31b-it-qat-w4a16-ct/.staging_complete not found or hf_url changed)
    ```
 
    After upload completes, a post-stage verification pass re-checks all store markers and fails with a clear per-model error list if any are still absent — preventing an install from proceeding with an incomplete model set.
@@ -686,7 +802,7 @@ The `install` command executes these steps in order:
    cd tools/artifacts_download_upload_scripts
 
    # Explicit GPU type
-   ./download_from_huggingface.sh --accelerator l40s   # or h100
+   ./download_from_huggingface.sh --accelerator l40s   # or h100 / rtx_pro_6000_blackwell
 
    # Interactive — prompted when no flag or ACCELERATOR env var is set:
    #   Select GPU type:
@@ -737,6 +853,8 @@ It:
 3. Installs k0s worker on each missing node
 4. Waits for nodes to become Ready
 5. Labels nodes with `splunk.ai/*` labels based on CPU/GPU role
+
+Like `install`, `join-workers` stages the offline artifacts first when `cluster.airgap: true` — the new node needs the same binaries, image tarballs, and NVIDIA closure as the original nodes.
 
 ### useExisting Flag
 
@@ -1182,40 +1300,70 @@ sudo k0s etcd snapshot restore /tmp/etcd-backup.db
 
 ## Air-Gapped Deployment
 
-Complete guide for deploying the Splunk AI Platform in environments with no outbound internet access from the cluster nodes or the install machine.
+Complete guide for deploying the Splunk AI Platform onto cluster nodes with no outbound internet access.
 
 ### Overview
 
-Two helper scripts bridge the gap between a connected machine and an air-gapped cluster:
+**There is one entry point for both modes.** `k0s_cluster_with_stack.sh` detects air-gap mode from the config and stages the artifacts itself before installing:
+
+```bash
+cd tools/cluster_setup
+CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+The mode is selected by the config, not by which script you run:
+
+```yaml
+cluster:
+  airgap: false   # standard install — proceeds directly (unchanged behavior)
+  airgap: true    # stages ~2.2 GB of artifacts first (~15 min), then installs
+```
+
+`AIRGAP_MODE=true` in the environment is an equally valid trigger, for a one-off air-gap run without editing the config:
+
+```bash
+AIRGAP_MODE=true CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+The two scripts involved:
 
 | Script | Where to run | What it does |
 |---|---|---|
-| `prepare_airgap_bundle.sh` | Internet-connected machine | Downloads every binary, chart, and manifest into a versioned `.tar.gz` bundle |
-| `install_from_airgap_bundle.sh` | Air-gapped install machine | Extracts the bundle, sets env-var overrides, invokes the main installer |
+| `k0s_cluster_with_stack.sh` | Installer machine | **The entry point for both modes.** With `cluster.airgap: true` (or `AIRGAP_MODE=true`) it hands off to `airgap_install.sh` to stage artifacts, which then calls it back to do the install |
+| `airgap_install.sh` | Installer machine — internet access **and** SSH reach to the cluster nodes | The staging step, also usable directly (**advanced**). Downloads every binary, chart, manifest, image tarball, and the NVIDIA driver closure into a staging directory, then runs the main installer against it |
 
-The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. `install_from_airgap_bundle.sh` sets all of them automatically.
+**How the handoff works.** The delegation sits in `k0s_cluster_with_stack.sh` just before its subcommand dispatch. It reads `cluster.airgap` with `yq`, falling back to a `grep` for that one key when `yq` isn't installed — commonly the case on a sealed host, since the bundle is what provides `yq`. If air-gap is on, it `exec`s `airgap_install.sh --config <cfg> --subcommand <cmd>`. That script stages, exports the `file://` overrides, sets `AIRGAP_STAGED=true`, and calls `k0s_cluster_with_stack.sh` back; `AIRGAP_STAGED` is the recursion guard, so the delegation branch stands down on the second pass. You never set `AIRGAP_STAGED` yourself — it is internal.
+
+**Only `install` and `join-workers` stage.** `validate`, `diagnose`, `delete`, `clean-all`, `verify-pods`, and `stage-artifacts` never trigger staging, so they stay instant even with `airgap: true`. A read-only config check must not require a 15-minute download.
+
+The air-gap boundary is between the installer machine and the nodes, not between two machines. There is no tarball to copy.
+
+The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. The staging step sets all of them automatically from the staged artifacts.
+
+**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--node-hosts`, `--node-kernels`, `--driver-version`, `--skip-nvidia-closure`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
 
 ### Prerequisites
 
-**Internet-connected machine (bundle preparation):**
+**Installer machine:**
 
 | Tool | Install |
 |---|---|
-| `curl` | `brew install curl` / `apt install curl` |
+| RHEL 9 x86_64 (RHEL 10 x86_64 if the cluster nodes are RHEL 10 — see note below) | Required for air-gap only — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
+| `curl` | `dnf install -y curl` |
 | `helm` | https://helm.sh/docs/intro/install/ |
-| `tar` | Pre-installed on most systems |
-| `sha256sum` or `shasum` | Pre-installed (Linux / macOS) |
+| `kubectl` | https://kubernetes.io/docs/tasks/tools/ |
+| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9 / RHEL 10 |
+| `createrepo_c` | `sudo dnf install -y createrepo_c` |
+| `sudo` + ~5 GB free disk | Required for staging — the NVIDIA RPM closure is built on this host |
+| `k0s`, `yq` | Downloaded for you — the staging step installs both to `/usr/local/bin/` |
 
-**Air-gapped install machine:**
+> These requirements apply only to the air-gap path. A standard (`airgap: false`) install needs none of them.
 
-| Tool | How to get it |
-|---|---|
-| `kubectl` | Pre-install or copy from a connected machine |
-| `helm` | Pre-install or copy from a connected machine |
-| `tar` | Pre-installed on most systems |
-| `ssh` | Pre-installed on most systems |
-| `k0s` | Bundled — the install script copies it automatically |
-| `yq` | Bundled — the install script copies it automatically |
+> **For air-gap builds, the installer machine's RHEL major must match the cluster's.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa) — and the air-gap path builds both closures (NVIDIA driver, node packages) on this host:
+> - Cluster nodes are **RHEL 10** → installer machine must be **RHEL 10 x86_64**.
+> - Cluster nodes are **RHEL 9** or **Ubuntu 24.04** → installer machine stays **RHEL 9 x86_64** (the Ubuntu `.deb` closure resolves inside an `ubuntu:24.04` container).
+>
+> A standard (`airgap: false`) install builds no closure — every node installs from its own repos — so the installer machine's OS does not have to match.
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
@@ -1223,30 +1371,40 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 ---
 
-### Step 1 — Build the Bundle (Connected Machine)
+### Step 1 — Stage the Artifacts
+
+Steps 1–3 are preparation. If your container images are already mirrored and your model weights already staged, go straight to [Step 4](#step-4--install) — that single command does Step 1 for you.
+
+Stage explicitly only if you want the artifacts on disk *before* the install window — to inspect them, to size them, or to work through Step 2's image list. `--download-only` lives on `airgap_install.sh` and has no equivalent on the unified command, so this is the way to pre-stage:
 
 ```bash
 cd tools/cluster_setup
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer
+./airgap_install.sh --download-only --config my-cluster-config.yaml
 
 # Pin a specific k0s version
-./prepare_airgap_bundle.sh --output-dir /mnt/transfer --k0s-version v1.31.2+k0s.0
+./airgap_install.sh --download-only --config my-cluster-config.yaml \
+  --k0s-version v1.31.2+k0s.0
+
+# Stage somewhere other than ./airgap-bundle
+./airgap_install.sh --download-only --config my-cluster-config.yaml \
+  --output-dir /mnt/staging
 ```
 
-**What gets downloaded into the bundle:**
+**What gets downloaded:**
 
 | Category | Contents |
 |---|---|
-| Binaries | `k0s` (latest stable or `--k0s-version`), `yq v4.44.1` |
+| Binaries | `k0s v1.36.1+k0s.0` (default; override with `--k0s-version`), `yq v4.44.1` |
 | **Image bundles** (`images/`) | **`k0s-images.tar`** — k0s control-plane images (pause, Calico, kube-proxy, CoreDNS, metrics-server); **`addon-images.tar`** — add-on component images (cert-manager, kube-prometheus-stack, kuberay, MetalLB, OTel, NVIDIA device plugin, busybox). Both built automatically and staged to `/var/lib/k0s/images/` on every node at install time. |
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
-| Helm charts | `kube-prometheus-stack` (version captured at bundle time), `opentelemetry-operator` (version captured at bundle time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
-| GPU packages | `epel-release-latest-9.noarch.rpm`, `cuda-rhel9.repo`, `nvidia-container-toolkit.repo`, PyYAML wheel (all nodes) |
+| Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
+| GPU packages | `packages/nvidia-closure/` — a complete offline dnf repo (driver, DKMS, gcc/make toolchain, container toolkit, `kernel-devel`/`kernel-headers` per GPU node kernel); PyYAML wheel (all nodes) |
+| Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
-Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB)
+Output: `./airgap-bundle/airgap-bundle-<timestamp>/` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB). The artifacts are consumed in place; there is no tarball. After a successful install the staged tree is deleted to reclaim disk unless you pass `--keep-staging`.
 
-> `kube-prometheus-stack` and `opentelemetry-operator` are not pinned in the installer — the bundle script resolves and records those versions at download time so the air-gapped install uses exactly the charts that were tested.
+> `kube-prometheus-stack` and `opentelemetry-operator` are not pinned in the installer — the staging step resolves and records those versions at download time so the air-gapped install uses exactly the charts that were tested.
 
 > **Two image bundles, built for you.** `k0s-images.tar` and `addon-images.tar`
 > cover the *infrastructure* images that k0s and the add-on charts/manifests pull
@@ -1259,18 +1417,19 @@ Output: `/mnt/transfer/airgap-bundle-<timestamp>.tar.gz` (~2–4 GB — the imag
 
 ### Step 2 — Mirror Container Images
 
-Container images are **not** in the bundle (they would add many GB). Mirror them separately to an internal registry that the cluster nodes can reach.
+Platform application images are **not** staged (they would add many GB). Mirror them separately to an internal registry that the cluster nodes can reach.
 
-The bundle includes a ready-made image list:
+The staged tree includes a ready-made image list:
 
 ```bash
-cat /mnt/transfer/airgap-bundle-*/container-images.txt
+cat ./airgap-bundle/airgap-bundle-*/container-images.txt
 ```
 
 **Mirror with `crane` (recommended):**
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
+IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
@@ -1278,10 +1437,17 @@ while IFS= read -r img; do
   dest="${INTERNAL_REGISTRY}/${img##*/}"
   echo "Copying $img → $dest"
   crane copy "$img" "$dest"
-done < container-images.txt
+done < "${IMAGE_LIST}"
 ```
 
 **Mirror with Docker:**
+
+Requires the Docker CE daemon on the workstation, and your user in the
+`docker` group so `docker` commands don't need `sudo`:
+
+```bash
+sudo usermod -aG docker "$USER"   # one-time; log out/in (or run `newgrp docker`) for it to take effect in the current shell
+```
 
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
@@ -1297,29 +1463,46 @@ docker push "${INTERNAL_REGISTRY}/weaviate:stable-v1.28-007846a"
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:latest"
+    image: "registry.airgap.local/splunk-ai-operator:v2.8"
   # ... all other image fields pointing at your internal registry
 
 imagePullSecrets:
   autoCreateECR: false   # disable automatic ECR token refresh
 ```
 
+> **Authenticated registry** (Harbor or similar)? `autoCreateECR: false` plus
+> `images.registry` alone creates no pull secret. The installer only creates
+> credentials for a generic internal registry when
+> `imagePullSecrets.custom.enabled` and its `server`/`username`/`password`
+> fields are set:
+>
+> ```yaml
+> imagePullSecrets:
+>   autoCreateECR: false
+>   custom:
+>     enabled: true
+>     name: "custom-registry-secret"
+>     server: "registry.airgap.local"
+>     username: "<registry-username>"
+>     password: "<registry-password>"
+> ```
+
 ---
 
 ### Step 3 — Stage Model Weights
 
-Model weights (>120 GB total) are not included in the binary bundle. Stage them separately into your object store on the internet-connected machine.
+Model weights (>120 GB total) are not staged by the air-gap staging step. Stage them separately into your object store from a machine with internet access.
 
 **System requirements for the staging machine:**
 
 | Resource | Minimum | Notes |
 |---|---|---|
-| Disk (free) | 250 GB | >120 GB for 10 model weight files + buffer for download staging and upload temp files |
+| Disk (free) | 250 GB | >120 GB for 10 model artifacts + buffer for download staging and upload temp files |
 | RAM | 16 GB | Needed to stream and process large files without swapping |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; resume with `SKIP_IF_EXISTS=1` |
 | CPU | 4 cores | Recommended for parallel upload scripts |
 
-This can be the same machine used to build the airgap bundle.
+This can be the same installer machine, provided the disk requirement is met.
 
 ```bash
 cd tools/artifacts_download_upload_scripts
@@ -1341,88 +1524,127 @@ storage:
 
 ---
 
-### Step 4 — Transfer Files to the Air-Gapped Environment
+### Step 4 — Install
 
-```bash
-# Copy bundle
-scp /mnt/transfer/airgap-bundle-<timestamp>.tar.gz admin@install-machine:/opt/splunk-ai/
+**4a. Add `cluster.airgap: true` to your config:**
 
-# Copy installer scripts (if not already on the machine)
-scp tools/cluster_setup/k0s_cluster_with_stack.sh \
-    tools/cluster_setup/install_from_airgap_bundle.sh \
-    tools/cluster_setup/k0s-cluster-config.yaml \
-    admin@install-machine:/opt/splunk-ai/
-
-# Copy your edited cluster config
-scp my-cluster-config.yaml admin@install-machine:/opt/splunk-ai/
-```
-
----
-
-### Step 5 — Install from the Bundle
-
-**5a. Add `cluster.airgap: true` to your config:**
+This is the mode switch — it is what makes the install command below stage artifacts instead of going straight at the nodes.
 
 ```yaml
 cluster:
   name: my-cluster
-  airgap: true        # skips internet connectivity checks immediately
+  airgap: true        # stage artifacts first; skip internet connectivity checks
   sshKeyPath: ~/.ssh/id_rsa
   sshUser: ec2-user
 ```
 
-> Without `airgap: true`, the installer will attempt connectivity checks to HuggingFace and NVIDIA package repos before skipping them — those checks pause for up to 5 minutes on unreachable hosts. Setting `airgap: true` skips them immediately. `install_from_airgap_bundle.sh` sets `AIRGAP_MODE=true` automatically via env var.
+> Beyond selecting the mode, `airgap: true` also stops the installer attempting connectivity checks to HuggingFace and NVIDIA package repos — those checks pause for up to 5 minutes on unreachable hosts. `AIRGAP_MODE=true` in the environment does the same thing for one run without editing the config.
 
-**5b. Run the installer:**
+**4b. Run the install:**
 
-```bash
-cd /opt/splunk-ai
-chmod +x install_from_airgap_bundle.sh k0s_cluster_with_stack.sh
-
-./install_from_airgap_bundle.sh \
-  --bundle /opt/splunk-ai/airgap-bundle-<timestamp>.tar.gz \
-  --config /opt/splunk-ai/my-cluster-config.yaml
-```
-
-**What `install_from_airgap_bundle.sh` does automatically:**
-
-1. Extracts the bundle to `/opt/airgap` (override with `--extract-dir`)
-2. Verifies SHA-256 checksums of every bundled file
-3. Installs `k0s` and `yq` from the bundle
-4. Registers a local Helm repository from the bundled `.tgz` files
-5. Exports all env-var overrides (13 URL + path variables)
-6. Runs `k0s_cluster_with_stack.sh install`
-
-The install plan displayed before any changes are made will show `Air-gap mode: true` — confirm this before proceeding.
-
-**Running an upgrade:**
+Exactly the same command as a standard install:
 
 ```bash
-./install_from_airgap_bundle.sh \
-  --bundle /opt/airgap-bundle-<new-timestamp>.tar.gz \
-  --config /opt/splunk-ai/my-cluster-config.yaml \
-  --subcommand upgrade
+cd tools/cluster_setup
+chmod +x airgap_install.sh k0s_cluster_with_stack.sh
+
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
+
+**What happens automatically in air-gap mode:**
+
+1. `cluster.airgap: true` is detected and the run hands off to `airgap_install.sh` to stage the artifacts
+2. Preflights the config, the installer script, the build host, and the GPU nodes derived from the config — everything that can fail cheaply fails here, in seconds
+3. Downloads binaries, manifests, charts, image tarballs, and the NVIDIA driver closure into `./airgap-bundle/airgap-bundle-<timestamp>/`
+4. Verifies SHA-256 checksums of every staged file
+5. Installs `k0s` and `yq` to `/usr/local/bin/`
+6. Exports all env-var overrides (13 URL + path variables)
+7. Calls `k0s_cluster_with_stack.sh install` back with `AIRGAP_STAGED=true` — that pass skips the staging branch and pushes the artifacts to every node over SSH
+
+Budget roughly 15 extra minutes up front for the ~2.2 GB of artifacts. The install plan displayed before any changes are made will show `Air-gap mode: true` — confirm this before proceeding.
+
+**Adding workers later:** `join-workers` delegates the same way — no extra flag, and the artifacts are re-staged so the new node gets them.
+
+```bash
+# Add GPU workers to an existing cluster
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh join-workers
+```
+
+Everything else — `validate`, `diagnose`, `delete`, `clean-all`, `verify-pods`, `stage-artifacts` — runs immediately with no staging, even with `airgap: true`.
+
+**Driving staging directly (advanced):** `airgap_install.sh` still accepts `--subcommand` if you need to pair a non-default staging flag with a specific installer subcommand.
+
+```bash
+./airgap_install.sh --config my-cluster-config.yaml \
+  --subcommand join-workers --keep-staging
+```
+
+**Retrying after a failure:** the staged tree is deliberately kept when the installer exits non-zero, so a retry needs no re-download. The script prints the exact commands to resume:
+
+```bash
+export AIRGAP_BUNDLE_DIR=./airgap-bundle/airgap-bundle-<timestamp>
+source "${AIRGAP_BUNDLE_DIR}/airgap-env.sh"
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+```
+
+`airgap-env.sh` exports `AIRGAP_STAGED=true` along with the `file://` overrides, so this run installs from the existing tree instead of staging it again.
 
 ---
 
 ### GPU Nodes in Air-Gapped Environments
 
-GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that normally download from the internet. In air-gap mode the installer detects missing `nvidia-smi` and fails clearly rather than timing out.
+GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that normally download from the internet. The air-gap staging step builds a self-contained RPM **closure** containing all of them, and the installer pushes it to each GPU node and installs from it offline — so this is handled for you.
 
-**Three strategies:**
+**Strategy 1 — Staged driver closure (recommended, fully automatic)**
 
-**Strategy 1 — Pre-install before running the installer (recommended)**
+Nothing extra is required — the plain install command already does it:
 
-Pre-install the NVIDIA driver and nvidia-container-toolkit on each GPU node before running `install_from_airgap_bundle.sh`. The installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips Container Toolkit install), then configures the containerd runtime offline.
+```bash
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+```
 
-A fully air-gapped GPU node cannot reach NVIDIA's RPM repos, so the bundle's bare `cuda-rhel9.repo` is not enough on its own — `dnf install` against it would still try to fetch packages and their dependencies over the blocked link. Instead, build a self-contained RPM **closure** on a connected RHEL 9 host, copy it to the node, and install from it as a local repo.
+The GPU node IPs are derived from your config (the workers in `nodes.existingIPs.workers` after the first `nodes.cpuWorkers` entries), and each node's `uname -r` is surveyed over SSH using the config's `sshUser`/`sshKeyPath`.
+
+To override the derived list, or to name the kernels explicitly (no SSH needed) and pin the driver for reproducible rebuilds, drive the staging step directly — these flags live on `airgap_install.sh`, which continues into the install just as the unified command would:
+
+```bash
+# Override the derived GPU node list
+./airgap_install.sh --config my-cluster-config.yaml \
+  --gpu-hosts 10.0.38.138,10.0.38.139
+
+# Name kernels explicitly and pin the driver version
+./airgap_install.sh --config my-cluster-config.yaml \
+  --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64,5.14.0-687.10.1.el9_8.x86_64 \
+  --driver-version 610.57.04
+```
+
+This produces `packages/nvidia-closure/` — a complete dnf repo (~500 MB, ~270 RPMs) holding the driver, DKMS, the gcc/make toolchain, the container toolkit, and `kernel-devel`/`kernel-headers` for every kernel covered. The same run then continues into the install.
+
+The installer scp's the closure to each GPU node, installs with `dnf --disablerepo='*' --repofrompath=...` so the node never contacts `developer.download.nvidia.com`, and DKMS compiles the module against that node's running kernel.
+
+**The closure must be built on a RHEL 9 x86_64 host** with `dnf` and `createrepo_c` — it cannot be built on macOS. The OS **minor** version and kernel do *not* need to match the GPU nodes: `$releasever` resolves to `9`, so a RHEL 9.6 installer machine can download `kernel-devel` for a 9.8 node, and the module compiles on the target anyway.
+
+**Every GPU node's running kernel must be covered.** NVIDIA ships DKMS-only packages for RHEL 9 (there is no precompiled kmod), so the module is built on the node and needs headers for that exact `uname -r`. The installer checks this per node *before* copying 500 MB and fails with the offending kernel named if it is missing.
+
+> **Pin kernels on GPU nodes.** Add `exclude=kernel*` to `/etc/dnf/dnf.conf` on each GPU node. If a node boots a kernel the closure has no headers for, DKMS cannot rebuild and `nvidia-smi` breaks with no offline path to recover.
+
+**Strategy 2 — Pre-install drivers yourself**
+
+If you would rather manage drivers out of band, install the NVIDIA driver and `nvidia-container-toolkit` on each GPU node before running the installer, and pass `--skip-nvidia-closure`. The installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips toolkit install), then configures the containerd runtime offline.
+
+To build the closure by hand for this path, the manual recipe follows.
 
 The driver flavor that succeeds on RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
 
+The unified air-gap installer checks whether that RPM is visible and, on RHEL 9
+only, resets any conflicting/default NVIDIA stream and enables
+`nvidia-driver:latest-dkms` before resolving the closure. RHEL 10 uses ordinary
+RPMs without this module-stream step, and Ubuntu follows its independent APT
+path.
+
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
 
-**Step 1 — build the closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the bundle-prep machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
+**Step 1 — build the closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the installer machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
 
 ```bash
 DEST=~/nvidia-offline
@@ -1435,6 +1657,7 @@ sudo dnf config-manager --add-repo \
   https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
   | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+sudo dnf module reset -y nvidia-driver
 sudo dnf module enable -y nvidia-driver:latest-dkms
 
 mkdir -p "$DEST"
@@ -1499,7 +1722,7 @@ EOF
 
 > **Do not reboot into a different kernel** after this. The kmod is DKMS-built against the running kernel only; pin/exclude kernel updates on air-gapped GPU nodes (`exclude=kernel*` in `/etc/dnf/dnf.conf`) so a reboot can't land on a kernel with no matching module.
 
-After this succeeds on every GPU node, run `install_from_airgap_bundle.sh` normally. The installer skips driver + toolkit install, then configures the containerd runtime, generates the CDI spec, and applies the device-plugin DaemonSet — all offline.
+After this succeeds on every GPU node, drive staging directly so you can pass the skip flag: `./airgap_install.sh --skip-nvidia-closure --config my-cluster-config.yaml`. The installer skips driver + toolkit install, then configures the containerd runtime, generates the CDI spec, and applies the device-plugin DaemonSet — all offline.
 
 **What the installer handles for you (k0s ≥ 1.33 / containerd 2.x):**
 
@@ -1507,69 +1730,57 @@ After this succeeds on every GPU node, run `install_from_airgap_bundle.sh` norma
 - **device-plugin image.** The bundle includes `nvcr.io/nvidia/k8s-device-plugin` in `addon-images.tar`, staged to `/var/lib/k0s/images/` on every worker, so the DaemonSet starts without pulling from `nvcr.io`.
 - **worker image staging on rejoin.** Workers joined into an existing cluster also receive the image tarballs, so a GPU node added later still comes up Ready offline.
 
-> `install_from_airgap_bundle.sh` also sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the PyYAML artifact in the bundle's `packages/` directory so the installer uses it instead of calling `dnf install python3-pyyaml`. PyYAML does not publish a pure-Python (`none-any`) wheel, so this is normally the source sdist (`PyYAML-*.tar.gz`), which `pip3 install` builds on the node; if a pure-Python wheel is ever published the bundle prefers it. Either way the path is wired up for you — don't expect a specific `.whl` filename.
-
-**Strategy 2 — Local RPM mirror (for organizations with many nodes)**
-
-Set up an internal mirror and redirect the installer via environment variables:
-
-```bash
-export CUDA_REPO_URL_OVERRIDE="http://mirror.internal/cuda/cuda-rhel9.repo"
-export EPEL_RPM_URL_OVERRIDE="http://mirror.internal/epel/epel-release-latest-9.noarch.rpm"
-export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-container-toolkit.repo"
-
-./install_from_airgap_bundle.sh --bundle ... --config ...
-```
+> Staging also sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the PyYAML artifact in the staged `packages/` directory so the installer uses it instead of calling `dnf install python3-pyyaml`. PyYAML does not publish a pure-Python (`none-any`) wheel, so this is normally the source sdist (`PyYAML-*.tar.gz`), which `pip3 install` builds on the node; if a pure-Python wheel is ever published the script prefers it. Either way the path is wired up for you — don't expect a specific `.whl` filename.
 
 **Strategy 3 — Partial air-gap (GPU nodes have controlled internet access)**
 
-If GPU nodes can reach NVIDIA's package servers but the control plane / install machine cannot, set `AIRGAP_MODE=true` in your config (to skip HuggingFace checks) while leaving GPU node driver install unblocked.
+If GPU nodes can reach NVIDIA's package servers but the control plane / installer machine cannot, set `AIRGAP_MODE=true` in your config (to skip HuggingFace checks) while leaving GPU node driver install unblocked.
 
 ---
 
 ### Environment Variable Reference
 
-These variables are set automatically by `install_from_airgap_bundle.sh`. Set them manually only if you extracted the bundle yourself or want to override a single component.
+These variables are set automatically by the air-gap staging step. Set them manually only if you are driving `k0s_cluster_with_stack.sh` against an already-staged tree (with `AIRGAP_STAGED=true` so it does not stage again), or want to override a single component. `<staged>` below is the staging directory, `./airgap-bundle/airgap-bundle-<timestamp>` by default.
 
 **Binary URLs:**
 
 | Variable | Default (online) | Air-gap usage |
 |---|---|---|
-| `K0S_INSTALL_URL` | `https://get.k0s.sh` | `file:///opt/airgap/bundle/binaries/k0s` |
-| `YQ_DOWNLOAD_URL` | GitHub releases URL | `file:///opt/airgap/bundle/binaries/yq` |
+| `K0S_INSTALL_URL` | `https://get.k0s.sh` | `file://<staged>/binaries/k0s` |
+| `YQ_DOWNLOAD_URL` | GitHub releases URL | `file://<staged>/binaries/yq` |
 
 **Manifest URLs:**
 
 | Variable | Default (online) | Air-gap usage |
 |---|---|---|
-| `CERT_MANAGER_MANIFEST_URL` | GitHub cert-manager release URL | `file:///opt/airgap/bundle/manifests/cert-manager.yaml` |
-| `LOCAL_PATH_MANIFEST_URL` | GitHub rancher/local-path-provisioner URL | `file:///opt/airgap/bundle/manifests/local-path-storage.yaml` |
-| `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA/k8s-device-plugin URL | `file:///opt/airgap/bundle/manifests/nvidia-device-plugin.yml` |
+| `CERT_MANAGER_MANIFEST_URL` | GitHub cert-manager release URL | `file://<staged>/manifests/cert-manager.yaml` |
+| `LOCAL_PATH_MANIFEST_URL` | GitHub rancher/local-path-provisioner URL | `file://<staged>/manifests/local-path-storage.yaml` |
+| `NVIDIA_DEVICE_PLUGIN_MANIFEST_URL` | GitHub NVIDIA/k8s-device-plugin URL | `file://<staged>/manifests/nvidia-device-plugin.yml` |
 
 **Helm Chart Paths:**
 
 | Variable | Default (online) | Air-gap usage |
 |---|---|---|
-| `PROMETHEUS_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/kube-prometheus-stack-<ver>.tgz` |
-| `OTEL_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/opentelemetry-operator-<ver>.tgz` |
-| `KUBERAY_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/kuberay-operator-1.2.2.tgz` |
-| `METALLB_CHART_PATH` | _(not set — uses remote repo)_ | `/opt/airgap/bundle/charts/metallb-0.14.8.tgz` |
+| `PROMETHEUS_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/kube-prometheus-stack-<ver>.tgz` |
+| `OTEL_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/opentelemetry-operator-<ver>.tgz` |
+| `KUBERAY_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/kuberay-operator-1.2.2.tgz` |
+| `METALLB_CHART_PATH` | _(not set — uses remote repo)_ | `<staged>/charts/metallb-0.14.8.tgz` |
 
 **GPU Node OS Package URLs:**
 
-| Variable | Default URL | What it controls |
+| Variable | Default | What it controls |
 |---|---|---|
-| `EPEL_RPM_URL_OVERRIDE` | `dl.fedoraproject.org/pub/epel/epel-release-latest-N.noarch.rpm` | EPEL release RPM for DKMS |
-| `CUDA_REPO_URL_OVERRIDE` | NVIDIA CUDA repo URL for the detected OS | CUDA package repo definition |
-| `NVIDIA_CTK_REPO_URL_OVERRIDE` | `nvidia.github.io/.../nvidia-container-toolkit.repo` | nvidia-container-toolkit repo |
+| `AIRGAP_NVIDIA_CLOSURE_DIR` | _(not set)_ | Path to `packages/nvidia-closure` on the **installer host**. The installer scp's this directory to each GPU node and installs the driver/DKMS/toolkit from it with `--disablerepo='*'`. |
 | `AIRGAP_PYYAML_WHEEL_PATH` | _(not set)_ | Path to the bundled PyYAML artifact (`.whl` if a pure-Python wheel exists, otherwise the `.tar.gz` sdist) for offline pip3 install |
+
+> These are paths on the installer host, not on the nodes. Environment variables do **not** cross the SSH boundary, so the installer copies the referenced files to each node itself — that is why a "point dnf at my own mirror URL" env var is not offered here.
 
 **Other:**
 
 | Variable | Default | Description |
 |---|---|---|
 | `AIRGAP_MODE` | `false` | Set to `true` to skip HuggingFace and NVIDIA repo connectivity checks. Env var takes precedence over YAML `cluster.airgap`. |
-| `AIRGAP_BUNDLE_DIR` | _(not set)_ | Path to the extracted bundle directory. |
+| `AIRGAP_BUNDLE_DIR` | _(not set)_ | Path to the staged artifact directory. |
 
 **Partial air-gap (override one component only):**
 
@@ -1591,10 +1802,13 @@ Unset variables fall back to the default public URLs automatically.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| "Checksum verification failed" | Bundle corrupted in transit | Re-transfer and `sha256sum airgap-bundle-<date>.tar.gz` |
-| "Expected chart not found" | Helm uses underscores vs dashes in filename | `ls /opt/airgap/airgap-bundle-*/charts/` and set `PROMETHEUS_CHART_PATH` explicitly |
-| "k0s not found on remote nodes" | `K0S_INSTALL_URL` not set to bundle path | Verify `file://` path exists on install machine, not remote node |
-| "nvidia-smi not found" in AIRGAP_MODE | Driver not pre-installed | Pre-install using Strategy 1 above |
+| "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging directory and re-run the install — staging repeats automatically |
+| "Expected chart not found" | Helm uses underscores vs dashes in filename | `ls ./airgap-bundle/airgap-bundle-*/charts/` and set `PROMETHEUS_CHART_PATH` explicitly |
+| "k0s not found on remote nodes" | `K0S_INSTALL_URL` not set to the staged path | Verify the `file://` path exists on the installer machine, not the remote node |
+| "no offline driver repo was provided" | Ran with `--skip-nvidia-closure` (or the closure build was skipped) | Re-run without `--skip-nvidia-closure`, or pre-install drivers on the nodes |
+| "no kernel-devel for &lt;node&gt;'s running kernel" | GPU node runs a kernel the closure wasn't built for | Re-run including that kernel: `--gpu-kernels $(ssh node uname -r)` |
+| "All matches were filtered out by modular filtering" | Stale `nvidia-driver` dnf module stream on the node | `sudo dnf module reset -y nvidia-driver` (the installer does this automatically) |
+| DKMS built for a different kernel | Node rebooted into a newer kernel after the closure was built | Boot the covered kernel, or re-run to rebuild the closure; then add `exclude=kernel*` to `/etc/dnf/dnf.conf` |
 | Images failing to pull | Images not mirrored or `images.registry` wrong | Confirm all images in `container-images.txt` were mirrored and `images.registry` is correct |
 
 ---
@@ -1604,6 +1818,100 @@ Unset variables fall back to the default public URLs automatically.
 The **Splunk AI Assistant** app (`Splunk_AI_Assistant_Cloud.tgz`) is a Splunk
 application that provides the AI chat UI. It must be installed on the Splunk
 Enterprise instance after the cluster is fully healthy.
+
+### Internal Splunk management transport (native-HTTPS compatibility mode)
+
+When `splunk.enabled: true` and `splunk.external.endpoint` is unset, the
+installer preserves native splunkd HTTPS on port 8089. The immutable Splunk AI
+Assistant app 2.0.4 depends on `https://127.0.0.1:8089` for its local SDK,
+capability, KV Store, onboarding, and scheduled-job calls.
+
+The installer uses the same short internal URL for Splunk's OAuth issuer and
+the AIPlatform endpoint:
+
+```text
+https://splunk-<standaloneName>-standalone-service:8089
+```
+
+SAIA and Slim both derive `SPLUNK_ISSUERS` from that endpoint. No additional
+nginx/JWKS proxy is deployed, and this path creates no TLS Secret, Certificate,
+CA ConfigMap, or CA mount. HEC configuration remains separate on port 8088
+through `splunkConfiguration.hecEndpoint`; the installer detects its effective
+`enableSSL` value and does not change it. A configured HEC endpoint is consumed
+only when an OTel collector is actually injected and running; it is not proof
+that telemetry has been delivered.
+
+Because OTel sidecar configuration is injected when a Ray pod is created,
+changing the HEC URL or scheme updates the Collector configuration but does not
+automatically replace Ray pods. This avoids an unrequested replacement
+RayCluster on fully allocated GPU installations. Existing Ray pods retain their
+injected configuration until they are recreated. Plan a controlled RayService
+rollout during a maintenance window with sufficient spare capacity when an
+existing installation must consume a changed HEC destination.
+
+> **Compatibility boundary:** this restores `main`'s native splunkd HTTPS and
+> short issuer contract while aligning the AIPlatform endpoint for SAIA and
+> Slim. It does not solve trust or hostname verification for Splunk's built-in
+> certificate. An SAIA or Slim image that strictly verifies outbound TLS may
+> reject that certificate because its CA is not trusted or its SAN does not
+> match the Service hostname. Verified end-to-end TLS requires the separate
+> hostname-valid certificate and CA-trust design.
+
+Upgrades from the earlier HTTP-management preview explicitly restore
+`SPLUNKD_SSL_ENABLE=true`, remove stale installer-owned
+`/mnt/splunk-cert*` paths, keep Splunk Web on HTTP, and preserve the PVC and
+indexed data. Because the issuer changes back to the short HTTPS URL, users
+must sign in again or repeat onboarding to receive tokens with the new `iss`
+claim.
+
+Check the resulting configuration:
+
+```bash
+kubectl -n ai-platform exec splunk-splunk-standalone-0 -- \
+  /opt/splunk/bin/splunk btool server list sslConfig \
+  | grep enableSplunkdSSL
+
+kubectl -n ai-platform exec splunk-splunk-standalone-0 -- \
+  /opt/splunk/bin/splunk btool authentication list oauth2_settings \
+  | grep issuer_uri
+
+kubectl -n ai-platform get aiplatform <cluster-name>-ai-platform \
+  -o jsonpath='{.spec.splunkConfiguration.endpoint}{"\n"}{.spec.splunkConfiguration.hecEndpoint}{"\n"}'
+```
+
+Expect `enableSplunkdSSL = true`, the short HTTPS Service URL as
+`issuer_uri` and `endpoint`, and the independently detected port-8088 URL as
+`hecEndpoint`.
+
+Run the reusable read-only validation after installation or upgrade:
+
+```bash
+KUBECONFIG=/path/to/kubeconfig \
+  ./tools/cluster_setup/test_internal_splunk_http.sh \
+  --namespace ai-platform \
+  --standalone splunk-standalone \
+  --aiplatform <cluster-name>-ai-platform
+```
+
+This validates the effective transport, issuer propagation, HEC exporter
+configuration, running injected collectors, and SAIA/Slim readiness. It does
+not read the Splunk admin password or assert that telemetry reached an index.
+
+For an opt-in end-to-end authentication check, run:
+
+```bash
+KUBECONFIG=/path/to/kubeconfig \
+  ./tools/cluster_setup/test_internal_splunk_authenticated.sh \
+  --namespace ai-platform \
+  --standalone splunk-standalone \
+  --aiplatform <cluster-name>-ai-platform
+```
+
+This second test reads the operator-managed Splunk admin Secret, uses the
+bundled Splunk AI Assistant SDK over its default local HTTPS connection, mints
+a short-lived interactive JWT, and requires authenticated HTTP 200 responses
+from both SAIA and Slim. The decoded password and JWT remain inside one in-pod
+process and are never printed or written to files.
 
 ### Prerequisites
 
@@ -1641,15 +1949,114 @@ Access URL: `http://<EXTERNAL-IP>`
 **kubectl port-forward (quick access, no external exposure)**
 
 ```bash
-kubectl port-forward -n ai-platform svc/splunk-standalone-service 8000:8000
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 ```
 
 Open `http://localhost:8000` in your browser.
 
+**Remote workstation via SSH bastion (SOCKS tunnel)**
+
+Use this when your browser doesn't run on the same host as `kubectl` — the
+cluster network is reachable only from the installer machine, and you're
+browsing from your laptop. The **installer machine** is the admin workstation
+from [Required Tools](#required-tools-on-admin-workstation): whatever host has
+SSH reach to every cluster node and holds the kubeconfig (often a bastion or
+EC2 instance, not your laptop) — it is not itself a cluster node. A plain
+`kubectl port-forward` only helps if your browser runs on that same host; the
+SOCKS proxy set up here also lets the browser reach other private cluster
+addresses directly, e.g. the SAIA API endpoint from
+[Onboarding to the AI Tier](#onboarding-to-the-ai-tier).
+
+Placeholders used below — replace with your own values:
+
+| Placeholder | Meaning |
+|---|---|
+| `<installer-ip>` | SSH-reachable address of the installer machine |
+| `<ssh-user>` | SSH login user on the installer machine |
+| `<ssh-key>` | Path to the SSH private key for the installer machine |
+| `<kubeconfig-path>` | Kubeconfig path on the installer machine |
+| `<saia-nodeport-addr>` | `<worker-node-ip>:<nodePort>` from [Onboarding to the AI Tier, Step 1](#onboarding-to-the-ai-tier) |
+| `<tenant-id>` | Your SAIA tenant ID |
+
+1. On the installer machine, start the port-forward and leave it running.
+   Reuse the `NAMESPACE`/`STANDALONE_NAME` from your cluster config if they
+   differ from the defaults shown here:
+
+   ```bash
+   NAMESPACE=ai-platform
+   STANDALONE_NAME=splunk-standalone
+   SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+   kubectl --kubeconfig <kubeconfig-path> -n "${NAMESPACE}" port-forward \
+     "svc/${SPLUNK_SERVICE}" 18002:8000 \
+     --address=127.0.0.1
+   ```
+
+2. From your workstation, open one SSH tunnel with both a local forward for
+   Splunk Web and a SOCKS proxy for everything else:
+
+   ```bash
+   ssh -N \
+     -o ExitOnForwardFailure=yes \
+     -o ServerAliveInterval=30 \
+     -L 18002:127.0.0.1:18002 \
+     -D 127.0.0.1:1080 \
+     -i <ssh-key> \
+     <ssh-user>@<installer-ip>
+   ```
+
+   Local port `18002` now reaches Splunk Web; local SOCKS port `1080` reaches
+   any other private cluster address.
+
+3. Verify SOCKS access to the SAIA endpoint before opening a browser:
+
+   ```bash
+   curl --socks5-hostname 127.0.0.1:1080 -i -X OPTIONS \
+     'http://<saia-nodeport-addr>/<tenant-id>/saia-api-v2/v2alpha1/metadata' \
+     -H 'Access-Control-Request-Headers: authorization,splunk-client,x-requested-with,x-stack-url' \
+     -H 'Access-Control-Request-Method: GET' \
+     -H 'Origin: http://localhost:18002'
+   ```
+
+   Expect `HTTP/1.1 204 No Content`.
+
+4. Launch an isolated Chrome profile routed through the SOCKS proxy, with
+   `localhost` traffic (Splunk Web) kept direct:
+
+   macOS:
+
+   ```bash
+   open -na "Google Chrome" --args \
+     --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+   Linux (Ubuntu/RHEL admin workstation):
+
+   ```bash
+   google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
+     --proxy-server=socks5://127.0.0.1:1080 \
+     --proxy-bypass-list="localhost;127.0.0.1"
+   ```
+
+5. In that Chrome instance, open `http://localhost:18002` (HTTP, not HTTPS)
+   — this is your Splunk Web session.
+
+6. When [onboarding the AI Tier](#onboarding-to-the-ai-tier), use
+   `http://<saia-nodeport-addr>` as the SAIA API URL — it works both from
+   inside the pod (onboarding checks) and from the browser via the SOCKS
+   tunnel.
+
 **Retrieve the admin password**
 
 ```bash
-kubectl get secret splunk-standalone-secret -n ai-platform \
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+kubectl get secret "${SPLUNK_SECRET}" -n "${NAMESPACE}" \
   -o jsonpath='{.data.password}' | base64 --decode && echo
 ```
 
@@ -1677,7 +2084,8 @@ the pod using `kubectl`:
 ```bash
 APP_TGZ="Splunk_AI_Assistant_Cloud.tgz"
 NAMESPACE="ai-platform"
-POD="splunk-standalone-0"
+STANDALONE_NAME="splunk-standalone"
+POD="splunk-${STANDALONE_NAME}-standalone-0"
 
 # 1. Copy the archive into the pod
 kubectl cp "${APP_TGZ}" "${NAMESPACE}/${POD}:/tmp/${APP_TGZ}"
@@ -1718,10 +2126,15 @@ kubectl get standalone splunk-standalone -n ai-platform -o json \
 **Via Splunk REST API (from inside the pod)**
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
-  curl -sku admin:"$(kubectl get secret splunk-standalone-secret \
-    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)" \
-  https://localhost:8089/services/apps/local/Splunk_AI_Assistant_Cloud \
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+SPLUNK_PASSWORD="$(kubectl get secret "${SPLUNK_SECRET}" \
+  -n "${NAMESPACE}" -o jsonpath='{.data.password}' | base64 --decode)"
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
+  curl -su admin:"${SPLUNK_PASSWORD}" \
+  http://localhost:8089/services/apps/local/Splunk_AI_Assistant_Cloud \
   | grep -E "<title>|disabled|version"
 ```
 
@@ -1764,8 +2177,14 @@ In Splunk Web: **Splunk AI Assistant → Configuration** (or navigate to `/en-US
 ```bash
 # Replace <worker-node-ip> and <nodePort> with values from Step 1
 SAIA_URL="http://<worker-node-ip>:<nodePort>"
+NAMESPACE="ai-platform"
+STANDALONE_NAME="splunk-standalone"
+SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+SPLUNK_PASSWORD="$(kubectl get secret "${SPLUNK_SECRET}" \
+  -n "${NAMESPACE}" -o jsonpath='{.data.password}' | base64 --decode)"
 
-kubectl exec -n ai-platform splunk-standalone-0 -- bash -c "
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- bash -c "
   mkdir -p /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local
   cat > /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf <<EOF
 [splunk_ai_assistant]
@@ -1776,11 +2195,10 @@ saia_endpoint = ${SAIA_URL}
 EOF"
 
 # Reload app config without a full Splunk restart
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk _internal call \
   /apps/local/Splunk_AI_Assistant_Cloud/_reload \
-  -auth admin:"\$(kubectl get secret splunk-standalone-secret \
-    -n ai-platform -o jsonpath='{.data.password}' | base64 --decode)"
+  -auth admin:"${SPLUNK_PASSWORD}"
 ```
 
 **Step 3 — smoke test**
@@ -1794,7 +2212,8 @@ Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm a
 **App does not appear after upload**
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   tail -50 /opt/splunk/var/log/splunk/splunkd.log | grep -iE "install|app|error"
 ```
 
@@ -1805,7 +2224,8 @@ kubectl exec -n ai-platform splunk-standalone-0 -- \
 kubectl get pods,svc -n ai-platform | grep saia
 
 # Test API reachability from inside the Splunk pod
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   curl -sv http://<worker-ip>:<nodePort>/health
 # Expected: HTTP 200
 ```
@@ -1822,9 +2242,10 @@ kubectl logs -n splunk-operator deploy/splunk-operator-controller-manager \
 A malformed `splunkaiassistant.conf` is the most common cause. Remove and restart:
 
 ```bash
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   rm -f /opt/splunk/etc/apps/Splunk_AI_Assistant_Cloud/local/splunkaiassistant.conf
-kubectl exec -n ai-platform splunk-standalone-0 -- \
+kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
   /opt/splunk/bin/splunk restart
 ```
 
@@ -1911,7 +2332,7 @@ aws s3 ls
 
 #### Switching `defaultAcceleratorType` from L40S to H100 shows models as MISSING
 
-This is expected and correct. L40S and H100 share some `artifact-id` values (e.g. `gemma-4-31b-it`) but point to different HuggingFace repositories. The staging marker at `staging_state/<id>/.staging_complete` contains an `accel=<type>` field. The pre-check validates this field, so an existing L40S marker is treated as missing when H100 is requested, forcing a fresh download and upload.
+This is expected and correct. L40S selects `model_artifacts_configs_unquantized.yaml`; H100 and RTX Pro select `model_artifacts_configs_quantized.yaml`. Gemma uses distinct artifact IDs and object-store prefixes in the two profiles. Staging checks validate each marker's `hf_url`, so a mismatched artifact is downloaded and uploaded rather than reused.
 
 ```bash
 # Force re-stage for H100 after changing defaultAcceleratorType to h100
@@ -1920,12 +2341,12 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
 #### `stage-artifacts` exits success with no models downloaded (`yq` failure)
 
-If `yq` is not installed or returns an error parsing `model_artifacts_configs.yaml`, the download script now exits non-zero immediately with:
+If `yq` is not installed or cannot parse the selected artifact profile, the download script exits non-zero immediately with, for example:
 ```
-ERROR: yq failed to parse 'model_artifacts_configs.yaml' — check that yq is installed and the file is valid YAML.
+ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
 ```
 
-Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
+Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
 
 #### Re-stage a single model without restarting from scratch
 
