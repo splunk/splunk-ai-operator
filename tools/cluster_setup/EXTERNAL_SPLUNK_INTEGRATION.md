@@ -11,10 +11,14 @@ Use this when:
   in-cluster Splunk standalone deployed by the installer.
 - The SAIA backend (`AIService`) must validate JWT tokens issued by that external Splunk.
 
-> **Release scope:** this workflow configures the external Splunk management/JWKS
-> issuer on port **8089**. HEC ingestion on port **8088** is not part of this
-> workflow. Do not supply a HEC URL or token just to enable external JWT
-> authentication.
+> **Release scope:** external Splunk integration is JWT authentication only,
+> using the management/JWKS issuer on port **8089**. HEC ingestion on port
+> **8088** and OTel export to external Splunk are unsupported and were not
+> release-qualified. The installer still contains the legacy external HEC path;
+> setting `splunk.external.endpoint` selects it and may create or update a
+> HEC-token Secret. That path is unsupported, so do not configure it or
+> `SPLUNK_HEC_TOKEN`. This boundary does not change the existing
+> bundled/internal Splunk HEC and OTel behavior.
 
 ---
 
@@ -367,9 +371,9 @@ manual edit.
     ```
 
    In this release, do **not** set `splunk.external.endpoint` for JWT-only
-   integration. That setting selects the installer's external HEC mode, which
-   requires a HEC token and is outside the scope of this workflow. Port `8088`
-   is not a JWT issuer.
+   integration. That setting selects the installer's legacy external HEC mode,
+   which requires a HEC token and is unsupported and not release-qualified.
+   Port `8088` is not a JWT issuer.
 
 2. Rerun the supported installer flow. Do not patch the generated AIPlatform,
    AIService, SAIA ConfigMap, or Slim ConfigMap as the installation method:
@@ -503,9 +507,9 @@ pod templates during AIService reconciliation. Without that operator behavior,
 the ConfigMap may be correct while the running v2 API and worker processes
 retain the old value until an unrelated rollout occurs.
 
-Upgrading an existing installation to the fixed operator adds this annotation
-to both v2 pod templates. Expect one controlled rollout of the v2 API and v2
-worker even when the configured issuer list itself has not changed.
+During engineering image-refresh testing, moving an existing installation to
+the fixed operator added this annotation to both v2 pod templates and caused
+one controlled rollout of the v2 API and v2 worker.
 
 The functional fix belongs in the operator, not SAIA-service. Extra installer
 verification is optional hardening: installer success confirms that resources
@@ -513,7 +517,7 @@ were applied, but operators should still run the ConfigMap and rollout checks
 in Step 4 to prove that the live workloads adopted the issuer.
 
 These lifecycle statements apply only to JWT issuers. External HEC ingestion
-remains out of scope.
+and OTel export to external Splunk are unsupported and not release-qualified.
 
 ---
 
@@ -565,5 +569,5 @@ the allowlist; `trustedIssuers` contains only the additional external issuers.
 | Config change has no effect after restart | Restarted with `sudo` but Splunk owned by another user | [Step 5](#step-5--restart-splunk-correctly) |
 | Fresh fix works but old browser session still fails | Stale JWT from before the restart — log out and back in | [Step 6](#step-6--final-verification) |
 | Request works from laptop but times out from cluster or Splunk host | Missing route or firewall/SG rule for that specific network path | [Network Requirements](#network-requirements) |
-| External JWT issuer and HEC destination are conflated | Put the exact management/JWKS `:8089` URL in `splunk.trustedIssuers`; do not use external HEC mode for JWT-only integration | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
+| External JWT issuer and HEC destination are conflated | Put the exact management/JWKS `:8089` URL in `splunk.trustedIssuers`; external HEC/OTel is unsupported, so do not use the legacy external HEC mode | [Step 4](#step-4--fix-issuer-not-allowed-from-saia-backend) |
 | AIPlatform issuer configuration changed but v2 pods use the old issuer | Operator version does not roll both v2 Deployments for spec-derived `SPLUNK_ISSUERS` changes | [Fresh Install and Issuer Updates](#fresh-install-and-issuer-updates) |

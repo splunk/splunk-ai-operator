@@ -57,9 +57,12 @@ The script installs everything needed for the AI Platform:
 1. **k0s Kubernetes Cluster** — CNCF certified, single-binary Kubernetes
 2. **Calico CNI** — High-performance networking with VXLAN
 3. **local-path Storage Provisioner** — Default StorageClass for PVCs
-4. **Cert-Manager v1.13.0** — Automated certificate management
+4. **Cert-Manager v1.13.0** — Operator/webhook certificate prerequisite;
+   workload mTLS is not supported in this release
 5. **Kube-Prometheus Stack** — Monitoring with Prometheus + Grafana
-6. **OpenTelemetry Operator** — Distributed tracing and telemetry
+6. **OpenTelemetry Operator** — Installed for the existing bundled/internal
+   collector path; workload telemetry remains experimental and is not a
+   supported feature claim for this release
 7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9)
 8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI
 9. **Splunk Operator** — Splunk Enterprise management
@@ -509,7 +512,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 
 > The SAIA `preview` defaults are mutable and workloads use `imagePullPolicy:
 > IfNotPresent`. Re-running the installer with the same tag may reuse a cached
-> image; use a new immutable tag or digest when performing a controlled upgrade.
+> image; use a new immutable tag or digest for a controlled image refresh.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -964,7 +967,7 @@ graph TB
         RAYCLUSTER[RayCluster<br/>Head + Workers]
         WEAVIATE[Weaviate<br/>Vector Database]
         SPLUNK[Splunk Standalone<br/>Enterprise Instance]
-        OTELCOL[OpenTelemetry Collector<br/>Sidecar]
+        OTELCOL[OpenTelemetry Collector<br/>Bundled internal path<br/>Experimental]
     end
 
     subgraph "Infrastructure"
@@ -986,10 +989,8 @@ graph TB
     SPLOP -->|watches & reconciles| SPLUNK
     SPLUNK -->|stores logs| OBJSTORE
 
-    CERTMGR -->|issues certs| RAYSERVICE
-
     OTELOP -->|watches & creates| OTELCOL
-    OTELCOL -->|sends traces| SPLUNK
+    OTELCOL -->|configured for experimental HEC export| SPLUNK
 
     AIPLATFORM -->|references| OBJSTORE
     AIPLATFORM -->|references| SPLUNK
@@ -1821,6 +1822,14 @@ Enterprise instance after the cluster is fully healthy.
 
 ### Internal Splunk management transport (native-HTTPS compatibility mode)
 
+> **Release support boundary:** the bundled/internal HEC and OTel behavior
+> described below remains active and unchanged so the tested installation path
+> does not regress. Workload telemetry is experimental and is not a supported
+> feature claim for this release. External Splunk integration is JWT-only via
+> `splunk.trustedIssuers` on management port 8089; external HEC/OTel is
+> unsupported. Leave `splunk.external.endpoint` unset and do not set
+> `SPLUNK_HEC_TOKEN`. Workload mTLS is not enabled or supported.
+
 When `splunk.enabled: true` and `splunk.external.endpoint` is unset, the
 installer preserves native splunkd HTTPS on port 8089. The immutable Splunk AI
 Assistant app 2.0.4 depends on `https://127.0.0.1:8089` for its local SDK,
@@ -1849,20 +1858,19 @@ injected configuration until they are recreated. Plan a controlled RayService
 rollout during a maintenance window with sufficient spare capacity when an
 existing installation must consume a changed HEC destination.
 
-> **Compatibility boundary:** this restores `main`'s native splunkd HTTPS and
+> **Compatibility boundary:** this preserves `main`'s native splunkd HTTPS and
 > short issuer contract while aligning the AIPlatform endpoint for SAIA and
 > Slim. It does not solve trust or hostname verification for Splunk's built-in
-> certificate. An SAIA or Slim image that strictly verifies outbound TLS may
-> reject that certificate because its CA is not trusted or its SAN does not
-> match the Service hostname. Verified end-to-end TLS requires the separate
-> hostname-valid certificate and CA-trust design.
+> certificate. Verified end-to-end workload TLS and workload mTLS are not
+> supported in this release. Do not disable verification globally to work
+> around a failed certificate check.
 
-Upgrades from the earlier HTTP-management preview explicitly restore
-`SPLUNKD_SSL_ENABLE=true`, remove stale installer-owned
-`/mnt/splunk-cert*` paths, keep Splunk Web on HTTP, and preserve the PVC and
-indexed data. Because the issuer changes back to the short HTTPS URL, users
-must sign in again or repeat onboarding to receive tokens with the new `iss`
-claim.
+During engineering image-refresh validation from the earlier HTTP-management
+preview, the installer restored `SPLUNKD_SSL_ENABLE=true`, removed stale
+installer-owned `/mnt/splunk-cert*` paths, kept Splunk Web on HTTP, and
+preserved the PVC and indexed data. Because the issuer changes back to the
+short HTTPS URL, users must sign in again or repeat onboarding to receive
+tokens with the new `iss` claim.
 
 Check the resulting configuration:
 
@@ -1883,7 +1891,8 @@ Expect `enableSplunkdSSL = true`, the short HTTPS Service URL as
 `issuer_uri` and `endpoint`, and the independently detected port-8088 URL as
 `hecEndpoint`.
 
-Run the reusable read-only validation after installation or upgrade:
+Run the reusable read-only validation after installation or an engineering
+image-refresh test:
 
 ```bash
 KUBECONFIG=/path/to/kubeconfig \
@@ -1893,9 +1902,11 @@ KUBECONFIG=/path/to/kubeconfig \
   --aiplatform <cluster-name>-ai-platform
 ```
 
-This validates the effective transport, issuer propagation, HEC exporter
-configuration, running injected collectors, and SAIA/Slim readiness. It does
-not read the Splunk admin password or assert that telemetry reached an index.
+This protects the existing bundled/internal path by validating the effective
+transport, issuer propagation, HEC exporter configuration, running injected
+collectors, and SAIA/Slim readiness. Passing it does not qualify external
+HEC/OTel or assert that telemetry reached an index. It does not read the Splunk
+admin password.
 
 For an opt-in end-to-end authentication check, run:
 

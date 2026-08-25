@@ -139,7 +139,7 @@ air-gap image list and the bulk `crane copy` alternative, see
 [DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
 
 > Image tags can be mutable and the workloads use `imagePullPolicy:
-> IfNotPresent`. Use an immutable digest for controlled upgrades; rerunning the
+> IfNotPresent`. Use an immutable digest for a controlled image refresh; rerunning the
 > installer with the same tag may keep the cached image.
 
 ---
@@ -447,8 +447,8 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 if your browser can't reach the cluster network directly), then
 [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
-> **Using an external Splunk Enterprise/Cloud instance instead of the
-> in-cluster one?** See
+> **Using an external, self-managed Splunk Enterprise instance for JWT authentication?**
+> External HEC/OTel is unsupported. See
 > [EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
 
 ---
@@ -462,8 +462,8 @@ Applies to both deployment paths — same commands for standard and air-gapped c
 | Re-run after partial failure | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
 | Add worker nodes | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers` |
 | Re-stage models only | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts` |
-| Upgrade platform | bump image tags in config, then re-run `install` (Helm upgrades in place; same command works for air-gap) |
-| Upgrade platform (air-gapped) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
+| Refresh platform image tags (engineering-validated behavior) | bump image tags in config, then re-run `install`; existing Helm releases are refreshed in place |
+| Refresh image tags (air-gapped engineering validation) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
 | Collect support bundle | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose` |
 | Wipe and start clean (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
 

@@ -107,8 +107,8 @@ graph TB
 | Splunk AI Operator | your build | Manages `AIPlatform` CR lifecycle |
 | Splunk Operator | 3.0.0 | Manages Splunk Enterprise |
 | KubeRay | 1.2.2 | Manages Ray clusters for AI inference |
-| cert-manager | v1.13.0 | TLS certificate management |
-| OTel Operator | latest | Observability |
+| cert-manager | v1.13.0 | Operator/webhook certificate prerequisite; workload mTLS is not supported in this release |
+| OTel Operator | latest | Installed for the existing bundled/internal collector path; workload telemetry remains experimental and is not a supported feature claim for this release |
 | NVIDIA Device Plugin | v0.17.3 | Exposes GPUs to Kubernetes |
 
 ### Version Compatibility
@@ -149,10 +149,17 @@ Certificate, CA ConfigMap, or CA mount for this path.
 This compatibility choice has an explicit limitation. Splunk's built-in
 certificate may not be trusted by an image that strictly verifies outbound TLS,
 and it may not contain a SAN matching the Kubernetes Service hostname. That
-certificate-validation problem is not solved in this branch. Environments
-which require verified end-to-end TLS must use the separate hostname-valid
-certificate and CA-trust design. Do not disable verification globally to work
-around a failed certificate check.
+certificate-validation problem is not solved in this branch. The separate
+certificate/CA design and verified end-to-end workload TLS are not supported in
+this release. Do not disable verification globally to work around a failed
+certificate check.
+
+> **Release support boundary:** the bundled/internal HEC and OTel behavior is
+> retained unchanged to avoid regressing the tested installation path, but
+> workload telemetry is not a supported feature claim for this release.
+> External Splunk is JWT-only through `splunk.trustedIssuers` on management port
+> 8089; external HEC/OTel is unsupported and not release-qualified.
+> Workload mTLS is not enabled or supported.
 
 OTel telemetry configuration remains independent. When an OTel collector is
 actually injected and running, it receives `splunkConfiguration.hecEndpoint`
@@ -1080,7 +1087,8 @@ flow, use the [Post-Install Sanity Checklist](SANITY_TEST_CHECKLIST.md).
 
 ### Re-run after a partial failure
 
-The installer is safe to re-run for most steps — Helm releases are upgraded if they already exist, and k0s join is skipped for nodes that are already Ready.
+The installer is safe to re-run for most steps — existing Helm releases are
+updated in place, and k0s join is skipped for nodes that are already Ready.
 
 **Steps that are NOT idempotent:**
 - **`clean-all`** — destructive; wipes all k0s state from every node with no recovery
@@ -1114,23 +1122,27 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
 The command is resumable — it checks which models are already staged in the object store and only downloads/uploads what is missing. The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for details on the pre-check, per-model logging, and direct script usage.
 
-### Upgrade the platform
+### Image-tag refresh observed in testing
 
-Update your config YAML with new image tags, then re-run install. The installer upgrades existing Helm releases in place:
+This is the initial release, so no version-to-version platform upgrade contract
+is defined. Engineering validation confirmed that updating image tags and
+rerunning the installer refreshes existing Helm releases in place:
 
 ```bash
 # 1. Update image tags in your config
 vi my-cluster.yaml   # bump operator, ray, saia, splunk image versions
 
-# 2. Run install — Helm upgrades existing releases, does not wipe the cluster
+# 2. Run install — Helm refreshes existing releases, does not wipe the cluster
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
-> The safety gate prevents `install` from wiping a cluster with Ready nodes — it upgrades the stack only. If you also need to upgrade k0s itself, run `clean-all` + `install` (destructive — back up etcd first).
+> The safety gate prevents `install` from wiping a cluster with Ready nodes and
+> updates the stack in place. This records tested image-refresh behavior; it
+> does not define version-to-version compatibility.
 
-**Air-gap upgrade:** re-run the same command on the installer machine — with
+**Air-gap image refresh:** re-run the same command on the installer machine — with
 `airgap: true` still in the config it re-stages the k0s and add-on infrastructure
-image bundles before upgrading the stack. It does **not** mirror the platform
+image bundles before refreshing the stack. It does **not** mirror the platform
 application image at the new tag — that's always a manual step
 ([Phase 2 — Mirror Container Images](#phase-2--mirror-container-images)), and
 skipping it leaves the sealed nodes unable to pull the new tag
