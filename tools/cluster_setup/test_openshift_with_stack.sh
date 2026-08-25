@@ -43,6 +43,7 @@ extract_function() {
 }
 
 eval "$(extract_function validate_scale_factor_config)"
+eval "$(extract_function openshift_feature_enabled)"
 eval "$(extract_function openshift_slim_feature_enabled)"
 eval "$(extract_function warn_on_mutable_image_tags)"
 eval "$(extract_function validate_image_config)"
@@ -53,7 +54,11 @@ eval "$(extract_function internal_splunk_hec_url)"
 eval "$(extract_function _internal_splunk_btool_http_value)"
 eval "$(extract_function render_splunk_defaults_manifest)"
 eval "$(extract_function render_ai_platform_manifest)"
+eval "$(extract_function normalize_openshift_clusterip_feature_services)"
 eval "$(extract_function patch_openshift_slim_public_service_workaround)"
+eval "$(extract_function openshift_route_enabled)"
+eval "$(extract_function openshift_route_host)"
+eval "$(extract_function create_openshift_feature_route)"
 eval "$(extract_function platform_readiness_snapshot)"
 eval "$(extract_function model_artifacts_config_name)"
 eval "$(extract_function image_repository_from_ref)"
@@ -92,6 +97,7 @@ CONFIG_FILE="test-config.yaml"
 echo "OpenShift SLIM feature detection"
 feature_names=$'saia\nslim'
 assert_rc "detects enabled SLIM feature" 0 openshift_slim_feature_enabled
+assert_rc "detects enabled SAIA feature" 0 openshift_feature_enabled saia
 feature_names="saia"
 assert_rc "does not enable SLIM for a SAIA-only config" 1 openshift_slim_feature_enabled
 
@@ -164,6 +170,75 @@ assert_eq "uses the configured distinct SLIM NodePort" "1" \
 assert_eq "recreates only the SLIM public Service" "1" \
   "$(grep -c 'delete svc test-platform-slim-slim-service' <<<"${slim_patch_output}" || true)"
 
+_run_clusterip_normalization() (
+  AI_NS="ai-platform"
+  AI_PLATFORM_NAME="test-platform"
+  CONFIG_FILE="test-config.yaml"
+  local oc_call_log recreated_marker
+  oc_call_log=$(mktemp)
+  recreated_marker=$(mktemp)
+  rm -f "${recreated_marker}"
+  yq() {
+    case "${2:-}" in
+      '.aiPlatform.serviceTemplate.type // ""') echo "ClusterIP" ;;
+      '.aiPlatform.features | length') echo "1" ;;
+      '.aiPlatform.features[0].name // ""') echo "slim" ;;
+      *) echo "" ;;
+    esac
+  }
+  oc() {
+    printf 'oc %s\n' "$*" >> "${oc_call_log}"
+    if [[ "$*" == *'get svc test-platform-slim-slim-service'*jsonpath* ]]; then
+      [[ -f "${recreated_marker}" ]] && echo "ClusterIP" || echo "NodePort"
+    elif [[ "$*" == *'delete svc test-platform-slim-slim-service'* ]]; then
+      : > "${recreated_marker}"
+    fi
+    return 0
+  }
+  normalize_openshift_clusterip_feature_services
+  cat "${oc_call_log}"
+  rm -f "${oc_call_log}" "${recreated_marker}"
+)
+
+echo "OpenShift ClusterIP convergence"
+clusterip_output=$(_run_clusterip_normalization)
+assert_eq "patches a preserved SLIM exposure override back to ClusterIP" "1" \
+  "$(grep -c 'patch aiservice test-platform-slim' <<<"${clusterip_output}" || true)"
+assert_eq "writes ClusterIP into the AIService exposure override" "1" \
+  "$(grep -c '"type": "ClusterIP"' <<<"${clusterip_output}" || true)"
+assert_eq "recreates a legacy SLIM NodePort Service" "1" \
+  "$(grep -c 'delete svc test-platform-slim-slim-service' <<<"${clusterip_output}" || true)"
+
+_render_feature_route() (
+  local feature="$1"
+  AI_NS="ai-platform"
+  INGRESS_DOMAIN="apps.example.com"
+  CONFIG_FILE="test-config.yaml"
+  yq() { echo ""; }
+  oc() {
+    if [[ "${1:-}" == "apply" ]]; then
+      cat
+    elif [[ "${1:-}" == "get" && "${2:-}" == "route" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  }
+  create_openshift_feature_route \
+    "${feature}" "${feature}" "test-platform-${feature}-${feature}-service"
+)
+
+echo "OpenShift feature Routes"
+slim_route=$(_render_feature_route slim)
+assert_eq "creates a SLIM Route" "1" \
+  "$(grep -c '^  name: slim$' <<<"${slim_route}" || true)"
+assert_eq "derives a stable SLIM ingress host" "1" \
+  "$(grep -c '^  host: slim.apps.example.com$' <<<"${slim_route}" || true)"
+assert_eq "targets the generated SLIM Service" "1" \
+  "$(grep -c '^    name: test-platform-slim-slim-service$' <<<"${slim_route}" || true)"
+assert_eq "routes SLIM to its HTTP service port" "1" \
+  "$(grep -c '^    targetPort: 8080$' <<<"${slim_route}" || true)"
+
 echo "OpenShift model artifact config selection"
 assert_eq "RTX Pro 6000 uses the quantized artifact manifest" \
   "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name rtx_pro_6000_blackwell)"
@@ -206,12 +281,18 @@ assert_eq "delete protects shared components with ownership checks" "1" \
   "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -c 'component_is_owned cert_manager' | tr -d '[:space:]')"
 assert_eq "delete targets only this stack's named platform resources" "0" \
   "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -Ec 'delete (aiplatform|standalone) --all' | tr -d '[:space:]')"
+assert_eq "delete removes both installer-managed feature Routes" "1" \
+  "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -c 'delete route saia slim' | tr -d '[:space:]')"
 assert_eq "Splunk Operator restart does not delete all ReplicaSets" "0" \
   "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -Ec 'delete replicaset .*--all' | tr -d '[:space:]')"
 assert_eq "Splunk Standalone explicitly configures both PVC storage classes" "2" \
   "$(awk '/^install_splunk_standalone\(\)/,/^}/' "${SCRIPT}" | grep -o 'storageClassName:' | wc -l | tr -d '[:space:]')"
 assert_eq "Splunk Standalone readiness detects the live HEC endpoint" "1" \
   "$(awk '/^wait_for_internal_splunk_ready\(\)/,/^}/' "${SCRIPT}" | grep -c '_detect_internal_splunk_hec_url' | tr -d '[:space:]')"
+assert_eq "Splunk management readiness accepts the expected unauthenticated 401 response" "0" \
+  "$(awk '/^wait_for_internal_splunk_ready\(\)/,/^}/' "${SCRIPT}" | grep -c -- '--fail' | tr -d '[:space:]')"
+assert_eq "feature Route creation remains compatible with Bash 3.2" "0" \
+  "$(awk '/^create_openshift_feature_route\(\)/,/^}/' "${SCRIPT}" | grep -c '\^\^' | tr -d '[:space:]')"
 assert_eq "qualified OpenShift minor is an immutable installer constant" "1" \
   "$(grep -c '^readonly QUALIFIED_OPENSHIFT_MINOR="4.21"$' "${SCRIPT}" | tr -d '[:space:]')"
 assert_eq "configured OpenShift minor cannot override qualification" "1" \
@@ -465,10 +546,14 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$([[ -n "${repository_slim_image}" ]] && echo 1 || echo 0)"
   assert_eq "repository OpenShift config enables the SLIM feature" "1" \
     "$("${REAL_YQ}" eval '[.aiPlatform.features[] | select(.name == "slim")] | length' "${CONFIG_FILE}" 2>/dev/null)"
-  assert_eq "repository OpenShift config exposes SAIA on NodePort 30080" "30080" \
-    "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.nodePort' "${CONFIG_FILE}" 2>/dev/null)"
-  assert_eq "repository OpenShift config exposes SLIM on NodePort 30081" "30081" \
-    "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.slimNodePort' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config keeps feature Services internal" "ClusterIP" \
+    "$("${REAL_YQ}" eval '.aiPlatform.serviceTemplate.type' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config does not allocate NodePorts by default" "0" \
+    "$("${REAL_YQ}" eval '[.aiPlatform.serviceTemplate.nodePort, .aiPlatform.serviceTemplate.slimNodePort] | map(select(. != null)) | length' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config enables the SAIA Route" "true" \
+    "$("${REAL_YQ}" eval '.openshift.routes.saia.enabled' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config enables the SLIM Route" "true" \
+    "$("${REAL_YQ}" eval '.openshift.routes.slim.enabled' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config pins the qualified cluster minor" "4.21" \
     "$("${REAL_YQ}" eval '.openshift.requiredVersion' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config explicitly verifies pre-staged models" "false" \

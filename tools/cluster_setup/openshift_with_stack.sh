@@ -444,8 +444,7 @@ ${yq_err}"
   GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "certified-operators")
 
   # Ingress domain: read from config if set, otherwise auto-detect from the cluster.
-  # Used to create an OpenShift Route for SAIA so both browsers and in-cluster services
-  # can reach it via a stable hostname.
+  # Used to create stable OpenShift Routes for the enabled SAIA and SLIM APIs.
   local cfg_ingress_domain
   cfg_ingress_domain=$(yq eval '.openshift.ingressDomain // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   if [[ -n "$cfg_ingress_domain" ]]; then
@@ -527,16 +526,20 @@ validate_scale_factor_config() {
   return 0
 }
 
-# True when the optional SLIM service is requested in aiPlatform.features[].
-# Keep image validation feature-gated so existing SAIA-only configurations do
-# not need to define an image for a workload they never deploy.
-openshift_slim_feature_enabled() {
-  local names
+# True when a named service is requested in aiPlatform.features[].
+openshift_feature_enabled() {
+  local requested_feature="$1" names
   names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   while IFS= read -r name; do
-    [[ "${name}" == "slim" ]] && return 0
+    [[ "${name}" == "${requested_feature}" ]] && return 0
   done <<< "${names}"
   return 1
+}
+
+# Keep SLIM image validation feature-gated so existing SAIA-only configurations
+# do not need to define an image for a workload they never deploy.
+openshift_slim_feature_enabled() {
+  openshift_feature_enabled slim
 }
 
 warn_on_mutable_image_tags() {
@@ -2537,7 +2540,7 @@ wait_for_internal_splunk_ready() {
     if [[ "${ready}" == "True" && "${phase}" == "Ready" && -z "${message}" ]] \
         && _internal_splunk_runtime_matches_desired "${pod_name}" \
         && oc exec -n "${AI_NS}" "${pod_name}" -- curl --insecure --silent --show-error \
-             --fail --output /dev/null --max-time 10 https://localhost:8089/services/server/info >/dev/null 2>&1; then
+             --output /dev/null --max-time 10 https://localhost:8089/services/server/info >/dev/null 2>&1; then
       _detect_internal_splunk_hec_url
       log "  ✓ Splunk Standalone is Ready with the expected HTTPS issuer"
       return 0
@@ -2960,6 +2963,58 @@ apply_openshift_service_annotations() {
   done
 }
 
+# Converge enabled feature Services back to ClusterIP when the OpenShift config
+# omits serviceTemplate or explicitly selects ClusterIP. AIService preserves
+# direct serviceTemplate overrides, so an older install that patched NodePorts
+# would otherwise keep those NodePorts forever. Recreate only Services whose
+# live type is not already ClusterIP.
+normalize_openshift_clusterip_feature_services() {
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -z "${svc_type}" || "${svc_type}" == "null" || "${svc_type}" == "ClusterIP" ]] || return 0
+
+  local feature_count index feature_name aiservice_name public_svc_name waited live_type
+  feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)
+  for (( index=0; index<feature_count; index++ )); do
+    feature_name=$(yq eval ".aiPlatform.features[${index}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || true)
+    [[ -n "${feature_name}" && "${feature_name}" != "null" ]] || continue
+
+    aiservice_name="${AI_PLATFORM_NAME}-${feature_name}"
+    public_svc_name="${aiservice_name}-${feature_name}-service"
+    # A fresh install has no preserved override to normalize. Do not wait here:
+    # Routes can be created before their Services and will self-heal when the
+    # operator creates the default ClusterIP AIService/Service later.
+    oc -n "${AI_NS}" get aiservice "${aiservice_name}" >/dev/null 2>&1 || continue
+
+    oc -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p '{
+  "spec": {
+    "serviceTemplate": {
+      "spec": {
+        "type": "ClusterIP",
+        "ports": [
+          {"name": "http", "port": 8080, "targetPort": 8080}
+        ]
+      }
+    }
+  }
+}' >/dev/null
+
+    live_type=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+    if [[ -n "${live_type}" && "${live_type}" != "ClusterIP" ]]; then
+      log "Recreating Service ${AI_NS}/${public_svc_name} as ClusterIP (was ${live_type})..."
+      oc -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+      waited=0
+      while true; do
+        live_type=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+        [[ "${live_type}" == "ClusterIP" ]] && break
+        (( waited >= 300 )) && err "Service ${AI_NS}/${public_svc_name} did not converge to ClusterIP within 300s"
+        sleep 5
+        waited=$((waited + 5))
+      done
+    fi
+  done
+}
+
 # Expose SLIM on a NodePort distinct from SAIA, following the k0s installer
 # design. AIPlatform.spec.serviceTemplate is copied to every feature's
 # AIService, so both features initially inherit the SAIA NodePort. Patch SLIM's
@@ -3034,41 +3089,62 @@ patch_openshift_slim_public_service_workaround() {
   log "  ✓ SLIM exposed on NodePort ${slim_node_port}"
 }
 
-# ====== CREATE SAIA ROUTE ======
-# Creates an OpenShift Route so SAIA is reachable via a stable external hostname.
-# The URL must be reachable from both the browser and from within the cluster
-# (Splunk's setup page validates connectivity from the server side).
-# NodePort alone doesn't work when node IPs are not externally routable.
-create_saia_route() {
+# True when a feature is enabled and its OpenShift Route has not been disabled.
+# Routes default to enabled to preserve the existing SAIA behavior and give SLIM
+# the same stable OpenShift-native exposure.
+openshift_route_enabled() {
+  local feature="$1" enabled
+  openshift_feature_enabled "${feature}" || return 1
+  enabled=$(yq eval ".openshift.routes.${feature}.enabled // \"true\"" "${CONFIG_FILE}" 2>/dev/null || echo "true")
+  [[ "${enabled}" == "true" ]]
+}
+
+openshift_route_host() {
+  local feature="$1" configured_host
+  configured_host=$(yq eval ".openshift.routes.${feature}.host // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${configured_host}" && "${configured_host}" != "null" ]]; then
+    printf '%s\n' "${configured_host}"
+  elif [[ -n "${INGRESS_DOMAIN:-}" ]]; then
+    printf '%s.%s\n' "${feature}" "${INGRESS_DOMAIN}"
+  fi
+}
+
+# Create an OpenShift Route for one AI feature. The backing Services remain
+# ClusterIP by default; optional NodePort/LoadBalancer serviceTemplate settings
+# continue to work as explicit fallbacks.
+create_openshift_feature_route() {
+  local feature="$1" route_name="$2" svc_name="$3"
+  local feature_label
+  feature_label=$(printf '%s' "${feature}" | tr '[:lower:]' '[:upper:]')
+
   # Re-attempt ingress domain detection in case it was unavailable during load_config.
   if [[ -z "${INGRESS_DOMAIN:-}" ]]; then
     INGRESS_DOMAIN=$(oc get ingresscontroller default -n openshift-ingress-operator \
       -o jsonpath='{.status.domain}' 2>/dev/null || echo "")
   fi
-  if [[ -z "${INGRESS_DOMAIN:-}" ]]; then
-    warn "Could not determine ingress domain — skipping SAIA Route creation"
-    warn "Create it manually: oc expose svc/${AI_PLATFORM_NAME}-saia-saia-service -n ${AI_NS}"
-    return 0
+
+  local route_host
+  route_host=$(openshift_route_host "${feature}")
+  if [[ -z "${route_host}" ]]; then
+    warn "Could not determine a host for the ${feature_label} Route"
+    warn "Set openshift.ingressDomain or openshift.routes.${feature}.host in ${CONFIG_FILE}"
+    return 1
   fi
 
-  local route_host="saia.${INGRESS_DOMAIN}"
-  local svc_name="${AI_PLATFORM_NAME}-saia-saia-service"
+  log "Creating ${feature_label} Route: http://${route_host} ..."
 
-  log "Creating SAIA Route: http://${route_host} ..."
-
-  # Create the Route immediately — do NOT wait for the SAIA service to exist.
+  # Create the Route immediately — do not wait for the feature Service to exist.
   # An OpenShift Route does not require its backend Service to be present at
   # creation time: the router resolves the backend dynamically and returns 503
   # until the service's endpoints appear, then serves traffic automatically.
-  # The operator can take tens of minutes to create the SAIA service (model
-  # download + vector-db posthook + reconcile), so blocking on it here caused
-  # the Route to be skipped whenever that exceeded the wait window — leaving the
-  # SAIA URL permanently unreachable even though the install reported success.
+  # The operator can take time to create feature Services, so blocking on them
+  # here can leave an otherwise healthy deployment without its configured
+  # external endpoint.
   if ! oc apply -f - <<EOF
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: saia
+  name: ${route_name}
   namespace: ${AI_NS}
   annotations:
     haproxy.router.openshift.io/timeout: "600s"
@@ -3082,26 +3158,29 @@ spec:
     targetPort: 8080
 EOF
   then
-    warn "Failed to create SAIA Route. Create it manually once the SAIA service exists:"
-    warn "  oc apply -f - <<'ROUTE'"
-    warn "  apiVersion: route.openshift.io/v1"
-    warn "  kind: Route"
-    warn "  metadata: { name: saia, namespace: ${AI_NS} }"
-    warn "  spec: { host: ${route_host}, to: { kind: Service, name: ${svc_name} }, port: { targetPort: 8080 } }"
-    warn "  ROUTE"
-    return 0
+    warn "Failed to create ${feature_label} Route ${AI_NS}/${route_name}"
+    return 1
   fi
 
   # Confirm the Route object now exists so a silent apply failure can't pass as success.
-  if ! oc get route saia -n "${AI_NS}" >/dev/null 2>&1; then
-    warn "SAIA Route apply reported success but the Route is not present — check cluster state."
-    return 0
+  if ! oc get route "${route_name}" -n "${AI_NS}" >/dev/null 2>&1; then
+    warn "${feature_label} Route apply reported success but ${AI_NS}/${route_name} is not present"
+    return 1
   fi
 
-  log "  ✓ SAIA Route created: http://${route_host}"
-  log "    (Returns 503 until the SAIA service endpoints come up — this is expected"
+  log "  ✓ ${feature_label} Route created: http://${route_host}"
+  log "    (Returns 503 until the ${feature_label} service endpoints come up — this is expected"
   log "     while the operator finishes reconciling; it self-heals, no rerun needed.)"
-  log "    Use this URL in Splunk AI setup: http://${route_host}"
+}
+
+create_saia_route() {
+  create_openshift_feature_route \
+    saia saia "${AI_PLATFORM_NAME}-saia-saia-service"
+}
+
+create_slim_route() {
+  create_openshift_feature_route \
+    slim slim "${AI_PLATFORM_NAME}-slim-slim-service"
 }
 
 # Return the model-artifact profile used by an accelerator. Keep this selection
@@ -3587,14 +3666,27 @@ main_install() {
   install_ai_platform_cr
   step_ok
 
-  step_start "SLIM NodePort"
+  step_start "Feature Services"
   apply_openshift_service_annotations
+  normalize_openshift_clusterip_feature_services
   patch_openshift_slim_public_service_workaround
   step_ok
 
   step_start "SAIA Route"
-  create_saia_route
-  step_ok
+  if openshift_route_enabled saia; then
+    create_saia_route
+    step_ok
+  else
+    step_skip "disabled"
+  fi
+
+  step_start "SLIM Route"
+  if openshift_route_enabled slim; then
+    create_slim_route
+    step_ok
+  else
+    step_skip "disabled"
+  fi
 
   step_start "Platform readiness"
   if verify_all_pods_healthy; then
@@ -3612,8 +3704,13 @@ main_install() {
 
   show_step_summary
 
-  local saia_url=""
-  [[ -n "$INGRESS_DOMAIN" ]] && saia_url="http://saia.${INGRESS_DOMAIN}"
+  local saia_url="" slim_url=""
+  if openshift_route_enabled saia; then
+    saia_url="http://$(openshift_route_host saia)"
+  fi
+  if openshift_route_enabled slim; then
+    slim_url="http://$(openshift_route_host slim)/tenant/slim-api/v1alpha1"
+  fi
 
   log "============================================"
   log " Install complete"
@@ -3630,6 +3727,11 @@ main_install() {
   log ""
   log "  SAIA app URL (use this in Splunk AI setup):"
   log "     ${saia_url}"
+  fi
+  if [[ -n "$slim_url" ]]; then
+  log ""
+  log "  SLIM API URL (use this in AITK setup):"
+  log "     ${slim_url}"
   fi
   log ""
   log "Log file: ${LOG_FILE}"
@@ -3674,8 +3776,8 @@ main_delete() {
   verify_install_state_cluster
 
   # ── 1. AI Platform CRs (trigger operator finalizers before namespace delete) ──
-  log "Removing SAIA Route..."
-  oc delete route saia -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+  log "Removing SAIA and SLIM Routes..."
+  oc delete route saia slim -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
 
   log "Removing AIPlatform CR and waiting for finalizers..."
   oc delete aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" --timeout=120s 2>/dev/null || true

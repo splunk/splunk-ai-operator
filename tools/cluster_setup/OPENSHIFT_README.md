@@ -24,7 +24,7 @@ Platform stack on top of it.
 7. [Architecture](#architecture)
 8. [OpenShift-Specific Behavior](#openshift-specific-behavior)
 9. [Image Pull Secrets (ECR)](#image-pull-secrets-ecr)
-10. [Accessing SAIA — the Splunk AI Assistant App](#accessing-saia--the-splunk-ai-assistant-app)
+10. [Accessing SAIA and SLIM](#accessing-saia-and-slim)
 11. [Air-Gapped Deployment](#air-gapped-deployment)
 12. [Model Staging](#model-staging)
 13. [Verification & Health Checks](#verification--health-checks)
@@ -71,8 +71,8 @@ Running `openshift_with_stack.sh install` creates the following, in order:
 | Splunk AI Operator | `splunk-ai-operator-system` | `artifacts.yaml` |
 | Splunk Operator | `splunk-operator` | `splunk-operator-cluster.yaml` |
 | Splunk Standalone CR | `ai-platform` | Splunk Operator |
-| AIPlatform CR (Ray, Weaviate, SAIA) | `ai-platform` | Splunk AI Operator |
-| SAIA Route | `ai-platform` | `oc create route` |
+| AIPlatform CR (Ray, Weaviate, SAIA, SLIM) | `ai-platform` | Splunk AI Operator |
+| SAIA and SLIM Routes | `ai-platform` | `oc apply` |
 
 The AI Platform workload namespace defaults to **`ai-platform`**.
 
@@ -148,9 +148,9 @@ S3-compatible model-marker verification.
 - An S3-compatible object store for model artifacts (AWS S3, MinIO, or
   SeaweedFS). 
 
-> The Ray head/worker and SAIA images are **built internally** and are not on any
-> public registry. They must already exist in your registry (or be mirrored for
-> air-gap) before install.
+> The Ray head/worker, SAIA, and SLIM images are **built internally** and are not
+> on any public registry. They must already exist in your registry (or be
+> mirrored for air-gap) before install.
 
 ---
 
@@ -223,13 +223,22 @@ openshift:
     - 00-25-b5-b5-00-35
     - 00-25-b5-b5-00-37
     - cc-40-f3-9f-e2-3c
+  routes:
+    saia:
+      enabled: true           # host defaults to saia.<ingress-domain>
+    slim:
+      enabled: true           # host defaults to slim.<ingress-domain>
 ```
 - `grantPrivilegedSCC` — set `"false"` only if your cluster policy already grants
   the required SCCs. Required for GPU (`nvidia.com/gpu`) workloads.
 - `nodeLabelStrategy` — `manual` labels only the nodes you list; `auto` labels
   every `node-role.kubernetes.io/worker` node.
 - `ingressDomain` — optional; auto-detected from the default `IngressController`
-  if omitted. Used to build the SAIA Route host.
+  if omitted. Used to build both feature Route hosts.
+- `routes.<feature>.enabled` — controls external Route creation independently
+  for SAIA and SLIM. Both default to `true` when their feature is enabled.
+- `routes.<feature>.host` — optional full hostname override. When omitted, the
+  installer uses `<feature>.<ingress-domain>`.
 
 ### `images`
 ```yaml
@@ -319,9 +328,7 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    type: NodePort
-    nodePort: 30080       # SAIA
-    slimNodePort: 30081   # SLIM; must differ from nodePort
+    type: ClusterIP
   features:
     - name: "saia"
       version: "1.1.0"
@@ -329,13 +336,18 @@ aiPlatform:
       version: "1.0.0"
 ```
 
-`serviceTemplate` is optional; omit it to keep feature services on `ClusterIP`.
-For `NodePort`, `nodePort` exposes SAIA and `slimNodePort` exposes SLIM. The
-AIPlatform API has one shared Kubernetes Service template, so the installer
-follows the k0s design: it renders the SAIA port into the AIPlatform CR, then
-patches SLIM's generated AIService to the distinct SLIM port. Do not reuse the
-same port for both services. The OpenShift Route remains the preferred SAIA
-endpoint when worker-node IPs are not externally routable.
+`serviceTemplate` is optional; omitted and explicit `ClusterIP` configurations
+both keep the backing feature Services internal. The OpenShift Routes provide
+stable external hostnames without exposing worker-node ports.
+
+On a reinstall, the installer also converts preserved feature-level NodePort
+overrides from an older deployment back to `ClusterIP` and recreates only the
+affected Service.
+
+`NodePort` remains an explicit fallback. When selected, set `nodePort` for SAIA
+and a different `slimNodePort` for SLIM; the installer patches SLIM's generated
+AIService to avoid the collision caused by the shared AIPlatform Service
+template. OpenShift deployments should normally retain `ClusterIP` and Routes.
 
 #### Scaling Deployment Capacity
 
@@ -412,10 +424,10 @@ non-ECR registries and use the `imagePullSecrets.*` blocks instead — see
 5. **Operators** — cert-manager → OpenTelemetry Operator → KubeRay Operator →
    ECR/image pull secrets → Splunk AI Operator → Splunk Operator.
 6. **AI Platform Stack** — converge Splunk TLS/issuer/HEC → AIPlatform CR →
-   service exposure → SAIA Route.
+   internal feature Services → SAIA Route → SLIM Route.
 7. **Readiness gate** — wait for pods, AIPlatform/AIService, RayCluster, and
    RayService readiness before reporting success.
-8. **Summary** — prints access info, including the SAIA URL.
+8. **Summary** — prints the SAIA and full AITK/SLIM endpoint URLs.
 
 ---
 
@@ -431,15 +443,18 @@ flowchart TB
       RH["Ray head"]
       WV["Weaviate (vector DB)"]
       SAIA["SAIA API (v1/v2 + nginx)"]
+      SLIM["SLIM API"]
       SPL["Splunk Standalone"]
       RW["Ray workers (GPU)"]
     end
-    RT["OpenShift Route: saia.<ingress-domain>"]
+    SAIART["OpenShift Route: saia.<ingress-domain>"]
+    SLIMRT["OpenShift Route: slim.<ingress-domain>"]
   end
   OBJ[("Object store\nSeaweedFS / S3 / MinIO")]
   ECR[("Image registry\nAWS ECR")]
 
-  Client["Splunk AI Assistant App"] -->|HTTP| RT --> SAIA
+  Client["Splunk AI Assistant App"] -->|HTTP| SAIART --> SAIA
+  AITK["Splunk AI Toolkit"] -->|HTTP| SLIMRT --> SLIM
   SAIA --> RH --> RW
   SAIA --> WV
   SAIA -->|HEC| SPL
@@ -452,7 +467,8 @@ flowchart TB
   `nvidia.com/gpu`.
 - **Weaviate** is the vector database (CPU workload); a `vector-db-setup` job
   populates it after install.
-- **SAIA** is the RAG API fronted by nginx and exposed via the Route.
+- **SAIA** is the RAG API fronted by nginx and exposed through the `saia` Route.
+- **SLIM** provides AITK model discovery and inference through the `slim` Route.
 - **Splunk Standalone** is deployed by the Splunk Operator; SAIA sends data to it
   over HEC at
   `http://splunk-<standalone-name>-standalone-service.<ns>.svc.cluster.local:8088`.
@@ -497,12 +513,18 @@ oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-ope
 oc adm policy remove-scc-from-group privileged system:serviceaccounts:local-path-storage
 ```
 
-### OpenShift Route (external access)
-SAIA is exposed via an OpenShift **Route** named `saia`, host
-`saia.<ingress-domain>`, backing service
-`<aiPlatform.name>-saia-saia-service` on `targetPort: 8080`. The Route carries a
-`600s` HAProxy timeout and disabled response buffering (for streaming). It is
-created immediately and returns `503` until the SAIA backend endpoints are ready.
+### OpenShift Routes (external access)
+SAIA and SLIM have independent OpenShift Routes:
+
+| Route | Default host | Backing Service |
+|---|---|---|
+| `saia` | `saia.<ingress-domain>` | `<aiPlatform.name>-saia-saia-service:8080` |
+| `slim` | `slim.<ingress-domain>` | `<aiPlatform.name>-slim-slim-service:8080` |
+
+Both Routes carry a `600s` HAProxy timeout and disabled response buffering for
+long-running and streaming inference. They are created immediately and return
+`503` until their operator-managed backend endpoints are ready. Set
+`openshift.routes.<feature>.enabled: false` to keep a feature internal-only.
 
 ### OLM operators (NFD + GPU Operator)
 NFD and the NVIDIA GPU Operator are installed as **OLM Subscriptions**, not Helm:
@@ -591,23 +613,34 @@ matches the images being pulled.
 
 ---
 
-## Accessing SAIA — the Splunk AI Assistant App
+## Accessing SAIA and SLIM
 
-After install, the script prints the SAIA URL:
-`http://saia.<ingress-domain>`.
+After install, the script prints both external URLs:
+
+```text
+SAIA: http://saia.<ingress-domain>
+SLIM: http://slim.<ingress-domain>/tenant/slim-api/v1alpha1
+```
 
 In the reference deployment this resolves to
 **`http://saia.apps.splunk-ai.rtplab.splunk.com`**, which the OpenShift Route
 forwards to the internal `openshift-ai-platform-saia-saia-service:8080`.
 
-Use this URL when configuring the **Splunk AI Assistant** app in Splunk. The
-SAIA services themselves (`saia-service`, `saia-v1`, `saia-v2`, `serve-svc`,
-`head-svc`, `weaviate`) are `ClusterIP` and are not directly reachable from
-outside the cluster — the Route is the single external entry point.
+Use the SAIA URL when configuring the **Splunk AI Assistant** app. Use the full
+SLIM URL, including `/tenant/slim-api/v1alpha1`, as the AI-tier endpoint in
+**Splunk AI Toolkit (AITK)**. The backing Services remain `ClusterIP`; the
+Routes are their external entry points.
+
+When bundled Splunk runs in the same cluster, AITK can avoid external ingress
+and use the internal endpoint instead:
+
+```text
+http://<aiPlatform.name>-slim-slim-service.<namespace>.svc.cluster.local:8080/tenant/slim-api/v1alpha1
+```
 
 To find the URL later:
 ```bash
-oc get route saia -n ai-platform -o jsonpath='{.spec.host}{"\n"}'
+oc get route saia slim -n ai-platform
 ```
 
 ---
@@ -754,7 +787,7 @@ A healthy reference deployment shows:
 - Ray head pod `3/3`, GPU worker pods `2/2`, SAIA deployment + nginx + v2 +
   worker Running, `weaviate-0` `1/1`, `splunk-standalone-0` `1/1`, and the
   `vector-db-setup` post-hook job `Completed`.
-- Route `saia` resolving to your ingress domain.
+- Routes `saia` and `slim` resolving to your ingress domain.
 
 If `verify` finds unhealthy pods it automatically runs `diagnose` (unless
 `AUTO_DIAGNOSE=false`), producing a support bundle.

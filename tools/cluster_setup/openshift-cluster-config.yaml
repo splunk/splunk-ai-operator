@@ -31,6 +31,16 @@ openshift:
   nodes:
     - cc-40-f3-9f-e2-3c
 
+  # OpenShift-native external exposure. Hosts default to
+  # <feature>.<default-ingress-domain>; set host explicitly to override.
+  routes:
+    saia:
+      enabled: true
+      # host: "saia.apps.example.com"
+    slim:
+      enabled: true
+      # host: "slim.apps.example.com"
+
 images:
   # Registry prefix applied to images that are not fully qualified
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
@@ -103,12 +113,9 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
-    nodePort: 30080         # Fixed NodePort for the SAIA public service.
-    # AIPlatform.serviceTemplate is initially inherited by every feature. The
-    # installer patches SLIM's AIService to this distinct port to avoid a
-    # collision with SAIA.
-    slimNodePort: 30081
+    # Routes above provide stable external access. Keep the backing feature
+    # Services internal unless NodePort or LoadBalancer is explicitly required.
+    type: ClusterIP         # ClusterIP | NodePort | LoadBalancer
   features:
     - name: "saia"
       version: "1.1.0"
