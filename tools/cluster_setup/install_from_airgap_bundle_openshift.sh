@@ -70,6 +70,7 @@ WHAT THIS SCRIPT DOES
      LOCAL_PATH_MANIFEST_URL     → file://<bundle>/manifests/local-path-storage.yaml
      OTEL_CHART_PATH             → <bundle>/charts/opentelemetry-operator-*.tgz
      KUBERAY_CHART_PATH          → <bundle>/charts/kuberay-operator-*.tgz
+     MODEL_ARTIFACTS_CONFIG_DIR  → <bundle>/model-metadata
      AIRGAP_MODE                 → true
 
   4. Invokes openshift_with_stack.sh <subcommand>.
@@ -229,6 +230,9 @@ export LOCAL_PATH_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/local-path-storag
 # Helm chart paths — installer uses these instead of remote repos
 export OTEL_CHART_PATH="${OTEL_TGZ}"
 export KUBERAY_CHART_PATH="${KUBERAY_TGZ}"
+export MODEL_ARTIFACTS_CONFIG_DIR="${BUNDLE_DIR}/model-metadata"
+[[ -f "${MODEL_ARTIFACTS_CONFIG_DIR}/model_artifacts_configs_quantized.yaml" ]] \
+  || err "Bundled model metadata is missing from ${MODEL_ARTIFACTS_CONFIG_DIR}"
 
 # Signal air-gapped mode (skips model staging, enforces offline paths)
 export AIRGAP_MODE="true"
@@ -239,6 +243,7 @@ log "  CERT_MANAGER_MANIFEST_URL = ${CERT_MANAGER_MANIFEST_URL}"
 log "  LOCAL_PATH_MANIFEST_URL   = ${LOCAL_PATH_MANIFEST_URL}"
 log "  OTEL_CHART_PATH           = ${OTEL_CHART_PATH}"
 log "  KUBERAY_CHART_PATH        = ${KUBERAY_CHART_PATH}"
+log "  MODEL_ARTIFACTS_CONFIG_DIR= ${MODEL_ARTIFACTS_CONFIG_DIR}"
 log "  AIRGAP_MODE               = ${AIRGAP_MODE}"
 log ""
 log "Launching installer..."

@@ -6,6 +6,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SCRIPT_DIR}/openshift_with_stack.sh"
+AIRGAP_PREPARE_SCRIPT="${SCRIPT_DIR}/prepare_airgap_bundle_openshift.sh"
+AIRGAP_INSTALL_SCRIPT="${SCRIPT_DIR}/install_from_airgap_bundle_openshift.sh"
 REAL_YQ=$(command -v yq 2>/dev/null || true)
 
 PASS=0
@@ -54,6 +56,11 @@ eval "$(extract_function render_ai_platform_manifest)"
 eval "$(extract_function patch_openshift_slim_public_service_workaround)"
 eval "$(extract_function platform_readiness_snapshot)"
 eval "$(extract_function model_artifacts_config_name)"
+eval "$(extract_function image_repository_from_ref)"
+eval "$(extract_function mirror_sources_cover_repository)"
+eval "$(extract_function operator_package_repositories)"
+eval "$(extract_function wait_for_subscription_csv)"
+eval "$(extract_function manifest_has_existing_resources)"
 eval "$(extract_function resolve_accelerator_type)"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
 
@@ -205,6 +212,75 @@ assert_eq "Splunk Standalone explicitly configures both PVC storage classes" "2"
   "$(awk '/^install_splunk_standalone\(\)/,/^}/' "${SCRIPT}" | grep -o 'storageClassName:' | wc -l | tr -d '[:space:]')"
 assert_eq "Splunk Standalone readiness detects the live HEC endpoint" "1" \
   "$(awk '/^wait_for_internal_splunk_ready\(\)/,/^}/' "${SCRIPT}" | grep -c '_detect_internal_splunk_hec_url' | tr -d '[:space:]')"
+assert_eq "qualified OpenShift minor is an immutable installer constant" "1" \
+  "$(grep -c '^readonly QUALIFIED_OPENSHIFT_MINOR="4.21"$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "configured OpenShift minor cannot override qualification" "1" \
+  "$(awk '/^load_config\(\)/,/^}/' "${SCRIPT}" | grep -c 'cannot override the installer qualification' | tr -d '[:space:]')"
+assert_eq "air-gap bundle includes model verification metadata" "1" \
+  "$(grep -c 'cp .*MODEL_METADATA_SOURCE.*model-metadata' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap wrapper exports bundled model metadata path" "1" \
+  "$(grep -c '^export MODEL_ARTIFACTS_CONFIG_DIR=.*model-metadata' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "Splunk Operator ownership checks every manifest resource" "1" \
+  "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -c 'manifest_has_existing_resources' | tr -d '[:space:]')"
+assert_eq "Splunk Operator ownership is not inferred from deployment presence" "0" \
+  "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -c 'operator_existed' | tr -d '[:space:]')"
+assert_eq "node restoration annotations are namespace-qualified" "1" \
+  "$(awk '/^set_installer_node_label\(\)/,/^}/' "${SCRIPT}" | grep -c '\${AI_NS}\.installer\.splunk\.com/previous-' | tr -d '[:space:]')"
+assert_eq "disconnected preflight validates mirror source coverage" "1" \
+  "$(awk '/^preflight_check_airgap_prerequisites\(\)/,/^}/' "${SCRIPT}" | grep -c 'mirror_sources_cover_repository' | tr -d '[:space:]')"
+assert_eq "OLM readiness requires currentCSV to become installedCSV" "1" \
+  "$(awk '/^wait_for_subscription_csv\(\)/,/^}/' "${SCRIPT}" | grep -c 'installed_csv.*==.*current_csv' | tr -d '[:space:]')"
+
+echo "OpenShift disconnected mirror source matching"
+mirror_sources=$'registry.redhat.io/openshift4\nnvcr.io/nvidia'
+assert_rc "accepts a required repository covered by a parent mirror source" 0 \
+  mirror_sources_cover_repository "${mirror_sources}" "nvcr.io/nvidia/cloud-native/gpu-operator"
+assert_rc "rejects an unrelated mirror source" 1 \
+  mirror_sources_cover_repository "${mirror_sources}" "quay.io/unrelated/application"
+
+_operator_repositories_fixture() (
+  oc() {
+    printf '%s\n' '{"items":[{"metadata":{"name":"gpu-operator-certified"},"status":{"catalogSource":"certified-operators","channels":[{"name":"v26.3","currentCSVDesc":{"containerImage":"registry.connect.redhat.com/nvidia/gpu-operator:v26.3","relatedImages":["nvcr.io/nvidia/driver@sha256:abc",{"image":"nvcr.io/nvidia/k8s-device-plugin:v1"}]}}]}}]}'
+  }
+  operator_package_repositories gpu-operator-certified certified-operators v26.3
+)
+assert_eq "reads string and object relatedImages from PackageManifest" \
+  $'nvcr.io/nvidia/driver\nnvcr.io/nvidia/k8s-device-plugin\nregistry.connect.redhat.com/nvidia/gpu-operator' \
+  "$(_operator_repositories_fixture)"
+
+_subscription_upgrade_waits_for_target() (
+  local polls=0
+  log() { :; }
+  sleep() { polls=$((polls + 1)); }
+  err() { return 1; }
+  oc() {
+    if [[ "${2:-}" == "subscription" && "$*" == *currentCSV* ]]; then
+      echo new.v2
+    elif [[ "${2:-}" == "subscription" && "$*" == *installedCSV* ]]; then
+      (( polls == 0 )) && echo old.v1 || echo new.v2
+    elif [[ "${2:-}" == "csv" && "$*" == *status.phase* ]]; then
+      echo Succeeded
+    else
+      return 1
+    fi
+  }
+  wait_for_subscription_csv operators test-subscription 30
+  echo "${polls}"
+)
+assert_eq "waits while currentCSV has not become installedCSV" "1" \
+  "$(_subscription_upgrade_waits_for_target)"
+
+_manifest_inventory_result() (
+  local mode="$1"
+  warn() { :; }
+  manifest_without_namespaces() { printf '%s\n' 'apiVersion: apps/v1' 'kind: Deployment'; }
+  oc() { [[ "${mode}" == "existing" ]] && echo deployment.apps/existing; return 0; }
+  manifest_has_existing_resources manifest.yaml
+)
+assert_rc "treats any existing manifest resource as pre-existing ownership" 0 \
+  _manifest_inventory_result existing
+assert_rc "allows exclusive ownership only when no manifest resource exists" 1 \
+  _manifest_inventory_result absent
 
 _exercise_platform_snapshot() (
   local mode="$1"
@@ -228,10 +304,29 @@ _exercise_platform_snapshot() (
           printf '%s\n' '{"items":[{"metadata":{"name":"pending-pod"},"status":{"phase":"Pending","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}]}'
         fi
         ;;
-      aiplatform) printf '%s\n' '{"metadata":{"name":"test-platform"},"status":{"phase":"Ready"}}' ;;
-      aiservice) printf '%s\n' '{"items":[{"metadata":{"name":"test-platform-saia"},"status":{"phase":"Ready"}}]}' ;;
-      raycluster) printf '%s\n' '{"items":[{"metadata":{"name":"ray"},"status":{"state":"ready","desiredWorkerReplicas":1,"readyWorkerReplicas":1}}]}' ;;
-      rayservice) printf '%s\n' '{"items":[{"metadata":{"name":"serve"},"status":{"serviceStatus":"Running"}}]}' ;;
+      aiplatform)
+        if [[ "${mode}" == "stale-platform" ]]; then
+          printf '%s\n' '{"metadata":{"name":"test-platform","generation":2},"status":{"observedGeneration":1,"rayServiceName":"test-platform","conditions":[{"type":"Ready","status":"True"}]}}'
+        else
+          printf '%s\n' '{"metadata":{"name":"test-platform","generation":2},"status":{"observedGeneration":2,"rayServiceName":"test-platform","conditions":[{"type":"Ready","status":"True"}]}}'
+        fi
+        ;;
+      aiservice)
+        [[ "${3:-}" == "test-platform-saia" ]] || return 1
+        if [[ "${mode}" == "stale-service" ]]; then
+          printf '%s\n' '{"metadata":{"name":"test-platform-saia","generation":3},"status":{"observedGeneration":2,"conditions":[{"type":"Ready","status":"True"}]}}'
+        else
+          printf '%s\n' '{"metadata":{"name":"test-platform-saia","generation":3},"status":{"observedGeneration":3,"conditions":[{"type":"Ready","status":"True"}]}}'
+        fi
+        ;;
+      rayservice)
+        [[ "${3:-}" == "test-platform" ]] || return 1
+        printf '%s\n' '{"metadata":{"name":"test-platform"},"status":{"serviceStatus":"Running","activeServiceStatus":{"rayClusterName":"test-platform-cluster"}}}'
+        ;;
+      raycluster)
+        [[ "${3:-}" == "test-platform-cluster" ]] || return 1
+        printf '%s\n' '{"metadata":{"name":"test-platform-cluster"},"status":{"state":"ready","desiredWorkerReplicas":1,"readyWorkerReplicas":1}}'
+        ;;
       *) return 1 ;;
     esac
   }
@@ -239,6 +334,8 @@ _exercise_platform_snapshot() (
 )
 assert_rc "accepts a fully Ready platform snapshot" 0 _exercise_platform_snapshot ready
 assert_rc "rejects a Pending pod despite Ready CRs" 1 _exercise_platform_snapshot pending
+assert_rc "rejects stale AIPlatform status from a prior generation" 1 _exercise_platform_snapshot stale-platform
+assert_rc "rejects stale AIService status from a prior generation" 1 _exercise_platform_snapshot stale-service
 
 echo "OpenShift accelerator validation"
 DEFAULT_ACCELERATOR=""

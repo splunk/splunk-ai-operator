@@ -629,10 +629,12 @@ private endpoints.
    ```bash
    ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer
    ```
-   The bundle contains **only** Helm charts and static manifests:
+   The bundle contains Helm charts, static manifests, and the small model
+   metadata profile required to verify pre-staged weights:
    - `manifests/cert-manager.yaml` (v1.13.0), `manifests/local-path-storage.yaml`
      (v0.0.26)
    - `charts/kuberay-operator-1.2.2.tgz`, `charts/opentelemetry-operator-*.tgz`
+   - `model-metadata/model_artifacts_configs_quantized.yaml`
    - `airgap-env.sh`, `container-images.txt`, `bundle-versions.txt`,
      `checksums.sha256`
 

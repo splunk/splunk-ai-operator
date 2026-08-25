@@ -24,6 +24,13 @@ trap cleanup_tmp EXIT
 export PAGER=cat
 export LANG=C LC_ALL=C
 
+# These values are part of the installer's qualified platform contract. A
+# customer config may assert the same OpenShift minor, but it must not redefine
+# the version that the pinned operands and Operator channels support.
+readonly QUALIFIED_OPENSHIFT_MINOR="4.21"
+readonly NFD_OPERATOR_CHANNEL="stable"
+readonly GPU_OPERATOR_CHANNEL="v26.3"
+
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/openshift-cluster-config.yaml}"
 
@@ -372,7 +379,13 @@ ${yq_err}"
   GRANT_PRIVILEGED_SCC=$(yq eval '.openshift.grantPrivilegedSCC // "true"' "${CONFIG_FILE}" 2>/dev/null || echo "true")
 
   NODE_LABEL_STRATEGY=$(yq eval '.openshift.nodeLabelStrategy // "auto"' "${CONFIG_FILE}" 2>/dev/null || echo "auto")
-  REQUIRED_OPENSHIFT_MINOR=$(yq eval '.openshift.requiredVersion // "4.21"' "${CONFIG_FILE}" 2>/dev/null || echo "4.21")
+  local configured_openshift_minor
+  configured_openshift_minor=$(yq eval '.openshift.requiredVersion // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${configured_openshift_minor}" && "${configured_openshift_minor}" != "null" &&
+        "${configured_openshift_minor}" != "${QUALIFIED_OPENSHIFT_MINOR}" ]]; then
+    err "openshift.requiredVersion cannot override the installer qualification. This build supports OpenShift ${QUALIFIED_OPENSHIFT_MINOR}, but ${configured_openshift_minor} was configured."
+  fi
+  REQUIRED_OPENSHIFT_MINOR="${QUALIFIED_OPENSHIFT_MINOR}"
 
   ECR_ENABLED=$(yq eval '.ecr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   ECR_ACCOUNT=$(yq eval '.ecr.account // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -893,6 +906,55 @@ preflight_check_insecure_registry_policy() {
   fi
 }
 
+image_repository_from_ref() {
+  printf '%s\n' "$1" | sed -E 's#^docker://##; s#@[^@]+$##; s#(:[^/:]+)$##'
+}
+
+collect_mirror_policy_sources() {
+  local resource policy_json
+  for resource in imagedigestmirrorset.config.openshift.io \
+                  imagetagmirrorset.config.openshift.io \
+                  imagecontentsourcepolicy.operator.openshift.io; do
+    policy_json=$(oc get "${resource}" -o json 2>/dev/null) || continue
+    printf '%s\n' "${policy_json}" | jq -r '
+      .items[]? |
+      (.spec.imageDigestMirrors[]?.source // empty),
+      (.spec.imageTagMirrors[]?.source // empty),
+      (.spec.repositoryDigestMirrors[]?.source // empty)'
+  done | sed '/^[[:space:]]*$/d' | sort -u
+}
+
+mirror_sources_cover_repository() {
+  local sources="$1" repository="$2" source
+  while IFS= read -r source; do
+    [[ -z "${source}" ]] && continue
+    source=$(image_repository_from_ref "${source}")
+    source="${source%/}"
+    if [[ "${repository}" == "${source}" || "${repository}" == "${source}/"* ]]; then
+      return 0
+    fi
+  done <<< "${sources}"
+  return 1
+}
+
+operator_package_repositories() {
+  local package="$1" catalog_source="$2" channel="$3" package_json
+  package_json=$(oc get packagemanifests -n openshift-marketplace -o json 2>/dev/null) || return 1
+  printf '%s\n' "${package_json}" | jq -r \
+    --arg package "${package}" --arg catalog "${catalog_source}" --arg channel "${channel}" '
+      .items[]?
+      | select(.metadata.name == $package and .status.catalogSource == $catalog)
+      | .status.channels[]?
+      | select(.name == $channel)
+      | .currentCSVDesc as $csv
+      | ($csv.containerImage // empty),
+        ($csv.relatedImages[]? | if type == "string" then . else (.image // empty) end)' \
+    | while IFS= read -r image; do
+        [[ -n "${image}" ]] && image_repository_from_ref "${image}"
+      done \
+    | sort -u
+}
+
 preflight_check_airgap_prerequisites() {
   [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
   pf_header "Disconnected OpenShift prerequisites"
@@ -902,6 +964,16 @@ preflight_check_airgap_prerequisites() {
     path="${path#file://}"
     [[ -n "${path}" && -f "${path}" ]] && pf_ok "Bundled artifact present: ${path}" || pf_fail "Required local air-gap artifact is missing: ${path:-<unset>}"
   done
+
+  local metadata_dir model_config_name model_config_path
+  metadata_dir=$(model_artifacts_metadata_dir || true)
+  model_config_name=$(model_artifacts_config_name "${DEFAULT_ACCELERATOR}" || true)
+  model_config_path="${metadata_dir:+${metadata_dir}/}${model_config_name}"
+  if [[ -n "${metadata_dir}" && -n "${model_config_name}" && -f "${model_config_path}" ]]; then
+    pf_ok "Bundled model metadata present: ${model_config_path}"
+  else
+    pf_fail "Required model metadata is missing: ${model_config_path:-<unresolved>}. Rebuild the air-gap bundle with the model-metadata directory."
+  fi
 
   local source state image_ref
   for source in "${NFD_CATALOG_SOURCE}" "${GPU_CATALOG_SOURCE}"; do
@@ -917,17 +989,54 @@ preflight_check_airgap_prerequisites() {
     fi
   done
 
-  local mirror_policy_count=0 count
-  for mirror_resource in imagedigestmirrorset.config.openshift.io \
-                         imagetagmirrorset.config.openshift.io \
-                         imagecontentsourcepolicy.operator.openshift.io; do
-    count=$(oc get "${mirror_resource}" -o name 2>/dev/null | wc -l | tr -d ' ')
-    mirror_policy_count=$((mirror_policy_count + count))
-  done
-  if (( mirror_policy_count == 0 )); then
+  local mirror_sources
+  mirror_sources=$(collect_mirror_policy_sources)
+  if [[ -z "${mirror_sources}" ]]; then
     pf_fail "No ImageDigestMirrorSet, ImageTagMirrorSet, or ImageContentSourcePolicy exists. Disconnected operator operands and Driver Toolkit images have no configured mirror path."
   else
-    pf_ok "OpenShift image mirror policies found: ${mirror_policy_count}"
+    local required_repositories=() package_repositories driver_toolkit_ref repository
+    # This operand is rendered directly by install_nfd(), outside the OLM CSV.
+    required_repositories+=("registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9")
+
+    package_repositories=$(operator_package_repositories nfd "${NFD_CATALOG_SOURCE}" "${NFD_OPERATOR_CHANNEL}" || true)
+    if [[ -z "${package_repositories}" ]]; then
+      pf_fail "Could not resolve related images for NFD package/channel ${NFD_CATALOG_SOURCE}/${NFD_OPERATOR_CHANNEL}."
+    else
+      while IFS= read -r repository; do
+        [[ -n "${repository}" ]] && required_repositories+=("${repository}")
+      done <<< "${package_repositories}"
+    fi
+
+    package_repositories=$(operator_package_repositories gpu-operator-certified "${GPU_CATALOG_SOURCE}" "${GPU_OPERATOR_CHANNEL}" || true)
+    if [[ -z "${package_repositories}" ]]; then
+      pf_fail "Could not resolve related images for GPU Operator package/channel ${GPU_CATALOG_SOURCE}/${GPU_OPERATOR_CHANNEL}."
+    else
+      while IFS= read -r repository; do
+        [[ -n "${repository}" ]] && required_repositories+=("${repository}")
+      done <<< "${package_repositories}"
+    fi
+
+    driver_toolkit_ref=$(oc get imagestream driver-toolkit -n openshift -o json 2>/dev/null \
+      | jq -r '[.status.tags[]?.items[]?.dockerImageReference][0] // empty' || true)
+    if [[ -z "${driver_toolkit_ref}" ]]; then
+      pf_fail "Could not resolve the OpenShift Driver Toolkit image source."
+    else
+      required_repositories+=("$(image_repository_from_ref "${driver_toolkit_ref}")")
+    fi
+
+    local missing_mirror_sources=()
+    while IFS= read -r repository; do
+      [[ -z "${repository}" ]] && continue
+      if ! mirror_sources_cover_repository "${mirror_sources}" "${repository}"; then
+        missing_mirror_sources+=("${repository}")
+      fi
+    done < <(printf '%s\n' "${required_repositories[@]}" | sort -u)
+
+    if (( ${#missing_mirror_sources[@]} > 0 )); then
+      pf_fail "Image mirror policies do not cover required source repositories: $(printf '%s; ' "${missing_mirror_sources[@]}" | sed 's/; $//'). Re-run oc mirror for the complete NFD/GPU Operator package closure and matching OpenShift release."
+    else
+      pf_ok "Image mirror policies cover all resolved NFD, GPU Operator, and Driver Toolkit source repositories"
+    fi
   fi
 
   pf_warn "This installer does not bundle GPU driver/operand images. The mirrored GPU Operator catalog, its related images, and the matching OpenShift release/Driver Toolkit image must already be reachable through the cluster mirror configuration."
@@ -1235,23 +1344,31 @@ wait_for_crd() {
 # CSV in a namespace can accidentally accept an unrelated or stale operator.
 wait_for_subscription_csv() {
   local namespace="$1" subscription="$2" timeout="${3:-600}"
-  local elapsed=0 csv_name="" phase=""
+  local elapsed=0 current_csv="" installed_csv="" csv_name="" phase=""
   log "Waiting for OLM Subscription ${namespace}/${subscription} (timeout: ${timeout}s)..."
   while (( elapsed < timeout )); do
-    csv_name=$(oc get subscription "${subscription}" -n "${namespace}" \
-      -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
-    [[ -z "${csv_name}" ]] && csv_name=$(oc get subscription "${subscription}" -n "${namespace}" \
+    current_csv=$(oc get subscription "${subscription}" -n "${namespace}" \
       -o jsonpath='{.status.currentCSV}' 2>/dev/null || true)
+    installed_csv=$(oc get subscription "${subscription}" -n "${namespace}" \
+      -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    csv_name="${current_csv:-${installed_csv}}"
     if [[ -n "${csv_name}" ]]; then
       phase=$(oc get csv "${csv_name}" -n "${namespace}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
       case "${phase}" in
         Succeeded)
-          log "  ✓ CSV ${csv_name} succeeded"
-          return 0
+          if [[ -z "${current_csv}" || "${installed_csv}" == "${current_csv}" ]]; then
+            log "  ✓ CSV ${csv_name} is installed and succeeded"
+            return 0
+          fi
+          ;;
+        Replacing)
           ;;
         Failed)
           oc get csv "${csv_name}" -n "${namespace}" -o yaml || true
           err "OLM CSV ${namespace}/${csv_name} failed"
+          ;;
+        *)
+          # Keep waiting while the target CSV is Pending/Installing/Unknown.
           ;;
       esac
     fi
@@ -1259,7 +1376,7 @@ wait_for_subscription_csv() {
     elapsed=$((elapsed + 10))
   done
   oc get subscription "${subscription}" -n "${namespace}" -o yaml || true
-  err "Timed out waiting for OLM Subscription ${namespace}/${subscription} (CSV=${csv_name:-not-created}, phase=${phase:-unknown})"
+  err "Timed out waiting for OLM Subscription ${namespace}/${subscription} (currentCSV=${current_csv:-not-created}, installedCSV=${installed_csv:-not-installed}, target phase=${phase:-unknown})"
 }
 
 # Record which shared cluster components were created by this installer. The
@@ -1353,6 +1470,20 @@ manifest_without_namespaces() {
   esac
 }
 
+# Return success when any non-Namespace object described by a manifest already
+# exists. Operator bundles contain shared CRDs/RBAC/webhooks, so deployment
+# presence alone is not a safe ownership signal. If inspection itself fails,
+# conservatively treat the manifest as pre-existing and preserve it on delete.
+manifest_has_existing_resources() {
+  local source="$1" existing
+  if ! existing=$(manifest_without_namespaces "${source}" \
+      | oc get -f - --ignore-not-found=true -o name 2>&1); then
+    warn "Could not inventory every existing resource in ${source}; treating the operator bundle as pre-existing for safe uninstall. Details: ${existing}"
+    return 0
+  fi
+  [[ -n "${existing}" ]]
+}
+
 # ====== ENSURE NAMESPACE ======
 ensure_namespace() {
   local ns="$1"
@@ -1367,7 +1498,7 @@ ensure_namespace() {
 
 set_installer_node_label() {
   local node="$1" label_key="$2" label_value="$3" annotation_suffix="$4"
-  local annotation_key="installer.splunk.com/previous-${annotation_suffix}" previous marker
+  local annotation_key="${AI_NS}.installer.splunk.com/previous-${annotation_suffix}" previous marker
   marker=$(oc get node "${node}" -o json 2>/dev/null | jq -r --arg key "${annotation_key}" '.metadata.annotations[$key] // ""')
   if [[ -z "${marker}" ]]; then
     previous=$(oc get node "${node}" -o json 2>/dev/null | jq -r --arg key "${label_key}" '.metadata.labels[$key] // "__absent__"')
@@ -1378,6 +1509,7 @@ set_installer_node_label() {
 
 restore_installer_node_labels() {
   local node label_key suffix annotation_key previous
+  local annotation_prefix="${AI_NS}.installer.splunk.com/previous-"
   while IFS= read -r node; do
     [[ -z "${node}" ]] && continue
     for entry in \
@@ -1385,7 +1517,7 @@ restore_installer_node_labels() {
       'splunk.ai/workload-type|workload-type' \
       'splunk.ai/ai-tier-node|ai-tier-node'; do
       label_key="${entry%%|*}"; suffix="${entry##*|}"
-      annotation_key="installer.splunk.com/previous-${suffix}"
+      annotation_key="${annotation_prefix}${suffix}"
       previous=$(oc get node "${node}" -o json | jq -r --arg key "${annotation_key}" '.metadata.annotations[$key] // ""')
       [[ -z "${previous}" ]] && continue
       if [[ "${previous}" == "__absent__" ]]; then
@@ -1396,12 +1528,13 @@ restore_installer_node_labels() {
       oc annotate node "${node}" "${annotation_key}-" 2>/dev/null || true
     done
 
-    previous=$(oc get node "${node}" -o json | jq -r '.metadata.annotations["installer.splunk.com/previous-gpu-taint"] // ""')
+    annotation_key="${annotation_prefix}gpu-taint"
+    previous=$(oc get node "${node}" -o json | jq -r --arg key "${annotation_key}" '.metadata.annotations[$key] // ""')
     if [[ "${previous}" == "true" ]]; then
       oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule --overwrite 2>/dev/null || true
-      oc annotate node "${node}" installer.splunk.com/previous-gpu-taint- 2>/dev/null || true
+      oc annotate node "${node}" "${annotation_key}-" 2>/dev/null || true
     fi
-  done < <(oc get nodes -o json 2>/dev/null | jq -r '.items[] | select(any((.metadata.annotations // {} | keys[]) ; startswith("installer.splunk.com/previous-"))) | .metadata.name')
+  done < <(oc get nodes -o json 2>/dev/null | jq -r --arg prefix "${annotation_prefix}" '.items[] | select(any((.metadata.annotations // {} | keys[]) ; startswith($prefix))) | .metadata.name')
 }
 
 # ====== OPENSHIFT: GRANT PRIVILEGED SCC ======
@@ -1469,7 +1602,7 @@ metadata:
   name: nfd
   namespace: openshift-nfd
 spec:
-  channel: stable
+  channel: ${NFD_OPERATOR_CHANNEL}
   name: nfd
   source: ${NFD_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
@@ -1552,7 +1685,7 @@ metadata:
   name: gpu-operator-certified
   namespace: nvidia-gpu-operator
 spec:
-  channel: v26.3
+  channel: ${GPU_OPERATOR_CHANNEL}
   name: gpu-operator-certified
   source: ${GPU_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
@@ -1677,7 +1810,7 @@ label_nodes() {
     # selecting ai-tier-node would stay Pending on it.
     if oc get node "${node}" -o json 2>/dev/null | jq -e \
         'any(.spec.taints[]?; .key == "nvidia.com/gpu" and .value == "true" and .effect == "NoSchedule")' >/dev/null; then
-      oc annotate node "${node}" installer.splunk.com/previous-gpu-taint=true --overwrite >/dev/null
+      oc annotate node "${node}" "${AI_NS}.installer.splunk.com/previous-gpu-taint=true" --overwrite >/dev/null
     fi
     oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
   done
@@ -2129,10 +2262,9 @@ install_splunk_ai_operator() {
   [[ -f "${SPLUNK_AI_FILE}" ]] || err "Manifest not found: ${SPLUNK_AI_FILE}"
 
   local ai_operator_ns="splunk-ai-operator-system"
-  local operator_existed="false"
-  oc get deployment splunk-ai-operator-controller-manager -n "${ai_operator_ns}" &>/dev/null && operator_existed="true"
+  local operator_resources_existed="false"
+  manifest_has_existing_resources "${SPLUNK_AI_FILE}" && operator_resources_existed="true"
   ensure_namespace "${ai_operator_ns}"
-  [[ "${operator_existed}" == "true" ]] || record_owned_component splunk_ai_operator
 
   # Grant SCCs before applying manifests so pods start on first attempt
   grant_privileged_scc
@@ -2152,6 +2284,12 @@ install_splunk_ai_operator() {
       || err "Splunk AI Operator manifest apply failed after retry"
   elif (( apply_rc != 0 )); then
     err "Splunk AI Operator manifest apply failed"
+  fi
+
+  if [[ "${operator_resources_existed}" == "false" ]]; then
+    record_owned_component splunk_ai_operator_bundle_v2
+  else
+    log "  Preserving Splunk AI Operator bundle on delete because at least one manifest resource predated this install."
   fi
 
   # Patch the operator SA and deployment with all configured pull secrets AFTER the
@@ -2234,10 +2372,9 @@ install_splunk_operator() {
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] || err "Splunk operator manifest not found: ${SPLUNK_OPERATOR_FILE}"
 
   local splunk_operator_ns="splunk-operator"
-  local operator_existed="false"
-  oc get deployment -n "${splunk_operator_ns}" -o name 2>/dev/null | grep -q . && operator_existed="true"
+  local operator_resources_existed="false"
+  manifest_has_existing_resources "${SPLUNK_OPERATOR_FILE}" && operator_resources_existed="true"
   ensure_namespace "${splunk_operator_ns}"
-  [[ "${operator_existed}" == "true" ]] || record_owned_component splunk_operator
 
   # Create ECR pull secret in splunk-operator namespace
   if [[ "${ECR_ENABLED}" == "true" ]]; then
@@ -2258,6 +2395,11 @@ install_splunk_operator() {
   # resource (Standalones, etc.). Server-side apply patches in place and preserves them.
   oc apply --server-side --force-conflicts -f "${SPLUNK_OPERATOR_FILE}" \
     || err "Splunk Operator manifest apply failed"
+  if [[ "${operator_resources_existed}" == "false" ]]; then
+    record_owned_component splunk_operator_bundle_v2
+  else
+    log "  Preserving Splunk Operator bundle on delete because at least one manifest resource predated this install."
+  fi
   log "  Splunk Operator resources applied"
 
   # Grant privileged SCC to the whole namespace group — this is the pattern OCP SCC admission
@@ -2973,6 +3115,14 @@ model_artifacts_config_name() {
   esac
 }
 
+# Resolve the directory containing immutable model metadata. Connected installs
+# use the repository's staging directory; the air-gap wrapper points this at the
+# metadata copied into the verified bundle.
+model_artifacts_metadata_dir() {
+  local candidate="${MODEL_ARTIFACTS_CONFIG_DIR:-$(dirname "$0")/../artifacts_download_upload_scripts}"
+  (cd "${candidate}" 2>/dev/null && pwd)
+}
+
 # ====== ALL MODELS STAGED PRE-CHECK ======
 # all_models_staged <staging_dir> <accel>
 # Checks whether every artifact already has a staging_complete marker with matching hf_url.
@@ -3084,8 +3234,8 @@ all_models_staged() {
 # separate staging process was run successfully.
 verify_pre_staged_model_artifacts() {
   local staging_dir accel config_name
-  staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
-    || { err "Cannot locate artifacts_download_upload_scripts directory"; return 1; }
+  staging_dir=$(model_artifacts_metadata_dir) \
+    || { err "Cannot locate model artifact metadata. Set MODEL_ARTIFACTS_CONFIG_DIR to a directory containing the bundled model config."; return 1; }
   accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
   config_name=$(model_artifacts_config_name "${accel}") || err "Unsupported accelerator for model verification: ${DEFAULT_ACCELERATOR}"
 
@@ -3543,7 +3693,7 @@ main_delete() {
   fi
 
   # ── 3. Splunk AI Operator ──
-  if component_is_owned splunk_ai_operator; then
+  if component_is_owned splunk_ai_operator_bundle_v2; then
     log "Removing installer-owned Splunk AI Operator..."
     if [[ -f "${SPLUNK_AI_FILE}" ]]; then
       manifest_without_namespaces "${SPLUNK_AI_FILE}" \
@@ -3555,7 +3705,7 @@ main_delete() {
   fi
 
   # ── 4. Splunk Operator ──
-  if component_is_owned splunk_operator; then
+  if component_is_owned splunk_operator_bundle_v2; then
     log "Removing installer-owned Splunk Operator..."
     if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
       manifest_without_namespaces "${SPLUNK_OPERATOR_FILE}" \
@@ -3643,9 +3793,8 @@ main_delete() {
   fi
 
   # ── 11. Node labels and taints added by label_nodes() ──
-  # Match both the current ai-tier-node label and the legacy workload-type label so
-  # teardown cleans up stacks installed before the single-label refactor. Also strip
-  # the nvidia.com/gpu taint older installs applied to GPU worker nodes.
+  # Namespace-qualified annotations ensure this delete restores only labels and
+  # taints recorded by the matching installation state.
   log "Restoring node labels and taints changed by this installer..."
   restore_installer_node_labels
 
@@ -3815,7 +3964,7 @@ EOF
 # only current pods can return a false success before KubeRay creates workers.
 platform_readiness_snapshot() {
   PLATFORM_PENDING_REASON=""
-  local pod_json bad_pods cr_json pending feature_count actual_count
+  local pod_json bad_pods platform_json cr_json pending feature aiservice_name
 
   pod_json=$(oc get pods -n "${AI_NS}" -o json 2>/dev/null) || {
     PLATFORM_PENDING_REASON="Cannot list pods in ${AI_NS}"
@@ -3831,55 +3980,72 @@ platform_readiness_snapshot() {
     | "pod \(.metadata.name): phase=\(.status.phase // "Unknown") waiting=\([$cs[]? | .state.waiting.reason // empty] | join(",")) ready=\([$cs[]? | select(.ready == true)] | length)/\($cs | length)"' 2>/dev/null || true)
   [[ -z "${bad_pods}" ]] || PLATFORM_PENDING_REASON="${bad_pods}"
 
-  cr_json=$(oc get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" -o json 2>/dev/null) || {
+  platform_json=$(oc get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" -o json 2>/dev/null) || {
     PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}AIPlatform ${AI_PLATFORM_NAME} does not exist"
     return 1
   }
-  pending=$(printf '%s\n' "${cr_json}" | jq -r '
-    if ((.status.phase // "") == "Ready") or
-       (any((.status.conditions // [])[]; .type == "Ready" and .status == "True"))
-    then "" else "AIPlatform \(.metadata.name): phase=\(.status.phase // "Unknown") Ready=\([(.status.conditions // [])[] | select(.type == "Ready") | .status] | first // "Unknown")" end')
+  pending=$(printf '%s\n' "${platform_json}" | jq -r '
+    (.metadata.generation // 0) as $generation
+    | (.status.observedGeneration // 0) as $observed
+    | if $observed != $generation then
+        "AIPlatform \(.metadata.name): observedGeneration=\($observed), generation=\($generation)"
+      elif any((.status.conditions // [])[]; .type == "Ready" and .status == "True") then
+        ""
+      else
+        "AIPlatform \(.metadata.name): Ready=\([(.status.conditions // [])[] | select(.type == "Ready") | .status] | first // "Unknown")"
+      end')
   [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
 
-  cr_json=$(oc get aiservice -n "${AI_NS}" -o json 2>/dev/null) || cr_json='{"items":[]}'
-  feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo 1)
-  actual_count=$(printf '%s\n' "${cr_json}" | jq '.items | length' 2>/dev/null || echo 0)
-  if (( actual_count < feature_count )); then
-    PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}AIService resources created=${actual_count}, expected=${feature_count}"
-  fi
-  pending=$(printf '%s\n' "${cr_json}" | jq -r '
-    .items[]
-    | select(
-        ((.status.phase // "") != "Ready") and
-        (any((.status.conditions // [])[]; .type == "Ready" and .status == "True") | not)
-      )
-    | "AIService \(.metadata.name): phase=\(.status.phase // "Unknown") Ready=\([(.status.conditions // [])[] | select(.type == "Ready") | .status] | first // "Unknown")"' 2>/dev/null || true)
-  [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+  # Query only the exact AIService names generated for this AIPlatform. A
+  # pre-existing namespace can contain unrelated AIPlatform children.
+  while IFS= read -r feature; do
+    [[ -z "${feature}" || "${feature}" == "null" ]] && continue
+    aiservice_name="${AI_PLATFORM_NAME}-${feature}"
+    if ! cr_json=$(oc get aiservice "${aiservice_name}" -n "${AI_NS}" -o json 2>/dev/null); then
+      PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}AIService ${aiservice_name} does not exist"
+      continue
+    fi
+    pending=$(printf '%s\n' "${cr_json}" | jq -r '
+      (.metadata.generation // 0) as $generation
+      | (.status.observedGeneration // 0) as $observed
+      | if $observed != $generation then
+          "AIService \(.metadata.name): observedGeneration=\($observed), generation=\($generation)"
+        elif any((.status.conditions // [])[]; .type == "Ready" and .status == "True") then
+          ""
+        else
+          "AIService \(.metadata.name): Ready=\([(.status.conditions // [])[] | select(.type == "Ready") | .status] | first // "Unknown")"
+        end' 2>/dev/null || true)
+    [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+  done < <(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || true)
 
   if yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null | grep -qx saia; then
-    cr_json=$(oc get raycluster -n "${AI_NS}" -o json 2>/dev/null) || cr_json='{"items":[]}'
-    actual_count=$(printf '%s\n' "${cr_json}" | jq '.items | length' 2>/dev/null || echo 0)
-    (( actual_count > 0 )) || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}No RayCluster has been created for SAIA"
-    pending=$(printf '%s\n' "${cr_json}" | jq -r '
-      .items[]
-      | (.status.desiredWorkerReplicas // 0) as $desired
-      | (.status.readyWorkerReplicas // 0) as $ready
-      | (any((.status.conditions // [])[]; .type == "RayClusterProvisioned" and .status == "True")) as $provisioned
-      | select((((.status.state // "") | ascii_downcase) != "ready" and ($provisioned | not)) or ($ready < $desired))
-      | "RayCluster \(.metadata.name): state=\(.status.state // "Unknown") workers=\($ready)/\($desired)"' 2>/dev/null || true)
-    [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+    local ray_service_name ray_cluster_name
+    # The operator names the RayService after the AIPlatform. The
+    # status.rayServiceName field contains the generated head Service name and
+    # must not be used as the RayService CR identity.
+    ray_service_name="${AI_PLATFORM_NAME}"
+    if [[ -z "${ray_service_name}" ]] || ! cr_json=$(oc get rayservice "${ray_service_name}" -n "${AI_NS}" -o json 2>/dev/null); then
+      PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}RayService ${ray_service_name:-<unresolved>} does not exist for AIPlatform ${AI_PLATFORM_NAME}"
+    else
+      pending=$(printf '%s\n' "${cr_json}" | jq -r '
+        if ((.status.serviceStatus // "") == "Running") or
+           any((.status.conditions // [])[]; .type == "Ready" and .status == "True")
+        then "" else "RayService \(.metadata.name): serviceStatus=\(.status.serviceStatus // "Unknown")" end' 2>/dev/null || true)
+      [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
 
-    cr_json=$(oc get rayservice -n "${AI_NS}" -o json 2>/dev/null) || cr_json='{"items":[]}'
-    actual_count=$(printf '%s\n' "${cr_json}" | jq '.items | length' 2>/dev/null || echo 0)
-    (( actual_count > 0 )) || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}No RayService has been created for SAIA"
-    pending=$(printf '%s\n' "${cr_json}" | jq -r '
-      .items[]
-      | select(
-          ((.status.serviceStatus // "") != "Running") and
-          (any((.status.conditions // [])[]; .type == "Ready" and .status == "True") | not)
-        )
-      | "RayService \(.metadata.name): serviceStatus=\(.status.serviceStatus // "Unknown")"' 2>/dev/null || true)
-    [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+      ray_cluster_name=$(printf '%s\n' "${cr_json}" | jq -r '.status.activeServiceStatus.rayClusterName // empty')
+      if [[ -z "${ray_cluster_name}" ]] || ! cr_json=$(oc get raycluster "${ray_cluster_name}" -n "${AI_NS}" -o json 2>/dev/null); then
+        PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}RayCluster ${ray_cluster_name:-<unresolved>} does not exist for RayService ${ray_service_name}"
+      else
+        pending=$(printf '%s\n' "${cr_json}" | jq -r '
+          (.status.desiredWorkerReplicas // 0) as $desired
+          | (.status.readyWorkerReplicas // 0) as $ready
+          | (any((.status.conditions // [])[]; .type == "RayClusterProvisioned" and .status == "True")) as $provisioned
+          | if ((((.status.state // "") | ascii_downcase) == "ready") or $provisioned) and ($ready >= $desired)
+            then "" else "RayCluster \(.metadata.name): state=\(.status.state // "Unknown") workers=\($ready)/\($desired)" end' 2>/dev/null || true)
+        [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+      fi
+    fi
   fi
 
   [[ -z "${PLATFORM_PENDING_REASON}" ]]

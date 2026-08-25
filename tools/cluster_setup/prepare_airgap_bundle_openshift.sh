@@ -26,6 +26,9 @@ CERT_MANAGER_VERSION="v1.13.0"
 LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
 KUBERAY_CHART_VERSION="1.2.2"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODEL_METADATA_SOURCE="${SCRIPT_DIR}/../artifacts_download_upload_scripts/model_artifacts_configs_quantized.yaml"
+
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle-openshift}"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -56,6 +59,9 @@ WHAT IS BUNDLED
   charts/
     opentelemetry-operator-*.tgz  — OTel operator (version resolved at bundle time)
     kuberay-operator-1.2.2.tgz    — KubeRay operator (pinned)
+
+  model-metadata/
+    model_artifacts_configs_quantized.yaml — required model IDs and marker URLs
 
   airgap-env.sh         — Source this to set env-var overrides before a manual install
   container-images.txt  — Full list of images to mirror to your internal registry
@@ -98,6 +104,7 @@ ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   LOCAL_PATH_MANIFEST_URL     URL/path to local-path-storage.yaml
   OTEL_CHART_PATH             Local path to opentelemetry-operator .tgz
   KUBERAY_CHART_PATH          Local path to kuberay-operator .tgz
+  MODEL_ARTIFACTS_CONFIG_DIR  Directory containing bundled model metadata
 
 EXAMPLES
   # Basic bundle
@@ -160,6 +167,8 @@ download() {
 require_cmd curl
 require_cmd helm
 require_cmd tar
+[[ -f "${MODEL_METADATA_SOURCE}" ]] \
+  || err "Required model metadata not found: ${MODEL_METADATA_SOURCE}. Run this script from a complete repository checkout."
 
 log "=== Splunk AI Platform — OpenShift Air-Gap Bundle Preparation ==="
 log "Output directory : ${OUTPUT_DIR}"
@@ -174,7 +183,8 @@ log ""
 
 mkdir -p \
   "${STAGE_DIR}/manifests" \
-  "${STAGE_DIR}/charts"
+  "${STAGE_DIR}/charts" \
+  "${STAGE_DIR}/model-metadata"
 
 # ── 1. Static Kubernetes manifests ────────────────────────────────────────────
 log "--- Downloading static manifests ---"
@@ -186,6 +196,10 @@ download \
 download \
   "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml" \
   "${STAGE_DIR}/manifests/local-path-storage.yaml"
+
+# Model weights remain external, but the installer needs this small immutable
+# profile to verify every pre-staged completion marker on the disconnected side.
+cp "${MODEL_METADATA_SOURCE}" "${STAGE_DIR}/model-metadata/"
 
 # ── 2. Helm charts ────────────────────────────────────────────────────────────
 log "--- Pulling Helm charts ---"
@@ -233,6 +247,9 @@ export LOCAL_PATH_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/local-path
 # Helm chart paths — installer uses these instead of remote repos when set.
 export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-$(cat "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version").tgz"
 export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION:-1.2.2}.tgz"
+
+# Model IDs and expected source URLs used for mandatory marker verification.
+export MODEL_ARTIFACTS_CONFIG_DIR="${AIRGAP_BUNDLE_DIR}/model-metadata"
 
 # Signal to the installer that this is an air-gapped run.
 export AIRGAP_MODE="true"
