@@ -30,6 +30,11 @@ export LANG=C LC_ALL=C
 readonly QUALIFIED_OPENSHIFT_MINOR="4.21"
 readonly NFD_OPERATOR_CHANNEL="stable"
 readonly GPU_OPERATOR_CHANNEL="v26.3"
+readonly CERT_MANAGER_VERSION="v1.13.0"
+readonly LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
+readonly OTEL_OPERATOR_CHART_VERSION="0.121.0"
+readonly KUBERAY_OPERATOR_VERSION="1.2.2"
+readonly QUALIFIED_RAY_RUNTIME_VERSION="2.56.0"
 
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/openshift-cluster-config.yaml}"
@@ -362,7 +367,7 @@ ${yq_err}"
   OTEL_COLLECTOR_IMAGE=$(yq eval '.images.otelCollector.image // "otel/opentelemetry-collector-contrib:0.122.1"' "${CONFIG_FILE}" 2>/dev/null || echo "otel/opentelemetry-collector-contrib:0.122.1")
   NGINX_IMAGE=$(yq eval '.images.nginx.image // "docker.io/library/nginx:1.27-alpine"' "${CONFIG_FILE}" 2>/dev/null || echo "docker.io/library/nginx:1.27-alpine")
   MODEL_VERSION=$(yq eval '.operators.ray.modelVersion // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  RAY_RUNTIME_VERSION=$(yq eval '.operators.ray.rayVersion // "2.44.0"' "${CONFIG_FILE}" 2>/dev/null || echo "2.44.0")
+  RAY_RUNTIME_VERSION=$(yq eval ".operators.ray.rayVersion // \"${QUALIFIED_RAY_RUNTIME_VERSION}\"" "${CONFIG_FILE}" 2>/dev/null || echo "${QUALIFIED_RAY_RUNTIME_VERSION}")
   local _config_dir
   _config_dir="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)"
   _resolve_manifest() {
@@ -400,13 +405,12 @@ ${yq_err}"
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   STORAGE_CLASS=$(yq eval '.storage.storageClass // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   VECTORDB_SIZE=$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
-  # OpenShift uses one shared AI-tier node pool for CPU and GPU workloads, so
-  # validate one capacity floor instead of pretending the nodes have exclusive
-  # CPU/GPU roles. The default covers the 350 GiB scaleFactor-1 RTX Pro Ray
-  # worker limit plus headroom for images, services, logs, and local-path PVCs.
-  MIN_DISK_AI_TIER_NODE=$(yq eval '.storage.minimumDiskSpace.aiTierNode // 500' "${CONFIG_FILE}" 2>/dev/null || echo "500")
+  # OpenShift uses one shared AI-tier node pool for CPU and GPU workloads. This
+  # is the scale-factor-1 usable-capacity floor; the node-storage preflight
+  # multiplies it by aiPlatform.scaleFactor.
+  MIN_DISK_AI_TIER_NODE=$(yq eval '.storage.minimumDiskSpace.aiTierNode // 1024' "${CONFIG_FILE}" 2>/dev/null || echo "1024")
   MIN_DISK_AI_TIER_NODE="${MIN_DISK_AI_TIER_NODE//[!0-9]/}"
-  [[ -n "${MIN_DISK_AI_TIER_NODE}" ]] || MIN_DISK_AI_TIER_NODE=500
+  [[ -n "${MIN_DISK_AI_TIER_NODE}" ]] || MIN_DISK_AI_TIER_NODE=1024
   OBJ_STORE_TYPE=$(yq eval '.storage.objectStore.type // "minio"' "${CONFIG_FILE}" 2>/dev/null || echo "minio")
   OBJ_STORE_BUCKET=$(yq eval '.storage.objectStore.bucket // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   OBJ_STORE_BUCKET="$(printf '%s' "${OBJ_STORE_BUCKET}" | tr '[:upper:]' '[:lower:]')"
@@ -524,6 +528,12 @@ validate_scale_factor_config() {
   fi
 
   return 0
+}
+
+required_ai_tier_disk_gib() {
+  local scale_one_minimum_gib="${1:-1024}"
+  local scale_factor="${2:-1}"
+  printf '%s\n' "$((scale_one_minimum_gib * scale_factor))"
 }
 
 # True when a named service is requested in aiPlatform.features[].
@@ -834,7 +844,8 @@ preflight_check_storage() {
 
 preflight_check_node_storage() {
   pf_header "AI-tier node container storage"
-  local nodes=() node output snapshot avail_kb avail_gib
+  local nodes=() node output snapshot avail_kb avail_gib required_gib
+  required_gib=$(required_ai_tier_disk_gib "${MIN_DISK_AI_TIER_NODE}" "${AI_SCALE_FACTOR}")
   if [[ "${NODE_LABEL_STRATEGY}" == "manual" ]]; then
     while IFS= read -r node; do [[ -n "${node}" && "${node}" != "null" ]] && nodes+=("${node}"); done \
       < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null || true)
@@ -859,10 +870,10 @@ preflight_check_node_storage() {
     fi
 
     avail_gib=$((avail_kb / 1048576))
-    if (( avail_gib < MIN_DISK_AI_TIER_NODE )); then
-      pf_fail "AI-tier node ${node} has ${avail_gib} GiB available for container storage; at least ${MIN_DISK_AI_TIER_NODE} GiB is required"
+    if (( avail_gib < required_gib )); then
+      pf_fail "AI-tier node ${node} has ${avail_gib} GiB available for container storage; at least ${required_gib} GiB is required at scaleFactor ${AI_SCALE_FACTOR}"
     else
-      pf_ok "AI-tier node ${node}: ${avail_gib} GiB available (minimum ${MIN_DISK_AI_TIER_NODE} GiB)"
+      pf_ok "AI-tier node ${node}: ${avail_gib} GiB available (minimum ${required_gib} GiB at scaleFactor ${AI_SCALE_FACTOR})"
     fi
   done
 }
@@ -1262,16 +1273,21 @@ preflight_checks() {
   PREFLIGHT_FAILURES=0
   PREFLIGHT_WARNINGS=0
 
-  local _aws_needed="false"
-  [[ "${ECR_ENABLED:-false}" == "true" ]] && _aws_needed="true"
-  [[ "${OBJ_STORE_TYPE:-}" == "aws" ]] && _aws_needed="true"
+  local _aws_reason=""
+  if [[ "${OBJ_STORE_TYPE:-}" == "aws" ]]; then
+    _aws_reason="AWS S3 model storage"
+  elif [[ "${ECR_ENABLED:-false}" == "true" || "${IMAGE_PULL_SECRETS_ECR_ENABLED:-false}" == "true" ]]; then
+    _aws_reason="automatic ECR pull-secret creation"
+  fi
 
   pf_header "Required tools"
   for tool in oc yq helm curl jq base64 tar timeout python3; do
     command -v "$tool" >/dev/null 2>&1 && pf_ok "$tool found" || pf_fail "$tool not found in PATH"
   done
-  if [[ "${_aws_needed}" == "true" ]]; then
-    command -v aws >/dev/null 2>&1 && pf_ok "aws found" || pf_fail "aws CLI is required for ECR/AWS S3"
+  if [[ -n "${_aws_reason}" ]]; then
+    command -v aws >/dev/null 2>&1 \
+      && pf_ok "aws found for ${_aws_reason}" \
+      || pf_fail "aws CLI is required for ${_aws_reason}"
   else
     pf_ok "aws CLI not required by this configuration"
   fi
@@ -1866,7 +1882,7 @@ install_cert_manager() {
   fi
 
   if [[ "${already_installed}" != "true" ]]; then
-    local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+    local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml}"
     # oc apply -f does not understand file:// — strip it to a bare path
     [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
     record_owned_component cert_manager
@@ -1954,7 +1970,7 @@ install_local_path_provisioner() {
   fi
 
   log "Installing local-path-provisioner..."
-  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
+  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml}"
   [[ "${_lp_url}" == file://* ]] && _lp_url="${_lp_url#file://}"
   record_owned_component local_path_provisioner
   [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_local-path-storage
@@ -2058,7 +2074,7 @@ install_otel_operator() {
     done
   fi
 
-  local otel_chart_ref
+  local otel_chart_ref otel_version_flag=()
   if [[ -n "${OTEL_CHART_PATH:-}" && -f "${OTEL_CHART_PATH}" ]]; then
     otel_chart_ref="${OTEL_CHART_PATH}"
     log "  Using local chart: ${otel_chart_ref}"
@@ -2066,6 +2082,7 @@ install_otel_operator() {
     helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
     helm repo update open-telemetry 2>/dev/null || true
     otel_chart_ref="open-telemetry/opentelemetry-operator"
+    otel_version_flag=(--version "${OTEL_OPERATOR_CHART_VERSION}")
   fi
 
   local otel_retries=0 otel_installed="false"
@@ -2075,6 +2092,7 @@ install_otel_operator() {
     local otel_out
     if otel_out=$(helm upgrade --install opentelemetry-operator "${otel_chart_ref}" \
       --namespace opentelemetry-operator-system --create-namespace \
+      "${otel_version_flag[@]+"${otel_version_flag[@]}"}" \
       --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
       --set admissionWebhooks.certManager.enabled=true \
       --wait=false --timeout=10m 2>&1); then
@@ -2131,7 +2149,7 @@ install_ray_operator() {
     helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
     helm repo update kuberay
     kuberay_chart_ref="kuberay/kuberay-operator"
-    kuberay_version_flag=(--version 1.2.2)
+    kuberay_version_flag=(--version "${KUBERAY_OPERATOR_VERSION}")
   fi
 
   record_owned_component kuberay_operator
@@ -2140,7 +2158,7 @@ install_ray_operator() {
     --namespace ray-system --create-namespace \
     "${kuberay_version_flag[@]+"${kuberay_version_flag[@]}"}" \
     --set image.repository=quay.io/kuberay/operator \
-    --set image.tag=v1.2.2 \
+    --set image.tag="v${KUBERAY_OPERATOR_VERSION}" \
     --wait --timeout=10m
   wait_for_crd rayservices.ray.io 300
   wait_for_crd rayclusters.ray.io 300
@@ -3839,7 +3857,7 @@ main_delete() {
   # ── 7. cert-manager (installed from a static manifest) ──
   if component_is_owned cert_manager; then
     log "Removing installer-owned cert-manager using its install manifest..."
-    local cm_manifest="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+    local cm_manifest="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml}"
     cm_manifest="${cm_manifest#file://}"
     if [[ -f "${cm_manifest}" || "${cm_manifest}" == http://* || "${cm_manifest}" == https://* ]]; then
       manifest_without_namespaces "${cm_manifest}" \
@@ -3855,7 +3873,7 @@ main_delete() {
   # ── 8. local-path-provisioner ──
   if component_is_owned local_path_provisioner; then
     log "Removing installer-owned local-path-provisioner..."
-    local lp_manifest="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
+    local lp_manifest="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml}"
     lp_manifest="${lp_manifest#file://}"
     if [[ -f "${lp_manifest}" || "${lp_manifest}" == http://* || "${lp_manifest}" == https://* ]]; then
       manifest_without_namespaces "${lp_manifest}" \
@@ -4010,6 +4028,14 @@ diagnose() {
     oc version 2>/dev/null || true
     helm version 2>/dev/null || true
     yq --version 2>/dev/null || true
+    jq --version 2>/dev/null || true
+    curl --version 2>/dev/null || true
+    timeout --version 2>/dev/null || true
+    python3 --version 2>/dev/null || true
+    tar --version 2>/dev/null || true
+    aws --version 2>/dev/null || true
+    mc --version 2>/dev/null || true
+    command -v base64 2>/dev/null || true
     echo "=== OS ==="
     uname -a
   } > "${bundle_dir}/versions.txt" 2>&1
@@ -4054,7 +4080,8 @@ Environment:
 Prerequisites:
   - Logged in to OpenShift: oc login <cluster-url>
   - oc, yq v4, helm, jq, curl, timeout, python3, tar in PATH
-  - mc for MinIO/SeaweedFS/S3-compatible model verification; aws for AWS S3/ECR
+  - mc for MinIO/SeaweedFS/S3-compatible model verification
+  - aws only for AWS S3 model storage; automatic ECR secret creation also uses aws
   - Cluster-admin access to OpenShift ${REQUIRED_OPENSHIFT_MINOR:-4.21}; this installer is qualified on RHCOS amd64 nodes
   - artifacts.yaml (operator manifests) in the same directory, or set files.aiPlatform in config
 EOF

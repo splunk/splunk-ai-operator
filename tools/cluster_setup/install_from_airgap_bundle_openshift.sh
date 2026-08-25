@@ -68,7 +68,7 @@ WHAT THIS SCRIPT DOES
 
      CERT_MANAGER_MANIFEST_URL   → file://<bundle>/manifests/cert-manager.yaml
      LOCAL_PATH_MANIFEST_URL     → file://<bundle>/manifests/local-path-storage.yaml
-     OTEL_CHART_PATH             → <bundle>/charts/opentelemetry-operator-*.tgz
+     OTEL_CHART_PATH             → <bundle>/charts/opentelemetry-operator-0.121.0.tgz
      KUBERAY_CHART_PATH          → <bundle>/charts/kuberay-operator-*.tgz
      MODEL_ARTIFACTS_CONFIG_DIR  → <bundle>/model-metadata
      AIRGAP_MODE                 → true
@@ -81,13 +81,14 @@ PREREQUISITES
     helm    — v3+
     yq v4, jq, curl, timeout, python3, tar
     mc      — MinIO client for MinIO/SeaweedFS/S3-compatible model-marker checks
-    aws     — AWS CLI when using AWS S3 or ECR
+    aws     — AWS CLI only when storage.objectStore.type=aws
 
   Required network access from the install machine:
     - The target OpenShift API.
     - The configured object store used by installer-side model-marker checks.
-    - Any registry or cloud API used directly for credential setup, such as
-      the AWS ECR API when ecr.enabled=true.
+    - Any registry or cloud API used directly for credential setup. Automatic
+      ECR secret creation (ecr.enabled=true) separately requires AWS CLI and
+      access to the AWS ECR API; mirrored/pre-authenticated registries do not.
 
   Required network access from the OpenShift nodes:
     - Internal registry mirrors and mirrored OLM catalog sources.

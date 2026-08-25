@@ -80,11 +80,11 @@ storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
   minimumDiskSpace:
-    # Available GiB on the filesystem backing /var/lib/containers for every
-    # shared AI-tier node. At scaleFactor 1, the RTX Pro Ray workers alone can
-    # consume up to 350 GiB; 500 GiB leaves room for images, platform services,
-    # logs, and local-path volumes.
-    aiTierNode: 500
+    # Scale-factor-1 minimum available GiB on the shared AI-tier node filesystem
+    # backing /var/lib/containers and /opt/local-path-provisioner. The installer
+    # multiplies this value by aiPlatform.scaleFactor: 1024 GiB at scale 1 and
+    # 2048 GiB at scale 2.
+    aiTierNode: 1024
   modelStaging:
     # false means models were staged separately; the installer still validates
     # every staging_state completion marker before touching the cluster.
@@ -137,7 +137,7 @@ operators:
     catalogSource: "certified-operators"
   ray:
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.53.0"
+    rayVersion: "2.56.0"
 
 files:
   aiPlatform: "./artifacts.yaml"

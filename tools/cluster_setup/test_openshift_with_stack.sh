@@ -43,6 +43,7 @@ extract_function() {
 }
 
 eval "$(extract_function validate_scale_factor_config)"
+eval "$(extract_function required_ai_tier_disk_gib)"
 eval "$(extract_function openshift_feature_enabled)"
 eval "$(extract_function openshift_slim_feature_enabled)"
 eval "$(extract_function warn_on_mutable_image_tags)"
@@ -273,7 +274,7 @@ assert_eq "missing derived Splunk HEC secret is fatal" "1" \
   "$(awk '/^install_ai_platform_cr\(\)/,/^}/' "${SCRIPT}" | grep -c 'derived.*Secret cannot be created' | tr -d '[:space:]')"
 assert_eq "NFD and GPU reruns validate their exact OLM subscriptions" "2" \
   "$(grep -c '^[[:space:]]*wait_for_subscription_csv .*\(nfd\|gpu-operator-certified\)' "${SCRIPT}" | tr -d '[:space:]')"
-assert_eq "node-storage preflight applies one shared AI-tier threshold" "3" \
+assert_eq "node-storage preflight derives one scale-aware shared AI-tier threshold" "1" \
   "$(awk '/^preflight_check_node_storage\(\)/,/^}/' "${SCRIPT}" | grep -c 'MIN_DISK_AI_TIER_NODE' | tr -d '[:space:]')"
 assert_eq "node-storage preflight does not invent exclusive CPU/GPU roles" "0" \
   "$(awk '/^preflight_check_node_storage\(\)/,/^}/' "${SCRIPT}" | grep -c '0x10de' | tr -d '[:space:]')"
@@ -293,6 +294,16 @@ assert_eq "Splunk management readiness accepts the expected unauthenticated 401 
   "$(awk '/^wait_for_internal_splunk_ready\(\)/,/^}/' "${SCRIPT}" | grep -c -- '--fail' | tr -d '[:space:]')"
 assert_eq "feature Route creation remains compatible with Bash 3.2" "0" \
   "$(awk '/^create_openshift_feature_route\(\)/,/^}/' "${SCRIPT}" | grep -c '\^\^' | tr -d '[:space:]')"
+assert_eq "OpenTelemetry Operator chart is pinned" "1" \
+  "$(grep -c '^readonly OTEL_OPERATOR_CHART_VERSION="0.121.0"$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap bundle pins the same OpenTelemetry chart" "1" \
+  "$(grep -c '^OTEL_CHART_VERSION="0.121.0"$' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap bundle does not resolve a mutable latest OpenTelemetry chart" "0" \
+  "$(grep -c 'helm search repo open-telemetry/opentelemetry-operator' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "qualified Ray runtime matches the published Ray images" "1" \
+  "$(grep -c '^readonly QUALIFIED_RAY_RUNTIME_VERSION="2.56.0"$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap prerequisites scope AWS CLI to AWS S3 storage" "1" \
+  "$(grep -c 'aws.*storage.objectStore.type=aws' "${SCRIPT_DIR}/install_from_airgap_bundle_openshift.sh" | tr -d '[:space:]')"
 assert_eq "qualified OpenShift minor is an immutable installer constant" "1" \
   "$(grep -c '^readonly QUALIFIED_OPENSHIFT_MINOR="4.21"$' "${SCRIPT}" | tr -d '[:space:]')"
 assert_eq "configured OpenShift minor cannot override qualification" "1" \
@@ -467,6 +478,10 @@ assert_eq "legacy error points to top-level setting" \
   "aiPlatform.features[].scaleFactor is no longer supported; move the capacity multiplier to aiPlatform.scaleFactor" \
   "${legacy_message}"
 
+echo "OpenShift scale-aware disk minimum"
+assert_eq "scale 1 requires 1024 GiB" "1024" "$(required_ai_tier_disk_gib 1024 1)"
+assert_eq "scale 2 requires 2048 GiB" "2048" "$(required_ai_tier_disk_gib 1024 2)"
+
 echo "OpenShift AIPlatform manifest render"
 AI_PLATFORM_NAME="test-platform"
 AI_NS="ai-platform"
@@ -558,7 +573,9 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$("${REAL_YQ}" eval '.openshift.requiredVersion' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config explicitly verifies pre-staged models" "false" \
     "$("${REAL_YQ}" eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null)"
-  assert_eq "repository OpenShift config requires 500 GiB on shared AI-tier nodes" "500" \
+  assert_eq "repository OpenShift config matches the qualified Ray runtime" "2.56.0" \
+    "$("${REAL_YQ}" eval '.operators.ray.rayVersion' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config requires 1024 GiB at scale 1" "1024" \
     "$("${REAL_YQ}" eval '.storage.minimumDiskSpace.aiTierNode' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config defines one additional trusted issuer" "1" \
     "$("${REAL_YQ}" eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null)"

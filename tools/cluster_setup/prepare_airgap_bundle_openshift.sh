@@ -25,6 +25,7 @@ set -euo pipefail
 CERT_MANAGER_VERSION="v1.13.0"
 LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
 KUBERAY_CHART_VERSION="1.2.2"
+OTEL_CHART_VERSION="0.121.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_METADATA_SOURCE="${SCRIPT_DIR}/../artifacts_download_upload_scripts/model_artifacts_configs_quantized.yaml"
@@ -57,7 +58,7 @@ WHAT IS BUNDLED
     local-path-storage.yaml    — Rancher local-path provisioner
 
   charts/
-    opentelemetry-operator-*.tgz  — OTel operator (version resolved at bundle time)
+    opentelemetry-operator-0.121.0.tgz — OTel operator chart (pinned)
     kuberay-operator-1.2.2.tgz    — KubeRay operator (pinned)
 
   model-metadata/
@@ -178,7 +179,7 @@ log "Component versions:"
 log "  cert-manager          : ${CERT_MANAGER_VERSION}"
 log "  local-path-provisioner: ${LOCAL_PATH_PROVISIONER_VERSION}"
 log "  kuberay chart         : ${KUBERAY_CHART_VERSION}"
-log "  otel chart            : (resolved at bundle time)"
+log "  otel chart            : ${OTEL_CHART_VERSION}"
 log ""
 
 mkdir -p \
@@ -208,12 +209,7 @@ helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm
 helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
 helm repo update open-telemetry kuberay
 
-# opentelemetry-operator — resolve latest version at bundle time
-OTEL_CHART_VERSION="$(helm search repo open-telemetry/opentelemetry-operator \
-  --output json | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
-[[ -z "${OTEL_CHART_VERSION}" ]] && err "Could not resolve opentelemetry-operator chart version."
-log "Resolved opentelemetry-operator chart version: ${OTEL_CHART_VERSION}"
-
+# opentelemetry-operator — pinned to the qualified chart version
 helm pull open-telemetry/opentelemetry-operator \
   --version "${OTEL_CHART_VERSION}" \
   --destination "${STAGE_DIR}/charts"

@@ -94,17 +94,24 @@ The AI Platform workload namespace defaults to **`ai-platform`**.
 - `cluster-admin` privileges (required for SCC grants, OLM installs, and the
   `oc debug node/` SELinux relabel).
 
-**Minimum shared-node sizing** (`scaleFactor: 1`):
+**Minimum shared AI-tier node sizing** (current single-worker topology):
 
-- **RAM requirement:** 256 GiB
-- **Disk requirement:** 1 TB+ nominal, providing at least 800 GiB usable capacity
-- **GPU memory:** 2 × 96 GB VRAM, separate from system RAM
-- **CPU:** 64 allocatable vCPU
+| `scaleFactor` | RAM requirement | Disk requirement | GPU memory | CPU |
+|---:|---:|---:|---:|---:|
+| `1` | 256 GiB | 1 TiB (1024 GiB) available | 2 × 96 GB VRAM | 64 allocatable vCPU |
+| `2` | 512 GiB | 2 TiB (2048 GiB) available | 4 × 96 GB VRAM | 128 allocatable vCPU |
+
+The disk values are **available usable capacity immediately before install** on
+the AI workload filesystem, not nominal drive labels. A drive sold as 1 TB
+contains only about 931 GiB before formatting and therefore does not satisfy the
+1024 GiB scale-1 minimum. Size the raw storage above the table value to allow
+for RAID, formatting, the host OS, and future operating headroom.
 
 CPU means Kubernetes-allocatable logical CPUs, after OpenShift node reservations.
 The scale-factor-1 platform can use approximately 47 vCPU at configured limits;
-64 vCPU leaves capacity for OpenShift system services and workload bursts. Increase
-CPU, memory, GPU, and storage capacity together when raising `scaleFactor`.
+64 vCPU leaves capacity for OpenShift system services and workload bursts. The
+scale-2 values are the corresponding capacity-planning minima when the current
+single-node workload is doubled.
 
 **Reference Cisco hardware configuration** (`scaleFactor: 1`):
 
@@ -114,7 +121,11 @@ Shared AI-tier worker — 1 &times; Cisco UCS C845A M8 AI Server:
 - **CPU:** 2 &times; `CAI-CPU-A9375F` — 64 physical cores / 128 threads
 - **GPU:** 2 &times; `CAI-GPU-RTXP6000` — 192 GB total VRAM
 - **Boot storage:** 2 &times; `CAI-M2-960G` with 1 &times;
-  `CAI-M2-HWRAID`, configured as RAID 1 — 1.92 TB raw / 960 GB usable
+  `CAI-M2-HWRAID`, configured as RAID 1 — 1.92 TB raw / 960 GB usable;
+  use this pair for boot, not to satisfy the AI workload disk requirement
+- **AI workload storage:** dedicated enterprise NVMe storage providing at least
+  1 TiB (1024 GiB) available to `/var/lib/containers` and
+  `/opt/local-path-provisioner` for scale 1, or 2 TiB (2048 GiB) for scale 2
 
 OpenShift control plane — 3 &times; dedicated Cisco UCS C225 M8 SFF
 servers, each configured with:
@@ -126,17 +137,58 @@ servers, each configured with:
   960 GB raw / 480 GB usable
 
 The three control-plane servers are separate physical hosts and are not AI-tier
-worker nodes. The C845A M.2 devices are boot-optimized; this minimum reference
-configuration assumes its RAID-1 root filesystem also backs
-`/var/lib/containers` and `/opt/local-path-provisioner` and retains at least
-800 GiB of usable capacity. For greater model, image, log, and upgrade headroom,
-use dedicated enterprise NVMe storage for those paths.
+worker nodes. The C845A RAID-1 boot pair provides only 960 GB decimal (about
+894 GiB) before OS consumption, so it cannot meet the scale-1 workload minimum.
+Provision the dedicated workload storage above in addition to the boot pair.
 
 **Client tools** on the install machine:
 `oc` (logged in via `oc login`), Mike Farah `yq` v4, `helm` (v3+), `curl`,
-`jq`, `base64`, `timeout`, `python3`, and `tar`. `aws` CLI is required when
-using ECR or AWS S3. `mc` is required for MinIO, SeaweedFS, and other
-S3-compatible model-marker verification.
+`jq`, `base64`, `timeout`, `python3`, and `tar`. `aws` CLI is required only for
+AWS S3 model storage (`storage.objectStore.type: aws`). `mc` is required for
+MinIO, SeaweedFS, and other S3-compatible model-marker verification.
+
+Automatic ECR pull-secret creation is a separate optional workflow. Enabling
+`ecr.enabled` or `imagePullSecrets.autoCreateECR` invokes
+`aws ecr get-login-password` and therefore also requires AWS CLI. Docker Hub,
+MinIO, an internal registry, or a pre-authenticated/mirrored registry does not.
+
+The client tools are interface requirements rather than exact pins. The
+following exact versions were used for this OpenShift validation:
+
+| Install-machine dependency | Validated version |
+|---|---|
+| OpenShift CLI (`oc`) | 4.22.0 client |
+| Helm | 3.18.4 |
+| Mike Farah `yq` | 4.48.1 |
+| `jq` | 1.7.1 |
+| `curl` | 8.7.1 |
+| GNU `timeout` | coreutils 9.7 |
+| Python | 3.14.2 |
+| `tar` | bsdtar 3.5.3 / libarchive 3.7.4 |
+| MinIO client (`mc`) | RELEASE.2025-08-13T08-35-41Z |
+| AWS CLI (conditional) | 2.28.12 |
+
+`base64` is also required, but the macOS system implementation used in this
+validation does not expose a separate version identifier.
+
+**Pinned and cluster-provided dependencies:**
+
+| Dependency | Installer contract | Exact live-cluster version |
+|---|---|---|
+| OpenShift | 4.21.x | 4.21.10 (Kubernetes 1.34.6) |
+| Node OS | RHCOS amd64 | RHCOS 9.6.20260407-0, kernel 5.14.0-570.106.1.el9_6.x86_64 |
+| NFD Operator | OLM `stable` channel for OpenShift 4.21 | 4.21.0-202608172306 |
+| NVIDIA GPU Operator | OLM `v26.3` channel | 26.3.3; driver 580.126.20 |
+| cert-manager | v1.13.0 | v1.13.0 |
+| local-path-provisioner | v0.0.26 | v0.0.26 |
+| KubeRay Operator chart/image | 1.2.2 | 1.2.2 |
+| OpenTelemetry Operator | chart 0.121.0 | chart 0.121.0; operator 0.157.0 |
+| Ray runtime | 2.56.0 | 2.56.0 |
+
+OLM resolves the exact NFD and GPU Operator patch/build from the pinned channel,
+so those two exact live values may advance while remaining on the qualified
+channel. Installer-downloaded manifests and Helm charts are fixed to the exact
+versions shown above.
 
 **External dependencies**
 - An image registry holding the platform images. Any registry works — AWS ECR,
@@ -275,7 +327,7 @@ storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
   minimumDiskSpace:
-    aiTierNode: 500
+    aiTierNode: 1024  # Scale-1 base in available GiB; multiplied by scaleFactor
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
@@ -287,15 +339,15 @@ storage:
 Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 `minio://` (minio **and** seaweedfs).
 
-`aiTierNode` is the minimum currently available GiB that the installer checks on
-the filesystem backing `/var/lib/containers`; it is not the total disk-size
-recommendation. OpenShift uses a shared AI-tier node pool, so the same free-space
-gate applies to every configured node. The hardware must still provide 1 TB+ of
-nominal disk and at least 800 GiB of usable filesystem capacity, as specified in
-the requirements above. This accounts for the 350 GiB scale-factor-1 Ray worker
-footprint, 160 GiB of configured local PVC capacity, container images, platform
-services, logs, image extraction, and operational headroom. Increase capacity
-further when using a higher scale factor.
+`aiTierNode` is the scale-factor-1 minimum available capacity, in GiB, checked on
+the filesystem backing `/var/lib/containers`. The installer multiplies it by
+`aiPlatform.scaleFactor`, so the reference setting enforces 1024 GiB at scale 1
+and 2048 GiB at scale 2. OpenShift uses a shared AI-tier node pool, so the same
+free-space gate applies to every configured node. The storage must also back, or
+provide equivalent capacity for, `/opt/local-path-provisioner`. These minima
+cover the Ray worker ephemeral-storage limits (350 GiB at scale 1 and 700 GiB at
+scale 2), local PVCs, container images, platform services, logs, image
+extraction, and upgrade headroom.
 
 ### `splunk`
 ```yaml
@@ -378,7 +430,7 @@ CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
 operators:
   ray:
     modelVersion: "v0.3.14-36-g1549f5a"   # model artifact version
-    rayVersion: "2.53.0"                   # Ray runtime version
+    rayVersion: "2.56.0"                   # Must match Ray in the head/worker images
 ```
 
 ### `files`
@@ -556,7 +608,8 @@ Two mechanisms exist:
 1. **ECR auto-secret** (`ecr.enabled: true`) — the installer runs
    `aws ecr get-login-password`, creates `ecr-registry-secret` in
    `splunk-ai-operator-system`, `ai-platform`, and `splunk-operator`, and
-   attaches it to the relevant service accounts.
+   attaches it to the relevant service accounts. This optional workflow
+   requires AWS CLI even when the object store is not AWS S3.
 2. **`imagePullSecrets.*` blocks** — for DockerHub, GCR, ACR, or a custom
    registry, enable the matching block; the installer creates the secret and
    attaches it to the `default` service account.
@@ -666,7 +719,8 @@ private endpoints.
    metadata profile required to verify pre-staged weights:
    - `manifests/cert-manager.yaml` (v1.13.0), `manifests/local-path-storage.yaml`
      (v0.0.26)
-   - `charts/kuberay-operator-1.2.2.tgz`, `charts/opentelemetry-operator-*.tgz`
+   - `charts/kuberay-operator-1.2.2.tgz`,
+     `charts/opentelemetry-operator-0.121.0.tgz`
    - `model-metadata/model_artifacts_configs_quantized.yaml`
    - `airgap-env.sh`, `container-images.txt`, `bundle-versions.txt`,
      `checksums.sha256`
