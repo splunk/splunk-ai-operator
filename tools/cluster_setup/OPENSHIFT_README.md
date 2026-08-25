@@ -24,7 +24,7 @@ Platform stack on top of it.
 7. [Architecture](#architecture)
 8. [OpenShift-Specific Behavior](#openshift-specific-behavior)
 9. [Image Pull Secrets (ECR)](#image-pull-secrets-ecr)
-10. [Accessing SAIA — the Splunk AI Assistant App](#accessing-saia--the-splunk-ai-assistant-app)
+10. [Accessing SAIA and SLIM](#accessing-saia-and-slim)
 11. [Air-Gapped Deployment](#air-gapped-deployment)
 12. [Model Staging](#model-staging)
 13. [Verification & Health Checks](#verification--health-checks)
@@ -71,8 +71,8 @@ Running `openshift_with_stack.sh install` creates the following, in order:
 | Splunk AI Operator | `splunk-ai-operator-system` | `artifacts.yaml` |
 | Splunk Operator | `splunk-operator` | `splunk-operator-cluster.yaml` |
 | Splunk Standalone CR | `ai-platform` | Splunk Operator |
-| AIPlatform CR (Ray, Weaviate, SAIA) | `ai-platform` | Splunk AI Operator |
-| SAIA Route | `ai-platform` | `oc create route` |
+| AIPlatform CR (Ray, Weaviate, SAIA, SLIM) | `ai-platform` | Splunk AI Operator |
+| SAIA and SLIM Routes | `ai-platform` | `oc apply` |
 
 The AI Platform workload namespace defaults to **`ai-platform`**.
 
@@ -82,22 +82,113 @@ The AI Platform workload namespace defaults to **`ai-platform`**.
 
 **Cluster**
 - A running **OpenShift Container Platform 4.21** cluster. The installer is
-  validated on OCP 4.21.
+  validated on OCP 4.21 and fails preflight on another minor version.
+- This installer is qualified on **RHCOS amd64** control-plane and compute
+  nodes. OpenShift itself requires RHCOS on the control plane and permits
+  supported RHEL compute nodes, but this AI/GPU deployment path has not been
+  validated on RHEL workers and therefore fails preflight for them. RHEL 9/10
+  and Ubuntu 24 may be used as the client/install workstation when the listed
+  GNU tools are installed (these client distributions are not currently covered
+  by repository CI). Ubuntu is not an OpenShift node operating system.
 - 3 control-plane nodes (etcd HA quorum).
 - `cluster-admin` privileges (required for SCC grants, OLM installs, and the
   `oc debug node/` SELinux relabel).
 
-**Reference hardware** (tested deployment):
+**Minimum shared AI-tier node sizing** (current single-worker topology):
 
-| Role | Sizing |
-|---|---|
-| CPU | 1 node, 32 cores / 128 Gi RAM |
-| GPU | 2 × RTX PRO 6000 Blackwell, 96 GB VRAM each |
+| `scaleFactor` | RAM requirement | Disk requirement | GPU memory | CPU |
+|---:|---:|---:|---:|---:|
+| `1` | 256 GiB | 1 TiB (1024 GiB) available | 2 × 96 GB VRAM | 64 allocatable vCPU |
+| `2` | 512 GiB | 2 TiB (2048 GiB) available | 4 × 96 GB VRAM | 128 allocatable vCPU |
+
+The disk values are **available usable capacity immediately before install** on
+the AI workload filesystem, not nominal drive labels. A drive sold as 1 TB
+contains only about 931 GiB before formatting and therefore does not satisfy the
+1024 GiB scale-1 minimum. Size the raw storage above the table value to allow
+for RAID, formatting, the host OS, and future operating headroom.
+
+CPU means Kubernetes-allocatable logical CPUs, after OpenShift node reservations.
+The scale-factor-1 platform can use approximately 47 vCPU at configured limits;
+64 vCPU leaves capacity for OpenShift system services and workload bursts. The
+scale-2 values are the corresponding capacity-planning minima when the current
+single-node workload is doubled.
+
+**Reference Cisco hardware configuration** (`scaleFactor: 1`):
+
+Shared AI-tier worker — 1 &times; Cisco UCS C845A M8 AI Server:
+
+- **Memory:** 8 &times; `CAI-MRX64G2RE5` — 512 GB installed
+- **CPU:** 2 &times; `CAI-CPU-A9375F` — 64 physical cores / 128 threads
+- **GPU:** 2 &times; `CAI-GPU-RTXP6000` — 192 GB total VRAM
+- **Boot storage:** 2 &times; `CAI-M2-960G` with 1 &times;
+  `CAI-M2-HWRAID`, configured as RAID 1 — 1.92 TB raw / 960 GB usable;
+  use this pair for boot, not to satisfy the AI workload disk requirement
+- **AI workload storage:** dedicated enterprise NVMe storage providing at least
+  1 TiB (1024 GiB) available to `/var/lib/containers` and
+  `/opt/local-path-provisioner` for scale 1, or 2 TiB (2048 GiB) for scale 2
+
+OpenShift control plane — 3 &times; dedicated Cisco UCS C225 M8 SFF
+servers, each configured with:
+
+- **Memory:** 8 &times; `UCS-MRX32G1RE3` — 256 GB installed
+- **CPU:** 1 &times; `UCS-CPU-A9224` — 24 physical cores / 48 threads
+  with SMT enabled
+- **Boot storage:** 2 &times; `UCS-M2-480G`, configured as RAID 1 —
+  960 GB raw / 480 GB usable
+
+The three control-plane servers are separate physical hosts and are not AI-tier
+worker nodes. The C845A RAID-1 boot pair provides only 960 GB decimal (about
+894 GiB) before OS consumption, so it cannot meet the scale-1 workload minimum.
+Provision the dedicated workload storage above in addition to the boot pair.
 
 **Client tools** on the install machine:
-`oc` (logged in via `oc login`), `yq`, `helm` (v3+), `curl`, `jq`, `base64`,
-`tar`. `aws` CLI is required when using ECR or an AWS S3 object store.
-`python3` / `mc` are optional (model staging helpers).
+`oc` (logged in via `oc login`), Mike Farah `yq` v4, `helm` (v3+), `curl`,
+`jq`, `base64`, `timeout`, `python3`, and `tar`. `aws` CLI is required only for
+AWS S3 model storage (`storage.objectStore.type: aws`). `mc` is required for
+MinIO, SeaweedFS, and other S3-compatible model-marker verification.
+
+Automatic ECR pull-secret creation is a separate optional workflow. Enabling
+`ecr.enabled` or `imagePullSecrets.autoCreateECR` invokes
+`aws ecr get-login-password` and therefore also requires AWS CLI. Docker Hub,
+MinIO, an internal registry, or a pre-authenticated/mirrored registry does not.
+
+The client tools are interface requirements rather than exact pins. The
+following exact versions were used for this OpenShift validation:
+
+| Install-machine dependency | Validated version |
+|---|---|
+| OpenShift CLI (`oc`) | 4.22.0 client |
+| Helm | 3.18.4 |
+| Mike Farah `yq` | 4.48.1 |
+| `jq` | 1.7.1 |
+| `curl` | 8.7.1 |
+| GNU `timeout` | coreutils 9.7 |
+| Python | 3.14.2 |
+| `tar` | bsdtar 3.5.3 / libarchive 3.7.4 |
+| MinIO client (`mc`) | RELEASE.2025-08-13T08-35-41Z |
+| AWS CLI (conditional) | 2.28.12 |
+
+`base64` is also required, but the macOS system implementation used in this
+validation does not expose a separate version identifier.
+
+**Pinned and cluster-provided dependencies:**
+
+| Dependency | Installer contract | Exact live-cluster version |
+|---|---|---|
+| OpenShift | 4.21.x | 4.21.10 (Kubernetes 1.34.6) |
+| Node OS | RHCOS amd64 | RHCOS 9.6.20260407-0, kernel 5.14.0-570.106.1.el9_6.x86_64 |
+| NFD Operator | OLM `stable` channel for OpenShift 4.21 | 4.21.0-202608172306 |
+| NVIDIA GPU Operator | OLM `v26.3` channel | 26.3.3; driver 580.126.20 |
+| cert-manager | v1.13.0 | v1.13.0 |
+| local-path-provisioner | v0.0.26 | v0.0.26 |
+| KubeRay Operator chart/image | 1.2.2 | 1.2.2 |
+| OpenTelemetry Operator | chart 0.121.0 | chart 0.121.0; operator 0.157.0 |
+| Ray runtime | 2.56.0 | 2.56.0 |
+
+OLM resolves the exact NFD and GPU Operator patch/build from the pinned channel,
+so those two exact live values may advance while remaining on the qualified
+channel. Installer-downloaded manifests and Helm charts are fixed to the exact
+versions shown above.
 
 **External dependencies**
 - An image registry holding the platform images. Any registry works — AWS ECR,
@@ -109,9 +200,9 @@ The AI Platform workload namespace defaults to **`ai-platform`**.
 - An S3-compatible object store for model artifacts (AWS S3, MinIO, or
   SeaweedFS). 
 
-> The Ray head/worker and SAIA images are **built internally** and are not on any
-> public registry. They must already exist in your registry (or be mirrored for
-> air-gap) before install.
+> The Ray head/worker, SAIA, and SLIM images are **built internally** and are not
+> on any public registry. They must already exist in your registry (or be
+> mirrored for air-gap) before install.
 
 ---
 
@@ -184,13 +275,22 @@ openshift:
     - 00-25-b5-b5-00-35
     - 00-25-b5-b5-00-37
     - cc-40-f3-9f-e2-3c
+  routes:
+    saia:
+      enabled: true           # host defaults to saia.<ingress-domain>
+    slim:
+      enabled: true           # host defaults to slim.<ingress-domain>
 ```
 - `grantPrivilegedSCC` — set `"false"` only if your cluster policy already grants
   the required SCCs. Required for GPU (`nvidia.com/gpu`) workloads.
 - `nodeLabelStrategy` — `manual` labels only the nodes you list; `auto` labels
   every `node-role.kubernetes.io/worker` node.
 - `ingressDomain` — optional; auto-detected from the default `IngressController`
-  if omitted. Used to build the SAIA Route host.
+  if omitted. Used to build both feature Route hosts.
+- `routes.<feature>.enabled` — controls external Route creation independently
+  for SAIA and SLIM. Both default to `true` when their feature is enabled.
+- `routes.<feature>.host` — optional full hostname override. When omitted, the
+  installer uses `<feature>.<ingress-domain>`.
 
 ### `images`
 ```yaml
@@ -226,6 +326,8 @@ is required only when `slim` is enabled under `aiPlatform.features`.
 storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
+  minimumDiskSpace:
+    aiTierNode: 1024  # Scale-1 base in available GiB; multiplied by scaleFactor
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
@@ -237,11 +339,15 @@ storage:
 Object storage path scheme by type: `s3://` (aws), `s3compat://`,
 `minio://` (minio **and** seaweedfs).
 
-> **`stage-artifacts` supports only `aws`, `minio`, and `seaweedfs`.** All four
-> types work at runtime, but the automated staging command has no uploader for
-> `s3compat` and will error out. If you use `s3compat`, **pre-stage the model
-> weights into the bucket manually** (see [Model Staging](#model-staging)) before
-> running `install` — the automated `stage-artifacts` step will not populate it.
+`aiTierNode` is the scale-factor-1 minimum available capacity, in GiB, checked on
+the filesystem backing `/var/lib/containers`. The installer multiplies it by
+`aiPlatform.scaleFactor`, so the reference setting enforces 1024 GiB at scale 1
+and 2048 GiB at scale 2. OpenShift uses a shared AI-tier node pool, so the same
+free-space gate applies to every configured node. The storage must also back, or
+provide equivalent capacity for, `/opt/local-path-provisioner`. These minima
+cover the Ray worker ephemeral-storage limits (350 GiB at scale 1 and 700 GiB at
+scale 2), local PVCs, container images, platform services, logs, image
+extraction, and upgrade headroom.
 
 ### `splunk`
 ```yaml
@@ -274,9 +380,7 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    type: NodePort
-    nodePort: 30080       # SAIA
-    slimNodePort: 30081   # SLIM; must differ from nodePort
+    type: ClusterIP
   features:
     - name: "saia"
       version: "1.1.0"
@@ -284,13 +388,18 @@ aiPlatform:
       version: "1.0.0"
 ```
 
-`serviceTemplate` is optional; omit it to keep feature services on `ClusterIP`.
-For `NodePort`, `nodePort` exposes SAIA and `slimNodePort` exposes SLIM. The
-AIPlatform API has one shared Kubernetes Service template, so the installer
-follows the k0s design: it renders the SAIA port into the AIPlatform CR, then
-patches SLIM's generated AIService to the distinct SLIM port. Do not reuse the
-same port for both services. The OpenShift Route remains the preferred SAIA
-endpoint when worker-node IPs are not externally routable.
+`serviceTemplate` is optional; omitted and explicit `ClusterIP` configurations
+both keep the backing feature Services internal. The OpenShift Routes provide
+stable external hostnames without exposing worker-node ports.
+
+On a reinstall, the installer also converts preserved feature-level NodePort
+overrides from an older deployment back to `ClusterIP` and recreates only the
+affected Service.
+
+`NodePort` remains an explicit fallback. When selected, set `nodePort` for SAIA
+and a different `slimNodePort` for SLIM; the installer patches SLIM's generated
+AIService to avoid the collision caused by the shared AIPlatform Service
+template. OpenShift deployments should normally retain `ClusterIP` and Routes.
 
 #### Scaling Deployment Capacity
 
@@ -321,7 +430,7 @@ CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
 operators:
   ray:
     modelVersion: "v0.3.14-36-g1549f5a"   # model artifact version
-    rayVersion: "2.53.0"                   # Ray runtime version
+    rayVersion: "2.56.0"                   # Must match Ray in the head/worker images
 ```
 
 ### `files`
@@ -357,15 +466,20 @@ non-ECR registries and use the `imagePullSecrets.*` blocks instead — see
 
 1. **Pre-config** — load & validate config, resolve images, resolve accelerator
    type, resolve model staging, print the install plan.
-2. **Model Staging** — stage weights to object storage (skipped in air-gap mode
-   or when disabled).
-3. **Preflight** — verify `oc whoami`, `cluster-admin`, and required tools.
+2. **Preflight** — verify tools, cluster-admin, OCP/RHCOS compatibility,
+   registry policy, storage capacity, object-store config, and disconnected
+   catalog/mirror prerequisites.
+3. **Model Staging/Verification** — stage weights when enabled; otherwise prove
+   every required pre-staged model marker exists. Air-gap is verification-only.
 4. **Infrastructure** — NFD Operator → GPU Operator → node labeling →
    local-path provisioner + SELinux relabel.
 5. **Operators** — cert-manager → OpenTelemetry Operator → KubeRay Operator →
    ECR/image pull secrets → Splunk AI Operator → Splunk Operator.
-6. **AI Platform Stack** — Splunk Standalone CR → AIPlatform CR → SAIA Route.
-7. **Summary** — prints access info, including the SAIA URL.
+6. **AI Platform Stack** — converge Splunk TLS/issuer/HEC → AIPlatform CR →
+   internal feature Services → SAIA Route → SLIM Route.
+7. **Readiness gate** — wait for pods, AIPlatform/AIService, RayCluster, and
+   RayService readiness before reporting success.
+8. **Summary** — prints the SAIA and full AITK/SLIM endpoint URLs.
 
 ---
 
@@ -377,21 +491,22 @@ flowchart TB
     subgraph CP["Control-plane nodes (x3)"]
       etcd["etcd HA quorum"]
     end
-    subgraph CPUW["CPU worker(s)"]
+    subgraph AIW["Shared AI-tier worker node"]
       RH["Ray head"]
       WV["Weaviate (vector DB)"]
       SAIA["SAIA API (v1/v2 + nginx)"]
+      SLIM["SLIM API"]
       SPL["Splunk Standalone"]
-    end
-    subgraph GPUW["GPU worker(s) — RTX PRO 6000 Blackwell"]
       RW["Ray workers (GPU)"]
     end
-    RT["OpenShift Route: saia.<ingress-domain>"]
+    SAIART["OpenShift Route: saia.<ingress-domain>"]
+    SLIMRT["OpenShift Route: slim.<ingress-domain>"]
   end
   OBJ[("Object store\nSeaweedFS / S3 / MinIO")]
   ECR[("Image registry\nAWS ECR")]
 
-  Client["Splunk AI Assistant App"] -->|HTTP| RT --> SAIA
+  Client["Splunk AI Assistant App"] -->|HTTP| SAIART --> SAIA
+  AITK["Splunk AI Toolkit"] -->|HTTP| SLIMRT --> SLIM
   SAIA --> RH --> RW
   SAIA --> WV
   SAIA -->|HEC| SPL
@@ -399,11 +514,13 @@ flowchart TB
   OCP -.pull images.-> ECR
 ```
 
-- **Ray (KubeRay)** runs the model-serving cluster: a head pod on a CPU node and
-  GPU worker pods pinned to GPU nodes by their `nvidia.com/gpu` resource request.
+- **Ray (KubeRay)** runs the model-serving cluster: the head and GPU worker pods
+  share the AI-tier node, with GPU workers additionally requesting
+  `nvidia.com/gpu`.
 - **Weaviate** is the vector database (CPU workload); a `vector-db-setup` job
   populates it after install.
-- **SAIA** is the RAG API fronted by nginx and exposed via the Route.
+- **SAIA** is the RAG API fronted by nginx and exposed through the `saia` Route.
+- **SLIM** provides AITK model discovery and inference through the `slim` Route.
 - **Splunk Standalone** is deployed by the Splunk Operator; SAIA sends data to it
   over HEC at
   `http://splunk-<standalone-name>-standalone-service.<ns>.svc.cluster.local:8088`.
@@ -448,12 +565,18 @@ oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-ope
 oc adm policy remove-scc-from-group privileged system:serviceaccounts:local-path-storage
 ```
 
-### OpenShift Route (external access)
-SAIA is exposed via an OpenShift **Route** named `saia`, host
-`saia.<ingress-domain>`, backing service
-`<aiPlatform.name>-saia-saia-service` on `targetPort: 8080`. The Route carries a
-`600s` HAProxy timeout and disabled response buffering (for streaming). It is
-created immediately and returns `503` until the SAIA backend endpoints are ready.
+### OpenShift Routes (external access)
+SAIA and SLIM have independent OpenShift Routes:
+
+| Route | Default host | Backing Service |
+|---|---|---|
+| `saia` | `saia.<ingress-domain>` | `<aiPlatform.name>-saia-saia-service:8080` |
+| `slim` | `slim.<ingress-domain>` | `<aiPlatform.name>-slim-slim-service:8080` |
+
+Both Routes carry a `600s` HAProxy timeout and disabled response buffering for
+long-running and streaming inference. They are created immediately and return
+`503` until their operator-managed backend endpoints are ready. Set
+`openshift.routes.<feature>.enabled: false` to keep a feature internal-only.
 
 ### OLM operators (NFD + GPU Operator)
 NFD and the NVIDIA GPU Operator are installed as **OLM Subscriptions**, not Helm:
@@ -485,7 +608,8 @@ Two mechanisms exist:
 1. **ECR auto-secret** (`ecr.enabled: true`) — the installer runs
    `aws ecr get-login-password`, creates `ecr-registry-secret` in
    `splunk-ai-operator-system`, `ai-platform`, and `splunk-operator`, and
-   attaches it to the relevant service accounts.
+   attaches it to the relevant service accounts. This optional workflow
+   requires AWS CLI even when the object store is not AWS S3.
 2. **`imagePullSecrets.*` blocks** — for DockerHub, GCR, ACR, or a custom
    registry, enable the matching block; the installer creates the secret and
    attaches it to the `default` service account.
@@ -542,23 +666,34 @@ matches the images being pulled.
 
 ---
 
-## Accessing SAIA — the Splunk AI Assistant App
+## Accessing SAIA and SLIM
 
-After install, the script prints the SAIA URL:
-`http://saia.<ingress-domain>`.
+After install, the script prints both external URLs:
+
+```text
+SAIA: http://saia.<ingress-domain>
+SLIM: http://slim.<ingress-domain>/tenant/slim-api/v1alpha1
+```
 
 In the reference deployment this resolves to
 **`http://saia.apps.splunk-ai.rtplab.splunk.com`**, which the OpenShift Route
 forwards to the internal `openshift-ai-platform-saia-saia-service:8080`.
 
-Use this URL when configuring the **Splunk AI Assistant** app in Splunk. The
-SAIA services themselves (`saia-service`, `saia-v1`, `saia-v2`, `serve-svc`,
-`head-svc`, `weaviate`) are `ClusterIP` and are not directly reachable from
-outside the cluster — the Route is the single external entry point.
+Use the SAIA URL when configuring the **Splunk AI Assistant** app. Use the full
+SLIM URL, including `/tenant/slim-api/v1alpha1`, as the AI-tier endpoint in
+**Splunk AI Toolkit (AITK)**. The backing Services remain `ClusterIP`; the
+Routes are their external entry points.
+
+When bundled Splunk runs in the same cluster, AITK can avoid external ingress
+and use the internal endpoint instead:
+
+```text
+http://<aiPlatform.name>-slim-slim-service.<namespace>.svc.cluster.local:8080/tenant/slim-api/v1alpha1
+```
 
 To find the URL later:
 ```bash
-oc get route saia -n ai-platform -o jsonpath='{.spec.host}{"\n"}'
+oc get route saia slim -n ai-platform
 ```
 
 ---
@@ -567,14 +702,26 @@ oc get route saia -n ai-platform -o jsonpath='{.spec.host}{"\n"}'
 
 Air-gap uses two scripts plus a separate image-mirroring step:
 
+An air-gapped install host does not require public internet after all content is
+transferred or mirrored, but it is not isolated from the deployment network. It
+must reach the OpenShift API, the object store used for model-marker checks, and
+any cloud or registry API used for credential setup. OpenShift nodes must reach
+the private registry/catalog mirrors, object store, and other configured runtime
+services. If any of these are public AWS S3, ECR, or other external endpoints,
+provide outbound access through an approved proxy or use the corresponding
+private endpoints.
+
 1. **On an internet-connected machine**, build the bundle:
    ```bash
    ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer
    ```
-   The bundle contains **only** Helm charts and static manifests:
+   The bundle contains Helm charts, static manifests, and the small model
+   metadata profile required to verify pre-staged weights:
    - `manifests/cert-manager.yaml` (v1.13.0), `manifests/local-path-storage.yaml`
      (v0.0.26)
-   - `charts/kuberay-operator-1.2.2.tgz`, `charts/opentelemetry-operator-*.tgz`
+   - `charts/kuberay-operator-1.2.2.tgz`,
+     `charts/opentelemetry-operator-0.121.0.tgz`
+   - `model-metadata/model_artifacts_configs_quantized.yaml`
    - `airgap-env.sh`, `container-images.txt`, `bundle-versions.txt`,
      `checksums.sha256`
 
@@ -600,7 +747,11 @@ Air-gap uses two scripts plus a separate image-mirroring step:
 
 3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
    (`certified-operators`) via `oc mirror`, and apply the generated
-   `ImageContentSourcePolicy` + `CatalogSource`.
+   `ImageDigestMirrorSet`/`ImageTagMirrorSet` (or legacy
+   `ImageContentSourcePolicy`) plus `CatalogSource`. Mirror the complete package
+   closure, including every GPU Operator related image, and preserve the
+   matching OpenShift 4.21 release/Driver Toolkit images in the disconnected
+   registry.
 
 4. **Stage model weights** separately (~60 GB) via
    `tools/artifacts_download_upload_scripts/`.
@@ -617,10 +768,18 @@ Air-gap uses two scripts plus a separate image-mirroring step:
    `openshift_with_stack.sh install`.
 
 **Not bundled** (and why): container images (`oc mirror`), NFD/GPU Operator (OLM
-catalog mirror), the k0s binary/yq (OpenShift is a pre-existing cluster), MetalLB
-(OpenShift uses Routes), kube-prometheus-stack (OpenShift ships its own
-monitoring), the NVIDIA device-plugin manifest and GPU host OS packages (the GPU
-Operator manages the driver lifecycle), and model weights (staged separately).
+catalog mirror), NVIDIA driver/operand containers and the OpenShift Driver
+Toolkit image (the disconnected mirror must provide them), the k0s binary/yq
+(OpenShift is a pre-existing cluster), MetalLB (OpenShift uses Routes),
+kube-prometheus-stack (OpenShift ships its own monitoring), and model weights
+(staged separately). Unlike the k0s air-gap workflow, this bundle does **not**
+download NVIDIA RPM/DEB driver packages. The GPU Operator builds/loads the node
+driver from mirrored container content, and the installer proves success by
+waiting for allocatable `nvidia.com/gpu` capacity.
+
+Follow NVIDIA's [disconnected GPU Operator guide](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/mirror-gpu-ocp-disconnected.html)
+and Red Hat's [OpenShift 4.21 disconnected-environment guide](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/disconnected_environments/index)
+to create and transfer that mirror content before running the offline installer.
 
 ---
 
@@ -682,7 +841,7 @@ A healthy reference deployment shows:
 - Ray head pod `3/3`, GPU worker pods `2/2`, SAIA deployment + nginx + v2 +
   worker Running, `weaviate-0` `1/1`, `splunk-standalone-0` `1/1`, and the
   `vector-db-setup` post-hook job `Completed`.
-- Route `saia` resolving to your ingress domain.
+- Routes `saia` and `slim` resolving to your ingress domain.
 
 If `verify` finds unhealthy pods it automatically runs `diagnose` (unless
 `AUTO_DIAGNOSE=false`), producing a support bundle.
@@ -709,11 +868,9 @@ your AIPlatform CR uses a different `name`, substitute the matching
 
 **Weaviate or Splunk Standalone stuck `Pending`**
 Usually a PV node-affinity mismatch. The `local-path` provisioner pins a PV to
-the first node it lands on; if that is a GPU node, a CPU-only workload whose
-scheduler selector cannot reach it will stay Pending. Prefer letting the PVC
-reprovision on a CPU node (delete the PVC and pod so the operator recreates
-them) rather than relabeling the GPU node — overwriting a GPU node's
-`splunk.ai/workload-type` would break GPU scheduling.
+the node where it was provisioned. If `openshift.nodes` is later changed, a
+replacement pod might not be able to reach that node. Keep the original node in
+the AI-tier pool or deliberately reprovision/migrate the PVC onto a listed node.
 
 **Do not patch operator-owned resources directly**
 The Weaviate StatefulSet and other stack resources are owned by the AIPlatform

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # install_from_airgap_bundle_openshift.sh
-# Run on the air-gapped OpenShift install machine (needs oc + helm pre-installed,
-# but NO outbound internet). Extracts the bundle produced by
+# Run on the disconnected OpenShift install machine. Public internet is not
+# required when every dependency has been transferred or mirrored, but the
+# machine must still reach the OpenShift API and the configured private
+# registry, catalog mirrors, and object store. Extracts the bundle produced by
 # prepare_airgap_bundle_openshift.sh, sets environment-variable overrides, then
 # invokes openshift_with_stack.sh.
 #
@@ -32,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<'HELP'
 install_from_airgap_bundle_openshift.sh — extract an OpenShift air-gap bundle
-and run the Splunk AI Platform installer with no outbound internet required.
+and run the Splunk AI Platform installer without relying on public internet.
 
 USAGE
   ./install_from_airgap_bundle_openshift.sh --bundle BUNDLE.tar.gz [OPTIONS]
@@ -66,23 +68,46 @@ WHAT THIS SCRIPT DOES
 
      CERT_MANAGER_MANIFEST_URL   → file://<bundle>/manifests/cert-manager.yaml
      LOCAL_PATH_MANIFEST_URL     → file://<bundle>/manifests/local-path-storage.yaml
-     OTEL_CHART_PATH             → <bundle>/charts/opentelemetry-operator-*.tgz
+     OTEL_CHART_PATH             → <bundle>/charts/opentelemetry-operator-0.121.0.tgz
      KUBERAY_CHART_PATH          → <bundle>/charts/kuberay-operator-*.tgz
+     MODEL_ARTIFACTS_CONFIG_DIR  → <bundle>/model-metadata
      AIRGAP_MODE                 → true
 
   4. Invokes openshift_with_stack.sh <subcommand>.
 
 PREREQUISITES
-  On this machine (no internet needed):
+  Tools on the install machine:
     oc      — logged in to the target OpenShift cluster (oc login ... done)
     helm    — v3+
-    tar
+    yq v4, jq, curl, timeout, python3, tar
+    mc      — MinIO client for MinIO/SeaweedFS/S3-compatible model-marker checks
+    aws     — AWS CLI only when storage.objectStore.type=aws
+
+  Required network access from the install machine:
+    - The target OpenShift API.
+    - The configured object store used by installer-side model-marker checks.
+    - Any registry or cloud API used directly for credential setup. Automatic
+      ECR secret creation (ecr.enabled=true) separately requires AWS CLI and
+      access to the AWS ECR API; mirrored/pre-authenticated registries do not.
+
+  Required network access from the OpenShift nodes:
+    - Internal registry mirrors and mirrored OLM catalog sources.
+    - The configured object store and any other runtime service endpoints.
+
+  Public internet is not required only when every installation artifact,
+  container image, OLM catalog/operator operand, NVIDIA driver/Driver Toolkit
+  image, and model artifact has already been transferred or mirrored. Public
+  AWS S3/ECR or other external endpoints require outbound connectivity, a
+  proxy, or corresponding private endpoints.
 
   Before running this script:
     - Mirror container images to your internal registry and update images.*
       in your cluster config.
     - For NFD / GPU Operator: apply the oc mirror ImageContentSourcePolicy and
-      CatalogSource so OLM can pull from your mirrored catalog.
+      CatalogSource so OLM can pull the complete mirrored package closure.
+      This bundle does not contain NVIDIA drivers: the GPU Operator related
+      images and matching OpenShift release/Driver Toolkit image must already
+      be available through the cluster mirror configuration.
     - Stage model weights via tools/artifacts_download_upload_scripts/.
 
 MANUAL USE (advanced)
@@ -206,6 +231,9 @@ export LOCAL_PATH_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/local-path-storag
 # Helm chart paths — installer uses these instead of remote repos
 export OTEL_CHART_PATH="${OTEL_TGZ}"
 export KUBERAY_CHART_PATH="${KUBERAY_TGZ}"
+export MODEL_ARTIFACTS_CONFIG_DIR="${BUNDLE_DIR}/model-metadata"
+[[ -f "${MODEL_ARTIFACTS_CONFIG_DIR}/model_artifacts_configs_quantized.yaml" ]] \
+  || err "Bundled model metadata is missing from ${MODEL_ARTIFACTS_CONFIG_DIR}"
 
 # Signal air-gapped mode (skips model staging, enforces offline paths)
 export AIRGAP_MODE="true"
@@ -216,6 +244,7 @@ log "  CERT_MANAGER_MANIFEST_URL = ${CERT_MANAGER_MANIFEST_URL}"
 log "  LOCAL_PATH_MANIFEST_URL   = ${LOCAL_PATH_MANIFEST_URL}"
 log "  OTEL_CHART_PATH           = ${OTEL_CHART_PATH}"
 log "  KUBERAY_CHART_PATH        = ${KUBERAY_CHART_PATH}"
+log "  MODEL_ARTIFACTS_CONFIG_DIR= ${MODEL_ARTIFACTS_CONFIG_DIR}"
 log "  AIRGAP_MODE               = ${AIRGAP_MODE}"
 log ""
 log "Launching installer..."

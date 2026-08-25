@@ -9,6 +9,10 @@ kubernetes:
 
 # OpenShift-specific settings
 openshift:
+  # This installer pins the NFD operand and GPU Operator channel for OpenShift
+  # 4.21 and fails preflight on a different cluster minor.
+  requiredVersion: "4.21"
+
   # Grant privileged SCC to Ray worker and operator service accounts.
   # Required when running GPU workloads (nvidia.com/gpu requests).
   # Set to "false" only if your cluster policy already covers this.
@@ -25,9 +29,17 @@ openshift:
   # run on — CPU workloads (weaviate, ray-head, saia-api) and GPU workloads
   # (ray-worker) both schedule here.
   nodes:
-    - 00-25-b5-b5-00-35
-    - 00-25-b5-b5-00-37
     - cc-40-f3-9f-e2-3c
+
+  # OpenShift-native external exposure. Hosts default to
+  # <feature>.<default-ingress-domain>; set host explicitly to override.
+  routes:
+    saia:
+      enabled: true
+      # host: "saia.apps.example.com"
+    slim:
+      enabled: true
+      # host: "slim.apps.example.com"
 
 images:
   # Registry prefix applied to images that are not fully qualified
@@ -67,6 +79,16 @@ images:
 storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
+  minimumDiskSpace:
+    # Scale-factor-1 minimum available GiB on the shared AI-tier node filesystem
+    # backing /var/lib/containers and /opt/local-path-provisioner. The installer
+    # multiplies this value by aiPlatform.scaleFactor: 1024 GiB at scale 1 and
+    # 2048 GiB at scale 2.
+    aiTierNode: 1024
+  modelStaging:
+    # false means models were staged separately; the installer still validates
+    # every staging_state completion marker before touching the cluster.
+    enabled: false
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
@@ -91,12 +113,9 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    type: NodePort          # ClusterIP | NodePort | LoadBalancer (omit block = ClusterIP)
-    nodePort: 30080         # Fixed NodePort for the SAIA public service.
-    # AIPlatform.serviceTemplate is initially inherited by every feature. The
-    # installer patches SLIM's AIService to this distinct port to avoid a
-    # collision with SAIA.
-    slimNodePort: 30081
+    # Routes above provide stable external access. Keep the backing feature
+    # Services internal unless NodePort or LoadBalancer is explicitly required.
+    type: ClusterIP         # ClusterIP | NodePort | LoadBalancer
   features:
     - name: "saia"
       version: "1.1.0"
@@ -109,9 +128,16 @@ aiPlatform:
         effect: "NoSchedule"
 
 operators:
+  # In a disconnected cluster these names must identify READY CatalogSources
+  # backed by mirrored catalog images in openshift-marketplace. The OpenShift
+  # air-gap bundle does not itself mirror GPU drivers or operator operands.
+  nfd:
+    catalogSource: "redhat-operators"
+  gpu:
+    catalogSource: "certified-operators"
   ray:
     modelVersion: "v0.3.14-36-g1549f5a"
-    rayVersion: "2.53.0"
+    rayVersion: "2.56.0"
 
 files:
   aiPlatform: "./artifacts.yaml"

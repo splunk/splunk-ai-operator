@@ -24,6 +24,18 @@ trap cleanup_tmp EXIT
 export PAGER=cat
 export LANG=C LC_ALL=C
 
+# These values are part of the installer's qualified platform contract. A
+# customer config may assert the same OpenShift minor, but it must not redefine
+# the version that the pinned operands and Operator channels support.
+readonly QUALIFIED_OPENSHIFT_MINOR="4.21"
+readonly NFD_OPERATOR_CHANNEL="stable"
+readonly GPU_OPERATOR_CHANNEL="v26.3"
+readonly CERT_MANAGER_VERSION="v1.13.0"
+readonly LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
+readonly OTEL_OPERATOR_CHART_VERSION="0.121.0"
+readonly KUBERAY_OPERATOR_VERSION="1.2.2"
+readonly QUALIFIED_RAY_RUNTIME_VERSION="2.56.0"
+
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/openshift-cluster-config.yaml}"
 
@@ -285,13 +297,13 @@ show_install_plan() {
   echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
   echo "" >&2
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
-  echo -e "    0.  Model artifact staging (HuggingFace → object store)" >&2
-  if [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
-    echo -e "        [SKIPPED — modelStaging.enabled=false]" >&2
-  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    echo -e "        [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
+  echo -e "    0.  Preflight checks (cluster, tools, registry, storage, air-gap closure)" >&2
+  echo -e "    1.  Model artifact staging/verification" >&2
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo -e "        [VERIFY ONLY — every model must already be pre-staged]" >&2
+  elif [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
+    echo -e "        [VERIFY ONLY — modelStaging.enabled=false]" >&2
   fi
-  echo -e "    1.  Preflight checks (oc login, tools, manifest files)" >&2
   echo -e "    2.  NFD Operator (OLM)" >&2
   echo -e "    3.  NVIDIA GPU Operator (OLM)" >&2
   echo -e "    4.  Node labeling (splunk.ai/ai-tier-node)" >&2
@@ -355,7 +367,7 @@ ${yq_err}"
   OTEL_COLLECTOR_IMAGE=$(yq eval '.images.otelCollector.image // "otel/opentelemetry-collector-contrib:0.122.1"' "${CONFIG_FILE}" 2>/dev/null || echo "otel/opentelemetry-collector-contrib:0.122.1")
   NGINX_IMAGE=$(yq eval '.images.nginx.image // "docker.io/library/nginx:1.27-alpine"' "${CONFIG_FILE}" 2>/dev/null || echo "docker.io/library/nginx:1.27-alpine")
   MODEL_VERSION=$(yq eval '.operators.ray.modelVersion // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  RAY_RUNTIME_VERSION=$(yq eval '.operators.ray.rayVersion // "2.44.0"' "${CONFIG_FILE}" 2>/dev/null || echo "2.44.0")
+  RAY_RUNTIME_VERSION=$(yq eval ".operators.ray.rayVersion // \"${QUALIFIED_RAY_RUNTIME_VERSION}\"" "${CONFIG_FILE}" 2>/dev/null || echo "${QUALIFIED_RAY_RUNTIME_VERSION}")
   local _config_dir
   _config_dir="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)"
   _resolve_manifest() {
@@ -372,6 +384,13 @@ ${yq_err}"
   GRANT_PRIVILEGED_SCC=$(yq eval '.openshift.grantPrivilegedSCC // "true"' "${CONFIG_FILE}" 2>/dev/null || echo "true")
 
   NODE_LABEL_STRATEGY=$(yq eval '.openshift.nodeLabelStrategy // "auto"' "${CONFIG_FILE}" 2>/dev/null || echo "auto")
+  local configured_openshift_minor
+  configured_openshift_minor=$(yq eval '.openshift.requiredVersion // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${configured_openshift_minor}" && "${configured_openshift_minor}" != "null" &&
+        "${configured_openshift_minor}" != "${QUALIFIED_OPENSHIFT_MINOR}" ]]; then
+    err "openshift.requiredVersion cannot override the installer qualification. This build supports OpenShift ${QUALIFIED_OPENSHIFT_MINOR}, but ${configured_openshift_minor} was configured."
+  fi
+  REQUIRED_OPENSHIFT_MINOR="${QUALIFIED_OPENSHIFT_MINOR}"
 
   ECR_ENABLED=$(yq eval '.ecr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   ECR_ACCOUNT=$(yq eval '.ecr.account // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -386,6 +405,12 @@ ${yq_err}"
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   STORAGE_CLASS=$(yq eval '.storage.storageClass // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   VECTORDB_SIZE=$(yq eval '.storage.vectorDbSize // "50Gi"' "${CONFIG_FILE}" 2>/dev/null || echo "50Gi")
+  # OpenShift uses one shared AI-tier node pool for CPU and GPU workloads. This
+  # is the scale-factor-1 usable-capacity floor; the node-storage preflight
+  # multiplies it by aiPlatform.scaleFactor.
+  MIN_DISK_AI_TIER_NODE=$(yq eval '.storage.minimumDiskSpace.aiTierNode // 1024' "${CONFIG_FILE}" 2>/dev/null || echo "1024")
+  MIN_DISK_AI_TIER_NODE="${MIN_DISK_AI_TIER_NODE//[!0-9]/}"
+  [[ -n "${MIN_DISK_AI_TIER_NODE}" ]] || MIN_DISK_AI_TIER_NODE=1024
   OBJ_STORE_TYPE=$(yq eval '.storage.objectStore.type // "minio"' "${CONFIG_FILE}" 2>/dev/null || echo "minio")
   OBJ_STORE_BUCKET=$(yq eval '.storage.objectStore.bucket // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   OBJ_STORE_BUCKET="$(printf '%s' "${OBJ_STORE_BUCKET}" | tr '[:upper:]' '[:lower:]')"
@@ -408,7 +433,9 @@ ${yq_err}"
 
   # Model staging
   MODEL_STAGING_ENABLED="$(yq eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
-  [[ "${MODEL_STAGING_ENABLED}" == "null" || -z "${MODEL_STAGING_ENABLED}" ]] && MODEL_STAGING_ENABLED="false"
+  # Keep an omitted value unset so an interactive install can ask. Silent
+  # installs still resolve the omission to false in resolve_model_staging().
+  [[ "${MODEL_STAGING_ENABLED}" == "null" ]] && MODEL_STAGING_ENABLED=""
 
   # ImagePullSecrets configuration
   IMAGE_PULL_SECRETS_ECR_ENABLED=$(yq eval '.imagePullSecrets.autoCreateECR // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
@@ -421,8 +448,7 @@ ${yq_err}"
   GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "certified-operators")
 
   # Ingress domain: read from config if set, otherwise auto-detect from the cluster.
-  # Used to create an OpenShift Route for SAIA so both browsers and in-cluster services
-  # can reach it via a stable hostname.
+  # Used to create stable OpenShift Routes for the enabled SAIA and SLIM APIs.
   local cfg_ingress_domain
   cfg_ingress_domain=$(yq eval '.openshift.ingressDomain // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   if [[ -n "$cfg_ingress_domain" ]]; then
@@ -504,16 +530,26 @@ validate_scale_factor_config() {
   return 0
 }
 
-# True when the optional SLIM service is requested in aiPlatform.features[].
-# Keep image validation feature-gated so existing SAIA-only configurations do
-# not need to define an image for a workload they never deploy.
-openshift_slim_feature_enabled() {
-  local names
+required_ai_tier_disk_gib() {
+  local scale_one_minimum_gib="${1:-1024}"
+  local scale_factor="${2:-1}"
+  printf '%s\n' "$((scale_one_minimum_gib * scale_factor))"
+}
+
+# True when a named service is requested in aiPlatform.features[].
+openshift_feature_enabled() {
+  local requested_feature="$1" names
   names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   while IFS= read -r name; do
-    [[ "${name}" == "slim" ]] && return 0
+    [[ "${name}" == "${requested_feature}" ]] && return 0
   done <<< "${names}"
   return 1
+}
+
+# Keep SLIM image validation feature-gated so existing SAIA-only configurations
+# do not need to define an image for a workload they never deploy.
+openshift_slim_feature_enabled() {
+  openshift_feature_enabled slim
 }
 
 warn_on_mutable_image_tags() {
@@ -716,10 +752,309 @@ configure_images() {
 }
 
 # ====== PREFLIGHT HELPER PRINTERS ======
+PREFLIGHT_FAILURES=0
+PREFLIGHT_WARNINGS=0
 pf_header() { echo -e "\n\033[1;34m  ── $* ──\033[0m" >&2; }
 pf_ok()     { echo -e "  \033[1;32m✔\033[0m $*" >&2; }
-pf_warn()   { echo -e "  \033[1;33m⚠\033[0m $*" >&2; }
-pf_fail()   { echo -e "  \033[1;31m✖\033[0m $*" >&2; PREFLIGHT_FAILURES=$(( ${PREFLIGHT_FAILURES:-0} + 1 )); }
+pf_warn()   { echo -e "  \033[1;33m⚠\033[0m $*" >&2; PREFLIGHT_WARNINGS=$((PREFLIGHT_WARNINGS + 1)); }
+pf_fail()   { echo -e "  \033[1;31m✖\033[0m $*" >&2; PREFLIGHT_FAILURES=$((PREFLIGHT_FAILURES + 1)); }
+pf_summary() {
+  echo -e "\n\033[1;34m  ── Preflight summary ──\033[0m" >&2
+  echo -e "  ${PREFLIGHT_FAILURES} error(s), ${PREFLIGHT_WARNINGS} warning(s)" >&2
+  (( PREFLIGHT_FAILURES == 0 )) || err "Preflight failed; fix the errors above and rerun the installer."
+}
+
+# Validate the cluster contract that the manifests and operator channels in this
+# installer were qualified against. This is intentionally a minor-version check:
+# the NFD operand and OLM channels below are pinned for one OpenShift minor.
+preflight_check_openshift_compatibility() {
+  pf_header "OpenShift compatibility"
+
+  local cluster_version cluster_minor
+  cluster_version=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || true)
+  if [[ -z "${cluster_version}" ]]; then
+    pf_fail "Cannot read ClusterVersion/version; confirm the cluster is OpenShift and the current identity can read cluster-scoped resources."
+    return
+  fi
+  cluster_minor=$(printf '%s' "${cluster_version}" | awk -F. '{print $1"."$2}')
+  if [[ "${cluster_minor}" != "${REQUIRED_OPENSHIFT_MINOR}" ]]; then
+    pf_fail "OpenShift ${cluster_version} is not supported by this installer; required minor is ${REQUIRED_OPENSHIFT_MINOR} (the NFD operand and GPU Operator channel are pinned for it)."
+  else
+    pf_ok "OpenShift version ${cluster_version} matches required ${REQUIRED_OPENSHIFT_MINOR}"
+  fi
+
+  local nodes_json incompatible_nodes worker_count
+  nodes_json=$(oc get nodes -o json 2>/dev/null || true)
+  if ! printf '%s\n' "${nodes_json}" | jq -e '.items | type == "array"' >/dev/null 2>&1; then
+    pf_fail "Cannot read OpenShift node inventory."
+    return
+  fi
+
+  incompatible_nodes=$(printf '%s\n' "${nodes_json}" | jq -r '
+    .items[]
+    | select((.status.nodeInfo.osImage // "") | test("Red Hat Enterprise Linux CoreOS") | not)
+    | "\(.metadata.name) (\(.status.nodeInfo.osImage // "unknown OS"))"')
+  if [[ -n "${incompatible_nodes}" ]]; then
+    pf_fail "This AI Platform installer is qualified only for RHCOS compute/control-plane nodes on OpenShift ${REQUIRED_OPENSHIFT_MINOR}; unqualified node OS detected: $(echo "${incompatible_nodes}" | tr '\n' '; ' | sed 's/; $//'). OpenShift itself permits supported RHEL compute nodes, but this GPU deployment path has not been validated on them."
+  else
+    pf_ok "All cluster nodes report Red Hat Enterprise Linux CoreOS"
+  fi
+
+  incompatible_nodes=$(printf '%s\n' "${nodes_json}" | jq -r '
+    .items[] | select((.status.nodeInfo.architecture // "") != "amd64")
+    | "\(.metadata.name) (\(.status.nodeInfo.architecture // "unknown"))"')
+  if [[ -n "${incompatible_nodes}" ]]; then
+    pf_fail "RTX Pro 6000 deployment currently supports amd64 nodes only: $(echo "${incompatible_nodes}" | tr '\n' '; ' | sed 's/; $//')"
+  else
+    pf_ok "All cluster nodes use amd64 architecture"
+  fi
+
+  worker_count=$(printf '%s\n' "${nodes_json}" | jq '[.items[] | select(.metadata.labels["node-role.kubernetes.io/worker"] != null)] | length')
+  (( worker_count > 0 )) && pf_ok "Worker nodes available: ${worker_count}" || pf_fail "No OpenShift worker nodes found"
+
+  if [[ "${NODE_LABEL_STRATEGY}" == "manual" ]]; then
+    local configured_node
+    while IFS= read -r configured_node; do
+      [[ -z "${configured_node}" || "${configured_node}" == "null" ]] && continue
+      if printf '%s\n' "${nodes_json}" | jq -e --arg n "${configured_node}" '.items[] | select(.metadata.name == $n)' >/dev/null; then
+        pf_ok "Configured AI-tier node exists: ${configured_node}"
+      else
+        pf_fail "Configured openshift.nodes entry does not exist: ${configured_node}"
+      fi
+    done < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null || true)
+  fi
+}
+
+preflight_check_storage() {
+  pf_header "Storage"
+  if [[ -n "${STORAGE_CLASS}" && "${STORAGE_CLASS}" != "null" ]]; then
+    if oc get storageclass "${STORAGE_CLASS}" &>/dev/null; then
+      pf_ok "StorageClass exists: ${STORAGE_CLASS}"
+    elif [[ "${STORAGE_CLASS}" == "local-path" ]]; then
+      pf_ok "StorageClass local-path will be installed"
+    else
+      pf_fail "Configured StorageClass '${STORAGE_CLASS}' does not exist; this installer can create only 'local-path'."
+    fi
+  elif oc get storageclass -o json 2>/dev/null | jq -e '.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true")' >/dev/null; then
+    pf_ok "A default StorageClass is configured"
+  else
+    pf_ok "No default StorageClass found; local-path will be installed"
+  fi
+}
+
+preflight_check_node_storage() {
+  pf_header "AI-tier node container storage"
+  local nodes=() node output snapshot avail_kb avail_gib required_gib
+  required_gib=$(required_ai_tier_disk_gib "${MIN_DISK_AI_TIER_NODE}" "${AI_SCALE_FACTOR}")
+  if [[ "${NODE_LABEL_STRATEGY}" == "manual" ]]; then
+    while IFS= read -r node; do [[ -n "${node}" && "${node}" != "null" ]] && nodes+=("${node}"); done \
+      < <(yq eval '.openshift.nodes[]' "${CONFIG_FILE}" 2>/dev/null || true)
+  else
+    while IFS= read -r node; do [[ -n "${node}" ]] && nodes+=("${node#node/}"); done \
+      < <(oc get nodes -l node-role.kubernetes.io/worker -o name 2>/dev/null || true)
+  fi
+
+  for node in "${nodes[@]:+${nodes[@]}}"; do
+    output=$(timeout 60 oc debug "node/${node}" --quiet --request-timeout=60s -- \
+      chroot /host sh -c '
+        path=/var/lib/containers
+        [ -d "$path" ] || path=/
+        avail_kb=$(df -Pk "$path" 2>/dev/null | awk "NR==2 {print \$4}")
+        printf "SPLUNK_AI_STORAGE %s\n" "${avail_kb:-}"
+      ' 2>/dev/null || true)
+    snapshot=$(printf '%s\n' "${output}" | awk '$1 == "SPLUNK_AI_STORAGE" {line=$0} END {print line}')
+    read -r _marker avail_kb <<< "${snapshot}"
+    if [[ -z "${avail_kb:-}" || ! "${avail_kb}" =~ ^[0-9]+$ ]]; then
+      pf_fail "Could not determine available /var/lib/containers disk space on ${node} via oc debug"
+      continue
+    fi
+
+    avail_gib=$((avail_kb / 1048576))
+    if (( avail_gib < required_gib )); then
+      pf_fail "AI-tier node ${node} has ${avail_gib} GiB available for container storage; at least ${required_gib} GiB is required at scaleFactor ${AI_SCALE_FACTOR}"
+    else
+      pf_ok "AI-tier node ${node}: ${avail_gib} GiB available (minimum ${required_gib} GiB at scaleFactor ${AI_SCALE_FACTOR})"
+    fi
+  done
+}
+
+preflight_check_object_store() {
+  pf_header "Object storage"
+  [[ -n "${OBJ_STORE_BUCKET}" ]] && pf_ok "Bucket configured: ${OBJ_STORE_BUCKET}" || pf_fail "storage.objectStore.bucket is required"
+  [[ -n "${MINIO_ROOT_USER}" ]] && pf_ok "Object-store access key configured" || pf_fail "storage.objectStore.auth.rootUser is required"
+  [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Object-store secret configured" || pf_fail "storage.objectStore.auth.rootPassword is required"
+
+  case "${MINIO_ROOT_USER}" in
+    ASIA*) pf_fail "Temporary AWS STS access keys (ASIA...) are unsupported because the generated Secret has no AWS_SESSION_TOKEN; use permanent credentials or extend the Secret contract." ;;
+  esac
+
+  case "${OBJ_STORE_TYPE}" in
+    aws)
+      pf_ok "AWS S3 region: ${OBJ_STORE_REGION}"
+      ;;
+    minio|s3compat)
+      [[ -n "${OBJ_STORE_ENDPOINT}" ]] && pf_ok "S3-compatible endpoint: ${OBJ_STORE_ENDPOINT}" || pf_fail "storage.objectStore.endpoint is required for ${OBJ_STORE_TYPE}"
+      ;;
+    seaweedfs)
+      if [[ -z "${OBJ_STORE_ENDPOINT}" ]]; then
+        pf_fail "storage.objectStore.endpoint is required for seaweedfs"
+      elif [[ "${OBJ_STORE_ENDPOINT}" == *:9000* ]]; then
+        pf_warn "SeaweedFS commonly exposes its S3 API on port 8333, but the configured endpoint uses port 9000; verify this is intentional."
+      else
+        pf_ok "SeaweedFS endpoint: ${OBJ_STORE_ENDPOINT}"
+      fi
+      ;;
+    *) pf_fail "Unsupported storage.objectStore.type '${OBJ_STORE_TYPE}'; use aws, minio, s3compat, or seaweedfs." ;;
+  esac
+}
+
+preflight_check_insecure_registry_policy() {
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] || return 0
+  pf_header "OpenShift insecure-registry policy"
+  local configured
+  configured=$(oc get image.config.openshift.io/cluster -o json 2>/dev/null | jq -r '.spec.registrySources.insecureRegistries[]?')
+  if printf '%s\n' "${configured}" | grep -Fxq "${IMAGE_REGISTRY}"; then
+    pf_ok "OpenShift image configuration allows insecure registry ${IMAGE_REGISTRY}"
+  else
+    pf_fail "images.registryInsecure=true only changes the installer probe. Add '${IMAGE_REGISTRY}' to image.config.openshift.io/cluster.spec.registrySources.insecureRegistries before installing."
+  fi
+}
+
+image_repository_from_ref() {
+  printf '%s\n' "$1" | sed -E 's#^docker://##; s#@[^@]+$##; s#(:[^/:]+)$##'
+}
+
+collect_mirror_policy_sources() {
+  local resource policy_json
+  for resource in imagedigestmirrorset.config.openshift.io \
+                  imagetagmirrorset.config.openshift.io \
+                  imagecontentsourcepolicy.operator.openshift.io; do
+    policy_json=$(oc get "${resource}" -o json 2>/dev/null) || continue
+    printf '%s\n' "${policy_json}" | jq -r '
+      .items[]? |
+      (.spec.imageDigestMirrors[]?.source // empty),
+      (.spec.imageTagMirrors[]?.source // empty),
+      (.spec.repositoryDigestMirrors[]?.source // empty)'
+  done | sed '/^[[:space:]]*$/d' | sort -u
+}
+
+mirror_sources_cover_repository() {
+  local sources="$1" repository="$2" source
+  while IFS= read -r source; do
+    [[ -z "${source}" ]] && continue
+    source=$(image_repository_from_ref "${source}")
+    source="${source%/}"
+    if [[ "${repository}" == "${source}" || "${repository}" == "${source}/"* ]]; then
+      return 0
+    fi
+  done <<< "${sources}"
+  return 1
+}
+
+operator_package_repositories() {
+  local package="$1" catalog_source="$2" channel="$3" package_json
+  package_json=$(oc get packagemanifests -n openshift-marketplace -o json 2>/dev/null) || return 1
+  printf '%s\n' "${package_json}" | jq -r \
+    --arg package "${package}" --arg catalog "${catalog_source}" --arg channel "${channel}" '
+      .items[]?
+      | select(.metadata.name == $package and .status.catalogSource == $catalog)
+      | .status.channels[]?
+      | select(.name == $channel)
+      | .currentCSVDesc as $csv
+      | ($csv.containerImage // empty),
+        ($csv.relatedImages[]? | if type == "string" then . else (.image // empty) end)' \
+    | while IFS= read -r image; do
+        [[ -n "${image}" ]] && image_repository_from_ref "${image}"
+      done \
+    | sort -u
+}
+
+preflight_check_airgap_prerequisites() {
+  [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
+  pf_header "Disconnected OpenShift prerequisites"
+
+  local path
+  for path in "${CERT_MANAGER_MANIFEST_URL:-}" "${LOCAL_PATH_MANIFEST_URL:-}" "${OTEL_CHART_PATH:-}" "${KUBERAY_CHART_PATH:-}"; do
+    path="${path#file://}"
+    [[ -n "${path}" && -f "${path}" ]] && pf_ok "Bundled artifact present: ${path}" || pf_fail "Required local air-gap artifact is missing: ${path:-<unset>}"
+  done
+
+  local metadata_dir model_config_name model_config_path
+  metadata_dir=$(model_artifacts_metadata_dir || true)
+  model_config_name=$(model_artifacts_config_name "${DEFAULT_ACCELERATOR}" || true)
+  model_config_path="${metadata_dir:+${metadata_dir}/}${model_config_name}"
+  if [[ -n "${metadata_dir}" && -n "${model_config_name}" && -f "${model_config_path}" ]]; then
+    pf_ok "Bundled model metadata present: ${model_config_path}"
+  else
+    pf_fail "Required model metadata is missing: ${model_config_path:-<unresolved>}. Rebuild the air-gap bundle with the model-metadata directory."
+  fi
+
+  local source state image_ref
+  for source in "${NFD_CATALOG_SOURCE}" "${GPU_CATALOG_SOURCE}"; do
+    if ! oc get catalogsource "${source}" -n openshift-marketplace &>/dev/null; then
+      pf_fail "Air-gap CatalogSource openshift-marketplace/${source} is missing; mirror and apply the NFD/GPU Operator catalogs before installation."
+      continue
+    fi
+    state=$(oc get catalogsource "${source}" -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || true)
+    image_ref=$(oc get catalogsource "${source}" -n openshift-marketplace -o jsonpath='{.spec.image}' 2>/dev/null || true)
+    [[ "${state}" == "READY" ]] && pf_ok "CatalogSource ${source} is READY" || pf_fail "CatalogSource ${source} is not READY (state=${state:-unknown})"
+    if [[ "${image_ref}" == registry.redhat.io/* || "${image_ref}" == quay.io/* ]]; then
+      pf_fail "CatalogSource ${source} still references public image ${image_ref}; use the mirrored catalog image in the disconnected registry."
+    fi
+  done
+
+  local mirror_sources
+  mirror_sources=$(collect_mirror_policy_sources)
+  if [[ -z "${mirror_sources}" ]]; then
+    pf_fail "No ImageDigestMirrorSet, ImageTagMirrorSet, or ImageContentSourcePolicy exists. Disconnected operator operands and Driver Toolkit images have no configured mirror path."
+  else
+    local required_repositories=() package_repositories driver_toolkit_ref repository
+    # This operand is rendered directly by install_nfd(), outside the OLM CSV.
+    required_repositories+=("registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9")
+
+    package_repositories=$(operator_package_repositories nfd "${NFD_CATALOG_SOURCE}" "${NFD_OPERATOR_CHANNEL}" || true)
+    if [[ -z "${package_repositories}" ]]; then
+      pf_fail "Could not resolve related images for NFD package/channel ${NFD_CATALOG_SOURCE}/${NFD_OPERATOR_CHANNEL}."
+    else
+      while IFS= read -r repository; do
+        [[ -n "${repository}" ]] && required_repositories+=("${repository}")
+      done <<< "${package_repositories}"
+    fi
+
+    package_repositories=$(operator_package_repositories gpu-operator-certified "${GPU_CATALOG_SOURCE}" "${GPU_OPERATOR_CHANNEL}" || true)
+    if [[ -z "${package_repositories}" ]]; then
+      pf_fail "Could not resolve related images for GPU Operator package/channel ${GPU_CATALOG_SOURCE}/${GPU_OPERATOR_CHANNEL}."
+    else
+      while IFS= read -r repository; do
+        [[ -n "${repository}" ]] && required_repositories+=("${repository}")
+      done <<< "${package_repositories}"
+    fi
+
+    driver_toolkit_ref=$(oc get imagestream driver-toolkit -n openshift -o json 2>/dev/null \
+      | jq -r '[.status.tags[]?.items[]?.dockerImageReference][0] // empty' || true)
+    if [[ -z "${driver_toolkit_ref}" ]]; then
+      pf_fail "Could not resolve the OpenShift Driver Toolkit image source."
+    else
+      required_repositories+=("$(image_repository_from_ref "${driver_toolkit_ref}")")
+    fi
+
+    local missing_mirror_sources=()
+    while IFS= read -r repository; do
+      [[ -z "${repository}" ]] && continue
+      if ! mirror_sources_cover_repository "${mirror_sources}" "${repository}"; then
+        missing_mirror_sources+=("${repository}")
+      fi
+    done < <(printf '%s\n' "${required_repositories[@]}" | sort -u)
+
+    if (( ${#missing_mirror_sources[@]} > 0 )); then
+      pf_fail "Image mirror policies do not cover required source repositories: $(printf '%s; ' "${missing_mirror_sources[@]}" | sed 's/; $//'). Re-run oc mirror for the complete NFD/GPU Operator package closure and matching OpenShift release."
+    else
+      pf_ok "Image mirror policies cover all resolved NFD, GPU Operator, and Driver Toolkit source repositories"
+    fi
+  fi
+
+  pf_warn "This installer does not bundle GPU driver/operand images. The mirrored GPU Operator catalog, its related images, and the matching OpenShift release/Driver Toolkit image must already be reachable through the cluster mirror configuration."
+}
 
 # ====== PREFLIGHT: REGISTRY REACHABILITY CHECK ======
 # Verifies the configured image registry is reachable and credentials work
@@ -935,67 +1270,76 @@ preflight_check_registry() {
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   log "Running preflight checks..."
+  PREFLIGHT_FAILURES=0
+  PREFLIGHT_WARNINGS=0
 
-  local _aws_needed="false"
-  [[ "${ECR_ENABLED:-false}" == "true" ]] && _aws_needed="true"
-  [[ "${OBJ_STORE_TYPE:-}" == "aws" ]] && _aws_needed="true"
-
-  for tool in oc yq helm curl jq base64 tar; do
-    command -v "$tool" >/dev/null 2>&1 && log "  ✓ $tool found" || err "Missing required tool: $tool"
-  done
-  if [[ "${_aws_needed}" == "true" ]]; then
-    command -v aws >/dev/null 2>&1 && log "  ✓ aws found" || err "Missing required tool: aws (needed for ECR/S3 — install from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)"
-  else
-    log "  – aws CLI not required (ECR disabled, object store is not AWS)"
+  local _aws_reason=""
+  if [[ "${OBJ_STORE_TYPE:-}" == "aws" ]]; then
+    _aws_reason="AWS S3 model storage"
+  elif [[ "${ECR_ENABLED:-false}" == "true" || "${IMAGE_PULL_SECRETS_ECR_ENABLED:-false}" == "true" ]]; then
+    _aws_reason="automatic ECR pull-secret creation"
   fi
 
-  # python3 is used by preflight_check_registry() to parse Bearer token JSON.
-  if command -v python3 >/dev/null 2>&1; then
-    log "  ✓ python3 found"
+  pf_header "Required tools"
+  for tool in oc yq helm curl jq base64 tar timeout python3; do
+    command -v "$tool" >/dev/null 2>&1 && pf_ok "$tool found" || pf_fail "$tool not found in PATH"
+  done
+  if [[ -n "${_aws_reason}" ]]; then
+    command -v aws >/dev/null 2>&1 \
+      && pf_ok "aws found for ${_aws_reason}" \
+      || pf_fail "aws CLI is required for ${_aws_reason}"
   else
-    warn "  python3 not found — image registry auth check will be skipped (install python3 to enable it)."
+    pf_ok "aws CLI not required by this configuration"
   fi
 
   # Object-store CLI tools — used for the model staging pre-check.
   case "${OBJ_STORE_TYPE:-}" in
     aws)
       if command -v aws >/dev/null 2>&1; then
-        log "  ✓ aws CLI found"
+        pf_ok "aws CLI found for model artifact checks"
       else
-        warn "  aws CLI not found — model staging pre-check will be skipped. Install aws CLI to enable it: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+        pf_fail "aws CLI is required to validate model artifacts in AWS S3"
       fi
       ;;
     minio|seaweedfs|s3compat)
       if command -v mc >/dev/null 2>&1; then
-        log "  ✓ mc (MinIO client) found"
+        pf_ok "mc found for model artifact checks"
       else
-        warn "  mc (MinIO client) not found — model staging pre-check will be skipped. Install mc to enable it: https://min.io/docs/minio/linux/reference/minio-mc.html"
+        pf_fail "mc (MinIO client) is required to validate model artifacts in ${OBJ_STORE_TYPE}"
       fi
       ;;
   esac
-
-  preflight_check_registry
 
   # Verify we are connected to the cluster
   if ! oc whoami &>/dev/null; then
     err "Not logged in to OpenShift. Run: oc login <cluster-url>"
   fi
-  log "  ✓ Logged in as: $(oc whoami)"
+  pf_ok "Logged in as: $(oc whoami)"
 
   # Verify cluster admin access (needed to install CRDs and grant SCCs)
   if ! oc auth can-i create clusterrolebinding --all-namespaces &>/dev/null; then
-    warn "  May not have cluster-admin; CRD and SCC operations might fail"
+    pf_fail "Cluster-admin privileges are required for CRDs, OLM subscriptions, cluster roles, node labels, and SCC grants"
   else
-    log "  ✓ Cluster-admin access confirmed"
+    pf_ok "Cluster-admin access confirmed"
   fi
 
-  [[ -f "${SPLUNK_AI_FILE}" ]] && log "  ✓ Manifest: ${SPLUNK_AI_FILE}" || err "Manifest not found: ${SPLUNK_AI_FILE}"
+  [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "Manifest: ${SPLUNK_AI_FILE}" || pf_fail "Manifest not found: ${SPLUNK_AI_FILE}"
+  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Manifest: ${SPLUNK_OPERATOR_FILE}" || pf_fail "Manifest not found: ${SPLUNK_OPERATOR_FILE}"
 
   if object_store_auth_looks_like_placeholder; then
-    err "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with real credentials in ${CONFIG_FILE}"
+    pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace them in ${CONFIG_FILE}"
+  else
+    pf_ok "Object-store credentials do not contain template placeholders"
   fi
-  log "  ✓ Object store credentials look real"
 
+  preflight_check_openshift_compatibility
+  preflight_check_storage
+  preflight_check_node_storage
+  preflight_check_object_store
+  preflight_check_insecure_registry_policy
+  preflight_check_airgap_prerequisites
+  preflight_check_registry
+  pf_summary
   log "Preflight checks passed"
 }
 
@@ -1015,13 +1359,201 @@ wait_for_crd() {
   log "  ✓ CRD ${crd_name} ready"
 }
 
+# Wait for the exact CSV referenced by an OLM Subscription. Checking the first
+# CSV in a namespace can accidentally accept an unrelated or stale operator.
+wait_for_subscription_csv() {
+  local namespace="$1" subscription="$2" timeout="${3:-600}"
+  local elapsed=0 current_csv="" installed_csv="" csv_name="" phase=""
+  log "Waiting for OLM Subscription ${namespace}/${subscription} (timeout: ${timeout}s)..."
+  while (( elapsed < timeout )); do
+    current_csv=$(oc get subscription "${subscription}" -n "${namespace}" \
+      -o jsonpath='{.status.currentCSV}' 2>/dev/null || true)
+    installed_csv=$(oc get subscription "${subscription}" -n "${namespace}" \
+      -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    csv_name="${current_csv:-${installed_csv}}"
+    if [[ -n "${csv_name}" ]]; then
+      phase=$(oc get csv "${csv_name}" -n "${namespace}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+      case "${phase}" in
+        Succeeded)
+          if [[ -z "${current_csv}" || "${installed_csv}" == "${current_csv}" ]]; then
+            log "  ✓ CSV ${csv_name} is installed and succeeded"
+            return 0
+          fi
+          ;;
+        Replacing)
+          ;;
+        Failed)
+          oc get csv "${csv_name}" -n "${namespace}" -o yaml || true
+          err "OLM CSV ${namespace}/${csv_name} failed"
+          ;;
+        *)
+          # Keep waiting while the target CSV is Pending/Installing/Unknown.
+          ;;
+      esac
+    fi
+    sleep 10
+    elapsed=$((elapsed + 10))
+  done
+  oc get subscription "${subscription}" -n "${namespace}" -o yaml || true
+  err "Timed out waiting for OLM Subscription ${namespace}/${subscription} (currentCSV=${current_csv:-not-created}, installedCSV=${installed_csv:-not-installed}, target phase=${phase:-unknown})"
+}
+
+# Record which shared cluster components were created by this installer. The
+# state lives outside the AI namespace so it remains available while delete is
+# removing that namespace. Reruns preserve existing ownership flags.
+installer_state_name() {
+  printf 'splunk-ai-installer-%s' "$(printf '%s' "${AI_NS}" | tr -c 'a-zA-Z0-9.-' '-')"
+}
+
+initialize_install_state() {
+  local state_name cluster_uid recorded_uid
+  state_name="$(installer_state_name)"
+  cluster_uid=$(oc get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  [[ -n "${cluster_uid}" ]] || err "Cannot read kube-system UID for installer ownership state"
+  if ! oc get configmap "${state_name}" -n openshift-config &>/dev/null; then
+    oc create configmap "${state_name}" -n openshift-config \
+      --from-literal=aiNamespace="${AI_NS}" \
+      --from-literal=clusterUID="${cluster_uid}" \
+      --from-literal=createdAt="$(_ts)" >/dev/null \
+      || err "Could not create installer ownership state openshift-config/${state_name}"
+  else
+    recorded_uid=$(oc get configmap "${state_name}" -n openshift-config -o jsonpath='{.data.clusterUID}' 2>/dev/null || true)
+    [[ -z "${recorded_uid}" || "${recorded_uid}" == "${cluster_uid}" ]] \
+      || err "Installer state ${state_name} belongs to a different cluster UID (${recorded_uid}); refusing to reuse it on ${cluster_uid}."
+  fi
+}
+
+verify_install_state_cluster() {
+  local state_name current_uid recorded_uid
+  state_name="$(installer_state_name)"
+  oc get configmap "${state_name}" -n openshift-config &>/dev/null || return 0
+  current_uid=$(oc get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  recorded_uid=$(oc get configmap "${state_name}" -n openshift-config -o jsonpath='{.data.clusterUID}' 2>/dev/null || true)
+  [[ -z "${recorded_uid}" || "${recorded_uid}" == "${current_uid}" ]] \
+    || err "Installer state belongs to cluster UID ${recorded_uid}, but the current cluster UID is ${current_uid}; refusing deletion."
+}
+
+record_owned_component() {
+  local component="$1" state_name
+  state_name="$(installer_state_name)"
+  oc patch configmap "${state_name}" -n openshift-config --type=merge \
+    -p "{\"data\":{\"${component}\":\"true\"}}" >/dev/null \
+    || err "Could not record installer ownership for ${component}"
+}
+
+component_is_owned() {
+  local component="$1" state_name value
+  state_name="$(installer_state_name)"
+  value=$(oc get configmap "${state_name}" -n openshift-config -o json 2>/dev/null \
+    | jq -r --arg key "${component}" '.data[$key] // "false"' 2>/dev/null || echo false)
+  [[ "${value}" == "true" ]]
+}
+
+ensure_owned_scc_group() {
+  local scc="$1" group="$2" component="$3"
+  if oc get scc "${scc}" -o json 2>/dev/null | jq -e --arg group "${group}" 'any((.groups // [])[]; . == $group)' >/dev/null; then
+    return 0
+  fi
+  oc adm policy add-scc-to-group "${scc}" "${group}" \
+    || err "Failed to grant SCC ${scc} to group ${group}"
+  record_owned_component "${component}"
+}
+
+ensure_owned_scc_user() {
+  local scc="$1" namespace="$2" service_account="$3" component="$4"
+  local user="system:serviceaccount:${namespace}:${service_account}"
+  if oc get scc "${scc}" -o json 2>/dev/null | jq -e --arg user "${user}" 'any((.users // [])[]; . == $user)' >/dev/null; then
+    return 0
+  fi
+  oc adm policy add-scc-to-user "${scc}" -z "${service_account}" -n "${namespace}" \
+    || err "Failed to grant SCC ${scc} to ${namespace}/${service_account}"
+  record_owned_component "${component}"
+}
+
+ensure_owned_clusterrolebinding() {
+  local name="$1" clusterrole="$2" serviceaccount="$3"
+  if oc get clusterrolebinding "${name}" &>/dev/null; then
+    return 0
+  fi
+  oc create clusterrolebinding "${name}" --clusterrole="${clusterrole}" --serviceaccount="${serviceaccount}" \
+    || err "Failed to create ClusterRoleBinding ${name}"
+  record_owned_component "crb_$(printf '%s' "${name}" | tr -c 'a-zA-Z0-9._-' '_')"
+}
+
+manifest_without_namespaces() {
+  local source="$1"
+  source="${source#file://}"
+  case "${source}" in
+    http://*|https://*) curl -fsSL "${source}" | yq eval 'select(.kind != "Namespace")' - ;;
+    *)                 yq eval 'select(.kind != "Namespace")' "${source}" ;;
+  esac
+}
+
+# Return success when any non-Namespace object described by a manifest already
+# exists. Operator bundles contain shared CRDs/RBAC/webhooks, so deployment
+# presence alone is not a safe ownership signal. If inspection itself fails,
+# conservatively treat the manifest as pre-existing and preserve it on delete.
+manifest_has_existing_resources() {
+  local source="$1" existing
+  if ! existing=$(manifest_without_namespaces "${source}" \
+      | oc get -f - --ignore-not-found=true -o name 2>&1); then
+    warn "Could not inventory every existing resource in ${source}; treating the operator bundle as pre-existing for safe uninstall. Details: ${existing}"
+    return 0
+  fi
+  [[ -n "${existing}" ]]
+}
+
 # ====== ENSURE NAMESPACE ======
 ensure_namespace() {
   local ns="$1"
   if ! oc get namespace "${ns}" &>/dev/null; then
     log "Creating namespace ${ns}..."
     oc create namespace "${ns}"
+    if oc get configmap "$(installer_state_name)" -n openshift-config &>/dev/null; then
+      record_owned_component "namespace_$(printf '%s' "${ns}" | tr -c 'a-zA-Z0-9._-' '_')"
+    fi
   fi
+}
+
+set_installer_node_label() {
+  local node="$1" label_key="$2" label_value="$3" annotation_suffix="$4"
+  local annotation_key="${AI_NS}.installer.splunk.com/previous-${annotation_suffix}" previous marker
+  marker=$(oc get node "${node}" -o json 2>/dev/null | jq -r --arg key "${annotation_key}" '.metadata.annotations[$key] // ""')
+  if [[ -z "${marker}" ]]; then
+    previous=$(oc get node "${node}" -o json 2>/dev/null | jq -r --arg key "${label_key}" '.metadata.labels[$key] // "__absent__"')
+    oc annotate node "${node}" "${annotation_key}=${previous}" --overwrite >/dev/null
+  fi
+  oc label node "${node}" "${label_key}=${label_value}" --overwrite
+}
+
+restore_installer_node_labels() {
+  local node label_key suffix annotation_key previous
+  local annotation_prefix="${AI_NS}.installer.splunk.com/previous-"
+  while IFS= read -r node; do
+    [[ -z "${node}" ]] && continue
+    for entry in \
+      'splunk.ai/node-role|node-role' \
+      'splunk.ai/workload-type|workload-type' \
+      'splunk.ai/ai-tier-node|ai-tier-node'; do
+      label_key="${entry%%|*}"; suffix="${entry##*|}"
+      annotation_key="${annotation_prefix}${suffix}"
+      previous=$(oc get node "${node}" -o json | jq -r --arg key "${annotation_key}" '.metadata.annotations[$key] // ""')
+      [[ -z "${previous}" ]] && continue
+      if [[ "${previous}" == "__absent__" ]]; then
+        oc label node "${node}" "${label_key}-" 2>/dev/null || true
+      else
+        oc label node "${node}" "${label_key}=${previous}" --overwrite 2>/dev/null || true
+      fi
+      oc annotate node "${node}" "${annotation_key}-" 2>/dev/null || true
+    done
+
+    annotation_key="${annotation_prefix}gpu-taint"
+    previous=$(oc get node "${node}" -o json | jq -r --arg key "${annotation_key}" '.metadata.annotations[$key] // ""')
+    if [[ "${previous}" == "true" ]]; then
+      oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule --overwrite 2>/dev/null || true
+      oc annotate node "${node}" "${annotation_key}-" 2>/dev/null || true
+    fi
+  done < <(oc get nodes -o json 2>/dev/null | jq -r --arg prefix "${annotation_prefix}" '.items[] | select(any((.metadata.annotations // {} | keys[]) ; startswith($prefix))) | .metadata.name')
 }
 
 # ====== OPENSHIFT: GRANT PRIVILEGED SCC ======
@@ -1043,15 +1575,11 @@ grant_privileged_scc() {
   # - anyuid: AI platform namespace so operator-created SAs (saia-sa, weaviate,
   #   raycluster-*) run as the UID defined in their images, not OCP's random UID range.
   # - privileged: also on AI platform so Splunk Standalone can write to hostPath PVCs.
-  oc adm policy add-scc-to-group privileged \
-    "system:serviceaccounts:${ai_operator_ns}" 2>/dev/null || true
-  oc adm policy add-scc-to-group anyuid \
-    "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-  oc adm policy add-scc-to-group privileged \
-    "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
+  ensure_owned_scc_group privileged "system:serviceaccounts:${ai_operator_ns}" scc_privileged_ai_operator
+  ensure_owned_scc_group anyuid "system:serviceaccounts:${AI_NS}" scc_anyuid_ai_namespace
+  ensure_owned_scc_group privileged "system:serviceaccounts:${AI_NS}" scc_privileged_ai_namespace
   # Splunk Operator pod adds NET_BIND_SERVICE capability which anyuid blocks; needs privileged.
-  oc adm policy add-scc-to-group privileged \
-    "system:serviceaccounts:splunk-operator" 2>/dev/null || true
+  ensure_owned_scc_group privileged "system:serviceaccounts:splunk-operator" scc_privileged_splunk_operator
 
   log "  ✓ anyuid + privileged SCC granted to all SAs in ${AI_NS} and splunk-operator"
 }
@@ -1061,6 +1589,8 @@ grant_privileged_scc() {
 # The GPU Operator depends on NFD labels to know which nodes to target.
 install_nfd() {
   log "Installing Node Feature Discovery Operator (NFD)..."
+  local namespace_existed="false"
+  oc get namespace openshift-nfd &>/dev/null && namespace_existed="true"
 
   # Step 1: Subscription + OperatorGroup — idempotent, skip creation if already present.
   # Do NOT early-return here: a prior run may have created the Subscription but never
@@ -1068,6 +1598,8 @@ install_nfd() {
   if oc get subscription nfd -n openshift-nfd &>/dev/null; then
     log "  ✓ NFD subscription already exists, skipping creation"
   else
+    record_owned_component nfd_subscription
+    [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_openshift-nfd
     oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
@@ -1089,27 +1621,16 @@ metadata:
   name: nfd
   namespace: openshift-nfd
 spec:
-  channel: stable
+  channel: ${NFD_OPERATOR_CHANNEL}
   name: nfd
   source: ${NFD_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
   installPlanApproval: Automatic
 EOF
-
-    log "Waiting for NFD CSV to succeed..."
-    local retries=0
-    while (( retries < 36 )); do
-      local phase
-      phase=$(oc get csv -n openshift-nfd -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-      if [[ "${phase}" == "Succeeded" ]]; then
-        log "  ✓ NFD operator ready"
-        break
-      fi
-      sleep 10
-      retries=$(( retries + 1 ))
-      log "  Waiting for NFD CSV... (${retries}/36, phase=${phase:-pending})"
-    done
   fi
+
+  # Validate OLM health on both fresh installs and reruns.
+  wait_for_subscription_csv openshift-nfd nfd 600
 
   # Step 2: NodeFeatureDiscovery CR — always ensure it exists, regardless of whether
   # the Subscription was just created or was already present from a prior run.
@@ -1119,7 +1640,8 @@ EOF
     log "  ✓ NodeFeatureDiscovery CR already exists, skipping"
   else
     log "Creating NodeFeatureDiscovery CR..."
-    oc apply -f - <<'EOF'
+    record_owned_component nfd_instance
+    oc apply -f - <<EOF
 apiVersion: nfd.openshift.io/v1
 kind: NodeFeatureDiscovery
 metadata:
@@ -1127,7 +1649,7 @@ metadata:
   namespace: openshift-nfd
 spec:
   operand:
-    image: registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9:v4.21
+    image: registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9:v${REQUIRED_OPENSHIFT_MINOR}
     imagePullPolicy: Always
   workerConfig:
     configData: |
@@ -1150,6 +1672,8 @@ EOF
 # Uses OCP Driver Toolkit (use_ocp_driver_toolkit: true) so no SSH to nodes needed.
 install_nvidia_gpu_operator() {
   log "Installing NVIDIA GPU Operator..."
+  local namespace_existed="false"
+  oc get namespace nvidia-gpu-operator &>/dev/null && namespace_existed="true"
 
   # Step 1: Subscription + OperatorGroup — idempotent, skip creation if already present.
   # Do NOT early-return here: a prior run may have created the Subscription but never
@@ -1157,6 +1681,8 @@ install_nvidia_gpu_operator() {
   if oc get subscription gpu-operator-certified -n nvidia-gpu-operator &>/dev/null; then
     log "  ✓ GPU Operator subscription already exists, skipping creation"
   else
+    record_owned_component gpu_subscription
+    [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_nvidia-gpu-operator
     oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
@@ -1178,27 +1704,16 @@ metadata:
   name: gpu-operator-certified
   namespace: nvidia-gpu-operator
 spec:
-  channel: v26.3
+  channel: ${GPU_OPERATOR_CHANNEL}
   name: gpu-operator-certified
   source: ${GPU_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
   installPlanApproval: Automatic
 EOF
-
-    log "Waiting for GPU Operator CSV to succeed..."
-    local retries=0
-    while (( retries < 36 )); do
-      local phase
-      phase=$(oc get csv -n nvidia-gpu-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-      if [[ "${phase}" == "Succeeded" ]]; then
-        log "  ✓ GPU Operator CSV ready"
-        break
-      fi
-      sleep 10
-      retries=$(( retries + 1 ))
-      log "  Waiting for GPU Operator CSV... (${retries}/36, phase=${phase:-pending})"
-    done
   fi
+
+  # Validate OLM health on both fresh installs and reruns.
+  wait_for_subscription_csv nvidia-gpu-operator gpu-operator-certified 900
 
   # Step 2: ClusterPolicy — always ensure it exists, regardless of whether the
   # Subscription was just created or pre-existing. Without this CR the driver,
@@ -1208,6 +1723,7 @@ EOF
     log "  ✓ ClusterPolicy already exists, skipping"
   else
     log "Creating ClusterPolicy CR..."
+    record_owned_component gpu_cluster_policy
     oc apply -f - <<'EOF'
 apiVersion: nvidia.com/v1
 kind: ClusterPolicy
@@ -1236,29 +1752,26 @@ spec:
 EOF
   fi
 
-  # Wait for nvidia.com/gpu.present=true to appear on at least one worker node.
-  # This confirms NFD + GFD have finished their discovery pass.
-  log "Waiting for GPU nodes to be labeled by GPU Operator / GFD..."
+  # Wait for both discovery and an allocatable GPU. The label alone can appear
+  # before the driver/toolkit/device-plugin stack is usable.
+  log "Waiting for GPU nodes and allocatable nvidia.com/gpu capacity..."
   local retries=0
   while (( retries < 60 )); do
-    local count
+    local count allocatable
     count=$(oc get nodes -l nvidia.com/gpu.present=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
-    if (( count > 0 )); then
-      log "  ✓ ${count} GPU node(s) labeled with nvidia.com/gpu.present=true"
-      break
+    allocatable=$(oc get nodes -o json 2>/dev/null | jq '[.items[] | ((.status.allocatable["nvidia.com/gpu"] // "0") | tonumber)] | add // 0' 2>/dev/null || echo 0)
+    if (( count > 0 && allocatable > 0 )); then
+      log "  ✓ ${count} GPU node(s) discovered; ${allocatable} GPU(s) allocatable"
+      return 0
     fi
     sleep 15
     retries=$(( retries + 1 ))
-    log "  Waiting for GPU node labels... (${retries}/60)"
+    log "  Waiting for GPU readiness... (${retries}/60, labeled=${count}, allocatable=${allocatable})"
   done
 
-  if (( retries >= 60 )); then
-    warn "GPU nodes not labeled after 15m — label_nodes will fall back to 0 GPU workers.
-    Check: oc get pods -n nvidia-gpu-operator
-           oc get clusterpolicy gpu-cluster-policy -o yaml"
-  fi
-
-  log "  ✓ NVIDIA GPU Operator installed"
+  oc get pods -n nvidia-gpu-operator -o wide || true
+  oc get clusterpolicy gpu-cluster-policy -o yaml || true
+  err "NVIDIA GPU stack did not expose allocatable nvidia.com/gpu capacity within 15 minutes. In air-gap mode, confirm the GPU Operator related images and matching OpenShift Driver Toolkit/release images were mirrored."
 }
 
 # ====== NODE LABELING ======
@@ -1299,10 +1812,8 @@ label_nodes() {
   # Label control-plane nodes
   for node in "${control_nodes[@]}"; do
     log "  Labeling control-plane node: ${node}"
-    oc label node "${node}" \
-      splunk.ai/node-role=controller \
-      splunk.ai/workload-type=control-plane \
-      --overwrite
+    set_installer_node_label "${node}" splunk.ai/node-role controller node-role
+    set_installer_node_label "${node}" splunk.ai/workload-type control-plane workload-type
   done
 
   # Label AI-tier worker nodes — every node gets splunk.ai/ai-tier-node=true.
@@ -1311,13 +1822,15 @@ label_nodes() {
   # so CPU and GPU workloads share the same node pool without a cpu/gpu label split.
   for node in "${ai_nodes[@]:+${ai_nodes[@]}}"; do
     log "  Labeling AI-tier worker node: ${node}"
-    oc label node "${node}" \
-      splunk.ai/node-role=worker \
-      splunk.ai/ai-tier-node=true \
-      --overwrite
+    set_installer_node_label "${node}" splunk.ai/node-role worker node-role
+    set_installer_node_label "${node}" splunk.ai/ai-tier-node true ai-tier-node
     # Remove any lingering nvidia.com/gpu taint — a node that previously ran as a GPU
     # worker retains the taint across in-place reinstalls; without this, CPU workloads
     # selecting ai-tier-node would stay Pending on it.
+    if oc get node "${node}" -o json 2>/dev/null | jq -e \
+        'any(.spec.taints[]?; .key == "nvidia.com/gpu" and .value == "true" and .effect == "NoSchedule")' >/dev/null; then
+      oc annotate node "${node}" "${AI_NS}.installer.splunk.com/previous-gpu-taint=true" --overwrite >/dev/null
+    fi
     oc adm taint node "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
   done
 
@@ -1358,31 +1871,37 @@ nodeLabelStrategy: manual and list nodes explicitly under openshift.nodes in the
 install_cert_manager() {
   log "Installing cert-manager..."
 
+  local already_installed="false" namespace_existed="false"
+  oc get namespace cert-manager &>/dev/null && namespace_existed="true"
   if oc get namespace cert-manager &>/dev/null; then
     log "  cert-manager namespace already exists, checking if running..."
     if oc get deployment cert-manager -n cert-manager &>/dev/null; then
-      log "  ✓ cert-manager already installed, skipping"
-      return 0
+      log "  cert-manager already installed; validating readiness"
+      already_installed="true"
     fi
   fi
 
-  local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
-  # oc apply -f does not understand file:// — strip it to a bare path
-  [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
-  oc apply -f "${_cm_url}"
+  if [[ "${already_installed}" != "true" ]]; then
+    local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml}"
+    # oc apply -f does not understand file:// — strip it to a bare path
+    [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
+    record_owned_component cert_manager
+    [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_cert-manager
+    oc apply -f "${_cm_url}"
+  fi
 
-  log "Waiting for cert-manager to be ready..."
-  oc wait --for=condition=ready pod \
-    -l app.kubernetes.io/instance=cert-manager \
-    -n cert-manager --timeout=300s
+  # Grant the SCC before waiting so newly-created pods are not blocked by SCC
+  # admission for the entire readiness timeout.
+  ensure_owned_scc_user anyuid cert-manager cert-manager scc_anyuid_cert_manager
+  ensure_owned_scc_user anyuid cert-manager cert-manager-cainjector scc_anyuid_cert_manager_cainjector
+  ensure_owned_scc_user anyuid cert-manager cert-manager-webhook scc_anyuid_cert_manager_webhook
 
-  # On OpenShift, cert-manager pods may need anyuid SCC
-  oc adm policy add-scc-to-user anyuid \
-    -z cert-manager -n cert-manager 2>/dev/null || true
-  oc adm policy add-scc-to-user anyuid \
-    -z cert-manager-cainjector -n cert-manager 2>/dev/null || true
-  oc adm policy add-scc-to-user anyuid \
-    -z cert-manager-webhook -n cert-manager 2>/dev/null || true
+  wait_for_crd certificates.cert-manager.io 300
+  log "Waiting for cert-manager deployments to be available..."
+  for deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
+    oc rollout status "deployment/${deployment}" -n cert-manager --timeout=300s \
+      || err "cert-manager deployment ${deployment} did not become Available"
+  done
 
   log "Waiting for cert-manager webhook to be reachable with a valid TLS certificate..."
   # The webhook endpoint being ready is not enough — the TLS cert has a notBefore
@@ -1401,6 +1920,7 @@ spec:
   selfSigned: {}
 EOF
   local retries=0
+  local webhook_ready="false"
   while (( retries < 60 )); do
     local out
     out=$(oc apply -f "${probe_file}" 2>&1) || true
@@ -1412,9 +1932,11 @@ EOF
     fi
     oc delete issuer cert-manager-webhook-probe -n cert-manager --ignore-not-found=true 2>/dev/null || true
     rm -f "${probe_file}"
+    webhook_ready="true"
     break
   done
   rm -f "${probe_file}" 2>/dev/null || true
+  [[ "${webhook_ready}" == "true" ]] || err "cert-manager webhook did not accept requests within 5 minutes"
   log "  ✓ cert-manager installed"
 }
 
@@ -1422,6 +1944,8 @@ EOF
 # k0s installs this as part of cluster setup. OpenShift has no default storage
 # class on bare-metal, so we install local-path-provisioner the same way.
 install_local_path_provisioner() {
+  local namespace_existed="false"
+  oc get namespace local-path-storage &>/dev/null && namespace_existed="true"
   # When the config requests a specific storage class, skip only if THAT class already
   # exists — not merely because the cluster has some other default. The AIPlatform CR
   # emits storageClassName: ${STORAGE_CLASS}, so skipping on an unrelated default would
@@ -1446,12 +1970,15 @@ install_local_path_provisioner() {
   fi
 
   log "Installing local-path-provisioner..."
-  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml}"
+  local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml}"
   [[ "${_lp_url}" == file://* ]] && _lp_url="${_lp_url#file://}"
+  record_owned_component local_path_provisioner
+  [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_local-path-storage
   oc apply -f "${_lp_url}"
 
   log "Waiting for local-path-provisioner to be ready..."
-  oc rollout status deployment local-path-provisioner -n local-path-storage --timeout=120s || true
+  oc rollout status deployment local-path-provisioner -n local-path-storage --timeout=120s \
+    || err "local-path-provisioner did not become ready"
 
   log "Setting local-path as default storage class..."
   oc patch storageclass local-path \
@@ -1460,14 +1987,10 @@ install_local_path_provisioner() {
   # The main provisioner pod and the helper pod it spawns both need privileged SCC.
   # The main provisioner runs as local-path-provisioner-service-account.
   # The helper pod runs as the namespace's default SA (no serviceAccountName set).
-  oc create clusterrolebinding local-path-provisioner-privileged \
-    --clusterrole=system:openshift:scc:privileged \
-    --serviceaccount=local-path-storage:local-path-provisioner-service-account \
-    2>/dev/null || true
-  oc create clusterrolebinding local-path-helper-privileged \
-    --clusterrole=system:openshift:scc:privileged \
-    --serviceaccount=local-path-storage:default \
-    2>/dev/null || true
+  ensure_owned_clusterrolebinding local-path-provisioner-privileged \
+    system:openshift:scc:privileged local-path-storage:local-path-provisioner-service-account
+  ensure_owned_clusterrolebinding local-path-helper-privileged \
+    system:openshift:scc:privileged local-path-storage:default
 
   # Patch the helper pod template to run privileged and relabel the created directory
   # busybox lacks chcon; use ubi-minimal which ships selinux-utils so chcon runs.
@@ -1521,10 +2044,19 @@ relabel_worker_nodes_for_selinux() {
 # ====== INSTALL OPENTELEMETRY OPERATOR ======
 install_otel_operator() {
   log "Installing OpenTelemetry Operator..."
+  local namespace_existed="false"
+  oc get namespace opentelemetry-operator-system &>/dev/null && namespace_existed="true"
 
-  if oc get deployment opentelemetry-operator-controller-manager \
-      -n opentelemetry-operator-system &>/dev/null; then
-    log "  ✓ OpenTelemetry Operator already installed, skipping"
+  if helm status opentelemetry-operator -n opentelemetry-operator-system &>/dev/null; then
+    log "  OpenTelemetry Operator already installed; validating readiness"
+    local existing_otel_deployment
+    existing_otel_deployment=$(oc get deployment -n opentelemetry-operator-system \
+      -l app.kubernetes.io/instance=opentelemetry-operator \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    [[ -n "${existing_otel_deployment}" ]] || err "OpenTelemetry Helm release exists but no deployment was found"
+    oc rollout status "deployment/${existing_otel_deployment}" -n opentelemetry-operator-system --timeout=5m \
+      || err "Existing OpenTelemetry Operator deployment is not ready"
+    wait_for_crd opentelemetrycollectors.opentelemetry.io 300
     return 0
   fi
 
@@ -1542,7 +2074,7 @@ install_otel_operator() {
     done
   fi
 
-  local otel_chart_ref
+  local otel_chart_ref otel_version_flag=()
   if [[ -n "${OTEL_CHART_PATH:-}" && -f "${OTEL_CHART_PATH}" ]]; then
     otel_chart_ref="${OTEL_CHART_PATH}"
     log "  Using local chart: ${otel_chart_ref}"
@@ -1550,36 +2082,45 @@ install_otel_operator() {
     helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
     helm repo update open-telemetry 2>/dev/null || true
     otel_chart_ref="open-telemetry/opentelemetry-operator"
+    otel_version_flag=(--version "${OTEL_OPERATOR_CHART_VERSION}")
   fi
 
-  local otel_retries=0
+  local otel_retries=0 otel_installed="false"
+  record_owned_component otel_operator
+  [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_opentelemetry-operator-system
   while (( otel_retries < 6 )); do
     local otel_out
-    otel_out=$(helm upgrade --install opentelemetry-operator "${otel_chart_ref}" \
+    if otel_out=$(helm upgrade --install opentelemetry-operator "${otel_chart_ref}" \
       --namespace opentelemetry-operator-system --create-namespace \
+      "${otel_version_flag[@]+"${otel_version_flag[@]}"}" \
       --set manager.collectorImage.repository=otel/opentelemetry-collector-contrib \
       --set admissionWebhooks.certManager.enabled=true \
-      --wait=false --timeout=10m 2>&1) || true
+      --wait=false --timeout=10m 2>&1); then
+      echo "${otel_out}"
+      otel_installed="true"
+      break
+    fi
     if echo "${otel_out}" | grep -q "x509: certificate\|failed to call webhook\|i/o timeout"; then
       warn "cert-manager webhook not ready yet, waiting 10s (${otel_retries}/6)..."
       sleep 10
       otel_retries=$((otel_retries + 1))
       continue
     fi
-    echo "${otel_out}"
-    break
+    err "OpenTelemetry Operator Helm install failed: ${otel_out}"
   done
-
+  [[ "${otel_installed}" == "true" ]] || err "OpenTelemetry Operator installation failed after ${otel_retries} retries"
   # Grant privileged SCC before pods start (runs as UID 65532 which is outside OCP's range)
-  oc create clusterrolebinding otel-operator-privileged \
-    --clusterrole=system:openshift:scc:privileged \
-    --serviceaccount=opentelemetry-operator-system:opentelemetry-operator \
-    2>/dev/null || true
+  ensure_owned_clusterrolebinding otel-operator-privileged \
+    system:openshift:scc:privileged opentelemetry-operator-system:opentelemetry-operator
 
-  oc rollout status deployment opentelemetry-operator \
-    -n opentelemetry-operator-system --timeout=5m || \
-    oc rollout restart deployment opentelemetry-operator \
-      -n opentelemetry-operator-system
+  local otel_deployment
+  otel_deployment=$(oc get deployment -n opentelemetry-operator-system \
+    -l app.kubernetes.io/name=opentelemetry-operator \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  [[ -n "${otel_deployment}" ]] || otel_deployment="opentelemetry-operator"
+  oc rollout status "deployment/${otel_deployment}" \
+    -n opentelemetry-operator-system --timeout=5m \
+    || err "OpenTelemetry Operator deployment did not become ready"
 
   wait_for_crd opentelemetrycollectors.opentelemetry.io 300
   log "  ✓ OpenTelemetry Operator installed"
@@ -1588,9 +2129,15 @@ install_otel_operator() {
 # ====== INSTALL KUBERAY OPERATOR ======
 install_ray_operator() {
   log "Installing KubeRay Operator..."
+  local namespace_existed="false"
+  oc get namespace ray-system &>/dev/null && namespace_existed="true"
 
   if oc get deployment kuberay-operator -n ray-system &>/dev/null; then
-    log "  ✓ KubeRay Operator already installed, skipping"
+    log "  KubeRay Operator already installed; validating readiness"
+    oc rollout status deployment/kuberay-operator -n ray-system --timeout=5m \
+      || err "Existing KubeRay Operator deployment is not ready"
+    wait_for_crd rayservices.ray.io 300
+    wait_for_crd rayclusters.ray.io 300
     return 0
   fi
 
@@ -1602,16 +2149,17 @@ install_ray_operator() {
     helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
     helm repo update kuberay
     kuberay_chart_ref="kuberay/kuberay-operator"
-    kuberay_version_flag=(--version 1.2.2)
+    kuberay_version_flag=(--version "${KUBERAY_OPERATOR_VERSION}")
   fi
 
+  record_owned_component kuberay_operator
+  [[ "${namespace_existed}" == "true" ]] || record_owned_component namespace_ray-system
   helm upgrade --install kuberay-operator "${kuberay_chart_ref}" \
     --namespace ray-system --create-namespace \
     "${kuberay_version_flag[@]+"${kuberay_version_flag[@]}"}" \
     --set image.repository=quay.io/kuberay/operator \
-    --set image.tag=v1.2.2 \
+    --set image.tag="v${KUBERAY_OPERATOR_VERSION}" \
     --wait --timeout=10m
-
   wait_for_crd rayservices.ray.io 300
   wait_for_crd rayclusters.ray.io 300
 
@@ -1732,26 +2280,37 @@ get_pull_secret_names() {
 install_splunk_ai_operator() {
   log "Installing Splunk AI Operator from ${SPLUNK_AI_FILE}..."
 
-  [[ -f "${SPLUNK_AI_FILE}" ]] || { warn "Manifest not found: ${SPLUNK_AI_FILE}"; return 0; }
+  [[ -f "${SPLUNK_AI_FILE}" ]] || err "Manifest not found: ${SPLUNK_AI_FILE}"
 
   local ai_operator_ns="splunk-ai-operator-system"
+  local operator_resources_existed="false"
+  manifest_has_existing_resources "${SPLUNK_AI_FILE}" && operator_resources_existed="true"
   ensure_namespace "${ai_operator_ns}"
 
   # Grant SCCs before applying manifests so pods start on first attempt
   grant_privileged_scc
 
   log "Applying Splunk AI Operator manifests (server-side apply)..."
-  local apply_output
-  apply_output=$(oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1) || true
+  local apply_output apply_rc=0
+  apply_output=$(oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1) || apply_rc=$?
   echo "${apply_output}"
 
   # Retry if cert-manager webhook not ready OR if cert-manager CRD mapping was missing.
   # Certificate/Issuer resources silently fail with "resource mapping not found" when
   # cert-manager pods are up but CRDs haven't been registered in the API server yet.
-  if echo "${apply_output}" | grep -qi "webhook.*cert-manager\|failed calling webhook.*cert-manager\|i/o timeout\|resource mapping not found\|no matches for kind.*cert-manager"; then
+  if (( apply_rc != 0 )) && echo "${apply_output}" | grep -qi "webhook.*cert-manager\|failed calling webhook.*cert-manager\|i/o timeout\|resource mapping not found\|no matches for kind.*cert-manager"; then
     warn "cert-manager CRDs not ready, waiting 20s and retrying full apply..."
     sleep 20
-    oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" 2>&1 || true
+    oc apply --server-side --force-conflicts -f "${SPLUNK_AI_FILE}" \
+      || err "Splunk AI Operator manifest apply failed after retry"
+  elif (( apply_rc != 0 )); then
+    err "Splunk AI Operator manifest apply failed"
+  fi
+
+  if [[ "${operator_resources_existed}" == "false" ]]; then
+    record_owned_component splunk_ai_operator_bundle_v2
+  else
+    log "  Preserving Splunk AI Operator bundle on delete because at least one manifest resource predated this install."
   fi
 
   # Patch the operator SA and deployment with all configured pull secrets AFTER the
@@ -1804,6 +2363,7 @@ install_splunk_ai_operator() {
     retries=$((retries + 1))
     (( retries % 3 == 0 )) && log "  Waiting for operator... (${retries}/40)"
   done
+  (( retries < 40 )) || err "Splunk AI Operator deployment did not become ready within 10 minutes"
 
   # Wait for the webhook service to have endpoints — the pod being Running is not
   # enough; the API server needs to register the endpoint before we apply CRs.
@@ -1821,6 +2381,7 @@ install_splunk_ai_operator() {
     wh_retries=$((wh_retries + 1))
     (( wh_retries % 6 == 0 )) && log "  Still waiting for webhook endpoint... (${wh_retries}/60)"
   done
+  (( wh_retries < 60 )) || err "Splunk AI Operator webhook has no ready endpoints after 5 minutes"
 
   log "  ✓ Splunk AI Operator installed"
 }
@@ -1829,9 +2390,11 @@ install_splunk_ai_operator() {
 install_splunk_operator() {
   log "Installing Splunk Operator..."
 
-  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] || { warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}, skipping"; return 0; }
+  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] || err "Splunk operator manifest not found: ${SPLUNK_OPERATOR_FILE}"
 
   local splunk_operator_ns="splunk-operator"
+  local operator_resources_existed="false"
+  manifest_has_existing_resources "${SPLUNK_OPERATOR_FILE}" && operator_resources_existed="true"
   ensure_namespace "${splunk_operator_ns}"
 
   # Create ECR pull secret in splunk-operator namespace
@@ -1851,20 +2414,25 @@ install_splunk_operator() {
   # This bundle includes CRDs and the splunk-operator Namespace; `oc replace --force` is
   # delete-then-recreate, so recreating the CRDs would cascade-delete every Splunk custom
   # resource (Standalones, etc.). Server-side apply patches in place and preserves them.
-  oc apply --server-side --force-conflicts -f "${SPLUNK_OPERATOR_FILE}" 2>&1 || true
+  oc apply --server-side --force-conflicts -f "${SPLUNK_OPERATOR_FILE}" \
+    || err "Splunk Operator manifest apply failed"
+  if [[ "${operator_resources_existed}" == "false" ]]; then
+    record_owned_component splunk_operator_bundle_v2
+  else
+    log "  Preserving Splunk Operator bundle on delete because at least one manifest resource predated this install."
+  fi
   log "  Splunk Operator resources applied"
 
   # Grant privileged SCC to the whole namespace group — this is the pattern OCP SCC admission
   # actually honours. The operator pod adds NET_BIND_SERVICE which anyuid blocks; privileged
   # covers both. group-based grant is namespace-scoped and survives operator manifest updates.
-  oc adm policy add-scc-to-group privileged \
-    "system:serviceaccounts:${splunk_operator_ns}" 2>/dev/null || true
-  # Force pod recreation so it picks up the new SCC grant
-  oc delete replicaset -n "${splunk_operator_ns}" --all 2>/dev/null || true
+  ensure_owned_scc_group privileged "system:serviceaccounts:${splunk_operator_ns}" scc_privileged_splunk_operator
 
   # Patch all configured pull secrets into the Splunk operator deployment.
   local dep_name _splunk_pull_secrets
-  dep_name=$(oc -n "${splunk_operator_ns}" get deploy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  dep_name="splunk-operator-controller-manager"
+  oc get deployment "${dep_name}" -n "${splunk_operator_ns}" &>/dev/null || \
+    err "Splunk Operator manifest did not create deployment ${splunk_operator_ns}/${dep_name}"
   _splunk_pull_secrets=$(get_pull_secret_names "${splunk_operator_ns}")
   if [[ -n "${dep_name}" && -n "${_splunk_pull_secrets}" ]]; then
     # Set imagePullSecrets to the full list in one merge patch (creates the field if
@@ -1876,10 +2444,17 @@ install_splunk_operator() {
       --type=merge \
       -p "{\"spec\":{\"template\":{\"spec\":{\"imagePullSecrets\":${_splunk_ips_json}}}}}" \
       2>/dev/null || true
-    oc rollout restart deployment "${dep_name}" -n "${splunk_operator_ns}" 2>/dev/null || true
   fi
 
+  # Restart only the selected operator deployment so it is admitted with the
+  # new SCC and pull-secret configuration. Do not delete every ReplicaSet in a
+  # potentially shared namespace.
+  oc rollout restart deployment "${dep_name}" -n "${splunk_operator_ns}" \
+    || err "Failed to restart Splunk Operator deployment ${dep_name}"
+
   wait_for_crd standalones.enterprise.splunk.com 300
+  oc rollout status "deployment/${dep_name}" -n "${splunk_operator_ns}" --timeout=10m \
+    || err "Splunk Operator deployment did not become ready"
   log "  ✓ Splunk Operator installed"
 }
 
@@ -1893,9 +2468,107 @@ internal_splunk_management_url() {
 }
 
 # HEC is consumed only by the OpenTelemetry exporter. It is not a JWT issuer.
+# Before Splunk is running, return the fresh-install default for manifest-render
+# tests. install_splunk_standalone() replaces it with the detected live URL.
 internal_splunk_hec_url() {
+  if [[ -n "${_INTERNAL_SPLUNK_HEC_URL:-}" ]]; then
+    printf '%s' "${_INTERNAL_SPLUNK_HEC_URL}"
+    return
+  fi
   printf 'http://splunk-%s-standalone-service.%s.svc.cluster.local:8088' \
     "${AI_STANDALONE_NAME}" "${AI_NS}"
+}
+
+internal_splunk_pod_name() {
+  printf 'splunk-%s-standalone-0' "${AI_STANDALONE_NAME}"
+}
+
+_internal_splunk_btool_http_value() {
+  local option="$1"
+  awk -v wanted="${option}" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      section=$0; sub(/^[[:space:]]*\[/, "", section); sub(/\][[:space:]]*$/, "", section)
+      in_http=(section == "http"); next
+    }
+    in_http && $1 == wanted && $2 == "=" { value=$3; sub(/\r$/, "", value); count++ }
+    END { if (count != 1) exit 1; print tolower(value) }
+  '
+}
+
+_detect_internal_splunk_hec_url() {
+  local pod_name btool_output hec_disabled hec_enable_ssl hec_port hec_scheme health_url
+  _INTERNAL_SPLUNK_HEC_URL=""
+  pod_name="$(internal_splunk_pod_name)"
+  btool_output=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
+    /opt/splunk/bin/splunk btool inputs list http 2>/dev/null) \
+    || err "Failed to read effective HEC settings from ${AI_NS}/${pod_name}; refusing to guess the telemetry protocol."
+
+  hec_disabled=$(printf '%s\n' "${btool_output}" | _internal_splunk_btool_http_value disabled) \
+    || err "Effective Splunk HEC [http]/disabled is missing or ambiguous"
+  case "${hec_disabled}" in
+    0|false|no|off) ;;
+    1|true|yes|on) err "Splunk HEC is disabled; OpenTelemetry requires it" ;;
+    *) err "Unsupported effective Splunk HEC disabled value: ${hec_disabled}" ;;
+  esac
+
+  hec_enable_ssl=$(printf '%s\n' "${btool_output}" | _internal_splunk_btool_http_value enableSSL) \
+    || err "Effective Splunk HEC [http]/enableSSL is missing or ambiguous"
+  case "${hec_enable_ssl}" in
+    0|false|no|off) hec_scheme="http" ;;
+    1|true|yes|on) hec_scheme="https" ;;
+    *) err "Unsupported effective Splunk HEC enableSSL value: ${hec_enable_ssl}" ;;
+  esac
+
+  hec_port=$(printf '%s\n' "${btool_output}" | _internal_splunk_btool_http_value port) \
+    || err "Effective Splunk HEC [http]/port is missing or ambiguous"
+  [[ "${hec_port}" == "8088" ]] || err "Splunk HEC uses port ${hec_port}, but the operator-managed Service exposes 8088"
+
+  health_url="${hec_scheme}://localhost:${hec_port}/services/collector/health"
+  local curl_args=(--silent --show-error --fail --output /dev/null --max-time 10)
+  [[ "${hec_scheme}" == "https" ]] && curl_args+=(--insecure)
+  oc exec -n "${AI_NS}" "${pod_name}" -- curl "${curl_args[@]}" "${health_url}" >/dev/null \
+    || err "Splunk HEC reports ${hec_scheme}, but ${health_url} is not healthy"
+
+  _INTERNAL_SPLUNK_HEC_URL="${hec_scheme}://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:${hec_port}"
+  log "  ✓ Detected healthy internal Splunk HEC endpoint: ${_INTERNAL_SPLUNK_HEC_URL}"
+}
+
+_internal_splunk_runtime_matches_desired() {
+  local pod_name="${1:-$(internal_splunk_pod_name)}" splunkd_ssl issuer_uri expected_issuer
+  expected_issuer="$(internal_splunk_management_url)"
+  splunkd_ssl=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
+    /opt/splunk/bin/splunk btool server list sslConfig 2>/dev/null | \
+    awk '$1 == "enableSplunkdSSL" && $2 == "=" {v=tolower($3); n++} END {if(n != 1) exit 1; print v}') || return 1
+  [[ "${splunkd_ssl}" == "true" || "${splunkd_ssl}" == "1" ]] || return 1
+
+  issuer_uri=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
+    /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null | \
+    awk '$1 == "issuer_uri" && $2 == "=" {v=$3; n++} END {if(n != 1) exit 1; print v}') || return 1
+  [[ "${issuer_uri}" == "${expected_issuer}" ]]
+}
+
+wait_for_internal_splunk_ready() {
+  local timeout="${1:-1200}" deadline=$((SECONDS + ${1:-1200})) pod_name ready phase message
+  pod_name="$(internal_splunk_pod_name)"
+  log "Waiting for Splunk Standalone, management HTTPS, issuer, and HEC to converge..."
+  while (( SECONDS < deadline )); do
+    ready=$(oc get pod "${pod_name}" -n "${AI_NS}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+    phase=$(oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    message=$(oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o jsonpath='{.status.message}' 2>/dev/null || true)
+    if [[ "${ready}" == "True" && "${phase}" == "Ready" && -z "${message}" ]] \
+        && _internal_splunk_runtime_matches_desired "${pod_name}" \
+        && oc exec -n "${AI_NS}" "${pod_name}" -- curl --insecure --silent --show-error \
+             --output /dev/null --max-time 10 https://localhost:8089/services/server/info >/dev/null 2>&1; then
+      _detect_internal_splunk_hec_url
+      log "  ✓ Splunk Standalone is Ready with the expected HTTPS issuer"
+      return 0
+    fi
+    sleep 10
+  done
+  oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o yaml || true
+  oc get pod "${pod_name}" -n "${AI_NS}" -o wide || true
+  oc logs "${pod_name}" -n "${AI_NS}" --tail=120 || true
+  err "Splunk Standalone did not converge within ${timeout}s (phase=${phase:-unknown}, message=${message:-none})"
 }
 
 render_splunk_defaults_manifest() {
@@ -1908,6 +2581,8 @@ metadata:
   name: splunk-defaults
 data:
   default.yml: |
+    ansible_pre_tasks:
+      - file:///mnt/defaults/remove-stale-installer-tls.yml
     splunk:
       conf:
         - key: authentication
@@ -1918,6 +2593,36 @@ data:
                 issuer_uri: ${internal_splunk_url}
                 certFile: \$SPLUNK_HOME/etc/auth/server.pem
                 sslPassword: password
+  remove-stale-installer-tls.yml: |
+    ---
+    - name: Restore built-in management TLS and keep Splunk Web on HTTP
+      ini_file:
+        path: "{{ item.path }}"
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        state: present
+      loop:
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: enableSplunkdSSL, value: "true" }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: enableSplunkWebSSL, value: "false" }
+      when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
+    - name: Remove stale installer-managed certificate paths
+      ini_file:
+        path: "{{ item.path }}"
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        state: absent
+      loop:
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: sslPassword }
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: serverCert }
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: sslRootCAPath }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: sslPassword }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: serverCert }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: privKeyPath }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: caCertPath }
+        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: sslPassword }
+        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: serverCert }
+      when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
 YAML
 }
 
@@ -1958,6 +2663,22 @@ install_splunk_standalone() {
   # AIPlatform.spec.splunkConfiguration.endpoint exactly.
   render_splunk_defaults_manifest | oc -n "${AI_NS}" apply -f -
 
+  # Preserve customer/operator-provided environment entries while explicitly
+  # converging management traffic to native HTTPS. This also repairs PVC-backed
+  # upgrades from older installer revisions that disabled splunkd TLS.
+  local existing_extra_env="[]" desired_extra_env splunk_storage_yaml=""
+  if oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" &>/dev/null; then
+    existing_extra_env=$(oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o json \
+      | jq -ec '(.spec.extraEnv // []) | if type == "array" then . else error("extraEnv is not an array") end') \
+      || err "Existing Standalone spec.extraEnv is invalid; refusing to overwrite it"
+  fi
+  desired_extra_env=$(printf '%s\n' "${existing_extra_env}" | jq -c \
+    '(map(select(.name != "SPLUNKD_SSL_ENABLE"))) + [{"name":"SPLUNKD_SSL_ENABLE","value":"true"}]') \
+    || err "Failed to preserve Standalone extraEnv"
+  if [[ -n "${STORAGE_CLASS}" && "${STORAGE_CLASS}" != "null" ]]; then
+    splunk_storage_yaml="  etcVolumeStorageConfig:"$'\n'"    storageClassName: ${STORAGE_CLASS}"$'\n'"  varVolumeStorageConfig:"$'\n'"    storageClassName: ${STORAGE_CLASS}"$'\n'
+  fi
+
   oc apply --server-side --force-conflicts -f - <<YAML
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
@@ -1966,6 +2687,8 @@ metadata:
   namespace: ${AI_NS}
 spec:
   replicas: 1
+  extraEnv: ${desired_extra_env}
+${splunk_storage_yaml}
   affinity:
     nodeAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -2003,6 +2726,7 @@ spec:
 YAML
 
   log "  ✓ Splunk Standalone CR applied"
+  wait_for_internal_splunk_ready 1200
 }
 
 # render_ai_platform_manifest prints only the AIPlatform resource. Keeping the
@@ -2144,7 +2868,7 @@ install_ai_platform_cr() {
     log "  Waiting for Splunk secret... (${retries}/60)"
   done
   if (( retries >= 60 )); then
-    warn "Splunk secret not ready after 10m — AIPlatform reconcile will retry automatically"
+    err "Splunk source secret ${standalone_secret} did not contain hec_token after 10 minutes; the derived ${splunk_ns_secret} Secret cannot be created automatically later."
   fi
 
   # Optional additional JWT issuers. The in-cluster issuer remains first via
@@ -2209,19 +2933,104 @@ PROBE_EOF
     break
   done
   rm -f "${tls_probe_file}" 2>/dev/null || true
+  (( tls_retries < 60 )) || err "Splunk AI Operator admission webhook TLS did not become valid within 5 minutes"
 
-  render_ai_platform_manifest | oc -n "${AI_NS}" apply --server-side --force-conflicts -f -
+  render_ai_platform_manifest | oc -n "${AI_NS}" apply --server-side --force-conflicts -f - \
+    || err "AIPlatform manifest apply failed"
 
   log "  ✓ AIPlatform CR applied"
 
   local timeout=60 elapsed=0
   while ! oc get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" >/dev/null 2>&1; do
     sleep 5; elapsed=$((elapsed + 5))
-    [[ ${elapsed} -ge ${timeout} ]] && { warn "Timeout waiting for AIPlatform CR"; break; }
+    [[ ${elapsed} -ge ${timeout} ]] && err "Timeout waiting for AIPlatform CR ${AI_NS}/${AI_PLATFORM_NAME} to exist"
   done
 
   oc get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" -o wide || true
   log "  ✓ AIPlatform CR installed"
+}
+
+# Apply configured public-Service annotations to each generated AIService. The
+# reconcilers copy these annotations onto their Services, matching k0s behavior
+# for LoadBalancer integrations and platform-specific controllers.
+apply_openshift_service_annotations() {
+  local annotation_keys feature_count index feature_name aiservice_name waited key value
+  annotation_keys=$(yq eval '.aiPlatform.serviceTemplate.annotations // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)
+  [[ -n "${annotation_keys}" ]] || return 0
+
+  feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)
+  for (( index=0; index<feature_count; index++ )); do
+    feature_name=$(yq eval ".aiPlatform.features[${index}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || true)
+    [[ -n "${feature_name}" && "${feature_name}" != "null" ]] || continue
+    aiservice_name="${AI_PLATFORM_NAME}-${feature_name}"
+    waited=0
+    while ! oc get aiservice "${aiservice_name}" -n "${AI_NS}" &>/dev/null; do
+      (( waited >= 600 )) && err "Timed out waiting for AIService ${AI_NS}/${aiservice_name} before applying Service annotations"
+      sleep 5; waited=$((waited + 5))
+    done
+
+    local annotate_args=()
+    while IFS= read -r key; do
+      [[ -n "${key}" && "${key}" != "null" ]] || continue
+      value=$(yq eval ".aiPlatform.serviceTemplate.annotations.\"${key}\"" "${CONFIG_FILE}" 2>/dev/null || true)
+      [[ -n "${value}" && "${value}" != "null" ]] && annotate_args+=("${key}=${value}")
+    done <<<"${annotation_keys}"
+    if (( ${#annotate_args[@]} > 0 )); then
+      oc annotate aiservice "${aiservice_name}" -n "${AI_NS}" "${annotate_args[@]}" --overwrite
+    fi
+  done
+}
+
+# Converge enabled feature Services back to ClusterIP when the OpenShift config
+# omits serviceTemplate or explicitly selects ClusterIP. AIService preserves
+# direct serviceTemplate overrides, so an older install that patched NodePorts
+# would otherwise keep those NodePorts forever. Recreate only Services whose
+# live type is not already ClusterIP.
+normalize_openshift_clusterip_feature_services() {
+  local svc_type
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -z "${svc_type}" || "${svc_type}" == "null" || "${svc_type}" == "ClusterIP" ]] || return 0
+
+  local feature_count index feature_name aiservice_name public_svc_name waited live_type
+  feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)
+  for (( index=0; index<feature_count; index++ )); do
+    feature_name=$(yq eval ".aiPlatform.features[${index}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || true)
+    [[ -n "${feature_name}" && "${feature_name}" != "null" ]] || continue
+
+    aiservice_name="${AI_PLATFORM_NAME}-${feature_name}"
+    public_svc_name="${aiservice_name}-${feature_name}-service"
+    # A fresh install has no preserved override to normalize. Do not wait here:
+    # Routes can be created before their Services and will self-heal when the
+    # operator creates the default ClusterIP AIService/Service later.
+    oc -n "${AI_NS}" get aiservice "${aiservice_name}" >/dev/null 2>&1 || continue
+
+    oc -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p '{
+  "spec": {
+    "serviceTemplate": {
+      "spec": {
+        "type": "ClusterIP",
+        "ports": [
+          {"name": "http", "port": 8080, "targetPort": 8080}
+        ]
+      }
+    }
+  }
+}' >/dev/null
+
+    live_type=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+    if [[ -n "${live_type}" && "${live_type}" != "ClusterIP" ]]; then
+      log "Recreating Service ${AI_NS}/${public_svc_name} as ClusterIP (was ${live_type})..."
+      oc -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+      waited=0
+      while true; do
+        live_type=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+        [[ "${live_type}" == "ClusterIP" ]] && break
+        (( waited >= 300 )) && err "Service ${AI_NS}/${public_svc_name} did not converge to ClusterIP within 300s"
+        sleep 5
+        waited=$((waited + 5))
+      done
+    fi
+  done
 }
 
 # Expose SLIM on a NodePort distinct from SAIA, following the k0s installer
@@ -2298,41 +3107,62 @@ patch_openshift_slim_public_service_workaround() {
   log "  ✓ SLIM exposed on NodePort ${slim_node_port}"
 }
 
-# ====== CREATE SAIA ROUTE ======
-# Creates an OpenShift Route so SAIA is reachable via a stable external hostname.
-# The URL must be reachable from both the browser and from within the cluster
-# (Splunk's setup page validates connectivity from the server side).
-# NodePort alone doesn't work when node IPs are not externally routable.
-create_saia_route() {
+# True when a feature is enabled and its OpenShift Route has not been disabled.
+# Routes default to enabled to preserve the existing SAIA behavior and give SLIM
+# the same stable OpenShift-native exposure.
+openshift_route_enabled() {
+  local feature="$1" enabled
+  openshift_feature_enabled "${feature}" || return 1
+  enabled=$(yq eval ".openshift.routes.${feature}.enabled // \"true\"" "${CONFIG_FILE}" 2>/dev/null || echo "true")
+  [[ "${enabled}" == "true" ]]
+}
+
+openshift_route_host() {
+  local feature="$1" configured_host
+  configured_host=$(yq eval ".openshift.routes.${feature}.host // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${configured_host}" && "${configured_host}" != "null" ]]; then
+    printf '%s\n' "${configured_host}"
+  elif [[ -n "${INGRESS_DOMAIN:-}" ]]; then
+    printf '%s.%s\n' "${feature}" "${INGRESS_DOMAIN}"
+  fi
+}
+
+# Create an OpenShift Route for one AI feature. The backing Services remain
+# ClusterIP by default; optional NodePort/LoadBalancer serviceTemplate settings
+# continue to work as explicit fallbacks.
+create_openshift_feature_route() {
+  local feature="$1" route_name="$2" svc_name="$3"
+  local feature_label
+  feature_label=$(printf '%s' "${feature}" | tr '[:lower:]' '[:upper:]')
+
   # Re-attempt ingress domain detection in case it was unavailable during load_config.
   if [[ -z "${INGRESS_DOMAIN:-}" ]]; then
     INGRESS_DOMAIN=$(oc get ingresscontroller default -n openshift-ingress-operator \
       -o jsonpath='{.status.domain}' 2>/dev/null || echo "")
   fi
-  if [[ -z "${INGRESS_DOMAIN:-}" ]]; then
-    warn "Could not determine ingress domain — skipping SAIA Route creation"
-    warn "Create it manually: oc expose svc/${AI_PLATFORM_NAME}-saia-saia-service -n ${AI_NS}"
-    return 0
+
+  local route_host
+  route_host=$(openshift_route_host "${feature}")
+  if [[ -z "${route_host}" ]]; then
+    warn "Could not determine a host for the ${feature_label} Route"
+    warn "Set openshift.ingressDomain or openshift.routes.${feature}.host in ${CONFIG_FILE}"
+    return 1
   fi
 
-  local route_host="saia.${INGRESS_DOMAIN}"
-  local svc_name="${AI_PLATFORM_NAME}-saia-saia-service"
+  log "Creating ${feature_label} Route: http://${route_host} ..."
 
-  log "Creating SAIA Route: http://${route_host} ..."
-
-  # Create the Route immediately — do NOT wait for the SAIA service to exist.
+  # Create the Route immediately — do not wait for the feature Service to exist.
   # An OpenShift Route does not require its backend Service to be present at
   # creation time: the router resolves the backend dynamically and returns 503
   # until the service's endpoints appear, then serves traffic automatically.
-  # The operator can take tens of minutes to create the SAIA service (model
-  # download + vector-db posthook + reconcile), so blocking on it here caused
-  # the Route to be skipped whenever that exceeded the wait window — leaving the
-  # SAIA URL permanently unreachable even though the install reported success.
+  # The operator can take time to create feature Services, so blocking on them
+  # here can leave an otherwise healthy deployment without its configured
+  # external endpoint.
   if ! oc apply -f - <<EOF
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: saia
+  name: ${route_name}
   namespace: ${AI_NS}
   annotations:
     haproxy.router.openshift.io/timeout: "600s"
@@ -2346,26 +3176,29 @@ spec:
     targetPort: 8080
 EOF
   then
-    warn "Failed to create SAIA Route. Create it manually once the SAIA service exists:"
-    warn "  oc apply -f - <<'ROUTE'"
-    warn "  apiVersion: route.openshift.io/v1"
-    warn "  kind: Route"
-    warn "  metadata: { name: saia, namespace: ${AI_NS} }"
-    warn "  spec: { host: ${route_host}, to: { kind: Service, name: ${svc_name} }, port: { targetPort: 8080 } }"
-    warn "  ROUTE"
-    return 0
+    warn "Failed to create ${feature_label} Route ${AI_NS}/${route_name}"
+    return 1
   fi
 
   # Confirm the Route object now exists so a silent apply failure can't pass as success.
-  if ! oc get route saia -n "${AI_NS}" >/dev/null 2>&1; then
-    warn "SAIA Route apply reported success but the Route is not present — check cluster state."
-    return 0
+  if ! oc get route "${route_name}" -n "${AI_NS}" >/dev/null 2>&1; then
+    warn "${feature_label} Route apply reported success but ${AI_NS}/${route_name} is not present"
+    return 1
   fi
 
-  log "  ✓ SAIA Route created: http://${route_host}"
-  log "    (Returns 503 until the SAIA service endpoints come up — this is expected"
+  log "  ✓ ${feature_label} Route created: http://${route_host}"
+  log "    (Returns 503 until the ${feature_label} service endpoints come up — this is expected"
   log "     while the operator finishes reconciling; it self-heals, no rerun needed.)"
-  log "    Use this URL in Splunk AI setup: http://${route_host}"
+}
+
+create_saia_route() {
+  create_openshift_feature_route \
+    saia saia "${AI_PLATFORM_NAME}-saia-saia-service"
+}
+
+create_slim_route() {
+  create_openshift_feature_route \
+    slim slim "${AI_PLATFORM_NAME}-slim-slim-service"
 }
 
 # Return the model-artifact profile used by an accelerator. Keep this selection
@@ -2377,6 +3210,14 @@ model_artifacts_config_name() {
     rtx_pro_6000_blackwell) echo "model_artifacts_configs_quantized.yaml" ;;
     *)                      return 1 ;;
   esac
+}
+
+# Resolve the directory containing immutable model metadata. Connected installs
+# use the repository's staging directory; the air-gap wrapper points this at the
+# metadata copied into the verified bundle.
+model_artifacts_metadata_dir() {
+  local candidate="${MODEL_ARTIFACTS_CONFIG_DIR:-$(dirname "$0")/../artifacts_download_upload_scripts}"
+  (cd "${candidate}" 2>/dev/null && pwd)
 }
 
 # ====== ALL MODELS STAGED PRE-CHECK ======
@@ -2423,7 +3264,7 @@ all_models_staged() {
 
   _marker_matches_url() {
     local content="$1" expected_url="$2"
-    echo "${content}" | grep -q "^hf_url=${expected_url}$"
+    printf '%s\n' "${content}" | grep -Fqx "hf_url=${expected_url}"
   }
 
   local missing=()
@@ -2440,11 +3281,11 @@ all_models_staged() {
         local content
         content=$(AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
                   AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-                  aws s3 cp "${marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { missing+=("${id}"); continue; }
+                  aws s3 cp "${marker_path}" - --region "${OBJ_STORE_REGION:-us-east-2}" 2>/dev/null) || { missing+=("${id}"); continue; }
         _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
       done
       ;;
-    minio|seaweedfs)
+    minio|seaweedfs|s3compat)
       if ! command -v mc &>/dev/null; then
         warn "all_models_staged: mc not found — skipping pre-check."
         return 1
@@ -2483,6 +3324,27 @@ all_models_staged() {
     log "  MISSING: ${_m}  (${OBJ_STORE_BUCKET}/staging_state/${_m}/.staging_complete not found or hf_url changed)"
   done
   return 1
+}
+
+# Air-gapped installs cannot download model weights. Verify the exact completion
+# marker for every model before modifying the cluster instead of trusting that a
+# separate staging process was run successfully.
+verify_pre_staged_model_artifacts() {
+  local staging_dir accel config_name
+  staging_dir=$(model_artifacts_metadata_dir) \
+    || { err "Cannot locate model artifact metadata. Set MODEL_ARTIFACTS_CONFIG_DIR to a directory containing the bundled model config."; return 1; }
+  accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
+  config_name=$(model_artifacts_config_name "${accel}") || err "Unsupported accelerator for model verification: ${DEFAULT_ACCELERATOR}"
+
+  if all_models_staged "${staging_dir}" "${accel}"; then
+    log "✓ Verified every required pre-staged model in ${OBJ_STORE_BUCKET}"
+    return 0
+  fi
+
+  err "Model artifact verification failed for bucket '${OBJ_STORE_BUCKET}'.
+  Every model in ${config_name} must have a matching
+  staging_state/<artifact-id>/.staging_complete marker. Stage the missing
+  artifacts from a connected machine, then rerun the installer."
 }
 
 # ====== MODEL ARTIFACT STAGING ======
@@ -2537,13 +3399,13 @@ stage_model_artifacts() {
       OBJ_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
       OBJ_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
       OBJ_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      S3_REGION="${REGION:-us-east-2}" \
+      S3_REGION="${OBJ_STORE_REGION:-us-east-2}" \
       S3_PREFIX="model_artifacts" \
       bash ./download_from_huggingface.sh ) \
     || { err "HuggingFace download failed — see output above"; return 1; }
 
   log "Uploading model artifacts to object store (type=${OBJ_STORE_TYPE})..."
-  if [[ "${OBJ_STORE_TYPE}" == "minio" || "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
+  if [[ "${OBJ_STORE_TYPE}" == "minio" || "${OBJ_STORE_TYPE}" == "s3compat" || "${OBJ_STORE_TYPE}" == "seaweedfs" ]]; then
     [[ -n "${OBJ_STORE_ENDPOINT}" ]] || { err "storage.objectStore.endpoint is required for ${OBJ_STORE_TYPE} model staging"; return 1; }
   fi
 
@@ -2558,7 +3420,7 @@ stage_model_artifacts() {
         bash ./upload_to_s3.sh ) \
         || { err "Upload to S3 failed"; return 1; }
       ;;
-    minio)
+    minio|s3compat)
       ( cd "${staging_dir}" && \
         OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
         OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
@@ -2579,7 +3441,7 @@ stage_model_artifacts() {
         || { err "Upload to SeaweedFS failed"; return 1; }
       ;;
     *)
-      err "Unsupported objectStore.type for model staging: '${OBJ_STORE_TYPE}' (expected: aws | minio | seaweedfs)"
+      err "Unsupported objectStore.type for model staging: '${OBJ_STORE_TYPE}' (expected: aws | minio | s3compat | seaweedfs)"
       return 1
       ;;
   esac
@@ -2589,8 +3451,7 @@ stage_model_artifacts() {
   if all_models_staged "${staging_dir}" "${_accel}"; then
     log "✓ Post-stage verification passed — all models confirmed staged."
   else
-    warn "Post-stage verification: some models may not have been staged successfully."
-    warn "Check the upload logs above. You can re-run with SKIP_IF_STAGED=0 to force re-upload."
+    err "Post-stage verification failed. Re-run '$0 stage-artifacts' with SKIP_IF_STAGED=0, then retry installation."
   fi
 
   log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
@@ -2747,17 +3608,24 @@ main_install() {
 
   show_install_plan
 
-  phase_start "Model Staging"
-  step_start "Model artifact staging"
-  stage_model_artifacts
-  step_ok
-  phase_end "Model Staging"
-
   phase_start "Preflight"
   step_start "Preflight checks"
   preflight_checks
   step_ok
   phase_end "Preflight"
+
+  phase_start "Model Staging"
+  if [[ "${AIRGAP_MODE:-false}" == "true" || "${MODEL_STAGING_ENABLED}" != "true" ]]; then
+    step_start "Verify pre-staged model artifacts"
+    verify_pre_staged_model_artifacts
+  else
+    step_start "Model artifact staging"
+    stage_model_artifacts
+  fi
+  step_ok
+  phase_end "Model Staging"
+
+  initialize_install_state
 
   phase_start "Infrastructure"
   step_start "NFD Operator"
@@ -2816,19 +3684,51 @@ main_install() {
   install_ai_platform_cr
   step_ok
 
-  step_start "SLIM NodePort"
+  step_start "Feature Services"
+  apply_openshift_service_annotations
+  normalize_openshift_clusterip_feature_services
   patch_openshift_slim_public_service_workaround
   step_ok
 
   step_start "SAIA Route"
-  create_saia_route
-  step_ok
+  if openshift_route_enabled saia; then
+    create_saia_route
+    step_ok
+  else
+    step_skip "disabled"
+  fi
+
+  step_start "SLIM Route"
+  if openshift_route_enabled slim; then
+    create_slim_route
+    step_ok
+  else
+    step_skip "disabled"
+  fi
+
+  step_start "Platform readiness"
+  if verify_all_pods_healthy; then
+    step_ok
+  else
+    step_fail "workloads did not become Ready"
+    show_step_summary
+    if [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+      log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
+      diagnose || true
+    fi
+    err "Installation did not reach the Ready state"
+  fi
   phase_end "AI Platform Stack"
 
   show_step_summary
 
-  local saia_url=""
-  [[ -n "$INGRESS_DOMAIN" ]] && saia_url="http://saia.${INGRESS_DOMAIN}"
+  local saia_url="" slim_url=""
+  if openshift_route_enabled saia; then
+    saia_url="http://$(openshift_route_host saia)"
+  fi
+  if openshift_route_enabled slim; then
+    slim_url="http://$(openshift_route_host slim)/tenant/slim-api/v1alpha1"
+  fi
 
   log "============================================"
   log " Install complete"
@@ -2845,6 +3745,11 @@ main_install() {
   log ""
   log "  SAIA app URL (use this in Splunk AI setup):"
   log "     ${saia_url}"
+  fi
+  if [[ -n "$slim_url" ]]; then
+  log ""
+  log "  SLIM API URL (use this in AITK setup):"
+  log "     ${slim_url}"
   fi
   log ""
   log "Log file: ${LOG_FILE}"
@@ -2886,120 +3791,154 @@ main_delete() {
 
   local ai_operator_ns="splunk-ai-operator-system"
   local splunk_operator_ns="splunk-operator"
+  verify_install_state_cluster
 
   # ── 1. AI Platform CRs (trigger operator finalizers before namespace delete) ──
-  log "Removing SAIA Route..."
-  oc delete route saia -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+  log "Removing SAIA and SLIM Routes..."
+  oc delete route saia slim -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
 
   log "Removing AIPlatform CR and waiting for finalizers..."
-  oc delete aiplatform --all -n "${AI_NS}" --timeout=120s 2>/dev/null || true
-  oc delete standalone --all -n "${AI_NS}" --timeout=60s 2>/dev/null || true
+  oc delete aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" --timeout=120s 2>/dev/null || true
+  oc delete standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=60s 2>/dev/null || true
 
-  # ── 2. AI Platform namespace (cascades all pods, PVCs, services, etc.) ──
-  log "Deleting namespace ${AI_NS}..."
-  force_delete_namespace "${AI_NS}" 180
-
-  # ── 3. Splunk AI Operator ──
-  log "Removing Splunk AI Operator..."
-  force_delete_namespace "${ai_operator_ns}" 60
-  # Remove cluster-scoped resources (CRDs, ClusterRoles, webhooks) from manifests
-  [[ -f "${SPLUNK_AI_FILE}" ]] && \
-    oc delete -f "${SPLUNK_AI_FILE}" --ignore-not-found=true 2>/dev/null || true
-
-  # ── 4. Splunk Operator ──
-  log "Removing Splunk Operator..."
-  force_delete_namespace "${splunk_operator_ns}" 60
-  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && \
-    oc delete -f "${SPLUNK_OPERATOR_FILE}" --ignore-not-found=true 2>/dev/null || true
-
-  # ── 5. KubeRay Operator (helm) ──
-  log "Removing KubeRay Operator..."
-  helm uninstall kuberay-operator -n ray-system 2>/dev/null || true
-  force_delete_namespace ray-system 60
-
-  # ── 6. OpenTelemetry Operator (helm) ──
-  log "Removing OpenTelemetry Operator..."
-  helm uninstall opentelemetry-operator -n opentelemetry-operator-system 2>/dev/null || true
-  force_delete_namespace opentelemetry-operator-system 60
-
-  # ── 7. cert-manager (helm) ──
-  log "Removing cert-manager..."
-  helm uninstall cert-manager -n cert-manager 2>/dev/null || true
-  force_delete_namespace cert-manager 60
-  # Remove CRDs left by cert-manager (helm uninstall doesn't remove CRDs by default)
-  oc get crd -o name 2>/dev/null | grep cert-manager | xargs -r oc delete --ignore-not-found=true 2>/dev/null || true
-
-  # ── 8. local-path-provisioner ──
-  log "Removing local-path-provisioner..."
-  oc delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml \
-    --ignore-not-found=true 2>/dev/null || true
-  force_delete_namespace local-path-storage 60
-  oc delete storageclass local-path --ignore-not-found=true 2>/dev/null || true
-
-  # ── 9. NVIDIA GPU Operator ──
-  log "Removing NVIDIA GPU Operator..."
-  oc delete clusterpolicy gpu-cluster-policy --ignore-not-found=true 2>/dev/null || true
-  oc delete subscription gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
-  oc delete csv -n nvidia-gpu-operator --all --ignore-not-found=true 2>/dev/null || true
-  force_delete_namespace nvidia-gpu-operator 60
-
-  # ── 10. NFD ──
-  log "Removing Node Feature Discovery..."
-  oc delete nodefeaturediscovery nfd-instance -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
-  oc delete subscription nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
-  oc delete csv -n openshift-nfd --all --ignore-not-found=true 2>/dev/null || true
-  force_delete_namespace openshift-nfd 60
-
-  # ── 11. Node labels and taints added by label_nodes() ──
-  # Match both the current ai-tier-node label and the legacy workload-type label so
-  # teardown cleans up stacks installed before the single-label refactor. Also strip
-  # the nvidia.com/gpu taint older installs applied to GPU worker nodes.
-  log "Removing splunk.ai/* node labels and GPU taint..."
-  for node in $( { oc get nodes -l 'splunk.ai/ai-tier-node' -o name 2>/dev/null; \
-                   oc get nodes -l 'splunk.ai/workload-type' -o name 2>/dev/null; \
-                 } | sort -u ); do
-    oc label "${node}" splunk.ai/ai-tier-node- splunk.ai/workload-type- 2>/dev/null || true
-    oc adm taint "${node}" nvidia.com/gpu=true:NoSchedule- 2>/dev/null || true
-  done
-
-  # ── 12. SCC grants added during install ──
-  if [[ "${GRANT_PRIVILEGED_SCC}" == "true" ]]; then
-    log "Removing SCC grants..."
-    oc adm policy remove-scc-from-group privileged \
-      "system:serviceaccounts:${ai_operator_ns}" 2>/dev/null || true
-    oc adm policy remove-scc-from-group anyuid \
-      "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-    oc adm policy remove-scc-from-group privileged \
-      "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-    oc adm policy remove-scc-from-group privileged \
-      "system:serviceaccounts:local-path-storage" 2>/dev/null || true
-    oc adm policy remove-scc-from-group privileged \
-      "system:serviceaccounts:splunk-operator" 2>/dev/null || true
+  # ── 2. AI Platform namespace (only when this installer created it) ──
+  local ai_namespace_component="namespace_$(printf '%s' "${AI_NS}" | tr -c 'a-zA-Z0-9._-' '_')"
+  if component_is_owned "${ai_namespace_component}"; then
+    log "Deleting installer-owned namespace ${AI_NS}..."
+    force_delete_namespace "${AI_NS}" 180
+  else
+    log "Preserving pre-existing namespace ${AI_NS}; removing installer-created configuration only."
+    oc delete configmap splunk-defaults -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+    oc delete secret minio-credentials "splunk-${AI_NS}-secret" -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
   fi
 
-  # Remove individual ClusterRoleBindings created during install
-  for crb in \
-    local-path-provisioner-privileged \
-    local-path-helper-privileged \
-    splunk-standalone-privileged \
-    splunk-operator-privileged \
-    splunk-operator-anyuid \
-    otel-operator-privileged \
-    otel-operator-anyuid \
-    scc-privileged-ai-platform-all \
-    scc-privileged-splunk-ai-operator-system-default \
-    scc-privileged-splunk-ai-operator-system-splunk-ai-operator-controller-manager; do
-    oc delete clusterrolebinding "${crb}" --ignore-not-found=true 2>/dev/null || true
+  # ── 3. Splunk AI Operator ──
+  if component_is_owned splunk_ai_operator_bundle_v2; then
+    log "Removing installer-owned Splunk AI Operator..."
+    if [[ -f "${SPLUNK_AI_FILE}" ]]; then
+      manifest_without_namespaces "${SPLUNK_AI_FILE}" \
+        | oc delete -f - --ignore-not-found=true 2>/dev/null || true
+    fi
+    component_is_owned namespace_splunk-ai-operator-system && force_delete_namespace "${ai_operator_ns}" 60
+  else
+    log "Preserving pre-existing Splunk AI Operator."
+  fi
+
+  # ── 4. Splunk Operator ──
+  if component_is_owned splunk_operator_bundle_v2; then
+    log "Removing installer-owned Splunk Operator..."
+    if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
+      manifest_without_namespaces "${SPLUNK_OPERATOR_FILE}" \
+        | oc delete -f - --ignore-not-found=true 2>/dev/null || true
+    fi
+    component_is_owned namespace_splunk-operator && force_delete_namespace "${splunk_operator_ns}" 60
+  else
+    log "Preserving pre-existing Splunk Operator."
+  fi
+
+  # ── 5. KubeRay Operator (helm) ──
+  if component_is_owned kuberay_operator; then
+    log "Removing installer-owned KubeRay Operator..."
+    helm uninstall kuberay-operator -n ray-system 2>/dev/null || true
+    component_is_owned namespace_ray-system && force_delete_namespace ray-system 60
+  else
+    log "Preserving pre-existing KubeRay Operator."
+  fi
+
+  # ── 6. OpenTelemetry Operator (helm) ──
+  if component_is_owned otel_operator; then
+    log "Removing installer-owned OpenTelemetry Operator..."
+    helm uninstall opentelemetry-operator -n opentelemetry-operator-system 2>/dev/null || true
+    component_is_owned namespace_opentelemetry-operator-system && force_delete_namespace opentelemetry-operator-system 60
+  else
+    log "Preserving pre-existing OpenTelemetry Operator."
+  fi
+
+  # ── 7. cert-manager (installed from a static manifest) ──
+  if component_is_owned cert_manager; then
+    log "Removing installer-owned cert-manager using its install manifest..."
+    local cm_manifest="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml}"
+    cm_manifest="${cm_manifest#file://}"
+    if [[ -f "${cm_manifest}" || "${cm_manifest}" == http://* || "${cm_manifest}" == https://* ]]; then
+      manifest_without_namespaces "${cm_manifest}" \
+        | oc delete -f - --ignore-not-found=true 2>/dev/null || true
+    else
+      warn "cert-manager install manifest is unavailable at delete time: ${cm_manifest}; preserving cluster-scoped resources."
+    fi
+    component_is_owned namespace_cert-manager && force_delete_namespace cert-manager 60
+  else
+    log "Preserving pre-existing cert-manager."
+  fi
+
+  # ── 8. local-path-provisioner ──
+  if component_is_owned local_path_provisioner; then
+    log "Removing installer-owned local-path-provisioner..."
+    local lp_manifest="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml}"
+    lp_manifest="${lp_manifest#file://}"
+    if [[ -f "${lp_manifest}" || "${lp_manifest}" == http://* || "${lp_manifest}" == https://* ]]; then
+      manifest_without_namespaces "${lp_manifest}" \
+        | oc delete -f - --ignore-not-found=true 2>/dev/null || true
+    else
+      warn "local-path install manifest is unavailable at delete time: ${lp_manifest}"
+    fi
+    component_is_owned namespace_local-path-storage && force_delete_namespace local-path-storage 60
+  else
+    log "Preserving pre-existing local-path-provisioner and StorageClass."
+  fi
+
+  # ── 9. NVIDIA GPU Operator ──
+  component_is_owned gpu_cluster_policy && \
+    oc delete clusterpolicy gpu-cluster-policy --ignore-not-found=true 2>/dev/null || true
+  if component_is_owned gpu_subscription; then
+    local gpu_csv
+    gpu_csv=$(oc get subscription gpu-operator-certified -n nvidia-gpu-operator -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    oc delete subscription gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
+    [[ -z "${gpu_csv}" ]] || oc delete csv "${gpu_csv}" -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
+    component_is_owned namespace_nvidia-gpu-operator && force_delete_namespace nvidia-gpu-operator 60
+  else
+    log "Preserving pre-existing NVIDIA GPU Operator."
+  fi
+
+  # ── 10. NFD ──
+  component_is_owned nfd_instance && \
+    oc delete nodefeaturediscovery nfd-instance -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
+  if component_is_owned nfd_subscription; then
+    local nfd_csv
+    nfd_csv=$(oc get subscription nfd -n openshift-nfd -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    oc delete subscription nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
+    [[ -z "${nfd_csv}" ]] || oc delete csv "${nfd_csv}" -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
+    component_is_owned namespace_openshift-nfd && force_delete_namespace openshift-nfd 60
+  else
+    log "Preserving pre-existing Node Feature Discovery Operator."
+  fi
+
+  # ── 11. Node labels and taints added by label_nodes() ──
+  # Namespace-qualified annotations ensure this delete restores only labels and
+  # taints recorded by the matching installation state.
+  log "Restoring node labels and taints changed by this installer..."
+  restore_installer_node_labels
+
+  # ── 12. SCC grants added during install ──
+  component_is_owned scc_privileged_ai_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${ai_operator_ns}" 2>/dev/null || true
+  component_is_owned scc_anyuid_ai_namespace && oc adm policy remove-scc-from-group anyuid "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
+  component_is_owned scc_privileged_ai_namespace && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
+  component_is_owned scc_privileged_splunk_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${splunk_operator_ns}" 2>/dev/null || true
+  component_is_owned scc_anyuid_cert_manager && oc adm policy remove-scc-from-user anyuid -z cert-manager -n cert-manager 2>/dev/null || true
+  component_is_owned scc_anyuid_cert_manager_cainjector && oc adm policy remove-scc-from-user anyuid -z cert-manager-cainjector -n cert-manager 2>/dev/null || true
+  component_is_owned scc_anyuid_cert_manager_webhook && oc adm policy remove-scc-from-user anyuid -z cert-manager-webhook -n cert-manager 2>/dev/null || true
+
+  for crb in local-path-provisioner-privileged local-path-helper-privileged otel-operator-privileged; do
+    component_is_owned "crb_$(printf '%s' "${crb}" | tr -c 'a-zA-Z0-9._-' '_')" && \
+      oc delete clusterrolebinding "${crb}" --ignore-not-found=true 2>/dev/null || true
   done
 
-  # ── 13. ECR pull secret ClusterRoleBindings ──
-  oc delete clusterrolebinding ecr-registry-secret-updater 2>/dev/null || true
+  oc delete configmap "$(installer_state_name)" -n openshift-config --ignore-not-found=true 2>/dev/null || true
 
   log "============================================"
   log " Delete complete"
   log "============================================"
   log ""
-  log "Cluster itself is untouched — only the AI Platform stack was removed."
+  log "Only the AI Platform stack and shared components recorded as installer-owned were removed."
   log "Log file: ${LOG_FILE}"
 }
 
@@ -3089,6 +4028,14 @@ diagnose() {
     oc version 2>/dev/null || true
     helm version 2>/dev/null || true
     yq --version 2>/dev/null || true
+    jq --version 2>/dev/null || true
+    curl --version 2>/dev/null || true
+    timeout --version 2>/dev/null || true
+    python3 --version 2>/dev/null || true
+    tar --version 2>/dev/null || true
+    aws --version 2>/dev/null || true
+    mc --version 2>/dev/null || true
+    command -v base64 2>/dev/null || true
     echo "=== OS ==="
     uname -a
   } > "${bundle_dir}/versions.txt" 2>&1
@@ -3132,26 +4079,128 @@ Environment:
 
 Prerequisites:
   - Logged in to OpenShift: oc login <cluster-url>
-  - oc, yq, helm in PATH
+  - oc, yq v4, helm, jq, curl, timeout, python3, tar in PATH
+  - mc for MinIO/SeaweedFS/S3-compatible model verification
+  - aws only for AWS S3 model storage; automatic ECR secret creation also uses aws
+  - Cluster-admin access to OpenShift ${REQUIRED_OPENSHIFT_MINOR:-4.21}; this installer is qualified on RHCOS amd64 nodes
   - artifacts.yaml (operator manifests) in the same directory, or set files.aiPlatform in config
 EOF
 }
 
-# ====== VERIFY ALL PODS HEALTHY ======
-verify_all_pods_healthy() {
-  load_config 2>/dev/null || true
-  log "Verifying all pods are healthy in namespace ${AI_NS:-ai-platform}..."
-  local unhealthy
-  unhealthy=$(oc get pods --all-namespaces --no-headers 2>/dev/null \
-    | awk '$4 != "Running" && $4 != "Completed" && $4 != "Succeeded" {print $1, $2, $4}')
-  if [[ -z "${unhealthy}" ]]; then
-    log "✓ All pods are healthy"
-    return 0
+# ====== VERIFY PLATFORM READINESS ======
+# Populate PLATFORM_PENDING_REASON and return success only when pods and the
+# operator-level custom resources agree that the platform is ready. Checking
+# only current pods can return a false success before KubeRay creates workers.
+platform_readiness_snapshot() {
+  PLATFORM_PENDING_REASON=""
+  local pod_json bad_pods platform_json cr_json pending feature aiservice_name
+
+  pod_json=$(oc get pods -n "${AI_NS}" -o json 2>/dev/null) || {
+    PLATFORM_PENDING_REASON="Cannot list pods in ${AI_NS}"
+    return 1
+  }
+  bad_pods=$(printf '%s\n' "${pod_json}" | jq -r '
+    .items[]
+    | (.status.containerStatuses // []) as $cs
+    | select(
+        (.status.phase != "Succeeded") and
+        ((.status.phase != "Running") or (($cs | length) == 0) or (any($cs[]; .ready != true)))
+      )
+    | "pod \(.metadata.name): phase=\(.status.phase // "Unknown") waiting=\([$cs[]? | .state.waiting.reason // empty] | join(",")) ready=\([$cs[]? | select(.ready == true)] | length)/\($cs | length)"' 2>/dev/null || true)
+  [[ -z "${bad_pods}" ]] || PLATFORM_PENDING_REASON="${bad_pods}"
+
+  platform_json=$(oc get aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" -o json 2>/dev/null) || {
+    PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}AIPlatform ${AI_PLATFORM_NAME} does not exist"
+    return 1
+  }
+  pending=$(printf '%s\n' "${platform_json}" | jq -r '
+    (.metadata.generation // 0) as $generation
+    | (.status.observedGeneration // 0) as $observed
+    | if $observed != $generation then
+        "AIPlatform \(.metadata.name): observedGeneration=\($observed), generation=\($generation)"
+      elif any((.status.conditions // [])[]; .type == "Ready" and .status == "True") then
+        ""
+      else
+        "AIPlatform \(.metadata.name): Ready=\([(.status.conditions // [])[] | select(.type == "Ready") | .status] | first // "Unknown")"
+      end')
+  [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+
+  # Query only the exact AIService names generated for this AIPlatform. A
+  # pre-existing namespace can contain unrelated AIPlatform children.
+  while IFS= read -r feature; do
+    [[ -z "${feature}" || "${feature}" == "null" ]] && continue
+    aiservice_name="${AI_PLATFORM_NAME}-${feature}"
+    if ! cr_json=$(oc get aiservice "${aiservice_name}" -n "${AI_NS}" -o json 2>/dev/null); then
+      PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}AIService ${aiservice_name} does not exist"
+      continue
+    fi
+    pending=$(printf '%s\n' "${cr_json}" | jq -r '
+      (.metadata.generation // 0) as $generation
+      | (.status.observedGeneration // 0) as $observed
+      | if $observed != $generation then
+          "AIService \(.metadata.name): observedGeneration=\($observed), generation=\($generation)"
+        elif any((.status.conditions // [])[]; .type == "Ready" and .status == "True") then
+          ""
+        else
+          "AIService \(.metadata.name): Ready=\([(.status.conditions // [])[] | select(.type == "Ready") | .status] | first // "Unknown")"
+        end' 2>/dev/null || true)
+    [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+  done < <(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || true)
+
+  if yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null | grep -qx saia; then
+    local ray_service_name ray_cluster_name
+    # The operator names the RayService after the AIPlatform. The
+    # status.rayServiceName field contains the generated head Service name and
+    # must not be used as the RayService CR identity.
+    ray_service_name="${AI_PLATFORM_NAME}"
+    if [[ -z "${ray_service_name}" ]] || ! cr_json=$(oc get rayservice "${ray_service_name}" -n "${AI_NS}" -o json 2>/dev/null); then
+      PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}RayService ${ray_service_name:-<unresolved>} does not exist for AIPlatform ${AI_PLATFORM_NAME}"
+    else
+      pending=$(printf '%s\n' "${cr_json}" | jq -r '
+        if ((.status.serviceStatus // "") == "Running") or
+           any((.status.conditions // [])[]; .type == "Ready" and .status == "True")
+        then "" else "RayService \(.metadata.name): serviceStatus=\(.status.serviceStatus // "Unknown")" end' 2>/dev/null || true)
+      [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+
+      ray_cluster_name=$(printf '%s\n' "${cr_json}" | jq -r '.status.activeServiceStatus.rayClusterName // empty')
+      if [[ -z "${ray_cluster_name}" ]] || ! cr_json=$(oc get raycluster "${ray_cluster_name}" -n "${AI_NS}" -o json 2>/dev/null); then
+        PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}RayCluster ${ray_cluster_name:-<unresolved>} does not exist for RayService ${ray_service_name}"
+      else
+        pending=$(printf '%s\n' "${cr_json}" | jq -r '
+          (.status.desiredWorkerReplicas // 0) as $desired
+          | (.status.readyWorkerReplicas // 0) as $ready
+          | (any((.status.conditions // [])[]; .type == "RayClusterProvisioned" and .status == "True")) as $provisioned
+          | if ((((.status.state // "") | ascii_downcase) == "ready") or $provisioned) and ($ready >= $desired)
+            then "" else "RayCluster \(.metadata.name): state=\(.status.state // "Unknown") workers=\($ready)/\($desired)" end' 2>/dev/null || true)
+        [[ -z "${pending}" ]] || PLATFORM_PENDING_REASON+="${PLATFORM_PENDING_REASON:+$'\n'}${pending}"
+      fi
+    fi
   fi
-  warn "Unhealthy pods detected:"
-  echo "${unhealthy}" | while read -r ns pod status; do
-    warn "  ${ns}/${pod} — ${status}"
+
+  [[ -z "${PLATFORM_PENDING_REASON}" ]]
+}
+
+verify_all_pods_healthy() {
+  [[ -n "${AI_NS:-}" ]] || load_config
+  local timeout="${PLATFORM_READY_TIMEOUT:-1800}" interval="${PLATFORM_READY_POLL_INTERVAL:-15}" elapsed=0
+  log "Waiting for pods, AIPlatform, AIServices, Ray clusters, and Ray Serve to become ready (timeout: ${timeout}s)..."
+  while (( elapsed <= timeout )); do
+    if platform_readiness_snapshot; then
+      log "✓ AI Platform pods and workload resources are Ready"
+      return 0
+    fi
+    if (( elapsed < timeout )); then
+      log "  Still reconciling (${elapsed}s/${timeout}s): $(printf '%s' "${PLATFORM_PENDING_REASON}" | head -1)"
+      sleep "${interval}"
+      elapsed=$((elapsed + interval))
+      continue
+    fi
+    break
   done
+
+  warn "Platform did not become ready within ${timeout}s:"
+  while IFS= read -r pending; do [[ -n "${pending}" ]] && warn "  ${pending}"; done <<<"${PLATFORM_PENDING_REASON}"
+  oc get pods,aiplatform,aiservice,raycluster,rayservice -n "${AI_NS}" -o wide || true
   return 1
 }
 
