@@ -616,6 +616,13 @@ oc get route saia -n ai-platform -o jsonpath='{.spec.host}{"\n"}'
 
 Air-gap uses two scripts plus a separate image-mirroring step:
 
+An air-gapped install host does not require public internet after all content is
+transferred or mirrored, but it is not isolated from the deployment network. It
+must reach the OpenShift API and the configured private object store and
+registry endpoints. If the configuration uses public AWS S3, ECR, or another
+external service, provide outbound access through an approved proxy or use the
+corresponding private endpoints.
+
 1. **On an internet-connected machine**, build the bundle:
    ```bash
    ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer

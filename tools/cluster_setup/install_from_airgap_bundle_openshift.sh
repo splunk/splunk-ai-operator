@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # install_from_airgap_bundle_openshift.sh
-# Run on the air-gapped OpenShift install machine (needs oc + helm pre-installed,
-# but NO outbound internet). Extracts the bundle produced by
+# Run on the disconnected OpenShift install machine. Public internet is not
+# required when every dependency has been transferred or mirrored, but the
+# machine must still reach the OpenShift API and the configured private
+# registry, catalog mirrors, and object store. Extracts the bundle produced by
 # prepare_airgap_bundle_openshift.sh, sets environment-variable overrides, then
 # invokes openshift_with_stack.sh.
 #
@@ -32,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<'HELP'
 install_from_airgap_bundle_openshift.sh — extract an OpenShift air-gap bundle
-and run the Splunk AI Platform installer with no outbound internet required.
+and run the Splunk AI Platform installer without relying on public internet.
 
 USAGE
   ./install_from_airgap_bundle_openshift.sh --bundle BUNDLE.tar.gz [OPTIONS]
@@ -73,12 +75,24 @@ WHAT THIS SCRIPT DOES
   4. Invokes openshift_with_stack.sh <subcommand>.
 
 PREREQUISITES
-  On this machine (no internet needed):
+  Tools on the install machine:
     oc      — logged in to the target OpenShift cluster (oc login ... done)
     helm    — v3+
     yq v4, jq, curl, timeout, python3, tar
     mc      — MinIO client for MinIO/SeaweedFS/S3-compatible model-marker checks
     aws     — AWS CLI when using AWS S3 or ECR
+
+  Required network access from the install machine:
+    - The target OpenShift API.
+    - The configured object store and any registry endpoints accessed directly
+      by installer-side verification or credential setup.
+    - Internal DNS, registry mirrors, and catalog sources used by the cluster.
+
+  Public internet is not required only when every installation artifact,
+  container image, OLM catalog/operator operand, NVIDIA driver/Driver Toolkit
+  image, and model artifact has already been transferred or mirrored. Public
+  AWS S3/ECR or other external endpoints require outbound connectivity, a
+  proxy, or corresponding private endpoints.
 
   Before running this script:
     - Mirror container images to your internal registry and update images.*
