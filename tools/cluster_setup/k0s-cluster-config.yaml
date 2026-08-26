@@ -193,9 +193,15 @@ splunk:
   # See K0S_README.md's "Internal Splunk management transport" section for
   # the native-HTTPS compatibility details behind the INTERNAL path.
   #
-  # External HEC ingestion is out of scope for this release workflow. Do not
-  # set splunk.external.endpoint or SPLUNK_HEC_TOKEN just to enable external
-  # JWT authentication; external.endpoint selects the legacy external HEC mode.
+  # Release support boundary:
+  # - The existing bundled/internal HEC and OTel path is left unchanged to
+  #   preserve the tested installation behavior. Workload telemetry is not a
+  #   supported feature claim for this release.
+  # - External Splunk is JWT-only through trustedIssuers on management port
+  #   8089. External HEC/OTel is unsupported and was not release-qualified.
+  #   Leave splunk.external.endpoint unset and do not set SPLUNK_HEC_TOKEN.
+  # - Workload mTLS remains off and unsupported. Do not add aiPlatform.mtls;
+  #   the k0s installer does not consume that sample key.
 
   # Exact Splunk management/JWKS issuers that SAIA and Slim should trust. Each
   # value must match Splunk's oauth2_settings.issuer_uri character-for-character

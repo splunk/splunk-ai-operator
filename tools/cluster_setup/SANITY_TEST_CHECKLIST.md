@@ -286,7 +286,10 @@ Overall sanity testing passes only when all applicable cases pass. A successful
 `/health` response alone is not sufficient evidence of model inference or the
 end-to-end SAIA user flow.
 
-For deployments using the bundled Traefik ingress, the read-only
-`tools/cluster_setup/validate_live_integration.sh` provides an optional extended
-TLS, routing, RBAC, JWKS/HEC, OTel, and workload check. Require exit code `0` and
-a final summary with `fail=0`; it does not replace SAN-04 or SAN-06.
+For deployments using bundled/internal Splunk, the read-only
+`tools/cluster_setup/test_internal_splunk_http.sh` provides optional regression
+coverage for the existing management/JWT, HEC configuration, injected OTel
+collector, and workload path. This diagnostic protects the tested internal
+behavior; it does not qualify external HEC/OTel, certify telemetry delivery, or
+replace SAN-04 or SAN-06. Because the bundled telemetry path is experimental,
+this diagnostic is regression evidence rather than a release support gate.

@@ -120,7 +120,15 @@ files:
   aiPlatform: "./artifacts.yaml"
 
 # With no splunk.external.endpoint, enabled=true installs the Splunk Operator
-# and a Splunk Standalone instance inside the cluster.
+# and a Splunk Standalone instance inside the cluster. This preserves the
+# existing bundled/internal HEC and OTel behavior, but workload telemetry is not
+# a supported feature claim for this release. External Splunk is JWT-only via
+# splunk.trustedIssuers on port 8089; external HEC/OTel is unsupported. Keep
+# splunk.external.endpoint unset and do not set SPLUNK_HEC_TOKEN. Workload mTLS
+# remains off and unsupported; do not add aiPlatform.mtls because the k0s
+# installer does not consume that sample key. For external-only JWT auth, set
+# enabled=false and list the management issuer under trustedIssuers; with
+# enabled=true, trustedIssuers are additional issuers alongside bundled Splunk.
 splunk:
   enabled: true
   standaloneName: "splunk-standalone"
