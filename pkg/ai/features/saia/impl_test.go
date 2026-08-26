@@ -1264,6 +1264,32 @@ func Test_reconcileSAIAService_ServiceTypeVariations(t *testing.T) {
 	}
 }
 
+func Test_reconcileSAIAService_UpdatesExistingServiceType(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	key := types.NamespacedName{Name: ai.Name + "-saia-service", Namespace: ai.Namespace}
+
+	require.NoError(t, r.reconcileSAIAService(context.Background(), ai))
+
+	ai.Spec.ServiceTemplate = corev1.Service{Spec: corev1.ServiceSpec{
+		Type:  corev1.ServiceTypeNodePort,
+		Ports: []corev1.ServicePort{{Name: "http", NodePort: 30080}},
+	}}
+	require.NoError(t, r.reconcileSAIAService(context.Background(), ai))
+	svc := &corev1.Service{}
+	require.NoError(t, fakeClient.Get(context.Background(), key, svc))
+	assert.Equal(t, corev1.ServiceTypeNodePort, svc.Spec.Type)
+	assert.Equal(t, int32(30080), svc.Spec.Ports[0].NodePort)
+
+	ai.Spec.ServiceTemplate = corev1.Service{Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP}}
+	require.NoError(t, r.reconcileSAIAService(context.Background(), ai))
+	require.NoError(t, fakeClient.Get(context.Background(), key, svc))
+	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+	assert.Zero(t, svc.Spec.Ports[0].NodePort)
+}
+
 // sanitize turns a free-form subtest name into a valid k8s resource name.
 func sanitize(s string) string {
 	s = strings.ToLower(s)

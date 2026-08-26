@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -163,6 +164,14 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 
 	// Validate Features
 	if errs := v.validateFeatures(aiplatform.Spec.Features, field.NewPath("spec").Child("features")); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+	if errs := v.validateFeatureNodePorts(
+		aiplatform.Spec.Features,
+		aiplatform.Spec.ServiceTemplate,
+		aiplatform.Spec.MTLS.Enabled && aiplatform.Spec.MTLS.Termination == "operator",
+		field.NewPath("spec").Child("features"),
+	); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -525,4 +534,84 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 	}
 
 	return allErrs
+}
+
+// validateFeatureNodePorts validates the per-feature override against the
+// common service type and rejects known collisions between SAIA and Slim.
+// A zero common http NodePort is intentionally treated as unknown because
+// Kubernetes will allocate it dynamically.
+func (v *AIPlatformCustomValidator) validateFeatureNodePorts(features []aiv1.FeatureSpec, serviceTemplate corev1.Service, mtlsHTTPS bool, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	isNodePort := serviceTemplate.Spec.Type == corev1.ServiceTypeNodePort
+	commonHTTPNodePort, hasCommonHTTPNodePort := namedHTTPNodePort(serviceTemplate)
+	knownPorts := make(map[string]int32, 2)
+	enabledFeatures := make(map[string]bool, 2)
+
+	for i, feature := range features {
+		featurePath := fldPath.Index(i)
+		if feature.PublicServiceNodePort != nil {
+			portPath := featurePath.Child("publicServiceNodePort")
+			port := *feature.PublicServiceNodePort
+			if port < 30000 || port > 32767 {
+				allErrs = append(allErrs, field.Invalid(
+					portPath,
+					port,
+					"publicServiceNodePort must be between 30000 and 32767",
+				))
+			}
+			if !isNodePort {
+				allErrs = append(allErrs, field.Forbidden(
+					portPath,
+					"publicServiceNodePort is only valid when spec.serviceTemplate.spec.type is NodePort",
+				))
+			}
+		}
+
+		if !isNodePort || (feature.Name != "saia" && feature.Name != "slim") {
+			continue
+		}
+		enabledFeatures[feature.Name] = true
+
+		if feature.PublicServiceNodePort != nil {
+			knownPorts[feature.Name] = *feature.PublicServiceNodePort
+		} else if hasCommonHTTPNodePort {
+			knownPorts[feature.Name] = commonHTTPNodePort
+		}
+	}
+
+	saiaPort, saiaKnown := knownPorts["saia"]
+	slimPort, slimKnown := knownPorts["slim"]
+	if saiaKnown && slimKnown && saiaPort == slimPort {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath,
+			slimPort,
+			fmt.Sprintf("SAIA and Slim effective public service NodePorts must be distinct; both resolve to %d", slimPort),
+		))
+	}
+
+	if isNodePort && mtlsHTTPS && enabledFeatures["saia"] && enabledFeatures["slim"] {
+		if httpsNodePort, found := namedNodePort(serviceTemplate, "https"); found {
+			allErrs = append(allErrs, field.Invalid(
+				fldPath,
+				httpsNodePort,
+				fmt.Sprintf("SAIA and Slim cannot share the fixed HTTPS NodePort %d; omit the https nodePort so Kubernetes allocates distinct ports", httpsNodePort),
+			))
+		}
+	}
+
+	return allErrs
+}
+
+func namedHTTPNodePort(serviceTemplate corev1.Service) (int32, bool) {
+	return namedNodePort(serviceTemplate, "http")
+}
+
+func namedNodePort(serviceTemplate corev1.Service, name string) (int32, bool) {
+	for _, port := range serviceTemplate.Spec.Ports {
+		if port.Name == name && port.NodePort != 0 {
+			return port.NodePort, true
+		}
+	}
+	return 0, false
 }

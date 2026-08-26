@@ -116,6 +116,11 @@ aiPlatform:
     # Routes above provide stable external access. Keep the backing feature
     # Services internal unless NodePort or LoadBalancer is explicitly required.
     type: ClusterIP         # ClusterIP | NodePort | LoadBalancer
+    # For the explicit NodePort fallback, uncomment both values and keep them
+    # distinct. The installer records each port on its matching feature so the
+    # assignment survives AIService deletion and recreation.
+    # nodePort: 30080       # SAIA
+    # slimNodePort: 30081   # SLIM
   features:
     - name: "saia"
       version: "1.1.0"

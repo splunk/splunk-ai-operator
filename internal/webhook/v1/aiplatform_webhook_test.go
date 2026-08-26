@@ -230,5 +230,101 @@ var _ = Describe("AIPlatform Webhook", func() {
 				Expect(errs).To(BeEmpty())
 			})
 		})
+
+		Describe("per-feature public service NodePort validation", func() {
+			featurePath := field.NewPath("spec").Child("features")
+			portPtr := func(port int32) *int32 { return &port }
+			nodePortTemplate := func(nodePort int32) corev1.Service {
+				service := corev1.Service{Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort}}
+				if nodePort != 0 {
+					service.Spec.Ports = []corev1.ServicePort{{Name: "http", Port: 8080, NodePort: nodePort}}
+				}
+				return service
+			}
+
+			It("should accept distinct explicit and inherited effective ports", func() {
+				features := []aiv1.FeatureSpec{
+					{Name: "saia"},
+					{Name: "slim", PublicServiceNodePort: portPtr(30081)},
+				}
+
+				Expect(validator.validateFeatureNodePorts(features, nodePortTemplate(30080), false, featurePath)).To(BeEmpty())
+			})
+
+			It("should allow unknown dynamically allocated ports", func() {
+				features := []aiv1.FeatureSpec{{Name: "saia"}, {Name: "slim"}}
+
+				Expect(validator.validateFeatureNodePorts(features, nodePortTemplate(0), false, featurePath)).To(BeEmpty())
+			})
+
+			It("should reject an override unless the common service type is NodePort", func() {
+				features := []aiv1.FeatureSpec{{Name: "slim", PublicServiceNodePort: portPtr(30081)}}
+				serviceTemplate := corev1.Service{Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP}}
+
+				errs := validator.validateFeatureNodePorts(features, serviceTemplate, false, featurePath)
+
+				Expect(errs).To(HaveLen(1))
+				Expect(errs[0].Field).To(Equal("spec.features[0].publicServiceNodePort"))
+				Expect(errs[0].Detail).To(ContainSubstring("only valid"))
+			})
+
+			It("should reject ports outside the supported NodePort range", func() {
+				features := []aiv1.FeatureSpec{{Name: "slim", PublicServiceNodePort: portPtr(29999)}}
+
+				errs := validator.validateFeatureNodePorts(features, nodePortTemplate(0), false, featurePath)
+
+				Expect(errs).To(HaveLen(1))
+				Expect(errs[0].Field).To(Equal("spec.features[0].publicServiceNodePort"))
+				Expect(errs[0].Detail).To(ContainSubstring("between 30000 and 32767"))
+			})
+
+			It("should reject duplicate explicit SAIA and Slim ports", func() {
+				features := []aiv1.FeatureSpec{
+					{Name: "saia", PublicServiceNodePort: portPtr(30080)},
+					{Name: "slim", PublicServiceNodePort: portPtr(30080)},
+				}
+
+				errs := validator.validateFeatureNodePorts(features, nodePortTemplate(0), false, featurePath)
+
+				Expect(errs).To(HaveLen(1))
+				Expect(errs[0].Detail).To(ContainSubstring("must be distinct"))
+			})
+
+			It("should reject a duplicate explicit and inherited effective port", func() {
+				features := []aiv1.FeatureSpec{
+					{Name: "saia"},
+					{Name: "slim", PublicServiceNodePort: portPtr(30080)},
+				}
+
+				errs := validator.validateFeatureNodePorts(features, nodePortTemplate(30080), false, featurePath)
+
+				Expect(errs).To(HaveLen(1))
+				Expect(errs[0].Detail).To(ContainSubstring("both resolve to 30080"))
+			})
+
+			It("should reject duplicate inherited effective ports", func() {
+				features := []aiv1.FeatureSpec{{Name: "saia"}, {Name: "slim"}}
+
+				errs := validator.validateFeatureNodePorts(features, nodePortTemplate(30080), false, featurePath)
+
+				Expect(errs).To(HaveLen(1))
+				Expect(errs[0].Detail).To(ContainSubstring("both resolve to 30080"))
+			})
+
+			It("should reject a fixed shared HTTPS NodePort when operator mTLS is enabled", func() {
+				features := []aiv1.FeatureSpec{
+					{Name: "saia", PublicServiceNodePort: portPtr(30080)},
+					{Name: "slim", PublicServiceNodePort: portPtr(30081)},
+				}
+				serviceTemplate := nodePortTemplate(30080)
+				serviceTemplate.Spec.Ports = append(serviceTemplate.Spec.Ports,
+					corev1.ServicePort{Name: "https", Port: 8443, NodePort: 30443})
+
+				errs := validator.validateFeatureNodePorts(features, serviceTemplate, true, featurePath)
+
+				Expect(errs).To(HaveLen(1))
+				Expect(errs[0].Detail).To(ContainSubstring("cannot share the fixed HTTPS NodePort 30443"))
+			})
+		})
 	})
 })

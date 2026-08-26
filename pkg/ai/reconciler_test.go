@@ -117,6 +117,146 @@ func TestBuildAIService_PropagatesServiceTemplate(t *testing.T) {
 		"buildAIService must deep-copy ServiceTemplate to avoid shared state")
 }
 
+func TestBuildAIService_AppliesFeatureNodePortToHTTPPort(t *testing.T) {
+	port := int32(30081)
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai", Namespace: "default"},
+		Spec: aiApi.AIPlatformSpec{
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ServiceTemplate: corev1.Service{
+				Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
+			},
+		},
+	}
+	feature := aiApi.FeatureSpec{Name: "slim", PublicServiceNodePort: &port}
+
+	service := (&AIPlatformReconciler{}).buildAIService(context.Background(), platform, feature, "my-ai-slim")
+
+	httpPort := findHTTPPort(t, service.Spec.ServiceTemplate)
+	assert.Equal(t, int32(30081), httpPort.NodePort)
+	assert.Equal(t, int32(8080), httpPort.Port)
+	assert.Equal(t, int32(8080), httpPort.TargetPort.IntVal)
+	assert.Empty(t, platform.Spec.ServiceTemplate.Spec.Ports, "the common template must be deep-copied")
+
+	*service.Spec.Feature.PublicServiceNodePort = 30082
+	assert.Equal(t, int32(30081), *feature.PublicServiceNodePort, "the child feature must not share the parent pointer")
+}
+
+func TestReconcileFeatures_CreatesDistinctFeatureNodePorts(t *testing.T) {
+	ctx := context.Background()
+	saiaPort := int32(30080)
+	slimPort := int32(30081)
+	platform := nodePortTestPlatform([]aiApi.FeatureSpec{
+		{Name: "saia", PublicServiceNodePort: &saiaPort},
+		{Name: "slim", PublicServiceNodePort: &slimPort},
+	})
+	reconciler := newNodePortTestReconciler(t, platform)
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-saia", 30080)
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30081)
+}
+
+func TestReconcileFeatures_CorrectsAndUpdatesExplicitFeatureNodePort(t *testing.T) {
+	ctx := context.Background()
+	slimPort := int32(30081)
+	platform := nodePortTestPlatform([]aiApi.FeatureSpec{
+		{Name: "slim", PublicServiceNodePort: &slimPort},
+	})
+	existing := &aiApi.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai-slim", Namespace: "default"},
+		Spec: aiApi.AIServiceSpec{
+			ServiceTemplate: corev1.Service{Spec: corev1.ServiceSpec{
+				Type:  corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{{Name: "http", Port: 8080, NodePort: 30080}},
+			}},
+		},
+	}
+	reconciler := newNodePortTestReconciler(t, platform, existing)
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30081)
+
+	updatedPort := int32(30082)
+	platform.Spec.Features[0].PublicServiceNodePort = &updatedPort
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30082)
+}
+
+func TestReconcileFeatures_ClearsExplicitFeatureNodePort(t *testing.T) {
+	ctx := context.Background()
+	slimPort := int32(30081)
+	platform := nodePortTestPlatform([]aiApi.FeatureSpec{
+		{Name: "slim", PublicServiceNodePort: &slimPort},
+	})
+	reconciler := newNodePortTestReconciler(t, platform)
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30081)
+
+	platform.Spec.Features[0].PublicServiceNodePort = nil
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30080)
+}
+
+func TestReconcileFeatures_ClearsFeatureNodePortWhenSwitchingToClusterIP(t *testing.T) {
+	ctx := context.Background()
+	slimPort := int32(30081)
+	platform := nodePortTestPlatform([]aiApi.FeatureSpec{
+		{Name: "slim", PublicServiceNodePort: &slimPort},
+	})
+	reconciler := newNodePortTestReconciler(t, platform)
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+
+	platform.Spec.Features[0].PublicServiceNodePort = nil
+	platform.Spec.ServiceTemplate = corev1.Service{Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP}}
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+
+	child := &aiApi.AIService{}
+	require.NoError(t, reconciler.Get(ctx,
+		types.NamespacedName{Name: "my-ai-slim", Namespace: "default"}, child))
+	assert.Equal(t, corev1.ServiceTypeClusterIP, child.Spec.ServiceTemplate.Spec.Type)
+	assert.Empty(t, child.Spec.ServiceTemplate.Spec.Ports)
+}
+
+func TestReconcileFeatures_RecreatesChildWithExplicitFeatureNodePort(t *testing.T) {
+	ctx := context.Background()
+	slimPort := int32(30081)
+	platform := nodePortTestPlatform([]aiApi.FeatureSpec{
+		{Name: "slim", PublicServiceNodePort: &slimPort},
+	})
+	reconciler := newNodePortTestReconciler(t, platform)
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	child := &aiApi.AIService{}
+	key := types.NamespacedName{Name: "my-ai-slim", Namespace: "default"}
+	require.NoError(t, reconciler.Get(ctx, key, child))
+	require.NoError(t, reconciler.Delete(ctx, child))
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30081)
+}
+
+func TestReconcileFeatures_PreservesLegacyChildTemplateWithoutExplicitOverride(t *testing.T) {
+	ctx := context.Background()
+	platform := nodePortTestPlatform([]aiApi.FeatureSpec{{Name: "slim"}})
+	existing := &aiApi.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai-slim", Namespace: "default"},
+		Spec: aiApi.AIServiceSpec{
+			ServiceTemplate: corev1.Service{Spec: corev1.ServiceSpec{
+				Type:  corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{{Name: "http", Port: 8080, NodePort: 30081}},
+			}},
+		},
+	}
+	reconciler := newNodePortTestReconciler(t, platform, existing)
+
+	require.NoError(t, reconciler.ReconcileFeatures(ctx, platform))
+	assertChildHTTPNodePort(t, ctx, reconciler.Client, "my-ai-slim", 30081)
+}
+
 func TestReconcileFeatures_CreatesNewAIService(t *testing.T) {
 	ctx := context.Background()
 	scheme := buildTestScheme(t)
@@ -383,4 +523,63 @@ func TestCheckAIServiceStatus_FailsWhenServiceHasFailedCondition(t *testing.T) {
 	assert.Contains(t, err.Error(), "my-ai-feature1")
 	assert.Contains(t, err.Error(), "PostInstallHookReady")
 	assert.Contains(t, err.Error(), "still running")
+}
+
+func nodePortTestPlatform(features []aiApi.FeatureSpec) *aiApi.AIPlatform {
+	return &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-ai",
+			Namespace: "default",
+			UID:       types.UID("test-ai-uid"),
+		},
+		Spec: aiApi.AIPlatformSpec{
+			Features:      features,
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+			ServiceTemplate: corev1.Service{Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{{
+					Name: "http", Port: 8080, NodePort: 30080,
+				}},
+			}},
+		},
+	}
+}
+
+func newNodePortTestReconciler(t *testing.T, platform *aiApi.AIPlatform, children ...*aiApi.AIService) *AIPlatformReconciler {
+	t.Helper()
+	scheme := buildTestScheme(t)
+	objects := []client.Object{platform.DeepCopy()}
+	for _, child := range children {
+		require.NoError(t, controllerutil.SetControllerReference(platform, child, scheme))
+		objects = append(objects, child)
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).
+		WithIndex(&aiApi.AIService{}, ownerKey, func(obj client.Object) []string {
+			if owner := metav1.GetControllerOfNoCopy(obj); owner != nil {
+				return []string{owner.Name}
+			}
+			return nil
+		}).
+		Build()
+	return &AIPlatformReconciler{Client: fakeClient, Scheme: scheme}
+}
+
+func assertChildHTTPNodePort(t *testing.T, ctx context.Context, k8sClient client.Client, name string, expected int32) {
+	t.Helper()
+	child := &aiApi.AIService{}
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, child))
+	assert.Equal(t, expected, findHTTPPort(t, child.Spec.ServiceTemplate).NodePort)
+}
+
+func findHTTPPort(t *testing.T, serviceTemplate corev1.Service) corev1.ServicePort {
+	t.Helper()
+	for _, port := range serviceTemplate.Spec.Ports {
+		if port.Name == "http" {
+			return port
+		}
+	}
+	t.Fatal("http port not found in service template")
+	return corev1.ServicePort{}
 }

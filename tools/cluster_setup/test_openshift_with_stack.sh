@@ -46,6 +46,9 @@ eval "$(extract_function validate_scale_factor_config)"
 eval "$(extract_function required_ai_tier_disk_gib)"
 eval "$(extract_function openshift_feature_enabled)"
 eval "$(extract_function openshift_slim_feature_enabled)"
+eval "$(extract_function openshift_feature_public_node_port)"
+eval "$(extract_function validate_openshift_service_config)"
+eval "$(extract_function build_openshift_features_yaml)"
 eval "$(extract_function warn_on_mutable_image_tags)"
 eval "$(extract_function validate_image_config)"
 eval "$(extract_function build_image_url)"
@@ -127,6 +130,33 @@ assert_rc "SAIA-only config does not require a SLIM image" 0 _run_validate_image
 assert_rc "SLIM-enabled config requires images.slim.apiImage" 1 _run_validate_image_config true ""
 assert_rc "SLIM-enabled config accepts its configured image" 0 _run_validate_image_config true "slim-api:v1"
 
+_run_validate_service_config() (
+  local service_type="$1" slim_enabled="$2" saia_port="$3" slim_port="$4"
+  CONFIG_FILE="test-config.yaml"
+  yq() {
+    case "${2:-}" in
+      '.aiPlatform.serviceTemplate.type // ""') echo "${service_type}" ;;
+      '.aiPlatform.serviceTemplate.nodePort // ""') echo "${saia_port}" ;;
+      '.aiPlatform.serviceTemplate.slimNodePort // ""') echo "${slim_port}" ;;
+      *) echo "" ;;
+    esac
+  }
+  openshift_slim_feature_enabled() { [[ "${slim_enabled}" == "true" ]]; }
+  validate_openshift_service_config
+)
+
+echo "OpenShift public NodePort validation"
+assert_rc "ClusterIP does not require fixed public ports" 0 \
+  _run_validate_service_config ClusterIP true "" ""
+assert_rc "NodePort requires a fixed SAIA port" 1 \
+  _run_validate_service_config NodePort false "" ""
+assert_rc "NodePort with SLIM requires an explicit slimNodePort" 1 \
+  _run_validate_service_config NodePort true 30080 ""
+assert_rc "SAIA and SLIM NodePorts must be distinct" 1 \
+  _run_validate_service_config NodePort true 30080 30080
+assert_rc "distinct in-range NodePorts are accepted" 0 \
+  _run_validate_service_config NodePort true 30080 30081
+
 _mutable_image_warnings() (
   SLIM_API_IMAGE="$1"
   warn() { printf '%s\n' "$*"; }
@@ -141,35 +171,98 @@ immutable_output=$(_mutable_image_warnings "slim-api:v0.0.4")
 assert_eq "does not warn for an immutable SLIM image tag" "0" \
   "$(grep -c 'images.slim.apiImage' <<<"${immutable_output}" || true)"
 
-_run_slim_nodeport_patch() (
-  AI_NS="ai-platform"
-  AI_PLATFORM_NAME="test-platform"
+_render_openshift_features() (
+  local service_type="$1"
   CONFIG_FILE="test-config.yaml"
-  local oc_call_log
-  oc_call_log=$(mktemp)
-  openshift_slim_feature_enabled() { return 0; }
   yq() {
     case "${2:-}" in
-      '.aiPlatform.serviceTemplate.type // ""') echo "NodePort" ;;
+      '.aiPlatform.serviceTemplate.type // ""') echo "${service_type}" ;;
       '.aiPlatform.serviceTemplate.nodePort // ""') echo "30080" ;;
       '.aiPlatform.serviceTemplate.slimNodePort // ""') echo "30081" ;;
+      '.aiPlatform.features | length') echo "2" ;;
+      '.aiPlatform.features[0].name') echo "saia" ;;
+      '.aiPlatform.features[1].name') echo "slim" ;;
+      '.aiPlatform.features[0].version // "1.0.0"') echo "1.1.0" ;;
+      '.aiPlatform.features[1].version // "1.0.0"') echo "1.0.0" ;;
+      '.aiPlatform.features[0].serviceAccountName // ""'|\
+      '.aiPlatform.features[1].serviceAccountName // ""') echo "" ;;
       *) echo "" ;;
     esac
   }
-  oc() { printf 'oc %s\n' "$*" >> "${oc_call_log}"; }
+  build_openshift_features_yaml
+  printf '%s' "${features_yaml}"
+)
+
+echo "OpenShift feature NodePort rendering"
+nodeport_features=$(_render_openshift_features NodePort)
+assert_eq "fresh NodePort renders SAIA's durable feature port" "1" \
+  "$(grep -A2 '^    - name: saia$' <<<"${nodeport_features}" | grep -c '^      publicServiceNodePort: 30080$' || true)"
+assert_eq "fresh NodePort renders SLIM's distinct durable feature port" "1" \
+  "$(grep -A2 '^    - name: slim$' <<<"${nodeport_features}" | grep -c '^      publicServiceNodePort: 30081$' || true)"
+clusterip_features=$(_render_openshift_features ClusterIP)
+assert_eq "ClusterIP omits all feature public NodePorts" "0" \
+  "$(grep -c 'publicServiceNodePort:' <<<"${clusterip_features}" || true)"
+
+_run_nodeport_compatibility_reconcile() (
+  local initial_type="$1" initial_slim_port="$2"
+  local configured_saia_port="$3" configured_slim_port="$4"
+  AI_NS="ai-platform"
+  AI_PLATFORM_NAME="test-platform"
+  CONFIG_FILE="test-config.yaml"
+  local slim_ai_type="${initial_type}" slim_ai_port="${initial_slim_port}"
+  local slim_svc_type="${initial_type}" slim_svc_port="${initial_slim_port}"
+  local oc_call_log command_line
+  oc_call_log=$(mktemp)
+  yq() {
+    case "${2:-}" in
+      '.aiPlatform.serviceTemplate.type // ""') echo "NodePort" ;;
+      '.aiPlatform.serviceTemplate.nodePort // ""') echo "${configured_saia_port}" ;;
+      '.aiPlatform.serviceTemplate.slimNodePort // ""') echo "${configured_slim_port}" ;;
+      '.aiPlatform.features[].name // ""') printf 'saia\nslim\n' ;;
+      *) echo "" ;;
+    esac
+  }
+  oc() {
+    command_line="$*"
+    printf 'oc %s\n' "${command_line}" >> "${oc_call_log}"
+    if [[ "${command_line}" == *'get aiservice test-platform-slim'* ]]; then
+      [[ "${command_line}" == *'jsonpath='*type* ]] && printf '%s' "${slim_ai_type}"
+      [[ "${command_line}" == *'jsonpath='*nodePort* ]] && printf '%s' "${slim_ai_port}"
+    elif [[ "${command_line}" == *'patch aiservice test-platform-slim'* ]]; then
+      slim_ai_type="NodePort"; slim_ai_port="${configured_slim_port}"
+    elif [[ "${command_line}" == *'get svc test-platform-slim-slim-service'* ]]; then
+      [[ "${command_line}" == *'jsonpath='*type* ]] && printf '%s' "${slim_svc_type}"
+      [[ "${command_line}" == *'jsonpath='*nodePort* ]] && printf '%s' "${slim_svc_port}"
+    elif [[ "${command_line}" == *'delete svc test-platform-slim-slim-service'* ]]; then
+      slim_svc_type="NodePort"; slim_svc_port="${configured_slim_port}"
+    fi
+    return 0
+  }
   patch_openshift_slim_public_service_workaround
-  cat "${oc_call_log}"
+  command cat "${oc_call_log}"
   rm -f "${oc_call_log}"
 )
 
-echo "OpenShift SLIM NodePort patch"
-slim_patch_output=$(_run_slim_nodeport_patch)
-assert_eq "patches the generated SLIM AIService" "1" \
-  "$(grep -c 'patch aiservice test-platform-slim' <<<"${slim_patch_output}" || true)"
-assert_eq "uses the configured distinct SLIM NodePort" "1" \
-  "$(grep -c '\"nodePort\": 30081' <<<"${slim_patch_output}" || true)"
-assert_eq "recreates only the SLIM public Service" "1" \
-  "$(grep -c 'delete svc test-platform-slim-slim-service' <<<"${slim_patch_output}" || true)"
+echo "OpenShift NodePort compatibility convergence"
+clusterip_to_nodeport_output=$(_run_nodeport_compatibility_reconcile ClusterIP "" 30080 30081)
+assert_eq "ClusterIP to NodePort patches the preserved SLIM AIService override" "1" \
+  "$(grep -c 'patch aiservice test-platform-' <<<"${clusterip_to_nodeport_output}" || true)"
+assert_eq "ClusterIP to NodePort recreates the mismatched SLIM public Service" "1" \
+  "$(grep -c 'delete svc test-platform-' <<<"${clusterip_to_nodeport_output}" || true)"
+
+changed_nodeport_output=$(_run_nodeport_compatibility_reconcile NodePort 30071 30080 30081)
+assert_eq "a changed SLIM port patches its AIService override" "1" \
+  "$(grep -c 'patch aiservice test-platform-' <<<"${changed_nodeport_output}" || true)"
+assert_eq "a changed SLIM port recreates its public Service" "1" \
+  "$(grep -c 'delete svc test-platform-' <<<"${changed_nodeport_output}" || true)"
+assert_eq "changed SLIM port is written to its AIService" "1" \
+  "$(grep -A20 'patch aiservice test-platform-slim' <<<"${changed_nodeport_output}" | grep -m1 -c '\"nodePort\": 30081' || true)"
+
+idempotent_nodeport_output=$(_run_nodeport_compatibility_reconcile NodePort 30081 30080 30081)
+assert_eq "matching NodePorts require no compatibility patches" "0" \
+  "$(grep -c 'patch aiservice test-platform-' <<<"${idempotent_nodeport_output}" || true)"
+assert_eq "matching NodePorts do not recreate Services" "0" \
+  "$(grep -c 'delete svc test-platform-' <<<"${idempotent_nodeport_output}" || true)"
 
 _run_clusterip_normalization() (
   AI_NS="ai-platform"
@@ -493,7 +586,7 @@ WORKER_IMAGE_REGISTRY="example.invalid/worker"
 obj_path="s3://test-bucket"
 obj_endpoint=""
 image_pull_secrets=""
-features_yaml=$'    - name: saia\n      version: "1.1.0"\n'
+features_yaml=$'    - name: saia\n      version: "1.1.0"\n      publicServiceNodePort: 30080\n    - name: slim\n      version: "1.0.0"\n      publicServiceNodePort: 30081\n'
 svc_template_yaml=$'  serviceTemplate:\n    spec:\n      type: NodePort\n      ports:\n      - name: http\n        port: 8080\n        targetPort: 8080\n        nodePort: 30080\n'
 storage_yaml=""
 cpu_tolerations_inline="[]"
@@ -542,7 +635,11 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '[.spec.features[]? | select(has("scaleFactor"))] | length' - 2>/dev/null)"
   assert_eq "rendered AIPlatform uses the SAIA NodePort" "30080" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.serviceTemplate.spec.ports[0].nodePort' - 2>/dev/null)"
-  assert_eq "installer-only slimNodePort is not rendered into the AIPlatform CR" "false" \
+  assert_eq "rendered SAIA feature owns its public NodePort" "30080" \
+    "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.features[] | select(.name == "saia") | .publicServiceNodePort' - 2>/dev/null)"
+  assert_eq "rendered SLIM feature owns its distinct public NodePort" "30081" \
+    "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.features[] | select(.name == "slim") | .publicServiceNodePort' - 2>/dev/null)"
+  assert_eq "installer-only slimNodePort is not added to the shared Service template" "false" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.serviceTemplate | has("slimNodePort")' - 2>/dev/null)"
   assert_eq "rendered manifest preserves the HEC endpoint" \
     "http://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8088" \
@@ -587,6 +684,12 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$("${REAL_YQ}" eval 'select(.kind == "CustomResourceDefinition" and .metadata.name == "aiplatforms.ai.splunk.com") | .spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.splunkConfiguration.properties.trustedIssuers.type' "${SCRIPT_DIR}/artifacts.yaml" 2>/dev/null)"
   assert_eq "bundled AIService CRD accepts trustedIssuers" "array" \
     "$("${REAL_YQ}" eval 'select(.kind == "CustomResourceDefinition" and .metadata.name == "aiservices.ai.splunk.com") | .spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.splunkConfiguration.properties.trustedIssuers.type' "${SCRIPT_DIR}/artifacts.yaml" 2>/dev/null)"
+  assert_eq "bundled AIPlatform CRD includes the per-feature NodePort field" "integer:30000:32767" \
+    "$("${REAL_YQ}" eval-all -N 'select(.kind == "CustomResourceDefinition" and .metadata.name == "aiplatforms.ai.splunk.com") | .spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.features.items.properties.publicServiceNodePort | [.type, .minimum, .maximum] | join(":")' "${SCRIPT_DIR}/artifacts.yaml" 2>/dev/null)"
+  assert_eq "bundled AIService CRD includes the per-feature NodePort field" "integer:30000:32767" \
+    "$("${REAL_YQ}" eval-all -N 'select(.kind == "CustomResourceDefinition" and .metadata.name == "aiservices.ai.splunk.com") | .spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.features.properties.publicServiceNodePort | [.type, .minimum, .maximum] | join(":")' "${SCRIPT_DIR}/artifacts.yaml" 2>/dev/null)"
+  assert_eq "Helm AIPlatform CRD includes the per-feature NodePort field" "integer:30000:32767" \
+    "$("${REAL_YQ}" eval -N '.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.features.items.properties.publicServiceNodePort | [.type, .minimum, .maximum] | join(":")' "${SCRIPT_DIR}/../../helm-chart/splunk-ai-operator/crds/ai.splunk.com_aiplatforms.yaml" 2>/dev/null)"
 
   TMP_FILES=()
   SPLUNK_AI_FILE="${SCRIPT_DIR}/artifacts.yaml"

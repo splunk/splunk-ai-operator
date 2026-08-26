@@ -1871,6 +1871,7 @@ func (r *SaiaReconciler) reconcileSAIAService(
 	default:
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 	}
+	desiredServiceType := svc.Spec.Type
 
 	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Service failed")
@@ -1879,6 +1880,7 @@ func (r *SaiaReconciler) reconcileSAIAService(
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": nginxComponent}
 		svc.Spec.Ports = ports
+		svc.Spec.Type = desiredServiceType
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Service failed")

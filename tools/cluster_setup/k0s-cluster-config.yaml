@@ -224,7 +224,7 @@ aiPlatform:
   workerGroupConfig:
     imageRegistry: ""
 
-  # ---------- SAIA public exposure ----------
+  # ---------- SAIA and Slim public exposure ----------
   # The SAIA "public" Service (nginx reverse proxy in front of v1 + v2 API
   # pods) defaults to ClusterIP — only reachable from inside the cluster. Two
   # call patterns hit it:
@@ -259,13 +259,12 @@ aiPlatform:
   # serviceTemplate block AND set metallb.install: false.
   serviceTemplate:
     type: NodePort          # ClusterIP | NodePort | LoadBalancer
-    nodePort: 30080         # Fixed NodePort (30000-32767) for the SAIA public service. Required only for NodePort.
-    # AIPlatform.serviceTemplate propagates identically to EVERY feature's
-    # AIService, so slim would otherwise inherit the same 30080 and collide with
-    # SAIA (a NodePort can back only one Service). When the "slim" feature is
-    # enabled under NodePort, the installer patches slim's public Service to this
-    # DISTINCT port instead. Reach slim at http://<any-worker-ip>:<slimNodePort>.
-    slimNodePort: 30081     # Fixed NodePort for the slim public service. Only used when slim is enabled + type=NodePort.
+    nodePort: 30080         # Required unquoted integer (30000-32767) for SAIA when type=NodePort.
+    # When Slim is enabled under NodePort, slimNodePort is also required and
+    # must differ from nodePort. The installer renders both values into their
+    # feature entries so operator reconciliation and child recreation preserve
+    # them. Reach Slim at http://<any-worker-ip>:<slimNodePort>.
+    slimNodePort: 30081     # Required unquoted integer for Slim when enabled + type=NodePort.
 
   features:
     - name: "saia"

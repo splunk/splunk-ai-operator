@@ -129,8 +129,9 @@ aiPlatform:
   # Supported values in the current installer: L40S, H100
   defaultAcceleratorType: "L40S"
 
-  # NodePort exposes the SAIA and Slim public services without MetalLB. The two
-  # enabled features require distinct NodePorts.
+  # NodePort exposes the SAIA and Slim public services without MetalLB. Both
+  # values are required unquoted integers in 30000-32767 and must be distinct;
+  # the installer renders them into the matching feature entries.
   serviceTemplate:
     type: "NodePort"
     nodePort: 30080

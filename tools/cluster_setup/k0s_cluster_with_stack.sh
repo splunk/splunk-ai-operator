@@ -819,12 +819,102 @@ validate_scale_factor_config() {
   return 0
 }
 
+# Validate one explicit Kubernetes NodePort. NodePort values are deliberately
+# required to be unquoted YAML integers so the generated AIPlatform CR cannot
+# silently contain a string that the API server rejects.
+validate_k0s_nodeport_value() {
+  local path="$1" label="$2"
+  local value value_tag value_decimal
+
+  if ! value=$(yq eval "${path}" "${CONFIG_FILE}" 2>/dev/null) || \
+     ! value_tag=$(yq eval "${path} | tag" "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read ${label} from ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ "${value_tag}" != "!!int" || ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${label} must be an unquoted YAML integer in the Kubernetes NodePort range 30000-32767 (got ${value:-null})"
+    return 1
+  fi
+
+  value_decimal=$((10#${value}))
+  if (( value_decimal < 30000 || value_decimal > 32767 )); then
+    echo "${label} must be in the Kubernetes NodePort range 30000-32767 (got ${value})"
+    return 1
+  fi
+
+  return 0
+}
+
+# NodePort exposure needs a fixed SAIA port and, when Slim is enabled, a
+# second distinct fixed port. Validate this before any cluster mutation.
+validate_k0s_nodeport_config() {
+  local svc_type node_port slim_node_port validation_error
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${svc_type}" == "NodePort" ]] || return 0
+
+  if ! validation_error=$(validate_k0s_nodeport_value \
+      '.aiPlatform.serviceTemplate.nodePort' \
+      'aiPlatform.serviceTemplate.nodePort'); then
+    echo "${validation_error}"
+    return 1
+  fi
+
+  if k0s_slim_feature_enabled; then
+    if ! validation_error=$(validate_k0s_nodeport_value \
+        '.aiPlatform.serviceTemplate.slimNodePort' \
+        'aiPlatform.serviceTemplate.slimNodePort'); then
+      echo "${validation_error}"
+      return 1
+    fi
+
+    node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort' "${CONFIG_FILE}" 2>/dev/null)
+    slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort' "${CONFIG_FILE}" 2>/dev/null)
+    if (( 10#${node_port} == 10#${slim_node_port} )); then
+      echo "aiPlatform.serviceTemplate.nodePort and aiPlatform.serviceTemplate.slimNodePort must be distinct when the 'slim' feature is enabled (both are ${node_port})"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# Map the installer-facing serviceTemplate ports to the typed, per-feature API
+# field understood by current operators. The installer emits explicit
+# overrides only for SAIA and Slim; other features retain operator defaults.
+k0s_public_service_nodeport_for_feature() {
+  local feature_name="$1" svc_type node_port
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${svc_type}" == "NodePort" ]] || return 0
+
+  case "${feature_name}" in
+    saia)
+      node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+      ;;
+    slim)
+      node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if [[ -n "${node_port}" && "${node_port}" != "null" ]]; then
+    printf '%s\n' "${node_port}"
+  fi
+  return 0
+}
+
 validate_image_config() {
   log "Validating image configuration..."
 
   local scale_factor_error
   if ! scale_factor_error=$(validate_scale_factor_config); then
     err "${scale_factor_error}"
+  fi
+
+  local nodeport_error
+  if ! nodeport_error=$(validate_k0s_nodeport_config); then
+    err "${nodeport_error}"
   fi
 
   if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
@@ -6149,12 +6239,12 @@ EOF
       ;;
   esac
 
-  # Build SAIA public-Service exposure block.
-  # The AIPlatform reconciler copies AIPlatform.spec.serviceTemplate down to
-  # each AIService; the SAIA feature reconciler uses it as the spec for the
-  # public saia-service.  For on-prem / airgap customers, NodePort is the
-  # recommended default (no cloud LB, no cert-manager, browser on VPN can
-  # reach any node IP for Pattern-B v2 APIs like /query streaming).
+  # Build the common public-Service exposure block. Current operators combine
+  # this service type with features[].publicServiceNodePort; retaining the
+  # common nodePort also keeps the manifest compatible with older operators.
+  # For on-prem / airgap customers, NodePort is the recommended default (no
+  # cloud LB, no cert-manager, browser on VPN can reach any node IP for
+  # Pattern-B v2 APIs like /query streaming).
   local svc_template_yaml=""
   local svc_type
   svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -6186,21 +6276,26 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa
+      local fname fver fsa feature_node_port
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
+        feature_node_port=$(k0s_public_service_nodeport_for_feature "${fname}")
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
+        [[ -n "${feature_node_port}" ]] && features_yaml+="      publicServiceNodePort: ${feature_node_port}"$'\n'
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: ${fsa}"$'\n'
-        log "  Feature: ${fname} v${fver}"
+        log "  Feature: ${fname} v${fver}${feature_node_port:+ (publicServiceNodePort=${feature_node_port})}"
       fi
       i=$((i + 1))
     done
   else
     log "No features in config — defaulting to saia"
     features_yaml="    - name: saia"$'\n'"      version: \"1.1.0\""$'\n'
+    local default_saia_node_port
+    default_saia_node_port=$(k0s_public_service_nodeport_for_feature saia)
+    [[ -n "${default_saia_node_port}" ]] && features_yaml+="      publicServiceNodePort: ${default_saia_node_port}"$'\n'
   fi
 
   # Apply AIPlatform CR (matching EKS script pattern)
@@ -6300,6 +6395,128 @@ wait_for_k0s_aiservice_exists() {
     sleep 5
     waited=$((waited + 5))
   done
+}
+
+wait_for_k0s_service_exists() {
+  local name="$1" timeout="${2:-300}" waited=0
+  while ! kubectl -n "${AI_NS}" get svc "${name}" >/dev/null 2>&1; do
+    if [[ $waited -ge $timeout ]]; then
+      warn "Timed out waiting for Service ${AI_NS}/${name}; the operator will retry reconciliation"
+      return 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+k0s_aiservice_public_exposure_matches() {
+  local name="$1" expected_type="$2" expected_node_port="${3:-}"
+  local actual_type actual_node_port
+
+  actual_type=$(kubectl -n "${AI_NS}" get aiservice "${name}" \
+    -o jsonpath='{.spec.serviceTemplate.spec.type}' 2>/dev/null || true)
+  [[ "${actual_type}" == "${expected_type}" ]] || return 1
+
+  if [[ "${expected_type}" == "NodePort" ]]; then
+    actual_node_port=$(kubectl -n "${AI_NS}" get aiservice "${name}" \
+      -o jsonpath='{.spec.serviceTemplate.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || true)
+    [[ "${actual_node_port}" == "${expected_node_port}" ]] || return 1
+  fi
+}
+
+k0s_public_service_exposure_matches() {
+  local name="$1" expected_type="$2" expected_node_port="${3:-}"
+  local actual_type actual_node_port
+
+  actual_type=$(kubectl -n "${AI_NS}" get svc "${name}" \
+    -o jsonpath='{.spec.type}' 2>/dev/null || true)
+  [[ "${actual_type}" == "${expected_type}" ]] || return 1
+
+  if [[ "${expected_type}" == "NodePort" ]]; then
+    actual_node_port=$(kubectl -n "${AI_NS}" get svc "${name}" \
+      -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || true)
+    [[ "${actual_node_port}" == "${expected_node_port}" ]] || return 1
+  fi
+}
+
+patch_k0s_aiservice_public_exposure() {
+  local aiservice_name="$1" svc_type="$2" node_port="${3:-}"
+
+  if [[ "${svc_type}" == "NodePort" ]]; then
+    kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${node_port}
+          }
+        ]
+      }
+    }
+  }
+}"
+  else
+    kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"${svc_type}\"
+      }
+    }
+  }
+}"
+  fi
+}
+
+# Compatibility path for operator versions that do not understand
+# features[].publicServiceNodePort. Current operators normally arrive here
+# with both objects already correct, in which case this is a read-only no-op.
+reconcile_k0s_public_service_compat() {
+  local aiservice_name="$1" public_svc_name="$2" label="$3"
+  local svc_type="$4" node_port="${5:-}"
+  local aiservice_matches=false service_exists=false service_matches=false
+
+  wait_for_k0s_aiservice_exists "${aiservice_name}"
+
+  if k0s_aiservice_public_exposure_matches "${aiservice_name}" "${svc_type}" "${node_port}"; then
+    aiservice_matches=true
+  fi
+  if kubectl -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; then
+    service_exists=true
+    if k0s_public_service_exposure_matches "${public_svc_name}" "${svc_type}" "${node_port}"; then
+      service_matches=true
+    fi
+  fi
+
+  if [[ "${aiservice_matches}" == "true" && "${service_matches}" == "true" ]]; then
+    log "${label} public exposure already matches ${svc_type}${node_port:+ (nodePort=${node_port})}; compatibility patch not needed"
+    apply_k0s_saia_service_annotations "${aiservice_name}"
+    return 0
+  fi
+
+  if [[ "${aiservice_matches}" != "true" ]]; then
+    log "Patching AIService/${aiservice_name} with ${label} public exposure settings (type=${svc_type})..."
+    patch_k0s_aiservice_public_exposure "${aiservice_name}" "${svc_type}" "${node_port}"
+  fi
+
+  apply_k0s_saia_service_annotations "${aiservice_name}"
+
+  if [[ "${service_matches}" == "true" ]]; then
+    return 0
+  fi
+
+  if [[ "${service_exists}" == "true" ]]; then
+    log "Recreating ${label} public Service because its exposure does not match the requested settings..."
+    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+  else
+    log "Waiting for the operator to create ${label} public Service ${AI_NS}/${public_svc_name}..."
+  fi
+  wait_for_k0s_service_exists "${public_svc_name}" || true
 }
 
 apply_k0s_saia_service_annotations() {
@@ -6494,57 +6711,15 @@ patch_k0s_saia_public_service_workaround() {
   svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
-  wait_for_k0s_aiservice_exists "${aiservice_name}"
-
   if saia_service_template_enabled_k0s; then
-    log "Patching AIService/${aiservice_name} with SAIA public exposure settings (type=${svc_type})..."
-    if [[ "${svc_type}" == "NodePort" && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
+    if [[ "${svc_type}" == "NodePort" ]]; then
       log "SAIA exposed via NodePort ${svc_node_port} — reach it at http://<worker-ip>:${svc_node_port} (front with a cloud LB on cloud VMs). For bare-metal L2 LANs you may alternatively use type=LoadBalancer with metallb.install=true; MetalLB is skipped automatically under NodePort." >&2
-      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
-  \"spec\": {
-    \"serviceTemplate\": {
-      \"spec\": {
-        \"type\": \"NodePort\",
-        \"ports\": [
-          {
-            \"name\": \"http\",
-            \"port\": 8080,
-            \"targetPort\": 8080,
-            \"nodePort\": ${svc_node_port}
-          }
-        ]
-      }
-    }
-  }
-}"
-    else
-      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
-  \"spec\": {
-    \"serviceTemplate\": {
-      \"spec\": {
-        \"type\": \"${svc_type}\"
-      }
-    }
-  }
-}"
     fi
-  fi
-
-  apply_k0s_saia_service_annotations "${aiservice_name}"
-
-  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
-
-  if saia_service_template_enabled_k0s; then
-    log "Recreating SAIA public Service to ensure patched settings take effect..."
-    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
-    # Wait briefly for the operator to recreate it before patching NodePort
-    # allocation off; if it doesn't come back the patch will be a no-op.
-    local waited=0
-    while ! kubectl -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
-      [[ ${waited} -ge 300 ]] && break
-      sleep 5
-      waited=$((waited + 5))
-    done
+    reconcile_k0s_public_service_compat \
+      "${aiservice_name}" "${public_svc_name}" "SAIA" "${svc_type}" "${svc_node_port}"
+  else
+    wait_for_k0s_aiservice_exists "${aiservice_name}"
+    apply_k0s_saia_service_annotations "${aiservice_name}"
   fi
 
   patch_k0s_saia_service_disable_nodeport
@@ -6561,15 +6736,9 @@ k0s_slim_feature_enabled() {
   return 1
 }
 
-# Expose the slim public Service the same way SAIA is exposed, but on a DISTINCT
-# NodePort (aiPlatform.serviceTemplate.slimNodePort, default 30081). This is
-# required because the AIPlatform reconciler copies AIPlatform.spec.serviceTemplate
-# down to EVERY feature's AIService verbatim, so slim would otherwise inherit
-# SAIA's nodePort (30080) and collide — a single NodePort can back only one
-# Service. We patch slim's own AIService.spec.serviceTemplate after it exists;
-# reconcileSlimService only mutates Selector/Ports on the existing Service and
-# the AIPlatform reconciler preserves an admin-patched serviceTemplate
-# (pkg/ai/reconciler.go), so this patch survives subsequent reconciles.
+# Compatibility fallback for operator versions predating the typed
+# features[].publicServiceNodePort field. Slim must use its explicitly
+# configured, distinct NodePort so it cannot claim SAIA's port first.
 patch_k0s_slim_public_service_workaround() {
   k0s_slim_feature_enabled || return 0
 
@@ -6580,64 +6749,17 @@ patch_k0s_slim_public_service_workaround() {
 
   svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  # slimNodePort keeps slim off SAIA's port; fall back to nodePort+1 if unset so
-  # a config that only sets one shared nodePort still avoids a hard collision.
   slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  if [[ ( -z "${slim_node_port}" || "${slim_node_port}" == "null" ) && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
-    slim_node_port=$((svc_node_port + 1))
-  fi
-
-  wait_for_k0s_aiservice_exists "${aiservice_name}"
 
   if saia_service_template_enabled_k0s; then
-    log "Patching AIService/${aiservice_name} with slim public exposure settings (type=${svc_type})..."
-    if [[ "${svc_type}" == "NodePort" && -n "${slim_node_port}" && "${slim_node_port}" != "null" ]]; then
+    if [[ "${svc_type}" == "NodePort" ]]; then
       log "slim exposed via NodePort ${slim_node_port} — reach it at http://<worker-ip>:${slim_node_port} (front with a cloud LB on cloud VMs). Distinct from SAIA's ${svc_node_port} to avoid a NodePort collision." >&2
-      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
-  \"spec\": {
-    \"serviceTemplate\": {
-      \"spec\": {
-        \"type\": \"NodePort\",
-        \"ports\": [
-          {
-            \"name\": \"http\",
-            \"port\": 8080,
-            \"targetPort\": 8080,
-            \"nodePort\": ${slim_node_port}
-          }
-        ]
-      }
-    }
-  }
-}"
-    else
-      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
-  \"spec\": {
-    \"serviceTemplate\": {
-      \"spec\": {
-        \"type\": \"${svc_type}\"
-      }
-    }
-  }
-}"
     fi
-  fi
-
-  apply_k0s_saia_service_annotations "${aiservice_name}"
-
-  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
-
-  if saia_service_template_enabled_k0s; then
-    log "Recreating slim public Service to ensure patched settings take effect..."
-    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
-    # Wait briefly for the operator to recreate it before moving on; if it
-    # doesn't come back in time the next reconcile will render it anyway.
-    local waited=0
-    while ! kubectl -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
-      [[ ${waited} -ge 300 ]] && break
-      sleep 5
-      waited=$((waited + 5))
-    done
+    reconcile_k0s_public_service_compat \
+      "${aiservice_name}" "${public_svc_name}" "slim" "${svc_type}" "${slim_node_port}"
+  else
+    wait_for_k0s_aiservice_exists "${aiservice_name}"
+    apply_k0s_saia_service_annotations "${aiservice_name}"
   fi
 }
 
@@ -6737,9 +6859,10 @@ install_ai_platform_stack() {
   # Install AI Platform only after native Splunk HTTPS is Ready.
   install_splunk_ai_operator
   install_ai_platform_cr
-  patch_k0s_saia_public_service_workaround
-  # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
+  # Run the legacy-operator Slim fallback first. If an older reconciler copied
+  # SAIA's port to Slim, this moves Slim away before SAIA tries to claim it.
   patch_k0s_slim_public_service_workaround
+  patch_k0s_saia_public_service_workaround
 
   # Final postcondition (normally immediate because installation already
   # verified the replacement pod).
@@ -8506,6 +8629,13 @@ validate_config() {
     errors=$(( errors + 1 ))
   else
     echo -e "  \033[1;32m✔\033[0m aiPlatform.scaleFactor is a positive integer (default: 1)" >&2
+  fi
+  local nodeport_error
+  if ! nodeport_error=$(validate_k0s_nodeport_config); then
+    echo -e "  \033[1;31m✖\033[0m ${nodeport_error}" >&2
+    errors=$(( errors + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m AI public-service NodePorts are valid and distinct" >&2
   fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2

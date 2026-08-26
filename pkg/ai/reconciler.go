@@ -12,6 +12,7 @@ import (
 	//"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	//"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -140,6 +141,7 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &svc, func() error {
 			// After client Get, svc holds the live AIService (empty on first create).
 			preservedResources := svc.Spec.Resources
+			wasFeatureNodePortManaged := svc.Spec.Feature.PublicServiceNodePort != nil
 			// Preserve any direct `kubectl patch aiservice` edit of ServiceTemplate.
 			// Without this, an admin who patches the public SAIA Service type
 			// (e.g. to NodePort for browser-direct v2 traffic) would see their
@@ -163,10 +165,13 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 			if resourceRequirementsNonEmpty(preservedResources) {
 				svc.Spec.Resources = preservedResources
 			}
-			// If the admin already patched serviceTemplate (non-empty
-			// spec.type), keep that override. Otherwise fall through to the
+			// If the admin already patched serviceTemplate (non-empty spec.type),
+			// keep that legacy override unless the feature has, or just cleared,
+			// an explicit parent-managed NodePort. Otherwise fall through to the
 			// value buildAIService() just set from AIPlatform.spec.
-			if preservedServiceTemplate.Spec.Type != "" {
+			if preservedServiceTemplate.Spec.Type != "" &&
+				feature.PublicServiceNodePort == nil &&
+				!wasFeatureNodePortManaged {
 				svc.Spec.ServiceTemplate = preservedServiceTemplate
 			}
 
@@ -228,6 +233,28 @@ func clusterDomainOrDefault(domain string) string {
 	return domain
 }
 
+func serviceTemplateForFeature(commonTemplate corev1.Service, feature aiApi.FeatureSpec) corev1.Service {
+	serviceTemplate := commonTemplate.DeepCopy()
+	if feature.PublicServiceNodePort == nil || serviceTemplate.Spec.Type != corev1.ServiceTypeNodePort {
+		return *serviceTemplate
+	}
+
+	for i := range serviceTemplate.Spec.Ports {
+		if serviceTemplate.Spec.Ports[i].Name == "http" {
+			serviceTemplate.Spec.Ports[i].NodePort = *feature.PublicServiceNodePort
+			return *serviceTemplate
+		}
+	}
+
+	serviceTemplate.Spec.Ports = append(serviceTemplate.Spec.Ports, corev1.ServicePort{
+		Name:       "http",
+		Port:       8080,
+		TargetPort: intstr.FromInt32(8080),
+		NodePort:   *feature.PublicServiceNodePort,
+	})
+	return *serviceTemplate
+}
+
 func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiApi.AIPlatform, feature aiApi.FeatureSpec, name string) *aiApi.AIService {
 	vectorDbUrl := platform.Status.VectorDbServiceName
 
@@ -247,7 +274,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			},
 		},
 		Spec: aiApi.AIServiceSpec{
-			Feature: feature,
+			Feature: *feature.DeepCopy(),
 			Version: feature.Version,
 			AIPlatformRef: corev1.ObjectReference{
 				APIVersion: "ai.splunk.com/v1",
@@ -280,7 +307,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			// this copy, the spec lands on AIPlatform and is silently ignored.
 			// Deep-copy because corev1.Service is a value type with nested
 			// slices/maps; a shallow copy would share state across children.
-			ServiceTemplate:  *platform.Spec.ServiceTemplate.DeepCopy(),
+			ServiceTemplate:  serviceTemplateForFeature(platform.Spec.ServiceTemplate, feature),
 			ImagePullSecrets: platform.Spec.Images.ImagePullSecrets,
 		},
 	}

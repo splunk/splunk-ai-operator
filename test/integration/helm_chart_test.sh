@@ -219,6 +219,7 @@ test_phase_3_template_rendering() {
         --set features[0].name="saia" \
         --set features[0].version="1.1.0" \
         --set features[0].serviceAccountName="default" \
+        --set features[0].publicServiceNodePort=30080 \
         --set workerGroupConfig.serviceAccountName="default" \
         --set splunk-ai-operator.enabled=false \
         --set kuberay-operator.enabled=false \
@@ -229,6 +230,7 @@ test_phase_3_template_rendering() {
 
     assert_contains "$platform_template_output" "kind: AIPlatform" "Platform chart renders AIPlatform CR"
     assert_contains "$platform_template_output" "objectStorage:" "Platform chart includes objectStorage config"
+    assert_contains "$platform_template_output" "publicServiceNodePort: 30080" "Platform chart renders per-feature public NodePort"
 
     success "Phase 3: Template rendering tests completed"
 }

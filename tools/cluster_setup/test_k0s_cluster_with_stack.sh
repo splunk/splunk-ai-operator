@@ -102,6 +102,10 @@ _load_functions() {
 
   eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn build_image_url)"
+  eval "$(_extract_fn k0s_slim_feature_enabled)"
+  eval "$(_extract_fn validate_k0s_nodeport_value)"
+  eval "$(_extract_fn validate_k0s_nodeport_config)"
+  eval "$(_extract_fn k0s_public_service_nodeport_for_feature)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn validate_scale_factor_config)"
@@ -222,6 +226,175 @@ assert_rc "rejects quoted integers" 1 validate_scale_factor_config
 
 _scale_factor_value="null"; _scale_factor_tag="!!null"
 assert_rc "rejects an explicitly null value" 1 validate_scale_factor_config
+
+# ── Tests: durable per-feature NodePort configuration ────────────────────────
+
+suite "durable per-feature NodePort configuration"
+echo "▶ durable per-feature NodePort configuration"
+
+_write_nodeport_fixture() {
+  local path="$1" svc_type="$2" node_port="$3" slim_node_port="$4" slim_enabled="$5"
+  {
+    printf 'aiPlatform:\n'
+    printf '  serviceTemplate:\n'
+    printf '    type: %s\n' "${svc_type}"
+    [[ "${node_port}" != "OMIT" ]] && printf '    nodePort: %s\n' "${node_port}"
+    [[ "${slim_node_port}" != "OMIT" ]] && printf '    slimNodePort: %s\n' "${slim_node_port}"
+    printf '  features:\n'
+    printf '    - name: saia\n'
+    if [[ "${slim_enabled}" == "true" ]]; then
+      printf '    - name: slim\n'
+    fi
+  } >"${path}"
+}
+
+_exercise_nodeport_validation() (
+  local svc_type="$1" node_port="$2" slim_node_port="$3" slim_enabled="$4"
+  local fixture
+  fixture=$(mktemp)
+  trap 'rm -f "${fixture}"' EXIT
+  _write_nodeport_fixture "${fixture}" "${svc_type}" "${node_port}" "${slim_node_port}" "${slim_enabled}"
+  yq() { "${YQ_BIN}" "$@"; }
+  CONFIG_FILE="${fixture}"
+  validate_k0s_nodeport_config
+)
+
+_exercise_nodeport_render_value() (
+  local svc_type="$1" feature_name="$2"
+  local fixture
+  fixture=$(mktemp)
+  trap 'rm -f "${fixture}"' EXIT
+  _write_nodeport_fixture "${fixture}" "${svc_type}" 30080 30081 true
+  yq() { "${YQ_BIN}" "$@"; }
+  CONFIG_FILE="${fixture}"
+  k0s_public_service_nodeport_for_feature "${feature_name}"
+)
+
+assert_rc "accepts distinct SAIA and Slim NodePorts" 0 \
+  _exercise_nodeport_validation NodePort 30080 30081 true
+
+assert_rc "LoadBalancer ignores absent NodePort settings" 0 \
+  _exercise_nodeport_validation LoadBalancer OMIT OMIT true
+
+assert_rc "rejects an absent SAIA NodePort" 1 \
+  _exercise_nodeport_validation NodePort OMIT 30081 true
+
+assert_rc "rejects a quoted SAIA NodePort" 1 \
+  _exercise_nodeport_validation NodePort '"30080"' 30081 true
+
+assert_rc "rejects a SAIA NodePort below the Kubernetes range" 1 \
+  _exercise_nodeport_validation NodePort 29999 30081 true
+
+assert_rc "allows slimNodePort to be absent when Slim is disabled" 0 \
+  _exercise_nodeport_validation NodePort 30080 OMIT false
+
+assert_rc "requires slimNodePort when Slim is enabled" 1 \
+  _exercise_nodeport_validation NodePort 30080 OMIT true
+
+assert_rc "rejects a quoted Slim NodePort" 1 \
+  _exercise_nodeport_validation NodePort 30080 '"30081"' true
+
+assert_rc "rejects a Slim NodePort above the Kubernetes range" 1 \
+  _exercise_nodeport_validation NodePort 30080 32768 true
+
+assert_rc "rejects a SAIA/Slim NodePort collision" 1 \
+  _exercise_nodeport_validation NodePort 30080 30080 true
+
+assert_eq "renders SAIA's typed feature override" "30080" \
+  "$(_exercise_nodeport_render_value NodePort saia)"
+
+assert_eq "renders Slim's typed feature override" "30081" \
+  "$(_exercise_nodeport_render_value NodePort slim)"
+
+assert_eq "does not emit a typed override for unrelated features" "" \
+  "$(_exercise_nodeport_render_value NodePort future-feature)"
+
+assert_eq "does not emit feature overrides for LoadBalancer" "" \
+  "$(_exercise_nodeport_render_value LoadBalancer saia)"
+
+_exercise_public_service_compat() (
+  local mode="$1" trace_file="$2"
+  local child_port=30081 service_port=30081 mock_service_exists=true
+  if [[ "${mode}" == "legacy-mismatch" ]]; then
+    child_port=30080
+    service_port=30080
+  fi
+
+  eval "$(_extract_fn wait_for_k0s_aiservice_exists)"
+  eval "$(_extract_fn wait_for_k0s_service_exists)"
+  eval "$(_extract_fn k0s_aiservice_public_exposure_matches)"
+  eval "$(_extract_fn k0s_public_service_exposure_matches)"
+  eval "$(_extract_fn patch_k0s_aiservice_public_exposure)"
+  eval "$(_extract_fn reconcile_k0s_public_service_compat)"
+
+  log() { :; }
+  warn() { :; }
+  err() { return 1; }
+  apply_k0s_saia_service_annotations() { :; }
+  sleep() { printf 'sleep\n' >>"${trace_file}"; }
+  kubectl() {
+    local args=" $* "
+    if [[ "${args}" == *' get aiservice '* ]]; then
+      if [[ "${args}" == *'serviceTemplate.spec.type'* ]]; then
+        printf 'NodePort'
+      elif [[ "${args}" == *'serviceTemplate.spec.ports'* ]]; then
+        printf '%s' "${child_port}"
+      fi
+      return 0
+    fi
+    if [[ "${args}" == *' patch aiservice '* ]]; then
+      printf 'patch-aiservice\n' >>"${trace_file}"
+      child_port=30081
+      return 0
+    fi
+    if [[ "${args}" == *' get svc '* ]]; then
+      [[ "${mock_service_exists}" == "true" ]] || return 1
+      if [[ "${args}" == *'jsonpath={.spec.type}'* ]]; then
+        printf 'NodePort'
+      elif [[ "${args}" == *'jsonpath={.spec.ports'* ]]; then
+        printf '%s' "${service_port}"
+      fi
+      return 0
+    fi
+    if [[ "${args}" == *' delete svc '* ]]; then
+      printf 'delete-service\n' >>"${trace_file}"
+      # Model the old operator recreating the Service from the patched child.
+      service_port=30081
+      mock_service_exists=true
+      return 0
+    fi
+    return 0
+  }
+
+  AI_NS=fixture-ns
+  reconcile_k0s_public_service_compat \
+    fixture-slim fixture-slim-service slim NodePort 30081
+)
+
+_NODEPORT_COMPAT_TMPDIR=$(mktemp -d)
+_nodeport_matching_trace="${_NODEPORT_COMPAT_TMPDIR}/matching.trace"
+_nodeport_mismatch_trace="${_NODEPORT_COMPAT_TMPDIR}/mismatch.trace"
+: >"${_nodeport_matching_trace}"
+: >"${_nodeport_mismatch_trace}"
+
+assert_rc "matching live child and Service need no compatibility mutation" 0 \
+  _exercise_public_service_compat matching "${_nodeport_matching_trace}"
+assert_eq "matching live child and Service are not patched, deleted, or polled" "" \
+  "$(cat "${_nodeport_matching_trace}")"
+
+assert_rc "legacy mismatched child and Service are repaired" 0 \
+  _exercise_public_service_compat legacy-mismatch "${_nodeport_mismatch_trace}"
+assert_eq "legacy repair patches the child before recreating only the mismatched Service" \
+  $'patch-aiservice\ndelete-service' "$(cat "${_nodeport_mismatch_trace}")"
+
+assert_eq "installer runs Slim compatibility before SAIA to release a copied port" "1" \
+  "$(printf '%s\n' "$(_extract_fn install_ai_platform_stack)" | awk '
+    /^[[:space:]]+patch_k0s_slim_public_service_workaround$/ { slim=NR }
+    /^[[:space:]]+patch_k0s_saia_public_service_workaround$/ { saia=NR }
+    END { print (slim > 0 && saia > slim) ? 1 : 0 }
+  ')"
+
+rm -rf "${_NODEPORT_COMPAT_TMPDIR}"
 
 # ── Tests: object_store_auth_looks_like_placeholder ───────────────────────────
 
@@ -522,6 +695,7 @@ _run_validate_image_config() {
     err()  { echo \"ERR: \$*\"; exit 1; }
     warn() { echo \"WARN: \$*\"; }
     validate_scale_factor_config() { return 0; }
+    validate_k0s_nodeport_config() { return 0; }
     k0s_slim_feature_enabled() { return 1; }
     validate_image_config
   "
@@ -1228,6 +1402,7 @@ _render_internal_splunk_https_manifests() (
   eval "$(_extract_fn _read_internal_splunk_state)"
   eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
   eval "$(_extract_fn install_splunk_standalone)"
+  eval "$(_extract_fn k0s_public_service_nodeport_for_feature)"
   eval "$(_extract_fn install_ai_platform_cr)"
 
   log() { :; }
@@ -1242,7 +1417,16 @@ _render_internal_splunk_https_manifests() (
 
   yq() {
     case "$*" in
-      *'.splunk.trustedIssuers | length'*|*'.aiPlatform.features | length'*) echo 0 ;;
+      *'.splunk.trustedIssuers | length'*) echo 0 ;;
+      *'.aiPlatform.features | length'*) echo 2 ;;
+      *'.aiPlatform.features[0].name'*) echo saia ;;
+      *'.aiPlatform.features[0].version'*) echo 1.1.0 ;;
+      *'.aiPlatform.features[1].name'*) echo slim ;;
+      *'.aiPlatform.features[1].version'*) echo 1.0.0 ;;
+      *'.aiPlatform.features['*'.serviceAccountName'*) echo '' ;;
+      *'.aiPlatform.serviceTemplate.type'*) echo NodePort ;;
+      *'.aiPlatform.serviceTemplate.slimNodePort'*) echo 30081 ;;
+      *'.aiPlatform.serviceTemplate.nodePort'*) echo 30080 ;;
       *) echo '' ;;
     esac
   }
@@ -1375,6 +1559,14 @@ assert_eq "oauth issuer and AIPlatform endpoint are byte-identical" \
   "${_rendered_issuer}" "${_rendered_endpoint}"
 assert_eq "OTel HEC endpoint follows the effective HTTP listener on port 8088" \
   "${_expected_internal_hec_url}" "${_rendered_hec_endpoint}"
+assert_eq "AIPlatform renders durable SAIA and Slim feature NodePorts" \
+  $'saia\t30080\nslim\t30081' \
+  "$("${YQ_BIN}" eval '.spec.features[] | [.name, .publicServiceNodePort] | @tsv' \
+    "${_AIP4614_TMPDIR}/aiplatform.yaml")"
+assert_eq "AIPlatform retains the common NodePort template for compatibility" \
+  "30080" \
+  "$("${YQ_BIN}" eval '.spec.serviceTemplate.spec.ports[0].nodePort' \
+    "${_AIP4614_TMPDIR}/aiplatform.yaml")"
 assert_eq "HEC endpoint is never used as a JWT issuer" "0" \
   "$(grep -c "issuer_uri: ${_expected_internal_hec_url}" \
     "${_AIP4614_TMPDIR}/splunk-defaults.yaml")"

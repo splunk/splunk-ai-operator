@@ -194,6 +194,12 @@ type FeatureSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
 	Version string `json:"version,omitempty"`
+	// PublicServiceNodePort overrides the common serviceTemplate http NodePort for this feature.
+	// It is valid only when AIPlatform.spec.serviceTemplate.spec.type is NodePort.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=30000
+	// +kubebuilder:validation:Maximum=32767
+	PublicServiceNodePort *int32 `json:"publicServiceNodePort,omitempty"`
 }
 
 // WeaviateSpec defines the configuration for the Weaviate vector database

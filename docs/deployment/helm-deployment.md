@@ -698,19 +698,33 @@ sidecars:
 
 ## Upgrading
 
+Helm installs files from a chart's `crds/` directory only on the first install;
+it does not upgrade existing CRDs. Apply the operator chart's CRDs before an
+operator or platform upgrade so the API server recognizes new fields such as
+`features[].publicServiceNodePort`:
+
+```bash
+OPERATOR_CHART_VERSION="<target-operator-chart-version>"
+
+helm show crds oci://ghcr.io/splunk/charts/splunk-ai-operator \
+  --version "${OPERATOR_CHART_VERSION}" | kubectl apply --server-side -f -
+```
+
+Wait for that command to succeed before running either upgrade below.
+
 ### Upgrade Operator
 
 ```bash
 # OCI Registry
 helm upgrade splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.2.0 \
+  --version "${OPERATOR_CHART_VERSION}" \
   --namespace splunk-ai-operator-system \
   --reuse-values
 
 # Or from GitHub Release
 helm upgrade splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz \
+  "https://github.com/splunk/splunk-ai-operator/releases/download/v${OPERATOR_CHART_VERSION}/splunk-ai-operator-${OPERATOR_CHART_VERSION}.tgz" \
   --namespace splunk-ai-operator-system \
   --reuse-values
 ```
@@ -718,9 +732,11 @@ helm upgrade splunk-ai-operator \
 ### Upgrade Platform
 
 ```bash
+PLATFORM_CHART_VERSION="<target-platform-chart-version>"
+
 helm upgrade my-platform \
   oci://ghcr.io/splunk/charts/splunk-ai-platform \
-  --version 0.2.0 \
+  --version "${PLATFORM_CHART_VERSION}" \
   --namespace ai-platform \
   --values platform-values.yaml
 ```

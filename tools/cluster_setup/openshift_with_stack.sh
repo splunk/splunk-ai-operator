@@ -552,6 +552,100 @@ openshift_slim_feature_enabled() {
   openshift_feature_enabled slim
 }
 
+# Return the configured public NodePort for a feature. The existing OpenShift
+# config keeps these values beside the shared Service template for backwards
+# compatibility, while the AIPlatform CR carries the resolved value on each
+# feature so it survives AIService recreation.
+openshift_feature_public_node_port() {
+  local feature="$1" node_port slim_node_port
+  node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+
+  case "${feature}" in
+    saia)
+      printf '%s\n' "${node_port}"
+      ;;
+    slim)
+      slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+      printf '%s\n' "${slim_node_port}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+validate_openshift_service_config() {
+  local svc_type node_port slim_node_port
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ "${svc_type}" == "NodePort" ]] || return 0
+
+  node_port=$(openshift_feature_public_node_port saia)
+  [[ "${node_port}" =~ ^[0-9]+$ ]] || {
+    echo "aiPlatform.serviceTemplate.nodePort must be set to an integer for NodePort exposure"
+    return 1
+  }
+  if (( node_port < 30000 || node_port > 32767 )); then
+    echo "aiPlatform.serviceTemplate.nodePort must be between 30000 and 32767"
+    return 1
+  fi
+
+  if openshift_slim_feature_enabled; then
+    slim_node_port=$(openshift_feature_public_node_port slim)
+    [[ "${slim_node_port}" =~ ^[0-9]+$ ]] || {
+      echo "aiPlatform.serviceTemplate.slimNodePort must be set to an integer for SLIM NodePort exposure"
+      return 1
+    }
+    if (( slim_node_port < 30000 || slim_node_port > 32767 )); then
+      echo "aiPlatform.serviceTemplate.slimNodePort must be between 30000 and 32767"
+      return 1
+    fi
+    if [[ "${slim_node_port}" == "${node_port}" ]]; then
+      echo "aiPlatform.serviceTemplate.slimNodePort must differ from nodePort"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# Build spec.features, including a durable feature-level public NodePort only
+# when NodePort exposure was explicitly selected. ClusterIP and LoadBalancer
+# configurations deliberately omit publicServiceNodePort.
+build_openshift_features_yaml() {
+  local svc_type feature_count i fname fver fsa public_node_port
+  features_yaml=""
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+
+  if [[ "${feature_count}" -gt 0 ]]; then
+    i=0
+    while [[ ${i} -lt ${feature_count} ]]; do
+      fname=$(yq eval ".aiPlatform.features[${i}].name" "${CONFIG_FILE}")
+      fver=$(yq eval ".aiPlatform.features[${i}].version // \"1.0.0\"" "${CONFIG_FILE}")
+      fsa=$(yq eval ".aiPlatform.features[${i}].serviceAccountName // \"\"" "${CONFIG_FILE}")
+      if [[ -n "${fname}" && "${fname}" != "null" ]]; then
+        features_yaml+="    - name: ${fname}"$'\n'
+        features_yaml+="      version: \"${fver}\""$'\n'
+        [[ -n "${fsa}" && "${fsa}" != "null" ]] && \
+          features_yaml+="      serviceAccountName: ${fsa}"$'\n'
+        if [[ "${svc_type}" == "NodePort" ]] && \
+            public_node_port=$(openshift_feature_public_node_port "${fname}") && \
+            [[ "${public_node_port}" =~ ^[0-9]+$ ]]; then
+          features_yaml+="      publicServiceNodePort: ${public_node_port}"$'\n'
+        fi
+      fi
+      i=$((i + 1))
+    done
+  else
+    features_yaml="    - name: saia"$'\n'"      version: \"1.1.0\""$'\n'
+    if [[ "${svc_type}" == "NodePort" ]] && \
+        public_node_port=$(openshift_feature_public_node_port saia) && \
+        [[ "${public_node_port}" =~ ^[0-9]+$ ]]; then
+      features_yaml+="      publicServiceNodePort: ${public_node_port}"$'\n'
+    fi
+  fi
+}
+
 warn_on_mutable_image_tags() {
   # Workload images use imagePullPolicy: IfNotPresent. Re-running install with
   # an unchanged mutable tag therefore does not guarantee that a newly pushed
@@ -601,6 +695,10 @@ validate_image_config() {
   local scale_factor_error
   if ! scale_factor_error=$(validate_scale_factor_config); then
     err "${scale_factor_error}"
+  fi
+  local service_config_error
+  if ! service_config_error=$(validate_openshift_service_config); then
+    err "${service_config_error}"
   fi
   [[ -z "$OPERATOR_IMAGE"        || "$OPERATOR_IMAGE"        == "null" ]] && err "REQUIRED: images.operator.image must be set in config"
   [[ -z "$RAY_HEAD_IMAGE"        || "$RAY_HEAD_IMAGE"        == "null" ]] && err "REQUIRED: images.ray.headImage must be set in config"
@@ -2808,28 +2906,10 @@ install_ai_platform_cr() {
     *) err "Unsupported objectStore.type: ${OBJ_STORE_TYPE}" ;;
   esac
 
-  # Features
+  # Features. For explicit NodePort exposure this also resolves the per-feature
+  # public ports into the declarative AIPlatform spec.
   local features_yaml=""
-  local feature_count
-  feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
-  if [[ "${feature_count}" -gt 0 ]]; then
-    local i=0
-    while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa
-      fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}")
-      fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}")
-      fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}")
-      if [[ -n "$fname" && "$fname" != "null" ]]; then
-        features_yaml+="    - name: ${fname}"$'\n'
-        features_yaml+="      version: \"${fver}\""$'\n'
-        [[ -n "$fsa" && "$fsa" != "null" ]] && \
-          features_yaml+="      serviceAccountName: ${fsa}"$'\n'
-      fi
-      i=$((i + 1))
-    done
-  else
-    features_yaml="    - name: saia"$'\n'"      version: \"1.1.0\""$'\n'
-  fi
+  build_openshift_features_yaml
 
   # Service template
   local svc_template_yaml=""
@@ -3033,48 +3113,38 @@ normalize_openshift_clusterip_feature_services() {
   done
 }
 
-# Expose SLIM on a NodePort distinct from SAIA, following the k0s installer
-# design. AIPlatform.spec.serviceTemplate is copied to every feature's
-# AIService, so both features initially inherit the SAIA NodePort. Patch SLIM's
-# generated AIService and recreate only its public Service to avoid the port
-# collision. The AIPlatform reconciler preserves this explicit AIService
-# serviceTemplate override on subsequent reconciles.
+# Compatibility convergence for installations upgraded from the SLIM-only
+# workaround. New operators normally make this a no-op: patch the generated
+# AIService only when its preserved direct override differs, and recreate its
+# public Service only when the live type or port differs.
 patch_openshift_slim_public_service_workaround() {
   openshift_slim_feature_enabled || return 0
 
-  local svc_type svc_node_port slim_node_port
+  local svc_type validation_error
   svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   [[ "${svc_type}" == "NodePort" ]] || return 0
-
-  svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  if [[ ( -z "${slim_node_port}" || "${slim_node_port}" == "null" ) && "${svc_node_port}" =~ ^[0-9]+$ ]]; then
-    slim_node_port=$((svc_node_port + 1))
+  if ! validation_error=$(validate_openshift_service_config); then
+    err "${validation_error}"
   fi
 
-  [[ "${svc_node_port}" =~ ^[0-9]+$ ]] || \
-    err "aiPlatform.serviceTemplate.nodePort must be set to an integer for NodePort exposure"
-  [[ "${slim_node_port}" =~ ^[0-9]+$ ]] || \
-    err "aiPlatform.serviceTemplate.slimNodePort must be set to an integer for SLIM NodePort exposure"
-  (( svc_node_port >= 30000 && svc_node_port <= 32767 )) || \
-    err "aiPlatform.serviceTemplate.nodePort must be between 30000 and 32767"
-  (( slim_node_port >= 30000 && slim_node_port <= 32767 )) || \
-    err "aiPlatform.serviceTemplate.slimNodePort must be between 30000 and 32767"
-  [[ "${slim_node_port}" != "${svc_node_port}" ]] || \
-    err "aiPlatform.serviceTemplate.slimNodePort must differ from nodePort"
+  local desired_node_port aiservice_name public_svc_name
+  local waited=0 timeout=600 current_type current_node_port live_type live_node_port
+  desired_node_port=$(openshift_feature_public_node_port slim)
+  aiservice_name="${AI_PLATFORM_NAME}-slim"
+  public_svc_name="${aiservice_name}-slim-service"
 
-  local aiservice_name="${AI_PLATFORM_NAME}-slim"
-  local public_svc_name="${aiservice_name}-slim-service"
-  local waited=0 timeout=600
-  log "Waiting for AIService ${AI_NS}/${aiservice_name} before assigning SLIM NodePort..."
+  log "Waiting for AIService ${AI_NS}/${aiservice_name} before verifying NodePort ${desired_node_port}..."
   while ! oc -n "${AI_NS}" get aiservice "${aiservice_name}" >/dev/null 2>&1; do
     (( waited >= timeout )) && err "Timed out waiting for AIService ${AI_NS}/${aiservice_name}"
     sleep 5
     waited=$((waited + 5))
   done
 
-  log "Patching AIService/${aiservice_name}: SLIM NodePort ${slim_node_port} (SAIA uses ${svc_node_port})..."
-  oc -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  current_type=$(oc -n "${AI_NS}" get aiservice "${aiservice_name}" -o jsonpath='{.spec.serviceTemplate.spec.type}' 2>/dev/null || echo "")
+  current_node_port=$(oc -n "${AI_NS}" get aiservice "${aiservice_name}" -o jsonpath='{.spec.serviceTemplate.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || echo "")
+  if [[ "${current_type}" != "NodePort" || "${current_node_port}" != "${desired_node_port}" ]]; then
+    log "Patching AIService/${aiservice_name}: SLIM NodePort ${desired_node_port}..."
+    oc -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
   \"spec\": {
     \"serviceTemplate\": {
       \"spec\": {
@@ -3084,27 +3154,35 @@ patch_openshift_slim_public_service_workaround() {
             \"name\": \"http\",
             \"port\": 8080,
             \"targetPort\": 8080,
-            \"nodePort\": ${slim_node_port}
+            \"nodePort\": ${desired_node_port}
           }
         ]
       }
     }
   }
 }"
+  fi
 
-  log "Recreating Service ${AI_NS}/${public_svc_name} with SLIM NodePort ${slim_node_port}..."
-  oc -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+  live_type=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+  live_node_port=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || echo "")
+  if [[ "${live_type}" != "NodePort" || "${live_node_port}" != "${desired_node_port}" ]]; then
+    log "Recreating Service ${AI_NS}/${public_svc_name} with SLIM NodePort ${desired_node_port}..."
+    oc -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
 
-  waited=0
-  while ! oc -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
-    if (( waited >= 300 )); then
-      warn "Service ${AI_NS}/${public_svc_name} was not recreated within 300s; the operator will retry reconciliation"
-      return 0
-    fi
-    sleep 5
-    waited=$((waited + 5))
-  done
-  log "  ✓ SLIM exposed on NodePort ${slim_node_port}"
+    waited=0
+    while true; do
+      live_type=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+      live_node_port=$(oc -n "${AI_NS}" get svc "${public_svc_name}" -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || echo "")
+      [[ "${live_type}" == "NodePort" && "${live_node_port}" == "${desired_node_port}" ]] && break
+      if (( waited >= 300 )); then
+        warn "Service ${AI_NS}/${public_svc_name} did not converge to NodePort ${desired_node_port} within 300s; the operator will retry reconciliation"
+        return 0
+      fi
+      sleep 5
+      waited=$((waited + 5))
+    done
+  fi
+  log "  ✓ SLIM exposed on NodePort ${desired_node_port}"
 }
 
 # True when a feature is enabled and its OpenShift Route has not been disabled.

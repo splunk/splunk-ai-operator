@@ -66,6 +66,8 @@ features: []
 # - name: "saia"
 #   serviceAccountName: "saia-service-sa"
 #   version: "1.1.0"
+#   # Optional fixed port for this feature when serviceTemplate.spec.type is NodePort.
+#   publicServiceNodePort: 30080
 
 # headGroupSpec:
 #   # Service account name for the Ray head group

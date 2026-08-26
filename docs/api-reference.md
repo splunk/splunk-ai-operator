@@ -61,6 +61,10 @@ spec:
     - name: "saia"
       serviceAccountName: "saia-sa"
       version: "0.2.0"
+      publicServiceNodePort: 30080
+    - name: "slim"
+      version: "1.0.0"
+      publicServiceNodePort: 30081
   workerGroupConfig:
     serviceAccountName: "ray-worker-sa"
     imageRegistry: "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-worker-gpu"  
@@ -137,6 +141,16 @@ spec:
       kind: "ClusterIssuer"
     dnsNames:
       - "saia.default.svc.cluster.local"
+
+  # A fixed per-feature NodePort is valid only with a NodePort Service template.
+  serviceTemplate:
+    spec:
+      type: NodePort
+      ports:
+        - name: http
+          port: 8080
+          targetPort: 8080
+          nodePort: 30080
 ```
 
 The `AIPlatform` resource provides the following `Spec` configuration parameters:
@@ -145,7 +159,7 @@ The `AIPlatform` resource provides the following `Spec` configuration parameters
 | ---------- | ------- | ------------------------------------------------- |
 | objectStorage   | object | **Required.** S3/GCS/Azure storage configuration for model artifacts. See [Service Artifacts Storage](storage-artifacts.md) |
 | serviceAccountName   | string | Kubernetes [Service Account](https://kubernetes.io/docs/concepts/security/service-accounts/) name. Used for IAM roles (IRSA on AWS) to access cloud resources |
-| features   | array | List of AI features to enable (e.g., `saia` for Splunk AI Assistant) |
+| features   | array | List of AI features to enable. `publicServiceNodePort` optionally overrides the common named `http` NodePort for that feature and must be distinct for SAIA and Slim. |
 | defaultAcceleratorType   | string | GPU type for AI workloads (e.g., `nvidia-tesla-t4`, `nvidia-a100`, `L40S`) |
 | gpuInstanceType   | string | GPU instance type for Ray worker groups (e.g., `g6.24xlarge`, `p4d.24xlarge`) |
 | workerGroupConfig   | object | Ray worker node configuration (service account, image registry) |

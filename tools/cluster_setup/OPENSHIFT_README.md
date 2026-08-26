@@ -397,9 +397,12 @@ overrides from an older deployment back to `ClusterIP` and recreates only the
 affected Service.
 
 `NodePort` remains an explicit fallback. When selected, set `nodePort` for SAIA
-and a different `slimNodePort` for SLIM; the installer patches SLIM's generated
-AIService to avoid the collision caused by the shared AIPlatform Service
-template. OpenShift deployments should normally retain `ClusterIP` and Routes.
+and a different `slimNodePort` for SLIM. The installer renders those values as
+`features[].publicServiceNodePort` in the AIPlatform CR, so the operator restores
+the correct assignment whenever an AIService is reconciled or recreated. An
+upgrade compatibility check repairs the older direct SLIM AIService override,
+but does not patch or recreate resources that already match. OpenShift
+deployments should normally retain `ClusterIP` and Routes.
 
 #### Scaling Deployment Capacity
 

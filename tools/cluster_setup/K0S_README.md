@@ -396,9 +396,10 @@ aiPlatform:
         operator: "Equal"
         value: "true"
         effect: "NoSchedule"
-  serviceTemplate:                      # Optional: expose SAIA externally
+  serviceTemplate:                      # Optional: expose public feature APIs
     type: "NodePort"                    # NodePort | LoadBalancer
-    nodePort: 30080                     # Port for NodePort type
+    nodePort: 30080                     # Required integer for NodePort (SAIA)
+    slimNodePort: 30081                 # Required, distinct integer when Slim is enabled
 
 imagePullSecrets:
   secrets: []
@@ -576,8 +577,9 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `aiPlatform.cpuScheduling.tolerations` | No | `[]` | Tolerations for CPU workloads |
 | `aiPlatform.gpuScheduling.nodeSelector` | No | auto-generated | Node selector for GPU workloads |
 | `aiPlatform.gpuScheduling.tolerations` | No | GPU toleration | Tolerations for GPU workloads |
-| `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
-| `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
+| `aiPlatform.serviceTemplate.type` | No | — | Public-service type: `NodePort` or `LoadBalancer` |
+| `aiPlatform.serviceTemplate.nodePort` | When `type=NodePort` | — | Unquoted SAIA NodePort integer in `30000-32767` |
+| `aiPlatform.serviceTemplate.slimNodePort` | When `type=NodePort` and Slim is enabled | — | Unquoted Slim NodePort integer in `30000-32767`; must differ from `nodePort` |
 
 #### Scaling Deployment Capacity
 
@@ -1259,18 +1261,27 @@ nodes:
 - etcd quorum maintained
 - Zero downtime for API server
 
-### Service Template (SAIA Public Exposure)
+### Service Template (SAIA and Slim Public Exposure)
 
-To expose the SAIA v2 chat UI externally:
+To expose SAIA and Slim externally on distinct ports:
 
 ```yaml
 aiPlatform:
+  features:
+    - name: "saia"
+      version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
   serviceTemplate:
-    type: "NodePort"      # or "LoadBalancer"
-    nodePort: 30080       # only for NodePort
+    type: "NodePort"       # or "LoadBalancer"
+    nodePort: 30080        # SAIA; unquoted integer in 30000-32767
+    slimNodePort: 30081    # Slim; required and distinct when Slim is enabled
 ```
 
-This generates a Kubernetes Service exposing port 8080 on the specified NodePort across all worker nodes.
+The installer renders these values into the matching feature entries in the
+AIPlatform CR. Operator reconciliation therefore preserves the assignments if
+an AIService or its public Service is recreated. Both Services expose port 8080
+across all worker nodes.
 
 ### Air-Gapped Deployment
 

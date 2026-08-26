@@ -44,6 +44,9 @@ spec:
 {{- if .version }}
       version: {{ .version | quote }}
 {{- end }}
+{{- if hasKey . "publicServiceNodePort" }}
+      publicServiceNodePort: {{ .publicServiceNodePort }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

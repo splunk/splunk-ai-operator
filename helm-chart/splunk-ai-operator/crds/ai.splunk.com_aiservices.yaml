@@ -1051,6 +1051,14 @@ spec:
                     - seca
                     - slim
                     type: string
+                  publicServiceNodePort:
+                    description: |-
+                      PublicServiceNodePort overrides the common serviceTemplate http NodePort for this feature.
+                      It is valid only when AIPlatform.spec.serviceTemplate.spec.type is NodePort.
+                    format: int32
+                    maximum: 32767
+                    minimum: 30000
+                    type: integer
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature

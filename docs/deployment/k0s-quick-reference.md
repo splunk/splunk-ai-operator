@@ -219,6 +219,8 @@ not `splunk-ai-operator` — adjust the `cd` above accordingly.
 | `storage.objectStore.auth.rootUser` / `rootPassword` | Access key / secret (never commit real values) |
 | `images.registry` | Your registry host, e.g. `123456789012.dkr.ecr.us-east-2.amazonaws.com` |
 | `aiPlatform.defaultAcceleratorType` | `L40S` or `H100` |
+| `aiPlatform.serviceTemplate.nodePort` | SAIA NodePort as an unquoted integer in `30000-32767` (default `30080`) |
+| `aiPlatform.serviceTemplate.slimNodePort` | Slim NodePort as a distinct unquoted integer in `30000-32767` when Slim is enabled (default `30081`) |
 | `ecr.account` / `ecr.region` | Your AWS account ID / region — **only if** `imagePullSecrets.autoCreateECR: true` (default) |
 
 Validate before installing — catches most config mistakes without touching any node:

@@ -86,10 +86,16 @@ jobs:
             --set features[0].name="saia" \
             --set features[0].version="1.1.0" \
             --set features[0].serviceAccountName="default" \
+            --set features[0].publicServiceNodePort=30080 \
+            --set serviceTemplate.spec.type=NodePort \
+            --set serviceTemplate.spec.ports[0].name=http \
+            --set serviceTemplate.spec.ports[0].port=8080 \
+            --set serviceTemplate.spec.ports[0].nodePort=30080 \
             --set workerGroupConfig.serviceAccountName="default" \
             --set prometheus.enabled=false \
             --set opentelemetry-operator.enabled=false \
             --debug > /tmp/platform-template.yaml
+          grep -q 'publicServiceNodePort: 30080' /tmp/platform-template.yaml
           echo "Chart templates generated successfully"
           echo "::endgroup::"
 
