@@ -37,7 +37,7 @@ jobs:
       IMAGE_NAME: ${{ github.repository }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
 
@@ -87,8 +87,18 @@ jobs:
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          # Keep the full release tag for reproducible image references.
+          IMAGE_TAG="v${VERSION}"
+          IS_STABLE=true
+          if [[ "$VERSION" == *-* ]]; then
+            IS_STABLE=false
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "is_stable=$IS_STABLE" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
+          echo "Building image tag: $IMAGE_TAG"
+          echo "Stable release: $IS_STABLE"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -98,9 +108,8 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             splunk/splunk-ai-operator
           tags: |
-            type=semver,pattern=v{{version}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.image_tag }}
+            type=semver,pattern=v{{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_stable }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker images
@@ -130,7 +139,7 @@ jobs:
       packages: write  # For pushing to GHCR OCI registry
     steps:
       - name: Checkout code
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
 
@@ -173,8 +182,17 @@ jobs:
             # Fallback to Chart.yaml version
             VERSION=$(grep '^version:' helm-chart/splunk-ai-operator/Chart.yaml | awk '{print $2}' | tr -d '"')
           fi
+          # Keep the full release tag for reproducible image references.
+          IMAGE_TAG="v${VERSION}"
+          IS_STABLE=true
+          if [[ "$VERSION" == *-* ]]; then
+            IS_STABLE=false
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "is_stable=$IS_STABLE" >> $GITHUB_OUTPUT
           echo "Packaging version: $VERSION"
+          echo "Packaging image tag: $IMAGE_TAG"
 
       - name: Update Chart versions
         run: |
@@ -183,6 +201,9 @@ jobs:
           # Update operator chart
           sed -i "s/^version:.*/version: \"$VERSION\"/" helm-chart/splunk-ai-operator/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" helm-chart/splunk-ai-operator/Chart.yaml
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+          # Keep the explicit Helm image value aligned with the immutable image tag.
+          sed -i "/^image:/,/^  pullPolicy:/ s|^  tag:.*|  tag: \"$IMAGE_TAG\"|" helm-chart/splunk-ai-operator/values.yaml
 
           # Validate operator chart update
           OP_VER=$(grep '^version:' helm-chart/splunk-ai-operator/Chart.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
@@ -218,9 +239,9 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
 
-          # Generate install.yaml with version-specific image tag
-          echo "Generating Kubernetes manifests for version $VERSION..."
-          IMG="ghcr.io/splunk/splunk-ai-operator:v$VERSION" make build-installer
+          # Generate install.yaml with the full release image tag.
+          echo "Generating Kubernetes manifests for release $VERSION with image tag ${{ steps.version.outputs.image_tag }}..."
+          IMG="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}" make build-installer
 
           # Rename to version-specific filename
           cp dist/install.yaml dist/install-v$VERSION.yaml
@@ -240,7 +261,8 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
 
           echo "Generating custom BOM for version $VERSION..."
-          make generate-bom VERSION=$VERSION
+          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}" \
+            make generate-bom VERSION=$VERSION
 
           echo ""
           echo "Generated BOM files:"
@@ -263,7 +285,7 @@ jobs:
       - name: Generate SBOM for operator image
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:v$VERSION"
+          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}"
 
           echo "Generating SBOM for operator image: $OPERATOR_IMAGE"
 
@@ -411,8 +433,8 @@ jobs:
             ### Container Images
 
             **Docker Images:**
-            - `ghcr.io/splunk/splunk-ai-operator:v${{ steps.version.outputs.version }}`
-            - `splunk/splunk-ai-operator:v${{ steps.version.outputs.version }}`
+            - `ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}`
+            - `splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}`
 
             ### Documentation
 
