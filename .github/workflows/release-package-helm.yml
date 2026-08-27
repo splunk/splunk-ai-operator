@@ -24,10 +24,6 @@ on:
         required: true
         type: string
 
-env:
-  # Keep the Docker image tag independent from the three-part Git release tag.
-  RELEASE_IMAGE_TAG: v1.0
-
 jobs:
   build-and-push-images:
     runs-on: ubuntu-latest
@@ -91,8 +87,13 @@ jobs:
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          # Use the major.minor portion of the release version for images.
+          # For example, release v1.0.0 produces image tag v1.0.
+          IMAGE_TAG="v$(printf '%s' "$VERSION" | cut -d. -f1-2)"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
+          echo "Building image tag: $IMAGE_TAG"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -102,7 +103,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             splunk/splunk-ai-operator
           tags: |
-            type=raw,value=${{ env.RELEASE_IMAGE_TAG }}
+            type=raw,value=${{ steps.version.outputs.image_tag }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker images
@@ -175,8 +176,13 @@ jobs:
             # Fallback to Chart.yaml version
             VERSION=$(grep '^version:' helm-chart/splunk-ai-operator/Chart.yaml | awk '{print $2}' | tr -d '"')
           fi
+          # Use the major.minor portion of the release version for images.
+          # For example, release v1.0.0 produces image tag v1.0.
+          IMAGE_TAG="v$(printf '%s' "$VERSION" | cut -d. -f1-2)"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Packaging version: $VERSION"
+          echo "Packaging image tag: $IMAGE_TAG"
 
       - name: Update Chart versions
         run: |
@@ -221,8 +227,8 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
 
           # Generate install.yaml with the stable release image tag.
-          echo "Generating Kubernetes manifests for release $VERSION with image tag ${RELEASE_IMAGE_TAG}..."
-          IMG="ghcr.io/splunk/splunk-ai-operator:${RELEASE_IMAGE_TAG}" make build-installer
+          echo "Generating Kubernetes manifests for release $VERSION with image tag ${{ steps.version.outputs.image_tag }}..."
+          IMG="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}" make build-installer
 
           # Rename to version-specific filename
           cp dist/install.yaml dist/install-v$VERSION.yaml
@@ -265,7 +271,7 @@ jobs:
       - name: Generate SBOM for operator image
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:${RELEASE_IMAGE_TAG}"
+          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}"
 
           echo "Generating SBOM for operator image: $OPERATOR_IMAGE"
 
@@ -413,8 +419,8 @@ jobs:
             ### Container Images
 
             **Docker Images:**
-            - `ghcr.io/splunk/splunk-ai-operator:${{ env.RELEASE_IMAGE_TAG }}`
-            - `splunk/splunk-ai-operator:${{ env.RELEASE_IMAGE_TAG }}`
+            - `ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}`
+            - `splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}`
 
             ### Documentation
 
