@@ -5,34 +5,32 @@ explanations, diagrams, and edge cases see
 [DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) and
 [K0S_README.md](../../tools/cluster_setup/K0S_README.md).
 
-
-
 ## Table of Contents
 
-1. [Prerequisites](#1-prerequisites)
-2. [Hardware Requirements](#2-hardware-requirements)
-3. [Config Setup](#3-config-setup)
-4. [Standard Deployment](#4-standard-deployment)
-   - [Hardware Setup (Standard Path)](#hardware-setup-standard-path)
-   - [Model Setup (Standard Path)](#model-setup-standard-path)
-   - [Install (Standard Path)](#install-standard-path)
-5. [Air-Gapped Deployment](#5-air-gapped-deployment)
-   - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
-   - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
-   - [Install (Air-Gapped Path)](#install-air-gapped-path)
-6. [Verify](#6-verify)
-7. [Common Operations](#7-common-operations)
-8. [Troubleshooting](#8-troubleshooting)
+1. [Step 1: Prerequisites](#step-1-prerequisites)
+2. [Step 2: Hardware Requirements](#step-2-hardware-requirements)
+3. [Step 3: Configure the Cluster](#step-3-configure-the-cluster)
+4. [Step 4: Choose and Install a Deployment](#step-4-choose-and-install-a-deployment)
+   - [Standard Deployment](#standard-deployment)
+     - [Hardware Setup (Standard Path)](#hardware-setup-standard-path)
+     - [Model Setup (Standard Path)](#model-setup-standard-path)
+     - [Install (Standard Path)](#install-standard-path)
+   - [Air-Gapped Deployment](#air-gapped-deployment)
+     - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
+     - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
+     - [Install (Air-Gapped Path)](#install-air-gapped-path)
+5. [Step 5: Verify](#step-5-verify)
+6. [Step 6: Common Operations](#step-6-common-operations)
+7. [Step 7: Troubleshooting](#step-7-troubleshooting)
 
 ---
 
-## 1. Prerequisites
+## Step 1: Prerequisites
 
 **Admin workstation** — the Ubuntu 24.04 or RHEL 9/10 machine you run
-`k0s_cluster_with_stack.sh` from ( a bastion host, or the installer
-machine). It
+`k0s_cluster_with_stack.sh` from (a bastion host or the installer machine). It
 needs SSH reach to every cluster node plus the CLI tools below; it is not itself
-a cluster node.
+a cluster node. The binary download commands below target x86_64/amd64.
 
 If this machine also handles model staging (downloading from HuggingFace and
 uploading to MinIO/SeaweedFS/S3 — automatic during `install`, or run
@@ -49,7 +47,8 @@ standalone via `stage-artifacts`), it additionally needs:
 
 Steps for setting up the tools:
 
-**Ubuntu 24.04**
+<details>
+<summary>Ubuntu 24.04</summary>
 
 ```bash
 # Install base dependencies
@@ -67,23 +66,18 @@ curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
 sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
 sudo chmod +x /usr/local/bin/yq
 
-# crane — used by the image-mirroring commands below (see Step 2 — Mirror
-# Container Images); no Docker daemon/root/group setup required
+# crane — used by the image-mirroring commands in Step 4; no Docker daemon,
+# root, or group setup required
 curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
 tar -xzf /tmp/crane.tar.gz -C /tmp crane
 sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
 rm -f /tmp/crane.tar.gz /tmp/crane
-
-# Verify installations
-kubectl version --client
-helm version
-git --version
-jq --version
-yq --version
-crane version
 ```
 
-**RHEL 9/10**
+</details>
+
+<details>
+<summary>RHEL 9/10</summary>
 
 ```bash
 sudo dnf install -y ca-certificates curl git jq openssh-clients tar wget
@@ -115,8 +109,13 @@ sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker
 sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER"   # log out/in (or newgrp docker) to apply
+```
 
-# Verify installations
+</details>
+
+Verify the tools once after completing the applicable Ubuntu or RHEL setup:
+
+```bash
 kubectl version --client
 helm version
 git --version
@@ -131,96 +130,49 @@ crane version
 | :--- | :--- |
 | **`kubectl` Client** | v1.36.1 |
 | **`Kustomize`** | Bundled with kubectl |
-| **`helm`** | v3.21.4 *(GitCommit: 813176c, Go: go1.26.5)* |
-| **`git`** | 2.52.0 |
-| **`jq`** | 1.6 |
+| **`helm`** | Helm 3, current stable release from the install script |
+| **`git`** | Distribution-provided supported version |
+| **`jq`** | Distribution-provided supported version |
 | **`yq`** | v4.44.1 |
 | **`crane`** | v0.21.9 |
 
+### Pinned k0s Component Versions
+
+| Component | Version |
+|---|---|
+| k0s | `v1.36.1+k0s.0` |
+| kubectl | `v1.36.1` |
+| yq | `v4.44.1` |
+| crane | `v0.21.9` |
+| cert-manager | `v1.13.0` |
+| local-path-provisioner | `v0.0.24` |
+| NVIDIA device plugin | `v0.17.3` |
+| MetalLB chart | `0.14.8` |
+| KubeRay chart | `1.2.2` |
 
 **Access and services checklist:**
 
 - [ ] SSH private key with access to every cluster node
 - [ ] Object storage reachable from all nodes: MinIO / SeaweedFS / S3 (500 GB+ recommended)
-- [ ] Private registry with platform images pushed (required only for air-gap; standard deployments pull directly from Docker Hub)
-- [ ] Decide your path now: [Standard Deployment](#4-standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#5-air-gapped-deployment) (sealed nodes, no outbound internet)
+- [ ] If air-gapped, private registry available for the platform images (standard deployments pull directly from Docker Hub)
+- [ ] Decide your path now: [Standard Deployment](#standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#air-gapped-deployment) (sealed nodes, no outbound internet)
 
-**For air-gapped deployments, mirror the platform images to your private
-registry.** Pull each image from Docker Hub, push it to your mirror, and then set
-the corresponding image fields in the cluster config to those mirrored paths.
 Standard deployments do not require a private registry: they pull the configured
-public image references directly from Docker Hub. A private registry is required
-only when the cluster is air-gapped.
-
-The example below mirrors the SAIA, Ray, SLIM, and Splunk AI Operator release
-images with the common tag `v1.0`. Set the corresponding image fields in the
-cluster config to the mirrored paths.
-
-With `crane` (no Docker daemon required):
-
-```bash
-REGISTRY="my-custom-registry.io"
-TAG="v1.0"
-
-for repo in \
-  splunk/ai-tier-saia-data-loader \
-  splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api \
-  splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker \
-  splunk/splunk-ai-operator \
-  splunk/ai-tier-slim-service; do 
-    crane copy "docker.io/${repo}:${TAG}" "${REGISTRY}/${repo}:${TAG}" 
-done
-```
-
-With Docker instead:
-
-```bash
-REGISTRY="my-custom-registry.io"
-TAG="v1.0"
-
-for repo in \
-  splunk/ai-tier-saia-data-loader \
-  splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api \
-  splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker \
-  splunk/splunk-ai-operator \
-  splunk/ai-tier-slim-service; do
-    docker pull "docker.io/${repo}:${TAG}"
-    docker tag "docker.io/${repo}:${TAG}" "${REGISTRY}/${repo}:${TAG}"
-    docker push "${REGISTRY}/${repo}:${TAG}"
-done
-```
-
-After mirroring, replace `images.ray.*`, `images.saia.*`,
-`images.slim.apiImage`, and `images.operator.image` with the corresponding
-`<your-registry>/...:v1.0` paths when preparing an air-gapped deployment.
-
-For a plain-HTTP private registry, such as the sample address `192.0.2.10:5000`, configure:
-
-```yaml
-images:
-  registry: "192.0.2.10:5000"
-  registryInsecure: true
-```
-
-Set `registryInsecure: false` for a secure HTTPS/TLS private registry. The
-setting tells the installer whether to configure containerd for HTTP or HTTPS.
-
+public image references directly from Docker Hub. A private registry and image
+mirroring are required only when the cluster is air-gapped; the mirroring steps
+are in [Step 4: Choose and Install a Deployment](#step-4-choose-and-install-a-deployment).
 
 ---
 
-## 2. Hardware Requirements
+## Step 2: Hardware Requirements
 
 Pick **one** GPU accelerator type for the cluster — `L40S` or `H100`, set via
-`aiPlatform.defaultAcceleratorType`in config — and provision only the matching GPU
+`aiPlatform.defaultAcceleratorType` in config — and provision only the matching GPU
 worker row below. The two GPU rows are alternatives, not additive; do not
 provision both.
 
 Min CPU/RAM/Disk below are **per node** — for GPU workers, multiply by the
-node count  to get the cluster total.
+node count to get the cluster total.
 
 | Node Type | Min CPU (per node) | Min RAM (per node) | Min Disk (per node) | Count | Notes |
 |---|---|---|---|---|---|
@@ -251,12 +203,12 @@ node count  to get the cluster total.
 | Runtime data | 100 GB | Grows with usage |
 | **Total bucket** | **500 GB+** | Sufficient for now |
 
+**Supported cluster-node OS:** use one supported OS family and version across
+all nodes in a cluster.
 
-
-
-
-  **Supported OS(It should be same across the cluster and installer machines):**
-
+**Installer-machine OS:** for standard deployments, use Ubuntu 24.04 or RHEL
+9/10. For air-gapped deployments, use an x86_64 RHEL 9 installer for RHEL 9 or
+Ubuntu 24.04 clusters, and an x86_64 RHEL 10 installer for RHEL 10 clusters.
 
 | OS | Version |
 | :--- | :--- |
@@ -265,13 +217,10 @@ node count  to get the cluster total.
 
 ---
 
-## 3. Config Setup
+## Step 3: Configure the Cluster
 
-Download the scripts with the configuration files on the installer machine.  
- 
-
-
- ### **Option 1: Setup via Git (Recommended)**
+Download the scripts with the configuration files on the installer machine.
+### **Option 1: Setup via Git (Recommended)**
 
 1. **Clone the Specific Branch**
    * Clone only the required branch by replacing `<branch-name>` with your given target branch:
@@ -304,14 +253,14 @@ Download the scripts with the configuration files on the installer machine.
 1. **Grab the Specific Archive**
    * Download the ZIP archive directly using the target branch path:
      ```text
-     https://github.com/splunk/splunk-ai-operator/archive/refs/heads/release/v1.zip
+     https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip
      ```
    * *Alternative via GitHub UI:* Click the **branch dropdown menu** (located top-left of the repo page next to the branch icon) and swap `main` to your targeted `<branch-name>` *before* selecting **Code → Download ZIP**.
 
 2. **Navigate with Branch Suffix**
-   * Move into the extracted folder. Keep in mind that GitHub includes the branch name in the root folder structure (e.g., `splunk-ai-operator-release-v1` instead of `splunk-ai-operator`):
+   * Move into the extracted folder. GitHub includes the branch name in the root folder structure (for example, `splunk-ai-operator-<branch-name>` instead of `splunk-ai-operator`):
      ```bash
-     cd splunk-ai-operator-release-v1/tools/cluster_setup
+     cd splunk-ai-operator-<branch-name>/tools/cluster_setup
      ```
 
 3. **Initialize Configuration File**
@@ -351,45 +300,47 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 > **Air-gapped clusters need a few additional fields** (`cluster.airgap: true`,
-> a private `images.registry`) — see [Air-Gapped Deployment](#5-air-gapped-deployment).
- Everything above still applies to air-gapped installs; pick your path below
-once this base config is filled in.
+> a private `images.registry`) — see [Air-Gapped Deployment](#air-gapped-deployment).
+> Everything above still applies to air-gapped installs; pick your path below
+> once this base config is filled in.
 
 > Full field-by-field reference:
 [K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
 
 ---
 
-## 4. Standard Deployment
+## Step 4: Choose and Install a Deployment
 
-For clusters where every node has outbound internet access. The standard path
-pulls the configured public images directly from Docker Hub; no private registry
-is required.
+Choose one deployment path:
 
-### Hardware Setup (Standard Path)
+- **Standard** — every cluster node has outbound internet access and pulls the
+  configured public images directly from Docker Hub; no private registry is
+  required.
+- **Air-gapped** — cluster nodes have no outbound internet access; the installer
+  machine stages the required artifacts and uses a private registry for the
+  platform images.
+
+### Standard Deployment
+
+#### Hardware Setup (Standard Path)
 
 Confirm every cluster node uses RHEL 9, RHEL 10, or Ubuntu 24.04 and has
 passwordless sudo and Python 3.8+. Confirm SSH access from the installer
 machine before running the installer. GPU driver installation is fully
 automatic; no manual driver steps are needed.
 
-### Model Setup (Standard Path)
+#### Model Setup (Standard Path)
 
 Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
-**Staging machine requirements:** see [Prerequisites](#1-prerequisites) — same machine as the admin workstation, sized for model staging.
+**Staging machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — same machine as the admin workstation, sized for model staging.
 
 - **Full (interactive) install** — the installer prompts whether to download
   models. Answer yes to stage them from the installer machine, or no if they
   are already present in the object store.
 
-
-
-
-
-
-### Install (Standard Path)
+#### Install (Standard Path)
 
 ```bash
 cd tools/cluster_setup
@@ -401,17 +352,17 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h fir
 tail -f logs/k0s-install-*.log
 ```
 
-Continue to [Verify](#6-verify).
+Continue to [Step 5: Verify](#step-5-verify).
 
 ---
 
-## 5. Air-Gapped Deployment
+### Air-Gapped Deployment
 
 For sealed cluster nodes with no outbound internet. Everything is staged and
 pushed from a single internet-connected installer machine that also has SSH
 reach to the cluster nodes — there is no separate transfer/bundle step.
 
-### Hardware Setup (Air-Gapped Path)
+#### Hardware Setup (Air-Gapped Path)
 
 **Cluster nodes** must use RHEL 9, RHEL 10, or Ubuntu 24.04. For air-gapped
 staging, use a RHEL 9 x86_64 installer machine for RHEL 9 or Ubuntu 24.04
@@ -459,24 +410,96 @@ Success: All required command-line dependencies (curl, helm, kubectl, tar, ssh, 
 
 Failure: Because the commands are chained using &&, execution stops immediately when any command is missing, inaccessible, or returns a non-zero exit code. Subsequent dependency checks will not be executed, and the overall command returns a failure status.
 
-### Model Setup (Air-Gapped Path)
+#### Model Setup (Air-Gapped Path)
 
 Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
-**Staging machine requirements:** see [Prerequisites](#1-prerequisites) — same machine as the admin workstation, sized for model staging.
+**Staging machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — same machine as the admin workstation, sized for model staging.
 
 - **Full (interactive) install** — the installer prompts whether to download
   models. Answer yes to stage them from the installer machine, or no if they
   are already present in the object store.
 
-### Install (Air-Gapped Path)
+#### Install (Air-Gapped Path)
 
 One entry point, same install command as the standard path — the config's
 `cluster.airgap: true` (or `AIRGAP_MODE=true`) is what switches the mode.
 
 Before running install, mirror the platform application images to your private
 registry.
+
+Mirror every application image used by the deployment. The release images below
+use the common tag `v1.0`; supporting images retain the versions from the
+configuration file. Set every applicable `images.*` field to its mirrored path.
+
+With `crane` (no Docker daemon required):
+
+```bash
+REGISTRY="my-custom-registry.io"
+
+for image in \
+  docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
+  docker.io/splunk/ai-tier-saia-api-v2:v1.0 \
+  docker.io/splunk/ai-tier-saia-api:v1.0 \
+  docker.io/splunk/ai-tier-ray-head:v1.0 \
+  docker.io/splunk/ai-tier-ray-worker:v1.0 \
+  docker.io/kpratyush775/splunk-ai-operator:v1.0 \
+  docker.io/splunk/ai-tier-slim-service:v1.0 \
+  docker.io/splunk/splunk:10.2-rhel9 \
+  docker.io/splunk/splunk-operator:3.0.0 \
+  docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
+  docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
+  docker.io/fluent/fluent-bit:1.9.6 \
+  docker.io/library/nginx:1.27-alpine; do
+    relative_image="${image#docker.io/}"
+    crane copy "${image}" "${REGISTRY}/${relative_image}"
+done
+```
+
+With Docker instead:
+
+```bash
+REGISTRY="my-custom-registry.io"
+
+for image in \
+  docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
+  docker.io/splunk/ai-tier-saia-api-v2:v1.0 \
+  docker.io/splunk/ai-tier-saia-api:v1.0 \
+  docker.io/splunk/ai-tier-ray-head:v1.0 \
+  docker.io/splunk/ai-tier-ray-worker:v1.0 \
+  docker.io/kpratyush775/splunk-ai-operator:v1.0 \
+  docker.io/splunk/ai-tier-slim-service:v1.0 \
+  docker.io/splunk/splunk:10.2-rhel9 \
+  docker.io/splunk/splunk-operator:3.0.0 \
+  docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
+  docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
+  docker.io/fluent/fluent-bit:1.9.6 \
+  docker.io/library/nginx:1.27-alpine; do
+    relative_image="${image#docker.io/}"
+    docker pull "${image}"
+    docker tag "${image}" "${REGISTRY}/${relative_image}"
+    docker push "${REGISTRY}/${relative_image}"
+done
+```
+
+After mirroring, replace every applicable `images.*` field, including the
+Splunk, Splunk Operator, Weaviate, Fluent Bit, OpenTelemetry Collector, and
+nginx image fields, with the corresponding private-registry paths. The
+release-image paths use `v1.0`; preserve the configured tags for supporting
+images.
+
+For a plain-HTTP private registry, such as the sample address `192.0.2.10:5000`, configure:
+
+```yaml
+images:
+  registry: "192.0.2.10:5000"
+  registryInsecure: true
+```
+
+Set `registryInsecure: false` for a secure HTTPS/TLS private registry. The
+setting tells the installer whether to configure containerd for HTTP or HTTPS.
+
 ```bash
 cd tools/cluster_setup
 
@@ -496,13 +519,11 @@ cd tools/cluster_setup
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
-
-
-Continue to [Verify](#6-verify).
+Continue to [Step 5: Verify](#step-5-verify).
 
 ---
 
-## 6. Verify
+## Step 5: Verify
 
 Applies to both standard and air-gapped deployment paths.
 
@@ -535,7 +556,7 @@ Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../
 
 ---
 
-## 7. Common Operations
+## Step 6: Common Operations
 
 Applies to both deployment paths — same commands for standard and air-gapped clusters.
 
@@ -551,7 +572,7 @@ Applies to both deployment paths — same commands for standard and air-gapped c
 
 ---
 
-## 8. Troubleshooting
+## Step 7: Troubleshooting
 
 Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup/TROUBLESHOOTING.md)
 
