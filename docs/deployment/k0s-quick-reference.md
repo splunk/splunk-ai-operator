@@ -124,10 +124,11 @@ yq --version
 crane version
 ```
 
-### Verification Matrix
+### Version Reference
 
-| Tool | Version / Status |
+| Component | Version / Status |
 | :--- | :--- |
+| **k0s** | v1.36.1+k0s.0 |
 | **`kubectl` Client** | v1.36.1 |
 | **`Kustomize`** | Bundled with kubectl |
 | **`helm`** | Helm 3, current stable release from the install script |
@@ -135,20 +136,11 @@ crane version
 | **`jq`** | Distribution-provided supported version |
 | **`yq`** | v4.44.1 |
 | **`crane`** | v0.21.9 |
-
-### Pinned k0s Component Versions
-
-| Component | Version |
-|---|---|
-| k0s | `v1.36.1+k0s.0` |
-| kubectl | `v1.36.1` |
-| yq | `v4.44.1` |
-| crane | `v0.21.9` |
-| cert-manager | `v1.13.0` |
-| local-path-provisioner | `v0.0.24` |
-| NVIDIA device plugin | `v0.17.3` |
-| MetalLB chart | `0.14.8` |
-| KubeRay chart | `1.2.2` |
+| **cert-manager** | v1.13.0 |
+| **local-path-provisioner** | v0.0.24 |
+| **NVIDIA device plugin** | v0.17.3 |
+| **MetalLB chart** | 0.14.8 |
+| **KubeRay chart** | 1.2.2 |
 
 **Access and services checklist:**
 
@@ -156,11 +148,6 @@ crane version
 - [ ] Object storage reachable from all nodes: MinIO / SeaweedFS / S3 (500 GB+ recommended)
 - [ ] If air-gapped, private registry available for the platform images (standard deployments pull directly from Docker Hub)
 - [ ] Decide your path now: [Standard Deployment](#standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#air-gapped-deployment) (sealed nodes, no outbound internet)
-
-Standard deployments do not require a private registry: they pull the configured
-public image references directly from Docker Hub. A private registry and image
-mirroring are required only when the cluster is air-gapped; the mirroring steps
-are in [Step 4: Choose and Install a Deployment](#step-4-choose-and-install-a-deployment).
 
 ---
 
