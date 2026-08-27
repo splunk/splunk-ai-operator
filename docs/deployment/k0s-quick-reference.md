@@ -5,37 +5,35 @@ explanations, diagrams, and edge cases see
 [DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) and
 [K0S_README.md](../../tools/cluster_setup/K0S_README.md).
 
-All commands run from `tools/cluster_setup/` unless noted otherwise.
-
 ## Table of Contents
 
-1. [Prerequisites](#1-prerequisites)
-2. [Hardware Requirements](#2-hardware-requirements)
-3. [Config Setup](#3-config-setup)
-4. [Standard Deployment](#4-standard-deployment)
-   - [Hardware Setup (Standard Path)](#hardware-setup-standard-path)
-   - [Model Setup (Standard Path)](#model-setup-standard-path)
-   - [Install (Standard Path)](#install-standard-path)
-5. [Air-Gapped Deployment](#5-air-gapped-deployment)
-   - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
-   - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
-   - [Install (Air-Gapped Path)](#install-air-gapped-path)
-6. [Verify](#6-verify)
-7. [Common Operations](#7-common-operations)
-8. [Troubleshooting](#8-troubleshooting)
+1. [Step 1: Prerequisites](#step-1-prerequisites)
+2. [Step 2: Hardware Requirements](#step-2-hardware-requirements)
+3. [Step 3: Configure the Cluster](#step-3-configure-the-cluster)
+4. [Step 4: Choose and Install a Deployment](#step-4-choose-and-install-a-deployment)
+   - [Standard Deployment](#standard-deployment)
+     - [Hardware Setup (Standard Path)](#hardware-setup-standard-path)
+     - [Model Setup (Standard Path)](#model-setup-standard-path)
+     - [Install (Standard Path)](#install-standard-path)
+   - [Air-Gapped Deployment](#air-gapped-deployment)
+     - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
+     - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
+     - [Install (Air-Gapped Path)](#install-air-gapped-path)
+5. [Step 5: Verify](#step-5-verify)
+6. [Step 6: Common Operations](#step-6-common-operations)
+7. [Step 7: Troubleshooting](#step-7-troubleshooting)
 
 ---
 
-## 1. Prerequisites
+## Step 1: Prerequisites
 
-**Admin workstation** — the machine you run `k0s_cluster_with_stack.sh` from
-(your laptop, a bastion host, or the installer machine described in
-[Air-Gapped Deployment](#5-air-gapped-deployment)). It needs SSH reach to every
-cluster node plus the CLI tools below; it is not itself a cluster node.
+**Installer machine** — Ubuntu 24.04 or RHEL 9/10, x86_64/amd64, with SSH
+access to every cluster node and the CLI tools below. Run commands locally or
+SSH into the machine first if it is remote; it is separate from the cluster
+nodes.
 
-If this machine also handles model staging (downloading from HuggingFace and
-uploading to MinIO/SeaweedFS/S3 — automatic during `install`, or run
-standalone via `stage-artifacts`), it additionally needs:
+If it also stages models from Hugging Face to MinIO/SeaweedFS/S3, it additionally
+needs:
 
 | Resource | Minimum | Why |
 |---|---|---|
@@ -44,115 +42,107 @@ standalone via `stage-artifacts`), it additionally needs:
 | CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
 
-**Admin workstation tools:**
+**Installer machine tools:**
 
-**macOS** — `brew install kubectl helm git jq yq`.
+Steps for setting up the tools:
 
-**Ubuntu / RHEL 9** — none of `kubectl`, `helm`, `yq`, or `crane` are in the
-default repos; `git` and `jq` are. Install each via its own supported method
-rather than a single package-manager command:
+<details>
+<summary>Ubuntu 24.04</summary>
 
-- `kubectl` — [official binary download](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/),
-  pinned to `v1.36.1` (matches the k0s version this repo installs by default)
-- `helm` — [install script or binary release](https://helm.sh/docs/intro/install/)
-- `yq` — [binary release](https://github.com/mikefarah/yq#install), pinned to
-  `v4.44.1` (matches the version this repo already relies on elsewhere)
-- `git`, `jq` — `sudo apt-get install -y git jq` (Ubuntu) or
-  `sudo dnf install -y git jq` (RHEL 9)
-- `crane` — [binary release](https://github.com/google/go-containerregistry/releases),
-  used by the image-mirroring commands below on **both** Ubuntu and RHEL 9;
-  no Docker daemon, root, or group setup required
-- `docker` (optional alternative to `crane` for mirroring; also needed to
-  build the offline GPU driver closure for air-gapped Ubuntu nodes) —
-  [Docker CE repo for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
-  or [Docker CE repo for RHEL](https://docs.docker.com/engine/install/rhel/)
-  (RHEL 9 requires `sudo dnf install -y dnf-plugins-core` first for `dnf
-  config-manager`)
+```bash
+# Install base dependencies
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg git jq openssh-client tar wget
 
-See
-[K0S_README.md — Required Tools](../../tools/cluster_setup/K0S_README.md#required-tools-on-admin-workstation)
-for the exact repo/install-script commands for each.
+# kubectl pinned to the same Kubernetes version as the k0s binary
+curl -fsSLO https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# pinned to match the version this repo already relies on
+sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands in Step 4; no Docker daemon,
+# root, or group setup required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
+```
+
+</details>
+
+<details>
+<summary>RHEL 9/10</summary>
+
+```bash
+sudo dnf install -y ca-certificates curl git jq openssh-clients tar wget
+
+# kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0)
+curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm -f kubectl
+
+# helm — install script (https://helm.sh/docs/intro/install/)
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# yq — pinned to match the version this repo relies on
+sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -o /usr/local/bin/yq
+sudo chmod +x /usr/local/bin/yq
+
+# crane — used by the image-mirroring commands below; no Docker daemon is required
+curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
+tar -xzf /tmp/crane.tar.gz -C /tmp crane
+sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
+rm -f /tmp/crane.tar.gz /tmp/crane
+
+# Docker is optional; use this only if you prefer docker pull/tag/push over
+# crane copy for image mirroring. Docker CE repository for RHEL:
+# https://docs.docker.com/engine/install/rhel/
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"   # log out/in (or newgrp docker) to apply
+```
+
+</details>
+
+Verify the tools once after completing the applicable Ubuntu or RHEL setup:
+
+```bash
+kubectl version --client
+helm version
+git --version
+jq --version
+yq --version
+crane version
+```
+
+Success: each command prints version information and exits successfully.
 
 **Access and services checklist:**
 
 - [ ] SSH private key with access to every cluster node
 - [ ] Object storage reachable from all nodes: MinIO / SeaweedFS / S3 (500 GB+ recommended)
-- [ ] Container registry with platform images pushed (or plan to mirror for air-gap)
-- [ ] Splunk account team has provided image entitlements / registry access
-- [ ] Decide your path now: [Standard Deployment](#4-standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#5-air-gapped-deployment) (sealed nodes, no outbound internet)
-
-**Mirror platform images to your internal registry.** Pull each image from
-Docker Hub, push it to your mirror, and then set the corresponding image fields
-in the cluster config to those mirrored paths (required for both paths —
-air-gap additionally needs every node to resolve that registry with no outbound
-internet):
-
-The example below mirrors the SAIA, Ray, and SLIM release images with the common
-tag `v1.0`, and the Splunk AI Operator with `v2.8`. Set the corresponding image
-fields in the cluster config to the mirrored paths.
-
-With `crane` (works on Ubuntu and RHEL 9, no Docker daemon required):
-
-```bash
-TAG="v1.0"
-for repo in \
-  splunk/ai-tier-saia-data-loader \
-  splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api \
-  splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker \
-  splunk/ai-tier-slim-service; do
-  crane copy "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
-done
-
-crane copy \
-  "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
-  "<your-registry>/splunk/splunk-ai-operator:v2.8"
-```
-
-With Docker instead:
-
-```bash
-TAG="v1.0"
-for repo in \
-  splunk/ai-tier-saia-data-loader \
-  splunk/ai-tier-saia-api-v2 \
-  splunk/ai-tier-saia-api \
-  splunk/ai-tier-ray-head \
-  splunk/ai-tier-ray-worker \
-  splunk/ai-tier-slim-service; do
-  docker pull "docker.io/${repo}:${TAG}"
-  docker tag "docker.io/${repo}:${TAG}" "<your-registry>/${repo}:${TAG}"
-  docker push "<your-registry>/${repo}:${TAG}"
-done
-
-docker pull "docker.io/kpratyush775/splunk-ai-operator:v2.8"
-docker tag "docker.io/kpratyush775/splunk-ai-operator:v2.8" \
-  "<your-registry>/splunk/splunk-ai-operator:v2.8"
-docker push "<your-registry>/splunk/splunk-ai-operator:v2.8"
-```
-
-After mirroring, replace the fully qualified `images.ray.*`, `images.saia.*`,
-`images.slim.apiImage`, and `images.operator.image` values in the cluster
-config with the corresponding `<your-registry>/...` paths. For the complete
-air-gap image list and the bulk `crane copy` alternative, see
-[DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images).
-
-> Image tags can be mutable and the workloads use `imagePullPolicy:
-> IfNotPresent`. Use an immutable digest for a controlled image refresh; rerunning the
-> installer with the same tag may keep the cached image.
+- [ ] If air-gapped, private registry available for the platform images (standard deployments pull directly from Docker Hub)
+- [ ] Decide your path now: [Standard Deployment](#standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#air-gapped-deployment) (sealed nodes, no outbound internet)
 
 ---
 
-## 2. Hardware Requirements
+## Step 2: Hardware Requirements
 
 Pick **one** GPU accelerator type for the cluster — `L40S` or `H100`, set via
-`aiPlatform.defaultAcceleratorType` — and provision only the matching GPU
+`aiPlatform.defaultAcceleratorType` in config — and provision only the matching GPU
 worker row below. The two GPU rows are alternatives, not additive; do not
 provision both.
 
 Min CPU/RAM/Disk below are **per node** — for GPU workers, multiply by the
-node count (2 minimum) to get the cluster total.
+node count to get the cluster total.
 
 | Node Type | Min CPU (per node) | Min RAM (per node) | Min Disk (per node) | Count | Notes |
 |---|---|---|---|---|---|
@@ -183,29 +173,81 @@ node count (2 minimum) to get the cluster total.
 | Runtime data | 100 GB | Grows with usage |
 | **Total bucket** | **500 GB+** | Sufficient for now |
 
+**Supported cluster-node OS:** use one supported OS family and version across
+all nodes in a cluster.
+
+**Installer machine OS:** for standard deployments, use Ubuntu 24.04 or RHEL
+9/10. For air-gapped deployments, use an x86_64 RHEL 9 installer machine for
+RHEL 9 or Ubuntu 24.04 clusters, and an x86_64 RHEL 10 installer machine for
+RHEL 10 clusters.
+
+| OS | Version |
+| :--- | :--- |
+| **RHEL** | 9.8, 10.2 |
+| **Ubuntu** | 24.04 |
+
 ---
 
-## 3. Config Setup
+## Step 3: Configure the Cluster
 
-Copy the template and fill in only the **mandatory** fields below — everything
-else has a working default. Full field-by-field reference:
-[K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
+Download the scripts with the configuration files on the installer machine.
+### **Option 1: Setup via Git (Recommended)**
 
-```bash
-# Replace <branch-name> with the branch you were given
-git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
-cd splunk-ai-operator/tools/cluster_setup
+1. **Clone the Specific Branch**
+   * Clone only the required branch by replacing `<branch-name>` with your given target branch:
+     ```bash
+     git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
+     ```
 
-cp k0s-cluster-config.yaml my-cluster.yaml
-vi my-cluster.yaml
-```
+2. **Navigate to the Setup Directory**
+   * Change into the standard repository directory structure:
+     ```bash
+     cd splunk-ai-operator/tools/cluster_setup
+     ```
 
-**No git / downloading a ZIP from the browser instead:** GitHub's branch
-dropdown (top-left of the repo page, next to the branch icon) defaults to
-`main` — switch it to `<branch-name>` *before* clicking **Code → Download
-ZIP**, or use `https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip`
-directly. The extracted folder is named `splunk-ai-operator-<branch-name>`,
-not `splunk-ai-operator` — adjust the `cd` above accordingly.
+3. **Initialize Configuration File**
+   * Duplicate the base template to create your working configuration:
+     ```bash
+     cp k0s-cluster-config.yaml my-cluster.yaml
+     ```
+
+4. **Edit Your Infrastructure Layout**
+   * Open the config file in your preferred text editor to make targeted additions:
+     ```bash
+     vi my-cluster.yaml
+     ```
+
+---
+
+### **Option 2: Setup via Browser ZIP Download**
+
+1. **Grab the Specific Archive**
+   * Download the ZIP archive directly using the target branch path:
+     ```text
+     https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<branch-name>.zip
+     ```
+   * *Alternative via GitHub UI:* Click the **branch dropdown menu** (located top-left of the repo page next to the branch icon) and swap `main` to your targeted `<branch-name>` *before* selecting **Code → Download ZIP**.
+
+2. **Navigate with Branch Suffix**
+   * Move into the extracted folder. GitHub includes the branch name in the root folder structure (for example, `splunk-ai-operator-<branch-name>` instead of `splunk-ai-operator`):
+     ```bash
+     cd splunk-ai-operator-<branch-name>/tools/cluster_setup
+     ```
+
+3. **Initialize Configuration File**
+   * Duplicate the template file to begin making cluster edits:
+     ```bash
+     cp k0s-cluster-config.yaml my-cluster.yaml
+     ```
+
+4. **Edit Your Infrastructure Layout**
+   * Launch your file inside a terminal editor to change values:
+     ```bash
+     vi my-cluster.yaml
+     ```
+
+Review and set the following fields as applicable; all other fields have a
+working default.
 
 | Field | Set to |
 |---|---|
@@ -217,243 +259,288 @@ not `splunk-ai-operator` — adjust the `cd` above accordingly.
 | `storage.objectStore.type` | `aws` \| `minio` \| `seaweedfs` |
 | `storage.objectStore.endpoint` | Object store API endpoint (not needed for `type: aws`) |
 | `storage.objectStore.auth.rootUser` / `rootPassword` | Access key / secret (never commit real values) |
-| `images.registry` | Your registry host, e.g. `123456789012.dkr.ecr.us-east-2.amazonaws.com` |
+| `images.registry` | Private registry host — required only for air-gapped deployments; leave empty for standard Docker Hub pulls |
+| `images.registryInsecure` | Set to `true` only for a plain-HTTP private registry; set to `false` for a secure HTTPS/TLS registry |
 | `aiPlatform.defaultAcceleratorType` | `L40S` or `H100` |
-| `ecr.account` / `ecr.region` | Your AWS account ID / region — **only if** `imagePullSecrets.autoCreateECR: true` (default) |
+| `imagePullSecrets.custom.*` | Registry credentials when the private registry requires authentication |
 
-Validate before installing — catches most config mistakes without touching any node:
+### Required: Validate the Configuration
+
+This step is required. After editing `my-cluster.yaml`, run validation before
+choosing a deployment path. Proceed with `install` only after validation
+completes successfully. Validation checks the configuration without modifying
+any cluster node.
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 > **Air-gapped clusters need a few additional fields** (`cluster.airgap: true`,
-> `imagePullSecrets.autoCreateECR: false`, an internal `images.registry`, and
-> `storage.modelStaging.enabled` set to `true` or `false` depending on
-> whether you're staging models from the installer machine or already have
-> them in your object store) — see [Air-Gapped Deployment](#5-air-gapped-deployment).
+> a private `images.registry`) — see [Air-Gapped Deployment](#air-gapped-deployment).
 > Everything above still applies to air-gapped installs; pick your path below
 > once this base config is filled in.
 
+> Full field-by-field reference:
+[K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
+
 ---
 
-## 4. Standard Deployment
+## Step 4: Choose and Install a Deployment
 
-For clusters where every node has outbound internet access.
+Choose one deployment path:
 
-### Hardware Setup (Standard Path)
+- **[Standard](#standard-deployment)** — every cluster node has outbound
+  internet access and pulls the configured public images directly from Docker
+  Hub; no private registry is required.
+- **[Air-gapped](#air-gapped-deployment)** — cluster nodes have no outbound
+  internet access; the installer machine stages the required artifacts and uses
+  a private registry for the platform images.
 
-Confirm every node's OS (RHEL 9 or Ubuntu 24.04), passwordless sudo, Python
-3.8+, and SSH access before running the installer — GPU driver install is
-fully automatic, no manual steps needed. Full commands and details:
-[DEPLOYMENT_GUIDE.md — Step-by-Step (Standard)](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#step-by-step-standard).
+### Standard Deployment
 
-### Model Setup (Standard Path)
+#### Hardware Setup (Standard Path)
+
+Confirm every cluster node uses RHEL 9, RHEL 10, or Ubuntu 24.04 and has
+passwordless sudo and Python 3.8+. Confirm SSH access from the installer
+machine before running the installer. GPU driver installation is fully
+automatic; no manual driver steps are needed.
+
+#### Model Setup (Standard Path)
 
 Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
-- **Full (interactive) install** — the installer always prompts whether to
-  download models; your answer at the prompt overrides
-  `storage.modelStaging.enabled`.
-- **Silent install** (`--silent` / `AUTO_APPROVE=true`) — set
-  `storage.modelStaging.enabled: true` in your config (the shipped template
-  defaults to `false`). The installer then downloads from HuggingFace and
-  uploads to your object store as part of `install`. Safe to re-run;
-  already-staged models are skipped.
+**Installer machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — use the installer machine for model staging.
 
-```bash
-# Re-run staging only, without a full install
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
-```
+- **Full (interactive) install** — the installer prompts whether to download
+  models. Answer yes to stage them from the installer machine, or no if they
+  are already present in the object store.
 
-**Staging machine requirements:** see [Prerequisites](#1-prerequisites) — same machine as the admin workstation, sized for model staging.
-
-> Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
-
-### Install (Standard Path)
+#### Install (Standard Path)
 
 ```bash
 cd tools/cluster_setup
 
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate   # config check, run first
+# Required: validation must succeed before install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+
+# Run only after validate completes successfully
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h first run (model download), ~30-60min if pre-staged
 
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
 ```
 
-Continue to [Verify](#6-verify).
+Continue to [Step 5: Verify](#step-5-verify).
 
 ---
 
-## 5. Air-Gapped Deployment
+### Air-Gapped Deployment
 
 For sealed cluster nodes with no outbound internet. Everything is staged and
 pushed from a single internet-connected installer machine that also has SSH
 reach to the cluster nodes — there is no separate transfer/bundle step.
 
-### Hardware Setup (Air-Gapped Path)
+#### Hardware Setup (Air-Gapped Path)
 
-Same node checks as the standard path (OS, sudo, Python, SSH — see
-[Hardware Setup (Standard Path)](#hardware-setup-standard-path)) apply to the
-**cluster nodes** (controllers, CPU workers, GPU workers) — those can be RHEL 9
-or Ubuntu 24.04. The **installer machine itself must be RHEL 9 x86_64** — it
-builds the offline RPM/.deb NVIDIA driver closures using its own `dnf`, and
-that only works from RHEL.
+**Cluster nodes** must use RHEL 9, RHEL 10, or Ubuntu 24.04. For air-gapped
+staging, use a RHEL 9 x86_64 installer machine for RHEL 9 or Ubuntu 24.04
+clusters, and a RHEL 10 x86_64 installer machine for RHEL 10 clusters. The
+installer machine needs internet access and SSH access to every sealed node.
 
-**GPU worker nodes** — no manual driver install needed.
-`k0s_cluster_with_stack.sh install` derives each GPU node's kernel and OS over
-SSH and builds/pushes a complete offline NVIDIA driver closure automatically
-as part of the same run — an RPM closure for RHEL 9 GPU nodes, a .deb closure
-for Ubuntu 24.04 GPU nodes. You can still pre-install the driver yourself (same
-commands as the standard path) if you prefer, but it isn't required. See
-[K0S_README.md — GPU Nodes in Air-Gapped Environments](../../tools/cluster_setup/K0S_README.md#gpu-nodes-in-air-gapped-environments)
-for the closure mechanics and manual overrides.
-
-**Installer machine requirements:** RHEL 9 x86_64, curl, helm, kubectl,
-tar/ssh/rpm/dnf/sha256sum, `createrepo_c`, sudo, ~5 GB free disk. Building a
-.deb closure for Ubuntu 24.04 GPU nodes additionally requires `podman` or
-`docker` on the installer machine.
-
-**Set up the installer machine — copy/paste these, in order.** Run on the
-RHEL 9 installer machine. `curl`, `tar`, `ssh`, `rpm`, `dnf`, `sha256sum`, and
-`sudo` already ship with RHEL 9, so there's nothing to install for those.
+Install the air-gap staging dependencies on the installer machine. Install
+`createrepo_c` when the GPU nodes use RHEL. Install `podman` or Docker when any
+GPU node uses Ubuntu 24.04:
 
 ```bash
-# 1. createrepo_c — builds the offline NVIDIA driver repo
-sudo dnf install -y createrepo_c
+# RHEL installer machine
+sudo dnf install -y curl createrepo_c
 
-# 2. helm
+# Required when any GPU node uses Ubuntu 24.04; the .deb closure is built
+# inside an ubuntu:24.04 container. Docker may be used instead.
+sudo dnf install -y podman
+
+# helm (if not already installed above)
 curl -fsSLo /tmp/get_helm.sh \
   https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
 chmod 700 /tmp/get_helm.sh
 sudo /tmp/get_helm.sh
 
-# 3. kubectl
-KUBECTL_VERSION="$(curl -Ls https://dl.k8s.io/release/stable.txt)"
+# kubectl (if not already installed above)
 curl -fsSLo /tmp/kubectl \
-  "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+  "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
 sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-
-# 4. Only if any GPU worker node runs Ubuntu 24.04 — skip this if every
-#    GPU node is RHEL 9
-sudo dnf install -y podman
 ```
-
-Also install `yq`, `git`, and `jq` from
-[Admin workstation tools](#1-prerequisites) above — the installer machine is
-the same admin workstation described there.
 
 Verify everything is in place:
 
 ```bash
 curl --version && helm version && kubectl version --client \
-  && tar --version && ssh -V && rpm --version && dnf --version \
-  && sha256sum --version && createrepo_c --version
+  && tar --version && ssh -V && sha256sum --version
+
+# Run the applicable closure-tool check:
+createrepo_c --version   # if any GPU node uses RHEL
+podman --version         # if any GPU node uses Ubuntu 24.04
 
 df -h /   # confirm ~5 GB free
 ```
 
-### Model Setup (Air-Gapped Path)
+Success: All required command-line dependencies (curl, helm, kubectl, tar, ssh, sha256sum, and the applicable closure tool—`createrepo_c` for RHEL GPU nodes or `podman` for Ubuntu GPU nodes) are installed and accessible. The command completes successfully (exit code 0) and prints version information for each tool.
 
-Cluster nodes can't reach HuggingFace, but the installer machine usually can
-— set `storage.modelStaging.enabled: true` to stage models from the
-installer machine during `install`, or `false` if models are already staged
-in your object store. Same choice and prompt behavior as the standard path.
+Failure: Because the commands are chained using &&, execution stops immediately when any command is missing, inaccessible, or returns a non-zero exit code. Subsequent dependency checks will not be executed, and the overall command returns a failure status.
 
-**Staging machine requirements** (only applies when staging, i.e.
-`enabled: true` — downloading from HuggingFace + uploading to
-MinIO/SeaweedFS/S3) — can be the same machine that runs the installer:
+#### Model Setup (Air-Gapped Path)
 
-| Resource | Minimum | Why |
-|---|---|---|
-| Disk (free) | 250 GB | >120 GB for 10 models + buffer for download staging and upload temp files |
-| RAM | 16 GB | Scripts stream large files; less RAM causes swapping and slow uploads |
-| CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
-| Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
+Model weights (>120 GB, 10 models) must land in your object store before the
+AI platform can serve inference.
 
-> Switching `aiPlatform.defaultAcceleratorType` between `L40S`/`H100` after staging invalidates the staged marker — re-run `stage-artifacts` to re-stage for the new accelerator.
+**Installer machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — use the installer machine for model staging.
 
-> To pre-stage manually ahead of install instead — e.g. to inspect artifacts
-> or size them before the install window — see
-> [K0S_README.md — Step 3: Stage Model Weights](../../tools/cluster_setup/K0S_README.md#step-3--stage-model-weights)
-> and [DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) for
-> the manual `download_from_huggingface.sh` / `upload_to_*.sh` and
-> `airgap_install.sh --download-only` workflows.
+- **Full (interactive) install** — the installer prompts whether to download
+  models. Answer yes to stage them from the installer machine, or no if they
+  are already present in the object store.
 
-### Install (Air-Gapped Path)
+#### Install (Air-Gapped Path)
 
 One entry point, same install command as the standard path — the config's
 `cluster.airgap: true` (or `AIRGAP_MODE=true`) is what switches the mode.
 
-Before running install, mirror the platform application images to your
-internal registry — see
-[DEPLOYMENT_GUIDE.md — Phase 2: Mirror Container Images](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#phase-2--mirror-container-images)
-for the image list (generated during staging) and mirroring commands.
+Before running install, mirror the platform application images to your private
+registry.
+
+Mirror every application image used by the deployment. The release images below
+use the common tag `v1.0`; supporting images retain the versions from the
+configuration file. Set every applicable `images.*` field to its mirrored path.
+
+With `crane` (no Docker daemon required):
+
+```bash
+REGISTRY="my-custom-registry.io"
+
+for image in \
+  docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
+  docker.io/splunk/ai-tier-saia-api-v2:v1.0 \
+  docker.io/splunk/ai-tier-saia-api:v1.0 \
+  docker.io/splunk/ai-tier-ray-head:v1.0 \
+  docker.io/splunk/ai-tier-ray-worker:v1.0 \
+  docker.io/splunk/splunk-ai-operator:v1.0 \
+  docker.io/splunk/ai-tier-slim-service:v1.0 \
+  docker.io/splunk/splunk:10.2-rhel9 \
+  docker.io/splunk/splunk-operator:3.0.0 \
+  docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
+  docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
+  docker.io/fluent/fluent-bit:1.9.6 \
+  docker.io/library/nginx:1.27-alpine; do
+    relative_image="${image#docker.io/}"
+    crane copy "${image}" "${REGISTRY}/${relative_image}"
+done
+```
+
+With Docker instead:
+
+```bash
+REGISTRY="my-custom-registry.io"
+
+for image in \
+  docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
+  docker.io/splunk/ai-tier-saia-api-v2:v1.0 \
+  docker.io/splunk/ai-tier-saia-api:v1.0 \
+  docker.io/splunk/ai-tier-ray-head:v1.0 \
+  docker.io/splunk/ai-tier-ray-worker:v1.0 \
+  docker.io/splunk/splunk-ai-operator:v1.0 \
+  docker.io/splunk/ai-tier-slim-service:v1.0 \
+  docker.io/splunk/splunk:10.2-rhel9 \
+  docker.io/splunk/splunk-operator:3.0.0 \
+  docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
+  docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
+  docker.io/fluent/fluent-bit:1.9.6 \
+  docker.io/library/nginx:1.27-alpine; do
+    relative_image="${image#docker.io/}"
+    docker pull "${image}"
+    docker tag "${image}" "${REGISTRY}/${relative_image}"
+    docker push "${REGISTRY}/${relative_image}"
+done
+```
+
+After mirroring, replace every applicable `images.*` field, including the
+Splunk, Splunk Operator, Weaviate, Fluent Bit, OpenTelemetry Collector, and
+nginx image fields, with the corresponding private-registry paths. The
+release-image paths use `v1.0`; preserve the configured tags for supporting
+images.
+
+For a plain-HTTP private registry, such as the sample address `192.0.2.10:5000`, configure:
+
+```yaml
+images:
+  registry: "192.0.2.10:5000"
+  registryInsecure: true
+```
+
+Set `registryInsecure: false` for a secure HTTPS/TLS private registry. The
+setting tells the installer whether to configure containerd for HTTP or HTTPS.
 
 ```bash
 cd tools/cluster_setup
 
-# 1. In your config, on top of the mandatory fields in Config Setup, set:
+# 1. In your config, on top of the fields in Config Setup, set:
 #    cluster.airgap: true
-#    imagePullSecrets.autoCreateECR: false
 #    images.registry: "registry.airgap.local"   (+ point every image at it)
-#    storage.modelStaging.enabled: true | false   (true = stage models from
-#      this machine during install; false = already staged — see Model Setup above)
+#    images.registryInsecure: true                # plain HTTP only; use false for HTTPS/TLS
 #
-#    registry.airgap.local requires authentication (Harbor, etc.)? autoCreateECR: false
-#    alone creates no pull secret — also set:
+#    If registry.airgap.local requires authentication (Harbor, etc.), also set:
 #    imagePullSecrets.custom.enabled: true
 #    imagePullSecrets.custom.name: "custom-registry-secret"
 #    imagePullSecrets.custom.server: "registry.airgap.local"
 #    imagePullSecrets.custom.username / .password: your registry credentials
 
-# 2. Run the install — stages ~2.2 GB of artifacts (~15 min, plus model
-#    staging time if storage.modelStaging.enabled: true) then installs
+# 2. Validate the configuration before installing.
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+
+# 3. Run the install — stages the required artifacts based on your input, then installs
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+
+# Follow progress in another terminal
+tail -f logs/k0s-install-*.log
 ```
 
-`airgap_install.sh` is the lower-level staging step the unified command calls
-for you — reach for it directly only for non-default flags (`--k0s-version`,
-`--gpu-hosts`, `--gpu-kernels`, `--driver-version`, `--skip-nvidia-closure`, …).
-GPU node IPs, SSH user/key, and each node's kernel are all derived from your
-config automatically, so no GPU flags are normally needed — the NVIDIA driver
-closure is built and pushed to GPU nodes as part of the same run.
-
-Continue to [Verify](#6-verify).
+Continue to [Step 5: Verify](#step-5-verify).
 
 ---
 
-## 6. Verify
+## Step 5: Verify
 
-Applies to both deployment paths.
+Applies to both standard and air-gapped deployment paths.
 
 ```bash
+# For getting the status of the pods and inference endpoints
+cd tools/cluster_setup
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+
+# Run kubectl commands directly from the installer machine
 export KUBECONFIG=~/.kube/k0s-<cluster-name>
 
 kubectl get nodes -o wide                                          # all Ready
 kubectl get pods -A --sort-by=.metadata.namespace                  # all Running/Completed
 kubectl get aiplatform -n ai-platform -o wide                      # Ready
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia # EXTERNAL-IP assigned
+kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia # NodePort: use worker-ip:30080
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 # → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
 ```
 
 **Access the in-cluster Splunk instance and set up the SAIA app:**
-[DEPLOYMENT_GUIDE.md — Internal Splunk Access](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#internal-splunk-access)
-(NodePort, LoadBalancer, or `kubectl port-forward`; add
-[K0S_README.md — Remote workstation via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url)
-if your browser can't reach the cluster network directly), then
-[DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+[K0S_README.md — Finding the Splunk Web URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
+Use NodePort, LoadBalancer, or `kubectl port-forward` as described there. If
+your browser cannot reach the cluster network directly, use
+[Remote installer machine via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
+Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
 > **Using an external, self-managed Splunk Enterprise instance for JWT authentication?**
-> External HEC/OTel is unsupported. See
+> See
 > [EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
 
 ---
 
-## 7. Common Operations
+## Step 6: Common Operations
 
 Applies to both deployment paths — same commands for standard and air-gapped clusters.
 
@@ -465,11 +552,12 @@ Applies to both deployment paths — same commands for standard and air-gapped c
 | Refresh platform image tags (engineering-validated behavior) | bump image tags in config, then re-run `install`; existing Helm releases are refreshed in place |
 | Refresh image tags (air-gapped engineering validation) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
 | Collect support bundle | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose` |
-| Wipe and start clean (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
+| Remove the stack and reset k0s (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh delete` |
+| Wipe and start clean (more destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
 
 ---
 
-## 8. Troubleshooting
+## Step 7: Troubleshooting
 
 Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup/TROUBLESHOOTING.md)
 
@@ -485,7 +573,7 @@ Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup
 | `ImagePullBackOff`: HTTP response to HTTPS client | Set `images.registryInsecure: true` for plain-HTTP registries |
 | All models MISSING after upload | Bucket name has uppercase letters — use lowercase `storage.objectStore.bucket` |
 | Air-gap: infra pods `ImagePullBackOff` / nodes NotReady | Confirm `images/*.tar` were staged and pushed to `/var/lib/k0s/images/`; re-run install with current scripts |
-| SAIA service has no `EXTERNAL-IP` | Check MetalLB: `kubectl get pods -n metallb-system` |
+| SAIA service is unreachable | For the default NodePort, use `<worker-ip>:30080`; for LoadBalancer, check MetalLB: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform`; check operator logs + GPU availability |
 
 ---
