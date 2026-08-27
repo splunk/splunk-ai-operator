@@ -2,7 +2,7 @@
 
 # Generate Bill of Materials (BOM) for Splunk AI Operator
 # This script extracts all Docker images used by the operator and its dependencies
-# Usage: ./scripts/generate-bom.sh [VERSION]
+# Usage: OPERATOR_IMAGE=<image:tag> ./scripts/generate-bom.sh [VERSION]
 
 set -euo pipefail
 
@@ -28,8 +28,9 @@ else
     echo "Warning: .env file not found, using defaults"
 fi
 
-# Operator image (from kustomization.yaml or parameter)
-OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:v${VERSION}"
+# Operator image. Release workflows can override this when the published image
+# tag is intentionally different from the three-part release version.
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-ghcr.io/splunk/splunk-ai-operator:v${VERSION}}"
 
 # Extract images from environment variables
 declare -A IMAGES=(

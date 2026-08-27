@@ -87,13 +87,18 @@ jobs:
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
-          # Use the major.minor portion of the release version for images.
-          # For example, release v1.0.0 produces image tag v1.0.
-          IMAGE_TAG="v$(printf '%s' "$VERSION" | cut -d. -f1-2)"
+          # Keep the full release tag for reproducible image references.
+          IMAGE_TAG="v${VERSION}"
+          IS_STABLE=true
+          if [[ "$VERSION" == *-* ]]; then
+            IS_STABLE=false
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "is_stable=$IS_STABLE" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
           echo "Building image tag: $IMAGE_TAG"
+          echo "Stable release: $IS_STABLE"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -104,6 +109,7 @@ jobs:
             splunk/splunk-ai-operator
           tags: |
             type=raw,value=${{ steps.version.outputs.image_tag }}
+            type=semver,pattern=v{{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_stable }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker images
@@ -176,11 +182,15 @@ jobs:
             # Fallback to Chart.yaml version
             VERSION=$(grep '^version:' helm-chart/splunk-ai-operator/Chart.yaml | awk '{print $2}' | tr -d '"')
           fi
-          # Use the major.minor portion of the release version for images.
-          # For example, release v1.0.0 produces image tag v1.0.
-          IMAGE_TAG="v$(printf '%s' "$VERSION" | cut -d. -f1-2)"
+          # Keep the full release tag for reproducible image references.
+          IMAGE_TAG="v${VERSION}"
+          IS_STABLE=true
+          if [[ "$VERSION" == *-* ]]; then
+            IS_STABLE=false
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "is_stable=$IS_STABLE" >> $GITHUB_OUTPUT
           echo "Packaging version: $VERSION"
           echo "Packaging image tag: $IMAGE_TAG"
 
@@ -191,6 +201,9 @@ jobs:
           # Update operator chart
           sed -i "s/^version:.*/version: \"$VERSION\"/" helm-chart/splunk-ai-operator/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" helm-chart/splunk-ai-operator/Chart.yaml
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+          # Keep the explicit Helm image value aligned with the immutable image tag.
+          sed -i "/^image:/,/^  pullPolicy:/ s|^  tag:.*|  tag: \"$IMAGE_TAG\"|" helm-chart/splunk-ai-operator/values.yaml
 
           # Validate operator chart update
           OP_VER=$(grep '^version:' helm-chart/splunk-ai-operator/Chart.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
@@ -226,7 +239,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
 
-          # Generate install.yaml with the stable release image tag.
+          # Generate install.yaml with the full release image tag.
           echo "Generating Kubernetes manifests for release $VERSION with image tag ${{ steps.version.outputs.image_tag }}..."
           IMG="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}" make build-installer
 
@@ -248,7 +261,8 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
 
           echo "Generating custom BOM for version $VERSION..."
-          make generate-bom VERSION=$VERSION
+          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:${{ steps.version.outputs.image_tag }}" \
+            make generate-bom VERSION=$VERSION
 
           echo ""
           echo "Generated BOM files:"
