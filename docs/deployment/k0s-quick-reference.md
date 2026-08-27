@@ -27,14 +27,13 @@ explanations, diagrams, and edge cases see
 
 ## Step 1: Prerequisites
 
-**Admin workstation** — the Ubuntu 24.04 or RHEL 9/10 machine you run
-`k0s_cluster_with_stack.sh` from (a bastion host or the installer machine). It
-needs SSH reach to every cluster node plus the CLI tools below; it is not itself
-a cluster node. The binary download commands below target x86_64/amd64.
+**Installer machine** — Ubuntu 24.04 or RHEL 9/10, x86_64/amd64, with SSH
+access to every cluster node and the CLI tools below. Run commands locally or
+SSH into the machine first if it is remote; it is separate from the cluster
+nodes.
 
-If this machine also handles model staging (downloading from HuggingFace and
-uploading to MinIO/SeaweedFS/S3 — automatic during `install`, or run
-standalone via `stage-artifacts`), it additionally needs:
+If it also stages models from Hugging Face to MinIO/SeaweedFS/S3, it additionally
+needs:
 
 | Resource | Minimum | Why |
 |---|---|---|
@@ -43,7 +42,7 @@ standalone via `stage-artifacts`), it additionally needs:
 | CPU | 4 cores | Parallel upload to MinIO/SeaweedFS/S3 |
 | Internet | Stable broadband | Downloads >120 GB from HuggingFace; safe to re-run — already-staged models are skipped |
 
-**Admin workstation tools:**
+**Installer machine tools:**
 
 Steps for setting up the tools:
 
@@ -124,23 +123,7 @@ yq --version
 crane version
 ```
 
-### Version Reference
-
-| Component | Version / Status |
-| :--- | :--- |
-| **k0s** | v1.36.1+k0s.0 |
-| **`kubectl` Client** | v1.36.1 |
-| **`Kustomize`** | Bundled with kubectl |
-| **`helm`** | Helm 3, current stable release from the install script |
-| **`git`** | Distribution-provided supported version |
-| **`jq`** | Distribution-provided supported version |
-| **`yq`** | v4.44.1 |
-| **`crane`** | v0.21.9 |
-| **cert-manager** | v1.13.0 |
-| **local-path-provisioner** | v0.0.24 |
-| **NVIDIA device plugin** | v0.17.3 |
-| **MetalLB chart** | 0.14.8 |
-| **KubeRay chart** | 1.2.2 |
+Success: each command prints version information and exits successfully.
 
 **Access and services checklist:**
 
@@ -193,13 +176,14 @@ node count to get the cluster total.
 **Supported cluster-node OS:** use one supported OS family and version across
 all nodes in a cluster.
 
-**Installer-machine OS:** for standard deployments, use Ubuntu 24.04 or RHEL
-9/10. For air-gapped deployments, use an x86_64 RHEL 9 installer for RHEL 9 or
-Ubuntu 24.04 clusters, and an x86_64 RHEL 10 installer for RHEL 10 clusters.
+**Installer machine OS:** for standard deployments, use Ubuntu 24.04 or RHEL
+9/10. For air-gapped deployments, use an x86_64 RHEL 9 installer machine for
+RHEL 9 or Ubuntu 24.04 clusters, and an x86_64 RHEL 10 installer machine for
+RHEL 10 clusters.
 
 | OS | Version |
 | :--- | :--- |
-| **RHEL** | 9.x, 10.x |
+| **RHEL** | 9.8, 10.2 |
 | **Ubuntu** | 24.04 |
 
 ---
@@ -326,7 +310,7 @@ automatic; no manual driver steps are needed.
 Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
-**Staging machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — same machine as the admin workstation, sized for model staging.
+**Installer machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — use the installer machine for model staging.
 
 - **Full (interactive) install** — the installer prompts whether to download
   models. Answer yes to stage them from the installer machine, or no if they
@@ -410,7 +394,7 @@ Failure: Because the commands are chained using &&, execution stops immediately 
 Model weights (>120 GB, 10 models) must land in your object store before the
 AI platform can serve inference.
 
-**Staging machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — same machine as the admin workstation, sized for model staging.
+**Installer machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — use the installer machine for model staging.
 
 - **Full (interactive) install** — the installer prompts whether to download
   models. Answer yes to stage them from the installer machine, or no if they
@@ -439,7 +423,7 @@ for image in \
   docker.io/splunk/ai-tier-saia-api:v1.0 \
   docker.io/splunk/ai-tier-ray-head:v1.0 \
   docker.io/splunk/ai-tier-ray-worker:v1.0 \
-  docker.io/kpratyush775/splunk-ai-operator:v1.0 \
+  docker.io/splunk/splunk-ai-operator:v1.0 \
   docker.io/splunk/ai-tier-slim-service:v1.0 \
   docker.io/splunk/splunk:10.2-rhel9 \
   docker.io/splunk/splunk-operator:3.0.0 \
@@ -463,7 +447,7 @@ for image in \
   docker.io/splunk/ai-tier-saia-api:v1.0 \
   docker.io/splunk/ai-tier-ray-head:v1.0 \
   docker.io/splunk/ai-tier-ray-worker:v1.0 \
-  docker.io/kpratyush775/splunk-ai-operator:v1.0 \
+  docker.io/splunk/splunk-ai-operator:v1.0 \
   docker.io/splunk/ai-tier-slim-service:v1.0 \
   docker.io/splunk/splunk:10.2-rhel9 \
   docker.io/splunk/splunk-operator:3.0.0 \
@@ -514,6 +498,9 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 
 # 3. Run the install — stages the required artifacts based on your input, then installs
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+
+# Follow progress in another terminal
+tail -f logs/k0s-install-*.log
 ```
 
 Continue to [Step 5: Verify](#step-5-verify).
@@ -544,7 +531,7 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 [K0S_README.md — Finding the Splunk Web URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
 Use NodePort, LoadBalancer, or `kubectl port-forward` as described there. If
 your browser cannot reach the cluster network directly, use
-[Remote workstation via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
+[Remote installer machine via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
 Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
 > **Using an external, self-managed Splunk Enterprise instance for JWT authentication?**
@@ -565,7 +552,8 @@ Applies to both deployment paths — same commands for standard and air-gapped c
 | Refresh platform image tags (engineering-validated behavior) | bump image tags in config, then re-run `install`; existing Helm releases are refreshed in place |
 | Refresh image tags (air-gapped engineering validation) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
 | Collect support bundle | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose` |
-| Wipe and start clean (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
+| Remove the stack and reset k0s (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh delete` |
+| Wipe and start clean (more destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
 
 ---
 
