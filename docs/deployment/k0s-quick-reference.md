@@ -280,7 +280,12 @@ working default.
 | `aiPlatform.defaultAcceleratorType` | `L40S` or `H100` |
 | `imagePullSecrets.custom.*` | Registry credentials when the private registry requires authentication |
 
-Validate before installing — catches most config mistakes without touching any node:
+### Required: Validate the Configuration
+
+This step is required. After editing `my-cluster.yaml`, run validation before
+choosing a deployment path. Proceed with `install` only after validation
+completes successfully. Validation checks the configuration without modifying
+any cluster node.
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
@@ -300,12 +305,12 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 
 Choose one deployment path:
 
-- **Standard** — every cluster node has outbound internet access and pulls the
-  configured public images directly from Docker Hub; no private registry is
-  required.
-- **Air-gapped** — cluster nodes have no outbound internet access; the installer
-  machine stages the required artifacts and uses a private registry for the
-  platform images.
+- **[Standard](#standard-deployment)** — every cluster node has outbound
+  internet access and pulls the configured public images directly from Docker
+  Hub; no private registry is required.
+- **[Air-gapped](#air-gapped-deployment)** — cluster nodes have no outbound
+  internet access; the installer machine stages the required artifacts and uses
+  a private registry for the platform images.
 
 ### Standard Deployment
 
@@ -332,7 +337,10 @@ AI platform can serve inference.
 ```bash
 cd tools/cluster_setup
 
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate   # config check, run first
+# Required: validation must succeed before install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+
+# Run only after validate completes successfully
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h first run (model download), ~30-60min if pre-staged
 
 # Follow progress in another terminal
@@ -501,8 +509,10 @@ cd tools/cluster_setup
 #    imagePullSecrets.custom.server: "registry.airgap.local"
 #    imagePullSecrets.custom.username / .password: your registry credentials
 
-# 2. Run the install — stages ~2.2 GB of artifacts (~15 min, plus model
-#    staging time if storage.modelStaging.enabled: true) then installs
+# 2. Validate the configuration before installing.
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+
+# 3. Run the install — stages the required artifacts based on your input, then installs
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
