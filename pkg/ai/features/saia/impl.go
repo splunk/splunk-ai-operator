@@ -2,12 +2,12 @@ package saia
 
 import (
 	"context"
-	"strings"
-
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -38,6 +38,18 @@ type SaiaReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 }
+
+const (
+	saiaQueueEnvName = "S3_QUEUE_ENABLED"
+
+	splunkIssuersHashAnnotation = "splunk-ai-operator/splunk-issuers-hash"
+
+	// Bump this value whenever the queue-related environment contract changes.
+	// The annotation forces existing SAIA pods to restart after legacy values
+	// are removed from the shared ConfigMap-backed EnvFrom source.
+	saiaQueueEnvContractAnnotation = "splunk-ai-operator/saia-queue-env-contract"
+	saiaQueueEnvContractVersion    = "v1-s3-only"
+)
 
 // Reconcile runs reconciliation stages for the CR.
 func (r *SaiaReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
@@ -289,13 +301,13 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 	ai *aiv1.AIService,
 ) error {
 	if ai.Spec.ServiceAccountName == "" {
-		// Clean ServiceTemplate before updating the spec
-		cleanServiceTemplate(&ai.Spec.ServiceTemplate)
-
+		// Resolve the default name in memory only. Do not persist it back onto
+		// ai.Spec: AIPlatform's ReconcileFeatures rebuilds this AIService's spec
+		// from AIPlatform.Spec.Features[].ServiceAccountName on every reconcile,
+		// so persisting a generated name here just gets it wiped back to "" on
+		// the next AIPlatform pass, which re-triggers this branch — an
+		// unbounded generation-bump loop between the two controllers.
 		ai.Spec.ServiceAccountName = ai.Name + "-sa"
-		if err := r.Update(ctx, ai); err != nil {
-			return fmt.Errorf("updating SA name in spec: %w", err)
-		}
 		sa := &corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      ai.Spec.ServiceAccountName,
@@ -314,6 +326,48 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 		}
 	}
 	return nil
+}
+
+// buildSplunkIssuersVal computes the comma-separated SPLUNK_ISSUERS value from the AIService spec.
+// The JWT issuer is the Splunk management endpoint (port 8089).
+// Priority: CRRef-derived service FQDN → explicit Endpoint → TrustedIssuers only.
+func buildSplunkIssuersVal(ai *aiv1.AIService) string {
+	var issuers []string
+	sc := ai.Spec.SplunkConfiguration
+	switch {
+	case sc.SplunkCustomResourceRef.Name != "":
+		kind := sc.SplunkCustomResourceRef.Kind
+		if kind == "" {
+			kind = "Standalone"
+		}
+		instanceType := "standalone"
+		if kind == "IndexerCluster" {
+			instanceType = "indexer"
+		}
+		refNS := sc.SplunkCustomResourceRef.Namespace
+		if refNS == "" {
+			refNS = ai.Namespace
+		}
+		clusterDomain := ai.Spec.ClusterDomain
+		if clusterDomain == "" {
+			clusterDomain = "cluster.local"
+		}
+		svc := fmt.Sprintf("splunk-%s-%s-service.%s.svc.%s", sc.SplunkCustomResourceRef.Name, instanceType, refNS, clusterDomain)
+		issuers = append(issuers, fmt.Sprintf("https://%s:%d", svc, splunkutils.SplunkMgmtPort))
+	case sc.Endpoint != "":
+		issuers = append(issuers, sc.Endpoint)
+	}
+	issuers = append(issuers, sc.TrustedIssuers...)
+	return strings.Join(issuers, ",")
+}
+
+// addSplunkIssuersHash annotates a pod template with the desired issuer set.
+// SPLUNK_ISSUERS is consumed through EnvFrom, so changing the ConfigMap alone
+// does not restart existing pods. Including the spec-derived value in the pod
+// template ensures an issuer change creates a new ReplicaSet.
+func addSplunkIssuersHash(ai *aiv1.AIService, annotations map[string]string) {
+	issuersVal := buildSplunkIssuersVal(ai)
+	annotations[splunkIssuersHashAnnotation] = fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 }
 
 // reconcileSAIAConfigMap manages the SAIA config ConfigMap for SPLUNK_ISSUERS.
@@ -335,11 +389,13 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 	//   403 {"detail":"Admin endpoints require an authenticated EC user token."}
 	// There is no authorization-skip value that also preserves CMP bridging —
 	// the value IS "true" even in airgap CMP mode.
+	splunkIssuersVal := buildSplunkIssuersVal(ai)
+
 	defaults := map[string]string{
 		// previously hardcoded
 		"SERVICE_NAME":                    "splunk_ai_assistant",
 		"SERVICE_INTERNAL_NAME":           "SAIA",
-		"SPLUNK_ISSUERS":                  "https://splunk-splunk-standalone-standalone-service:8089",
+		"SPLUNK_ISSUERS":                  splunkIssuersVal,
 		"SPLUNK_AI_ASSISTANT_SERVICE_CMP": "true",
 		"ENABLE_AUTHZ":                    "true",
 		"FEATURE_CONFIG_FILE_LOCATION":    "/etc/config/features_config.yaml",
@@ -364,12 +420,30 @@ func (r *SaiaReconciler) reconcileSAIAConfigMap(
 		return fmt.Errorf("fetching SAIA ConfigMap %q: %w", cmName, err)
 	}
 
-	// Merge defaults for any missing keys, but don't override user-set values.
+	// Merge defaults: SPLUNK_ISSUERS is always recomputed from spec so that
+	// removing or changing a CRRef/endpoint/trustedIssuers is reflected immediately
+	// (including clearing to empty when Splunk is disabled).
+	// All other keys use fill-if-missing to preserve manual overrides.
 	if found.Data == nil {
 		found.Data = map[string]string{}
 	}
 	needsUpdate := false
+	// S3_QUEUE_ENABLED is a v1 workload-specific switch, not shared SAIA
+	// configuration. Older/manual ConfigMaps may contain it; leaving it here
+	// causes the v2 API and worker to inherit the v1 flag through EnvFrom.
+	// The v1 Deployment owns its desired value explicitly below.
+	if _, exists := found.Data[saiaQueueEnvName]; exists {
+		delete(found.Data, saiaQueueEnvName)
+		needsUpdate = true
+	}
 	for k, v := range defaults {
+		if k == "SPLUNK_ISSUERS" {
+			if found.Data[k] != v {
+				found.Data[k] = v
+				needsUpdate = true
+			}
+			continue
+		}
 		if _, ok := found.Data[k]; !ok || found.Data[k] == "" {
 			found.Data[k] = v
 			needsUpdate = true
@@ -711,6 +785,23 @@ func buildSAIABaseEnv(ai *aiv1.AIService) []corev1.EnvVar {
 	return appendSAIABoto3Env(ai, env)
 }
 
+// usesS3PersonalizationQueue reports whether SAIA's S3/boto3-backed durable
+// ingestion queue can use the configured task-volume scheme. Native GCS and
+// Azure paths require provider-specific queue adapters and therefore retain
+// the image's existing behavior.
+func usesS3PersonalizationQueue(path string) bool {
+	scheme, _, ok := strings.Cut(strings.TrimSpace(path), "://")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(scheme) {
+	case "s3", "s3compat", "minio", "seaweedfs":
+		return true
+	default:
+		return false
+	}
+}
+
 // appendSAIABoto3Env adds boto3-canonical AWS_* env vars for all SAIA pods (v1 and v2).
 // SAIA v1 calls boto3 directly and does not read S3COMPAT_OBJECT_STORE_*; without
 // AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY k0s deployments with static keys fail with
@@ -878,6 +969,40 @@ func saiaEnvFrom(ai *aiv1.AIService) []corev1.EnvFromSource {
 	}
 }
 
+const (
+	defaultV2EmbeddingModel     = "uae_large"
+	unsupportedV2EmbeddingModel = "bi_encoder"
+)
+
+// resolveV2EmbeddingModel reads the optional user override from the shared
+// SAIA ConfigMap and returns the model that the v2 API and worker must use.
+//
+// EMBEDDING_MODEL is added to the containers' explicit env list rather than
+// relying on envFrom. Kubernetes gives explicit env entries precedence over
+// envFrom entries with the same name, so a legacy bi_encoder value cannot make
+// SAIA v2 call the unsupported AI-tier endpoint. Other configured models are
+// preserved. SAIA v1 continues to consume the ConfigMap exactly as before.
+func (r *SaiaReconciler) resolveV2EmbeddingModel(ctx context.Context, ai *aiv1.AIService) (string, error) {
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-saia-config", ai.Name),
+		Namespace: ai.Namespace,
+	}, cm)
+	if apierrors.IsNotFound(err) {
+		return defaultV2EmbeddingModel, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("fetching SAIA ConfigMap for v2 embedding model: %w", err)
+	}
+
+	configured := cm.Data["EMBEDDING_MODEL"]
+	trimmed := strings.TrimSpace(configured)
+	if trimmed == "" || strings.EqualFold(trimmed, unsupportedV2EmbeddingModel) {
+		return defaultV2EmbeddingModel, nil
+	}
+	return configured, nil
+}
+
 // saiaVolumes returns the standard config volume and mount for SAIA pods.
 func saiaVolumes(ai *aiv1.AIService) ([]corev1.Volume, []corev1.VolumeMount) {
 	featureConfigName := fmt.Sprintf("splunk-%s-feature-config", ai.Name)
@@ -914,10 +1039,7 @@ func saiaLabelsAndAnnotations(ai *aiv1.AIService, component string) (map[string]
 		"prometheus.io/path":   "/metrics",
 		"prometheus.io/scheme": "http",
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
 	return labels, annotations
@@ -951,6 +1073,15 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	}
 
 	env := buildSAIABaseEnv(ai)
+	// Personalization uploads arrive through the v1 API, while the v2
+	// ingestion worker consumes them. Use the shared object-storage queue so
+	// accepted uploads survive API pod restarts and are visible to the worker.
+	// Keep this as an explicit env var: explicit values take precedence over
+	// EnvFrom and prevent an old ConfigMap value from restoring the lossy
+	// process-local queue during an upgrade.
+	if usesS3PersonalizationQueue(ai.Spec.TaskVolume.Path) {
+		env = append(env, corev1.EnvVar{Name: saiaQueueEnvName, Value: "true"})
+	}
 
 	// mTLS handling (dynamic)
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
@@ -1003,17 +1134,18 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		labels[k] = v
 	}
 
+	issuersVal := buildSplunkIssuersVal(ai)
+	issuersChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 	annotations := map[string]string{
-		"prometheus.io/port":   "8088",
-		"prometheus.io/path":   "/metrics",
-		"prometheus.io/scheme": "http",
+		"prometheus.io/port":                     "8088",
+		"prometheus.io/path":                     "/metrics",
+		"prometheus.io/scheme":                   "http",
+		"splunk-ai-operator/splunk-issuers-hash": issuersChecksum,
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" || k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		}
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
+	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
@@ -1095,6 +1227,11 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 	ctx context.Context,
 	ai *aiv1.AIService,
 ) error {
+	embeddingModel, err := r.resolveV2EmbeddingModel(ctx, ai)
+	if err != nil {
+		return err
+	}
+
 	volumes, mounts := saiaVolumes(ai)
 	ports := []corev1.ContainerPort{
 		{Name: "http", ContainerPort: 8000},
@@ -1103,12 +1240,17 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	env := buildSAIABaseEnv(ai)
 	env = append(env, buildV2ExtraEnv(ai)...)
-	env = append(env, corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"})
+	env = append(env,
+		corev1.EnvVar{Name: "EMBEDDING_MODEL", Value: embeddingModel},
+		corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"},
+	)
 	env, volumes, mounts, ports = buildSAIATLSEnv(ai, env, volumes, mounts, ports)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 
 	component := ai.Name + "-v2-api"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	addSplunkIssuersHash(ai, annotations)
+	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1184,9 +1326,13 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 						ProbeHandler: corev1.ProbeHandler{
 							HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8000)},
 						},
+						// Initializing the synchronous and asynchronous Weaviate clients can
+						// take more than two minutes on a freshly installed or air-gapped
+						// cluster. Keep liveness/readiness strict after startup, but allow up
+						// to five minutes for the API to begin serving its health endpoint.
 						InitialDelaySeconds: 10,
 						PeriodSeconds:       30,
-						FailureThreshold:    5,
+						FailureThreshold:    10,
 					},
 				}},
 				Volumes:          volumes,
@@ -1207,6 +1353,11 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	ctx context.Context,
 	ai *aiv1.AIService,
 ) error {
+	embeddingModel, err := r.resolveV2EmbeddingModel(ctx, ai)
+	if err != nil {
+		return err
+	}
+
 	volumes, mounts := saiaVolumes(ai)
 	ports := []corev1.ContainerPort{
 		{Name: "metrics", ContainerPort: 8088},
@@ -1227,6 +1378,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	// conflate with the v1 worker APScheduler cron (which uses 600s for weekly
 	// jobs); v2 reuses the same env name for a different purpose.
 	env = append(env,
+		corev1.EnvVar{Name: "EMBEDDING_MODEL", Value: embeddingModel},
 		corev1.EnvVar{Name: "RUN_TASKS_DELAY_S", Value: "600"},
 		corev1.EnvVar{Name: "VAULT_TEMPLATE_DISABLED", Value: "true"},
 		corev1.EnvVar{Name: "WORKER_HEARTBEAT_PATH", Value: "/tmp/ingestion_worker_heartbeat"},
@@ -1236,6 +1388,8 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 
 	component := ai.Name + "-v2-worker"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	addSplunkIssuersHash(ai, annotations)
+	annotations[saiaQueueEnvContractAnnotation] = saiaQueueEnvContractVersion
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1326,15 +1480,14 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 	return nil
 }
 
-// reconcileNginxConfigMap creates the ConfigMap with nginx.conf for path-based routing.
-func (r *SaiaReconciler) reconcileNginxConfigMap(
-	ctx context.Context,
-	ai *aiv1.AIService,
-) error {
+// renderNginxConfig returns the complete nginx configuration. The same
+// rendered value is stored in the ConfigMap and hashed into the nginx pod
+// template so subPath-mounted configuration changes trigger a rollout.
+func renderNginxConfig(ai *aiv1.AIService) string {
 	v1ServiceName := ai.Name + "-saia-v1-service"
 	v2ServiceName := ai.Name + "-saia-v2-service"
 
-	nginxConf := fmt.Sprintf(`worker_processes auto;
+	return fmt.Sprintf(`worker_processes auto;
 error_log /dev/stderr warn;
 pid /tmp/nginx.pid;
 
@@ -1430,6 +1583,11 @@ http {
 
         # v1: everything else (including /health, /{tenant}/saia-api/v1alpha1/...)
         location / {
+            # Splunk personalization metadata, especially dashboard exports, can
+            # exceed nginx's 1 MiB default. Keep a bounded v1 limit so legitimate
+            # uploads reach SAIA without widening the v2 request-body allowance.
+            client_max_body_size 100m;
+
             # Mirror the CORS preflight short-circuit for v1 routes; spl-copilot's
             # Pattern B (direct browser fetch) may hit v1 admin endpoints too. Same
             # rationale as v2: SAIA v1 middlewares authenticate on OPTIONS and would
@@ -1458,6 +1616,14 @@ http {
     }
 }
 `, v1ServiceName, v2ServiceName)
+}
+
+// reconcileNginxConfigMap creates the ConfigMap with nginx.conf for path-based routing.
+func (r *SaiaReconciler) reconcileNginxConfigMap(
+	ctx context.Context,
+	ai *aiv1.AIService,
+) error {
+	nginxConf := renderNginxConfig(ai)
 
 	cmName := ai.Name + "-saia-nginx-config"
 	cm := &corev1.ConfigMap{
@@ -1487,6 +1653,8 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 ) error {
 	component := ai.Name + "-nginx"
 	labels, annotations := saiaLabelsAndAnnotations(ai, component)
+	nginxConfigChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(renderNginxConfig(ai))))
+	annotations["splunk-ai-operator/nginx-config-hash"] = nginxConfigChecksum
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1683,13 +1851,7 @@ func (r *SaiaReconciler) reconcileSAIAService(
 	for k, v := range ai.Labels {
 		svc.ObjectMeta.Labels[k] = v
 	}
-	for k, v := range ai.Annotations {
-		if k == "kubectl.kubernetes.io/last-applied-configuration" {
-			continue
-		} // Ignore last-applied-configuration annotation
-		if k == "kubectl.kubernetes.io/restartedAt" {
-			continue
-		} // Ignore restartedAt annotation
+	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		svc.ObjectMeta.Annotations[k] = v
 	}
 

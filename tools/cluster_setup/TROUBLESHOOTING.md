@@ -133,17 +133,48 @@ again at the start of every `install` invocation.
 
 ### "Unsupported OS on \<role\> \<ip\>: \<pretty-name\>"
 
-The node is not running RHEL 9.
+The node is not running a supported OS.
 
-**Supported:** RHEL 9 only. Other Linux distributions are not tested or supported for cluster nodes.
+**Supported:** RHEL 9, RHEL 10 (non-air-gapped installs only), and Ubuntu 24.04. Other Linux distributions are not tested or supported for cluster nodes.
 
 **Options:**
 
-1. Re-provision the node with RHEL 9.
+1. Re-provision the node with a supported OS.
 2. For internal testing only — bypass the check at your own risk:
    ```bash
    FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
    ```
+
+### "RHEL 10 needs an offline package closure for air-gapped installs on \<role\> \<ip\>"
+
+RHEL 10 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs iptables with in `kernel-modules-extra` rather than the base kernel package. A sealed node cannot fetch that package itself, so a node without it joins and then sits NotReady with no way to recover offline.
+
+Staging normally handles this: each node is probed over SSH and, for every kernel missing the module, `kernel-modules-extra` is downloaded into `packages/node-closure/`. This error means the node has neither the module nor a staged closure — usually because the bundle was pre-staged with `--download-only` and no node list, so nothing was probed. Re-stage with the node IPs, e.g.:
+
+```bash
+# Simplest: pass the cluster config — every node IP is derived from it
+./airgap_install.sh --download-only --config ./my-cluster.yaml
+
+# Configless staging: name the nodes explicitly (controllers included)
+./airgap_install.sh --download-only --gpu-os rhel10 \
+  --gpu-hosts <gpu-worker-ip> \
+  --node-hosts <controller-ip>,<cpu-worker-ip>,<gpu-worker-ip>
+
+# Nodes not reachable from the build host: name the kernels instead
+./airgap_install.sh --download-only --gpu-os rhel10 \
+  --gpu-kernels 6.12.0-124.8.1.el10_1.x86_64 \
+  --node-kernels 6.12.0-124.8.1.el10_1.x86_64
+```
+
+`FORCE_UNSUPPORTED_OS=1` bypasses the check, but the install will then stop later at "xt_conntrack still unavailable" unless you have installed `kernel-modules-extra` on every node yourself.
+
+If you are staging a RHEL 10 closure on purpose, run the installer itself from a **RHEL 10 x86_64** installer machine, not RHEL 9 — `dnf`'s `$releasever` comes from the installer host's own OS, so a RHEL 9 installer machine resolves RHEL 9 packages even when targeting RHEL 10 nodes. RHEL 9 and Ubuntu 24.04 targets are unaffected and keep using a RHEL 9 installer machine.
+
+### "xt_conntrack still unavailable for kernel \<version\>"
+
+Node preparation could not install `kernel-modules-extra` matching the node's running kernel, so kube-proxy would be unable to program a single iptables rule and every ClusterIP — including the API server's `10.96.0.1` — would be unreachable. The installer stops here rather than letting the node come up broken.
+
+The package must match `uname -r` exactly; a build for any other kernel installs into a directory `modprobe` never searches. Either install `kernel-modules-extra-$(uname -r)` on the node from a repo that carries it, or boot a kernel that has a matching package available, then re-run the installer.
 
 ---
 
@@ -639,15 +670,17 @@ re-run the installer — it will detect the existing cluster and skip bootstrap.
 
 ### "Checksum verification failed"
 
-The bundle was corrupted in transit.
+A staged artifact was truncated or corrupted mid-download.
 
 ```bash
-# Re-verify the bundle file itself
-sha256sum airgap-bundle-<timestamp>.tar.gz
-# Compare against the value printed when the bundle was created
+# Re-verify the staged tree against its own manifest
+cd ./airgap-bundle/airgap-bundle-<timestamp>
+sha256sum --check checksums.sha256 --quiet
 ```
 
-Re-transfer the bundle and verify the SHA-256 before extracting.
+Delete the staging directory and re-run the install
+(`CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install`) — with
+`cluster.airgap: true` it re-stages the artifacts automatically.
 
 ---
 
@@ -656,33 +689,37 @@ Re-transfer the bundle and verify the SHA-256 before extracting.
 Helm sometimes uses underscores instead of dashes in filenames.
 
 ```bash
-ls /opt/airgap/airgap-bundle-*/charts/
+ls ./airgap-bundle/airgap-bundle-*/charts/
 ```
 
 Set the path explicitly:
 
 ```bash
-export PROMETHEUS_CHART_PATH="/opt/airgap/airgap-bundle-<date>/charts/kube-prometheus-stack-72.3.0.tgz"
+export PROMETHEUS_CHART_PATH="./airgap-bundle/airgap-bundle-<date>/charts/kube-prometheus-stack-72.3.0.tgz"
 ```
 
 ---
 
 ### "Cannot reach get.k0s.sh" on nodes
 
-In air-gap mode, k0s must already be installed on nodes OR the bundle's k0s
-binary is used. Ensure `install_from_airgap_bundle.sh` was used to run the
-install (it sets `K0S_INSTALL_URL` automatically).
+In air-gap mode, k0s must already be installed on nodes OR the staged k0s
+binary is used. Check that `cluster.airgap: true` is set in your config (or
+`AIRGAP_MODE=true` in the environment) — that is what makes `install` stage the
+artifacts and set `K0S_INSTALL_URL` automatically. If the install log does not
+open with `Air-gap mode — staging artifacts before install`, the mode switch did
+not take effect.
 
 ---
 
 ### python3-pyyaml missing on nodes in air-gap mode
 
-`install_from_airgap_bundle.sh` automatically sets `AIRGAP_PYYAML_WHEEL_PATH`
-from the bundle's `packages/` directory. If you ran the main installer
-directly, set it manually:
+Air-gap staging sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the staged
+`packages/` directory. If you are driving the installer against an
+already-staged tree, set it manually:
 
 ```bash
-export AIRGAP_PYYAML_WHEEL_PATH="/opt/airgap/airgap-bundle-<date>/packages/PyYAML-6.0.2-cp39-cp39-linux_x86_64.whl"
+export AIRGAP_PYYAML_WHEEL_PATH="./airgap-bundle/airgap-bundle-<date>/packages/PyYAML-6.0.2-cp39-cp39-linux_x86_64.whl"
+export AIRGAP_STAGED=true    # already staged — don't re-download
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
@@ -691,9 +728,11 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ### GPU driver install fails in air-gap mode
 
 See [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments).
-Pre-install drivers on GPU nodes using the bundle's `packages/` directory
-before running the main installer. The installer detects `nvidia-smi` and
-skips the driver install entirely.
+Air-gap staging builds an offline NVIDIA RPM closure and the installer
+pushes it to each GPU node. If you would rather manage drivers out of band,
+pre-install them on the GPU nodes and stage via
+`./airgap_install.sh --skip-nvidia-closure --config <cfg>` — the installer
+detects `nvidia-smi` and skips the driver install entirely.
 
 ---
 

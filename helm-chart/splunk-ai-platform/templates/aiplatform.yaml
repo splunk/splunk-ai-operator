@@ -29,6 +29,9 @@ spec:
   gpuInstanceType: {{ .Values.gpuInstanceType | quote }}
 {{- end }}
 
+  # Platform-wide positive-integer capacity multiplier
+  scaleFactor: {{ .Values.scaleFactor }}
+
   # Features configuration
 {{- if .Values.features }}
   features:
@@ -40,9 +43,6 @@ spec:
 {{- end }}
 {{- if .version }}
       version: {{ .version | quote }}
-{{- end }}
-{{- if .scaleFactor }}
-      scaleFactor: {{ .scaleFactor }}
 {{- end }}
 {{- end }}
 {{- end }}

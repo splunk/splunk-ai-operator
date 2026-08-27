@@ -72,7 +72,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "",
 				}
-				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring("required"))
@@ -84,7 +84,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
 				}
-				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
@@ -96,7 +96,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/vault/secrets/../../../etc/passwd",
 				}
-				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring(".."))
@@ -108,7 +108,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/vault/secrets-evil/token",
 				}
-				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				e := findErr(errs, "vaultFilePath")
 				Expect(e).NotTo(BeNil(), "expected a vaultFilePath error")
 				Expect(e.Detail).To(ContainSubstring("/vault/secrets/"))
@@ -121,7 +121,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					SecretSource:  aiv1.SecretSourceVault,
 					VaultFilePath: "/vault/secrets/splunk-hec-token",
 				}
-				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				for _, e := range errs {
 					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
 				}
@@ -134,10 +134,100 @@ var _ = Describe("AIPlatform Webhook", func() {
 					SecretSource:  aiv1.SecretSourceKubernetes,
 					VaultFilePath: "/etc/passwd",
 				}
-				errs := validator.validateSplunkConfiguration(splunkConfig, fldPath)
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
 				for _, e := range errs {
 					Expect(e.Field).NotTo(ContainSubstring("vaultFilePath"))
 				}
+			})
+
+			It("should accept an empty Splunk config (Splunk disabled)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{}
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
+				Expect(errs).To(BeEmpty(), "empty Splunk config must be admitted (Splunk optional)")
+			})
+
+			It("should still require secretRef when endpoint is set (partial config)", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:     "http://splunk:8088",
+					SecretSource: aiv1.SecretSourceKubernetes,
+				}
+				errs := validator.validateSplunkConfiguration(splunkConfig, false, fldPath)
+				e := findErr(errs, "secretRef")
+				Expect(e).NotTo(BeNil(), "endpoint without secretRef must still error")
+			})
+		})
+
+		Describe("hecEndpoint validation", func() {
+			fldPath := field.NewPath("spec").Child("splunkConfiguration")
+
+			for _, withSecret := range []bool{false, true} {
+				withSecret := withSecret
+				description := " without secretRef"
+				if withSecret {
+					description = " with secretRef"
+				}
+				It("should reject hecEndpoint without a management/JWKS source"+description, func() {
+					splunkConfig := &aiv1.SplunkConfigurationSpec{
+						HECEndpoint: "http://splunk:8088",
+					}
+					if withSecret {
+						splunkConfig.SecretRef.Name = "splunk-hec"
+					}
+
+					errs := validator.validateSplunkConfiguration(splunkConfig, true, fldPath)
+
+					Expect(errs).To(HaveLen(1))
+					Expect(errs[0].Field).To(Equal("spec.splunkConfiguration.hecEndpoint"))
+					Expect(errs[0].Detail).To(ContainSubstring("endpoint or splunkCustomResourceRef.name"))
+				})
+			}
+
+			It("should accept hecEndpoint with endpoint and secretRef", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					Endpoint:    "https://splunk:8089",
+					HECEndpoint: "https://splunk:8088",
+				}
+				splunkConfig.SecretRef.Name = "splunk-hec"
+
+				Expect(validator.validateSplunkConfiguration(splunkConfig, true, fldPath)).To(BeEmpty())
+			})
+
+			It("should accept hecEndpoint with a Splunk CR reference", func() {
+				splunkConfig := &aiv1.SplunkConfigurationSpec{
+					HECEndpoint: "https://splunk:8088",
+				}
+				splunkConfig.SplunkCustomResourceRef.Name = "splunk-standalone"
+
+				Expect(validator.validateSplunkConfiguration(splunkConfig, true, fldPath)).To(BeEmpty())
+			})
+		})
+
+		Describe("scaleFactor validation", func() {
+			sfPath := field.NewPath("spec").Child("scaleFactor")
+
+			It("should reject scaleFactor of 0", func() {
+				zero := int32(0)
+				errs := validator.validateScaleFactor(&zero, sfPath)
+				Expect(errs).NotTo(BeEmpty(), "expected a scaleFactor error")
+				Expect(errs[0].Detail).To(ContainSubstring("at least 1"))
+			})
+
+			It("should reject a negative scaleFactor", func() {
+				neg := int32(-1)
+				errs := validator.validateScaleFactor(&neg, sfPath)
+				Expect(errs).NotTo(BeEmpty(), "expected a scaleFactor error")
+				Expect(errs[0].Detail).To(ContainSubstring("at least 1"))
+			})
+
+			It("should accept a scaleFactor of 1", func() {
+				one := int32(1)
+				errs := validator.validateScaleFactor(&one, sfPath)
+				Expect(errs).To(BeEmpty())
+			})
+
+			It("should accept an unset scaleFactor (defaults to 1)", func() {
+				errs := validator.validateScaleFactor(nil, sfPath)
+				Expect(errs).To(BeEmpty())
 			})
 		})
 	})

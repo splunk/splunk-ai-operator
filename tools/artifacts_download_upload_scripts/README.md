@@ -23,8 +23,8 @@ This directory contains scripts for downloading model artifacts from Hugging Fac
 Downloads model artifacts from Hugging Face repositories. Supports resumable, idempotent downloads — safe to re-run after any failure.
 
 **Features:**
-- Reads configuration from `model_artifacts_configs.yaml` (l40s) or `model_artifacts_configs_h100.yaml` (h100)
-- **GPU type selection**: pass `--accelerator l40s` or `--accelerator h100`; if omitted and `ACCELERATOR` env var is not set, prompts interactively
+- Reads `model_artifacts_configs_unquantized.yaml` for L40S or `model_artifacts_configs_quantized.yaml` for H100 and RTX Pro
+- **GPU type selection**: pass `--accelerator l40s`, `--accelerator h100`, or `--accelerator rtx_pro_6000_blackwell`; if omitted and `ACCELERATOR` is not set, prompts interactively
 - Supports both public and gated Hugging Face models
 - Automatically installs dependencies (wget, yq, git-lfs)
 - **Memory-optimized cloning**: shallow clone (`--depth 1 --single-branch`) + separate `git lfs pull` to prevent OOM
@@ -42,7 +42,7 @@ Downloads model artifacts from Hugging Face repositories. Supports resumable, id
 **Usage:**
 ```bash
 # Explicit GPU type
-./download_from_huggingface.sh --accelerator l40s   # or h100
+./download_from_huggingface.sh --accelerator l40s   # or h100 / rtx_pro_6000_blackwell
 
 # Interactive — prompted when no flag and no ACCELERATOR env var
 ./download_from_huggingface.sh
@@ -52,7 +52,7 @@ SKIP_IF_STAGED=1 ./download_from_huggingface.sh --accelerator l40s
 ```
 
 **Prerequisites:**
-- `model_artifacts_configs.yaml` (l40s) or `model_artifacts_configs_h100.yaml` (h100) present in the same directory
+- `model_artifacts_configs_unquantized.yaml` and `model_artifacts_configs_quantized.yaml` present in the same directory
 - Python 3 installed (required for URL encoding credentials)
 - For gated models: HF token and username configured in the YAML file
 - May require sudo for installing dependencies (wget, yq, git-lfs)
@@ -61,7 +61,7 @@ SKIP_IF_STAGED=1 ./download_from_huggingface.sh --accelerator l40s
 
 | Variable | Default | Description |
 |---|---|---|
-| `ACCELERATOR` | — | GPU type (`l40s` or `h100`). Overridden by `--accelerator` flag. If unset and no flag, prompts interactively. |
+| `ACCELERATOR` | — | GPU type (`l40s`, `h100`, or `rtx_pro_6000_blackwell`). Overridden by `--accelerator`. If unset, prompts interactively. |
 | `SKIP_IF_STAGED` | `0` | Set to `1` to check the object store first; skip models whose `staging_state/<id>/.staging_complete` marker exists |
 | `HF_DOWNLOAD_RETRIES` | `2` | Number of download retries per model before giving up |
 | `OBJ_STORE_TYPE` | — | Store type for pre-check: `aws`, `minio`, or `seaweedfs` |
@@ -317,7 +317,7 @@ sudo ./test_minio_connection.sh
 
 ## Configuration
 
-The download script uses the `model_artifacts_configs.yaml` configuration file.
+The download script selects `model_artifacts_configs_unquantized.yaml` for L40S and `model_artifacts_configs_quantized.yaml` for H100 or RTX Pro.
 
 ### ⚠️ What You Need to Change:
 
@@ -340,13 +340,14 @@ The download script uses the `model_artifacts_configs.yaml` configuration file.
 
 **Artifact Configuration (`artifact-configs`):**
 
-The following models are pre-configured and ready to download:
-- `gemma-4-31b-it` - Primary LLM for chat, SPL generation, reasoning
+The following artifacts are pre-configured and ready to download:
+- `gemma-4-31b-it` - Unquantized Gemma model for L40S
+- `gemma-4-31b-it-qat-w4a16-ct` - Quantized Gemma model for H100 and RTX Pro
 - `gpt-oss-20b` - Secondary LLM
 - `all-minilm-l6-v2` - Sentence transformer model
-- `bi-encoder` - BGE small encoder
 - `cross-encoder` - MS MARCO cross-encoder
 - `e5-language-classifier` - Multilingual language detection
+- `fm_timeseries` - Cisco Time Series Model (CTSM) forecaster
 - `mbart-translator` - Multilingual translation
 - `pii-classifier` - PII detection model
 - `uae-large` - UAE embedding model
@@ -464,7 +465,7 @@ The staging pipeline is **resumable and idempotent**. Re-running after any failu
 
 ## Notes
 
-- The download script creates a `./model_artifacts/` directory and downloads artifacts based on `model_artifacts_configs.yaml` (l40s) or `model_artifacts_configs_h100.yaml` (h100)
+- The download script creates `./model_artifacts/` and selects the unquantized or quantized artifact profile from the accelerator type
 - **Memory optimization**: shallow cloning + separate LFS downloads minimizes RAM usage; suitable for cloud instances with limited memory
 - **Resumable / idempotent**: re-running after failure skips completed models (local marker) and fully-staged models (store marker). Partial folders without a marker are deleted and re-downloaded cleanly
 - **Error handling**: failures are collected; the script reports all failed models at the end and exits non-zero. Individual model failures don't abort other downloads
@@ -529,7 +530,7 @@ For downloading 70B+ parameter models, consider:
 
 #### Solution 3: Download Models Selectively
 
-Edit `model_artifacts_configs.yaml` to comment out models and download them one at a time:
+Edit the selected `model_artifacts_configs_{unquantized,quantized}.yaml` profile to comment out models and download them one at a time:
 
 ```yaml
 artifact-configs:
@@ -607,4 +608,3 @@ Installs AWS CLI:
    - Downloads appropriate binary (amd64 or arm64)
    - Installs to `/usr/local/aws-cli` (with sudo) or `~/.local/aws-cli` (without sudo)
    - Requires unzip utility (auto-installed if missing)
-

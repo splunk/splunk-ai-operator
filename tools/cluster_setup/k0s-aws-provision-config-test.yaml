@@ -1,0 +1,57 @@
+# ===================================================================
+# k0s AWS Provisioner -- CHEAP TEST CONFIG (Level 2)
+# ===================================================================
+# Uses t3.small/medium instances instead of GPU boxes.
+# Validates the full provision/output/status/destroy cycle for ~$1-2.
+# Run:
+#   ./k0s_aws_provision.sh provision --config k0s-aws-provision-config-test.yaml
+#   ./k0s_aws_provision.sh output    --config k0s-aws-provision-config-test.yaml
+#   ./k0s_aws_provision.sh status    --config k0s-aws-provision-config-test.yaml
+#   ./k0s_aws_provision.sh destroy   --config k0s-aws-provision-config-test.yaml
+# ===================================================================
+
+stackName: k0s-infra-test
+region: us-west-2
+availabilityZone: us-west-2a
+sshAllowedCidr: "0.0.0.0/0"
+
+# us-west-2 default: shared ai-platform VPC (SCP blocks new-VPC creation in splunkcloud-ai-dev).
+# Subnets are pinned explicitly to avoid auto-selection ambiguity in test runs.
+# To test auto-create network mode, set vpcId: "" (use a different AWS account).
+network:
+  vpcId: vpc-09b191e89c83d588e              # us-west-2 default: ai-platform-us-west-2-vpc
+  subnetId: subnet-0f10872b190a44521        # private us-west-2a (k0s nodes, NAT outbound)
+  installerSubnetId: subnet-0561d78f4f4744596  # public us-west-2a (installer, IGW for SSH via EIP)
+
+keyPair:
+  name: ""
+  localPath: ""
+
+nodes:
+  controller:
+    count: 1
+    instanceType: t3.medium
+    diskGb: 10
+
+  cpuWorker:
+    count: 1
+    instanceType: t3.medium
+    diskGb: 10
+
+  gpuWorker:
+    count: 1
+    instanceType: t3.medium         # no GPU -- tests provisioning + EBS mount flow only
+    diskGb: 10
+    dataDiskGb: 8                   # tests attach + XFS format + mount
+
+installer:
+  instanceType: t3.small
+  diskGb: 10
+
+minio:
+  enabled: true
+  dataDiskGb: 8
+  bucket: ai-platform-test
+  rootUser: minioadmin
+  rootPassword: ""
+  port: 9000

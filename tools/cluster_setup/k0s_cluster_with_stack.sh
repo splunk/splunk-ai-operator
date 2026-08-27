@@ -39,9 +39,12 @@ export LANG=C LC_ALL=C
 # - VERIFY_RC                set by main_install from verify_all_pods_healthy;
 #                            read by show_platform_access_info to choose
 #                            between success / partial-readiness banners.
+# - K0S_RESET_FAILED         passed from main_delete to clean_all so the final
+#                            command status includes failures from both phases.
 declare -a POD_LINES=()
 WORKLOAD_PENDING_REASON=""
 VERIFY_RC=0
+K0S_RESET_FAILED=0
 
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
@@ -164,37 +167,60 @@ trap cleanup_tmp EXIT
 #        step_fail "reason"                  → marks it failed (does not exit)
 # show_step_summary                          → final table printed at end of install
 declare -a _STEP_NAMES=()
-declare -a _STEP_STATUS=()  # "ok" | "fail" | "skip"
+declare -a _STEP_STATUS=()   # "ok" | "fail" | "skip"
+declare -a _STEP_START_TS=() # epoch seconds at step_start
+declare -a _STEP_ELAPSED=()  # seconds taken, set by step_ok/fail/skip
 _STEP_CURRENT=""
+_INSTALL_START_TS=${SECONDS}
 
 step_start() {
   _STEP_CURRENT="$1"
   _STEP_NAMES+=("$1")
   _STEP_STATUS+=("running")
+  _STEP_START_TS+=("${SECONDS}")
+  _STEP_ELAPSED+=(0)
   local n=${#_STEP_NAMES[@]}
   echo -e "\n\033[1;34m[$(_ts) ── STEP ${n}: $1 ──]\033[0m" >&2
 }
 
+_step_record_elapsed() {
+  local last=$(( ${#_STEP_START_TS[@]} - 1 ))
+  _STEP_ELAPSED[$last]=$(( SECONDS - _STEP_START_TS[$last] ))
+}
+
 step_ok() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="ok"
+  local elapsed="${_STEP_ELAPSED[$last]}"
+  echo -e "\033[1;32m[$(_ts) ✔ ${_STEP_NAMES[$last]} — $(printf '%dm%02ds' $((elapsed/60)) $((elapsed%60)))]\033[0m" >&2
 }
 
 step_fail() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="fail:${1:-unknown error}"
 }
 
 step_skip() {
+  _step_record_elapsed
   local last=$(( ${#_STEP_STATUS[@]} - 1 ))
   _STEP_STATUS[$last]="skip:${1:-}"
 }
 
 show_step_summary() {
+  local total_elapsed=$(( SECONDS - _INSTALL_START_TS ))
   echo -e "\n\033[1;34m[$(_ts) ════ INSTALL SUMMARY ════]\033[0m" >&2
   local total=${#_STEP_NAMES[@]} ok=0 fail=0 skip=0
   for i in "${!_STEP_NAMES[@]}"; do
     local s="${_STEP_STATUS[$i]}"
+    local elapsed="${_STEP_ELAPSED[$i]:-0}"
+    local duration
+    if (( elapsed >= 60 )); then
+      duration=$(printf '%dm%02ds' $((elapsed/60)) $((elapsed%60)))
+    else
+      duration="${elapsed}s"
+    fi
     local icon color label
     case "${s%%:*}" in
       ok)      icon="✔"; color="\033[1;32m"; label="OK";           ok=$((ok+1)) ;;
@@ -203,13 +229,19 @@ show_step_summary() {
       running) icon="?"; color="\033[1;33m"; label="interrupted";  fail=$((fail+1)) ;;
       *)       icon="?"; color="\033[0m";    label="${s}" ;;
     esac
-    printf "  ${color}${icon}\033[0m  %-45s %s\n" "${_STEP_NAMES[$i]}" "${label}" >&2
+    printf "  ${color}${icon}\033[0m  %-45s %-8s %s\n" "${_STEP_NAMES[$i]}" "${duration}" "${label}" >&2
   done
   echo "" >&2
-  if (( fail == 0 )); then
-    echo -e "  \033[1;32mAll ${total} steps completed successfully.\033[0m" >&2
+  local total_dur
+  if (( total_elapsed >= 3600 )); then
+    total_dur=$(printf '%dh%02dm%02ds' $((total_elapsed/3600)) $(((total_elapsed%3600)/60)) $((total_elapsed%60)))
   else
-    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped.\033[0m" >&2
+    total_dur=$(printf '%dm%02ds' $((total_elapsed/60)) $((total_elapsed%60)))
+  fi
+  if (( fail == 0 )); then
+    echo -e "  \033[1;32mAll ${total} steps completed successfully in ${total_dur}.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${fail} step(s) failed, ${ok} succeeded, ${skip} skipped. Total: ${total_dur}\033[0m" >&2
     echo -e "  \033[1;31mSee log: ${LOG_FILE}\033[0m" >&2
   fi
   echo "" >&2
@@ -255,10 +287,11 @@ wait_for_dependency() {
 }
 
 # ====== NODE OS GATE ======
-# Only RHEL 9 is tested and supported. All other OS families (RHEL 10,
-# Amazon Linux, Debian/Ubuntu) stop the script with a clear error.
-# Set FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and
-# continue at your own risk (useful for internal testing).
+# Supported: RHEL 9, RHEL 10 and Ubuntu 24.04 — air-gapped RHEL 10 also needs a
+# staged node package closure (see below). All other OS families (Amazon Linux,
+# other Ubuntu/Debian releases) stop the script with a clear error. Set
+# FORCE_UNSUPPORTED_OS=1 to downgrade the error to a warning and continue at
+# your own risk (useful for internal testing).
 _check_node_os() {
   local node_ip="$1" role="${2:-node}"
   local os_id="" os_version_id="" os_pretty=""
@@ -270,17 +303,43 @@ _check_node_os() {
   os_pretty=$(ssh_exec "${node_ip}" \
     ". /etc/os-release 2>/dev/null && echo \"\${PRETTY_NAME}\"" 2>/dev/null || echo "unknown")
 
-  # Supported: RHEL 9 only. Other family members kept for internal testing.
   if [[ "${os_id}" =~ ^(rhel|centos|rocky|almalinux)$ ]] && [[ "${os_version_id}" == "9" ]]; then
     log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
     return 0
   fi
+  # RHEL 10 proper only — the rebuilds are untested and the el10 path below
+  # installs from RHEL repos. Air-gapped el10 additionally needs the bundle to
+  # stage kernel-modules-extra, since a sealed node cannot fetch it itself.
+  local msg=""
+  if [[ "${os_id}" == "rhel" ]] && [[ "${os_version_id}" == "10" ]]; then
+    if [[ "${AIRGAP_MODE:-false}" != "true" ]] \
+      || [[ -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]] \
+      || ssh_exec "${node_ip}" "sudo modinfo xt_conntrack >/dev/null 2>&1"; then
+      log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+      return 0
+    fi
+    msg="RHEL 10 needs an offline package closure for air-gapped installs on ${role} ${node_ip}: ${os_pretty}
+  el10 keeps xt_conntrack (which kube-proxy and Calico require) in
+  kernel-modules-extra rather than the base kernel package, and a sealed node
+  cannot fetch it, so it would come up NotReady. This node does not have the
+  module, and AIRGAP_NODE_RPM_CLOSURE_DIR is unset or missing, meaning the bundle
+  staged no such closure.
+  Use RHEL 9 or Ubuntu 24.04 for air-gapped clusters, re-build the bundle with a
+  node package closure, or set:
+    FORCE_UNSUPPORTED_OS=1"
+  fi
+  if [[ "${os_id}" == "ubuntu" ]] && [[ "${os_version_id}" == "24" ]]; then
+    log "  OS check passed on ${role} ${node_ip}: ${os_pretty}"
+    return 0
+  fi
 
-  local msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
-  Only RHEL 9 is tested and supported. Installation on other OS versions
-  is not validated and may fail in unexpected ways.
+  if [[ -z "${msg}" ]]; then
+    msg="Unsupported OS on ${role} ${node_ip}: ${os_pretty}
+  Only RHEL 9, RHEL 10 and Ubuntu 24.04 are tested and supported. Installation
+  on other OS versions is not validated and may fail in unexpected ways.
   To skip this check and continue at your own risk, set:
     FORCE_UNSUPPORTED_OS=1"
+  fi
 
   if [[ "${FORCE_UNSUPPORTED_OS:-0}" == "1" ]]; then
     warn "${msg}"
@@ -299,14 +358,14 @@ resolve_model_staging() {
     log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
   fi
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "Air-gap mode: model staging skipped (models must be pre-staged in object store); no prompt."
-    MODEL_STAGING_ENABLED=false
-    return 0
-  fi
-  # Full/interactive: prompt always overrides config value
+  # Full/interactive: prompt always overrides config value. Air-gap means the
+  # CLUSTER NODES have no internet, not necessarily this installer machine —
+  # so staging from here is still valid and must still be offered.
   echo "" >&2
   echo -e "  \033[1mModel Download\033[0m" >&2
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo "  Air-gap mode: models must be staged from THIS machine (the cluster nodes have no internet)." >&2
+  fi
   echo "  Do you want to download and stage model artifacts from HuggingFace now?" >&2
   echo "  (Required for a first install unless models are already in your object store.)" >&2
   local ans
@@ -383,25 +442,38 @@ show_install_plan() {
   echo -e "  \033[1mObject store     :\033[0m type=$(yq eval '.storage.objectStore.type // "?"' "${CONFIG_FILE}" 2>/dev/null)  bucket=$(yq eval '.storage.objectStore.bucket // "?"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mModel staging    :\033[0m ${MODEL_STAGING_ENABLED}" >&2
+  if [[ "${SPLUNK_MODE}" == "external" ]]; then
+    echo -e "  \033[1mSplunk           :\033[0m external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME})" >&2
+  else
+    echo -e "  \033[1mSplunk           :\033[0m ${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED})" >&2
+  fi
   echo -e "  \033[1mImage registry   :\033[0m $(yq eval '.images.registry // "<public>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
   echo "" >&2
   echo -e "  \033[1mSteps that will run:\033[0m" >&2
   echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
-    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-      echo -e "    2. Model artifact staging  [SKIPPED — AIRGAP_MODE=true, models must be pre-staged]" >&2
-    else
-      echo -e "    2. Model artifact staging (HuggingFace → object store)" >&2
-    fi
+    echo -e "    2. Model artifact staging (installer host: HuggingFace → object store)" >&2
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo -e "    2. Verify pre-staged model artifacts in object store" >&2
   else
     echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
   fi
   echo -e "    3. k0s cluster installation" >&2
   echo -e "    4. Phase 1 (parallel): cert-manager, prometheus, NVIDIA drivers" >&2
-  echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, Splunk operator, NVIDIA device-plugin" >&2
+  else
+    echo -e "    5. Phase 2 (parallel): OTel, KubeRay, NVIDIA device-plugin  [Splunk operator SKIPPED — mode=${SPLUNK_MODE}]" >&2
+  fi
   echo -e "    6. MetalLB load-balancer" >&2
-  echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+  elif [[ "${SPLUNK_MODE}" == "external" ]]; then
+    echo -e "    7. AI Platform operator + CR (external Splunk HEC)  [Splunk Standalone SKIPPED — external mode]" >&2
+  else
+    echo -e "    7. AI Platform operator + CR  [Splunk Standalone SKIPPED — mode=disabled]" >&2
+  fi
   echo -e "    8. Health check + pod verification" >&2
   echo "" >&2
 
@@ -427,6 +499,7 @@ show_install_plan() {
 ensure_yq() {
   command -v yq >/dev/null 2>&1 && return 0
   local os arch url
+  local -a _yq_fetch
   # Pinned version — matches download_from_huggingface.sh; update both together.
   local YQ_VERSION="v4.44.1"
   os="$(uname -s)"
@@ -440,7 +513,13 @@ ensure_yq() {
     Linux)
       url="${YQ_DOWNLOAD_URL:-https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}}"
       log "Installing yq ${YQ_VERSION} (linux-${arch})..."
-      if curl -fsSL -o /tmp/yq "${url}"; then
+      # file:// is a URI — curl rejects a relative path in it, so copy instead.
+      if [[ "${url}" == file://* ]]; then
+        _yq_fetch=( cp -- "${url#file://}" /tmp/yq )
+      else
+        _yq_fetch=( curl -fsSL -o /tmp/yq "${url}" )
+      fi
+      if "${_yq_fetch[@]}"; then
         chmod +x /tmp/yq
         if [[ "$(id -u)" -eq 0 ]]; then
           mv /tmp/yq /usr/local/bin/yq
@@ -511,7 +590,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   fi
 
   # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
-  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically; customers
+  # airgap_install.sh sets AIRGAP_MODE=true automatically; customers
   # running the installer directly should set cluster.airgap: true in their config.
   local _yaml_airgap
   _yaml_airgap=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
@@ -582,6 +661,46 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   # Splunk configuration
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
 
+  # Splunk integration (JWT/auth issuer for SAIA/Slim, plus optional HEC
+  # telemetry export) is OPT-IN and defaults to DISABLED. It only turns on when
+  # splunk.enabled: true is explicitly set AND the required Splunk images are
+  # present (enforced in validate_image_config). When disabled the script skips
+  # the Splunk Operator, the Standalone CR, and omits splunkConfiguration from
+  # the AIPlatform CR — the operator treats an empty config as "no Splunk".
+  # yq returns "null" for an absent key, which we treat as false. yq also mishandles
+  # boolean false, so we normalise explicitly.
+  SPLUNK_ENABLED="$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
+  [[ "${SPLUNK_ENABLED}" != "true" ]] && SPLUNK_ENABLED="false"
+
+  # External Splunk: use a Splunk running OUTSIDE the cluster as the JWT/auth
+  # issuer for SAIA/Slim (and, optionally, the HEC telemetry destination).
+  # When splunk.external.endpoint is set (and splunk.enabled is true), the
+  # script does NOT install the in-cluster Splunk Operator/Standalone — it only
+  # wires the AIPlatform CR at the external HEC endpoint + a Secret holding the
+  # HEC token. The token is supplied via the SPLUNK_HEC_TOKEN env var (never the
+  # config file), mirroring how MINIO_ROOT_PASSWORD works; the script creates
+  # the Secret post-cluster-bootstrap so there is no chicken-and-egg ordering.
+  SPLUNK_EXTERNAL_ENDPOINT="$(yq eval '.splunk.external.endpoint // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${SPLUNK_EXTERNAL_ENDPOINT}" == "null" ]] && SPLUNK_EXTERNAL_ENDPOINT=""
+  SPLUNK_EXTERNAL_SECRET_NAME="$(yq eval '.splunk.external.secretName // "splunk-hec-external"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-hec-external")"
+  [[ -z "${SPLUNK_EXTERNAL_SECRET_NAME}" || "${SPLUNK_EXTERNAL_SECRET_NAME}" == "null" ]] && SPLUNK_EXTERNAL_SECRET_NAME="splunk-hec-external"
+  # HEC token: env var only (keep it out of the config file and logs).
+  SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+
+  # Derive a single mode so downstream logic is unambiguous:
+  #   disabled  — splunk.enabled=false: no Splunk integration at all
+  #   external  — splunk.enabled=true + splunk.external.endpoint set: skip
+  #               in-cluster Splunk, use customer's external Splunk
+  #   internal  — splunk.enabled=true, no external endpoint: install SOK +
+  #               Standalone in-cluster (legacy behavior)
+  if [[ "${SPLUNK_ENABLED}" != "true" ]]; then
+    SPLUNK_MODE="disabled"
+  elif [[ -n "${SPLUNK_EXTERNAL_ENDPOINT}" ]]; then
+    SPLUNK_MODE="external"
+  else
+    SPLUNK_MODE="internal"
+  fi
+
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
@@ -596,6 +715,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_API_IMAGE="$(yq eval '.images.saia.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   NGINX_IMAGE="$(yq eval '.images.nginx.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -634,6 +754,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   log "Configuration loaded: cluster=${CLUSTER_NAME}, namespace=${AI_NS}"
   log "Object storage: ${OBJ_STORE_TYPE}, endpoint=${OBJ_STORE_ENDPOINT:-not set}, bucket=${OBJ_STORE_BUCKET}"
   log "Model staging: ${MODEL_STAGING_ENABLED} (storage.modelStaging.enabled)"
+  log "Splunk integration: mode=${SPLUNK_MODE} (splunk.enabled=${SPLUNK_ENABLED}${SPLUNK_EXTERNAL_ENDPOINT:+, external endpoint set})"
   if [[ -n "${ECR_ACCOUNT}" ]]; then
     log "ECR Account: ${ECR_ACCOUNT}"
   fi
@@ -668,14 +789,54 @@ build_image_url() {
   fi
 }
 
+# validate_scale_factor_config validates the user-facing k0s setting before
+# any installation work begins. An omitted value is valid and uses the CRD
+# default of 1; an explicitly configured value must be a YAML integer >= 1.
+validate_scale_factor_config() {
+  local present value value_tag
+  if ! present=$(yq eval '(.aiPlatform // {}) | has("scaleFactor")' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+
+  if [[ "${present}" != "true" ]]; then
+    return 0
+  fi
+  if ! value=$(yq eval '.aiPlatform.scaleFactor' "${CONFIG_FILE}" 2>/dev/null) || \
+     ! value_tag=$(yq eval '.aiPlatform.scaleFactor | tag' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.scaleFactor from ${CONFIG_FILE}"
+    return 1
+  fi
+  if [[ "${value_tag}" != "!!int" ]]; then
+    echo "aiPlatform.scaleFactor must be a YAML integer greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+  if [[ ! "${value}" =~ ^-?[0-9]+$ ]] || (( value < 1 )); then
+    echo "aiPlatform.scaleFactor must be greater than or equal to 1 (got ${value:-null})"
+    return 1
+  fi
+
+  return 0
+}
+
 validate_image_config() {
   log "Validating image configuration..."
+
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    err "${scale_factor_error}"
+  fi
 
   if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
     err "REQUIRED: images.operator.image must be specified in k0s-cluster-config.yaml"
   fi
-  if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
-    err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml"
+  # Splunk images are only required for INTERNAL mode (in-cluster SOK +
+  # Standalone). Disabled and external modes never install those workloads, so a
+  # missing images.splunk.image must not fail the whole install.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    if [[ -z "$SPLUNK_IMAGE" || "$SPLUNK_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.splunk.image must be specified in k0s-cluster-config.yaml when splunk.enabled is true (internal mode)"
+    fi
   fi
   if [[ -z "$RAY_HEAD_IMAGE" || "$RAY_HEAD_IMAGE" == "null" ]]; then
     err "REQUIRED: images.ray.headImage must be specified in k0s-cluster-config.yaml"
@@ -694,6 +855,13 @@ validate_image_config() {
   fi
   if [[ -z "$SAIA_DATALOADER_IMAGE" || "$SAIA_DATALOADER_IMAGE" == "null" ]]; then
     err "REQUIRED: images.saia.dataLoaderImage must be specified in k0s-cluster-config.yaml"
+  fi
+  # slim-api is only deployed when the "slim" feature is enabled, so require its
+  # image only in that case (mirrors the feature-gated Splunk image handling).
+  if k0s_slim_feature_enabled; then
+    if [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.slim.apiImage must be specified in k0s-cluster-config.yaml when the 'slim' feature is enabled"
+    fi
   fi
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
@@ -720,24 +888,84 @@ validate_image_config() {
     log "Using default Ray runtime version: $RAY_RUNTIME_VERSION"
   fi
 
+  # Every workload container runs imagePullPolicy: IfNotPresent, so re-running
+  # install with an unchanged mutable tag (:latest, :preview, :stable-*) will
+  # NOT pick up a newer build pushed under that same tag — the kubelet serves
+  # the cached layer and the operator's CreateOrUpdate sees no template diff,
+  # so no rollout even happens. Upgrades require a new, distinct tag. This is
+  # a config-hygiene warning, not an error: mutable tags are still valid for
+  # first-time installs.
+  local mutable_tag_images=(
+    "images.operator.image:${OPERATOR_IMAGE}"
+    "images.ray.headImage:${RAY_HEAD_IMAGE}"
+    "images.ray.workerImage:${RAY_WORKER_IMAGE}"
+    "images.weaviate.image:${WEAVIATE_IMAGE}"
+    "images.saia.apiImage:${SAIA_API_IMAGE}"
+    "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
+    "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
+    "images.fluentBit.image:${FLUENT_BIT_IMAGE}"
+    "images.nginx.image:${NGINX_IMAGE}"
+    "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}"
+  )
+  # images.splunk.image and images.splunk.operatorImage are only patched into
+  # the manifest (and only actually deployed) in internal mode — disabled/
+  # external modes never run them.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    mutable_tag_images+=(
+      "images.splunk.image:${SPLUNK_IMAGE}"
+      "images.splunk.operatorImage:${SPLUNK_OPERATOR_IMAGE}"
+    )
+  fi
+  local entry key image last_segment tag
+  for entry in "${mutable_tag_images[@]}"; do
+    key="${entry%%:*}"
+    image="${entry#*:}"
+    if [[ -z "$image" || "$image" == "null" ]]; then
+      continue
+    fi
+    # Parse the tag from the last path segment only, so a registry port
+    # (e.g. localhost:5000/team/saia-api) is never mistaken for a tag.
+    last_segment="${image##*/}"
+    if [[ "$last_segment" == *:* ]]; then
+      tag="${last_segment##*:}"
+    else
+      tag=""
+    fi
+    if [[ -z "$tag" ]]; then
+      warn "${key} (${image}) has no explicit tag — defaults to :latest, which will NOT be re-pulled on a same-tag re-run of install (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
+    elif [[ "$tag" =~ ^(latest|preview|stable.*|dev|nightly)$ ]]; then
+      warn "${key} uses mutable tag ':${tag}' — re-running install without changing this tag will NOT upgrade the running image (imagePullPolicy: IfNotPresent). Use a distinct, immutable tag for upgrades to take effect."
+    fi
+  done
+
   log "✓ Image configuration validated successfully"
 }
 
 configure_images() {
   log "Configuring container images in manifest files..."
 
-  if [[ ! -f "${SPLUNK_AI_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_AI_FILE}.original"
-    cp "$SPLUNK_AI_FILE" "${SPLUNK_AI_FILE}.original"
-  fi
-  if [[ ! -f "${SPLUNK_OPERATOR_FILE}.original" ]]; then
-    log "Creating backup: ${SPLUNK_OPERATOR_FILE}.original"
-    cp "$SPLUNK_OPERATOR_FILE" "${SPLUNK_OPERATOR_FILE}.original"
-  fi
+  # Render each manifest into a throwaway temp copy and patch only the copy,
+  # leaving the committed manifest untouched. This guarantees every run starts
+  # from the current bundled CRD/manifest — no stale ".original" backup can
+  # shadow a freshly-pulled schema (e.g. spec.scaleFactor). Temps are removed by
+  # the cleanup_tmp EXIT trap. Reassigning the global path vars makes every
+  # downstream consumer (sed patch, kubectl apply, retries) use the temp.
+  local ai_rendered operator_rendered
+  ai_rendered=$(mktemp) || err "failed to create temp manifest"
+  cp "$SPLUNK_AI_FILE" "$ai_rendered"
+  TMP_FILES+=("$ai_rendered")
+  SPLUNK_AI_FILE="$ai_rendered"
 
-  log "Restoring from clean originals to ensure idempotent updates..."
-  cp "${SPLUNK_AI_FILE}.original" "$SPLUNK_AI_FILE"
-  cp "${SPLUNK_OPERATOR_FILE}.original" "$SPLUNK_OPERATOR_FILE"
+  # Only render the Splunk Operator manifest in internal mode. External/
+  # disabled modes never apply the manifest, so touching it
+  # (which also requires the file to exist) is pointless and would break
+  # Splunk-free installs that don't ship splunk-operator-cluster.yaml.
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    operator_rendered=$(mktemp) || err "failed to create temp manifest"
+    cp "$SPLUNK_OPERATOR_FILE" "$operator_rendered"
+    TMP_FILES+=("$operator_rendered")
+    SPLUNK_OPERATOR_FILE="$operator_rendered"
+  fi
 
   log "Updating $SPLUNK_AI_FILE..."
 
@@ -748,6 +976,10 @@ configure_images() {
   local saia_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_IMAGE")
   local saia_api_v2_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_API_V2_IMAGE")
   local saia_dataloader_full=$(build_image_url "$IMAGE_REGISTRY" "$SAIA_DATALOADER_IMAGE")
+  # slim-api is optional (feature-gated); only build a URL when configured.
+  local slim_api_full=""
+  [[ -n "$SLIM_API_IMAGE" && "$SLIM_API_IMAGE" != "null" ]] && \
+    slim_api_full=$(build_image_url "$IMAGE_REGISTRY" "$SLIM_API_IMAGE")
   local fluent_bit_full=$(build_image_url "$IMAGE_REGISTRY" "$FLUENT_BIT_IMAGE")
   local otel_collector_full=$(build_image_url "$IMAGE_REGISTRY" "$OTEL_COLLECTOR_IMAGE")
   # Nginx is an upstream image; don't rewrite it to the ECR registry unless the
@@ -762,6 +994,7 @@ configure_images() {
   local saia_api_escaped=$(echo "$saia_api_full" | sed 's/[\/&]/\\&/g')
   local saia_api_v2_escaped=$(echo "$saia_api_v2_full" | sed 's/[\/&]/\\&/g')
   local saia_dataloader_escaped=$(echo "$saia_dataloader_full" | sed 's/[\/&]/\\&/g')
+  local slim_api_escaped=$(echo "$slim_api_full" | sed 's/[\/&]/\\&/g')
   local fluent_bit_escaped=$(echo "$fluent_bit_full" | sed 's/[\/&]/\\&/g')
   local otel_collector_escaped=$(echo "$otel_collector_full" | sed 's/[\/&]/\\&/g')
   local nginx_escaped=$(echo "$nginx_full" | sed 's/[\/&]/\\&/g')
@@ -785,12 +1018,24 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API$/,/value:/ s|value:.*|value: ${saia_api_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SAIA_API_V2/,/value:/ s|value:.*|value: ${saia_api_v2_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_POST_INSTALL_HOOK/,/value:/ s|value:.*|value: ${saia_dataloader_escaped}|" "$SPLUNK_AI_FILE"
+  # slim-api is feature-gated; only rewrite when an image was configured so the
+  # manifest's default value survives untouched on saia-only installs.
+  if [[ -n "$slim_api_full" ]]; then
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SLIM_API/,/value:/ s|value:.*|value: ${slim_api_escaped}|" "$SPLUNK_AI_FILE"
+  fi
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_FLUENT_BIT/,/value:/ s|value:.*|value: ${fluent_bit_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_OTEL_COLLECTOR/,/value:/ s|value:.*|value: ${otel_collector_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_NGINX/,/value:/ s|value:.*|value: ${nginx_escaped}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
-  "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_escaped}|I" "$SPLUNK_AI_FILE"
+  # Anchor on the RAY_VERSION env entry (unique, always immediately precedes
+  # the operator container's image: line) rather than matching the image
+  # string's content. A content-based match like *splunk*ai*operator* only
+  # matches the pristine manifest's default image; once a custom
+  # image (e.g. a private registry with no such substring) has been written
+  # here, re-running install with a new tag would silently fail to match and
+  # leave the stale image in place.
+  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^        image:/ s|^        image:.*|        image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
 
   log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
   log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
@@ -798,6 +1043,7 @@ configure_images() {
   log "  ✓ Updated RELATED_IMAGE_SAIA_API: $saia_api_full"
   log "  ✓ Updated RELATED_IMAGE_SAIA_API_V2: $saia_api_v2_full"
   log "  ✓ Updated RELATED_IMAGE_POST_INSTALL_HOOK: $saia_dataloader_full"
+  [[ -n "$slim_api_full" ]] && log "  ✓ Updated RELATED_IMAGE_SLIM_API: $slim_api_full"
   log "  ✓ Updated RELATED_IMAGE_FLUENT_BIT: $fluent_bit_full"
   log "  ✓ Updated RELATED_IMAGE_OTEL_COLLECTOR: $otel_collector_full"
   log "  ✓ Updated RELATED_IMAGE_NGINX: $nginx_full"
@@ -805,19 +1051,27 @@ configure_images() {
   log "  ✓ Updated MODEL_VERSION: $MODEL_VERSION"
   log "  ✓ Updated RAY_VERSION: $RAY_RUNTIME_VERSION"
 
-  log "Updating $SPLUNK_OPERATOR_FILE..."
+  if [[ "${SPLUNK_MODE}" == "internal" ]]; then
+    log "Updating $SPLUNK_OPERATOR_FILE..."
 
-  local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
-  local splunk_operator_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
+    local splunk_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_IMAGE")
+    local splunk_operator_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
 
-  local splunk_escaped=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
-  local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
+    local splunk_escaped=$(echo "$splunk_full" | sed 's/[\/&]/\\&/g')
+    local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
-  "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
-  "${SED_INPLACE[@]}" "s|image: .*splunk.*operator.*|image: ${splunk_op_escaped}|I" "$SPLUNK_OPERATOR_FILE"
+    "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
+    # Same rationale as the AI operator image above: anchor on the unique
+    # POD_NAME env entry that always immediately precedes this container's
+    # image: line, instead of content-matching *splunk*operator* in the
+    # image string itself.
+    "${SED_INPLACE[@]}" "/name: POD_NAME/,/^        image:/ s|^        image:.*|        image: ${splunk_op_escaped}|" "$SPLUNK_OPERATOR_FILE"
 
-  log "  ✓ Updated Splunk Enterprise image: $splunk_full"
-  log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
+    log "  ✓ Updated Splunk Enterprise image: $splunk_full"
+    log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
+  else
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Operator manifest rewrite (no in-cluster Splunk)"
+  fi
   log "✓ All images configured successfully"
 }
 
@@ -882,7 +1136,22 @@ preflight_checks() {
 
   pf_header "Configuration"
   [[ -n "${CLUSTER_NAME}" ]] && pf_ok "Cluster name: ${CLUSTER_NAME}" || pf_fail "Cluster name not set"
-  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
+  case "${SPLUNK_MODE}" in
+    internal)
+      [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Splunk operator file: ${SPLUNK_OPERATOR_FILE}" || pf_warn "Splunk operator file not found: ${SPLUNK_OPERATOR_FILE}"
+      ;;
+    external)
+      pf_ok "Splunk: external → ${SPLUNK_EXTERNAL_ENDPOINT} (secret=${SPLUNK_EXTERNAL_SECRET_NAME}, in-cluster Splunk skipped)"
+      # The HEC token must be supplied via env; fail fast here rather than
+      # discovering it at CR-apply time after the cluster is already up.
+      [[ -n "${SPLUNK_HEC_TOKEN}" ]] && pf_ok "SPLUNK_HEC_TOKEN is set (external HEC token)" || pf_fail "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
+      # Endpoint should be a base HEC URL; the operator appends /services/collector.
+      [[ "${SPLUNK_EXTERNAL_ENDPOINT}" =~ ^https?:// ]] && pf_ok "External HEC endpoint scheme OK" || pf_warn "splunk.external.endpoint should start with http:// or https:// (got: ${SPLUNK_EXTERNAL_ENDPOINT})"
+      ;;
+    *)
+      pf_ok "Splunk disabled (splunk.enabled=false) — Splunk Operator/Standalone will be skipped"
+      ;;
+  esac
   [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "AI platform file: ${SPLUNK_AI_FILE}" || pf_warn "AI platform file not found: ${SPLUNK_AI_FILE}"
 
   pf_header "Object storage (customer-managed)"
@@ -1002,7 +1271,7 @@ scp_file() {
 # MUST be called AFTER `k0s install` (which, together with the stale-state cleanup,
 # recreates /var/lib/k0s) and BEFORE `k0s start` (k0s scans /var/lib/k0s/images/
 # only at kubelet startup). No-op unless AIRGAP_K0S_IMAGE_DIR points at a dir with
-# at least one *.tar (set only by install_from_airgap_bundle.sh).
+# at least one *.tar (set only by airgap_install.sh).
 stage_k0s_image_bundle() {
   local node_ip="$1"
   [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 0
@@ -1021,6 +1290,306 @@ stage_k0s_image_bundle() {
       warn "    Failed to copy ${_name} to ${node_ip} — some images may fail to pull"
     fi
   done
+}
+
+# Return success when this invocation has staged one or more k0s OCI image
+# bundles. Keeping this check in one place prevents the online path from paying
+# for journal/containerd probes that are meaningful only for air-gap installs.
+airgap_k0s_image_bundles_enabled() {
+  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 1
+  compgen -G "${AIRGAP_K0S_IMAGE_DIR}/*.tar" >/dev/null 2>&1
+}
+
+# Wait for the current k0s service invocation to finish importing every staged
+# OCI bundle. k0s starts its managed containerd and the OCIBundleReconciler in
+# parallel. Changing /etc/k0s/containerd.d while that first import is active
+# restarts containerd and aborts the import with "error reading from server:
+# EOF". Call this immediately after k0s starts and BEFORE writing containerd
+# registry configuration.
+wait_for_k0s_image_bundles() {
+  local node_ip="$1" service_name="$2" since_epoch="$3"
+  airgap_k0s_image_bundles_enabled || return 0
+
+  local timeout_seconds="${AIRGAP_IMAGE_IMPORT_TIMEOUT:-600}"
+  local elapsed=0 poll_seconds=5 journal_output=""
+  local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  local service_pid journal_query
+
+  # Include the second before systemctl start/restart so logs emitted in the
+  # same wall-clock second are not missed by journalctl's timestamp boundary.
+  (( since_epoch > 0 )) && since_epoch=$((since_epoch - 1))
+  service_pid=$(ssh_exec "${node_ip}" \
+    "sudo systemctl show --property=MainPID --value ${service_name} 2>/dev/null" \
+    2>/dev/null | tr -d '[:space:]' || true)
+  if [[ "${service_pid}" =~ ^[1-9][0-9]*$ ]]; then
+    # _PID scopes the search to this exact k0s invocation. Timestamp-only
+    # filtering can accidentally accept a success emitted by the containerd
+    # config watcher's transient restart immediately before systemctl restart.
+    journal_query="sudo journalctl _PID=${service_pid} --no-pager -o cat 2>/dev/null"
+  else
+    journal_query="sudo journalctl -u ${service_name} --since='@${since_epoch}' --no-pager -o cat 2>/dev/null"
+  fi
+  log "  Waiting for ${#_tars[@]} air-gap image bundle(s) to import on ${node_ip}..."
+
+  while (( elapsed < timeout_seconds )); do
+    journal_output=$(ssh_exec "${node_ip}" \
+      "${journal_query} | grep -E 'OCI bundle|Failed to load OCI bundle' || true" \
+      2>/dev/null || true)
+
+    local all_loaded=true _tar _name
+    for _tar in "${_tars[@]}"; do
+      _name="$(basename "${_tar}")"
+      if grep -Fq "OCI bundle /var/lib/k0s/images/${_name} loaded" <<<"${journal_output}"; then
+        continue
+      fi
+      if grep -Fq "Failed to load OCI bundle /var/lib/k0s/images/${_name}" <<<"${journal_output}"; then
+        warn "  k0s failed to import ${_name} on ${node_ip}."
+        warn "  Refusing to configure/restart containerd while the offline image set is incomplete."
+        return 1
+      fi
+      all_loaded=false
+    done
+
+    if [[ "${all_loaded}" == "true" ]]; then
+      log "  ✓ All air-gap image bundles imported on ${node_ip}"
+      return 0
+    fi
+
+    sleep "${poll_seconds}"
+    elapsed=$((elapsed + poll_seconds))
+  done
+
+  warn "  Timed out after ${timeout_seconds}s waiting for air-gap image imports on ${node_ip}."
+  return 1
+}
+
+# Verify that every reference used to build the offline bundles is registered
+# in the node's k8s.io containerd namespace. A successful tar read alone is not
+# enough: this catches partial imports before cert-manager or any other add-on
+# creates pods that would otherwise fall back to a blocked public registry.
+verify_airgap_bundle_images_on_node() {
+  local node_ip="$1"
+  airgap_k0s_image_bundles_enabled || return 0
+
+  local _lists=( "${AIRGAP_K0S_IMAGE_DIR}"/*.list )
+  if [[ ! -f "${_lists[0]}" ]]; then
+    warn "  No *.list files found next to the air-gap image bundles in ${AIRGAP_K0S_IMAGE_DIR}."
+    return 1
+  fi
+
+  local present_images
+  if ! present_images=$(ssh_exec "${node_ip}" "sudo k0s ctr -n k8s.io images list -q 2>/dev/null"); then
+    warn "  Could not query containerd images on ${node_ip}."
+    return 1
+  fi
+
+  local missing=() _list image docker_normalized index_normalized
+  for _list in "${_lists[@]}"; do
+    [[ -f "${_list}" ]] || continue
+    while IFS= read -r image || [[ -n "${image}" ]]; do
+      image="${image%$'\r'}"
+      [[ -z "${image}" || "${image}" == \#* ]] && continue
+
+      if grep -Fqx "${image}" <<<"${present_images}"; then
+        continue
+      fi
+
+      docker_normalized=""
+      if [[ "${image}" != */* ]]; then
+        docker_normalized="docker.io/library/${image}"
+      elif [[ "${image%%/*}" != *.* && "${image%%/*}" != *:* && "${image%%/*}" != "localhost" ]]; then
+        docker_normalized="docker.io/${image}"
+      fi
+      index_normalized="${docker_normalized/docker.io\//index.docker.io/}"
+
+      if [[ -n "${docker_normalized}" ]] && \
+         { grep -Fqx "${docker_normalized}" <<<"${present_images}" || \
+           grep -Fqx "${index_normalized}" <<<"${present_images}"; }; then
+        continue
+      fi
+      missing+=("${image}")
+    done < "${_list}"
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    warn "  ${node_ip} is missing ${#missing[@]} image(s) from the air-gap bundles:"
+    local _missing
+    for _missing in "${missing[@]:0:20}"; do warn "    - ${_missing}"; done
+    (( ${#missing[@]} > 20 )) && warn "    ... and $((${#missing[@]} - 20)) more"
+    return 1
+  fi
+
+  log "  ✓ Verified all bundled image references on ${node_ip}"
+}
+
+# Registry drop-ins are written only after the first OCI import completes. The
+# k0s containerd config watcher may restart containerd when those files change,
+# so follow that change with one explicit full k0s restart and verify the second
+# bundle reconciliation before continuing.
+restart_k0s_after_registry_configuration() {
+  local node_ip="$1" service_name="$2"
+  [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] || return 0
+
+  local restart_epoch
+  restart_epoch=$(ssh_exec "${node_ip}" "date +%s")
+  log "  Restarting ${service_name} on ${node_ip} after registry configuration..."
+  ssh_exec "${node_ip}" "sudo systemctl restart ${service_name}"
+
+  local elapsed=0
+  until ssh_exec "${node_ip}" "sudo systemctl is-active --quiet ${service_name}" &>/dev/null; do
+    if (( elapsed >= 120 )); then
+      warn "  ${service_name} did not become active on ${node_ip} after registry configuration."
+      return 1
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  wait_for_k0s_image_bundles "${node_ip}" "${service_name}" "${restart_epoch}" || return 1
+  verify_airgap_bundle_images_on_node "${node_ip}"
+}
+
+# Refresh changed OCI bundles on a node whose k0s service is already running.
+# The normal bootstrap path stages bundles before the first start, but a rerun
+# can point at a newer bundle (for example after k0s adds system images).  Copy
+# changed archives to /tmp while k0s stays available, stop the service only for
+# the atomic replacement, then start it once and wait for reconciliation.  This
+# avoids both stale archives and an in-flight import being cut off by a restart.
+refresh_airgap_image_bundles_on_running_node() {
+  local node_ip="$1" service_name="$2"
+  airgap_k0s_image_bundles_enabled || return 0
+
+  local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
+  local changed_names=() staged_paths=()
+  local _tar _name _local_sha _remote_sha _remote_tmp
+
+  for _tar in "${_tars[@]}"; do
+    _name="$(basename "${_tar}")"
+    _local_sha="$(sha256sum "${_tar}" | awk '{print $1}')"
+    _remote_sha="$(ssh_exec "${node_ip}" \
+      "sudo sha256sum /var/lib/k0s/images/${_name} 2>/dev/null | awk '{print \$1}'" \
+      2>/dev/null | tr -d '[:space:]' || true)"
+
+    if [[ -n "${_remote_sha}" && "${_remote_sha}" == "${_local_sha}" ]]; then
+      log "  ✓ ${node_ip}: ${_name} already matches the staged bundle"
+      continue
+    fi
+
+    _remote_tmp="/tmp/k0s-airgap-${$}-${_name}"
+    log "  Staging updated ${_name} on ${node_ip} before ${service_name} restart..."
+    if ! scp_file "${_tar}" "${node_ip}" "${_remote_tmp}"; then
+      warn "  Failed to copy updated ${_name} to ${node_ip}."
+      local _cleanup_path
+      for _cleanup_path in "${staged_paths[@]}"; do
+        ssh_exec "${node_ip}" "rm -f ${_cleanup_path}" >/dev/null 2>&1 || true
+      done
+      return 1
+    fi
+    changed_names+=("${_name}")
+    staged_paths+=("${_remote_tmp}")
+  done
+
+  if (( ${#changed_names[@]} == 0 )); then
+    log "  ✓ ${node_ip}: all on-node air-gap archives are current"
+    verify_airgap_bundle_images_on_node "${node_ip}"
+    return
+  fi
+
+  log "  Replacing ${#changed_names[@]} changed archive(s) and restarting ${service_name} on ${node_ip}..."
+  if ! ssh_exec "${node_ip}" "sudo systemctl stop ${service_name}"; then
+    warn "  Could not stop ${service_name} on ${node_ip}; updated archives remain in /tmp."
+    return 1
+  fi
+
+  local move_failed=0 i
+  for i in "${!changed_names[@]}"; do
+    if ! ssh_exec "${node_ip}" \
+      "sudo mv -f ${staged_paths[$i]} /var/lib/k0s/images/${changed_names[$i]} && sudo chown root:root /var/lib/k0s/images/${changed_names[$i]} && sudo chmod 600 /var/lib/k0s/images/${changed_names[$i]}"; then
+      warn "  Failed to replace ${changed_names[$i]} on ${node_ip}."
+      move_failed=1
+    fi
+  done
+
+  local start_epoch
+  start_epoch="$(ssh_exec "${node_ip}" "date +%s")"
+  if ! ssh_exec "${node_ip}" "sudo systemctl start ${service_name}"; then
+    warn "  ${service_name} failed to start on ${node_ip} after refreshing air-gap archives."
+    return 1
+  fi
+  (( move_failed == 0 )) || return 1
+
+  local elapsed=0
+  until ssh_exec "${node_ip}" "sudo systemctl is-active --quiet ${service_name}" &>/dev/null; do
+    if (( elapsed >= 120 )); then
+      warn "  ${service_name} did not become active on ${node_ip} after refreshing air-gap archives."
+      return 1
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  wait_for_k0s_image_bundles "${node_ip}" "${service_name}" "${start_epoch}" || return 1
+  verify_airgap_bundle_images_on_node "${node_ip}" || return 1
+
+  if [[ "${service_name}" == "k0scontroller" ]]; then
+    elapsed=0
+    until ssh_exec "${node_ip}" "sudo k0s kubectl get --raw /healthz 2>/dev/null" &>/dev/null; do
+      if (( elapsed >= 120 )); then
+        warn "  Controller API did not recover on ${node_ip} after refreshing air-gap archives."
+        return 1
+      fi
+      sleep 5
+      elapsed=$((elapsed + 5))
+    done
+  fi
+}
+
+# Existing-cluster installs must refresh the on-node archives before the final
+# image gate.  Without this, a new staging run can verify a new *.list against
+# an older /var/lib/k0s/images/*.tar and report every newly-added k0s image as
+# missing even though the new archive was built correctly.
+refresh_airgap_image_bundles_on_existing_nodes() {
+  airgap_k0s_image_bundles_enabled || return 0
+
+  log "Refreshing air-gap image bundles on the existing cluster..."
+  local failed_nodes=() node_ip
+  for node_ip in "${CONTROLLER_IPS[@]}"; do
+    refresh_airgap_image_bundles_on_running_node "${node_ip}" "k0scontroller" \
+      || failed_nodes+=("${node_ip}")
+  done
+  for node_ip in "${WORKER_IPS[@]}"; do
+    refresh_airgap_image_bundles_on_running_node "${node_ip}" "k0sworker" \
+      || failed_nodes+=("${node_ip}")
+  done
+
+  if (( ${#failed_nodes[@]} > 0 )); then
+    err "Failed to refresh air-gap image bundles on: ${failed_nodes[*]}
+    The retained bundle is safe to reuse after fixing the node-level error."
+  fi
+}
+
+# Final pre-stack gate. It also protects the useExisting/rerun path, where k0s
+# bootstrap is intentionally skipped but the installer must still prove that
+# sealed nodes can launch every infrastructure image without public egress.
+verify_airgap_bundle_images_on_all_nodes() {
+  airgap_k0s_image_bundles_enabled || return 0
+
+  log "Verifying air-gap image bundles on every cluster node..."
+  local all_node_ips=()
+  declare -p CONTROLLER_IPS &>/dev/null && all_node_ips+=( "${CONTROLLER_IPS[@]}" )
+  declare -p WORKER_IPS &>/dev/null && all_node_ips+=( "${WORKER_IPS[@]}" )
+  (( ${#all_node_ips[@]} > 0 )) \
+    || err "Air-gap image verification could not determine any cluster node IPs."
+  local failed_nodes=() node_ip
+  for node_ip in "${all_node_ips[@]}"; do
+    verify_airgap_bundle_images_on_node "${node_ip}" || failed_nodes+=("${node_ip}")
+  done
+
+  if (( ${#failed_nodes[@]} > 0 )); then
+    err "Air-gap image verification failed on: ${failed_nodes[*]}
+    k0s add-ons were not installed because they would attempt public-registry pulls.
+    Check the k0s service journal for OCIBundleReconciler errors, then rerun install."
+  fi
 }
 
 # ====== PREFLIGHT: REGISTRY REACHABILITY CHECK ======
@@ -1104,7 +1673,7 @@ preflight_check_registry() {
 
   local probe_ref=""
   local probe_source=""
-  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
+  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE SLIM_API_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
     local _val="${!_candidate_var:-}"
     local _ref
     if _ref=$(_image_targets_registry "${_val}"); then
@@ -1331,14 +1900,92 @@ prepare_nodes_for_k0s() {
       fi
     fi
 
+    # Same reasoning as the k0s binary above: AIRGAP_PYYAML_WHEEL_PATH is a path on
+    # the installer host and does not cross into the heredoc below, so the file has
+    # to be copied to a fixed location the remote script can find.
+    if [[ "${AIRGAP_MODE}" == "true" && -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
+      log "    Copying bundled PyYAML to ${node_ip}:/tmp/pyyaml-airgap ..."
+      scp_file "${AIRGAP_PYYAML_WHEEL_PATH}" "${node_ip}" \
+        "/tmp/pyyaml-airgap$([[ "${AIRGAP_PYYAML_WHEEL_PATH}" == *.whl ]] && echo .whl || echo .tar.gz)" \
+        || warn "    Failed to copy PyYAML to ${node_ip} — k0s config generation may fail"
+    fi
+
+    # Netfilter modules for kernels that omit them (el10 keeps xt_conntrack in
+    # kernel-modules-extra). Copied to a fixed path because the closure path does
+    # not cross into the heredoc below. Absent on RHEL 9 / Ubuntu bundles.
+    if [[ "${AIRGAP_MODE}" == "true" && -d "${AIRGAP_NODE_RPM_CLOSURE_DIR:-}" ]]; then
+      local _nc_tar="/tmp/node-closure-$$-${node_ip//[^0-9]/_}.tar"
+      if tar -cf "${_nc_tar}" -C "$(dirname "${AIRGAP_NODE_RPM_CLOSURE_DIR}")" \
+           "$(basename "${AIRGAP_NODE_RPM_CLOSURE_DIR}")"; then
+        log "    Copying node package closure to ${node_ip}:/tmp/node-closure.tar ..."
+        scp_file "${_nc_tar}" "${node_ip}" "/tmp/node-closure.tar" \
+          || warn "    Failed to copy the node package closure to ${node_ip} — node prep may fail"
+      else
+        warn "    Failed to pack ${AIRGAP_NODE_RPM_CLOSURE_DIR} — node prep may fail"
+      fi
+      rm -f "${_nc_tar}"
+    fi
+
+    local _prep_rc=0
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
-      bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
-      # Disable firewalld if active (blocks k0s ports: 6443, 10250, 8472, etc.)
-      if systemctl is-active firewalld >/dev/null 2>&1; then
-        echo 'Disabling firewalld...'
-        sudo systemctl stop firewalld
-        sudo systemctl disable firewalld
+      bash -s <<'REMOTE_SCRIPT' || _prep_rc=$?
+      # Disable host firewalls if active (they block k0s ports: 6443, 10250,
+      # 8472, 179, etc.). Each family ships a different one, and on-prem images
+      # differ from cloud images: AWS Ubuntu AMIs leave ufw inactive, but a
+      # stock Ubuntu Server install commonly has it enabled, in which case the
+      # cluster silently fails to form rather than erroring out.
+      for _fw in firewalld ufw nftables; do
+        if systemctl is-active "${_fw}" >/dev/null 2>&1; then
+          echo "Disabling ${_fw}..."
+          sudo systemctl stop "${_fw}" || true
+          sudo systemctl disable "${_fw}" || true
+        fi
+      done
+      # ufw can be enabled without its unit being reported active; the CLI is
+      # the authoritative check on Debian-family hosts.
+      if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        echo 'Disabling ufw (via CLI)...'
+        sudo ufw --force disable || true
+      fi
+
+      # RHEL 10 ships the netfilter modules kube-proxy and Calico need (xt_conntrack
+      # et al) in kernel-modules-extra, not the base kernel package, and the stock
+      # AMI omits it. Without them the iptables proxier programs no rules, so every
+      # ClusterIP is unreachable and nodes stay NotReady. Probing the module rather
+      # than the OS version leaves RHEL 9 and Ubuntu 24.04 untouched.
+      # Via sudo so the probe cannot false-negative on a login shell whose PATH
+      # omits /usr/sbin, which would wrongly fail an otherwise fine RHEL 9 node.
+      if ! sudo modinfo xt_conntrack >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
+        echo "xt_conntrack missing — installing kernel-modules-extra-$(uname -r)..."
+        # Pinned to the running kernel, with no fall back to the repo's current
+        # version: modules for a different kernel land in a /lib/modules directory
+        # modprobe never searches, so that "success" would leave the node broken.
+        if [ -f /tmp/node-closure.tar ]; then
+          # --disablerepo='*' keeps the node offline and stops dnf spending
+          # minutes timing out against RHUI mirrors it cannot reach.
+          echo "  installing from the air-gap node package closure"
+          sudo rm -rf /opt/airgap-node-rpms
+          sudo mkdir -p /opt/airgap-node-rpms
+          sudo tar -xf /tmp/node-closure.tar -C /opt/airgap-node-rpms --strip-components=1
+          rm -f /tmp/node-closure.tar
+          sudo dnf install -y \
+            --disablerepo='*' \
+            --repofrompath="airgap-node,/opt/airgap-node-rpms" \
+            --setopt=airgap-node.gpgcheck=0 \
+            "kernel-modules-extra-$(uname -r)" || true
+        else
+          sudo dnf install -y "kernel-modules-extra-$(uname -r)" || true
+        fi
+        if ! sudo modinfo xt_conntrack >/dev/null 2>&1; then
+          echo "ERROR: xt_conntrack still unavailable for kernel $(uname -r)."
+          echo "  kube-proxy cannot program iptables rules, so this node would stay NotReady."
+          echo "  Install kernel-modules-extra-$(uname -r), or boot a kernel that has a"
+          echo "  matching package in your repos, then re-run the installer."
+          # 78 tells the caller this node can never join, as opposed to the
+          # best-effort steps elsewhere in this script that only warn.
+          exit 78
+        fi
       fi
 
       # Load kernel modules required by Calico and kube-proxy
@@ -1356,19 +2003,26 @@ prepare_nodes_for_k0s() {
         echo "python3+pyyaml already present"
       else
         echo "Installing python3-pyyaml..."
-        # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
-        # back to the OS package manager (which will succeed if a local repo
-        # mirror is configured on the node).  Internet-only paths are guarded
-        # by the AIRGAP_PYYAML_WHEEL_PATH check so we never silently skip them.
-        if [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]]; then
-          echo "Installing pyyaml from bundled wheel ${AIRGAP_PYYAML_WHEEL_PATH}..."
-          sudo pip3 install --no-index --find-links="$(dirname "${AIRGAP_PYYAML_WHEEL_PATH}")" pyyaml 2>/dev/null \
-            || sudo pip3 install "${AIRGAP_PYYAML_WHEEL_PATH}" 2>/dev/null \
-            || echo "WARN: pip3 wheel install failed — python3-pyyaml may be missing"
+        # Air-gap: the installer host scp'd the bundled wheel/sdist to
+        # /tmp/pyyaml-airgap.* before this heredoc ran (the env var itself does not
+        # cross the SSH boundary, so the fixed path is how the file is found).
+        # Prefer it over any network path so an air-gapped node never reaches out.
+        _pyyaml_local="$(ls /tmp/pyyaml-airgap.whl /tmp/pyyaml-airgap.tar.gz 2>/dev/null | head -1)"
+        if [ -n "${_pyyaml_local}" ]; then
+          echo "Installing pyyaml from air-gap bundle (${_pyyaml_local})..."
+          # Ubuntu 24.04 marks the system Python externally-managed (PEP 668), so
+          # a plain pip3 install fails there; --break-system-packages is the
+          # documented opt-out and is a no-op on pip versions that predate it.
+          sudo pip3 install --no-index "${_pyyaml_local}" 2>/dev/null \
+            || sudo pip3 install --no-index --break-system-packages "${_pyyaml_local}" 2>/dev/null \
+            || sudo dnf install -y python3-pyyaml 2>/dev/null \
+            || echo "WARN: pyyaml install from bundle failed — k0s config generation may fail"
+          rm -f "${_pyyaml_local}"
         elif command -v dnf >/dev/null 2>&1; then
           sudo dnf install -y python3-pyyaml 2>/dev/null || sudo pip3 install pyyaml 2>/dev/null || true
         elif command -v apt-get >/dev/null 2>&1; then
-          sudo apt-get install -y python3-yaml 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y python3-yaml 2>/dev/null || true
         else
           echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
         fi
@@ -1398,6 +2052,11 @@ prepare_nodes_for_k0s() {
         sudo ln -sf /usr/local/bin/k0s /usr/bin/k0s
       fi
 REMOTE_SCRIPT
+    if [[ ${_prep_rc} -eq 78 ]]; then
+      err "Node preparation failed on ${node_ip}: the netfilter kernel modules kube-proxy requires are unavailable (details above)."
+    elif [[ ${_prep_rc} -ne 0 ]]; then
+      warn "  Preparation had issues on ${node_ip}"
+    fi
   done
 }
 
@@ -1745,7 +2404,15 @@ PYSCRIPT"
   # plugin key at preflight, crashing k0s before configure_insecure_registry_on_node
   # can execute its own cleanup.
   ssh_exec "${controller_ip}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
+  local controller_start_epoch
+  controller_start_epoch=$(ssh_exec "${controller_ip}" "date +%s")
   ssh_exec "${controller_ip}" "sudo k0s start"
+
+  # Do not write any containerd drop-ins until k0s has finished its first OCI
+  # reconciliation. The containerd config watcher restarts the runtime and
+  # would otherwise sever an in-flight bundle import with an EOF.
+  wait_for_k0s_image_bundles "${controller_ip}" "k0scontroller" "${controller_start_epoch}" \
+    || err "Offline image bundle import failed on controller ${controller_ip}."
 
   log "Waiting for controller API server to be ready..."
   local ctrl_retries=0
@@ -1762,6 +2429,27 @@ PYSCRIPT"
   # Configure insecure registry after k0s start so that containerd has written
   # /etc/k0s/containerd.toml — required for correct containerd v1/v2 detection.
   configure_insecure_registry_on_node "${controller_ip}"
+
+  if [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]]; then
+    restart_k0s_after_registry_configuration "${controller_ip}" "k0scontroller" \
+      || err "Controller ${controller_ip} did not recover cleanly after registry configuration."
+
+    log "Waiting for controller API server after registry restart..."
+    local ctrl_restart_retries=0
+    while (( ctrl_restart_retries < 60 )); do
+      if ssh_exec "${controller_ip}" "sudo k0s kubectl get --raw /healthz 2>/dev/null" &>/dev/null; then
+        log "  ✓ Controller API server is ready after registry restart (${ctrl_restart_retries}s)"
+        break
+      fi
+      sleep 5
+      ctrl_restart_retries=$((ctrl_restart_retries + 5))
+    done
+    (( ctrl_restart_retries < 60 )) \
+      || err "Controller API server did not recover after registry configuration restart."
+  else
+    verify_airgap_bundle_images_on_node "${controller_ip}" \
+      || err "Offline image verification failed on controller ${controller_ip}."
+  fi
 
   # Generate worker token
   log "Generating worker join token..."
@@ -1820,11 +2508,31 @@ PYSCRIPT"
     # plugin key at preflight, crashing k0sworker before configure_insecure_registry_on_node
     # can execute its own cleanup.
     ssh_exec "${worker_ip}" "sudo rm -f /etc/k0s/containerd.d/insecure-registry.toml" || true
+    local worker_start_epoch
+    worker_start_epoch=$(ssh_exec "${worker_ip}" "date +%s")
     if ssh_exec "${worker_ip}" "sudo k0s start"; then
       log "  ✓ k0s started on ${worker_ip}"
-      # Configure insecure registry after k0s start so containerd is running
-      # and the v1/v2 detection against the containerd binary is reliable.
+
+      if ! wait_for_k0s_image_bundles "${worker_ip}" "k0sworker" "${worker_start_epoch}"; then
+        warn "  ✗ Offline image bundle import failed on ${worker_ip}"
+        failed_workers+=("${worker_ip}")
+        continue
+      fi
+
+      # Configure the registry only after the initial bundle import is done,
+      # then perform one deliberate full restart and verify the second import.
       configure_insecure_registry_on_node "${worker_ip}"
+      if [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]]; then
+        if ! restart_k0s_after_registry_configuration "${worker_ip}" "k0sworker"; then
+          warn "  ✗ k0sworker did not recover cleanly on ${worker_ip} after registry configuration"
+          failed_workers+=("${worker_ip}")
+          continue
+        fi
+      elif ! verify_airgap_bundle_images_on_node "${worker_ip}"; then
+        warn "  ✗ Offline image verification failed on ${worker_ip}"
+        failed_workers+=("${worker_ip}")
+        continue
+      fi
     else
       warn "  ✗ Failed to start k0s on ${worker_ip}"
       failed_workers+=("${worker_ip}")
@@ -1939,15 +2647,59 @@ PYSCRIPT"
 }
 
 # ====== RESOLVE NODE NAME ======
-# Maps a config IP to its Kubernetes node name by SSHing to the node
-# and reading its hostname (which is what k0s uses as the node name).
-# Usage: node_name=$(resolve_node_name "1.2.3.4")
+# Maps a config IP to its Kubernetes node name. Prefer the name already
+# registered in the API for that InternalIP; otherwise try the node's full and
+# short hostnames, accepting only a candidate that exists in the API server.
+# Optionally retry for up to timeout_seconds while the Node object registers.
+# Usage: node_name=$(resolve_node_name "1.2.3.4" [timeout_seconds])
 resolve_node_name() {
   local ip="$1"
-  # SSH to the node and get the hostname that k0s registered it with
-  local node_name
-  node_name=$(ssh_exec "${ip}" "hostname -f 2>/dev/null || hostname" 2>/dev/null || echo "")
-  echo "${node_name}"
+  local timeout="${2:-0}"
+  local node_name full_name short_name candidate
+  local elapsed=0
+
+  while :; do
+    node_name=$(kubectl get nodes -o json 2>/dev/null \
+      | jq -r --arg ip "${ip}" '
+          first(
+            .items[]
+            | select(any(.status.addresses[]?;
+                .type == "InternalIP" and .address == $ip))
+            | .metadata.name
+          ) // empty
+        ' 2>/dev/null \
+      || true)
+    if [[ -n "${node_name}" ]]; then
+      echo "${node_name}"
+      return 0
+    fi
+
+    # Cache successful SSH lookups, but retry either lookup if SSH was not ready
+    # when this function first ran.
+    [[ -n "${full_name:-}" ]] \
+      || full_name=$(ssh_exec "${ip}" "hostname -f" 2>/dev/null || true)
+    [[ -n "${short_name:-}" ]] \
+      || short_name=$(ssh_exec "${ip}" "hostname -s" 2>/dev/null || true)
+
+    # Some environments register the FQDN (notably EC2 private DNS names),
+    # while others register the short hostname. Never return a
+    # guessed/truncated name: verify each candidate against the API first.
+    for candidate in "${full_name:-}" "${short_name:-}"; do
+      [[ -z "${candidate}" ]] && continue
+      if kubectl get node "${candidate}" >/dev/null 2>&1; then
+        echo "${candidate}"
+        return 0
+      fi
+    done
+
+    if (( elapsed >= timeout )); then
+      break
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  return 1
 }
 
 # ====== LABEL NODES FOR WORKLOAD SCHEDULING ======
@@ -1988,23 +2740,18 @@ label_nodes() {
     fi
   done
 
-  # Helper: wait up to 60s for a given node name to appear in the API server.
+  # Helper: wait up to 60s for a config IP to resolve to a visible Node.
   # This guards against the race where a worker joined the cluster just after
   # the top-of-function readiness check returned but its Node object is still
   # propagating to the API server we're talking to.
   _wait_for_node_visible() {
-    local node_name="$1"
-    local ip="$2"
-    local tries=0
-    local max_tries=12  # 12 * 5s = 60s
-    while (( tries < max_tries )); do
-      if kubectl get node "${node_name}" &>/dev/null; then
-        return 0
-      fi
-      sleep 5
-      tries=$((tries + 1))
-    done
-    warn "  Node '${node_name}' (from ${ip}) did not become visible in API server after 60s"
+    local ip="$1"
+    local node_name
+    if node_name=$(resolve_node_name "${ip}" 60); then
+      echo "${node_name}"
+      return 0
+    fi
+    warn "  Node from ${ip} did not become visible in API server after 60s"
     return 1
   }
 
@@ -2014,16 +2761,9 @@ label_nodes() {
   # Label controller nodes
   for controller_ip in "${CONTROLLER_IPS[@]}"; do
     local node_name
-    node_name=$(resolve_node_name "${controller_ip}")
-
-    if [[ -z "${node_name}" ]]; then
-      warn "  Could not resolve hostname for controller ${controller_ip}, skipping..."
-      labeling_failures+=("${controller_ip} (hostname unresolved)")
-      continue
-    fi
-
-    if ! _wait_for_node_visible "${node_name}" "${controller_ip}"; then
-      labeling_failures+=("${controller_ip} / ${node_name} (never visible)")
+    if ! node_name=$(_wait_for_node_visible "${controller_ip}"); then
+      warn "  Could not resolve Kubernetes node for controller ${controller_ip}, skipping..."
+      labeling_failures+=("${controller_ip} (never visible)")
       continue
     fi
 
@@ -2050,17 +2790,9 @@ label_nodes() {
   local worker_index=0
   for worker_ip in "${WORKER_IPS[@]}"; do
     local node_name
-    node_name=$(resolve_node_name "${worker_ip}")
-
-    if [[ -z "${node_name}" ]]; then
-      warn "  Could not resolve hostname for worker ${worker_ip}, skipping..."
-      labeling_failures+=("${worker_ip} (hostname unresolved)")
-      worker_index=$((worker_index + 1))
-      continue
-    fi
-
-    if ! _wait_for_node_visible "${node_name}" "${worker_ip}"; then
-      labeling_failures+=("${worker_ip} / ${node_name} (never visible)")
+    if ! node_name=$(_wait_for_node_visible "${worker_ip}"); then
+      warn "  Could not resolve Kubernetes node for worker ${worker_ip}, skipping..."
+      labeling_failures+=("${worker_ip} (never visible)")
       worker_index=$((worker_index + 1))
       continue
     fi
@@ -2112,8 +2844,7 @@ label_nodes() {
     done
     for ip in "${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}"; do
       local nn
-      nn=$(resolve_node_name "${ip}")
-      [[ -z "${nn}" ]] && continue
+      nn=$(resolve_node_name "${ip}") || continue
       if echo "${unlabeled}" | grep -qx "${nn}"; then
         # Best-effort: apply CPU labels to the controller, CPU labels to
         # any worker whose index is < CPU_WORKER_COUNT, else GPU labels.
@@ -2225,7 +2956,7 @@ ensure_s3compat_credentials() {
   # may still be starting up, or its VIP may not be routable yet.
   local _endpoint=""
   case "${OBJ_STORE_TYPE}" in
-    minio|seaweedfs)
+    minio|seaweedfs|s3compat)
       _endpoint="${OBJ_STORE_ENDPOINT:-${MINIO_ENDPOINT:-}}"
       ;;
     aws)
@@ -2273,24 +3004,23 @@ ensure_s3compat_credentials() {
 
 # ====== MODEL ARTIFACT STAGING ======
 
-# Return the model-artifact manifest used by an accelerator. RTX Pro 6000
-# Blackwell uses the same quantized model set as H100. Keep this selection in
-# one place so pre-staging and post-upload verification cannot drift apart.
+# Return the model-artifact profile used by an accelerator. Keep this selection
+# in one place so pre-staging and post-upload verification cannot drift apart.
 model_artifacts_config_name() {
   local accel
   accel=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
   case "${accel}" in
-    h100|rtx_pro_6000_blackwell) echo "model_artifacts_configs_h100.yaml" ;;
-    *)                           echo "model_artifacts_configs.yaml" ;;
+    l40s|"")                    echo "model_artifacts_configs_unquantized.yaml" ;;
+    h100|rtx_pro_6000_blackwell) echo "model_artifacts_configs_quantized.yaml" ;;
+    *)                           return 1 ;;
   esac
 }
 
 # all_models_staged <staging_dir> <accel>
-# Checks whether every artifact in the GPU-specific model config already has a
-# staging_state/<id>/.staging_complete marker in the object store AND that the
-# marker's accel= field matches the requested accelerator. A marker with a
-# mismatched accel (e.g. l40s marker found when h100 is requested) is treated as
-# missing so the correct model weights are downloaded and uploaded.
+# Checks whether every artifact in the selected model profile already has a
+# staging_state/<id>/.staging_complete marker in the object store and that its
+# hf_url= field matches the selected profile. This permits H100 and RTX Pro to
+# reuse identical quantized artifacts while keeping L40S weights separate.
 # Returns 0 (all staged) or 1 (one or more missing / check unavailable).
 # Fails open: if the store is unreachable or a required tool is missing, returns 1
 # so staging proceeds normally.
@@ -2373,8 +3103,8 @@ all_models_staged() {
       for i in "${!ids[@]}"; do
         local id="${ids[$i]}" hf_url="${hf_urls[$i]:-}"
         local marker_path="${_alias}/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete"
-        local content
-        content=$(mc cat "${marker_path}" 2>/dev/null) || { missing+=("${id}"); continue; }
+        local content=""
+        content=$(mc cat "${marker_path}" 2>/dev/null) || content=""
         _marker_matches_url "${content}" "${hf_url}" || missing+=("${id}")
       done
       ;;
@@ -2398,8 +3128,8 @@ all_models_staged() {
 
 # Downloads model artifacts from Hugging Face and uploads them to the configured
 # object store. Runs before k0s cluster work so models are available when Ray
-# workers start. Reads HF credentials from model_artifacts_configs.yaml (in the
-# same directory as the upload/download scripts — no extra env vars needed for HF).
+# workers start. Reads HF credentials from the selected model-artifact profile
+# in the upload/download scripts directory.
 stage_model_artifacts() {
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
@@ -2429,15 +3159,14 @@ stage_model_artifacts() {
     return 0
   fi
 
-  # ---- Check HuggingFace reachability (skip in air-gap mode) ----
-  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
-    wait_for_dependency \
-      "HuggingFace (huggingface.co) — required for model weight download" \
-      "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
-      300
-  else
-    log "AIRGAP_MODE=true — skipping HuggingFace connectivity check (models must be pre-staged in object store)"
-  fi
+  # ---- Check HuggingFace reachability ----
+  # This function only runs when staging is actually about to happen (from
+  # THIS machine), regardless of AIRGAP_MODE — air-gap only means the cluster
+  # nodes lack internet, not necessarily this installer machine.
+  wait_for_dependency \
+    "HuggingFace (huggingface.co) — required for model weight download" \
+    "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+    300
 
   # ---- Download from Hugging Face ----
   log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
@@ -2555,6 +3284,49 @@ stage_model_artifacts() {
   log "✓ Model artifact staging complete (type=${OBJ_STORE_TYPE}, bucket=${OBJ_STORE_BUCKET})"
 }
 
+# When automatic staging is disabled for an air-gap install, do not merely
+# trust that models were staged out-of-band. Verify the per-model completion
+# markers before touching the cluster; otherwise the installer can finish while
+# SAIA and Ray Serve immediately fail with NoSuchBucket/404 errors.
+verify_pre_staged_model_artifacts() {
+  local staging_dir
+  staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
+    || { err "Cannot locate artifacts_download_upload_scripts directory"; return 1; }
+
+  local _accel
+  _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
+
+  if all_models_staged "${staging_dir}" "${_accel}"; then
+    log "✓ Verified pre-staged model artifacts in ${OBJ_STORE_BUCKET}"
+    return 0
+  fi
+
+  err "Air-gap model verification failed for bucket '${OBJ_STORE_BUCKET}'.
+    storage.modelStaging.enabled=false means every required model must already
+    exist in that bucket with a matching staging_state marker. Either correct
+    storage.objectStore.bucket, or set storage.modelStaging.enabled=true on an
+    internet-connected installer and rerun."
+}
+
+# Return the names of cert-manager pods whose current pod UID is stuck in
+# kubelet's image-pull backoff.  The explicit []? iterator matters here:
+# any(array; condition) evaluates the condition against the array itself,
+# which makes `.state.waiting.reason` fail with "Cannot index array with
+# string state" and silently prevents rerun recovery.
+cert_manager_image_pull_backoff_pods() {
+  kubectl get pods -n cert-manager \
+    -l app.kubernetes.io/instance=cert-manager -o json 2>/dev/null \
+    | jq -r '
+        .items[]
+        | select(any(
+            (((.status.initContainerStatuses // [])
+              + (.status.containerStatuses // []))[]?);
+            ((.state.waiting.reason // "") == "ImagePullBackOff"
+             or (.state.waiting.reason // "") == "ErrImagePull")
+          ))
+        | .metadata.name'
+}
+
 # ====== INSTALL CERT-MANAGER ======
 install_cert_manager() {
   log "Installing cert-manager..."
@@ -2566,8 +3338,30 @@ install_cert_manager() {
   [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
   kubectl apply -f "${_cm_url}"
 
+  # A previous run may have created cert-manager pods before the offline image
+  # import completed. Kubelet retains exponential pull backoff for those pod
+  # UIDs even after the image becomes available locally. Recreate only pods
+  # currently stuck on an image pull; healthy cert-manager pods are untouched.
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    local _failed_cm_pods=()
+    mapfile -t _failed_cm_pods < <(cert_manager_image_pull_backoff_pods)
+    if (( ${#_failed_cm_pods[@]} > 0 )); then
+      log "Recreating ${#_failed_cm_pods[@]} cert-manager pod(s) left in image-pull backoff by an earlier run..."
+      kubectl delete pod -n cert-manager --wait=false "${_failed_cm_pods[@]}"
+    fi
+  fi
+
   wait_for_crd certificates.cert-manager.io 300
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
+
+  # Do not wait on a pod-label snapshot here. After deleting a stale pod with
+  # --wait=false, `kubectl wait pod -l ...` can retain that deleted pod's name
+  # and spend the entire timeout waiting for an obsolete UID. Deployment
+  # rollout status follows the replacement ReplicaSet/pod instead.
+  local _cm_deployment
+  for _cm_deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
+    kubectl rollout status "deployment/${_cm_deployment}" \
+      -n cert-manager --timeout=300s
+  done
 
   # Wait for webhook to be fully operational
   log "Waiting for cert-manager webhooks to be ready..."
@@ -2591,26 +3385,16 @@ install_cert_manager() {
 
   if (( retries >= max_retries )); then
     warn "cert-manager webhook endpoint not found after ${max_retries} retries"
+    return 1
   fi
 
-  # Brief pause for webhook registration with API server
-  log "Waiting for webhooks to stabilize (10s)..."
-  sleep 10
-
-  # Test webhook by creating a test Certificate resource
-  log "Testing cert-manager webhook functionality..."
-  cat <<EOF | kubectl apply -f - || warn "Webhook test failed, but continuing..."
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: test-selfsigned
-  namespace: cert-manager
-spec:
-  selfSigned: {}
-EOF
-
-  # Clean up test issuer
-  kubectl delete issuer test-selfsigned -n cert-manager --ignore-not-found=true 2>/dev/null || true
+  # A populated Service endpoint only proves that the webhook pod is Ready.
+  # Require an actual admission request to succeed as well; this verifies that
+  # cainjector has populated the webhook caBundle and the API server trusts it.
+  if ! wait_for_cert_manager_webhook 30 10; then
+    warn "cert-manager admission webhook is not functional; refusing to install dependent components"
+    return 1
+  fi
 
   log "cert-manager installed successfully"
 }
@@ -2630,6 +3414,294 @@ EOF
 #     internal testing but are not supported (blocked by _check_node_os).
 #
 # Returns 0 on fully-successful install, non-zero on any verification failure.
+_nvidia_runtime_is_healthy() {
+  local gpu_ip="$1"
+
+  ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+
+    nvidia-smi -L >/dev/null
+    command -v nvidia-ctk >/dev/null
+    command -v nvidia-container-runtime >/dev/null
+    lsmod | grep -q '^nvidia '
+    if ! ldconfig -p 2>/dev/null | grep -q 'libnvidia-ml\\.so\\.1'; then
+      ls /usr/lib64/libnvidia-ml.so.1 \\
+         /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 \\
+         /usr/lib/libnvidia-ml.so.1 2>/dev/null | head -1 | grep -q .
+    fi
+
+    systemctl is-active --quiet k0sworker
+    [ -s /etc/k0s/containerd.toml ]
+    [ -s /etc/k0s/containerd.d/nvidia.toml ]
+    grep -q 'default_runtime_name = \"nvidia\"' /etc/k0s/containerd.d/nvidia.toml
+
+    if grep -q 'io\\.containerd\\.cri\\.v1\\.runtime' /etc/k0s/containerd.toml; then
+      grep -q 'io\\.containerd\\.cri\\.v1\\.runtime' /etc/k0s/containerd.d/nvidia.toml
+    else
+      grep -q 'io\\.containerd\\.grpc\\.v1\\.cri' /etc/k0s/containerd.d/nvidia.toml
+    fi
+
+    [ -s /etc/cdi/nvidia.yaml ]
+    grep -q 'name: ' /etc/cdi/nvidia.yaml
+
+    # Validate the generated CDI devices through nvidia-ctk instead of
+    # looking for physical GPU UUIDs in the YAML. The default CDI naming
+    # strategy uses GPU indexes, so a healthy spec need not contain UUIDs.
+    cdi_list_help=\$(nvidia-ctk cdi list --help 2>&1)
+    if [[ \"\${cdi_list_help}\" == *'--spec-dir'* ]]; then
+      cdi_devices=\$(nvidia-ctk cdi list --spec-dir /etc/cdi)
+    else
+      # nvidia-ctk 1.14 scans the standard CDI directories and does not
+      # support restricting the list command to one directory.
+      cdi_devices=\$(nvidia-ctk cdi list)
+    fi
+    printf '%s\\n' \"\${cdi_devices}\" | grep -qx 'nvidia.com/gpu=all'
+
+    gpu_count=0
+    for gpu_index in \$(nvidia-smi --query-gpu=index --format=csv,noheader); do
+      gpu_count=\$((gpu_count + 1))
+      printf '%s\\n' \"\${cdi_devices}\" | grep -qx \"nvidia.com/gpu=\${gpu_index}\"
+    done
+    [ \"\${gpu_count}\" -gt 0 ]
+  "
+}
+
+# ====== AIR-GAP: INSTALL NVIDIA DRIVER FROM THE BUNDLED OFFLINE REPO ======
+# Pushes the closure built by airgap_install.sh to a GPU node and installs
+# the driver, DKMS, build toolchain, container toolkit and matching kernel-devel
+# entirely from it. The node never contacts developer.download.nvidia.com.
+#
+# The closure must be scp'd rather than referenced by path: AIRGAP_NVIDIA_CLOSURE_DIR
+# is a path on the INSTALLER host, and env vars do not cross the SSH boundary.
+# Same reason prepare_nodes_for_k0s() scp's the k0s binary.
+_install_nvidia_from_closure() {
+  local gpu_ip="$1"
+  local closure="${AIRGAP_NVIDIA_CLOSURE_DIR:-}"
+
+  if [[ -z "${closure}" || ! -d "${closure}" ]]; then
+    echo "ERROR: AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found on ${gpu_ip}," >&2
+    echo "  and no offline driver repo was provided (AIRGAP_NVIDIA_CLOSURE_DIR is unset)." >&2
+    echo "" >&2
+    echo "  Fix by either:" >&2
+    echo "    a) Running the air-gap installer, which builds the driver closure and" >&2
+    echo "       exports this path automatically:" >&2
+    echo "         ./airgap_install.sh --config <your-config>.yaml" >&2
+    echo "    b) Pre-installing the NVIDIA driver + nvidia-container-toolkit on" >&2
+    echo "       ${gpu_ip} yourself. The installer skips driver install when" >&2
+    echo "       nvidia-smi is already present." >&2
+    return 1
+  fi
+  # Package format is recorded by the builder. Fall back to sniffing the index
+  # file so a closure staged by an older bundle still works.
+  local pkg_format
+  pkg_format="$(cat "${closure}/.pkg-format" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "${pkg_format}" ]]; then
+    if [[ -f "${closure}/Packages.gz" ]]; then pkg_format="deb"; else pkg_format="rpm"; fi
+  fi
+
+  if [[ "${pkg_format}" == "deb" ]]; then
+    if [[ ! -f "${closure}/Packages.gz" ]]; then
+      echo "ERROR: ${closure} has no Packages.gz — it is not a valid apt repo." >&2
+      echo "  Re-run ./airgap_install.sh; dpkg-scanpackages must run over the closure directory." >&2
+      return 1
+    fi
+  elif [[ ! -f "${closure}/repodata/repomd.xml" ]]; then
+    echo "ERROR: ${closure} has no repodata/repomd.xml — it is not a valid dnf repo." >&2
+    echo "  Re-run ./airgap_install.sh; createrepo_c must run over the closure directory." >&2
+    return 1
+  fi
+
+  # Verify the closure actually covers this node's running kernel BEFORE pushing
+  # ~500 MB. DKMS needs kernel-devel matching `uname -r` exactly; without it the
+  # module cannot build and there is no way to recover offline.
+  local node_krel
+  node_krel=$(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null | tr -d '[:space:]') || node_krel=""
+  [[ -n "${node_krel}" ]] || { echo "ERROR: could not read 'uname -r' from ${gpu_ip}" >&2; return 1; }
+
+  local _hdr_glob
+  if [[ "${pkg_format}" == "deb" ]]; then
+    _hdr_glob="${closure}/linux-headers-${node_krel}_*.deb"
+  else
+    _hdr_glob="${closure}/kernel-devel-${node_krel%.x86_64}*.rpm"
+  fi
+  if ! compgen -G "${_hdr_glob}" >/dev/null 2>&1; then
+    echo "ERROR: the offline NVIDIA repo has no kernel headers for ${gpu_ip}'s running kernel." >&2
+    echo "  Node kernel     : ${node_krel}" >&2
+    echo "  Package format  : ${pkg_format}" >&2
+    echo "  Closure covers  : $(cat "${closure}/.target-kernels" 2>/dev/null || echo unknown)" >&2
+    echo "" >&2
+    echo "  NVIDIA ships DKMS-only packages, so the kernel module is compiled on" >&2
+    echo "  the node and needs headers for that exact kernel." >&2
+    echo "  Re-stage the closure including this kernel:" >&2
+    echo "    ./airgap_install.sh --config <your-config>.yaml --gpu-kernels ${node_krel}" >&2
+    return 1
+  fi
+
+  echo "Installing NVIDIA driver on ${gpu_ip} from offline repo (kernel ${node_krel})..."
+
+  # Stage the closure as a tarball: one scp of ~500 MB beats several hundred
+  # round-trips, and scp has no recursive-with-progress equivalent worth using here.
+  # Per-node path. GPU nodes are installed concurrently and `$$` stays the parent
+  # shell's PID inside the background subshells, so a shared name meant one node
+  # deleted the tarball while another was still packing or copying it.
+  local tarball="/tmp/nvidia-closure-$$-${gpu_ip//[^0-9]/_}.tar"
+  echo "  Packing closure..."
+  tar -cf "${tarball}" -C "$(dirname "${closure}")" "$(basename "${closure}")" \
+    || { echo "ERROR: failed to pack ${closure}" >&2; rm -f "${tarball}"; return 1; }
+
+  echo "  Copying $(du -h "${tarball}" | cut -f1) to ${gpu_ip}..."
+  if ! scp_file "${tarball}" "${gpu_ip}" "/tmp/nvidia-closure.tar"; then
+    echo "ERROR: failed to copy the NVIDIA closure to ${gpu_ip}" >&2
+    rm -f "${tarball}"
+    return 1
+  fi
+  rm -f "${tarball}"
+
+  ssh_exec "${gpu_ip}" "
+    set -euo pipefail
+    PKGFMT='${pkg_format}'
+    PKGDIR=/opt/airgap-nvidia
+    sudo rm -rf \"\${PKGDIR}\"
+    sudo mkdir -p \"\${PKGDIR}\"
+    sudo tar -xf /tmp/nvidia-closure.tar -C \"\${PKGDIR}\" --strip-components=1
+    rm -f /tmp/nvidia-closure.tar
+    echo \"Offline repo staged: \$(find \"\${PKGDIR}\" -name \"*.\${PKGFMT}\" | wc -l) \${PKGFMT} packages\"
+
+    KREL=\$(uname -r)
+
+    # A leftover /etc/dnf/modules.d/nvidia-driver.module (from a previous online
+    # install) makes dnf hide every NVIDIA package with 'All matches were filtered
+    # out by modular filtering', because createrepo_c generates no modules.yaml.
+    # Resetting the stream clears that state. No-op if the module was never enabled.
+    if [ \"\${PKGFMT}\" != 'deb' ]; then
+      sudo dnf module reset -y nvidia-driver >/dev/null 2>&1 || true
+    fi
+
+    # Blacklist nouveau before installing so the nvidia module can load.
+    if lsmod | grep -q '^nouveau'; then
+      echo '--- Blacklisting nouveau + unloading ---'
+      printf 'blacklist nouveau\\noptions nouveau modeset=0\\n' \\
+        | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
+      sudo rmmod nouveau 2>/dev/null || true
+      # Regenerate the initramfs so the blacklist survives a reboot. The online
+      # path branches on OS family here; this one must too, or an Ubuntu node
+      # silently keeps nouveau in its initramfs and can reclaim the GPU.
+      if [ \"\${PKGFMT}\" = 'deb' ]; then
+        sudo update-initramfs -u 2>/dev/null || true
+      else
+        sudo dracut --force 2>/dev/null || true
+      fi
+    fi
+
+    echo '--- Installing NVIDIA driver + DKMS + toolkit from offline repo ---'
+    if [ \"\${PKGFMT}\" = 'deb' ]; then
+      # Confine apt to the staged repo. There is no single --disablerepo
+      # equivalent, so all four options are needed: a dedicated sources.list
+      # holding only the file:// repo, sourceparts pointed at /dev/null to
+      # ignore /etc/apt/sources.list.d/*, and List-Cleanup off so the node's
+      # normal apt state is not damaged. Without these, apt tries (and slowly
+      # times out on) the archive URLs the node cannot reach.
+      echo \"deb [trusted=yes] file://\${PKGDIR} ./\" \\
+        | sudo tee /etc/apt/sources.list.d/airgap-nvidia.list >/dev/null
+      APT_OFFLINE=\"-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/airgap-nvidia.list
+                   -o Dir::Etc::sourceparts=/dev/null
+                   -o APT::Get::List-Cleanup=0
+                   -o Acquire::Languages=none\"
+
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${APT_OFFLINE} \\
+        -o DPkg::Lock::Timeout=300 update
+
+      # cuda-drivers is the meta-package the non-air-gap Ubuntu path installs, so
+      # both paths land on the same driver set. Headers are named explicitly for
+      # the running kernel; the closure also carries headers for any spare kernel
+      # so dkms's per-kernel postinst build does not fail silently.
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${APT_OFFLINE} \\
+        -o DPkg::Lock::Timeout=300 \\
+        -o Dpkg::Options::=--force-confdef \\
+        -o Dpkg::Options::=--force-confold \\
+        install -y --no-install-recommends \\
+        cuda-drivers nvidia-container-toolkit \\
+        dkms build-essential libelf-dev \\
+        \"linux-headers-\${KREL}\"
+
+      # Leaving the file:// repo in place would break every later apt run once
+      # /opt/airgap-nvidia is cleaned up.
+      sudo rm -f /etc/apt/sources.list.d/airgap-nvidia.list
+    else
+      # Install ONLY from the staged repo. --disablerepo='*' guarantees no network
+      # access is attempted even if the node has stale repo files pointing upstream.
+      # Named packages (not 'dnf install *.rpm'): installing every file force-installs
+      # unrelated arch/version duplicates and fails on file conflicts.
+      sudo dnf install -y --refresh \\
+        --disablerepo='*' \\
+        --repofrompath=\"airgap-nvidia,\${PKGDIR}\" \\
+        --setopt=airgap-nvidia.gpgcheck=0 \\
+        --setopt=install_weak_deps=False \\
+        kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \\
+        nvidia-kmod-common nvidia-modprobe nvidia-persistenced \\
+        nvidia-container-toolkit \\
+        dkms gcc make elfutils-libelf-devel \\
+        \"kernel-devel-\${KREL}\"
+    fi
+
+    # DKMS builds the module in the RPM %post scriptlet. Verify it actually
+    # succeeded and built for the RUNNING kernel — a mismatch here is the
+    # difference between a working GPU node and a silent failure at pod start.
+    echo '--- Verifying DKMS build ---'
+    DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
+    if [ -z \"\${DKMS_OUT}\" ]; then
+      echo 'ERROR: dkms status shows no nvidia entry — the kmod did not register' >&2
+      exit 1
+    fi
+    echo \"DKMS: \${DKMS_OUT}\"
+    if ! echo \"\${DKMS_OUT}\" | grep -qE 'installed|built'; then
+      echo 'ERROR: nvidia DKMS module not built. Diagnose: sudo dkms status; cat /var/lib/dkms/nvidia/*/build/make.log' >&2
+      exit 1
+    fi
+    if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${KREL}\"; then
+      echo \"ERROR: DKMS built for a different kernel than the running \${KREL}: \${DKMS_OUT}\" >&2
+      exit 1
+    fi
+
+    # Debian's dkms auto-builds for every kernel in /lib/modules via
+    # /etc/kernel/postinst.d/dkms, and a failure there is a postinst WARNING that
+    # does not fail the apt transaction. So a spare kernel with no module passes
+    # every check above and only shows up after the node reboots into it. Warn
+    # rather than fail: the running kernel is verified working, and a node is not
+    # expected to reboot mid-install.
+    if [ \"\${PKGFMT}\" = 'deb' ]; then
+      for _km in /lib/modules/*; do
+        _kv=\$(basename \"\${_km}\")
+        [ \"\${_kv}\" = \"\${KREL}\" ] && continue
+        if ! echo \"\${DKMS_OUT}\" | grep -qF \"\${_kv}\"; then
+          echo \"WARN: no nvidia DKMS module for installed kernel \${_kv} (running \${KREL} is OK).\" >&2
+          echo \"WARN:   If this node reboots into \${_kv}, the GPU will not be available.\" >&2
+          echo \"WARN:   Remove that kernel, or re-stage the closure with headers for it.\" >&2
+        fi
+      done
+    fi
+
+    sudo modprobe nvidia || {
+      echo 'ERROR: modprobe nvidia failed after DKMS build succeeded.' >&2
+      echo 'Diagnose with: sudo dmesg | grep -i nvidia | tail -30' >&2
+      exit 1
+    }
+  " || {
+    echo "❌ Offline NVIDIA driver install failed on ${gpu_ip}" >&2
+    return 1
+  }
+
+  # Hard-verify from the installer side rather than trusting the remote exit code.
+  local ver_check
+  ver_check=$(ssh_exec "${gpu_ip}" "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1" || echo "")
+  if [[ -z "${ver_check}" ]] || ! [[ "${ver_check}" =~ ^[0-9]+\.[0-9]+ ]]; then
+    echo "❌ nvidia-smi verification failed on ${gpu_ip} after offline install (got: '${ver_check}')" >&2
+    return 1
+  fi
+  echo "✓ NVIDIA driver v${ver_check} installed offline on ${gpu_ip}"
+  return 0
+}
+
 _install_nvidia_on_node() {
   local gpu_ip="$1"
   local recovery_reboots="${2:-0}"
@@ -2646,22 +3718,21 @@ _install_nvidia_on_node() {
   if [[ -n "${driver_ver}" ]]; then
     echo "✓ NVIDIA driver already installed on ${gpu_ip} (version: ${driver_ver})"
   elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    # In air-gap mode the node must have NVIDIA drivers pre-installed.
-    # The Phase A check above already looked for nvidia-smi; if we reach
-    # here it wasn't found.  Fail clearly rather than attempting internet
-    # package downloads that will time out or silently fail.
-    echo "ERROR: AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found on ${gpu_ip}." >&2
-    echo "  Pre-install the NVIDIA driver on this node using a local RPM/DEB mirror" >&2
-    echo "  or the bundled package directory, then re-run the installer." >&2
-    echo "  See AIRGAP.md → 'GPU Node OS Packages' for step-by-step instructions." >&2
-    return 1
+    # Air-gap: install from the bundled offline closure. Only if no closure was
+    # bundled do we fail — the node cannot reach NVIDIA's servers.
+    if ! _install_nvidia_from_closure "${gpu_ip}"; then
+      return 1
+    fi
   else
     echo "Installing NVIDIA driver on ${gpu_ip}..."
 
     # ---- Phase B: install driver + supporting packages --------------------
     # `set -euo pipefail` means ANY failure aborts the block. Each step below
     # must either succeed or have an explicit fallback branch that succeeds.
-    if ! ssh_exec "${gpu_ip}" "
+    # Capture exit code explicitly — `if ! ssh_exec ...; then` loses it because
+    # bash sets $? to 0 after the ! negation regardless of the real exit code.
+    local _nvidia_rc=0
+    ssh_exec "${gpu_ip}" "
       set -euo pipefail
 
       # Requested accelerator type (expanded locally from DEFAULT_ACCELERATOR).
@@ -2686,6 +3757,8 @@ _install_nvidia_on_node() {
         OS_VERSION=\$(rpm -E %{rhel})
       elif [ -f /etc/debian_version ]; then
         OS_FAMILY=debian
+        # CUDA repo paths use the version with no dot: 24.04 -> 2404.
+        OS_VERSION=\$(. /etc/os-release; echo \"\${VERSION_ID}\" | tr -d '.')
       fi
       if [ -z \"\${OS_FAMILY}\" ]; then
         echo 'ERROR: unsupported OS (not amzn/rhel/debian)' >&2
@@ -2694,20 +3767,54 @@ _install_nvidia_on_node() {
       fi
       echo \"OS_FAMILY=\${OS_FAMILY}  OS_VERSION=\${OS_VERSION:-n/a}\"
 
+      # Every apt-get below goes through this wrapper. Two flags matter on a
+      # freshly booted node: DEBIAN_FRONTEND stops any package's postinst from
+      # blocking on a whiptail prompt (needrestart does this), and the lock
+      # timeout waits out apt-daily/unattended-upgrades instead of failing with
+      # \"Could not get lock\" — those timers hold the dpkg lock for minutes after
+      # boot, so without it node prep is a coin flip.
+      apt_get() {
+        sudo DEBIAN_FRONTEND=noninteractive apt-get \\
+          -o DPkg::Lock::Timeout=300 \\
+          -o Dpkg::Options::=--force-confdef \\
+          -o Dpkg::Options::=--force-confold \\
+          \"\$@\"
+      }
+
       # --- Step 1: kernel headers (required for DKMS to build nvidia kmod) ---
       KREL=\$(uname -r)
       echo \"--- Installing kernel headers for kernel \${KREL} ---\"
       if [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        sudo apt-get update -qq
-        sudo apt-get install -y \"linux-headers-\${KREL}\"
+        apt_get update -qq
+        # Exact headers for the running kernel are required for DKMS. If the
+        # AMI's kernel is older than what the archive still carries, fall back
+        # to the generic metapackage rather than failing outright — the DKMS
+        # verification in Step 5 catches a resulting kernel mismatch.
+        apt_get install -y \"linux-headers-\${KREL}\" \\
+          || apt_get install -y linux-headers-generic
       else
         # Exact-match: every historical kernel-devel is usually in RHUI for
-        # RHEL 9/10. Fall back to the latest only when absent (rare).
+        # RHEL 9/10. When absent (e.g. AMI has an older kernel than current
+        # RHUI), install the latest kernel+kernel-devel and reboot into it so
+        # DKMS builds for the running kernel. The node rejoins k0s after reboot;
+        # the installer retries SSH so the install continues automatically.
         if ! sudo dnf install -y \"kernel-devel-\${KREL}\" \"kernel-headers-\${KREL}\"; then
-          echo \"WARN: Exact kernel-devel-\${KREL} not found; installing latest kernel-devel/headers.\"
-          echo \"      DKMS will build against the latest headers — if they don't match the running kernel,\"
-          echo \"      modprobe will fail below and you'll need to reboot into the updated kernel.\"
-          sudo dnf install -y kernel-devel kernel-headers
+          echo \"WARN: Exact kernel-devel-\${KREL} not found in repos.\"
+          # Get the latest available kernel version from the repo
+          LATEST_KVER=\$(sudo dnf list available kernel --quiet 2>/dev/null | awk '/^kernel/{print \$2\".x86_64\"}' | tail -1)
+          if [ -n \"\${LATEST_KVER}\" ] && [ \"\${KREL}\" != \"\${LATEST_KVER}\" ]; then
+            echo \"Installing latest kernel (\${LATEST_KVER}) + matching kernel-devel so DKMS can build.\"
+            sudo dnf install -y \"kernel-\${LATEST_KVER%.*}\" \"kernel-devel-\${LATEST_KVER%.*}\" \"kernel-headers-\${LATEST_KVER%.*}\" 2>/dev/null || \
+              sudo dnf install -y kernel kernel-devel kernel-headers
+            echo \"REBOOT_REQUIRED: kernel upgraded from \${KREL} to \${LATEST_KVER%.*} — rebooting now\"
+            # Signal the outer SSH call to detect the reboot and wait
+            sudo reboot &
+            sleep 5
+            exit 42
+          else
+            echo \"WARN: No newer kernel in repos; installing latest kernel-devel/headers (may mismatch).\"
+            sudo dnf install -y kernel-devel kernel-headers
+          fi
         fi
       fi
 
@@ -2730,12 +3837,11 @@ _install_nvidia_on_node() {
         sudo dnf install -y dnf-plugins-core
 
         # EPEL: provides DKMS on RHEL (RHEL's own repos don't ship DKMS).
-        # EPEL_RPM_URL_OVERRIDE lets air-gap customers redirect to a local mirror:
-        #   export EPEL_RPM_URL_OVERRIDE="http://mirror.internal/epel/epel-release-latest-9.noarch.rpm"
+        # This is the ONLINE path only — air-gapped nodes are handled earlier by
+        # _install_nvidia_from_closure(), which installs DKMS from the bundled repo.
         if ! rpm -q epel-release >/dev/null 2>&1; then
           echo \"--- Installing EPEL for DKMS (major \${EPEL_MAJOR}) ---\"
-          _EPEL_URL=\"\${EPEL_RPM_URL_OVERRIDE:-https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm}\"
-          sudo dnf install -y \"\${_EPEL_URL}\"
+          sudo dnf install -y \"https://dl.fedoraproject.org/pub/epel/epel-release-latest-\${EPEL_MAJOR}.noarch.rpm\"
         fi
         # CRB (formerly PowerTools on RHEL 8) hosts a few EPEL build deps on
         # RHEL. AL2023 doesn't have a CRB repo (its core packages are in
@@ -2752,29 +3858,33 @@ _install_nvidia_on_node() {
         # with different weak-deps don't silently miss a needed package.
         echo '--- Installing DKMS + build toolchain (gcc, make, elfutils-libelf-devel) ---'
         sudo dnf install -y dkms gcc make elfutils-libelf-devel
+      elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        # Ubuntu ships dkms in main, so no third-party repo is needed. The
+        # equivalent of elfutils-libelf-devel is libelf-dev; build-essential
+        # covers gcc/make. Without these the driver package's DKMS build in
+        # %post silently has no toolchain and the kmod never gets built.
+        echo '--- Installing DKMS + build toolchain (build-essential, libelf-dev) ---'
+        apt_get install -y dkms build-essential libelf-dev
       fi
 
       # --- Step 3: CUDA repo for the right OS family + version --------------
       # Clean cross-major repos so dnf doesn't try to install from the wrong
       # CUDA metadata (common failure mode on in-place RHEL 9 → 10 upgrades,
       # and on re-runs of this script where the target OS may have changed).
-      #
-      # CUDA_REPO_URL_OVERRIDE: set to a local mirror .repo/.deb URL to redirect
-      # away from developer.download.nvidia.com:
-      #   export CUDA_REPO_URL_OVERRIDE="http://mirror.internal/cuda/cuda-rhel9.repo"
+      # ONLINE path only — see the EPEL note above.
       if [ \"\${OS_FAMILY}\" = 'amzn' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-amzn*.repo
-        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo}\"
-        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
+        sudo dnf config-manager --add-repo \"https://developer.download.nvidia.com/compute/cuda/repos/amzn\${OS_VERSION:-2023}/x86_64/cuda-amzn\${OS_VERSION:-2023}.repo\"
       elif [ \"\${OS_FAMILY}\" = 'rhel' ]; then
         sudo rm -f /etc/yum.repos.d/cuda-rhel*.repo
-        _CUDA_REPO=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo}\"
-        sudo dnf config-manager --add-repo \"\${_CUDA_REPO}\"
+        sudo dnf config-manager --add-repo \"https://developer.download.nvidia.com/compute/cuda/repos/rhel\${OS_VERSION}/x86_64/cuda-rhel\${OS_VERSION}.repo\"
       elif [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        _CUDA_DEB=\"\${CUDA_REPO_URL_OVERRIDE:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb}\"
-        curl -fsSL \"\${_CUDA_DEB}\" -o /tmp/cuda-keyring.deb
+        # OS_VERSION is the dotless release (24.04 -> 2404). Falling back to
+        # 2204 would install a keyring for the wrong release and silently pull
+        # mismatched driver packages.
+        curl -fsSL \"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu\${OS_VERSION}/x86_64/cuda-keyring_1.1-1_all.deb\" -o /tmp/cuda-keyring.deb
         sudo dpkg -i /tmp/cuda-keyring.deb
-        sudo apt-get update -qq
+        apt_get update -qq
       fi
 
       # --- Step 4: install the driver -------------------------------------
@@ -2798,19 +3908,43 @@ _install_nvidia_on_node() {
       # a no-op on RHEL 9/AL2023 where there's nothing to erase.
       echo '--- Installing NVIDIA driver (meta package: cuda-drivers) ---'
       REQUIRE_OPEN_MODULE=0
-      if [ \"\${OS_FAMILY}\" = 'debian' ]; then
-        sudo apt-get install -y nvidia-driver-550
-      else
-        # Blacklist nouveau so the new nvidia driver can load without fighting it.
-        # Harmless if nouveau isn't loaded (grep returns nothing).
-        if lsmod | grep -q '^nouveau'; then
-          echo '--- Blacklisting nouveau + unloading ---'
-          echo -e 'blacklist nouveau\\noptions nouveau modeset=0' \\
-            | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
-          sudo rmmod nouveau 2>/dev/null || true
-          # Regenerate initramfs so nouveau doesn't come back on reboot.
+      # Blacklist nouveau so the new nvidia driver can load without fighting it.
+      # Harmless if nouveau isn't loaded (grep returns nothing). Both families
+      # need this; only the initramfs regeneration tool differs.
+      if lsmod | grep -q '^nouveau'; then
+        echo '--- Blacklisting nouveau + unloading ---'
+        echo -e 'blacklist nouveau\\noptions nouveau modeset=0' \\
+          | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
+        sudo rmmod nouveau 2>/dev/null || true
+        # Regenerate initramfs so nouveau doesn't come back on reboot.
+        if [ \"\${OS_FAMILY}\" = 'debian' ]; then
+          sudo update-initramfs -u 2>/dev/null || true
+        else
           sudo dracut --force 2>/dev/null || true
         fi
+      fi
+
+      if [ \"\${OS_FAMILY}\" = 'debian' ]; then
+        # cuda-drivers is the same meta-package name in the Ubuntu CUDA repo as
+        # on RHEL, and tracks the current driver branch — so it supports newer
+        # GPUs (L40S etc.) that an older pinned branch does not. The
+        # -server fallbacks are the datacenter-flavour metapackages in Ubuntu's
+        # own archive, used when the NVIDIA repo is unreachable.
+        if apt_get install -y cuda-drivers; then
+          echo '✓ Installed cuda-drivers meta-package'
+        elif apt_get install -y nvidia-driver-580-server; then
+          echo '✓ Installed nvidia-driver-580-server (ubuntu archive fallback)'
+        elif apt_get install -y nvidia-driver-570-server; then
+          echo '✓ Installed nvidia-driver-570-server (ubuntu archive fallback)'
+        else
+          echo 'ERROR: all NVIDIA driver install strategies failed (debian)' >&2
+          echo '  Tried: cuda-drivers, nvidia-driver-580-server, nvidia-driver-570-server' >&2
+          echo '  Possible causes:' >&2
+          echo \"    - CUDA repo keyring wrong for ubuntu\${OS_VERSION}\" >&2
+          echo '    - Network blocked to developer.download.nvidia.com' >&2
+          exit 1
+        fi
+      else
 
         # Driver-module variant depends on the GPU architecture:
         #
@@ -2885,8 +4019,11 @@ _install_nvidia_on_node() {
       # --- Step 5: verify DKMS built + load kmod ---------------------------
       # Before modprobe: check dkms status so we catch kernel-mismatch cases
       # early with a clear error instead of the cryptic 'Module not found'.
+      # The checks below are distro-neutral (dkms is dkms), so they run on
+      # debian too — skipping them there allowed a driver that never built to
+      # look like a success until pods failed to see a GPU.
       echo '--- Verifying DKMS status + loading nvidia kmod ---'
-      if [ \"\${OS_FAMILY}\" != 'debian' ]; then
+      if true; then
         DKMS_OUT=\$(sudo dkms status 2>&1 | grep nvidia || true)
         if [ -z \"\${DKMS_OUT}\" ]; then
           echo 'ERROR: dkms status shows no nvidia entry — driver install did not register with DKMS' >&2
@@ -3013,7 +4150,20 @@ _install_nvidia_on_node() {
       fi
       [ \"\${PERSISTENCE_WAS_ACTIVE}\" = '1' ] && sudo systemctl start nvidia-persistenced || true
       [ \"\${K0S_WAS_ACTIVE}\" = '1' ] && sudo systemctl start k0sworker || true
-    "; then
+    " || _nvidia_rc=$?
+    if [[ "${_nvidia_rc:-0}" -ne 0 ]]; then
+      if [[ "${_nvidia_rc}" -eq 42 ]]; then
+        # exit 42 = kernel upgrade triggered a reboot; wait for node and retry
+        echo "Kernel upgraded on ${gpu_ip} — waiting for reboot (up to 5 min)..."
+        local _wait=0
+        while ! ssh_exec "${gpu_ip}" "echo ok" &>/dev/null; do
+          sleep 15; _wait=$(( _wait + 15 ))
+          [[ "${_wait}" -ge 300 ]] && { echo "❌ ${gpu_ip} did not come back after kernel reboot" >&2; return 1; }
+        done
+        echo "Node ${gpu_ip} is back (kernel: $(ssh_exec "${gpu_ip}" "uname -r" 2>/dev/null)). Retrying NVIDIA install..."
+        _install_nvidia_on_node "${gpu_ip}"
+        return $?
+      fi
       echo "❌ NVIDIA driver install failed on ${gpu_ip}" >&2
       return 1
     fi
@@ -3095,9 +4245,16 @@ _install_nvidia_on_node() {
   local _ctk_present
   _ctk_present=$(ssh_exec "${gpu_ip}" "command -v nvidia-ctk >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo no)
   if [[ "${_ctk_present}" != "yes" ]] && [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
+    # Probe the same repo flavour the install below will actually use: the rpm
+    # and deb trees are separate paths, so probing rpm on Ubuntu can report a
+    # reachable repo the node cannot install from (or vice versa).
+    local _ctk_probe_path='stable/rpm/nvidia-container-toolkit.repo'
+    if ssh_exec "${gpu_ip}" "[ -f /etc/debian_version ]" 2>/dev/null; then
+      _ctk_probe_path='stable/deb/nvidia-container-toolkit.list'
+    fi
     wait_for_dependency \
       "NVIDIA package repo (nvidia.github.io) — required for container-toolkit install on ${gpu_ip}" \
-      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo >/dev/null 2>&1'" \
+      "ssh_exec '${gpu_ip}' 'curl -sf --connect-timeout 10 --max-time 15 https://nvidia.github.io/libnvidia-container/${_ctk_probe_path} >/dev/null 2>&1'" \
       180
   elif [[ "${_ctk_present}" == "yes" ]]; then
     log "nvidia-ctk already installed on ${gpu_ip} — skipping repo check"
@@ -3105,29 +4262,59 @@ _install_nvidia_on_node() {
     log "AIRGAP_MODE=true — skipping NVIDIA repo check for ${gpu_ip}; drivers must be pre-installed on the node"
   fi
 
-  echo "Installing NVIDIA Container Toolkit on ${gpu_ip}..."
+  if [[ "${_ctk_present}" == "yes" ]] && _nvidia_runtime_is_healthy "${gpu_ip}"; then
+    echo "✓ NVIDIA runtime and CDI already healthy on ${gpu_ip} — skipping reconfiguration and k0sworker restart"
+    return 0
+  fi
+
+  echo "Installing or repairing NVIDIA Container Toolkit on ${gpu_ip}..."
   if ! ssh_exec "${gpu_ip}" "
     set -euo pipefail
     if command -v nvidia-ctk >/dev/null 2>&1; then
       echo '✓ nvidia-ctk already installed (version: '\"\$(nvidia-ctk --version 2>/dev/null | head -1)\"')'
+    elif [ -f /opt/airgap-nvidia/repodata/repomd.xml ]; then
+      # Air-gap: the driver closure staged by _install_nvidia_from_closure also
+      # carries the container toolkit. Reached when the driver was pre-installed
+      # on the node (so the closure install was skipped) but CTK was not.
+      echo '--- Installing nvidia-container-toolkit from offline repo ---'
+      sudo dnf install -y --refresh \\
+        --disablerepo='*' \\
+        --repofrompath='airgap-nvidia,/opt/airgap-nvidia' \\
+        --setopt=airgap-nvidia.gpgcheck=0 \\
+        --setopt=install_weak_deps=False \\
+        nvidia-container-toolkit
+    elif [ -f /opt/airgap-nvidia/Packages.gz ]; then
+      # Same case on Ubuntu: the deb closure carries CTK too.
+      echo '--- Installing nvidia-container-toolkit from offline apt repo ---'
+      echo 'deb [trusted=yes] file:///opt/airgap-nvidia ./' \\
+        | sudo tee /etc/apt/sources.list.d/airgap-nvidia.list >/dev/null
+      _APT_OFF=\"-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/airgap-nvidia.list
+                -o Dir::Etc::sourceparts=/dev/null
+                -o APT::Get::List-Cleanup=0
+                -o Acquire::Languages=none\"
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${_APT_OFF} -o DPkg::Lock::Timeout=300 update
+      sudo DEBIAN_FRONTEND=noninteractive apt-get \${_APT_OFF} -o DPkg::Lock::Timeout=300 \\
+        install -y --no-install-recommends nvidia-container-toolkit
+      sudo rm -f /etc/apt/sources.list.d/airgap-nvidia.list
+    elif [ \"${AIRGAP_MODE:-false}\" = 'true' ]; then
+      echo 'ERROR: AIRGAP_MODE=true, nvidia-ctk is missing, and no offline repo is staged' >&2
+      echo '  at /opt/airgap-nvidia. Re-run ./airgap_install.sh --config <cfg>.yaml' >&2
+      echo '  so the NVIDIA closure is staged, or install' >&2
+      echo '  nvidia-container-toolkit on this node manually.' >&2
+      exit 1
     else
       echo '--- Adding NVIDIA container-toolkit repo ---'
-      # NVIDIA_CTK_REPO_URL_OVERRIDE: set to a local mirror repo URL to redirect
-      # away from nvidia.github.io (partial air-gap or local mirror scenario):
-      #   export NVIDIA_CTK_REPO_URL_OVERRIDE="http://mirror.internal/nvidia-ctk/nvidia-container-toolkit.repo"
       if [ -f /etc/debian_version ]; then
-        _CTK_BASE=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container}\"
-        curl -fsSL \"\${_CTK_BASE}/gpgkey\" | \
+        curl -fsSL 'https://nvidia.github.io/libnvidia-container/gpgkey' | \
           sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-        curl -fsSL \"\${_CTK_BASE}/stable/deb/nvidia-container-toolkit.list\" | \
+        curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list' | \
           sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
           sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
-        sudo apt-get update -qq
-        sudo apt-get install -y nvidia-container-toolkit
+        sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y nvidia-container-toolkit
       else
         # RHEL 9 and 10 both use the same libnvidia-container stable RPM repo.
-        _CTK_REPO=\"\${NVIDIA_CTK_REPO_URL_OVERRIDE:-https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo}\"
-        curl -fsSL \"\${_CTK_REPO}\" | \
+        curl -fsSL 'https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo' | \
           sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
         sudo dnf install -y nvidia-container-toolkit
       fi
@@ -3257,13 +4444,13 @@ _install_nvidia_on_node() {
       exit 1
     fi
 
-    # --- Restart k0sworker to pick up new runtime + CDI spec -----------
-    echo '--- Restarting k0sworker to pick up runtime changes ---'
-    sudo systemctl stop k0sworker || true
-    sleep 3
-    sudo pkill -9 containerd-shim || true
-    sudo rm -f /run/k0s/containerd.sock || true
-    sudo systemctl start k0sworker
+    # --- Restart k0sworker to pick up repaired runtime + CDI config -----
+    # Keep containerd shims alive: they preserve running containers across
+    # a daemon restart. Killing them turns an installer re-run into an
+    # outage and can leave GPU-owning child processes without supervision.
+    echo '--- Restarting k0sworker to pick up repaired runtime changes ---'
+    sudo systemctl restart k0sworker
+    sudo systemctl is-active --quiet k0sworker
 
     # Quick sanity: confirm nvidia-ctk + libnvidia-ml.so exist where expected.
     # Search all known paths (distributions differ): RHEL/Fedora use
@@ -3431,11 +4618,14 @@ install_nvidia_host_drivers() {
   while [[ ${gpu_wait_elapsed} -lt ${gpu_wait_timeout} ]]; do
     all_gpu_ready=true
     for gpu_ip in "${gpu_ips[@]}"; do
-      # Resolve GPU node name via SSH hostname lookup
+      # Resolve GPU node name via InternalIP or an API-validated hostname.
       local gpu_node
-      gpu_node=$(resolve_node_name "${gpu_ip}")
+      if ! gpu_node=$(resolve_node_name "${gpu_ip}"); then
+        all_gpu_ready=false
+        break
+      fi
 
-      if [[ -z "${gpu_node}" ]] || ! kubectl get node "${gpu_node}" &>/dev/null; then
+      if ! kubectl get node "${gpu_node}" &>/dev/null; then
         all_gpu_ready=false
         break
       fi
@@ -3460,9 +4650,8 @@ install_nvidia_host_drivers() {
   done
 
   if [[ "${all_gpu_ready}" != "true" ]]; then
-    warn "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s — continuing install."
-    warn "Check node status after install: kubectl get nodes"
-    warn "If nodes are NotReady due to a pending reboot, reboot the node and re-run the installer."
+    err "Some GPU nodes did not become Ready within ${gpu_wait_timeout}s. \
+Check 'kubectl get nodes' and reboot any NotReady GPU node, then re-run the installer."
   fi
 
   # Verify GPUs are visible to Kubernetes. If the device-plugin DaemonSet
@@ -3537,7 +4726,14 @@ RTEOF
   local manifest
   manifest=$(mktemp)
   local nvidia_manifest_url="${NVIDIA_DEVICE_PLUGIN_MANIFEST_URL:-https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml}"
-  if ! curl -fsSL "${nvidia_manifest_url}" -o "${manifest}"; then
+  # file:// is a URI, so curl rejects a relative path in it. Copy the bare path
+  # instead, which works whether the bundle dir is absolute or relative.
+  if [[ "${nvidia_manifest_url}" == file://* ]]; then
+    if ! cp "${nvidia_manifest_url#file://}" "${manifest}" 2>/dev/null; then
+      rm -f "${manifest}"
+      err "Air-gap NVIDIA device-plugin manifest not found: ${nvidia_manifest_url#file://}"
+    fi
+  elif ! curl -fsSL "${nvidia_manifest_url}" -o "${manifest}"; then
     rm -f "${manifest}"
     err "Failed to fetch NVIDIA device-plugin manifest (version ${ver}).
     URL: ${nvidia_manifest_url}
@@ -3663,6 +4859,11 @@ install_ray_operator() {
 
 # ====== INSTALL SPLUNK OPERATOR ======
 install_splunk_operator() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Operator install (no in-cluster Splunk)"
+    return 0
+  fi
+
   log "Installing Splunk Operator..."
 
   if [[ ! -f "${SPLUNK_OPERATOR_FILE}" ]]; then
@@ -3758,10 +4959,12 @@ wait_for_cert_manager_webhook() {
     return 1
   fi
 
-  # 3. Functional test: create and delete a test Issuer
+  # 3. Functional test: submit a server-side dry-run Issuer. This exercises
+  # admission (including webhook TLS/CA validation) without persisting a test
+  # resource in the cluster.
   local test_ok=false
   for i in $(seq 1 "${max_attempts}"); do
-    if kubectl apply -f - <<'TESTEOF' 2>/dev/null
+    if kubectl create --dry-run=server -f - <<'TESTEOF' 2>/dev/null
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -3771,8 +4974,6 @@ spec:
   selfSigned: {}
 TESTEOF
     then
-      kubectl delete issuer cert-manager-webhook-test -n cert-manager \
-        --ignore-not-found=true 2>/dev/null || true
       test_ok=true
       log "✓ cert-manager webhook is responsive"
       break
@@ -3859,9 +5060,12 @@ install_splunk_ai_operator() {
     warn "Certificate resources may not have been created — the AI operator webhook may not work"
   fi
 
-  # Specifically ensure ClusterRole is updated (common RBAC update issue)
+  # Specifically ensure ClusterRole is updated (common RBAC update issue).
+  # Capture output so we can filter the log but preserve the apply exit code.
   log "Verifying ClusterRole RBAC permissions..."
-  kubectl apply -f "${SPLUNK_AI_FILE}" --server-side --force-conflicts 2>&1 | grep -i "clusterrole" || true
+  local clusterrole_output
+  clusterrole_output=$(kubectl apply -f "${SPLUNK_AI_FILE}" --server-side --force-conflicts 2>&1)
+  echo "${clusterrole_output}" | grep -i "clusterrole" || true
 
   # Find the operator deployment
   log "Waiting for Splunk AI Operator deployment..."
@@ -4226,8 +5430,347 @@ create_ecr_secret() {
   log "✓ Secret will be referenced in AIPlatform CR spec.imagePullSecrets"
 }
 
+# Restore main's native splunkd HTTPS and short-issuer contract, then use that
+# same endpoint for both SAIA and Slim so their SPLUNK_ISSUERS values align.
+internal_splunk_management_url() {
+  printf 'https://splunk-%s-standalone-service:8089' \
+    "${AI_STANDALONE_NAME}"
+}
+
+internal_splunk_pod_name() {
+  printf 'splunk-%s-standalone-0' "${AI_STANDALONE_NAME}"
+}
+
+# Read one effective setting from btool's global [http] stanza. btool has
+# already merged every inputs.conf layer, so exactly one value is expected.
+# Ambiguous or missing values are rejected instead of guessing a HEC protocol.
+_internal_splunk_btool_http_value() {
+  local option="$1"
+  awk -v wanted="${option}" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      in_http = (section == "http")
+      next
+    }
+    in_http && $1 == wanted && $2 == "=" {
+      value = $3
+      sub(/\r$/, "", value)
+      count++
+    }
+    END {
+      if (count != 1) exit 1
+      print tolower(value)
+    }
+  '
+}
+
+# HEC is consumed only by the OTel telemetry exporter. Do not change its TLS
+# setting here: fresh Splunk Operator installs commonly use HTTP while an
+# upgraded/customer-configured instance may use HTTPS. Detect the effective
+# listener after Splunk is Ready, validate it, and expose the result through a
+# global so an err() exit cannot be swallowed by command substitution.
+_detect_internal_splunk_hec_url() {
+  local pod_name
+  local btool_output
+  local hec_disabled
+  local hec_enable_ssl
+  local hec_port
+  local hec_scheme
+  local health_url
+  _INTERNAL_SPLUNK_HEC_URL=""
+
+  pod_name="$(internal_splunk_pod_name)"
+  if ! btool_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool inputs list http 2>/dev/null); then
+    err "Failed to read effective HEC settings from ${AI_NS}/${pod_name}; refusing to guess the OTel endpoint protocol."
+    return 1
+  fi
+
+  if ! hec_disabled=$(printf '%s\n' "${btool_output}" | \
+      _internal_splunk_btool_http_value disabled); then
+    err "Effective Splunk HEC setting [http]/disabled is missing or ambiguous."
+    return 1
+  fi
+  case "${hec_disabled}" in
+    0|false|no|off) ;;
+    1|true|yes|on)
+      err "Splunk HEC is disabled; OTel telemetry requires the internal HEC listener."
+      return 1
+      ;;
+    *)
+      err "Unsupported effective Splunk HEC disabled value: ${hec_disabled}"
+      return 1
+      ;;
+  esac
+
+  if ! hec_enable_ssl=$(printf '%s\n' "${btool_output}" | \
+      _internal_splunk_btool_http_value enableSSL); then
+    err "Effective Splunk HEC setting [http]/enableSSL is missing or ambiguous."
+    return 1
+  fi
+  case "${hec_enable_ssl}" in
+    0|false|no|off) hec_scheme="http" ;;
+    1|true|yes|on) hec_scheme="https" ;;
+    *)
+      err "Unsupported effective Splunk HEC enableSSL value: ${hec_enable_ssl}"
+      return 1
+      ;;
+  esac
+
+  if ! hec_port=$(printf '%s\n' "${btool_output}" | \
+      _internal_splunk_btool_http_value port); then
+    err "Effective Splunk HEC setting [http]/port is missing or ambiguous."
+    return 1
+  fi
+  if [[ "${hec_port}" != "8088" ]]; then
+    err "Effective Splunk HEC port is ${hec_port}; the operator-managed Service exposes only port 8088."
+    return 1
+  fi
+
+  health_url="${hec_scheme}://localhost:${hec_port}/services/collector/health"
+  if [[ "${hec_scheme}" == "https" ]]; then
+    if ! kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+        curl --insecure --silent --show-error --fail --output /dev/null \
+          --max-time 10 "${health_url}" >/dev/null 2>&1; then
+      err "Splunk HEC reports enableSSL=${hec_enable_ssl}, but its HTTPS health endpoint is not ready."
+      return 1
+    fi
+  elif ! kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      curl --silent --show-error --fail --output /dev/null \
+        --max-time 10 "${health_url}" >/dev/null 2>&1; then
+    err "Splunk HEC reports enableSSL=${hec_enable_ssl}, but its HTTP health endpoint is not ready."
+    return 1
+  fi
+
+  _INTERNAL_SPLUNK_HEC_URL="${hec_scheme}://splunk-${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:${hec_port}"
+  log "✓ Detected healthy internal Splunk HEC listener for OTel: ${_INTERNAL_SPLUNK_HEC_URL}"
+}
+
+# Read the Standalone once and distinguish a confirmed NotFound (fresh install)
+# from API, RBAC, transport, or decoding failures. Callers use the globals below
+# so command-substitution subshells cannot hide err() exits.
+_read_internal_splunk_state() {
+  local response
+  _SPLUNK_STANDALONE_EXISTS="false"
+  _SPLUNK_STANDALONE_JSON=""
+
+  if response=$(kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o json 2>&1); then
+    if ! printf '%s\n' "${response}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      err "Kubernetes returned invalid JSON for Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to overwrite its configuration."
+    fi
+    _SPLUNK_STANDALONE_EXISTS="true"
+    _SPLUNK_STANDALONE_JSON="${response}"
+    return 0
+  fi
+
+  if printf '%s\n' "${response}" | grep -q '(NotFound)'; then
+    return 0
+  fi
+
+  err "Failed to read Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to treat an API/RBAC error as a fresh install: ${response}"
+}
+
+_apply_internal_splunk_standalone_cr() {
+  local minio_endpoint="$1"
+  local management_mode="$2"
+  local existing_extra_env_json="${3:-[]}"
+  local desired_extra_env_json
+
+  case "${management_mode}" in
+    bootstrap)
+      # Splunk Operator 3.0.0 installs its telemetry app with a hard-coded
+      # https://localhost:8089 request. Force HTTPS during bootstrap as well as
+      # in the final state. Relying on the image default is not sufficient for
+      # an interrupted upgrade whose PVC still contains enableSplunkdSSL=false.
+      if ! desired_extra_env_json=$(printf '%s\n' "${existing_extra_env_json}" | \
+          jq -c '(map(select(.name != "SPLUNKD_SSL_ENABLE"))) + [{"name":"SPLUNKD_SSL_ENABLE","value":"true"}]'); then
+        err "Failed to preserve Splunk extraEnv while rendering bootstrap mode"
+      fi
+      ;;
+    https)
+      # Explicitly restore the native HTTPS listener on upgrades from an
+      # earlier AIP-4614 preview which persisted SPLUNKD_SSL_ENABLE=false.
+      # The immutable Splunk AI Assistant 2.0.4 app depends on this local
+      # https://127.0.0.1:8089 contract.
+      if ! desired_extra_env_json=$(printf '%s\n' "${existing_extra_env_json}" | \
+          jq -c '(map(select(.name != "SPLUNKD_SSL_ENABLE"))) + [{"name":"SPLUNKD_SSL_ENABLE","value":"true"}]'); then
+        err "Failed to preserve Splunk extraEnv while rendering HTTPS mode"
+      fi
+      ;;
+    *)
+      err "Unsupported internal Splunk management mode: ${management_mode}"
+      ;;
+  esac
+  [[ -n "${desired_extra_env_json}" ]] || err "Failed to render Splunk extraEnv for management mode ${management_mode}"
+
+  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: ${AI_STANDALONE_NAME}
+  namespace: ${AI_NS}
+spec:
+  replicas: 1
+  # Compact JSON is valid YAML. Preserve every existing extraEnv entry while
+  # owning only the SPLUNKD_SSL_ENABLE value needed by this installer.
+  extraEnv: ${desired_extra_env_json}
+  etcVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  varVolumeStorageConfig:
+    storageClassName: ${STORAGE_CLASS}
+  volumes:
+    - name: defaults
+      configMap:
+        name: splunk-defaults
+  defaultsUrl: /mnt/defaults/default.yml
+  appRepo:
+    appInstallPeriodSeconds: 90
+    appSources:
+      - name: apps
+        scope: local
+        location: apps
+    appsRepoPollIntervalSeconds: 60
+    defaults:
+      scope: local
+      volumeName: volume_app_repo
+    installMaxRetries: 2
+    volumes:
+      - name: volume_app_repo
+        provider: aws
+        storageType: s3
+        endpoint: ${minio_endpoint}
+        path: ${MINIO_BUCKET}
+        secretRef: minio-credentials
+YAML
+}
+
+_wait_for_splunk_telemetry_bootstrap() {
+  local timeout="${1:-600}"
+  local elapsed=0
+  local installed=""
+
+  log "Waiting for the Splunk Operator telemetry bootstrap to complete..."
+  while (( elapsed < timeout )); do
+    installed=$(kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+      -o jsonpath='{.status.telAppInstalled}' 2>/dev/null || true)
+    if [[ "${installed}" == "true" ]]; then
+      log "✓ Splunk Operator telemetry bootstrap completed"
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+    -o jsonpath='phase={.status.phase}{"\n"}message={.status.message}{"\n"}' || true
+  err "Timed out waiting for Splunk Operator telemetry bootstrap on native management HTTPS."
+}
+
+# Validate the effective state inside the running Splunk pod. A Ready pod and a
+# successful TLS handshake are not sufficient: an old issuer_uri would still
+# make every fresh JWT fail SAIA/Slim's allowlist, while stale installer-owned
+# certificate paths can break the next restart. Callers retry this predicate
+# while the Splunk Operator finishes reconciling the Standalone.
+_internal_splunk_runtime_matches_desired() {
+  local pod_name="${1:-$(internal_splunk_pod_name)}"
+  local expected_issuer
+  local splunkd_ssl
+  local issuer_uri
+  local debug_output
+
+  expected_issuer="$(internal_splunk_management_url)"
+  if ! splunkd_ssl=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool server list sslConfig 2>/dev/null | \
+      awk '
+        $1 == "enableSplunkdSSL" && $2 == "=" { value=tolower($3); count++ }
+        END { if (count != 1) exit 1; print value }
+      '); then
+    return 1
+  fi
+  [[ "${splunkd_ssl}" == "true" || "${splunkd_ssl}" == "1" ]] || return 1
+
+  if ! issuer_uri=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null | \
+      awk '
+        $1 == "issuer_uri" && $2 == "=" { value=$3; count++ }
+        END { if (count != 1) exit 1; print value }
+      '); then
+    return 1
+  fi
+  [[ "${issuer_uri}" == "${expected_issuer}" ]] || return 1
+
+  if ! debug_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool server list sslConfig --debug 2>/dev/null); then
+    return 1
+  fi
+  ! grep -q '/mnt/splunk-cert' <<<"${debug_output}" || return 1
+
+  if ! debug_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool web list settings --debug 2>/dev/null); then
+    return 1
+  fi
+  ! grep -q '/mnt/splunk-cert' <<<"${debug_output}" || return 1
+
+  if ! debug_output=$(kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+      /opt/splunk/bin/splunk btool inputs list http --debug 2>/dev/null); then
+    return 1
+  fi
+  ! grep -q '/mnt/splunk-cert' <<<"${debug_output}" || return 1
+}
+
+_wait_for_internal_splunk_https() {
+  local timeout="${1:-600}"
+  local deadline=$((SECONDS + timeout))
+  local pod_name
+  local ready=""
+  local standalone_json=""
+  local standalone_phase=""
+  local standalone_message=""
+  pod_name="$(internal_splunk_pod_name)"
+
+  log "Waiting for Splunk Standalone management HTTPS to become ready..."
+  while (( SECONDS < deadline )); do
+    ready=$(kubectl get pod "${pod_name}" -n "${AI_NS}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+    if [[ "${ready}" == "True" ]]; then
+      standalone_json=$(kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+        -o json 2>/dev/null || true)
+      standalone_phase=$(printf '%s\n' "${standalone_json}" | \
+        jq -r '.status.phase // ""' 2>/dev/null || true)
+      standalone_message=$(printf '%s\n' "${standalone_json}" | \
+        jq -r '.status.message // ""' 2>/dev/null || true)
+      if [[ "${standalone_phase}" == "Ready" && -z "${standalone_message}" && \
+            "${ready}" == "True" ]] && \
+         _internal_splunk_runtime_matches_desired "${pod_name}" && \
+         kubectl exec -n "${AI_NS}" "${pod_name}" -- \
+           curl --insecure --silent --show-error --output /dev/null --max-time 10 \
+           https://localhost:8089/services/server/info >/dev/null 2>&1; then
+        log "✓ Splunk management HTTPS, issuer, and migrated TLS paths are ready"
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+
+  kubectl get pod "${pod_name}" -n "${AI_NS}" -o wide || true
+  kubectl get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" \
+    -o jsonpath='phase={.status.phase}{"\n"}message={.status.message}{"\n"}' || true
+  warn "Recent Splunk container logs (current attempt):"
+  kubectl logs "${pod_name}" -n "${AI_NS}" --tail=120 2>&1 || true
+  warn "Recent Splunk container logs (previous attempt, when available):"
+  kubectl logs "${pod_name}" -n "${AI_NS}" --previous --tail=120 2>&1 || true
+  err "Splunk did not converge to native HTTPS, the expected issuer_uri, and clean installer TLS paths within ${timeout}s."
+}
+
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    log "Splunk mode=${SPLUNK_MODE} — skipping Splunk Standalone install (no in-cluster Splunk)"
+    return 0
+  fi
+
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
 
   ensure_namespace "${AI_NS}"
@@ -4247,13 +5790,30 @@ install_splunk_standalone() {
   fi
 
   # Create splunk-defaults ConfigMap (optional but recommended)
-  cat <<'YAML' | kubectl -n "${AI_NS}" apply -f -
+  #
+  # issuer_uri becomes the "iss" claim on every interactive JWT Splunk mints.
+  # It MUST byte-for-byte match splunkConfiguration.endpoint below (which feeds
+  # SPLUNK_ISSUERS on saia/slim) or CMP auth rejects every token with
+  # "Issuer '<iss>' is not allowed". Match main's short, namespace-local HTTPS
+  # Service URL for both SAIA and Slim. This compatibility path provisions no
+  # custom certificate or CA; external Splunk configuration is unaffected.
+  local internal_splunk_url
+  internal_splunk_url="$(internal_splunk_management_url)"
+  cat <<YAML | kubectl -n "${AI_NS}" apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: splunk-defaults
 data:
   default.yml: |
+    # Compatibility migration for installations that were previously managed
+    # by the TLS-preview installer. Those releases persisted certificate paths
+    # under /mnt/splunk-cert* in the Splunk PVC. Restore Splunk's built-in
+    # management certificate and keep Splunk Web on HTTP before startup. The
+    # task is idempotent and only acts on files which still contain the
+    # installer-owned mount prefix.
+    ansible_pre_tasks:
+      - file:///mnt/defaults/remove-stale-installer-tls.yml
     splunk:
       conf:
         - key: authentication
@@ -4261,9 +5821,47 @@ data:
             directory: /opt/splunk/etc/system/local
             content:
               oauth2_settings:
-                issuer_uri: https://splunk-splunk-standalone-standalone-service:8089
-                certFile: $SPLUNK_HOME/etc/auth/server.pem
+                issuer_uri: ${internal_splunk_url}
+                certFile: \$SPLUNK_HOME/etc/auth/server.pem
                 sslPassword: password
+  remove-stale-installer-tls.yml: |
+    ---
+    - name: Restore built-in management TLS and keep Splunk Web on HTTP
+      ini_file:
+        path: "{{ item.path }}"
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        state: present
+      loop:
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: enableSplunkdSSL, value: "true" }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: enableSplunkWebSSL, value: "false" }
+      when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
+
+    - name: Remove stale installer-managed TLS options
+      ini_file:
+        path: "{{ item.path }}"
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        state: absent
+      loop:
+        # Keep password entries before path entries. The when condition is
+        # evaluated for every item, so a legacy path remains present until all
+        # options belonging to that file have been removed.
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: sslPassword }
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: serverCert }
+        - { path: /opt/splunk/etc/system/local/server.conf, section: sslConfig, option: sslRootCAPath }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: sslPassword }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: serverCert }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: privKeyPath }
+        - { path: /opt/splunk/etc/system/local/web.conf, section: settings, option: caCertPath }
+        # HEC transport is outside AIP-4614's management/JWKS change. Remove
+        # only the preview installer's custom certificate material; do not
+        # mutate enableSSL. The installer detects the resulting effective HEC
+        # protocol after Splunk becomes Ready and gives that URL only to OTel.
+        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: sslPassword }
+        - { path: /opt/splunk/etc/apps/splunk_httpinput/local/inputs.conf, section: http, option: serverCert }
+      when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
 YAML
 
   # Ensure default ServiceAccount has imagePullSecrets for ECR
@@ -4305,54 +5903,62 @@ YAML
     err "Splunk Standalone needs a non-empty S3 endpoint; check storage.objectStore.endpoint (or storage.objectStore.type)."
     return 1
   fi
-  local endpoint_line="        endpoint: ${minio_endpoint}"
+  # A fresh Splunk Operator 3.0.0 installation has one HTTPS-only telemetry-app
+  # bootstrap call. Fresh installations bootstrap with the image default, then
+  # every installation is reconciled to explicit native management HTTPS.
+  local telemetry_bootstrapped="false"
+  local existing_extra_env_json="[]"
+  _read_internal_splunk_state
+  if [[ "${_SPLUNK_STANDALONE_EXISTS}" == "true" ]]; then
+    if ! telemetry_bootstrapped=$(printf '%s\n' "${_SPLUNK_STANDALONE_JSON}" | jq -er '
+        .status.telAppInstalled as $installed
+        | if $installed == null then "false"
+          elif ($installed | type) == "boolean" then ($installed | tostring)
+          else error("telAppInstalled is not boolean") end'); then
+      err "Invalid status.telAppInstalled on Standalone ${AI_NS}/${AI_STANDALONE_NAME}"
+    fi
+    if ! existing_extra_env_json=$(printf '%s\n' "${_SPLUNK_STANDALONE_JSON}" | \
+        jq -ec '(.spec.extraEnv // []) | if type == "array" then . else error("extraEnv is not an array") end'); then
+      err "Invalid spec.extraEnv on Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to overwrite it."
+    fi
+  fi
 
-  cat <<YAML | kubectl apply --server-side --force-conflicts -f -
-apiVersion: enterprise.splunk.com/v4
-kind: Standalone
-metadata:
-  name: ${AI_STANDALONE_NAME}
-  namespace: ${AI_NS}
-spec:
-  replicas: 1
-  etcVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  varVolumeStorageConfig:
-    storageClassName: ${STORAGE_CLASS}
-  volumes:
-    - name: defaults
-      configMap:
-        name: splunk-defaults
-  defaultsUrl: /mnt/defaults/default.yml
-  appRepo:
-    appInstallPeriodSeconds: 90
-    appSources:
-      - name: apps
-        scope: local
-        location: apps
-    appsRepoPollIntervalSeconds: 60
-    defaults:
-      scope: local
-      volumeName: volume_app_repo
-    installMaxRetries: 2
-    volumes:
-      - name: volume_app_repo
-        provider: aws
-        storageType: s3
-${endpoint_line}
-        path: ${MINIO_BUCKET}
-        secretRef: minio-credentials
-YAML
+  if [[ "${telemetry_bootstrapped}" != "true" ]]; then
+    _apply_internal_splunk_standalone_cr "${minio_endpoint}" bootstrap "${existing_extra_env_json}"
+    _wait_for_splunk_telemetry_bootstrap 600
+  fi
 
-  log "Splunk Standalone CR applied (pod starts in background)"
+  # Re-read after the potentially long bootstrap so a concurrent extraEnv
+  # update is preserved in the final manifest.
+  _read_internal_splunk_state
+  [[ "${_SPLUNK_STANDALONE_EXISTS}" == "true" ]] || \
+    err "Standalone ${AI_NS}/${AI_STANDALONE_NAME} disappeared during installation"
+  if ! existing_extra_env_json=$(printf '%s\n' "${_SPLUNK_STANDALONE_JSON}" | \
+      jq -ec '(.spec.extraEnv // []) | if type == "array" then . else error("extraEnv is not an array") end'); then
+    err "Invalid spec.extraEnv on Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to overwrite it."
+  fi
+
+  _apply_internal_splunk_standalone_cr "${minio_endpoint}" https "${existing_extra_env_json}"
+  _wait_for_internal_splunk_https 900
+  _detect_internal_splunk_hec_url
+  log "Splunk Standalone is using native management HTTPS"
 }
 
-# Blocks until Splunk Standalone pod is ready. Called at the end of the
-# install flow so the operator and CR can deploy while Splunk boots.
+# Final readiness postcondition for the Splunk Standalone pod.
 wait_for_splunk_standalone() {
+  if [[ "${SPLUNK_MODE}" != "internal" ]]; then
+    return 0
+  fi
+
   log "Waiting for Splunk Standalone to be ready..."
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
-  log "Splunk Standalone is ready"
+  local splunk_pod_name
+  splunk_pod_name="$(internal_splunk_pod_name)"
+  if ! kubectl wait --for=condition=ready "pod/${splunk_pod_name}" \
+      -n "${AI_NS}" --timeout=600s; then
+    kubectl get pod "${splunk_pod_name}" -n "${AI_NS}" -o wide || true
+    err "Timed out waiting for Splunk Standalone to become ready"
+  fi
+  log "✓ Splunk Standalone is ready"
 }
 
 # ====== INSTALL AI PLATFORM CR ======
@@ -4375,9 +5981,101 @@ install_ai_platform_cr() {
     xargs -r -I {} kubectl delete pod {} -n "${AI_NS}" --wait=false --grace-period=0 --force 2>/dev/null || true
   log "✓ Cleanup complete"
 
-  # Get Splunk secret name (for HEC endpoint)
-  local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
-  log "Using Splunk secret: ${splunk_secret}"
+  # Build trustedIssuers YAML fragment from config (splunk.trustedIssuers[]).
+  # Used in all modes: appended to in-cluster issuer (internal) or sole source (external/disabled).
+  local trusted_issuers_yaml=""
+  local trusted_issuers_count
+  trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  if [[ "${trusted_issuers_count}" -gt 0 ]]; then
+    trusted_issuers_yaml="    trustedIssuers:"$'\n'
+    local _ti=0
+    while [[ $_ti -lt $trusted_issuers_count ]]; do
+      local _url
+      _url=$(yq eval ".splunk.trustedIssuers[$_ti]" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      [[ -n "${_url}" && "${_url}" != "null" ]] && trusted_issuers_yaml+="      - \"${_url}\""$'\n'
+      _ti=$((_ti + 1))
+    done
+  fi
+
+  # Splunk configuration block for the AIPlatform CR. Rendered by mode:
+  #   disabled — omits splunkConfiguration; trustedIssuers still written if set.
+  #   internal — point at the in-cluster Standalone as JWT issuer + HEC + operator-managed secret.
+  #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
+  #              var and point at the customer's external Splunk as JWT issuer/HEC endpoint.
+  local splunk_config_yaml=""
+  case "${SPLUNK_MODE}" in
+    internal)
+      local splunk_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
+      local internal_splunk_url
+      local internal_splunk_hec_url_value
+      internal_splunk_url="$(internal_splunk_management_url)"
+      internal_splunk_hec_url_value="${_INTERNAL_SPLUNK_HEC_URL:-}"
+      [[ -n "${internal_splunk_hec_url_value}" ]] || \
+        err "Internal Splunk HEC protocol was not detected before rendering AIPlatform."
+      log "Using Splunk secret: ${splunk_secret}"
+      splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (internal — in-cluster Standalone)
+  # Scheme+host here MUST byte-for-byte match the oauth2_settings.issuer_uri
+  # set in the splunk-defaults ConfigMap above (install_splunk_standalone) —
+  # it becomes the JWT "iss" claim that CMP auth whitelists via SPLUNK_ISSUERS.
+  # Match main's short namespace-local issuer URL; no TLS resources are
+  # provisioned or mounted by this compatibility path.
+  splunkConfiguration:
+    endpoint: ${internal_splunk_url}
+    # Used only by the OTel exporter for telemetry ingestion. Its scheme comes
+    # from Splunk's effective HEC listener and it is never a JWT issuer.
+    hecEndpoint: ${internal_splunk_hec_url_value}
+    secretRef:
+      name: ${splunk_secret}
+      namespace: ${AI_NS}
+${trusted_issuers_yaml}
+EOF
+)
+      ;;
+    external)
+      # The HEC token comes from the env var only (never the config file). The
+      # namespace is guaranteed here (internal mode created it via the Standalone
+      # install; external mode skips that, so ensure it now before the Secret).
+      ensure_namespace "${AI_NS}"
+      if [[ -z "${SPLUNK_HEC_TOKEN}" ]]; then
+        err "Splunk external mode requires the HEC token: export SPLUNK_HEC_TOKEN before running the installer."
+      fi
+      log "Creating external Splunk HEC secret '${SPLUNK_EXTERNAL_SECRET_NAME}' in ${AI_NS} (token from SPLUNK_HEC_TOKEN env)..."
+      # --dry-run|apply keeps this idempotent across re-runs. The token value is
+      # never echoed; only the secret name is logged.
+      kubectl -n "${AI_NS}" create secret generic "${SPLUNK_EXTERNAL_SECRET_NAME}" \
+        --from-literal=hec_token="${SPLUNK_HEC_TOKEN}" \
+        --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+      log "✓ External Splunk HEC secret ready: ${SPLUNK_EXTERNAL_SECRET_NAME}"
+      log "Using external Splunk HEC endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}"
+      splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (external — customer-managed Splunk)
+  splunkConfiguration:
+    endpoint: ${SPLUNK_EXTERNAL_ENDPOINT}
+    secretRef:
+      name: ${SPLUNK_EXTERNAL_SECRET_NAME}
+      namespace: ${AI_NS}
+${trusted_issuers_yaml}
+EOF
+)
+      ;;
+    *)
+      if [[ -n "${trusted_issuers_yaml}" ]]; then
+        log "Splunk disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
+        splunk_config_yaml=$(cat <<EOF
+
+  # Splunk configuration (disabled — trustedIssuers only for JWT validation)
+  splunkConfiguration:
+${trusted_issuers_yaml}
+EOF
+)
+      else
+        log "Splunk disabled (splunk.enabled=false) — omitting splunkConfiguration from AIPlatform CR"
+      fi
+      ;;
+  esac
 
   # Ensure object storage credentials secret exists in AI namespace
   log "Creating/updating S3-compatible credentials secret (minio-credentials) in ${AI_NS}..."
@@ -4470,6 +6168,15 @@ EOF
     log "SAIA public exposure: ${svc_type}${svc_node_port:+ (nodePort=${svc_node_port})}"
   fi
 
+  # Platform-wide positive-integer capacity multiplier
+  # (aiPlatform.scaleFactor). Omitted => operator default (1).
+  local scale_factor_yaml="" ai_scale_factor
+  ai_scale_factor=$(yq eval '.aiPlatform.scaleFactor // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ -n "$ai_scale_factor" && "$ai_scale_factor" != "null" ]]; then
+    scale_factor_yaml="  scaleFactor: ${ai_scale_factor}"$'\n'
+    log "  scaleFactor: ${ai_scale_factor}"
+  fi
+
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
   local feature_count
@@ -4517,6 +6224,8 @@ ${image_pull_secrets}
   # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
   defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
 
+  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
+${scale_factor_yaml}
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}
@@ -4546,13 +6255,7 @@ ${svc_template_yaml}
         operator: "Equal"
         value: "true"
         effect: "NoSchedule"
-
-  # Splunk configuration
-  splunkConfiguration:
-    endpoint: http://${AI_STANDALONE_NAME}-standalone-service.${AI_NS}.svc.cluster.local:8089
-    secretRef:
-      name: ${splunk_secret}
-      namespace: ${AI_NS}
+${splunk_config_yaml}
 YAML
 
   log "AIPlatform CR created successfully"
@@ -4847,6 +6550,97 @@ patch_k0s_saia_public_service_workaround() {
   patch_k0s_saia_service_disable_nodeport
 }
 
+# True when the "slim" feature is present in aiPlatform.features[]. slim has no
+# v1/v2/nginx split, so its public Service is just <platform>-slim-slim-service.
+k0s_slim_feature_enabled() {
+  local names
+  names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  while IFS= read -r n; do
+    [[ "${n}" == "slim" ]] && return 0
+  done <<< "${names}"
+  return 1
+}
+
+# Expose the slim public Service the same way SAIA is exposed, but on a DISTINCT
+# NodePort (aiPlatform.serviceTemplate.slimNodePort, default 30081). This is
+# required because the AIPlatform reconciler copies AIPlatform.spec.serviceTemplate
+# down to EVERY feature's AIService verbatim, so slim would otherwise inherit
+# SAIA's nodePort (30080) and collide — a single NodePort can back only one
+# Service. We patch slim's own AIService.spec.serviceTemplate after it exists;
+# reconcileSlimService only mutates Selector/Ports on the existing Service and
+# the AIPlatform reconciler preserves an admin-patched serviceTemplate
+# (pkg/ai/reconciler.go), so this patch survives subsequent reconciles.
+patch_k0s_slim_public_service_workaround() {
+  k0s_slim_feature_enabled || return 0
+
+  local platform_name="${CLUSTER_NAME}-ai-platform"
+  local aiservice_name="${platform_name}-slim"
+  local public_svc_name="${aiservice_name}-slim-service"
+  local svc_type svc_node_port slim_node_port
+
+  svc_type=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  svc_node_port=$(yq eval '.aiPlatform.serviceTemplate.nodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  # slimNodePort keeps slim off SAIA's port; fall back to nodePort+1 if unset so
+  # a config that only sets one shared nodePort still avoids a hard collision.
+  slim_node_port=$(yq eval '.aiPlatform.serviceTemplate.slimNodePort // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  if [[ ( -z "${slim_node_port}" || "${slim_node_port}" == "null" ) && -n "${svc_node_port}" && "${svc_node_port}" != "null" ]]; then
+    slim_node_port=$((svc_node_port + 1))
+  fi
+
+  wait_for_k0s_aiservice_exists "${aiservice_name}"
+
+  if saia_service_template_enabled_k0s; then
+    log "Patching AIService/${aiservice_name} with slim public exposure settings (type=${svc_type})..."
+    if [[ "${svc_type}" == "NodePort" && -n "${slim_node_port}" && "${slim_node_port}" != "null" ]]; then
+      log "slim exposed via NodePort ${slim_node_port} — reach it at http://<worker-ip>:${slim_node_port} (front with a cloud LB on cloud VMs). Distinct from SAIA's ${svc_node_port} to avoid a NodePort collision." >&2
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"NodePort\",
+        \"ports\": [
+          {
+            \"name\": \"http\",
+            \"port\": 8080,
+            \"targetPort\": 8080,
+            \"nodePort\": ${slim_node_port}
+          }
+        ]
+      }
+    }
+  }
+}"
+    else
+      kubectl -n "${AI_NS}" patch aiservice "${aiservice_name}" --type merge -p "{
+  \"spec\": {
+    \"serviceTemplate\": {
+      \"spec\": {
+        \"type\": \"${svc_type}\"
+      }
+    }
+  }
+}"
+    fi
+  fi
+
+  apply_k0s_saia_service_annotations "${aiservice_name}"
+
+  kubectl -n "${AI_NS}" annotate aiservice "${aiservice_name}" script-reconcile-ts="$(date +%s)" --overwrite >/dev/null
+
+  if saia_service_template_enabled_k0s; then
+    log "Recreating slim public Service to ensure patched settings take effect..."
+    kubectl -n "${AI_NS}" delete svc "${public_svc_name}" --ignore-not-found >/dev/null 2>&1 || true
+    # Wait briefly for the operator to recreate it before moving on; if it
+    # doesn't come back in time the next reconcile will render it anyway.
+    local waited=0
+    while ! kubectl -n "${AI_NS}" get svc "${public_svc_name}" >/dev/null 2>&1; do
+      [[ ${waited} -ge 300 ]] && break
+      sleep 5
+      waited=$((waited + 5))
+    done
+  fi
+}
+
 # ====== INSTALL FULL STACK ======
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
@@ -4867,18 +6661,22 @@ install_ai_platform_stack() {
   install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
   phase1_pids+=($!); phase1_names+=("nvidia-drivers")
 
-  # Track which phase-1 tasks failed. nvidia-drivers failures are fatal:
-  # without them the device-plugin crash-loops and the whole GPU stack
-  # silently fails. Every other phase-1 task is merely warned on failure.
+  # Track required phase-1 tasks. cert-manager must be functional before any
+  # operator manifests containing Certificate/Issuer resources are applied;
+  # NVIDIA host drivers are required before the device plugin can start.
   local phase1_fatal_failures=0
+  local phase1_fatal_names=()
   for i in "${!phase1_pids[@]}"; do
     if wait "${phase1_pids[$i]}"; then
       log "  ✓ ${phase1_names[$i]} completed"
     else
       warn "  ✗ ${phase1_names[$i]} had issues"
-      if [[ "${phase1_names[$i]}" == "nvidia-drivers" ]]; then
-        phase1_fatal_failures=$((phase1_fatal_failures + 1))
-      fi
+      case "${phase1_names[$i]}" in
+        cert-manager|nvidia-drivers)
+          phase1_fatal_failures=$((phase1_fatal_failures + 1))
+          phase1_fatal_names+=("${phase1_names[$i]}")
+          ;;
+      esac
     fi
     while IFS= read -r line; do
       log "    [${phase1_names[$i]}] ${line}"
@@ -4887,9 +6685,7 @@ install_ai_platform_stack() {
   rm -rf "${phase1_logdir}"
 
   if [[ ${phase1_fatal_failures} -gt 0 ]]; then
-    err "NVIDIA driver install failed on at least one GPU node; aborting install.
-    Device-plugin pods would otherwise crash-loop with NVML: ERROR_LIBRARY_NOT_FOUND
-    and model pods would stay Pending forever. Fix the errors above and re-run."
+    err "Required Phase 1 component(s) failed: ${phase1_fatal_names[*]}. Aborting before dependent operators are installed. Fix the errors above and re-run."
   fi
 
   ensure_s3compat_credentials
@@ -4926,7 +6722,8 @@ install_ai_platform_stack() {
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
 
-  # Apply Splunk Standalone CR (non-blocking — pod boots in background)
+  # Install and finalize Splunk before AIPlatform. Native HTTPS remains enabled
+  # for both Splunk-local clients and the aligned short issuer endpoint.
   install_splunk_standalone
 
   # MetalLB must be installed BEFORE the AIPlatform CR is reconciled — the
@@ -4937,12 +6734,15 @@ install_ai_platform_stack() {
   # ClusterIP only).
   install_metallb
 
-  # Install AI Platform operator and CR while Splunk Standalone boots
+  # Install AI Platform only after native Splunk HTTPS is Ready.
   install_splunk_ai_operator
   install_ai_platform_cr
   patch_k0s_saia_public_service_workaround
+  # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
+  patch_k0s_slim_public_service_workaround
 
-  # Now wait for Splunk Standalone to be ready (likely already done by now)
+  # Final postcondition (normally immediate because installation already
+  # verified the replacement pod).
   wait_for_splunk_standalone
 
   log "AI Platform stack installation complete!"
@@ -5119,7 +6919,7 @@ check_platform_health() {
 #     after Job-level retries succeed.
 #
 # Tunables (env vars):
-#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 600).
+#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 1200).
 #   POD_HEALTH_PENDING_GRACE  How long Pending pods are tolerated (default 300).
 #   POD_HEALTH_POLL_INTERVAL  Re-check interval while waiting (default 15).
 #
@@ -5132,13 +6932,13 @@ verify_all_pods_healthy() {
   log "============================================"
   log ""
 
-  # The default budget (10 minutes) is sized for the typical case: KubeRay
+  # The default budget (20 minutes) is sized for the typical case: KubeRay
   # creates worker pods only AFTER the head pod becomes Running+Ready, and
   # each worker then has to pull a multi-GB image and register with the
   # head. Splunk Standalone has a similar 2–5 min init.
-  # On slow networks or fresh clusters where Ray Serve has lots to download,
-  # bump this with POD_HEALTH_STABLE_WAIT (e.g. 1200 for 20 minutes).
-  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-600}"
+  # Override this with POD_HEALTH_STABLE_WAIT when a different settle budget
+  # is appropriate for the deployment environment.
+  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-1200}"
   local pending_grace_secs="${POD_HEALTH_PENDING_GRACE:-300}"
   local poll_interval="${POD_HEALTH_POLL_INTERVAL:-15}"
   # Clamp grace ≤ wait. Without this, configuring a short STABLE_WAIT (e.g.
@@ -5655,14 +7455,16 @@ _check_workload_readiness() {
   done <<<"${_wl_rows}"
 
   # ---- KubeRay: RayServices ---------------------------------------------------
-  # A RayService is Ready when its 'Ready' condition is True. KubeRay also
-  # reports 'numServeEndpoints' once the serve apps are reachable.
+  # Prefer the Kubernetes-style Ready condition when KubeRay exposes it. Older
+  # KubeRay versions (including v1.2.2) expose only serviceStatus=Running.
+  # KubeRay also reports 'numServeEndpoints' once the serve apps are reachable.
   _wl_query_crd rayservices.ray.io rayservices '
       .items[]
       | [
           .metadata.namespace,
           .metadata.name,
           ([(.status.conditions // [])[] | select(.type=="Ready") | .status] | first // ""),
+          (.status.serviceStatus // ""),
           ([(.status.conditions // [])[] | select(.type=="UpgradeInProgress") | .status] | first // ""),
           (.status.numServeEndpoints // 0 | tostring)
         ]
@@ -5670,10 +7472,17 @@ _check_workload_readiness() {
     '
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
-    local rs_ns rs_name rs_ready rs_upgrading rs_endpoints
-    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_upgrading rs_endpoints <<<"${line}"
-    if [[ "${rs_ready}" != "True" ]]; then
+    local rs_ns rs_name rs_ready rs_service_status rs_upgrading rs_endpoints
+    IFS="${_POD_FS}" read -r rs_ns rs_name rs_ready rs_service_status rs_upgrading rs_endpoints <<<"${line}"
+    local rs_is_ready=0
+    if [[ -n "${rs_ready}" ]]; then
+      [[ "${rs_ready}" == "True" ]] && rs_is_ready=1
+    elif [[ "${rs_service_status}" == "Running" ]]; then
+      rs_is_ready=1
+    fi
+    if (( rs_is_ready == 0 )); then
       local why="RayService ${rs_ns}/${rs_name}: Ready=${rs_ready:-Unknown}"
+      why+=" serviceStatus=${rs_service_status:-Unknown}"
       [[ "${rs_upgrading}" == "True" ]] && why+=" (upgrade in progress)"
       why+=" serveEndpoints=${rs_endpoints}"
       missing+=("${why}")
@@ -5993,7 +7802,7 @@ show_platform_access_info() {
   log "     kubectl get pods -n ${AI_NS} -l app.kubernetes.io/instance=splunk-standalone"
   log "  "
   log "  💡 Access Splunk Web (once ready):"
-  log "     kubectl port-forward -n ${AI_NS} svc/splunk-standalone-standalone-service 8000:8000"
+  log "     kubectl port-forward -n ${AI_NS} svc/splunk-${AI_STANDALONE_NAME}-standalone-service 8000:8000"
   log "     Open: http://localhost:8000"
   log ""
 
@@ -6122,6 +7931,11 @@ main_install() {
     step_start "Model artifact staging (HuggingFace → object store)"
     log "Model staging enabled — downloading from Hugging Face and uploading to object store…"
     stage_model_artifacts
+    step_ok
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    step_start "Verify pre-staged model artifacts"
+    log "Model staging disabled — verifying required models already exist in the configured object store..."
+    verify_pre_staged_model_artifacts
     step_ok
   else
     step_start "Model artifact staging"
@@ -6285,6 +8099,17 @@ main_install() {
     log ""
   fi
 
+  # A rerun may have staged a newer archive than the one left on the nodes by a
+  # previous install. Refresh changed archives before checking their image lists.
+  if [[ "${use_existing_cluster}" == "true" ]]; then
+    refresh_airgap_image_bundles_on_existing_nodes
+  fi
+
+  # This runs for both fresh bootstrap and useExisting/rerun installs. Do not
+  # create cert-manager or other add-on pods until every sealed node has the
+  # complete offline image set registered in containerd.
+  verify_airgap_bundle_images_on_all_nodes
+
   # Install AI Platform stack
   phase_start "AI Platform Stack"
   step_start "Install AI Platform stack"
@@ -6347,6 +8172,7 @@ main_install() {
 
 # ====== MAIN DELETE FLOW ======
 main_delete() {
+  local cleanup_mode="${1:-delete}"
   load_config
 
   log "============================================"
@@ -6391,22 +8217,36 @@ main_delete() {
   IFS=' ' read -ra CONTROLLER_IPS <<< "${EXISTING_CONTROLLER_IPS}"
   IFS=' ' read -ra WORKER_IPS <<< "${EXISTING_WORKER_IPS}"
 
-  log "Stopping k0s on controller nodes..."
-  for ip in "${CONTROLLER_IPS[@]}"; do
-    log "  Stopping k0s on controller: ${ip}..."
-    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
+  local reset_succeeded=0
+  local reset_failed=0
+  local -a reset_failed_nodes=()
+  local -a all_node_ips=("${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}")
+
+  log "Stopping and resetting k0s on configured nodes..."
+  for ip in "${all_node_ips[@]}"; do
+    log "  Resetting k0s on node: ${ip}..."
+    if ssh_exec "${ip}" "
+      if command -v k0s >/dev/null 2>&1; then
+        sudo k0s stop || true
+        sudo k0s reset
+      else
+        echo 'k0s binary is already absent; nothing to reset'
+      fi
+    "; then
+      reset_succeeded=$((reset_succeeded + 1))
+    else
+      warn "Failed to reset k0s on ${ip}"
+      reset_failed=$((reset_failed + 1))
+      reset_failed_nodes+=("${ip}")
+    fi
   done
 
-  log "Stopping k0s on worker nodes..."
-  for ip in "${WORKER_IPS[@]}"; do
-    log "  Stopping k0s on worker: ${ip}..."
-    ssh_exec "${ip}" "sudo k0s stop || true; sudo k0s reset --force || true" || warn "Failed to stop k0s on ${ip}"
-  done
+  K0S_RESET_FAILED="${reset_failed}"
 
-  log "k0s stopped on all nodes"
-  log "NOTE: Node machines are still running. To clean up completely:"
-  log "  - Remove k0s binaries: sudo rm -f /usr/local/bin/k0s"
-  log "  - Clean up data: sudo rm -rf /var/lib/k0s /etc/k0s"
+  log "k0s reset results: ${reset_succeeded} succeeded/already absent, ${reset_failed} failed"
+  if (( reset_failed > 0 )); then
+    warn "Nodes that failed k0s reset: ${reset_failed_nodes[*]}"
+  fi
 
   # Clean up local files
   log "Cleaning up local files..."
@@ -6414,42 +8254,26 @@ main_delete() {
   for kc in "${HOME}/.kube/k0s-${CLUSTER_NAME}" "${HOME}/.kube/k0s-${CLUSTER_NAME}.bak"; do
     if [[ -f "${kc}" ]]; then
       rm -f "${kc}"
-      ((kubeconfig_count++))
+      kubeconfig_count=$((kubeconfig_count + 1))
     fi
   done
   rm -rf "/tmp/splunk-ai-operator" || true
 
-  log "============================================"
-  log "Cleanup Summary"
-  log "============================================"
+  if [[ "${cleanup_mode}" == "delete" ]]; then
+    log "============================================"
+    log "Delete Summary"
+    log "============================================"
+    log "  - k0s reset: ${reset_succeeded} succeeded/already absent, ${reset_failed} failed"
+    log "  - Kubeconfig files: ${kubeconfig_count} cleaned up"
+    log "  - Node machines remain running"
 
-  log "Infrastructure: On-premises"
-  log "  - k0s stopped and reset on all nodes"
-  log "  - NOTE: Nodes are still running, k0s binaries remain"
+    if (( reset_failed > 0 )); then
+      warn "Delete completed with node reset failures."
+      return 1
+    fi
 
-  log ""
-  log "Kubernetes Resources:"
-  log "  - AI Platform resources deleted"
-  log "  - Splunk Standalone deleted"
-  log "  - Ray services/clusters deleted"
-  log "  - All operators uninstalled"
-  log "  - All namespaces deleted"
-  log ""
-  log "Local Files:"
-  log "  - Kubeconfig files: ${kubeconfig_count} cleaned up"
-
-  log ""
-  log "============================================"
-  log "Cleanup complete!"
-  log "============================================"
-  log ""
-  log "Cluster '${CLUSTER_NAME}' has been deleted."
-
-  log ""
-  log "Nodes are still running with k0s stopped."
-  log "To fully clean up each node, run:"
-  log "  sudo rm -f /usr/local/bin/k0s"
-  log "  sudo rm -rf /var/lib/k0s /etc/k0s"
+    log "Delete complete!"
+  fi
 }
 
 # ====== CLEAN ALL (AGGRESSIVE CLEANUP) ======
@@ -6459,10 +8283,12 @@ clean_all() {
   log "============================================"
   warn "This will forcefully remove all resources and data!"
 
-  load_config
-
   # Run normal delete first
-  main_delete
+  main_delete clean-all
+
+  local aggressive_succeeded=0
+  local aggressive_failed=0
+  local -a aggressive_failed_nodes=()
 
   # Additional aggressive cleanup for on-prem
   if [[ -n "${EXISTING_CONTROLLER_IPS}" ]]; then
@@ -6472,21 +8298,46 @@ clean_all() {
     log "Performing aggressive cleanup on nodes..."
     for ip in "${CONTROLLER_IPS[@]}" "${WORKER_IPS[@]}"; do
       log "  Deep cleaning node: ${ip}..."
-      ssh_exec "${ip}" "
-        sudo systemctl stop k0scontroller k0sworker || true
-        sudo systemctl disable k0scontroller k0sworker || true
-        sudo rm -rf /var/lib/k0s /etc/k0s
-        sudo rm -f /usr/local/bin/k0s
-        sudo rm -rf /var/lib/kubelet /etc/cni /opt/cni
-        sudo rm -rf /var/lib/calico /etc/calico
-        sudo iptables -F || true
-        sudo iptables -X || true
-        sudo iptables -t nat -F || true
-        sudo iptables -t nat -X || true
-        sudo iptables -t mangle -F || true
-        sudo iptables -t mangle -X || true
-      " || warn "Failed aggressive cleanup on ${ip}"
+      if ssh_exec "${ip}" "
+        cleanup_failed=0
+        sudo systemctl stop k0scontroller k0sworker >/dev/null 2>&1 || true
+        sudo systemctl disable k0scontroller k0sworker >/dev/null 2>&1 || true
+        if mountpoint -q /var/lib/k0s; then
+          sudo find /var/lib/k0s -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || cleanup_failed=1
+        else
+          sudo rm -rf /var/lib/k0s || cleanup_failed=1
+        fi
+        sudo rm -rf /etc/k0s || cleanup_failed=1
+        sudo rm -f /usr/local/bin/k0s || cleanup_failed=1
+        sudo rm -rf /var/lib/kubelet /etc/cni /opt/cni || cleanup_failed=1
+        sudo rm -rf /var/lib/calico /etc/calico || cleanup_failed=1
+        if command -v iptables >/dev/null 2>&1; then
+          sudo iptables -F || cleanup_failed=1
+          sudo iptables -X || cleanup_failed=1
+          sudo iptables -t nat -F || cleanup_failed=1
+          sudo iptables -t nat -X || cleanup_failed=1
+          sudo iptables -t mangle -F || cleanup_failed=1
+          sudo iptables -t mangle -X || cleanup_failed=1
+        fi
+        exit \${cleanup_failed}
+      "; then
+        aggressive_succeeded=$((aggressive_succeeded + 1))
+      else
+        warn "Failed aggressive cleanup on ${ip}"
+        aggressive_failed=$((aggressive_failed + 1))
+        aggressive_failed_nodes+=("${ip}")
+      fi
     done
+
+    log "Aggressive cleanup results: ${aggressive_succeeded} succeeded, ${aggressive_failed} failed"
+    if (( aggressive_failed > 0 )); then
+      warn "Nodes that failed aggressive cleanup: ${aggressive_failed_nodes[*]}"
+    fi
+  fi
+
+  if (( K0S_RESET_FAILED > 0 || aggressive_failed > 0 )); then
+    warn "Clean-all completed with cleanup failures. Review the failed nodes above."
+    return 1
   fi
 
   log "Aggressive cleanup complete!"
@@ -6649,6 +8500,13 @@ validate_config() {
       errors=$(( errors + 1 ))
     fi
   fi
+  local scale_factor_error
+  if ! scale_factor_error=$(validate_scale_factor_config); then
+    echo -e "  \033[1;31m✖\033[0m ${scale_factor_error}" >&2
+    errors=$(( errors + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m aiPlatform.scaleFactor is a positive integer (default: 1)" >&2
+  fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
     warnings=$(( warnings + 1 ))
@@ -6727,9 +8585,9 @@ Environment:
                              for install; also skips delete/clean-all confirmations).
   POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
                              RayService, Splunk Standalone, AIPlatform/AIService) to
-                             reach Ready during verify (default: 600 = 10 minutes).
-                             Bump to 1200 (20 min) on slow networks or fresh clusters
-                             where Ray Serve has lots of model artifacts to download.
+                             reach Ready during verify (default: 1200 = 20 minutes).
+                             Override it when the deployment environment needs a
+                             different settle budget.
   POD_HEALTH_PENDING_GRACE - Seconds to ignore Pending pods younger than this
                              (default: 300)
   POD_HEALTH_POLL_INTERVAL - Seconds between checks while waiting (default: 15)
@@ -6781,7 +8639,7 @@ Notes:
     storage.modelStaging.enabled: false to skip auto-staging during 'install'
     while still being able to run it manually via this subcommand.
     HF credentials (hf-token, hf-username) are read from
-    ../artifacts_download_upload_scripts/model_artifacts_configs.yaml.
+    the selected model_artifacts_configs_{unquantized,quantized}.yaml file.
   - 'verify-pods' runs the same pod-health audit that 'install' triggers at
     the end. Useful for re-checking a cluster, gathering remediation hints
     after a partial failure, or verifying a manual fix.
@@ -6879,9 +8737,9 @@ join_workers() {
   cluster_nodes_json=$(kubectl get nodes -o json 2>/dev/null || echo '{"items":[]}')
 
   for worker_ip in "${WORKER_IPS[@]}"; do
-    # Resolve the Kubernetes node name by SSHing to the worker and getting its hostname
+    # Resolve the Kubernetes node name by InternalIP or a validated hostname.
     local node_exists=""
-    node_exists=$(resolve_node_name "${worker_ip}")
+    node_exists=$(resolve_node_name "${worker_ip}") || node_exists=""
 
     # Verify this node actually exists in the cluster
     if [[ -n "${node_exists}" ]]; then
@@ -6999,12 +8857,26 @@ join_workers() {
 
     # Start worker using systemctl (more reliable than k0s start)
     log "  Starting k0s worker..."
+    local worker_start_epoch
+    worker_start_epoch=$(ssh_exec "${worker_ip}" "date +%s")
     if ssh_exec "${worker_ip}" "sudo systemctl start k0sworker"; then
       log "  ✓ Worker service started"
     else
       warn "  Failed to start k0s worker on ${worker_ip}"
       # Try fallback
       ssh_exec "${worker_ip}" "sudo k0s start" || continue
+    fi
+
+    if ! wait_for_k0s_image_bundles "${worker_ip}" "k0sworker" "${worker_start_epoch}"; then
+      warn "  Offline image bundle import failed on ${worker_ip}; worker will not be joined."
+      continue
+    fi
+
+    configure_insecure_registry_on_node "${worker_ip}"
+    if [[ -n "${IMAGE_REGISTRY:-}" && "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]]; then
+      restart_k0s_after_registry_configuration "${worker_ip}" "k0sworker" || continue
+    else
+      verify_airgap_bundle_images_on_node "${worker_ip}" || continue
     fi
 
     # Wait briefly and verify
@@ -7061,6 +8933,61 @@ join_workers() {
 # Parse install-specific flags before handing off to subcommands.
 _CMD="${1:-install}"
 shift 2>/dev/null || true
+
+# ====== AIR-GAP DELEGATION ======
+# One command serves both modes: with cluster.airgap: true the artifacts must be
+# downloaded before anything can be pushed to the sealed nodes, so hand off to
+# airgap_install.sh, which stages them and then re-invokes this script with the
+# file:// overrides exported.
+#
+# AIRGAP_STAGED is the recursion guard — airgap_install.sh sets it before calling
+# back, so this branch is skipped on the second pass.
+#
+# Only install/join-workers stage: they are the two subcommands that touch nodes.
+# validate/diagnose/delete/clean-all must stay instant, and needing a 15-minute
+# download to run a read-only config check would be absurd.
+if [[ "${AIRGAP_STAGED:-false}" != "true" ]]; then
+  case "${_CMD}" in
+    install|join-workers)
+      _sd="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      _ag="false"
+      if [[ -f "${CONFIG_FILE}" ]]; then
+        if command -v yq >/dev/null 2>&1; then
+          _ag="$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo false)"
+          [[ "${_ag}" == "null" ]] && _ag="false"
+        else
+          # yq is often absent on a sealed host — the bundle is what provides it.
+          # Falling through as "online" here would run the whole install against
+          # unreachable registries, so parse the one key we need with grep.
+          grep -qE '^[[:space:]]*airgap:[[:space:]]*true([[:space:]]|#|$)' "${CONFIG_FILE}" && _ag="true"
+        fi
+      fi
+      # AIRGAP_MODE=true is an equally valid trigger: it is the documented way to
+      # request air-gap for one run without editing the config.
+      if [[ "${_ag}" == "true" || "${AIRGAP_MODE:-false}" == "true" ]]; then
+        if [[ ! -x "${_sd}/airgap_install.sh" ]]; then
+          echo "ERROR: cluster.airgap is true but ${_sd}/airgap_install.sh is missing." >&2
+          echo "  That script downloads the artifacts a sealed cluster cannot fetch itself." >&2
+          exit 1
+        fi
+        echo "[LOG] Air-gap mode — staging artifacts before ${_CMD} (see airgap_install.sh)."
+        # exec: replace this process so there is exactly one installer in the
+        # tree and the staged run's exit status surfaces directly to the caller.
+        # No pass-through for staging flags (--driver-version, --gpu-kernels, …):
+        # run airgap_install.sh directly when you need them.
+        #
+        # --installer names THIS file explicitly. Without it airgap_install.sh
+        # defaults to the literal name k0s_cluster_with_stack.sh, so a renamed
+        # copy would stage and then call back into the original instead of itself.
+        exec "${_sd}/airgap_install.sh" \
+          --config "${CONFIG_FILE}" \
+          --installer "${_sd}/$(basename "${BASH_SOURCE[0]}")" \
+          --subcommand "${_CMD}"
+      fi
+      ;;
+  esac
+fi
+
 case "${_CMD}" in
   install)
     while [[ $# -gt 0 ]]; do

@@ -341,6 +341,9 @@ func TestBuildWorkerAnnotationsAndLabels(t *testing.T) {
 					Sidecars: aiv1.SidecarSpec{
 						Otel: true,
 					},
+					SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+						Endpoint: "https://splunk.example.com:8088",
+					},
 				},
 			},
 			cfg: InstanceDetail{
@@ -449,11 +452,32 @@ func TestBuildHeadAnnotationsAndLabels(t *testing.T) {
 					Sidecars: aiv1.SidecarSpec{
 						Otel: true,
 					},
+					SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+						Endpoint: "https://splunk.example.com:8088",
+					},
 				},
 			},
 			validate: func(t *testing.T, annotations, labels map[string]string) {
 				assert.Equal(t, "test-platform-otel-otel-coll", annotations["sidecar.opentelemetry.io/inject"])
 				assert.Equal(t, "true", annotations["sidecar.opentelemetry.io/auto-instrument"])
+			},
+		},
+		{
+			name: "no OTEL sidecar annotations when Splunk is not configured",
+			platform: &aiv1.AIPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform-otel-no-splunk",
+					Namespace: "default",
+				},
+				Spec: aiv1.AIPlatformSpec{
+					Sidecars: aiv1.SidecarSpec{
+						Otel: true,
+					},
+				},
+			},
+			validate: func(t *testing.T, annotations, labels map[string]string) {
+				assert.NotContains(t, annotations, "sidecar.opentelemetry.io/inject")
+				assert.NotContains(t, annotations, "sidecar.opentelemetry.io/auto-instrument")
 			},
 		},
 		{
@@ -553,7 +577,10 @@ func TestBuilder_makeWorkerTemplate(t *testing.T) {
 				}
 				assert.Equal(t, "nvidia-a100", envMap["DEFAULT_GPU_TYPE"])
 				assert.Equal(t, "nvidia-a100", envMap["GPU_TYPE"])
-				assert.Contains(t, envMap["RAY_HEAD_SERVICE_HOST"], "test-platform-head-svc")
+				assert.NotContains(t, envMap, "RAY_HEAD_SERVICE_HOST")
+				if assert.NotEmpty(t, rayWorker.Args) {
+					assert.Contains(t, rayWorker.Args[0], `export RAY_HEAD_SERVICE_HOST="${FQ_RAY_IP}";`)
+				}
 
 				// Verify resources
 				assert.Equal(t, resource.MustParse("8"), rayWorker.Resources.Requests[corev1.ResourceCPU])

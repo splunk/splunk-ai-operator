@@ -14,6 +14,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+var nonPropagatedAnnotations = map[string]struct{}{
+	"kubectl.kubernetes.io/last-applied-configuration": {},
+	"kubectl.kubernetes.io/restartedAt":                {},
+	"script-reconcile-ts":                              {},
+}
+
+// FilterPropagatedAnnotations copies annotations that are safe to propagate
+// from an AIService to its child resources. Installer/controller bookkeeping
+// annotations must stay on the AIService: copying them into pod templates
+// turns every installer run into an otherwise unnecessary workload rollout.
+func FilterPropagatedAnnotations(src map[string]string) map[string]string {
+	filtered := make(map[string]string, len(src))
+	for key, value := range src {
+		if _, skip := nonPropagatedAnnotations[key]; skip {
+			continue
+		}
+		filtered[key] = value
+	}
+	return filtered
+}
+
 var IsConditionTrue = func(conditions []metav1.Condition, condType string) bool {
 	for _, cond := range conditions {
 		if cond.Type == condType && cond.Status == metav1.ConditionTrue {

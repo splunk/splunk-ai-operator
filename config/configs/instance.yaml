@@ -65,27 +65,6 @@ H100:
         memory: "48Gi"
         ephemeral-storage: "100Gi"
         nvidia.com/gpu: "1"
-H100_NVL:
-  - tier: h100-nvl-0-gpu
-    gpusPerPod: 0
-    resources:
-      limits:
-        cpu: "16"
-        memory: "32Gi"
-        ephemeral-storage: "10Gi"
-        nvidia.com/gpu: "0"
-      requests:
-        cpu: "4"
-  - tier: h100-nvl-1-gpu
-    gpusPerPod: 1
-    resources:
-      requests:
-        cpu: "4"
-      limits:
-        cpu: "16"
-        memory: "48Gi"
-        ephemeral-storage: "100Gi"
-        nvidia.com/gpu: "1"
 RTX_PRO_6000_BLACKWELL:
   - tier: rtx-pro-6000-blackwell-0-gpu
     gpusPerPod: 0
@@ -117,5 +96,5 @@ RTX_PRO_6000_BLACKWELL:
       limits:
         cpu: "8"
         memory: "96Gi"
-        ephemeral-storage: "350Gi"
+        ephemeral-storage: "300Gi"
         nvidia.com/gpu: "2"

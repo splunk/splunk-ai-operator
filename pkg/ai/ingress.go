@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	kuberayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -14,6 +16,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+// resolveRayServiceName falls back to the KubeRay-normalized name when
+// p.Status.RayServiceName isn't populated yet (e.g. before the first reconcile).
+func resolveRayServiceName(p *aiApi.AIPlatform) (string, error) {
+	if p.Status.RayServiceName != "" {
+		return p.Status.RayServiceName, nil
+	}
+	return kuberayutils.GenerateHeadServiceName(kuberayutils.RayServiceCRD, rayv1.RayClusterSpec{}, p.Name)
+}
 
 // ReconcileIngress creates or updates Ingress resources for the AIPlatform
 func (r *AIPlatformReconciler) ReconcileIngress(ctx context.Context, p *aiApi.AIPlatform) error {
@@ -57,6 +68,11 @@ func (r *AIPlatformReconciler) ReconcileIngress(ctx context.Context, p *aiApi.AI
 		return err
 	}
 
+	rayServiceName, err := resolveRayServiceName(p)
+	if err != nil {
+		return fmt.Errorf("determine RayService name: %w", err)
+	}
+
 	// Build Ingress rules from spec
 	rules := []networkingv1.IngressRule{}
 	for _, hostSpec := range p.Spec.Ingress.Hosts {
@@ -65,12 +81,11 @@ func (r *AIPlatformReconciler) ReconcileIngress(ctx context.Context, p *aiApi.AI
 			pathType := parsePathType(pathSpec.PathType)
 
 			// Determine which service to route to based on path
-			serviceName := p.Status.RayServiceName
+			serviceName := rayServiceName
 			servicePort := int32(8000) // Ray Serve default port
 
 			// Support routing to different services
 			if pathSpec.Path == "/dashboard" || pathSpec.Path == "/dashboard/*" {
-				serviceName = fmt.Sprintf("%s-head-svc", p.Name)
 				servicePort = 8265 // Ray Dashboard port
 			} else if pathSpec.Path == "/weaviate" || pathSpec.Path == "/weaviate/*" {
 				serviceName = p.Status.VectorDbServiceName
@@ -117,7 +132,7 @@ func (r *AIPlatformReconciler) ReconcileIngress(ctx context.Context, p *aiApi.AI
 	}
 
 	// Create or update the Ingress
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, ingress, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, ingress, func() error {
 		ingress.Spec = networkingv1.IngressSpec{
 			IngressClassName: ingressClassName,
 			Rules:            rules,

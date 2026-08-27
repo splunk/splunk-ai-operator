@@ -140,7 +140,7 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 	}
 
 	// Validate SplunkConfiguration
-	if errs := v.validateSplunkConfiguration(&aiplatform.Spec.SplunkConfiguration, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
+	if errs := v.validateSplunkConfiguration(&aiplatform.Spec.SplunkConfiguration, aiplatform.Spec.Sidecars.Otel, field.NewPath("spec").Child("splunkConfiguration")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -163,6 +163,11 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 
 	// Validate Features
 	if errs := v.validateFeatures(aiplatform.Spec.Features, field.NewPath("spec").Child("features")); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+
+	// Validate top-level ScaleFactor
+	if errs := v.validateScaleFactor(aiplatform.Spec.ScaleFactor, field.NewPath("spec").Child("scaleFactor")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -257,38 +262,41 @@ func (v *AIPlatformCustomValidator) validateObjectStorage(objStorage *aiv1.Objec
 	return allErrs
 }
 
-// validateSplunkConfiguration validates the Splunk configuration
-func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, fldPath *field.Path) field.ErrorList {
+// validateSplunkConfiguration validates the Splunk configuration.
+// otelEnabled indicates whether the OTel sidecar is enabled; it affects secretRef requirements.
+func (v *AIPlatformCustomValidator) validateSplunkConfiguration(splunkConfig *aiv1.SplunkConfigurationSpec, otelEnabled bool, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
-	// Must have either Endpoint or SplunkCustomResourceRef
 	hasEndpoint := splunkConfig.Endpoint != ""
+	hasHECEndpoint := splunkConfig.HECEndpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
+	hasSecretRef := splunkConfig.SecretRef.Name != ""
 
-	if !hasEndpoint && !hasCRRef {
-		allErrs = append(allErrs, field.Required(
-			fldPath,
-			"SplunkConfiguration must have either Endpoint or SplunkCustomResourceRef set",
+	// hecEndpoint configures telemetry ingestion only; it cannot provide the
+	// management/JWKS issuer required by SAIA and Slim. Reject this partial
+	// configuration instead of treating it as Splunk being disabled.
+	if hasHECEndpoint && !hasEndpoint && !hasCRRef {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("hecEndpoint"),
+			splunkConfig.HECEndpoint,
+			"hecEndpoint requires endpoint or splunkCustomResourceRef.name",
 		))
 	}
 
-	// TODO: Temporarily disabled - allow service names without http:// prefix
-	// This validation was preventing valid Kubernetes service names from being used
-	// We may want to add smarter validation later that distinguishes between URLs and service names
-	/*
-		if hasEndpoint && !strings.HasPrefix(splunkConfig.Endpoint, "http://") && !strings.HasPrefix(splunkConfig.Endpoint, "https://") {
-			allErrs = append(allErrs, field.Invalid(
-				fldPath.Child("endpoint"),
-				splunkConfig.Endpoint,
-				"endpoint must start with http:// or https://",
-			))
-		}
-	*/
+	// Completely empty config means Splunk disabled — no telemetry.
+	// A partial config (e.g. only vaultFilePath set) is a misconfiguration
+	// and must fail validation below rather than silently disabling telemetry.
+	if !hasEndpoint && !hasHECEndpoint && !hasCRRef && !hasSecretRef && splunkConfig.VaultFilePath == "" {
+		return allErrs
+	}
 
-	// Vault source supplies its token via a file; it does not use a k8s SecretRef.
-	// All other sources require SecretRef when an explicit endpoint is set.
-	if splunkConfig.SecretSource != aiv1.SecretSourceVault {
-		if hasEndpoint && splunkConfig.SecretRef.Name == "" {
+	// All sources require secretRef when an endpoint is set, EXCEPT vault when
+	// the OTel sidecar is disabled. The OTel collector path (renderOtelConf and
+	// the collector env) has not been ported to vault: it still emits a
+	// secretKeyRef and does a Kubernetes Secret Get, so vault-only configs with
+	// otel enabled would write a broken collector. Require secretRef in that case.
+	if splunkConfig.SecretSource != aiv1.SecretSourceVault || otelEnabled {
+		if hasEndpoint && !hasSecretRef {
 			allErrs = append(allErrs, field.Required(
 				fldPath.Child("secretRef").Child("name"),
 				"secretRef.name is required when using endpoint",
@@ -473,6 +481,22 @@ func (v *AIPlatformCustomValidator) validateMTLS(mtls *aiv1.MTLSConfig, certific
 	return allErrs
 }
 
+// validateScaleFactor validates the platform-wide scaleFactor. The CRD
+// Minimum=1 marker is the primary guard; this mirrors it for defense in depth.
+func (v *AIPlatformCustomValidator) validateScaleFactor(scaleFactor *int32, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if scaleFactor != nil && *scaleFactor < 1 {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath,
+			*scaleFactor,
+			"scaleFactor must be at least 1",
+		))
+	}
+
+	return allErrs
+}
+
 // validateFeatures validates the Features configuration
 func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
@@ -498,15 +522,6 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 			))
 		}
 		featureNames[feature.Name] = true
-
-		// Validate scaleFactor if specified
-		if feature.ScaleFactor != nil && *feature.ScaleFactor < 1 {
-			allErrs = append(allErrs, field.Invalid(
-				featurePath.Child("scaleFactor"),
-				*feature.ScaleFactor,
-				"scaleFactor must be at least 1",
-			))
-		}
 	}
 
 	return allErrs

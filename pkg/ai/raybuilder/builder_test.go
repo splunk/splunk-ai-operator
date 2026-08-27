@@ -74,6 +74,8 @@ func TestBuilder_Build(t *testing.T) {
 	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
 	os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
 	os.Setenv("INSTANCE_FILE", "../../../config/configs/instance.yaml")
+	os.Setenv("MODEL_SCALE_FILE", "../../../config/configs/model-scale.yaml")
+	os.Setenv("WORKER_SCALE_FILE", "../../../config/configs/worker-scale.yaml")
 
 	s := scheme.Scheme
 	_ = aiv1.AddToScheme(s)
@@ -93,6 +95,7 @@ func TestBuilder_Build(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-platform",
 					Namespace: "default",
+					Labels:    map[string]string{"test-label": "test-value"},
 				},
 				Spec: aiv1.AIPlatformSpec{
 					ServiceAccountName: "test-sa",
@@ -176,6 +179,14 @@ func TestBuilder_Build(t *testing.T) {
 				// Verify RayClusterSpec is populated
 				assert.NotNil(t, rayService.Spec.RayClusterSpec)
 				assert.NotNil(t, rayService.Spec.RayClusterSpec.HeadGroupSpec)
+				headService := rayService.Spec.RayClusterSpec.HeadGroupSpec.HeadService
+				require.NotNil(t, headService)
+				assert.Empty(t, headService.Name)
+				assert.Empty(t, headService.Namespace)
+				assert.Equal(t, "/metrics", headService.Annotations["prometheus.io/path"])
+				for key, value := range tt.platform.Labels {
+					assert.Equal(t, value, headService.Labels[key])
+				}
 			}
 		})
 	}
@@ -498,4 +509,3 @@ func TestSetImageRegistry(t *testing.T) {
 		})
 	}
 }
-

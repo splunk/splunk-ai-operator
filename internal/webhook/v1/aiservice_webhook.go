@@ -306,15 +306,26 @@ func (v *AIServiceCustomValidator) validateTaskVolume(taskVolume *aiv1.ObjectSto
 func (v *AIServiceCustomValidator) validateSplunkConfigurationForService(splunkConfig *aiv1.SplunkConfigurationSpec, fldPath *field.Path) field.ErrorList {
 	var allErrs field.ErrorList
 
-	// Must have either Endpoint or SplunkCustomResourceRef
 	hasEndpoint := splunkConfig.Endpoint != ""
+	hasHECEndpoint := splunkConfig.HECEndpoint != ""
 	hasCRRef := splunkConfig.SplunkCustomResourceRef.Name != ""
 
-	if !hasEndpoint && !hasCRRef {
-		allErrs = append(allErrs, field.Required(
-			fldPath,
-			"SplunkConfiguration must have either Endpoint or SplunkCustomResourceRef set",
+	// hecEndpoint configures telemetry ingestion only; it cannot provide the
+	// management/JWKS issuer required by SAIA and Slim. Reject this partial
+	// configuration instead of treating it as Splunk being disabled.
+	if hasHECEndpoint && !hasEndpoint && !hasCRRef {
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("hecEndpoint"),
+			splunkConfig.HECEndpoint,
+			"hecEndpoint requires endpoint or splunkCustomResourceRef.name",
 		))
+	}
+
+	// Empty Splunk configuration means "Splunk disabled" — no telemetry. This
+	// mirrors the graceful-skip the reconcilers already implement, so a service
+	// can run without any Splunk. A partially-filled config still validates below.
+	if !hasEndpoint && !hasHECEndpoint && !hasCRRef {
+		return allErrs
 	}
 
 	// TODO: Temporarily disabled - allow service names without http:// prefix

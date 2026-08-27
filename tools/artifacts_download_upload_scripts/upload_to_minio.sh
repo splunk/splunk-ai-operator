@@ -118,8 +118,8 @@ if [[ ! -d "$SOURCE_DIR" ]]; then
     exit 1
 fi
 
-# Count artifacts in the directory (both files and directories)
-artifact_count=$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+# Count artifacts in the directory (both files and directories); -L follows symlinks
+artifact_count=$(find -L "$SOURCE_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
 
 if [[ "$artifact_count" -eq 0 ]]; then
     echo "No artifacts found in $SOURCE_DIR"

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -21,6 +20,7 @@ import (
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,8 +39,9 @@ import (
 type Builder struct {
 	ai *enterpriseApi.AIPlatform
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme               *runtime.Scheme
+	Recorder             record.EventRecorder
+	reconciledRayService *rayv1.RayService
 }
 
 type ApplicationParams struct {
@@ -153,7 +154,11 @@ type InstanceDetail struct {
 	Resources  corev1.ResourceRequirements `yaml:"resources"`
 }
 
-type FeatureConfig struct {
+// ScaleConfig models the two global scale files. model-scale.yaml supplies
+// applicationScale (model name -> base replica count); worker-scale.yaml
+// supplies instanceScale (accelerator -> tier -> base pod count). Each file
+// populates only its own field.
+type ScaleConfig struct {
 	ApplicationScale map[string]int32            `yaml:"applicationScale"`
 	InstanceScale    map[string]map[string]int32 `yaml:"instanceScale"`
 }
@@ -168,7 +173,7 @@ func New(ai *enterpriseApi.AIPlatform, client client.Client, scheme *runtime.Sch
 	}
 }
 
-// effectiveAcceleratorType returns spec.defaultAcceleratorType or L40S when unset, matching instance.yaml keys (L40S, H100_NVL).
+// effectiveAcceleratorType returns spec.defaultAcceleratorType or L40S when unset, matching instance.yaml keys.
 func (b *Builder) effectiveAcceleratorType() string {
 	if s := strings.TrimSpace(b.ai.Spec.DefaultAcceleratorType); s != "" {
 		return s
@@ -176,9 +181,41 @@ func (b *Builder) effectiveAcceleratorType() string {
 	return "L40S"
 }
 
+// effectiveScaleFactor returns the platform-wide capacity multiplier from
+// spec.scaleFactor, defaulting to 1 when unset. It uniformly multiplies both
+// model (Serve) replicas and GPU worker-pool pod counts so the two stay in
+// lockstep on the shared, fixed GPU pool.
+func (b *Builder) effectiveScaleFactor() int32 {
+	if b.ai.Spec.ScaleFactor != nil && *b.ai.Spec.ScaleFactor >= 1 {
+		return *b.ai.Spec.ScaleFactor
+	}
+	return 1
+}
+
+// loadScaleConfig reads a global scale file (model-scale.yaml or
+// worker-scale.yaml) from the path in the given env var, falling back to
+// defaultFile in the working directory when the env var is unset (e.g. local
+// or test runs; in the operator image the env vars are always set).
+func loadScaleConfig(envVar, defaultFile string) (ScaleConfig, error) {
+	var cfg ScaleConfig
+	file := os.Getenv(envVar)
+	if file == "" {
+		file = defaultFile
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return cfg, fmt.Errorf("failed to read scale file %s: %w", file, err)
+	}
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("failed to parse scale file %s: %w", file, err)
+	}
+	return cfg, nil
+}
+
 // --- 7️⃣ ReconcileRayService: build & create/update the RayService CR ---
 func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPlatform) error {
 	logger := log.FromContext(ctx) // Define logger
+	b.reconciledRayService = nil
 	rs, err := b.Build(ctx)
 	if err != nil {
 		logger.Error(err, "Failed to build RayService")
@@ -198,39 +235,21 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	// table, including AWS regional-endpoint detection.
 	cloudProvider, artifactsProvider, needsS3CompatCreds := classifyObjectStorage(u.Scheme, p.Spec.ObjectStorage.Endpoint)
 
-	// Initialize the replicas map by iterating through features
-	replicasMap := make(map[string]int32)
+	// Build the model replica map from the global model-scale.yaml, scaled by
+	// the platform-wide scaleFactor. Every model in the catalog is always
+	// deployed; sizing no longer depends on spec.Features (which now drives
+	// only AIService creation in ReconcileFeatures).
+	modelScale, err := loadScaleConfig("MODEL_SCALE_FILE", "model-scale.yaml")
+	if err != nil {
+		logger.Error(err, "Failed to load model scale config")
+		return err
+	}
+	scaleFactor := b.effectiveScaleFactor()
+	logger.V(1).Info("Loaded model scale config", "scaleFactor", scaleFactor, "models", len(modelScale.ApplicationScale))
 
-	for _, feature := range p.Spec.Features {
-		// Read YAML file for this feature
-		fileName := filepath.Join("features", feature.Name+".yaml")
-		yamlData, err := os.ReadFile(fileName)
-		if err != nil {
-			logger.Error(err, "Failed to read feature YAML file", "feature", feature.Name, "file", fileName)
-			continue
-		}
-
-		// Parse the YAML content into a map
-		var featureConfig FeatureConfig
-		err = yaml.UnmarshalStrict(yamlData, &featureConfig)
-		if err != nil {
-			logger.Error(err, "Failed to parse feature YAML", "feature", feature.Name, "file", fileName)
-			continue
-		}
-
-		// Calculate replicas multiplier from feature.Replicas (nil means auto => 1)
-		var multiplier int32 = 1
-		if feature.ScaleFactor != nil {
-			// Validation guarantees value >= 1
-			multiplier = *feature.ScaleFactor
-		}
-		// Use V(1) for verbose debug logging - only shown with --zap-log-level=debug
-		logger.V(1).Info("Loaded feature configuration", "feature", feature.Name, "scaleFactor", multiplier)
-
-		// Generate map from product of values and feature's Replicas setting
-		for appName, baseReplicas := range featureConfig.ApplicationScale {
-			replicasMap[appName] = baseReplicas * multiplier
-		}
+	replicasMap := make(map[string]int32, len(modelScale.ApplicationScale))
+	for appName, baseReplicas := range modelScale.ApplicationScale {
+		replicasMap[appName] = baseReplicas * scaleFactor
 	}
 
 	// S3-compatible endpoint is only meaningful when the classifier picked the
@@ -287,7 +306,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	// Use embedded applications.yaml content
 	applicationFile := os.Getenv("APPLICATION_FILE")
 	if applicationFile == "" {
-		applicationFile = "applications.yaml" // fallback for backward compatibility
+		applicationFile = "applications.yaml" // default when APPLICATION_FILE is unset (local/test runs)
 	}
 	templateData, err := os.ReadFile(applicationFile)
 	if err != nil {
@@ -368,6 +387,7 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 				if err := b.Client.Create(ctx, rayService); err != nil {
 					return err
 				}
+				b.reconciledRayService = rayService.DeepCopy()
 				b.Recorder.Event(p, corev1.EventTypeNormal, "RayServiceCreated", "RayService resource created successfully")
 				return nil
 			}
@@ -375,11 +395,28 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 			return err
 		}
 
-		// mutate current.Spec to match desired svc.Spec
-		current.Spec = rs.Spec
-		// now try update
-		controllerutil.SetOwnerReference(p, &current, b.Scheme)
-		return b.Client.Update(ctx, &current)
+		// Build the desired object on a copy so we can compare against what's
+		// actually stored before writing. KubeRay's own controller rewrites
+		// .status on this object every ~2-4s; if we also issue an unconditional
+		// spec Update() every AIPlatform reconcile regardless of whether our
+		// owned fields (spec, owner refs) actually changed, we compound onto
+		// that churn. Skipping the write when nothing we own has changed avoids
+		// adding a second, redundant full-object rewrite on top of KubeRay's.
+		desired := current.DeepCopy()
+		desired.Spec = rs.Spec
+		controllerutil.SetOwnerReference(p, desired, b.Scheme)
+
+		if apiequality.Semantic.DeepEqual(current.Spec, desired.Spec) &&
+			apiequality.Semantic.DeepEqual(current.OwnerReferences, desired.OwnerReferences) {
+			b.reconciledRayService = current.DeepCopy()
+			return nil
+		}
+
+		if err := b.Client.Update(ctx, desired); err != nil {
+			return err
+		}
+		b.reconciledRayService = desired.DeepCopy()
+		return nil
 	})
 }
 
@@ -730,21 +767,22 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		},
 		HeadService: &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        b.ai.Name + "-head-svc",
-				Namespace:   b.ai.Namespace,
 				Annotations: annotations,
 				Labels:      labels,
 			},
 		},
 		Template: b.makeHeadTemplate(),
 	}
+	// Leave the custom head Service unnamed so KubeRay assigns the generated
+	// RayCluster-specific name. Setting a name here would make active and pending
+	// RayClusters contend with the stable RayService head Service.
 
 	head.Template.ObjectMeta.Annotations = annotations
 	head.Template.ObjectMeta.Labels = labels
 
 	instanceFile := os.Getenv("INSTANCE_FILE")
 	if instanceFile == "" {
-		instanceFile = "instance.yaml" // fallback for backward compatibility
+		instanceFile = "instance.yaml" // default when INSTANCE_FILE is unset (local/test runs)
 	}
 	instanceYamlFile, err := os.ReadFile(instanceFile)
 	if err != nil {
@@ -757,35 +795,26 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 		return nil, fmt.Errorf("error reading YAML file: %v", err)
 	}
 
+	// Build the GPU worker-pool sizing from the global worker-scale.yaml,
+	// scaled by the same platform-wide scaleFactor used for Serve replicas so
+	// the worker pool grows in lockstep with the replicas it must schedule on
+	// the shared, fixed GPU pool.
+	workerScale, err := loadScaleConfig("WORKER_SCALE_FILE", "worker-scale.yaml")
+	if err != nil {
+		return nil, err
+	}
+	scaleFactor := b.effectiveScaleFactor()
+
 	// initialize instanceScale to avoid nil map assignment panic
 	instanceScale := make(map[string]int32)
-	for _, feature := range b.ai.Spec.Features {
-		// Read YAML file for this feature
-		fileName := filepath.Join("features", feature.Name+".yaml")
-		yamlData, err := os.ReadFile(fileName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read feature YAML file %s: %v", feature.Name, err)
-
-		}
-		var featureConfig FeatureConfig
-		err = yaml.UnmarshalStrict(yamlData, &featureConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse feature YAML file %s: %v", fileName, err)
-		}
-		for k, val := range featureConfig.InstanceScale[acceleratorType] {
-			old_val, ok := instanceScale[k]
-			if ok {
-				instanceScale[k] = old_val + val
-			} else {
-				instanceScale[k] = val
-			}
-		}
+	for k, val := range workerScale.InstanceScale[acceleratorType] {
+		instanceScale[k] = val * scaleFactor
 	}
 
 	var workers []rayv1.WorkerGroupSpec
 	gpuConfigs := instanceMap[acceleratorType]
 	if len(gpuConfigs) == 0 {
-		return nil, fmt.Errorf("instance.yaml has no worker tiers for defaultAcceleratorType %q; keys must match exactly (e.g. L40S, H100_NVL)", acceleratorType)
+		return nil, fmt.Errorf("instance.yaml has no worker tiers for defaultAcceleratorType %q; keys must match exactly (e.g. L40S, H100)", acceleratorType)
 	}
 	for _, cfg := range gpuConfigs {
 		annotations, labels := buildWorkerAnnotationsAndLabels(b.ai, cfg)
@@ -962,13 +991,13 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:              resource.MustParse("1"),
-					corev1.ResourceMemory:           resource.MustParse("2Gi"),
+					corev1.ResourceMemory:           resource.MustParse("4Gi"),
 					corev1.ResourceEphemeralStorage: resource.MustParse("5Gi"),
 					"nvidia.com/gpu":                resource.MustParse("0"),
 				},
 				Limits: corev1.ResourceList{
 					corev1.ResourceCPU:              resource.MustParse("4"),
-					corev1.ResourceMemory:           resource.MustParse("8Gi"),
+					corev1.ResourceMemory:           resource.MustParse("16Gi"),
 					corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
 					"nvidia.com/gpu":                resource.MustParse("0"),
 				},
@@ -995,7 +1024,6 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec {
 	defaultEnv := []corev1.EnvVar{
 		{Name: "DEFAULT_GPU_TYPE", Value: b.effectiveAcceleratorType()},
-		{Name: "RAY_HEAD_SERVICE_HOST", Value: fmt.Sprintf("%s.%s.svc.%s", b.ai.Name+"-head-svc", b.ai.Namespace, os.Getenv("CLUSTER_DOMAIN"))},
 		{Name: "SERVICE_NAME", Value: b.ai.Name},
 		{Name: "SERVICE_INTERNAL_NAME", Value: b.ai.Name},
 		{Name: "USE_SYSTEM_PERMISSIONS", Value: "true"},
@@ -1026,7 +1054,8 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 	combinedEnv = append(combinedEnv, b.objectStorageSecretEnv()...)
 	rayCommand := fmt.Sprintf(`echo %s worker;
         ulimit -n 65536;
-    	export PATH="/home/ray/anaconda3/bin:$PATH";
+        export PATH="/home/ray/anaconda3/bin:$PATH";
+        export RAY_HEAD_SERVICE_HOST="${FQ_RAY_IP}";
         KUBERAY_GEN_RAY_START_CMD=$(echo $KUBERAY_GEN_RAY_START_CMD | sed -e 's/"{/{/g' -e 's/}"/}/g' -e 's/\\\"/"/g');
         $KUBERAY_GEN_RAY_START_CMD`, cfg.Tier)
 	spec := corev1.PodSpec{
@@ -1138,7 +1167,9 @@ func buildWorkerAnnotationsAndLabels(aiPlatform *enterpriseApi.AIPlatform, cfg I
 	annotations["prometheus.io/port"] = "8080"
 	annotations["prometheus.io/scheme"] = "http"
 	annotations["ray.io/overwrite-container-cmd"] = "true"
-	if aiPlatform.Spec.Sidecars.Otel {
+	splunkEnabled := aiPlatform.Spec.SplunkConfiguration.Endpoint != "" ||
+		aiPlatform.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != ""
+	if aiPlatform.Spec.Sidecars.Otel && splunkEnabled {
 		annotations["sidecar.opentelemetry.io/inject"] = fmt.Sprintf("%s-otel-coll", aiPlatform.Name)
 		annotations["sidecar.opentelemetry.io/auto-instrument"] = "true"
 	}
@@ -1172,7 +1203,9 @@ func buildHeadAnnotationsAndLabels(aiPlatform *enterpriseApi.AIPlatform) (map[st
 	annotations["prometheus.io/scheme"] = "http"
 	annotations["ray.io/overwrite-container-cmd"] = "true"
 
-	if aiPlatform.Spec.Sidecars.Otel {
+	splunkEnabledHead := aiPlatform.Spec.SplunkConfiguration.Endpoint != "" ||
+		aiPlatform.Spec.SplunkConfiguration.SplunkCustomResourceRef.Name != ""
+	if aiPlatform.Spec.Sidecars.Otel && splunkEnabledHead {
 		annotations["sidecar.opentelemetry.io/inject"] = fmt.Sprintf("%s-otel-coll", aiPlatform.Name)
 		annotations["sidecar.opentelemetry.io/auto-instrument"] = "true"
 	}
