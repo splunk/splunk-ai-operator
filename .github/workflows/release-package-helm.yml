@@ -24,6 +24,10 @@ on:
         required: true
         type: string
 
+env:
+  # Keep the Docker image tag independent from the three-part Git release tag.
+  RELEASE_IMAGE_TAG: v1.0
+
 jobs:
   build-and-push-images:
     runs-on: ubuntu-latest
@@ -37,7 +41,7 @@ jobs:
       IMAGE_NAME: ${{ github.repository }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
 
@@ -98,9 +102,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             splunk/splunk-ai-operator
           tags: |
-            type=semver,pattern=v{{version}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ env.RELEASE_IMAGE_TAG }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker images
@@ -130,7 +132,7 @@ jobs:
       packages: write  # For pushing to GHCR OCI registry
     steps:
       - name: Checkout code
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
 
@@ -218,9 +220,9 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
 
-          # Generate install.yaml with version-specific image tag
-          echo "Generating Kubernetes manifests for version $VERSION..."
-          IMG="ghcr.io/splunk/splunk-ai-operator:v$VERSION" make build-installer
+          # Generate install.yaml with the stable release image tag.
+          echo "Generating Kubernetes manifests for release $VERSION with image tag ${RELEASE_IMAGE_TAG}..."
+          IMG="ghcr.io/splunk/splunk-ai-operator:${RELEASE_IMAGE_TAG}" make build-installer
 
           # Rename to version-specific filename
           cp dist/install.yaml dist/install-v$VERSION.yaml
@@ -263,7 +265,7 @@ jobs:
       - name: Generate SBOM for operator image
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:v$VERSION"
+          OPERATOR_IMAGE="ghcr.io/splunk/splunk-ai-operator:${RELEASE_IMAGE_TAG}"
 
           echo "Generating SBOM for operator image: $OPERATOR_IMAGE"
 
@@ -411,8 +413,8 @@ jobs:
             ### Container Images
 
             **Docker Images:**
-            - `ghcr.io/splunk/splunk-ai-operator:v${{ steps.version.outputs.version }}`
-            - `splunk/splunk-ai-operator:v${{ steps.version.outputs.version }}`
+            - `ghcr.io/splunk/splunk-ai-operator:${{ env.RELEASE_IMAGE_TAG }}`
+            - `splunk/splunk-ai-operator:${{ env.RELEASE_IMAGE_TAG }}`
 
             ### Documentation
 
