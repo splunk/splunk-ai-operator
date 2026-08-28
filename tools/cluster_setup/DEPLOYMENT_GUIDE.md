@@ -146,7 +146,7 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| Node OS | RHEL 9.8, RHEL 10.2, or Ubuntu 24.04 — all three air-gapped or non-air-gapped | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. Air-gapped RHEL 10.2 needs `kernel-modules-extra` staged in the bundle (el10 keeps kube-proxy's netfilter modules there rather than in the base kernel); the staging step does that automatically, and preflight rejects an el10 node only if it has neither the module nor that closure. Air-gap RPM closures are resolved with the **installer machine's** own `dnf`, so for air-gap its RHEL major must match the nodes' — RHEL 9.8 or Ubuntu 24.04 nodes → RHEL 9.8 x86_64 installer machine; RHEL 10.2 nodes → RHEL 10.2 x86_64 installer machine — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
+| Node OS | RHEL 9.8, RHEL 10.2, or Ubuntu 24.04 — all three air-gapped or non-air-gapped | Tested OS versions for **cluster** nodes (controllers, CPU workers, GPU workers). Air-gapped RHEL 10.2 needs `kernel-modules-extra` staged in the bundle (el10 keeps kube-proxy's netfilter modules there rather than in the base kernel); the staging step does that automatically. Air-gap RPM closures are resolved with the **installer machine's** own `dnf`, so for air-gap its RHEL major must match the nodes' — RHEL 9.8 or Ubuntu 24.04 nodes → RHEL 9.8 x86_64 installer machine; RHEL 10.2 nodes → RHEL 10.2 x86_64 installer machine — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
 | NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
@@ -354,7 +354,7 @@ flowchart TD
 
 ```bash
 # On each node (controller, CPU worker, GPU worker) — confirm OS, passwordless sudo, and Python
-cat /etc/os-release               # must be RHEL 9.8, RHEL 10.2, or Ubuntu 24.04
+cat /etc/os-release               # tested: RHEL 9.8, RHEL 10.2, or Ubuntu 24.04
 sudo -n true && echo "passwordless sudo OK"
 python3 --version                 # 3.8+
 
@@ -363,13 +363,12 @@ chmod 600 <path-to-private-key>   # required if the key was copied or downloaded
 ssh -i <key> <user>@<node-ip> hostname
 ```
 
-RHEL 9.8, RHEL 10.2 and Ubuntu 24.04 are the only supported node OSes — mix and
-match freely across controllers/workers, the installer detects each node's OS
-over SSH. **RHEL 10 air-gapped** additionally needs `kernel-modules-extra` in the
-bundle — el10 keeps the netfilter modules kube-proxy needs there rather than in
-the base kernel — which the staging step stages automatically for each node's
-running kernel, from a RHEL 10 installer machine. Any other OS is rejected at
-preflight (`FORCE_UNSUPPORTED_OS=1` bypasses this at your own risk).
+RHEL 9.8, RHEL 10.2 and Ubuntu 24.04 are the tested node OSes. The installer
+detects each node's OS over SSH. **RHEL 10 air-gapped** additionally needs
+`kernel-modules-extra` in the bundle — el10 keeps the netfilter modules
+kube-proxy needs there rather than in the base kernel — which the staging step
+stages automatically for each node's running kernel, from a RHEL 10 installer
+machine.
 
 **GPU worker nodes** need no manual driver install. The installer installs
 the driver automatically on internet-connected nodes — RHEL: EPEL →
