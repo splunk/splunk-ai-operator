@@ -466,15 +466,14 @@ show_install_plan() {
   else
     echo -e "    5. Phase 2 (parallel): OTel, KubeRay, NVIDIA device-plugin  [Splunk operator SKIPPED — mode=${SPLUNK_MODE}]" >&2
   fi
-  echo -e "    6. MetalLB load-balancer" >&2
   if [[ "${SPLUNK_MODE}" == "internal" ]]; then
-    echo -e "    7. Splunk Standalone + AI Platform operator + CR" >&2
+    echo -e "    6. Splunk Standalone + AI Platform operator + CR" >&2
   elif [[ "${SPLUNK_MODE}" == "external" ]]; then
-    echo -e "    7. AI Platform operator + CR (external Splunk HEC)  [Splunk Standalone SKIPPED — external mode]" >&2
+    echo -e "    6. AI Platform operator + CR (external Splunk HEC)  [Splunk Standalone SKIPPED — external mode]" >&2
   else
-    echo -e "    7. AI Platform operator + CR  [Splunk Standalone SKIPPED — mode=disabled]" >&2
+    echo -e "    6. AI Platform operator + CR  [Splunk Standalone SKIPPED — mode=disabled]" >&2
   fi
-  echo -e "    8. Health check + pod verification" >&2
+  echo -e "    7. Health check + pod verification" >&2
   echo "" >&2
 
   if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
