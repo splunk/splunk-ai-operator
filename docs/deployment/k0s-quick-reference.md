@@ -541,9 +541,6 @@ your browser cannot reach the cluster network directly, use the [SSH bastion
 SOCKS tunnel](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
 Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant
 App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
-For ClusterIP onboarding, configure Splunk with the in-cluster URL
-`http://<cluster-name>-ai-platform-saia-saia-service.ai-platform.svc.cluster.local:8080`;
-use `kubectl port-forward` only for browser or local testing.
 
 </details>
 
