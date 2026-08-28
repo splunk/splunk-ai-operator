@@ -19,9 +19,9 @@ explanations, diagrams, and edge cases see
      - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
      - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
      - [Install (Air-Gapped Path)](#install-air-gapped-path)
-5. [Step 5: Verify](#step-5-verify)
-6. [Step 6: Common Operations](#step-6-common-operations)
-7. [Step 7: Troubleshooting](#step-7-troubleshooting)
+5. [Step 5: Splunk Integration](#step-5-splunk-integration)
+6. [Step 6: Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
+7. [Step 7: Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
 
 ---
 
@@ -191,6 +191,10 @@ RHEL 10 clusters.
 ## Step 3: Configure the Cluster
 
 Download the scripts with the configuration files on the installer machine.
+
+<details>
+<summary><strong>Option 1: Setup via Git (Recommended)</strong></summary>
+
 ### **Option 1: Setup via Git (Recommended)**
 
 1. **Clone the Specific Branch**
@@ -208,7 +212,10 @@ Download the scripts with the configuration files on the installer machine.
 3. **Initialize Configuration File**
    * Duplicate the base template to create your working configuration:
      ```bash
+     # Standard deployment
      cp k0s-cluster-config.yaml my-cluster.yaml
+     # For air-gapped deployment, use this instead:
+     # cp k0s-airgapped-config.yaml my-cluster.yaml
      ```
 
 4. **Edit Your Infrastructure Layout**
@@ -217,7 +224,12 @@ Download the scripts with the configuration files on the installer machine.
      vi my-cluster.yaml
      ```
 
+</details>
+
 ---
+
+<details>
+<summary><strong>Option 2: Setup via Browser ZIP Download</strong></summary>
 
 ### **Option 2: Setup via Browser ZIP Download**
 
@@ -237,7 +249,10 @@ Download the scripts with the configuration files on the installer machine.
 3. **Initialize Configuration File**
    * Duplicate the template file to begin making cluster edits:
      ```bash
+     # Standard deployment
      cp k0s-cluster-config.yaml my-cluster.yaml
+     # For air-gapped deployment, use this instead:
+     # cp k0s-airgapped-config.yaml my-cluster.yaml
      ```
 
 4. **Edit Your Infrastructure Layout**
@@ -245,6 +260,8 @@ Download the scripts with the configuration files on the installer machine.
      ```bash
      vi my-cluster.yaml
      ```
+
+</details>
 
 Review and set the following fields as applicable; all other fields have a
 working default.
@@ -264,14 +281,17 @@ working default.
 | `aiPlatform.defaultAcceleratorType` | `L40S` or `H100` |
 | `imagePullSecrets.custom.*` | Registry credentials when the private registry requires authentication |
 
+The air-gapped template already enables air-gap mode and defines relative image
+paths for the private registry.
+
 ### Required: Validate the Configuration
 
-This step is required. After editing `my-cluster.yaml`, run validation before
-choosing a deployment path. Proceed with `install` only after validation
-completes successfully. Validation checks the configuration without modifying
-any cluster node.
+This step is required. Validate the configuration you will install before
+choosing a deployment path. Validation checks the configuration without
+modifying any cluster node.
 
 ```bash
+# Validate the selected deployment config.
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
@@ -295,6 +315,9 @@ Choose one deployment path:
 - **[Air-gapped](#air-gapped-deployment)** — cluster nodes have no outbound
   internet access; the installer machine stages the required artifacts and uses
   a private registry for the platform images.
+
+<details>
+<summary>Standard Deployment</summary>
 
 ### Standard Deployment
 
@@ -327,13 +350,21 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 # Run only after validate completes successfully
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h first run (model download), ~30-60min if pre-staged
 
+# Check the status of pods and inference endpoints
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
 ```
 
-Continue to [Step 5: Verify](#step-5-verify).
+Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
 
 ---
+
+</details>
+
+<details>
+<summary>Air-Gapped Deployment</summary>
 
 ### Air-Gapped Deployment
 
@@ -402,20 +433,21 @@ AI platform can serve inference.
 
 #### Install (Air-Gapped Path)
 
-One entry point, same install command as the standard path — the config's
-`cluster.airgap: true` (or `AIRGAP_MODE=true`) is what switches the mode.
+Use the already edited and validated `my-cluster.yaml` for this path. When
+using the air-gapped template, it sets `cluster.airgap: true` and uses relative
+image paths prefixed with `images.registry`.
 
-Before running install, mirror the platform application images to your private
-registry.
+Before mirroring, set `images.registry` in `my-cluster.yaml` to your private
+registry and use the same value for `REGISTRY` below. Leave the relative image
+paths and tags unchanged; the installer prefixes them automatically. Set
+`registryInsecure: true` only for plain HTTP registries; use `false` for
+HTTPS/TLS.
 
-Mirror every application image used by the deployment. The release images below
-use the common tag `v1.0`; supporting images retain the versions from the
-configuration file. Set every applicable `images.*` field to its mirrored path.
-
-With `crane` (no Docker daemon required):
+<details>
+<summary>Mirror with crane (no Docker daemon required)</summary>
 
 ```bash
-REGISTRY="my-custom-registry.io"
+REGISTRY="registry.example.com" # Must match images.registry in the config
 
 for image in \
   docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
@@ -436,10 +468,13 @@ for image in \
 done
 ```
 
-With Docker instead:
+</details>
+
+<details>
+<summary>Mirror with Docker</summary>
 
 ```bash
-REGISTRY="my-custom-registry.io"
+REGISTRY="registry.example.com" # Must match images.registry in the config
 
 for image in \
   docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
@@ -462,119 +497,74 @@ for image in \
 done
 ```
 
-After mirroring, replace every applicable `images.*` field, including the
-Splunk, Splunk Operator, Weaviate, Fluent Bit, OpenTelemetry Collector, and
-nginx image fields, with the corresponding private-registry paths. The
-release-image paths use `v1.0`; preserve the configured tags for supporting
-images.
-
-For a plain-HTTP private registry, such as the sample address `192.0.2.10:5000`, configure:
-
-```yaml
-images:
-  registry: "192.0.2.10:5000"
-  registryInsecure: true
-```
-
-Set `registryInsecure: false` for a secure HTTPS/TLS private registry. The
-setting tells the installer whether to configure containerd for HTTP or HTTPS.
+</details>
 
 ```bash
 cd tools/cluster_setup
 
-# 1. In your config, on top of the fields in Config Setup, set:
-#    cluster.airgap: true
-#    images.registry: "registry.airgap.local"   (+ point every image at it)
-#    images.registryInsecure: true                # plain HTTP only; use false for HTTPS/TLS
-#
-#    If registry.airgap.local requires authentication (Harbor, etc.), also set:
+# If your registry requires authentication (Harbor, etc.), also set:
 #    imagePullSecrets.custom.enabled: true
 #    imagePullSecrets.custom.name: "custom-registry-secret"
-#    imagePullSecrets.custom.server: "registry.airgap.local"
+#    imagePullSecrets.custom.server: "registry.example.com"
 #    imagePullSecrets.custom.username / .password: your registry credentials
 
-# 2. Validate the configuration before installing.
+# Validate the configuration before installing.
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 
-# 3. Run the install — stages the required artifacts based on your input, then installs
+# Run the install — stages the required artifacts based on your input, then installs
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+
+# Check the status of pods and inference endpoints
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
 ```
 
-Continue to [Step 5: Verify](#step-5-verify).
+Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
 
 ---
 
-## Step 5: Verify
+</details>
 
-Applies to both standard and air-gapped deployment paths.
+## Step 5: Splunk Integration
 
-```bash
-# For getting the status of the pods and inference endpoints
-cd tools/cluster_setup
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+<details>
+<summary>Internal Splunk</summary>
 
-# Run kubectl commands directly from the installer machine
-export KUBECONFIG=~/.kube/k0s-<cluster-name>
+For the bundled in-cluster Splunk instance, use NodePort, LoadBalancer, or
+`kubectl port-forward` as described in [K0S_README.md — Finding the Splunk Web
+URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url). If
+your browser cannot reach the cluster network directly, use the [SSH bastion
+SOCKS tunnel](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
+Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant
+App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
-kubectl get nodes -o wide                                          # all Ready
-kubectl get pods -A --sort-by=.metadata.namespace                  # all Running/Completed
-kubectl get aiplatform -n ai-platform -o wide                      # Ready
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia # NodePort: use worker-ip:30080
-kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
-# → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
-```
+</details>
 
-**Access the in-cluster Splunk instance and set up the SAIA app:**
-[K0S_README.md — Finding the Splunk Web URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
-Use NodePort, LoadBalancer, or `kubectl port-forward` as described there. If
-your browser cannot reach the cluster network directly, use
-[Remote installer machine via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
-Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+<details>
+<summary>External Splunk</summary>
 
-> **Using an external, self-managed Splunk Enterprise instance for JWT authentication?**
-> See
-> [EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
+For a self-managed Splunk Enterprise instance outside the cluster, configure
+JWT authentication as described in
+[EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
+
+</details>
 
 ---
 
 ## Step 6: Common Operations
 
-Applies to both deployment paths — same commands for standard and air-gapped clusters.
-
-| Task | Command |
-|---|---|
-| Re-run after partial failure | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
-| Add worker nodes | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers` |
-| Re-stage models only | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts` |
-| Refresh platform image tags (engineering-validated behavior) | bump image tags in config, then re-run `install`; existing Helm releases are refreshed in place |
-| Refresh image tags (air-gapped engineering validation) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
-| Collect support bundle | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose` |
-| Remove the stack and reset k0s (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh delete` |
-| Wipe and start clean (more destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
+See [Deployment Guide — Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
+for re-runs, worker management, model staging, image refreshes, support
+bundles, and cleanup commands.
 
 ---
 
 ## Step 7: Troubleshooting
 
-Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup/TROUBLESHOOTING.md)
-
-| Symptom | Fix |
-|---|---|
-| SSH connection refused | Check firewall/security group on port 22 |
-| "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | Set `cluster.useExisting: auto` or run `clean-all` first |
-| `python3+pyyaml missing` on nodes | RHEL: `dnf install -y python3-pyyaml`; Ubuntu: `apt-get install -y python3-yaml`; or set `AIRGAP_PYYAML_WHEEL_PATH` for air-gap |
-| `nvidia-smi not found` in AIRGAP_MODE, no closure staged | Re-run without `--skip-nvidia-closure`, or pre-install the driver manually (see [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)) |
-| Closure doesn't cover a GPU node's kernel | Re-run `airgap_install.sh` with `--gpu-kernels` including that node's `uname -r` |
-| Checksum verification failed during staging | Re-run staging; check disk space and network stability |
-| Pod `ImagePullBackOff` (platform images) | Check `images.registry` + pull secret exist |
-| `ImagePullBackOff`: HTTP response to HTTPS client | Set `images.registryInsecure: true` for plain-HTTP registries |
-| All models MISSING after upload | Bucket name has uppercase letters — use lowercase `storage.objectStore.bucket` |
-| Air-gap: infra pods `ImagePullBackOff` / nodes NotReady | Confirm `images/*.tar` were staged and pushed to `/var/lib/k0s/images/`; re-run install with current scripts |
-| SAIA service is unreachable | For the default NodePort, use `<worker-ip>:30080`; for LoadBalancer, check MetalLB: `kubectl get pods -n metallb-system` |
-| AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform`; check operator logs + GPU availability |
+See [Deployment Guide — Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
+for diagnosis steps, decision trees, and the complete symptom reference.
 
 ---
 

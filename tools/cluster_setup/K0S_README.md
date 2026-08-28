@@ -340,27 +340,27 @@ storage:
 images:
   registry: "registry.corp.com"
   operator:
-    image: "registry.corp.com/splunk/splunk-ai-operator:v2.8"
+    image: "registry.corp.com/splunk/splunk-ai-operator:v1.0"
   splunk:
-    image: "registry.corp.com/splunk/splunk:latest"
+    image: "registry.corp.com/splunk/splunk:10.2-rhel9"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   ray:
-    headImage: "registry.corp.com/splunk/ai-tier-ray-head:v0.2"
-    workerImage: "registry.corp.com/splunk/ai-tier-ray-worker:v0.2"
+    headImage: "registry.corp.com/splunk/ai-tier-ray-head:v1.0"
+    workerImage: "registry.corp.com/splunk/ai-tier-ray-worker:v1.0"
   weaviate:
-    image: "docker.io/semitechnologies/weaviate:stable-v1.28"
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
   saia:
-    apiImage: "registry.corp.com/saia/saia-api:build-v1alpha1"
-    apiV2Image: "registry.corp.com/saia/saia-api-v2:build-v1alpha1"
-    dataLoaderImage: "registry.corp.com/saia/saia-data-loader:build-v1alpha1"
+    apiImage: "registry.corp.com/splunk/ai-tier-saia-api:v1.0"
+    apiV2Image: "registry.corp.com/splunk/ai-tier-saia-api-v2:v1.0"
+    dataLoaderImage: "registry.corp.com/splunk/ai-tier-saia-data-loader:v1.0"
   slim:
     apiImage: "registry.corp.com/splunk/ai-tier-slim-service:v1.0"
   nginx:
-    image: "docker.io/library/nginx:1.27-alpine"
+    image: "registry.corp.com/library/nginx:1.27-alpine"
   fluentBit:
-    image: "docker.io/fluent/fluent-bit:1.9.6"
+    image: "registry.corp.com/fluent/fluent-bit:1.9.6"
   otelCollector:
-    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+    image: "registry.corp.com/otel/opentelemetry-collector-contrib:0.122.1"
 
 operators:
   ray:
@@ -510,7 +510,7 @@ unchanged. For a private registry or air-gapped installation, mirror the images
 and replace the corresponding fields with the mirrored paths; setting only
 `images.registry` does not rewrite a fully qualified Docker Hub reference.
 
-> The SAIA `preview` defaults are mutable and workloads use `imagePullPolicy:
+> The SAIA `v1.0` defaults are mutable and workloads use `imagePullPolicy:
 > IfNotPresent`. Re-running the installer with the same tag may reuse a cached
 > image; use a new immutable tag or digest for a controlled image refresh.
 
@@ -518,15 +518,15 @@ and replace the corresponding fields with the mirrored paths; setting only
 |-------|----------|---------|-------------|
 | `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
 | `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
-| `images.operator.image` | **Yes** | `docker.io/kpratyush775/splunk-ai-operator:v2.8` | Splunk AI Operator image |
+| `images.operator.image` | **Yes** | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
-| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:v0.2` | Ray head node image |
-| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:v0.2` | Ray GPU worker image |
+| `images.ray.headImage` | **Yes** | `docker.io/splunk/ai-tier-ray-head:v1.0` | Ray head node image |
+| `images.ray.workerImage` | **Yes** | `docker.io/splunk/ai-tier-ray-worker:v1.0` | Ray GPU worker image |
 | `images.weaviate.image` | **Yes** | — | Weaviate vector DB image |
-| `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:preview` | SAIA API v1 image |
-| `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:preview` | SAIA API v2 image |
-| `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:preview` | SAIA data loader / post-install hook image |
+| `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:v1.0` | SAIA API v1 image |
+| `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:v1.0` | SAIA API v2 image |
+| `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:v1.0` | SAIA data loader / post-install hook image |
 | `images.slim.apiImage` | No | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API image (required when the `slim` feature is enabled) |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
@@ -1464,7 +1464,7 @@ docker push "${INTERNAL_REGISTRY}/weaviate:stable-v1.28-007846a"
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:v2.8"
+    image: "registry.airgap.local/splunk/splunk-ai-operator:v1.0"
   # ... all other image fields pointing at your internal registry
 
 imagePullSecrets:
