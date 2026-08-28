@@ -76,7 +76,7 @@ images:
     image: "splunk/splunk-ai-operator:v1.0"
 
   splunk:
-    image: "splunk/splunk:10-2-ai-custom"
+    image: "splunk/splunk:10.2-rhel9"
     operatorImage: "splunk/splunk-operator:3.0.0"
 
   ray:

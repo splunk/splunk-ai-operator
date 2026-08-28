@@ -208,7 +208,10 @@ Download the scripts with the configuration files on the installer machine.
 3. **Initialize Configuration File**
    * Duplicate the base template to create your working configuration:
      ```bash
+     # Standard deployment
      cp k0s-cluster-config.yaml my-cluster.yaml
+     # For air-gapped deployment, use this instead:
+     # cp k0s-airgapped-config.yaml my-cluster.yaml
      ```
 
 4. **Edit Your Infrastructure Layout**
@@ -237,7 +240,10 @@ Download the scripts with the configuration files on the installer machine.
 3. **Initialize Configuration File**
    * Duplicate the template file to begin making cluster edits:
      ```bash
+     # Standard deployment
      cp k0s-cluster-config.yaml my-cluster.yaml
+     # For air-gapped deployment, use this instead:
+     # cp k0s-airgapped-config.yaml my-cluster.yaml
      ```
 
 4. **Edit Your Infrastructure Layout**
@@ -264,14 +270,17 @@ working default.
 | `aiPlatform.defaultAcceleratorType` | `L40S` or `H100` |
 | `imagePullSecrets.custom.*` | Registry credentials when the private registry requires authentication |
 
+The air-gapped template already enables air-gap mode and defines relative image
+paths for the private registry.
+
 ### Required: Validate the Configuration
 
-This step is required. After editing `my-cluster.yaml`, run validation before
-choosing a deployment path. Proceed with `install` only after validation
-completes successfully. Validation checks the configuration without modifying
-any cluster node.
+This step is required. Validate the configuration you will install before
+choosing a deployment path. Validation checks the configuration without
+modifying any cluster node.
 
 ```bash
+# Validate the selected deployment config.
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
@@ -413,18 +422,21 @@ AI platform can serve inference.
 
 #### Install (Air-Gapped Path)
 
-For an air-gapped deployment, use `k0s-airgapped-config.yaml`. It already sets
-`cluster.airgap: true`, includes a sample registry, and uses relative image
-paths that are prefixed with `images.registry`.
+Use the already edited and validated `my-cluster.yaml` for this path. When
+using the air-gapped template, it sets `cluster.airgap: true` and uses relative
+image paths prefixed with `images.registry`.
 
-Before installing, mirror all platform application images to the registry in
-the config.
+Before mirroring, set `images.registry` in `my-cluster.yaml` to your private
+registry and use the same value for `REGISTRY` below. Leave the relative image
+paths and tags unchanged; the installer prefixes them automatically. Set
+`registryInsecure: true` only for plain HTTP registries; use `false` for
+HTTPS/TLS.
 
 <details>
 <summary>Mirror with crane (no Docker daemon required)</summary>
 
 ```bash
-REGISTRY="$(yq -r '.images.registry' k0s-airgapped-config.yaml)"
+REGISTRY="registry.example.com" # Must match images.registry in the config
 
 for image in \
   docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
@@ -434,7 +446,7 @@ for image in \
   docker.io/splunk/ai-tier-ray-worker:v1.0 \
   docker.io/splunk/splunk-ai-operator:v1.0 \
   docker.io/splunk/ai-tier-slim-service:v1.0 \
-  docker.io/splunk/splunk:10-2-ai-custom \
+  docker.io/splunk/splunk:10.2-rhel9 \
   docker.io/splunk/splunk-operator:3.0.0 \
   docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
   docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
@@ -451,7 +463,7 @@ done
 <summary>Mirror with Docker</summary>
 
 ```bash
-REGISTRY="$(yq -r '.images.registry' k0s-airgapped-config.yaml)"
+REGISTRY="registry.example.com" # Must match images.registry in the config
 
 for image in \
   docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
@@ -461,7 +473,7 @@ for image in \
   docker.io/splunk/ai-tier-ray-worker:v1.0 \
   docker.io/splunk/splunk-ai-operator:v1.0 \
   docker.io/splunk/ai-tier-slim-service:v1.0 \
-  docker.io/splunk/splunk:10-2-ai-custom \
+  docker.io/splunk/splunk:10.2-rhel9 \
   docker.io/splunk/splunk-operator:3.0.0 \
   docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
   docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
@@ -476,9 +488,6 @@ done
 
 </details>
 
-After mirroring, set only `images.registry` in `k0s-airgapped-config.yaml` to
-your private registry. Set `registryInsecure: false` for HTTPS/TLS.
-
 ```bash
 cd tools/cluster_setup
 
@@ -489,13 +498,13 @@ cd tools/cluster_setup
 #    imagePullSecrets.custom.username / .password: your registry credentials
 
 # Validate the configuration before installing.
-CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 
 # Run the install — stages the required artifacts based on your input, then installs
-CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 # Check the status of pods and inference endpoints
-CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh verify-pods
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
