@@ -23,9 +23,13 @@
 #   - Passwordless sudo: add to /etc/sudoers:
 #       <sshUser> ALL=(ALL) NOPASSWD:ALL
 #   - curl (used to download the k0s binary if not pre-installed)
-#   - Internet access to https://get.k0s.sh and NVIDIA package repos
-#     For airgapped clusters: pre-install k0s on all nodes and install
-#     NVIDIA drivers manually before running this script
+#   - Standard clusters: internet access to https://get.k0s.sh and NVIDIA
+#     package repositories
+#   - Air-gapped clusters: the installer machine stages k0s, NVIDIA packages,
+#     and the container toolkit offline closure, then installs them on the
+#     nodes over SSH. The nodes do not need outbound internet access. Manual
+#     driver installation is only needed when using the optional
+#     --skip-nvidia-closure path.
 #   - python3 (pyyaml is installed automatically by the script via dnf/apt)
 #   - Supported OS: RHEL/CentOS/Amazon Linux (dnf) or Ubuntu/Debian (apt)
 #

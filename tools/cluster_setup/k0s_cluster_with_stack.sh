@@ -614,7 +614,8 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
     err "nodes.existingIPs.controllers must be set in config YAML — this script requires pre-provisioned nodes"
   fi
 
-  CONTROLLER_COUNT=$(yq eval '.nodes.controllers' "${CONFIG_FILE}" 2>/dev/null || echo "1")
+  CONTROLLER_COUNT=$(yq eval '.nodes.controllers // 1' "${CONFIG_FILE}" 2>/dev/null || echo "1")
+  CONTROLLER_IP_COUNT=$(yq eval '(.nodes.existingIPs.controllers // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
   CPU_WORKER_COUNT=$(yq eval '.nodes.cpuWorkers' "${CONFIG_FILE}" 2>/dev/null || echo "2")
   GPU_WORKER_COUNT=$(yq eval '.nodes.gpuWorkers' "${CONFIG_FILE}" 2>/dev/null || echo "1")
 
@@ -769,6 +770,26 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   if [[ ${#enabled_registries[@]} -gt 0 ]]; then
     log "ImagePullSecrets enabled for: ${enabled_registries[*]}"
   fi
+}
+
+# The k0s installer provisions a single controller and never issues a
+# controller-join token. Keep this guard separate from load_config so cleanup,
+# diagnostics, and verification can still inspect a legacy configuration that
+# happens to list extra controllers. Install, validate, and join-workers call
+# this before they perform work against the cluster.
+validate_single_controller_topology() {
+  local declared_count="${CONTROLLER_COUNT:-1}"
+  local controller_ip_count="${CONTROLLER_IP_COUNT:-0}"
+
+  if [[ "${declared_count}" != "1" ]]; then
+    printf '%s\n' "This installer supports exactly one k0s controller: nodes.controllers must be 1 (got ${declared_count})."
+    return 1
+  fi
+  if [[ "${controller_ip_count}" != "1" ]]; then
+    printf '%s\n' "This installer supports exactly one k0s controller: nodes.existingIPs.controllers must contain exactly one IP (got ${controller_ip_count})."
+    return 1
+  fi
+  return 0
 }
 
 # ====== IMAGE HELPERS ======
@@ -6918,7 +6939,7 @@ check_platform_health() {
 #     after Job-level retries succeed.
 #
 # Tunables (env vars):
-#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 1200).
+#   POD_HEALTH_STABLE_WAIT    Total settle budget in seconds (default 1800).
 #   POD_HEALTH_PENDING_GRACE  How long Pending pods are tolerated (default 300).
 #   POD_HEALTH_POLL_INTERVAL  Re-check interval while waiting (default 15).
 #
@@ -6931,13 +6952,14 @@ verify_all_pods_healthy() {
   log "============================================"
   log ""
 
-  # The default budget (20 minutes) is sized for the typical case: KubeRay
+  # The default budget (30 minutes) allows for slower Ray Serve startup in
+  # addition to the typical case: KubeRay
   # creates worker pods only AFTER the head pod becomes Running+Ready, and
   # each worker then has to pull a multi-GB image and register with the
   # head. Splunk Standalone has a similar 2–5 min init.
   # Override this with POD_HEALTH_STABLE_WAIT when a different settle budget
   # is appropriate for the deployment environment.
-  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-1200}"
+  local stable_wait_secs="${POD_HEALTH_STABLE_WAIT:-1800}"
   local pending_grace_secs="${POD_HEALTH_PENDING_GRACE:-300}"
   local poll_interval="${POD_HEALTH_POLL_INTERVAL:-15}"
   # Clamp grace ≤ wait. Without this, configuring a short STABLE_WAIT (e.g.
@@ -7910,6 +7932,10 @@ main_install() {
   [[ "${SILENT_INSTALL}" == "true" ]] && AUTO_APPROVE=true
 
   load_config
+  local controller_topology_error=""
+  if ! controller_topology_error=$(validate_single_controller_topology); then
+    err "${controller_topology_error} No installation changes were made."
+  fi
 
   validate_image_config
   resolve_accelerator_type
@@ -8447,6 +8473,13 @@ diagnose() {
 validate_config() {
   load_config
 
+  local controller_topology_error=""
+  if ! controller_topology_error=$(validate_single_controller_topology); then
+    echo -e "  \033[1;31m✖\033[0m ${controller_topology_error}" >&2
+    echo -e "  \033[1;31m✖\033[0m Fix the controller topology before running install." >&2
+    exit 1
+  fi
+
   echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
   local errors=0 warnings=0
 
@@ -8584,7 +8617,7 @@ Environment:
                              for install; also skips delete/clean-all confirmations).
   POD_HEALTH_STABLE_WAIT   - Seconds to wait for pods AND workload CRs (RayCluster,
                              RayService, Splunk Standalone, AIPlatform/AIService) to
-                             reach Ready during verify (default: 1200 = 20 minutes).
+                             reach Ready during verify (default: 1800 = 30 minutes).
                              Override it when the deployment environment needs a
                              different settle budget.
   POD_HEALTH_PENDING_GRACE - Seconds to ignore Pending pods younger than this
@@ -8701,6 +8734,10 @@ join_workers() {
   log "============================================"
 
   load_config
+  local controller_topology_error=""
+  if ! controller_topology_error=$(validate_single_controller_topology); then
+    err "${controller_topology_error} No worker-join changes were made."
+  fi
 
   # Set proper kubeconfig
   export KUBECONFIG="${HOME}/.kube/k0s-${CLUSTER_NAME}"

@@ -9,6 +9,7 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
 ## Table of Contents
 
 - [Which Path Is Right for You?](#which-path-is-right-for-you)
+- [Keep the Installer Session Alive](#keep-the-installer-session-alive)
 - [What Gets Deployed](#what-gets-deployed)
   - [Internal Splunk Transport](#internal-splunk-transport)
   - [Scaling Deployment Capacity](#scaling-deployment-capacity)
@@ -52,6 +53,35 @@ flowchart TD
 |---|---|---|---|
 | Typical cloud / on-prem | ✅ | ✅ | [Standard deployment](#standard-deployment-internet-connected) |
 | Cluster isolated | ✅ | ❌ | [Air-gapped deployment](#air-gapped-deployment-no-internet-on-cluster) — the **same** `k0s_cluster_with_stack.sh install` command, with `cluster.airgap: true` in the config |
+
+---
+
+## Keep the Installer Session Alive
+
+The first install can run for **3–7 hours**, mostly while staging model weights.
+Run it inside a persistent `tmux` or `screen` session on the installer machine
+so an SSH disconnect does not interrupt the job. Install `tmux` if needed:
+
+```bash
+# Ubuntu 24.04
+sudo apt-get install -y tmux
+
+# RHEL 9.8 or RHEL 10.2
+sudo dnf install -y tmux
+
+tmux new -s saia-install
+# Run the install command here, then detach with Ctrl-b followed by d.
+```
+
+Reconnect later with:
+
+```bash
+tmux attach -t saia-install
+```
+
+Use `screen -S saia-install` and `screen -r saia-install` instead if `screen`
+is your standard. Keep the installer machine powered on and connected to the
+cluster nodes for the duration of the run.
 
 ---
 
@@ -116,13 +146,13 @@ graph TB
 | Component | Supported version | Notes |
 |---|---|---|
 | k0s (Kubernetes) | v1.31+ (validated on v1.36.1, containerd 2.x) | Installed automatically by the installer |
-| Node OS | RHEL 9, RHEL 10, or Ubuntu 24.04 — all three air-gapped or non-air-gapped | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. Air-gapped RHEL 10 needs `kernel-modules-extra` staged in the bundle (el10 keeps kube-proxy's netfilter modules there rather than in the base kernel); the staging step does that automatically, and preflight rejects an el10 node only if it has neither the module nor that closure. Air-gap RPM closures are resolved with the **installer machine's** own `dnf`, so for air-gap its RHEL major must match the nodes' — RHEL 9 or Ubuntu 24.04 nodes → RHEL 9 x86_64 installer machine; RHEL 10 nodes → RHEL 10 x86_64 installer machine — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
+| Node OS | RHEL 9.8, RHEL 10.2, or Ubuntu 24.04 — all three air-gapped or non-air-gapped | Only tested/supported OSes for **cluster** nodes (controllers, CPU workers, GPU workers). Any other OS is rejected at preflight; set `FORCE_UNSUPPORTED_OS=1` to bypass at your own risk. Air-gapped RHEL 10.2 needs `kernel-modules-extra` staged in the bundle (el10 keeps kube-proxy's netfilter modules there rather than in the base kernel); the staging step does that automatically, and preflight rejects an el10 node only if it has neither the module nor that closure. Air-gap RPM closures are resolved with the **installer machine's** own `dnf`, so for air-gap its RHEL major must match the nodes' — RHEL 9.8 or Ubuntu 24.04 nodes → RHEL 9.8 x86_64 installer machine; RHEL 10.2 nodes → RHEL 10.2 x86_64 installer machine — see [Installer-host requirements](#gpu-nodes-in-air-gapped-environments) |
 | NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
 | Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
 
-> **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are access-controlled through your private registry. Contact your Splunk account team to confirm entitlements before deployment.
+> **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are pulled from the configured public or private registry; ensure your deployment has the required image access before deployment.
 
 ### Internal Splunk Transport
 
@@ -217,7 +247,7 @@ ask your cluster administrator to add the required GPU capacity first.
 flowchart LR
     subgraph PRE["Prerequisites Checklist"]
         direction TB
-        A["✅ Admin workstation\nkubectl · helm · git\njq · yq · ssh"]
+        A["✅ Installer machine\nkubectl · helm · git\njq · yq · ssh"]
         B["✅ SSH key\nprivate key access to\nall cluster nodes"]
         C["✅ Cluster nodes\nController · CPU Worker(s)\nGPU Worker(s)\npasswordless sudo"]
         D["✅ Object storage\nMinIO / SeaweedFS / S3\nprovisioned & reachable"]
@@ -236,7 +266,7 @@ flowchart LR
 
 > **Minimum viable topology:** The platform requires at least 1 controller + 1 CPU worker + 2 GPU workers. The controller and CPU worker roles can coexist on a single machine for lab/testing use, but this is not supported for production. A single GPU worker is not sufficient — the AI inference stack distributes work across both nodes.
 >
-> **Only one controller is supported.** `install_k0s_cluster` joins a k0s controller on `nodes.existingIPs.controllers[0]` only — it never issues a controller-join token to the remaining entries. Listing additional controller IPs does not produce an HA control plane; those addresses are unused (or cause node-label verification to fail). Set `nodes.controllers: 1` and list exactly one controller IP.
+> **Only one controller is supported.** The installer rejects configurations where `nodes.controllers` is not `1` or where more than one controller IP is listed. It never issues a controller-join token, so this release does not provide an HA control plane or etcd quorum. Set `nodes.controllers: 1` and list exactly one controller IP.
 
 **Ports to open between nodes:** 22 (SSH), 6443 (k8s API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN/Calico), 179 (Calico BGP).
 
@@ -324,15 +354,16 @@ flowchart TD
 
 ```bash
 # On each node (controller, CPU worker, GPU worker) — confirm OS, passwordless sudo, and Python
-cat /etc/os-release               # must be RHEL 9, RHEL 10, or Ubuntu 24.04
+cat /etc/os-release               # must be RHEL 9.8, RHEL 10.2, or Ubuntu 24.04
 sudo -n true && echo "passwordless sudo OK"
 python3 --version                 # 3.8+
 
-# From the admin workstation — confirm SSH access to each node
+# From the installer machine — confirm SSH access to each node
+chmod 600 <path-to-private-key>   # required if the key was copied or downloaded
 ssh -i <key> <user>@<node-ip> hostname
 ```
 
-RHEL 9, RHEL 10 and Ubuntu 24.04 are the only supported node OSes — mix and
+RHEL 9.8, RHEL 10.2 and Ubuntu 24.04 are the only supported node OSes — mix and
 match freely across controllers/workers, the installer detects each node's OS
 over SSH. **RHEL 10 air-gapped** additionally needs `kernel-modules-extra` in the
 bundle — el10 keeps the netfilter modules kube-proxy needs there rather than in
@@ -375,9 +406,16 @@ The config sections to fill in:
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
+`validate` checks local configuration completeness only. It does not contact
+the cluster nodes, object store, or image registry, and it does not confirm
+that model artifacts are staged. The `install` command runs those environment
+checks during preflight before making changes.
+
 This runs a read-only config check and prints a ✔/✖ checklist. Fix any ✖ items before proceeding.
 
 **4. Run the installer**
+
+Start this command inside the [persistent installer session](#keep-the-installer-session-alive).
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
@@ -415,7 +453,7 @@ flowchart LR
         INTERNET[("GitHub · NVIDIA\nHuggingFace\nHelm repos")]
     end
 
-    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9 x86_64)\ninternet + SSH to the nodes"]
+    subgraph INSTALLER["🖥️  Installer Machine (RHEL 9.8 x86_64)\ninternet + SSH to the nodes"]
         ENTRY["k0s_cluster_with_stack.sh install\nconfig has cluster.airgap: true"]
         AGI["airgap_install.sh\ninvoked automatically\nto stage the artifacts"]
         STAGE["./airgap-bundle/airgap-bundle-<ts>/\nbinaries · charts · manifests\nimage tarballs · NVIDIA closure\n(RPM for RHEL 9 / .deb for Ubuntu 24.04\nGPU nodes — auto-detected over SSH)"]
@@ -629,7 +667,8 @@ IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
   [[ -z "$img" ]] && continue
-  dest="${INTERNAL_REGISTRY}/${img##*/}"
+  relative_image="${img#*/}"
+  dest="${INTERNAL_REGISTRY}/${relative_image}"
   echo "Copying $img → $dest"
   crane copy "$img" "$dest"
 done < "${IMAGE_LIST}"
@@ -641,7 +680,7 @@ After mirroring, update your config:
 images:
   registry: "registry.airgap.local"
   operator:
-    image: "registry.airgap.local/splunk-ai-operator:v2.8"
+    image: "registry.airgap.local/splunk/splunk-ai-operator:v1.0"
   # ... all other images pointing at your internal registry
 
 imagePullSecrets:
@@ -716,7 +755,7 @@ cluster:
 **4b. Run the install**
 
 The same command as a standard install, on the internet-connected installer
-machine:
+machine. Start it inside the [persistent installer session](#keep-the-installer-session-alive):
 
 ```bash
 cd tools/cluster_setup
@@ -830,7 +869,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph S1["Strategy 1\n✅ Recommended — automatic"]
-        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9 x86_64 host;\nGPU IPs + OS (RHEL 9 or Ubuntu 24.04)\nread/detected from the config"]
+        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9.8 x86_64 host;\nGPU IPs + OS (RHEL 9.8, RHEL 10.2,\nor Ubuntu 24.04) read/detected from config"]
         S1B["Script resolves a full RPM or .deb\nclosure incl. kernel headers\nfor each node's kernel"]
         S1C["Installer scp's the closure\nto each GPU node and installs\noffline; DKMS compiles"]
         S1A --> S1B --> S1C
@@ -845,7 +884,9 @@ flowchart LR
 
 **Strategy 1 — staging the driver closure:**
 
-Run this on the internet-connected RHEL 9 x86_64 installer machine. NVIDIA
+Run this on the internet-connected RHEL 9.8 x86_64 installer machine for RHEL
+9.8 or Ubuntu 24.04 targets, or on a RHEL 10.2 x86_64 installer machine for
+RHEL 10.2 targets. NVIDIA
 publishes **DKMS-only** packages for both target OSes — `kmod-nvidia-latest-dkms`
 on RHEL 9 (the older `cuda-drivers` meta-package is gone there), and
 `cuda-drivers` on Ubuntu 24.04 (current and used as-is) — so the kernel module
@@ -885,7 +926,7 @@ the install just as the unified command would:
 > defaults to `auto`, which SSHes to the first GPU node and reads
 > `/etc/os-release` to pick `rhel9` (RPM closure) or `ubuntu24` (.deb closure).
 
-Installer-host requirements: RHEL 9 x86_64 Linux with `dnf`, `rpm`, and
+Installer-host requirements: RHEL 9.8 x86_64 Linux with `dnf`, `rpm`, and
 `createrepo_c` (`sudo dnf install -y createrepo_c`) for an RPM closure; add
 `podman` or `docker` if any GPU node is Ubuntu 24.04, since the .deb closure is
 resolved inside an `ubuntu:24.04` container regardless of the build host's own
@@ -894,12 +935,12 @@ RHEL 9 GPU nodes — `$releasever` resolves to `9`, so a 9.6 build host can supp
 `kernel-devel` for a 9.8 node. All of this is validated in preflight, before any
 downloads.
 
-> **Air-gapped RHEL 10 clusters need a RHEL 10 installer machine.** The RHEL major
+> **Air-gapped RHEL 10.2 clusters need a RHEL 10.2 installer machine.** The RHEL major
 > version is not just a minor detail here — `dnf`'s `$releasever` is derived from
 > the *installer host's* own `/etc/os-release`, so a RHEL 9 installer machine
 > resolves RHEL 9 packages even when targeting RHEL 10 nodes, and vice versa.
-> Build RHEL 10 bundles on a RHEL 10 x86_64 host; RHEL 9 and Ubuntu 24.04 clusters
-> keep using a RHEL 9 x86_64 installer machine as documented above. Non-air-gapped
+> Build RHEL 10.2 bundles on a RHEL 10.2 x86_64 host; RHEL 9.8 and Ubuntu 24.04 clusters
+> keep using a RHEL 9.8 x86_64 installer machine as documented above. Non-air-gapped
 > installs build no closure — the nodes use their own repos — so the installer
 > machine's OS is unconstrained there.
 
@@ -974,8 +1015,9 @@ kubectl get pods -A --sort-by=.metadata.namespace
 # AIPlatform CR must be Ready
 kubectl get aiplatform -n ai-platform -o wide
 
-# SAIA service must have an EXTERNAL-IP (if using LoadBalancer)
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
+# Inspect the generated SAIA service and its exposure mode
+SAIA_SERVICE="<cluster-name>-ai-platform-saia-saia-service"
+kubectl get svc "${SAIA_SERVICE}" -n ai-platform -o wide
 
 # GPU nodes must show available GPUs
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
@@ -994,7 +1036,7 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 | `kuberay-operator` pods | `Running` |
 | `splunk-standalone` | `Ready` |
 | `aiplatform/<name>` | `Ready` |
-| SAIA service | `EXTERNAL-IP` assigned |
+| SAIA service | Matches the configured `ClusterIP`, `NodePort`, or `LoadBalancer` exposure mode |
 | GPU nodes | `nvidia.com/gpu: N` in allocatable |
 
 **Sample output — healthy cluster:**
@@ -1018,11 +1060,13 @@ If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 
 
 ## Internal Splunk Access
 
-The in-cluster Splunk Enterprise instance is reachable via NodePort (default),
-LoadBalancer (MetalLB), or `kubectl port-forward` for quick access from your
-admin workstation with no external exposure. See
+The in-cluster Splunk Enterprise instance is a ClusterIP service by default;
+the installer does not create a Splunk NodePort or LoadBalancer. Use
+`kubectl port-forward` for quick access from the installer machine. See
 [K0S_README.md — Finding the Splunk Web URL](K0S_README.md#finding-the-splunk-web-url)
-for the commands for each method, plus how to retrieve the admin password.
+for the exact service and operator-managed Secret lookup. This section applies
+only to bundled Splunk; external Splunk uses its administrator-provided URL and
+credentials.
 
 ---
 
@@ -1032,38 +1076,57 @@ After the cluster is healthy, install the **Splunk AI Assistant** app
 (`Splunk_AI_Assistant_Cloud.tgz`) on the Splunk Enterprise instance, then
 onboard it to the AI tier.
 
-> **Obtaining the app:** `Splunk_AI_Assistant_Cloud.tgz` is provided by your Splunk account team. Contact your Splunk representative if you do not have it.
+> **Obtaining the app:** The app is planned for listing on Splunk Base. Once
+> listed, download `Splunk_AI_Assistant_Cloud.tgz` from Splunk Base. Until then,
+> use the archive location provided with the release or evaluation package.
+
+The app is installed after the platform deployment is healthy; it is a separate
+post-install step and does not change the cluster installation flow.
 
 ### 1. Find your Splunk Web URL
 
 ```bash
-# Retrieve the admin password
-kubectl get secret splunk-standalone-secret -n ai-platform \
+# Bundled Splunk only: discover the operator-managed versioned Secret.
+NAMESPACE="ai-platform"
+STANDALONE_NAME="splunk-standalone"
+SPLUNK_SECRET="$(kubectl get secret -n "${NAMESPACE}" \
+  -l 'app.kubernetes.io/component=versionedSecrets,app.kubernetes.io/managed-by=splunk-operator' \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.metadata.ownerReferences[0].name}{"\n"}{end}' \
+  | awk -F'|' -v owner="${STANDALONE_NAME}" '$2 == owner {print $1; exit}')"
+[[ -n "${SPLUNK_SECRET}" ]] || { echo "Splunk admin Secret not found" >&2; exit 1; }
+kubectl get secret "${SPLUNK_SECRET}" -n "${NAMESPACE}" \
   -o jsonpath='{.data.password}' | base64 --decode && echo
 
-# NodePort (default) — open on any worker node IP
-kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
-# → http://<node-ip>:<nodePort>
+# Splunk Web is ClusterIP by default; expose it locally.
+SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+kubectl get svc "${SPLUNK_SERVICE}" -n "${NAMESPACE}"
+kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 ```
 
 ### 2. Install the app
 
-1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`)
+1. Log in to Splunk Web (`http://localhost:8000` when using the port-forward above)
 2. **Apps → Manage Apps → Install app from file**
 3. Select `Splunk_AI_Assistant_Cloud.tgz`, check **Upgrade app** if updating, click **Upload**
 4. Restart Splunk if prompted
 
 ### 3. Onboard to the AI tier
 
-The app needs the SAIA API URL (`http://<node-ip>:<nodePort>`) to route prompts to the AI backend.
+The app needs the SAIA API URL to route prompts to the AI backend.
 
 ```bash
-# Find the SAIA NodePort
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-# PORT(S) column shows  8080:<nodePort>/TCP  — use that nodePort
+# The installer creates this service from the AIPlatform/AIService names.
+NAMESPACE="ai-platform"
+CLUSTER_NAME="<cluster-name>"
+SAIA_SERVICE="${CLUSTER_NAME}-ai-platform-saia-saia-service"
+kubectl get svc "${SAIA_SERVICE}" -n "${NAMESPACE}" -o wide
+# NodePort: use the reported nodePort with http://<worker-node-ip>:<nodePort>
+# LoadBalancer: use the reported external address with port 8080
+# ClusterIP: run `kubectl port-forward svc/${SAIA_SERVICE} 8080:8080`
 ```
 
-In Splunk Web: **Splunk AI Assistant → Configuration** → enter `http://<worker-node-ip>:<nodePort>` as the AI Tier Endpoint and save.
+In Splunk Web: **Splunk AI Assistant → Configuration** → enter the endpoint
+from the service exposure mode above and save.
 
 > **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
 
@@ -1222,18 +1285,18 @@ flowchart TD
 
 | Symptom | First check | Fix |
 |---|---|---|
-| "SSH connection refused" | `ssh -i key user@node-ip hostname` | Check firewall / security groups on port 22 |
+| "SSH connection refused" or "Connection timed out" | `ssh -i key user@node-ip hostname` | For refusal, check that SSH is running on the node. For a timeout, check routing/VPN and allow inbound TCP 22 from the installer machine in the security group or firewall. |
 | "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | `kubectl get nodes` | Set `cluster.useExisting: auto` in config or run `clean-all` first |
 | "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
-| "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Pre-install NVIDIA driver — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
+| "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Check that staging created the offline driver closure and re-run without `--skip-nvidia-closure`; manual driver installation is only needed for the optional pre-installed-driver path — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging dir and re-run the install (staging repeats automatically) |
 | "Expected chart not found" | `ls ./airgap-bundle/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
 | `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](K0S_README.md#insecure-registry-support-containerd-v2) |
-| All models reported MISSING after a successful upload | `mc ls myminio/<bucket>/staging_state/` | Bucket name has uppercase letters — the upload scripts normalize to lowercase; use a lowercase `storage.objectStore.bucket` value. See [Model Staging Issues](K0S_README.md#model-staging-issues) |
+| All models reported MISSING | `mc ls myminio/<bucket>/staging_state/` or `aws s3api head-bucket --bucket <bucket>` | Confirm the bucket exists, is the configured bucket, and contains `staging_state/` and `model_artifacts/` entries. An empty or missing bucket must be created/populated; uppercase names are normalized, but lowercase config values are recommended. See [Model Staging Issues](K0S_README.md#model-staging-issues) |
 | All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](K0S_README.md#switching-defaultacceleratortype-from-l40s-to-h100-shows-models-as-missing) |
 | Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in the staged tree (`--download-only` to inspect); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
-| SAIA service no `EXTERNAL-IP` | `kubectl get svc -n ai-platform` | Check MetalLB pods: `kubectl get pods -n metallb-system` |
+| SAIA service has no external address or is unreachable | `kubectl get svc <cluster-name>-ai-platform-saia-saia-service -n ai-platform -o wide` | `NodePort` and `ClusterIP` services correctly have no `EXTERNAL-IP`; use the reported NodePort or `kubectl port-forward`. For a `LoadBalancer` with no address, check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
 
 > For the full symptom list — Ray workers not starting, models not loading, Splunk stuck initializing, and more — see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.

@@ -106,6 +106,7 @@ _load_functions() {
   eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn validate_scale_factor_config)"
   eval "$(_extract_fn object_store_auth_looks_like_placeholder)"
+  eval "$(_extract_fn validate_single_controller_topology)"
   eval "$(_extract_fn _pod_is_healthy)"
   eval "$(_extract_fn _classify_pod_failure)"
   eval "$(_extract_fn _print_pod_section)"
@@ -154,6 +155,31 @@ _actual_k0s_release_tuple=$("${YQ_BIN}" eval '
 ' "${SCRIPT_DIR}/k0s-cluster-config.yaml")
 assert_eq "k0s config uses the requested operator, Ray, Slim, and Ray runtime defaults" \
   "${_expected_k0s_release_tuple}" "${_actual_k0s_release_tuple}"
+
+# ── Tests: single-controller topology guard ──────────────────────────────────
+
+suite "single-controller topology"
+echo "▶ single-controller topology"
+
+CONTROLLER_COUNT=1
+CONTROLLER_IP_COUNT=1
+assert_rc "accepts the supported one-controller configuration" 0 \
+  validate_single_controller_topology
+
+CONTROLLER_COUNT=3
+CONTROLLER_IP_COUNT=1
+assert_rc "rejects a declared multi-controller configuration" 1 \
+  validate_single_controller_topology
+
+CONTROLLER_COUNT=1
+CONTROLLER_IP_COUNT=3
+assert_rc "rejects multiple controller IPs" 1 \
+  validate_single_controller_topology
+
+CONTROLLER_COUNT=1
+CONTROLLER_IP_COUNT=0
+assert_rc "rejects a missing controller IP" 1 \
+  validate_single_controller_topology
 
 _expected_eks_platform_images=$'docker.io/splunk/ai-tier-ray-head:preview\ndocker.io/splunk/ai-tier-ray-worker:preview\ndocker.io/splunk/ai-tier-saia-api:preview\ndocker.io/splunk/ai-tier-saia-api-v2:preview\ndocker.io/splunk/ai-tier-saia-data-loader:preview'
 _actual_eks_platform_images=$("${YQ_BIN}" eval '
