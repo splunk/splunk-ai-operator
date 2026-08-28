@@ -1,7 +1,7 @@
 # k0s Deployment — Quick Reference
 
-One-page cheat sheet for installing the Splunk AI Platform on k0s. For full
-explanations, diagrams, and edge cases see
+Quick reference for installing the Splunk AI Platform on k0s. For full
+explanations, diagrams, and edge cases, see
 [DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) and
 [K0S_README.md](../../tools/cluster_setup/K0S_README.md).
 
@@ -27,7 +27,7 @@ explanations, diagrams, and edge cases see
 
 ## Step 1: Prerequisites
 
-**Installer machine** — Ubuntu 24.04 or RHEL 9/10, x86_64/amd64, with SSH
+**Installer machine** — Ubuntu 24.04, RHEL 9.8, or RHEL 10.2, x86_64/amd64, with SSH
 access to every cluster node and the CLI tools below. Run commands locally or
 SSH into the machine first if it is remote; it is separate from the cluster
 nodes.
@@ -76,7 +76,7 @@ rm -f /tmp/crane.tar.gz /tmp/crane
 </details>
 
 <details>
-<summary>RHEL 9/10</summary>
+<summary>RHEL 9.8 / 10.2</summary>
 
 ```bash
 sudo dnf install -y ca-certificates curl git jq openssh-clients tar wget
@@ -177,9 +177,9 @@ node count to get the cluster total.
 all nodes in a cluster.
 
 **Installer machine OS:** for standard deployments, use Ubuntu 24.04 or RHEL
-9/10. For air-gapped deployments, use an x86_64 RHEL 9 installer machine for
-RHEL 9 or Ubuntu 24.04 clusters, and an x86_64 RHEL 10 installer machine for
-RHEL 10 clusters.
+9.8/10.2. For air-gapped deployments, use an x86_64 RHEL 9.8 installer machine
+for RHEL 9.8 or Ubuntu 24.04 clusters, and an x86_64 RHEL 10.2 installer
+machine for RHEL 10.2 clusters.
 
 | OS | Version |
 | :--- | :--- |
@@ -222,6 +222,7 @@ Download the scripts with the configuration files on the installer machine.
    * Open the config file in your preferred text editor to make targeted additions:
      ```bash
      vi my-cluster.yaml
+     chmod 600 /path/to/private-key     
      ```
 
 </details>
@@ -257,6 +258,7 @@ Download the scripts with the configuration files on the installer machine.
    * Launch your file inside a terminal editor to change values:
      ```bash
      vi my-cluster.yaml
+     chmod 600 /path/to/private-key
      ```
 
 </details>
@@ -321,7 +323,7 @@ Choose one deployment path:
 
 #### Hardware Setup (Standard Path)
 
-Confirm every cluster node uses RHEL 9, RHEL 10, or Ubuntu 24.04 and has
+Confirm every cluster node uses RHEL 9.8, RHEL 10.2, or Ubuntu 24.04 and has
 passwordless sudo and Python 3.8+. Confirm SSH access from the installer
 machine before running the installer. GPU driver installation is fully
 automatic; no manual driver steps are needed.
@@ -372,9 +374,9 @@ reach to the cluster nodes — there is no separate transfer/bundle step.
 
 #### Hardware Setup (Air-Gapped Path)
 
-**Cluster nodes** must use RHEL 9, RHEL 10, or Ubuntu 24.04. For air-gapped
-staging, use a RHEL 9 x86_64 installer machine for RHEL 9 or Ubuntu 24.04
-clusters, and a RHEL 10 x86_64 installer machine for RHEL 10 clusters. The
+**Cluster nodes** must use RHEL 9.8, RHEL 10.2, or Ubuntu 24.04. For air-gapped
+staging, use a RHEL 9.8 x86_64 installer machine for RHEL 9.8 or Ubuntu 24.04
+clusters, and a RHEL 10.2 x86_64 installer machine for RHEL 10.2 clusters. The
 installer machine needs internet access and SSH access to every sealed node.
 
 Install the air-gap staging dependencies on the installer machine. Install
@@ -438,7 +440,7 @@ image paths prefixed with `images.registry`.
 Before mirroring, set `images.registry` in `my-cluster.yaml` to your private
 registry and use the same value for `REGISTRY` below. Leave the relative image
 paths and tags unchanged; the installer prefixes them automatically. Set
-`registryInsecure: true` only for plain HTTP registries; use `false` for
+`registryInsecure: false` only for
 HTTPS/TLS.
 
 <details>

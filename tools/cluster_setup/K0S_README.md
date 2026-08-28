@@ -63,7 +63,7 @@ The script installs everything needed for the AI Platform:
 6. **OpenTelemetry Operator** — Installed for the existing bundled/internal
    collector path; workload telemetry remains experimental and is not a
    supported feature claim for this release
-7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9)
+7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9.8, RHEL 10.2, Ubuntu 24.04)
 8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI
 9. **Splunk Operator** — Splunk Enterprise management
 10. **Splunk AI Platform Operator** — AI platform orchestration (SAIA feature)
@@ -96,7 +96,7 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ## Prerequisites
 
-### Required Tools (on Admin Workstation)
+### Required Tools (on Installer Machine)
 
 ```bash
 # Install required tools on macOS
@@ -106,7 +106,7 @@ brew install kubectl helm git jq yq crane
 # git and jq are in the default apt repos; kubectl and helm are not — add their
 # upstream repos/install scripts, and yq/crane need sudo to write to /usr/local/bin
 sudo apt-get update
-sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq tmux
 
 # pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -136,13 +136,13 @@ yq --version
 crane version
 ```
 
-**RHEL 9** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
+**RHEL 9.8 / RHEL 10.2** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
 default `dnf` repos; `git` and `jq` are. Install each via its own supported
 method (standalone binary, install script, or vendor repo, per each tool's
 docs) rather than a single `dnf install`:
 
 ```bash
-sudo dnf install -y git jq
+sudo dnf install -y git jq tmux
 
 # kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
 # pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
@@ -180,7 +180,7 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 ```
 
 The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images))
-default to `crane copy`, which works on both Ubuntu and RHEL 9 with no
+default to `crane copy`, which works on Ubuntu 24.04 and RHEL 9.8/10.2 with no
 Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
 there too as an equivalent alternative if you already run Docker.
 
@@ -196,8 +196,14 @@ there too as an equivalent alternative if you already run Docker.
 
 ### Software Requirements (on All Nodes)
 
-- RHEL 9
-- Passwordless SSH access from admin workstation
+**Supported node operating systems:**
+
+- RHEL 9.8
+- RHEL 10.2
+- Ubuntu 24.04
+
+Use one supported OS family and version across all nodes in a cluster.
+- Passwordless SSH access from installer machine
 - Sudo privileges without password
 - Python 3.8+ installed
 
@@ -444,6 +450,13 @@ ecr:
 | `cluster.sshKeyPath` | Yes | — | Path to SSH private key |
 | `cluster.apiExternalAddress` | No | Auto-detected private bind address | API IP or hostname reachable by every worker; set for public-only or routed worker topologies |
 
+If the private key was copied or downloaded onto the installer machine, restrict
+its permissions before the first SSH test:
+
+```bash
+chmod 600 /path/to/private-key
+```
+
 #### Nodes Section
 
 | Field | Required | Default | Description |
@@ -464,7 +477,7 @@ ecr:
 | `storage.minimumDiskSpace.cpuWorker` | No | `200` | Minimum disk (GB) for CPU worker preflight check |
 | `storage.minimumDiskSpace.gpuWorker` | No | `500` | Minimum disk (GB) for GPU worker preflight check |
 | `storage.objectStore.type` | No | `minio` | `aws`, `s3compat`, `minio`, or `seaweedfs` |
-| `storage.objectStore.bucket` | No | `ai-platform-data` | S3 bucket name. **Must be lowercase** — the installer normalizes to lowercase automatically; uppercase letters in the config value are silently converted before any store operations. |
+| `storage.objectStore.bucket` | No | `ai-platform-data` | S3 bucket name. Use lowercase; the installer normalizes the value before store operations. |
 | `storage.objectStore.endpoint` | **Yes*** | — | S3-compatible endpoint URL (*required for s3compat/minio/seaweedfs) |
 | `storage.objectStore.auth.rootUser` | Yes | — | Access key / root user |
 | `storage.objectStore.auth.rootPassword` | Yes | — | Secret key / root password |
@@ -695,7 +708,7 @@ cluster:
 
 **What `airgap: true` does:**
 - Skips the HuggingFace connectivity check before model staging (models must be pre-staged in object store)
-- Skips the NVIDIA package repo connectivity check on GPU workers (drivers must be pre-installed)
+- Skips the NVIDIA package repo connectivity check on GPU workers; the staging step builds an offline driver closure and installs it on each GPU node automatically
 - Object store connectivity is still checked — it lives on your local network and must be reachable
 - The install plan banner shows `Air-gap mode: true` so customers can confirm it was picked up
 
@@ -1231,7 +1244,9 @@ images:
 The script installs NVIDIA host drivers directly on GPU nodes (not the GPU Operator).
 
 **Supported distributions:**
-- RHEL 9
+- RHEL 9.8
+- RHEL 10.2
+- Ubuntu 24.04
 
 **What happens on GPU nodes:**
 1. Kernel headers installed
@@ -1350,11 +1365,11 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 | Tool | Install |
 |---|---|
-| RHEL 9 x86_64 (RHEL 10 x86_64 if the cluster nodes are RHEL 10 — see note below) | Required for air-gap only — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
+| RHEL 9.8 x86_64 (RHEL 10.2 x86_64 if the cluster nodes are RHEL 10.2 — see note below) | Required for air-gap only — the NVIDIA driver closure / node package closure is resolved with the host's own `dnf` |
 | `curl` | `dnf install -y curl` |
 | `helm` | https://helm.sh/docs/intro/install/ |
 | `kubectl` | https://kubernetes.io/docs/tasks/tools/ |
-| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9 / RHEL 10 |
+| `tar`, `ssh`, `rpm`, `dnf`, `sha256sum` | Pre-installed on RHEL 9.8 / RHEL 10.2 |
 | `createrepo_c` | `sudo dnf install -y createrepo_c` |
 | `sudo` + ~5 GB free disk | Required for staging — the NVIDIA RPM closure is built on this host |
 | `k0s`, `yq` | Downloaded for you — the staging step installs both to `/usr/local/bin/` |
@@ -1362,14 +1377,14 @@ The main installer has no hardcoded download URLs — every internet address is 
 > These requirements apply only to the air-gap path. A standard (`airgap: false`) install needs none of them.
 
 > **For air-gap builds, the installer machine's RHEL major must match the cluster's.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa) — and the air-gap path builds both closures (NVIDIA driver, node packages) on this host:
-> - Cluster nodes are **RHEL 10** → installer machine must be **RHEL 10 x86_64**.
-> - Cluster nodes are **RHEL 9** or **Ubuntu 24.04** → installer machine stays **RHEL 9 x86_64** (the Ubuntu `.deb` closure resolves inside an `ubuntu:24.04` container).
+> - Cluster nodes are **RHEL 10.2** → installer machine must be **RHEL 10.2 x86_64**.
+> - Cluster nodes are **RHEL 9.8** or **Ubuntu 24.04** → installer machine stays **RHEL 9.8 x86_64** (the Ubuntu `.deb` closure resolves inside an `ubuntu:24.04` container).
 >
 > A standard (`airgap: false`) install builds no closure — every node installs from its own repos — so the installer machine's OS does not have to match.
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
-> **NVIDIA drivers:** The installer detects and skips driver installation if `nvidia-smi` is already present. For air-gapped GPU nodes, pre-install the NVIDIA driver and `nvidia-container-toolkit` from an offline RPM closure before running the installer — see [Strategy 1 — Pre-install before running the installer](#gpu-nodes-in-air-gapped-environments) for the full recipe.
+> **NVIDIA drivers:** The installer detects and skips driver installation if `nvidia-smi` is already present. Otherwise, air-gap staging builds the required offline RPM or `.deb` closure and installs the driver and container toolkit on each GPU node automatically. Pre-install them only when using the optional `--skip-nvidia-closure` path — see [Strategy 2 — Pre-install drivers yourself](#gpu-nodes-in-air-gapped-environments).
 
 ---
 
@@ -1436,7 +1451,8 @@ IMAGE_LIST=$(ls ./airgap-bundle/airgap-bundle-*/container-images.txt | tail -1)
 while IFS= read -r img; do
   [[ "$img" =~ ^# ]] && continue
   [[ -z "$img" ]] && continue
-  dest="${INTERNAL_REGISTRY}/${img##*/}"
+  relative_image="${img#*/}"
+  dest="${INTERNAL_REGISTRY}/${relative_image}"
   echo "Copying $img → $dest"
   crane copy "$img" "$dest"
 done < "${IMAGE_LIST}"
@@ -1444,7 +1460,7 @@ done < "${IMAGE_LIST}"
 
 **Mirror with Docker:**
 
-Requires the Docker CE daemon on the workstation, and your user in the
+Requires the Docker CE daemon on the installer machine, and your user in the
 `docker` group so `docker` commands don't need `sudo`:
 
 ```bash
@@ -1454,9 +1470,10 @@ sudo usermod -aG docker "$USER"   # one-time; log out/in (or run `newgrp docker`
 ```bash
 INTERNAL_REGISTRY="registry.airgap.local"
 IMAGE="docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+RELATIVE_IMAGE="${IMAGE#*/}"
 docker pull "$IMAGE"
-docker tag "$IMAGE" "${INTERNAL_REGISTRY}/weaviate:stable-v1.28-007846a"
-docker push "${INTERNAL_REGISTRY}/weaviate:stable-v1.28-007846a"
+docker tag "$IMAGE" "${INTERNAL_REGISTRY}/${RELATIVE_IMAGE}"
+docker push "${INTERNAL_REGISTRY}/${RELATIVE_IMAGE}"
 ```
 
 **Configure the installer to use your registry:**
@@ -1527,6 +1544,21 @@ storage:
 ---
 
 ### Step 4 — Install
+
+The first install can take **3–7 hours**, mainly for model staging. Run the
+command inside a persistent `tmux` or `screen` session on the installer machine
+so an SSH disconnect does not interrupt it:
+
+```bash
+tmux new -s saia-install
+# Run the install command here, then detach with Ctrl-b followed by d.
+```
+
+Reconnect after an SSH disconnect with:
+
+```bash
+tmux attach -t saia-install
+```
 
 **4a. Add `cluster.airgap: true` to your config:**
 
@@ -1818,8 +1850,11 @@ Unset variables fall back to the default public URLs automatically.
 ## Splunk AI Assistant App
 
 The **Splunk AI Assistant** app (`Splunk_AI_Assistant_Cloud.tgz`) is a Splunk
-application that provides the AI chat UI. It must be installed on the Splunk
-Enterprise instance after the cluster is fully healthy.
+application that provides the AI chat UI. Install it on the Splunk Enterprise
+instance after the cluster is fully healthy. The app is planned for listing on
+Splunk Base; once listed, download it there. Until then, use the archive location
+provided with the release or evaluation package. This is a separate post-install
+step, not a prerequisite for deploying the cluster.
 
 ### Internal Splunk management transport (native-HTTPS compatibility mode)
 
@@ -1930,7 +1965,8 @@ process and are never printed or written to files.
 - All pods are Running: `kubectl get pods -A | grep -v "Running\|Completed"`
 - `AIPlatform` CR is Ready: `kubectl get aiplatform -n ai-platform`
 - SAIA service is up: `kubectl get pods,svc -n ai-platform | grep saia`
-- You have the `Splunk_AI_Assistant_Cloud.tgz` archive (obtain from your Splunk account team)
+- You have the `Splunk_AI_Assistant_Cloud.tgz` archive (download from Splunk Base
+  when listed; until then use the release or evaluation package location)
 - Splunk Web is reachable from your browser (see [Finding the Splunk Web URL](#finding-the-splunk-web-url))
 
 ---
@@ -1958,12 +1994,12 @@ kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 
 Open `http://localhost:8000` in your browser.
 
-**Remote workstation via SSH bastion (SOCKS tunnel)**
+**Remote installer machine via SSH bastion (SOCKS tunnel)**
 
 Use this when your browser doesn't run on the same host as `kubectl` — the
 cluster network is reachable only from the installer machine, and you're
-browsing from your laptop. The **installer machine** is the admin workstation
-from [Required Tools](#required-tools-on-admin-workstation): whatever host has
+browsing from your laptop. The **installer machine** is the host described in
+[Required Tools](#required-tools-on-installer-machine): whatever host has
 SSH reach to every cluster node and holds the kubeconfig (often a bastion or
 EC2 instance, not your laptop) — it is not itself a cluster node. A plain
 `kubectl port-forward` only helps if your browser runs on that same host; the
@@ -2035,7 +2071,7 @@ Placeholders used below — replace with your own values:
      --proxy-bypass-list="localhost;127.0.0.1"
    ```
 
-   Linux (Ubuntu/RHEL admin workstation):
+   Linux (Ubuntu/RHEL installer machine):
 
    ```bash
    google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
@@ -2348,19 +2384,30 @@ CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
 
 ### Model Staging Issues
 
-#### All models reported MISSING after a successful upload
+#### Models reported MISSING
 
-The most common cause is a bucket name with uppercase letters. The upload scripts normalize to lowercase before writing markers, but the config value was previously used verbatim in path checks.
+The configured bucket may not exist, may be empty, may not be the bucket used by
+the upload step, or may be missing the expected completion markers. Uppercase
+bucket names are normalized to lowercase by the installer, but use lowercase in
+the config to keep the configured name and object-store paths unambiguous.
 
-**Check:** Compare the bucket name in your config with the actual bucket in MinIO/S3:
+**Check:** Confirm the bucket exists and contains model completion markers:
 ```bash
 # MinIO
-mc ls myminio/
+mc ls myminio/<bucket>/staging_state/
+mc ls myminio/<bucket>/model_artifacts/
 # S3
-aws s3 ls
+aws s3api head-bucket --bucket <bucket>
+aws s3 ls s3://<bucket>/staging_state/
+aws s3 ls s3://<bucket>/model_artifacts/
 ```
 
-**Fix:** Use a lowercase bucket name in `storage.objectStore.bucket`. The installer now normalizes to lowercase automatically (uppercase values are silently converted), but lowercase-only names are safest and are required by the S3 spec.
+**Fix:** Create or select the configured bucket, then run `stage-artifacts` to
+upload the required models and completion markers:
+
+```bash
+CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
 
 #### Switching `defaultAcceleratorType` from L40S to H100 shows models as MISSING
 
@@ -2549,7 +2596,7 @@ EOF
 
 The script downloads various binaries, manifests, Helm charts, OS packages, and container images from the internet. This section lists every external download for air-gapped planning and security review.
 
-### Downloads from the Admin Workstation (where the script runs)
+### Downloads from the Installer Machine (where the script runs)
 
 | What | URL / Source |
 |------|-------------|

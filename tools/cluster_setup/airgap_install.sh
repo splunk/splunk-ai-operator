@@ -1585,23 +1585,32 @@ cat > "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
 #   while IFS= read -r img; do
 #     [[ "$img" =~ ^# ]] && continue
 #     [[ -z "$img" ]] && continue
-#     dest="your-internal-registry.example.com/${img##*/}"
+#     relative_image="${img#*/}"
+#     dest="your-internal-registry.example.com/${relative_image}"
 #     crane copy "$img" "$dest"
 #   done < container-images.txt
 #
 # How to mirror using docker:
-#   docker pull IMAGE && docker tag IMAGE INTERNAL_REGISTRY/IMAGE && docker push INTERNAL_REGISTRY/IMAGE
+#   relative_image="${IMAGE#*/}"
+#   docker pull "$IMAGE" && docker tag "$IMAGE" "INTERNAL_REGISTRY/${relative_image}" && docker push "INTERNAL_REGISTRY/${relative_image}"
 #
 # After mirroring, set images.registry in your k0s-cluster-config.yaml to
 # your internal registry prefix.
 
 # ── Splunk ──────────────────────────────────────────────────────────────────
-splunk/splunk:10.2.0
+docker.io/splunk/splunk:10.2-rhel9
 docker.io/splunk/splunk-operator:3.0.0
 
 # ── Ray ─────────────────────────────────────────────────────────────────────
-# Set images.ray.headImage and images.ray.workerImage in config to your mirrors
-# (these are built internally — not on a public registry)
+docker.io/splunk/ai-tier-ray-head:v1.0
+docker.io/splunk/ai-tier-ray-worker:v1.0
+
+# ── Splunk AI Platform ──────────────────────────────────────────────────────
+docker.io/splunk/splunk-ai-operator:v1.0
+docker.io/splunk/ai-tier-saia-api:v1.0
+docker.io/splunk/ai-tier-saia-api-v2:v1.0
+docker.io/splunk/ai-tier-saia-data-loader:v1.0
+docker.io/splunk/ai-tier-slim-service:v1.0
 
 # ── Weaviate ─────────────────────────────────────────────────────────────────
 docker.io/semitechnologies/weaviate:stable-v1.28-007846a
