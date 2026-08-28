@@ -974,8 +974,9 @@ kubectl get pods -A --sort-by=.metadata.namespace
 # AIPlatform CR must be Ready
 kubectl get aiplatform -n ai-platform -o wide
 
-# SAIA service must have an EXTERNAL-IP (if using LoadBalancer)
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
+# Inspect the generated SAIA service and its exposure mode
+SAIA_SERVICE="<cluster-name>-ai-platform-saia-saia-service"
+kubectl get svc "${SAIA_SERVICE}" -n ai-platform -o wide
 
 # GPU nodes must show available GPUs
 kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
@@ -994,7 +995,7 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 | `kuberay-operator` pods | `Running` |
 | `splunk-standalone` | `Ready` |
 | `aiplatform/<name>` | `Ready` |
-| SAIA service | `EXTERNAL-IP` assigned |
+| SAIA service | Matches the configured `ClusterIP`, `NodePort`, or `LoadBalancer` exposure mode |
 | GPU nodes | `nvidia.com/gpu: N` in allocatable |
 
 **Sample output — healthy cluster:**
@@ -1018,11 +1019,13 @@ If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 
 
 ## Internal Splunk Access
 
-The in-cluster Splunk Enterprise instance is reachable via NodePort (default),
-LoadBalancer (MetalLB), or `kubectl port-forward` for quick access from your
-admin workstation with no external exposure. See
+The in-cluster Splunk Enterprise instance is a ClusterIP service by default;
+the installer does not create a Splunk NodePort or LoadBalancer. Use
+`kubectl port-forward` for quick access from your admin workstation. See
 [K0S_README.md — Finding the Splunk Web URL](K0S_README.md#finding-the-splunk-web-url)
-for the commands for each method, plus how to retrieve the admin password.
+for the exact service and operator-managed Secret lookup. This section applies
+only to bundled Splunk; external Splunk uses its administrator-provided URL and
+credentials.
 
 ---
 
@@ -1037,33 +1040,47 @@ onboard it to the AI tier.
 ### 1. Find your Splunk Web URL
 
 ```bash
-# Retrieve the admin password
-kubectl get secret splunk-standalone-secret -n ai-platform \
+# Bundled Splunk only: discover the operator-managed versioned Secret.
+NAMESPACE="ai-platform"
+STANDALONE_NAME="splunk-standalone"
+SPLUNK_SECRET="$(kubectl get secret -n "${NAMESPACE}" \
+  -l 'app.kubernetes.io/component=versionedSecrets,app.kubernetes.io/managed-by=splunk-operator' \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.metadata.ownerReferences[0].name}{"\n"}{end}' \
+  | awk -F'|' -v owner="${STANDALONE_NAME}" '$2 == owner {print $1; exit}')"
+[[ -n "${SPLUNK_SECRET}" ]] || { echo "Splunk admin Secret not found" >&2; exit 1; }
+kubectl get secret "${SPLUNK_SECRET}" -n "${NAMESPACE}" \
   -o jsonpath='{.data.password}' | base64 --decode && echo
 
-# NodePort (default) — open on any worker node IP
-kubectl get svc -n ai-platform -l app.kubernetes.io/name=splunk
-# → http://<node-ip>:<nodePort>
+# Splunk Web is ClusterIP by default; expose it locally.
+SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+kubectl get svc "${SPLUNK_SERVICE}" -n "${NAMESPACE}"
+kubectl port-forward -n "${NAMESPACE}" "svc/${SPLUNK_SERVICE}" 8000:8000
 ```
 
 ### 2. Install the app
 
-1. Log in to Splunk Web (`http://<node-ip>:<nodePort>`)
+1. Log in to Splunk Web (`http://localhost:8000` when using the port-forward above)
 2. **Apps → Manage Apps → Install app from file**
 3. Select `Splunk_AI_Assistant_Cloud.tgz`, check **Upgrade app** if updating, click **Upload**
 4. Restart Splunk if prompted
 
 ### 3. Onboard to the AI tier
 
-The app needs the SAIA API URL (`http://<node-ip>:<nodePort>`) to route prompts to the AI backend.
+The app needs the SAIA API URL to route prompts to the AI backend.
 
 ```bash
-# Find the SAIA NodePort
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-# PORT(S) column shows  8080:<nodePort>/TCP  — use that nodePort
+# The installer creates this service from the AIPlatform/AIService names.
+NAMESPACE="ai-platform"
+CLUSTER_NAME="<cluster-name>"
+SAIA_SERVICE="${CLUSTER_NAME}-ai-platform-saia-saia-service"
+kubectl get svc "${SAIA_SERVICE}" -n "${NAMESPACE}" -o wide
+# NodePort: use the reported nodePort with http://<worker-node-ip>:<nodePort>
+# LoadBalancer: use the reported external address with port 8080
+# ClusterIP: run `kubectl port-forward svc/${SAIA_SERVICE} 8080:8080`
 ```
 
-In Splunk Web: **Splunk AI Assistant → Configuration** → enter `http://<worker-node-ip>:<nodePort>` as the AI Tier Endpoint and save.
+In Splunk Web: **Splunk AI Assistant → Configuration** → enter the endpoint
+from the service exposure mode above and save.
 
 > **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
 

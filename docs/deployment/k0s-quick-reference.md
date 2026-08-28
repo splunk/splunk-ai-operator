@@ -226,8 +226,6 @@ Download the scripts with the configuration files on the installer machine.
 
 </details>
 
----
-
 <details>
 <summary><strong>Option 2: Setup via Browser ZIP Download</strong></summary>
 
