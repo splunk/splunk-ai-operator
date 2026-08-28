@@ -14,6 +14,12 @@
 #
 # See the Air-Gapped Deployment section in K0S_README.md for staging options,
 # installer-host requirements, and the separate model-artifact workflow.
+#
+# The installer machine must have internet access for staging and SSH access to
+# every node. The installer automatically stages k0s, NVIDIA packages, and the
+# container toolkit offline closure, then installs them over SSH; the cluster
+# nodes do not need outbound internet access. Manual driver installation is only
+# needed when using the optional --skip-nvidia-closure path.
 
 # Cluster access
 cluster:

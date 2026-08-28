@@ -135,7 +135,7 @@ again at the start of every `install` invocation.
 
 The node is not running a supported OS.
 
-**Supported:** RHEL 9, RHEL 10 (non-air-gapped installs only), and Ubuntu 24.04. Other Linux distributions are not tested or supported for cluster nodes.
+**Supported:** RHEL 9.8, RHEL 10.2, and Ubuntu 24.04 for both air-gapped and non-air-gapped installs. Other Linux distributions are not tested or supported for cluster nodes.
 
 **Options:**
 
@@ -168,7 +168,7 @@ Staging normally handles this: each node is probed over SSH and, for every kerne
 
 `FORCE_UNSUPPORTED_OS=1` bypasses the check, but the install will then stop later at "xt_conntrack still unavailable" unless you have installed `kernel-modules-extra` on every node yourself.
 
-If you are staging a RHEL 10 closure on purpose, run the installer itself from a **RHEL 10 x86_64** installer machine, not RHEL 9 — `dnf`'s `$releasever` comes from the installer host's own OS, so a RHEL 9 installer machine resolves RHEL 9 packages even when targeting RHEL 10 nodes. RHEL 9 and Ubuntu 24.04 targets are unaffected and keep using a RHEL 9 installer machine.
+If you are staging a RHEL 10.2 closure on purpose, run the installer itself from a **RHEL 10.2 x86_64** installer machine, not RHEL 9.8 — `dnf`'s `$releasever` comes from the installer host's own OS, so a RHEL 9.8 installer machine resolves RHEL 9 packages even when targeting RHEL 10.2 nodes. RHEL 9.8 and Ubuntu 24.04 targets are unaffected and keep using a RHEL 9.8 installer machine.
 
 ### "xt_conntrack still unavailable for kernel \<version\>"
 
@@ -312,10 +312,14 @@ kubectl label node <node-name> splunk.ai/workload-type=<cpu|gpu> --overwrite
 ### "AIRGAP_MODE=true but NVIDIA driver (nvidia-smi) not found"
 
 In air-gap mode, the installer cannot download GPU packages from the internet.
-You must pre-install NVIDIA drivers on GPU nodes before running the installer.
+The normal air-gap flow builds an offline RPM or `.deb` driver closure during
+staging and installs it on each GPU node automatically. This error means the
+closure was not staged or the node could not install it. Re-run without
+`--skip-nvidia-closure` and check the staging log. Pre-install NVIDIA drivers
+only when intentionally using the optional `--skip-nvidia-closure` path.
 
 See [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments) for
-step-by-step instructions and bundled package files.
+the closure requirements and the optional pre-installed-driver path.
 
 ---
 
@@ -587,16 +591,19 @@ Every peer must have all three fields: `peerAddress`, `peerASN`, `myASN`.
 
 ---
 
-### SAIA service has no EXTERNAL-IP
+### SAIA service has no external address or is unreachable
 
 ```bash
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia
-kubectl describe svc -n ai-platform <saia-service>
+SAIA_SERVICE="<cluster-name>-ai-platform-saia-saia-service"
+kubectl get svc "${SAIA_SERVICE}" -n ai-platform -o wide
+kubectl describe svc "${SAIA_SERVICE}" -n ai-platform
 
-# Check MetalLB controller logs
+# Show the configured exposure type, port, NodePort, and LoadBalancer address
+kubectl get svc "${SAIA_SERVICE}" -n ai-platform \
+  -o custom-columns='TYPE:.spec.type,PORT:.spec.ports[0].port,NODEPORT:.spec.ports[0].nodePort,ADDRESS:.status.loadBalancer.ingress[0].ip'
+
+# If TYPE is LoadBalancer and ADDRESS is empty, check MetalLB:
 kubectl logs -n metallb-system deploy/controller --tail=50
-
-# Check IPAddressPool
 kubectl get ipaddresspool -n metallb-system
 kubectl get l2advertisement -n metallb-system
 ```
@@ -605,10 +612,12 @@ kubectl get l2advertisement -n metallb-system
 
 | Cause | Fix |
 |---|---|
+| Service not found | Replace `<cluster-name>` with the `cluster.name` value from your config. The expected service is `<cluster-name>-ai-platform-saia-saia-service` in namespace `ai-platform`. |
 | IP pool exhausted | Add more addresses to `metallb.pool.addresses`. |
 | IP range not routable | The addresses must be IPs that your LAN router will route to the node. ARP-based (layer2) requires IPs on the same subnet as the node. |
 | MetalLB controller not running | Check `kubectl get pods -n metallb-system`. |
-| Service type is NodePort, not LoadBalancer | Check `aiPlatform.serviceTemplate.type` in config — set to `LoadBalancer` to use MetalLB. |
+| Service type is `NodePort`, not `LoadBalancer` | No `EXTERNAL-IP` is expected. Use the `NODEPORT` shown above with a worker-node IP, or set `aiPlatform.serviceTemplate.type` to `LoadBalancer` to use MetalLB. |
+| Service type is `ClusterIP` | No external address is expected. Use `kubectl port-forward svc/${SAIA_SERVICE} 8080:8080` and access `http://127.0.0.1:8080`. |
 
 ---
 

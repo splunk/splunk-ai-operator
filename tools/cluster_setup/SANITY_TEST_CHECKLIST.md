@@ -36,7 +36,7 @@ the install command: it validates current Pods and expected workload resources,
 including Ray workers that may be created after the Ray head becomes ready.
 
 ```bash
-POD_HEALTH_STABLE_WAIT=1200 \
+POD_HEALTH_STABLE_WAIT=1800 \
   CONFIG_FILE="$CONFIG_FILE" \
   tools/cluster_setup/k0s_cluster_with_stack.sh verify-pods
 echo "exit_code=$?"
