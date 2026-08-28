@@ -191,6 +191,10 @@ RHEL 10 clusters.
 ## Step 3: Configure the Cluster
 
 Download the scripts with the configuration files on the installer machine.
+
+<details>
+<summary><strong>Option 1: Setup via Git (Recommended)</strong></summary>
+
 ### **Option 1: Setup via Git (Recommended)**
 
 1. **Clone the Specific Branch**
@@ -220,7 +224,12 @@ Download the scripts with the configuration files on the installer machine.
      vi my-cluster.yaml
      ```
 
+</details>
+
 ---
+
+<details>
+<summary><strong>Option 2: Setup via Browser ZIP Download</strong></summary>
 
 ### **Option 2: Setup via Browser ZIP Download**
 
@@ -251,6 +260,8 @@ Download the scripts with the configuration files on the installer machine.
      ```bash
      vi my-cluster.yaml
      ```
+
+</details>
 
 Review and set the following fields as applicable; all other fields have a
 working default.
