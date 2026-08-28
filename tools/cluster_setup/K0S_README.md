@@ -2212,14 +2212,18 @@ kubectl get svc "${SAIA_SERVICE}" -n "${NAMESPACE}" \
 
 For `NodePort`, use `http://<worker-node-ip>:<NODEPORT>` with the value shown by
 the command; do not assume a fixed port. For `LoadBalancer`, use the reported
-load-balancer address and port. For `ClusterIP`, expose the service locally:
+load-balancer address and port. For `ClusterIP`, use the in-cluster DNS URL
+`http://${SAIA_SERVICE}.${NAMESPACE}.svc.cluster.local:8080` for Splunk-side
+configuration. To test SAIA locally from the installer machine, expose it with:
 
 ```bash
 kubectl port-forward -n "${NAMESPACE}" "svc/${SAIA_SERVICE}" 8080:8080
 ```
 
-Then use `http://127.0.0.1:8080` as the SAIA API URL. The installer creates the
-SAIA Service as `${AI_PLATFORM_NAME}-saia-saia-service`.
+Use `http://127.0.0.1:8080` from the installer machine only for local testing;
+do not save that loopback URL in `splunkaiassistant.conf`, because it points
+back to the Splunk pod when the app makes server-side requests. The installer
+creates the SAIA Service as `${AI_PLATFORM_NAME}-saia-saia-service`.
 
 For LoadBalancer deployments:
 
@@ -2236,9 +2240,15 @@ In Splunk Web: **Splunk AI Assistant → Configuration** (or navigate to `/en-US
 **Step 2 (alternative) — set via `splunkaiassistant.conf` (scripted / air-gapped)**
 
 ```bash
-# Set this to the URL from Step 1. For ClusterIP, use http://127.0.0.1:8080
-SAIA_URL="http://<worker-node-ip>:<NODEPORT>"
 NAMESPACE="ai-platform"
+CLUSTER_NAME="<cluster-name>"
+AI_PLATFORM_NAME="${CLUSTER_NAME}-ai-platform"
+SAIA_SERVICE="${AI_PLATFORM_NAME}-saia-saia-service"
+# Set this to a URL reachable from the Splunk pod.
+# NodePort: SAIA_URL="http://<worker-node-ip>:<NODEPORT>"
+# LoadBalancer: SAIA_URL="http://<EXTERNAL-IP>:8080"
+# ClusterIP (default): use the in-cluster service DNS name below.
+SAIA_URL="http://${SAIA_SERVICE}.${NAMESPACE}.svc.cluster.local:8080"
 STANDALONE_NAME="splunk-standalone"
 SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
 SPLUNK_SECRET="$(kubectl get secret -n "${NAMESPACE}" \
@@ -2292,8 +2302,10 @@ SAIA_SERVICE="${CLUSTER_NAME}-ai-platform-saia-saia-service"
 kubectl get pods -n "${NAMESPACE}"
 kubectl get svc "${SAIA_SERVICE}" -n "${NAMESPACE}" -o wide
 
-# For a NodePort, test the configured worker-node URL. For ClusterIP, use
-# `kubectl port-forward svc/${SAIA_SERVICE} 8080:8080` and test localhost.
+# For a NodePort, test the configured worker-node URL. For ClusterIP, use the
+# in-cluster DNS URL from the scripted configuration, or use this port-forward
+# for a local test only:
+# kubectl port-forward svc/${SAIA_SERVICE} 8080:8080
 curl -sv http://<saia-endpoint>/health
 # Expected: HTTP 200 (when the endpoint is reachable from this machine)
 ```

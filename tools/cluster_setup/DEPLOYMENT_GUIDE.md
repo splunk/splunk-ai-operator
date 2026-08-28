@@ -1067,6 +1067,11 @@ for the exact service and operator-managed Secret lookup. This section applies
 only to bundled Splunk; external Splunk uses its administrator-provided URL and
 credentials.
 
+For ClusterIP onboarding, configure Splunk with the in-cluster URL
+`http://<cluster-name>-ai-platform-saia-saia-service.ai-platform.svc.cluster.local:8080`.
+Use `kubectl port-forward` only for browser or local testing; do not save its
+`127.0.0.1` URL in the Splunk AI Assistant configuration.
+
 ---
 
 ## Install the Splunk AI Assistant App
@@ -1121,11 +1126,15 @@ SAIA_SERVICE="${CLUSTER_NAME}-ai-platform-saia-saia-service"
 kubectl get svc "${SAIA_SERVICE}" -n "${NAMESPACE}" -o wide
 # NodePort: use the reported nodePort with http://<worker-node-ip>:<nodePort>
 # LoadBalancer: use the reported external address with port 8080
-# ClusterIP: run `kubectl port-forward svc/${SAIA_SERVICE} 8080:8080`
+# ClusterIP: use the in-cluster DNS URL from the note below for Splunk-side config
 ```
 
 In Splunk Web: **Splunk AI Assistant → Configuration** → enter the endpoint
-from the service exposure mode above and save.
+from the service exposure mode above and save. For `ClusterIP`, use
+`http://${SAIA_SERVICE}.${NAMESPACE}.svc.cluster.local:8080`; this URL is
+reachable from the Splunk pod. A `kubectl port-forward` is only for browser or
+local testing from the installer machine, and its `127.0.0.1` URL must not be
+saved in the Splunk app configuration.
 
 > **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
 
