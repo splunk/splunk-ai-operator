@@ -19,10 +19,9 @@ explanations, diagrams, and edge cases see
      - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
      - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
      - [Install (Air-Gapped Path)](#install-air-gapped-path)
-5. [Step 5: Verify](#step-5-verify)
-6. [Step 6: Splunk Integration](#step-6-splunk-integration)
-7. [Step 7: Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
-8. [Step 8: Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
+5. [Step 5: Splunk Integration](#step-5-splunk-integration)
+6. [Step 6: Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
+7. [Step 7: Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
 
 ---
 
@@ -331,11 +330,14 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 # Run only after validate completes successfully
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h first run (model download), ~30-60min if pre-staged
 
+# Check the status of pods and inference endpoints
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
 ```
 
-Continue to [Step 5: Verify](#step-5-verify).
+Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
 
 ---
 
@@ -492,37 +494,20 @@ CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh validate
 # Run the install — stages the required artifacts based on your input, then installs
 CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
 
+# Check the status of pods and inference endpoints
+CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh verify-pods
+
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
 ```
 
-Continue to [Step 5: Verify](#step-5-verify).
+Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
 
 ---
 
 </details>
 
-## Step 5: Verify
-
-Applies to both standard and air-gapped deployment paths.
-
-```bash
-# For getting the status of the pods and inference endpoints
-cd tools/cluster_setup
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
-
-# Run kubectl commands directly from the installer machine
-export KUBECONFIG=~/.kube/k0s-<cluster-name>
-
-kubectl get nodes -o wide                                          # all Ready
-kubectl get pods -A --sort-by=.metadata.namespace                  # all Running/Completed
-kubectl get aiplatform -n ai-platform -o wide                      # Ready
-kubectl get svc -n ai-platform -l app.kubernetes.io/component=saia # NodePort: use worker-ip:30080
-kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
-# → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
-```
-
-## Step 6: Splunk Integration
+## Step 5: Splunk Integration
 
 <details>
 <summary>Internal Splunk</summary>
@@ -548,7 +533,7 @@ JWT authentication as described in
 
 ---
 
-## Step 7: Common Operations
+## Step 6: Common Operations
 
 See [Deployment Guide — Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
 for re-runs, worker management, model staging, image refreshes, support
@@ -556,7 +541,7 @@ bundles, and cleanup commands.
 
 ---
 
-## Step 8: Troubleshooting
+## Step 7: Troubleshooting
 
 See [Deployment Guide — Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
 for diagnosis steps, decision trees, and the complete symptom reference.

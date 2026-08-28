@@ -144,7 +144,7 @@ assert_eq "returns bare path when registry is null" \
 suite "shipped image defaults"
 echo "▶ shipped image defaults"
 
-_expected_k0s_release_tuple=$'docker.io/kpratyush775/splunk-ai-operator:v2.8\ndocker.io/splunk/ai-tier-ray-head:v0.2\ndocker.io/splunk/ai-tier-ray-worker:v0.2\ndocker.io/splunk/ai-tier-slim-service:v1.0\n2.56.0'
+_expected_k0s_release_tuple=$'docker.io/splunk/splunk-ai-operator:v1.0\ndocker.io/splunk/ai-tier-ray-head:v1.0\ndocker.io/splunk/ai-tier-ray-worker:v1.0\ndocker.io/splunk/ai-tier-slim-service:v1.0\n2.56.0'
 _actual_k0s_release_tuple=$("${YQ_BIN}" eval '
   .images.operator.image,
   .images.ray.headImage,
