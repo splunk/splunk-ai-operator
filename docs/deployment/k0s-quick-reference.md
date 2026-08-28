@@ -20,8 +20,9 @@ explanations, diagrams, and edge cases see
      - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
      - [Install (Air-Gapped Path)](#install-air-gapped-path)
 5. [Step 5: Verify](#step-5-verify)
-6. [Step 6: Common Operations](#step-6-common-operations)
-7. [Step 7: Troubleshooting](#step-7-troubleshooting)
+6. [Step 6: Splunk Integration](#step-6-splunk-integration)
+7. [Step 7: Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
+8. [Step 8: Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
 
 ---
 
@@ -296,6 +297,9 @@ Choose one deployment path:
   internet access; the installer machine stages the required artifacts and uses
   a private registry for the platform images.
 
+<details>
+<summary>Standard Deployment</summary>
+
 ### Standard Deployment
 
 #### Hardware Setup (Standard Path)
@@ -334,6 +338,11 @@ tail -f logs/k0s-install-*.log
 Continue to [Step 5: Verify](#step-5-verify).
 
 ---
+
+</details>
+
+<details>
+<summary>Air-Gapped Deployment</summary>
 
 ### Air-Gapped Deployment
 
@@ -402,20 +411,18 @@ AI platform can serve inference.
 
 #### Install (Air-Gapped Path)
 
-One entry point, same install command as the standard path — the config's
-`cluster.airgap: true` (or `AIRGAP_MODE=true`) is what switches the mode.
+For an air-gapped deployment, use `k0s-airgapped-config.yaml`. It already sets
+`cluster.airgap: true`, includes a sample registry, and uses relative image
+paths that are prefixed with `images.registry`.
 
-Before running install, mirror the platform application images to your private
-registry.
+Before installing, mirror all platform application images to the registry in
+the config.
 
-Mirror every application image used by the deployment. The release images below
-use the common tag `v1.0`; supporting images retain the versions from the
-configuration file. Set every applicable `images.*` field to its mirrored path.
-
-With `crane` (no Docker daemon required):
+<details>
+<summary>Mirror with crane (no Docker daemon required)</summary>
 
 ```bash
-REGISTRY="my-custom-registry.io"
+REGISTRY="$(yq -r '.images.registry' k0s-airgapped-config.yaml)"
 
 for image in \
   docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
@@ -425,7 +432,7 @@ for image in \
   docker.io/splunk/ai-tier-ray-worker:v1.0 \
   docker.io/splunk/splunk-ai-operator:v1.0 \
   docker.io/splunk/ai-tier-slim-service:v1.0 \
-  docker.io/splunk/splunk:10.2-rhel9 \
+  docker.io/splunk/splunk:10-2-ai-custom \
   docker.io/splunk/splunk-operator:3.0.0 \
   docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
   docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
@@ -436,10 +443,13 @@ for image in \
 done
 ```
 
-With Docker instead:
+</details>
+
+<details>
+<summary>Mirror with Docker</summary>
 
 ```bash
-REGISTRY="my-custom-registry.io"
+REGISTRY="$(yq -r '.images.registry' k0s-airgapped-config.yaml)"
 
 for image in \
   docker.io/splunk/ai-tier-saia-data-loader:v1.0 \
@@ -449,7 +459,7 @@ for image in \
   docker.io/splunk/ai-tier-ray-worker:v1.0 \
   docker.io/splunk/splunk-ai-operator:v1.0 \
   docker.io/splunk/ai-tier-slim-service:v1.0 \
-  docker.io/splunk/splunk:10.2-rhel9 \
+  docker.io/splunk/splunk:10-2-ai-custom \
   docker.io/splunk/splunk-operator:3.0.0 \
   docker.io/semitechnologies/weaviate:stable-v1.28-007846a \
   docker.io/otel/opentelemetry-collector-contrib:0.122.1 \
@@ -462,42 +472,25 @@ for image in \
 done
 ```
 
-After mirroring, replace every applicable `images.*` field, including the
-Splunk, Splunk Operator, Weaviate, Fluent Bit, OpenTelemetry Collector, and
-nginx image fields, with the corresponding private-registry paths. The
-release-image paths use `v1.0`; preserve the configured tags for supporting
-images.
+</details>
 
-For a plain-HTTP private registry, such as the sample address `192.0.2.10:5000`, configure:
-
-```yaml
-images:
-  registry: "192.0.2.10:5000"
-  registryInsecure: true
-```
-
-Set `registryInsecure: false` for a secure HTTPS/TLS private registry. The
-setting tells the installer whether to configure containerd for HTTP or HTTPS.
+After mirroring, set only `images.registry` in `k0s-airgapped-config.yaml` to
+your private registry. Set `registryInsecure: false` for HTTPS/TLS.
 
 ```bash
 cd tools/cluster_setup
 
-# 1. In your config, on top of the fields in Config Setup, set:
-#    cluster.airgap: true
-#    images.registry: "registry.airgap.local"   (+ point every image at it)
-#    images.registryInsecure: true                # plain HTTP only; use false for HTTPS/TLS
-#
-#    If registry.airgap.local requires authentication (Harbor, etc.), also set:
+# If your registry requires authentication (Harbor, etc.), also set:
 #    imagePullSecrets.custom.enabled: true
 #    imagePullSecrets.custom.name: "custom-registry-secret"
-#    imagePullSecrets.custom.server: "registry.airgap.local"
+#    imagePullSecrets.custom.server: "registry.example.com"
 #    imagePullSecrets.custom.username / .password: your registry credentials
 
-# 2. Validate the configuration before installing.
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+# Validate the configuration before installing.
+CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh validate
 
-# 3. Run the install — stages the required artifacts based on your input, then installs
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+# Run the install — stages the required artifacts based on your input, then installs
+CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
 
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
@@ -506,6 +499,8 @@ tail -f logs/k0s-install-*.log
 Continue to [Step 5: Verify](#step-5-verify).
 
 ---
+
+</details>
 
 ## Step 5: Verify
 
@@ -527,54 +522,44 @@ kubectl get nodes -l splunk.ai/workload-type=gpu -o yaml | grep nvidia.com/gpu
 # → nvidia.com/gpu: "<count>" under both capacity and allocatable, per GPU node
 ```
 
-**Access the in-cluster Splunk instance and set up the SAIA app:**
-[K0S_README.md — Finding the Splunk Web URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
-Use NodePort, LoadBalancer, or `kubectl port-forward` as described there. If
-your browser cannot reach the cluster network directly, use
-[Remote installer machine via SSH bastion (SOCKS tunnel)](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
-Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+## Step 6: Splunk Integration
 
-> **Using an external, self-managed Splunk Enterprise instance for JWT authentication?**
-> See
-> [EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
+<details>
+<summary>Internal Splunk</summary>
 
----
+For the bundled in-cluster Splunk instance, use NodePort, LoadBalancer, or
+`kubectl port-forward` as described in [K0S_README.md — Finding the Splunk Web
+URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url). If
+your browser cannot reach the cluster network directly, use the [SSH bastion
+SOCKS tunnel](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
+Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant
+App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
-## Step 6: Common Operations
+</details>
 
-Applies to both deployment paths — same commands for standard and air-gapped clusters.
+<details>
+<summary>External Splunk</summary>
 
-| Task | Command |
-|---|---|
-| Re-run after partial failure | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
-| Add worker nodes | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers` |
-| Re-stage models only | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts` |
-| Refresh platform image tags (engineering-validated behavior) | bump image tags in config, then re-run `install`; existing Helm releases are refreshed in place |
-| Refresh image tags (air-gapped engineering validation) | **first** mirror each changed image at its new tag to your internal registry (`install` never does this for you), **then** bump the tag in config and re-run `install` — otherwise sealed nodes hit `ImagePullBackOff` on the new tag |
-| Collect support bundle | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose` |
-| Remove the stack and reset k0s (destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh delete` |
-| Wipe and start clean (more destructive) | `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all` then `CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install` |
+For a self-managed Splunk Enterprise instance outside the cluster, configure
+JWT authentication as described in
+[EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
+
+</details>
 
 ---
 
-## Step 7: Troubleshooting
+## Step 7: Common Operations
 
-Quick hits — full symptom list: [TROUBLESHOOTING.md](../../tools/cluster_setup/TROUBLESHOOTING.md)
+See [Deployment Guide — Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
+for re-runs, worker management, model staging, image refreshes, support
+bundles, and cleanup commands.
 
-| Symptom | Fix |
-|---|---|
-| SSH connection refused | Check firewall/security group on port 22 |
-| "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | Set `cluster.useExisting: auto` or run `clean-all` first |
-| `python3+pyyaml missing` on nodes | RHEL: `dnf install -y python3-pyyaml`; Ubuntu: `apt-get install -y python3-yaml`; or set `AIRGAP_PYYAML_WHEEL_PATH` for air-gap |
-| `nvidia-smi not found` in AIRGAP_MODE, no closure staged | Re-run without `--skip-nvidia-closure`, or pre-install the driver manually (see [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)) |
-| Closure doesn't cover a GPU node's kernel | Re-run `airgap_install.sh` with `--gpu-kernels` including that node's `uname -r` |
-| Checksum verification failed during staging | Re-run staging; check disk space and network stability |
-| Pod `ImagePullBackOff` (platform images) | Check `images.registry` + pull secret exist |
-| `ImagePullBackOff`: HTTP response to HTTPS client | Set `images.registryInsecure: true` for plain-HTTP registries |
-| All models MISSING after upload | Bucket name has uppercase letters — use lowercase `storage.objectStore.bucket` |
-| Air-gap: infra pods `ImagePullBackOff` / nodes NotReady | Confirm `images/*.tar` were staged and pushed to `/var/lib/k0s/images/`; re-run install with current scripts |
-| SAIA service is unreachable | For the default NodePort, use `<worker-ip>:30080`; for LoadBalancer, check MetalLB: `kubectl get pods -n metallb-system` |
-| AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform`; check operator logs + GPU availability |
+---
+
+## Step 8: Troubleshooting
+
+See [Deployment Guide — Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
+for diagnosis steps, decision trees, and the complete symptom reference.
 
 ---
 
