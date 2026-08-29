@@ -381,10 +381,10 @@ reach to the cluster nodes — there is no separate transfer/bundle step.
 #### Air-Gapped Step 1: Confirm Prerequisites
 
 Use the requirements in [Step 1: Prerequisites](#step-1-prerequisites) and
-[Step 2: Hardware Requirements](#step-2-hardware-requirements). The tested
-cluster-node and installer-machine versions are RHEL 9.8, RHEL 10.2, and Ubuntu
-24.04. The installer machine needs internet access and SSH access to every
-sealed node.
+[Step 2: Hardware Requirements](#step-2-hardware-requirements). For air-gapped
+staging, use a RHEL 9.8 installer machine for RHEL 9.8 or Ubuntu 24.04
+clusters, and a RHEL 10.2 installer machine for RHEL 10.2 clusters. The
+installer machine needs internet access and SSH access to every sealed node.
 
 Install the air-gap staging dependencies on the installer machine. Install
 `createrepo_c` when the GPU nodes use RHEL. Install `podman` or Docker when any
