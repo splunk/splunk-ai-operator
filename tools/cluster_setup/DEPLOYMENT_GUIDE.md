@@ -150,7 +150,7 @@ graph TB
 | NVIDIA driver | `nvidia-driver:latest-dkms` (RHEL, DKMS module) or `cuda-drivers` (Ubuntu, DKMS) | Installed via the NVIDIA repo on GPU nodes; RHEL's older `cuda-drivers` meta-package is gone, but Ubuntu's is current and used there |
 | NVIDIA Container Toolkit | latest stable | Installed alongside the driver |
 | GPU hardware | NVIDIA L40S or H100 | Set `defaultAcceleratorType: L40S` or `defaultAcceleratorType: H100` |
-| Splunk Enterprise | matched to your build | Provided via your registry — do not mix versions |
+| Splunk Enterprise | `10.2` (tested for internal and external Splunk) | For bundled/in-cluster Splunk, use `docker.io/splunk/splunk:10.2-rhel9` or the corresponding private-registry path; use Splunk Enterprise 10.2 for the tested external integration path; do not mix versions |
 
 > **Licensing:** Splunk Enterprise and the Splunk AI Operator require valid Splunk licenses. Container images are pulled from the configured public or private registry; ensure your deployment has the required image access before deployment.
 

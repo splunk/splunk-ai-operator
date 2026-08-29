@@ -6,6 +6,10 @@ The Splunk instance may run in a different VPC or network from the k0s cluster;
 what matters is routable, firewall-approved connectivity for each flow described
 below.
 
+> **Tested Splunk version:** Splunk Enterprise **10.2** is the tested version for
+> both bundled/internal and external Splunk integration. For bundled Splunk, the
+> tested container image is `docker.io/splunk/splunk:10.2-rhel9`.
+
 Use this when:
 - Splunk Enterprise runs on a separate host (bare-metal, EC2, VM) — not the bundled
   in-cluster Splunk standalone deployed by the installer.

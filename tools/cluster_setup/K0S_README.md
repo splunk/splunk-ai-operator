@@ -1856,6 +1856,10 @@ Splunk Base; once listed, download it there. Until then, use the archive locatio
 provided with the release or evaluation package. This is a separate post-install
 step, not a prerequisite for deploying the cluster.
 
+> **Tested Splunk version:** Splunk Enterprise **10.2** is the tested version for
+> both bundled/internal and external Splunk integration. The bundled deployment
+> uses `docker.io/splunk/splunk:10.2-rhel9`.
+
 ### Internal Splunk management transport (native-HTTPS compatibility mode)
 
 > **Release support boundary:** the bundled/internal HEC and OTel behavior

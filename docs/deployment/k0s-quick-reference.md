@@ -560,6 +560,11 @@ Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
 
 ## Step 5: Splunk Integration
 
+Splunk Enterprise **10.2** is the tested version for both internal/bundled and
+external Splunk. The bundled deployment uses
+`docker.io/splunk/splunk:10.2-rhel9`; use the corresponding private-registry
+path for air-gapped deployments.
+
 <details>
 <summary>Internal Splunk</summary>
 
