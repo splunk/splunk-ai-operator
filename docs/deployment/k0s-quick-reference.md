@@ -16,9 +16,14 @@ explanations, diagrams, and edge cases, see
      - [Model Setup (Standard Path)](#model-setup-standard-path)
      - [Install (Standard Path)](#install-standard-path)
    - [Air-Gapped Deployment](#air-gapped-deployment)
-     - [Hardware Setup (Air-Gapped Path)](#hardware-setup-air-gapped-path)
-     - [Model Setup (Air-Gapped Path)](#model-setup-air-gapped-path)
-     - [Install (Air-Gapped Path)](#install-air-gapped-path)
+     - [Air-Gapped Step 1: Confirm Prerequisites](#air-gapped-step-1-confirm-prerequisites)
+     - [Air-Gapped Step 2: Prepare the Configuration](#air-gapped-step-2-prepare-the-configuration)
+     - [Air-Gapped Step 3: Configure the Private Registry](#air-gapped-step-3-configure-the-private-registry)
+     - [Air-Gapped Step 4: Mirror Application Images](#air-gapped-step-4-mirror-application-images)
+     - [Air-Gapped Step 5: Stage Model Artifacts](#air-gapped-step-5-stage-model-artifacts)
+     - [Air-Gapped Step 6: Validate the Configuration](#air-gapped-step-6-validate-the-configuration)
+     - [Air-Gapped Step 7: Install the Platform](#air-gapped-step-7-install-the-platform)
+     - [Air-Gapped Step 8: Monitor and Verify](#air-gapped-step-8-monitor-and-verify)
 5. [Step 5: Splunk Integration](#step-5-splunk-integration)
 6. [Step 6: Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
 7. [Step 7: Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
@@ -373,12 +378,12 @@ For sealed cluster nodes with no outbound internet. Everything is staged and
 pushed from a single internet-connected installer machine that also has SSH
 reach to the cluster nodes — there is no separate transfer/bundle step.
 
-#### Hardware Setup (Air-Gapped Path)
+#### Air-Gapped Step 1: Confirm Prerequisites
 
-**Cluster nodes** For a tested air-gapped deployment, use RHEL 9.8, RHEL 10.2, or
-Ubuntu 24.04. For air-gapped
-staging, use a RHEL 9.8 x86_64 installer machine for RHEL 9.8 or Ubuntu 24.04
-clusters, and a RHEL 10.2 x86_64 installer machine for RHEL 10.2 clusters. The
+Use the requirements in [Step 1: Prerequisites](#step-1-prerequisites) and
+[Step 2: Hardware Requirements](#step-2-hardware-requirements). For air-gapped
+staging, use a RHEL 9.8 installer machine for RHEL 9.8 or Ubuntu 24.04
+clusters, and a RHEL 10.2 installer machine for RHEL 10.2 clusters. The
 installer machine needs internet access and SSH access to every sealed node.
 
 Install the air-gap staging dependencies on the installer machine. Install
@@ -405,7 +410,7 @@ curl -fsSLo /tmp/kubectl \
 sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
 ```
 
-Verify everything is in place:
+Verify the air-gap dependencies:
 
 ```bash
 curl --version && helm version && kubectl version --client \
@@ -418,32 +423,38 @@ podman --version         # if any GPU node uses Ubuntu 24.04
 df -h /   # confirm ~5 GB free
 ```
 
-Success: All required command-line dependencies (curl, helm, kubectl, tar, ssh, sha256sum, and the applicable closure tool—`createrepo_c` for RHEL GPU nodes or `podman` for Ubuntu GPU nodes) are installed and accessible. The command completes successfully (exit code 0) and prints version information for each tool.
+#### Air-Gapped Step 2: Prepare the Configuration
 
-Failure: Because the commands are chained using &&, execution stops immediately when any command is missing, inaccessible, or returns a non-zero exit code. Subsequent dependency checks will not be executed, and the overall command returns a failure status.
+Use `k0s-airgapped-config.yaml` as the template. If you have not already
+created the working configuration in Step 3, copy it now:
 
-#### Model Setup (Air-Gapped Path)
+```bash
+cp k0s-airgapped-config.yaml my-cluster.yaml
+```
 
-Model weights (>120 GB, 10 models) must land in your object store before the
-AI platform can serve inference.
+Edit `my-cluster.yaml`, keep `cluster.airgap: true`, and complete the cluster,
+node, object-store, and SSH settings. Leave the relative image paths unchanged;
+the installer prefixes them with `images.registry`.
 
-**Installer machine requirements:** see [Step 1: Prerequisites](#step-1-prerequisites) — use the installer machine for model staging.
+#### Air-Gapped Step 3: Configure the Private Registry
 
-- **Full (interactive) install** — the installer prompts whether to download
-  models. Answer yes to stage them from the installer machine, or no if they
-  are already present in the object store.
+Set only your private registry in `my-cluster.yaml` before mirroring images:
 
-#### Install (Air-Gapped Path)
+```yaml
+images:
+  registry: registry.example.com  # replace with your private registry
+  registryInsecure: true         # false only for HTTPS/TLS
+```
 
-Use the already edited and validated `my-cluster.yaml` for this path. When
-using the air-gapped template, it sets `cluster.airgap: true` and uses relative
-image paths prefixed with `images.registry`.
+If the registry requires authentication, also configure
+`imagePullSecrets.custom.*` in `my-cluster.yaml`. The registry value used by
+the mirroring commands must match `images.registry`.
 
-Before mirroring, set `images.registry` in `my-cluster.yaml` to your private
-registry and use the same value for `REGISTRY` below. Leave the relative image
-paths and tags unchanged; the installer prefixes them automatically. Set
-`registryInsecure: false` only for
-HTTPS/TLS.
+#### Air-Gapped Step 4: Mirror Application Images
+
+Run one of the following methods from the installer machine. The commands use
+release `v1.0` images and the configured supporting-image tags. Replace
+`registry.example.com` with the same private registry set above.
 
 <details>
 <summary>Mirror with crane (no Docker daemon required)</summary>
@@ -501,26 +512,44 @@ done
 
 </details>
 
+#### Air-Gapped Step 5: Stage Model Artifacts
+
+Model weights (>120 GB, 10 models) must land in your object store before the
+AI platform can serve inference. During the full interactive install, answer
+yes when prompted to stage models from the installer machine, or no if they are
+already present in the object store.
+
+#### Air-Gapped Step 6: Validate the Configuration
+
+Run validation from the setup directory and fix any reported errors before
+continuing:
+
 ```bash
 cd tools/cluster_setup
-
-# If your registry requires authentication (Harbor, etc.), also set:
-#    imagePullSecrets.custom.enabled: true
-#    imagePullSecrets.custom.name: "custom-registry-secret"
-#    imagePullSecrets.custom.server: "registry.example.com"
-#    imagePullSecrets.custom.username / .password: your registry credentials
-
-# Validate the configuration before installing.
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+```
 
-# Run the install — stages the required artifacts based on your input, then installs
+#### Air-Gapped Step 7: Install the Platform
+
+The install command stages the required offline k0s and GPU-driver artifacts
+from the installer machine, then installs the platform on the sealed nodes:
+
+```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+```
 
-# Check the status of pods and inference endpoints
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+#### Air-Gapped Step 8: Monitor and Verify
 
-# Follow progress in another terminal
+Optional: Follow the installation log from another terminal while the install runs:
+
+```bash
 tail -f logs/k0s-install-*.log
+```
+
+After the install completes, check the pods and inference endpoints:
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
 Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
@@ -530,6 +559,11 @@ Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).
 </details>
 
 ## Step 5: Splunk Integration
+
+Splunk Enterprise **10.2** is the tested version for both internal/bundled and
+external Splunk. The bundled deployment uses
+`docker.io/splunk/splunk:10.2-rhel9`; use the corresponding private-registry
+path for air-gapped deployments.
 
 <details>
 <summary>Internal Splunk</summary>

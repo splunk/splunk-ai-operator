@@ -27,6 +27,13 @@
 ---
 The Splunk AI Operator is a Kubernetes operator that enables customers to manage AI workloads using standardized CRDs, Helm charts, and Kubernetes primitives without reliance on any specific cloud provider’s tooling or rigid infrastructure. This repo includes the Splunk AI Operator, and multiple CRDs to manage the Splunk AI Platform and Splunk AI Services.
 
+## Customer Deployment on k0s
+
+Customers deploying the Splunk AI Platform on k0s should start with the
+[k0s Deployment Quick Reference](docs/deployment/k0s-quick-reference.md). It
+covers the prerequisites, standard and air-gapped deployment paths, image
+mirroring, installation, verification, and Splunk integration.
+
 ## Getting Started
 
 ### Quick Install
