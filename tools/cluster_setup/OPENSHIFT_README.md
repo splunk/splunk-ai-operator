@@ -260,6 +260,20 @@ The config file (default `openshift-cluster-config.yaml`, override with
 `CONFIG_FILE=`) is validated with `yq`. Below are the sections and the values
 from the reference deployment.
 
+### `cluster`
+```yaml
+cluster:
+  airgap: false
+  airgapBundlePath: ""
+```
+
+- Set `airgap: true` to make the normal `openshift_with_stack.sh install`
+  command use the air-gap bundle workflow.
+- Leave `airgapBundlePath` empty when the installer machine has internet; it
+  creates the bundle automatically.
+- On an isolated installer machine, set `airgapBundlePath` to the absolute path
+  of a previously prepared and transferred `airgap-bundle-openshift-*.tar.gz`.
+
 ### `kubernetes`
 ```yaml
 kubernetes:
@@ -700,7 +714,9 @@ oc get route saia slim -n ai-platform
 
 ## Air-Gapped Deployment
 
-Air-gap uses two scripts plus a separate image-mirroring step:
+Set `cluster.airgap: true` and use the normal installer command. The entry point
+automatically delegates to the bundle workflow and returns the final installer's
+exit status.
 
 An air-gapped install host does not require public internet after all content is
 transferred or mirrored, but it is not isolated from the deployment network. It
@@ -711,10 +727,22 @@ services. If any of these are public AWS S3, ECR, or other external endpoints,
 provide outbound access through an approved proxy or use the corresponding
 private endpoints.
 
-1. **On an internet-connected machine**, build the bundle:
+1. **Select how the artifact bundle is supplied.**
+
+   When the installer machine has internet, leave `cluster.airgapBundlePath`
+   empty. The normal install command runs this preparation step automatically:
    ```bash
    ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer
    ```
+
+   When the installer machine is isolated, run that command on an
+   internet-connected machine, transfer the resulting tarball, and set:
+   ```yaml
+   cluster:
+     airgap: true
+     airgapBundlePath: "/absolute/path/airgap-bundle-openshift-<date>.tar.gz"
+   ```
+
    The bundle contains Helm charts, static manifests, and the small model
    metadata profile required to verify pre-staged weights:
    - `manifests/cert-manager.yaml` (v1.13.0), `manifests/local-path-storage.yaml`
@@ -756,16 +784,19 @@ private endpoints.
 4. **Stage model weights** separately (~60 GB) via
    `tools/artifacts_download_upload_scripts/`.
 
-5. **On the air-gapped machine**, install from the bundle:
+5. **Run the normal installer command** on the install machine:
    ```bash
-   ./install_from_airgap_bundle_openshift.sh \
-     --bundle airgap-bundle-openshift-<date>.tar.gz \
-     --config openshift-cluster-config.yaml \
-     [--extract-dir /opt/airgap]
+   CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
    ```
-   This extracts the bundle, verifies SHA-256 checksums (hard-fails on mismatch),
-   exports the `file://` env overrides, sets `AIRGAP_MODE=true`, and invokes
-   `openshift_with_stack.sh install`.
+   With no configured bundle path, the entry point first creates the bundle on
+   the internet-connected installer. With a configured path, it uses the
+   transferred bundle directly. It then extracts the bundle, verifies SHA-256
+   checksums (hard-fails on mismatch), exports the `file://` overrides, and
+   re-enters `openshift_with_stack.sh install` with a recursion guard.
+
+For a one-run override without editing YAML, set `AIRGAP_MODE=true`. Set
+`OPENSHIFT_AIRGAP_BUNDLE=/absolute/path/bundle.tar.gz` to use a transferred
+bundle without adding `cluster.airgapBundlePath` to the config.
 
 **Not bundled** (and why): container images (`oc mirror`), NFD/GPU Operator (OLM
 catalog mirror), NVIDIA driver/operand containers and the OpenShift Driver

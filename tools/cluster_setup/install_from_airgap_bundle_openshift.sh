@@ -11,6 +11,8 @@
 #   ./install_from_airgap_bundle_openshift.sh \
 #       --bundle airgap-bundle-openshift-<date>.tar.gz \
 #       --config openshift-cluster-config.yaml [--extract-dir /opt/airgap]
+# Normally openshift_with_stack.sh invokes this wrapper automatically when
+# cluster.airgap=true. Direct use remains supported for manual workflows.
 #
 # The installer (openshift_with_stack.sh) must be in the same directory as
 # this script, or pass --installer /path/to/openshift_with_stack.sh.
@@ -35,6 +37,10 @@ while [[ $# -gt 0 ]]; do
       cat <<'HELP'
 install_from_airgap_bundle_openshift.sh — extract an OpenShift air-gap bundle
 and run the Splunk AI Platform installer without relying on public internet.
+
+Normally set cluster.airgap=true and run openshift_with_stack.sh install. The
+main entry point invokes this wrapper automatically. Use this command directly
+only for a manual bundle workflow.
 
 USAGE
   ./install_from_airgap_bundle_openshift.sh --bundle BUNDLE.tar.gz [OPTIONS]
@@ -237,6 +243,10 @@ export MODEL_ARTIFACTS_CONFIG_DIR="${BUNDLE_DIR}/model-metadata"
 
 # Signal air-gapped mode (skips model staging, enforces offline paths)
 export AIRGAP_MODE="true"
+# Suppress openshift_with_stack.sh's air-gap delegation on the staged second
+# pass. Without this recursion guard, cluster.airgap: true would call this
+# wrapper repeatedly instead of entering main_install.
+export AIRGAP_STAGED="true"
 
 log ""
 log "Environment overrides set:"
@@ -246,6 +256,7 @@ log "  OTEL_CHART_PATH           = ${OTEL_CHART_PATH}"
 log "  KUBERAY_CHART_PATH        = ${KUBERAY_CHART_PATH}"
 log "  MODEL_ARTIFACTS_CONFIG_DIR= ${MODEL_ARTIFACTS_CONFIG_DIR}"
 log "  AIRGAP_MODE               = ${AIRGAP_MODE}"
+log "  AIRGAP_STAGED             = ${AIRGAP_STAGED}"
 log ""
 log "Launching installer..."
 log ""

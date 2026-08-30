@@ -971,7 +971,7 @@ operator_package_repositories() {
 
 preflight_check_airgap_prerequisites() {
   [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
-  pf_header "Disconnected OpenShift prerequisites"
+  pf_header "Air-gapped OpenShift prerequisites"
 
   local path
   for path in "${CERT_MANAGER_MANIFEST_URL:-}" "${LOCAL_PATH_MANIFEST_URL:-}" "${OTEL_CHART_PATH:-}" "${KUBERAY_CHART_PATH:-}"; do
@@ -4074,6 +4074,9 @@ Environment:
   AUTO_APPROVE=true      Skip confirmation prompts (for CI/CD use)
   SILENT_INSTALL=true    Non-interactive mode: no prompts, 5-second countdown before install.
                          Equivalent to --silent on the install subcommand.
+  AIRGAP_MODE=true       Use the air-gapped bundle workflow for this install.
+  OPENSHIFT_AIRGAP_BUNDLE=/path/to/bundle.tar.gz
+                         Consume a prepared bundle instead of creating one.
   AUTO_DIAGNOSE=false    Suppress automatic support-bundle collection on verify/install failure.
   SKIP_IF_STAGED=0       Force re-download/re-upload even if models are already staged.
 
@@ -4204,9 +4207,101 @@ verify_all_pods_healthy() {
   return 1
 }
 
+# Hand an air-gapped install to the bundle workflow before main_install starts.
+# This mirrors the k0s entry-point design: users always run this script's normal
+# install command, while the recursion guard lets the staged second pass proceed.
+#
+# When cluster.airgapBundlePath (or OPENSHIFT_AIRGAP_BUNDLE) is empty, the
+# installer machine must have internet access so the preparation script can
+# create the bundle. An isolated installer machine must point at a bundle that
+# was prepared and transferred earlier. Container images, mirrored OLM catalog
+# content, GPU operands/Driver Toolkit images, and model weights are separate
+# prerequisites and are intentionally not produced by the small artifact bundle.
+delegate_airgap_install_if_needed() {
+  local subcommand="$1"
+  shift || true
+
+  [[ "${subcommand}" == "install" ]] || return 0
+  [[ "${AIRGAP_STAGED:-false}" != "true" ]] || return 0
+
+  local requested="false"
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    requested="true"
+  elif [[ -f "${CONFIG_FILE}" ]]; then
+    if command -v yq >/dev/null 2>&1; then
+      requested=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+      [[ "${requested}" == "null" ]] && requested="false"
+    elif grep -qE '^[[:space:]]*airgap:[[:space:]]*true([[:space:]]|#|$)' "${CONFIG_FILE}"; then
+      # A transferred air-gap bundle may be the source of yq, so retain the
+      # same narrow fallback used by the k0s entry point.
+      requested="true"
+    fi
+  fi
+  [[ "${requested}" == "true" ]] || return 0
+
+  [[ -f "${CONFIG_FILE}" ]] || err "Air-gap mode requires a cluster configuration file: ${CONFIG_FILE}"
+
+  local option
+  for option in "$@"; do
+    case "${option}" in
+      --silent|-s) export SILENT_INSTALL="true" ;;
+      *) err "Unknown install option: ${option}" ;;
+    esac
+  done
+
+  local script_dir prepare_script wrapper_script bundle_path output_dir extract_dir config_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  prepare_script="${OPENSHIFT_AIRGAP_PREPARE_SCRIPT:-${script_dir}/prepare_airgap_bundle_openshift.sh}"
+  wrapper_script="${OPENSHIFT_AIRGAP_INSTALL_SCRIPT:-${script_dir}/install_from_airgap_bundle_openshift.sh}"
+  [[ -x "${wrapper_script}" ]] || err "Air-gap installer wrapper is missing or not executable: ${wrapper_script}"
+
+  bundle_path="${OPENSHIFT_AIRGAP_BUNDLE:-}"
+  if [[ -z "${bundle_path}" ]] && command -v yq >/dev/null 2>&1; then
+    bundle_path=$(yq eval '.cluster.airgapBundlePath // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ "${bundle_path}" == "null" ]] && bundle_path=""
+  fi
+
+  # Resolve a relative configured path next to the config file. Environment
+  # overrides may also be relative to the caller's current directory.
+  if [[ -n "${bundle_path}" && "${bundle_path}" != /* && -z "${OPENSHIFT_AIRGAP_BUNDLE:-}" ]]; then
+    config_dir="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)"
+    bundle_path="${config_dir}/${bundle_path}"
+  fi
+
+  # Match the preparation script's normal behavior and keep generated transfer
+  # artifacts in the caller's working directory rather than modifying the
+  # installer checkout.
+  output_dir="${OPENSHIFT_AIRGAP_OUTPUT_DIR:-${PWD}/airgap-bundle-openshift}"
+  if [[ -z "${bundle_path}" ]]; then
+    [[ -x "${prepare_script}" ]] || err "Air-gap bundle preparation script is missing or not executable: ${prepare_script}"
+    log "Air-gap mode requested; preparing the OpenShift artifact bundle on this installer machine..."
+    mkdir -p "${output_dir}"
+    "${prepare_script}" --output-dir "${output_dir}"
+    bundle_path=$(find "${output_dir}" -maxdepth 1 -type f -name 'airgap-bundle-openshift-*.tar.gz' -print \
+      | sort | tail -1)
+    [[ -n "${bundle_path}" ]] || err "Air-gap bundle preparation completed without producing a bundle in ${output_dir}"
+  fi
+  [[ -f "${bundle_path}" ]] || err "Configured OpenShift air-gap bundle does not exist: ${bundle_path}"
+
+  if [[ -n "${OPENSHIFT_AIRGAP_EXTRACT_DIR:-}" ]]; then
+    extract_dir="${OPENSHIFT_AIRGAP_EXTRACT_DIR}"
+  else
+    extract_dir=$(mktemp -d "${TMPDIR:-/tmp}/splunk-ai-openshift-airgap.XXXXXX")
+  fi
+
+  log "Air-gap artifacts ready; delegating installation through $(basename "${wrapper_script}")."
+  exec "${wrapper_script}" \
+    --bundle "${bundle_path}" \
+    --config "${CONFIG_FILE}" \
+    --extract-dir "${extract_dir}" \
+    --installer "${script_dir}/$(basename "${BASH_SOURCE[0]}")" \
+    --subcommand "${subcommand}"
+}
+
 # ====== MAIN ======
 _CMD="${1:-install}"
 shift 2>/dev/null || true
+delegate_airgap_install_if_needed "${_CMD}" "$@"
 case "${_CMD}" in
   install)
     while [[ $# -gt 0 ]]; do

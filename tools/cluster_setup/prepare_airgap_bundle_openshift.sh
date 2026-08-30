@@ -2,8 +2,9 @@
 # prepare_airgap_bundle_openshift.sh
 # Run on an internet-connected machine to download every Helm chart and static
 # manifest needed by openshift_with_stack.sh. Produces a single tar.gz that
-# can be copied to an air-gapped OpenShift cluster and consumed by
-# install_from_airgap_bundle_openshift.sh.
+# can be copied to an air-gapped OpenShift installer machine. Set the resulting
+# tarball as cluster.airgapBundlePath; the normal openshift_with_stack.sh install
+# command then consumes it through install_from_airgap_bundle_openshift.sh.
 #
 # NOTE: This script does NOT bundle container images, OLM catalog content, or
 # NVIDIA driver/Driver Toolkit images.
@@ -124,9 +125,9 @@ NEXT STEPS AFTER BUNDLING
   3. For NFD / GPU Operator: mirror OLM catalogs using oc mirror and apply
      ImageContentSourcePolicy before running the installer.
   4. Copy the .tar.gz to the air-gapped install machine.
-  5. Run: ./install_from_airgap_bundle_openshift.sh \
-             --bundle airgap-bundle-openshift-<date>.tar.gz \
-             --config openshift-cluster-config.yaml
+  5. Set cluster.airgap=true and cluster.airgapBundlePath to the transferred
+     tarball, then run:
+       CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
 
 HELP
       exit 0
@@ -430,10 +431,9 @@ log "       tools/artifacts_download_upload_scripts/"
 log ""
 log "  3. Copy ${BUNDLE_TARBALL} to the air-gapped install machine."
 log ""
-log "  4. On the install machine, run:"
-log "       ./install_from_airgap_bundle_openshift.sh \\"
-log "         --bundle ${BUNDLE_NAME}.tar.gz \\"
-log "         --config openshift-cluster-config.yaml"
+log "  4. On the install machine, set cluster.airgap=true and"
+log "     cluster.airgapBundlePath to the transferred tarball, then run:"
+log "       CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install"
 log ""
 log "Cleaning up staging directory..."
 rm -rf "${STAGE_DIR}"

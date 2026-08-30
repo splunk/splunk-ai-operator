@@ -68,6 +68,7 @@ eval "$(extract_function operator_package_repositories)"
 eval "$(extract_function wait_for_subscription_csv)"
 eval "$(extract_function manifest_has_existing_resources)"
 eval "$(extract_function resolve_accelerator_type)"
+eval "$(extract_function delegate_airgap_install_if_needed)"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
 
 log() { :; }
@@ -312,6 +313,10 @@ assert_eq "air-gap bundle includes model verification metadata" "1" \
   "$(grep -c 'cp .*MODEL_METADATA_SOURCE.*model-metadata' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
 assert_eq "air-gap wrapper exports bundled model metadata path" "1" \
   "$(grep -c '^export MODEL_ARTIFACTS_CONFIG_DIR=.*model-metadata' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "normal install checks for OpenShift air-gap delegation" "1" \
+  "$(grep -c '^delegate_airgap_install_if_needed "\${_CMD}" "\$@"$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap wrapper sets the staged recursion guard" "1" \
+  "$(grep -c '^export AIRGAP_STAGED="true"$' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership checks every manifest resource" "1" \
   "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -c 'manifest_has_existing_resources' | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership is not inferred from deployment presence" "0" \
@@ -322,6 +327,91 @@ assert_eq "disconnected preflight validates mirror source coverage" "1" \
   "$(awk '/^preflight_check_airgap_prerequisites\(\)/,/^}/' "${SCRIPT}" | grep -c 'mirror_sources_cover_repository' | tr -d '[:space:]')"
 assert_eq "OLM readiness requires currentCSV to become installedCSV" "1" \
   "$(awk '/^wait_for_subscription_csv\(\)/,/^}/' "${SCRIPT}" | grep -c 'installed_csv.*==.*current_csv' | tr -d '[:space:]')"
+
+_exercise_airgap_delegation() (
+  local mode="$1" tmp trace config bundle=""
+  tmp=$(mktemp -d)
+  trace="${tmp}/trace.log"
+  config="${tmp}/config.yaml"
+
+  cat > "${config}" <<'YAML'
+cluster:
+  airgap: true
+  airgapBundlePath: ""
+YAML
+
+  cat > "${tmp}/prepare_airgap_bundle_openshift.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+output_dir=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir) output_dir="$2"; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+mkdir -p "${output_dir}"
+: > "${output_dir}/airgap-bundle-openshift-test.tar.gz"
+printf 'prepare\n' >> "${TRACE_FILE}"
+SCRIPT
+
+  cat > "${tmp}/install_from_airgap_bundle_openshift.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+exit 0
+SCRIPT
+  chmod +x \
+    "${tmp}/prepare_airgap_bundle_openshift.sh" \
+    "${tmp}/install_from_airgap_bundle_openshift.sh"
+
+  if [[ "${mode}" == "existing" ]]; then
+    bundle="${tmp}/transferred-airgap-bundle.tar.gz"
+    : > "${bundle}"
+    export OPENSHIFT_AIRGAP_BUNDLE="${bundle}"
+  else
+    unset OPENSHIFT_AIRGAP_BUNDLE
+  fi
+
+  export TRACE_FILE="${trace}"
+  CONFIG_FILE="${config}"
+  OPENSHIFT_AIRGAP_PREPARE_SCRIPT="${tmp}/prepare_airgap_bundle_openshift.sh"
+  OPENSHIFT_AIRGAP_INSTALL_SCRIPT="${tmp}/install_from_airgap_bundle_openshift.sh"
+  OPENSHIFT_AIRGAP_OUTPUT_DIR="${tmp}/output"
+  OPENSHIFT_AIRGAP_EXTRACT_DIR="${tmp}/extract"
+  AIRGAP_MODE="false"
+  AIRGAP_STAGED="false"
+  SILENT_INSTALL="false"
+  yq() {
+    case "${2:-}" in
+      '.cluster.airgap // "false"') echo "true" ;;
+      '.cluster.airgapBundlePath // ""') echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  exec() {
+    printf 'wrapper %s\n' "$*" >> "${trace}"
+    printf 'silent=%s\n' "${SILENT_INSTALL:-false}" >> "${trace}"
+  }
+
+  delegate_airgap_install_if_needed install --silent
+
+  cat "${trace}"
+  rm -rf "${tmp}"
+)
+
+echo "OpenShift unified air-gap entry point"
+auto_airgap_trace=$(_exercise_airgap_delegation auto)
+assert_eq "air-gap install automatically prepares a bundle when none is supplied" "1" \
+  "$(grep -c '^prepare$' <<<"${auto_airgap_trace}" || true)"
+assert_eq "air-gap install delegates the generated bundle to the wrapper" "1" \
+  "$(grep -c 'wrapper .*--bundle .*airgap-bundle-openshift-test.tar.gz.*--subcommand install' <<<"${auto_airgap_trace}" || true)"
+assert_eq "air-gap delegation preserves silent install mode" "silent=true" \
+  "$(grep '^silent=' <<<"${auto_airgap_trace}" || true)"
+
+existing_airgap_trace=$(_exercise_airgap_delegation existing)
+assert_eq "a transferred bundle skips automatic bundle preparation" "0" \
+  "$(grep -c '^prepare$' <<<"${existing_airgap_trace}" || true)"
+assert_eq "a transferred bundle is passed directly to the wrapper" "1" \
+  "$(grep -c 'wrapper .*--bundle .*transferred-airgap-bundle.tar.gz.*--subcommand install' <<<"${existing_airgap_trace}" || true)"
 
 echo "OpenShift disconnected mirror source matching"
 mirror_sources=$'registry.redhat.io/openshift4\nnvcr.io/nvidia'
@@ -573,6 +663,10 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$("${REAL_YQ}" eval '.openshift.requiredVersion' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config explicitly verifies pre-staged models" "false" \
     "$("${REAL_YQ}" eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config defaults to connected installation" "false" \
+    "$("${REAL_YQ}" eval '.cluster.airgap' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config leaves the transferred air-gap bundle optional" "" \
+    "$("${REAL_YQ}" eval '.cluster.airgapBundlePath' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config matches the qualified Ray runtime" "2.56.0" \
     "$("${REAL_YQ}" eval '.operators.ray.rayVersion' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config requires 1024 GiB at scale 1" "1024" \

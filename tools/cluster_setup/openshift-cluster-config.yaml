@@ -4,6 +4,17 @@
 # Used by openshift_with_stack.sh
 # =============================================================================
 
+# Set airgap=true to use the same openshift_with_stack.sh install command for
+# an air-gapped deployment. With an empty airgapBundlePath, the installer
+# machine must have internet access and creates the small artifact bundle
+# automatically. On an isolated installer machine, set airgapBundlePath to the
+# transferred airgap-bundle-openshift-*.tar.gz file. Images, OLM catalogs and
+# operands, Driver Toolkit content, and model weights must already be mirrored
+# or staged separately.
+cluster:
+  airgap: false
+  airgapBundlePath: ""
+
 kubernetes:
   namespace: ai-platform
 
