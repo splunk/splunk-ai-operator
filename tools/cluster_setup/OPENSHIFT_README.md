@@ -732,53 +732,11 @@ It needs internet while mirroring installer-owned content or downloading a model
 that is missing from the object store.
 
 Air-gap installation must run on a Linux x86_64 installer machine because Red
-Hat `oc-mirror` is Linux-only. A RHEL 9 container running under Docker Desktop
-is supported when it can reach the Mac's VPN routes and has enough Docker disk
-capacity. The qualified OpenShift 4.21 Operator and GPU content currently uses
-about 24 GiB; keep at least 35 GiB free for the prepared directory and runtime
-overhead, with 50 GiB recommended.
-
-### Run the installer from a RHEL 9 container on macOS
-
-From the repository root on the Mac, build the supplied installer image once:
-
-```bash
-docker build --platform linux/amd64 \
-  -f tools/cluster_setup/Dockerfile.openshift-installer-rhel9 \
-  -t splunk-ai-openshift-installer:rhel9 .
-```
-
-Start the container with the repository and kubeconfig mounted. The separate
-home directory keeps Helm and registry state writable while generated files
-remain owned by the Mac user:
-
-```bash
-mkdir -p "$HOME/.splunk-ai-installer"
-
-docker run --rm -it --platform linux/amd64 \
-  --name splunk-ai-openshift-installer \
-  --user "$(id -u):$(id -g)" \
-  -e HOME=/installer/home \
-  -e KUBECONFIG=/installer/kubeconfig \
-  -v "$HOME/.splunk-ai-installer:/installer/home" \
-  -v "$HOME/.kube/openshift:/installer/kubeconfig:ro" \
-  -v "$PWD:/workspace/splunk-ai-operator" \
-  -w /workspace/splunk-ai-operator/tools/cluster_setup \
-  splunk-ai-openshift-installer:rhel9 bash
-```
-
-Inside the container, confirm access and run the normal installer:
-
-```bash
-oc whoami
-oc get clusterversion version
-CONFIG_FILE=./openshift-cluster-config-local.yaml ./openshift_with_stack.sh install
-```
-
-Connect the Mac to the required VPN before starting Docker. If `oc whoami`
-times out inside the container, reconnect the VPN and restart Docker Desktop so
-its Linux virtual machine receives the current routes, or use a reachable Linux
-installer host.
+Hat `oc-mirror` is Linux-only. Use a supported Linux x86_64 host with the
+documented client dependencies and network access. The qualified OpenShift 4.21
+Operator and GPU content currently uses about 24 GiB; plan for about 100 GiB of
+free installer storage for `oc-mirror` working data, logs, and installation
+overhead.
 
 The installer automatically handles:
 
