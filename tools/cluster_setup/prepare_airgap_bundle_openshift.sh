@@ -17,6 +17,7 @@ GPU_CHANNEL="v26.3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/openshift-cluster-config.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle-openshift}"
+CREATE_ARCHIVE="${CREATE_ARCHIVE:-true}"
 
 # Print the connected-side bundle-builder contract and command options.
 usage() {
@@ -31,6 +32,8 @@ OPTIONS
   --config FILE       OpenShift cluster config used by the target install.
                       Default: ./openshift-cluster-config.yaml beside this script
   --output-dir DIR    Output directory. Default: ./airgap-bundle-openshift
+  --no-archive        Keep the prepared bundle directory and do not create a
+                      duplicate transfer archive. Used by same-host installs.
   -h, --help          Show this help.
 
 BUNDLED AUTOMATICALLY
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_FILE="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --no-archive) CREATE_ARCHIVE="false"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -336,12 +340,17 @@ log "Computing checksums"
   done
 ) > "${STAGE_DIR}/checksums.sha256"
 
-BUNDLE_TARBALL="${OUTPUT_DIR}/${BUNDLE_NAME}.tar.gz"
-tar -czf "${BUNDLE_TARBALL}" -C "${OUTPUT_DIR}" "${BUNDLE_NAME}"
-BUNDLE_SIZE=$(du -sh "${BUNDLE_TARBALL}" | awk '{print $1}')
-BUNDLE_SHA=$(sha256 "${BUNDLE_TARBALL}")
-
-log "Bundle ready: ${BUNDLE_TARBALL} (${BUNDLE_SIZE})"
-log "SHA256: ${BUNDLE_SHA}"
+if [[ "${CREATE_ARCHIVE}" == "true" ]]; then
+  BUNDLE_TARBALL="${OUTPUT_DIR}/${BUNDLE_NAME}.tar.gz"
+  tar -czf "${BUNDLE_TARBALL}" -C "${OUTPUT_DIR}" "${BUNDLE_NAME}"
+  BUNDLE_SIZE=$(du -sh "${BUNDLE_TARBALL}" | awk '{print $1}')
+  BUNDLE_SHA=$(sha256 "${BUNDLE_TARBALL}")
+  log "Bundle ready: ${BUNDLE_TARBALL} (${BUNDLE_SIZE})"
+  log "SHA256: ${BUNDLE_SHA}"
+else
+  BUNDLE_SIZE=$(du -sh "${STAGE_DIR}" | awk '{print $1}')
+  log "Prepared bundle directory ready for same-host use: ${STAGE_DIR} (${BUNDLE_SIZE})"
+  log "Transfer archive creation skipped; the installer will reuse this directory directly."
+fi
 log "Customer application image inventory: ${STAGE_DIR}/customer-provided-images.txt"
 log "Run the normal install command with cluster.airgap=true and this bundle path."

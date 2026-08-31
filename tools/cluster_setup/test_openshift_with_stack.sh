@@ -340,6 +340,10 @@ assert_eq "air-gap bundle records customer-provided application images separatel
   "$(grep -c 'sort -u .*customer-provided-images.txt' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
 assert_eq "air-gap wrapper imports bundled images into the configured registry" "1" \
   "$(grep -c -- '--from.*BUNDLE_DIR.*/mirror' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "same-host air-gap preparation skips the duplicate transfer archive" "1" \
+  "$(awk '/^delegate_airgap_install_if_needed\(\)/,/^}/' "${SCRIPT}" | grep -c -- '--no-archive' | tr -d '[:space:]')"
+assert_eq "air-gap wrapper accepts a prepared bundle directory" "1" \
+  "$(grep -c 'Reusing prepared bundle directory directly' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
 assert_eq "air-gap wrapper applies generated OpenShift mirror resources" "1" \
   "$(grep -c '^apply_generated_mirror_resources()' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
 assert_eq "air-gap preparation avoids the oc-mirror REGISTRY_AUTH_FILE parser conflict" "1" \
@@ -406,16 +410,17 @@ YAML
 #!/usr/bin/env bash
 set -euo pipefail
 output_dir=""
+no_archive="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) shift 2 ;;
     --output-dir) output_dir="$2"; shift 2 ;;
+    --no-archive) no_archive="true"; shift ;;
     *) exit 2 ;;
   esac
 done
-mkdir -p "${output_dir}"
-: > "${output_dir}/airgap-bundle-openshift-test.tar.gz"
-printf 'prepare\n' >> "${TRACE_FILE}"
+mkdir -p "${output_dir}/airgap-bundle-openshift-test"
+printf 'prepare no_archive=%s\n' "${no_archive}" >> "${TRACE_FILE}"
 SCRIPT
 
   cat > "${tmp}/install_from_airgap_bundle_openshift.sh" <<'SCRIPT'
@@ -466,17 +471,21 @@ SCRIPT
 echo "OpenShift unified air-gap entry point"
 auto_airgap_trace=$(_exercise_airgap_delegation auto)
 assert_eq "air-gap install automatically prepares a bundle when none is supplied" "1" \
-  "$(grep -c '^prepare$' <<<"${auto_airgap_trace}" || true)"
-assert_eq "air-gap install delegates the generated bundle to the wrapper" "1" \
-  "$(grep -c 'wrapper .*--bundle .*airgap-bundle-openshift-test.tar.gz.*--subcommand install' <<<"${auto_airgap_trace}" || true)"
+  "$(grep -c '^prepare no_archive=true$' <<<"${auto_airgap_trace}" || true)"
+assert_eq "air-gap install delegates the prepared directory to the wrapper" "1" \
+  "$(grep -c 'wrapper .*--bundle .*airgap-bundle-openshift-test .*--subcommand install' <<<"${auto_airgap_trace}" || true)"
+assert_eq "same-host prepared directories are not assigned an extraction directory" "0" \
+  "$(grep -c 'wrapper .*airgap-bundle-openshift-test.*--extract-dir' <<<"${auto_airgap_trace}" || true)"
 assert_eq "air-gap delegation preserves silent install mode" "silent=true" \
   "$(grep '^silent=' <<<"${auto_airgap_trace}" || true)"
 
 existing_airgap_trace=$(_exercise_airgap_delegation existing)
 assert_eq "a transferred bundle skips automatic bundle preparation" "0" \
-  "$(grep -c '^prepare$' <<<"${existing_airgap_trace}" || true)"
+  "$(grep -c '^prepare ' <<<"${existing_airgap_trace}" || true)"
 assert_eq "a transferred bundle is passed directly to the wrapper" "1" \
   "$(grep -c 'wrapper .*--bundle .*transferred-airgap-bundle.tar.gz.*--subcommand install' <<<"${existing_airgap_trace}" || true)"
+assert_eq "a transferred archive receives an extraction directory" "1" \
+  "$(grep -c 'wrapper .*transferred-airgap-bundle.tar.gz.*--extract-dir' <<<"${existing_airgap_trace}" || true)"
 
 echo "OpenShift k0s-style insecure endpoints"
 assert_eq "normalizes a registry with scheme and repository prefix" \

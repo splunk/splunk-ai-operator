@@ -4476,6 +4476,7 @@ delegate_airgap_install_if_needed() {
   done
 
   local script_dir prepare_script wrapper_script bundle_path output_dir extract_dir
+  local -a wrapper_args
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   prepare_script="${OPENSHIFT_AIRGAP_PREPARE_SCRIPT:-${script_dir}/prepare_airgap_bundle_openshift.sh}"
   wrapper_script="${OPENSHIFT_AIRGAP_INSTALL_SCRIPT:-${script_dir}/install_from_airgap_bundle_openshift.sh}"
@@ -4485,34 +4486,39 @@ delegate_airgap_install_if_needed() {
   # only cluster.airgap and the installer generates the artifacts automatically.
   bundle_path="${OPENSHIFT_AIRGAP_BUNDLE:-}"
 
-  # Match the preparation script's normal behavior and keep generated transfer
-  # artifacts in the caller's working directory rather than modifying the
-  # installer checkout.
+  # Keep generated content in the caller's working directory. Automatic
+  # same-host installs reuse the prepared directory directly; transfer archives
+  # remain supported only through the explicit OPENSHIFT_AIRGAP_BUNDLE hook.
   output_dir="${OPENSHIFT_AIRGAP_OUTPUT_DIR:-${PWD}/airgap-bundle-openshift}"
   if [[ -z "${bundle_path}" ]]; then
     [[ -x "${prepare_script}" ]] || err "Air-gap bundle preparation script is missing or not executable: ${prepare_script}"
     log "Air-gap mode requested; preparing installer-owned OpenShift content automatically..."
     mkdir -p "${output_dir}"
-    "${prepare_script}" --config "${CONFIG_FILE}" --output-dir "${output_dir}"
-    bundle_path=$(find "${output_dir}" -maxdepth 1 -type f -name 'airgap-bundle-openshift-*.tar.gz' -print \
+    "${prepare_script}" --config "${CONFIG_FILE}" --output-dir "${output_dir}" --no-archive
+    bundle_path=$(find "${output_dir}" -mindepth 1 -maxdepth 1 -type d -name 'airgap-bundle-openshift-*' -print \
       | sort | tail -1)
-    [[ -n "${bundle_path}" ]] || err "Air-gap bundle preparation completed without producing a bundle in ${output_dir}"
+    [[ -n "${bundle_path}" ]] || err "Air-gap bundle preparation completed without producing a prepared directory in ${output_dir}"
   fi
-  [[ -f "${bundle_path}" ]] || err "Configured OpenShift air-gap bundle does not exist: ${bundle_path}"
+  [[ -f "${bundle_path}" || -d "${bundle_path}" ]] \
+    || err "Configured OpenShift air-gap bundle file or directory does not exist: ${bundle_path}"
 
-  if [[ -n "${OPENSHIFT_AIRGAP_EXTRACT_DIR:-}" ]]; then
-    extract_dir="${OPENSHIFT_AIRGAP_EXTRACT_DIR}"
-  else
-    extract_dir=$(mktemp -d "${TMPDIR:-/tmp}/splunk-ai-openshift-airgap.XXXXXX")
+  wrapper_args=(
+    --bundle "${bundle_path}"
+    --config "${CONFIG_FILE}"
+    --installer "${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    --subcommand "${subcommand}"
+  )
+  if [[ -f "${bundle_path}" ]]; then
+    if [[ -n "${OPENSHIFT_AIRGAP_EXTRACT_DIR:-}" ]]; then
+      extract_dir="${OPENSHIFT_AIRGAP_EXTRACT_DIR}"
+    else
+      extract_dir=$(mktemp -d "${TMPDIR:-/tmp}/splunk-ai-openshift-airgap.XXXXXX")
+    fi
+    wrapper_args+=(--extract-dir "${extract_dir}")
   fi
 
   log "Air-gap artifacts ready; delegating installation through $(basename "${wrapper_script}")."
-  exec "${wrapper_script}" \
-    --bundle "${bundle_path}" \
-    --config "${CONFIG_FILE}" \
-    --extract-dir "${extract_dir}" \
-    --installer "${script_dir}/$(basename "${BASH_SOURCE[0]}")" \
-    --subcommand "${subcommand}"
+  exec "${wrapper_script}" "${wrapper_args[@]}"
 }
 
 # ====== MAIN ======

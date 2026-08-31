@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Extract a connected-side OpenShift bundle, import installer-owned image
-# content into the configured internal registry, apply generated mirror and
-# catalog resources, then invoke openshift_with_stack.sh.
+# Reuse a prepared OpenShift bundle directory or extract a transferred archive,
+# import installer-owned image content into the configured internal registry,
+# apply generated mirror and catalog resources, then invoke the installer.
 
 set -euo pipefail
 
@@ -15,7 +15,7 @@ cleanup_auto_registry_auth_file() {
 }
 trap cleanup_auto_registry_auth_file EXIT
 
-BUNDLE_TARBALL=""
+BUNDLE_SOURCE=""
 CONFIG_FILE=""
 EXTRACT_DIR="${EXTRACT_DIR:-/opt/airgap}"
 INSTALLER_SCRIPT=""
@@ -29,10 +29,11 @@ content bundle. Normally this wrapper is called automatically when
 cluster.airgap=true.
 
 USAGE
-  ./install_from_airgap_bundle_openshift.sh --bundle BUNDLE.tar.gz --config CONFIG [OPTIONS]
+  ./install_from_airgap_bundle_openshift.sh --bundle BUNDLE --config CONFIG [OPTIONS]
 
 REQUIRED
-  --bundle FILE       Bundle produced by prepare_airgap_bundle_openshift.sh
+  --bundle PATH       Prepared bundle directory or transfer archive produced by
+                      prepare_airgap_bundle_openshift.sh
   --config FILE       Target openshift-cluster-config.yaml
 
 OPTIONS
@@ -62,7 +63,7 @@ HELP
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bundle) BUNDLE_TARBALL="$2"; shift 2 ;;
+    --bundle) BUNDLE_SOURCE="$2"; shift 2 ;;
     --config) CONFIG_FILE="$2"; shift 2 ;;
     --extract-dir) EXTRACT_DIR="$2"; shift 2 ;;
     --installer) INSTALLER_SCRIPT="$2"; shift 2 ;;
@@ -244,8 +245,9 @@ import_bundled_images() {
   apply_generated_mirror_resources
 }
 
-[[ -n "${BUNDLE_TARBALL}" ]] || err "--bundle is required"
-[[ -f "${BUNDLE_TARBALL}" ]] || err "Bundle not found: ${BUNDLE_TARBALL}"
+[[ -n "${BUNDLE_SOURCE}" ]] || err "--bundle is required"
+[[ -f "${BUNDLE_SOURCE}" || -d "${BUNDLE_SOURCE}" ]] \
+  || err "Bundle file or directory not found: ${BUNDLE_SOURCE}"
 [[ -n "${CONFIG_FILE}" ]] || err "--config is required"
 [[ -f "${CONFIG_FILE}" ]] || err "Config not found: ${CONFIG_FILE}"
 [[ "${SUBCOMMAND}" == "install" || "${SUBCOMMAND}" == "delete" ]] \
@@ -261,25 +263,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -n "${INSTALLER_SCRIPT}" ]] || INSTALLER_SCRIPT="${SCRIPT_DIR}/openshift_with_stack.sh"
 [[ -f "${INSTALLER_SCRIPT}" ]] || err "Installer not found: ${INSTALLER_SCRIPT}"
 CONFIG_FILE=$(absolute_path "${CONFIG_FILE}")
-BUNDLE_TARBALL=$(absolute_path "${BUNDLE_TARBALL}")
+BUNDLE_SOURCE=$(absolute_path "${BUNDLE_SOURCE}")
 
-log "Extracting ${BUNDLE_TARBALL}"
-mkdir -p "${EXTRACT_DIR}"
-# The matching entry is at the start of bundles produced by the companion
-# builder. grep -m1 intentionally closes the pipe early, so mask the resulting
-# SIGPIPE from tar under `set -o pipefail`; the explicit non-empty check below
-# still rejects malformed archives.
-BUNDLE_TOP=$(tar -tzf "${BUNDLE_TARBALL}" \
-  | sed 's#/.*##' \
-  | grep -m1 '^airgap-bundle-openshift-' \
-  || true)
-[[ -n "${BUNDLE_TOP}" ]] || err "Bundle has no airgap-bundle-openshift-* top-level directory"
-BUNDLE_DIR="${EXTRACT_DIR}/${BUNDLE_TOP}"
-if [[ -d "${BUNDLE_DIR}" ]]; then
-  log "Using existing extracted bundle: ${BUNDLE_DIR}"
+if [[ -d "${BUNDLE_SOURCE}" ]]; then
+  # The unified same-host flow consumes the completed staging directory
+  # directly. This avoids creating a transfer tarball and then extracting a
+  # second copy of the same multi-gigabyte mirror content.
+  BUNDLE_DIR="${BUNDLE_SOURCE}"
+  log "Reusing prepared bundle directory directly: ${BUNDLE_DIR}"
 else
-  tar -xzf "${BUNDLE_TARBALL}" -C "${EXTRACT_DIR}" \
-    || err "Failed to extract bundle: ${BUNDLE_TARBALL}"
+  log "Extracting transferred bundle archive: ${BUNDLE_SOURCE}"
+  mkdir -p "${EXTRACT_DIR}"
+  # The matching entry is at the start of bundles produced by the companion
+  # builder. grep -m1 intentionally closes the pipe early, so mask the resulting
+  # SIGPIPE from tar under `set -o pipefail`; the explicit non-empty check below
+  # still rejects malformed archives.
+  BUNDLE_TOP=$(tar -tzf "${BUNDLE_SOURCE}" \
+    | sed 's#/.*##' \
+    | grep -m1 '^airgap-bundle-openshift-' \
+    || true)
+  [[ -n "${BUNDLE_TOP}" ]] || err "Bundle has no airgap-bundle-openshift-* top-level directory"
+  BUNDLE_DIR="${EXTRACT_DIR}/${BUNDLE_TOP}"
+  if [[ -d "${BUNDLE_DIR}" ]]; then
+    log "Using existing extracted bundle: ${BUNDLE_DIR}"
+  else
+    tar -xzf "${BUNDLE_SOURCE}" -C "${EXTRACT_DIR}" \
+      || err "Failed to extract bundle: ${BUNDLE_SOURCE}"
+  fi
 fi
 [[ -d "${BUNDLE_DIR}" ]] || err "Extracted bundle directory is missing: ${BUNDLE_DIR}"
 verify_checksums

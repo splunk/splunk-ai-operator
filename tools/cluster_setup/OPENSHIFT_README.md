@@ -722,7 +722,9 @@ cluster:
 Then use the normal install command. The installer automatically downloads its
 OpenShift infrastructure content, mirrors it into `images.registry`, applies
 the generated image mirror policies and Operator CatalogSources, and continues
-the installation. Users do not create or select a bundle.
+the installation. Users do not create or select a bundle. When preparation and
+installation run on the same machine, the installer consumes the prepared
+directory directly; it does not create and extract duplicate transfer archives.
 
 OpenShift nodes do not require public internet. The installer machine must reach
 the OpenShift API, public source registries, internal registry, and object store.
@@ -732,7 +734,9 @@ that is missing from the object store.
 Air-gap installation must run on a Linux x86_64 installer machine because Red
 Hat `oc-mirror` is Linux-only. A RHEL 9 container running under Docker Desktop
 is supported when it can reach the Mac's VPN routes and has enough Docker disk
-capacity for temporary mirror archives.
+capacity. The qualified OpenShift 4.21 Operator and GPU content currently uses
+about 24 GiB; keep at least 35 GiB free for the prepared directory and runtime
+overhead, with 50 GiB recommended.
 
 ### Run the installer from a RHEL 9 container on macOS
 
