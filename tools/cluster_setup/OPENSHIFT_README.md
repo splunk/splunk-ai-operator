@@ -264,15 +264,12 @@ from the reference deployment.
 ```yaml
 cluster:
   airgap: false
-  airgapBundlePath: ""
 ```
 
-- Set `airgap: true` to make the normal `openshift_with_stack.sh install`
-  command use the air-gap bundle workflow.
-- Leave `airgapBundlePath` empty when the installer machine has internet; it
-  creates the bundle automatically.
-- On an isolated installer machine, set `airgapBundlePath` to the absolute path
-  of a previously prepared and transferred `airgap-bundle-openshift-*.tar.gz`.
+- Set `airgap: true` for an air-gapped installation. The normal
+  `openshift_with_stack.sh install` command automatically stages and mirrors
+  the required OpenShift dependencies.
+- Set `airgap: false` for a connected installation.
 
 ### `kubernetes`
 ```yaml
@@ -483,8 +480,9 @@ non-ECR registries and use the `imagePullSecrets.*` blocks instead — see
 2. **Preflight** — verify tools, cluster-admin, OCP/RHCOS compatibility,
    registry policy, storage capacity, object-store config, and disconnected
    catalog/mirror prerequisites.
-3. **Model Staging/Verification** — stage weights when enabled; otherwise prove
-   every required pre-staged model marker exists. Air-gap is verification-only.
+3. **Model Staging/Verification** — when enabled, check the object store and
+   download/upload only missing or changed weights from the installer machine.
+   When disabled in air-gap mode, verify every required pre-staged marker.
 4. **Infrastructure** — NFD Operator → GPU Operator → node labeling →
    local-path provisioner + SELinux relabel.
 5. **Operators** — cert-manager → OpenTelemetry Operator → KubeRay Operator →
@@ -714,103 +712,103 @@ oc get route saia slim -n ai-platform
 
 ## Air-Gapped Deployment
 
-Set `cluster.airgap: true` and use the normal installer command. The entry point
-automatically delegates to the bundle workflow and returns the final installer's
-exit status.
+Set one value in the cluster config:
 
-An air-gapped install host does not require public internet after all content is
-transferred or mirrored, but it is not isolated from the deployment network. It
-must reach the OpenShift API, the object store used for model-marker checks, and
-any cloud or registry API used for credential setup. OpenShift nodes must reach
-the private registry/catalog mirrors, object store, and other configured runtime
-services. If any of these are public AWS S3, ECR, or other external endpoints,
-provide outbound access through an approved proxy or use the corresponding
-private endpoints.
+```yaml
+cluster:
+  airgap: true
+```
 
-1. **Select how the artifact bundle is supplied.**
+Then use the normal install command. The installer automatically downloads its
+OpenShift infrastructure content, mirrors it into `images.registry`, applies
+the generated image mirror policies and Operator CatalogSources, and continues
+the installation. Users do not create or select a bundle.
 
-   When the installer machine has internet, leave `cluster.airgapBundlePath`
-   empty. The normal install command runs this preparation step automatically:
-   ```bash
-   ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer
-   ```
+OpenShift nodes do not require public internet. The installer machine must reach
+the OpenShift API, public source registries, internal registry, and object store.
+It needs internet while mirroring installer-owned content or downloading a model
+that is missing from the object store.
 
-   When the installer machine is isolated, run that command on an
-   internet-connected machine, transfer the resulting tarball, and set:
-   ```yaml
-   cluster:
-     airgap: true
-     airgapBundlePath: "/absolute/path/airgap-bundle-openshift-<date>.tar.gz"
-   ```
+Air-gap installation must run on a Linux x86_64 installer machine because Red
+Hat `oc-mirror` is Linux-only. A RHEL 9 container running under Docker Desktop
+is supported when it can reach the Mac's VPN routes and has enough Docker disk
+capacity for temporary mirror archives.
 
-   The bundle contains Helm charts, static manifests, and the small model
-   metadata profile required to verify pre-staged weights:
-   - `manifests/cert-manager.yaml` (v1.13.0), `manifests/local-path-storage.yaml`
-     (v0.0.26)
-   - `charts/kuberay-operator-1.2.2.tgz`,
-     `charts/opentelemetry-operator-0.121.0.tgz`
-   - `model-metadata/model_artifacts_configs_quantized.yaml`
-   - `airgap-env.sh`, `container-images.txt`, `bundle-versions.txt`,
-     `checksums.sha256`
+### Run the installer from a RHEL 9 container on macOS
 
-2. **Mirror container images** to your internal registry with `oc mirror` (or
-   `crane`), then update `images.registry` and each `images.*` field in the
-   config to the mirrored paths.
+From the repository root on the Mac, build the supplied installer image once:
 
-   `container-images.txt` in the bundle lists the publicly available images
-   (Weaviate, KubeRay, OTel, Fluent Bit, nginx, cert-manager, Splunk,
-   Splunk Operator). **Four image groups are built internally and are not
-   listed as real entries** — they must be mirrored separately from your source
-   registry:
+```bash
+docker build --platform linux/amd64 \
+  -f tools/cluster_setup/Dockerfile.openshift-installer-rhel9 \
+  -t splunk-ai-openshift-installer:rhel9 .
+```
 
-   | Config key | Images to mirror |
-   |---|---|
-   | `images.operator.image` | Splunk AI Operator image |
-   | `images.ray.headImage`, `images.ray.workerImage` | Ray head + worker GPU images |
-   | `images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage` | SAIA API v1/v2 + data loader images |
-   | `images.slim.apiImage` | SLIM API image (when the `slim` feature is enabled) |
+Start the container with the repository and kubeconfig mounted. The separate
+home directory keeps Helm and registry state writable while generated files
+remain owned by the Mac user:
 
-   Mirror all four groups in addition to the images in `container-images.txt`,
-   or the install will hit `ImagePullBackOff` on those pods.
+```bash
+mkdir -p "$HOME/.splunk-ai-installer"
 
-3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
-   (`certified-operators`) via `oc mirror`, and apply the generated
-   `ImageDigestMirrorSet`/`ImageTagMirrorSet` (or legacy
-   `ImageContentSourcePolicy`) plus `CatalogSource`. Mirror the complete package
-   closure, including every GPU Operator related image, and preserve the
-   matching OpenShift 4.21 release/Driver Toolkit images in the disconnected
-   registry.
+docker run --rm -it --platform linux/amd64 \
+  --name splunk-ai-openshift-installer \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/installer/home \
+  -e KUBECONFIG=/installer/kubeconfig \
+  -v "$HOME/.splunk-ai-installer:/installer/home" \
+  -v "$HOME/.kube/openshift:/installer/kubeconfig:ro" \
+  -v "$PWD:/workspace/splunk-ai-operator" \
+  -w /workspace/splunk-ai-operator/tools/cluster_setup \
+  splunk-ai-openshift-installer:rhel9 bash
+```
 
-4. **Stage model weights** separately (~60 GB) via
-   `tools/artifacts_download_upload_scripts/`.
+Inside the container, confirm access and run the normal installer:
 
-5. **Run the normal installer command** on the install machine:
-   ```bash
-   CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
-   ```
-   With no configured bundle path, the entry point first creates the bundle on
-   the internet-connected installer. With a configured path, it uses the
-   transferred bundle directly. It then extracts the bundle, verifies SHA-256
-   checksums (hard-fails on mismatch), exports the `file://` overrides, and
-   re-enters `openshift_with_stack.sh install` with a recursion guard.
+```bash
+oc whoami
+oc get clusterversion version
+CONFIG_FILE=./openshift-cluster-config-local.yaml ./openshift_with_stack.sh install
+```
 
-For a one-run override without editing YAML, set `AIRGAP_MODE=true`. Set
-`OPENSHIFT_AIRGAP_BUNDLE=/absolute/path/bundle.tar.gz` to use a transferred
-bundle without adding `cluster.airgapBundlePath` to the config.
+Connect the Mac to the required VPN before starting Docker. If `oc whoami`
+times out inside the container, reconnect the VPN and restart Docker Desktop so
+its Linux virtual machine receives the current routes, or use a reachable Linux
+installer host.
 
-**Not bundled** (and why): container images (`oc mirror`), NFD/GPU Operator (OLM
-catalog mirror), NVIDIA driver/operand containers and the OpenShift Driver
-Toolkit image (the disconnected mirror must provide them), the k0s binary/yq
-(OpenShift is a pre-existing cluster), MetalLB (OpenShift uses Routes),
-kube-prometheus-stack (OpenShift ships its own monitoring), and model weights
-(staged separately). Unlike the k0s air-gap workflow, this bundle does **not**
-download NVIDIA RPM/DEB driver packages. The GPU Operator builds/loads the node
-driver from mirrored container content, and the installer proves success by
-waiting for allocatable `nvidia.com/gpu` capacity.
+The installer automatically handles:
 
-Follow NVIDIA's [disconnected GPU Operator guide](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/mirror-gpu-ocp-disconnected.html)
-and Red Hat's [OpenShift 4.21 disconnected-environment guide](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/disconnected_environments/index)
-to create and transfer that mirror content before running the offline installer.
+- cert-manager, local-path-provisioner, KubeRay, and OpenTelemetry content
+- Node Feature Discovery Operator and NVIDIA GPU Operator content
+- GPU operand and driver images
+- the target cluster's current OpenShift Driver Toolkit image when it is not
+  already supplied by the cluster's disconnected base-release mirror
+- generated `ImageDigestMirrorSet`, `ImageTagMirrorSet`, and CatalogSources
+
+The customer still provides:
+
+- application images listed under `images.*` in `images.registry`
+- model weights in the configured object store, unless model staging is enabled
+- registry credentials, object-store credentials, or Hugging Face tokens
+
+The installer builds temporary registry authentication from the cluster global
+pull secret and `imagePullSecrets.custom`. Run:
+
+```bash
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
+```
+
+For a controlled, isolated network, OpenShift can use the same plain-HTTP design
+as k0s. Set `images.registryInsecure: true` and use an `http://` object-store
+endpoint. The installer preserves existing OpenShift registry policy, adds the
+configured registry to `image.config.openshift.io/cluster` insecure registries,
+allows HTTP on matching OpenShift Routes, and waits for the configured AI-tier
+nodes to receive the container-runtime change. Leave this disabled for
+production or any network where traffic can be observed.
+
+The existing disconnected OpenShift cluster remains responsible for its base
+release image mirror. The installer adds only the platform-specific
+Operator and infrastructure content listed above.
 
 ---
 
@@ -818,7 +816,14 @@ to create and transfer that mirror content before running the offline installer.
 
 Model artifacts are downloaded from HuggingFace and uploaded to your object
 store. Staging is controlled by `storage.modelStaging.enabled` (or forced by the
-`stage-artifacts` subcommand) and is skipped entirely in air-gap mode.
+`stage-artifacts` subcommand). Air-gap mode does not disable staging because the
+installer machine, not the cluster nodes, performs downloads and uploads.
+
+With staging enabled, completion markers are checked first. If all models are
+current, no download occurs. Otherwise, only missing or changed models are
+downloaded and uploaded. On an isolated installer, set staging to `false` only
+after every required model has been staged; installation then verifies all
+markers and fails early if any model is missing.
 
 OpenShift uses `model_artifacts_configs_quantized.yaml` for RTX Pro 6000
 Blackwell deployments (all models are non-gated):

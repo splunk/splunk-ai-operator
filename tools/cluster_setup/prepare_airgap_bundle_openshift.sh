@@ -1,154 +1,85 @@
 #!/usr/bin/env bash
-# prepare_airgap_bundle_openshift.sh
-# Run on an internet-connected machine to download every Helm chart and static
-# manifest needed by openshift_with_stack.sh. Produces a single tar.gz that
-# can be copied to an air-gapped OpenShift installer machine. Set the resulting
-# tarball as cluster.airgapBundlePath; the normal openshift_with_stack.sh install
-# command then consumes it through install_from_airgap_bundle_openshift.sh.
-#
-# NOTE: This script does NOT bundle container images, OLM catalog content, or
-# NVIDIA driver/Driver Toolkit images.
-#   - Container images: mirror them using `oc mirror` + your internal registry.
-#     See container-images.txt in the output bundle for the full image list.
-#   - NFD / GPU Operator: install via OLM from a mirrored catalog
-#     (oc mirror + ImageContentSourcePolicy). See bundle README section.
-#   - Model weights: stage separately via tools/artifacts_download_upload_scripts/.
-#
-# Usage:
-#   ./prepare_airgap_bundle_openshift.sh [--output-dir DIR]
-#
-# Requirements on this machine:
-#   curl, helm, tar, gzip, sha256sum (or shasum on macOS)
+# Build the installer-owned OpenShift transfer bundle on a connected machine.
+# Customer-provided application images from images.* and model weights are
+# deliberately excluded. Operator Lifecycle Manager content and infrastructure
+# images are captured with Red Hat oc-mirror v2 for automatic import later.
 
 set -euo pipefail
 
-# ── Versions (keep in sync with openshift_with_stack.sh) ────────────────────
 CERT_MANAGER_VERSION="v1.13.0"
 LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
 KUBERAY_CHART_VERSION="1.2.2"
 OTEL_CHART_VERSION="0.121.0"
+QUALIFIED_OPENSHIFT_VERSION="4.21"
+NFD_CHANNEL="stable"
+GPU_CHANNEL="v26.3"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODEL_METADATA_SOURCE="${SCRIPT_DIR}/../artifacts_download_upload_scripts/model_artifacts_configs_quantized.yaml"
-
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/openshift-cluster-config.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle-openshift}"
 
-# ── Argument parsing ─────────────────────────────────────────────────────────
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
-    -h|--help)
-      cat <<'HELP'
-prepare_airgap_bundle_openshift.sh — download all Splunk AI Platform install
-artifacts needed by openshift_with_stack.sh into a self-contained tar.gz bundle
-for air-gapped OpenShift deployments.
+# Print the connected-side bundle-builder contract and command options.
+usage() {
+  cat <<'HELP'
+prepare_airgap_bundle_openshift.sh — build the installer-owned content bundle
+for a disconnected OpenShift deployment.
 
 USAGE
   ./prepare_airgap_bundle_openshift.sh [OPTIONS]
 
 OPTIONS
-  --output-dir DIR      Directory where the bundle is written.
-                        Default: ./airgap-bundle-openshift
-                        Env: OUTPUT_DIR
+  --config FILE       OpenShift cluster config used by the target install.
+                      Default: ./openshift-cluster-config.yaml beside this script
+  --output-dir DIR    Output directory. Default: ./airgap-bundle-openshift
+  -h, --help          Show this help.
 
-  -h, --help            Show this help text.
+BUNDLED AUTOMATICALLY
+  - cert-manager and local-path-provisioner manifests
+  - KubeRay Operator and OpenTelemetry Operator Helm charts
+  - infrastructure images referenced by the manifests and charts
+  - Node Feature Discovery Operator package and operand images
+  - NVIDIA GPU Operator package, driver, and operand images
+  - the target cluster's current OpenShift Driver Toolkit image
+  - the oc-mirror binary used to import the image archives
 
-WHAT IS BUNDLED
-  manifests/
-    cert-manager.yaml          — cert-manager CRDs + controller
-    local-path-storage.yaml    — Rancher local-path provisioner
+NOT BUNDLED
+  - application images listed under images.* in the cluster config; the customer
+    must provide those in the configured internal registry
+  - model weights; install-time model staging checks the configured object store,
+    skips current models, and downloads/uploads only missing or changed models
+  - registry credentials, object-store credentials, or Hugging Face tokens
 
-  charts/
-    opentelemetry-operator-0.121.0.tgz — OTel operator chart (pinned)
-    kuberay-operator-1.2.2.tgz    — KubeRay operator (pinned)
-
-  model-metadata/
-    model_artifacts_configs_quantized.yaml — required model IDs and marker URLs
-
-  airgap-env.sh         — Source this to set env-var overrides before a manual install
-  container-images.txt  — Full list of images to mirror to your internal registry
-  bundle-versions.txt   — Records all component versions for reproducibility
-  checksums.sha256      — SHA-256 checksums for every file in the bundle
-
-WHAT IS NOT BUNDLED (and why)
-  Container images
-    OpenShift uses oc mirror + ImageContentSourcePolicy / ImageDigestMirrorSet to
-    redirect pulls from public registries to your internal mirror. Run:
-      oc mirror --config=imageset-config.yaml file:///path/to/mirror
-    then push the mirror to your registry. See container-images.txt for the list.
-
-  NFD / GPU Operator (OLM)
-    Install via OLM from a mirrored OperatorHub catalog:
-      oc mirror --config=imageset-config.yaml file:///path/to/mirror
-    Apply the resulting ImageContentSourcePolicy + CatalogSource, then create
-    Subscription objects as normal.
-
-  NVIDIA GPU driver and OpenShift Driver Toolkit images
-    The GPU Operator installs the driver through containers; this bundle does
-    not contain host RPM/DEB packages or those driver containers. Mirror the
-    complete gpu-operator-certified package closure (all related images) and
-    retain the matching OpenShift 4.21 release/Driver Toolkit images in the
-    disconnected registry. The installer fails if the CatalogSources or image
-    mirror policies are missing, and later waits for allocatable GPUs.
-
-  k0s binary / yq — not applicable (OpenShift provides its own cluster)
-  MetalLB — not applicable (OpenShift uses Routes; MetalLB is k0s-only)
-  kube-prometheus-stack — not applicable (OpenShift ships its own monitoring stack)
-  NVIDIA device plugin manifest — not applicable (GPU Operator via OLM handles this)
-  GPU node OS packages — not applicable (GPU Operator manages driver lifecycle)
-  Model weights — stage separately via tools/artifacts_download_upload_scripts/
-
-ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
-  These are exported automatically by install_from_airgap_bundle_openshift.sh.
-  You only need to set them manually if you extract the bundle yourself.
-
-  CERT_MANAGER_MANIFEST_URL   URL/path to cert-manager.yaml (file:// or https://)
-  LOCAL_PATH_MANIFEST_URL     URL/path to local-path-storage.yaml
-  OTEL_CHART_PATH             Local path to opentelemetry-operator .tgz
-  KUBERAY_CHART_PATH          Local path to kuberay-operator .tgz
-  MODEL_ARTIFACTS_CONFIG_DIR  Directory containing bundled model metadata
-
-EXAMPLES
-  # Basic bundle
-  ./prepare_airgap_bundle_openshift.sh
-
-  # Custom output directory
-  ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer
-
-  # Using env vars instead of flags
-  OUTPUT_DIR=/mnt/transfer ./prepare_airgap_bundle_openshift.sh
-
-NEXT STEPS AFTER BUNDLING
-  1. Mirror container images listed in container-images.txt to your internal registry.
-     Update images.registry and images.* in your openshift-cluster-config.yaml.
-  2. Stage model weights via tools/artifacts_download_upload_scripts/ (separate step).
-  3. For NFD / GPU Operator: mirror OLM catalogs using oc mirror and apply
-     ImageContentSourcePolicy before running the installer.
-  4. Copy the .tar.gz to the air-gapped install machine.
-  5. Set cluster.airgap=true and cluster.airgapBundlePath to the transferred
-     tarball, then run:
-       CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
-
+REQUIREMENTS
+  curl, helm, jq, oc, oc-mirror, tar, yq v4
+  - Bundle preparation requires Linux because Red Hat distributes oc-mirror
+    for Linux.
+  - oc must be logged in to the target OpenShift cluster so its exact Driver
+    Toolkit image can be discovered.
+  - oc-mirror must be able to pull from Red Hat and public registries. The
+    normal openshift_with_stack.sh install entry point builds its auth file from
+    the cluster pull secret and imagePullSecrets.custom. For direct standalone
+    use of this helper, REGISTRY_AUTH_FILE remains available.
 HELP
-      exit 0
-      ;;
-    *) echo "Unknown option: $1" >&2; echo "Run with --help for usage." >&2; exit 1 ;;
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config) CONFIG_FILE="$2"; shift 2 ;;
+    --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
-BUNDLE_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-BUNDLE_NAME="airgap-bundle-openshift-${BUNDLE_TIMESTAMP}"
-STAGE_DIR="${OUTPUT_DIR}/${BUNDLE_NAME}"
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO  $*"; }
-warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN  $*" >&2; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR $*" >&2; exit 1; }
 
+# Fail early when a required connected-side command is unavailable.
 require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || err "Required tool not found: $1 — install it before running this script."
+  command -v "$1" >/dev/null 2>&1 || err "Required tool not found: $1"
 }
 
+# Print a portable SHA-256 digest on Linux or macOS.
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -157,283 +88,260 @@ sha256() {
   fi
 }
 
+# Download one pinned manifest with bounded retries.
 download() {
   local url="$1" dest="$2"
-  log "Downloading $(basename "$dest") ..."
-  if ! curl -fsSL --retry 3 --retry-delay 5 -o "$dest" "$url"; then
-    err "Download failed: $url"
+  log "Downloading $(basename "${dest}")"
+  curl -fsSL --retry 3 --retry-delay 5 -o "${dest}" "${url}" \
+    || err "Download failed: ${url}"
+}
+
+# Resolve a file path without depending on GNU realpath.
+absolute_path() {
+  local path="$1" dir base
+  dir=$(cd "$(dirname "${path}")" && pwd)
+  base=$(basename "${path}")
+  printf '%s/%s\n' "${dir}" "${base}"
+}
+
+# Match openshift_with_stack.sh image resolution so this inventory names the
+# exact application references the customer must make available.
+resolved_application_image() {
+  local image="$1" registry="$2"
+  if [[ "${image}" =~ ^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+ ]]; then
+    printf '%s\n' "${image}"
+  elif [[ -n "${registry}" && "${registry}" != "null" ]]; then
+    printf '%s/%s\n' "${registry%/}" "${image#/}"
+  else
+    printf '%s\n' "${image}"
   fi
 }
 
-# ── Pre-flight ─────────────────────────────────────────────────────────────────
-require_cmd curl
-require_cmd helm
-require_cmd tar
-[[ -f "${MODEL_METADATA_SOURCE}" ]] \
-  || err "Required model metadata not found: ${MODEL_METADATA_SOURCE}. Run this script from a complete repository checkout."
+# oc-mirror v2 requires an explicit registry hostname for additionalImages.
+# Kubernetes treats unqualified names as Docker Hub references; record that
+# expansion directly so the mirror mapping is deterministic.
+qualified_additional_image() {
+  local image="$1" first
+  first="${image%%/*}"
+  if [[ "${image}" != */* ]]; then
+    printf 'docker.io/library/%s\n' "${image}"
+  elif [[ "${first}" == *.* || "${first}" == *:* || "${first}" == "localhost" ]]; then
+    printf '%s\n' "${image}"
+  else
+    printf 'docker.io/%s\n' "${image}"
+  fi
+}
 
-log "=== Splunk AI Platform — OpenShift Air-Gap Bundle Preparation ==="
-log "Output directory : ${OUTPUT_DIR}"
-log "Bundle name      : ${BUNDLE_NAME}"
-log ""
-log "Component versions:"
-log "  cert-manager          : ${CERT_MANAGER_VERSION}"
-log "  local-path-provisioner: ${LOCAL_PATH_PROVISIONER_VERSION}"
-log "  kuberay chart         : ${KUBERAY_CHART_VERSION}"
-log "  otel chart            : ${OTEL_CHART_VERSION}"
-log ""
+# Append concrete container image references rendered in a static manifest.
+append_manifest_images() {
+  local file="$1" output="$2"
+  yq eval \
+    '.. | select(tag == "!!map" and has("image")) | .image | select(tag == "!!str")' \
+    "${file}" 2>/dev/null \
+    | sed '/^---$/d' \
+    | grep -v '^busybox\(:.*\)\?$' \
+    >> "${output}" || true
+}
 
-mkdir -p \
-  "${STAGE_DIR}/manifests" \
-  "${STAGE_DIR}/charts" \
-  "${STAGE_DIR}/model-metadata"
+# Render a Helm chart and append images used by non-test workloads.
+append_chart_images() {
+  local release="$1" chart="$2" output="$3"
+  helm template "${release}" "${chart}" 2>/dev/null \
+    | yq eval \
+        '.. | select(tag == "!!map" and has("image")) | .image | select(tag == "!!str")' - 2>/dev/null \
+    | sed '/^---$/d' \
+    | grep -v '^busybox\(:.*\)\?$' \
+    >> "${output}" || true
+}
 
-# ── 1. Static Kubernetes manifests ────────────────────────────────────────────
-log "--- Downloading static manifests ---"
+[[ "$(uname -s)" == "Linux" ]] \
+  || err "Disconnected bundle preparation requires Linux because Red Hat oc-mirror is Linux-only."
+require_cmd oc-mirror
+for tool in curl helm jq oc tar yq; do require_cmd "${tool}"; done
+[[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
+yq eval '.' "${CONFIG_FILE}" >/dev/null || err "Invalid YAML: ${CONFIG_FILE}"
+oc whoami >/dev/null 2>&1 || err "oc is not logged in to the target OpenShift cluster"
+
+CONFIG_FILE=$(absolute_path "${CONFIG_FILE}")
+OPENSHIFT_VERSION=$(yq eval ".openshift.requiredVersion // \"${QUALIFIED_OPENSHIFT_VERSION}\"" "${CONFIG_FILE}")
+[[ "${OPENSHIFT_VERSION}" == "${QUALIFIED_OPENSHIFT_VERSION}" ]] \
+  || err "This installer bundle is qualified only for OpenShift ${QUALIFIED_OPENSHIFT_VERSION}; config requests ${OPENSHIFT_VERSION}"
+IMAGE_REGISTRY=$(yq eval '.images.registry // ""' "${CONFIG_FILE}")
+
+DRIVER_TOOLKIT_IMAGE="${OPENSHIFT_DRIVER_TOOLKIT_IMAGE:-}"
+if [[ -z "${DRIVER_TOOLKIT_IMAGE}" ]]; then
+  DRIVER_TOOLKIT_IMAGE=$(oc get imagestream driver-toolkit -n openshift -o json 2>/dev/null \
+    | jq -r '[.status.tags[]?.items[]?.dockerImageReference][0] // empty')
+fi
+[[ -n "${DRIVER_TOOLKIT_IMAGE}" ]] || err "Could not resolve the target cluster's OpenShift Driver Toolkit image. Log in with oc or set OPENSHIFT_DRIVER_TOOLKIT_IMAGE to its digest reference."
+
+BUNDLE_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+BUNDLE_NAME="airgap-bundle-openshift-${BUNDLE_TIMESTAMP}"
+STAGE_DIR="${OUTPUT_DIR}/${BUNDLE_NAME}"
+mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/charts" "${STAGE_DIR}/manifests" "${STAGE_DIR}/mirror"
+
+log "=== OpenShift disconnected bundle preparation ==="
+log "Config              : ${CONFIG_FILE}"
+log "OpenShift           : ${OPENSHIFT_VERSION}"
+log "Driver Toolkit      : ${DRIVER_TOOLKIT_IMAGE}"
+log "Application registry: ${IMAGE_REGISTRY:-<not set>}"
 
 download \
   "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml" \
   "${STAGE_DIR}/manifests/cert-manager.yaml"
-
 download \
   "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml" \
   "${STAGE_DIR}/manifests/local-path-storage.yaml"
 
-# Model weights remain external, but the installer needs this small immutable
-# profile to verify every pre-staged completion marker on the disconnected side.
-cp "${MODEL_METADATA_SOURCE}" "${STAGE_DIR}/model-metadata/"
-
-# ── 2. Helm charts ────────────────────────────────────────────────────────────
-log "--- Pulling Helm charts ---"
-
-helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
-helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 2>/dev/null || true
-helm repo update open-telemetry kuberay
-
-# opentelemetry-operator — pinned to the qualified chart version
-helm pull open-telemetry/opentelemetry-operator \
-  --version "${OTEL_CHART_VERSION}" \
-  --destination "${STAGE_DIR}/charts"
+log "Pulling pinned Helm charts"
+helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts >/dev/null 2>&1 || true
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/ >/dev/null 2>&1 || true
+helm repo update open-telemetry kuberay >/dev/null
+helm pull open-telemetry/opentelemetry-operator --version "${OTEL_CHART_VERSION}" --destination "${STAGE_DIR}/charts"
+helm pull kuberay/kuberay-operator --version "${KUBERAY_CHART_VERSION}" --destination "${STAGE_DIR}/charts"
 echo "${OTEL_CHART_VERSION}" > "${STAGE_DIR}/charts/opentelemetry-operator.version"
 
-# kuberay — pinned
-helm pull kuberay/kuberay-operator \
-  --version "${KUBERAY_CHART_VERSION}" \
-  --destination "${STAGE_DIR}/charts"
+# Keep the host-compatible plugin in the transfer bundle so import does not
+# require a separate oc-mirror installation.
+cp -L "$(command -v oc-mirror)" "${STAGE_DIR}/bin/oc-mirror"
+chmod +x "${STAGE_DIR}/bin/oc-mirror"
 
-# ── 3. Env-var override manifest ──────────────────────────────────────────────
-log "--- Writing env-var override manifest ---"
+APPLICATION_RAW="${STAGE_DIR}/.application-images.raw"
+: > "${APPLICATION_RAW}"
+for path in \
+  '.images.operator.image' \
+  '.images.ray.headImage' \
+  '.images.ray.workerImage' \
+  '.images.weaviate.image' \
+  '.images.saia.apiImage' \
+  '.images.saia.apiV2Image' \
+  '.images.saia.dataLoaderImage' \
+  '.images.slim.apiImage' \
+  '.images.splunk.image' \
+  '.images.splunk.operatorImage' \
+  '.images.fluentBit.image' \
+  '.images.otelCollector.image' \
+  '.images.nginx.image'; do
+  image=$(yq eval "${path} // \"\"" "${CONFIG_FILE}")
+  [[ -n "${image}" && "${image}" != "null" ]] \
+    && resolved_application_image "${image}" "${IMAGE_REGISTRY}" >> "${APPLICATION_RAW}"
+done
+sort -u "${APPLICATION_RAW}" > "${STAGE_DIR}/customer-provided-images.txt"
+rm -f "${APPLICATION_RAW}"
+
+INFRA_RAW="${STAGE_DIR}/.infrastructure-images.raw"
+: > "${INFRA_RAW}"
+append_manifest_images "${STAGE_DIR}/manifests/cert-manager.yaml" "${INFRA_RAW}"
+append_manifest_images "${STAGE_DIR}/manifests/local-path-storage.yaml" "${INFRA_RAW}"
+append_chart_images kuberay-operator "${STAGE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION}.tgz" "${INFRA_RAW}"
+append_chart_images opentelemetry-operator "${STAGE_DIR}/charts/opentelemetry-operator-${OTEL_CHART_VERSION}.tgz" "${INFRA_RAW}"
+printf '%s\n' \
+  'registry.access.redhat.com/ubi8/ubi-minimal:latest' \
+  "registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9:v${OPENSHIFT_VERSION}" \
+  >> "${INFRA_RAW}"
+# A pre-existing disconnected OpenShift release mirror already owns Driver
+# Toolkit content when the imagestream points into the configured registry.
+if [[ -z "${IMAGE_REGISTRY}" || "${DRIVER_TOOLKIT_IMAGE}" != "${IMAGE_REGISTRY%/}/"* ]]; then
+  printf '%s\n' "${DRIVER_TOOLKIT_IMAGE}" >> "${INFRA_RAW}"
+else
+  log "Driver Toolkit already resolves inside images.registry; reusing the cluster's base release mirror"
+fi
+while IFS= read -r image; do
+  [[ -n "${image}" ]] && qualified_additional_image "${image}"
+done < <(sort -u "${INFRA_RAW}" | grep -v '^$') \
+  | sort -u > "${STAGE_DIR}/bundled-infrastructure-images.txt"
+rm -f "${INFRA_RAW}"
+
+ISC="${STAGE_DIR}/imageset-config.yaml"
+cat > "${ISC}" <<YAML
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+archiveSize: 4
+mirror:
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v${OPENSHIFT_VERSION}
+      packages:
+        - name: nfd
+          channels:
+            - name: ${NFD_CHANNEL}
+    - catalog: registry.redhat.io/redhat/certified-operator-index:v${OPENSHIFT_VERSION}
+      packages:
+        - name: gpu-operator-certified
+          channels:
+            - name: ${GPU_CHANNEL}
+  additionalImages:
+YAML
+while IFS= read -r image; do
+  printf '    - name: %s\n' "${image}" >> "${ISC}"
+done < "${STAGE_DIR}/bundled-infrastructure-images.txt"
+
+log "Capturing Operator Lifecycle Manager packages and infrastructure images"
+# Some certified Operator sources publish the image manifest without the
+# detached signature object. Red Hat documents --remove-signatures for bypassing
+# source-side invalid, expired, or unavailable signatures during mirroring.
+MIRROR_CMD=("${STAGE_DIR}/bin/oc-mirror" --config "${ISC}" "file://${STAGE_DIR}/mirror" --v2 --remove-signatures)
+if [[ -n "${REGISTRY_AUTH_FILE:-}" ]]; then
+  [[ -f "${REGISTRY_AUTH_FILE}" ]] || err "REGISTRY_AUTH_FILE does not exist: ${REGISTRY_AUTH_FILE}"
+  MIRROR_CMD+=(--authfile "${REGISTRY_AUTH_FILE}")
+fi
+# oc-mirror 4.21 v2 treats REGISTRY_AUTH_FILE as its own structured
+# configuration variable and panics when its normal path value is exported.
+# The explicit flag is the supported authentication input for this invocation.
+env -u REGISTRY_AUTH_FILE "${MIRROR_CMD[@]}"
 
 cat > "${STAGE_DIR}/airgap-env.sh" <<'ENVEOF'
-# Source this file before running openshift_with_stack.sh in an air-gapped
-# environment. It points every internet URL to the local bundle.
-#
-# Usage:
-#   source /path/to/bundle/airgap-env.sh
-#   CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
-
-# Set by install_from_airgap_bundle_openshift.sh to the extraction directory.
-# Override here only if you extracted the bundle manually.
-: "${AIRGAP_BUNDLE_DIR:?AIRGAP_BUNDLE_DIR must be set to the bundle extraction path}"
-
-# Static manifests — oc apply -f does not understand file://, so these are bare
-# paths. The installer strips the file:// prefix automatically.
+: "${AIRGAP_BUNDLE_DIR:?AIRGAP_BUNDLE_DIR must point to the extracted bundle}"
 export CERT_MANAGER_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/cert-manager.yaml"
 export LOCAL_PATH_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/local-path-storage.yaml"
-
-# Helm chart paths — installer uses these instead of remote repos when set.
-export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-$(cat "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version").tgz"
-export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION:-1.2.2}.tgz"
-
-# Model IDs and expected source URLs used for mandatory marker verification.
-export MODEL_ARTIFACTS_CONFIG_DIR="${AIRGAP_BUNDLE_DIR}/model-metadata"
-
-# Signal to the installer that this is an air-gapped run.
+export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-0.121.0.tgz"
+export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-1.2.2.tgz"
 export AIRGAP_MODE="true"
 ENVEOF
 
-# ── 4. Container image list ───────────────────────────────────────────────────
-log "--- Generating container image list ---"
-
-cat > "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
-# Container images required by the Splunk AI Platform stack on OpenShift.
-# Mirror ALL of these into your internal registry before running the installer.
-#
-# Recommended mirroring tool: oc mirror (OpenShift mirror registry)
-#   oc mirror --config=imageset-config.yaml file:///path/to/local-mirror
-#
-# Alternative using crane:
-#   while IFS= read -r img; do
-#     [[ "$img" =~ ^# ]] && continue
-#     [[ -z "$img" ]] && continue
-#     dest="your-internal-registry.example.com/${img##*/}"
-#     crane copy "$img" "$dest"
-#   done < container-images.txt
-#
-# After mirroring, update images.registry in your openshift-cluster-config.yaml
-# to your internal registry prefix, and set each images.* field to the mirrored path.
-
-# ── Splunk ───────────────────────────────────────────────────────────────────
-# Set images.splunk.image / images.splunk.operatorImage in cluster config
-splunk/splunk:10.2.0
-docker.io/splunk/splunk-operator:3.0.0
-
-# ── Ray ──────────────────────────────────────────────────────────────────────
-# Built internally — not on a public registry.
-# Set images.ray.headImage and images.ray.workerImage in cluster config.
-# Example (replace with your actual build tags):
-#   <your-ecr>/ml-platform/ray/ray-head:build-953
-#   <your-ecr>/ml-platform/ray/ray-worker-gpu:build-953
-
-# ── SAIA ─────────────────────────────────────────────────────────────────────
-# Built internally — set images.saia.* in cluster config.
-# Example:
-#   <your-ecr>/ml-platform/saia/saia-api:build-v2-main-c3b489d
-#   <your-ecr>/ml-platform/saia/saia-api-v2:build-v2-main-c3b489d
-#   <your-ecr>/ml-platform/saia/saia-data-loader:build-v2-main-c3b489d
-
-# ── SLIM ─────────────────────────────────────────────────────────────────────
-# Built internally — set images.slim.apiImage in cluster config when the
-# "slim" feature is enabled.
-# Example:
-#   <your-ecr>/ml-platform/slim/slim-api:build-1
-
-# ── Weaviate ──────────────────────────────────────────────────────────────────
-docker.io/semitechnologies/weaviate:stable-v1.28-007846a
-
-# ── KubeRay Operator ─────────────────────────────────────────────────────────
-quay.io/kuberay/operator:v1.2.2
-
-# ── OpenTelemetry ─────────────────────────────────────────────────────────────
-# Collector image (injected into OpenTelemetryCollector CRs). The operator's own
-# controller-manager + kube-rbac-proxy images are appended below from the bundled chart.
-docker.io/otel/opentelemetry-collector-contrib:0.122.1
-
-# ── Fluent Bit ────────────────────────────────────────────────────────────────
-docker.io/fluent/fluent-bit:1.9.6
-
-# ── Nginx ─────────────────────────────────────────────────────────────────────
-docker.io/library/nginx:1.27-alpine
-
-# ── cert-manager (images extracted from bundled manifest) ─────────────────────
-IMGEOF
-
-grep 'image: ' "${STAGE_DIR}/manifests/cert-manager.yaml" 2>/dev/null | sed 's/.*image: *//' | awk '{print $1}' | sort -u >> "${STAGE_DIR}/container-images.txt" || true
-
-cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
-
-# ── local-path-provisioner ────────────────────────────────────────────────────
-# The helper pod and `oc debug` relabeling image is hard-coded to ubi8/ubi-minimal
-# in openshift_with_stack.sh (no tag → :latest); mirror the exact image it pulls.
-registry.access.redhat.com/ubi8/ubi-minimal:latest
-IMGEOF
-
-# opentelemetry-operator controller images — extracted from the bundled chart so they
-# always match the version pulled above (chart version is resolved dynamically). The
-# installer only overrides manager.collectorImage; the manager (+ any rbac-proxy) image
-# comes from chart defaults, so a disconnected install that mirrors only this list would
-# otherwise ImagePullBackOff on the operator pod. Rendered images are inline-quoted, e.g.
-#   image: "ghcr.io/.../opentelemetry-operator:0.154.0"
-# Exclude helm test-hook images (busybox:latest) — they never deploy during install.
-{
-  echo ""
-  echo "# ── OpenTelemetry Operator (controller images from bundled chart) ─────────────"
-  helm template opentelemetry-operator \
-    "${STAGE_DIR}/charts/opentelemetry-operator-${OTEL_CHART_VERSION}.tgz" \
-    2>/dev/null \
-    | grep -oE 'image:[[:space:]]*"?[^[:space:]"]+' \
-    | sed -E 's/^image:[[:space:]]*"?//' \
-    | grep -v '^busybox:' \
-    | sort -u
-} >> "${STAGE_DIR}/container-images.txt" || true
-
-grep 'image: ' "${STAGE_DIR}/manifests/local-path-storage.yaml" 2>/dev/null | sed 's/.*image: *//' | awk '{print $1}' | sort -u >> "${STAGE_DIR}/container-images.txt" || true
-
-cat >> "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
-
-# ── OLM Operators (NFD + GPU Operator) ───────────────────────────────────────
-# These are NOT direct image references — they are OLM Subscriptions backed by
-# OperatorHub catalog content. Mirror them with oc mirror:
-#
-#   The GPU Operator ships in the CERTIFIED catalog (certified-operators /
-#   certified-operator-index) while NFD ships in the redhat-operators catalog
-#   (redhat-operator-index). They must be mirrored from their respective catalogs,
-#   matching the installer defaults: operators.gpu.catalogSource=certified-operators,
-#   operators.nfd.catalogSource=redhat-operators.
-#
-#   imageset-config.yaml example:
-#     kind: ImageSetConfiguration
-#     apiVersion: mirror.openshift.io/v1alpha2
-#     mirror:
-#       operators:
-#         - catalog: registry.redhat.io/redhat/certified-operator-index:v4.21
-#           packages:
-#             - name: gpu-operator-certified
-#         - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.21
-#           packages:
-#             - name: nfd
-#
-#   Then apply the generated ImageDigestMirrorSet/ImageTagMirrorSet (or legacy
-#   ImageContentSourcePolicy) and CatalogSource resources.
-#   Mirror every related image reported for these packages and preserve the
-#   OpenShift 4.21 release/Driver Toolkit mirror used by the GPU driver build.
-#   See: https://docs.openshift.com/container-platform/4.21/installing/disconnected_install/
-
-# ── NOTE: Model weights (HuggingFace) ─────────────────────────────────────────
-# Model weights (~60 GB total) are NOT container images.
-# Use tools/artifacts_download_upload_scripts/ to stage them separately to S3/MinIO.
-# Models: gemma-4-31b-it-qat-w4a16-ct, gpt-oss-20b, all-minilm-l6-v2,
-#         cross-encoder, e5-language-classifier, fm_timeseries,
-#         mbart-translator, pii-classifier, uae-large,
-#         xlm-roberta-language-classifier
-IMGEOF
-
-# ── 5. Write version manifest ─────────────────────────────────────────────────
 cat > "${STAGE_DIR}/bundle-versions.txt" <<VEOF
 cert_manager_version=${CERT_MANAGER_VERSION}
 local_path_provisioner_version=${LOCAL_PATH_PROVISIONER_VERSION}
 kuberay_chart_version=${KUBERAY_CHART_VERSION}
 otel_chart_version=${OTEL_CHART_VERSION}
+openshift_version=${OPENSHIFT_VERSION}
+bundle_os=$(uname -s)
+bundle_arch=$(uname -m)
 bundle_timestamp=${BUNDLE_TIMESTAMP}
 VEOF
 
-# ── 6. Checksums ──────────────────────────────────────────────────────────────
-log "--- Computing checksums ---"
+cat > "${STAGE_DIR}/README.txt" <<'README'
+This bundle contains installer-owned OpenShift infrastructure content only.
+The disconnected installer imports its oc-mirror archives into images.registry
+and applies generated image mirror policies and Operator catalog sources.
+
+The customer must separately provide every image in customer-provided-images.txt.
+Model weights are not bundled. With storage.modelStaging.enabled=true, the
+installer checks completion markers in the configured object store and downloads
+and uploads only missing or changed models from the installer machine.
+
+Registry credentials and Hugging Face credentials are intentionally external
+to the bundle. The installer reads registry credentials from the target
+cluster/config when it runs.
+README
+
+log "Computing checksums"
 (
   cd "${STAGE_DIR}"
-  find . -type f ! -name "checksums.sha256" | sed 's|^\./||' | sort | while read -r f; do
-    printf "%s  %s\n" "$(sha256 "$f")" "$f"
+  # oc-mirror updates mirror/working-dir during disk-to-registry import. Verify
+  # the transfer archives and all installer assets, but do not checksum that
+  # explicitly mutable retry workspace.
+  find . -type f ! -name checksums.sha256 ! -path './mirror/working-dir/*' \
+    | sed 's#^./##' | sort | while IFS= read -r file; do
+    printf '%s  %s\n' "$(sha256 "${file}")" "${file}"
   done
 ) > "${STAGE_DIR}/checksums.sha256"
-log "Checksums written to ${STAGE_DIR}/checksums.sha256"
 
-# ── 7. Pack the bundle ────────────────────────────────────────────────────────
-log "--- Creating tar.gz bundle ---"
 BUNDLE_TARBALL="${OUTPUT_DIR}/${BUNDLE_NAME}.tar.gz"
 tar -czf "${BUNDLE_TARBALL}" -C "${OUTPUT_DIR}" "${BUNDLE_NAME}"
+BUNDLE_SIZE=$(du -sh "${BUNDLE_TARBALL}" | awk '{print $1}')
+BUNDLE_SHA=$(sha256 "${BUNDLE_TARBALL}")
 
-BUNDLE_SIZE="$(du -sh "${BUNDLE_TARBALL}" | cut -f1)"
-BUNDLE_SHA="$(sha256 "${BUNDLE_TARBALL}")"
-log ""
-log "=== Bundle ready ==="
-log "  File  : ${BUNDLE_TARBALL}"
-log "  Size  : ${BUNDLE_SIZE}"
-log "  SHA256: ${BUNDLE_SHA}"
-log ""
-log "Next steps:"
-log "  1. Mirror the container images listed in:"
-log "       ${STAGE_DIR}/container-images.txt"
-log "     to your internal registry. Update images.* in your cluster config."
-log "     For NFD/GPU Operator, mirror OLM catalogs with oc mirror."
-log ""
-log "  2. Stage model weights (if not already staged) using:"
-log "       tools/artifacts_download_upload_scripts/"
-log ""
-log "  3. Copy ${BUNDLE_TARBALL} to the air-gapped install machine."
-log ""
-log "  4. On the install machine, set cluster.airgap=true and"
-log "     cluster.airgapBundlePath to the transferred tarball, then run:"
-log "       CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install"
-log ""
-log "Cleaning up staging directory..."
-rm -rf "${STAGE_DIR}"
+log "Bundle ready: ${BUNDLE_TARBALL} (${BUNDLE_SIZE})"
+log "SHA256: ${BUNDLE_SHA}"
+log "Customer application image inventory: ${STAGE_DIR}/customer-provided-images.txt"
+log "Run the normal install command with cluster.airgap=true and this bundle path."

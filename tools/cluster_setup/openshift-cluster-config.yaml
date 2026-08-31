@@ -4,16 +4,11 @@
 # Used by openshift_with_stack.sh
 # =============================================================================
 
-# Set airgap=true to use the same openshift_with_stack.sh install command for
-# an air-gapped deployment. With an empty airgapBundlePath, the installer
-# machine must have internet access and creates the small artifact bundle
-# automatically. On an isolated installer machine, set airgapBundlePath to the
-# transferred airgap-bundle-openshift-*.tar.gz file. Images, OLM catalogs and
-# operands, Driver Toolkit content, and model weights must already be mirrored
-# or staged separately.
+# Set airgap=true for an air-gapped deployment. The normal install command then
+# mirrors and configures installer-owned OpenShift dependencies automatically.
+# Air-gap installation must run on Linux because Red Hat oc-mirror is Linux-only.
 cluster:
   airgap: false
-  airgapBundlePath: ""
 
 kubernetes:
   namespace: ai-platform
@@ -53,8 +48,14 @@ openshift:
       # host: "slim.apps.example.com"
 
 images:
-  # Registry prefix applied to images that are not fully qualified
+  # In an air-gapped install this is the internal registry that already contains
+  # the customer-provided images below. The installer automatically imports its
+  # OpenShift infrastructure and Operator content into this registry.
+  # Registry prefix applied to images that are not fully qualified.
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
+  # Lab/isolated-network option only. When true, the installer permits HTTP on
+  # a matching Route and configures OpenShift nodes for insecure image pulls.
+  registryInsecure: false
 
   operator:
     image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.10"
@@ -97,9 +98,13 @@ storage:
     # 2048 GiB at scale 2.
     aiTierNode: 1024
   modelStaging:
-    # false means models were staged separately; the installer still validates
-    # every staging_state completion marker before touching the cluster.
-    enabled: false
+    # true checks every completion marker in the object store, skips models that
+    # are already current, and downloads/uploads only missing or changed models
+    # from the installer machine. Cluster nodes do not need internet access.
+    # Set false in air-gap mode only when every model is already staged; the
+    # installer then verifies all markers and fails before modifying the cluster
+    # if anything is missing.
+    enabled: true
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
     bucket: "ai-platform-bucket"
@@ -139,9 +144,8 @@ aiPlatform:
         effect: "NoSchedule"
 
 operators:
-  # In a disconnected cluster these names must identify READY CatalogSources
-  # backed by mirrored catalog images in openshift-marketplace. The OpenShift
-  # air-gap bundle does not itself mirror GPU drivers or operator operands.
+  # In an air-gapped install the installer assigns these stable names to the
+  # internally mirrored CatalogSources it creates automatically.
   nfd:
     catalogSource: "redhat-operators"
   gpu:

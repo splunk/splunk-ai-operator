@@ -1,0 +1,36 @@
+FROM registry.access.redhat.com/ubi9/ubi:9.6
+
+ARG OPENSHIFT_VERSION=4.21.10
+ARG HELM_VERSION=v3.18.4
+ARG YQ_VERSION=v4.48.1
+
+RUN dnf install -y \
+      bash \
+      findutils \
+      git \
+      gzip \
+      jq \
+      openssl \
+      python3 \
+      tar \
+    && dnf clean all \
+    && curl -fsSL --retry 3 \
+      "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OPENSHIFT_VERSION}/openshift-client-linux-amd64-rhel9-${OPENSHIFT_VERSION}.tar.gz" \
+      | tar -xz -C /usr/local/bin oc kubectl \
+    && curl -fsSL --retry 3 \
+      "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OPENSHIFT_VERSION}/oc-mirror.rhel9.tar.gz" \
+      | tar -xz -C /usr/local/bin oc-mirror \
+    && curl -fsSL --retry 3 \
+      "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+      | tar -xz --strip-components=1 -C /usr/local/bin linux-amd64/helm \
+    && curl -fsSL --retry 3 -o /usr/local/bin/yq \
+      "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+    && curl -fsSL --retry 3 -o /usr/local/bin/mc \
+      "https://dl.min.io/client/mc/release/linux-amd64/mc" \
+    && chmod 0755 /usr/local/bin/oc /usr/local/bin/kubectl \
+      /usr/local/bin/oc-mirror /usr/local/bin/helm /usr/local/bin/yq \
+      /usr/local/bin/mc
+
+WORKDIR /workspace/splunk-ai-operator/tools/cluster_setup
+
+CMD ["bash"]
