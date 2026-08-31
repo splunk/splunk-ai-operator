@@ -145,9 +145,9 @@ The node is not running a supported OS.
    FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
    ```
 
-### "RHEL 10 needs an offline package closure for air-gapped installs on \<role\> \<ip\>"
+### "RHEL 10.2 needs an offline package closure for air-gapped installs on \<role\> \<ip\>"
 
-RHEL 10 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs iptables with in `kernel-modules-extra` rather than the base kernel package. A sealed node cannot fetch that package itself, so a node without it joins and then sits NotReady with no way to recover offline.
+RHEL 10.2 keeps `xt_conntrack` and the other netfilter modules kube-proxy programs iptables with in `kernel-modules-extra` rather than the base kernel package. A sealed node cannot fetch that package itself, so a node without it joins and then sits NotReady with no way to recover offline.
 
 Staging normally handles this: each node is probed over SSH and, for every kernel missing the module, `kernel-modules-extra` is downloaded into `packages/node-closure/`. This error means the node has neither the module nor a staged closure — usually because the bundle was pre-staged with `--download-only` and no node list, so nothing was probed. Re-stage with the node IPs, e.g.:
 
@@ -401,6 +401,24 @@ ssh <ssh-user>@<gpu-ip> "nvidia-smi"
 
 ---
 
+### GPU workloads do not schedule
+
+Confirm that Kubernetes advertises the GPU, then inspect the target node's
+taints and the pending pod's tolerations and events:
+
+```bash
+kubectl get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'
+kubectl describe node <gpu-node> | grep -A3 Taints
+kubectl describe pod <pod-name> -n ai-platform
+kubectl get pod <pod-name> -n ai-platform -o yaml | grep -A5 tolerations
+```
+
+`Insufficient nvidia.com/gpu` means the requested GPU capacity is unavailable.
+A taint-related scheduling event means the workload's tolerations or the node's
+k0s workload labels do not match the configured GPU scheduling policy.
+
+---
+
 ## Helm Chart Install Failures
 
 ### "Helm failed after N attempts"
@@ -450,6 +468,77 @@ kubectl logs -n <operator-namespace> deploy/<operator-name> --tail=50
 
 ## Model Staging Failures
 
+### Models are reported MISSING after upload
+
+The configured bucket may not exist, may be empty, may differ from the bucket
+used during upload, or may lack the expected completion markers. Use lowercase
+bucket names so the configured name and object-store paths remain unambiguous.
+
+```bash
+# MinIO
+mc ls myminio/<bucket>/staging_state/
+mc ls myminio/<bucket>/model_artifacts/
+
+# AWS S3
+aws s3api head-bucket --bucket <bucket>
+aws s3 ls s3://<bucket>/staging_state/
+aws s3 ls s3://<bucket>/model_artifacts/
+```
+
+After correcting the bucket or credentials, stage the required artifacts and
+completion markers again:
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+---
+
+### Switching `defaultAcceleratorType` from L40S to H100 reports models as MISSING
+
+This is expected. L40S selects the unquantized artifact profile, while H100
+selects the quantized profile. Gemma uses different artifact IDs and object-store
+prefixes in those profiles, and the completion marker must match the selected
+artifact URL.
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+---
+
+### `stage-artifacts` fails because `yq` cannot parse the profile
+
+Install the pinned `yq` release used by the installer, confirm it can parse the
+selected artifact profile, and then rerun staging:
+
+```bash
+sudo wget -qO /usr/local/bin/yq \
+  https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
+sudo chmod +x /usr/local/bin/yq
+yq eval '.' tools/artifacts_download_upload_scripts/model_artifacts_configs_unquantized.yaml
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+---
+
+### Re-stage one model without restarting every download
+
+Remove only that model's completion marker, then rerun staging. The installer
+will retain completed models and process the missing one.
+
+```bash
+# MinIO
+mc rm myminio/<bucket>/staging_state/<model-id>/.staging_complete
+
+# AWS S3
+aws s3 rm s3://<bucket>/staging_state/<model-id>/.staging_complete
+
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+```
+
+---
+
 ### "Hugging Face download failed"
 
 ```bash
@@ -464,7 +553,6 @@ bash -x ./download_from_huggingface.sh 2>&1 | tee /tmp/hf-download.log
 
 | Cause | Fix |
 |---|---|
-| Disk full on staging machine | Minimum 250 GB free. `df -h .` to check. |
 | Disk full on staging machine | Minimum 250 GB free. `df -h .` to check. |
 | Interrupted download | Set `SKIP_IF_EXISTS=1` to resume without re-downloading completed files. |
 | Network timeout on large files | Use a stable wired connection. The script is restartable — re-run with `SKIP_IF_EXISTS=1`. |
@@ -622,6 +710,25 @@ kubectl get l2advertisement -n metallb-system
 ---
 
 ## AIPlatform CR Not Ready
+
+### PVC remains Pending
+
+Check the claim, its StorageClass, and the local-path provisioner before
+investigating the application pod:
+
+```bash
+kubectl get pvc -n ai-platform
+kubectl describe pvc <pvc-name> -n ai-platform
+kubectl get storageclass
+kubectl get pods -n local-path-storage
+kubectl logs -n local-path-storage deployment/local-path-provisioner
+```
+
+The provisioner must be running, and the PVC must reference an installed
+StorageClass. For a non-default CSI driver, confirm that its controller and node
+components are healthy.
+
+---
 
 ### AIPlatform stuck in `Pending` or `Reconciling`
 
