@@ -68,12 +68,12 @@ The install machine is missing a required binary.
 
 | Tool | Install |
 |---|---|
-| `kubectl` | `brew install kubectl` / [kubernetes.io/docs/tasks/tools](https://kubernetes.io/docs/tasks/tools/) |
-| `helm` | `brew install helm` / [helm.sh/docs/intro/install](https://helm.sh/docs/intro/install/) |
-| `yq` | `brew install yq` / `wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq` |
-| `jq` | `brew install jq` / `apt-get install jq` / `dnf install jq` |
-| `ssh` | `apt-get install openssh-client` / `brew install openssh` |
-| `curl` | `apt-get install curl` / `brew install curl` |
+| `kubectl` | Follow [Install and Set Up kubectl on Linux](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/) on the supported RHEL installer machine. |
+| `helm` | Follow [Installing Helm](https://helm.sh/docs/intro/install/) on the supported RHEL installer machine. |
+| `yq` | `sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && sudo chmod +x /usr/local/bin/yq` |
+| `jq` | `sudo dnf install -y jq` |
+| `ssh` | `sudo dnf install -y openssh-clients` |
+| `curl` | `sudo dnf install -y curl` |
 
 ---
 
@@ -516,7 +516,7 @@ selected artifact profile, and then rerun staging:
 sudo wget -qO /usr/local/bin/yq \
   https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
 sudo chmod +x /usr/local/bin/yq
-yq eval '.' tools/artifacts_download_upload_scripts/model_artifacts_configs_unquantized.yaml
+yq eval '.' ../artifacts_download_upload_scripts/model_artifacts_configs_unquantized.yaml
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 

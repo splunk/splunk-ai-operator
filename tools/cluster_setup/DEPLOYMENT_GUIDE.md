@@ -71,6 +71,11 @@ across all controllers and workers.
 | Air-gapped — RHEL 10.2 nodes | RHEL 10.2 | RHEL 10.2 | The installer machine requires internet access, SSH access to every sealed node, and `createrepo_c`; staging includes the required `kernel-modules-extra` closure. Cluster nodes require no outbound internet access. |
 | Air-gapped — Ubuntu 24.04 nodes | RHEL 9.8 | Ubuntu 24.04 | The installer machine requires internet access, SSH access to every sealed node, and Podman or Docker to build the Ubuntu package closure. Cluster nodes require no outbound internet access. |
 
+For a standard deployment, either supported RHEL installer release can be
+used with any supported cluster-node OS. Matching the installer RHEL release
+to the node release is required only when building air-gap package closures.
+Ubuntu 24.04 is supported for cluster nodes, not for the installer machine.
+
 The installer machine is separate from the cluster nodes. Run the commands
 locally on it, or SSH into it first when it is remote.
 
@@ -104,10 +109,7 @@ Run it inside a persistent `tmux` or `screen` session on the installer machine
 so an SSH disconnect does not interrupt the job. Install `tmux` if needed:
 
 ```bash
-# Ubuntu 24.04
-sudo apt-get install -y tmux
-
-# RHEL 9.8 or RHEL 10.2
+# RHEL 9.8 or RHEL 10.2 installer machine
 sudo dnf install -y tmux
 
 tmux new -s splunk-ai-install
@@ -1335,8 +1337,8 @@ flowchart TD
 | "Expected chart not found" | `ls ./airgap-bundle/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
 | `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](K0S_README.md#insecure-registry-support-containerd-v2) |
-| All models reported MISSING | `mc ls myminio/<bucket>/staging_state/` or `aws s3api head-bucket --bucket <bucket>` | Confirm the bucket exists, is the configured bucket, and contains `staging_state/` and `model_artifacts/` entries. An empty or missing bucket must be created/populated; uppercase names are normalized, but lowercase config values are recommended. See [Model Staging Issues](K0S_README.md#model-staging-issues) |
-| All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](K0S_README.md#switching-defaultacceleratortype-from-l40s-to-h100-shows-models-as-missing) |
+| All models reported MISSING | `mc ls myminio/<bucket>/staging_state/` or `aws s3api head-bucket --bucket <bucket>` | Confirm the bucket exists, is the configured bucket, and contains `staging_state/` and `model_artifacts/` entries. An empty or missing bucket must be created/populated; uppercase names are normalized, but lowercase config values are recommended. See [Models are reported MISSING after upload](TROUBLESHOOTING.md#models-are-reported-missing-after-upload) |
+| All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](TROUBLESHOOTING.md#switching-defaultacceleratortype-from-l40s-to-h100-reports-models-as-missing) |
 | Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in the staged tree (`--download-only` to inspect); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
 | SAIA service has no external address or is unreachable | `kubectl get svc <cluster-name>-ai-platform-saia-saia-service -n ai-platform -o wide` | `NodePort` and `ClusterIP` services correctly have no `EXTERNAL-IP`; use the reported NodePort or `kubectl port-forward`. For a `LoadBalancer` with no address, check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
