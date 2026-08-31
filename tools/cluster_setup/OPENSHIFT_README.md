@@ -310,7 +310,7 @@ images:
   slim:
     apiImage: "ml-platform/slim/slim-api:build-1"
   splunk:
-    image:         ".../splunk/splunk:10-2-ai-custom"
+    image:         "docker.io/splunk/splunk:10.2-rhel9"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
   fluentBit:     { image: "docker.io/fluent/fluent-bit:1.9.6" }
   otelCollector: { image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1" }
