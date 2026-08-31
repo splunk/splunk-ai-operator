@@ -32,7 +32,7 @@ explanations, diagrams, and edge cases, see
 
 ## Step 1: Prerequisites
 
-**Installer machine** — Ubuntu 24.04, RHEL 9.8, or RHEL 10.2, x86_64/amd64, with SSH
+**Installer machine** — RHEL 9.8 or RHEL 10.2, x86_64/amd64, with SSH
 access to every cluster node and the CLI tools below. Run commands locally or
 SSH into the machine first if it is remote; it is separate from the cluster
 nodes.
@@ -50,35 +50,6 @@ needs:
 **Installer machine tools:**
 
 Steps for setting up the tools:
-
-<details>
-<summary>Ubuntu 24.04</summary>
-
-```bash
-# Install base dependencies
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg git jq openssh-client tar wget
-
-# kubectl pinned to the same Kubernetes version as the k0s binary
-curl -fsSLO https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl
-sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-rm -f kubectl
-
-curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-# pinned to match the version this repo already relies on
-sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
-sudo chmod +x /usr/local/bin/yq
-
-# crane — used by the image-mirroring commands in Step 4; no Docker daemon,
-# root, or group setup required
-curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
-tar -xzf /tmp/crane.tar.gz -C /tmp crane
-sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
-rm -f /tmp/crane.tar.gz /tmp/crane
-```
-
-</details>
 
 <details>
 <summary>RHEL 9.8 / 10.2</summary>
@@ -117,7 +88,7 @@ sudo usermod -aG docker "$USER"   # log out/in (or newgrp docker) to apply
 
 </details>
 
-Verify the tools once after completing the applicable Ubuntu or RHEL setup:
+Verify the tools once after completing the RHEL setup:
 
 ```bash
 kubectl version --client
@@ -136,6 +107,19 @@ Success: each command prints version information and exits successfully.
 - [ ] Object storage reachable from all nodes: MinIO / SeaweedFS / S3 (500 GB+ recommended)
 - [ ] If air-gapped, private registry available for the platform images (standard deployments pull directly from Docker Hub)
 - [ ] Decide your path now: [Standard Deployment](#standard-deployment) (cluster nodes have internet access) or [Air-Gapped Deployment](#air-gapped-deployment) (sealed nodes, no outbound internet)
+
+**Supported operating systems:** use one supported OS family and version across
+all cluster nodes.
+
+| Installer machine OS | Cluster-node OS |
+| :--- | :--- |
+| RHEL 9.8 | RHEL 9.8 or Ubuntu 24.04 |
+| RHEL 10.2 | RHEL 10.2 |
+
+**Supported Splunk Enterprise version:** 10.2 is the tested version for both
+internal/bundled and external Splunk. The bundled deployment uses
+`docker.io/splunk/splunk:10.2-rhel9`; use the corresponding private-registry
+path for air-gapped deployments.
 
 ---
 
@@ -177,19 +161,6 @@ node count to get the cluster total.
 | Model weights | 250 GB | >120 GB for 10 models + re-staging headroom |
 | Runtime data | 100 GB | Grows with usage |
 | **Total bucket** | **500 GB+** | Sufficient for now |
-
-**Supported cluster-node OS:** use one supported OS family and version across
-all nodes in a cluster.
-
-**Installer machine OS:** for standard deployments, use Ubuntu 24.04 or RHEL
-9.8/10.2. For air-gapped deployments, use an x86_64 RHEL 9.8 installer machine
-for RHEL 9.8 or Ubuntu 24.04 clusters, and an x86_64 RHEL 10.2 installer
-machine for RHEL 10.2 clusters.
-
-| OS | Version |
-| :--- | :--- |
-| **RHEL** | 9.8, 10.2 |
-| **Ubuntu** | 24.04 |
 
 ---
 
