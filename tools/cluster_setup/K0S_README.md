@@ -99,44 +99,9 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 Installer-machine, cluster-node, and air-gapped operating-system requirements
 are defined in the canonical
-[Supported platforms matrix](../../docs/deployment/k0s-quick-reference.md#supported-platforms).
+[Supported platforms matrix](DEPLOYMENT_GUIDE.md#supported-platforms).
 
 ### Required Tools (on Installer Machine)
-
-```bash
-# Install required tools on Ubuntu 24.04
-# git and jq are in the default apt repos; kubectl and helm are not — add their
-# upstream repos/install scripts, and yq/crane need sudo to write to /usr/local/bin
-sudo apt-get update
-sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq tmux
-
-# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo apt-get update
-sudo apt-get install -y kubectl
-
-curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-# pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
-sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
-sudo chmod +x /usr/local/bin/yq
-
-# crane — used by the image-mirroring commands below (see Step 2 — Mirror
-# Container Images); no Docker daemon/root/group setup required
-curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
-tar -xzf /tmp/crane.tar.gz -C /tmp crane
-sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
-rm -f /tmp/crane.tar.gz /tmp/crane
-
-# Verify installations
-kubectl version --client
-helm version
-git --version
-jq --version
-yq --version
-crane version
-```
 
 **RHEL 9.8 / RHEL 10.2** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
 default `dnf` repos; `git` and `jq` are. Install each via its own supported
@@ -182,8 +147,8 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 ```
 
 The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images))
-default to `crane copy`, which works on Ubuntu 24.04 and RHEL 9.8/10.2 with no
-Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
+default to `crane copy`, which works on the supported RHEL 9.8/10.2 installer
+machines with no Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
 there too as an equivalent alternative if you already run Docker.
 
 ### Hardware Requirements
@@ -203,7 +168,7 @@ workers.
 ### Software Requirements (on All Nodes)
 
 Use one supported OS family and version across all nodes in a cluster. See the
-[Supported platforms matrix](../../docs/deployment/k0s-quick-reference.md#supported-platforms)
+[Supported platforms matrix](DEPLOYMENT_GUIDE.md#supported-platforms)
 for the exact supported versions.
 - Passwordless SSH access from installer machine
 - Sudo privileges without password
@@ -2104,7 +2069,7 @@ Placeholders used below — replace with your own values:
      --proxy-bypass-list="localhost;127.0.0.1"
    ```
 
-   Linux (Ubuntu/RHEL installer machine):
+   Linux (RHEL installer machine):
 
    ```bash
    google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
