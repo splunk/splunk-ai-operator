@@ -260,6 +260,17 @@ The config file (default `openshift-cluster-config.yaml`, override with
 `CONFIG_FILE=`) is validated with `yq`. Below are the sections and the values
 from the reference deployment.
 
+### `cluster`
+```yaml
+cluster:
+  airgap: false
+```
+
+- Set `airgap: true` for an air-gapped installation. The normal
+  `openshift_with_stack.sh install` command automatically stages and mirrors
+  the required OpenShift dependencies.
+- Set `airgap: false` for a connected installation.
+
 ### `kubernetes`
 ```yaml
 kubernetes:
@@ -469,8 +480,9 @@ non-ECR registries and use the `imagePullSecrets.*` blocks instead — see
 2. **Preflight** — verify tools, cluster-admin, OCP/RHCOS compatibility,
    registry policy, storage capacity, object-store config, and disconnected
    catalog/mirror prerequisites.
-3. **Model Staging/Verification** — stage weights when enabled; otherwise prove
-   every required pre-staged model marker exists. Air-gap is verification-only.
+3. **Model Staging/Verification** — when enabled, check the object store and
+   download/upload only missing or changed weights from the installer machine.
+   When disabled in air-gap mode, verify every required pre-staged marker.
 4. **Infrastructure** — NFD Operator → GPU Operator → node labeling →
    local-path provisioner + SELinux relabel.
 5. **Operators** — cert-manager → OpenTelemetry Operator → KubeRay Operator →
@@ -700,86 +712,65 @@ oc get route saia slim -n ai-platform
 
 ## Air-Gapped Deployment
 
-Air-gap uses two scripts plus a separate image-mirroring step:
+Set one value in the cluster config:
 
-An air-gapped install host does not require public internet after all content is
-transferred or mirrored, but it is not isolated from the deployment network. It
-must reach the OpenShift API, the object store used for model-marker checks, and
-any cloud or registry API used for credential setup. OpenShift nodes must reach
-the private registry/catalog mirrors, object store, and other configured runtime
-services. If any of these are public AWS S3, ECR, or other external endpoints,
-provide outbound access through an approved proxy or use the corresponding
-private endpoints.
+```yaml
+cluster:
+  airgap: true
+```
 
-1. **On an internet-connected machine**, build the bundle:
-   ```bash
-   ./prepare_airgap_bundle_openshift.sh --output-dir /mnt/transfer
-   ```
-   The bundle contains Helm charts, static manifests, and the small model
-   metadata profile required to verify pre-staged weights:
-   - `manifests/cert-manager.yaml` (v1.13.0), `manifests/local-path-storage.yaml`
-     (v0.0.26)
-   - `charts/kuberay-operator-1.2.2.tgz`,
-     `charts/opentelemetry-operator-0.121.0.tgz`
-   - `model-metadata/model_artifacts_configs_quantized.yaml`
-   - `airgap-env.sh`, `container-images.txt`, `bundle-versions.txt`,
-     `checksums.sha256`
+Then use the normal install command. The installer automatically downloads its
+OpenShift infrastructure content, mirrors it into `images.registry`, applies
+the generated image mirror policies and Operator CatalogSources, and continues
+the installation. Users do not create or select a bundle. When preparation and
+installation run on the same machine, the installer consumes the prepared
+directory directly; it does not create and extract duplicate transfer archives.
 
-2. **Mirror container images** to your internal registry with `oc mirror` (or
-   `crane`), then update `images.registry` and each `images.*` field in the
-   config to the mirrored paths.
+OpenShift nodes do not require public internet. The installer machine must reach
+the OpenShift API, public source registries, internal registry, and object store.
+It needs internet while mirroring installer-owned content or downloading a model
+that is missing from the object store.
 
-   `container-images.txt` in the bundle lists the publicly available images
-   (Weaviate, KubeRay, OTel, Fluent Bit, nginx, cert-manager, Splunk,
-   Splunk Operator). **Four image groups are built internally and are not
-   listed as real entries** — they must be mirrored separately from your source
-   registry:
+Air-gap installation must run on a Linux x86_64 installer machine because Red
+Hat `oc-mirror` is Linux-only. Use a supported Linux x86_64 host with the
+documented client dependencies and network access. The qualified OpenShift 4.21
+Operator and GPU content currently uses about 24 GiB; plan for about 100 GiB of
+free installer storage for `oc-mirror` working data, logs, and installation
+overhead.
 
-   | Config key | Images to mirror |
-   |---|---|
-   | `images.operator.image` | Splunk AI Operator image |
-   | `images.ray.headImage`, `images.ray.workerImage` | Ray head + worker GPU images |
-   | `images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage` | SAIA API v1/v2 + data loader images |
-   | `images.slim.apiImage` | SLIM API image (when the `slim` feature is enabled) |
+The installer automatically handles:
 
-   Mirror all four groups in addition to the images in `container-images.txt`,
-   or the install will hit `ImagePullBackOff` on those pods.
+- cert-manager, local-path-provisioner, KubeRay, and OpenTelemetry content
+- Node Feature Discovery Operator and NVIDIA GPU Operator content
+- GPU operand and driver images
+- the target cluster's current OpenShift Driver Toolkit image when it is not
+  already supplied by the cluster's disconnected base-release mirror
+- generated `ImageDigestMirrorSet`, `ImageTagMirrorSet`, and CatalogSources
 
-3. **Mirror the OLM catalogs** for NFD (`redhat-operators`) and GPU Operator
-   (`certified-operators`) via `oc mirror`, and apply the generated
-   `ImageDigestMirrorSet`/`ImageTagMirrorSet` (or legacy
-   `ImageContentSourcePolicy`) plus `CatalogSource`. Mirror the complete package
-   closure, including every GPU Operator related image, and preserve the
-   matching OpenShift 4.21 release/Driver Toolkit images in the disconnected
-   registry.
+The customer still provides:
 
-4. **Stage model weights** separately (~60 GB) via
-   `tools/artifacts_download_upload_scripts/`.
+- application images listed under `images.*` in `images.registry`
+- model weights in the configured object store, unless model staging is enabled
+- registry credentials, object-store credentials, or Hugging Face tokens
 
-5. **On the air-gapped machine**, install from the bundle:
-   ```bash
-   ./install_from_airgap_bundle_openshift.sh \
-     --bundle airgap-bundle-openshift-<date>.tar.gz \
-     --config openshift-cluster-config.yaml \
-     [--extract-dir /opt/airgap]
-   ```
-   This extracts the bundle, verifies SHA-256 checksums (hard-fails on mismatch),
-   exports the `file://` env overrides, sets `AIRGAP_MODE=true`, and invokes
-   `openshift_with_stack.sh install`.
+The installer builds temporary registry authentication from the cluster global
+pull secret and `imagePullSecrets.custom`. Run:
 
-**Not bundled** (and why): container images (`oc mirror`), NFD/GPU Operator (OLM
-catalog mirror), NVIDIA driver/operand containers and the OpenShift Driver
-Toolkit image (the disconnected mirror must provide them), the k0s binary/yq
-(OpenShift is a pre-existing cluster), MetalLB (OpenShift uses Routes),
-kube-prometheus-stack (OpenShift ships its own monitoring), and model weights
-(staged separately). Unlike the k0s air-gap workflow, this bundle does **not**
-download NVIDIA RPM/DEB driver packages. The GPU Operator builds/loads the node
-driver from mirrored container content, and the installer proves success by
-waiting for allocatable `nvidia.com/gpu` capacity.
+```bash
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
+```
 
-Follow NVIDIA's [disconnected GPU Operator guide](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/mirror-gpu-ocp-disconnected.html)
-and Red Hat's [OpenShift 4.21 disconnected-environment guide](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/disconnected_environments/index)
-to create and transfer that mirror content before running the offline installer.
+For a controlled, isolated network, OpenShift can use the same plain-HTTP design
+as k0s. Set `images.registryInsecure: true` and use an `http://` object-store
+endpoint. The installer preserves existing OpenShift registry policy, adds the
+configured registry to `image.config.openshift.io/cluster` insecure registries,
+allows HTTP on matching OpenShift Routes, and waits for the configured AI-tier
+nodes to receive the container-runtime change. Leave this disabled for
+production or any network where traffic can be observed.
+
+The existing disconnected OpenShift cluster remains responsible for its base
+release image mirror. The installer adds only the platform-specific
+Operator and infrastructure content listed above.
 
 ---
 
@@ -787,7 +778,14 @@ to create and transfer that mirror content before running the offline installer.
 
 Model artifacts are downloaded from HuggingFace and uploaded to your object
 store. Staging is controlled by `storage.modelStaging.enabled` (or forced by the
-`stage-artifacts` subcommand) and is skipped entirely in air-gap mode.
+`stage-artifacts` subcommand). Air-gap mode does not disable staging because the
+installer machine, not the cluster nodes, performs downloads and uploads.
+
+With staging enabled, completion markers are checked first. If all models are
+current, no download occurs. Otherwise, only missing or changed models are
+downloaded and uploaded. On an isolated installer, set staging to `false` only
+after every required model has been staged; installation then verifies all
+markers and fails early if any model is missing.
 
 OpenShift uses `model_artifacts_configs_quantized.yaml` for RTX Pro 6000
 Blackwell deployments (all models are non-gated):

@@ -62,12 +62,22 @@ eval "$(extract_function openshift_route_host)"
 eval "$(extract_function create_openshift_feature_route)"
 eval "$(extract_function platform_readiness_snapshot)"
 eval "$(extract_function model_artifacts_config_name)"
+eval "$(extract_function resolve_model_staging)"
 eval "$(extract_function image_repository_from_ref)"
 eval "$(extract_function mirror_sources_cover_repository)"
 eval "$(extract_function operator_package_repositories)"
 eval "$(extract_function wait_for_subscription_csv)"
 eval "$(extract_function manifest_has_existing_resources)"
 eval "$(extract_function resolve_accelerator_type)"
+eval "$(extract_function delegate_airgap_install_if_needed)"
+eval "$(extract_function openshift_endpoint_host)"
+eval "$(extract_function openshift_decode_base64)"
+eval "$(extract_function openshift_configured_ai_nodes)"
+eval "$(extract_function openshift_allow_http_route)"
+eval "$(extract_function openshift_wait_for_insecure_registry)"
+eval "$(extract_function configure_openshift_insecure_endpoints)"
+eval "$(extract_function prepare_airgap_registry_auth_file)"
+eval "$(sed -n '/^qualified_additional_image()/,/^}/p' "${AIRGAP_PREPARE_SCRIPT}")"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
 
 log() { :; }
@@ -247,6 +257,18 @@ assert_eq "defaultAcceleratorType values are normalized" \
   "model_artifacts_configs_quantized.yaml" "$(model_artifacts_config_name RTX_PRO_6000_BLACKWELL)"
 assert_rc "unsupported artifact accelerator is rejected" 1 model_artifacts_config_name A100
 
+_exercise_airgap_model_staging_resolution() (
+  SILENT_INSTALL=false
+  AIRGAP_MODE=true
+  MODEL_STAGING_ENABLED=true
+  resolve_model_staging <<< "yes" >/dev/null 2>&1
+  printf '%s' "${MODEL_STAGING_ENABLED}"
+)
+assert_eq "air-gap mode offers staging from the connected installer machine" \
+  "true" "$(_exercise_airgap_model_staging_resolution)"
+assert_eq "air-gap model staging is not short-circuited" "0" \
+  "$(awk '/^stage_model_artifacts\(\)/,/^}/' "${SCRIPT}" | grep -c 'AIRGAP_MODE=true.*skipping model staging' | tr -d '[:space:]')"
+
 echo "OpenShift Splunk HEC parsing"
 hec_btool_output=$'[http]\ndisabled = 0\nenableSSL = true\nport = 8088\n'
 assert_eq "reads effective HEC TLS from the global http stanza" "true" \
@@ -308,10 +330,54 @@ assert_eq "qualified OpenShift minor is an immutable installer constant" "1" \
   "$(grep -c '^readonly QUALIFIED_OPENSHIFT_MINOR="4.21"$' "${SCRIPT}" | tr -d '[:space:]')"
 assert_eq "configured OpenShift minor cannot override qualification" "1" \
   "$(awk '/^load_config\(\)/,/^}/' "${SCRIPT}" | grep -c 'cannot override the installer qualification' | tr -d '[:space:]')"
-assert_eq "air-gap bundle includes model verification metadata" "1" \
+assert_eq "air-gap bundle does not duplicate repository model metadata" "0" \
   "$(grep -c 'cp .*MODEL_METADATA_SOURCE.*model-metadata' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
-assert_eq "air-gap wrapper exports bundled model metadata path" "1" \
+assert_eq "air-gap wrapper does not override the repository model profile" "0" \
   "$(grep -c '^export MODEL_ARTIFACTS_CONFIG_DIR=.*model-metadata' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap bundle captures Operator packages with oc-mirror v2" "1" \
+  "$(grep -c '^apiVersion: mirror.openshift.io/v2alpha1' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap bundle records customer-provided application images separately" "1" \
+  "$(grep -c 'sort -u .*customer-provided-images.txt' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap wrapper imports bundled images into the configured registry" "1" \
+  "$(grep -c -- '--from.*BUNDLE_DIR.*/mirror' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "same-host air-gap preparation skips the duplicate transfer archive" "1" \
+  "$(awk '/^delegate_airgap_install_if_needed\(\)/,/^}/' "${SCRIPT}" | grep -c -- '--no-archive' | tr -d '[:space:]')"
+assert_eq "air-gap wrapper accepts a prepared bundle directory" "1" \
+  "$(grep -c 'Reusing prepared bundle directory directly' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap wrapper applies generated OpenShift mirror resources" "1" \
+  "$(grep -c '^apply_generated_mirror_resources()' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap preparation avoids the oc-mirror REGISTRY_AUTH_FILE parser conflict" "1" \
+  "$(grep -c '^env -u REGISTRY_AUTH_FILE "\${MIRROR_CMD\[@\]}"$' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap import avoids the oc-mirror REGISTRY_AUTH_FILE parser conflict" "1" \
+  "$(grep -c 'env -u REGISTRY_AUTH_FILE "\${MIRROR_CMD\[@\]}"' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap import retries transient registry upload failures" "1" \
+  "$(grep -c 'oc-mirror import failed after.*attempts' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap import allows slow large-image uploads" "1" \
+  "$(awk '/^import_bundled_images\(\)/,/^}/' "${AIRGAP_INSTALL_SCRIPT}" | grep -c -- '--image-timeout 30m' | tr -d '[:space:]')"
+assert_eq "air-gap bundle excludes the mutable oc-mirror workspace from checksums" "1" \
+  "$(grep -c "! -path './mirror/working-dir/\*'" "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap retries ignore runtime oc-mirror workspace checksum changes" "2" \
+  "$(awk '/^verify_checksums\(\)/,/^}/' "${AIRGAP_INSTALL_SCRIPT}" | grep -c "grep -vE.*mirror/working-dir" | tr -d '[:space:]')"
+assert_eq "air-gap preparation tolerates unavailable source signature objects" "1" \
+  "$(grep -c 'MIRROR_CMD=.*--remove-signatures' "${AIRGAP_PREPARE_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap import does not require detached signature storage" "1" \
+  "$(awk '/^import_bundled_images\(\)/,/^}/' "${AIRGAP_INSTALL_SCRIPT}" | grep -c -- '--remove-signatures' | tr -d '[:space:]')"
+assert_eq "air-gap preparation does not expose an assets-only mode" "0" \
+  "$(grep -c -- '--assets-only' "${AIRGAP_PREPARE_SCRIPT}" || true)"
+assert_eq "air-gap wrapper does not expose a pre-mirrored mode" "0" \
+  "$(grep -c -- '--skip-image-import' "${AIRGAP_INSTALL_SCRIPT}" || true)"
+assert_eq "normal install checks for OpenShift air-gap delegation" "1" \
+  "$(grep -c '^delegate_airgap_install_if_needed "\${_CMD}" "\$@"$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "air-gap wrapper sets the staged recursion guard" "1" \
+  "$(grep -c '^export AIRGAP_STAGED="true"$' "${AIRGAP_INSTALL_SCRIPT}" | tr -d '[:space:]')"
+assert_eq "normal install automatically configures explicitly insecure endpoints" "1" \
+  "$(awk '/^main_install\(\)/,/^}/' "${SCRIPT}" | grep -c 'configure_openshift_insecure_endpoints' | tr -d '[:space:]')"
+assert_eq "unified air-gap entry point prepares registry authentication" "1" \
+  "$(awk '/^delegate_airgap_install_if_needed\(\)/,/^}/' "${SCRIPT}" | grep -c 'prepare_airgap_registry_auth_file' | tr -d '[:space:]')"
+assert_eq "OpenShift insecure registry configuration preserves existing entries" "1" \
+  "$(awk '/^configure_openshift_insecure_endpoints\(\)/,/^}/' "${SCRIPT}" | grep -c 'insecureRegistries.*unique' | tr -d '[:space:]')"
+assert_eq "standard air-gap README does not require manual registry auth export" "0" \
+  "$(grep -c '^export \(AIRGAP_\)\?REGISTRY_AUTH_FILE=' "${SCRIPT_DIR}/OPENSHIFT_README.md" | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership checks every manifest resource" "1" \
   "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -c 'manifest_has_existing_resources' | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership is not inferred from deployment presence" "0" \
@@ -322,8 +388,196 @@ assert_eq "disconnected preflight validates mirror source coverage" "1" \
   "$(awk '/^preflight_check_airgap_prerequisites\(\)/,/^}/' "${SCRIPT}" | grep -c 'mirror_sources_cover_repository' | tr -d '[:space:]')"
 assert_eq "OLM readiness requires currentCSV to become installedCSV" "1" \
   "$(awk '/^wait_for_subscription_csv\(\)/,/^}/' "${SCRIPT}" | grep -c 'installed_csv.*==.*current_csv' | tr -d '[:space:]')"
+assert_eq "non-AWS Splunk app repositories use the MinIO provider" "1" \
+  "$(awk '/^install_splunk_standalone\(\)/,/^}/' "${SCRIPT}" | grep -c 'splunk_app_repo_provider="minio"' | tr -d '[:space:]')"
+assert_eq "Splunk app repository polling is configured explicitly" "1" \
+  "$(awk '/^install_splunk_standalone\(\)/,/^}/' "${SCRIPT}" | grep -c 'appsRepoPollIntervalSeconds: 60' | tr -d '[:space:]')"
+assert_eq "OpenShift object-store Routes resolve to cluster-local services" "1" \
+  "$(grep -c '^openshift_route_service_endpoint()' "${SCRIPT}" | tr -d '[:space:]')"
+
+_exercise_airgap_delegation() (
+  local mode="$1" tmp trace config bundle=""
+  tmp=$(mktemp -d)
+  trace="${tmp}/trace.log"
+  config="${tmp}/config.yaml"
+
+  cat > "${config}" <<'YAML'
+cluster:
+  airgap: true
+YAML
+
+  cat > "${tmp}/prepare_airgap_bundle_openshift.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+output_dir=""
+no_archive="false"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config) shift 2 ;;
+    --output-dir) output_dir="$2"; shift 2 ;;
+    --no-archive) no_archive="true"; shift ;;
+    *) exit 2 ;;
+  esac
+done
+mkdir -p "${output_dir}/airgap-bundle-openshift-test"
+printf 'prepare no_archive=%s\n' "${no_archive}" >> "${TRACE_FILE}"
+SCRIPT
+
+  cat > "${tmp}/install_from_airgap_bundle_openshift.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+exit 0
+SCRIPT
+  chmod +x \
+    "${tmp}/prepare_airgap_bundle_openshift.sh" \
+    "${tmp}/install_from_airgap_bundle_openshift.sh"
+
+  if [[ "${mode}" == "existing" ]]; then
+    bundle="${tmp}/transferred-airgap-bundle.tar.gz"
+    : > "${bundle}"
+    export OPENSHIFT_AIRGAP_BUNDLE="${bundle}"
+  else
+    unset OPENSHIFT_AIRGAP_BUNDLE
+  fi
+
+  export TRACE_FILE="${trace}"
+  CONFIG_FILE="${config}"
+  OPENSHIFT_AIRGAP_PREPARE_SCRIPT="${tmp}/prepare_airgap_bundle_openshift.sh"
+  OPENSHIFT_AIRGAP_INSTALL_SCRIPT="${tmp}/install_from_airgap_bundle_openshift.sh"
+  OPENSHIFT_AIRGAP_OUTPUT_DIR="${tmp}/output"
+  OPENSHIFT_AIRGAP_EXTRACT_DIR="${tmp}/extract"
+  AIRGAP_MODE="false"
+  AIRGAP_STAGED="false"
+  SILENT_INSTALL="false"
+  uname() { echo Linux; }
+  configure_openshift_insecure_endpoints() { :; }
+  prepare_airgap_registry_auth_file() { :; }
+  yq() {
+    case "${2:-}" in
+      '.cluster.airgap // "false"') echo "true" ;;
+      *) echo "" ;;
+    esac
+  }
+  exec() {
+    printf 'wrapper %s\n' "$*" >> "${trace}"
+    printf 'silent=%s\n' "${SILENT_INSTALL:-false}" >> "${trace}"
+  }
+
+  delegate_airgap_install_if_needed install --silent
+
+  cat "${trace}"
+  rm -rf "${tmp}"
+)
+
+echo "OpenShift unified air-gap entry point"
+auto_airgap_trace=$(_exercise_airgap_delegation auto)
+assert_eq "air-gap install automatically prepares a bundle when none is supplied" "1" \
+  "$(grep -c '^prepare no_archive=true$' <<<"${auto_airgap_trace}" || true)"
+assert_eq "air-gap install delegates the prepared directory to the wrapper" "1" \
+  "$(grep -c 'wrapper .*--bundle .*airgap-bundle-openshift-test .*--subcommand install' <<<"${auto_airgap_trace}" || true)"
+assert_eq "same-host prepared directories are not assigned an extraction directory" "0" \
+  "$(grep -c 'wrapper .*airgap-bundle-openshift-test.*--extract-dir' <<<"${auto_airgap_trace}" || true)"
+assert_eq "air-gap delegation preserves silent install mode" "silent=true" \
+  "$(grep '^silent=' <<<"${auto_airgap_trace}" || true)"
+
+existing_airgap_trace=$(_exercise_airgap_delegation existing)
+assert_eq "a transferred bundle skips automatic bundle preparation" "0" \
+  "$(grep -c '^prepare ' <<<"${existing_airgap_trace}" || true)"
+assert_eq "a transferred bundle is passed directly to the wrapper" "1" \
+  "$(grep -c 'wrapper .*--bundle .*transferred-airgap-bundle.tar.gz.*--subcommand install' <<<"${existing_airgap_trace}" || true)"
+assert_eq "a transferred archive receives an extraction directory" "1" \
+  "$(grep -c 'wrapper .*transferred-airgap-bundle.tar.gz.*--extract-dir' <<<"${existing_airgap_trace}" || true)"
+
+echo "OpenShift k0s-style insecure endpoints"
+assert_eq "normalizes a registry with scheme and repository prefix" \
+  "registry.apps.example.com" \
+  "$(openshift_endpoint_host 'https://registry.apps.example.com/team/images')"
+
+_exercise_insecure_endpoint_configuration() (
+  local tmp config route_trace image_patch previous argument
+  tmp=$(mktemp -d)
+  config="${tmp}/config.yaml"
+  route_trace="${tmp}/routes"
+  image_patch="${tmp}/image-patch.json"
+  cat > "${config}" <<'YAML'
+images:
+  registry: registry.apps.example.com
+  registryInsecure: true
+storage:
+  objectStore:
+    endpoint: http://minio.apps.example.com
+openshift:
+  nodeLabelStrategy: manual
+  nodes: []
+YAML
+  yq() { "${REAL_YQ}" "$@"; }
+  oc() {
+    case "$*" in
+      'get routes.route.openshift.io -A -o json')
+        printf '%s\n' '{"items":[{"metadata":{"namespace":"ai-infra","name":"registry"},"spec":{"host":"registry.apps.example.com","tls":{"termination":"edge","insecureEdgeTerminationPolicy":"Redirect"}}},{"metadata":{"namespace":"ai-infra","name":"minio-api"},"spec":{"host":"minio.apps.example.com","tls":{"termination":"edge","insecureEdgeTerminationPolicy":"Redirect"}}}]}'
+        ;;
+      '-n ai-infra patch route registry --type=merge '*|'-n ai-infra patch route minio-api --type=merge '*)
+        printf '%s\n' "$*" >> "${route_trace}"
+        ;;
+      'get image.config.openshift.io/cluster -o json')
+        printf '%s\n' '{"spec":{"registrySources":{"insecureRegistries":["existing.example.com"]}}}'
+        ;;
+      'patch image.config.openshift.io/cluster --type=merge '*)
+        previous=""
+        for argument in "$@"; do
+          [[ "${previous}" == "-p" ]] && printf '%s\n' "${argument}" > "${image_patch}"
+          previous="${argument}"
+        done
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  configure_openshift_insecure_endpoints "${config}"
+  printf '%s ' "$(wc -l < "${route_trace}" | tr -d '[:space:]')"
+  jq -r '(.spec.registrySources.insecureRegistries | sort) == ["existing.example.com","registry.apps.example.com"]' "${image_patch}"
+  rm -rf "${tmp}"
+)
+assert_eq "allows HTTP Routes and preserves existing OpenShift registry policy" \
+  "2 true" "$(_exercise_insecure_endpoint_configuration)"
+
+_exercise_auto_registry_auth() (
+  local tmp config source_auth custom_auth
+  tmp=$(mktemp -d)
+  config="${tmp}/config.yaml"
+  cat > "${config}" <<'YAML'
+imagePullSecrets:
+  custom:
+    enabled: true
+    server: https://registry.apps.example.com
+    username: registry-user
+    password: registry-password
+YAML
+  source_auth='{"auths":{"registry.redhat.io":{"auth":"redhat-token"}}}'
+  PULL_SECRET_ENCODED=$(printf '%s' "${source_auth}" | base64 | tr -d '\n')
+  oc() {
+    printf '{"data":{".dockerconfigjson":"%s"}}\n' "${PULL_SECRET_ENCODED}"
+  }
+  yq() { "${REAL_YQ}" "$@"; }
+  TMP_FILES=()
+  unset REGISTRY_AUTH_FILE
+  unset OPENSHIFT_AUTO_REGISTRY_AUTH_FILE
+  prepare_airgap_registry_auth_file "${config}"
+  custom_auth=$(printf '%s' 'registry-user:registry-password' | base64 | tr -d '\n')
+  jq -r --arg expected "${custom_auth}" \
+    '[(.auths["registry.redhat.io"].auth == "redhat-token"), (.auths["registry.apps.example.com"].auth == $expected)] | all' \
+    "${REGISTRY_AUTH_FILE}"
+  ((${#TMP_FILES[@]} == 0)) || rm -f "${TMP_FILES[@]}"
+  rm -rf "${tmp}"
+)
+assert_eq "merges cluster pull-secret and custom internal-registry credentials" \
+  "true" "$(_exercise_auto_registry_auth)"
 
 echo "OpenShift disconnected mirror source matching"
+assert_eq "qualifies a Docker Hub organization image for oc-mirror" \
+  "docker.io/rancher/local-path-provisioner:v0.0.26" \
+  "$(qualified_additional_image 'rancher/local-path-provisioner:v0.0.26')"
+assert_eq "preserves an explicitly qualified registry image" \
+  "quay.io/kuberay/operator:v1.2.2" \
+  "$(qualified_additional_image 'quay.io/kuberay/operator:v1.2.2')"
 mirror_sources=$'registry.redhat.io/openshift4\nnvcr.io/nvidia'
 assert_rc "accepts a required repository covered by a parent mirror source" 0 \
   mirror_sources_cover_repository "${mirror_sources}" "nvcr.io/nvidia/cloud-native/gpu-operator"
@@ -571,8 +825,14 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$("${REAL_YQ}" eval '.openshift.routes.slim.enabled' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config pins the qualified cluster minor" "4.21" \
     "$("${REAL_YQ}" eval '.openshift.requiredVersion' "${CONFIG_FILE}" 2>/dev/null)"
-  assert_eq "repository OpenShift config explicitly verifies pre-staged models" "false" \
+  assert_eq "repository OpenShift config stages only missing or changed models by default" "true" \
     "$("${REAL_YQ}" eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config defaults to connected installation" "false" \
+    "$("${REAL_YQ}" eval '.cluster.airgap' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config does not expose an air-gap content mode" "false" \
+    "$("${REAL_YQ}" eval '.cluster | has("airgapContentMode")' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config does not require an air-gap bundle path" "false" \
+    "$("${REAL_YQ}" eval '.cluster | has("airgapBundlePath")' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config matches the qualified Ray runtime" "2.56.0" \
     "$("${REAL_YQ}" eval '.operators.ray.rayVersion' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config requires 1024 GiB at scale 1" "1024" \

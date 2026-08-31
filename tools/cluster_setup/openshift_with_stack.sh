@@ -213,30 +213,20 @@ wait_for_dependency() {
 }
 
 # ====== RESOLVE MODEL STAGING ======
-# Prompts the user interactively whether to download & stage models.
-# In silent/airgap mode the prompt is skipped and MODEL_STAGING_ENABLED is unchanged.
+# Prompts the user interactively whether to download and stage models. Air-gap
+# describes cluster-node connectivity; the installer machine may still be
+# connected and can stage missing models exactly as the k0s installer does.
 resolve_model_staging() {
-  # Airgap: models must be pre-staged; staging via this script is not possible.
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "AIRGAP_MODE=true — model staging skipped (models must be pre-staged in object store)."
-    MODEL_STAGING_ENABLED="false"
-    return 0
-  fi
-
-  # Already explicitly set in config or env — honour it and skip the prompt.
-  if [[ "${MODEL_STAGING_ENABLED}" == "true" || "${MODEL_STAGING_ENABLED}" == "false" ]]; then
-    log "MODEL_STAGING_ENABLED=${MODEL_STAGING_ENABLED} (from config/env)"
-    return 0
-  fi
-
-  # Silent install: cannot prompt — default to false.
   if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
-    log "SILENT_INSTALL=true — model staging defaulting to false (set storage.modelStaging.enabled=true in config to enable)."
-    MODEL_STAGING_ENABLED="false"
+    [[ -n "${MODEL_STAGING_ENABLED}" ]] || MODEL_STAGING_ENABLED="false"
+    log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
   fi
 
   echo -e "\n  \033[1mModel artifact staging:\033[0m" >&2
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    echo -e "  Air-gap mode: downloads run on THIS installer machine, not on cluster nodes." >&2
+  fi
   echo -e "  Download model weights from HuggingFace and upload them to the object store?" >&2
   echo -e "  (Requires HF_TOKEN and object store credentials. Type 'yes' to enable.)" >&2
   local answer
@@ -304,8 +294,8 @@ show_install_plan() {
   elif [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
     echo -e "        [VERIFY ONLY — modelStaging.enabled=false]" >&2
   fi
-  echo -e "    2.  NFD Operator (OLM)" >&2
-  echo -e "    3.  NVIDIA GPU Operator (OLM)" >&2
+  echo -e "    2.  Node Feature Discovery Operator (Operator Lifecycle Manager)" >&2
+  echo -e "    3.  NVIDIA GPU Operator (Operator Lifecycle Manager)" >&2
   echo -e "    4.  Node labeling (splunk.ai/ai-tier-node)" >&2
   echo -e "    5.  local-path-provisioner + SELinux relabeling" >&2
   echo -e "    6.  cert-manager" >&2
@@ -430,7 +420,6 @@ ${yq_err}"
   else
     export AIRGAP_MODE="false"
   fi
-
   # Model staging
   MODEL_STAGING_ENABLED="$(yq eval '.storage.modelStaging.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")"
   # Keep an omitted value unset so an interactive install can ask. Silent
@@ -444,8 +433,16 @@ ${yq_err}"
   IMAGE_PULL_SECRETS_ACR_ENABLED=$(yq eval '.imagePullSecrets.acr.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
   IMAGE_PULL_SECRETS_CUSTOM_ENABLED=$(yq eval '.imagePullSecrets.custom.enabled // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
 
-  NFD_CATALOG_SOURCE=$(yq eval '.operators.nfd.catalogSource // "redhat-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "redhat-operators")
-  GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "certified-operators")
+  if [[ -n "${AIRGAP_NFD_CATALOG_SOURCE:-}" ]]; then
+    NFD_CATALOG_SOURCE="${AIRGAP_NFD_CATALOG_SOURCE}"
+  else
+    NFD_CATALOG_SOURCE=$(yq eval '.operators.nfd.catalogSource // "redhat-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "redhat-operators")
+  fi
+  if [[ -n "${AIRGAP_GPU_CATALOG_SOURCE:-}" ]]; then
+    GPU_CATALOG_SOURCE="${AIRGAP_GPU_CATALOG_SOURCE}"
+  else
+    GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}" 2>/dev/null || echo "certified-operators")
+  fi
 
   # Ingress domain: read from config if set, otherwise auto-detect from the cluster.
   # Used to create stable OpenShift Routes for the enabled SAIA and SLIM APIs.
@@ -459,6 +456,219 @@ ${yq_err}"
   fi
 
   log "Configuration loaded: namespace=${AI_NS}, accelerator=${DEFAULT_ACCELERATOR}, airgap=${AIRGAP_MODE:-false}, modelStaging=${MODEL_STAGING_ENABLED}"
+}
+
+# Return the host[:port] portion of a registry or HTTP endpoint, stripping an
+# optional scheme and repository/path suffix.
+openshift_endpoint_host() {
+  local value="$1"
+  value="${value#http://}"
+  value="${value#https://}"
+  value="${value%%/*}"
+  printf '%s\n' "${value%/}"
+}
+
+# Resolve an OpenShift Route endpoint to its backing cluster-local Service.
+# In-cluster S3 clients can otherwise choose virtual-host-style addressing
+# (bucket.<route-host>), which an exact Route rejects with HTTP 503. Keeping
+# this translation local to in-cluster consumers avoids broadening the Route
+# with wildcard subdomain exposure.
+openshift_route_service_endpoint() {
+  local endpoint="$1" host route namespace service target_port service_json port termination scheme
+  host=$(openshift_endpoint_host "${endpoint}")
+  [[ -n "${host}" ]] || return 1
+
+  route=$(oc get routes.route.openshift.io -A -o json 2>/dev/null \
+    | jq -c --arg host "${host}" '[.items[]? | select(.spec.host == $host)][0] // empty' 2>/dev/null || true)
+  [[ -n "${route}" && "${route}" != "null" ]] || return 1
+
+  namespace=$(printf '%s' "${route}" | jq -r '.metadata.namespace // empty')
+  service=$(printf '%s' "${route}" | jq -r '.spec.to.name // empty')
+  target_port=$(printf '%s' "${route}" | jq -r '.spec.port.targetPort // empty')
+  termination=$(printf '%s' "${route}" | jq -r '.spec.tls.termination // empty')
+  [[ -n "${namespace}" && -n "${service}" ]] || return 1
+
+  service_json=$(oc -n "${namespace}" get service "${service}" -o json 2>/dev/null) || return 1
+  port=$(printf '%s' "${service_json}" | jq -r --arg target "${target_port}" '
+    (([.spec.ports[]?
+       | select($target == "" or (.name // "") == $target or ((.port | tostring) == $target))][0])
+      // .spec.ports[0] // {})
+    | .port // empty' 2>/dev/null)
+  [[ -n "${port}" ]] || return 1
+
+  case "${termination}" in
+    passthrough|reencrypt) scheme="https" ;;
+    *) scheme="http" ;;
+  esac
+  printf '%s://%s.%s.svc.cluster.local:%s\n' "${scheme}" "${service}" "${namespace}" "${port}"
+}
+
+# Decode base64 with either GNU or BSD/macOS base64.
+openshift_decode_base64() {
+  if base64 --decode </dev/null >/dev/null 2>&1; then
+    base64 --decode
+  else
+    base64 -D
+  fi
+}
+
+# Print the nodes that must receive container-runtime registry configuration.
+# Manual mode uses openshift.nodes; auto mode uses all OpenShift worker nodes.
+openshift_configured_ai_nodes() {
+  local config_file="$1" strategy
+  strategy=$(yq eval '.openshift.nodeLabelStrategy // "auto"' "${config_file}" 2>/dev/null || echo auto)
+  if [[ "${strategy}" == "manual" ]]; then
+    yq eval '.openshift.nodes[]? // empty' "${config_file}" 2>/dev/null
+  else
+    oc get nodes -l node-role.kubernetes.io/worker -o json 2>/dev/null \
+      | jq -r '.items[]?.metadata.name' 2>/dev/null
+  fi
+}
+
+# If an explicitly insecure endpoint is an OpenShift Route in this cluster,
+# permit HTTP instead of the Route's normal HTTP-to-HTTPS redirect. External
+# endpoints and already-HTTP Routes are left unchanged.
+openshift_allow_http_route() {
+  local host="$1" route namespace name termination policy
+  route=$(oc get routes.route.openshift.io -A -o json 2>/dev/null \
+    | jq -c --arg host "${host}" '[.items[]? | select(.spec.host == $host)][0] // empty' 2>/dev/null || true)
+  [[ -n "${route}" && "${route}" != "null" ]] || return 0
+
+  namespace=$(printf '%s' "${route}" | jq -r '.metadata.namespace // empty')
+  name=$(printf '%s' "${route}" | jq -r '.metadata.name // empty')
+  termination=$(printf '%s' "${route}" | jq -r '.spec.tls.termination // empty')
+  policy=$(printf '%s' "${route}" | jq -r '.spec.tls.insecureEdgeTerminationPolicy // empty')
+  if [[ -n "${termination}" && "${policy}" != "Allow" ]]; then
+    oc -n "${namespace}" patch route "${name}" --type=merge \
+      -p '{"spec":{"tls":{"insecureEdgeTerminationPolicy":"Allow"}}}' >/dev/null
+    log "  ✓ Enabled HTTP access on Route ${namespace}/${name}"
+  fi
+}
+
+# Wait until each configured AI-tier node has applied the newly rendered
+# MachineConfig containing the insecure-registry policy.
+openshift_wait_for_insecure_registry() {
+  local config_file="$1" before_file="$2"
+  local timeout_seconds="${OPENSHIFT_REGISTRY_CONFIG_TIMEOUT:-2700}"
+  local elapsed=0 interval=15 node before current desired state pending
+
+  while (( elapsed < timeout_seconds )); do
+    pending=""
+    while IFS= read -r node; do
+      [[ -n "${node}" ]] || continue
+      before=$(awk -F= -v node="${node}" '$1 == node { print substr($0, index($0, "=") + 1); exit }' "${before_file}" 2>/dev/null)
+      current=$(oc get node "${node}" -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}' 2>/dev/null || true)
+      desired=$(oc get node "${node}" -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}' 2>/dev/null || true)
+      state=$(oc get node "${node}" -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/state}' 2>/dev/null || true)
+      if [[ -z "${current}" || "${current}" == "${before}" || "${current}" != "${desired}" || "${state}" != "Done" ]]; then
+        pending="${pending}${pending:+, }${node}"
+      fi
+    done < <(openshift_configured_ai_nodes "${config_file}")
+
+    if [[ -z "${pending}" ]]; then
+      log "  ✓ Insecure-registry policy is active on all configured AI-tier nodes"
+      return 0
+    fi
+    (( elapsed == 0 || elapsed % 60 == 0 )) \
+      && log "  Waiting for insecure-registry policy on: ${pending} (${elapsed}s/${timeout_seconds}s)"
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+
+  warn "Timed out waiting for insecure-registry configuration on: ${pending}"
+  return 1
+}
+
+# Apply the k0s-equivalent plain-HTTP design when explicitly requested. The
+# registry is merged into OpenShift's insecureRegistries list, matching Routes
+# are allowed to serve HTTP, and existing registry policy entries are retained.
+configure_openshift_insecure_endpoints() {
+  local config_file="$1" registry insecure registry_host object_endpoint object_host
+  local image_json patch before_file node current changed="false"
+
+  registry=$(yq eval '.images.registry // ""' "${config_file}" 2>/dev/null || echo "")
+  insecure=$(yq eval '.images.registryInsecure // "false"' "${config_file}" 2>/dev/null || echo false)
+  registry_host=$(openshift_endpoint_host "${registry}")
+
+  if [[ "${insecure}" == "true" && -n "${registry_host}" ]]; then
+    openshift_allow_http_route "${registry_host}"
+    image_json=$(oc get image.config.openshift.io/cluster -o json 2>/dev/null) \
+      || { warn "Cannot read image.config.openshift.io/cluster"; return 1; }
+    if ! printf '%s' "${image_json}" | jq -e --arg host "${registry_host}" \
+      '.spec.registrySources.insecureRegistries // [] | index($host) != null' >/dev/null; then
+      before_file=$(mktemp "${TMPDIR:-/tmp}/openshift-insecure-registry.XXXXXX")
+      : > "${before_file}"
+      while IFS= read -r node; do
+        [[ -n "${node}" ]] || continue
+        current=$(oc get node "${node}" -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}' 2>/dev/null || true)
+        printf '%s=%s\n' "${node}" "${current}" >> "${before_file}"
+      done < <(openshift_configured_ai_nodes "${config_file}")
+
+      patch=$(printf '%s' "${image_json}" | jq -c --arg host "${registry_host}" \
+        '{spec:{registrySources:{insecureRegistries:(((.spec.registrySources.insecureRegistries // []) + [$host]) | unique)}}}')
+      oc patch image.config.openshift.io/cluster --type=merge -p "${patch}" >/dev/null
+      changed="true"
+      log "  ✓ Added ${registry_host} to OpenShift insecureRegistries"
+      if [[ -s "${before_file}" ]]; then
+        openshift_wait_for_insecure_registry "${config_file}" "${before_file}" || {
+          rm -f "${before_file}"
+          return 1
+        }
+      fi
+      rm -f "${before_file}"
+    fi
+  fi
+
+  object_endpoint=$(yq eval '.storage.objectStore.endpoint // ""' "${config_file}" 2>/dev/null || echo "")
+  if [[ "${object_endpoint}" == http://* ]]; then
+    object_host=$(openshift_endpoint_host "${object_endpoint}")
+    [[ -n "${object_host}" ]] && openshift_allow_http_route "${object_host}"
+  fi
+
+  [[ "${changed}" == "true" ]] || log "  ✓ Insecure endpoint configuration already matches the cluster"
+}
+
+# Build the oc-mirror auth file used by the unified air-gap command. It merges
+# the cluster pull secret (Red Hat/public sources) with imagePullSecrets.custom
+# (the customer-provided internal registry). Explicit auth-file overrides win.
+prepare_airgap_registry_auth_file() {
+  local config_file="$1" auth_file cluster_auth encoded custom_enabled server username password email auth
+  [[ -n "${REGISTRY_AUTH_FILE:-}" ]] && return 0
+
+  auth_file=$(mktemp "${TMPDIR:-/tmp}/openshift-registry-auth.XXXXXX")
+  cluster_auth=$(mktemp "${TMPDIR:-/tmp}/openshift-cluster-pull-secret.XXXXXX")
+  chmod 600 "${auth_file}" "${cluster_auth}"
+  TMP_FILES+=("${auth_file}" "${cluster_auth}")
+  printf '{"auths":{}}\n' > "${auth_file}"
+
+  encoded=$(oc -n openshift-config get secret pull-secret -o json 2>/dev/null \
+    | jq -r '.data[".dockerconfigjson"] // empty' 2>/dev/null || true)
+  if [[ -n "${encoded}" ]]; then
+    printf '%s' "${encoded}" | openshift_decode_base64 > "${cluster_auth}"
+    jq -e '.auths | type == "object"' "${cluster_auth}" >/dev/null 2>&1 \
+      && cp "${cluster_auth}" "${auth_file}"
+  fi
+
+  custom_enabled=$(yq eval '.imagePullSecrets.custom.enabled // "false"' "${config_file}" 2>/dev/null || echo false)
+  if [[ "${custom_enabled}" == "true" ]]; then
+    server=$(yq eval '.imagePullSecrets.custom.server // ""' "${config_file}" 2>/dev/null || echo "")
+    username=$(yq eval '.imagePullSecrets.custom.username // ""' "${config_file}" 2>/dev/null || echo "")
+    password=$(yq eval '.imagePullSecrets.custom.password // ""' "${config_file}" 2>/dev/null || echo "")
+    email=$(yq eval '.imagePullSecrets.custom.email // ""' "${config_file}" 2>/dev/null || echo "")
+    server=$(openshift_endpoint_host "${server}")
+    if [[ -n "${server}" && -n "${username}" && -n "${password}" &&
+          "${username}" != "null" && "${password}" != "null" ]]; then
+      auth=$(printf '%s:%s' "${username}" "${password}" | base64 | tr -d '\n')
+      jq --arg server "${server}" --arg auth "${auth}" --arg email "${email}" \
+        '.auths = (.auths // {}) | .auths[$server] = ({auth:$auth} + (if $email == "" or $email == "null" then {} else {email:$email} end))' \
+        "${auth_file}" > "${auth_file}.new"
+      mv "${auth_file}.new" "${auth_file}"
+    fi
+  fi
+
+  export REGISTRY_AUTH_FILE="${auth_file}"
+  export OPENSHIFT_AUTO_REGISTRY_AUTH_FILE="${auth_file}"
+  log "  ✓ Prepared temporary oc-mirror authentication from cluster/config credentials"
 }
 
 # ====== PLACEHOLDER CREDENTIAL GUARD ======
@@ -911,12 +1121,13 @@ preflight_check_object_store() {
 preflight_check_insecure_registry_policy() {
   [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] || return 0
   pf_header "OpenShift insecure-registry policy"
-  local configured
+  local configured registry_host
+  registry_host=$(openshift_endpoint_host "${IMAGE_REGISTRY}")
   configured=$(oc get image.config.openshift.io/cluster -o json 2>/dev/null | jq -r '.spec.registrySources.insecureRegistries[]?')
-  if printf '%s\n' "${configured}" | grep -Fxq "${IMAGE_REGISTRY}"; then
-    pf_ok "OpenShift image configuration allows insecure registry ${IMAGE_REGISTRY}"
+  if printf '%s\n' "${configured}" | grep -Fxq "${registry_host}"; then
+    pf_ok "OpenShift image configuration allows insecure registry ${registry_host}"
   else
-    pf_fail "images.registryInsecure=true only changes the installer probe. Add '${IMAGE_REGISTRY}' to image.config.openshift.io/cluster.spec.registrySources.insecureRegistries before installing."
+    pf_fail "Installer did not converge image.config.openshift.io/cluster for insecure registry ${registry_host}."
   fi
 }
 
@@ -971,7 +1182,7 @@ operator_package_repositories() {
 
 preflight_check_airgap_prerequisites() {
   [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
-  pf_header "Disconnected OpenShift prerequisites"
+  pf_header "Air-gapped OpenShift prerequisites"
 
   local path
   for path in "${CERT_MANAGER_MANIFEST_URL:-}" "${LOCAL_PATH_MANIFEST_URL:-}" "${OTEL_CHART_PATH:-}" "${KUBERAY_CHART_PATH:-}"; do
@@ -979,20 +1190,10 @@ preflight_check_airgap_prerequisites() {
     [[ -n "${path}" && -f "${path}" ]] && pf_ok "Bundled artifact present: ${path}" || pf_fail "Required local air-gap artifact is missing: ${path:-<unset>}"
   done
 
-  local metadata_dir model_config_name model_config_path
-  metadata_dir=$(model_artifacts_metadata_dir || true)
-  model_config_name=$(model_artifacts_config_name "${DEFAULT_ACCELERATOR}" || true)
-  model_config_path="${metadata_dir:+${metadata_dir}/}${model_config_name}"
-  if [[ -n "${metadata_dir}" && -n "${model_config_name}" && -f "${model_config_path}" ]]; then
-    pf_ok "Bundled model metadata present: ${model_config_path}"
-  else
-    pf_fail "Required model metadata is missing: ${model_config_path:-<unresolved>}. Rebuild the air-gap bundle with the model-metadata directory."
-  fi
-
   local source state image_ref
   for source in "${NFD_CATALOG_SOURCE}" "${GPU_CATALOG_SOURCE}"; do
     if ! oc get catalogsource "${source}" -n openshift-marketplace &>/dev/null; then
-      pf_fail "Air-gap CatalogSource openshift-marketplace/${source} is missing; mirror and apply the NFD/GPU Operator catalogs before installation."
+      pf_fail "Disconnected CatalogSource openshift-marketplace/${source} is missing; the cluster administrator must mirror the required Operator catalog and apply the oc-mirror generated cluster resources."
       continue
     fi
     state=$(oc get catalogsource "${source}" -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || true)
@@ -1008,9 +1209,21 @@ preflight_check_airgap_prerequisites() {
   if [[ -z "${mirror_sources}" ]]; then
     pf_fail "No ImageDigestMirrorSet, ImageTagMirrorSet, or ImageContentSourcePolicy exists. Disconnected operator operands and Driver Toolkit images have no configured mirror path."
   else
-    local required_repositories=() package_repositories driver_toolkit_ref repository
+    local required_repositories=() package_repositories driver_toolkit_ref repository infrastructure_inventory image
     # This operand is rendered directly by install_nfd(), outside the OLM CSV.
     required_repositories+=("registry.redhat.io/openshift4/ose-node-feature-discovery-rhel9")
+
+    # The assets bundle records images referenced by cert-manager,
+    # local-path-provisioner, KubeRay, OpenTelemetry, and installer helper pods.
+    # Require mirror policies for those sources as well as the OLM operands.
+    infrastructure_inventory="${AIRGAP_BUNDLE_DIR:-}/bundled-infrastructure-images.txt"
+    if [[ -f "${infrastructure_inventory}" ]]; then
+      while IFS= read -r image; do
+        [[ -n "${image}" ]] && required_repositories+=("$(image_repository_from_ref "${image}")")
+      done < "${infrastructure_inventory}"
+    else
+      pf_fail "Air-gap infrastructure image inventory is missing: ${infrastructure_inventory:-<unset>}"
+    fi
 
     package_repositories=$(operator_package_repositories nfd "${NFD_CATALOG_SOURCE}" "${NFD_OPERATOR_CHANNEL}" || true)
     if [[ -z "${package_repositories}" ]]; then
@@ -1034,6 +1247,8 @@ preflight_check_airgap_prerequisites() {
       | jq -r '[.status.tags[]?.items[]?.dockerImageReference][0] // empty' || true)
     if [[ -z "${driver_toolkit_ref}" ]]; then
       pf_fail "Could not resolve the OpenShift Driver Toolkit image source."
+    elif [[ -n "${IMAGE_REGISTRY:-}" && "${driver_toolkit_ref}" == "${IMAGE_REGISTRY%/}/"* ]]; then
+      pf_ok "OpenShift Driver Toolkit already resolves inside the configured internal registry"
     else
       required_repositories+=("$(image_repository_from_ref "${driver_toolkit_ref}")")
     fi
@@ -1047,13 +1262,11 @@ preflight_check_airgap_prerequisites() {
     done < <(printf '%s\n' "${required_repositories[@]}" | sort -u)
 
     if (( ${#missing_mirror_sources[@]} > 0 )); then
-      pf_fail "Image mirror policies do not cover required source repositories: $(printf '%s; ' "${missing_mirror_sources[@]}" | sed 's/; $//'). Re-run oc mirror for the complete NFD/GPU Operator package closure and matching OpenShift release."
+      pf_fail "Image mirror policies do not cover required source repositories: $(printf '%s; ' "${missing_mirror_sources[@]}" | sed 's/; $//'). Mirror the prerequisite content and apply the oc-mirror generated cluster resources."
     else
-      pf_ok "Image mirror policies cover all resolved NFD, GPU Operator, and Driver Toolkit source repositories"
+      pf_ok "Image mirror policies cover all resolved installer infrastructure, Operator, and OpenShift Driver Toolkit repositories"
     fi
   fi
-
-  pf_warn "This installer does not bundle GPU driver/operand images. The mirrored GPU Operator catalog, its related images, and the matching OpenShift release/Driver Toolkit image must already be reachable through the cluster mirror configuration."
 }
 
 # ====== PREFLIGHT: REGISTRY REACHABILITY CHECK ======
@@ -2652,12 +2865,24 @@ install_splunk_standalone() {
     --dry-run=client -o yaml | oc -n "${AI_NS}" apply -f -
 
   # Derive S3 endpoint for Splunk appRepo (endpoint is required by the Splunk Operator)
-  local minio_endpoint="${OBJ_STORE_ENDPOINT}"
+  local minio_endpoint="${OBJ_STORE_ENDPOINT}" cluster_local_object_endpoint="" splunk_app_repo_provider="aws"
   if [[ -z "${minio_endpoint}" && "${OBJ_STORE_TYPE}" == "aws" ]]; then
     minio_endpoint="https://s3.${OBJ_STORE_REGION}.amazonaws.com"
     log "  type=aws: using S3 endpoint ${minio_endpoint}"
   fi
   [[ -z "${minio_endpoint}" ]] && err "storage.objectStore.endpoint must be set for type=${OBJ_STORE_TYPE}"
+  if [[ "${OBJ_STORE_TYPE}" != "aws" ]]; then
+    # Splunk App Framework supports provider=minio with storageType=s3 for
+    # MinIO and other S3-compatible stores. Unlike provider=aws, this uses
+    # path-style bucket access and works with exact OpenShift Routes and
+    # Kubernetes Service DNS names.
+    splunk_app_repo_provider="minio"
+    cluster_local_object_endpoint=$(openshift_route_service_endpoint "${minio_endpoint}" || true)
+    if [[ -n "${cluster_local_object_endpoint}" ]]; then
+      minio_endpoint="${cluster_local_object_endpoint}"
+      log "  Using cluster-local Splunk appRepo endpoint: ${minio_endpoint}"
+    fi
+  fi
 
   # This issuer becomes the JWT "iss" claim and must match
   # AIPlatform.spec.splunkConfiguration.endpoint exactly.
@@ -2708,6 +2933,7 @@ ${splunk_storage_yaml}
         name: splunk-defaults
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
+    appsRepoPollIntervalSeconds: 60
     appSources:
       - name: apps
         scope: local
@@ -2717,7 +2943,7 @@ ${splunk_storage_yaml}
       volumeName: volume_app_repo
     volumes:
       - name: volume_app_repo
-        provider: aws
+        provider: ${splunk_app_repo_provider}
         storageType: s3
         endpoint: ${minio_endpoint}
         region: ${OBJ_STORE_REGION}
@@ -3212,11 +3438,10 @@ model_artifacts_config_name() {
   esac
 }
 
-# Resolve the directory containing immutable model metadata. Connected installs
-# use the repository's staging directory; the air-gap wrapper points this at the
-# metadata copied into the verified bundle.
+# Resolve the repository directory containing the model profile. The profile is
+# source-controlled installer logic and is not duplicated in the air-gap bundle.
 model_artifacts_metadata_dir() {
-  local candidate="${MODEL_ARTIFACTS_CONFIG_DIR:-$(dirname "$0")/../artifacts_download_upload_scripts}"
+  local candidate="$(dirname "$0")/../artifacts_download_upload_scripts"
   (cd "${candidate}" 2>/dev/null && pwd)
 }
 
@@ -3326,13 +3551,12 @@ all_models_staged() {
   return 1
 }
 
-# Air-gapped installs cannot download model weights. Verify the exact completion
-# marker for every model before modifying the cluster instead of trusting that a
-# separate staging process was run successfully.
+# When automatic staging is disabled for an air-gapped install, verify the exact
+# completion marker for every model before modifying the cluster.
 verify_pre_staged_model_artifacts() {
   local staging_dir accel config_name
   staging_dir=$(model_artifacts_metadata_dir) \
-    || { err "Cannot locate model artifact metadata. Set MODEL_ARTIFACTS_CONFIG_DIR to a directory containing the bundled model config."; return 1; }
+    || { err "Cannot locate the repository model profile under tools/artifacts_download_upload_scripts."; return 1; }
   accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
   config_name=$(model_artifacts_config_name "${accel}") || err "Unsupported accelerator for model verification: ${DEFAULT_ACCELERATOR}"
 
@@ -3344,21 +3568,17 @@ verify_pre_staged_model_artifacts() {
   err "Model artifact verification failed for bucket '${OBJ_STORE_BUCKET}'.
   Every model in ${config_name} must have a matching
   staging_state/<artifact-id>/.staging_complete marker. Stage the missing
-  artifacts from a connected machine, then rerun the installer."
+  artifacts from an installer machine that can reach Hugging Face, or set
+  storage.modelStaging.enabled=true and rerun from that connected machine."
 }
 
 # ====== MODEL ARTIFACT STAGING ======
 # Downloads model artifacts from HuggingFace and uploads them to the configured
-# object store. Controlled by storage.modelStaging.enabled in config (default: false).
-# Skipped when AIRGAP_MODE=true — models must be pre-staged in that case.
+# object store. Air-gap mode does not disable this because downloads happen on
+# the installer machine, not on the OpenShift nodes.
 stage_model_artifacts() {
   if [[ "${MODEL_STAGING_ENABLED}" != "true" ]]; then
     log "Model staging disabled (storage.modelStaging.enabled=false), skipping"
-    return 0
-  fi
-
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "AIRGAP_MODE=true — skipping model staging (models must be pre-staged in object store)"
     return 0
   fi
 
@@ -3608,6 +3828,9 @@ main_install() {
 
   show_install_plan
 
+  configure_openshift_insecure_endpoints "${CONFIG_FILE}" \
+    || err "Could not configure OpenShift insecure registry/object-store access"
+
   phase_start "Preflight"
   step_start "Preflight checks"
   preflight_checks
@@ -3615,14 +3838,19 @@ main_install() {
   phase_end "Preflight"
 
   phase_start "Model Staging"
-  if [[ "${AIRGAP_MODE:-false}" == "true" || "${MODEL_STAGING_ENABLED}" != "true" ]]; then
+  if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
+    step_start "Model artifact staging (Hugging Face → object store)"
+    stage_model_artifacts
+    step_ok
+  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
     step_start "Verify pre-staged model artifacts"
     verify_pre_staged_model_artifacts
+    step_ok
   else
     step_start "Model artifact staging"
-    stage_model_artifacts
+    log "Model staging disabled (storage.modelStaging.enabled=false) — skipping download and upload"
+    step_skip "modelStaging.enabled=false"
   fi
-  step_ok
   phase_end "Model Staging"
 
   initialize_install_state
@@ -4204,9 +4432,99 @@ verify_all_pods_healthy() {
   return 1
 }
 
+# Automatically stage installer-owned content before an air-gapped install.
+# Users select only cluster.airgap=true; the generated transfer artifacts and
+# oc-mirror import remain internal implementation details.
+delegate_airgap_install_if_needed() {
+  local subcommand="$1"
+  shift || true
+
+  [[ "${subcommand}" == "install" ]] || return 0
+  [[ "${AIRGAP_STAGED:-false}" != "true" ]] || return 0
+
+  local requested="false"
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    requested="true"
+  fi
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    if command -v yq >/dev/null 2>&1; then
+      if [[ "${requested}" != "true" ]]; then
+        requested=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
+        [[ "${requested}" == "null" ]] && requested="false"
+      fi
+    elif grep -qE '^[[:space:]]*airgap:[[:space:]]*true([[:space:]]|#|$)' "${CONFIG_FILE}"; then
+      # Retain the same narrow fallback used by the k0s entry point.
+      requested="true"
+    fi
+  fi
+  [[ "${requested}" == "true" ]] || return 0
+
+  [[ -f "${CONFIG_FILE}" ]] || err "Air-gap mode requires a cluster configuration file: ${CONFIG_FILE}"
+  [[ "$(uname -s)" == "Linux" ]] \
+    || err "OpenShift air-gap installation requires a Linux installer machine because Red Hat oc-mirror is Linux-only."
+  configure_openshift_insecure_endpoints "${CONFIG_FILE}" \
+    || err "Could not configure OpenShift insecure registry/object-store access"
+  prepare_airgap_registry_auth_file "${CONFIG_FILE}" \
+    || err "Could not prepare oc-mirror registry authentication"
+
+  local option
+  for option in "$@"; do
+    case "${option}" in
+      --silent|-s) export SILENT_INSTALL="true" ;;
+      *) err "Unknown install option: ${option}" ;;
+    esac
+  done
+
+  local script_dir prepare_script wrapper_script bundle_path output_dir extract_dir
+  local -a wrapper_args
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  prepare_script="${OPENSHIFT_AIRGAP_PREPARE_SCRIPT:-${script_dir}/prepare_airgap_bundle_openshift.sh}"
+  wrapper_script="${OPENSHIFT_AIRGAP_INSTALL_SCRIPT:-${script_dir}/install_from_airgap_bundle_openshift.sh}"
+  [[ -x "${wrapper_script}" ]] || err "Air-gap installer wrapper is missing or not executable: ${wrapper_script}"
+
+  # OPENSHIFT_AIRGAP_BUNDLE is an internal/CI reuse hook. Ordinary users set
+  # only cluster.airgap and the installer generates the artifacts automatically.
+  bundle_path="${OPENSHIFT_AIRGAP_BUNDLE:-}"
+
+  # Keep generated content in the caller's working directory. Automatic
+  # same-host installs reuse the prepared directory directly; transfer archives
+  # remain supported only through the explicit OPENSHIFT_AIRGAP_BUNDLE hook.
+  output_dir="${OPENSHIFT_AIRGAP_OUTPUT_DIR:-${PWD}/airgap-bundle-openshift}"
+  if [[ -z "${bundle_path}" ]]; then
+    [[ -x "${prepare_script}" ]] || err "Air-gap bundle preparation script is missing or not executable: ${prepare_script}"
+    log "Air-gap mode requested; preparing installer-owned OpenShift content automatically..."
+    mkdir -p "${output_dir}"
+    "${prepare_script}" --config "${CONFIG_FILE}" --output-dir "${output_dir}" --no-archive
+    bundle_path=$(find "${output_dir}" -mindepth 1 -maxdepth 1 -type d -name 'airgap-bundle-openshift-*' -print \
+      | sort | tail -1)
+    [[ -n "${bundle_path}" ]] || err "Air-gap bundle preparation completed without producing a prepared directory in ${output_dir}"
+  fi
+  [[ -f "${bundle_path}" || -d "${bundle_path}" ]] \
+    || err "Configured OpenShift air-gap bundle file or directory does not exist: ${bundle_path}"
+
+  wrapper_args=(
+    --bundle "${bundle_path}"
+    --config "${CONFIG_FILE}"
+    --installer "${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    --subcommand "${subcommand}"
+  )
+  if [[ -f "${bundle_path}" ]]; then
+    if [[ -n "${OPENSHIFT_AIRGAP_EXTRACT_DIR:-}" ]]; then
+      extract_dir="${OPENSHIFT_AIRGAP_EXTRACT_DIR}"
+    else
+      extract_dir=$(mktemp -d "${TMPDIR:-/tmp}/splunk-ai-openshift-airgap.XXXXXX")
+    fi
+    wrapper_args+=(--extract-dir "${extract_dir}")
+  fi
+
+  log "Air-gap artifacts ready; delegating installation through $(basename "${wrapper_script}")."
+  exec "${wrapper_script}" "${wrapper_args[@]}"
+}
+
 # ====== MAIN ======
 _CMD="${1:-install}"
 shift 2>/dev/null || true
+delegate_airgap_install_if_needed "${_CMD}" "$@"
 case "${_CMD}" in
   install)
     while [[ $# -gt 0 ]]; do
@@ -4225,9 +4543,8 @@ case "${_CMD}" in
     ;;
   stage-artifacts)
     load_config
-    # Running this subcommand IS an explicit request to stage, so force staging on
-    # regardless of storage.modelStaging.enabled (which only gates install-time staging).
-    # The airgap guard inside stage_model_artifacts still applies.
+    # Running this subcommand is an explicit request to stage, so force staging
+    # regardless of storage.modelStaging.enabled.
     MODEL_STAGING_ENABLED="true"
     resolve_accelerator_type
     stage_model_artifacts
