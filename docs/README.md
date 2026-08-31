@@ -17,7 +17,7 @@ Welcome to the Splunk AI Operator documentation!
 ## Configuration Guides
 
 - **[Storage Configuration](configuration/storage-configuration.md)** - Persistent storage for Weaviate vector database
-- **[Storage Artifacts](configuration/storage-artifacts.md)** - S3/GCS/Azure storage for AI models
+- **[Storage Artifacts](configuration/storage-artifacts.md)** - S3 and S3-compatible storage for AI models
 - **[Ingress Configuration](configuration/ingress-configuration.md)** - Expose AI services externally
 - **[Webhook Certificates](configuration/webhook-certificates.md)** - Configure admission webhook TLS
 
