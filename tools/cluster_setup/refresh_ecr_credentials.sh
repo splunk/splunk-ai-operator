@@ -66,7 +66,7 @@ info "Restarting ECR-based deployments..."
 for ns in ${NAMESPACES}; do
   for dep in $($KUBECTL -n "${ns}" get deployments -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
     [[ -z "$dep" ]] && continue
-    images=$($KUBECTL -n "${ns}" get deployment "${dep}" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null || "")
+    images=$($KUBECTL -n "${ns}" get deployment "${dep}" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null || true)
     if echo "$images" | grep -q "${ECR_ACCOUNT}" 2>/dev/null; then
       $KUBECTL -n "${ns}" rollout restart deployment "${dep}" 2>/dev/null && \
         info "  Restarted: ${dep}" || true

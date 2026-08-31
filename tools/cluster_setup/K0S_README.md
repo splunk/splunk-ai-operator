@@ -1666,7 +1666,9 @@ The installer scp's the closure to each GPU node, installs with `dnf --disablere
 
 If you would rather manage drivers out of band, install the NVIDIA driver and `nvidia-container-toolkit` on each GPU node before running the installer, and pass `--skip-nvidia-closure`. The installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips toolkit install), then configures the containerd runtime offline.
 
-To build the closure by hand for this path, the manual recipe follows.
+To build the closure by hand for this optional RHEL 9 path, the manual recipe
+follows. For RHEL 10 or Ubuntu 24.04 GPU nodes, use the automatic closure
+staging described in Strategy 1 instead of this RHEL 9 recipe.
 
 The driver flavor that succeeds on RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
 
@@ -1678,7 +1680,7 @@ path.
 
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
 
-**Step 1 — build the closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the installer machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
+**Step 1 — build the RHEL 9 closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the installer machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
 
 ```bash
 DEST=~/nvidia-offline
@@ -1966,7 +1968,7 @@ process and are never printed or written to files.
 
 ### Prerequisites
 
-- All pods are Running: `kubectl get pods -A | grep -v "Running\|Completed"`
+- All pods are Running: `kubectl get pods -A --no-headers | awk '$4 != "Running" && $4 != "Completed" {print}'`
 - `AIPlatform` CR is Ready: `kubectl get aiplatform -n ai-platform`
 - SAIA service is up: `kubectl get pods,svc -n ai-platform | grep saia`
 - You have the `Splunk_AI_Assistant_Cloud.tgz` archive (download from Splunk Base

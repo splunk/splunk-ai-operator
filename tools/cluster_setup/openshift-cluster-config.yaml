@@ -64,7 +64,7 @@ images:
     apiImage: "arif/slim-api:v0.0.4"
 
   splunk:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom"
+    image: "docker.io/splunk/splunk:10.2-rhel9"
     operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
 
   fluentBit:

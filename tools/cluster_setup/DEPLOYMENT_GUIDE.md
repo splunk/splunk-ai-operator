@@ -436,8 +436,15 @@ tail -f tools/cluster_setup/logs/k0s-install-*.log
 ```bash
 export KUBECONFIG=~/.kube/k0s-<your-cluster-name>
 kubectl get nodes                          # all nodes Ready
-kubectl get pods -A                        # all pods Running
+kubectl get pods -A                        # all pods Running or Completed
 kubectl get aiplatform -n ai-platform      # AIPlatform Ready
+```
+
+Run the same verification command for standard and air-gapped deployments:
+
+```bash
+cd tools/cluster_setup
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
 ---
@@ -520,6 +527,15 @@ Phases 1–3 are preparation you do before installing. If your container images
 are already mirrored and your model weights already staged, skip straight to
 [Phase 4](#phase-4--install) — the single command there does Phase 1 for you.
 
+Before starting the phases, create the working configuration from the
+air-gapped template and update its required values:
+
+```bash
+cd tools/cluster_setup
+cp k0s-airgapped-config.yaml my-cluster.yaml
+# Edit my-cluster.yaml and fill in the required values
+```
+
 Stage explicitly only if you want the artifacts on disk *before* the install
 window — to inspect them, to check their size, or to work through Phase 2's
 image list. `--download-only` has no equivalent on the unified command, so this
@@ -530,14 +546,14 @@ machine — the same machine that can SSH to the cluster nodes.
 cd tools/cluster_setup
 
 # Stage everything and stop, without installing
-./airgap_install.sh --download-only --config my-cluster-config.yaml
+./airgap_install.sh --download-only --config my-cluster.yaml
 
 # Pin a specific k0s version
-./airgap_install.sh --download-only --config my-cluster-config.yaml \
+./airgap_install.sh --download-only --config my-cluster.yaml \
   --k0s-version v1.31.2+k0s.0
 
 # Stage somewhere other than ./airgap-bundle
-./airgap_install.sh --download-only --config my-cluster-config.yaml \
+./airgap_install.sh --download-only --config my-cluster.yaml \
   --output-dir /mnt/staging
 ```
 
@@ -760,7 +776,7 @@ machine. Start it inside the [persistent installer session](#keep-the-installer-
 cd tools/cluster_setup
 chmod +x airgap_install.sh k0s_cluster_with_stack.sh
 
-CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 That is the whole thing. GPU node IPs and the SSH user/key are read from the
@@ -775,7 +791,7 @@ front for the ~2.2 GB of artifacts.
 
 ```mermaid
 flowchart TD
-    A["CONFIG_FILE=./my-cluster-config.yaml\n./k0s_cluster_with_stack.sh install"] --> A2
+    A["CONFIG_FILE=./my-cluster.yaml\n./k0s_cluster_with_stack.sh install"] --> A2
 
     A2["0. cluster.airgap: true detected\n→ hands off to airgap_install.sh\nto stage the artifacts"]
     A2 --> B
@@ -868,7 +884,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph S1["Strategy 1\n✅ Recommended — automatic"]
-        S1A["k0s_cluster_with_stack.sh install\non a connected RHEL 9.8 x86_64 host;\nGPU IPs + OS (RHEL 9.8, RHEL 10.2,\nor Ubuntu 24.04) read/detected from config"]
+        S1A["k0s_cluster_with_stack.sh install\non the matching RHEL installer host;\nGPU IPs + OS (RHEL 9.8, RHEL 10.2,\nor Ubuntu 24.04) read/detected from config"]
         S1B["Script resolves a full RPM or .deb\nclosure incl. kernel headers\nfor each node's kernel"]
         S1C["Installer scp's the closure\nto each GPU node and installs\noffline; DKMS compiles"]
         S1A --> S1B --> S1C
@@ -899,7 +915,7 @@ or Ubuntu 24.04.
 ```bash
 # Nothing extra to do — the GPU node IPs and OS are derived from your config
 # and each node's `uname -r` / OS is surveyed over SSH.
-CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 To override the derived kernel, host list, or OS, drive the staging step
@@ -908,15 +924,15 @@ the install just as the unified command would:
 
 ```bash
 # Override the derived list only if needed (e.g. non-standard node layout)
-./airgap_install.sh --config my-cluster-config.yaml \
+./airgap_install.sh --config my-cluster.yaml \
   --gpu-hosts 10.0.38.138,10.0.38.139
 
 # …or name the kernels explicitly if the nodes aren't reachable over SSH yet
-./airgap_install.sh --config my-cluster-config.yaml \
+./airgap_install.sh --config my-cluster.yaml \
   --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64
 
 # …or force the GPU node OS/package format instead of auto-detecting it
-./airgap_install.sh --config my-cluster-config.yaml --gpu-os ubuntu24
+./airgap_install.sh --config my-cluster.yaml --gpu-os ubuntu24
 ```
 
 > GPU node IPs come from your config: the workers listed in
@@ -1224,10 +1240,10 @@ skipping it leaves the sealed nodes unable to pull the new tag
 crane copy "docker.io/splunk/<image>:<new-tag>" "registry.airgap.local/<image>:<new-tag>"
 
 # 2. Update the tag in your config to point at the mirrored image
-vi my-cluster-config.yaml
+vi my-cluster.yaml
 
 # 3. Re-run install
-CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ### Collect a support bundle

@@ -55428,7 +55428,7 @@ spec:
         - name: WATCH_NAMESPACE
           value: ""
         - name: RELATED_IMAGE_SPLUNK_ENTERPRISE
-          value: 658391232643.dkr.ecr.us-east-2.amazonaws.com/splunk/splunk:10-2-ai-custom
+          value: docker.io/splunk/splunk:10.2-rhel9
         - name: OPERATOR_NAME
           value: splunk-operator
         - name: SPLUNK_GENERAL_TERMS
