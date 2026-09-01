@@ -67,7 +67,7 @@ The script installs everything needed for the AI Platform:
 7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9.8, RHEL 10.2, Ubuntu 24.04)
 8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI
 9. **Splunk Operator** — Splunk Enterprise management
-10. **Splunk AI tier Operator** — AI platform orchestration (SAIA feature)
+10. **Splunk AI tier Operator** — AI platform orchestration (SAIA, SLIM feature)
 11. **AIPlatform CR** — Complete AI deployment with features, scheduling, and secrets
 
 ### Operational Features
@@ -156,7 +156,7 @@ there too as an equivalent alternative if you already run Docker.
 | Node Type | Min CPU | Min RAM | Min Disk | Notes |
 |-----------|---------|---------|----------|-------|
 | Controller | 4+ | 8 GB | 100 GB | Runs API server, etcd, scheduler |
-| CPU Worker | 8+ | 32 GB | 200 GB | Runs Weaviate, Ray head, Splunk, SAIA API/v2, Data Loader |
+| CPU Worker | 8+ | 32 GB | 200 GB | Runs Weaviate, Ray head, Splunk, SAIA API/v2, SLIM, Data Loader |
 | GPU Worker — L40S | 48 vCPUs | 384 GiB | 500 GB | 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **2 nodes required = 8 × L40S total (384 GB total GPU memory)** · equivalent to `g6e.12xlarge` |
 | GPU Worker — H100 | 16 vCPUs | 256 GiB | 500 GB | 1 × NVIDIA H100 per node (80 GB HBM3 each) · **2 nodes required = 2 × H100 total (160 GB total GPU memory)** · equivalent to `p5.4xlarge` |
 
@@ -360,6 +360,8 @@ aiPlatform:
     - name: "saia"
       version: "1.1.0"
       serviceAccountName: ""
+    - name: "slim"
+      version: "1.0.0"
   cpuScheduling:
     nodeSelector:
       splunk.ai/workload-type: cpu
@@ -374,7 +376,8 @@ aiPlatform:
         effect: "NoSchedule"
   serviceTemplate:                      # Optional: expose SAIA externally
     type: "NodePort"                    # NodePort | LoadBalancer
-    nodePort: 30080                     # Port for NodePort type
+    nodePort: 30080                     # Port for SAIA NodePort type
+    slimNodePort: 30081                 # Port for SLIM NodePort type
 
 imagePullSecrets:
   secrets: []
@@ -490,7 +493,7 @@ unchanged. For a private registry or air-gapped installation, mirror the images
 and replace the corresponding fields with the mirrored paths; setting only
 `images.registry` does not rewrite a fully qualified Docker Hub reference.
 
-> The SAIA `v1.0` defaults are mutable and workloads use `imagePullPolicy:
+> The SAIA & SLIM `v1.0` defaults are mutable and workloads use `imagePullPolicy:
 > IfNotPresent`. Re-running the installer with the same tag may reuse a cached
 > image; use a new immutable tag or digest for a controlled image refresh.
 
@@ -507,7 +510,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `images.saia.apiImage` | **Yes** | `docker.io/splunk/ai-tier-saia-api:v1.0` | SAIA API v1 image |
 | `images.saia.apiV2Image` | **Yes** | `docker.io/splunk/ai-tier-saia-api-v2:v1.0` | SAIA API v2 image |
 | `images.saia.dataLoaderImage` | **Yes** | `docker.io/splunk/ai-tier-saia-data-loader:v1.0` | SAIA data loader / post-install hook image |
-| `images.slim.apiImage` | No | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API image (required when the `slim` feature is enabled) |
+| `images.slim.apiImage` | **Yes** | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API image (required when the `slim` feature is enabled) |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -552,15 +555,16 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `aiPlatform.scaleFactor` | No | `1` | AI workload capacity multiplier; use a whole number of 1 or higher |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
-| `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
+| `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`, `slim`) |
 | `aiPlatform.features[].version` | Yes | — | Feature version |
 | `aiPlatform.features[].serviceAccountName` | No | `""` | Service account override |
 | `aiPlatform.cpuScheduling.nodeSelector` | No | auto-generated | Node selector for CPU workloads |
 | `aiPlatform.cpuScheduling.tolerations` | No | `[]` | Tolerations for CPU workloads |
 | `aiPlatform.gpuScheduling.nodeSelector` | No | auto-generated | Node selector for GPU workloads |
 | `aiPlatform.gpuScheduling.tolerations` | No | GPU toleration | Tolerations for GPU workloads |
-| `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
-| `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
+| `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA & SLIM exposure: `NodePort` or `LoadBalancer` |
+| `aiPlatform.serviceTemplate.nodePort` | No | — | SAIA node port number (only when type=NodePort) |
+| `aiPlatform.serviceTemplate.slimNodePort` | No | — | SLIM node port number (only when type=NodePort) |
 
 #### Scaling Deployment Capacity
 
@@ -942,7 +946,7 @@ graph TB
 
     subgraph "AI Platform Namespace"
         AIPLATFORM[AIPlatform CR<br/>Custom Resource]
-        AISERVICE[AIService CRs<br/>saia]
+        AISERVICE[AIService CRs<br/>saia + slim]
         RAYSERVICE[RayService<br/>Ray Serve + Cluster]
         RAYCLUSTER[RayCluster<br/>Head + Workers]
         WEAVIATE[Weaviate<br/>Vector Database]
@@ -1243,15 +1247,16 @@ nodes:
 The installer fails before making changes if `nodes.controllers` is not `1` or
 if more than one controller IP is configured.
 
-### Service Template (SAIA Public Exposure)
+### Service Template (SAIA & SLIM Public Exposure)
 
-To expose the SAIA v2 chat UI externally:
+To expose the SAIA v2 chat UI externally & use SLIM service for `ai` & `apply CDTSM` commands with Splunk AI Toolkit app:
 
 ```yaml
 aiPlatform:
   serviceTemplate:
     type: "NodePort"      # or "LoadBalancer"
     nodePort: 30080       # only for NodePort
+    slimNodePort: 30081   # only for NodePort
 ```
 
 This generates a Kubernetes Service exposing port 8080 on the specified NodePort across all worker nodes.
@@ -1828,6 +1833,7 @@ combinations are not qualified by this guide.
 | Splunk Enterprise | 10.2 |
 | Splunk AI Tier / Splunk AI Operator | v1.0 |
 | SAIA services | v1.0 |
+| Splunk AI Toolkit | 6.1.0 |
 | SLIM service | v1.0 |
 
 The bundled deployment uses `docker.io/splunk/splunk:10.2-rhel9`.
@@ -1863,7 +1869,7 @@ the AIPlatform endpoint:
 https://splunk-<standaloneName>-standalone-service:8089
 ```
 
-SAIA and Slim both derive `SPLUNK_ISSUERS` from that endpoint. No additional
+SAIA and SLIM both derive `SPLUNK_ISSUERS` from that endpoint. No additional
 nginx/JWKS proxy is deployed, and this path creates no TLS Secret, Certificate,
 CA ConfigMap, or CA mount. HEC configuration remains separate on port 8088
 through `splunkConfiguration.hecEndpoint`; the installer detects its effective
@@ -1925,7 +1931,7 @@ KUBECONFIG=/path/to/kubeconfig \
 
 This protects the existing bundled/internal path by validating the effective
 transport, issuer propagation, HEC exporter configuration, running injected
-collectors, and SAIA/Slim readiness. Passing it does not qualify external
+collectors, and SAIA/SLIM readiness. Passing it does not qualify external
 HEC/OTel or assert that telemetry reached an index. It does not read the Splunk
 admin password.
 
@@ -1942,7 +1948,7 @@ KUBECONFIG=/path/to/kubeconfig \
 This second test reads the operator-managed Splunk admin Secret, uses the
 bundled Splunk AI Assistant SDK over its default local HTTPS connection, mints
 a short-lived interactive JWT, and requires authenticated HTTP 200 responses
-from both SAIA and Slim. The decoded password and JWT remain inside one in-pod
+from both SAIA and SLIM. The decoded password and JWT remain inside one in-pod
 process and are never printed or written to files.
 
 ### Splunk AI Assistant App
@@ -2449,6 +2455,7 @@ These images are pulled from registries when pods are scheduled. Pre-pull for ai
 | Ray Head / Ray Worker GPU | ECR or configured registry |
 | Weaviate | `docker.io/semitechnologies/weaviate:...` |
 | SAIA API v1 / v2 / Data Loader | ECR or configured registry |
+| SLIM Service | ECR or configured registry |
 | Nginx | `docker.io/library/nginx:1.27-alpine` |
 | Fluent Bit | `docker.io/fluent/fluent-bit:1.9.6` |
 | OpenTelemetry Collector | `docker.io/otel/opentelemetry-collector-contrib:0.122.1` |

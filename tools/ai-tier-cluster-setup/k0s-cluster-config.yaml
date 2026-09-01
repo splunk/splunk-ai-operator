@@ -101,11 +101,11 @@ storage:
 
   objectStore:
     type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
-    bucket: "ai-platform-bucket-minio-us-east-2"
+    bucket: "ai-platform-bucket-minio-us-east-2" # TODO - If we create the bucket then edit this to "ai-platform-bucket"
     endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS/S3 API endpoint
     auth:
-      rootUser: "<paste-AWS_ACCESS_KEY_ID-here>"          # CHANGE THIS — AWS_ACCESS_KEY_ID (AKIA…) or MinIO root user
-      rootPassword: "<paste-AWS_SECRET_ACCESS_KEY-here>"  # CHANGE THIS — AWS secret OR MinIO root password; NEVER commit real keys
+      rootUser: "<paste-the-root-user-here>"          # CHANGE THIS — AWS_ACCESS_KEY_ID (AKIA…) or MinIO root user
+      rootPassword: "<paste-the-root-password-here>"  # CHANGE THIS — AWS secret OR MinIO root password; NEVER commit real keys
 
 # ---------- Container Images Configuration ----------
 images:
