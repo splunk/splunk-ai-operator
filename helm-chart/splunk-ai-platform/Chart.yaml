@@ -32,7 +32,7 @@ annotations:
     - name: Documentation
       url: https://github.com/splunk/splunk-ai-operator/tree/main/docs
     - name: Installation Guide
-      url: https://github.com/splunk/splunk-ai-operator/blob/main/docs/installation.md
+      url: https://github.com/splunk/splunk-ai-operator/blob/main/docs/splunk-ai-operator-docs/splunk-ai-operator-installation.md
     - name: Compatibility Matrix
       url: https://github.com/splunk/splunk-ai-operator/blob/main/compatibility-matrix.yaml
   artifacthub.io/recommendations: |

@@ -127,7 +127,7 @@ func classifyObjectStorage(scheme, endpoint string) (cloudProvider, artifactsPro
 //
 // We need this because the k0s installer requires a non-empty
 // objectStore.endpoint even for type=aws (see preflight in
-// tools/cluster_setup/k0s_cluster_with_stack.sh:434), so an empty-endpoint
+// tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh:434), so an empty-endpoint
 // check alone is not sufficient to identify real AWS S3.
 //
 // The match is intentionally narrow: host must end in `.amazonaws.com` AND

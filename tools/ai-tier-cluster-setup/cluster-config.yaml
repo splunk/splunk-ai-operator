@@ -1,0 +1,442 @@
+# ===================================================================
+# EKS Cluster Configuration Template for Splunk AI tier
+# ===================================================================
+# IMPORTANT: This is a template file with placeholder values.
+# Copy this file and replace ALL placeholder values with your actual AWS resources.
+#
+# Quick Start:
+#   1. Copy: cp cluster-config.yaml my-cluster-config.yaml
+#   2. Edit: vi my-cluster-config.yaml
+#   3. Replace all values marked with "CHANGE THIS"
+#   4. Run: CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
+# ===================================================================
+
+# ---------- Cluster Configuration ----------
+cluster:
+  # ------------------------------------------------------------------------
+  # LIFECYCLE WORKFLOW (to avoid VPC/IGW quota churn and DELETE_FAILED loops)
+  # ------------------------------------------------------------------------
+  #   1. FIRST install (cluster does not exist yet):
+  #        useExisting: false            # eksctl creates the cluster + VPC
+  #        ./eks_cluster_with_stack.sh install
+  #
+  #   2. AFTER first install succeeds, flip this one line:
+  #        useExisting: false            # subsequent `install` only reconciles
+  #                                      # operators/CRs on the existing cluster.
+  #      Re-running `install` is now safe and does NOT create new VPCs/IGWs.
+  #
+  #   3. When you genuinely want to tear down:
+  #        ALWAYS use `delete-full` (NOT `delete`). It uninstalls CRs/operators
+  #        first so the AWS Load Balancer Controller removes its NLBs + SGs
+  #        before CFN deletes the VPC -- this prevents DELETE_FAILED stacks
+  #        leaving orphan VPCs behind and eating your per-region quota.
+  #        ./eks_cluster_with_stack.sh delete-full
+  # ------------------------------------------------------------------------
+  useExisting: false  # true = do not create cluster; use existing one (script fails if cluster not found)
+  name: "ai-cluster"                             # CHANGE THIS: Your EKS cluster name (DNS-1123 compliant: lowercase, numbers, hyphens)
+  region: "us-east-2"                     # CHANGE THIS: Your AWS region (e.g., us-east-1, us-west-2, eu-west-1)
+  k8sVersion: "1.31"                      # Kubernetes version (1.29, 1.30, 1.31 supported)
+  # When true: require subnets (existing VPC). On 'delete', only EKS and related resources are removed; VPC is preserved so you can redeploy (e.g. with MinIO on EC2 in same VPC).
+  preserveVpcOnDelete: false              # Set true to keep VPC on delete and redeploy without recreating VPC
+
+  # To use an EXISTING VPC: provide subnets below; eksctl will not create a new VPC. Idempotent: cluster is only created if it does not exist.
+  # If you do not provide subnets, eksctl creates a new VPC and subnets automatically.
+  # VPC Subnets - CHANGE ALL OF THESE to your actual subnet IDs
+  # Find your subnets: aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxxxx" --region us-west-2
+# subnets:
+#    private:                              # Private subnets (at least 2 in different AZs)
+#      - id: "subnet-02734905b10e7ad5a"    # CHANGE THIS: Your private subnet 1
+#        az: "us-east-2b"                  # CHANGE THIS: Availability zone for subnet 1
+#      - id: "subnet-0c1d7dc49788d11dc"    # CHANGE THIS: Your private subnet 2
+#        az: "us-east-2c"                  # CHANGE THIS: Availability zone for subnet 2
+#      - id: "subnet-0f8f94998d65dfcd2"    # CHANGE THIS: Your private subnet 2
+#        az: "us-east-2a"   
+#    public:                               # Public subnets (at least 2 in different AZs)
+#      - id: "subnet-0f0ea3b190a618540"    # CHANGE THIS: Your public subnet 1
+#        az: "us-east-2c"                  # CHANGE THIS: Availability zone for subnet 1
+#      - id: "subnet-02b736130e7c2a787"    # CHANGE THIS: Your public subnet 2
+#        az: "us-east-2a"                  # CHANGE THIS: Availability zone for subnet 2
+#      - id: "subnet-02c35a8cd0b5d90a5"    # OPTIONAL: Additional public subnet for HA
+#        az: "us-east-2b"                  # OPTIONAL: Third availability zone
+
+# ---------- Node Groups ----------
+#
+# GPU TYPE QUICK REFERENCE — set instanceType and defaultAcceleratorType (under aiPlatform) together:
+#
+#   L40S  (default):
+#     instanceType:        g6e.12xlarge    (4x L40S GPUs, 48 GB VRAM each)
+#     defaultAcceleratorType: L40S
+#     capacityReservation: not required
+#     availabilityZones:   not required
+
+nodeGroups:
+  cpu:
+    enabled: true                         # Set to false to skip CPU node group
+    instanceType: "m5.xlarge"             # CPU instance type (m5.xlarge=4vCPU/16GB, m5.2xlarge=8vCPU/32GB)
+    desiredCapacity: 4                    # Initial number of CPU nodes
+    minSize: 2                            # Minimum nodes (for autoscaling)
+    maxSize: 8                            # Maximum nodes (for autoscaling)
+    volumeSize: 500                       # EBS volume size per node (GB)
+    volumeType: "gp3"                     # EBS volume type (gp3 recommended, gp2, io1, io2)
+
+  gpu:
+    enabled: true                         # Set to false to skip GPU nodes (saves cost)
+    instanceType: "g6e.12xlarge"          # CHANGE THIS: see GPU TYPE QUICK REFERENCE above
+    desiredCapacity: 2                    # Initial number of GPU nodes
+    minSize: 2                            # Minimum GPU nodes
+    maxSize: 4                            # Maximum GPU nodes
+    volumeSize: 500                      # EBS volume size per GPU node (GB) - larger for model storage
+    volumeType: "gp3"                     # EBS volume type
+
+# ---------- Storage Configuration ----------
+# Object storage: only AWS S3 or external S3-compatible (no in-cluster MinIO install).
+# Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
+storage:
+  s3Bucket: "ai-platform-bucket-us-east-2"  # Used when objectStore.type is aws
+  storageClass: "gp3"                        # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
+  vectorDbSize: "50Gi"                       # VectorDB persistent volume size
+
+  # Object store: aws (S3) or external S3-compatible (s3compat, minio, seaweedfs). No in-cluster install.
+  # - s3compat: generic S3 API (MinIO :9000, SeaweedFS S3 :8333, etc.) — AIPlatform path uses s3compat://bucket
+  # - minio: same wiring as s3compat but path uses minio:// (use if an older operator webhook rejects s3compat://)
+  # - seaweedfs: path uses seaweedfs:// (requires operator webhook that allows that scheme)
+  objectStore:
+    type: "aws"                         # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-us-east-2"            # Must match SeaweedFS env (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) or MinIO root
+
+# ---------- Container Images Configuration ----------
+images:
+  # ==================================================================================
+  # REGISTRY PREFIX - Applied to ALL images (unless image has full registry path)
+  # ==================================================================================
+  # This registry is automatically prepended to ALL image paths below UNLESS
+  # the image path already contains a registry (e.g., docker.io/..., ghcr.io/...)
+  #
+  # HOW IT WORKS:
+  # --------------
+  # 1. If image path has NO registry → prepends 'registry' value
+  #    Example: "ray/ray-head:v1" → "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-head:v1"
+  #
+  # 2. If image path has FULL registry → uses as-is (ignores 'registry' value)
+  #    Example: "docker.io/splunk/splunk:10.2.0" → "docker.io/splunk/splunk:10.2.0"
+  #
+  # 3. If 'registry' is empty → assumes Docker Hub for images without registry
+  #    Example: "splunk/splunk:10.2.0" → "splunk/splunk:10.2.0" (Docker Hub)
+  #
+  # REQUIRED: Specify your private registry URL for custom images
+  # Leave empty to use Docker Hub defaults for all images
+  registry: "123456789012.dkr.ecr.us-east-2.amazonaws.com"  # CHANGE THIS: Your ECR/Docker/Harbor registry
+
+  # Set to true ONLY for plain-HTTP (no-TLS) registries, e.g. a local mirror
+  # served without a certificate (host:port with no HTTPS). Leave false for
+  # ECR, Docker Hub, Harbor, or any registry that serves over HTTPS.
+  registryInsecure: false
+
+  # ==================================================================================
+  # CONTAINER IMAGES - Specify paths (registry prefix auto-applied if needed)
+  # ==================================================================================
+
+  # Splunk AI Operator Image
+  operator:
+    # Option 1: Relative path (uses registry prefix)
+    #   image: "splunk-ai-operator:v1.0.0"
+    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk-ai-operator:v1.0.0"
+    #
+    # Option 2: Full path (ignores registry prefix)
+    #   image: "docker.io/myorg/splunk-ai-operator:v1.0.0"
+    #   Result: "docker.io/myorg/splunk-ai-operator:v1.0.0"
+    # Bump tag after building fixed operator (SAIA 8Gi default, SchemaJobId persist, feature config)
+    #image: "123456789012.dkr.ecr.us-east-2.amazonaws.com/ml-platform/splunk-ai-operator:v0.1.8"
+    image: "docker.io/splunk/splunk-ai-operator:0.2.0"
+
+  # Splunk Enterprise Images
+  splunk:
+    # Splunk Enterprise image
+    # Default behavior: If no registry in path, uses Docker Hub
+    #   "splunk/splunk:10.2.0" → Docker Hub
+    #   "123456789012.dkr.ecr.us-west-2.amazonaws.com/splunk/splunk:10.2.0" → ECR
+    image: "docker.io/splunk/splunk:10.2-rhel9"
+
+    # Splunk Operator image (optional - has default)
+    # Default: "docker.io/splunk/splunk-operator:3.0.0"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+
+  # Ray Images
+  ray:
+    # Option 1: Relative path (RECOMMENDED - uses registry prefix)
+    #   headImage: "ray/ray-head:build-17"
+    #   Result: "123456789012.dkr.ecr.us-west-2.amazonaws.com/ray/ray-head:build-17"
+    #
+    # Option 2: Full path with different registry
+    #   headImage: "docker.io/rayproject/ray:2.44.0"
+    #   Result: "docker.io/rayproject/ray:2.44.0"
+    # The Docker Hub defaults are fully qualified, so images.registry does not
+    # rewrite them. Replace these values with mirrored image paths when using a
+    # private registry or an air-gapped environment.
+    headImage: "docker.io/splunk/ai-tier-ray-head:preview"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:preview"
+
+  # Weaviate Vector Database
+  weaviate:
+    # Docker Hub public image (has full path, registry prefix ignored)
+    # OR specify your mirrored image:
+    #   image: "weaviate/weaviate:1.28.0"  → uses registry prefix
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+
+  # SAIA (Splunk AI Assistant) Images
+  saia:
+    # Fully qualified Docker Hub defaults. Replace these values with short or
+    # fully qualified mirror paths when using images.registry.
+    # NOTE: keep dataLoaderImage in sync with apiImage/apiV2Image. Tags older than
+    # v2-008 (specifically pre v2.0.4-13-g3b677604) ship a broken URL-compat shim
+    # that ignores VECTOR_DB_GRPC_* env vars and falls back to grpc.<host>:443 TLS,
+    # causing the vector-db-setup posthook Job to fail with a Weaviate gRPC health
+    # check error. See pkg/ai/features/saia/impl.go (reconcilePostInstallHook).
+    apiImage: "docker.io/splunk/ai-tier-saia-api:preview"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:preview"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:preview"
+  # Supporting Images
+  fluentBit:
+    # Docker Hub public image (has full path, registry prefix ignored)
+    # OR specify your mirrored image:
+    #   image: "fluent-bit:1.9.6"  → uses registry prefix
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  # OpenTelemetry Collector (use full URL so it is not rewritten to ECR)
+  otelCollector:
+    # Public image - full path so registry prefix is NOT applied; validation checks this URL
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+  # NGINX reverse proxy used by the SAIA reconciler to route v1 / v2 requests
+  # by path. OPTIONAL: omit this block to use the script default
+  # (docker.io/library/nginx:1.27-alpine). Add it only to pin a specific tag
+  # or point at an internal mirror in airgapped clusters.
+  #
+  # nginx:
+  #   image: "harbor.internal/library/nginx:1.27-alpine"
+
+# ---------- Operator Versions ----------
+operators:
+  ray:
+    version: "v1.2.2"                     # do not change Ray operator version
+    modelVersion: "v0.3.14-36-g1549f5a"   # Model version for Ray
+    rayVersion: "2.53.0"                  # Ray runtime version
+
+  certManager:
+    installCRDs: true              # no change
+
+  nvidia:
+    devicePluginVersion: "v0.17.3"  # no change
+
+# ---------- AI Platform Configuration ----------
+aiPlatform:
+  namespace: "ai-platform" # no change
+  name: "splunk-ai-stack" # no change
+
+  # Service Accounts
+  serviceAccounts:
+    rayHead: "ray-head-sa" # no change
+    rayWorker: "ray-worker-sa" # no change
+    saiaService: "saia-service-sa" # no change
+
+  # Default accelerator type — must match a top-level key in instance.yaml.
+  # Must be changed in sync with nodeGroups.gpu.instanceType (see GPU TYPE QUICK REFERENCE above).
+  #   L40S     → instanceType: g6e.12xlarge
+  defaultAcceleratorType: "L40S"
+
+  # Optional platform-wide capacity multiplier. It scales model replicas and
+  # Ray worker-pool base sizes together. Use an unquoted integer >= 1 and make
+  # sure the GPU node group has proportional capacity before increasing it.
+  scaleFactor: 1
+
+  # Features to enable
+  features: # no change
+    - name: "saia"
+      version: "1.1.0"
+      serviceAccountName: "saia-service-sa"
+
+  # Worker Group Configuration (replaces gpuConfigs)
+  workerGroupConfig:
+    serviceAccountName: "ray-worker-sa"
+    imageRegistry: ""                     # Leave empty for default
+
+  # ---------------------------------------------------------------------------
+  # Public SAIA exposure (NodePort-free)
+  # ---------------------------------------------------------------------------
+  # The operator renders a public Kubernetes Service named
+  # `<aiService.name>-saia-service`; because the AIService is typically named
+  # `<aiPlatform.name>-saia`, the resulting Service is usually
+  # `<aiPlatform.name>-saia-saia-service`. Its endpoints are the in-cluster
+  # nginx pods (nginx terminates path routing to saia v1 / v2). The install
+  # script then configures HOW that Service is reached from outside the cluster.
+  #
+  # IMPORTANT: this template intentionally does NOT use Service.type=NodePort.
+  # Many enterprise security policies prohibit opening 30000-32767 on every
+  # worker. All three modes below are NodePort-free — the script sets
+  # `allocateLoadBalancerNodePorts: false` on LoadBalancer Services so
+  # kube-proxy never opens a node port; for the BYO mode the Service stays
+  # ClusterIP and AWS LBC registers pod IPs into the customer's target group.
+  #
+  # Pick ONE of the modes below by editing the active block at the bottom of
+  # this section. Each mode shows: the YAML to use, what the script does, and
+  # what you must provision outside the cluster.
+  #
+  # ---------------------------------------------------------------------------
+  # MODE 1 — Operator-managed AWS NLB, IP-target mode (DEFAULT)
+  # ---------------------------------------------------------------------------
+  #   serviceTemplate:
+  #     type: LoadBalancer
+  #     annotations:
+  #       service.beta.kubernetes.io/aws-load-balancer-type:             "external"
+  #       service.beta.kubernetes.io/aws-load-balancer-scheme:           "internet-facing"   # or "internal"
+  #       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type:  "ip"                # ← pods, not nodes
+  #       service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+  #     # Optional TLS termination at the NLB:
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:..."
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+  #     # service.beta.kubernetes.io/aws-load-balancer-ssl-negotiation-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  #   awsLoadBalancerController:
+  #     install: true
+  #   byoTargetGroup:
+  #     enabled: false
+  #
+  # Script does:
+  #   * Installs AWS Load Balancer Controller (LBC) with IRSA, tags subnets.
+  #   * Creates the LoadBalancer Service; LBC provisions an NLB whose targets
+  #     are pod IPs (no NodePort, no kube-proxy hop, real client IP preserved).
+  #   * Patches the rendered Service to set `allocateLoadBalancerNodePorts:
+  #     false` and `externalTrafficPolicy: Local`.
+  # You must do: nothing on the AWS side. DNS appears in
+  # `.status.loadBalancer.ingress[0].hostname` after ~2-3 min.
+  #
+  # ---------------------------------------------------------------------------
+  # MODE 2 — Bring-your-own AWS LB (TargetGroupBinding, IP-target)
+  # ---------------------------------------------------------------------------
+  # Customer already owns the NLB / ALB / target group. LBC is installed only
+  # to manage target-group membership; it does NOT create LBs in this mode.
+  #
+  #   serviceTemplate:
+  #     type: ClusterIP                # LB is owned by the customer
+  #   awsLoadBalancerController:
+  #     install: true                  # required for TargetGroupBinding
+  #   byoTargetGroup:
+  #     enabled: true
+  #     targetGroupArn: "arn:aws:elasticloadbalancing:<region>:<account>:targetgroup/<your-tg>/<id>"
+  #     securityGroupId: "sg-xxxxxxxxxxxxxxxxx"   # the customer's LB security group
+  #
+  # Script does:
+  #   * Installs LBC.
+  #   * Leaves the public Service as ClusterIP.
+  #   * Applies a TargetGroupBinding CR with `targetType: ip` so LBC registers
+  #     nginx pod IPs into the customer's target group as endpoints change.
+  # You must do (outside the cluster):
+  #   1. Pre-create the target group in the EKS VPC with:
+  #        - Target type:   ip
+  #        - Protocol/Port: TCP/8080 (NLB) or HTTP/8080 (ALB)  ← pod port, not 30080
+  #        - Health check:  HTTP /nginx_health on traffic-port, 200 OK
+  #   2. Attach the target group to your existing LB listener.
+  #   3. Worker pod SG ingress 8080 from the LB SG only — the
+  #      TargetGroupBinding `networking.ingress.from.securityGroup` block
+  #      configured by the script does this for you.
+  #
+  # ---------------------------------------------------------------------------
+  # MODE 3 — On-prem / k0s / airgap (NOT applicable to this EKS template)
+  # ---------------------------------------------------------------------------
+  # Use the dedicated `k0s-cluster-config.yaml` template, which configures
+  # MetalLB to allocate a routable VIP. The user-facing contract there is
+  # identical (`type: LoadBalancer`) — only the LB provider changes.
+  #
+  # ---------------------------------------------------------------------------
+  # SECURITY NOTES (apply to all modes)
+  # ---------------------------------------------------------------------------
+  #   * Always terminate TLS at the LB (ACM cert on AWS) and place an auth
+  #     layer in front (oauth2-proxy, Cognito on the ALB, API Gateway, …)
+  #     before exposing on the public internet.
+  #   * Restrict the LB listener to trusted source CIDRs / SGs (never
+  #     0.0.0.0/0 to a sensitive endpoint).
+  #   * Pod SG ingress should allow 8080 only from the LB SG.
+  # ---------------------------------------------------------------------------
+
+  # Active mode below — EDIT to switch. Default is MODE 1.
+  serviceTemplate:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: "external"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+      service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+  awsLoadBalancerController:
+    install: true
+
+  # Bring-your-own AWS target group (Mode 2). Set enabled: true and provide
+  # both targetGroupArn and securityGroupId; the script will then leave the
+  # SAIA Service as ClusterIP and apply a TargetGroupBinding (LBC manages
+  # target registration into your existing target group).
+  byoTargetGroup:
+    enabled: false
+    # targetGroupArn: "arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/my-saia-tg/abc123"
+    # securityGroupId: "sg-0123456789abcdef0"
+
+  # CPU Scheduling
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+
+  # GPU Scheduling
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+  # Ingress Configuration
+  ingress: # not used
+    enabled: false
+    className: "nginx"
+    host: "ai.example.com"
+    tlsSecretName: "ai-platform-tls"
+
+  # Certificate configuration
+  certificate: # no change from user
+    issuerName: "platform-issuer"
+
+# ---------- Splunk Standalone Configuration ----------
+splunkStandalone: # no change
+  name: "splunk-standalone"
+  serviceAccount: "saia-service-sa"
+
+  appRepo:
+    enabled: true
+    appInstallPeriodSeconds: 90
+    appsRepoPollIntervalSeconds: 60
+    installMaxRetries: 2
+
+  # Optional: Path to local Splunk app to upload
+  # Leave empty to skip app upload
+  localAppPath: ""                        # e.g., "/path/to/Splunk_AI_Assistant_Cloud.tgz"
+
+# ---------- File Paths ----------
+files:
+  splunkOperatorManifest: "./splunk-operator-cluster.yaml"
+  splunkAiOperatorManifest: "./artifacts.yaml"
+
+# ---------- Advanced Settings ----------
+advanced:
+  # Cluster Autoscaler settings
+  clusterAutoscaler:
+    balanceSimilarNodeGroups: true
+    skipNodesWithSystemPods: false
+    expander: "least-waste"
+
+  # Monitoring
+  monitoring:
+    kubePrometheus: true
+
+  # OpenTelemetry
+  openTelemetry:
+    enabled: true
+    namespace: "observability"
+    collectorImage: "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest"

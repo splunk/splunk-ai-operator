@@ -1,0 +1,167 @@
+# =============================================================================
+# OpenShift Cluster Config for Splunk AI tier
+# =============================================================================
+# Used by openshift_with_stack.sh
+# =============================================================================
+
+# Set airgap=true for an air-gapped deployment. The normal install command then
+# mirrors and configures installer-owned OpenShift dependencies automatically.
+# Air-gap installation must run on Linux because Red Hat oc-mirror is Linux-only.
+cluster:
+  airgap: false
+
+kubernetes:
+  namespace: ai-platform
+
+# OpenShift-specific settings
+openshift:
+  # This installer pins the NFD operand and GPU Operator channel for OpenShift
+  # 4.21 and fails preflight on a different cluster minor.
+  requiredVersion: "4.21"
+
+  # Grant privileged SCC to Ray worker and operator service accounts.
+  # Required when running GPU workloads (nvidia.com/gpu requests).
+  # Set to "false" only if your cluster policy already covers this.
+  grantPrivilegedSCC: "true"
+
+  # Node labeling for the splunk.ai/ai-tier-node scheduler selector.
+  # Both CPU and GPU workloads target this single AI-tier node pool; GPU workers
+  # are pinned to GPU-capable nodes by their nvidia.com/gpu resource request.
+  # Use "auto" to label all worker nodes automatically.
+  # Use "manual" to specify node names explicitly below.
+  nodeLabelStrategy: "manual"
+
+  # Nodes that make up the AI-tier pool. List every node the AI platform should
+  # run on — CPU workloads (weaviate, ray-head, saia-api) and GPU workloads
+  # (ray-worker) both schedule here.
+  nodes:
+    - cc-40-f3-9f-e2-3c
+
+  # OpenShift-native external exposure. Hosts default to
+  # <feature>.<default-ingress-domain>; set host explicitly to override.
+  routes:
+    saia:
+      enabled: true
+      # host: "saia.apps.example.com"
+    slim:
+      enabled: true
+      # host: "slim.apps.example.com"
+
+images:
+  # In an air-gapped install this is the internal registry that already contains
+  # the customer-provided images below. The installer automatically imports its
+  # OpenShift infrastructure and Operator content into this registry.
+  # Registry prefix applied to images that are not fully qualified.
+  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
+  # Lab/isolated-network option only. When true, the installer permits HTTP on
+  # a matching Route and configures OpenShift nodes for insecure image pulls.
+  registryInsecure: false
+
+  operator:
+    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.10"
+
+  ray:
+    headImage: "ml-platform/ray/ray-head:build-953"
+    workerImage: "ml-platform/ray/ray-worker-gpu:build-953"
+
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+
+  saia:
+    apiImage: "ml-platform/saia/saia-api:build-v2-main-c3b489d"
+    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
+    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
+
+  slim:
+    apiImage: "arif/slim-api:v0.0.4"
+
+  splunk:
+    image: "docker.io/splunk/splunk:10.2-rhel9"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "50Gi"
+  minimumDiskSpace:
+    # Scale-factor-1 minimum available GiB on the shared AI-tier node filesystem
+    # backing /var/lib/containers and /opt/local-path-provisioner. The installer
+    # multiplies this value by aiPlatform.scaleFactor: 1024 GiB at scale 1 and
+    # 2048 GiB at scale 2.
+    aiTierNode: 1024
+  modelStaging:
+    # true checks every completion marker in the object store, skips models that
+    # are already current, and downloads/uploads only missing or changed models
+    # from the installer machine. Cluster nodes do not need internet access.
+    # Set false in air-gap mode only when every model is already staged; the
+    # installer then verifies all markers and fails before modifying the cluster
+    # if anything is missing.
+    enabled: true
+  objectStore:
+    type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
+    bucket: "ai-platform-bucket"
+    endpoint: "<S3_ENDPOINT_URL>"
+    auth:
+      rootUser: "<S3_ACCESS_KEY_ID>"
+      rootPassword: "<S3_SECRET_ACCESS_KEY>"
+
+splunk:
+  standaloneName: splunk-standalone
+  # Additional management/JWT issuers appended to the primary endpoint for
+  # both SAIA and SLIM.
+  trustedIssuers:
+    - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
+
+aiPlatform:
+  name: "openshift-ai-platform"
+  defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
+  # Fresh-install capacity multiplier for both model replicas and GPU workers.
+  # Must be a YAML integer greater than or equal to 1.
+  scaleFactor: 1
+  workerGroupConfig:
+    imageRegistry: ""
+  serviceTemplate:
+    # Routes above provide stable external access. Keep the backing feature
+    # Services internal unless NodePort or LoadBalancer is explicitly required.
+    type: ClusterIP         # ClusterIP | NodePort | LoadBalancer
+  features:
+    - name: "saia"
+      version: "1.1.0"
+    - name: "slim"
+      version: "1.0.0"
+  cpuScheduling:
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+operators:
+  # In an air-gapped install the installer assigns these stable names to the
+  # internally mirrored CatalogSources it creates automatically.
+  nfd:
+    catalogSource: "redhat-operators"
+  gpu:
+    catalogSource: "certified-operators"
+  ray:
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.56.0"
+
+files:
+  aiPlatform: "./artifacts.yaml"
+  splunkOperator: "./splunk-operator-cluster.yaml"
+
+# ECR pull secret — created automatically in all relevant namespaces during install.
+# Requires AWS credentials in the environment (e.g. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# or an instance profile). Set enabled: false for non-ECR registries.
+ecr:
+  enabled: true
+  account: "658391232643"
+  region: "us-east-2"

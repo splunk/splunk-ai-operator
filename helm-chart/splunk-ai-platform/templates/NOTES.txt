@@ -1,6 +1,6 @@
 Thank you for installing {{ .Chart.Name }}!
 
-Your Splunk AI Platform "{{ include "splunk-ai-platform.fullname" . }}" has been deployed to namespace "{{ include "splunk-ai-platform.namespace" . }}".
+Your Splunk AI tier "{{ include "splunk-ai-platform.fullname" . }}" has been deployed to namespace "{{ include "splunk-ai-platform.namespace" . }}".
 
 To check the status of your AIPlatform:
   kubectl get aiplatform {{ include "splunk-ai-platform.fullname" . }} -n {{ include "splunk-ai-platform.namespace" . }}

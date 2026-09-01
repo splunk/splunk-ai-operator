@@ -29,11 +29,11 @@ splunk-ai-operator:
   #   enabled: false
 
 # Metadata overrides:
-# Override the Splunk AI Platform helm chart name
+# Override the Splunk AI tier helm chart name
 nameOverride: ""
-# Override the Splunk AI Platform deployment name
+# Override the Splunk AI tier deployment name
 fullnameOverride: ""
-# Override the namespace for the Splunk AI Platform deployment
+# Override the namespace for the Splunk AI tier deployment
 namespaceOverride: ""
 
 # Storage volume

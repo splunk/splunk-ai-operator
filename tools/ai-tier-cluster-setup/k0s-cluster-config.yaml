@@ -1,0 +1,354 @@
+# ===================================================================
+# k0s Cluster Configuration for Splunk AI tier
+# ===================================================================
+# Mirrors cluster-config.yaml (EKS) but adapted for k0s on bare-metal / EC2.
+#
+# Quick Start:
+#   1. Copy: cp k0s-cluster-config.yaml my-k0s-config.yaml
+#   2. Edit: vi my-k0s-config.yaml
+#   3. Replace all values marked with "CHANGE THIS"
+#   4. Run: CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
+#
+# Prerequisites (must be satisfied BEFORE running the installer):
+#
+# Local machine:
+#   ssh, kubectl, helm, git, jq, yq, docker — see the Prerequisites section of
+#   docs/ai-tier-docs/k0s-quick-reference.md for install instructions per OS.
+#   macOS: brew install kubectl helm git jq yq
+#   RHEL 9: none of kubectl/helm/docker/yq are in the default dnf repos —
+#     install each via its own official method (git/jq ARE available via dnf).
+#
+# All remote nodes (controllers + workers):
+#   - SSH access using the key at cluster.sshKeyPath as cluster.sshUser
+#   - Passwordless sudo: add to /etc/sudoers:
+#       <sshUser> ALL=(ALL) NOPASSWD:ALL
+#   - curl (used to download the k0s binary if not pre-installed)
+#   - Standard clusters: internet access to https://get.k0s.sh and NVIDIA
+#     package repositories
+#   - Air-gapped clusters: the installer machine stages k0s, NVIDIA packages,
+#     and the container toolkit offline closure, then installs them on the
+#     nodes over SSH. The nodes do not need outbound internet access. Manual
+#     driver installation is only needed when using the optional
+#     --skip-nvidia-closure path.
+#   - python3 (pyyaml is installed automatically by the script via dnf/apt)
+#   - Supported OS: RHEL/CentOS/Amazon Linux (dnf) or Ubuntu/Debian (apt)
+#
+# GPU worker nodes additionally require:
+#   - Minimum 500 GB free on /var/lib/k0s (model weights are large)
+#     Mount a dedicated disk at /var/lib/k0s before running if needed
+#   - kernel-devel matching the running kernel (installer attempts this via dnf/apt)
+# ===================================================================
+
+# ---------- Cluster Configuration ----------
+cluster:
+  name: ai-cluster
+  region: us-east-2                       # CHANGE THIS — required when storage.objectStore.type=aws (region of the S3 bucket); ignored for true on-prem
+  sshKeyPath: ~/.ssh/id_rsa                  # CHANGE THIS: Path to SSH private key
+  sshUser: root                       # CHANGE THIS: SSH user for remote nodes
+  # airgap: false                         # Set to true for fully disconnected environments.
+  #                                       # When true, the installer skips internet connectivity
+  #                                       # checks for HuggingFace and NVIDIA package repos, and
+  #                                       # assumes k0s + NVIDIA drivers are pre-installed on nodes.
+  #                                       # Object store connectivity is still checked (it is local).
+  #                                       # Can also be set via: AIRGAP_MODE=true (env var override).
+  #                                       # install_from_airgap_bundle.sh sets this automatically.
+
+# ---------- Node Configuration ----------
+nodes:
+  controllers: 1                          # one node for controller
+  cpuWorkers: 1                           # Number of CPU workers listed FIRST in existingIPs.workers below
+  gpuWorkers: 2                           # Number of GPU workers listed AFTER the CPU workers below
+
+  existingIPs:
+    controllers:
+      - 10.0.0.1                          # CHANGE THIS: Your controller server IP
+    workers:                              # List CPU workers first, then GPU workers (order must match cpuWorkers/gpuWorkers above)
+      - 10.0.0.2                          # CHANGE THIS: CPU worker 1
+      - 10.0.0.3                          # CHANGE THIS: GPU worker 1
+      - 10.0.0.4                          # CHANGE THIS: GPU worker 2
+
+# ---------- Storage Configuration ----------
+# Prerequisites (must be provisioned BEFORE running the installer):
+#   - /var/lib/k0s must have at least 500 GB free on GPU workers
+#   - /var/lib/k0s must have at least 200 GB free on CPU workers
+#   - /var/lib/k0s must have at least 100 GB free on controllers
+#   If using a dedicated disk, mount it at /var/lib/k0s before running this script.
+#
+# Object storage: AWS S3 or external S3-compatible (no in-cluster MinIO install).
+# Use objectStore.type: aws (S3) or s3compat | minio | seaweedfs (external; endpoint + credentials required).
+storage:
+  storageClass: "local-path"                 # Storage class for Kubernetes PVCs (gp3, gp2, io1, io2)
+  vectorDbSize: "50Gi"                       # VectorDB persistent volume size
+
+  # Minimum available disk space (GB) on /var/lib/k0s per node role.
+  # The installer checks these thresholds at preflight and fails if not met.
+  # Override to lower values only if you know your workload footprint is smaller.
+  # minimumDiskSpace:
+  #   controller: 50    # k0s control plane, kine/etcd, container images
+  #   cpuWorker: 150     # weaviate, saia-api, data-loader, fluent-bit
+  #   gpuWorker: 300     # model weights (60-240 GB each), ray-worker-gpu image (~30 GB)
+
+  # Model staging: download model artifacts from Hugging Face and upload them to
+  # the object store during 'install' (before the cluster pulls them).
+  #
+  # Full install (default):  the installer will PROMPT you whether to download
+  #   models — your answer overrides this value at runtime.
+  # Silent install (--silent / AUTO_APPROVE=true):  this value is used as-is.
+  #   Set false to skip — e.g. if models are already staged or you want to run
+  #   the download separately via the 'stage-artifacts' subcommand.
+  modelStaging:
+    enabled: false
+
+  objectStore:
+    type: "minio"                                # aws | s3compat | minio | seaweedfs (external only for non-aws)
+    bucket: "ai-platform-bucket-minio-us-east-2"
+    endpoint: "http://10.0.0.5:9000"              # CHANGE THIS: MinIO/SeaweedFS/S3 API endpoint
+    auth:
+      rootUser: "<paste-AWS_ACCESS_KEY_ID-here>"          # CHANGE THIS — AWS_ACCESS_KEY_ID (AKIA…) or MinIO root user
+      rootPassword: "<paste-AWS_SECRET_ACCESS_KEY-here>"  # CHANGE THIS — AWS secret OR MinIO root password; NEVER commit real keys
+
+# ---------- Container Images Configuration ----------
+images:
+  # Registry prefix - applied to images without a full registry path
+  registry: ""                                    # CHANGE THIS: Your ECR/Docker/Harbor registry (e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com)
+  # Set to true when using a plain-HTTP (non-TLS) private registry such as a
+  # local Docker registry or internal Harbor without HTTPS. When true:
+  #   1. Preflight checks the registry over http:// instead of https://
+  #   2. containerd on every node is configured to allow insecure pulls from
+  #      this registry (hosts.toml for containerd v2, drop-in TOML for v1).
+  # Leave false (default) for ECR, Docker Hub, or any HTTPS-backed registry.
+  registryInsecure: false
+
+  operator:
+    image: "docker.io/splunk/splunk-ai-operator:v1.0"
+
+  splunk:
+    image: "docker.io/splunk/splunk:10.2-rhel9"
+    operatorImage: "docker.io/splunk/splunk-operator:3.0.0"
+
+  ray:
+    # These Docker Hub defaults are fully qualified and therefore are not
+    # rewritten by images.registry. Replace them with your mirrored image paths
+    # for private-registry or air-gapped installations.
+    headImage: "docker.io/splunk/ai-tier-ray-head:v1.0"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:v1.0"
+
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
+
+  saia:
+    apiImage: "docker.io/splunk/ai-tier-saia-api:v1.0"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:v1.0"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:v1.0"
+
+  # slim-api service image (consumed via RELATED_IMAGE_SLIM_API). Only needed
+  # when the "slim" feature is enabled under aiPlatform.features[].
+  slim:
+    apiImage: "docker.io/splunk/ai-tier-slim-service:v1.0"
+
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+
+  otelCollector:
+    image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
+
+  # Reverse proxy used by the SAIA reconciler to route v1 / v2 requests by
+  # path. Consumed via RELATED_IMAGE_NGINX. Point this at an internal mirror
+  # for airgapped clusters.
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+
+# ---------- Operator Versions ----------
+operators:
+  ray:
+    version: "v1.2.2"
+    modelVersion: "v0.3.14-36-g1549f5a"
+    rayVersion: "2.56.0"
+
+  certManager:
+    installCRDs: true
+
+  nvidia:
+    devicePluginVersion: "v0.17.3"
+
+# ---------- Kubernetes ----------
+kubernetes:
+  namespace: ai-platform
+
+# ---------- File Paths ----------
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"  # CHANGE THIS: Path to Splunk Operator manifest
+  aiPlatform: "./artifacts.yaml"                     # CHANGE THIS: Path to AI Platform artifacts
+
+# ---------- Splunk Configuration ----------
+splunk:
+  # Opt in to the bundled in-cluster Splunk deployment; defaults to disabled,
+  # enabled here. When false (or absent), no Splunk Operator/Standalone is
+  # installed. A JWT-only external integration can still render
+  # splunkConfiguration by setting trustedIssuers below.
+  enabled: true
+
+  # Name of the in-cluster Splunk Standalone CR (INTERNAL mode only).
+  standaloneName: splunk-standalone
+
+  # With enabled=true and no external.endpoint, the installer deploys Splunk
+  # Operator + Standalone in-cluster (requires images.splunk.image and
+  # images.splunk.operatorImage).
+  # See docs/ai-tier-docs/K0S_README.md's "Internal Splunk management
+  # transport" section for the native-HTTPS compatibility details behind the
+  # INTERNAL path.
+  #
+  # Release support boundary:
+  # - The existing bundled/internal HEC and OTel path is left unchanged to
+  #   preserve the tested installation behavior. Workload telemetry is not a
+  #   supported feature claim for this release.
+  # - External Splunk is JWT-only through trustedIssuers on management port
+  #   8089. External HEC/OTel is unsupported and was not release-qualified.
+  #   Leave splunk.external.endpoint unset and do not set SPLUNK_HEC_TOKEN.
+  # - Workload mTLS remains off and unsupported. Do not add aiPlatform.mtls;
+  #   the k0s installer does not consume that sample key.
+
+  # Exact Splunk management/JWKS issuers that SAIA and Slim should trust. Each
+  # value must match Splunk's oauth2_settings.issuer_uri character-for-character
+  # and normally uses management port 8089, never HEC port 8088.
+  #
+  # External Splunk only: set enabled=false and list the external issuer here.
+  # Bundled + external Splunk: keep enabled=true and list only the additional
+  # external issuer here; the bundled issuer is included automatically.
+  # trustedIssuers:
+  #   - https://splunk.example.com:8089
+
+# ---------- AI Platform Configuration ----------
+aiPlatform:
+  name: "splunk-ai-stack"
+  defaultAcceleratorType: "L40S"
+
+  # scaleFactor: 2
+  #   Optional, platform-wide. Runs the whole platform at N times its normal
+  #   capacity — scales BOTH the model replicas AND the GPU worker pods
+  #   together, so you never need to know which models exist or how many GPUs
+  #   each one uses. Omit or set to 1 for the default single-capacity
+  #   deployment. Your cluster must have proportionally more GPUs available
+  #   before raising this (e.g. 2x the GPUs on the node pool for scaleFactor: 2).
+  #   The value must be an integer greater than or equal to 1.
+
+  workerGroupConfig:
+    imageRegistry: ""
+
+  # ---------- SAIA public exposure ----------
+  # The SAIA "public" Service (nginx reverse proxy in front of v1 + v2 API
+  # pods) defaults to ClusterIP — only reachable from inside the cluster. Two
+  # call patterns hit it:
+  #   (A) Splunk Enterprise pod   → saia-service   (works with ClusterIP)
+  #   (B) End user's browser      → saia-service   (needs external exposure)
+  #
+  # Pattern B is used by the v2 chat UI (/query streaming, conversations,
+  # feedback, admin endpoints). Without external exposure the v2 chat UI
+  # breaks for users; v1 one-shot SPL still works.
+  #
+  # Choose the exposure type based on WHERE k0s runs:
+  #
+  #   NodePort   — the default/portable option; works everywhere (bare-metal,
+  #                on-prem, AND cloud VMs like EC2). Opens a fixed port
+  #                (default 30080) on every worker node; reach SAIA at
+  #                http://<any-worker-ip>:<nodePort>. On a cloud VM, point an
+  #                external load balancer (AWS NLB, GCP LB) at the worker nodes
+  #                on this port to get a public DNS name. Use this whenever
+  #                MetalLB/LoadBalancer is unavailable (i.e. any cloud VPC),
+  #                since it has no L2 network assumptions. On bare-metal L2 you
+  #                may instead prefer LoadBalancer below for a stable VIP.
+  #
+  #   LoadBalancer — only for TRUE bare-metal / on-prem k0s on a real L2 LAN,
+  #                backed by MetalLB (see the metallb block below). MetalLB
+  #                allocates a routable VIP and announces it via ARP (layer2)
+  #                or BGP. This does NOT work on AWS/GCP/Azure VPCs: cloud
+  #                fabrics drop the gratuitous ARP MetalLB relies on and only
+  #                route to real ENI addresses, so the VIP is unreachable. On a
+  #                cloud VM use NodePort + a cloud load balancer instead.
+  #
+  # To DISABLE external exposure (ClusterIP only), comment out the whole
+  # serviceTemplate block AND set metallb.install: false.
+  serviceTemplate:
+    type: NodePort          # ClusterIP | NodePort | LoadBalancer
+    nodePort: 30080         # Fixed NodePort (30000-32767) for the SAIA public service. Required only for NodePort.
+    # AIPlatform.serviceTemplate propagates identically to EVERY feature's
+    # AIService, so slim would otherwise inherit the same 30080 and collide with
+    # SAIA (a NodePort can back only one Service). When the "slim" feature is
+    # enabled under NodePort, the installer patches slim's public Service to this
+    # DISTINCT port instead. Reach slim at http://<any-worker-ip>:<slimNodePort>.
+    slimNodePort: 30081     # Fixed NodePort for the slim public service. Only used when slim is enabled + type=NodePort.
+
+  features:
+    - name: "saia"
+      version: "1.1.0"
+    # Enable the slim-api service (no v1/v2 routing). Exposed on slimNodePort above.
+    - name: "slim"
+      version: "1.0.0"
+
+  cpuScheduling:
+    nodeSelector: {}
+    tolerations: []
+
+  gpuScheduling:
+    nodeSelector: {}
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+# ---------- MetalLB (k0s LoadBalancer provider) ----------
+# ONLY for true bare-metal / on-prem k0s on a real L2 LAN, and ONLY when
+# aiPlatform.serviceTemplate.type=LoadBalancer. Does NOT work on cloud VPCs
+# (AWS/GCP/Azure) — see the SAIA public exposure notes above. Pinned chart
+# version for supply-chain reproducibility (codeguard-0-supply-chain-security).
+#
+# If serviceTemplate.type=NodePort (the default), the installer skips MetalLB
+# entirely even when metallb.install=true (NodePort does not use a
+# LoadBalancer provider). Leave install: false unless you switch to
+# LoadBalancer on bare-metal.
+metallb:
+  install: false                   # true only for bare-metal LoadBalancer; ignored under NodePort
+  chartVersion: "0.14.8"           # metallb/metallb Helm chart (matches MetalLB v0.14.8)
+  namespace: "metallb-system"
+
+  # Address pool — a range of IPs MetalLB can hand out to LoadBalancer
+  # Services. Must be routable from clients (VPN-connected users) to your k0s
+  # workers. Use IPs that are NOT used elsewhere on the LAN.
+  pool:
+    name: "saia-pool"
+    addresses:
+      - "10.20.30.100-10.20.30.110"   # CHANGE THIS to a free range on your network
+
+  # Advertisement mode: "layer2" works on most LANs without network gear
+  # changes (one elected node answers ARP for the VIP at a time; failover ~
+  # seconds). Use "bgp" only if your fabric supports BGP peering — then also
+  # populate metallb.bgpPeers below.
+  mode: "layer2"                  # layer2 | bgp
+
+  # Required only when mode=bgp. Leave empty for layer2.
+  bgpPeers: []
+    # - peerAddress: "10.0.0.1"
+    #   peerASN: 65001
+    #   myASN: 65000
+
+# ---------- Image Pull Secrets ----------
+imagePullSecrets:
+  secrets:
+    - ecr-registry-secret
+  autoCreateECR: true
+
+  # Authenticated non-ECR registry (e.g. Docker Hub, Harbor). Only used when
+  # enabled: true and server/username/password are all set — otherwise no
+  # pull secret is created for images.registry beyond autoCreateECR above.
+  # custom:
+  #   enabled: true
+  #   name: custom-registry-secret
+  #   server: https://index.docker.io/v1/
+  #   username: <registry-username>
+  #   password: <registry-password-or-token>
+  #   email: <registry-account-email>
+
+ecr:
+  account: ""                                        # CHANGE THIS: Your AWS account ID (e.g. 123456789012)
+  region: us-east-2                                  # CHANGE THIS: Your AWS region

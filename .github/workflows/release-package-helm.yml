@@ -438,8 +438,8 @@ jobs:
 
             ### Documentation
 
-            - [Helm Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/deployment/helm-deployment.md)
-            - [Installation Guide](https://github.com/${{ github.repository }}/blob/main/docs/installation.md)
-            - [API Reference](https://github.com/${{ github.repository }}/blob/main/docs/api-reference.md)
+            - [Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/ai-tier-docs/DEPLOYMENT_GUIDE.md)
+            - [Installation Guide](https://github.com/${{ github.repository }}/blob/main/docs/splunk-ai-operator-docs/splunk-ai-operator-installation.md)
+            - [API Reference](https://github.com/${{ github.repository }}/blob/main/docs/splunk-ai-operator-docs/api-reference.md)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

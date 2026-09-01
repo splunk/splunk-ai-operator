@@ -32,7 +32,10 @@ skaffold.env.local
 .skaffold/
 
 # Logs
-tools/cluster_setup/logs/
+tools/ai-tier-cluster-setup/logs/
+
+# Local cluster configuration may contain object-store credentials.
+my-cluster.yaml
 
 # Helm build artifacts
 *.tgz
@@ -40,8 +43,8 @@ helm-chart/**/charts/
 !helm-chart/**/charts/.gitkeep
 
 # Cluster-setup script byproducts (*.original): pristine-snapshot backups
-# written by tools/cluster_setup/eks_cluster_with_stack.sh on first run and
+# written by tools/ai-tier-cluster-setup/eks_cluster_with_stack.sh on first run and
 # reused as a reset point on subsequent runs. Needed locally for idempotent
 # re-installs; never committed. (k0s_cluster_with_stack.sh no longer uses
 # this snapshot/restore pattern, but the EKS script still does.)
-tools/cluster_setup/*.original
+tools/ai-tier-cluster-setup/*.original
