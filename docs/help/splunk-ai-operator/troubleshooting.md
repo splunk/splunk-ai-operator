@@ -1,13 +1,16 @@
 # Troubleshooting
 
-Start with the custom resource status, Kubernetes events, operator logs, and the status of the
-managed pods.
+Start with the custom resource status, Kubernetes events, operator logs, and the readiness of the
+managed pods, Services, and endpoints. A successful reconciliation condition alone does not prove
+that every application endpoint is ready.
 
 ## Platform is not ready
 
 ```bash
 kubectl get aiplatform <platform-name> -n <namespace>
 kubectl describe aiplatform <platform-name> -n <namespace>
+kubectl get aiservice -n <namespace>
+kubectl get pods,services,endpoints -n <namespace>
 kubectl get events -n <namespace> --sort-by='.lastTimestamp'
 ```
 
@@ -31,6 +34,11 @@ kubectl get nodes --show-labels
 
 For GPU workloads, confirm that the device plugin is installed and that taints, tolerations,
 labels, and affinity rules match.
+
+If an event reports that a ServiceAccount does not exist, either remove the explicit
+`serviceAccountName` override so the service can use its operator/default account, or create the
+named account and required RBAC in the workload namespace. The workload namespace itself must
+exist before you apply an `AIPlatform` resource.
 
 ## Image pull failures
 
@@ -60,35 +68,62 @@ mode is supported.
 
 ## Splunk connectivity failures
 
-Test port `8089` from a cluster node or diagnostic pod:
+Test the exact issuer URL from a SAIA or SLIM pod network. For example, the SAIA v2 image includes
+Python, so you can make a strict-TLS request from its running API container:
 
 ```bash
-nc -zv <splunk-host> 8089
-curl -skS -o /dev/null -w '%{http_code}\n' \
-  'https://<splunk-host>:8089/services/authorization/tokens-keys?output_mode=json'
+kubectl exec -n <namespace> \
+  deployment/<aiservice-name>-saia-v2-deployment \
+  -c saia-v2-api -- \
+  python3 -c 'import json, urllib.request; response = urllib.request.urlopen(
+    "https://<splunk-host>:8089/services/authorization/tokens-keys?output_mode=json",
+    timeout=10); print(response.status, type(json.load(response)).__name__)'
 ```
 
-An HTTP `200` confirms that the endpoint and JWKS path are reachable. If strict TLS verification
-fails, install the correct CA chain and verify the certificate name; do not treat `curl -k` as the
-production fix.
+Run the Python argument on one line if your shell does not preserve the formatting. An HTTP `200`
+with a parsed JSON response confirms that the pod can route to the token-key endpoint, validate its
+certificate, and receive JSON. Inspect the returned token-key data separately when authentication
+still fails. A node or laptop test does not prove pod connectivity because routing and network
+policies can differ.
+
+As a diagnostic only, a request with certificate verification disabled can distinguish a routing
+problem from a certificate problem. It is not a service configuration workaround. This release
+does not expose a custom external-issuer CA-bundle field; production requires a certificate chain
+already trusted by the workload image.
 
 ## JWT issuer or token errors
 
 For AI-tier authentication, verify:
 
-1. The token has the expected token type.
-2. The issuer is trusted.
-3. A bare issuer identity has an `SPLUNK_ISSUER_ENDPOINTS` mapping.
-4. The mapped endpoint is present in `SPLUNK_ISSUERS`.
-5. SAIA can retrieve JWKS from the mapped endpoint.
-6. Splunk accepts the token through the current-context check.
+1. Decode a newly issued token without logging or sharing it and record its exact `iss` value.
+2. Confirm that the exact URL appears in `AIPlatform.spec.splunkConfiguration.trustedIssuers`, or
+   equals the endpoint derived from the internal Splunk reference.
+3. Confirm that the operator-generated allowlist contains it:
 
-The modern CMP format is `typ=at+jwt` with `token_type=splunk.cmp`. Legacy deployments may use
-`type=Splunk.interactive`.
+   ```bash
+   kubectl get configmap <aiservice-name>-saia-config -n <namespace> \
+     -o jsonpath='{.data.SPLUNK_ISSUERS}{"\n"}'
+   ```
 
-## Browser cannot call SAIA V2
+4. Confirm that the running v2 API process has the same value:
 
-SAIA V2 Agent mode makes a direct browser request to the SAIA V2 service. Check:
+   ```bash
+   kubectl exec -n <namespace> \
+     deployment/<aiservice-name>-saia-v2-deployment \
+     -c saia-v2-api -- printenv SPLUNK_ISSUERS
+   ```
+
+5. Confirm that the issuer's native token-key route is reachable from the SAIA and SLIM workload
+   network with strict TLS verification.
+6. Obtain a fresh token after changing Splunk's configured issuer.
+
+The operator does not generate `SPLUNK_ISSUER_ENDPOINTS` or translate one issuer identity to a
+different management endpoint.
+
+## Browser cannot call SAIA
+
+The browser calls the published SAIA base URL. The front-door SAIA nginx Service routes v1 and v2
+API paths internally; customers do not select a separate Kubernetes v2 endpoint. Check:
 
 - ingress or proxy routing;
 - DNS resolution from the browser environment;
@@ -97,6 +132,11 @@ SAIA V2 Agent mode makes a direct browser request to the SAIA V2 service. Check:
 - network policy and security-group rules; and
 - SOCKS proxy configuration when the service is private.
 
+`AIPlatform.spec.ingress` does not expose SAIA; its default route targets Ray Serve. Use the SAIA
+Service exposure described in [Deploy the AI Platform](deploy-platform.md#expose-saia) or another
+release-supported proxy. Confirm that the public route ultimately targets
+`<AIPlatform-name>-saia-saia-service` on port `8080`.
+
 A single `kubectl port-forward` is sufficient only for the endpoint and port it forwards. A SOCKS
 proxy or reverse proxy is needed when the browser must reach multiple private endpoints or ports.
 
@@ -104,7 +144,9 @@ proxy or reverse proxy is needed when the browser must reach multiple private en
 
 ```bash
 kubectl get aiplatform <platform-name> -n <namespace> -o yaml
+kubectl get aiservice -n <namespace> -o yaml
 kubectl get pods -n <namespace> -o wide
+kubectl get services,endpoints,ingress -n <namespace> -o wide
 kubectl get events -n <namespace> --sort-by='.lastTimestamp'
 kubectl logs -n splunk-ai-operator-system \
   -l control-plane=controller-manager --tail=300

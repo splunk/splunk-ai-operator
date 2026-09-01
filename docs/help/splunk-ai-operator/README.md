@@ -35,4 +35,3 @@ maintain Splunk AI Platform deployments.
 
 - [Splunk AI Operator release notes](release-notes.md)
 - [AI Platform architecture](architecture.md)
-- [Documentation publication checklist](publication-checklist.md)
