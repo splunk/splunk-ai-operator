@@ -1,6 +1,6 @@
 # k0s Deployment — Quick Reference
 
-Quick reference for installing the Splunk AI Platform on k0s. For full
+Quick reference for installing the Splunk AI tier on k0s. For full
 explanations, diagrams, and edge cases, see
 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) and
 [K0S_README.md](K0S_README.md).

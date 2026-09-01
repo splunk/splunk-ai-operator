@@ -1,6 +1,6 @@
-# k0s Cluster Setup for Splunk AI Platform
+# k0s Cluster Setup for Splunk AI tier
 
-Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
+Complete guide for deploying Splunk AI tier on k0s Kubernetes clusters.
 
 ## Table of Contents
 
@@ -29,7 +29,7 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
 
 ## Overview
 
-The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI Platform on k0s Kubernetes, supporting:
+The `k0s_cluster_with_stack.sh` script deploys the complete Splunk AI tier on k0s Kubernetes, supporting:
 
 - **Bare metal / on-premises deployments** with existing hardware and SSH access
 - **External S3-compatible object storage** (SeaweedFS, MinIO, or any S3-compatible endpoint) — customer-managed
@@ -67,7 +67,7 @@ The script installs everything needed for the AI Platform:
 7. **NVIDIA Host Drivers + Device Plugin** — GPU support (RHEL 9.8, RHEL 10.2, Ubuntu 24.04)
 8. **KubeRay Operator v1.2.2** — Ray cluster management for distributed AI
 9. **Splunk Operator** — Splunk Enterprise management
-10. **Splunk AI Platform Operator** — AI platform orchestration (SAIA feature)
+10. **Splunk AI tier Operator** — AI platform orchestration (SAIA feature)
 11. **AIPlatform CR** — Complete AI deployment with features, scheduling, and secrets
 
 ### Operational Features
@@ -1284,7 +1284,7 @@ sudo k0s etcd snapshot restore /tmp/etcd-backup.db
 
 ## Air-Gapped Deployment
 
-Complete guide for deploying the Splunk AI Platform onto cluster nodes with no outbound internet access.
+Complete guide for deploying the Splunk AI tier onto cluster nodes with no outbound internet access.
 
 ### Overview
 
@@ -2531,4 +2531,4 @@ sudo k0s start
 
 **Version:** 3.0
 **Last Updated:** April 2026
-**Maintainer:** Splunk AI Platform Team
+**Maintainer:** Splunk AI tier Team

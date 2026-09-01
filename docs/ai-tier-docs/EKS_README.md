@@ -1,6 +1,6 @@
-# AWS EKS Deployment for Splunk AI Platform
+# AWS EKS Deployment for Splunk AI tier
 
-Complete guide for deploying Splunk AI Platform on AWS Elastic Kubernetes Service (EKS).
+Complete guide for deploying Splunk AI tier on AWS Elastic Kubernetes Service (EKS).
 
 ## Table of Contents
 
@@ -22,7 +22,7 @@ Complete guide for deploying Splunk AI Platform on AWS Elastic Kubernetes Servic
 
 ## Overview
 
-The `eks_cluster_with_stack.sh` script deploys the complete Splunk AI Platform on AWS EKS with full AWS integration, supporting:
+The `eks_cluster_with_stack.sh` script deploys the complete Splunk AI tier on AWS EKS with full AWS integration, supporting:
 
 - **Production AWS deployments** with managed Kubernetes
 - **Auto-scaling workloads** with GPU and CPU node groups
@@ -59,7 +59,7 @@ The script installs everything needed for the AI Platform:
 10. **NVIDIA Device Plugin** - GPU support for AI workloads
 11. **KubeRay Operator** - Ray cluster management for distributed AI
 12. **Splunk Operator** - Splunk Enterprise management
-13. **Splunk AI Platform Operator** - AI platform orchestration
+13. **Splunk AI tier Operator** - AI platform orchestration
 14. **AI Platform CR** - Complete AI deployment with features
 
 ### AWS Integration Features
@@ -765,7 +765,7 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
    - ✓ OpenTelemetry Operator + collector
    - ✓ KubeRay Operator (Ray clusters)
    - ✓ Splunk Operator (Splunk management)
-   - ✓ Splunk AI Platform Operator (with your images!)
+   - ✓ Splunk AI tier Operator (with your images!)
 
 6. **Deploy AI Platform** (5-10 min)
    - ✓ Creates S3 bucket and prefixes (artifacts/, apps/, tasks/)
@@ -810,7 +810,7 @@ CONFIG_FILE=./my-cluster-config.yaml ./eks_cluster_with_stack.sh install
 14. ✓ Installs OpenTelemetry Operator + collector
 15. ✓ Installs KubeRay Operator
 16. ✓ Installs Splunk Operator
-17. ✓ Installs Splunk AI Platform Operator
+17. ✓ Installs Splunk AI tier Operator
 18. ✓ Creates S3 bucket and IAM roles (IRSA for Ray head/worker/SAIA)
 19. ✓ Adds ECR permissions to IRSA roles
 20. ✓ Creates Splunk Standalone instance

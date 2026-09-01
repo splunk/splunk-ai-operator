@@ -1,7 +1,7 @@
-# External Splunk Integration with Splunk AI Platform
+# External Splunk Integration with Splunk AI tier
 
 Runbook for connecting an **externally hosted Splunk Enterprise instance** to
-Splunk AI Platform for JWT-authenticated SAIA and AI Toolkit (AITK) requests.
+Splunk AI tier for JWT-authenticated SAIA and AI Toolkit (AITK) requests.
 The Splunk instance may run in a different VPC or network from the k0s cluster;
 what matters is routable, firewall-approved connectivity for each flow described
 below.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# k0s Cluster Setup Script for Splunk AI Platform
+# k0s Cluster Setup Script for Splunk AI tier
 # =============================================================================
 # Deploys a k0s cluster on customer-provided (on-prem / baremetal) nodes.
 # Requires existingIPs in the config YAML (controller + worker IPs).
@@ -8570,7 +8570,7 @@ usage() {
   cat <<EOF
 Usage: $0 [install|validate|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
 
-Deploys Splunk AI Platform on k0s cluster using pre-provisioned nodes.
+Deploys Splunk AI tier on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
 
 Commands:

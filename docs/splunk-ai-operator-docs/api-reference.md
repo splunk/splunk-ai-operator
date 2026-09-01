@@ -2,7 +2,7 @@
 
 The Splunk AI Operator provides a collection of
 [custom resources](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/)
-you can use to manage Splunk AI Platform deployments in your Kubernetes cluster.
+you can use to manage Splunk AI tier deployments in your Kubernetes cluster.
 
 - [Custom Resource Guide](#custom-resource-guide)
   - [Metadata Parameters](#metadata-parameters)

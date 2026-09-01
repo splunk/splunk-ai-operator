@@ -1,6 +1,6 @@
-# Splunk AI Platform — Deployment Guide
+# Splunk AI tier — Deployment Guide
 
-End-to-end customer experience guide for deploying the Splunk AI Platform on
+End-to-end customer experience guide for deploying the Splunk AI tier on
 k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
 (fully disconnected) deployments.
 
@@ -38,7 +38,7 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
 
 ```mermaid
 flowchart TD
-    START([Start: Deploy Splunk AI Platform]) --> Q1
+    START([Start: Deploy Splunk AI tier]) --> Q1
 
     Q1{Can your cluster nodes\nreach the internet?}
     Q1 -->|Yes| STANDARD[Standard Deployment\nairgap: false\nAll downloads happen automatically]
@@ -130,7 +130,7 @@ cluster nodes for the duration of the run.
 
 ## What Gets Deployed
 
-The installer deploys the complete Splunk AI Platform stack onto your k0s cluster.
+The installer deploys the complete Splunk AI tier stack onto your k0s cluster.
 
 > **SAIA** = Splunk AI Assistant — the AI chat and SPL-generation application that runs on top of the platform.
 
@@ -672,7 +672,7 @@ directory into containerd at kubelet startup, so the infra pods start with
 
 > **This is distinct from [Phase 2 — Mirror Container Images](#phase-2--mirror-container-images).**
 > The `images/` bundles cover **infrastructure** images (k0s + add-ons) and are
-> built for you. Phase 2 covers the **Splunk AI Platform application** images
+> built for you. Phase 2 covers the **Splunk AI tier application** images
 > (Splunk Enterprise, SAIA, Ray, Weaviate, the operator …), which you mirror to
 > your own registry and point `images.registry` at. Both are required.
 
@@ -1347,4 +1347,4 @@ flowchart TD
 
 ---
 
-*Splunk AI Platform · k0s Deployment Guide · Last updated 2026-07-02*
+*Splunk AI tier · k0s Deployment Guide · Last updated 2026-07-02*

@@ -3617,7 +3617,7 @@ add_ecr_permissions_to_role() {
 
 # ---------- Orchestrator for AI Platform setup ----------
 install_ai_platform_stack() {
-  log "=== Setting up Splunk AI Platform stack ==="
+  log "=== Setting up Splunk AI tier stack ==="
   if [[ "${USE_EXTERNAL_OBJ_STORE}" == "true" ]]; then
     log "Using external S3-compatible object storage (${OBJ_STORE_TYPE}); skipping S3 bucket creation; using ECR-only policy for IRSA."
     ensure_external_objstore_upload_splunk_app
@@ -3654,7 +3654,7 @@ install_ai_platform_stack() {
 
   install_ai_platform_cr "${splunk_secret}"
 
-  log "=== Splunk AI Platform setup completed ==="
+  log "=== Splunk AI tier setup completed ==="
 }
 
 # ---------- CREATE / RECONCILE / DELETE FLOWS ----------

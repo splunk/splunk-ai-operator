@@ -1,5 +1,5 @@
 # ===================================================================
-# k0s Cluster Configuration for Splunk AI Platform
+# k0s Cluster Configuration for Splunk AI tier
 # ===================================================================
 # Mirrors cluster-config.yaml (EKS) but adapted for k0s on bare-metal / EC2.
 #

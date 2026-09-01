@@ -1,4 +1,4 @@
-# k0s configuration for Splunk AI Platform on pre-provisioned,
+# k0s configuration for Splunk AI tier on pre-provisioned,
 # air-gapped cluster nodes.
 #
 # In the standard one-command flow, the installer host must have internet

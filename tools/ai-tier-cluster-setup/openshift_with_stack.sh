@@ -8,7 +8,7 @@ cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/n
 trap cleanup_tmp EXIT
 
 # =============================================================================
-# OpenShift Cluster Setup Script for Splunk AI Platform
+# OpenShift Cluster Setup Script for Splunk AI tier
 # =============================================================================
 # Installs/removes the Splunk AI Operator stack onto an existing OpenShift
 # cluster. Assumes you are already logged in via `oc login` or have a valid
@@ -3811,7 +3811,7 @@ create_image_pull_secrets() {
 # ====== MAIN INSTALL ======
 main_install() {
   log "============================================"
-  log " Splunk AI Platform — OpenShift Install"
+  log " Splunk AI tier — OpenShift Install"
   log "============================================"
 
   # Sync SILENT_INSTALL ↔ AUTO_APPROVE
@@ -3986,7 +3986,7 @@ main_install() {
 # ====== MAIN DELETE ======
 main_delete() {
   log "============================================"
-  log " Splunk AI Platform — OpenShift Delete"
+  log " Splunk AI tier — OpenShift Delete"
   log "============================================"
 
   load_config
@@ -4287,9 +4287,9 @@ usage() {
 Usage: $(basename "$0") [install|delete|diagnose|stage-artifacts|verify] [options]
 
   install [--silent|-s]
-                Deploy the Splunk AI Platform stack onto an existing OpenShift cluster.
+                Deploy the Splunk AI tier stack onto an existing OpenShift cluster.
                   --silent / -s  Non-interactive: skip all prompts (equivalent to SILENT_INSTALL=true).
-  delete        Remove the Splunk AI Platform stack (leaves the cluster intact).
+  delete        Remove the Splunk AI tier stack (leaves the cluster intact).
   diagnose      Collect a support bundle (logs, cluster state, config) into a tar.gz.
   stage-artifacts
                 Download model weights from HuggingFace and upload to the object store.

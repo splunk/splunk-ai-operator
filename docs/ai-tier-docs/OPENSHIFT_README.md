@@ -1,8 +1,8 @@
-# Splunk AI Platform on OpenShift — Customer Onboarding Guide
+# Splunk AI tier on OpenShift — Customer Onboarding Guide
 
 
 
-This guide walks you through deploying the Splunk AI Platform stack onto an
+This guide walks you through deploying the Splunk AI tier stack onto an
 **existing** OpenShift cluster using `openshift_with_stack.sh`. Unlike the k0s
 installer, this installer does **not** provision a cluster — it assumes you
 already have a running, healthy OpenShift cluster and installs only the AI
@@ -35,7 +35,7 @@ Platform stack on top of it.
 
 ## Overview
 
-The Splunk AI Platform packages the models, vector database, and Splunk
+The Splunk AI tier packages the models, vector database, and Splunk
 integration that power the **Splunk AI Assistant (SAIA)** feature inside Splunk.
 On OpenShift the stack is deployed by a single script, `openshift_with_stack.sh`,
 which drives OLM operators, cert-manager, KubeRay, and the Splunk AI Operator to

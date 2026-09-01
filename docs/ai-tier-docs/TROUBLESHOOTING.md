@@ -1,7 +1,7 @@
 # Troubleshooting — k0s Installer (`k0s_cluster_with_stack.sh`)
 
 Reference guide for diagnosing and fixing failures in every phase of the
-Splunk AI Platform k0s installer. Each section maps a concrete error message
+Splunk AI tier k0s installer. Each section maps a concrete error message
 or symptom to its root cause and resolution.
 
 ---

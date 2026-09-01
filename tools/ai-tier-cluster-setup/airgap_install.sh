@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # airgap_install.sh
-# One-command air-gapped install of the Splunk AI Platform.
+# One-command air-gapped install of the Splunk AI tier.
 #
 # Run this on the internet-connected installer machine that also has SSH access
 # to the (sealed) cluster nodes. It downloads every binary, Helm chart, static
@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
     --skip-nvidia-closure) SKIP_NVIDIA_CLOSURE="true"; shift ;;
     -h|--help)
       cat <<'HELP'
-airgap_install.sh — one-command air-gapped install of the Splunk AI Platform.
+airgap_install.sh — one-command air-gapped install of the Splunk AI tier.
 
 Downloads every artifact the cluster needs (binaries, Helm charts, manifests,
 container-image tarballs, and the complete NVIDIA driver RPM closure), then runs
@@ -629,7 +629,7 @@ require_cmd curl
 require_cmd helm
 require_cmd tar
 
-log "=== Splunk AI Platform — Air-Gap Bundle Preparation ==="
+log "=== Splunk AI tier — Air-Gap Bundle Preparation ==="
 log "Output directory : ${OUTPUT_DIR}"
 log "Bundle name      : ${BUNDLE_NAME}"
 log ""
@@ -1579,7 +1579,7 @@ ENVEOF
 log "--- Generating container image list ---"
 
 cat > "${STAGE_DIR}/container-images.txt" <<'IMGEOF'
-# Container images required by the Splunk AI Platform stack.
+# Container images required by the Splunk AI tier stack.
 # Mirror ALL of these into your internal registry before running the installer.
 #
 # How to mirror (example using crane):
@@ -1606,7 +1606,7 @@ docker.io/splunk/splunk-operator:3.0.0
 docker.io/splunk/ai-tier-ray-head:v1.0
 docker.io/splunk/ai-tier-ray-worker:v1.0
 
-# ── Splunk AI Platform ──────────────────────────────────────────────────────
+# ── Splunk AI tier ──────────────────────────────────────────────────────
 docker.io/splunk/splunk-ai-operator:v1.0
 docker.io/splunk/ai-tier-saia-api:v1.0
 docker.io/splunk/ai-tier-saia-api-v2:v1.0

@@ -1,4 +1,4 @@
-# Splunk AI Platform Post-Install Sanity Checklist
+# Splunk AI tier Post-Install Sanity Checklist
 
 Use this checklist after `k0s_cluster_with_stack.sh install` to confirm that the
 installation completed, the cluster and AI workloads are ready, a model can

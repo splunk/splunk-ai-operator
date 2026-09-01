@@ -25,11 +25,11 @@
 [![GitHub stars](https://img.shields.io/github/stars/splunk/splunk-ai-operator)](https://github.com/splunk/splunk-ai-operator/stargazers)
 
 ---
-The Splunk AI Operator is a Kubernetes operator that enables customers to manage AI workloads using standardized CRDs, Helm charts, and Kubernetes primitives without reliance on any specific cloud provider’s tooling or rigid infrastructure. This repo includes the Splunk AI Operator, and multiple CRDs to manage the Splunk AI Platform and Splunk AI Services.
+The Splunk AI Operator is a Kubernetes operator that enables customers to manage AI workloads using standardized CRDs, Helm charts, and Kubernetes primitives without reliance on any specific cloud provider’s tooling or rigid infrastructure. This repo includes the Splunk AI Operator, and multiple CRDs to manage the Splunk AI tier and Splunk AI Services.
 
 ## Getting Started
 
-The default installation path deploys the complete Splunk AI Platform on a k0s cluster by using
+The default installation path deploys the complete Splunk AI tier on a k0s cluster by using
 `tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh`.
 
 ```bash

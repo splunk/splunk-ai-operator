@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# MinIO on EC2 for Splunk AI Platform (EKS)
+# MinIO on EC2 for Splunk AI tier (EKS)
 #
 # Mode 1 - Install on this machine (run ON the EC2 instance after SSH, as root):
 #   sudo ./install_minio_ec2.sh [--bucket NAME] [--user USER] [--password PASSWORD]
