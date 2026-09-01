@@ -541,6 +541,6 @@ trivy image ghcr.io/splunk/splunk-ai-operator:v${VERSION}
 
 ## Need Help?
 
-- **Documentation:** [docs/bill-of-materials.md](./bill-of-materials.md)
+- **Documentation:** [bill-of-materials.md](./bill-of-materials.md)
 - **Issues:** https://github.com/splunk/splunk-ai-operator/issues
 - **Discussions:** https://github.com/splunk/splunk-ai-operator/discussions

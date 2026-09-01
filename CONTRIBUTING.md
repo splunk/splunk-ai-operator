@@ -353,7 +353,7 @@ Update relevant documentation:
 
 - `README.md` - Project overview
 - `docs/` - Detailed guides
-- `docs/ai-tier-deployment/` - AI-tier deployment guides
+- `docs/ai-tier-docs/` - AI-tier deployment guides
 - `tools/ai-tier-cluster-setup/` - Installer scripts, configuration, and tests
 - Helm chart README files
 

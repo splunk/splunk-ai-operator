@@ -542,7 +542,7 @@ storage:
 ```
 
 **Generic object store (`storage.objectStore.type`)**  
-Only **AWS S3** or **external S3-compatible** storage is supported (no in-cluster MinIO install). Set `storage.objectStore.type` to `aws`, `s3compat`, `minio`, or `seaweedfs` (default is `aws` when unset). The script sets the AIPlatform `objectStorage.path` and creates a credentials secret for s3compat/minio/seaweedfs; you must provide `endpoint` and credentials. See [Object Storage Selection](../../docs/configuration/object-storage.md).
+Only **AWS S3** or **external S3-compatible** storage is supported (no in-cluster MinIO install). Set `storage.objectStore.type` to `aws`, `s3compat`, `minio`, or `seaweedfs` (default is `aws` when unset). The script sets the AIPlatform `objectStorage.path` and creates a credentials secret for s3compat/minio/seaweedfs; you must provide `endpoint` and credentials. See [Object Storage Selection](../splunk-ai-operator-docs/splunk-ai-operator-configuration/object-storage.md).
 
 **External S3-compatible (MinIO, SeaweedFS, etc.)**  
 Set `storage.objectStore.type` to `minio`, `s3compat`, or `seaweedfs`, and set `storage.objectStore.endpoint` (e.g. `http://<host>:9000` for MinIO) and credentials. You can run MinIO or SeaweedFS on EC2 or elsewhere; use `install_minio_ec2.sh` to install MinIO on an EC2 in the same VPC if desired. Pre-populate artifacts before cluster setup. The Splunk app (when using `splunkStandalone.localAppPath`) is not uploaded to external object storage automatically; upload it to your bucket at `apps/` via console or `mc`/`aws s3 --endpoint-url`.
@@ -603,7 +603,7 @@ CONFIG_FILE=./cluster-config.yaml ./eks_cluster_with_stack.sh install
 | `cluster.preserveVpcOnDelete` | Keep VPC when running `delete` | ⚙️ Set `true` when using an existing VPC you don't want deleted |
 | `cluster.subnets` | VPC subnets for nodes | ⚙️ **OPTIONAL:** Leave empty for new VPC or provide existing subnet IDs to use existing VPC |
 | `storage.s3Bucket` | S3 bucket for AI artifacts (used when `objectStore.type` is aws) | ✅ **REQUIRED** if not using MinIO/SeaweedFS |
-| `storage.objectStore` | Object store: `type` (aws \| s3compat \| minio \| seaweedfs), `bucket`, `endpoint`, `auth`. Default type is `aws` when unset. External only (no in-cluster install). | ⚙️ Required for s3compat/minio/seaweedfs: set `endpoint` and credentials. See [Object Storage Selection](../../docs/configuration/object-storage.md). |
+| `storage.objectStore` | Object store: `type` (aws \| s3compat \| minio \| seaweedfs), `bucket`, `endpoint`, `auth`. Default type is `aws` when unset. External only (no in-cluster install). | ⚙️ Required for s3compat/minio/seaweedfs: set `endpoint` and credentials. See [Object Storage Selection](../splunk-ai-operator-docs/splunk-ai-operator-configuration/object-storage.md). |
 | `images.registry` | Container registry URL | ✅ **REQUIRED:** Your ECR/Docker registry |
 | `images.*` | All container images | ✅ **REQUIRED:** Configure all image paths |
 | `nodeGroups.cpu` | CPU node group settings | ⚙️ Optional: adjust size/type |
@@ -2515,7 +2515,7 @@ the model is loaded from object storage (S3/MinIO) into that path inside the pod
    - `kubectl get secret minio-credentials -n <namespace> -o jsonpath='{.data}'`
 
 4. **Full troubleshooting steps**  
-   See [Troubleshooting: Invalid repository ID or local directory](../../docs/troubleshooting.md) in the main docs for verification commands and details.
+   See [Troubleshooting: Invalid repository ID or local directory](../splunk-ai-operator-docs/troubleshooting.md) in the main docs for verification commands and details.
 
 ### Script Execution Issues
 

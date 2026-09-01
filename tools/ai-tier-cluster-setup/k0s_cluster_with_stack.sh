@@ -7878,10 +7878,10 @@ show_platform_access_info() {
 
   log "============================================"
   log "📚 Documentation:"
-  log "  Setup Guide: ../../docs/ai-tier-deployment/K0S_README.md"
-  log "  Deployment Guide: ../../docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md"
-  log "  Troubleshooting: ../../docs/ai-tier-deployment/TROUBLESHOOTING.md"
-  log "  Custom Resources: ../../docs/api-reference.md"
+  log "  Setup Guide: ../../docs/ai-tier-docs/K0S_README.md"
+  log "  Deployment Guide: ../../docs/ai-tier-docs/DEPLOYMENT_GUIDE.md"
+  log "  Troubleshooting: ../../docs/ai-tier-docs/TROUBLESHOOTING.md"
+  log "  Custom Resources: ../../docs/splunk-ai-operator-docs/api-reference.md"
   log "============================================"
   log ""
 

@@ -1,7 +1,7 @@
 # Service Artifacts Storage
 
 ## Splunk AI Artifacts
-The Splunk AI team has provided global artifact storage in a publicly readable S3 bucket. This bucket contains LLM model files and weaviate bootstrap data. In order to create the Splunk AI tier and Splunk AI Service CRs, users need to have a storage bucket created to transfer the data. Include the bucket connection information in the `spec.volume` field in the [Splunk AI tier CR](api-reference.md#ai-platform-spec-parameters) to trigger a job to transfer the data from the public bucket to the local bucket.
+The Splunk AI team has provided global artifact storage in a publicly readable S3 bucket. This bucket contains LLM model files and weaviate bootstrap data. In order to create the Splunk AI tier and Splunk AI Service CRs, users need to have a storage bucket created to transfer the data. Include the bucket connection information in the `spec.volume` field in the [Splunk AI tier CR](../api-reference.md#ai-platform-spec-parameters) to trigger a job to transfer the data from the public bucket to the local bucket.
 
 ## Prerequisites
 

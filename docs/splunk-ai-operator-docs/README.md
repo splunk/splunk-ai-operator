@@ -4,7 +4,7 @@ Welcome to the Splunk AI Operator documentation!
 
 ## Getting Started
 
-1. **[Installation Guide](installation.md)** - Install the operator in your Kubernetes cluster
+1. **[Installation Guide](splunk-ai-operator-installation.md)** - Install the operator in your Kubernetes cluster
 2. **[API Reference](api-reference.md)** - Complete CRD specification
 3. **[Local Development](local-development.md)** - Set up local development environment
 4. **[Troubleshooting](troubleshooting.md)** - Common issues and solutions
@@ -14,10 +14,10 @@ Welcome to the Splunk AI Operator documentation!
 
 ## Configuration Guides
 
-- **[Storage Configuration](configuration/storage-configuration.md)** - Persistent storage for Weaviate vector database
-- **[Storage Artifacts](configuration/storage-artifacts.md)** - S3/GCS/Azure storage for AI models
-- **[Ingress Configuration](configuration/ingress-configuration.md)** - Expose AI services externally
-- **[Webhook Certificates](configuration/webhook-certificates.md)** - Configure admission webhook TLS
+- **[Storage Configuration](splunk-ai-operator-configuration/storage-configuration.md)** - Persistent storage for Weaviate vector database
+- **[Storage Artifacts](splunk-ai-operator-configuration/storage-artifacts.md)** - S3/GCS/Azure storage for AI models
+- **[Ingress Configuration](splunk-ai-operator-configuration/ingress-configuration.md)** - Expose AI services externally
+- **[Webhook Certificates](splunk-ai-operator-configuration/webhook-certificates.md)** - Configure admission webhook TLS
 
 ## Project Documentation
 

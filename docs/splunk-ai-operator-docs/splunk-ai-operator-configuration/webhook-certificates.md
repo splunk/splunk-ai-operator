@@ -260,4 +260,4 @@ kubectl wait --for=condition=Ready certificate/serving-cert -n splunk-ai-operato
 - [cert-manager Documentation](https://cert-manager.io/docs/)
 - [Kubernetes Admission Webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
 - [Kubebuilder Webhook Guide](https://book.kubebuilder.io/cronjob-tutorial/webhook-implementation.html)
-- [LOCAL_DEVELOPMENT.md](local-development.md) - Local development setup guide
+- [LOCAL_DEVELOPMENT.md](../local-development.md) - Local development setup guide

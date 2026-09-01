@@ -327,6 +327,6 @@ rm -rf /tmp/webhook-certs
 
 ## Next Steps
 
-- Read [DEVELOPMENT.md](DEVELOPMENT.md) for contribution guidelines
-- Check [KUBEBUILDER_MARKERS.md](KUBEBUILDER_MARKERS.md) for API validation rules
+- Read [CONTRIBUTING.md](../../CONTRIBUTING.md) for contribution guidelines
+- Check [PROJECT](../../PROJECT) for API validation rules
 - Review [ERROR_HANDLING_AND_EVENTS.md](troubleshooting.md) for error handling patterns

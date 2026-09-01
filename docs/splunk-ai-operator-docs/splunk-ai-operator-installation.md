@@ -399,16 +399,16 @@ kubectl describe pod -n splunk-ai-operator-system <pod-name>
 
 After installing the operator:
 
-1. **Deploy AI Platform**: See [Deployment Guide](ai-tier-deployment/DEPLOYMENT_GUIDE.md)
-2. **Configure Storage**: See [Storage Configuration](configuration/storage-configuration.md)
-3. **Set Up Ingress**: See [Ingress Configuration](configuration/ingress-configuration.md)
+1. **Deploy AI Platform**: See [Deployment Guide](../ai-tier-docs/DEPLOYMENT_GUIDE.md)
+2. **Configure Storage**: See [Storage Configuration](splunk-ai-operator-configuration/storage-configuration.md)
+3. **Set Up Ingress**: See [Ingress Configuration](splunk-ai-operator-configuration/ingress-configuration.md)
 4. **Review API**: See [API Reference](api-reference.md)
 
 ---
 
 ## Additional Resources
 
-- [Deployment Guide](ai-tier-deployment/DEPLOYMENT_GUIDE.md)
+- [Deployment Guide](../ai-tier-docs/DEPLOYMENT_GUIDE.md)
 - [Local Development](local-development.md)
 - [Troubleshooting Guide](troubleshooting.md)
 - [Releases](releases.md)

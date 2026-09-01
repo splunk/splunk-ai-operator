@@ -2344,7 +2344,7 @@ Use the guide that matches the failing layer:
 - Installer, SSH, k0s bootstrap, GPU, model staging, storage, or air-gap
   failures: [k0s Installer Troubleshooting](TROUBLESHOOTING.md)
 - AIPlatform status, Kubernetes events, Ray, Weaviate, or runtime failures:
-  [Troubleshooting with Events and Status](../../docs/troubleshooting.md)
+  [Troubleshooting with Events and Status](../splunk-ai-operator-docs/troubleshooting.md)
 - Splunk AI Assistant installation or SAIA connectivity:
   [Troubleshooting the App](#troubleshooting-the-app)
 

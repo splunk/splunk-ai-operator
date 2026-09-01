@@ -114,8 +114,8 @@ trivy --version
 
 ## 📖 Full Documentation
 
-- **Detailed Guide:** [docs/using-bom-compatibility.md](./using-bom-compatibility.md)
-- **BOM Overview:** [docs/bill-of-materials.md](./bill-of-materials.md)
+- **Detailed Guide:** [using-bom-compatibility.md](./using-bom-compatibility.md)
+- **BOM Overview:** [bill-of-materials.md](./bill-of-materials.md)
 - **Issues:** https://github.com/splunk/splunk-ai-operator/issues
 
 ## 💡 Pro Tips

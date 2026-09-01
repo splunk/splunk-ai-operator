@@ -17,7 +17,7 @@ you can use to manage Splunk AI tier deployments in your Kubernetes cluster.
     - [CR Status Message](#cr-status-message)
 
 For examples on how to use these custom resources, please see
-[Configuring Splunk Enterprise Deployments](Examples.md).
+[Configuring Splunk Enterprise Deployments](../ai-tier-docs/EXTERNAL_SPLUNK_INTEGRATION.md).
 
 
 ## Metadata Parameters
@@ -143,7 +143,7 @@ The `AIPlatform` resource provides the following `Spec` configuration parameters
 
 | Key        | Type    | Description                                       |
 | ---------- | ------- | ------------------------------------------------- |
-| objectStorage   | object | **Required.** S3/GCS/Azure storage configuration for model artifacts. See [Service Artifacts Storage](storage-artifacts.md) |
+| objectStorage   | object | **Required.** S3/GCS/Azure storage configuration for model artifacts. See [Service Artifacts Storage](splunk-ai-operator-configuration/storage-artifacts.md) |
 | serviceAccountName   | string | Kubernetes [Service Account](https://kubernetes.io/docs/concepts/security/service-accounts/) name. Used for IAM roles (IRSA on AWS) to access cloud resources |
 | features   | array | List of AI features to enable (e.g., `saia` for Splunk AI Assistant) |
 | defaultAcceleratorType   | string | GPU type for AI workloads (e.g., `nvidia-tesla-t4`, `nvidia-a100`, `L40S`) |
@@ -154,10 +154,10 @@ The `AIPlatform` resource provides the following `Spec` configuration parameters
 | images   | object | Container image overrides for Ray head/worker, SAIA, Weaviate |
 | certificateRef   | string | References a cert-manager Certificate or Issuer for mTLS |
 | splunkConfiguration   | object | Connection details for Splunk Enterprise instance |
-| **storage**   | object | **Persistent storage** for Weaviate vector database. See [Storage Configuration](storage-configuration.md) |
+| **storage**   | object | **Persistent storage** for Weaviate vector database. See [Storage Configuration](splunk-ai-operator-configuration/storage-configuration.md) |
 | gpuScheduler   | object | Node selectors, affinity, tolerations for GPU workloads |
 | cpuScheduler   | object | Node selectors, affinity, tolerations for CPU workloads (head, Weaviate) |
-| **ingress**   | object | **External access** configuration. Exposes AI services via HTTP/HTTPS. See [Ingress Usage](ingress-configuration.md) |
+| **ingress**   | object | **External access** configuration. Exposes AI services via HTTP/HTTPS. See [Ingress Usage](splunk-ai-operator-configuration/ingress-configuration.md) |
 | **mtls**   | object | **mTLS/TLS certificates** managed by cert-manager for secure service communication |
 | serviceTemplate   | object | Template used to create Kubernetes services for platform components |
 

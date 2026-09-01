@@ -414,7 +414,7 @@ Contact maintainers for:
 
 ## Related Documentation
 
-- [Installation Guide](installation.md)
-- [Contributing Guide](../CONTRIBUTING.md)
-- [Changelog](../CHANGELOG.md)
-- [Security Policy](../SECURITY.md)
+- [Installation Guide](splunk-ai-operator-installation.md)
+- [Contributing Guide](../../CONTRIBUTING.md)
+- [Changelog](../../CHANGELOG.md)
+- [Security Policy](../../SECURITY.md)

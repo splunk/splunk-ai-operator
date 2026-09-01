@@ -324,4 +324,4 @@ When updating managed image versions:
 
 For questions about BOM/SBOM:
 - Open an issue: https://github.com/splunk/splunk-ai-operator/issues
-- Security concerns: See [SECURITY.md](../SECURITY.md)
+- Security concerns: See [SECURITY.md](../../SECURITY.md)

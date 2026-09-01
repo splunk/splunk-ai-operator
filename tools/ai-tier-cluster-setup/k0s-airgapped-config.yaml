@@ -13,7 +13,7 @@
 #   4. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
 #
 # See the Air-Gapped Deployment section in
-# docs/ai-tier-deployment/K0S_README.md for staging options, installer-host
+# docs/ai-tier-docs/K0S_README.md for staging options, installer-host
 # requirements, and the separate model-artifact workflow.
 #
 # The installer machine must have internet access for staging and SSH access to

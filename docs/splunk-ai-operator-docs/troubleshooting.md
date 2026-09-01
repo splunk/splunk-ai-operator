@@ -213,7 +213,7 @@ the model loader is trying to use a **local path** where the model should have b
 1. **Model not in object storage**  
    The prefix `model_artifacts/llama31-8b-instruct` must exist in your bucket with a full Hugging Face–style layout (including `config.json` and weight files).
    - Download: `./tools/artifacts_download_upload_scripts/download_from_huggingface.sh`
-   - Upload to MinIO/S3-compatible: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, and credentials as in the [artifacts README](../tools/artifacts_download_upload_scripts/README.md); `MINIO_*` env vars are also accepted).
+   - Upload to MinIO/S3-compatible: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, and credentials as in the [artifacts README](../../tools/artifacts_download_upload_scripts/README.md); `MINIO_*` env vars are also accepted).
 
 2. **Ray workers cannot reach MinIO/S3**  
    - For **external MinIO** (e.g. EC2): ensure the MinIO endpoint in `cluster-config.yaml` (`storage.minio.endpoint`) is reachable from EKS (security groups, VPC, and if using a public IP, that nodes can egress to it).
