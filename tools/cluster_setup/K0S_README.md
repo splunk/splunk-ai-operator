@@ -17,7 +17,8 @@ Complete guide for deploying Splunk AI Platform on k0s Kubernetes clusters.
   - [Kine Compaction](#kine-compaction)
   - [Insecure Registry Support (containerd v2)](#insecure-registry-support-containerd-v2)
 - [Air-Gapped Deployment](#air-gapped-deployment)
-- [Splunk AI Assistant App](#splunk-ai-assistant-app)
+- [Splunk Integration and Authentication](#splunk-integration-and-authentication)
+  - [Splunk AI Assistant App](#splunk-ai-assistant-app)
   - [Onboarding to the AI Tier](#onboarding-to-the-ai-tier)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
@@ -96,45 +97,11 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 ## Prerequisites
 
+Installer-machine, cluster-node, and air-gapped operating-system requirements
+are defined in the canonical
+[Supported platforms matrix](DEPLOYMENT_GUIDE.md#supported-platforms).
+
 ### Required Tools (on Installer Machine)
-
-```bash
-# Install required tools on macOS
-brew install kubectl helm git jq yq crane
-
-# Install required tools on Ubuntu/Debian
-# git and jq are in the default apt repos; kubectl and helm are not — add their
-# upstream repos/install scripts, and yq/crane need sudo to write to /usr/local/bin
-sudo apt-get update
-sudo apt-get install -y apt-transport-https ca-certificates curl gnupg git jq tmux
-
-# pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0) — keep in sync with that version
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo apt-get update
-sudo apt-get install -y kubectl
-
-curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-# pinned to match the version this repo already relies on (k0s_cluster_with_stack.sh, airgap_install.sh)
-sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
-sudo chmod +x /usr/local/bin/yq
-
-# crane — used by the image-mirroring commands below (see Step 2 — Mirror
-# Container Images); no Docker daemon/root/group setup required
-curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz -o /tmp/crane.tar.gz
-tar -xzf /tmp/crane.tar.gz -C /tmp crane
-sudo install -o root -g root -m 0755 /tmp/crane /usr/local/bin/crane
-rm -f /tmp/crane.tar.gz /tmp/crane
-
-# Verify installations
-kubectl version --client
-helm version
-git --version
-jq --version
-yq --version
-crane version
-```
 
 **RHEL 9.8 / RHEL 10.2** — none of `kubectl`, `helm`, `docker`, `yq`, or `crane` are in the
 default `dnf` repos; `git` and `jq` are. Install each via its own supported
@@ -180,8 +147,8 @@ kubectl version --client && helm version && git --version && jq --version && yq 
 ```
 
 The image-mirroring commands used later (see [Step 2 — Mirror Container Images](#step-2--mirror-container-images))
-default to `crane copy`, which works on Ubuntu 24.04 and RHEL 9.8/10.2 with no
-Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
+default to `crane copy`, which works on the supported RHEL 9.8/10.2 installer
+machines with no Docker daemon, root, or group setup. `docker pull`/`tag`/`push` is documented
 there too as an equivalent alternative if you already run Docker.
 
 ### Hardware Requirements
@@ -190,19 +157,19 @@ there too as an equivalent alternative if you already run Docker.
 |-----------|---------|---------|----------|-------|
 | Controller | 4+ | 8 GB | 100 GB | Runs API server, etcd, scheduler |
 | CPU Worker | 8+ | 32 GB | 200 GB | Runs Weaviate, Ray head, Splunk, SAIA API/v2, Data Loader |
-| GPU Worker | 48 vCPUs | 384 GiB | 500 GB | 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **2 nodes required = 8 × L40S total (384 GB total GPU memory)** · 100 Gbps · equivalent to g6e.12xlarge |
+| GPU Worker — L40S | 48 vCPUs | 384 GiB | 500 GB | 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **2 nodes required = 8 × L40S total (384 GB total GPU memory)** · equivalent to `g6e.12xlarge` |
+| GPU Worker — H100 | 16 vCPUs | 256 GiB | 500 GB | 1 × NVIDIA H100 per node (80 GB HBM3 each) · **2 nodes required = 2 × H100 total (160 GB total GPU memory)** · equivalent to `p5.4xlarge` |
+
+Choose one GPU-worker row for the entire cluster; do not mix L40S and H100
+workers.
 
 **Ports between nodes:** 22 (SSH), 6443 (API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN), 179 (Calico BGP). Best practice: allow all ports between nodes.
 
 ### Software Requirements (on All Nodes)
 
-**Supported node operating systems:**
-
-- RHEL 9.8
-- RHEL 10.2
-- Ubuntu 24.04
-
-Use one supported OS family and version across all nodes in a cluster.
+Use one supported OS family and version across all nodes in a cluster. See the
+[Supported platforms matrix](DEPLOYMENT_GUIDE.md#supported-platforms)
+for the exact supported versions.
 - Passwordless SSH access from installer machine
 - Sudo privileges without password
 - Python 3.8+ installed
@@ -581,7 +548,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `aiPlatform.name` | No | `${CLUSTER_NAME}-ai-platform` | Base name for the AIPlatform CR |
-| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type — `L40S`, `H100`, or `RTX_PRO_6000_BLACKWELL` |
+| `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type for k0s — `L40S` or `H100` |
 | `aiPlatform.scaleFactor` | No | `1` | AI workload capacity multiplier; use a whole number of 1 or higher |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
@@ -771,7 +738,7 @@ The `install` command executes these steps in order:
    | Model artifact ID | Purpose |
    |---|---|
    | `gemma-4-31b-it` | Unquantized Gemma model for L40S |
-   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 and RTX Pro |
+   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
    | `cross-encoder` | MS MARCO cross-encoder |
@@ -818,7 +785,7 @@ The `install` command executes these steps in order:
    cd tools/artifacts_download_upload_scripts
 
    # Explicit GPU type
-   ./download_from_huggingface.sh --accelerator l40s   # or h100 / rtx_pro_6000_blackwell
+   ./download_from_huggingface.sh --accelerator l40s   # or h100
 
    # Interactive — prompted when no flag or ACCELERATOR env var is set:
    #   Select GPU type:
@@ -1376,7 +1343,7 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 > These requirements apply only to the air-gap path. A standard (`airgap: false`) install needs none of them.
 
-> **For air-gap builds, the installer machine's RHEL major must match the cluster's.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9 installer machine cannot resolve RHEL 10 packages (or vice versa) — and the air-gap path builds both closures (NVIDIA driver, node packages) on this host:
+> **For air-gap builds, the installer machine's RHEL major must match the cluster's.** `dnf`'s `$releasever` resolves from the *installer host's* own OS, not the target node's, so a RHEL 9.8 installer machine cannot resolve RHEL 10.2 packages (or vice versa) — and the air-gap path builds both closures (NVIDIA driver, node packages) on this host:
 > - Cluster nodes are **RHEL 10.2** → installer machine must be **RHEL 10.2 x86_64**.
 > - Cluster nodes are **RHEL 9.8** or **Ubuntu 24.04** → installer machine stays **RHEL 9.8 x86_64** (the Ubuntu `.deb` closure resolves inside an `ubuntu:24.04` container).
 >
@@ -1416,7 +1383,7 @@ cd tools/cluster_setup
 | Manifests | `cert-manager v1.13.0`, `local-path-provisioner v0.0.24`, `nvidia-device-plugin v0.17.3` |
 | Helm charts | `kube-prometheus-stack` (version captured at download time), `opentelemetry-operator` (version captured at download time), `kuberay-operator 1.2.2`, `metallb 0.14.8` |
 | GPU packages | `packages/nvidia-closure/` — a complete offline dnf repo (driver, DKMS, gcc/make toolchain, container toolkit, `kernel-devel`/`kernel-headers` per GPU node kernel); PyYAML wheel (all nodes) |
-| Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
+| Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10.2 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
 Output: `./airgap-bundle/airgap-bundle-<timestamp>/` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB). The artifacts are consumed in place; there is no tarball. After a successful install the staged tree is deleted to reclaim disk unless you pass `--keep-staging`.
@@ -1550,14 +1517,15 @@ command inside a persistent `tmux` or `screen` session on the installer machine
 so an SSH disconnect does not interrupt it:
 
 ```bash
-tmux new -s saia-install
-# Run the install command here, then detach with Ctrl-b followed by d.
+tmux new -s splunk-ai-install
+# The tmux name is only a session label. Run the full platform install command
+# here, then detach with Ctrl-b followed by d.
 ```
 
 Reconnect after an SSH disconnect with:
 
 ```bash
-tmux attach -t saia-install
+tmux attach -t splunk-ai-install
 ```
 
 **4a. Add `cluster.airgap: true` to your config:**
@@ -1656,9 +1624,9 @@ This produces `packages/nvidia-closure/` — a complete dnf repo (~500 MB, ~270 
 
 The installer scp's the closure to each GPU node, installs with `dnf --disablerepo='*' --repofrompath=...` so the node never contacts `developer.download.nvidia.com`, and DKMS compiles the module against that node's running kernel.
 
-**The closure must be built on a RHEL 9 x86_64 host** with `dnf` and `createrepo_c` — it cannot be built on macOS. The OS **minor** version and kernel do *not* need to match the GPU nodes: `$releasever` resolves to `9`, so a RHEL 9.6 installer machine can download `kernel-devel` for a 9.8 node, and the module compiles on the target anyway.
+**For RHEL 9.8 GPU nodes, the closure must be built on a RHEL 9.8 x86_64 host** with `dnf` and `createrepo_c`; it cannot be built on macOS. The GPU node kernel need not match the installer host kernel, but every target kernel must be named or discovered so its exact `kernel-devel` package is staged.
 
-**Every GPU node's running kernel must be covered.** NVIDIA ships DKMS-only packages for RHEL 9 (there is no precompiled kmod), so the module is built on the node and needs headers for that exact `uname -r`. The installer checks this per node *before* copying 500 MB and fails with the offending kernel named if it is missing.
+**Every GPU node's running kernel must be covered.** NVIDIA ships DKMS-only packages for RHEL 9.8 (there is no precompiled kmod), so the module is built on the node and needs headers for that exact `uname -r`. The installer checks this per node *before* copying 500 MB and fails with the offending kernel named if it is missing.
 
 > **Pin kernels on GPU nodes.** Add `exclude=kernel*` to `/etc/dnf/dnf.conf` on each GPU node. If a node boots a kernel the closure has no headers for, DKMS cannot rebuild and `nvidia-smi` breaks with no offline path to recover.
 
@@ -1666,21 +1634,21 @@ The installer scp's the closure to each GPU node, installs with `dnf --disablere
 
 If you would rather manage drivers out of band, install the NVIDIA driver and `nvidia-container-toolkit` on each GPU node before running the installer, and pass `--skip-nvidia-closure`. The installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips toolkit install), then configures the containerd runtime offline.
 
-To build the closure by hand for this optional RHEL 9 path, the manual recipe
-follows. For RHEL 10 or Ubuntu 24.04 GPU nodes, use the automatic closure
-staging described in Strategy 1 instead of this RHEL 9 recipe.
+To build the closure by hand for this optional RHEL 9.8 path, the manual recipe
+follows. For RHEL 10.2 or Ubuntu 24.04 GPU nodes, use the automatic closure
+staging described in Strategy 1 instead of this RHEL 9.8 recipe.
 
-The driver flavor that succeeds on RHEL 9 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
+The driver flavor used on RHEL 9.8 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
 
-The unified air-gap installer checks whether that RPM is visible and, on RHEL 9
+The unified air-gap installer checks whether that RPM is visible and, on RHEL 9.8
 only, resets any conflicting/default NVIDIA stream and enables
-`nvidia-driver:latest-dkms` before resolving the closure. RHEL 10 uses ordinary
+`nvidia-driver:latest-dkms` before resolving the closure. RHEL 10.2 uses ordinary
 RPMs without this module-stream step, and Ubuntu follows its independent APT
 path.
 
 > **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
 
-**Step 1 — build the RHEL 9 closure on a connected RHEL 9 host.** A machine on the same RHEL 9 minor as the GPU node (the installer machine works) is ideal. Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
+**Step 1 — build the RHEL 9.8 closure on a connected RHEL 9.8 host.** Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
 
 ```bash
 DEST=~/nvidia-offline
@@ -1849,20 +1817,31 @@ Unset variables fall back to the default public URLs automatically.
 
 ---
 
-## Splunk AI Assistant App
+## Splunk Integration and Authentication
 
-The **Splunk AI Assistant** app (`Splunk_AI_Assistant_Cloud.tgz`) is a Splunk
-application that provides the AI chat UI. Install it on the Splunk Enterprise
-instance after the cluster is fully healthy. The app is planned for listing on
-Splunk Base; once listed, download it there. Until then, use the archive location
-provided with the release or evaluation package. This is a separate post-install
-step, not a prerequisite for deploying the cluster.
+Use the following component versions together for this release. Other version
+combinations are not qualified by this guide.
 
-> **Tested Splunk version:** Splunk Enterprise **10.2** is the tested version for
-> both bundled/internal and external Splunk integration. The bundled deployment
-> uses `docker.io/splunk/splunk:10.2-rhel9`.
+| Component | Supported version |
+|---|---|
+| Splunk AI Assistant app | 2.3.0 |
+| Splunk Enterprise | 10.2 |
+| Splunk AI Tier / Splunk AI Operator | v1.0 |
+| SAIA services | v1.0 |
+| SLIM service | v1.0 |
 
-### Internal Splunk management transport (native-HTTPS compatibility mode)
+The bundled deployment uses `docker.io/splunk/splunk:10.2-rhel9`.
+
+### SAIA API Generations
+
+SAIA v1 and v2 are internal API generations. The platform deploys both behind
+one SAIA Service endpoint, and the Splunk AI Assistant app routes each request
+to the appropriate backend. Customers do not select an API generation or
+configure separate v1 and v2 endpoints.
+
+### Shared Authentication and Management Transport
+
+#### Internal Splunk management transport (native-HTTPS compatibility mode)
 
 > **Release support boundary:** the bundled/internal HEC and OTel behavior
 > described below remains active and unchanged so the tested installation path
@@ -1874,7 +1853,7 @@ step, not a prerequisite for deploying the cluster.
 
 When `splunk.enabled: true` and `splunk.external.endpoint` is unset, the
 installer preserves native splunkd HTTPS on port 8089. The immutable Splunk AI
-Assistant app 2.0.4 depends on `https://127.0.0.1:8089` for its local SDK,
+Assistant app 2.3.0 depends on `https://127.0.0.1:8089` for its local SDK,
 capability, KV Store, onboarding, and scheduled-job calls.
 
 The installer uses the same short internal URL for Splunk's OAuth issuer and
@@ -1966,18 +1945,31 @@ a short-lived interactive JWT, and requires authenticated HTTP 200 responses
 from both SAIA and Slim. The decoded password and JWT remain inside one in-pod
 process and are never printed or written to files.
 
-### Prerequisites
+### Splunk AI Assistant App
+
+The [**Splunk AI Assistant** app](https://splunkbase.splunk.com/app/7245)
+(`Splunk_AI_Assistant_Cloud.tgz`) provides the AI chat UI. Install supported app
+version 2.3.0 on Splunk Enterprise 10.2 after the cluster is fully healthy.
+Download the package from its Splunkbase listing. For an air-gapped environment,
+download it on a connected machine and transfer the archive to the machine used
+for installation. This is a separate post-install step, not a prerequisite for
+deploying the cluster.
+
+SLIM uses the shared authentication configuration described above, but its
+client onboarding is separate from SAIA app onboarding.
+
+#### Prerequisites
 
 - All pods are Running: `kubectl get pods -A --no-headers | awk '$4 != "Running" && $4 != "Completed" {print}'`
 - `AIPlatform` CR is Ready: `kubectl get aiplatform -n ai-platform`
 - SAIA service is up: `kubectl get pods,svc -n ai-platform | grep saia`
-- You have the `Splunk_AI_Assistant_Cloud.tgz` archive (download from Splunk Base
-  when listed; until then use the release or evaluation package location)
+- You have the version 2.3.0 `Splunk_AI_Assistant_Cloud.tgz` archive from
+  the [Splunk AI Assistant listing on Splunkbase](https://splunkbase.splunk.com/app/7245)
 - Splunk Web is reachable from your browser (see [Finding the Splunk Web URL](#finding-the-splunk-web-url))
 
 ---
 
-### Finding the Splunk Web URL
+#### Finding the Splunk Web URL
 
 Splunk Enterprise listens on port **8000**. How you reach it depends on your
 service configuration. These commands apply only when `splunk.enabled: true`
@@ -2077,7 +2069,7 @@ Placeholders used below — replace with your own values:
      --proxy-bypass-list="localhost;127.0.0.1"
    ```
 
-   Linux (Ubuntu/RHEL installer machine):
+   Linux (RHEL installer machine):
 
    ```bash
    google-chrome --user-data-dir=/tmp/<cluster-name>-chrome \
@@ -2109,7 +2101,7 @@ kubectl get secret "${SPLUNK_SECRET}" -n "${NAMESPACE}" \
 
 ---
 
-### Install via Splunk UI
+#### Install via Splunk UI
 
 1. Open the Splunk Web URL in your browser and log in as `admin`
 2. Click the **Apps** menu in the top navigation bar → **Manage Apps**
@@ -2123,7 +2115,7 @@ After restart, the **Splunk AI Assistant** app appears in the Apps list.
 
 ---
 
-### Install in an Air-Gapped Environment
+#### Install in an Air-Gapped Environment
 
 When the browser machine cannot reach Splunk Web directly, copy the app into
 the pod using `kubectl`:
@@ -2151,7 +2143,7 @@ Wait ~60 seconds, then verify (see [Verifying the Installation](#verifying-the-i
 
 ---
 
-### Verifying the Installation
+#### Verifying the Installation
 
 **Via Kubernetes Standalone status**
 
@@ -2195,7 +2187,7 @@ Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm a
 
 ---
 
-### Onboarding to the AI Tier
+#### Onboarding to the AI Tier
 
 After the app is installed, you must point it at the SAIA API endpoint so prompts are routed to the AI inference backend. This is the onboarding step that activates the AI functionality.
 
@@ -2288,7 +2280,7 @@ Open the **Splunk AI Assistant** app in Splunk Web, type a prompt, and confirm a
 
 ---
 
-### Troubleshooting the App
+#### Troubleshooting the App
 
 **App does not appear after upload**
 
@@ -2339,224 +2331,25 @@ kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
 
 ## Troubleshooting
 
-### Installation Issues
-
-#### SSH Connection Failures
-
-```bash
-# Test SSH access
-ssh -i ~/.ssh/my-key.pem ubuntu@node-ip hostname
-
-# Common issues:
-# 1. Wrong key permissions
-chmod 600 ~/.ssh/my-key.pem
-
-# 2. SSH agent not running
-eval $(ssh-agent)
-ssh-add ~/.ssh/my-key.pem
-
-# 3. Firewall blocking port 22
-# 4. Wrong username (try: ubuntu, ec2-user, admin, root)
-```
-
-#### k0s Installation Failures
+Run the installer validation and collect a support bundle before changing the
+cluster:
 
 ```bash
-# Check k0s status on controller
-ssh ubuntu@controller-ip
-sudo k0s status
-
-# View k0s logs
-sudo journalctl -u k0scontroller -f
-
-# Check k0s config
-sudo cat /etc/k0s/k0s.yaml
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
 ```
 
-#### Worker Join Failures
+Use the guide that matches the failing layer:
 
-```bash
-# Check if worker is running
-ssh ubuntu@worker-ip
-sudo k0s status
+- Installer, SSH, k0s bootstrap, GPU, model staging, storage, or air-gap
+  failures: [k0s Installer Troubleshooting](TROUBLESHOOTING.md)
+- AIPlatform status, Kubernetes events, Ray, Weaviate, or runtime failures:
+  [Troubleshooting with Events and Status](../../docs/troubleshooting.md)
+- Splunk AI Assistant installation or SAIA connectivity:
+  [Troubleshooting the App](#troubleshooting-the-app)
 
-# View worker logs
-sudo journalctl -u k0sworker -f
-
-# Use join-workers command to retry
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
-```
-
-#### Safety Gate Blocking Install
-
-If install fails with "k0s cluster has Ready nodes — refusing to wipe":
-
-```bash
-# Option 1: Use existing cluster (deploy stack only)
-# Set useExisting: auto in config, then re-run install
-
-# Option 2: Tear down first
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh delete
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
-```
-
-### Model Staging Issues
-
-#### Models reported MISSING
-
-The configured bucket may not exist, may be empty, may not be the bucket used by
-the upload step, or may be missing the expected completion markers. Uppercase
-bucket names are normalized to lowercase by the installer, but use lowercase in
-the config to keep the configured name and object-store paths unambiguous.
-
-**Check:** Confirm the bucket exists and contains model completion markers:
-```bash
-# MinIO
-mc ls myminio/<bucket>/staging_state/
-mc ls myminio/<bucket>/model_artifacts/
-# S3
-aws s3api head-bucket --bucket <bucket>
-aws s3 ls s3://<bucket>/staging_state/
-aws s3 ls s3://<bucket>/model_artifacts/
-```
-
-**Fix:** Create or select the configured bucket, then run `stage-artifacts` to
-upload the required models and completion markers:
-
-```bash
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
-```
-
-#### Switching `defaultAcceleratorType` from L40S to H100 shows models as MISSING
-
-This is expected and correct. L40S selects `model_artifacts_configs_unquantized.yaml`; H100 and RTX Pro select `model_artifacts_configs_quantized.yaml`. Gemma uses distinct artifact IDs and object-store prefixes in the two profiles. Staging checks validate each marker's `hf_url`, so a mismatched artifact is downloaded and uploaded rather than reused.
-
-```bash
-# Force re-stage for H100 after changing defaultAcceleratorType to h100
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
-```
-
-#### `stage-artifacts` exits success with no models downloaded (`yq` failure)
-
-If `yq` is not installed or cannot parse the selected artifact profile, the download script exits non-zero immediately with, for example:
-```
-ERROR: yq failed to parse './model_artifacts_configs_unquantized.yaml' — check that yq is installed and the file is valid YAML.
-```
-
-Install yq: `sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`
-
-#### Re-stage a single model without restarting from scratch
-
-Delete the store marker for that model and re-run `stage-artifacts`:
-```bash
-# MinIO
-mc rm myminio/<bucket>/staging_state/<model-id>/.staging_complete
-# S3
-aws s3 rm s3://<bucket>/staging_state/<model-id>/.staging_complete
-
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
-```
-
-### Storage Issues
-
-#### Object Storage Connectivity
-
-```bash
-# Test endpoint from a node
-ssh ubuntu@worker-ip
-curl -s http://<endpoint>:<port>/minio/health/live
-
-# Verify S3 secret exists
-kubectl get secret s3-secret -n ai-platform -o yaml
-```
-
-#### PVC Stuck in Pending
-
-```bash
-# Check PVC status
-kubectl get pvc -n ai-platform
-
-# Check storage class
-kubectl get sc
-
-# For local-path issues:
-kubectl get pods -n local-path-storage
-kubectl logs -n local-path-storage deployment/local-path-provisioner
-```
-
-### GPU Issues
-
-#### GPU Not Detected
-
-```bash
-# Check NVIDIA device plugin pods
-kubectl get pods -n kube-system -l name=nvidia-device-plugin-ds
-
-# Check node GPU resources
-kubectl get nodes -o json | jq '.items[].status.capacity | select(.["nvidia.com/gpu"] != null)'
-
-# Manually verify GPU on node
-ssh ubuntu@gpu-worker-ip
-nvidia-smi
-```
-
-#### GPU Workloads Not Scheduling
-
-```bash
-# Check if GPU nodes are tainted
-kubectl describe node <gpu-node> | grep Taints
-
-# Check if pods have tolerations
-kubectl get pod <pod-name> -n ai-platform -o yaml | grep -A5 tolerations
-```
-
-### Application Issues
-
-#### AIPlatform Not Ready
-
-```bash
-# Check AIPlatform status
-kubectl get aiplatform -n ai-platform -o wide
-
-# Describe for events
-kubectl describe aiplatform <name> -n ai-platform
-
-# Check operator logs
-kubectl logs -n splunk-ai-operator-system \
-  deployment/splunk-ai-operator-controller-manager
-```
-
-### Session Logs
-
-All install output is captured in timestamped log files:
-
-```bash
-# View the latest log
-ls -lt tools/cluster_setup/logs/ | head -5
-
-# Tail a running install
-tail -f tools/cluster_setup/logs/k0s-install-*.log
-```
-
-### Debugging Commands
-
-```bash
-# Get all resources in namespace
-kubectl get all -n ai-platform
-
-# Check events across cluster
-kubectl get events --all-namespaces --sort-by='.lastTimestamp'
-
-# Check resource usage
-kubectl top nodes
-kubectl top pods -n ai-platform
-
-# Exec into pod for debugging
-kubectl exec -it <pod-name> -n ai-platform -- /bin/bash
-
-# Check pod logs (all containers)
-kubectl logs <pod-name> -n ai-platform --all-containers=true --tail=100
-```
+The installer guide is the source of truth for operational commands. Keep
+app-specific checks here beside the onboarding workflow.
 
 ---
 
@@ -2642,7 +2435,7 @@ The script downloads various binaries, manifests, Helm charts, OS packages, and 
 | What | URL / Source |
 |------|-------------|
 | Kernel headers | `dnf install kernel-devel-$(uname -r) kernel-headers-$(uname -r)` |
-| NVIDIA GPU driver (RHEL 9) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo` |
+| NVIDIA GPU driver (RHEL 9.8) | Repo: `https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo` |
 | EPEL for DKMS | `https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm` |
 | NVIDIA Container Toolkit | Repo: `https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo` |
 
