@@ -438,7 +438,7 @@ jobs:
 
             ### Documentation
 
-            - [Helm Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/deployment/helm-deployment.md)
+            - [Helm Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/ai_tier_deployment/helm-deployment.md)
             - [Installation Guide](https://github.com/${{ github.repository }}/blob/main/docs/installation.md)
             - [API Reference](https://github.com/${{ github.repository }}/blob/main/docs/api-reference.md)
         env:

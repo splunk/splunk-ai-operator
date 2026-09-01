@@ -38,7 +38,7 @@ including Ray workers that may be created after the Ray head becomes ready.
 ```bash
 POD_HEALTH_STABLE_WAIT=1800 \
   CONFIG_FILE="$CONFIG_FILE" \
-  tools/cluster_setup/k0s_cluster_with_stack.sh verify-pods
+  tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh verify-pods
 echo "exit_code=$?"
 ```
 
@@ -287,7 +287,7 @@ Overall sanity testing passes only when all applicable cases pass. A successful
 end-to-end SAIA user flow.
 
 For deployments using bundled/internal Splunk, the read-only
-`tools/cluster_setup/test_internal_splunk_http.sh` provides optional regression
+`tools/ai_tier_cluster_setup/test_internal_splunk_http.sh` provides optional regression
 coverage for the existing management/JWT, HEC configuration, injected OTel
 collector, and workload path. This diagnostic protects the tested internal
 behavior; it does not qualify external HEC/OTel, certify telemetry delivery, or

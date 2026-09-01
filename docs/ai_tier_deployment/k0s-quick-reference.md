@@ -2,8 +2,8 @@
 
 Quick reference for installing the Splunk AI Platform on k0s. For full
 explanations, diagrams, and edge cases, see
-[DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) and
-[K0S_README.md](../../tools/cluster_setup/K0S_README.md).
+[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) and
+[K0S_README.md](K0S_README.md).
 
 ## Table of Contents
 
@@ -25,8 +25,8 @@ explanations, diagrams, and edge cases, see
      - [Air-Gapped Step 7: Install the Platform](#air-gapped-step-7-install-the-platform)
      - [Air-Gapped Step 8: Monitor and Verify](#air-gapped-step-8-monitor-and-verify)
 5. [Step 5: Splunk Integration](#step-5-splunk-integration)
-6. [Step 6: Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
-7. [Step 7: Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
+6. [Step 6: Common Operations](DEPLOYMENT_GUIDE.md#common-operations)
+7. [Step 7: Troubleshooting](DEPLOYMENT_GUIDE.md#troubleshooting)
 
 ---
 
@@ -182,7 +182,7 @@ Download the scripts with the configuration files on the installer machine.
 2. **Navigate to the Setup Directory**
    * Change into the standard repository directory structure:
      ```bash
-     cd splunk-ai-operator/tools/cluster_setup
+     cd splunk-ai-operator/tools/ai_tier_cluster_setup
      ```
 
 3. **Initialize Configuration File**
@@ -218,7 +218,7 @@ Download the scripts with the configuration files on the installer machine.
 2. **Navigate with Branch Suffix**
    * Move into the extracted folder. GitHub includes the branch name in the root folder structure (for example, `splunk-ai-operator-<branch-name>` instead of `splunk-ai-operator`):
      ```bash
-     cd splunk-ai-operator-<branch-name>/tools/cluster_setup
+     cd splunk-ai-operator-<branch-name>/tools/ai_tier_cluster_setup
      ```
 
 3. **Initialize Configuration File**
@@ -277,7 +277,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 > once this base config is filled in.
 
 > Full field-by-field reference:
-[K0S_README.md — Configuration Reference](../../tools/cluster_setup/K0S_README.md#configuration-reference).
+[K0S_README.md — Configuration Reference](K0S_README.md#configuration-reference).
 
 ---
 
@@ -319,7 +319,7 @@ AI platform can serve inference.
 #### Install (Standard Path)
 
 ```bash
-cd tools/cluster_setup
+cd tools/ai_tier_cluster_setup
 
 # Required: validation must succeed before install
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
@@ -496,7 +496,7 @@ Run validation from the setup directory and fix any reported errors before
 continuing:
 
 ```bash
-cd tools/cluster_setup
+cd tools/ai_tier_cluster_setup
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
@@ -541,11 +541,11 @@ path for air-gapped deployments.
 
 For the bundled in-cluster Splunk instance, use NodePort, LoadBalancer, or
 `kubectl port-forward` as described in [K0S_README.md — Finding the Splunk Web
-URL](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url). If
+URL](K0S_README.md#finding-the-splunk-web-url). If
 your browser cannot reach the cluster network directly, use the [SSH bastion
-SOCKS tunnel](../../tools/cluster_setup/K0S_README.md#finding-the-splunk-web-url).
+SOCKS tunnel](K0S_README.md#finding-the-splunk-web-url).
 Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant
-App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+App](DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
 </details>
 
@@ -554,7 +554,7 @@ App](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assista
 
 For a self-managed Splunk Enterprise instance outside the cluster, configure
 JWT authentication as described in
-[EXTERNAL_SPLUNK_INTEGRATION.md](../../tools/cluster_setup/EXTERNAL_SPLUNK_INTEGRATION.md).
+[EXTERNAL_SPLUNK_INTEGRATION.md](EXTERNAL_SPLUNK_INTEGRATION.md).
 
 </details>
 
@@ -562,7 +562,7 @@ JWT authentication as described in
 
 ## Step 6: Common Operations
 
-See [Deployment Guide — Common Operations](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#common-operations)
+See [Deployment Guide — Common Operations](DEPLOYMENT_GUIDE.md#common-operations)
 for re-runs, worker management, model staging, image refreshes, support
 bundles, and cleanup commands.
 
@@ -570,9 +570,9 @@ bundles, and cleanup commands.
 
 ## Step 7: Troubleshooting
 
-See [Deployment Guide — Troubleshooting](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#troubleshooting)
+See [Deployment Guide — Troubleshooting](DEPLOYMENT_GUIDE.md#troubleshooting)
 for diagnosis steps, decision trees, and the complete symptom reference.
 
 ---
 
-*Quick reference — see [DEPLOYMENT_GUIDE.md](../../tools/cluster_setup/DEPLOYMENT_GUIDE.md) for the full walkthrough.*
+*Quick reference — see [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for the full walkthrough.*

@@ -17,8 +17,8 @@ jobs:
           fi
           yq --version
 
-      - name: Run cluster_setup unit tests
-        run: bash tools/cluster_setup/test_k0s_cluster_with_stack.sh
+      - name: Run ai_tier_cluster_setup unit tests
+        run: bash tools/ai_tier_cluster_setup/test_k0s_cluster_with_stack.sh
 
       - name: Run Splunk-optional installer dry-run tests
-        run: bash tools/cluster_setup/test_installer_dry_run.sh
+        run: bash tools/ai_tier_cluster_setup/test_installer_dry_run.sh

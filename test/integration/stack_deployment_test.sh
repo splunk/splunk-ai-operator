@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-TOOLS_DIR="${REPO_ROOT}/tools/cluster_setup"
+TOOLS_DIR="${REPO_ROOT}/tools/ai_tier_cluster_setup"
 
 # Colors
 RED='\033[0;31m'

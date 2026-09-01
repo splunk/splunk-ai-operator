@@ -3589,7 +3589,7 @@ stage_model_artifacts() {
 
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
-    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of cluster_setup/)"; return 1; }
+    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of ai_tier_cluster_setup/)"; return 1; }
 
   log "Model staging directory: ${staging_dir}"
 

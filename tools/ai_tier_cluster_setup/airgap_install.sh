@@ -24,7 +24,8 @@ NVIDIA_DEVICE_PLUGIN_VERSION="v0.17.3"
 METALLB_CHART_VERSION="0.14.8"
 KUBERAY_CHART_VERSION="1.2.2"
 
-# Pinned to the release validated in DEPLOYMENT_GUIDE.md's Hardware Requirements
+# Pinned to the release validated in
+# docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md's Hardware Requirements
 # (v1.36.1, containerd 2.x). Override with --k0s-version for a different
 # release; "latest" resolves the newest k0s release at run time.
 K0S_VERSION="${K0S_VERSION:-v1.36.1+k0s.0}"

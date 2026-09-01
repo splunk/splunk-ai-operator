@@ -1,5 +1,5 @@
 # SeaweedFS all-in-one server (master, volume, filer, S3).
-# Install: see tools/cluster_setup/SEAWEEDFS_SYSTEMD.md or run install_seaweedfs_systemd.sh
+# Install: see tools/artifacts_download_upload_scripts/SEAWEEDFS_SYSTEMD.md or run install_seaweedfs_systemd.sh
 # Credentials: set in /etc/default/seaweedfs or use the drop-in below.
 
 [Unit]

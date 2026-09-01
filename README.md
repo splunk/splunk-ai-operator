@@ -27,136 +27,37 @@
 ---
 The Splunk AI Operator is a Kubernetes operator that enables customers to manage AI workloads using standardized CRDs, Helm charts, and Kubernetes primitives without reliance on any specific cloud provider’s tooling or rigid infrastructure. This repo includes the Splunk AI Operator, and multiple CRDs to manage the Splunk AI Platform and Splunk AI Services.
 
-## Customer Deployment on k0s
-
-Customers deploying the Splunk AI Platform on k0s should start with the
-[k0s Deployment Quick Reference](docs/deployment/k0s-quick-reference.md). It
-covers the prerequisites, standard and air-gapped deployment paths, image
-mirroring, installation, verification, and Splunk integration.
-
 ## Getting Started
 
-### Quick Install
+The default installation path deploys the complete Splunk AI Platform on a k0s cluster by using
+`tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh`.
 
 ```bash
-# Install using Helm OCI registry (Recommended - Helm 3.8+)
-helm install splunk-ai-operator \
-  oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.2.0 \
-  --namespace splunk-ai-operator-system \
-  --create-namespace
+git clone https://github.com/splunk/splunk-ai-operator.git
+cd splunk-ai-operator/tools/ai_tier_cluster_setup
+cp k0s-cluster-config.yaml my-cluster.yaml
 
-# Or install using kubectl
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
+# Edit my-cluster.yaml for your environment, then validate and install.
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
-See [Installation Guide](docs/installation.md) for detailed instructions and all installation methods.
+Review the [k0s Deployment Quick Reference](docs/ai_tier_deployment/k0s-quick-reference.md)
+before installation. See the [complete k0s guide](docs/ai_tier_deployment/K0S_README.md) for
+standard and air-gapped deployment details.
 
-### Prerequisites
-- **Kubernetes**: v1.31+ cluster
-- **kubectl**: v1.11.3+
-- **Helm**: v3.8+ (for Helm installation)
-- **Go**: v1.23.0+ (for development only)
-- **Docker**: 17.03+ (for development only)
+## Documentation
 
-### Installation Options
-
-**Option 1: Helm OCI Registry (Recommended)**
-```bash
-# Requires Helm 3.8+
-helm install splunk-ai-operator \
-  oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.2.0 \
-  --namespace splunk-ai-operator-system \
-  --create-namespace
-```
-
-**Option 2: kubectl (Manifests)**
-```bash
-# Install operator with all dependencies
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/install-v0.2.0.yaml
-```
-
-**Option 3: Helm (GitHub Release)**
-```bash
-# For compatibility with older Helm versions
-helm install splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz \
-  --namespace splunk-ai-operator-system \
-  --create-namespace
-```
-
-**Option 4: From Source (Development)**
-```bash
-# Install CRDs
-make install
-
-# Build and deploy
-make docker-build docker-push IMG=ghcr.io/splunk/splunk-ai-operator:tag
-make deploy IMG=ghcr.io/splunk/splunk-ai-operator:tag
-```
-
-### Helm Charts
-
-Charts are published to OCI registry and GitHub Releases:
-
-- **OCI Registry (GHCR)**: `oci://ghcr.io/splunk/charts/splunk-ai-operator` (recommended)
-- **GitHub Releases**: Available as `.tgz` files for compatibility
-
-```bash
-# Install from OCI registry
-helm install splunk-ai-operator \
-  oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.2.0
-
-# View available versions
-# Visit: https://github.com/splunk/splunk-ai-operator/pkgs/container/charts%2Fsplunk-ai-operator
-```
-
-### Container Images
-
-Images are published to multiple registries:
-
-- **GHCR**: `ghcr.io/splunk/splunk-ai-operator:v0.2.0`
-- **Docker Hub**: `splunk/splunk-ai-operator:v0.2.0`
-
-```bash
-# Pull from GHCR (recommended)
-docker pull ghcr.io/splunk/splunk-ai-operator:v0.2.0
-
-# Pull from Docker Hub
-docker pull splunk/splunk-ai-operator:v0.2.0
-```
-
-### Deploy AI Platform
-
-```bash
-# Create sample AI Platform
-kubectl apply -k config/samples/
-```
-
-### Uninstall
-
-**Helm:**
-```bash
-helm uninstall splunk-ai-operator -n splunk-ai-operator
-```
-
-**From Source:**
-```bash
-kubectl delete -k config/samples/
-make undeploy
-make uninstall
-```
-
-### Documentation
-
-- **[Installation Guide](docs/installation.md)** - Detailed installation instructions
-- **[Helm Deployment](docs/deployment/helm-deployment.md)** - Helm chart installation
+- **[k0s Deployment Quick Reference](docs/ai_tier_deployment/k0s-quick-reference.md)** - Default installation workflow
+- **[Complete k0s Guide](docs/ai_tier_deployment/K0S_README.md)** - Configuration, installation, and operations
+- **[Deployment Guide](docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md)** - Standard and air-gapped deployment details
+- **[OpenShift Guide](docs/ai_tier_deployment/OPENSHIFT_README.md)** - OpenShift-specific deployment
+- **[AWS EKS Guide](docs/ai_tier_deployment/EKS_README.md)** - AWS EKS deployment
 - **[API Reference](docs/api-reference.md)** - Complete CRD specification
-- **[AWS EKS Deployment](docs/deployment/deployment-aws-eks.md)** - Production deployment on AWS
 - **[Configuration Guides](docs/configuration/)** - Storage, ingress, and webhook configuration
-- **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
+- **[Installer Troubleshooting](docs/ai_tier_deployment/TROUBLESHOOTING.md)** - k0s installation issues
+- **[Local Development](docs/local-development.md)** - Build and development workflow
 
 ## License
 
@@ -173,4 +74,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

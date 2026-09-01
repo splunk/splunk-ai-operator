@@ -545,7 +545,7 @@ helm-all: helm-lint helm-package helm-index ## Build and package all Helm charts
 ##@ Zarf Operations
 
 ZARF_VERSION ?= $(VERSION)
-ZARF_DIR := tools/cluster_setup/zarf
+ZARF_DIR := tools/ai_tier_cluster_setup/zarf
 
 .PHONY: zarf-check
 zarf-check: ## Check if Zarf CLI is installed
@@ -592,7 +592,7 @@ zarf-build-complete: zarf-check helm-package ## Build complete Zarf package (k0s
 	@ls -lh zarf-package-splunk-ai-platform-complete-*.tar.zst
 	@echo ""
 	@echo "This package can deploy everything from bare metal to AI Platform"
-	@echo "See tools/cluster_setup/zarf/docs/COMPLETE_DEPLOYMENT.md"
+	@echo "See tools/ai_tier_cluster_setup/zarf/docs/COMPLETE_DEPLOYMENT.md"
 
 .PHONY: zarf-inspect
 zarf-inspect: ## Inspect the Zarf package contents
@@ -661,5 +661,5 @@ zarf-all: helm-all zarf-build zarf-inspect ## Build Helm charts and Zarf package
 	@echo "  2. Run: zarf init --confirm"
 	@echo "  3. Run: zarf package deploy <package-file> --confirm"
 	@echo ""
-	@echo "See tools/cluster_setup/zarf/docs/zarf-deployment.md for complete guide"
+	@echo "See tools/ai_tier_cluster_setup/zarf/docs/zarf-deployment.md for complete guide"
 	@echo "  3. Update docs with new version"

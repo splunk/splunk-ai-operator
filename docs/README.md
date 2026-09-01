@@ -11,8 +11,6 @@ Welcome to the Splunk AI Operator documentation!
 
 ## Deployment Guides
 
-- **[Helm Deployment](deployment/helm-deployment.md)** - Deploy using Helm charts
-- **[AWS EKS Deployment](deployment/deployment-aws-eks.md)** - Production deployment on AWS EKS
 
 ## Configuration Guides
 

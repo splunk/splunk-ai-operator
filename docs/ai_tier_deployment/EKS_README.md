@@ -362,7 +362,7 @@ The script is **idempotent** - you can run it multiple times safely:
 
 **Backup files created:**
 ```
-tools/cluster_setup/
+tools/ai_tier_cluster_setup/
 ├── artifacts.yaml              # Modified with your images
 ├── artifacts.yaml.original     # Clean backup (preserved)
 ├── splunk-operator-cluster.yaml
@@ -416,7 +416,7 @@ You must configure these images in `cluster-config.yaml`:
 ### 1. Navigate to Cluster Setup Directory
 
 ```bash
-cd /path/to/splunk-ai-operator/tools/cluster_setup
+cd /path/to/splunk-ai-operator/tools/ai_tier_cluster_setup
 ```
 
 ### 2. Prepare AWS Prerequisites
@@ -2499,7 +2499,7 @@ the model is loaded from object storage (S3/MinIO) into that path inside the pod
 **Checklist:**
 
 1. **Model is in MinIO/S3**  
-   Upload the model so the bucket has the prefix `model_artifacts/llama31-8b-instruct/` with at least `config.json` and the model weights (see [artifacts README](../artifacts_download_upload_scripts/README.md)):
+   Upload the model so the bucket has the prefix `model_artifacts/llama31-8b-instruct/` with at least `config.json` and the model weights (see [artifacts README](../../tools/artifacts_download_upload_scripts/README.md)):
    - Download: `./tools/artifacts_download_upload_scripts/download_from_huggingface.sh`
    - Upload: `./tools/artifacts_download_upload_scripts/upload_to_minio.sh` (set `S3COMPAT_OBJECT_STORE_ENDPOINT`, `S3COMPAT_OBJECT_STORE_BUCKET`, and credentials to match your `cluster-config.yaml`; `MINIO_*` env vars are also accepted).
 
@@ -3372,5 +3372,5 @@ See the main repository LICENSE file.
 
 **Quick Links:**
 - [k0s Deployment Guide](./K0S_README.md)
-- [Main README](./README.md)
+- [Main README](../../README.md)
 - [Splunk AI Operator GitHub](https://github.com/splunk/splunk-ai-operator)

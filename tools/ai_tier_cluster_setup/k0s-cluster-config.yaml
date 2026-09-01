@@ -13,7 +13,7 @@
 #
 # Local machine:
 #   ssh, kubectl, helm, git, jq, yq, docker — see the Prerequisites section of
-#   docs/deployment/k0s-quick-reference.md for install instructions per OS.
+#   docs/ai_tier_deployment/k0s-quick-reference.md for install instructions per OS.
 #   macOS: brew install kubectl helm git jq yq
 #   RHEL 9: none of kubectl/helm/docker/yq are in the default dnf repos —
 #     install each via its own official method (git/jq ARE available via dnf).
@@ -194,8 +194,9 @@ splunk:
   # With enabled=true and no external.endpoint, the installer deploys Splunk
   # Operator + Standalone in-cluster (requires images.splunk.image and
   # images.splunk.operatorImage).
-  # See K0S_README.md's "Internal Splunk management transport" section for
-  # the native-HTTPS compatibility details behind the INTERNAL path.
+  # See docs/ai_tier_deployment/K0S_README.md's "Internal Splunk management
+  # transport" section for the native-HTTPS compatibility details behind the
+  # INTERNAL path.
   #
   # Release support boundary:
   # - The existing bundled/internal HEC and OTel path is left unchanged to

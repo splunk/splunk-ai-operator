@@ -76,7 +76,7 @@ The script installs everything needed for the AI Platform:
 - **Helm retry with exponential backoff** — Automatic retries on transient errors (timeouts, TLS handshake failures)
 - **Preflight validation** — Checks tools, config, SSH connectivity, and disk space before starting
 - **Safety gate** — Refuses to wipe a cluster that has Ready nodes (prevents accidental data loss)
-- **Session logging** — All stdout/stderr captured to `tools/cluster_setup/logs/k0s-install-YYYY-MM-DD_HH-MM-SS.log`
+- **Session logging** — All stdout/stderr captured to `tools/ai_tier_cluster_setup/logs/k0s-install-YYYY-MM-DD_HH-MM-SS.log`
 - **Existing cluster detection** — `useExisting` flag (auto/force/never) to skip k0s install and deploy stack only
 
 ### Image Pull Secrets Support
@@ -205,7 +205,7 @@ You must provide an external S3-compatible object storage endpoint:
 ```bash
 # Replace <branch-name> with the branch you were given
 git clone -b <branch-name> --single-branch https://github.com/splunk/splunk-ai-operator.git
-cd splunk-ai-operator/tools/cluster_setup
+cd splunk-ai-operator/tools/ai_tier_cluster_setup
 ```
 
 **No git / downloading a ZIP from the browser instead:** GitHub's branch
@@ -714,7 +714,7 @@ See [Air-Gapped Deployment](#air-gapped-deployment) for the full air-gap workflo
 All script output (stdout and stderr) is automatically captured to a timestamped log file:
 
 ```
-tools/cluster_setup/logs/k0s-install-2026-04-29_14-30-00.log
+tools/ai_tier_cluster_setup/logs/k0s-install-2026-04-29_14-30-00.log
 ```
 
 Override the log directory:
@@ -1291,7 +1291,7 @@ Complete guide for deploying the Splunk AI Platform onto cluster nodes with no o
 **There is one entry point for both modes.** `k0s_cluster_with_stack.sh` detects air-gap mode from the config and stages the artifacts itself before installing:
 
 ```bash
-cd tools/cluster_setup
+cd tools/ai_tier_cluster_setup
 CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
@@ -1362,7 +1362,7 @@ Steps 1–3 are preparation. If your container images are already mirrored and y
 Stage explicitly only if you want the artifacts on disk *before* the install window — to inspect them, to size them, or to work through Step 2's image list. `--download-only` lives on `airgap_install.sh` and has no equivalent on the unified command, so this is the way to pre-stage:
 
 ```bash
-cd tools/cluster_setup
+cd tools/ai_tier_cluster_setup
 ./airgap_install.sh --download-only --config my-cluster-config.yaml
 
 # Pin a specific k0s version
@@ -1547,7 +1547,7 @@ cluster:
 Exactly the same command as a standard install:
 
 ```bash
-cd tools/cluster_setup
+cd tools/ai_tier_cluster_setup
 chmod +x airgap_install.sh k0s_cluster_with_stack.sh
 
 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
@@ -1917,7 +1917,7 @@ image-refresh test:
 
 ```bash
 KUBECONFIG=/path/to/kubeconfig \
-  ./tools/cluster_setup/test_internal_splunk_http.sh \
+  ./tools/ai_tier_cluster_setup/test_internal_splunk_http.sh \
   --namespace ai-platform \
   --standalone splunk-standalone \
   --aiplatform <cluster-name>-ai-platform
@@ -1933,7 +1933,7 @@ For an opt-in end-to-end authentication check, run:
 
 ```bash
 KUBECONFIG=/path/to/kubeconfig \
-  ./tools/cluster_setup/test_internal_splunk_authenticated.sh \
+  ./tools/ai_tier_cluster_setup/test_internal_splunk_authenticated.sh \
   --namespace ai-platform \
   --standalone splunk-standalone \
   --aiplatform <cluster-name>-ai-platform

@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SCRIPT_DIR}/openshift_with_stack.sh"
 AIRGAP_PREPARE_SCRIPT="${SCRIPT_DIR}/prepare_airgap_bundle_openshift.sh"
 AIRGAP_INSTALL_SCRIPT="${SCRIPT_DIR}/install_from_airgap_bundle_openshift.sh"
+OPENSHIFT_README="${SCRIPT_DIR}/../../docs/ai_tier_deployment/OPENSHIFT_README.md"
 REAL_YQ=$(command -v yq 2>/dev/null || true)
 
 PASS=0
@@ -377,7 +378,7 @@ assert_eq "unified air-gap entry point prepares registry authentication" "1" \
 assert_eq "OpenShift insecure registry configuration preserves existing entries" "1" \
   "$(awk '/^configure_openshift_insecure_endpoints\(\)/,/^}/' "${SCRIPT}" | grep -c 'insecureRegistries.*unique' | tr -d '[:space:]')"
 assert_eq "standard air-gap README does not require manual registry auth export" "0" \
-  "$(grep -c '^export \(AIRGAP_\)\?REGISTRY_AUTH_FILE=' "${SCRIPT_DIR}/OPENSHIFT_README.md" | tr -d '[:space:]')"
+  "$(grep -c '^export \(AIRGAP_\)\?REGISTRY_AUTH_FILE=' "${OPENSHIFT_README}" | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership checks every manifest resource" "1" \
   "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -c 'manifest_has_existing_resources' | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership is not inferred from deployment presence" "0" \
