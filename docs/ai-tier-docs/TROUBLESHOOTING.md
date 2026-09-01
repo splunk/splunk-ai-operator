@@ -679,15 +679,17 @@ Every peer must have all three fields: `peerAddress`, `peerASN`, `myASN`.
 
 ---
 
-### SAIA service has no external address or is unreachable
+### SAIA / SLIM service has no external address or is unreachable
 
 ```bash
-SAIA_SERVICE="<cluster-name>-ai-platform-saia-saia-service"
-kubectl get svc "${SAIA_SERVICE}" -n ai-platform -o wide
-kubectl describe svc "${SAIA_SERVICE}" -n ai-platform
+SERVICE="<cluster-name>-ai-platform-saia-saia-service"
+# In case of SLIM use below
+SERVICE="<cluster-name>-ai-platform-slim-slim-service"
+kubectl get svc "${SERVICE}" -n ai-platform -o wide
+kubectl describe svc "${SERVICE}" -n ai-platform
 
 # Show the configured exposure type, port, NodePort, and LoadBalancer address
-kubectl get svc "${SAIA_SERVICE}" -n ai-platform \
+kubectl get svc "${SERVICE}" -n ai-platform \
   -o custom-columns='TYPE:.spec.type,PORT:.spec.ports[0].port,NODEPORT:.spec.ports[0].nodePort,ADDRESS:.status.loadBalancer.ingress[0].ip'
 
 # If TYPE is LoadBalancer and ADDRESS is empty, check MetalLB:
@@ -700,12 +702,12 @@ kubectl get l2advertisement -n metallb-system
 
 | Cause | Fix |
 |---|---|
-| Service not found | Replace `<cluster-name>` with the `cluster.name` value from your config. The expected service is `<cluster-name>-ai-platform-saia-saia-service` in namespace `ai-platform`. |
+| Service not found | Replace `<cluster-name>` with the `cluster.name` value from your config. The expected service is `<cluster-name>-ai-platform-saia-saia-service` (or) `<cluster-name>-ai-platform-slim-slim-service` in namespace `ai-platform`. |
 | IP pool exhausted | Add more addresses to `metallb.pool.addresses`. |
 | IP range not routable | The addresses must be IPs that your LAN router will route to the node. ARP-based (layer2) requires IPs on the same subnet as the node. |
 | MetalLB controller not running | Check `kubectl get pods -n metallb-system`. |
 | Service type is `NodePort`, not `LoadBalancer` | No `EXTERNAL-IP` is expected. Use the `NODEPORT` shown above with a worker-node IP, or set `aiPlatform.serviceTemplate.type` to `LoadBalancer` to use MetalLB. |
-| Service type is `ClusterIP` | No external address is expected. Use `kubectl port-forward svc/${SAIA_SERVICE} 8080:8080` and access `http://127.0.0.1:8080`. |
+| Service type is `ClusterIP` | No external address is expected. Use `kubectl port-forward svc/${SERVICE} 8080:8080` and access `http://127.0.0.1:8080`. |
 
 ---
 
@@ -743,7 +745,7 @@ kubectl logs -n splunk-ai-operator-system \
 
 ---
 
-### AI services not starting (Ray, SAIA, Weaviate)
+### AI services not starting (Ray, SAIA, SLIM service, Weaviate)
 
 ```bash
 # List all non-Running pods
@@ -886,7 +888,8 @@ grep -n "CHANGE\|<\|image:$\|image: \"\"" my-cluster.yaml
 
 Required fields: `images.operator.image`, `images.splunk.image`,
 `images.ray.headImage`, `images.ray.workerImage`, `images.weaviate.image`,
-`images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage`.
+`images.saia.apiImage`, `images.saia.apiV2Image`, `images.saia.dataLoaderImage`
+`images.slim.apiImage`.
 
 ---
 
