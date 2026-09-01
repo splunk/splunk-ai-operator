@@ -11,6 +11,10 @@ Welcome to the Splunk AI Operator documentation!
 
 ## Deployment Guides
 
+- **[General Deployment Guide](../ai-tier-docs/DEPLOYMENT_GUIDE.md)** - Standard and air-gapped deployment workflows
+- **[k0s Deployment Guide](../ai-tier-docs/K0S_README.md)** - Complete k0s installation and operations guide
+- **[AWS EKS Deployment Guide](../ai-tier-docs/EKS_README.md)** - AWS EKS deployment and configuration
+- **[OpenShift Deployment Guide](../ai-tier-docs/OPENSHIFT_README.md)** - OpenShift-specific deployment guide
 
 ## Configuration Guides
 

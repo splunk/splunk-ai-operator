@@ -34,6 +34,9 @@ skaffold.env.local
 # Logs
 tools/ai-tier-cluster-setup/logs/
 
+# Local cluster configuration may contain object-store credentials.
+my-cluster.yaml
+
 # Helm build artifacts
 *.tgz
 helm-chart/**/charts/

@@ -46,11 +46,20 @@ WORKLOAD_PENDING_REASON=""
 VERIFY_RC=0
 K0S_RESET_FAILED=0
 
+# ====== REPOSITORY LOCATION ======
+# Resolve paths from this script rather than the caller's current directory.
+# The installer is commonly launched from the repository root, where paths
+# such as ../../docs would incorrectly resolve above the repository.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+AI_TIER_DOCS_DIR="${REPO_ROOT}/docs/ai-tier-docs"
+OPERATOR_DOCS_DIR="${REPO_ROOT}/docs/splunk-ai-operator-docs"
+
 # ====== CONFIG FILE LOCATION ======
-CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/k0s-cluster-config.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/k0s-cluster-config.yaml}"
 
 # ====== SESSION LOG ======
-LOG_DIR="${LOG_DIR:-$(dirname "$0")/logs}"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/k0s-install-$(date '+%Y-%m-%d_%H-%M-%S').log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -7878,10 +7887,10 @@ show_platform_access_info() {
 
   log "============================================"
   log "📚 Documentation:"
-  log "  Setup Guide: ../../docs/ai-tier-docs/K0S_README.md"
-  log "  Deployment Guide: ../../docs/ai-tier-docs/DEPLOYMENT_GUIDE.md"
-  log "  Troubleshooting: ../../docs/ai-tier-docs/TROUBLESHOOTING.md"
-  log "  Custom Resources: ../../docs/splunk-ai-operator-docs/api-reference.md"
+  log "  Setup Guide: ${AI_TIER_DOCS_DIR}/K0S_README.md"
+  log "  Deployment Guide: ${AI_TIER_DOCS_DIR}/DEPLOYMENT_GUIDE.md"
+  log "  Troubleshooting: ${AI_TIER_DOCS_DIR}/TROUBLESHOOTING.md"
+  log "  Custom Resources: ${OPERATOR_DOCS_DIR}/api-reference.md"
   log "============================================"
   log ""
 
