@@ -10,14 +10,13 @@ consumes; it does not provision them.
 
 | Resource or component | Purpose |
 | --- | --- |
-| `AIPlatform` | Defines the platform, storage, workers, ingress, and enabled AI features. |
+| `AIPlatform` | Defines the platform, storage, workers, and enabled AI features. |
 | `AIService` | Operator-generated resource that carries service-specific deployment requirements. |
 | Ray | Runs model-serving and AI workloads on CPU or GPU workers. |
 | Weaviate | Provides vector storage for AI workloads. |
 | Object storage | External prerequisite that stores model and application artifacts. |
 | SAIA | Provides the Splunk AI Assistant APIs. One SAIA feature creates both internal API generations. |
 | SLIM | Provides the Splunk AI service integration used by supported deployments. |
-| AIPlatform ingress | Exposes Ray Serve, the Ray dashboard, and Weaviate. It does not expose SAIA or SLIM. |
 
 SAIA V1 and V2 identify internal API generations and workloads. Customers enable the `saia`
 feature once and configure one published SAIA base URL; no separate feature or endpoint selection
@@ -56,7 +55,6 @@ Kubernetes cluster
 │   ├── Weaviate vector database
 │   ├── SAIA front-door Service and internal V1/V2 workloads
 │   └── SLIM service
-├── AIPlatform ingress for Ray and Weaviate
 └── External prerequisites
     ├── Object storage
     └── Optional Splunk deployment or external Splunk issuer

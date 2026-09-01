@@ -22,10 +22,10 @@ change.
 
 ## TLS
 
-If `AIPlatform.spec.ingress` is used for Ray or Weaviate, `spec.ingress.tls` requests
-client-to-ingress TLS termination using a TLS Secret in the `AIPlatform` namespace. It does not
-expose SAIA or SLIM, configure ingress-to-backend TLS, or modify CA trust for outbound Splunk
-connections.
+Leave `AIPlatform.spec.ingress` disabled. External Ray and Weaviate exposure is not supported for
+customer use in this release because the operator does not add authentication or authorization to
+those routes. TLS on a separately deployed SAIA or SLIM Ingress, Route, or proxy protects incoming
+client traffic only; it does not modify CA trust for outbound Splunk connections.
 
 For SAIA and SLIM issuer validation over HTTPS, the certificate subject alternative name must
 match the DNS name or IP address in the configured issuer URL. The certificate chain must terminate
@@ -64,8 +64,8 @@ destinations.
 
 - The operator is cluster-scoped and uses cluster-wide RBAC. `watchNamespace` is not a namespace
   isolation control in this release.
-- `AIPlatform.spec.ingress` publishes Ray and Weaviate routes only. Use a separately secured
-  Service, ingress, or proxy for SAIA and SLIM.
+- External Ray and Weaviate exposure through `AIPlatform.spec.ingress` is not supported. Leave it
+  disabled and use a separately secured Service, ingress, Route, or proxy for SAIA and SLIM.
 - HEC/OpenTelemetry export is not supported in this release. Keep the OpenTelemetry workload
   sidecar disabled.
 

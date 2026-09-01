@@ -15,7 +15,6 @@ Splunk AI Operator
           ├── Weaviate StatefulSet and persistent storage
           ├── SAIA front-door Service and internal V1/V2 deployments
           ├── SLIM deployment
-          ├── Ray and Weaviate ingress
           └── Configuration and customer-managed credential inputs
 ```
 
@@ -37,9 +36,9 @@ Depending on the app workflow, the browser, the Splunk host, or both might need 
 the published SAIA URL. In a private or air-gapped environment, use an approved routed connection,
 proxy, or tunnel. See [Access and connectivity](access-and-connectivity.md).
 
-`AIPlatform.spec.ingress` does not publish SAIA or SLIM. It routes `/dashboard` to the Ray
-dashboard, `/weaviate` to Weaviate, and other configured paths to Ray Serve. Publish the generated
-SAIA or SLIM Service separately when clients outside the cluster require access.
+External Ray and Weaviate exposure is not supported for customer use in this release. Leave
+`AIPlatform.spec.ingress` disabled. Publish the generated SAIA or SLIM Service separately when
+clients outside the cluster require access.
 
 ## Storage
 

@@ -19,8 +19,9 @@ require separate customer endpoints.
 ## Ingress access
 
 Use an ingress controller and DNS when services need stable externally addressable host names.
-`AIPlatform.spec.ingress` exposes Ray and Weaviate only. To expose SAIA or SLIM, create a separate
-Ingress that targets the generated front-door Service, as shown in
+Do not use `AIPlatform.spec.ingress`; external Ray and Weaviate exposure is not supported for
+customer use in this release. To expose SAIA or SLIM, create a separate Ingress that targets the
+generated front-door Service, as shown in
 [Deploy the AI Platform](deploy-platform.md#expose-saia).
 
 Verify the ingress address and TLS status:

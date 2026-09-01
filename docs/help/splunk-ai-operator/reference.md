@@ -4,7 +4,7 @@
 
 | Resource | Purpose |
 | --- | --- |
-| `AIPlatform` | Defines the platform, enabled features, storage, workers, ingress, and scheduling. |
+| `AIPlatform` | Defines the platform, enabled features, storage, workers, and scheduling. |
 | `AIService` | Operator-generated service resource. Configure supported customer inputs on the owning `AIPlatform`; direct `AIService` changes can be overwritten during reconciliation. |
 
 Inspect the installed schemas with:
@@ -33,7 +33,7 @@ kubectl get events -A --sort-by='.lastTimestamp'
 | `spec.scaleFactor` | Multiplies Ray Serve model replicas and every selected-profile Ray worker-group count, including the zero-GPU group. Minimum and default: `1`. |
 | `spec.workerGroupConfig` | Ray worker ServiceAccount and image-registry overrides only. It does not expose replica or resource settings. |
 | `spec.defaultAcceleratorType` | Selects the release-supported GPU worker profile: `L40S` or `H100` for k0s; `RTX_PRO_6000_BLACKWELL` for OpenShift. |
-| `spec.ingress` | Ray Serve, Ray dashboard, and Weaviate ingress configuration. It does not expose SAIA or SLIM. |
+| `spec.ingress` | Not supported for customer use in this release. Leave it unset or disabled. |
 | `spec.serviceTemplate` | Optional Service template used by generated front-door SAIA and SLIM Services. |
 | `spec.splunkConfiguration` | Internal Splunk reference or external trusted JWT issuers. |
 

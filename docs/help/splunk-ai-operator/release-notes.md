@@ -28,7 +28,8 @@ do not represent separate customer-selectable releases or base endpoints.
 - The operator is cluster-scoped and uses cluster-wide RBAC.
 - External Splunk integration supports JWT issuer validation. HEC/OpenTelemetry export is outside
   the scope of this release and must remain disabled.
-- `AIPlatform.spec.ingress` exposes Ray and Weaviate routes. It does not expose SAIA or SLIM.
+- External Ray and Weaviate exposure through `AIPlatform.spec.ingress` is not supported. Leave it
+  disabled and publish SAIA or SLIM separately when required.
 - `features[].version` is metadata and does not select or upgrade workload images. Use only the
   selected platform installer's approved maintenance procedure.
 - External Splunk certificates must already chain to a certificate authority trusted by the SAIA

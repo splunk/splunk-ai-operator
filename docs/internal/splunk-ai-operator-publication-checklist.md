@@ -19,6 +19,8 @@ Help.
       linked Splunkbase page.
 - [ ] Add the approved MLTK installation and configuration links.
 - [ ] Confirm SAIA v1/v2 internal API routing, front-door Service ports, and browser-access behavior.
+- [ ] Do not document external Ray or Weaviate exposure until an authenticated and authorized
+      gateway or an equivalent supported control is implemented and release-qualified.
 - [ ] Confirm the AI-tier internal and external Splunk integration procedures.
 - [ ] Confirm the SOCKS proxy guidance with the networking owner.
 - [ ] Obtain Security and Product approval for the documented static object-storage credential
