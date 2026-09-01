@@ -383,7 +383,7 @@ manual edit.
    AIService, SAIA ConfigMap, or Slim ConfigMap as the installation method:
 
     ```bash
-    cd tools/ai_tier_cluster_setup
+    cd tools/ai-tier-cluster-setup
     CONFIG_FILE=./k0s-cluster-config.yaml \
       ./k0s_cluster_with_stack.sh install
     ```
@@ -548,7 +548,7 @@ Do not remove it only from the generated ConfigMap. Verify the resulting
 allowlist:
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 CONFIG_FILE=./k0s-cluster-config.yaml \
   ./k0s_cluster_with_stack.sh install
 

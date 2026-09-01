@@ -1208,7 +1208,7 @@ preflight_checks() {
   esac
   [[ -n "${MINIO_ROOT_PASSWORD}" ]] && pf_ok "Credentials configured" || pf_fail "Object store credentials required (objectStore.auth.rootPassword)"
   if object_store_auth_looks_like_placeholder; then
-    pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with a real access key and secret in your config (keep secrets in a Git-ignored file such as tools/ai_tier_cluster_setup/k0s-config.local.yaml)."
+    pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with a real access key and secret in your config (keep secrets in a Git-ignored file such as tools/ai-tier-cluster-setup/k0s-config.local.yaml)."
   fi
   # Reject STS temporary credentials early — the minio-credentials Secret schema
   # has no AWS_SESSION_TOKEN field, so ASIA* keys silently fail at SAIA startup
@@ -3153,7 +3153,7 @@ all_models_staged() {
 stage_model_artifacts() {
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
-    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of ai_tier_cluster_setup/)"; return 1; }
+    || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of ai-tier-cluster-setup/)"; return 1; }
 
   log "Model staging directory: ${staging_dir}"
 
@@ -5016,7 +5016,7 @@ install_splunk_ai_operator() {
 
   if [[ ! -f "${SPLUNK_AI_FILE}" ]]; then
     warn "Splunk AI Operator file not found: ${SPLUNK_AI_FILE}"
-    warn "Please ensure artifacts.yaml exists in the ai_tier_cluster_setup directory"
+    warn "Please ensure artifacts.yaml exists in the ai-tier-cluster-setup directory"
     return 0
   fi
 
@@ -7878,10 +7878,10 @@ show_platform_access_info() {
 
   log "============================================"
   log "📚 Documentation:"
-  log "  Setup Guide: ./docs/ai_tier_deployment/K0S_README.md"
-  log "  Deployment Guide: ./docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md"
-  log "  Troubleshooting: ./docs/ai_tier_deployment/TROUBLESHOOTING.md"
-  log "  Custom Resources: ./docs/CustomResources.md"
+  log "  Setup Guide: ../../docs/ai-tier-deployment/K0S_README.md"
+  log "  Deployment Guide: ../../docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md"
+  log "  Troubleshooting: ../../docs/ai-tier-deployment/TROUBLESHOOTING.md"
+  log "  Custom Resources: ../../docs/api-reference.md"
   log "============================================"
   log ""
 

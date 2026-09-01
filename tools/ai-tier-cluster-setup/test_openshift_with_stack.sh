@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SCRIPT_DIR}/openshift_with_stack.sh"
 AIRGAP_PREPARE_SCRIPT="${SCRIPT_DIR}/prepare_airgap_bundle_openshift.sh"
 AIRGAP_INSTALL_SCRIPT="${SCRIPT_DIR}/install_from_airgap_bundle_openshift.sh"
-OPENSHIFT_README="${SCRIPT_DIR}/../../docs/ai_tier_deployment/OPENSHIFT_README.md"
+OPENSHIFT_README="${SCRIPT_DIR}/../../docs/ai-tier-deployment/OPENSHIFT_README.md"
 REAL_YQ=$(command -v yq 2>/dev/null || true)
 
 PASS=0

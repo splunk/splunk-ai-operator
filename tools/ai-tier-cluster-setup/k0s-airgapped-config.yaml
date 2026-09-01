@@ -6,14 +6,14 @@
 # artifacts and copies them to the nodes; the nodes do not need outbound
 # internet access.
 #
-# Quick start (run from tools/ai_tier_cluster_setup):
+# Quick start (run from tools/ai-tier-cluster-setup):
 #   1. Replace every value marked CHANGE THIS in k0s-airgapped-config.yaml.
 #   2. Mirror every platform image below to the configured internal registry.
 #   3. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh validate
 #   4. CONFIG_FILE=./k0s-airgapped-config.yaml ./k0s_cluster_with_stack.sh install
 #
 # See the Air-Gapped Deployment section in
-# docs/ai_tier_deployment/K0S_README.md for staging options, installer-host
+# docs/ai-tier-deployment/K0S_README.md for staging options, installer-host
 # requirements, and the separate model-artifact workflow.
 #
 # The installer machine must have internet access for staging and SSH access to

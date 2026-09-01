@@ -362,7 +362,7 @@ The script is **idempotent** - you can run it multiple times safely:
 
 **Backup files created:**
 ```
-tools/ai_tier_cluster_setup/
+tools/ai-tier-cluster-setup/
 ├── artifacts.yaml              # Modified with your images
 ├── artifacts.yaml.original     # Clean backup (preserved)
 ├── splunk-operator-cluster.yaml
@@ -416,7 +416,7 @@ You must configure these images in `cluster-config.yaml`:
 ### 1. Navigate to Cluster Setup Directory
 
 ```bash
-cd /path/to/splunk-ai-operator/tools/ai_tier_cluster_setup
+cd /path/to/splunk-ai-operator/tools/ai-tier-cluster-setup
 ```
 
 ### 2. Prepare AWS Prerequisites

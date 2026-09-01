@@ -1181,7 +1181,7 @@ func Test_reconcileSAIAService_ServiceTypeVariations(t *testing.T) {
 	// omit / empty / explicitly-set serviceTemplate and get the expected
 	// Service.Type. Without this test, a future refactor could silently break
 	// the "just omit the block = ClusterIP" escape hatch documented in
-	// tools/ai_tier_cluster_setup/k0s-cluster-config.yaml.
+	// tools/ai-tier-cluster-setup/k0s-cluster-config.yaml.
 	scheme := buildFullTestScheme(t)
 
 	cases := []struct {

@@ -856,11 +856,11 @@ PREREQ
 
   log "Copying k0s cluster scripts to installer..."
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" \
-    'mkdir -p ~/ai_tier_cluster_setup'
+    'mkdir -p ~/ai-tier-cluster-setup'
   scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no \
     "${SCRIPT_DIR}/"*.sh "${SCRIPT_DIR}/"*.yaml \
-    "ec2-user@${eip}:~/ai_tier_cluster_setup/" 2>/dev/null || true
-  # Copy artifacts_download_upload_scripts (sibling of ai_tier_cluster_setup) — required by model staging step
+    "ec2-user@${eip}:~/ai-tier-cluster-setup/" 2>/dev/null || true
+  # Copy artifacts_download_upload_scripts (sibling of ai-tier-cluster-setup) — required by model staging step
   local artifacts_dir="${SCRIPT_DIR}/../artifacts_download_upload_scripts"
   if [[ -d "${artifacts_dir}" ]]; then
     scp -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no -r \
@@ -981,9 +981,9 @@ AUTHSCRIPT
 
 # -- Patch infra fields into my-k0s-config.yaml on the installer --
 # Behaviour:
-#   1. If ~/ai_tier_cluster_setup/my-k0s-config.yaml exists  → back it up, then patch in-place.
+#   1. If ~/ai-tier-cluster-setup/my-k0s-config.yaml exists  → back it up, then patch in-place.
 #   2. If it doesn't exist                            → copy k0s-cluster-config.yaml as
-#                                                        the base (already in ~/ai_tier_cluster_setup/
+#                                                        the base (already in ~/ai-tier-cluster-setup/
 #                                                        via setup_installer), then patch.
 # Only infrastructure fields are written — everything else in the file is preserved.
 push_k0s_config() {
@@ -1005,8 +1005,8 @@ push_k0s_config() {
 
   ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" "bash -s" <<PATCHSCRIPT
 set -e
-TARGET="\$HOME/ai_tier_cluster_setup/my-k0s-config.yaml"
-BASE="\$HOME/ai_tier_cluster_setup/k0s-cluster-config.yaml"
+TARGET="\$HOME/ai-tier-cluster-setup/my-k0s-config.yaml"
+BASE="\$HOME/ai-tier-cluster-setup/k0s-cluster-config.yaml"
 
 # Step 1 — ensure the file exists (use template as base if not)
 if [[ -f "\$TARGET" ]]; then
@@ -1015,7 +1015,7 @@ if [[ -f "\$TARGET" ]]; then
   echo "[k0s-provision] Backed up existing my-k0s-config.yaml → \$(basename \$BACKUP)"
 else
   if [[ ! -f "\$BASE" ]]; then
-    echo "[k0s-provision] ERROR: neither my-k0s-config.yaml nor k0s-cluster-config.yaml found in ~/ai_tier_cluster_setup/" >&2
+    echo "[k0s-provision] ERROR: neither my-k0s-config.yaml nor k0s-cluster-config.yaml found in ~/ai-tier-cluster-setup/" >&2
     exit 1
   fi
   cp "\$BASE" "\$TARGET"
@@ -1079,7 +1079,7 @@ elif [[ -n "${SEAWEED_ENDPOINT}" ]]; then
 fi
 
 echo "[k0s-provision] Patched infra fields into my-k0s-config.yaml"
-echo "[k0s-provision] Run: CONFIG_FILE=~/ai_tier_cluster_setup/my-k0s-config.yaml ~/ai_tier_cluster_setup/k0s_cluster_with_stack.sh install"
+echo "[k0s-provision] Run: CONFIG_FILE=~/ai-tier-cluster-setup/my-k0s-config.yaml ~/ai-tier-cluster-setup/k0s_cluster_with_stack.sh install"
 PATCHSCRIPT
 }
 
@@ -1309,8 +1309,8 @@ cmd_provision() {
   echo "  Step 1 — Launch the k0s install (runs in background on installer):"
   echo ""
   echo "    ssh -i ${KEY_LOCAL} ec2-user@${EIP} \\"
-  echo "      \"cd ~/ai_tier_cluster_setup && \\"
-  echo "       CONFIG_FILE=~/ai_tier_cluster_setup/my-k0s-config.yaml \\"
+  echo "      \"cd ~/ai-tier-cluster-setup && \\"
+  echo "       CONFIG_FILE=~/ai-tier-cluster-setup/my-k0s-config.yaml \\"
   echo "       nohup ./k0s_cluster_with_stack.sh install > ~/install.log 2>&1 &\""
   echo ""
   echo "  Step 2 — Monitor progress from your laptop:"
@@ -1371,11 +1371,11 @@ cmd_output() {
   echo "    ssh -i ${KEY_LOCAL} ec2-user@${EIP}"
   echo ""
   echo "  Auto-generated k0s config on installer:"
-  echo "    ~/ai_tier_cluster_setup/my-k0s-config.yaml"
+  echo "    ~/ai-tier-cluster-setup/my-k0s-config.yaml"
   echo ""
   echo "  Run install from installer:"
-  echo "    CONFIG_FILE=~/ai_tier_cluster_setup/my-k0s-config.yaml \\"
-  echo "      ~/ai_tier_cluster_setup/k0s_cluster_with_stack.sh install"
+  echo "    CONFIG_FILE=~/ai-tier-cluster-setup/my-k0s-config.yaml \\"
+  echo "      ~/ai-tier-cluster-setup/k0s_cluster_with_stack.sh install"
   echo "================================================================"
 }
 

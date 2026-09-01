@@ -39,8 +39,8 @@ AWS_PROFILE=splunkcloud-ai-dev \
 
 Takes ~10 min. When it completes, the installer EC2 has:
 - SSH key copied to `~/.ssh/id_rsa`
-- All cluster scripts in `~/ai_tier_cluster_setup/`
-- `~/ai_tier_cluster_setup/my-k0s-config.yaml` pre-patched with node IPs, region,
+- All cluster scripts in `~/ai-tier-cluster-setup/`
+- `~/ai-tier-cluster-setup/my-k0s-config.yaml` pre-patched with node IPs, region,
   disk thresholds, object store config, and absolute `sshKeyPath`
 - Containerd ECR auth (`/etc/containerd/certs.d/<registry>/hosts.toml`)
   pre-configured on **every k0s node** so images pull without `ImagePullBackOff`
@@ -58,8 +58,8 @@ EIP=$(AWS_PROFILE=splunkcloud-ai-dev \
   | grep "ssh -i" | awk '{print $NF}')
 
 ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP \
-  "cd ~/ai_tier_cluster_setup && \
-   CONFIG_FILE=~/ai_tier_cluster_setup/my-k0s-config.yaml \
+  "cd ~/ai-tier-cluster-setup && \
+   CONFIG_FILE=~/ai-tier-cluster-setup/my-k0s-config.yaml \
    nohup ./k0s_cluster_with_stack.sh install > ~/install.log 2>&1 &"
 ```
 
@@ -327,11 +327,11 @@ minio:
 16. Check NAT outbound connectivity on each k0s node (3 endpoints)
 17. Mount data disks via SSH (detect device, format XFS, add UUID fstab entry, mount)
 18. Install prerequisites on installer (yq, kubectl, helm, jq, git)
-19. Copy `~/ai_tier_cluster_setup/` scripts and `~/artifacts_download_upload_scripts/` to installer
+19. Copy `~/ai-tier-cluster-setup/` scripts and `~/artifacts_download_upload_scripts/` to installer
 20. If `minio.enabled`: symlink `artifacts_download_upload_scripts/model_artifacts` →
     `/data/minio/model_artifacts` (prevents root disk fill during large model downloads)
 21. If `minio.enabled`: run `install_minio_ec2.sh` on installer
-22. Patch `~/ai_tier_cluster_setup/my-k0s-config.yaml` (see below)
+22. Patch `~/ai-tier-cluster-setup/my-k0s-config.yaml` (see below)
 23. If `ecr.account` set: pre-configure containerd ECR auth on **all k0s nodes** via
     `hosts.toml` — eliminates `ImagePullBackOff` on first pod scheduling
 24. Print `output` block
@@ -341,7 +341,7 @@ minio:
 ## `my-k0s-config.yaml` — What Gets Patched
 
 `provision` patches a fixed set of infrastructure fields into
-`~/ai_tier_cluster_setup/my-k0s-config.yaml` on the installer using `yq`. It never
+`~/ai-tier-cluster-setup/my-k0s-config.yaml` on the installer using `yq`. It never
 overwrites the whole file.
 
 | Situation | What happens |
@@ -641,8 +641,8 @@ AWS_PROFILE=splunkcloud-ai-dev \
 # 2. Launch install on installer (backgrounded, survives SSH disconnect)
 EIP=<printed-by-provision>
 ssh -i ~/.ssh/k0s-ai-platform.pem ec2-user@$EIP \
-  "cd ~/ai_tier_cluster_setup && \
-   CONFIG_FILE=~/ai_tier_cluster_setup/my-k0s-config.yaml \
+  "cd ~/ai-tier-cluster-setup && \
+   CONFIG_FILE=~/ai-tier-cluster-setup/my-k0s-config.yaml \
    nohup ./k0s_cluster_with_stack.sh install > ~/install.log 2>&1 &"
 
 # 3. Monitor from your laptop

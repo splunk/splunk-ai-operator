@@ -46,8 +46,8 @@ Run on any developer laptop. Total time: under 5 minutes. All tests are gating f
 ### T1-1: Bash syntax validation
 
 ```bash
-bash -n tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-bash -n tools/ai_tier_cluster_setup/airgap_install.sh
+bash -n tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+bash -n tools/ai-tier-cluster-setup/airgap_install.sh
 ```
 
 **Pass:** All exit 0, no output.
@@ -58,7 +58,7 @@ bash -n tools/ai_tier_cluster_setup/airgap_install.sh
 ### T1-2: `--help` output is complete and exits cleanly
 
 ```bash
-tools/ai_tier_cluster_setup/airgap_install.sh --help
+tools/ai-tier-cluster-setup/airgap_install.sh --help
 echo "exit: $?"
 ```
 
@@ -71,9 +71,9 @@ echo "exit: $?"
 
 ```bash
 grep -rn "H100" \
-  docs/ai_tier_deployment/K0S_README.md \
-  tools/ai_tier_cluster_setup/k0s-cluster-config.yaml \
-  tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+  docs/ai-tier-deployment/K0S_README.md \
+  tools/ai-tier-cluster-setup/k0s-cluster-config.yaml \
+  tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Zero matches.
@@ -82,7 +82,7 @@ grep -rn "H100" \
 EKS H100 references must still be present (real code path):
 
 ```bash
-grep -c "H100" docs/ai_tier_deployment/EKS_README.md
+grep -c "H100" docs/ai-tier-deployment/EKS_README.md
 ```
 
 **Pass:** Count > 0.
@@ -94,8 +94,8 @@ grep -c "H100" docs/ai_tier_deployment/EKS_README.md
 
 ```bash
 grep -l "gemma-4-31b-it" \
-  docs/ai_tier_deployment/K0S_README.md \
-  docs/ai_tier_deployment/EKS_README.md \
+  docs/ai-tier-deployment/K0S_README.md \
+  docs/ai-tier-deployment/EKS_README.md \
   tools/artifacts_download_upload_scripts/README.md
 ```
 
@@ -118,7 +118,7 @@ artifact_ids() {
 # No output means the K0s model table contains every artifact ID.
 comm -3 \
   <(artifact_ids) \
-  <(grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" docs/ai_tier_deployment/K0S_README.md \
+  <(grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" docs/ai-tier-deployment/K0S_README.md \
     | awk -F'`' '{print $2}' | sort -u)
 
 # No output means the artifacts README contains every artifact ID.
@@ -147,7 +147,7 @@ for var in \
   OTEL_CHART_PATH \
   KUBERAY_CHART_PATH \
   METALLB_CHART_PATH; do
-  grep -qF "\${${var}" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+  grep -qF "\${${var}" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
     && echo "OK: $var" \
     || echo "MISSING: $var"
 done
@@ -161,11 +161,11 @@ done
 ### T1-7: Online URLs still present as fallback defaults
 
 ```bash
-grep "get.k0s.sh"                    tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "cert-manager/releases/download" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "rancher/local-path-provisioner" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "NVIDIA/k8s-device-plugin"       tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "mikefarah/yq/releases"          tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep "get.k0s.sh"                    tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "cert-manager/releases/download" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "rancher/local-path-provisioner" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "NVIDIA/k8s-device-plugin"       tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "mikefarah/yq/releases"          tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** All 5 print at least one match — original URLs preserved as defaults.
@@ -176,7 +176,7 @@ grep "mikefarah/yq/releases"          tools/ai_tier_cluster_setup/k0s_cluster_wi
 ### T1-8: Internal doc links resolve
 
 ```bash
-for doc in docs/ai_tier_deployment/K0S_README.md docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md docs/ai_tier_deployment/TROUBLESHOOTING.md; do
+for doc in docs/ai-tier-deployment/K0S_README.md docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md docs/ai-tier-deployment/TROUBLESHOOTING.md; do
   grep -oP '\[.*?\]\(\K[^)]+(?=\))' "$doc" \
     | grep -v "^http" | grep -v "^#" \
     | while read -r f; do
@@ -194,7 +194,7 @@ done
 Air-gap content referenced from DEPLOYMENT_GUIDE:
 
 ```bash
-grep -c "K0S_README.md.*air" docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md
+grep -c "K0S_README.md.*air" docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md
 ```
 
 **Pass:** Count ≥ 1 (reference link to K0S_README air-gap section).
@@ -204,7 +204,7 @@ grep -c "K0S_README.md.*air" docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md
 ### T1-9: Timestamps appear in log/warn/err definitions
 
 ```bash
-grep -A1 "^log()\|^warn()\|^err()" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+grep -A1 "^log()\|^warn()\|^err()" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
   | grep "_ts\|date"
 ```
 
@@ -217,7 +217,7 @@ grep -A1 "^log()\|^warn()\|^err()" tools/ai_tier_cluster_setup/k0s_cluster_with_
 
 ```bash
 for sub in validate diagnose; do
-  grep -q "^  ${sub})" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+  grep -q "^  ${sub})" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
     && echo "OK: $sub" || echo "MISSING: $sub"
 done
 ```
@@ -229,7 +229,7 @@ done
 ### T1-11: Log rotation code present
 
 ```bash
-grep -c "_rotate_logs" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep -c "_rotate_logs" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Count = 2 (definition + call).
@@ -239,7 +239,7 @@ grep -c "_rotate_logs" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
 ### T1-12: Confirmation prompt present in main_delete
 
 ```bash
-grep -A5 "Type the cluster name" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep -A5 "Type the cluster name" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Shows the prompt text and a `read -r` call.
@@ -250,7 +250,7 @@ grep -A5 "Type the cluster name" tools/ai_tier_cluster_setup/k0s_cluster_with_st
 ### T1-13: AUTO_APPROVE bypasses all prompts
 
 ```bash
-grep -c 'AUTO_APPROVE.*true' tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep -c 'AUTO_APPROVE.*true' tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Count ≥ 2 (install plan gate + delete prompt gate).
@@ -261,14 +261,14 @@ grep -c 'AUTO_APPROVE.*true' tools/ai_tier_cluster_setup/k0s_cluster_with_stack.
 
 ```bash
 # Helper definition present
-grep -c "^_check_node_os()" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep -c "^_check_node_os()" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 
 # Wired into prepare_nodes_for_k0s
-grep -A60 "^prepare_nodes_for_k0s()" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+grep -A60 "^prepare_nodes_for_k0s()" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
   | grep "_check_node_os"
 
 # Wired into _install_nvidia_on_node
-grep -A20 "^_install_nvidia_on_node()" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+grep -A20 "^_install_nvidia_on_node()" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
   | grep "_check_node_os"
 ```
 
@@ -280,7 +280,7 @@ grep -A20 "^_install_nvidia_on_node()" tools/ai_tier_cluster_setup/k0s_cluster_w
 ### T1-15: `FORCE_UNSUPPORTED_OS` escape hatch is present
 
 ```bash
-grep "FORCE_UNSUPPORTED_OS" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep "FORCE_UNSUPPORTED_OS" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** At least one line with `FORCE_UNSUPPORTED_OS:-0` guard in `_check_node_os`.
@@ -291,7 +291,7 @@ grep "FORCE_UNSUPPORTED_OS" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.s
 ### T1-16: AIRGAP_MODE hard-fail code path is present in `_install_nvidia_on_node`
 
 ```bash
-grep -A8 'AIRGAP_MODE.*true' tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+grep -A8 'AIRGAP_MODE.*true' tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
   | grep -E "ERROR.*AIRGAP_MODE|nvidia-smi.*not found"
 ```
 
@@ -306,11 +306,11 @@ The closure is a complete local dnf repo built by `airgap_install.sh`, which als
 the path, and pushed to each GPU node by the installer.
 
 ```bash
-grep -q 'dnf download --resolve --alldeps' tools/ai_tier_cluster_setup/airgap_install.sh \
+grep -q 'dnf download --resolve --alldeps' tools/ai-tier-cluster-setup/airgap_install.sh \
   && echo "OK: builder resolves the RPM closure"
-grep -q 'AIRGAP_NVIDIA_CLOSURE_DIR' tools/ai_tier_cluster_setup/airgap_install.sh \
+grep -q 'AIRGAP_NVIDIA_CLOSURE_DIR' tools/ai-tier-cluster-setup/airgap_install.sh \
   && echo "OK: launcher exports the closure path"
-grep -q '_install_nvidia_from_closure' tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+grep -q '_install_nvidia_from_closure' tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
   && echo "OK: installer installs from the closure"
 ```
 
@@ -322,9 +322,9 @@ grep -q '_install_nvidia_from_closure' tools/ai_tier_cluster_setup/k0s_cluster_w
 ### T1-18: Online GPU package URLs still present for the non-air-gapped path
 
 ```bash
-grep "dl.fedoraproject.org/pub/epel"        tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "developer.download.nvidia.com/compute" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "nvidia.github.io/libnvidia-container"  tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+grep "dl.fedoraproject.org/pub/epel"        tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "developer.download.nvidia.com/compute" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "nvidia.github.io/libnvidia-container"  tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** All 3 match — the online install path is intact.
@@ -335,8 +335,8 @@ grep "nvidia.github.io/libnvidia-container"  tools/ai_tier_cluster_setup/k0s_clu
 ### T1-19: `AIRGAP_PYYAML_WHEEL_PATH` branch is present in installer
 
 ```bash
-grep "AIRGAP_PYYAML_WHEEL_PATH" tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
-grep "AIRGAP_PYYAML_WHEEL_PATH" tools/ai_tier_cluster_setup/airgap_install.sh
+grep "AIRGAP_PYYAML_WHEEL_PATH" tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
+grep "AIRGAP_PYYAML_WHEEL_PATH" tools/ai-tier-cluster-setup/airgap_install.sh
 ```
 
 **Pass:** At least one match in each file.
@@ -348,9 +348,9 @@ grep "AIRGAP_PYYAML_WHEEL_PATH" tools/ai_tier_cluster_setup/airgap_install.sh
 
 ```bash
 grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
-  docs/ai_tier_deployment/K0S_README.md \
-  docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md \
-  docs/ai_tier_deployment/TROUBLESHOOTING.md
+  docs/ai-tier-deployment/K0S_README.md \
+  docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md \
+  docs/ai-tier-deployment/TROUBLESHOOTING.md
 ```
 
 **Pass:** Zero matches.
@@ -362,9 +362,9 @@ grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
 
 ```bash
 grep -rni "Rocky\|AlmaLinux\|CentOS" \
-  docs/ai_tier_deployment/K0S_README.md \
-  docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md \
-  docs/ai_tier_deployment/TROUBLESHOOTING.md
+  docs/ai-tier-deployment/K0S_README.md \
+  docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md \
+  docs/ai-tier-deployment/TROUBLESHOOTING.md
 ```
 
 **Pass:** Zero matches — only RHEL 9 is mentioned as supported.
@@ -376,9 +376,9 @@ grep -rni "Rocky\|AlmaLinux\|CentOS" \
 
 ```bash
 grep -rni "VOC.Portal\|voc portal" \
-  docs/ai_tier_deployment/K0S_README.md \
-  docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md \
-  docs/ai_tier_deployment/TROUBLESHOOTING.md
+  docs/ai-tier-deployment/K0S_README.md \
+  docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md \
+  docs/ai-tier-deployment/TROUBLESHOOTING.md
 ```
 
 **Pass:** Zero matches.
@@ -389,7 +389,7 @@ grep -rni "VOC.Portal\|voc portal" \
 ### T1-23: `defaultAcceleratorType` described as required, L40S only
 
 ```bash
-grep -A2 "defaultAcceleratorType" docs/ai_tier_deployment/K0S_README.md \
+grep -A2 "defaultAcceleratorType" docs/ai-tier-deployment/K0S_README.md \
   | grep -i "L40S\|only"
 ```
 
@@ -402,8 +402,8 @@ grep -A2 "defaultAcceleratorType" docs/ai_tier_deployment/K0S_README.md \
 
 ```bash
 grep -c "8.*L40S\|L40S.*8" \
-  docs/ai_tier_deployment/K0S_README.md \
-  docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md
+  docs/ai-tier-deployment/K0S_README.md \
+  docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md
 ```
 
 **Pass:** Count ≥ 1 in each file.
@@ -415,8 +415,8 @@ grep -c "8.*L40S\|L40S.*8" \
 
 ```bash
 for f in \
-  docs/ai_tier_deployment/K0S_README.md \
-  docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md; do
+  docs/ai-tier-deployment/K0S_README.md \
+  docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md; do
   grep -qiE "250.?GB|250 GB" "$f" \
     && echo "OK (250 GB): $f" \
     || echo "MISSING (250 GB): $f"
@@ -434,7 +434,7 @@ done
 ### T1-26: `airgap_install.sh` — `--gpu-os` argument parsing present
 
 ```bash
-grep "gpu.os\|gpu_os\|GPU_NODE_OS" tools/ai_tier_cluster_setup/airgap_install.sh
+grep "gpu.os\|gpu_os\|GPU_NODE_OS" tools/ai-tier-cluster-setup/airgap_install.sh
 ```
 
 **Pass:** At least 3 matches (variable declaration, argument parsing, validation gate).
@@ -446,7 +446,7 @@ grep "gpu.os\|gpu_os\|GPU_NODE_OS" tools/ai_tier_cluster_setup/airgap_install.sh
 
 ```bash
 grep -A5 "gpu_node_os.*not supported\|GPU_NODE_OS.*!=.*rhel9\|Only.*rhel9" \
-  tools/ai_tier_cluster_setup/airgap_install.sh
+  tools/ai-tier-cluster-setup/airgap_install.sh
 ```
 
 **Pass:** Error message and exit 1 present.
@@ -457,7 +457,7 @@ grep -A5 "gpu_node_os.*not supported\|GPU_NODE_OS.*!=.*rhel9\|Only.*rhel9" \
 ### T1-28: `airgap_install.sh` packages/ section present
 
 ```bash
-grep -c "packages/" tools/ai_tier_cluster_setup/airgap_install.sh
+grep -c "packages/" tools/ai-tier-cluster-setup/airgap_install.sh
 ```
 
 **Pass:** Count ≥ 3 (mkdir, download lines, checksums find).
@@ -470,7 +470,7 @@ grep -c "packages/" tools/ai_tier_cluster_setup/airgap_install.sh
 The unified entry point must delegate to `airgap_install.sh` for `install`/`join-workers` only, guard against recursion, and tolerate a missing `yq`.
 
 ```bash
-S=tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+S=tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 
 grep -c 'AIRGAP_STAGED' "$S"                    # recursion guard present
 grep -n 'install|join-workers' "$S"             # only these two subcommands delegate
@@ -487,10 +487,10 @@ grep -n 'airgap:\[\[:space:\]\]\*true' "$S"     # grep fallback when yq is absen
 
 ```bash
 # File exists
-test -f docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md && echo "OK: file exists" || echo "MISSING"
+test -f docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md && echo "OK: file exists" || echo "MISSING"
 
 # Count Mermaid blocks
-grep -c '```mermaid' docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md
+grep -c '```mermaid' docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md
 ```
 
 **Pass:** File exists; count = 11.
@@ -505,7 +505,7 @@ Requires: `curl`, `helm`, `tar`. Time: ~10–15 minutes.
 ### T2-1: `airgap_install.sh --download-only` runs end-to-end
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 ./airgap_install.sh --download-only --output-dir /tmp/test-bundle \
   --gpu-hosts <gpu-node-ip> --k0s-version v1.31.2+k0s.0
 ```
@@ -600,10 +600,10 @@ bash -n "${BUNDLE_DIR}/airgap-env.sh" && echo "Syntax OK"
 Both cases must fail in preflight — before any download starts.
 
 ```bash
-./tools/ai_tier_cluster_setup/airgap_install.sh
+./tools/ai-tier-cluster-setup/airgap_install.sh
 # Expected: "no cluster config given — nothing to install" error, exit 1
 
-./tools/ai_tier_cluster_setup/airgap_install.sh --config /nonexistent.yaml
+./tools/ai-tier-cluster-setup/airgap_install.sh --config /nonexistent.yaml
 # Expected: "config file not found: /nonexistent.yaml" error, exit 1
 ```
 
@@ -615,8 +615,8 @@ Both cases must fail in preflight — before any download starts.
 ### T2-7: `validate` subcommand catches missing config values
 
 ```bash
-CONFIG_FILE=tools/ai_tier_cluster_setup/k0s-cluster-config.yaml \
-  ./tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh validate
+CONFIG_FILE=tools/ai-tier-cluster-setup/k0s-cluster-config.yaml \
+  ./tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh validate
 ```
 
 **Pass:** Prints a checklist with ✔/✖/! symbols, exits 1 because placeholder `CHANGE THIS` values are detected.
@@ -627,8 +627,8 @@ CONFIG_FILE=tools/ai_tier_cluster_setup/k0s-cluster-config.yaml \
 ### T2-8: `diagnose` subcommand runs without a live cluster
 
 ```bash
-CONFIG_FILE=tools/ai_tier_cluster_setup/k0s-cluster-config.yaml \
-  ./tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=tools/ai-tier-cluster-setup/k0s-cluster-config.yaml \
+  ./tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh diagnose
 ```
 
 **Pass:** Prints "Cluster not reachable" warning, produces a `.tar.gz` in `logs/`, exits 0.
@@ -646,7 +646,7 @@ done
 ls /tmp/rot-test/ | wc -l  # Should be 12
 
 LOG_DIR=/tmp/rot-test bash -c '
-  source tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh 2>/dev/null || true' 2>/dev/null
+  source tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh 2>/dev/null || true' 2>/dev/null
 
 ls /tmp/rot-test/ | wc -l  # Should be ≤ 11
 ```
@@ -660,7 +660,7 @@ ls /tmp/rot-test/ | wc -l  # Should be ≤ 11
 
 ```bash
 bash -c '
-  source tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh 2>/dev/null
+  source tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh 2>/dev/null
   wait_for_dependency "unreachable host" "ping -c1 192.0.2.1 >/dev/null 2>&1" 10
 ' 2>&1
 echo "exit: $?"
@@ -674,9 +674,9 @@ echo "exit: $?"
 ### T2-11: `show_install_plan` aborts on non-"yes" input
 
 ```bash
-echo "no" | CONFIG_FILE=tools/ai_tier_cluster_setup/k0s-cluster-config.yaml \
+echo "no" | CONFIG_FILE=tools/ai-tier-cluster-setup/k0s-cluster-config.yaml \
   AUTO_APPROVE=false \
-  ./tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh install 2>&1 | tail -5
+  ./tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh install 2>&1 | tail -5
 echo "exit: $?"
 ```
 
@@ -689,8 +689,8 @@ echo "exit: $?"
 
 ```bash
 echo "wrong-name" | AUTO_APPROVE=false \
-  CONFIG_FILE=tools/ai_tier_cluster_setup/k0s-cluster-config.yaml \
-  ./tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh delete 2>&1 | tail -3
+  CONFIG_FILE=tools/ai-tier-cluster-setup/k0s-cluster-config.yaml \
+  ./tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh delete 2>&1 | tail -3
 echo "exit: $?"
 ```
 
@@ -703,7 +703,7 @@ echo "exit: $?"
 
 ```bash
 grep -A25 "^ensure_s3compat_credentials" \
-  tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh \
+  tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh \
   | grep "wait_for_dependency"
 ```
 
@@ -716,7 +716,7 @@ grep -A25 "^ensure_s3compat_credentials" \
 
 ```bash
 grep -A5 "AIRGAP_MODE.*true.*skip.*HuggingFace\|skipping HuggingFace" \
-  tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+  tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Log line confirming skip is present.
@@ -728,7 +728,7 @@ grep -A5 "AIRGAP_MODE.*true.*skip.*HuggingFace\|skipping HuggingFace" \
 
 ```bash
 grep -A5 "AIRGAP_MODE.*true.*skip.*NVIDIA\|skipping NVIDIA repo" \
-  tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh
+  tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
 
 **Pass:** Log line confirming skip is present.
@@ -739,10 +739,10 @@ grep -A5 "AIRGAP_MODE.*true.*skip.*NVIDIA\|skipping NVIDIA repo" \
 ### T2-16: `airgap_install.sh --gpu-os` validation rejects unsupported values
 
 ```bash
-./tools/ai_tier_cluster_setup/airgap_install.sh --gpu-os rhel10 --download-only --output-dir /tmp/dummy 2>&1
+./tools/ai-tier-cluster-setup/airgap_install.sh --gpu-os rhel10 --download-only --output-dir /tmp/dummy 2>&1
 echo "exit: $?"
 
-./tools/ai_tier_cluster_setup/airgap_install.sh --gpu-os amzn2023 --download-only --output-dir /tmp/dummy 2>&1
+./tools/ai-tier-cluster-setup/airgap_install.sh --gpu-os amzn2023 --download-only --output-dir /tmp/dummy 2>&1
 echo "exit: $?"
 ```
 
@@ -754,7 +754,7 @@ echo "exit: $?"
 ### T2-17: `airgap_install.sh --gpu-os rhel9` stages all GPU package files
 
 ```bash
-./tools/ai_tier_cluster_setup/airgap_install.sh \
+./tools/ai-tier-cluster-setup/airgap_install.sh \
   --download-only \
   --output-dir /tmp/test-bundle-gpu \
   --gpu-os rhel9 \
@@ -831,7 +831,7 @@ grep "gpu_node_os" "${BUNDLE_DIR}/bundle-versions.txt"
 ### T2-21: `--help` output of `airgap_install.sh` references `--gpu-os` and package strategy notes
 
 ```bash
-./tools/ai_tier_cluster_setup/airgap_install.sh --help | grep -E "gpu.os|GPU_NODE_OS|EPEL|CUDA|NVIDIA_CTK|PyYAML|rhel9"
+./tools/ai-tier-cluster-setup/airgap_install.sh --help | grep -E "gpu.os|GPU_NODE_OS|EPEL|CUDA|NVIDIA_CTK|PyYAML|rhel9"
 ```
 
 **Pass:** At least 4 matching lines covering the new options and package notes.
@@ -1295,7 +1295,7 @@ Open the file on GitHub (or in a Mermaid-aware viewer) and confirm all 14 diagra
 
 ```bash
 # Quick local check — count mermaid blocks to catch accidental deletions
-grep -c '```mermaid' docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md
+grep -c '```mermaid' docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md
 # Expected: 14
 ```
 
@@ -1331,7 +1331,7 @@ The 14 diagrams to review (in order):
 ```bash
 # Clean up Kubernetes resources and stop k0s on all nodes
 CONFIG_FILE=./ec2-test-config.yaml AUTO_APPROVE=true \
-  ./tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh clean-all
+  ./tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh clean-all
 
 # Terminate EC2 instances
 aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www

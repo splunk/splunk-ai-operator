@@ -182,7 +182,7 @@ Download the scripts with the configuration files on the installer machine.
 2. **Navigate to the Setup Directory**
    * Change into the standard repository directory structure:
      ```bash
-     cd splunk-ai-operator/tools/ai_tier_cluster_setup
+     cd splunk-ai-operator/tools/ai-tier-cluster-setup
      ```
 
 3. **Initialize Configuration File**
@@ -218,7 +218,7 @@ Download the scripts with the configuration files on the installer machine.
 2. **Navigate with Branch Suffix**
    * Move into the extracted folder. GitHub includes the branch name in the root folder structure (for example, `splunk-ai-operator-<branch-name>` instead of `splunk-ai-operator`):
      ```bash
-     cd splunk-ai-operator-<branch-name>/tools/ai_tier_cluster_setup
+     cd splunk-ai-operator-<branch-name>/tools/ai-tier-cluster-setup
      ```
 
 3. **Initialize Configuration File**
@@ -319,7 +319,7 @@ AI platform can serve inference.
 #### Install (Standard Path)
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 
 # Required: validation must succeed before install
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
@@ -496,7 +496,7 @@ Run validation from the setup directory and fix any reported errors before
 continuing:
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 ```
 

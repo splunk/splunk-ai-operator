@@ -405,7 +405,7 @@ repo → `cuda-drivers` (DKMS) → `nvidia-container-toolkit` — and verifies w
 **2. Configure your cluster**
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 cp k0s-cluster-config.yaml my-cluster.yaml
 # Open my-cluster.yaml and fill in ALL fields marked CHANGE THIS
 ```
@@ -454,7 +454,7 @@ The installer prints timestamped progress to the terminal and to a log file:
 
 ```bash
 # In another terminal — follow the live log
-tail -f tools/ai_tier_cluster_setup/logs/k0s-install-*.log
+tail -f tools/ai-tier-cluster-setup/logs/k0s-install-*.log
 ```
 
 **6. Verify the result**
@@ -469,7 +469,7 @@ kubectl get aiplatform -n ai-platform      # AIPlatform Ready
 Run the same verification command for standard and air-gapped deployments:
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
@@ -557,7 +557,7 @@ Before starting the phases, create the working configuration from the
 air-gapped template and update its required values:
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 cp k0s-airgapped-config.yaml my-cluster.yaml
 # Edit my-cluster.yaml and fill in the required values
 ```
@@ -570,7 +570,7 @@ specified by the [Supported platforms matrix](#supported-platforms) —
 the same machine that can SSH to the cluster nodes.
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 
 # Stage everything and stop, without installing
 ./airgap_install.sh --download-only --config my-cluster.yaml
@@ -800,7 +800,7 @@ The same command as a standard install, on the internet-connected installer
 machine. Start it inside the [persistent installer session](#keep-the-installer-session-alive):
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 chmod +x airgap_install.sh k0s_cluster_with_stack.sh
 
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
@@ -1186,7 +1186,7 @@ Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end co
 
 For a reusable pass/fail sequence covering installer completion, Pods, workload
 resources, direct model inference, trusted SAIA reachability, and the browser
-flow, use the [Post-Install Sanity Checklist](../../tools/ai_tier_cluster_setup/SANITY_TEST_CHECKLIST.md).
+flow, use the [Post-Install Sanity Checklist](../../tools/ai-tier-cluster-setup/SANITY_TEST_CHECKLIST.md).
 
 ---
 
@@ -1270,7 +1270,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
-ls tools/ai_tier_cluster_setup/logs/k0s-diagnose-*.tar.gz
+ls tools/ai-tier-cluster-setup/logs/k0s-diagnose-*.tar.gz
 ```
 
 The tar.gz contains: pod logs from all namespaces, Kubernetes events, node descriptions, AIPlatform CR status, and the install session log — with secrets and credentials redacted. **Attach this file when opening a Splunk support case.**
@@ -1290,14 +1290,14 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 **Step 2 — check the session log** (search for `ERROR`):
 
 ```bash
-tail -100 tools/ai_tier_cluster_setup/logs/k0s-install-*.log | grep -i error
+tail -100 tools/ai-tier-cluster-setup/logs/k0s-install-*.log | grep -i error
 ```
 
 **Step 3 — collect a support bundle**:
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
-ls tools/ai_tier_cluster_setup/logs/k0s-diagnose-*.tar.gz
+ls tools/ai-tier-cluster-setup/logs/k0s-diagnose-*.tar.gz
 ```
 
 ### Decision tree

@@ -31,9 +31,9 @@ or symptom to its root cause and resolution.
 **1. Check the session log.** Every run writes a timestamped log:
 
 ```bash
-ls -lt tools/ai_tier_cluster_setup/logs/k0s-install-*.log | head -5
+ls -lt tools/ai-tier-cluster-setup/logs/k0s-install-*.log | head -5
 # Open the most recent one and search for ERROR:
-grep "ERROR" tools/ai_tier_cluster_setup/logs/k0s-install-*.log | tail -20
+grep "ERROR" tools/ai-tier-cluster-setup/logs/k0s-install-*.log | tail -20
 ```
 
 **2. Collect a support bundle.**
@@ -977,18 +977,18 @@ kubectl logs -n kube-system -l name=nvidia-device-plugin-ds --tail=30
 
 ```bash
 # Most recent session log
-ls -lt tools/ai_tier_cluster_setup/logs/ | head -5
+ls -lt tools/ai-tier-cluster-setup/logs/ | head -5
 
 # Tail live during a run
-tail -f tools/ai_tier_cluster_setup/logs/k0s-install-$(date '+%Y-%m-%d')*.log
+tail -f tools/ai-tier-cluster-setup/logs/k0s-install-$(date '+%Y-%m-%d')*.log
 
 # Search for errors across all logs
-grep -h "ERROR" tools/ai_tier_cluster_setup/logs/k0s-install-*.log | sort | uniq -c | sort -rn
+grep -h "ERROR" tools/ai-tier-cluster-setup/logs/k0s-install-*.log | sort | uniq -c | sort -rn
 ```
 
 ### Collect and send a support bundle
 
 ```bash
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
-ls -lh tools/ai_tier_cluster_setup/logs/splunk-ai-diagnose-*.tar.gz | tail -1
+ls -lh tools/ai-tier-cluster-setup/logs/splunk-ai-diagnose-*.tar.gz | tail -1
 ```

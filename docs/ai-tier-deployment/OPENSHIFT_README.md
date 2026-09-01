@@ -209,7 +209,7 @@ versions shown above.
 ## Quick Start
 
 ```bash
-cd tools/ai_tier_cluster_setup
+cd tools/ai-tier-cluster-setup
 
 # 1. Log in to your OpenShift cluster as cluster-admin
 oc login --token=<token> --server=https://api.<cluster>:6443

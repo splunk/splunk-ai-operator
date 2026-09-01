@@ -30,11 +30,11 @@ The Splunk AI Operator is a Kubernetes operator that enables customers to manage
 ## Getting Started
 
 The default installation path deploys the complete Splunk AI Platform on a k0s cluster by using
-`tools/ai_tier_cluster_setup/k0s_cluster_with_stack.sh`.
+`tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh`.
 
 ```bash
 git clone https://github.com/splunk/splunk-ai-operator.git
-cd splunk-ai-operator/tools/ai_tier_cluster_setup
+cd splunk-ai-operator/tools/ai-tier-cluster-setup
 cp k0s-cluster-config.yaml my-cluster.yaml
 
 # Edit my-cluster.yaml for your environment, then validate and install.
@@ -43,20 +43,20 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
-Review the [k0s Deployment Quick Reference](docs/ai_tier_deployment/k0s-quick-reference.md)
-before installation. See the [complete k0s guide](docs/ai_tier_deployment/K0S_README.md) for
+Review the [k0s Deployment Quick Reference](docs/ai-tier-deployment/k0s-quick-reference.md)
+before installation. See the [complete k0s guide](docs/ai-tier-deployment/K0S_README.md) for
 standard and air-gapped deployment details.
 
 ## Documentation
 
-- **[k0s Deployment Quick Reference](docs/ai_tier_deployment/k0s-quick-reference.md)** - Default installation workflow
-- **[Complete k0s Guide](docs/ai_tier_deployment/K0S_README.md)** - Configuration, installation, and operations
-- **[Deployment Guide](docs/ai_tier_deployment/DEPLOYMENT_GUIDE.md)** - Standard and air-gapped deployment details
-- **[OpenShift Guide](docs/ai_tier_deployment/OPENSHIFT_README.md)** - OpenShift-specific deployment
-- **[AWS EKS Guide](docs/ai_tier_deployment/EKS_README.md)** - AWS EKS deployment
+- **[k0s Deployment Quick Reference](docs/ai-tier-deployment/k0s-quick-reference.md)** - Default installation workflow
+- **[Complete k0s Guide](docs/ai-tier-deployment/K0S_README.md)** - Configuration, installation, and operations
+- **[Deployment Guide](docs/ai-tier-deployment/DEPLOYMENT_GUIDE.md)** - Standard and air-gapped deployment details
+- **[OpenShift Guide](docs/ai-tier-deployment/OPENSHIFT_README.md)** - OpenShift-specific deployment
+- **[AWS EKS Guide](docs/ai-tier-deployment/EKS_README.md)** - AWS EKS deployment
 - **[API Reference](docs/api-reference.md)** - Complete CRD specification
 - **[Configuration Guides](docs/configuration/)** - Storage, ingress, and webhook configuration
-- **[Installer Troubleshooting](docs/ai_tier_deployment/TROUBLESHOOTING.md)** - k0s installation issues
+- **[Installer Troubleshooting](docs/ai-tier-deployment/TROUBLESHOOTING.md)** - k0s installation issues
 - **[Local Development](docs/local-development.md)** - Build and development workflow
 
 ## License
