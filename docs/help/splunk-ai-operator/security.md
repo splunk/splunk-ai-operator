@@ -7,20 +7,30 @@ standards.
 
 - Store object-storage, registry, and Splunk credentials in Kubernetes Secrets or the approved
   secret-management system.
+- Create referenced Secrets in the same namespace as the `AIPlatform` unless a field explicitly
+  documents another scope. For internal Splunk, follow the namespace-local Secret naming rule in
+  [Configure Splunk integration](splunk-integration.md#internal-splunk).
 - Grant service accounts only the permissions required by their workloads.
 - Avoid putting tokens or passwords in manifests committed to source control.
 - Rotate credentials according to your organization’s policy.
 
+The current Ray reconciliation path reads static object-storage credentials from a Secret and
+snapshots them into an operator-generated `RayService` and ConfigMap. Treat those generated
+resources as sensitive, restrict their RBAC, and prefer release-supported workload identity where
+available. Secret-only handling of static Ray object-storage credentials requires an operator code
+change.
+
 ## TLS
 
-Ingress TLS protects client-to-ingress traffic when `spec.ingress.tls` is configured. Connections
-from SAIA to a Splunk management endpoint can use the HTTPS endpoint configured for Splunk. The
-standard deployment procedure does not enable TLS between the operator-managed services inside
-the cluster.
+Ingress TLS protects client-to-ingress traffic when `spec.ingress.tls` references a Kubernetes TLS
+Secret in the workload namespace. It is separate from workload-to-Splunk TLS and does not add a
+certificate authority to SAIA or SLIM.
 
-Use a certificate chain trusted by the calling client or workload. Do not use disabled certificate
-verification as a permanent configuration; it is useful only for isolating a certificate problem
-during troubleshooting.
+For an HTTPS Splunk issuer, use a certificate whose subject alternative name covers the configured
+host name or IP address and whose chain is already trusted by the SAIA and SLIM workload images.
+This release does not expose a custom external-issuer CA-bundle field. Disabled certificate
+verification is useful only for isolating a certificate problem; it is not a production
+configuration.
 
 ## Network controls
 
@@ -33,13 +43,29 @@ Restrict access to:
 - Ingress endpoints exposed to users.
 
 Network policies and security groups should allow only the required source and destination
-traffic. Validate connectivity from the actual pod or node network where possible.
+traffic. Validate each required direction from its actual source network. A node or installer
+laptop test does not prove that a pod, browser, or external Splunk host has the same route.
 
 ## Issuer and endpoint validation
 
-For AI-tier CMP authentication, SAIA validates the token issuer and resolves it to a configured
-Splunk endpoint. The endpoint mapping must remain within the operator-configured trusted endpoint
-list. This prevents a token claim from causing an outbound request to an arbitrary host.
+For AI-tier CMP authentication, the operator writes the configured issuer URLs to the generated
+SAIA and SLIM `SPLUNK_ISSUERS` allowlists. It does not generate an issuer-to-endpoint mapping.
+Splunk's `oauth2_settings.issuer_uri`, the JWT `iss` claim, the configured trusted issuer, and the
+reachable management URL must all match exactly. For HTTPS, the certificate must cover that URL's
+host name or IP address and chain to a trusted certificate authority.
+
+Each issuer expands both the authentication trust boundary and the set of management hosts that
+the workloads can contact. Configure only controlled Splunk endpoints and limit egress to those
+destinations.
+
+## Release security boundaries
+
+- The operator is cluster-scoped and uses cluster-wide RBAC. `watchNamespace` is not a namespace
+  isolation control in this release.
+- `AIPlatform.spec.ingress` publishes Ray and Weaviate routes only. Use a separately secured
+  Service, ingress, or proxy for SAIA and SLIM.
+- HEC/OpenTelemetry export is not supported in this release. Keep the OpenTelemetry workload
+  sidecar disabled.
 
 ## Air-gapped environments
 

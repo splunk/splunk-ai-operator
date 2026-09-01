@@ -2,20 +2,26 @@
 
 The Splunk AI Operator automates the deployment and lifecycle management of Splunk AI Platform
 resources on Kubernetes. It watches AI Platform custom resources and creates the required
-Kubernetes workloads, services, storage, ingress, and supporting configuration.
+Kubernetes workloads, services, vector storage, and supporting configuration. Object storage and,
+for static-credential deployments, credential Secrets are prerequisites that the operator
+consumes; it does not provision them.
 
 ## What the operator manages
 
 | Resource or component | Purpose |
 | --- | --- |
 | `AIPlatform` | Defines the platform, storage, workers, ingress, and enabled AI features. |
-| `AIService` | Defines service-specific configuration and deployment requirements. |
+| `AIService` | Operator-generated resource that carries service-specific deployment requirements. |
 | Ray | Runs model-serving and AI workloads on CPU or GPU workers. |
 | Weaviate | Provides vector storage for AI workloads. |
-| Object storage | Stores model artifacts, application data, and platform artifacts. |
-| SAIA | Provides the Splunk AI Assistant APIs, including V1 and V2 services. |
+| Object storage | External prerequisite that stores model and application artifacts. |
+| SAIA | Provides the Splunk AI Assistant APIs. One SAIA feature creates both internal API generations. |
 | SLIM | Provides the Splunk AI service integration used by supported deployments. |
-| Ingress | Exposes configured services; ingress TLS can be enabled when the cluster has a suitable certificate and ingress controller. |
+| AIPlatform ingress | Exposes Ray Serve, the Ray dashboard, and Weaviate. It does not expose SAIA or SLIM. |
+
+SAIA V1 and V2 identify internal API generations and workloads. Customers enable the `saia`
+feature once and configure one published SAIA base URL; no separate feature or endpoint selection
+is required for the two generations.
 
 ## Deployment models
 
@@ -31,11 +37,14 @@ The operator supports the following deployment patterns:
 
 ## How reconciliation works
 
-1. You create or update an `AIPlatform` or `AIService` resource.
-2. The operator validates the resource and reconciles the requested state.
-3. The operator creates or updates dependent Kubernetes resources.
-4. Status conditions and Kubernetes events report progress and failures.
-5. Changes to the custom resource are reflected in the managed workloads.
+1. You create or update an `AIPlatform` resource.
+2. The operator validates the resource and creates or updates the generated `AIService` resources.
+3. The operator reconciles the dependent Kubernetes resources.
+4. Status conditions and Kubernetes events report reconciliation progress and failures.
+5. Supported `AIPlatform` changes are reflected in the managed workloads.
+
+Treat generated `AIService`, Deployment, ConfigMap, Ray, and other child resources as
+operator-owned. Direct changes can be overwritten during reconciliation.
 
 ## High-level architecture
 
@@ -45,13 +54,12 @@ Kubernetes cluster
 ├── AI Platform
 │   ├── Ray head and worker workloads
 │   ├── Weaviate vector database
-│   ├── SAIA V1 service
-│   ├── SAIA V2 service
+│   ├── SAIA front-door Service and internal V1/V2 workloads
 │   └── SLIM service
-└── Supporting services
+├── AIPlatform ingress for Ray and Weaviate
+└── External prerequisites
     ├── Object storage
-    ├── Ingress and TLS
-    └── Optional Splunk deployment or external Splunk endpoint
+    └── Optional Splunk deployment or external Splunk issuer
 ```
 
 ## Next steps

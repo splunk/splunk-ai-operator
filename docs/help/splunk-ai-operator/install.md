@@ -1,93 +1,103 @@
 # Install the Splunk AI Operator
 
-This page describes the supported installation patterns. Replace the version placeholders with
-the version listed in the release-specific compatibility matrix.
+Use the release-qualified installer for the selected platform. The installer installs, verifies,
+or reuses the required dependency operators and renders the Splunk AI Operator manifest with the
+qualified runtime and workload-image values.
 
-## Install from an OCI chart
+## k0s installation
 
-OCI installation is the recommended method when the cluster can access the chart registry.
+Follow the appropriate section of the k0s deployment guide:
 
-Review and accept the applicable Splunk General Terms before installation.
+- [Standard deployment](../../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#standard-deployment-internet-connected)
+- [Air-gapped deployment](../../../tools/cluster_setup/DEPLOYMENT_GUIDE.md#air-gapped-deployment-no-internet-on-cluster)
 
-```bash
-helm install splunk-ai-operator \
-  oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version <operator-version> \
-  --namespace splunk-ai-operator-system \
-  --create-namespace \
-  --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required-value>"
+Run commands from `tools/cluster_setup` and use the configuration file documented for the
+selected flow. Do not apply the operator artifact separately before running the installer.
+
+## OpenShift installation
+
+Follow the OpenShift onboarding guide:
+
+- [OpenShift quick start](../../../tools/cluster_setup/OPENSHIFT_README.md#quick-start)
+- [OpenShift air-gapped deployment](../../../tools/cluster_setup/OPENSHIFT_README.md#air-gapped-deployment)
+
+Before running the OpenShift installer, replace the development image references in its sample
+configuration with these qualified images, or their digest-equivalent private-registry mirrors:
+
+```yaml
+images:
+  operator:
+    image: docker.io/splunk/splunk-ai-operator:v1.0
+  ray:
+    headImage: docker.io/splunk/ai-tier-ray-head:v1.0
+    workerImage: docker.io/splunk/ai-tier-ray-worker:v1.0
+  saia:
+    apiImage: docker.io/splunk/ai-tier-saia-api:v1.0
+    apiV2Image: docker.io/splunk/ai-tier-saia-api-v2:v1.0
+    dataLoaderImage: docker.io/splunk/ai-tier-saia-data-loader:v1.0
+  slim:
+    apiImage: docker.io/splunk/ai-tier-slim-service:v1.0
+
+operators:
+  ray:
+    rayVersion: "2.56.0"
 ```
 
-The required terms-acceptance value is documented by the Splunk Operator for Kubernetes
-installation instructions.
+Do not use the sample's development or test tags for a release deployment. Preserve all other
+required OpenShift configuration fields described by the onboarding guide. `features[].version`
+is metadata and can be omitted; it does not select these images.
 
-## Install from a release package
+The bundled Splunk Operator manifest contains the Splunk General Terms acceptance flag, and the
+installers do not prompt for separate confirmation. Review the
+[Splunk General Terms requirements](https://github.com/splunk/splunk-operator#splunk-general-terms-acceptance)
+and run an installer only if you are authorized to accept them for the deployment.
 
-Use the release package when OCI registry access is unavailable or when the environment requires
-an approved release artifact.
+## Direct artifact limitations
 
-```bash
-helm install splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/<release-tag>/splunk-ai-operator-<operator-version>.tgz \
-  --namespace splunk-ai-operator-system \
-  --create-namespace \
-  --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required-value>"
-```
+Do not install this release directly from the published `1.0.0` OCI chart, packaged chart, or
+standalone Kubernetes manifest.
 
-## Install from Kubernetes manifests
+- The chart embeds workload-image defaults outside the qualified v1.0 combination and fixes
+  `RAY_VERSION` at `2.44.0`. Image-value overrides alone cannot select the qualified Ray `2.56.0`
+  runtime.
+- The standalone manifest assumes that dependency CRDs and controllers already exist and does not
+  install cert-manager, Prometheus Operator, KubeRay, or any enabled OpenTelemetry or Splunk
+  Operator dependencies.
 
-Use the release manifest when Helm is not available.
-
-```bash
-kubectl apply -f https://github.com/splunk/splunk-ai-operator/releases/download/<release-tag>/install-<operator-version>.yaml
-```
-
-Use the manifest published for the exact operator release. Do not mix CRDs or manifests from
-different releases.
+The platform installers supply and verify those dependencies, runtime settings, and images. A
+future direct-chart or manifest installation path must be explicitly identified as supported by
+its release documentation.
 
 ## Air-gapped installation
 
-For an air-gapped cluster:
+Follow the selected platform guide's complete air-gapped flow. Set mirror locations in that
+installer's YAML configuration file; do not substitute a generic Helm values file. The installer
+creates the `AIPlatform` as part of the stack installation, so do not create it independently
+during this flow.
 
-1. Download the approved operator and platform charts on a connected machine.
-2. Download or mirror all required container images into the private registry.
-3. Transfer charts, image metadata, model artifacts, and configuration to the secured environment.
-4. Create image-pull and storage credentials in the target cluster.
-5. Update the values file to use private registry locations.
-6. Install the operator and verify its pods before creating an `AIPlatform` resource.
-
-The air-gapped process must include every transitive image used by the selected platform features.
-Use the release bill of materials to build the image-mirroring list.
+The air-gapped process must include every transitive dependency-chart, hook, operator, and workload
+image used by the selected features. Do not use the operator release BOM alone as the mirroring
+list; it does not enumerate every transitive image.
 
 ## Verify the operator
 
 ```bash
-kubectl get pods -n splunk-ai-operator-system
-kubectl get crds | grep ai.splunk.com
+kubectl rollout status \
+  deployment/splunk-ai-operator-controller-manager \
+  --namespace splunk-ai-operator-system \
+  --timeout 5m
+kubectl wait --for=condition=Established --timeout=60s \
+  crd/aiplatforms.ai.splunk.com \
+  crd/aiservices.ai.splunk.com
 kubectl logs -n splunk-ai-operator-system \
   -l control-plane=controller-manager --tail=100
 ```
 
-The operator pod should be `Running`, and the AI Platform CRDs should be present before you
-continue.
+The rollout and CRD waits must succeed before you continue. Also verify the enabled dependency
+operators are ready.
 
-## Install with namespace scope
+## Operator scope
 
-By default, the operator can watch all namespaces. To restrict it, set the chart's watch namespace
-value and install the operator in the selected namespace:
-
-```bash
-helm install splunk-ai-operator \
-  oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version <operator-version> \
-  --namespace <operator-namespace> \
-  --create-namespace \
-  --set watchNamespace=<workload-namespace> \
-  --set splunk-operator.acceptGeneralTerms=true \
-  --set splunk-operator.splunkOperator.splunkGeneralTerms="<required-value>"
-```
-
-Confirm that the operator's RBAC and watch scope match the namespaces where AI Platform resources
-will be created.
+The current release is cluster-scoped and uses cluster-wide RBAC. A `WATCH_NAMESPACE` environment
+variable or chart `watchNamespace` value does not restrict the manager cache or permissions and
+must not be treated as a namespace-isolation or security control.

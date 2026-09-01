@@ -5,53 +5,54 @@ creates the service workloads and the supporting configuration associated with e
 
 ## Enable SAIA and SLIM
 
-Use the feature names and versions supported by the target release:
+Enable the release-supported services by name:
 
 ```yaml
 spec:
   features:
     - name: saia
-      version: "<saia-version>"
-      serviceAccountName: saia-service-account
     - name: slim
-      version: "<slim-version>"
-      serviceAccountName: slim-service-account
 ```
 
-Do not assume that every feature version is compatible with every operator release. Check the
-release compatibility matrix.
+When `serviceAccountName` is omitted, the SAIA and SLIM reconcilers create an operator-managed
+ServiceAccount for each service. An explicit name is an override and must refer to a pre-created
+ServiceAccount in the workload namespace.
+
+`features[].version` is metadata in this release. It does not select or upgrade a service image.
+Service images are supplied to the operator Deployment by the release-qualified platform
+installer and can change only through an approved platform maintenance procedure.
 
 ## SAIA V1 and V2
 
-SAIA V1 and SAIA V2 are separate services with separate API paths and deployment workloads.
+SAIA V1 and V2 are internal API generations with separate workloads and path families. Enabling
+the `saia` feature deploys both behind one operator-managed SAIA nginx Service. Customers do not
+select a generation or configure separate base endpoints.
 
-| Service | Typical API path | Client pattern |
+| Internal generation | API path family | Routing |
 | --- | --- | --- |
-| SAIA V1 | `/saia-api/v1alpha1/...` | Often called through the SAIA App backend on the Search Head. |
-| SAIA V2 | `/saia-api-v2/v2alpha1/...` | Can be called directly by a browser or API client when network access is configured. |
+| SAIA V1 | `/saia-api/v1alpha1/...` | Routed by the front-door SAIA nginx Service. |
+| SAIA V2 | `/saia-api-v2/v2alpha1/...` | Routed by the same front-door SAIA nginx Service. |
 
-The exact host name and ingress path depend on the deployment configuration.
+The Splunk AI Assistant app uses the appropriate API path. Configure one published SAIA base URL.
 
-## MLTK app setup
+## Splunk AI Assistant app
 
-When the AI-Tier workflow requires the Splunk Machine Learning Toolkit (MLTK) app:
+For this release, the qualified Splunk AI Assistant app version is `2.3.0` on Splunk Enterprise
+`10.2`. Download that exact version from [Splunkbase](https://splunkbase.splunk.com/app/7245) after
+it appears in the page's version history; do not substitute the page's default version. Configure
+it only after the published SAIA URL is reachable from every required browser and Splunk-host
+network.
 
-1. Install the release-approved MLTK app version on the required Splunk Search Head.
-2. Confirm that the app is enabled and that the target users have the required capabilities.
-3. Confirm that the Search Head can reach the configured AI Platform and SAIA endpoints.
-4. Validate the MLTK workflow using the release-specific MLTK setup procedure.
+## Update service configuration
 
-The final Help publication should link this section to the approved MLTK installation and
-configuration pages.
-
-## Update a service
-
-Update the relevant feature version or service configuration in the custom resource and apply it:
+Update supported service configuration in the `AIPlatform` custom resource and apply it:
 
 ```bash
 kubectl apply -f ai-platform.yaml
-kubectl get pods -n ai-platform --watch
+kubectl get pods -n <namespace> --watch
 ```
 
-Review the operator events and service logs during the rollout. Back up or preserve persistent
-data before changing storage or service versions.
+Review operator events and service logs during reconciliation. Do not change `features[].version`
+to upgrade a service. To update SAIA, SLIM, Ray, Weaviate, or supporting images, follow the
+release-specific platform maintenance procedure in
+[Operations and lifecycle management](operations.md#maintenance-and-upgrades).
