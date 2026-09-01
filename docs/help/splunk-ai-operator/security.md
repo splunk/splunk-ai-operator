@@ -22,15 +22,17 @@ change.
 
 ## TLS
 
-Ingress TLS protects client-to-ingress traffic when `spec.ingress.tls` references a Kubernetes TLS
-Secret in the workload namespace. It is separate from workload-to-Splunk TLS and does not add a
-certificate authority to SAIA or SLIM.
+If `AIPlatform.spec.ingress` is used for Ray or Weaviate, `spec.ingress.tls` requests
+client-to-ingress TLS termination using a TLS Secret in the `AIPlatform` namespace. It does not
+expose SAIA or SLIM, configure ingress-to-backend TLS, or modify CA trust for outbound Splunk
+connections.
 
-For an HTTPS Splunk issuer, use a certificate whose subject alternative name covers the configured
-host name or IP address and whose chain is already trusted by the SAIA and SLIM workload images.
-This release does not expose a custom external-issuer CA-bundle field. Disabled certificate
-verification is useful only for isolating a certificate problem; it is not a production
-configuration.
+For SAIA and SLIM issuer validation over HTTPS, the certificate subject alternative name must
+match the DNS name or IP address in the configured issuer URL. The certificate chain must terminate
+at a CA trusted by both workload images. This release exposes neither a custom issuer CA-bundle
+field nor a supported setting to disable issuer certificate verification. A deliberately insecure
+one-off client request can help diagnose a certificate problem, but it is not a supported
+production configuration.
 
 ## Network controls
 
