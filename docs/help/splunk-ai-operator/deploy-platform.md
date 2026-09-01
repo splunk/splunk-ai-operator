@@ -136,37 +136,6 @@ and minimum value is `1`. CPU and GPU scheduler fields control placement; they d
 per-pod resources. Ensure that node labels, taints, GPUs, CPU, memory, storage, and object-store
 capacity can accommodate the requested scale.
 
-## Configure Ray and Weaviate ingress
-
-`AIPlatform.spec.ingress` publishes Ray and Weaviate routes. In the following example, `/` routes
-to Ray Serve on port `8000`:
-
-```yaml
-spec:
-  ingress:
-    enabled: true
-    className: nginx
-    hosts:
-      - host: ai.example.com
-        paths:
-          - path: /
-            pathType: Prefix
-    tls:
-      - hosts:
-          - ai.example.com
-        secretName: ai-platform-tls
-```
-
-The ingress controller and DNS record must be available in the target cluster. The
-`ai-platform-tls` Secret must already exist in `ai-platform`, or a configured certificate
-controller must issue it. The `tls` block configures client-to-ingress TLS; it does not enable TLS
-between operator-managed pods or services.
-
-Configure `/dashboard` with `pathType: Prefix` to route that prefix and its subpaths to the Ray
-dashboard. Configure `/weaviate` with `pathType: Prefix` to route that prefix and its subpaths to
-Weaviate. Do not append `*`; Kubernetes Prefix paths do not use wildcard syntax. Other configured
-paths route to Ray Serve. This ingress does not route to SAIA or SLIM.
-
 ## Expose SAIA
 
 The `saia` feature creates a front-door Service named

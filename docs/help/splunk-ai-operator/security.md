@@ -22,15 +22,17 @@ change.
 
 ## TLS
 
-Ingress TLS protects client-to-ingress traffic when `spec.ingress.tls` references a Kubernetes TLS
-Secret in the workload namespace. It is separate from workload-to-Splunk TLS and does not add a
-certificate authority to SAIA or SLIM.
+Leave `AIPlatform.spec.ingress` disabled. External Ray and Weaviate exposure is not supported for
+customer use in this release because the operator does not add authentication or authorization to
+those routes. TLS on a separately deployed SAIA or SLIM Ingress, Route, or proxy protects incoming
+client traffic only; it does not modify CA trust for outbound Splunk connections.
 
-For an HTTPS Splunk issuer, use a certificate whose subject alternative name covers the configured
-host name or IP address and whose chain is already trusted by the SAIA and SLIM workload images.
-This release does not expose a custom external-issuer CA-bundle field. Disabled certificate
-verification is useful only for isolating a certificate problem; it is not a production
-configuration.
+For SAIA and SLIM issuer validation over HTTPS, the certificate subject alternative name must
+match the DNS name or IP address in the configured issuer URL. The certificate chain must terminate
+at a CA trusted by both workload images. This release exposes neither a custom issuer CA-bundle
+field nor a supported setting to disable issuer certificate verification. A deliberately insecure
+one-off client request can help diagnose a certificate problem, but it is not a supported
+production configuration.
 
 ## Network controls
 
@@ -62,8 +64,8 @@ destinations.
 
 - The operator is cluster-scoped and uses cluster-wide RBAC. `watchNamespace` is not a namespace
   isolation control in this release.
-- `AIPlatform.spec.ingress` publishes Ray and Weaviate routes only. Use a separately secured
-  Service, ingress, or proxy for SAIA and SLIM.
+- External Ray and Weaviate exposure through `AIPlatform.spec.ingress` is not supported. Leave it
+  disabled and use a separately secured Service, ingress, Route, or proxy for SAIA and SLIM.
 - HEC/OpenTelemetry export is not supported in this release. Keep the OpenTelemetry workload
   sidecar disabled.
 

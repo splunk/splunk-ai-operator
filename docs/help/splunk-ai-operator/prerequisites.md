@@ -41,8 +41,9 @@ accelerator from the generic Kubernetes API examples in this guide.
 - A supported ingress controller when external HTTP or HTTPS access is required.
 - DNS that resolves the configured service and ingress host names.
 
-`AIPlatform.spec.ingress` publishes Ray and Weaviate routes only. Plan a separate supported
-Service, ingress, or proxy path for SAIA and SLIM clients.
+Leave `AIPlatform.spec.ingress` disabled; external Ray and Weaviate exposure is not supported for
+customer use in this release. Plan a separate supported Service, ingress, or proxy path for SAIA
+and SLIM clients.
 
 ## Operator dependencies
 

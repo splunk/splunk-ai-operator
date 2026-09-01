@@ -132,7 +132,7 @@ API paths internally; customers do not select a separate Kubernetes v2 endpoint.
 - network policy and security-group rules; and
 - SOCKS proxy configuration when the service is private.
 
-`AIPlatform.spec.ingress` does not expose SAIA; its default route targets Ray Serve. Use the SAIA
+Do not use `AIPlatform.spec.ingress` for SAIA, and leave it disabled in this release. Use the SAIA
 Service exposure described in [Deploy the AI Platform](deploy-platform.md#expose-saia) or another
 release-supported proxy. Confirm that the public route ultimately targets
 `<AIPlatform-name>-saia-saia-service` on port `8080`.
