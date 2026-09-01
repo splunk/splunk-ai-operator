@@ -1579,9 +1579,9 @@ wait_for_subscription_csv() {
   local elapsed=0 current_csv="" installed_csv="" csv_name="" phase=""
   log "Waiting for OLM Subscription ${namespace}/${subscription} (timeout: ${timeout}s)..."
   while (( elapsed < timeout )); do
-    current_csv=$(oc get subscription "${subscription}" -n "${namespace}" \
+    current_csv=$(oc get subscriptions.operators.coreos.com "${subscription}" -n "${namespace}" \
       -o jsonpath='{.status.currentCSV}' 2>/dev/null || true)
-    installed_csv=$(oc get subscription "${subscription}" -n "${namespace}" \
+    installed_csv=$(oc get subscriptions.operators.coreos.com "${subscription}" -n "${namespace}" \
       -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
     csv_name="${current_csv:-${installed_csv}}"
     if [[ -n "${csv_name}" ]]; then
@@ -1607,7 +1607,7 @@ wait_for_subscription_csv() {
     sleep 10
     elapsed=$((elapsed + 10))
   done
-  oc get subscription "${subscription}" -n "${namespace}" -o yaml || true
+  oc get subscriptions.operators.coreos.com "${subscription}" -n "${namespace}" -o yaml || true
   err "Timed out waiting for OLM Subscription ${namespace}/${subscription} (currentCSV=${current_csv:-not-created}, installedCSV=${installed_csv:-not-installed}, target phase=${phase:-unknown})"
 }
 
@@ -1808,7 +1808,7 @@ install_nfd() {
   # Step 1: Subscription + OperatorGroup — idempotent, skip creation if already present.
   # Do NOT early-return here: a prior run may have created the Subscription but never
   # the NodeFeatureDiscovery CR below, so we must always fall through to Step 2.
-  if oc get subscription nfd -n openshift-nfd &>/dev/null; then
+  if oc get subscriptions.operators.coreos.com nfd -n openshift-nfd &>/dev/null; then
     log "  ✓ NFD subscription already exists, skipping creation"
   else
     record_owned_component nfd_subscription
@@ -1891,7 +1891,7 @@ install_nvidia_gpu_operator() {
   # Step 1: Subscription + OperatorGroup — idempotent, skip creation if already present.
   # Do NOT early-return here: a prior run may have created the Subscription but never
   # the ClusterPolicy below, so we must always fall through to Step 2.
-  if oc get subscription gpu-operator-certified -n nvidia-gpu-operator &>/dev/null; then
+  if oc get subscriptions.operators.coreos.com gpu-operator-certified -n nvidia-gpu-operator &>/dev/null; then
     log "  ✓ GPU Operator subscription already exists, skipping creation"
   else
     record_owned_component gpu_subscription
@@ -4119,8 +4119,8 @@ main_delete() {
     oc delete clusterpolicy gpu-cluster-policy --ignore-not-found=true 2>/dev/null || true
   if component_is_owned gpu_subscription; then
     local gpu_csv
-    gpu_csv=$(oc get subscription gpu-operator-certified -n nvidia-gpu-operator -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
-    oc delete subscription gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
+    gpu_csv=$(oc get subscriptions.operators.coreos.com gpu-operator-certified -n nvidia-gpu-operator -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    oc delete subscriptions.operators.coreos.com gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
     [[ -z "${gpu_csv}" ]] || oc delete csv "${gpu_csv}" -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
     component_is_owned namespace_nvidia-gpu-operator && force_delete_namespace nvidia-gpu-operator 60
   else
@@ -4132,8 +4132,8 @@ main_delete() {
     oc delete nodefeaturediscovery nfd-instance -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
   if component_is_owned nfd_subscription; then
     local nfd_csv
-    nfd_csv=$(oc get subscription nfd -n openshift-nfd -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
-    oc delete subscription nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
+    nfd_csv=$(oc get subscriptions.operators.coreos.com nfd -n openshift-nfd -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    oc delete subscriptions.operators.coreos.com nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
     [[ -z "${nfd_csv}" ]] || oc delete csv "${nfd_csv}" -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
     component_is_owned namespace_openshift-nfd && force_delete_namespace openshift-nfd 60
   else
