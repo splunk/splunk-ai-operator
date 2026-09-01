@@ -169,8 +169,10 @@ spec:
       secretName: saia-tls
 ```
 
-Create `saia-tls` in `ai-platform` or configure a certificate controller to issue it. Apply the
-required authentication, CORS, DNS, and network controls before allowing browser access.
+Create `saia-tls` in `ai-platform` or configure a certificate controller to issue it. This example
+terminates client TLS at the Ingress and forwards HTTP to the SAIA Service; it does not enable TLS
+between workloads inside the cluster. Apply the required authentication, CORS, DNS, and network
+controls before allowing browser access.
 
 ## Check platform status
 

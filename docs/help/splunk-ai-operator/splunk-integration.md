@@ -126,9 +126,10 @@ When a Splunk issuer uses HTTPS, its certificate subject alternative name must c
 host name or IP address, and its certificate chain must already be trusted by the SAIA and SLIM
 workload images. This release does not expose a custom external-issuer CA-bundle field.
 
-Disabling certificate verification can help diagnose connectivity, but it is not a production
-TLS solution. Ingress TLS uses a separate namespace-local Kubernetes TLS Secret and does not add
-trust for workload-to-Splunk connections.
+Client TLS terminated by a customer-managed Ingress, Route, load balancer, or reverse proxy is
+separate from this outbound connection. It protects traffic to that access point and then forwards
+HTTP to the generated SAIA or SLIM Service. It neither enables TLS between in-cluster workloads nor
+adds certificate trust for connections to Splunk.
 
 ## Validate an issued token
 
