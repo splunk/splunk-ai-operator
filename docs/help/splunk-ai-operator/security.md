@@ -22,17 +22,18 @@ change.
 
 ## TLS
 
-Leave `AIPlatform.spec.ingress` disabled. External Ray and Weaviate exposure is not supported for
-customer use in this release because the operator does not add authentication or authorization to
-those routes. TLS on a separately deployed SAIA or SLIM Ingress, Route, or proxy protects incoming
-client traffic only; it does not modify CA trust for outbound Splunk connections.
+Traffic between AI-tier workloads inside the cluster uses HTTP in this release. Workload TLS and
+mTLS are not supported.
 
-For SAIA and SLIM issuer validation over HTTPS, the certificate subject alternative name must
-match the DNS name or IP address in the configured issuer URL. The certificate chain must terminate
-at a CA trusted by both workload images. This release exposes neither a custom issuer CA-bundle
-field nor a supported setting to disable issuer certificate verification. A deliberately insecure
-one-off client request can help diagnose a certificate problem, but it is not a supported
-production configuration.
+When SAIA or SLIM is published through a customer-managed Ingress, Route, load balancer, or reverse
+proxy, terminate TLS at that access point and forward traffic to the generated Service over HTTP.
+This protects the client-to-access-point connection; it does not enable TLS inside the cluster.
+
+HTTPS from SAIA or SLIM to an external Splunk issuer is a separate outbound connection. The host in
+the configured issuer URL must match the certificate's subject alternative name, and the
+certificate chain must already be trusted by the relevant workload image. Custom CA bundles and
+certificate-verification overrides for external issuer connections are not supported in this
+release. See [Configure Splunk integration](splunk-integration.md#tls-and-certificates).
 
 ## Network controls
 
