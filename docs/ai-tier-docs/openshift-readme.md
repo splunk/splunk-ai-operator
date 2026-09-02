@@ -14,11 +14,12 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
 4. [Connected installation](#connected-installation)
 5. [Air-gapped installation](#air-gapped-installation)
 6. [Verify and access the deployment](#verify-and-access-the-deployment)
-7. [Configuration reference](#configuration-reference)
-8. [OpenShift behavior](#openshift-behavior)
-9. [Model staging](#model-staging)
-10. [Troubleshooting](#troubleshooting)
-11. [Uninstall](#uninstall)
+7. [Install and test the Splunk apps](#install-and-test-the-splunk-apps)
+8. [Configuration reference](#configuration-reference)
+9. [OpenShift behavior](#openshift-behavior)
+10. [Model staging](#model-staging)
+11. [Troubleshooting](#troubleshooting)
+12. [Uninstall](#uninstall)
 
 ## What the installer deploys
 
@@ -136,16 +137,37 @@ dependencies:
 
 Before installation, provide:
 
-- A registry containing every image configured under `images.*`.
+- Network access to the registries containing the images under `images.*`, or
+  an internal registry containing their mirrors for an air-gapped cluster.
 - An AWS S3, MinIO, SeaweedFS, or generic S3-compatible object store for model
   artifacts.
 - Credentials for private registries and the object store.
 - Access from the installer machine to Hugging Face when model staging is
   enabled and any required model is missing.
 
-OpenShift nodes do not need direct internet access when all images are
-available through registries reachable by the cluster and all models are in the
-configured object store.
+In connected mode, the cluster must reach the configured Operator catalogs and
+image registries. OpenShift nodes do not need public internet access only when
+all Operator and application content is mirrored to registries reachable by
+the cluster and all models are in the configured object store.
+
+### Network requirements
+
+Allow these flows for the selected installation and integration path:
+
+| Source | Destination | Purpose |
+|---|---|---|
+| Installer machine | OpenShift API endpoint, normally TCP 6443 | Install and verify resources |
+| Installer machine | GitHub, Helm repositories, source registries, and Red Hat registries | Connected installation or preparation of air-gap mirror content |
+| Installer machine | Hugging Face | Download a required model that is missing when model staging is enabled |
+| Installer machine and AI workloads | Object-store endpoint | Stage and read models and runtime state |
+| OpenShift nodes | Configured image registries | Pull Operator and workload images |
+| User browser and external Splunk | OpenShift router on TCP 80, or 443 after customer-managed TLS is configured | Reach the SAIA and SLIM Routes |
+| SAIA and SLIM workloads | Bundled Splunk management service on TCP 8089 | Fetch signing keys and validate JWTs |
+| Internal OpenTelemetry collectors | Bundled Splunk HEC service on TCP 8088 | Send internal telemetry |
+
+An external Splunk server and the user's browser must each be able to resolve
+and reach the appropriate Route. A laptop VPN does not provide connectivity for
+the external Splunk server or for workloads running inside OpenShift.
 
 ## Prepare the configuration
 
@@ -162,7 +184,8 @@ Edit the copy and set, at minimum:
 
 - `openshift.nodes` to the AI-tier worker node names when using the `manual`
   labeling strategy
-- every `images.*` reference and its registry authentication method
+- confirm the `images.*` release references; replace them and configure
+  registry authentication when using a private registry or mirror
 - `storage.objectStore` endpoint, bucket, type, and credentials
 - `storage.modelStaging.enabled` for the intended model workflow
 - `ecr.enabled: false` when the image registry is not Amazon ECR
@@ -289,6 +312,104 @@ oc port-forward -n ai-platform svc/openshift-ai-platform-head-svc 8265:8265
 Then open `http://localhost:8265`. Replace `openshift-ai-platform` if
 `aiPlatform.name` was changed.
 
+## Install and test the Splunk apps
+
+The OpenShift installer always deploys a bundled Splunk Standalone. An
+externally managed Splunk Enterprise instance can also use the SAIA and SLIM
+Routes, but it does not replace the bundled instance in the current installer.
+For external Splunk, make sure its JWT issuer is listed under
+`splunk.trustedIssuers` and that both Splunk and the user's browser can reach
+the required Routes.
+
+### Open bundled Splunk Web
+
+Read the configured names, retrieve the generated admin password, and forward
+Splunk Web to the installer machine:
+
+```bash
+NAMESPACE="$(yq eval '.kubernetes.namespace // "ai-platform"' "$CONFIG_FILE")"
+STANDALONE_NAME="$(yq eval '.splunk.standaloneName // "splunk-standalone"' "$CONFIG_FILE")"
+SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
+
+oc get secret "$SPLUNK_SECRET" -n "$NAMESPACE" \
+  -o jsonpath='{.data.password}' | base64 --decode && echo
+oc port-forward -n "$NAMESPACE" "svc/$SPLUNK_SERVICE" 18001:8000
+```
+
+Keep the port-forward running and open `http://localhost:18001`. Log in as
+`admin` with the password printed above.
+
+### Install and configure Splunk AI Assistant
+
+Use Splunk Enterprise 10.2 and install
+[Splunk AI Assistant](https://splunkbase.splunk.com/app/7245) version 2.3.0
+(`Splunk_AI_Assistant_Cloud.tgz`):
+
+1. In Splunk Web, go to **Apps → Manage Apps → Install app from file**.
+2. Upload `Splunk_AI_Assistant_Cloud.tgz` and restart Splunk if prompted.
+3. Open **Splunk AI Assistant → Configuration**.
+4. Enter the SAIA Route printed by the installer, for example
+   `http://saia.<ingress-domain>`, and save it.
+5. Send a prompt and confirm that the app returns a model response.
+
+The user's browser calls the configured SAIA URL directly. The Route must
+therefore be resolvable and reachable from the browser, not only from Splunk.
+If customer-managed Route TLS is enabled, use `https://` and a certificate
+trusted by the browser.
+
+### Install and configure Splunk AI Toolkit
+
+Install the Python for Scientific Computing app first, then install
+[Splunk AI Toolkit](https://splunkbase.splunk.com/app/2890) version 6.1.0 or
+later (`Splunk_ML_Toolkit.tgz`) through **Manage Apps**. Restart Splunk if
+prompted.
+
+AITK uses SLIM, not SAIA. In **Splunk AI Toolkit → Connections**, select
+**+ Connection → Endpoint → Splunk AI tier** and save an endpoint that includes
+the complete API path:
+
+```text
+http://<slim-host>/tenant/slim-api/v1alpha1
+```
+
+For the bundled Splunk instance, use the internal endpoint:
+
+```bash
+AI_PLATFORM_NAME="$(yq eval '.aiPlatform.name // "openshift-ai-platform"' "$CONFIG_FILE")"
+echo "http://${AI_PLATFORM_NAME}-slim-slim-service.${NAMESPACE}.svc.cluster.local:8080/tenant/slim-api/v1alpha1"
+```
+
+For an external Splunk instance, use the SLIM Route printed by the installer:
+
+```text
+http://slim.<ingress-domain>/tenant/slim-api/v1alpha1
+```
+
+Saving the endpoint validates its format but is not a complete connectivity
+test. Confirm that models appear when creating an LLM connection. To use the
+`ai` command, also create **+ Connection → LLM → Splunk AI tier LLM**, select a
+model, and save the named connection.
+
+Run these searches as end-to-end smoke tests. Replace `<connection-name>` with
+the LLM connection created above:
+
+```text
+| inputlookup internet_traffic.csv
+| head 2000
+| apply CDTSM bits_transferred forecast_k=128
+```
+
+```text
+| makeresults
+| eval text="Fifteen failed logins were detected from one host within two minutes."
+| ai connection="<connection-name>" prompt="Summarize this security event in one concise sentence: {text}"
+| table text ai_result_1
+```
+
+Forecast values from `apply CDTSM` and a non-empty `ai_result_1` confirm the
+Splunk → SLIM → model path.
+
 ## Configuration reference
 
 ### Cluster and OpenShift
@@ -312,7 +433,31 @@ in this installer.
 ### Images and registry credentials
 
 `images.registry` is prepended only to image names that are not fully
-qualified. Fully qualified references are used as written.
+qualified. Fully qualified references such as `docker.io/splunk/...` are used
+as written, so replace each one with its mirrored path for an air-gapped
+installation.
+
+| Setting | Release default | Purpose |
+|---|---|---|
+| `images.registry` | empty | Optional registry prefix for short image names |
+| `images.registryInsecure` | `false` | Allow plain-HTTP pulls from `images.registry`; use only in a controlled lab |
+| `images.operator.image` | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator |
+| `images.ray.headImage` | `docker.io/splunk/ai-tier-ray-head:v1.0` | Ray head runtime |
+| `images.ray.workerImage` | `docker.io/splunk/ai-tier-ray-worker:v1.0` | Ray GPU worker runtime |
+| `images.weaviate.image` | `docker.io/semitechnologies/weaviate:stable-v1.28-007846a` | Weaviate vector database |
+| `images.saia.apiImage` | `docker.io/splunk/ai-tier-saia-api:v1.0` | SAIA API v1 |
+| `images.saia.apiV2Image` | `docker.io/splunk/ai-tier-saia-api-v2:v1.0` | SAIA API v2 |
+| `images.saia.dataLoaderImage` | `docker.io/splunk/ai-tier-saia-data-loader:v1.0` | SAIA post-install data loader |
+| `images.slim.apiImage` | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API used by AITK |
+| `images.splunk.image` | `docker.io/splunk/splunk:10.2-rhel9` | Bundled Splunk Enterprise |
+| `images.splunk.operatorImage` | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator |
+| `images.fluentBit.image` | `docker.io/fluent/fluent-bit:1.9.6` | Fluent Bit sidecar |
+| `images.otelCollector.image` | `docker.io/otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
+| `images.nginx.image` | `docker.io/library/nginx:1.27-alpine` | SAIA reverse proxy |
+
+The application `v1.0` tags may be mutable, and workloads use
+`imagePullPolicy: IfNotPresent`. For a controlled refresh, use a new immutable
+tag or image digest instead of reusing a changed tag.
 
 For Amazon ECR, enable:
 
@@ -324,8 +469,9 @@ ecr:
 ```
 
 The installer runs `aws ecr get-login-password` and creates pull secrets in
-the required namespaces. Amazon ECR tokens expire after 12 hours; long-running
-clusters need an external refresh process.
+the required namespaces during installation. Amazon ECR tokens expire after
+12 hours; customers using ECR must provide a credential-refresh process for
+long-running clusters.
 
 For another private registry, disable ECR and configure the matching
 `imagePullSecrets` block. Example:
@@ -345,7 +491,20 @@ imagePullSecrets:
 Supported blocks are `dockerHub`, `gcr`, `acr`, and `custom`. A public
 registry that does not require authentication needs no pull-secret block.
 
-### Object store
+### Storage and object store
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `storage.storageClass` | `local-path` | StorageClass used for workload PVCs |
+| `storage.vectorDbSize` | `50Gi` | Requested Weaviate PVC size |
+| `storage.minimumDiskSpace.aiTierNode` | `1024` | Minimum available GiB on every AI-tier node at `scaleFactor: 1`; multiplied by the scale factor |
+| `storage.modelStaging.enabled` | `true` | Stage only missing or changed models; `false` verifies that all required models already exist |
+| `storage.objectStore.type` | `seaweedfs` in the template | `aws`, `minio`, `seaweedfs`, or `s3compat` |
+| `storage.objectStore.bucket` | `ai-platform-bucket` | Bucket used for model artifacts and runtime state |
+| `storage.objectStore.endpoint` | none | Required for MinIO, SeaweedFS, and generic S3-compatible storage |
+| `storage.objectStore.region` | ECR region when omitted | AWS S3 region; set it explicitly when S3 and ECR use different regions |
+| `storage.objectStore.auth.rootUser` | none | Object-store access key |
+| `storage.objectStore.auth.rootPassword` | none | Object-store secret key |
 
 ```yaml
 storage:
@@ -362,6 +521,12 @@ storage:
 `storage.objectStore.region`; AWS CLI is required. Temporary AWS STS access
 keys are not supported because the generated secret has no session-token
 field.
+
+The installer does not deploy the object store. The bucket contains staged
+models under `model_artifacts/` and `staging_state/`, and SAIA creates runtime
+state such as `conversations/`, `config/`, and `storage_queue/`. Treat the
+bucket as persistent application data and do not delete those runtime paths
+during a reinstall.
 
 ### Splunk issuers and HEC
 
@@ -391,6 +556,20 @@ needed for the standard OpenShift design.
 
 Reducing `scaleFactor` resizes workloads and causes temporary service downtime.
 Downscale during a maintenance window.
+
+### Operators
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `operators.nfd.catalogSource` | `redhat-operators` | Connected-mode CatalogSource for the Node Feature Discovery Operator |
+| `operators.gpu.catalogSource` | `certified-operators` | Connected-mode CatalogSource for the NVIDIA GPU Operator |
+| `operators.ray.modelVersion` | `v0.3.14-36-g1549f5a` | Ray Serve application-package version expected in object storage |
+| `operators.ray.rayVersion` | `2.56.0` | Ray runtime version; it must match the Ray head and worker images |
+
+In air-gap mode, the installer mirrors the required Operator catalogs and uses
+the generated internal CatalogSources. KubeRay Operator version 1.2.2 is pinned
+by `openshift_with_stack.sh`; it is not selected by `modelVersion` or
+`rayVersion`.
 
 ### Manifest paths
 

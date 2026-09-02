@@ -38,30 +38,32 @@ openshift:
       # host: "slim.apps.example.com"
 
 images:
-  # Prefix for image names that are not fully qualified. For an air-gapped
-  # cluster, use the internal registry containing the images listed below.
-  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
+  # Optional prefix for image names that are not fully qualified. The release
+  # defaults below use Docker Hub and are therefore not rewritten by this
+  # value. For an air-gapped cluster, replace each fully qualified image with
+  # its path in the customer-provided internal registry.
+  registry: ""
   # Lab use only. true permits plain-HTTP registry pulls; it does not disable
   # certificate verification for an HTTPS registry.
   registryInsecure: false
 
   operator:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.10"
+    image: "docker.io/splunk/splunk-ai-operator:v1.0"
 
   ray:
-    headImage: "ml-platform/ray/ray-head:build-953"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-953"
+    headImage: "docker.io/splunk/ai-tier-ray-head:v1.0"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:v1.0"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
   saia:
-    apiImage: "ml-platform/saia/saia-api:build-v2-main-c3b489d"
-    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
+    apiImage: "docker.io/splunk/ai-tier-saia-api:v1.0"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:v1.0"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:v1.0"
 
   slim:
-    apiImage: "arif/slim-api:v0.0.4"
+    apiImage: "docker.io/splunk/ai-tier-slim-service:v1.0"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
@@ -143,11 +145,22 @@ files:
   aiPlatform: "./artifacts.yaml"
   splunkOperator: "./splunk-operator-cluster.yaml"
 
+# Optional authentication for a private non-ECR registry. Leave disabled for
+# public images. Do not commit real credentials.
+imagePullSecrets:
+  custom:
+    enabled: false
+    name: "custom-registry-secret"
+    server: "registry.example.com"
+    username: "<registry-username>"
+    password: "<registry-password-or-token>"
+    email: "<registry-account-email>"
+
 # Amazon ECR authentication. When enabled, the installer uses AWS credentials
 # from the environment or an instance profile to create image-pull secrets in
 # the required namespaces. Set enabled to false when using another registry,
 # and configure the appropriate imagePullSecrets block instead.
 ecr:
-  enabled: true
-  account: "658391232643"
+  enabled: false
+  account: ""
   region: "us-east-2"
