@@ -1,26 +1,32 @@
-# Splunk AI tier on OpenShift (AI POD)
+# Splunk AI Tier on OpenShift (AI POD)
 
-This guide installs Splunk AI tier (AI POD) on an **existing** OpenShift
-cluster. The installer does not create, upgrade, or remove the OpenShift
-cluster itself.
+This guide explains how to install Splunk AI Tier (AI POD) on an existing
+OpenShift cluster and connect Splunk AI Assistant and Splunk AI Toolkit.
+
+> [!IMPORTANT]
+> The installer deploys AI POD workloads and supporting operators. It does not
+> create, upgrade, or remove the OpenShift cluster itself.
 
 For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
 
 ## Contents
 
-1. [What the installer deploys](#what-the-installer-deploys)
-2. [Requirements](#requirements)
-3. [Prepare the configuration](#prepare-the-configuration)
-4. [Standard deployment (internet-connected)](#standard-deployment-internet-connected)
-5. [Air-gapped deployment](#air-gapped-deployment)
-6. [Verify and access the deployment](#verify-and-access-the-deployment)
-7. [Install and test the Splunk apps](#install-and-test-the-splunk-apps)
-8. [Configuration reference](#configuration-reference)
-9. [OpenShift behavior](#openshift-behavior)
-10. [Security and production considerations](#security-and-production-considerations)
-11. [Model staging](#model-staging)
-12. [Troubleshooting](#troubleshooting)
-13. [Uninstall](#uninstall)
+- **Plan**
+  - [What the installer deploys](#what-the-installer-deploys)
+  - [Requirements](#requirements)
+- **Deploy**
+  - [Prepare the configuration](#prepare-the-configuration)
+  - [Standard deployment (internet-connected)](#standard-deployment-internet-connected)
+  - [Air-gapped deployment](#air-gapped-deployment)
+  - [Verify and access the deployment](#verify-and-access-the-deployment)
+- **Configure and operate**
+  - [Install and test the Splunk apps](#install-and-test-the-splunk-apps)
+  - [Configuration reference](#configuration-reference)
+  - [OpenShift behavior](#openshift-behavior)
+  - [Security and production considerations](#security-and-production-considerations)
+  - [Model staging](#model-staging)
+  - [Troubleshooting](#troubleshooting)
+  - [Uninstall](#uninstall)
 
 ## What the installer deploys
 
@@ -56,8 +62,9 @@ The workload namespace is configurable and defaults to `ai-platform`.
 - Network connectivity from the installer machine to the OpenShift API,
   configured image registry, and object store.
 
-The installer is qualified for OpenShift 4.21. Setting another value in the
-configuration does not add support for another OpenShift release.
+> [!NOTE]
+> This installer is qualified for OpenShift 4.21. Setting another version in
+> the configuration does not add support for that OpenShift release.
 
 ### AI-tier worker capacity
 
@@ -69,32 +76,35 @@ workloads.
 | `1` | 256 GiB | 1 TiB (1024 GiB) | 2 × 96 GB VRAM | 64 allocatable vCPU |
 | `2` | 512 GiB | 2 TiB (2048 GiB) | 4 × 96 GB VRAM | 128 allocatable vCPU |
 
-The disk requirement is usable capacity available immediately before install,
-not the drive's advertised size. A 1 TB drive provides about 931 GiB before
-formatting and does not meet the 1024 GiB scale-1 check. The storage must cover
-`/var/lib/containers` and `/opt/local-path-provisioner` or provide equivalent
-capacity for both.
+> [!IMPORTANT]
+> Disk values are usable capacity available immediately before installation,
+> not advertised drive size. A 1 TB drive provides about 931 GiB before
+> formatting and does not meet the 1024 GiB scale-1 check. Storage must cover
+> `/var/lib/containers` and `/opt/local-path-provisioner`, or provide equivalent
+> capacity for both.
 
 `scaleFactor` does not add hardware. Add the required CPU, memory, GPU, and
 storage capacity before increasing it.
 
 ### Reference hardware for `scaleFactor: 1`
 
-Shared AI-tier worker — one Cisco UCS C845A M8 AI Server:
+**Shared AI-tier worker:** one Cisco UCS C845A M8 AI Server
 
-- Memory: 8 × `CAI-MRX64G2RE5` — 512 GB installed
-- CPU: 2 × `CAI-CPU-A9375F` — 64 physical cores / 128 threads
-- GPU: 2 × `CAI-GPU-RTXP6000` — 192 GB total VRAM
-- Boot: 2 × `CAI-M2-960G` with `CAI-M2-HWRAID`, RAID 1 — 1.92 TB raw /
-  960 GB usable
-- Workload storage: dedicated enterprise NVMe providing at least 1 TiB
-  available for scale 1
+| Resource | Configuration |
+|---|---|
+| Memory | 8 × `CAI-MRX64G2RE5` — 512 GB installed |
+| CPU | 2 × `CAI-CPU-A9375F` — 64 physical cores / 128 threads |
+| GPU | 2 × `CAI-GPU-RTXP6000` — 192 GB total VRAM |
+| Boot storage | 2 × `CAI-M2-960G` with `CAI-M2-HWRAID`, RAID 1 — 1.92 TB raw / 960 GB usable |
+| Workload storage | Dedicated enterprise NVMe providing at least 1 TiB available for scale 1 |
 
-OpenShift control plane — three Cisco UCS C225 M8 SFF servers, each with:
+**OpenShift control plane:** three Cisco UCS C225 M8 SFF servers
 
-- Memory: 8 × `UCS-MRX32G1RE3` — 256 GB installed
-- CPU: 1 × `UCS-CPU-A9224` — 24 physical cores / 48 threads with SMT
-- Boot: 2 × `UCS-M2-480G`, RAID 1 — 960 GB raw / 480 GB usable
+| Resource | Configuration per server |
+|---|---|
+| Memory | 8 × `UCS-MRX32G1RE3` — 256 GB installed |
+| CPU | 1 × `UCS-CPU-A9224` — 24 physical cores / 48 threads with SMT |
+| Boot storage | 2 × `UCS-M2-480G`, RAID 1 — 960 GB raw / 480 GB usable |
 
 The AI worker's boot pair does not satisfy the workload-disk requirement.
 Provide separate workload storage.
@@ -103,8 +113,8 @@ Provide separate workload storage.
 
 | Installation type | Supported installer host |
 |---|---|
-| Connected | macOS or Linux with the required tools |
-| Air-gapped cluster | Linux host; `oc-mirror` is Linux-only |
+| Standard (internet-connected) | macOS or Linux with the required tools |
+| Air-gapped | Linux host; `oc-mirror` is Linux-only |
 
 RHEL 9, RHEL 10, and Ubuntu 24 can be used as installer hosts when all tools
 are available. They are installer machines, not supported OpenShift node
@@ -146,10 +156,10 @@ Before installation, provide:
 - Access from the installer machine to Hugging Face when model staging is
   enabled and any required model is missing.
 
-In connected mode, the cluster must reach the configured Operator catalogs and
-image registries. OpenShift nodes do not need public internet access only when
-all Operator and application content is mirrored to registries reachable by
-the cluster and all models are in the configured object store.
+In a standard deployment, the cluster must reach the configured Operator
+catalogs and image registries. OpenShift nodes do not need public internet
+access only when all Operator and application content is mirrored to registries
+reachable by the cluster and all models are in the configured object store.
 
 ### Network requirements
 
@@ -210,9 +220,10 @@ Edit the copy and set, at minimum:
 - `storage.modelStaging.enabled` for the intended model workflow
 - `ecr.enabled: false` when the image registry is not Amazon ECR
 
-Do not commit credentials. Relative paths under `files` are resolved relative
-to the configuration file, so keep the copied file in
-`tools/ai-tier-cluster-setup` or use absolute manifest paths.
+> [!WARNING]
+> Do not commit registry or object-store credentials. Relative paths under
+> `files` are resolved from the configuration file, so keep the copy in
+> `tools/ai-tier-cluster-setup` or use absolute manifest paths.
 
 Validate cluster access before installation:
 
@@ -222,6 +233,13 @@ oc whoami
 oc whoami --show-server
 oc auth can-i '*' '*' --all-namespaces     # must print yes
 ```
+
+Choose the deployment mode before running the installer:
+
+| Mode | Configuration | Installer host | Cluster content source |
+|---|---|---|---|
+| Standard (internet-connected) | `cluster.airgap: false` | macOS or Linux | Configured Operator catalogs and image registries |
+| Air-gapped | `cluster.airgap: true` | Linux with `oc-mirror` v2 | Internal registry and object store only |
 
 ## Standard deployment (internet-connected)
 
@@ -256,9 +274,11 @@ Run the same command from a Linux installer machine:
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
 ```
 
+### Content mirrored by the installer
+
 The installer uses `oc-mirror` to mirror its OpenShift-specific dependencies
-into `images.registry`, applies the generated mirror policies and catalog
-sources, and continues the installation. It mirrors:
+into `images.registry`, applies the generated mirror policies and CatalogSource
+resources, and continues the installation. It mirrors:
 
 - Node Feature Discovery and NVIDIA GPU Operator catalogs and operand images
 - the OpenShift Driver Toolkit image when it is not already in the cluster's
@@ -266,19 +286,25 @@ sources, and continues the installation. It mirrors:
 - cert-manager, Local Path Provisioner, KubeRay, and OpenTelemetry images
 - installer helper images
 
+### Content provided by the customer
+
 The customer must provide separately:
 
 - every application image configured under `images.*` in the internal registry
 - object-store and registry credentials
 - model weights, unless the installer machine can download missing models
 
-The installer host must be Linux and have `oc-mirror` v2. Plan for approximately
-**100 GiB of temporary free space** for mirror content and working files. This
-is a planning recommendation, not an installer-enforced minimum; actual usage
-depends on the selected catalog content and versions. During preparation the
-host must reach the target OpenShift API, public source registries, the internal
-registry, and the object store. If model staging is enabled, it must also reach
-Hugging Face when a model is missing.
+### Installer host requirements
+
+> [!IMPORTANT]
+> The installer host must be Linux and have `oc-mirror` v2. Plan for
+> approximately **100 GiB of temporary free space** for mirror content and
+> working files. This is a planning recommendation, not an installer-enforced
+> minimum; actual usage depends on the selected catalog content and versions.
+
+During preparation, the host must reach the target OpenShift API, public source
+registries, the internal registry, and the object store. If model staging is
+enabled, it must also reach Hugging Face when a model is missing.
 
 The cluster nodes do not need public internet access. They must reach the
 internal registry and object store.
@@ -289,6 +315,8 @@ registry. Leave it `false` for production.
 
 ## Verify and access the deployment
 
+### Check platform health
+
 Check the custom resources and pods:
 
 ```bash
@@ -296,6 +324,8 @@ oc get aiplatform,aiservice,raycluster,rayservice -n ai-platform
 oc get pods -n ai-platform
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify
 ```
+
+### Use the service endpoints
 
 The default external endpoints are:
 
@@ -324,6 +354,8 @@ oc get route saia slim -n ai-platform
 The installer creates HTTP Routes. Production HTTPS requires Route TLS and a
 certificate trusted by the client; that certificate configuration is outside
 the current installer.
+
+### Open the Ray dashboard
 
 To open the Ray dashboard locally:
 
@@ -460,7 +492,7 @@ cloud-connected stacks.
 
 | Setting | Meaning |
 |---|---|
-| `cluster.airgap` | `false` for connected; `true` for an air-gapped cluster |
+| `cluster.airgap` | `false` for a standard deployment; `true` for an air-gapped deployment |
 | `kubernetes.namespace` | Workload namespace; default `ai-platform` |
 | `openshift.requiredVersion` | Qualified OpenShift minor; must be `4.21` |
 | `openshift.grantPrivilegedSCC` | Grant required SCC access; disable only when equivalent policy exists |
@@ -479,7 +511,7 @@ in this installer.
 `images.registry` is prepended only to image names that are not fully
 qualified. Fully qualified references such as `docker.io/splunk/...` are used
 as written, so replace each one with its mirrored path for an air-gapped
-installation.
+deployment.
 
 | Setting | Release default | Purpose |
 |---|---|---|
@@ -605,8 +637,8 @@ Downscale during a maintenance window.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `operators.nfd.catalogSource` | `redhat-operators` | Connected-mode CatalogSource for the Node Feature Discovery Operator |
-| `operators.gpu.catalogSource` | `certified-operators` | Connected-mode CatalogSource for the NVIDIA GPU Operator |
+| `operators.nfd.catalogSource` | `redhat-operators` | Standard-deployment CatalogSource for the Node Feature Discovery Operator |
+| `operators.gpu.catalogSource` | `certified-operators` | Standard-deployment CatalogSource for the NVIDIA GPU Operator |
 | `operators.ray.modelVersion` | `v0.3.14-36-g1549f5a` | Ray Serve application-package version expected in object storage |
 | `operators.ray.rayVersion` | `2.56.0` | Ray runtime version; it must match the Ray head and worker images |
 
