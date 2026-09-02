@@ -6,7 +6,7 @@ OpenShift workflow only. Do not use the k0s-specific SSH, MetalLB, cluster
 bootstrap, or host-driver procedures from [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md).
 
 For installation requirements and configuration, see
-[`OPENSHIFT_README.md`](./OPENSHIFT_README.md). For AIPlatform conditions,
+[`openshift_readme.md`](./openshift_readme.md). For AIPlatform conditions,
 events, Ray, and Weaviate runtime details that are common across Kubernetes
 platforms, also see the
 [operator troubleshooting guide](../splunk-ai-operator-docs/troubleshooting.md).
@@ -33,6 +33,9 @@ Run diagnostics before patching or deleting resources.
 Run installer commands from `tools/ai-tier-cluster-setup` unless a command says
 otherwise.
 
+The command examples use Bash-compatible syntax. Start `bash` first when the
+installer machine's interactive shell is Fish.
+
 ### 1. Use the same configuration
 
 Set the kubeconfig and configuration used for installation:
@@ -58,12 +61,20 @@ export AI_PLATFORM_NAME="$(yq eval '.aiPlatform.name // "openshift-ai-platform"'
 
 ### 2. Check the installer log
 
-Each invocation creates a timestamped log under `logs/` in the current working
-directory:
+Each invocation creates a timestamped log under the installer's `logs/`
+directory by default:
 
 ```bash
-ls -lt logs/openshift-install-*.log | head -5
-grep -E 'ERROR|WARN|✖' "$(ls -t logs/openshift-install-*.log | head -1)"
+find logs -maxdepth 1 -type f -name 'openshift-install-*.log' -print \
+  | sort -r | head -5
+
+LATEST_LOG="$(find logs -maxdepth 1 -type f \
+  -name 'openshift-install-*.log' -print | sort -r | head -1)"
+if [ -n "$LATEST_LOG" ]; then
+  grep -E 'ERROR|WARN|✖' "$LATEST_LOG" || true
+else
+  echo "No installer logs found"
+fi
 ```
 
 Fix the first concrete failure. Later readiness messages are often
@@ -86,10 +97,10 @@ fails, the installer automatically runs `diagnose` unless
 
 ```bash
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh diagnose
-ls -lh logs/splunk-ai-diagnose-*.tar.gz | tail -1
 ```
 
-The bundle includes installer logs, cluster inventory, events, workload
+The command prints the exact generated bundle path. The bundle includes
+installer logs, cluster inventory, events, workload
 descriptions, pod logs, operator logs, tool versions, and a redacted copy of
 the configuration. Review it before sharing because cluster and application
 logs can still contain operationally sensitive information.
@@ -131,7 +142,7 @@ helm version
 ```
 
 Use the dependency installation instructions in
-[`OPENSHIFT_README.md`](./OPENSHIFT_README.md#installer-machine). Do not use the
+[`openshift_readme.md`](./openshift_readme.md#installer-machine). Do not use the
 Python-based `yq`; the installer requires Mike Farah `yq` v4 syntax.
 
 ### `Config file not found` or YAML syntax errors
@@ -213,7 +224,9 @@ to `/`, on every selected AI-tier node. The minimum is 1024 GiB multiplied by
 Inspect the same path through OpenShift:
 
 ```bash
-oc debug node/<node-name> --quiet -- chroot /host sh -c \
+oc get nodes
+read -r -p "Node name: " NODE_NAME
+oc debug node/"$NODE_NAME" --quiet -- chroot /host sh -c \
   'path=/var/lib/containers; [ -d "$path" ] || path=/; df -h "$path"'
 ```
 
@@ -245,10 +258,10 @@ Check only the non-secret values:
 
 ```bash
 yq eval '{
-  type: .storage.objectStore.type,
-  bucket: .storage.objectStore.bucket,
-  endpoint: .storage.objectStore.endpoint,
-  region: .storage.objectStore.region
+  "type": .storage.objectStore.type,
+  "bucket": .storage.objectStore.bucket,
+  "endpoint": .storage.objectStore.endpoint,
+  "region": .storage.objectStore.region
 }' "$CONFIG_FILE"
 ```
 
@@ -280,7 +293,7 @@ a certificate trusted by the installer and OpenShift nodes.
 A standard deployment downloads cert-manager and Local Path Provisioner
 manifests and the OpenTelemetry and KubeRay charts. Confirm the installer
 machine can reach the sources listed under
-[External content dependencies](./OPENSHIFT_README.md#external-content-dependencies).
+[External content dependencies](./openshift_readme.md#external-content-dependencies).
 
 The OpenShift nodes separately need access to the Operator catalogs and every
 registry referenced by Operator and workload images. Internet access on the
@@ -292,7 +305,9 @@ Identify the exact image and event first:
 
 ```bash
 oc get pods --all-namespaces | grep -E 'ImagePullBackOff|ErrImagePull' || true
-oc describe pod <pod-name> -n <namespace>
+read -r -p "Pod namespace: " POD_NAMESPACE
+read -r -p "Pod name: " POD_NAME
+oc describe pod "$POD_NAME" -n "$POD_NAMESPACE"
 ```
 
 Then confirm:
@@ -305,8 +320,10 @@ Then confirm:
    configured as insecure.
 
 ```bash
-oc get secret -n <namespace>
-oc get serviceaccount <service-account> -n <namespace> -o yaml
+SERVICE_ACCOUNT="$(oc get pod "$POD_NAME" -n "$POD_NAMESPACE" \
+  -o jsonpath='{.spec.serviceAccountName}')"
+oc get secret -n "$POD_NAMESPACE"
+oc get serviceaccount "$SERVICE_ACCOUNT" -n "$POD_NAMESPACE" -o yaml
 oc get image.config.openshift.io/cluster -o yaml
 ```
 
@@ -334,7 +351,7 @@ Check space and existing prepared directories:
 
 ```bash
 df -h .
-du -sh airgap-bundle-openshift/* 2>/dev/null
+du -sh airgap-bundle-openshift 2>/dev/null || true
 ```
 
 Set `OPENSHIFT_AIRGAP_OUTPUT_DIR` to a filesystem with sufficient temporary
@@ -379,7 +396,8 @@ check. Recreate or recopy the bundle and retry.
 
 ```bash
 oc get catalogsource -n openshift-marketplace
-oc describe catalogsource <catalog-source> -n openshift-marketplace
+read -r -p "CatalogSource name: " CATALOG_SOURCE
+oc describe catalogsource "$CATALOG_SOURCE" -n openshift-marketplace
 oc get pods -n openshift-marketplace
 ```
 
@@ -408,7 +426,8 @@ report `Updated=True` before installing dependent operators.
 
 ```bash
 oc get machineconfigpool
-oc describe machineconfigpool <pool-name>
+read -r -p "MachineConfigPool name: " MACHINE_CONFIG_POOL
+oc describe machineconfigpool "$MACHINE_CONFIG_POOL"
 oc get nodes
 ```
 
@@ -452,9 +471,12 @@ oc get pods -n splunk-operator -o wide
 Describe the failing pod and read both current and previous container logs:
 
 ```bash
-oc describe pod <pod-name> -n <namespace>
-oc logs <pod-name> -n <namespace> --all-containers=true --tail=300
-oc logs <pod-name> -n <namespace> --all-containers=true --previous --tail=100
+read -r -p "Pod namespace: " POD_NAMESPACE
+read -r -p "Pod name: " POD_NAME
+oc describe pod "$POD_NAME" -n "$POD_NAMESPACE"
+oc logs "$POD_NAME" -n "$POD_NAMESPACE" --all-containers=true --tail=300
+oc logs "$POD_NAME" -n "$POD_NAMESPACE" --all-containers=true \
+  --previous --tail=100 2>/dev/null || echo "No previous container logs"
 ```
 
 ### Webhook has no endpoints
@@ -462,7 +484,7 @@ oc logs <pod-name> -n <namespace> --all-containers=true --previous --tail=100
 Wait for the owning operator to become ready and confirm its Service endpoints:
 
 ```bash
-oc get deployment,pods,svc,endpoints -n splunk-ai-operator-system
+oc get deployment,pods,svc,endpointslice -n splunk-ai-operator-system
 oc logs -n splunk-ai-operator-system \
   -l control-plane=controller-manager --tail=300
 ```
@@ -519,7 +541,10 @@ If the GPU label exists but allocatable capacity is empty, inspect the NVIDIA
 driver, toolkit, device-plugin, and validator pods scheduled to that node:
 
 ```bash
-oc get pods -n nvidia-gpu-operator -o wide --field-selector spec.nodeName=<node-name>
+oc get nodes -l nvidia.com/gpu.present=true
+read -r -p "GPU node name: " NODE_NAME
+oc get pods -n nvidia-gpu-operator -o wide \
+  --field-selector "spec.nodeName=$NODE_NAME"
 ```
 
 Resolve the first failing GPU Operator operand. Do not manually install a host
@@ -528,7 +553,14 @@ driver alongside the Operator-managed OpenShift Driver Toolkit path.
 ### GPU workload remains `Pending`
 
 ```bash
-oc describe pod <ray-worker-pod> -n "$AI_NAMESPACE"
+RAY_WORKER_POD="$(oc get pods -n "$AI_NAMESPACE" \
+  -l ray.io/node-type=worker --field-selector=status.phase=Pending \
+  -o json | jq -r '.items[0].metadata.name // empty')"
+if [ -n "$RAY_WORKER_POD" ]; then
+  oc describe pod "$RAY_WORKER_POD" -n "$AI_NAMESPACE"
+else
+  echo "No Pending Ray worker pod found"
+fi
 oc get nodes -L splunk.ai/ai-tier-node,nvidia.com/gpu.present
 ```
 
@@ -542,7 +574,14 @@ CPU and GPU workloads otherwise share the selected AI-tier node pool.
 
 ```bash
 oc get pvc,pv -n "$AI_NAMESPACE" -o wide
-oc describe pvc <pvc-name> -n "$AI_NAMESPACE"
+PENDING_PVC="$(oc get pvc -n "$AI_NAMESPACE" \
+  -o json | jq -r \
+  '.items[] | select(.status.phase == "Pending") | .metadata.name' | head -1)"
+if [ -n "$PENDING_PVC" ]; then
+  oc describe pvc "$PENDING_PVC" -n "$AI_NAMESPACE"
+else
+  echo "No Pending PersistentVolumeClaim found"
+fi
 oc get storageclass
 ```
 
@@ -569,8 +608,10 @@ Do not disable SELinux.
 ### Node reports disk pressure
 
 ```bash
-oc describe node <node-name>
-oc debug node/<node-name> --quiet -- chroot /host df -h
+oc get nodes
+read -r -p "Node name: " NODE_NAME
+oc describe node "$NODE_NAME"
+oc debug node/"$NODE_NAME" --quiet -- chroot /host df -h
 ```
 
 Container storage, local persistent volumes, logs, and temporary model staging
@@ -588,27 +629,23 @@ locations because successful access from a laptop does not prove cluster
 egress:
 
 ```bash
-curl -v --connect-timeout 10 "$(yq eval '.storage.objectStore.endpoint' "$CONFIG_FILE")"
-oc run object-store-check -n "$AI_NAMESPACE" --rm -i --restart=Never \
-  --image=curlimages/curl -- \
-  curl -v --connect-timeout 10 "$(yq eval '.storage.objectStore.endpoint' "$CONFIG_FILE")"
+export OBJECT_STORE_ENDPOINT="$(yq eval '.storage.objectStore.endpoint' "$CONFIG_FILE")"
+curl -sS --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w 'HTTP %{http_code}\n' "$OBJECT_STORE_ENDPOINT"
+
+NGINX_POD="$(oc get pod -n "$AI_NAMESPACE" \
+  -l "component=${AI_PLATFORM_NAME}-saia-nginx" \
+  -o jsonpath='{.items[0].metadata.name}')"
+oc exec "$NGINX_POD" -n "$AI_NAMESPACE" -- \
+  curl -sS --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w 'HTTP %{http_code}\n' "$OBJECT_STORE_ENDPOINT"
 ```
 
-The temporary image must already be available to the cluster; in an air-gapped
-environment, use an approved internal diagnostic image instead. An HTTP 403
-can still prove network reachability, but it does not prove that the configured
-credentials or bucket permissions are correct.
-
-For AWS S3, use the configured region and credentials:
-
-```bash
-aws s3api head-bucket \
-  --bucket "$(yq eval '.storage.objectStore.bucket' "$CONFIG_FILE")" \
-  --region "$(yq eval '.storage.objectStore.region' "$CONFIG_FILE")"
-```
-
-Configure AWS credentials through the customer's approved secret mechanism;
-do not place them directly in shared shell history.
+The cluster-side command uses `curl` already present in the deployed SAIA
+nginx container, so it does not pull a public diagnostic image. An HTTP 403 can
+still prove network reachability, but it does not prove that the configured
+credentials or bucket permissions are correct. For AWS S3, validate access
+with the customer's approved AWS credential and network-diagnostic workflow.
 
 ### Required models are reported missing
 
@@ -680,7 +717,14 @@ ready.
 ### Pod remains `Pending`
 
 ```bash
-oc describe pod <pod-name> -n "$AI_NAMESPACE"
+PENDING_POD="$(oc get pods -n "$AI_NAMESPACE" \
+  --field-selector=status.phase=Pending \
+  -o json | jq -r '.items[0].metadata.name // empty')"
+if [ -n "$PENDING_POD" ]; then
+  oc describe pod "$PENDING_POD" -n "$AI_NAMESPACE"
+else
+  echo "No Pending pod found"
+fi
 oc get pvc,pv -n "$AI_NAMESPACE" -o wide
 oc get nodes -L splunk.ai/ai-tier-node,nvidia.com/gpu.present
 ```
@@ -692,9 +736,12 @@ placement rather than editing the generated pod.
 ### Pod is in `CrashLoopBackOff`
 
 ```bash
-oc logs <pod-name> -n "$AI_NAMESPACE" --all-containers=true --tail=300
-oc logs <pod-name> -n "$AI_NAMESPACE" --all-containers=true --previous --tail=300
-oc describe pod <pod-name> -n "$AI_NAMESPACE"
+oc get pods -n "$AI_NAMESPACE"
+read -r -p "CrashLoopBackOff pod name: " POD_NAME
+oc logs "$POD_NAME" -n "$AI_NAMESPACE" --all-containers=true --tail=300
+oc logs "$POD_NAME" -n "$AI_NAMESPACE" --all-containers=true \
+  --previous --tail=300 2>/dev/null || echo "No previous container logs"
+oc describe pod "$POD_NAME" -n "$AI_NAMESPACE"
 ```
 
 The previous log is usually the most useful after a restart. Check the event
@@ -743,8 +790,10 @@ resource requests directly on generated Ray resources.
 
 ```bash
 oc get pods,pvc -n "$AI_NAMESPACE" | grep -i weaviate
-oc describe pod <weaviate-pod> -n "$AI_NAMESPACE"
-oc logs <weaviate-pod> -n "$AI_NAMESPACE" --all-containers=true --tail=300
+read -r -p "Weaviate pod name: " WEAVIATE_POD
+oc describe pod "$WEAVIATE_POD" -n "$AI_NAMESPACE"
+oc logs "$WEAVIATE_POD" -n "$AI_NAMESPACE" \
+  --all-containers=true --tail=300
 ```
 
 Check persistent-volume binding, permissions, node affinity, and available
@@ -759,8 +808,9 @@ the operator can recreate it:
 
 ```bash
 oc get jobs -n "$AI_NAMESPACE"
-oc logs job/<job-name> -n "$AI_NAMESPACE" --all-containers=true
-oc delete job <job-name> -n "$AI_NAMESPACE"
+read -r -p "Vector database setup Job name: " JOB_NAME
+oc logs job/"$JOB_NAME" -n "$AI_NAMESPACE" --all-containers=true
+oc delete job "$JOB_NAME" -n "$AI_NAMESPACE"
 ```
 
 Do not delete unrelated Jobs.
@@ -774,7 +824,7 @@ temporary 503 during reconciliation is expected.
 
 ```bash
 oc get route saia slim -n "$AI_NAMESPACE"
-oc get svc,endpoints -n "$AI_NAMESPACE" | grep -E 'saia|slim'
+oc get svc,endpointslice -n "$AI_NAMESPACE" | grep -E 'saia|slim'
 oc get pods -n "$AI_NAMESPACE" -o wide
 ```
 
@@ -856,7 +906,7 @@ http://<slim-host>/tenant/slim-api/v1alpha1
 ```
 
 For the bundled Splunk deployment, use the internal ClusterIP service shown in
-[`OPENSHIFT_README.md`](./OPENSHIFT_README.md#install-and-configure-splunk-ai-toolkit).
+[`openshift_readme.md`](./openshift_readme.md#install-and-configure-splunk-ai-toolkit).
 For an external Splunk deployment, use the SLIM Route and confirm that the
 Splunk host—not only the user's browser—can resolve and reach it.
 
@@ -943,7 +993,7 @@ oc get subscription,installplan,csv -A
 ```bash
 oc get aiplatform,aiservice,raycluster,rayservice -n "$AI_NAMESPACE" -o wide
 oc get pods,deployments,statefulsets,daemonsets,jobs -n "$AI_NAMESPACE" -o wide
-oc get pvc,svc,endpoints,route -n "$AI_NAMESPACE"
+oc get pvc,svc,endpointslice,route -n "$AI_NAMESPACE"
 oc get events -n "$AI_NAMESPACE" --sort-by='.lastTimestamp' | tail -100
 ```
 
@@ -957,9 +1007,12 @@ oc logs -n splunk-ai-operator-system \
 ### One failing pod
 
 ```bash
-oc describe pod <pod-name> -n <namespace>
-oc logs <pod-name> -n <namespace> --all-containers=true --tail=300
-oc logs <pod-name> -n <namespace> --all-containers=true --previous --tail=100
+read -r -p "Pod namespace: " POD_NAMESPACE
+read -r -p "Pod name: " POD_NAME
+oc describe pod "$POD_NAME" -n "$POD_NAMESPACE"
+oc logs "$POD_NAME" -n "$POD_NAMESPACE" --all-containers=true --tail=300
+oc logs "$POD_NAME" -n "$POD_NAMESPACE" --all-containers=true \
+  --previous --tail=100 2>/dev/null || echo "No previous container logs"
 ```
 
 ### Installer support bundle
@@ -968,5 +1021,5 @@ oc logs <pod-name> -n <namespace> --all-containers=true --previous --tail=100
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh diagnose
 ```
 
-Attach the resulting `logs/splunk-ai-diagnose-*.tar.gz` only after reviewing it
+Attach the bundle at the path printed by `diagnose` only after reviewing it
 for operationally sensitive content.
