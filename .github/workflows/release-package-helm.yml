@@ -438,7 +438,7 @@ jobs:
 
             ### Documentation
 
-            - [Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/ai-tier-docs/DEPLOYMENT_GUIDE.md)
+            - [Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/ai-tier-docs/deployment-guide.md)
             - [Installation Guide](https://github.com/${{ github.repository }}/blob/main/docs/splunk-ai-operator-docs/splunk-ai-operator-installation.md)
             - [API Reference](https://github.com/${{ github.repository }}/blob/main/docs/splunk-ai-operator-docs/api-reference.md)
         env:
