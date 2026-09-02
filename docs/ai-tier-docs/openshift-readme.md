@@ -9,7 +9,7 @@ already have a running, healthy OpenShift cluster and installs only the AI
 Platform stack on top of it.
 
 > If you are deploying on a self-managed k0s cluster instead, use
-> [`K0S_README.md`](./K0S_README.md). This document covers **OpenShift only**.
+> [`k0s-readme.md`](./k0s-readme.md). This document covers **OpenShift only**.
 
 ---
 

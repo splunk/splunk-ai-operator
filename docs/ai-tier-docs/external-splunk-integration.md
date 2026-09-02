@@ -100,7 +100,7 @@ useful for browser testing when the browser cannot directly reach a private
 SAIA address, but it does not solve persistent workload-to-workload
 connectivity. For production, publish the required services through a routed
 private path or a secured ingress/load balancer. For the tested browser setup,
-follow [K0S_README.md — Remote workstation via SSH bastion (SOCKS tunnel)](K0S_README.md#finding-the-splunk-web-url).
+follow [k0s-readme.md — Remote workstation via SSH bastion (SOCKS tunnel)](k0s-readme.md#finding-the-splunk-web-url).
 
 Opening a security-group rule permits traffic only when a route already exists.
 It cannot create routing between unrelated VPCs. If the networks are separate,

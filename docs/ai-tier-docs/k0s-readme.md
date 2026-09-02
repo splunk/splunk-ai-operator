@@ -102,7 +102,7 @@ AIPlatform CR → AIService → Job/RayCluster → Pods
 
 Installer-machine, cluster-node, and air-gapped operating-system requirements
 are defined in the canonical
-[Supported platforms matrix](DEPLOYMENT_GUIDE.md#supported-platforms).
+[Supported platforms matrix](deployment-guide.md#supported-platforms).
 
 ### Required Tools (on Installer Machine)
 
@@ -116,7 +116,7 @@ sudo dnf install -y git jq tmux
 
 # kubectl — official binary download (https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
 # pinned to match the k0s version this repo installs by default (v1.36.1+k0s.0,
-# see DEPLOYMENT_GUIDE.md's Hardware Requirements) — keep in sync with that version
+# see deployment-guide.md's Hardware Requirements) — keep in sync with that version
 curl -fsSLO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl"
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 rm -f kubectl
@@ -163,15 +163,15 @@ there too as an equivalent alternative if you already run Docker.
 | GPU Worker — L40S | 48 vCPUs | 384 GiB | 500 GB | 4 × NVIDIA L40S per node (48 GB GDDR6 each) · **2 nodes required = 8 × L40S total (384 GB total GPU memory)** · equivalent to `g6e.12xlarge` |
 | GPU Worker — H100 | 16 vCPUs | 256 GiB | 500 GB | 1 × NVIDIA H100 per node (80 GB HBM3 each) · **2 nodes required = 2 × H100 total (160 GB total GPU memory)** · equivalent to `p5.4xlarge` |
 
-Choose one GPU-worker row for the entire cluster; do not mix L40S and H100
-workers.
+Choose one GPU-worker row for the entire cluster; do not use a combination of
+L40S and H100 GPUs in a single setup.
 
 **Ports between nodes:** 22 (SSH), 6443 (API), 2380 (etcd), 10250 (kubelet), 8132 (konnectivity), 4789/UDP (VXLAN), 179 (Calico BGP). Best practice: allow all ports between nodes.
 
 ### Software Requirements (on All Nodes)
 
 Use one supported OS family and version across all nodes in a cluster. See the
-[Supported platforms matrix](DEPLOYMENT_GUIDE.md#supported-platforms)
+[Supported platforms matrix](deployment-guide.md#supported-platforms)
 for the exact supported versions.
 - Passwordless SSH access from installer machine
 - Sudo privileges without password
@@ -278,7 +278,7 @@ ecr:               # account, region
 cluster:
   name: prod-ai-platform
   useExisting: auto               # auto | force | never
-  sshUser: ubuntu
+  sshUser: ubuntu                # Update this to match the SSH user configured on your nodes.
   sshKeyPath: ~/.ssh/prod-key.pem
   # Set when workers cannot reach the controller's auto-detected private IP.
   apiExternalAddress: api.prod.example.com
@@ -419,7 +419,7 @@ ecr:
 |-------|----------|---------|-------------|
 | `cluster.name` | Yes | — | Cluster identifier (used for kubeconfig, labels) |
 | `cluster.useExisting` | No | `never` | `auto` = detect existing cluster, `force` = fail if not found, `never` = always create new |
-| `cluster.sshUser` | Yes | `ubuntu` | SSH username for all nodes |
+| `cluster.sshUser` | Yes | `ubuntu` | SSH username for all nodes; configure it to match the user available on your nodes |
 | `cluster.sshKeyPath` | Yes | — | Path to SSH private key |
 | `cluster.apiExternalAddress` | No | Auto-detected private bind address | API IP or hostname reachable by every worker; set for public-only or routed worker topologies |
 
@@ -503,7 +503,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `images.registry` | No | `""` | Registry hostname (and optional port) used to prefix short image paths, e.g. `registry.internal:5000` or `123456789.dkr.ecr.us-east-2.amazonaws.com` |
-| `images.registryInsecure` | No | `false` | Set to `true` only for plain-HTTP (no-TLS) registries such as a local mirror. Leave `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
+| `images.registryInsecure` | No | `true` | Enables HTTP pulls from `images.registry`. Set it to `false` for ECR, Docker Hub, Harbor, or any HTTPS registry. When `true`, the installer configures containerd on every node to allow HTTP pulls from `images.registry` — see [Insecure Registry Support](#insecure-registry-support-containerd-v2). |
 | `images.operator.image` | **Yes** | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator image |
 | `images.splunk.image` | **Yes** | — | Splunk Enterprise image |
 | `images.splunk.operatorImage` | No | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator image |
@@ -522,10 +522,10 @@ and replace the corresponding fields with the mirrored paths; setting only
 
 | Registry type | `images.registry` | `images.registryInsecure` | Notes |
 |---|---|---|---|
-| AWS ECR | `<account>.dkr.ecr.<region>.amazonaws.com` | `false` (default) | HTTPS; use `imagePullSecrets.autoCreateECR: true` for token refresh |
-| Harbor / internal HTTPS | `registry.internal:443` | `false` (default) | HTTPS with valid TLS cert — no extra config needed |
+| AWS ECR | `<account>.dkr.ecr.<region>.amazonaws.com` | `false` | HTTPS; use `imagePullSecrets.autoCreateECR: true` for token refresh |
+| Harbor / internal HTTPS | `registry.internal:443` | `false` | HTTPS with valid TLS cert — no extra config needed |
 | Plain-HTTP internal mirror | `10.0.0.5:5000` or `registry.internal:5000` | **`true`** | Installer writes containerd config for HTTP pulls on every node; see [Insecure Registry Support](#insecure-registry-support-containerd-v2) |
-| Docker Hub | `docker.io` | `false` (default) | Public HTTPS — no `images.registry` needed unless mirroring |
+| Docker Hub | `docker.io` | `false` | Public HTTPS — no `images.registry` needed unless mirroring |
 
 > **Do not set `registryInsecure: true` for HTTPS registries.** It has no effect on TLS registries and may cause unexpected behaviour.
 
@@ -677,7 +677,7 @@ cluster:
   name: my-cluster
   airgap: true   # disconnected environment — skips HuggingFace + NVIDIA repo checks
   sshKeyPath: ~/.ssh/id_rsa
-  sshUser: ec2-user
+  sshUser: ec2-user # Update this to match the SSH user configured on your nodes.
 ```
 
 **What `airgap: true` does:**
@@ -733,7 +733,7 @@ LOG_DIR=/var/log/k0s CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh in
 
 The `install` command executes these steps in order:
 
-0. **Air-gap check** *(air-gap only)* — if `cluster.airgap: true` (or `AIRGAP_MODE=true`), the run first hands off to `airgap_install.sh` to stage ~2.2 GB of offline artifacts, which then calls this script back to continue from step 1. With `airgap: false` this step is a no-op. See [Air-Gapped Deployment](#air-gapped-deployment).
+0. **Air-gap check** *(air-gap only)* — if `cluster.airgap: true` (or `AIRGAP_MODE=true`), the run first hands off to `airgap_install.sh` to stage ~3 GB of offline artifacts, which then calls this script back to continue from step 1. With `airgap: false` this step is a no-op. See [Air-Gapped Deployment](#air-gapped-deployment).
 1. **Load config** — Parse YAML, validate existingIPs
 2. **Validate images** — Ensure all required image fields are set
 3. **Configure images** — Patch `RELATED_IMAGE_*` env vars in manifest files
@@ -744,8 +744,8 @@ The `install` command executes these steps in order:
 
    | Model artifact ID | Purpose |
    |---|---|
-   | `gemma-4-31b-it` | Unquantized Gemma model for L40S |
-   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100 |
+   | `gemma-4-31b-it` | Unquantized Gemma model for L40S; selected automatically for L40S |
+   | `gemma-4-31b-it-qat-w4a16-ct` | Quantized Gemma model for H100; selected automatically for H100 |
    | `gpt-oss-20b` | Secondary LLM |
    | `all-minilm-l6-v2` | Sentence transformer / semantic search |
    | `cross-encoder` | MS MARCO cross-encoder |
@@ -755,6 +755,9 @@ The `install` command executes these steps in order:
    | `pii-classifier` | PII detection |
    | `uae-large` | Embedding model |
    | `xlm-roberta-language-classifier` | Language classifier |
+
+   Gemma selection follows `aiPlatform.defaultAcceleratorType`; do not stage the
+   L40S and H100 Gemma variants as interchangeable artifacts.
 
    **System requirements for the staging machine** (the machine running the installer or staging scripts):
 
@@ -1308,7 +1311,7 @@ The mode is selected by the config, not by which script you run:
 ```yaml
 cluster:
   airgap: false   # standard install — proceeds directly (unchanged behavior)
-  airgap: true    # stages ~2.2 GB of artifacts first (~15 min), then installs
+  airgap: true    # stages ~3 GB of artifacts first (~15 min), then installs
 ```
 
 `AIRGAP_MODE=true` in the environment is an equally valid trigger, for a one-off air-gap run without editing the config:
@@ -1394,7 +1397,7 @@ cd tools/ai-tier-cluster-setup
 | Node packages | `packages/node-closure/` — `kernel-modules-extra` for every node kernel that lacks `xt_conntrack` (RHEL 10.2 keeps kube-proxy's netfilter modules there). Only present when a node needs it; with `--download-only` and no `--config`, pass `--node-hosts` (or `--node-kernels`) so the nodes get probed. |
 | Metadata | `bundle-versions.txt`, `container-images.txt`, `airgap-env.sh`, `checksums.sha256` |
 
-Output: `./airgap-bundle/airgap-bundle-<timestamp>/` (~2–4 GB — the image bundles are the bulk; binaries/charts/manifests alone are ~500 MB). The artifacts are consumed in place; there is no tarball. After a successful install the staged tree is deleted to reclaim disk unless you pass `--keep-staging`.
+Output: `./airgap-bundle/airgap-bundle-<timestamp>/` (~3 GB; the image bundles are the bulk and the exact size varies with the resolved image set). The artifacts are consumed in place; there is no tarball. After a successful install the staged tree is deleted to reclaim disk unless you pass `--keep-staging`.
 
 > `kube-prometheus-stack` and `opentelemetry-operator` are not pinned in the installer — the staging step resolves and records those versions at download time so the air-gapped install uses exactly the charts that were tested.
 
@@ -1524,6 +1527,9 @@ The first install can take **3–7 hours**, mainly for model staging. Run the
 command inside a persistent `tmux` or `screen` session on the installer machine
 so an SSH disconnect does not interrupt it:
 
+`tmux` keeps the installer running in a persistent session if your SSH
+connection disconnects. **Install `tmux` if needed:**
+
 ```bash
 tmux new -s splunk-ai-install
 # The tmux name is only a session label. Run the full platform install command
@@ -1545,7 +1551,7 @@ cluster:
   name: my-cluster
   airgap: true        # stage artifacts first; skip internet connectivity checks
   sshKeyPath: ~/.ssh/id_rsa
-  sshUser: ec2-user
+  sshUser: ec2-user # Update this to match the SSH user configured on your nodes.
 ```
 
 > Beyond selecting the mode, `airgap: true` also stops the installer attempting connectivity checks to HuggingFace and NVIDIA package repos — those checks pause for up to 5 minutes on unreachable hosts. `AIRGAP_MODE=true` in the environment does the same thing for one run without editing the config.
@@ -1571,7 +1577,7 @@ CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 6. Exports all env-var overrides (13 URL + path variables)
 7. Calls `k0s_cluster_with_stack.sh install` back with `AIRGAP_STAGED=true` — that pass skips the staging branch and pushes the artifacts to every node over SSH
 
-Budget roughly 15 extra minutes up front for the ~2.2 GB of artifacts. The install plan displayed before any changes are made will show `Air-gap mode: true` — confirm this before proceeding.
+Budget roughly 15 extra minutes up front for ~3 GB of artifacts. The install plan displayed before any changes are made will show `Air-gap mode: true` — confirm this before proceeding.
 
 **Adding workers later:** `join-workers` delegates the same way — no extra flag, and the artifacts are re-staged so the new node gets them.
 
@@ -2539,7 +2545,7 @@ KUBECONFIG=/path/to/kubeconfig \
 2. Click **+ Connection** → under **Endpoint**, choose **Splunk AI tier**
 3. Read the **Overview** and **Getting started** screens (they restate the
    cluster-health and endpoint-discovery checks above, and link to the
-   [deployment guide](DEPLOYMENT_GUIDE.md#3-onboard-to-the-ai-tier)), then click
+   [deployment guide](deployment-guide.md#3-onboard-to-the-ai-tier)), then click
    **Next**
 4. On **Enter AI tier endpoint**, enter the URL from Step 1 in **AI tier
    endpoint URL** and click **Complete setup**
@@ -2691,7 +2697,7 @@ Saving performs no connectivity probe. Run the Step 2 `/health` check from
 inside the Splunk pod — a Splunk instance outside the cluster needs a routed
 path to the published NodePort or load-balancer address, which a laptop VPN or
 SOCKS tunnel does not provide. For external Splunk, see
-[EXTERNAL_SPLUNK_INTEGRATION.md](EXTERNAL_SPLUNK_INTEGRATION.md).
+[external-splunk-integration.md](external-splunk-integration.md).
 
 ---
 
@@ -2708,7 +2714,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
 Use the guide that matches the failing layer:
 
 - Installer, SSH, k0s bootstrap, GPU, model staging, storage, or air-gap
-  failures: [k0s Installer Troubleshooting](TROUBLESHOOTING.md)
+  failures: [k0s Installer Troubleshooting](troubleshooting.md)
 - AIPlatform status, Kubernetes events, Ray, Weaviate, or runtime failures:
   [Troubleshooting with Events and Status](../splunk-ai-operator-docs/troubleshooting.md)
 - Splunk AI Assistant installation or SAIA connectivity:

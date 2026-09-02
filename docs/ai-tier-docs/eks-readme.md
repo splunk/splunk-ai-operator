@@ -3287,7 +3287,7 @@ kubectl logs -n splunk-ai-operator-system deployment/splunk-ai-operator-controll
 
 If moving from EKS back to k0s (e.g., for on-premises):
 
-See the K0S_README.md migration guide section.
+See the k0s-readme.md migration guide section.
 
 ---
 
@@ -3371,6 +3371,6 @@ See the main repository LICENSE file.
 ---
 
 **Quick Links:**
-- [k0s Deployment Guide](./K0S_README.md)
+- [k0s Deployment Guide](./k0s-readme.md)
 - [Main README](../../README.md)
 - [Splunk AI Operator GitHub](https://github.com/splunk/splunk-ai-operator)
