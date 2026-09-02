@@ -30,6 +30,7 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
   - [Security and production considerations](#security-and-production-considerations)
   - [Model staging](#model-staging)
   - [Troubleshooting](#troubleshooting)
+    - [OpenShift troubleshooting guide](./OPENSHIFT_TROUBLESHOOTING.md)
   - [Uninstall](#uninstall)
 
 ## What the installer deploys
@@ -972,6 +973,11 @@ The uploader selected by object-store type is `upload_to_s3.sh` for AWS,
 artifact that is already current.
 
 ## Troubleshooting
+
+Use [`OPENSHIFT_TROUBLESHOOTING.md`](./OPENSHIFT_TROUBLESHOOTING.md) for the
+complete OpenShift installer, Operator Lifecycle Manager, GPU, storage,
+air-gap, workload, Route, and Splunk app troubleshooting workflow. The quick
+checks below cover the most common symptoms.
 
 ### Collect a support bundle
 
