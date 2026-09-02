@@ -1335,7 +1335,7 @@ The air-gap boundary is between the installer machine and the nodes, not between
 
 The main installer has no hardcoded download URLs — every internet address is overridable via environment variables. The staging step sets all of them automatically from the staged artifacts.
 
-**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--node-hosts`, `--node-kernels`, `--driver-version`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
+**When to reach for `airgap_install.sh` directly:** to pre-stage with `--download-only` (which has no equivalent on the unified command), or to drive staging with non-default flags — `--k0s-version`, `--output-dir`, `--keep-staging`, `--gpu-hosts`, `--gpu-kernels`, `--gpu-os`, `--node-hosts`, `--node-kernels`, `--driver-version`, `--skip-nvidia-closure`, `--installer`, `--subcommand`. Nothing was removed; the unified command simply calls it with defaults.
 
 ### Prerequisites
 
@@ -1362,7 +1362,7 @@ The main installer has no hardcoded download URLs — every internet address is 
 
 **Cluster nodes:** Same prerequisites as a normal k0s install (passwordless sudo, SSH access, 500 GB free on GPU workers). Nodes need no internet access.
 
-> **NVIDIA drivers:** The installer detects and skips driver installation if `nvidia-smi` is already present. Otherwise, air-gap staging builds the required offline RPM or `.deb` closure and installs the driver and container toolkit on each GPU node automatically.
+> **NVIDIA drivers:** The installer detects and skips driver installation if `nvidia-smi` is already present. Otherwise, air-gap staging builds the required offline RPM or `.deb` closure and installs the driver and container toolkit on each GPU node automatically. Pre-install them only when using the optional `--skip-nvidia-closure` path — see [Strategy 2 — Pre-install drivers yourself](#gpu-nodes-in-air-gapped-environments).
 
 ---
 
@@ -1611,7 +1611,7 @@ CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 
 GPU nodes require OS packages (EPEL, DKMS, CUDA, nvidia-container-toolkit) that normally download from the internet. The air-gap staging step builds a self-contained RPM **closure** containing all of them, and the installer pushes it to each GPU node and installs from it offline — so this is handled for you.
 
-**Automatic staged driver closure (recommended)**
+**Strategy 1 — Staged driver closure (recommended, fully automatic)**
 
 Nothing extra is required — the plain install command already does it:
 
@@ -1644,6 +1644,104 @@ The installer scp's the closure to each GPU node, installs with `dnf --disablere
 
 > **Pin kernels on GPU nodes.** Add `exclude=kernel*` to `/etc/dnf/dnf.conf` on each GPU node. If a node boots a kernel the closure has no headers for, DKMS cannot rebuild and `nvidia-smi` breaks with no offline path to recover.
 
+**Strategy 2 — Pre-install drivers yourself**
+
+If you would rather manage drivers out of band, install the NVIDIA driver and `nvidia-container-toolkit` on each GPU node before running the installer, and pass `--skip-nvidia-closure`. The installer detects `nvidia-smi` (skips driver install) and `nvidia-ctk` (skips toolkit install), then configures the containerd runtime offline.
+
+To build the closure by hand for this optional RHEL 9.8 path, the manual recipe
+follows. For RHEL 10.2 or Ubuntu 24.04 GPU nodes, use the automatic closure
+staging described in Strategy 1 instead of this RHEL 9.8 recipe.
+
+The driver flavor used on RHEL 9.8 is the DKMS module `nvidia-driver:latest-dkms` (`kmod-nvidia-latest-dkms`). The older `cuda-drivers` meta-package has been **removed** from NVIDIA's current rhel9 repo and no longer resolves — do not use it.
+
+The unified air-gap installer checks whether that RPM is visible and, on RHEL 9.8
+only, resets any conflicting/default NVIDIA stream and enables
+`nvidia-driver:latest-dkms` before resolving the closure. RHEL 10.2 uses ordinary
+RPMs without this module-stream step, and Ubuntu follows its independent APT
+path.
+
+> **Driver vs. GPU model:** the driver RPMs are **not** GPU-model-specific — the same `kmod-nvidia-latest-dkms` covers T4, A10G, **L40S**, A100, H100. Only `kernel-devel` / `kernel-headers` are node-specific (pinned to the node's `uname -r`).
+
+**Step 1 — build the RHEL 9.8 closure on a connected RHEL 9.8 host.** Add the EPEL, CUDA, and container-toolkit repos to the build host first, then enable the DKMS driver module. Pin every node-specific value to the *GPU node's* running kernel and OS minor, not the build host's:
+
+```bash
+DEST=~/nvidia-offline
+NODE_KREL="5.14.0-687.10.1.el9_8"   # GPU node's `uname -r`
+NODE_MINOR="9.8"                     # GPU node's RHEL minor (cat /etc/os-release)
+
+# Repos on the BUILD host (one-time): EPEL + NVIDIA CUDA + container-toolkit
+sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+sudo dnf config-manager --add-repo \
+  https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+  | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+sudo dnf module reset -y nvidia-driver
+sudo dnf module enable -y nvidia-driver:latest-dkms
+
+mkdir -p "$DEST"
+sudo dnf download --resolve --alldeps --releasever="$NODE_MINOR" \
+  --setopt=install_weak_deps=False --destdir="$DEST" \
+  -x 'kernel-core*' -x 'kernel-modules-core*' -x 'kernel-5.14*' \
+  kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
+  nvidia-kmod-common nvidia-modprobe nvidia-persistenced \
+  dkms gcc make elfutils-libelf-devel \
+  "kernel-devel-${NODE_KREL}" "kernel-headers-${NODE_KREL}"
+
+# Container Toolkit into the same dir
+sudo dnf download --resolve --alldeps --releasever="$NODE_MINOR" \
+  --setopt=install_weak_deps=False --destdir="$DEST" \
+  nvidia-container-toolkit
+```
+
+**Step 2 — fix three traps before publishing the repo** (redo each on every rebuild):
+
+1. **glibc skew.** `--alldeps` always pulls the *latest* `glibc` (e.g. `-270`), but the node runs an older minor (e.g. `-266`) and you **cannot** upgrade a core lib offline. Delete the too-new glibc RPMs and re-pull only the two `gcc` actually needs, at the node's installed version:
+   ```bash
+   rm -f "$DEST"/glibc-2.34-270*.rpm
+   sudo dnf download --releasever="$NODE_MINOR" --destdir="$DEST" \
+     glibc-devel-2.34-266 glibc-headers-2.34-266   # match the node's glibc
+   ```
+2. **dkms kernel-devel-matched.** `dkms` has a rich dependency `(kernel-devel-matched if kernel-core)`; the node has `kernel-core`, so the closure must contain `kernel-devel-matched-<KREL>`:
+   ```bash
+   sudo dnf download --releasever="$NODE_MINOR" --destdir="$DEST" \
+     "kernel-devel-matched-${NODE_KREL}"
+   ```
+3. **repo metadata.** Build the repo index, then transfer to the node:
+   ```bash
+   createrepo_c "$DEST"
+   GPU_NODE="10.0.0.3"
+   scp -r "$DEST" "${GPU_NODE}:/tmp/nvidia-offline"
+   ```
+
+**Step 3 — install on the GPU node from the local repo.** Use **named packages against a local `--repofrompath`** (not `dnf install *.rpm`, which force-installs every file and conflicts). The `dnf clean all` + `--refresh` is mandatory — dnf caches repodata by repo name+path and will otherwise replay stale-metadata errors:
+
+```bash
+ssh "${GPU_NODE}" bash <<'EOF'
+  PKGDIR=/tmp/nvidia-offline
+  sudo dnf clean all
+  sudo dnf install -y --refresh --disablerepo='*' \
+    --repofrompath="airgap-nvidia,${PKGDIR}" \
+    --setopt=airgap-nvidia.gpgcheck=0 --setopt=install_weak_deps=False \
+    kmod-nvidia-latest-dkms nvidia-driver-cuda nvidia-driver-cuda-libs \
+    nvidia-kmod-common nvidia-modprobe nvidia-persistenced \
+    dkms gcc make elfutils-libelf-devel "kernel-devel-$(uname -r)"
+
+  sudo dnf install -y --refresh --disablerepo='*' \
+    --repofrompath="airgap-nvidia,${PKGDIR}" \
+    --setopt=airgap-nvidia.gpgcheck=0 nvidia-container-toolkit
+
+  # DKMS builds the kmod in %post — verify the whole stack before continuing:
+  dkms status | grep -i nvidia      # → ...: installed
+  nvidia-smi                        # → lists the GPU
+  nvidia-ctk --version              # → NVIDIA Container Toolkit CLI version ...
+  ls -l /lib64/libnvidia-ml.so.1    # → present
+EOF
+```
+
+> **Do not reboot into a different kernel** after this. The kmod is DKMS-built against the running kernel only; pin/exclude kernel updates on air-gapped GPU nodes (`exclude=kernel*` in `/etc/dnf/dnf.conf`) so a reboot can't land on a kernel with no matching module.
+
+After this succeeds on every GPU node, drive staging directly so you can pass the skip flag: `./airgap_install.sh --skip-nvidia-closure --config my-cluster-config.yaml`. The installer skips driver + toolkit install, then configures the containerd runtime, generates the CDI spec, and applies the device-plugin DaemonSet — all offline.
+
 **What the installer handles for you (k0s ≥ 1.33 / containerd 2.x):**
 
 - **containerd 2.x runtime config.** `nvidia-ctk runtime configure` still emits the legacy `io.containerd.grpc.v1.cri` plugin key, which containerd 2.x rejects (crash-looping the worker). The installer rewrites the drop-in to the new `io.containerd.cri.v1.runtime` key automatically when the node's k0s base config uses it — no manual edit needed.
@@ -1652,7 +1750,7 @@ The installer scp's the closure to each GPU node, installs with `dnf --disablere
 
 > Staging also sets `AIRGAP_PYYAML_WHEEL_PATH` automatically from the PyYAML artifact in the staged `packages/` directory so the installer uses it instead of calling `dnf install python3-pyyaml`. PyYAML does not publish a pure-Python (`none-any`) wheel, so this is normally the source sdist (`PyYAML-*.tar.gz`), which `pip3 install` builds on the node; if a pure-Python wheel is ever published the script prefers it. Either way the path is wired up for you — don't expect a specific `.whl` filename.
 
-**Partial air-gap (GPU nodes have controlled internet access)**
+**Strategy 3 — Partial air-gap (GPU nodes have controlled internet access)**
 
 If GPU nodes can reach NVIDIA's package servers but the control plane / installer machine cannot, set `AIRGAP_MODE=true` in your config (to skip HuggingFace checks) while leaving GPU node driver install unblocked.
 
@@ -1725,7 +1823,7 @@ Unset variables fall back to the default public URLs automatically.
 | "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging directory and re-run the install — staging repeats automatically |
 | "Expected chart not found" | Helm uses underscores vs dashes in filename | `ls ./airgap-bundle/airgap-bundle-*/charts/` and set `PROMETHEUS_CHART_PATH` explicitly |
 | "k0s not found on remote nodes" | `K0S_INSTALL_URL` not set to the staged path | Verify the `file://` path exists on the installer machine, not the remote node |
-| "no offline driver repo was provided" | The NVIDIA closure was not staged | Re-run the install and confirm that NVIDIA closure staging completes successfully |
+| "no offline driver repo was provided" | Ran with `--skip-nvidia-closure` (or the closure build was skipped) | Re-run without `--skip-nvidia-closure`, or pre-install drivers on the nodes |
 | "no kernel-devel for &lt;node&gt;'s running kernel" | GPU node runs a kernel the closure wasn't built for | Re-run including that kernel: `--gpu-kernels $(ssh node uname -r)` |
 | "All matches were filtered out by modular filtering" | Stale `nvidia-driver` dnf module stream on the node | `sudo dnf module reset -y nvidia-driver` (the installer does this automatically) |
 | DKMS built for a different kernel | Node rebooted into a newer kernel after the closure was built | Boot the covered kernel, or re-run to rebuild the closure; then add `exclude=kernel*` to `/etc/dnf/dnf.conf` |

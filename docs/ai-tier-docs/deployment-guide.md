@@ -421,7 +421,7 @@ The config sections to fill in:
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
 | `nodes.existingIPs` | IP addresses of your controller and worker nodes — list workers **CPU workers first**: the installer treats the first `nodes.cpuWorkers` entries as CPU nodes and every remaining entry as GPU |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
-| `images.registry` | Optional registry prefix; leave empty to use the fully qualified public image paths, or set an ECR/private-registry hostname |
+| `images.registry` | Your registry hostname, e.g. `123456789.dkr.ecr.us-east-2.amazonaws.com` or `registry.internal:5000`; leave empty when using fully qualified public image paths |
 | `images.registryInsecure` | Applies only when `images.registry` is set; defaults to `true` for plain HTTP, and must be `false` for ECR, Harbor, or any HTTPS registry |
 | `images` (tags) | Public image paths, or private-registry paths when using an optional mirror |
 | `aiPlatform` | `defaultAcceleratorType` — `L40S` or `H100` |
