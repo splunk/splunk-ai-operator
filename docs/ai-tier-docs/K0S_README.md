@@ -22,6 +22,7 @@ Complete guide for deploying Splunk AI tier on k0s Kubernetes clusters.
   - [Onboarding to the AI Tier](#onboarding-to-the-ai-tier)
   - [Splunk AI Toolkit App](#splunk-ai-toolkit-app)
   - [Onboarding to the AI Tier (Splunk AI Toolkit)](#onboarding-to-the-ai-tier-splunk-ai-toolkit)
+  - [Bring Your Own LLM](#bring-your-own-llm)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
 - [Internet Dependencies](#internet-dependencies)
@@ -2575,6 +2576,53 @@ Forecast values (or anomaly annotations) in the results mean the full path —
 Splunk → SLIM → model — is healthy. For the `ai` command, run it against the
 connection you created in Step 4; use the in-product search assistant for its
 exact argument form.
+
+---
+
+#### Bring Your Own LLM
+
+AITK can share one of its own LLM connections with the **Splunk AI Assistant**
+app, so SAIA inference runs against a customer-supplied model instead of a
+Splunk-hosted one. This is unrelated to the SLIM/SAIA AI-tier endpoints above —
+it's a same-Splunk-instance, app-to-app share, not a cluster or network step.
+
+Requirements: a **Custom provider** LLM connection in AITK using **OpenID
+Connect (OIDC)** authentication — API key connections cannot be shared. Not
+available on cloud or cloud-connected stacks.
+
+**1. Create and share the connection (AITK → Connections → + Connection → LLM → Custom provider)**
+
+1. Fill in **Endpoint** and **Request Timeout**
+2. Under **Authentication settings**, choose **OpenID Connect (OIDC)** and fill
+   in **Token URL**, **Client ID**, **Client Secret**, and **Scope**
+3. Fill in **Model settings**
+4. Under **Connect to services**, check **Splunk AI Assistant App**
+5. Accept **Warning and Consent**, then **Save**
+
+Creating, editing, or deleting this connection needs the same two
+capabilities as [Toolkit onboarding](#toolkit-prerequisites) —
+`edit_ai_commander_config` and `list_ai_commander_config`.
+
+**2. Select it in the Splunk AI Assistant app (Settings → Model Runtime)**
+
+Choose **Bring your own model configured in the Splunk AI Tool Kit**, then
+pick the shared connection from the dropdown that appears below it. This
+option only appears when AITK 6.1.0+ is installed and enabled — SAIA checks
+`/apps/local/Splunk_ML_Toolkit` for that. This is a stack-wide, admin-managed
+setting, not a per-chat choice.
+
+Fetching the shared connections for this dropdown needs `list_ai_commander_config`
+and `admin_all_objects` — already covered by the roles listed under
+[Toolkit Prerequisites](#toolkit-prerequisites). SAIA's backend performs this
+lookup under Splunk's system token, so individual chat users never need
+`admin_all_objects` on their own role — only whoever manages the Settings page
+does.
+
+**3. Use it in a chat**
+
+Start or continue any chat in the Splunk AI Assistant app as normal — no
+per-chat model selection is needed. Every response on that stack now routes
+through the shared AITK connection instead of a Splunk-hosted model.
 
 ---
 
