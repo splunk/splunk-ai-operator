@@ -11,15 +11,16 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
 1. [What the installer deploys](#what-the-installer-deploys)
 2. [Requirements](#requirements)
 3. [Prepare the configuration](#prepare-the-configuration)
-4. [Connected installation](#connected-installation)
-5. [Air-gapped installation](#air-gapped-installation)
+4. [Standard deployment (internet-connected)](#standard-deployment-internet-connected)
+5. [Air-gapped deployment](#air-gapped-deployment)
 6. [Verify and access the deployment](#verify-and-access-the-deployment)
 7. [Install and test the Splunk apps](#install-and-test-the-splunk-apps)
 8. [Configuration reference](#configuration-reference)
 9. [OpenShift behavior](#openshift-behavior)
-10. [Model staging](#model-staging)
-11. [Troubleshooting](#troubleshooting)
-12. [Uninstall](#uninstall)
+10. [Security and production considerations](#security-and-production-considerations)
+11. [Model staging](#model-staging)
+12. [Troubleshooting](#troubleshooting)
+13. [Uninstall](#uninstall)
 
 ## What the installer deploys
 
@@ -117,7 +118,7 @@ Required tools:
 - `curl`, `jq`, `base64`, GNU `timeout`, `python3`, and `tar`
 - MinIO client (`mc`) for MinIO, SeaweedFS, or generic S3-compatible storage
 - AWS CLI only when using AWS S3 or automatic Amazon ECR authentication
-- `oc-mirror` v2 for an air-gapped installation
+- `oc-mirror` v2 for an air-gapped deployment
 
 Exact client patch versions are not pinned. The installer pins these platform
 dependencies:
@@ -157,17 +158,36 @@ Allow these flows for the selected installation and integration path:
 | Source | Destination | Purpose |
 |---|---|---|
 | Installer machine | OpenShift API endpoint, normally TCP 6443 | Install and verify resources |
-| Installer machine | GitHub, Helm repositories, source registries, and Red Hat registries | Connected installation or preparation of air-gap mirror content |
+| Installer machine | GitHub, Helm repositories, source registries, and Red Hat registries | Standard deployment or preparation of air-gap mirror content |
 | Installer machine | Hugging Face | Download a required model that is missing when model staging is enabled |
 | Installer machine and AI workloads | Object-store endpoint | Stage and read models and runtime state |
 | OpenShift nodes | Configured image registries | Pull Operator and workload images |
 | User browser and external Splunk | OpenShift router on TCP 80, or 443 after customer-managed TLS is configured | Reach the SAIA and SLIM Routes |
 | SAIA and SLIM workloads | Bundled Splunk management service on TCP 8089 | Fetch signing keys and validate JWTs |
 | Internal OpenTelemetry collectors | Bundled Splunk HEC service on TCP 8088 | Send internal telemetry |
+| Splunk Enterprise, only when using Bring Your Own LLM | Customer OIDC token endpoint and LLM endpoint | Authenticate to and invoke the custom model provider |
 
 An external Splunk server and the user's browser must each be able to resolve
 and reach the appropriate Route. A laptop VPN does not provide connectivity for
 the external Splunk server or for workloads running inside OpenShift.
+
+### External content dependencies
+
+Standard deployment and air-gap preparation use these external sources:
+
+| Consumer | Source | Content |
+|---|---|---|
+| Installer machine | `github.com` and `raw.githubusercontent.com` | cert-manager and Local Path Provisioner manifests |
+| Installer machine | `open-telemetry.github.io` and `ray-project.github.io` | OpenTelemetry and KubeRay Helm charts |
+| Installer machine | `huggingface.co` | Model weights, only when model staging is enabled and a required model is missing |
+| Installer machine or `oc-mirror` | Red Hat, certified Operator, and public image registries | Operator catalogs, operands, Driver Toolkit, and installer-owned images |
+| OpenShift nodes | Registries referenced by cluster mirror policy and `images.*` | Operator and workload images at pod scheduling time |
+
+In air-gap mode, the installer machine must reach both the public sources and
+the internal registry while preparing and importing mirror content. OpenShift
+nodes then pull from the internal mirrors. GPU workers do not download host
+drivers directly; the NVIDIA GPU Operator and OpenShift Driver Toolkit consume
+the mirrored cluster content.
 
 ## Prepare the configuration
 
@@ -203,7 +223,7 @@ oc whoami --show-server
 oc auth can-i '*' '*' --all-namespaces     # must print yes
 ```
 
-## Connected installation
+## Standard deployment (internet-connected)
 
 Set `cluster.airgap: false`, then run:
 
@@ -221,7 +241,7 @@ For unattended installation:
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install --silent
 ```
 
-## Air-gapped installation
+## Air-gapped deployment
 
 This mode supports an OpenShift cluster without public internet access. Set:
 
@@ -252,9 +272,11 @@ The customer must provide separately:
 - object-store and registry credentials
 - model weights, unless the installer machine can download missing models
 
-The installer host must be Linux, have `oc-mirror` v2, and have about **100 GiB
-of free disk space** for mirror content and working files. During preparation it
-must reach the target OpenShift API, public source registries, the internal
+The installer host must be Linux and have `oc-mirror` v2. Plan for approximately
+**100 GiB of temporary free space** for mirror content and working files. This
+is a planning recommendation, not an installer-enforced minimum; actual usage
+depends on the selected catalog content and versions. During preparation the
+host must reach the target OpenShift API, public source registries, the internal
 registry, and the object store. If model staging is enabled, it must also reach
 Hugging Face when a model is missing.
 
@@ -409,6 +431,28 @@ the LLM connection created above:
 
 Forecast values from `apply CDTSM` and a non-empty `ai_result_1` confirm the
 Splunk → SLIM → model path.
+
+### Bring Your Own LLM
+
+AITK can share a customer-managed LLM connection with Splunk AI Assistant. This
+is an application workflow and does not change the OpenShift installation or
+the SAIA and SLIM endpoints.
+
+1. In **Splunk AI Toolkit → Connections**, create an **LLM → Custom provider**
+   connection.
+2. Select **OpenID Connect (OIDC)** and enter the Token URL, Client ID, Client
+   Secret, scope, model endpoint, and model settings. API-key connections
+   cannot be shared with Splunk AI Assistant.
+3. Under **Connect to services**, select **Splunk AI Assistant App**, accept the
+   warning and consent, and save the connection.
+4. In **Splunk AI Assistant → Settings → Model Runtime**, select **Bring your
+   own model configured in the Splunk AI Tool Kit**, then select the shared
+   connection.
+5. Start a chat and confirm that it uses the customer-managed model.
+
+The Splunk host must be able to resolve and reach both the OIDC token endpoint
+and the custom LLM endpoint. This workflow is not available on cloud or
+cloud-connected stacks.
 
 ## Configuration reference
 
@@ -589,9 +633,10 @@ When `openshift.grantPrivilegedSCC` is `"true"`, the installer grants the
 `anyuid` and `privileged` constraints required by the operators and workloads.
 It records the grants it owns and removes them during `delete`.
 
-Use the same configuration for install and delete. If SCC management is turned
-off before delete, the installer cannot remove grants created by the earlier
-run.
+Use the same namespace and resource names for install and delete. SCC cleanup
+uses ownership recorded by the installer in `openshift-config` and is
+independent of the current `openshift.grantPrivilegedSCC` value. The delete
+command removes only grants recorded as installer-owned.
 
 ### Operators and GPU drivers
 
@@ -619,6 +664,30 @@ SAIA and SLIM have separate Routes backed by `ClusterIP` Services. The Routes
 use a 600-second timeout and disabled response buffering for long-running and
 streaming responses. A Route may return HTTP 503 until its backing Service has
 ready endpoints.
+
+## Security and production considerations
+
+- The installer creates HTTP SAIA and SLIM Routes. Production HTTPS requires
+  customer-managed Route TLS and a certificate trusted by every client.
+- Workload mTLS is not enabled or qualified by this installer. Route TLS does
+  not by itself provide end-to-end workload mTLS.
+- Keep `images.registryInsecure: false` in production. The `true` setting is
+  only for a controlled plain-HTTP registry.
+- Keep registry and object-store credentials out of source control. Manage
+  OpenShift secret encryption, RBAC, audit logging, and credential rotation
+  according to the customer's cluster-security policy.
+- The installer requires cluster-admin privileges and records the shared
+  cluster resources and SCC grants it creates so `delete` preserves resources
+  it did not own.
+- Do not apply a generic deny-all NetworkPolicy without a tested allowlist. A
+  policy must preserve OpenShift router ingress, DNS, Operator and webhook
+  traffic, same-namespace service calls, object-store access, and the required
+  Splunk management and HEC flows.
+- Back up the object-store runtime data and required persistent volumes. The
+  installer does not provide a backup or disaster-recovery workflow.
+- External Splunk integration is limited to JWT validation through its
+  management issuer on port 8089. The current installer configures HEC and
+  OpenTelemetry only for the bundled Splunk deployment.
 
 ## Model staging
 

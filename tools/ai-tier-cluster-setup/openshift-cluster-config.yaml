@@ -2,8 +2,8 @@
 # Copy this file, replace environment-specific values, and pass the copy through
 # CONFIG_FILE. Do not commit credentials.
 
-# false: connected cluster. true: air-gapped cluster.
-# Air-gapped installation requires a Linux installer host with oc-mirror.
+# false: standard deployment (internet-connected). true: air-gapped deployment.
+# An air-gapped deployment requires a Linux installer host with oc-mirror.
 # Images under images.* must already exist in the configured internal registry.
 cluster:
   airgap: false
@@ -128,7 +128,7 @@ aiPlatform:
         effect: "NoSchedule"
 
 operators:
-  # Connected installs use these OpenShift OLM CatalogSources. In air-gap mode,
+  # Standard deployments use these OpenShift OLM CatalogSources. In air-gap mode,
   # the installer mirrors the required catalogs and substitutes the generated
   # internal CatalogSource names automatically.
   nfd:
