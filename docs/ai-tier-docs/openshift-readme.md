@@ -3,6 +3,9 @@
 This guide explains how to install Splunk AI Tier (AI POD) on an existing
 OpenShift cluster and connect Splunk AI Assistant and Splunk AI Toolkit.
 
+For the condensed installation checklist, see
+[`openshift-quick-reference.md`](./openshift-quick-reference.md).
+
 > [!IMPORTANT]
 > The installer deploys AI POD workloads and supporting operators. It does not
 > create, upgrade, or remove the OpenShift cluster itself.
@@ -30,7 +33,7 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
   - [Security and production considerations](#security-and-production-considerations)
   - [Model staging](#model-staging)
   - [Troubleshooting](#troubleshooting)
-    - [OpenShift troubleshooting guide](./openshift_troubleshooting.md)
+    - [OpenShift troubleshooting guide](./openshift-troubleshooting.md)
   - [Uninstall](#uninstall)
 
 ## What the installer deploys
@@ -296,12 +299,13 @@ Choose the deployment mode before running the installer:
 
 | Command | Purpose |
 |---|---|
+| `./openshift_with_stack.sh validate` | Validate the configuration without changing the cluster |
 | `./openshift_with_stack.sh install` | Install or reconcile the complete platform |
 | `./openshift_with_stack.sh install --silent` | Install non-interactively using configuration values |
-| `./openshift_with_stack.sh verify` | Check platform resources and pod health; collect diagnostics on failure |
+| `./openshift_with_stack.sh verify-pods` | Check platform resources and pod health; collect diagnostics on failure |
 | `./openshift_with_stack.sh diagnose` | Create a compressed support bundle |
 | `./openshift_with_stack.sh stage-artifacts` | Stage model artifacts without installing the platform |
-| `./openshift_with_stack.sh delete` | Remove installer-owned platform resources while preserving the OpenShift cluster |
+| `./openshift_with_stack.sh clean-all` | Remove installer-owned platform resources while preserving the OpenShift cluster |
 
 The default command is `install` when no subcommand is supplied. Set
 `CONFIG_FILE` for every command so the installer uses the intended namespace,
@@ -312,6 +316,7 @@ resource names, and object-store settings.
 Set `cluster.airgap: false`, then run:
 
 ```bash
+CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh validate
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
 ```
 
@@ -337,6 +342,7 @@ cluster:
 Run the same command from a Linux installer machine:
 
 ```bash
+CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh validate
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
 ```
 
@@ -433,7 +439,7 @@ Check the custom resources and pods:
 ```bash
 oc get aiplatform,aiservice,raycluster,rayservice -n ai-platform
 oc get pods -n ai-platform
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify
+CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify-pods
 ```
 
 Use these commands when observing a deployment in progress:
@@ -446,7 +452,7 @@ oc logs -n splunk-ai-operator-system \
 
 A healthy deployment has current-generation `Ready=True` conditions on the
 AIPlatform and enabled AIServices, ready Ray resources, no failed or pending
-platform pods, and completed post-install Jobs. If `verify` finds an unhealthy
+platform pods, and completed post-install Jobs. If `verify-pods` finds an unhealthy
 resource, it runs `diagnose` automatically unless `AUTO_DIAGNOSE=false`.
 
 ### Use the service endpoints
@@ -832,11 +838,11 @@ following component-specific grants required by its current manifests:
 | OpenTelemetry Operator | `privileged` SCC ClusterRoleBinding |
 | Splunk Operator namespace | `privileged` |
 
-The installer records the grants it owns and removes them during `delete`.
+The installer records the grants it owns and removes them during `clean-all`.
 
-Use the same namespace and resource names for install and delete. SCC cleanup
+Use the same namespace and resource names for install and cleanup. SCC cleanup
 uses ownership recorded by the installer in `openshift-config` and is
-independent of the current `openshift.grantPrivilegedSCC` value. The delete
+independent of the current `openshift.grantPrivilegedSCC` value. The `clean-all`
 command removes only grants recorded as installer-owned.
 
 ### Operators and GPU drivers
@@ -913,7 +919,7 @@ Set `openshift.routes.<feature>.enabled: false` to keep that feature internal.
   OpenShift secret encryption, RBAC, audit logging, and credential rotation
   according to the customer's cluster-security policy.
 - The installer requires cluster-admin privileges and records the shared
-  cluster resources and SCC grants it creates so `delete` preserves resources
+  cluster resources and SCC grants it creates so `clean-all` preserves resources
   it did not own.
 - Do not apply a generic deny-all NetworkPolicy without a tested allowlist. A
   policy must preserve OpenShift router ingress, DNS, Operator and webhook
@@ -974,7 +980,7 @@ artifact that is already current.
 
 ## Troubleshooting
 
-Use [`openshift_troubleshooting.md`](./openshift_troubleshooting.md) for the
+Use [`openshift-troubleshooting.md`](./openshift-troubleshooting.md) for the
 complete OpenShift installer, Operator Lifecycle Manager, GPU, storage,
 air-gap, workload, Route, and Splunk app troubleshooting workflow. The quick
 checks below cover the most common symptoms.
@@ -985,7 +991,7 @@ checks below cover the most common symptoms.
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh diagnose
 ```
 
-`verify` automatically collects diagnostics on failure unless
+`verify-pods` automatically collects diagnostics on failure unless
 `AUTO_DIAGNOSE=false`.
 
 ### `ImagePullBackOff`
@@ -1062,7 +1068,7 @@ operator reconciles them from the AIPlatform and AIService custom resources.
 ## Uninstall
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh delete
+CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all
 ```
 
 This removes resources owned by the installer and leaves the OpenShift cluster

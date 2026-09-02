@@ -6,7 +6,7 @@ OpenShift workflow only. Do not use the k0s-specific SSH, MetalLB, cluster
 bootstrap, or host-driver procedures from [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md).
 
 For installation requirements and configuration, see
-[`openshift_readme.md`](./openshift_readme.md). For AIPlatform conditions,
+[`openshift-readme.md`](./openshift-readme.md). For AIPlatform conditions,
 events, Ray, and Weaviate runtime details that are common across Kubernetes
 platforms, also see the
 [operator troubleshooting guide](../splunk-ai-operator-docs/troubleshooting.md).
@@ -85,10 +85,10 @@ consequences of the same problem.
 ```bash
 oc get aiplatform,aiservice,raycluster,rayservice -n "$AI_NAMESPACE"
 oc get pods -n "$AI_NAMESPACE" -o wide
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify
+CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify-pods
 ```
 
-`verify` waits up to 30 minutes by default. It checks pods, AIPlatform,
+`verify-pods` waits up to 30 minutes by default. It checks pods, AIPlatform,
 AIServices, RayCluster, RayService, and Ray Serve readiness. If verification
 fails, the installer automatically runs `diagnose` unless
 `AUTO_DIAGNOSE=false` is set.
@@ -142,7 +142,7 @@ helm version
 ```
 
 Use the dependency installation instructions in
-[`openshift_readme.md`](./openshift_readme.md#installer-machine). Do not use the
+[`openshift-readme.md`](./openshift-readme.md#installer-machine). Do not use the
 Python-based `yq`; the installer requires Mike Farah `yq` v4 syntax.
 
 ### `Config file not found` or YAML syntax errors
@@ -293,7 +293,7 @@ a certificate trusted by the installer and OpenShift nodes.
 A standard deployment downloads cert-manager and Local Path Provisioner
 manifests and the OpenTelemetry and KubeRay charts. Confirm the installer
 machine can reach the sources listed under
-[External content dependencies](./openshift_readme.md#external-content-dependencies).
+[External content dependencies](./openshift-readme.md#external-content-dependencies).
 
 The OpenShift nodes separately need access to the Operator catalogs and every
 registry referenced by Operator and workload images. Internet access on the
@@ -906,7 +906,7 @@ http://<slim-host>/tenant/slim-api/v1alpha1
 ```
 
 For the bundled Splunk deployment, use the internal ClusterIP service shown in
-[`openshift_readme.md`](./openshift_readme.md#install-and-configure-splunk-ai-toolkit).
+[`openshift-readme.md`](./openshift-readme.md#install-and-configure-splunk-ai-toolkit).
 For an external Splunk deployment, use the SLIM Route and confirm that the
 Splunk host—not only the user's browser—can resolve and reach it.
 
@@ -927,16 +927,16 @@ configured internal endpoint because OpenTelemetry sends platform telemetry to
 it. JWT issuer traffic uses Splunk management port 8089; `hecEndpoint` is a
 different endpoint on port 8088.
 
-## Delete and reinstall failures
+## Cleanup and reinstall failures
 
-### Delete leaves the OpenShift cluster running
+### Cleanup leaves the OpenShift cluster running
 
-This is expected. `delete` removes the installer-owned AI POD stack and shared
+This is expected. `clean-all` removes the installer-owned AI POD stack and shared
 components recorded as installer-owned; it does not delete the OpenShift
 cluster.
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh delete
+CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all
 ```
 
 Use the same namespace and resource names used for install. Ownership is
