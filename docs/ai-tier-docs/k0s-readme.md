@@ -222,16 +222,16 @@ not `splunk-ai-operator` — adjust the `cd` above accordingly.
 
 ```bash
 # Copy the template
-cp k0s-cluster-config.yaml my-cluster.yaml
+cp k0s-cluster-config.yaml my-cluster-config.yaml
 
 # Edit with your settings
-vi my-cluster.yaml
+vi my-cluster-config.yaml
 ```
 
 ### 3. Deploy the Cluster
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ### 4. Verify Installation
@@ -634,22 +634,22 @@ imagePullSecrets:
 
 ```bash
 # Install cluster and full AI Platform stack
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 
 # Stage model artifacts only (download from HF + upload to object store)
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
 # Re-stage without re-downloading models already present locally
-SKIP_IF_EXISTS=1 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+SKIP_IF_EXISTS=1 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
 # Delete entire cluster (stop k0s, remove services)
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh delete
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh delete
 
 # Clean all k0s state from bare-metal nodes (stop/reset/remove)
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh clean-all
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh clean-all
 
 # Join additional workers to an existing cluster (or rejoin failed workers)
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh join-workers
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 > **Air-gap uses these same commands.** With `cluster.airgap: true` in the config, `install` and `join-workers` stage the offline artifacts first and then continue; every other subcommand runs immediately, unchanged. See [Air-Gapped Deployment](#air-gapped-deployment).
@@ -726,7 +726,7 @@ tools/ai-tier-cluster-setup/logs/k0s-install-2026-04-29_14-30-00.log
 
 Override the log directory:
 ```bash
-LOG_DIR=/var/log/k0s CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+LOG_DIR=/var/log/k0s CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ### Install Flow
@@ -774,10 +774,10 @@ The `install` command executes these steps in order:
 
    ```bash
    # Stage models — GPU type read from aiPlatform.defaultAcceleratorType in config
-   CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+   CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 
    # Resume: skip models already staged in the object store (default behaviour of the installer)
-   SKIP_IF_STAGED=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+   SKIP_IF_STAGED=1 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
    ```
 
    Before starting any download work, `stage-artifacts` runs `all_models_staged()` — a fast pre-check that reads the selected artifact profile and verifies that each model's `staging_state/<id>/.staging_complete` marker contains the expected `hf_url`. If every marker matches, it exits immediately without downloading or uploading. Otherwise, it lists the artifacts that need staging:
@@ -1809,7 +1809,7 @@ export METALLB_CHART_PATH="/shared/charts/metallb-0.14.8.tgz"
 # Use an internal mirror for NVIDIA device plugin manifest only
 export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="https://manifests.internal/nvidia-device-plugin-v0.17.3.yml"
 
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 Unset variables fall back to the default public URLs automatically.
@@ -2707,8 +2707,8 @@ Run the installer validation and collect a support bundle before changing the
 cluster:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh diagnose
 ```
 
 Use the guide that matches the failing layer:

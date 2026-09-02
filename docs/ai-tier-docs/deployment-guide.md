@@ -410,8 +410,8 @@ repo → `cuda-drivers` (DKMS) → `nvidia-container-toolkit` — and verifies w
 
 ```bash
 cd tools/ai-tier-cluster-setup
-cp k0s-cluster-config.yaml my-cluster.yaml
-# Open my-cluster.yaml and fill in ALL fields marked CHANGE THIS
+cp k0s-cluster-config.yaml my-cluster-config.yaml
+# Open my-cluster-config.yaml and fill in ALL fields marked CHANGE THIS
 ```
 
 The config sections to fill in:
@@ -481,14 +481,14 @@ cluster:
 ```
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 `AIRGAP_MODE=true` in the environment is an equally valid trigger, for a one-off
 air-gap run without editing the config:
 
 ```bash
-AIRGAP_MODE=true CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+AIRGAP_MODE=true CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 **Only `install` and `join-workers` stage artifacts.** `validate`, `diagnose`,
@@ -518,8 +518,8 @@ air-gapped template and update its required values:
 
 ```bash
 cd tools/ai-tier-cluster-setup
-cp k0s-airgapped-config.yaml my-cluster.yaml
-# Edit my-cluster.yaml and fill in the required values
+cp k0s-airgapped-config.yaml my-cluster-config.yaml
+# Edit my-cluster-config.yaml and fill in the required values
 ```
 
 Stage explicitly only if you want the artifacts on disk *before* the install
@@ -533,14 +533,14 @@ the same machine that can SSH to the cluster nodes.
 cd tools/ai-tier-cluster-setup
 
 # Stage everything and stop, without installing
-./airgap_install.sh --download-only --config my-cluster.yaml
+./airgap_install.sh --download-only --config my-cluster-config.yaml
 
 # Pin a specific k0s version
-./airgap_install.sh --download-only --config my-cluster.yaml \
+./airgap_install.sh --download-only --config my-cluster-config.yaml \
   --k0s-version v1.31.2+k0s.0
 
 # Stage somewhere other than ./airgap-bundle
-./airgap_install.sh --download-only --config my-cluster.yaml \
+./airgap_install.sh --download-only --config my-cluster-config.yaml \
   --output-dir /mnt/staging
 ```
 
@@ -774,7 +774,7 @@ adds roughly 15 minutes up front.
 
 ```mermaid
 flowchart TD
-    A["CONFIG_FILE=./my-cluster.yaml\n./k0s_cluster_with_stack.sh install"] --> A2
+    A["CONFIG_FILE=./my-cluster-config.yaml\n./k0s_cluster_with_stack.sh install"] --> A2
 
     A2["0. cluster.airgap: true detected\n→ hands off to airgap_install.sh\nto stage the artifacts"]
     A2 --> B
@@ -895,7 +895,7 @@ RHEL 9-specific step does not run for RHEL 10.2 or Ubuntu 24.04.
 ```bash
 # Nothing extra to do — the GPU node IPs and OS are derived from your config
 # and each node's `uname -r` / OS is surveyed over SSH.
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 To override the derived kernel, host list, or OS, drive the staging step
@@ -904,15 +904,15 @@ the install just as the unified command would:
 
 ```bash
 # Override the derived list only if needed (e.g. non-standard node layout)
-./airgap_install.sh --config my-cluster.yaml \
+./airgap_install.sh --config my-cluster-config.yaml \
   --gpu-hosts 10.0.38.138,10.0.38.139
 
 # …or name the kernels explicitly if the nodes aren't reachable over SSH yet
-./airgap_install.sh --config my-cluster.yaml \
+./airgap_install.sh --config my-cluster-config.yaml \
   --gpu-kernels 5.14.0-687.29.1.el9_8.x86_64
 
 # …or force the GPU node OS/package format instead of auto-detecting it
-./airgap_install.sh --config my-cluster.yaml --gpu-os ubuntu24
+./airgap_install.sh --config my-cluster-config.yaml --gpu-os ubuntu24
 ```
 
 > GPU node IPs come from your config: the workers listed in
@@ -986,7 +986,7 @@ preparation above, run these shared steps from
 ### 1. Validate your config before installing
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 `validate` checks local configuration completeness only. It does not contact
@@ -1002,7 +1002,7 @@ before proceeding.
 Start this command inside the [persistent installer session](#keep-the-installer-session-alive):
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 The installer shows an install plan and asks for confirmation before making any
@@ -1023,7 +1023,7 @@ tail -f logs/k0s-install-*.log
 Run the same verification command for standard and air-gapped deployments:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
 ## Post-Install Verification
@@ -1280,26 +1280,26 @@ Model staging is now **resumable** — re-runs skip already-staged models automa
 If install fails partway, re-run directly:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 The safety gate prevents wiping a cluster with Ready nodes. If you need to start completely clean:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh clean-all
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ### Add worker nodes
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 ### Re-stage models only
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
 The command is resumable — it checks which models are already staged in the object store and only downloads/uploads what is missing. The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [k0s-readme.md](k0s-readme.md) for details on the pre-check, per-model logging, and direct script usage.
@@ -1312,10 +1312,10 @@ and rerunning the installer refreshes existing Helm releases in place:
 
 ```bash
 # 1. Update image tags in your config
-vi my-cluster.yaml   # bump operator, ray, saia, splunk image versions
+vi my-cluster-config.yaml   # bump operator, ray, saia, splunk image versions
 
 # 2. Run install — Helm refreshes existing releases, does not wipe the cluster
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 > The safety gate prevents `install` from wiping a cluster with Ready nodes and
@@ -1335,16 +1335,16 @@ skipping it leaves the sealed nodes unable to pull the new tag
 crane copy "docker.io/splunk/<image>:<new-tag>" "registry.airgap.local/<image>:<new-tag>"
 
 # 2. Update the tag in your config to point at the mirrored image
-vi my-cluster.yaml
+vi my-cluster-config.yaml
 
 # 3. Re-run install
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ### Collect a support bundle
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh diagnose
 ls tools/ai-tier-cluster-setup/logs/k0s-diagnose-*.tar.gz
 ```
 
@@ -1359,7 +1359,7 @@ The tar.gz contains: pod logs from all namespaces, Kubernetes events, node descr
 **Step 1 — validate config** (catches ~40% of issues before touching any node):
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 **Step 2 — check the session log** (search for `ERROR`):
@@ -1371,7 +1371,7 @@ tail -100 tools/ai-tier-cluster-setup/logs/k0s-install-*.log | grep -i error
 **Step 3 — collect a support bundle**:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh diagnose
 ls tools/ai-tier-cluster-setup/logs/k0s-diagnose-*.tar.gz
 ```
 

@@ -39,7 +39,7 @@ grep "ERROR" tools/ai-tier-cluster-setup/logs/k0s-install-*.log | tail -20
 **2. Collect a support bundle.**
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh diagnose
 ```
 
 This SSHs to the cluster (if reachable), collects pod logs, events, node
@@ -49,7 +49,7 @@ state, and config (credentials redacted) into a single `.tar.gz` under
 **3. Validate your config before re-running.**
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 Prints a ✔/✖ checklist. Fix every ✖ before re-running `install`.
@@ -142,7 +142,7 @@ The node is not running a supported OS.
 1. Re-provision the node with a supported OS.
 2. For internal testing only — bypass the check at your own risk:
    ```bash
-   FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+   FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
    ```
 
 ### "RHEL 10.2 needs an offline package closure for air-gapped installs on \<role\> \<ip\>"
@@ -153,7 +153,7 @@ Staging normally handles this: each node is probed over SSH and, for every kerne
 
 ```bash
 # Simplest: pass the cluster config — every node IP is derived from it
-./airgap_install.sh --download-only --config ./my-cluster.yaml
+./airgap_install.sh --download-only --config ./my-cluster-config.yaml
 
 # Configless staging: name the nodes explicitly (controllers included)
 ./airgap_install.sh --download-only --gpu-os rhel10 \
@@ -189,10 +189,10 @@ installer refuses to overwrite it to prevent data loss.
 
 ```bash
 # Tear down first — this destroys all cluster data
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh clean-all
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh clean-all
 
 # Then re-install
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 **If you want to reuse the existing cluster:**
@@ -267,7 +267,7 @@ ssh <ssh-user>@<worker-ip> "sudo journalctl -u k0sworker -n 100 --no-pager"
 After fixing, rejoin workers without a full reinstall:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 ---
@@ -290,7 +290,7 @@ The install continues after this warning. You can manually add the missing
 workers later:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh join-workers
 ```
 
 ---
@@ -489,7 +489,7 @@ After correcting the bucket or credentials, stage the required artifacts and
 completion markers again:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
 ---
@@ -502,7 +502,7 @@ prefixes in those profiles, and the completion marker must match the selected
 artifact URL.
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
 ---
@@ -517,7 +517,7 @@ sudo wget -qO /usr/local/bin/yq \
   https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
 sudo chmod +x /usr/local/bin/yq
 yq eval '.' ../artifacts_download_upload_scripts/model_artifacts_configs_unquantized.yaml
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
 ---
@@ -534,7 +534,7 @@ mc rm myminio/<bucket>/staging_state/<model-id>/.staging_complete
 # AWS S3
 aws s3 rm s3://<bucket>/staging_state/<model-id>/.staging_complete
 
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
 ---
@@ -597,7 +597,7 @@ mc ls mystore/<bucket>
 The config still has `<CHANGE ME>` placeholders in the object store credentials.
 
 ```bash
-grep -n "CHANGE\|<" my-cluster.yaml
+grep -n "CHANGE\|<" my-cluster-config.yaml
 ```
 
 Replace all placeholder values with real credentials before re-running.
@@ -797,7 +797,7 @@ sha256sum --check checksums.sha256 --quiet
 ```
 
 Delete the staging directory and re-run the install
-(`CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install`) — with
+(`CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install`) — with
 `cluster.airgap: true` it re-stages the artifacts automatically.
 
 ---
@@ -838,7 +838,7 @@ already-staged tree, set it manually:
 ```bash
 export AIRGAP_PYYAML_WHEEL_PATH="./airgap-bundle/airgap-bundle-<date>/packages/PyYAML-6.0.2-cp39-cp39-linux_x86_64.whl"
 export AIRGAP_STAGED=true    # already staged — don't re-download
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ---
@@ -859,9 +859,9 @@ detects `nvidia-smi` and skips the driver install entirely.
 ### "Config file not found: \<path\>"
 
 ```bash
-export CONFIG_FILE=./my-cluster.yaml
+export CONFIG_FILE=./my-cluster-config.yaml
 # or pass it inline:
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 ---
@@ -870,7 +870,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 ```bash
 # Validate YAML syntax
-yq eval '.' my-cluster.yaml
+yq eval '.' my-cluster-config.yaml
 
 # Common issue: unquoted special characters, missing colons, wrong indentation
 ```
@@ -883,7 +883,7 @@ One or more image fields are empty or still show placeholder values.
 
 ```bash
 # Find all image fields that need filling
-grep -n "CHANGE\|<\|image:$\|image: \"\"" my-cluster.yaml
+grep -n "CHANGE\|<\|image:$\|image: \"\"" my-cluster-config.yaml
 ```
 
 Required fields: `images.operator.image`, `images.splunk.image`,
@@ -898,7 +898,7 @@ Required fields: `images.operator.image`, `images.splunk.image`,
 Run `validate` before every install:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 Fix every ✖ item (errors) before proceeding. ⚠ items (warnings) are
@@ -919,7 +919,7 @@ you want to proceed:
 ```bash
 # Force the operation despite the mismatch
 # (only use if you are sure you are targeting the right cluster)
-CONFIG_FILE=./my-cluster.yaml \
+CONFIG_FILE=./my-cluster-config.yaml \
   ./k0s_cluster_with_stack.sh delete
 ```
 
@@ -992,6 +992,6 @@ grep -h "ERROR" tools/ai-tier-cluster-setup/logs/k0s-install-*.log | sort | uniq
 ### Collect and send a support bundle
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh diagnose
 ls -lh tools/ai-tier-cluster-setup/logs/splunk-ai-diagnose-*.tar.gz | tail -1
 ```

@@ -189,15 +189,15 @@ Download the scripts with the configuration files on the installer machine.
    * Duplicate the base template to create your working configuration:
      ```bash
      # Standard deployment
-     cp k0s-cluster-config.yaml my-cluster.yaml
+     cp k0s-cluster-config.yaml my-cluster-config.yaml
      # For air-gapped deployment, use this instead:
-     # cp k0s-airgapped-config.yaml my-cluster.yaml
+     # cp k0s-airgapped-config.yaml my-cluster-config.yaml
      ```
 
 4. **Edit Your Infrastructure Layout**
    * Open the config file in your preferred text editor to make targeted additions:
      ```bash
-     vi my-cluster.yaml
+     vi my-cluster-config.yaml
      chmod 600 /path/to/private-key     
      ```
 
@@ -225,15 +225,15 @@ Download the scripts with the configuration files on the installer machine.
    * Duplicate the template file to begin making cluster edits:
      ```bash
      # Standard deployment
-     cp k0s-cluster-config.yaml my-cluster.yaml
+     cp k0s-cluster-config.yaml my-cluster-config.yaml
      # For air-gapped deployment, use this instead:
-     # cp k0s-airgapped-config.yaml my-cluster.yaml
+     # cp k0s-airgapped-config.yaml my-cluster-config.yaml
      ```
 
 4. **Edit Your Infrastructure Layout**
    * Launch your file inside a terminal editor to change values:
      ```bash
-     vi my-cluster.yaml
+     vi my-cluster-config.yaml
      chmod 600 /path/to/private-key
      ```
 
@@ -268,7 +268,7 @@ modifying any cluster node.
 
 ```bash
 # Validate the selected deployment config.
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 > **Air-gapped clusters need a few additional fields** (`cluster.airgap: true`,
@@ -322,13 +322,13 @@ AI platform can serve inference.
 cd tools/ai-tier-cluster-setup
 
 # Required: validation must succeed before install
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 
 # Run only after validate completes successfully
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h first run (model download), ~30-60min if pre-staged
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install    # ~3-7h first run (model download), ~30-60min if pre-staged
 
 # Check the status of pods and inference endpoints
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh verify-pods
 
 # Follow progress in another terminal
 tail -f logs/k0s-install-*.log
@@ -400,16 +400,16 @@ Use `k0s-airgapped-config.yaml` as the template. If you have not already
 created the working configuration in Step 3, copy it now:
 
 ```bash
-cp k0s-airgapped-config.yaml my-cluster.yaml
+cp k0s-airgapped-config.yaml my-cluster-config.yaml
 ```
 
-Edit `my-cluster.yaml`, keep `cluster.airgap: true`, and complete the cluster,
+Edit `my-cluster-config.yaml`, keep `cluster.airgap: true`, and complete the cluster,
 node, object-store, and SSH settings. Leave the relative image paths unchanged;
 the installer prefixes them with `images.registry`.
 
 #### Air-Gapped Step 3: Configure the Private Registry
 
-Set only your private registry in `my-cluster.yaml` before mirroring images:
+Set only your private registry in `my-cluster-config.yaml` before mirroring images:
 
 ```yaml
 images:
@@ -418,7 +418,7 @@ images:
 ```
 
 If the registry requires authentication, also configure
-`imagePullSecrets.custom.*` in `my-cluster.yaml`. The registry value used by
+`imagePullSecrets.custom.*` in `my-cluster-config.yaml`. The registry value used by
 the mirroring commands must match `images.registry`.
 
 **Air-gapped private registry sizing:** Reserve **~25–30 GB** for the mirrored
@@ -501,7 +501,7 @@ continuing:
 
 ```bash
 cd tools/ai-tier-cluster-setup
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
 ```
 
 #### Air-Gapped Step 7: Install the Platform
@@ -510,7 +510,7 @@ The install command stages the required offline k0s and GPU-driver artifacts
 from the installer machine, then installs the platform on the sealed nodes:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 #### Air-Gapped Step 8: Monitor and Verify
@@ -524,7 +524,7 @@ tail -f logs/k0s-install-*.log
 After the install completes, check the pods and inference endpoints:
 
 ```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
 Continue to [Step 5: Splunk Integration](#step-5-splunk-integration).

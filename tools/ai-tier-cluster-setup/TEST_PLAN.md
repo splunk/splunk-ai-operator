@@ -964,7 +964,7 @@ grep "════ PHASE:" logs/k0s-install-*.log
 ### T3-7: `diagnose` produces a complete bundle on a live cluster
 
 ```bash
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh diagnose
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh diagnose
 ls -lh logs/splunk-ai-diagnose-*.tar.gz | tail -1
 tar -tzf logs/splunk-ai-diagnose-*.tar.gz | grep -E "pods.txt|events.txt|nodes.txt"
 ```
@@ -1011,7 +1011,7 @@ Start an install where the MinIO endpoint is unreachable at install time (e.g. s
 ssh minio-host "sudo systemctl stop minio"
 
 # Start install
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install &
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install &
 INSTALL_PID=$!
 
 # Wait ~15s then restart MinIO
@@ -1069,7 +1069,7 @@ Attempt an install against a node running an unsupported OS (e.g. Ubuntu 22.04 o
 
 ```bash
 # Run installer — expect failure at OS gate, before any k0s components are touched
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 | grep -E "Unsupported OS|Only RHEL 9"
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 | grep -E "Unsupported OS|Only RHEL 9"
 echo "exit: $?"
 ```
 
@@ -1081,7 +1081,7 @@ echo "exit: $?"
 ### T3-14: `FORCE_UNSUPPORTED_OS=1` downgrades error to warning and continues
 
 ```bash
-FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 \
+FORCE_UNSUPPORTED_OS=1 CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 \
   | grep -E "Unsupported OS|WARN"
 ```
 
@@ -1096,7 +1096,7 @@ Set up a GPU node with no NVIDIA drivers pre-installed, stage artifacts with
 `--skip-nvidia-closure`, then drive the installer directly:
 
 ```bash
-AIRGAP_MODE=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 \
+AIRGAP_MODE=true CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install 2>&1 \
   | grep -E "no offline driver repo|AIRGAP_NVIDIA_CLOSURE_DIR|nvidia-container-toolkit"
 echo "exit: $?"
 ```
@@ -1116,7 +1116,7 @@ its IP comes from the config and `uname -r` is surveyed over SSH.
 
 ```bash
 ./airgap_install.sh --download-only \
-  --config ./my-config.yaml \
+  --config ./my-cluster-config.yaml \
   --output-dir /tmp/airgap-out
 
 # Confirm the closure is real, not just repo pointers
@@ -1129,7 +1129,7 @@ ls "${BUNDLE}/packages/nvidia-closure/repodata/repomd.xml"
 **Then install — one command on the installer machine (config has `airgap: true`):**
 
 ```bash
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install \
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install \
   2>&1 | tee /tmp/t3-16-driver-install.log
 ```
 
