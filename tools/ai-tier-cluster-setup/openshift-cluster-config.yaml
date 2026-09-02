@@ -31,7 +31,8 @@ openshift:
     - cc-40-f3-9f-e2-3c
 
   # External HTTP Routes. If host is omitted, the installer uses
-  # <feature>.<default-ingress-domain>. Configure Route TLS separately if needed.
+  # <feature>.<default-ingress-domain>. HTTPS Route TLS and workload mTLS are
+  # not configured or qualified by this installation workflow.
   routes:
     saia:
       enabled: true
@@ -46,9 +47,9 @@ images:
   # value. For an air-gapped cluster, replace each fully qualified image with
   # its path in the customer-provided internal registry.
   registry: ""
-  # Lab use only. true permits plain-HTTP pulls, adds the host to OpenShift's
-  # insecureRegistries, and disables destination TLS verification during an
-  # air-gap oc-mirror import.
+  # Production deployments must leave this false. true permits plain-HTTP
+  # pulls, adds the host to OpenShift's insecureRegistries, and disables
+  # destination TLS verification during an air-gap oc-mirror import.
   registryInsecure: false
 
   operator:

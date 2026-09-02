@@ -43,7 +43,7 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
 | Splunk AI Operator | `splunk-ai-operator-system` | Manifest |
 | Splunk Operator | `splunk-operator` | Manifest |
 | Splunk Standalone, Ray, Weaviate, SAIA, and SLIM | `ai-platform` | Operators and custom resources |
-| SAIA and SLIM Routes | `ai-platform` | OpenShift Routes |
+| SAIA and SLIM Routes | `ai-platform` | HTTP OpenShift Routes |
 
 The workload namespace is configurable and defaults to `ai-platform`.
 
@@ -172,7 +172,7 @@ Allow these flows for the selected installation and integration path:
 | Installer machine | Hugging Face | Download a required model that is missing when model staging is enabled |
 | Installer machine and AI workloads | Object-store endpoint | Stage and read models and runtime state |
 | OpenShift nodes | Configured image registries | Pull Operator and workload images |
-| User browser and external Splunk | OpenShift router on TCP 80, or 443 after customer-managed TLS is configured | Reach the SAIA and SLIM Routes |
+| User browser and external Splunk | OpenShift router on TCP 80 | Reach the supported HTTP SAIA and SLIM Routes |
 | SAIA and SLIM workloads | Bundled Splunk management service on TCP 8089 | Fetch signing keys and validate JWTs |
 | Internal OpenTelemetry collectors | Bundled Splunk HEC service on TCP 8088 | Send internal telemetry |
 | Splunk Enterprise, only when using Bring Your Own LLM | Customer OIDC token endpoint and LLM endpoint | Authenticate to and invoke the custom model provider |
@@ -180,6 +180,9 @@ Allow these flows for the selected installation and integration path:
 An external Splunk server and the user's browser must each be able to resolve
 and reach the appropriate Route. A laptop VPN does not provide connectivity for
 the external Splunk server or for workloads running inside OpenShift.
+
+The supported SAIA and SLIM exposure uses HTTP on TCP 80. HTTPS Route TLS and
+workload mTLS are not configured or qualified by this installation workflow.
 
 ### External content dependencies
 
@@ -330,8 +333,9 @@ internal registry and object store.
 `images.registryInsecure: true` adds the registry host to OpenShift's
 `insecureRegistries`, permits plain-HTTP pulls, and passes
 `--dest-tls-verify=false` to the air-gap `oc-mirror` import. For an HTTPS
-registry, this skips destination certificate verification. Use this setting
-only in a controlled lab; leave it `false` for production.
+registry, this skips destination certificate verification. Production
+deployments must leave it `false` and use a registry certificate trusted by the
+installer host and OpenShift nodes.
 
 ## Verify and access the deployment
 
@@ -371,9 +375,9 @@ List the Routes:
 oc get route saia slim -n ai-platform
 ```
 
-The installer creates HTTP Routes. Production HTTPS requires Route TLS and a
-certificate trusted by the client; that certificate configuration is outside
-the current installer.
+The installer supports and qualifies HTTP Routes only. HTTPS Route TLS and
+workload mTLS are not configured or supported by this deployment workflow. Use
+the HTTP URLs printed by the installer.
 
 ### Open the Ray dashboard
 
@@ -427,10 +431,10 @@ Use Splunk Enterprise 10.2 and install
    `http://saia.<ingress-domain>`, and save it.
 5. Send a prompt and confirm that the app returns a model response.
 
-The user's browser calls the configured SAIA URL directly. The Route must
+The user's browser calls the configured SAIA URL directly. The HTTP Route must
 therefore be resolvable and reachable from the browser, not only from Splunk.
-If customer-managed Route TLS is enabled, use `https://` and a certificate
-trusted by the browser.
+Do not change the configured URL to `https://`; HTTPS is not supported by this
+installation workflow.
 
 ### Install and configure Splunk AI Toolkit
 
@@ -519,8 +523,8 @@ cloud-connected stacks.
 | `openshift.nodeLabelStrategy` | `manual` labels listed nodes; `auto` labels all workers |
 | `openshift.nodes` | AI-tier nodes used by the `manual` strategy |
 | `openshift.ingressDomain` | Optional ingress-domain override |
-| `openshift.routes.<feature>.enabled` | Create the SAIA or SLIM Route |
-| `openshift.routes.<feature>.host` | Optional Route hostname override |
+| `openshift.routes.<feature>.enabled` | Create the supported HTTP SAIA or SLIM Route |
+| `openshift.routes.<feature>.host` | Optional HTTP Route hostname override |
 
 CPU and GPU workloads share the AI-tier pool. GPU workers are selected by their
 `nvidia.com/gpu` resource request; there is no separate CPU/GPU scheduling mode
@@ -541,7 +545,7 @@ air-gapped deployment.
 | Setting | Release default | Purpose |
 |---|---|---|
 | `images.registry` | empty | Optional registry prefix for short image names |
-| `images.registryInsecure` | `false` | Allow plain HTTP and skip destination TLS verification during air-gap import; use only in a controlled lab |
+| `images.registryInsecure` | `false` | Must remain `false` in production; `true` permits plain HTTP and skips destination TLS verification during air-gap import |
 | `images.operator.image` | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator |
 | `images.ray.headImage` | `docker.io/splunk/ai-tier-ray-head:v1.0` | Ray head runtime |
 | `images.ray.workerImage` | `docker.io/splunk/ai-tier-ray-worker:v1.0` | Ray GPU worker runtime |
@@ -735,17 +739,16 @@ no longer eligible.
 SAIA and SLIM have separate Routes backed by `ClusterIP` Services. The Routes
 use a 600-second timeout and disabled response buffering for long-running and
 streaming responses. A Route may return HTTP 503 until its backing Service has
-ready endpoints.
+ready endpoints. The generated Routes target HTTP port 8080 and do not include
+a Route `spec.tls` configuration.
 
 ## Security and production considerations
 
-- The installer creates HTTP SAIA and SLIM Routes. Production HTTPS requires
-  customer-managed Route TLS and a certificate trusted by every client.
-- Workload mTLS is not enabled or qualified by this installer. Route TLS does
-  not by itself provide end-to-end workload mTLS.
-- Keep `images.registryInsecure: false` in production. The `true` setting
-  permits plain HTTP and disables destination TLS verification for air-gap
-  mirroring; use it only in a controlled lab.
+- The supported production deployment exposes SAIA and SLIM through HTTP
+  Routes. HTTPS Route TLS and workload mTLS are not configured, supported, or
+  qualified by this installation workflow.
+- `images.registryInsecure` is unrelated to SAIA and SLIM transport. Keep it
+  `false` in production so registry TLS verification remains enabled.
 - Keep registry and object-store credentials out of source control. Manage
   OpenShift secret encryption, RBAC, audit logging, and credential rotation
   according to the customer's cluster-security policy.
