@@ -1,44 +1,34 @@
-# =============================================================================
-# OpenShift Cluster Config for Splunk AI tier
-# =============================================================================
-# Used by openshift_with_stack.sh
-# =============================================================================
+# Splunk AI tier (AI POD) settings for OpenShift.
+# Copy this file, replace environment-specific values, and pass the copy through
+# CONFIG_FILE. Do not commit credentials.
 
-# Set airgap=true for an air-gapped deployment. The normal install command then
-# mirrors and configures installer-owned OpenShift dependencies automatically.
-# Air-gap installation must run on Linux because Red Hat oc-mirror is Linux-only.
+# false: connected cluster. true: air-gapped cluster.
+# Air-gapped installation requires a Linux installer host with oc-mirror.
+# Images under images.* must already exist in the configured internal registry.
 cluster:
   airgap: false
 
 kubernetes:
   namespace: ai-platform
 
-# OpenShift-specific settings
 openshift:
-  # This installer pins the NFD operand and GPU Operator channel for OpenShift
-  # 4.21 and fails preflight on a different cluster minor.
+  # Qualified OpenShift minor. Changing this value does not add support.
   requiredVersion: "4.21"
 
-  # Grant privileged SCC to Ray worker and operator service accounts.
-  # Required when running GPU workloads (nvidia.com/gpu requests).
-  # Set to "false" only if your cluster policy already covers this.
+  # Let the installer grant required SCC access. Set false only when the
+  # cluster administrator provides equivalent permissions separately.
   grantPrivilegedSCC: "true"
 
-  # Node labeling for the splunk.ai/ai-tier-node scheduler selector.
-  # Both CPU and GPU workloads target this single AI-tier node pool; GPU workers
-  # are pinned to GPU-capable nodes by their nvidia.com/gpu resource request.
-  # Use "auto" to label all worker nodes automatically.
-  # Use "manual" to specify node names explicitly below.
+  # auto labels every worker node; manual labels only the nodes listed below.
   nodeLabelStrategy: "manual"
 
-  # Nodes that make up the AI-tier pool. List every node the AI platform should
-  # run on — CPU workloads (weaviate, ray-head, saia-api) and GPU workloads
-  # (ray-worker) both schedule here.
+  # AI-tier node pool used when nodeLabelStrategy is manual. CPU and GPU
+  # workloads share this pool; GPU resource requests select GPU-capable nodes.
   nodes:
     - cc-40-f3-9f-e2-3c
 
-  # OpenShift-native external exposure. Hosts default to
-  # <feature>.<default-ingress-domain>; set host explicitly to override.
+  # External HTTP Routes. If host is omitted, the installer uses
+  # <feature>.<default-ingress-domain>. Configure Route TLS separately if needed.
   routes:
     saia:
       enabled: true
@@ -48,13 +38,11 @@ openshift:
       # host: "slim.apps.example.com"
 
 images:
-  # In an air-gapped install this is the internal registry that already contains
-  # the customer-provided images below. The installer automatically imports its
-  # OpenShift infrastructure and Operator content into this registry.
-  # Registry prefix applied to images that are not fully qualified.
+  # Prefix for image names that are not fully qualified. For an air-gapped
+  # cluster, use the internal registry containing the images listed below.
   registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
-  # Lab/isolated-network option only. When true, the installer permits HTTP on
-  # a matching Route and configures OpenShift nodes for insecure image pulls.
+  # Lab use only. true permits plain-HTTP registry pulls; it does not disable
+  # certificate verification for an HTTPS registry.
   registryInsecure: false
 
   operator:
@@ -92,18 +80,12 @@ storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
   minimumDiskSpace:
-    # Scale-factor-1 minimum available GiB on the shared AI-tier node filesystem
-    # backing /var/lib/containers and /opt/local-path-provisioner. The installer
-    # multiplies this value by aiPlatform.scaleFactor: 1024 GiB at scale 1 and
-    # 2048 GiB at scale 2.
+    # Available GiB required on each AI-tier node at scale 1. The installer
+    # multiplies it by aiPlatform.scaleFactor (1024 at scale 1; 2048 at 2).
     aiTierNode: 1024
   modelStaging:
-    # true checks every completion marker in the object store, skips models that
-    # are already current, and downloads/uploads only missing or changed models
-    # from the installer machine. Cluster nodes do not need internet access.
-    # Set false in air-gap mode only when every model is already staged; the
-    # installer then verifies all markers and fails before modifying the cluster
-    # if anything is missing.
+    # true stages only missing or changed models from the installer machine.
+    # false verifies the required completion markers already exist.
     enabled: true
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
@@ -115,22 +97,22 @@ storage:
 
 splunk:
   standaloneName: splunk-standalone
-  # Additional management/JWT issuers appended to the primary endpoint for
-  # both SAIA and SLIM.
+  # Additional management/JWT issuers accepted by SAIA and SLIM. The installer
+  # adds the primary short Splunk service URL automatically.
   trustedIssuers:
     - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 
 aiPlatform:
   name: "openshift-ai-platform"
+  # GPU profile supported by this OpenShift installer.
   defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
-  # Fresh-install capacity multiplier for both model replicas and GPU workers.
-  # Must be a YAML integer greater than or equal to 1.
+  # Capacity multiplier for model replicas, GPU workers, and the disk check.
+  # Use an integer greater than or equal to 1.
   scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    # Routes above provide stable external access. Keep the backing feature
-    # Services internal unless NodePort or LoadBalancer is explicitly required.
+    # Keep feature Services internal when Routes provide external access.
     type: ClusterIP         # ClusterIP | NodePort | LoadBalancer
   features:
     - name: "saia"
@@ -144,23 +126,27 @@ aiPlatform:
         effect: "NoSchedule"
 
 operators:
-  # In an air-gapped install the installer assigns these stable names to the
-  # internally mirrored CatalogSources it creates automatically.
+  # Connected installs use these OpenShift OLM CatalogSources. In air-gap mode,
+  # the installer mirrors the required catalogs and substitutes the generated
+  # internal CatalogSource names automatically.
   nfd:
     catalogSource: "redhat-operators"
   gpu:
     catalogSource: "certified-operators"
   ray:
+    # Ray Serve application-package version expected in object storage.
     modelVersion: "v0.3.14-36-g1549f5a"
+    # Ray runtime version; must match the Ray head and worker images.
     rayVersion: "2.56.0"
 
 files:
   aiPlatform: "./artifacts.yaml"
   splunkOperator: "./splunk-operator-cluster.yaml"
 
-# ECR pull secret — created automatically in all relevant namespaces during install.
-# Requires AWS credentials in the environment (e.g. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-# or an instance profile). Set enabled: false for non-ECR registries.
+# Amazon ECR authentication. When enabled, the installer uses AWS credentials
+# from the environment or an instance profile to create image-pull secrets in
+# the required namespaces. Set enabled to false when using another registry,
+# and configure the appropriate imagePullSecrets block instead.
 ecr:
   enabled: true
   account: "658391232643"
