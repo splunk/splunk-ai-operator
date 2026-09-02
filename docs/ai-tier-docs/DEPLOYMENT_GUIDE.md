@@ -29,6 +29,7 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
 - [Post-Install Verification](#post-install-verification)
 - [Internal Splunk Access](#internal-splunk-access)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
+- [Install the Splunk AI Toolkit App](#install-the-splunk-ai-toolkit-app)
 - [Common Operations](#common-operations)
 - [Troubleshooting](#troubleshooting)
 
@@ -86,6 +87,7 @@ Use these versions together for this release:
 | Component | Version |
 |---|---|
 | [Splunk AI Assistant app](https://splunkbase.splunk.com/app/7245) | 2.3.0 |
+| [Splunk AI Toolkit app](https://splunkbase.splunk.com/app/2890) | >= 6.1.0 |
 | Splunk Enterprise | 10.2 |
 | AI Tier / Splunk AI Operator | v1.0 |
 | SAIA container images (API v1, API v2, and data loader) | v1.0 |
@@ -206,8 +208,8 @@ graph TB
 For k0s **internal Splunk** mode, this branch restores `main`'s native splunkd
 HTTPS and short-issuer contract rather than installing certificates or another
 proxy. It also aligns the AIPlatform endpoint with that issuer for both SAIA
-and Slim. Splunkd keeps its native HTTPS listener on port 8089. This is required
-by the Splunk AI Assistant app 2.3.0, whose local Splunk SDK connects
+and SLIM Service. Splunkd keeps its native HTTPS listener on port 8089. This is
+required by the Splunk AI Assistant app 2.3.0, whose local Splunk SDK connects
 to `https://127.0.0.1:8089`.
 
 Splunk's OAuth `issuer_uri` and
@@ -218,7 +220,7 @@ namespace-local Service URL:
 https://splunk-<standaloneName>-standalone-service:8089
 ```
 
-The operator propagates that endpoint to both SAIA and Slim as
+The operator propagates that endpoint to both SAIA and SLIM Service as
 `SPLUNK_ISSUERS`, so the JWT `iss` claim and both feature allowlists remain
 byte-identical. The installer does not create a JWKS proxy, TLS Secret,
 Certificate, CA ConfigMap, or CA mount for this path.
@@ -1187,6 +1189,73 @@ Open the Splunk AI Assistant app and send a test prompt to confirm end-to-end co
 For a reusable pass/fail sequence covering installer completion, Pods, workload
 resources, direct model inference, trusted SAIA reachability, and the browser
 flow, use the [Post-Install Sanity Checklist](../../tools/ai-tier-cluster-setup/SANITY_TEST_CHECKLIST.md).
+
+---
+
+## Install the Splunk AI Toolkit App
+
+After the cluster is healthy, install the **Splunk AI Toolkit** app
+(`Splunk_ML_Toolkit`, packaged as `Splunk_ML_Toolkit.tgz`) version 6.1.0 on the
+same Splunk Enterprise 10.2 instance — installing the Splunk AI Assistant app
+above is not a prerequisite. Unlike the Assistant app, the Toolkit app calls
+the **SLIM service**, not SAIA, and adds the `ai` and `apply CDTSM` SPL
+commands. This is a separate post-install step and does not change the cluster
+installation flow.
+
+> **Prerequisite:** the `slim` feature must be enabled and its Service exposed
+> so Splunk can reach it — see
+> [`aiPlatform.serviceTemplate.slimNodePort`](K0S_README.md#service-template-saia--slim-public-exposure).
+> The default `ClusterIP` exposure is enough only when Splunk runs in the same
+> cluster.
+
+### 1. Install the app
+
+Using the same Splunk Web session as [above](#install-the-splunk-ai-assistant-app):
+
+1. **Apps → Manage Apps → Install app from file**
+2. Select `Splunk_ML_Toolkit.tgz`, check **Upgrade app** if updating, click **Upload**
+3. Restart Splunk if prompted
+
+### 2. Onboard to the AI tier
+
+The app needs the SLIM base URL, including the API path, to route the `ai` and
+`apply CDTSM` commands to the AI tier.
+
+```bash
+NAMESPACE="ai-platform"
+CLUSTER_NAME="<cluster-name>"
+SLIM_SERVICE="${CLUSTER_NAME}-ai-platform-slim-slim-service"
+kubectl get svc "${SLIM_SERVICE}" -n "${NAMESPACE}" -o wide
+# NodePort: http://<worker-node-ip>:<nodePort>/tenant/slim-api/v1alpha1
+# LoadBalancer: http://<external-ip-or-hostname>:8080/tenant/slim-api/v1alpha1
+# ClusterIP: http://${SLIM_SERVICE}.${NAMESPACE}.svc.cluster.local:8080/tenant/slim-api/v1alpha1
+```
+
+`tenant` is a literal path segment that SLIM reads as a tenant label; keep it
+as written or use another short name.
+
+In Splunk Web: **Splunk AI Toolkit → Connections**. Click **+ Connection** →
+under **Endpoint**, choose **Splunk AI tier**, then walk through the wizard and
+enter the URL above — including the `/tenant/slim-api/v1alpha1` suffix — as the
+**AI tier endpoint URL**. Saving performs no connectivity check; confirm SLIM
+is reachable first with a `/health` probe from inside the Splunk pod (see the
+full guide below).
+
+> **Full configuration options** (endpoint reachability checks, the AI tier
+> LLM connection required for `ai`, and troubleshooting) — see
+> [K0S_README.md — Splunk AI Toolkit App](K0S_README.md#splunk-ai-toolkit-app)
+> and
+> [Onboarding to the AI Tier (Splunk AI Toolkit)](K0S_README.md#onboarding-to-the-ai-tier-splunk-ai-toolkit).
+
+### 3. Verify
+
+```text
+| inputlookup internet_traffic.csv | head 2000 | apply CDTSM bits_transferred forecast_k=128
+```
+
+Forecast values in the results mean the full path — Splunk → SLIM → model — is
+healthy. The `ai` command additionally needs an AI tier LLM connection
+(**Connections → + Connection → LLM → Splunk AI tier LLM**) before it can run.
 
 ---
 
