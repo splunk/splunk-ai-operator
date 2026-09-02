@@ -1195,10 +1195,10 @@ flow, use the [Post-Install Sanity Checklist](../../tools/ai-tier-cluster-setup/
 ## Install the Splunk AI Toolkit App
 
 After the cluster is healthy, install the **Splunk AI Toolkit** app
-(`Splunk_ML_Toolkit`, packaged as `Splunk_ML_Toolkit.tgz`) version 6.1.0 on the
-same Splunk Enterprise 10.2 instance — installing the Splunk AI Assistant app
-above is not a prerequisite. Unlike the Assistant app, the Toolkit app calls
-the **SLIM service**, not SAIA, and adds the `ai` and `apply CDTSM` SPL
+(`Splunk_ML_Toolkit`, packaged as `Splunk_ML_Toolkit.tgz`) version >= 6.1.0 on
+the same Splunk Enterprise 10.2 instance — installing the Splunk AI Assistant
+app above is not a prerequisite. Unlike the Assistant app, the Toolkit app
+calls the **SLIM service**, not SAIA, and adds the `ai` and `apply CDTSM` SPL
 commands. This is a separate post-install step and does not change the cluster
 installation flow.
 

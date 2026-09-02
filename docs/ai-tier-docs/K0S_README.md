@@ -2373,6 +2373,7 @@ endpoint, and the two are configured independently. Once onboarded, AITK adds:
 - All pods are Running and the `AIPlatform` CR is Ready (same checks as the
   [Splunk AI Assistant App](#splunk-ai-assistant-app) prerequisites)
 - The slim `AIService` is Ready: `kubectl get aiservice -n ai-platform`
+- You have the **Python for Scientific Computing** app installed from Splunkbase
 - You have the version >= 6.1.0 `Splunk_ML_Toolkit.tgz` archive. For an air-gapped
   environment, download it on a connected machine and transfer the archive to
   the machine used for installation.
@@ -2431,8 +2432,8 @@ SPLUNK_SECRET="$(kubectl get secret -n "${NAMESPACE}" \
 SPLUNK_PASSWORD="$(kubectl get secret "${SPLUNK_SECRET}" \
   -n "${NAMESPACE}" -o jsonpath='{.data.password}' | base64 --decode)"
 kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
-  curl -su admin:"${SPLUNK_PASSWORD}" \
-  http://localhost:8089/services/apps/local/Splunk_ML_Toolkit \
+  curl -sku admin:"${SPLUNK_PASSWORD}" \
+  https://localhost:8089/services/apps/local/Splunk_ML_Toolkit \
   | grep -E "<title>|disabled|version"
 ```
 
@@ -2514,9 +2515,15 @@ Everything under `/tenant/slim-api/v1alpha1` requires both a `request_id`
 header and a Splunk-minted bearer token; a manual `curl` against, say,
 `chat/models` without a `request_id` header fails with `400 Request ID not
 present in header` before SLIM even looks at the `Authorization` header, which
-can look like a routing problem when it is not. For an authenticated
-end-to-end check that mints a short-lived JWT, sends the required headers, and
-calls `chat/models`, run the bundled script instead of hand-rolling curl:
+can look like a routing problem when it is not.
+
+For an authenticated end-to-end check that mints a short-lived JWT, sends the
+required headers, and calls `chat/models`, run the bundled script instead of
+hand-rolling curl. It mints its token through the Splunk AI Assistant app's
+bundled SDK and also checks the SAIA Service, so it needs that app installed
+too (see [Splunk AI Assistant App](#splunk-ai-assistant-app)) — it is not a
+Toolkit-only check. On a Toolkit-only install, skip this and rely on the
+CDTSM smoke test in Step 5 below to validate the authenticated path instead.
 
 ```bash
 KUBECONFIG=/path/to/kubeconfig \
@@ -2706,7 +2713,7 @@ Use the guide that matches the failing layer:
   [Troubleshooting with Events and Status](../splunk-ai-operator-docs/troubleshooting.md)
 - Splunk AI Assistant installation or SAIA connectivity:
   [Troubleshooting the App](#troubleshooting-the-app)
-- Splunk AI Toolkit installation, AI tier onboarding, or SLIM connectivity:
+- Splunk AI Toolkit installation, AITK onboarding to AI tier, or SLIM connectivity:
   [Troubleshooting the Toolkit App](#troubleshooting-the-toolkit-app)
 
 The installer guide is the source of truth for operational commands. Keep
