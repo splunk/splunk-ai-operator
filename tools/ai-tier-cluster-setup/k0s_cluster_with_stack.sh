@@ -714,7 +714,8 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   # Default to "true" for plain-HTTP (no-TLS) registries such as a local mirror.
   # Set false for ECR, Docker Hub, Harbor, or any HTTPS registry.
-  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "true"' "$CONFIG_FILE" 2>/dev/null || echo "true")"
+  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure' "$CONFIG_FILE" 2>/dev/null || echo "true")"
+  [[ -z "${IMAGE_REGISTRY_INSECURE}" || "${IMAGE_REGISTRY_INSECURE}" == "null" ]] && IMAGE_REGISTRY_INSECURE="true"
   OPERATOR_IMAGE="$(yq eval '.images.operator.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_IMAGE="$(yq eval '.images.splunk.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_OPERATOR_IMAGE="$(yq eval '.images.splunk.operatorImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
