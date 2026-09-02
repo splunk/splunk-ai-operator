@@ -294,6 +294,24 @@ The customer must provide separately:
 - object-store and registry credentials
 - model weights, unless the installer machine can download missing models
 
+### Registry authentication for mirroring
+
+`oc-mirror` must authenticate to both its source registries and
+`images.registry` before workload pull secrets are created. The unified
+installer combines the cluster pull secret with `imagePullSecrets.custom` for
+this step.
+
+When `images.registry` is Amazon ECR, `ecr.enabled: true` is not sufficient for
+the earlier mirror import; it creates pod pull secrets later in the install.
+Also provide ECR destination credentials through one of these methods:
+
+- configure `imagePullSecrets.custom` with the ECR server, username `AWS`, and
+  a current ECR authorization token
+- add ECR credentials to the cluster pull secret
+- provide a complete Docker-compatible auth file through `REGISTRY_AUTH_FILE`
+  or `AIRGAP_REGISTRY_AUTH_FILE`; it must cover the source and destination
+  registries
+
 ### Installer host requirements
 
 > [!IMPORTANT]
@@ -309,9 +327,11 @@ enabled, it must also reach Hugging Face when a model is missing.
 The cluster nodes do not need public internet access. They must reach the
 internal registry and object store.
 
-`images.registryInsecure: true` enables a plain-HTTP registry for a controlled
-lab network. It does not disable certificate verification for an HTTPS
-registry. Leave it `false` for production.
+`images.registryInsecure: true` adds the registry host to OpenShift's
+`insecureRegistries`, permits plain-HTTP pulls, and passes
+`--dest-tls-verify=false` to the air-gap `oc-mirror` import. For an HTTPS
+registry, this skips destination certificate verification. Use this setting
+only in a controlled lab; leave it `false` for production.
 
 ## Verify and access the deployment
 
@@ -495,7 +515,7 @@ cloud-connected stacks.
 | `cluster.airgap` | `false` for a standard deployment; `true` for an air-gapped deployment |
 | `kubernetes.namespace` | Workload namespace; default `ai-platform` |
 | `openshift.requiredVersion` | Qualified OpenShift minor; must be `4.21` |
-| `openshift.grantPrivilegedSCC` | Grant required SCC access; disable only when equivalent policy exists |
+| `openshift.grantPrivilegedSCC` | Control namespace-wide grants for AI workloads and the Splunk AI Operator; component-specific grants remain automatic |
 | `openshift.nodeLabelStrategy` | `manual` labels listed nodes; `auto` labels all workers |
 | `openshift.nodes` | AI-tier nodes used by the `manual` strategy |
 | `openshift.ingressDomain` | Optional ingress-domain override |
@@ -508,15 +528,20 @@ in this installer.
 
 ### Images and registry credentials
 
-`images.registry` is prepended only to image names that are not fully
-qualified. Fully qualified references such as `docker.io/splunk/...` are used
-as written, so replace each one with its mirrored path for an air-gapped
-deployment.
+`images.registry` is prepended unless the installer recognizes the image as a
+fully qualified reference. The supported qualified form starts with a domain
+name containing a dot or an IPv4 address, optionally includes a port, and has a
+tag, for example `docker.io/splunk/app:v1` or
+`10.0.0.1:5000/splunk/app:v1`. Registry names without a dot, `localhost`, and
+tagless references are treated as short names and are prefixed when
+`images.registry` is set. Use the supported tagged form for predictable image
+resolution, and replace public paths with their internal paths for an
+air-gapped deployment.
 
 | Setting | Release default | Purpose |
 |---|---|---|
 | `images.registry` | empty | Optional registry prefix for short image names |
-| `images.registryInsecure` | `false` | Allow plain-HTTP pulls from `images.registry`; use only in a controlled lab |
+| `images.registryInsecure` | `false` | Allow plain HTTP and skip destination TLS verification during air-gap import; use only in a controlled lab |
 | `images.operator.image` | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator |
 | `images.ray.headImage` | `docker.io/splunk/ai-tier-ray-head:v1.0` | Ray head runtime |
 | `images.ray.workerImage` | `docker.io/splunk/ai-tier-ray-worker:v1.0` | Ray GPU worker runtime |
@@ -545,9 +570,12 @@ ecr:
 ```
 
 The installer runs `aws ecr get-login-password` and creates pull secrets in
-the required namespaces during installation. Amazon ECR tokens expire after
-12 hours; customers using ECR must provide a credential-refresh process for
-long-running clusters.
+the required namespaces during installation. This happens after air-gap mirror
+import, so an air-gapped ECR destination also requires the mirror
+authentication described under [Registry authentication for
+mirroring](#registry-authentication-for-mirroring). Amazon ECR tokens expire
+after 12 hours; customers using ECR must provide a credential-refresh process
+for long-running clusters.
 
 For another private registry, disable ECR and configure the matching
 `imagePullSecrets` block. Example:
@@ -574,7 +602,7 @@ registry that does not require authentication needs no pull-secret block.
 | `storage.storageClass` | `local-path` | StorageClass used for workload PVCs |
 | `storage.vectorDbSize` | `50Gi` | Requested Weaviate PVC size |
 | `storage.minimumDiskSpace.aiTierNode` | `1024` | Minimum available GiB on every AI-tier node at `scaleFactor: 1`; multiplied by the scale factor |
-| `storage.modelStaging.enabled` | `true` | Stage only missing or changed models; `false` verifies that all required models already exist |
+| `storage.modelStaging.enabled` | `true` | Stage only missing or changed models; `false` skips staging and performs a pre-check only for air-gapped installs |
 | `storage.objectStore.type` | `seaweedfs` in the template | `aws`, `minio`, `seaweedfs`, or `s3compat` |
 | `storage.objectStore.bucket` | `ai-platform-bucket` | Bucket used for model artifacts and runtime state |
 | `storage.objectStore.endpoint` | none | Required for MinIO, SeaweedFS, and generic S3-compatible storage |
@@ -661,9 +689,21 @@ Relative paths are resolved from the directory containing `CONFIG_FILE`.
 
 ### Security Context Constraints
 
-When `openshift.grantPrivilegedSCC` is `"true"`, the installer grants the
-`anyuid` and `privileged` constraints required by the operators and workloads.
-It records the grants it owns and removes them during `delete`.
+When `openshift.grantPrivilegedSCC` is `"true"`, the installer grants
+namespace-wide `anyuid` and `privileged` access to the AI workload namespace
+and `privileged` access to the Splunk AI Operator namespace.
+
+This setting is not a global SCC switch. The installer always applies the
+following component-specific grants required by its current manifests:
+
+| Component | Grant |
+|---|---|
+| cert-manager service accounts | `anyuid` |
+| Local Path Provisioner and helper | `privileged` SCC ClusterRoleBindings |
+| OpenTelemetry Operator | `privileged` SCC ClusterRoleBinding |
+| Splunk Operator namespace | `privileged` |
+
+The installer records the grants it owns and removes them during `delete`.
 
 Use the same namespace and resource names for install and delete. SCC cleanup
 uses ownership recorded by the installer in `openshift-config` and is
@@ -703,8 +743,9 @@ ready endpoints.
   customer-managed Route TLS and a certificate trusted by every client.
 - Workload mTLS is not enabled or qualified by this installer. Route TLS does
   not by itself provide end-to-end workload mTLS.
-- Keep `images.registryInsecure: false` in production. The `true` setting is
-  only for a controlled plain-HTTP registry.
+- Keep `images.registryInsecure: false` in production. The `true` setting
+  permits plain HTTP and disables destination TLS verification for air-gap
+  mirroring; use it only in a controlled lab.
 - Keep registry and object-store credentials out of source control. Manage
   OpenShift secret encryption, RBAC, audit logging, and credential rotation
   according to the customer's cluster-security policy.
@@ -730,8 +771,9 @@ The RTX Pro 6000 Blackwell profile uses
 
 - `true`: check completion markers and download/upload only missing or changed
   models from the installer machine
-- `false`: do not download models; verify that every required completion marker
-  already exists before changing the cluster
+- `false`: do not download models; air-gapped installs verify every required
+  completion marker before platform installation, while standard installs skip
+  this pre-check and can fail later if required artifacts are missing
 
 The cluster nodes do not download models from Hugging Face. Ray workers read
 the staged artifacts from the object store.

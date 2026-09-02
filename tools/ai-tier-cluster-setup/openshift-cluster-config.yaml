@@ -15,8 +15,11 @@ openshift:
   # Qualified OpenShift minor. Changing this value does not add support.
   requiredVersion: "4.21"
 
-  # Let the installer grant required SCC access. Set false only when the
-  # cluster administrator provides equivalent permissions separately.
+  # Controls the namespace-wide SCC grants for the AI workloads and Splunk AI
+  # Operator. Component-specific grants for cert-manager, Local Path
+  # Provisioner, OpenTelemetry, and Splunk Operator are always applied. Set
+  # false only when the cluster administrator provides equivalent AI workload
+  # and Splunk AI Operator permissions separately.
   grantPrivilegedSCC: "true"
 
   # auto labels every worker node; manual labels only the nodes listed below.
@@ -43,8 +46,9 @@ images:
   # value. For an air-gapped cluster, replace each fully qualified image with
   # its path in the customer-provided internal registry.
   registry: ""
-  # Lab use only. true permits plain-HTTP registry pulls; it does not disable
-  # certificate verification for an HTTPS registry.
+  # Lab use only. true permits plain-HTTP pulls, adds the host to OpenShift's
+  # insecureRegistries, and disables destination TLS verification during an
+  # air-gap oc-mirror import.
   registryInsecure: false
 
   operator:
@@ -87,7 +91,8 @@ storage:
     aiTierNode: 1024
   modelStaging:
     # true stages only missing or changed models from the installer machine.
-    # false verifies the required completion markers already exist.
+    # false skips staging. Air-gapped installs verify completion markers before
+    # platform installation; standard installs do not perform that pre-check.
     enabled: true
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
@@ -145,8 +150,11 @@ files:
   aiPlatform: "./artifacts.yaml"
   splunkOperator: "./splunk-operator-cluster.yaml"
 
-# Optional authentication for a private non-ECR registry. Leave disabled for
-# public images. Do not commit real credentials.
+# Optional authentication for a private registry. Air-gapped installs also use
+# this block to authenticate the oc-mirror destination. When that destination
+# is ECR, ecr.enabled alone is not enough for the earlier mirror import; provide
+# a current ECR token here, in the cluster pull secret, or in a registry auth
+# file. Leave disabled for public images. Do not commit real credentials.
 imagePullSecrets:
   custom:
     enabled: false
@@ -156,10 +164,11 @@ imagePullSecrets:
     password: "<registry-password-or-token>"
     email: "<registry-account-email>"
 
-# Amazon ECR authentication. When enabled, the installer uses AWS credentials
-# from the environment or an instance profile to create image-pull secrets in
-# the required namespaces. Set enabled to false when using another registry,
-# and configure the appropriate imagePullSecrets block instead.
+# Amazon ECR workload authentication. When enabled, the installer uses AWS
+# credentials from the environment or an instance profile to create pod pull
+# secrets after air-gap mirror import. For an air-gapped ECR destination, also
+# provide oc-mirror authentication as described under imagePullSecrets above.
+# Set enabled to false when using another registry.
 ecr:
   enabled: false
   account: ""
