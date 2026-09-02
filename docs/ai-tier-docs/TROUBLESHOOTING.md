@@ -684,7 +684,7 @@ Every peer must have all three fields: `peerAddress`, `peerASN`, `myASN`.
 ```bash
 SERVICE="<cluster-name>-ai-platform-saia-saia-service"
 # In case of SLIM use below
-SERVICE="<cluster-name>-ai-platform-slim-slim-service"
+# SERVICE="<cluster-name>-ai-platform-slim-slim-service"
 kubectl get svc "${SERVICE}" -n ai-platform -o wide
 kubectl describe svc "${SERVICE}" -n ai-platform
 
