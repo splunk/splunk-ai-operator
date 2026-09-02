@@ -35,12 +35,12 @@ The default installation path deploys the complete Splunk AI tier on a k0s clust
 ```bash
 git clone https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/ai-tier-cluster-setup
-cp k0s-cluster-config.yaml my-cluster.yaml
+cp k0s-cluster-config.yaml my-cluster-config.yaml
 
-# Edit my-cluster.yaml for your environment, then validate and install.
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+# Edit my-cluster-config.yaml for your environment, then validate and install.
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh validate
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
 Review the [k0s Deployment Quick Reference](docs/ai-tier-docs/k0s-quick-reference.md)

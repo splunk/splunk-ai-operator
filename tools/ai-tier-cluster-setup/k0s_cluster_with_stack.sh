@@ -8636,30 +8636,30 @@ Environment:
 
 Examples:
   # Full install (interactive): prompts for model download, then asks 'yes' to proceed
-  CONFIG_FILE=./my-config.yaml $0 install
+  CONFIG_FILE=./my-cluster-config.yaml $0 install
 
   # Silent install (non-interactive, CI/CD): uses config values, no prompts, 5-second abort window
-  CONFIG_FILE=./my-config.yaml $0 install --silent
+  CONFIG_FILE=./my-cluster-config.yaml $0 install --silent
   # Equivalent:
-  AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml $0 install
+  AUTO_APPROVE=true CONFIG_FILE=./my-cluster-config.yaml $0 install
 
   # Stage model artifacts only (no cluster install; always runs regardless of config)
-  CONFIG_FILE=./my-config.yaml $0 stage-artifacts
+  CONFIG_FILE=./my-cluster-config.yaml $0 stage-artifacts
 
   # Join worker nodes (if install failed or was interrupted)
-  CONFIG_FILE=./my-config.yaml $0 join-workers
+  CONFIG_FILE=./my-cluster-config.yaml $0 join-workers
 
   # Delete cluster (with confirmation prompt)
-  CONFIG_FILE=./my-config.yaml $0 delete
+  CONFIG_FILE=./my-cluster-config.yaml $0 delete
 
   # Delete cluster (auto-approve, no prompt)
-  AUTO_APPROVE=true CONFIG_FILE=./my-config.yaml $0 delete
+  AUTO_APPROVE=true CONFIG_FILE=./my-cluster-config.yaml $0 delete
 
   # Deep cleanup (aggressive)
-  CONFIG_FILE=./my-config.yaml $0 clean-all
+  CONFIG_FILE=./my-cluster-config.yaml $0 clean-all
 
   # Verify all pods are healthy (re-runs diagnostics any time)
-  CONFIG_FILE=./my-config.yaml $0 verify-pods
+  CONFIG_FILE=./my-cluster-config.yaml $0 verify-pods
 
 Notes:
   - 'install' performs full cluster setup including worker joins

@@ -283,7 +283,7 @@ MANUAL USE (advanced)
   To drive the installer yourself against already-staged artifacts:
     export AIRGAP_BUNDLE_DIR=./airgap-bundle/airgap-bundle-<timestamp>
     source "${AIRGAP_BUNDLE_DIR}/airgap-env.sh"
-    CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+    CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 
 GPU NODE PACKAGES (packages/ directory)
   The bundle includes a complete offline dnf repository for GPU workers. The
@@ -1524,7 +1524,7 @@ cat > "${STAGE_DIR}/airgap-env.sh" <<'ENVEOF'
 #
 # Usage:
 #   AIRGAP_BUNDLE_DIR=/path/to/staged source /path/to/staged/airgap-env.sh
-#   CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+#   CONFIG_FILE=./my-cluster-config.yaml ./k0s_cluster_with_stack.sh install
 
 # Must point at the staged artifact directory (the --output-dir timestamped path).
 : "${AIRGAP_BUNDLE_DIR:?AIRGAP_BUNDLE_DIR must be set to the bundle extraction path}"

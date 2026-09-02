@@ -16,7 +16,7 @@
 #
 # Examples:
 #   bash fix_insecure_registry.sh
-#   bash fix_insecure_registry.sh --config /path/to/my-cluster.yaml
+#   bash fix_insecure_registry.sh --config /path/to/my-cluster-config.yaml
 #   bash fix_insecure_registry.sh \
 #     --controller 172.31.59.50 \
 #     --workers "172.31.33.255 172.31.22.91 172.31.22.173" \
