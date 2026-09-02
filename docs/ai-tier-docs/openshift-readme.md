@@ -13,11 +13,15 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
 
 - **Plan**
   - [What the installer deploys](#what-the-installer-deploys)
+  - [How OpenShift differs from k0s](#how-openshift-differs-from-k0s)
+  - [Architecture](#architecture)
   - [Requirements](#requirements)
 - **Deploy**
   - [Prepare the configuration](#prepare-the-configuration)
+  - [Installer command reference](#installer-command-reference)
   - [Standard deployment (internet-connected)](#standard-deployment-internet-connected)
   - [Air-gapped deployment](#air-gapped-deployment)
+  - [Installation flow](#installation-flow)
   - [Verify and access the deployment](#verify-and-access-the-deployment)
 - **Configure and operate**
   - [Install and test the Splunk apps](#install-and-test-the-splunk-apps)
@@ -46,6 +50,49 @@ For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
 | SAIA and SLIM Routes | `ai-platform` | HTTP OpenShift Routes |
 
 The workload namespace is configurable and defaults to `ai-platform`.
+
+## How OpenShift differs from k0s
+
+| Concern | k0s | OpenShift |
+|---|---|---|
+| Cluster provisioning | Installer creates the cluster | Installer uses an existing cluster |
+| Pod security | Kubernetes Pod Security Admission | OpenShift Security Context Constraints |
+| Node Feature Discovery and NVIDIA GPU Operator | Helm | Operator Lifecycle Manager Subscriptions |
+| External SAIA and SLIM access | MetalLB LoadBalancer | HTTP OpenShift Routes |
+| Local storage | Local Path Provisioner | Local Path Provisioner with SELinux relabeling |
+| Primary CLI | `kubectl` | `oc` |
+
+## Architecture
+
+```mermaid
+flowchart TB
+  ASSISTANT[Splunk AI Assistant] -->|HTTP| SAIA_ROUTE[SAIA Route]
+  AITK[Splunk AI Toolkit] -->|HTTP| SLIM_ROUTE[SLIM Route]
+
+  subgraph OCP[OpenShift cluster]
+    SAIA_ROUTE --> SAIA[SAIA API]
+    SLIM_ROUTE --> SLIM[SLIM API]
+    SAIA --> RAY[Ray model serving]
+    SLIM --> RAY
+    SAIA --> WEAVIATE[Weaviate]
+    SAIA -->|JWT validation| SPLUNK[Bundled Splunk Standalone]
+    SLIM -->|JWT validation| SPLUNK
+    OTEL[OpenTelemetry collectors] -->|HEC| SPLUNK
+  end
+
+  RAY -->|model weights| OBJECT_STORE[(Object store)]
+  SAIA -->|runtime state| OBJECT_STORE
+  REGISTRY[(Image registry)] -.->|image pulls| OCP
+```
+
+- **Ray** runs the model-serving head and GPU worker workloads.
+- **Weaviate** stores vector data and is initialized by a post-install job.
+- **SAIA** provides the Splunk AI Assistant API and retrieval-augmented
+  generation workflow.
+- **SLIM** provides model discovery and inference for Splunk AI Toolkit.
+- **Splunk Standalone** provides JWT issuer validation and receives internal
+  telemetry through HTTP Event Collector.
+- **Object storage** contains model artifacts and persistent SAIA runtime data.
 
 ## Requirements
 
@@ -244,6 +291,21 @@ Choose the deployment mode before running the installer:
 | Standard (internet-connected) | `cluster.airgap: false` | macOS or Linux | Configured Operator catalogs and image registries |
 | Air-gapped | `cluster.airgap: true` | Linux with `oc-mirror` v2 | Internal registry and object store only |
 
+## Installer command reference
+
+| Command | Purpose |
+|---|---|
+| `./openshift_with_stack.sh install` | Install or reconcile the complete platform |
+| `./openshift_with_stack.sh install --silent` | Install non-interactively using configuration values |
+| `./openshift_with_stack.sh verify` | Check platform resources and pod health; collect diagnostics on failure |
+| `./openshift_with_stack.sh diagnose` | Create a compressed support bundle |
+| `./openshift_with_stack.sh stage-artifacts` | Stage model artifacts without installing the platform |
+| `./openshift_with_stack.sh delete` | Remove installer-owned platform resources while preserving the OpenShift cluster |
+
+The default command is `install` when no subcommand is supplied. Set
+`CONFIG_FILE` for every command so the installer uses the intended namespace,
+resource names, and object-store settings.
+
 ## Standard deployment (internet-connected)
 
 Set `cluster.airgap: false`, then run:
@@ -337,6 +399,30 @@ registry, this skips destination certificate verification. Production
 deployments must leave it `false` and use a registry certificate trusted by the
 installer host and OpenShift nodes.
 
+## Installation flow
+
+`openshift_with_stack.sh install` performs these phases in order:
+
+1. **Air-gap preparation, when enabled** — mirror installer-owned OpenShift
+   content into the internal registry and apply the generated mirror resources.
+2. **Configuration** — load and validate settings, resolve images, accelerator,
+   model staging, and print the installation plan.
+3. **Preflight** — validate client tools, cluster-admin access, OpenShift and
+   node compatibility, storage, object-store access, registry access, and
+   air-gap prerequisites.
+4. **Model staging** — upload missing or changed models when enabled. An
+   air-gapped install with staging disabled verifies the required completion
+   markers.
+5. **Infrastructure** — install Node Feature Discovery and NVIDIA GPU
+   Operators, label nodes, install Local Path Provisioner, and apply the SELinux
+   relabeling required for local volumes.
+6. **Operators** — install cert-manager, OpenTelemetry Operator, KubeRay
+   Operator, registry pull secrets, Splunk AI Operator, and Splunk Operator.
+7. **AI Platform stack** — create Splunk Standalone and AIPlatform resources,
+   normalize feature Services, and create the enabled HTTP Routes.
+8. **Readiness and summary** — wait for platform resources and pods to become
+   ready, then print the SAIA and SLIM endpoints.
+
 ## Verify and access the deployment
 
 ### Check platform health
@@ -348,6 +434,19 @@ oc get aiplatform,aiservice,raycluster,rayservice -n ai-platform
 oc get pods -n ai-platform
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify
 ```
+
+Use these commands when observing a deployment in progress:
+
+```bash
+oc get raycluster,rayservice -n ai-platform -w
+oc logs -n splunk-ai-operator-system \
+  -l control-plane=controller-manager -f
+```
+
+A healthy deployment has current-generation `Ready=True` conditions on the
+AIPlatform and enabled AIServices, ready Ray resources, no failed or pending
+platform pods, and completed post-install Jobs. If `verify` finds an unhealthy
+resource, it runs `diagnose` automatically unless `AUTO_DIAGNOSE=false`.
 
 ### Use the service endpoints
 
@@ -581,23 +680,48 @@ mirroring](#registry-authentication-for-mirroring). Amazon ECR tokens expire
 after 12 hours; customers using ECR must provide a credential-refresh process
 for long-running clusters.
 
-For another private registry, disable ECR and configure the matching
-`imagePullSecrets` block. Example:
+For another private registry, disable ECR and configure only the matching
+`imagePullSecrets` block. Each enabled block is independent. The installer
+creates its secret in `ai-platform`, `splunk-ai-operator-system`, and
+`splunk-operator`, then attaches it to the relevant service accounts.
 
 ```yaml
 ecr:
   enabled: false
 
 imagePullSecrets:
+  autoCreateECR: false
+
+  dockerHub:
+    enabled: false
+    username: "<docker-hub-user>"
+    password: "<docker-hub-access-token>"
+    email: "<optional-email>"
+
+  gcr:
+    enabled: false
+    jsonKey: |
+      {"type": "service_account"}
+
+  acr:
+    enabled: false
+    registry: "<registry-name>.azurecr.io"
+    username: "<service-principal-or-registry-user>"
+    password: "<password>"
+
   custom:
     enabled: true
+    name: "custom-registry-secret"
     server: "registry.example.com"
     username: "<username>"
     password: "<access-token>"
+    email: "<optional-email>"
 ```
 
-Supported blocks are `dockerHub`, `gcr`, `acr`, and `custom`. A public
-registry that does not require authentication needs no pull-secret block.
+`imagePullSecrets.autoCreateECR: true` also enables ECR secret creation, but
+the public configuration template uses `ecr.enabled`. A block is skipped with
+a warning when required credentials are absent. A public registry that does
+not require authentication needs no pull-secret block.
 
 ### Storage and object store
 
@@ -720,9 +844,37 @@ Node Feature Discovery and the NVIDIA GPU Operator are installed through
 Operator Lifecycle Manager. The GPU Operator uses the OpenShift Driver Toolkit;
 the installer does not SSH to nodes or install host drivers manually.
 
+| Operator | Subscription | Channel | Namespace | Custom resource |
+|---|---|---|---|---|
+| Node Feature Discovery | `nfd` | `stable` | `openshift-nfd` | `NodeFeatureDiscovery/nfd-instance` |
+| NVIDIA GPU Operator | `gpu-operator-certified` | `v26.3` | `nvidia-gpu-operator` | `ClusterPolicy/gpu-cluster-policy` |
+
+The CatalogSources come from `operators.nfd.catalogSource` and
+`operators.gpu.catalogSource`. Operator Lifecycle Manager resolves the
+compatible patch release within each configured channel. The generated GPU
+ClusterPolicy enables `driver.use_ocp_driver_toolkit`, so OpenShift manages the
+node-driver deployment through the Driver Toolkit.
+
 For a disconnected cluster, the relevant catalogs, operand images, GPU driver
 images, and Driver Toolkit image must be available through the configured
 mirror. The air-gapped workflow handles this content.
+
+### Node labeling and scheduling
+
+The installer applies these labels:
+
+| Nodes | Labels |
+|---|---|
+| Control-plane nodes | `splunk.ai/node-role=controller`, `splunk.ai/workload-type=control-plane` |
+| AI-tier worker nodes | `splunk.ai/node-role=worker`, `splunk.ai/ai-tier-node=true` |
+
+With `openshift.nodeLabelStrategy: auto`, every worker joins the shared AI-tier
+pool. With `manual`, only nodes listed under `openshift.nodes` join it. CPU and
+GPU schedulers select the same pool; GPU pods additionally request
+`nvidia.com/gpu`, which limits them to nodes where the GPU resource is
+allocatable. The installer removes a lingering
+`nvidia.com/gpu=true:NoSchedule` taint from selected AI-tier nodes so CPU
+workloads can also use them.
 
 ### Storage and SELinux
 
@@ -741,6 +893,13 @@ use a 600-second timeout and disabled response buffering for long-running and
 streaming responses. A Route may return HTTP 503 until its backing Service has
 ready endpoints. The generated Routes target HTTP port 8080 and do not include
 a Route `spec.tls` configuration.
+
+| Route | Default host | Backing Service |
+|---|---|---|
+| `saia` | `saia.<ingress-domain>` | `<aiPlatform.name>-saia-saia-service:8080` |
+| `slim` | `slim.<ingress-domain>` | `<aiPlatform.name>-slim-slim-service:8080` |
+
+Set `openshift.routes.<feature>.enabled: false` to keep that feature internal.
 
 ## Security and production considerations
 
@@ -789,6 +948,28 @@ CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh stage-artifacts
 ```
 
 Set `SKIP_IF_STAGED=0` to force a fresh download and upload.
+
+The current quantized model manifest contains:
+
+| Artifact ID | Source |
+|---|---|
+| `all-minilm-l6-v2` | `sentence-transformers/all-MiniLM-L6-v2` |
+| `cross-encoder` | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| `e5-language-classifier` | `Mike0307/multilingual-e5-language-detection` |
+| `fm_timeseries` | `cisco-ai/cisco-time-series-model-1.0` |
+| `gpt-oss-20b` | `openai/gpt-oss-20b` |
+| `mbart-translator` | `facebook/mbart-large-50-many-to-many-mmt` |
+| `gemma-4-31b-it-qat-w4a16-ct` | `google/gemma-4-31B-it-qat-w4a16-ct` |
+| `pii-classifier` | `StanfordAIMI/stanford-deidentifier-base` |
+| `uae-large` | `WhereIsAI/UAE-Large-V1` |
+| `xlm-roberta-language-classifier` | `papluca/xlm-roberta-base-language-detection` |
+
+The uploader selected by object-store type is `upload_to_s3.sh` for AWS,
+`upload_to_minio.sh` for MinIO and generic S3-compatible stores, and
+`upload_to_seaweedfs_upload_only.sh` for SeaweedFS. Artifacts are stored below
+`model_artifacts/<artifact-id>/`; the corresponding
+`staging_state/<artifact-id>/.staging_complete` marker makes reruns skip an
+artifact that is already current.
 
 ## Troubleshooting
 
@@ -841,6 +1022,31 @@ oc get pods,endpoints -n splunk-ai-operator-system
 Confirm that every cluster node uses a common Network Time Protocol source.
 The installer retries transient cert-manager clock-skew errors, but incorrect
 node time must be fixed at the infrastructure level.
+
+### Node Feature Discovery or GPU Operator is not ready
+
+Check the Operator Lifecycle Manager resources and GPU discovery state:
+
+```bash
+oc get subscription,csv -n openshift-nfd
+oc get subscription,csv -n nvidia-gpu-operator
+oc get clusterpolicy gpu-cluster-policy
+oc get nodes -l nvidia.com/gpu.present=true
+```
+
+In an air-gapped deployment, also confirm that the operator catalogs, operand
+images, driver images, and matching OpenShift Driver Toolkit image were
+successfully mirrored.
+
+### Re-run vector database setup
+
+The setup Job is owned by the AIService and cannot be rerun in place. Find and
+delete it; the operator recreates it:
+
+```bash
+oc get jobs -n ai-platform
+oc delete job <vector-db-setup-job-name> -n ai-platform
+```
 
 ### Operator-owned resources
 
