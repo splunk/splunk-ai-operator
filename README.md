@@ -44,19 +44,19 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
 ```
 
 Review the [k0s Deployment Quick Reference](docs/ai-tier-docs/k0s-quick-reference.md)
-before installation. See the [complete k0s guide](docs/ai-tier-docs/K0S_README.md) for
+before installation. See the [complete k0s guide](docs/ai-tier-docs/k0s-readme.md) for
 standard and air-gapped deployment details.
 
 ## Documentation
 
 - **[k0s Deployment Quick Reference](docs/ai-tier-docs/k0s-quick-reference.md)** - Default installation workflow
-- **[Complete k0s Guide](docs/ai-tier-docs/K0S_README.md)** - Configuration, installation, and operations
-- **[Deployment Guide](docs/ai-tier-docs/DEPLOYMENT_GUIDE.md)** - Standard and air-gapped deployment details
-- **[OpenShift Guide](docs/ai-tier-docs/OPENSHIFT_README.md)** - OpenShift-specific deployment
-- **[AWS EKS Guide](docs/ai-tier-docs/EKS_README.md)** - AWS EKS deployment
+- **[Complete k0s Guide](docs/ai-tier-docs/k0s-readme.md)** - Configuration, installation, and operations
+- **[Deployment Guide](docs/ai-tier-docs/deployment-guide.md)** - Standard and air-gapped deployment details
+- **[OpenShift Guide](docs/ai-tier-docs/openshift-readme.md)** - OpenShift-specific deployment
+- **[AWS EKS Guide](docs/ai-tier-docs/eks-readme.md)** - AWS EKS deployment
 - **[API Reference](docs/splunk-ai-operator-docs/api-reference.md)** - Complete CRD specification
 - **[Configuration Guides](docs/splunk-ai-operator-docs/splunk-ai-operator-configuration/)** - Storage, ingress, and webhook configuration
-- **[Installer Troubleshooting](docs/ai-tier-docs/TROUBLESHOOTING.md)** - k0s installation issues
+- **[Installer Troubleshooting](docs/ai-tier-docs/troubleshooting.md)** - k0s installation issues
 - **[Local Development](docs/splunk-ai-operator-docs/local-development.md)** - Build and development workflow
 
 ## License

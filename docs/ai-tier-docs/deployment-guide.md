@@ -24,9 +24,11 @@ k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
   - [Phase 1 — Stage the Artifacts](#phase-1--stage-the-artifacts)
   - [Phase 2 — Mirror Container Images](#phase-2--mirror-container-images)
   - [Phase 3 — Stage Model Weights](#phase-3--stage-model-weights)
-  - [Phase 4 — Install](#phase-4--install)
+  - [Phase 4 — Enable Air-Gap Mode](#phase-4--enable-air-gap-mode)
   - [GPU Nodes in Air-Gapped Environments](#gpu-nodes-in-air-gapped-environments)
-- [Post-Install Verification](#post-install-verification)
+- **Shared steps for standard and air-gapped deployments**
+  - [Install, Monitor, and Verify](#install-monitor-and-verify-both-deployment-modes)
+  - [Post-Install Verification](#post-install-verification)
 - [Internal Splunk Access](#internal-splunk-access)
 - [Install the Splunk AI Assistant App](#install-the-splunk-ai-assistant-app)
 - [Install the Splunk AI Toolkit App](#install-the-splunk-ai-toolkit-app)
@@ -276,7 +278,7 @@ flowchart LR
         B["✅ SSH key\nprivate key access to\nall cluster nodes"]
         C["✅ Cluster nodes\nController · CPU Worker(s)\nGPU Worker(s)\npasswordless sudo"]
         D["✅ Object storage\nMinIO / SeaweedFS / S3\nprovisioned & reachable"]
-        E["✅ Container registry\nImages pushed to ECR\nor your private registry"]
+        E["✅ Container image access\nPublic registry pulls\nor an optional private registry"]
         F["✅ config YAML\nk0s-cluster-config.yaml\nfilled in"]
     end
 ```
@@ -419,61 +421,16 @@ The config sections to fill in:
 | `cluster` | `name`, `sshKeyPath`, `sshUser` |
 | `nodes.existingIPs` | IP addresses of your controller and worker nodes — list workers **CPU workers first**: the installer treats the first `nodes.cpuWorkers` entries as CPU nodes and every remaining entry as GPU |
 | `storage.objectStore` | Your MinIO / SeaweedFS / S3 endpoint + credentials |
-| `images.registry` | Your registry hostname, e.g. `123456789.dkr.ecr.us-east-2.amazonaws.com` or `registry.internal:5000` |
-| `images.registryInsecure` | `true` only for plain-HTTP (no-TLS) registries; leave `false` (default) for ECR, Harbor, or any HTTPS registry |
-| `images` (tags) | All image tags pointing at your registry |
+| `images.registry` | Optional registry prefix; leave empty to use the fully qualified public image paths, or set an ECR/private-registry hostname |
+| `images.registryInsecure` | Applies only when `images.registry` is set; defaults to `true` for plain HTTP, and must be `false` for ECR, Harbor, or any HTTPS registry |
+| `images` (tags) | Public image paths, or private-registry paths when using an optional mirror |
 | `aiPlatform` | `defaultAcceleratorType` — `L40S` or `H100` |
 | `metallb.pool.addresses` | A free IP range on your LAN (for LoadBalancer VIP) |
 
-> For full field descriptions, secure vs insecure registry guidance, and examples — see [Configuration Reference in K0S_README.md](K0S_README.md#images-section).
+> For full field descriptions, secure vs insecure registry guidance, and examples — see [Configuration Reference in k0s-readme.md](k0s-readme.md#images-section).
 
-**3. Validate your config before installing**
-
-```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
-```
-
-`validate` checks local configuration completeness only. It does not contact
-the cluster nodes, object store, or image registry, and it does not confirm
-that model artifacts are staged. The `install` command runs those environment
-checks during preflight before making changes.
-
-This runs a read-only config check and prints a ✔/✖ checklist. Fix any ✖ items before proceeding.
-
-**4. Run the installer**
-
-Start this command inside the [persistent installer session](#keep-the-installer-session-alive).
-
-```bash
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
-```
-
-The installer shows an install plan and asks for confirmation before making any changes.
-
-**5. Monitor progress**
-
-The installer prints timestamped progress to the terminal and to a log file:
-
-```bash
-# In another terminal — follow the live log
-tail -f tools/ai-tier-cluster-setup/logs/k0s-install-*.log
-```
-
-**6. Verify the result**
-
-```bash
-export KUBECONFIG=~/.kube/k0s-<your-cluster-name>
-kubectl get nodes                          # all nodes Ready
-kubectl get pods -A                        # all pods Running or Completed
-kubectl get aiplatform -n ai-platform      # AIPlatform Ready
-```
-
-Run the same verification command for standard and air-gapped deployments:
-
-```bash
-cd tools/ai-tier-cluster-setup
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
-```
+After completing the standard-deployment preparation, continue to
+[Install, Monitor, and Verify (Both Deployment Modes)](#install-monitor-and-verify-both-deployment-modes).
 
 ---
 
@@ -520,18 +477,18 @@ selects the mode:
 ```yaml
 cluster:
   airgap: false   # standard install — proceeds directly to the nodes
-  airgap: true    # stages ~2.2 GB of artifacts first (~15 min), then installs
+  airgap: true    # stages ~3 GB of artifacts first (~15 min), then installs
 ```
 
 ```bash
-CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 `AIRGAP_MODE=true` in the environment is an equally valid trigger, for a one-off
 air-gap run without editing the config:
 
 ```bash
-AIRGAP_MODE=true CONFIG_FILE=./my-config.yaml ./k0s_cluster_with_stack.sh install
+AIRGAP_MODE=true CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 ```
 
 **Only `install` and `join-workers` stage artifacts.** `validate`, `diagnose`,
@@ -553,7 +510,8 @@ automatically from the staged artifacts.
 
 Phases 1–3 are preparation you do before installing. If your container images
 are already mirrored and your model weights already staged, skip straight to
-[Phase 4](#phase-4--install) — the single command there does Phase 1 for you.
+[Phase 4](#phase-4--enable-air-gap-mode) — the single command there does
+Phase 1 for you.
 
 Before starting the phases, create the working configuration from the
 air-gapped template and update its required values:
@@ -643,7 +601,7 @@ graph TD
 Output: a timestamped staging directory, consumed in place:
 
 ```
-./airgap-bundle/airgap-bundle-20260612-103000/   (~2–4 GB)
+./airgap-bundle/airgap-bundle-20260612-103000/   (~3 GB)
 ```
 
 > **Staging size:** the image tarballs are the bulk — expect a few GB (the
@@ -681,6 +639,10 @@ directory into containerd at kubelet startup, so the infra pods start with
 ### Phase 2 — Mirror Container Images
 
 Platform application images are **not** staged (they would add many GB). Mirror them separately to your internal registry. `--download-only` in Phase 1 gives you the list to work from.
+
+**Air-gapped private registry sizing:** Reserve **~25–30 GB** for the mirrored
+platform images. The exact amount depends on the selected images and mirroring
+strategy; it is separate from object-storage capacity.
 
 ```mermaid
 flowchart LR
@@ -781,7 +743,7 @@ storage:
     enabled: false
 ```
 
-### Phase 4 — Install
+### Phase 4 — Enable Air-Gap Mode
 
 **4a. Add `cluster.airgap: true` to your config**
 
@@ -793,24 +755,16 @@ cluster:
   name: my-cluster
   airgap: true        # stage artifacts first; skip internet connectivity checks
   sshKeyPath: ~/.ssh/id_rsa
-  sshUser: ec2-user
+  sshUser: ec2-user # Update this to match the SSH user configured on your nodes.
 ```
 
-**4b. Run the install**
+**4b. Continue with the shared install steps**
 
-The same command as a standard install, on the internet-connected installer
-machine. Start it inside the [persistent installer session](#keep-the-installer-session-alive):
-
-```bash
-cd tools/ai-tier-cluster-setup
-chmod +x airgap_install.sh k0s_cluster_with_stack.sh
-
-CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
-```
-
-That is the whole thing. GPU node IPs and the SSH user/key are read from the
-config, so no GPU flags are normally needed. Expect roughly 15 extra minutes up
-front for the ~2.2 GB of artifacts.
+The install command is the same as for a standard deployment. Continue to
+[Install, Monitor, and Verify (Both Deployment Modes)](#install-monitor-and-verify-both-deployment-modes).
+The GPU node IPs and SSH user/key are read from the config, so no GPU flags are
+normally needed. Air-gapped installation stages ~3 GB of artifacts first and
+adds roughly 15 minutes up front.
 
 > **Air-gap staging requirements (installer host only):** `createrepo_c`,
 > `sudo`, and ~5 GB free — the NVIDIA RPM closure is built there. A standard
@@ -991,7 +945,7 @@ different kernel afterward; the DKMS module is built only against the one it saw
 
 > **Full reference** — flags, kernel-coverage rules, and troubleshooting rows for
 > each failure mode are in
-> [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments).
+> [k0s-readme.md — GPU Nodes in Air-Gapped Environments](k0s-readme.md#gpu-nodes-in-air-gapped-environments).
 
 The same run then continues into the install. It exports
 `AIRGAP_NVIDIA_CLOSURE_DIR`, and the installer copies the closure to each GPU node,
@@ -1016,9 +970,61 @@ spec, and applies the device-plugin DaemonSet — all offline.
   also receive the image tarballs, so a GPU node added later still comes up
   Ready offline.
 
-> **Environment variable reference and advanced options** — see [K0S_README.md — Air-Gapped Deployment](K0S_README.md#air-gapped-deployment).
+> **Environment variable reference and advanced options** — see [k0s-readme.md — Air-Gapped Deployment](k0s-readme.md#air-gapped-deployment).
 
 ---
+
+## Install, Monitor, and Verify (Both Deployment Modes)
+
+> **This section applies to both standard and air-gapped deployments.** It is
+> not part of the air-gapped-only workflow.
+
+After completing either the standard-deployment preparation or the air-gapped
+preparation above, run these shared steps from
+`tools/ai-tier-cluster-setup`.
+
+### 1. Validate your config before installing
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
+```
+
+`validate` checks local configuration completeness only. It does not contact
+the cluster nodes, object store, or image registry, and it does not confirm
+that model artifacts are staged. The `install` command runs those environment
+checks during preflight before making changes.
+
+This runs a read-only config check and prints a ✔/✖ checklist. Fix any ✖ items
+before proceeding.
+
+### 2. Run the installer
+
+Start this command inside the [persistent installer session](#keep-the-installer-session-alive):
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
+```
+
+The installer shows an install plan and asks for confirmation before making any
+changes. With `cluster.airgap: true`, this same command stages the offline
+artifacts before it installs the platform.
+
+### 3. Monitor progress
+
+The installer prints timestamped progress to the terminal and to a log file:
+
+```bash
+# In another terminal — follow the live log
+tail -f logs/k0s-install-*.log
+```
+
+### 4. Run the quick verification
+
+Run the same verification command for standard and air-gapped deployments:
+
+```bash
+CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh verify-pods
+```
 
 ## Post-Install Verification
 
@@ -1098,7 +1104,7 @@ If any node shows `NotReady` or the AIPlatform CR shows `Pending` for more than 
 The in-cluster Splunk Enterprise instance is a ClusterIP service by default;
 the installer does not create a Splunk NodePort or LoadBalancer. Use
 `kubectl port-forward` for quick access from the installer machine. See
-[K0S_README.md — Finding the Splunk Web URL](K0S_README.md#finding-the-splunk-web-url)
+[k0s-readme.md — Finding the Splunk Web URL](k0s-readme.md#finding-the-splunk-web-url)
 for the exact service and operator-managed Secret lookup. This section applies
 only to bundled Splunk; external Splunk uses its administrator-provided URL and
 credentials.
@@ -1174,7 +1180,7 @@ reachable from the Splunk pod. A `kubectl port-forward` is only for browser or
 local testing from the installer machine, and its `127.0.0.1` URL must not be
 saved in the Splunk app configuration.
 
-> **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [K0S_README.md — Splunk AI Assistant App](K0S_README.md#splunk-ai-assistant-app).
+> **Full configuration options** (scripted setup via `splunkaiassistant.conf`, air-gapped install, verification, and troubleshooting) — see [k0s-readme.md — Splunk AI Assistant App](k0s-readme.md#splunk-ai-assistant-app).
 
 ### 4. Verify
 
@@ -1204,7 +1210,7 @@ installation flow.
 
 > **Prerequisite:** the `slim` feature must be enabled and its Service exposed
 > so Splunk can reach it — see
-> [`aiPlatform.serviceTemplate.slimNodePort`](K0S_README.md#service-template-saia--slim-public-exposure).
+> [`aiPlatform.serviceTemplate.slimNodePort`](k0s-readme.md#service-template-saia--slim-public-exposure).
 > The default `ClusterIP` exposure is enough only when Splunk runs in the same
 > cluster.
 
@@ -1243,9 +1249,9 @@ full guide below).
 
 > **Full configuration options** (endpoint reachability checks, the AI tier
 > LLM connection required for `ai`, and troubleshooting) — see
-> [K0S_README.md — Splunk AI Toolkit App](K0S_README.md#splunk-ai-toolkit-app)
+> [k0s-readme.md — Splunk AI Toolkit App](k0s-readme.md#splunk-ai-toolkit-app)
 > and
-> [Onboarding to the AI Tier (Splunk AI Toolkit)](K0S_README.md#onboarding-to-the-ai-tier-splunk-ai-toolkit).
+> [Onboarding to the AI Tier (Splunk AI Toolkit)](k0s-readme.md#onboarding-to-the-ai-tier-splunk-ai-toolkit).
 
 ### 3. Verify
 
@@ -1296,7 +1302,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh join-workers
 CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh stage-artifacts
 ```
 
-The command is resumable — it checks which models are already staged in the object store and only downloads/uploads what is missing. The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [K0S_README.md](K0S_README.md) for details on the pre-check, per-model logging, and direct script usage.
+The command is resumable — it checks which models are already staged in the object store and only downloads/uploads what is missing. The GPU type is read from `aiPlatform.defaultAcceleratorType` in your config (`L40S` or `H100`). See [k0s-readme.md](k0s-readme.md) for details on the pre-check, per-model logging, and direct script usage.
 
 ### Image-tag refresh observed in testing
 
@@ -1401,18 +1407,18 @@ flowchart TD
 | "SSH connection refused" or "Connection timed out" | `ssh -i key user@node-ip hostname` | For refusal, check that SSH is running on the node. For a timeout, check routing/VPN and allow inbound TCP 22 from the installer machine in the security group or firewall. |
 | "Refusing to wipe — Ready nodes" (rare — a plain re-run normally detects the already-running k0s and resumes into stack deploy without hitting this) | `kubectl get nodes` | Set `cluster.useExisting: auto` in config or run `clean-all` first |
 | "python3+pyyaml missing" on nodes | `ssh user@node python3 -c 'import yaml'` | Run `dnf install -y python3-pyyaml` on the node (or set `AIRGAP_PYYAML_WHEEL_PATH`) |
-| "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Check that staging created the offline driver closure and re-run without `--skip-nvidia-closure`; manual driver installation is only needed for the optional pre-installed-driver path — see [Air-Gapped Deployment](K0S_README.md#gpu-nodes-in-air-gapped-environments) |
+| "nvidia-smi not found" in AIRGAP_MODE | `ssh user@gpu-node which nvidia-smi` | Check that staging created the offline driver closure and re-run without `--skip-nvidia-closure`; manual driver installation is only needed for the optional pre-installed-driver path — see [Air-Gapped Deployment](k0s-readme.md#gpu-nodes-in-air-gapped-environments) |
 | "Checksum verification failed" | A staged file was truncated mid-download | Delete the staging dir and re-run the install (staging repeats automatically) |
 | "Expected chart not found" | `ls ./airgap-bundle/airgap-bundle-*/charts/` | Set `PROMETHEUS_CHART_PATH` etc. to the actual filename |
 | Pod stuck in `ImagePullBackOff` (SAIA / Splunk / Ray / Weaviate) | `kubectl describe pod <pod> -n <ns>` | Check `images.registry` in config and that image pull secret exists — these are the platform images you mirrored in [Phase 2](#phase-2--mirror-container-images) |
-| `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](K0S_README.md#insecure-registry-support-containerd-v2) |
-| All models reported MISSING | `mc ls myminio/<bucket>/staging_state/` or `aws s3api head-bucket --bucket <bucket>` | Confirm the bucket exists, is the configured bucket, and contains `staging_state/` and `model_artifacts/` entries. An empty or missing bucket must be created/populated; uppercase names are normalized, but lowercase config values are recommended. See [Models are reported MISSING after upload](TROUBLESHOOTING.md#models-are-reported-missing-after-upload) |
-| All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](TROUBLESHOOTING.md#switching-defaultacceleratortype-from-l40s-to-h100-reports-models-as-missing) |
+| `ImagePullBackOff` with `http: server gave HTTP response to HTTPS client` | `kubectl describe pod <pod>` → look at image pull error | Registry is plain-HTTP — set `images.registryInsecure: true` in config and re-run install; see [Insecure Registry Support](k0s-readme.md#insecure-registry-support-containerd-v2) |
+| All models reported MISSING | `mc ls myminio/<bucket>/staging_state/` or `aws s3api head-bucket --bucket <bucket>` | Confirm the bucket exists, is the configured bucket, and contains `staging_state/` and `model_artifacts/` entries. An empty or missing bucket must be created/populated; uppercase names are normalized, but lowercase config values are recommended. See [Models are reported MISSING after upload](troubleshooting.md#models-are-reported-missing-after-upload) |
+| All models MISSING after changing `defaultAcceleratorType` from L40S to H100 | Expected — marker `accel=` field is validated | Re-run `stage-artifacts`; the pre-check detects the accel mismatch and triggers a fresh download/upload. See [Switching accelerator type](troubleshooting.md#switching-defaultacceleratortype-from-l40s-to-h100-reports-models-as-missing) |
 | Air-gap: infra pods `ImagePullBackOff` (Calico / CoreDNS / cert-manager / device-plugin) or nodes `NotReady` | `ssh <node> 'ls -la /var/lib/k0s/images/'` | Image bundles didn't reach the node. Confirm `images/*.tar` exists in the staged tree (`--download-only` to inspect); re-run install — see [Why two image bundles?](#why-two-image-bundles) |
 | SAIA service has no external address or is unreachable | `kubectl get svc <cluster-name>-ai-platform-saia-saia-service -n ai-platform -o wide` | `NodePort` and `ClusterIP` services correctly have no `EXTERNAL-IP`; use the reported NodePort or `kubectl port-forward`. For a `LoadBalancer` with no address, check MetalLB pods: `kubectl get pods -n metallb-system` |
 | AIPlatform CR stuck `Pending` | `kubectl describe aiplatform -n ai-platform` | Check operator logs and GPU node availability |
 
-> For the full symptom list — Ray workers not starting, models not loading, Splunk stuck initializing, and more — see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.
+> For the full symptom list — Ray workers not starting, models not loading, Splunk stuck initializing, and more — see **[troubleshooting.md](troubleshooting.md)**.
 
 ---
 

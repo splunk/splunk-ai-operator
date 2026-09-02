@@ -31,7 +31,7 @@
 | **`airgap_install.sh` packages/ section** | ~80 lines (new section 5) | None (new code in existing script) | **Low** — additive; does not touch existing sections | **Yes** — `bash -n` + grep |
 | **`--gpu-os` argument + validation gate** | ~30 lines in `airgap_install.sh` | Argument-parsing block | **None** — new argument; existing behaviour unchanged if not passed | **Yes** — grep |
 | **RHEL 10 / AL2023 removal from docs** | ~50 lines changed across 3 docs | K0S_README, DEPLOYMENT_GUIDE, k0s_cluster_with_stack.sh comments | **None** — documentation | **Yes** — grep |
-| **DEPLOYMENT_GUIDE.md (restructured)** | Steps + diagrams focused, detail in K0S_README | None | **None** — documentation only | **Partial** — file parseable locally; diagram rendering needs GitHub preview |
+| **deployment-guide.md (restructured)** | Steps + diagrams focused, detail in K0S_README | None | **None** — documentation only | **Partial** — file parseable locally; diagram rendering needs GitHub preview |
 | **Staging machine requirements** | ~20 lines across K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
 | **GPU spec update (8 × L40S, g6e.12xlarge)** | ~15 lines across K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
 | **VOC Portal removal from k0s docs** | ~5 lines changed in K0S_README, DEPLOYMENT_GUIDE | None | **None** — documentation | **Yes** — grep |
@@ -71,7 +71,7 @@ echo "exit: $?"
 
 ```bash
 grep -rn "H100" \
-  docs/ai-tier-docs/K0S_README.md \
+  docs/ai-tier-docs/k0s-readme.md \
   tools/ai-tier-cluster-setup/k0s-cluster-config.yaml \
   tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh
 ```
@@ -82,7 +82,7 @@ grep -rn "H100" \
 EKS H100 references must still be present (real code path):
 
 ```bash
-grep -c "H100" docs/ai-tier-docs/EKS_README.md
+grep -c "H100" docs/ai-tier-docs/eks-readme.md
 ```
 
 **Pass:** Count > 0.
@@ -94,8 +94,8 @@ grep -c "H100" docs/ai-tier-docs/EKS_README.md
 
 ```bash
 grep -l "gemma-4-31b-it" \
-  docs/ai-tier-docs/K0S_README.md \
-  docs/ai-tier-docs/EKS_README.md \
+  docs/ai-tier-docs/k0s-readme.md \
+  docs/ai-tier-docs/eks-readme.md \
   tools/artifacts_download_upload_scripts/README.md
 ```
 
@@ -118,7 +118,7 @@ artifact_ids() {
 # No output means the K0s model table contains every artifact ID.
 comm -3 \
   <(artifact_ids) \
-  <(grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" docs/ai-tier-docs/K0S_README.md \
+  <(grep -E "^\s+\| \`[a-z][a-z0-9_-]+\` \|" docs/ai-tier-docs/k0s-readme.md \
     | awk -F'`' '{print $2}' | sort -u)
 
 # No output means the artifacts README contains every artifact ID.
@@ -176,7 +176,7 @@ grep "mikefarah/yq/releases"          tools/ai-tier-cluster-setup/k0s_cluster_wi
 ### T1-8: Internal doc links resolve
 
 ```bash
-for doc in docs/ai-tier-docs/K0S_README.md docs/ai-tier-docs/DEPLOYMENT_GUIDE.md docs/ai-tier-docs/TROUBLESHOOTING.md; do
+for doc in docs/ai-tier-docs/k0s-readme.md docs/ai-tier-docs/deployment-guide.md docs/ai-tier-docs/troubleshooting.md; do
   grep -oP '\[.*?\]\(\K[^)]+(?=\))' "$doc" \
     | grep -v "^http" | grep -v "^#" \
     | while read -r f; do
@@ -194,7 +194,7 @@ done
 Air-gap content referenced from DEPLOYMENT_GUIDE:
 
 ```bash
-grep -c "K0S_README.md.*air" docs/ai-tier-docs/DEPLOYMENT_GUIDE.md
+grep -c "k0s-readme.md.*air" docs/ai-tier-docs/deployment-guide.md
 ```
 
 **Pass:** Count ≥ 1 (reference link to K0S_README air-gap section).
@@ -348,9 +348,9 @@ grep "AIRGAP_PYYAML_WHEEL_PATH" tools/ai-tier-cluster-setup/airgap_install.sh
 
 ```bash
 grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
-  docs/ai-tier-docs/K0S_README.md \
-  docs/ai-tier-docs/DEPLOYMENT_GUIDE.md \
-  docs/ai-tier-docs/TROUBLESHOOTING.md
+  docs/ai-tier-docs/k0s-readme.md \
+  docs/ai-tier-docs/deployment-guide.md \
+  docs/ai-tier-docs/troubleshooting.md
 ```
 
 **Pass:** Zero matches.
@@ -362,9 +362,9 @@ grep -rni "rhel.10\|rhel10\|amazon.linux.2023\|amzn2023\|AL2023" \
 
 ```bash
 grep -rni "Rocky\|AlmaLinux\|CentOS" \
-  docs/ai-tier-docs/K0S_README.md \
-  docs/ai-tier-docs/DEPLOYMENT_GUIDE.md \
-  docs/ai-tier-docs/TROUBLESHOOTING.md
+  docs/ai-tier-docs/k0s-readme.md \
+  docs/ai-tier-docs/deployment-guide.md \
+  docs/ai-tier-docs/troubleshooting.md
 ```
 
 **Pass:** Zero matches — only RHEL 9 is mentioned as supported.
@@ -376,9 +376,9 @@ grep -rni "Rocky\|AlmaLinux\|CentOS" \
 
 ```bash
 grep -rni "VOC.Portal\|voc portal" \
-  docs/ai-tier-docs/K0S_README.md \
-  docs/ai-tier-docs/DEPLOYMENT_GUIDE.md \
-  docs/ai-tier-docs/TROUBLESHOOTING.md
+  docs/ai-tier-docs/k0s-readme.md \
+  docs/ai-tier-docs/deployment-guide.md \
+  docs/ai-tier-docs/troubleshooting.md
 ```
 
 **Pass:** Zero matches.
@@ -389,7 +389,7 @@ grep -rni "VOC.Portal\|voc portal" \
 ### T1-23: `defaultAcceleratorType` described as required, L40S only
 
 ```bash
-grep -A2 "defaultAcceleratorType" docs/ai-tier-docs/K0S_README.md \
+grep -A2 "defaultAcceleratorType" docs/ai-tier-docs/k0s-readme.md \
   | grep -i "L40S\|only"
 ```
 
@@ -402,8 +402,8 @@ grep -A2 "defaultAcceleratorType" docs/ai-tier-docs/K0S_README.md \
 
 ```bash
 grep -c "8.*L40S\|L40S.*8" \
-  docs/ai-tier-docs/K0S_README.md \
-  docs/ai-tier-docs/DEPLOYMENT_GUIDE.md
+  docs/ai-tier-docs/k0s-readme.md \
+  docs/ai-tier-docs/deployment-guide.md
 ```
 
 **Pass:** Count ≥ 1 in each file.
@@ -415,8 +415,8 @@ grep -c "8.*L40S\|L40S.*8" \
 
 ```bash
 for f in \
-  docs/ai-tier-docs/K0S_README.md \
-  docs/ai-tier-docs/DEPLOYMENT_GUIDE.md; do
+  docs/ai-tier-docs/k0s-readme.md \
+  docs/ai-tier-docs/deployment-guide.md; do
   grep -qiE "250.?GB|250 GB" "$f" \
     && echo "OK (250 GB): $f" \
     || echo "MISSING (250 GB): $f"
@@ -483,14 +483,14 @@ grep -n 'airgap:\[\[:space:\]\]\*true' "$S"     # grep fallback when yq is absen
 
 ---
 
-### T1-29: DEPLOYMENT_GUIDE.md exists and contains all 11 Mermaid diagrams
+### T1-29: deployment-guide.md exists and contains all 11 Mermaid diagrams
 
 ```bash
 # File exists
-test -f docs/ai-tier-docs/DEPLOYMENT_GUIDE.md && echo "OK: file exists" || echo "MISSING"
+test -f docs/ai-tier-docs/deployment-guide.md && echo "OK: file exists" || echo "MISSING"
 
 # Count Mermaid blocks
-grep -c '```mermaid' docs/ai-tier-docs/DEPLOYMENT_GUIDE.md
+grep -c '```mermaid' docs/ai-tier-docs/deployment-guide.md
 ```
 
 **Pass:** File exists; count = 11.
@@ -1193,7 +1193,7 @@ grep "pip3.*no-index\|AIRGAP_PYYAML_WHEEL_PATH\|pyyaml.*wheel" logs/k0s-install-
 Pre-configure nodes with no NVIDIA drivers, then run `CONFIG_FILE=./my-k0s-config.yaml ./k0s_cluster_with_stack.sh install` with `cluster.airgap: true`:
 
 1. The staging step should automatically set `AIRGAP_PYYAML_WHEEL_PATH`
-2. The staged NVIDIA closure should be pushed to each GPU node and installed offline (Strategy 1 in K0S_README.md — GPU Nodes in Air-Gapped Environments)
+2. The staged NVIDIA closure should be pushed to each GPU node and installed offline (Strategy 1 in k0s-readme.md — GPU Nodes in Air-Gapped Environments)
 3. On a re-run against nodes that now have drivers, the installer should detect `nvidia-smi` and skip driver install
 
 ```bash
@@ -1289,13 +1289,13 @@ images:
 
 Use Spot instances to cut cost by ~70%. Terminate all instances immediately after each run.
 
-### Visual review — DEPLOYMENT_GUIDE.md diagrams
+### Visual review — deployment-guide.md diagrams
 
 Open the file on GitHub (or in a Mermaid-aware viewer) and confirm all 14 diagrams render without syntax errors:
 
 ```bash
 # Quick local check — count mermaid blocks to catch accidental deletions
-grep -c '```mermaid' docs/ai-tier-docs/DEPLOYMENT_GUIDE.md
+grep -c '```mermaid' docs/ai-tier-docs/deployment-guide.md
 # Expected: 14
 ```
 
@@ -1399,7 +1399,7 @@ aws ec2 terminate-instances --instance-ids i-xxx i-yyy i-zzz i-www
 | T1-27 | `--gpu-os` validation gate rejects non-rhel9 — code review | No | No | < 1 min | Yes |
 | T1-28 | `packages/` section integrated into `airgap_install.sh` | No | No | < 1 min | Yes |
 | T1-28b | Air-gap delegation wired into `k0s_cluster_with_stack.sh` | No | No | < 1 min | Yes |
-| T1-29 | `DEPLOYMENT_GUIDE.md` exists with 11 Mermaid diagrams | No | No | < 1 min | Yes |
+| T1-29 | `deployment-guide.md` exists with 11 Mermaid diagrams | No | No | < 1 min | Yes |
 | T2-16 | `--gpu-os` validation rejects unsupported values (live run) | No | No | < 1 min | Yes |
 | T2-17 | `packages/` dir staged — NVIDIA closure + PyYAML present | No | Yes | ~5 min | Recommended |
 | T2-18 | Bundle checksums include `packages/` files | No | No | < 1 min | Recommended |

@@ -2,8 +2,8 @@
 
 Quick reference for installing the Splunk AI tier on k0s. For full
 explanations, diagrams, and edge cases, see
-[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) and
-[K0S_README.md](K0S_README.md).
+[deployment-guide.md](deployment-guide.md) and
+[k0s-readme.md](k0s-readme.md).
 
 ## Table of Contents
 
@@ -25,8 +25,8 @@ explanations, diagrams, and edge cases, see
      - [Air-Gapped Step 7: Install the Platform](#air-gapped-step-7-install-the-platform)
      - [Air-Gapped Step 8: Monitor and Verify](#air-gapped-step-8-monitor-and-verify)
 5. [Step 5: Splunk Integration](#step-5-splunk-integration)
-6. [Step 6: Common Operations](DEPLOYMENT_GUIDE.md#common-operations)
-7. [Step 7: Troubleshooting](DEPLOYMENT_GUIDE.md#troubleshooting)
+6. [Step 6: Common Operations](deployment-guide.md#common-operations)
+7. [Step 7: Troubleshooting](deployment-guide.md#troubleshooting)
 
 ---
 
@@ -245,7 +245,7 @@ working default.
 | Field | Set to |
 |---|---|
 | `cluster.sshKeyPath` | Path to your SSH private key |
-| `cluster.sshUser` | SSH user for remote nodes |
+| `cluster.sshUser` | SSH user for remote nodes; configure it to match the user available on your nodes |
 | `cluster.region` | Your region — required only if `storage.objectStore.type: aws` |
 | `nodes.existingIPs.controllers` | Controller node IP (only 1 is supported — see Hardware Requirements) |
 | `nodes.existingIPs.workers` | CPU + GPU worker node IPs, **CPU workers first**: the installer treats the first `nodes.cpuWorkers` entries as CPU nodes and every remaining entry as GPU — set `nodes.cpuWorkers` to match, or the wrong machines get GPU driver/workload setup |
@@ -277,7 +277,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh validate
 > once this base config is filled in.
 
 > Full field-by-field reference:
-[K0S_README.md — Configuration Reference](K0S_README.md#configuration-reference).
+[k0s-readme.md — Configuration Reference](k0s-readme.md#configuration-reference).
 
 ---
 
@@ -421,6 +421,10 @@ If the registry requires authentication, also configure
 `imagePullSecrets.custom.*` in `my-cluster.yaml`. The registry value used by
 the mirroring commands must match `images.registry`.
 
+**Air-gapped private registry sizing:** Reserve **~25–30 GB** for the mirrored
+platform images. The exact amount depends on the selected images and mirroring
+strategy; it is separate from object-storage capacity.
+
 #### Air-Gapped Step 4: Mirror Application Images
 
 Run one of the following methods from the installer machine. The commands use
@@ -540,12 +544,12 @@ path for air-gapped deployments.
 <summary>Internal Splunk</summary>
 
 For the bundled in-cluster Splunk instance, use NodePort, LoadBalancer, or
-`kubectl port-forward` as described in [K0S_README.md — Finding the Splunk Web
-URL](K0S_README.md#finding-the-splunk-web-url). If
+`kubectl port-forward` as described in [k0s-readme.md — Finding the Splunk Web
+URL](k0s-readme.md#finding-the-splunk-web-url). If
 your browser cannot reach the cluster network directly, use the [SSH bastion
-SOCKS tunnel](K0S_README.md#finding-the-splunk-web-url).
-Then follow [DEPLOYMENT_GUIDE.md — Install the Splunk AI Assistant
-App](DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
+SOCKS tunnel](k0s-readme.md#finding-the-splunk-web-url).
+Then follow [deployment-guide.md — Install the Splunk AI Assistant
+App](deployment-guide.md#install-the-splunk-ai-assistant-app).
 
 </details>
 
@@ -554,7 +558,7 @@ App](DEPLOYMENT_GUIDE.md#install-the-splunk-ai-assistant-app).
 
 For a self-managed Splunk Enterprise instance outside the cluster, configure
 JWT authentication as described in
-[EXTERNAL_SPLUNK_INTEGRATION.md](EXTERNAL_SPLUNK_INTEGRATION.md).
+[external-splunk-integration.md](external-splunk-integration.md).
 
 </details>
 
@@ -562,7 +566,7 @@ JWT authentication as described in
 
 ## Step 6: Common Operations
 
-See [Deployment Guide — Common Operations](DEPLOYMENT_GUIDE.md#common-operations)
+See [Deployment Guide — Common Operations](deployment-guide.md#common-operations)
 for re-runs, worker management, model staging, image refreshes, support
 bundles, and cleanup commands.
 
@@ -570,9 +574,9 @@ bundles, and cleanup commands.
 
 ## Step 7: Troubleshooting
 
-See [Deployment Guide — Troubleshooting](DEPLOYMENT_GUIDE.md#troubleshooting)
+See [Deployment Guide — Troubleshooting](deployment-guide.md#troubleshooting)
 for diagnosis steps, decision trees, and the complete symptom reference.
 
 ---
 
-*Quick reference — see [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for the full walkthrough.*
+*Quick reference — see [deployment-guide.md](deployment-guide.md) for the full walkthrough.*

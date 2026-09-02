@@ -17,7 +17,7 @@ you can use to manage Splunk AI tier deployments in your Kubernetes cluster.
     - [CR Status Message](#cr-status-message)
 
 For examples on how to use these custom resources, please see
-[Configuring Splunk Enterprise Deployments](../ai-tier-docs/EXTERNAL_SPLUNK_INTEGRATION.md).
+[Configuring Splunk Enterprise Deployments](../ai-tier-docs/external-splunk-integration.md).
 
 
 ## Metadata Parameters

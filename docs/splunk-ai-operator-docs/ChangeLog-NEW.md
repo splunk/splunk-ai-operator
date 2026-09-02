@@ -27,7 +27,7 @@ c539254 docs: address customer/PM/support feedback on DEPLOYMENT_GUIDE
 124b832 docs: move SAIA app install guide into K0S_README; add summary to DEPLOYMENT_GUIDE
 cfed7eb docs: add SAIA_APP_INSTALL.md — Splunk AI Assistant app install guide
 9671f23 docs: remove Rocky Linux 9 and AlmaLinux 9 as supported OS
-e39ea2c docs: add TROUBLESHOOTING.md for k0s installer
+e39ea2c docs: add troubleshooting.md for k0s installer
 415fc48 docs: correct model weight download size from ~60 GB to >120 GB
 191831c docs: update TEST_PLAN with session changes; fix DEPLOYMENT_GUIDE diagram colors
 2b2ad3b docs: clarify total GPU count as 8 × L40S across 2 nodes (384 GB total GPU memory)
@@ -35,7 +35,7 @@ de9283b docs: update GPU worker spec to 2×g6e.12xlarge (4×L40S, 48 vCPU, 384 G
 3e49b86 docs: remove VOC Portal references; fix defaultAcceleratorType to L40S only
 655d938 chore: restrict supported OS to RHEL 9; gate other OS families in scripts
 372d4f5 docs: add staging machine system requirements (250GB disk, 16GB RAM)
-d0d01bd docs: add DEPLOYMENT_GUIDE.md with Mermaid diagrams for standard and air-gapped deployments
+d0d01bd docs: add deployment-guide.md with Mermaid diagrams for standard and air-gapped deployments
 703ed22 feat: air-gap support for GPU node OS package installs
 1ccba4a feat: make air-gap mode configurable via cluster.airgap in YAML (+ env var override)
 b0b7fc1 feat: wire wait_for_dependency() into all three external dependency touch-points

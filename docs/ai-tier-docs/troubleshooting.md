@@ -318,7 +318,7 @@ closure was not staged or the node could not install it. Re-run without
 `--skip-nvidia-closure` and check the staging log. Pre-install NVIDIA drivers
 only when intentionally using the optional `--skip-nvidia-closure` path.
 
-See [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments) for
+See [k0s-readme.md — GPU Nodes in Air-Gapped Environments](k0s-readme.md#gpu-nodes-in-air-gapped-environments) for
 the closure requirements and the optional pre-installed-driver path.
 
 ---
@@ -845,7 +845,7 @@ CONFIG_FILE=./my-cluster.yaml ./k0s_cluster_with_stack.sh install
 
 ### GPU driver install fails in air-gap mode
 
-See [K0S_README.md — GPU Nodes in Air-Gapped Environments](K0S_README.md#gpu-nodes-in-air-gapped-environments).
+See [k0s-readme.md — GPU Nodes in Air-Gapped Environments](k0s-readme.md#gpu-nodes-in-air-gapped-environments).
 Air-gap staging builds an offline NVIDIA RPM closure and the installer
 pushes it to each GPU node. If you would rather manage drivers out of band,
 pre-install them on the GPU nodes and stage via

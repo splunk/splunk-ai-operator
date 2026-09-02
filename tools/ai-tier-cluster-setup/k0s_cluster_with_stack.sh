@@ -712,9 +712,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
-  # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
-  # Leave false (default) for ECR, Docker Hub, Harbor, or any HTTPS registry.
-  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "false"' "$CONFIG_FILE" 2>/dev/null || echo "false")"
+  # Default to "true" for plain-HTTP (no-TLS) registries such as a local mirror.
+  # Set false for ECR, Docker Hub, Harbor, or any HTTPS registry.
+  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "true"' "$CONFIG_FILE" 2>/dev/null || echo "true")"
   OPERATOR_IMAGE="$(yq eval '.images.operator.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_IMAGE="$(yq eval '.images.splunk.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SPLUNK_OPERATOR_IMAGE="$(yq eval '.images.splunk.operatorImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -7887,9 +7887,9 @@ show_platform_access_info() {
 
   log "============================================"
   log "📚 Documentation:"
-  log "  Setup Guide: ${AI_TIER_DOCS_DIR}/K0S_README.md"
-  log "  Deployment Guide: ${AI_TIER_DOCS_DIR}/DEPLOYMENT_GUIDE.md"
-  log "  Troubleshooting: ${AI_TIER_DOCS_DIR}/TROUBLESHOOTING.md"
+  log "  Setup Guide: ${AI_TIER_DOCS_DIR}/k0s-readme.md"
+  log "  Deployment Guide: ${AI_TIER_DOCS_DIR}/deployment-guide.md"
+  log "  Troubleshooting: ${AI_TIER_DOCS_DIR}/troubleshooting.md"
   log "  Custom Resources: ${OPERATOR_DOCS_DIR}/api-reference.md"
   log "============================================"
   log ""

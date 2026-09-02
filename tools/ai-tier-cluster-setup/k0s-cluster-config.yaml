@@ -111,13 +111,13 @@ storage:
 images:
   # Registry prefix - applied to images without a full registry path
   registry: ""                                    # CHANGE THIS: Your ECR/Docker/Harbor registry (e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com)
-  # Set to true when using a plain-HTTP (non-TLS) private registry such as a
+  # Defaults to true for a plain-HTTP (non-TLS) private registry such as a
   # local Docker registry or internal Harbor without HTTPS. When true:
   #   1. Preflight checks the registry over http:// instead of https://
   #   2. containerd on every node is configured to allow insecure pulls from
   #      this registry (hosts.toml for containerd v2, drop-in TOML for v1).
-  # Leave false (default) for ECR, Docker Hub, or any HTTPS-backed registry.
-  registryInsecure: false
+  # Set false for ECR, Docker Hub, or any HTTPS-backed registry.
+  registryInsecure: true
 
   operator:
     image: "docker.io/splunk/splunk-ai-operator:v1.0"
@@ -194,7 +194,7 @@ splunk:
   # With enabled=true and no external.endpoint, the installer deploys Splunk
   # Operator + Standalone in-cluster (requires images.splunk.image and
   # images.splunk.operatorImage).
-  # See docs/ai-tier-docs/K0S_README.md's "Internal Splunk management
+  # See docs/ai-tier-docs/k0s-readme.md's "Internal Splunk management
   # transport" section for the native-HTTPS compatibility details behind the
   # INTERNAL path.
   #
