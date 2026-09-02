@@ -20,6 +20,8 @@ Complete guide for deploying Splunk AI tier on k0s Kubernetes clusters.
 - [Splunk Integration and Authentication](#splunk-integration-and-authentication)
   - [Splunk AI Assistant App](#splunk-ai-assistant-app)
   - [Onboarding to the AI Tier](#onboarding-to-the-ai-tier)
+  - [Splunk AI Toolkit App](#splunk-ai-toolkit-app)
+  - [Onboarding to the AI Tier (Splunk AI Toolkit)](#onboarding-to-the-ai-tier-splunk-ai-toolkit)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
 - [Internet Dependencies](#internet-dependencies)
@@ -2335,6 +2337,309 @@ kubectl exec -n ai-platform "${SPLUNK_POD}" -- \
 
 ---
 
+### Splunk AI Toolkit App
+
+The **Splunk AI Toolkit** app (AITK app) brings AI tier models into SPL.
+Install supported app versions >= 6.1.0 on Splunk Enterprise 10.2 after the
+cluster is fully healthy. This is a separate post-install step, not a
+prerequisite for deploying the cluster.
+
+AITK consumes the **SLIM service**, not SAIA. The Splunk AI Assistant app is
+onboarded against the SAIA endpoint; AITK is onboarded against the SLIM
+endpoint, and the two are configured independently. Once onboarded, AITK adds:
+
+- `ai` — prompt Splunk-hosted LLMs from SPL. Requires an AI tier **LLM
+  connection** (see [Step 4](#onboarding-to-the-ai-tier-splunk-ai-toolkit)).
+- `apply CDTSM` — forecasting, predictive alerting, and anomaly detection with
+  the Cisco Deep Time Series Model, a pretrained model that needs no per-metric
+  training. Uses the saved endpoint directly; no LLM connection required.
+
+#### Toolkit Prerequisites
+
+- The `slim` feature is enabled and publicly exposed in the cluster config:
+
+  ```yaml
+  aiPlatform:
+    features:
+      - name: "slim"
+    serviceTemplate:
+      type: "NodePort"      # or "LoadBalancer"
+      slimNodePort: 30081   # only for NodePort; keeps SLIM off SAIA's 30080
+  ```
+
+  `ClusterIP` (the default) is enough only when Splunk itself runs in the same
+  cluster and reaches SLIM over in-cluster DNS.
+- All pods are Running and the `AIPlatform` CR is Ready (same checks as the
+  [Splunk AI Assistant App](#splunk-ai-assistant-app) prerequisites)
+- The slim `AIService` is Ready: `kubectl get aiservice -n ai-platform`
+- You have the version >= 6.1.0 `Splunk_ML_Toolkit.tgz` archive. For an air-gapped
+  environment, download it on a connected machine and transfer the archive to
+  the machine used for installation.
+- Splunk Web is reachable from your browser (see [Finding the Splunk Web URL](#finding-the-splunk-web-url))
+- The Splunk user that performs onboarding holds both the
+  `list_ai_commander_config` and `edit_ai_commander_config` capabilities.
+  `admin`, `mltk_admin`, `sc_admin`, `mltk_dsdl_admin`, and `mltk_model_admin`
+  already grant them.
+
+---
+
+#### Installing the Toolkit App
+
+Installation is identical in shape to the Assistant app — only the archive name
+changes.
+
+**Via Splunk UI**
+
+1. Open the Splunk Web URL and log in as `admin`
+2. **Apps** → **Manage Apps** → **Install app from file**
+3. Select `Splunk_ML_Toolkit.tgz`, check **Upgrade app** if a previous version
+   is installed, and click **Upload**
+4. If Splunk prompts for a restart, click **Restart Splunk** and wait ~60 seconds
+
+**In an air-gapped environment**
+
+```bash
+APP_TGZ="Splunk_ML_Toolkit.tgz"
+NAMESPACE="ai-platform"
+STANDALONE_NAME="splunk-standalone"
+POD="splunk-${STANDALONE_NAME}-standalone-0"
+
+kubectl cp "${APP_TGZ}" "${NAMESPACE}/${POD}:/tmp/${APP_TGZ}"
+
+kubectl exec -n "${NAMESPACE}" "${POD}" -- bash -c "
+  tar -xzf /tmp/${APP_TGZ} -C /opt/splunk/etc/apps
+  rm /tmp/${APP_TGZ}
+  echo 'Extracted to /opt/splunk/etc/apps/Splunk_ML_Toolkit'"
+
+kubectl exec -n "${NAMESPACE}" "${POD}" -- /opt/splunk/bin/splunk restart
+```
+
+---
+
+#### Verifying the Toolkit Installation
+
+```bash
+NAMESPACE=ai-platform
+STANDALONE_NAME=splunk-standalone
+SPLUNK_POD="splunk-${STANDALONE_NAME}-standalone-0"
+SPLUNK_SECRET="$(kubectl get secret -n "${NAMESPACE}" \
+  -l 'app.kubernetes.io/component=versionedSecrets,app.kubernetes.io/managed-by=splunk-operator' \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.metadata.ownerReferences[0].name}{"\n"}{end}' \
+  | awk -F'|' -v owner="${STANDALONE_NAME}" '$2 == owner {print $1; exit}')"
+[[ -n "${SPLUNK_SECRET}" ]] || { echo "Splunk admin Secret not found" >&2; exit 1; }
+SPLUNK_PASSWORD="$(kubectl get secret "${SPLUNK_SECRET}" \
+  -n "${NAMESPACE}" -o jsonpath='{.data.password}' | base64 --decode)"
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
+  curl -su admin:"${SPLUNK_PASSWORD}" \
+  http://localhost:8089/services/apps/local/Splunk_ML_Toolkit \
+  | grep -E "<title>|disabled|version"
+```
+
+Expect `version` `6.1.0` and `disabled` `0`. The `Standalone` app-deploy status
+check under [Verifying the Installation](#verifying-the-installation) applies to
+this app too.
+
+---
+
+#### Onboarding to the AI Tier (Splunk AI Toolkit)
+
+Installing AITK does not connect it to anything. Onboarding saves one shared
+**AI tier endpoint** — the SLIM base URL — which every AI tier feature in the
+app then uses. This mirrors the in-app **AI tier setup** wizard
+(**Connections** → **+ Connection** → **Endpoint** → **Splunk AI tier**), whose
+three screens are Overview, Getting started, and Enter AI tier endpoint.
+
+The endpoint must include the SLIM API path, not just host and port:
+
+```text
+http://<worker-node-ip>:<nodePort>/tenant/slim-api/v1alpha1
+```
+
+`tenant` here is a URL path segment that SLIM reads as a tenant name and uses
+only for log anonymization and metric labels, so the literal string `tenant`
+works. The bundled validation scripts use `admin` in the same position. Both are
+accepted.
+
+**Step 1 — find the SLIM endpoint**
+
+```bash
+NAMESPACE=ai-platform
+CLUSTER_NAME="<cluster-name>"
+SLIM_SERVICE="${CLUSTER_NAME}-ai-platform-slim-slim-service"
+
+# The public SLIM Service carries the feature=slim label
+kubectl get svc -n "${NAMESPACE}" -l feature=slim
+kubectl get svc "${SLIM_SERVICE}" -n "${NAMESPACE}" \
+  -o custom-columns='TYPE:.spec.type,PORT:.spec.ports[0].port,NODEPORT:.spec.ports[0].nodePort,ADDRESS:.status.loadBalancer.ingress[0].ip'
+```
+
+In the `PORT(S)` column look for `8080:<nodePort>/TCP`, then build the endpoint
+for your exposure mode:
+
+| Service type | AI tier endpoint to save |
+|---|---|
+| `NodePort` | `http://<worker-node-ip>:<nodePort>/tenant/slim-api/v1alpha1` |
+| `LoadBalancer` | `http://<external-ip-or-hostname>:8080/tenant/slim-api/v1alpha1` |
+| `ClusterIP` (bundled Splunk only) | `http://${SLIM_SERVICE}.${NAMESPACE}.svc.cluster.local:8080/tenant/slim-api/v1alpha1` |
+
+Use a worker-node IP that the **Splunk instance** can reach, not one that only
+your laptop can reach — the `ai` and `apply CDTSM` commands call SLIM from the
+Splunk search process, not from the browser. Never save a
+`http://127.0.0.1:...` port-forward URL: inside the Splunk pod that address
+points back at Splunk itself.
+
+The separate `-slim-metrics-service` on port 8088 is internal and is not an
+onboarding endpoint.
+
+**Step 2 — confirm Splunk can reach SLIM before saving**
+
+`/health` is served at the service root, without the tenant prefix, and needs no
+token — it is the cheapest reachability probe:
+
+```bash
+NAMESPACE=ai-platform
+SPLUNK_POD="splunk-splunk-standalone-standalone-0"
+SLIM_BASE="http://<worker-node-ip>:<nodePort>"   # host and port only
+
+kubectl exec -n "${NAMESPACE}" "${SPLUNK_POD}" -- \
+  curl -s -o /dev/null -w '%{http_code}\n' "${SLIM_BASE}/health"
+```
+
+Expect `200`. The committed API schema is also reachable unauthenticated at
+`${SLIM_BASE}/service/info/specs/v1alpha1/openapi.json` if you want the full
+route list.
+
+Everything under `/tenant/slim-api/v1alpha1` requires both a `request_id`
+header and a Splunk-minted bearer token; a manual `curl` against, say,
+`chat/models` without a `request_id` header fails with `400 Request ID not
+present in header` before SLIM even looks at the `Authorization` header, which
+can look like a routing problem when it is not. For an authenticated
+end-to-end check that mints a short-lived JWT, sends the required headers, and
+calls `chat/models`, run the bundled script instead of hand-rolling curl:
+
+```bash
+KUBECONFIG=/path/to/kubeconfig \
+  ./tools/ai-tier-cluster-setup/test_internal_splunk_authenticated.sh \
+  --namespace ai-platform \
+  --standalone splunk-standalone \
+  --aiplatform <cluster-name>-ai-platform
+```
+
+**Step 3 — save the endpoint via the Splunk UI**
+
+1. Open **Splunk AI Toolkit** in Splunk Web and go to **Connections**
+2. Click **+ Connection** → under **Endpoint**, choose **Splunk AI tier**
+3. Read the **Overview** and **Getting started** screens (they restate the
+   cluster-health and endpoint-discovery checks above, and link to the
+   [deployment guide](DEPLOYMENT_GUIDE.md#3-onboard-to-the-ai-tier)), then click
+   **Next**
+4. On **Enter AI tier endpoint**, enter the URL from Step 1 in **AI tier
+   endpoint URL** and click **Complete setup**
+
+The saved endpoint appears in the Connections table as an `Endpoint` row; use
+its **Edit** action to change it later. Saving validates only the URL *format*
+— `http://` is permitted for this provider and no live call is made — so a
+typo or an unreachable host is not reported until you create an LLM connection
+or run a search. Step 2 exists to catch that early.
+
+**Step 4 — create the AI tier LLM connection (needed for `ai`)**
+
+`apply CDTSM` works as soon as the endpoint is saved. The `ai` command
+additionally needs a named LLM connection:
+
+1. In **Connections**, click **+ Connection** → **LLM** → **Splunk AI tier LLM**
+   (it reads *Setup required* and starts endpoint setup instead if Step 3 was
+   skipped)
+2. Pick the model and save
+
+Creating or testing this connection is the first operation that actually calls
+SLIM: the app mints a Splunk interactive token, calls `chat/models` on the saved
+endpoint, and resolves the model ID. In an AI tier deployment that catalog holds
+two Splunk-hosted models:
+
+| Model | ID |
+|---|---|
+| OpenAI GPT-OSS 20B | `gpt_oss_20b` |
+| Gemma 4 31B | `gemma4_31b_it` |
+
+**Step 5 — smoke test**
+
+CDTSM, using `internet_traffic.csv` — a time-series lookup shipped with the app:
+
+```text
+| inputlookup internet_traffic.csv | head 2000 | apply CDTSM bits_transferred forecast_k=128
+| inputlookup internet_traffic.csv | head 5000 | apply CDTSM bits_transferred mode=anomaly method=iqr_residual
+```
+
+Forecast values (or anomaly annotations) in the results mean the full path —
+Splunk → SLIM → model — is healthy. For the `ai` command, run it against the
+connection you created in Step 4; use the in-product search assistant for its
+exact argument form.
+
+---
+
+#### Troubleshooting the Toolkit App
+
+**`AI Tier endpoint is not configured`**
+
+No endpoint has been saved yet. Complete Step 3.
+
+**`Could not resolve model_id for model '<m>' via AI Tier's chat/models endpoint`**
+
+The requested model is not in the AI tier catalog. Compare it against the two
+supported model IDs in Step 4. `test_internal_splunk_authenticated.sh` confirms
+whether an authenticated `chat/models` call succeeds at all.
+
+**`400 Request ID not present in header` from SLIM**
+
+Every route under `/tenant/slim-api/v1alpha1` requires a `request_id` header
+on the request, checked before authentication. AITK's own client sends this
+automatically; it only shows up if you are hand-testing with `curl` instead of
+using the bundled script. Add `-H "request_id: $(uuidgen)"` and retry — a
+genuine auth failure then surfaces as one of the 401s below instead.
+
+**HTTP 401 from SLIM**
+
+SLIM accepts a Splunk-signed JWT only when the token's `iss` claim is listed in
+its trusted issuers, and it re-validates the session against that issuer. Check
+the propagated issuer and that SLIM can reach Splunk management port 8089:
+
+```bash
+NAMESPACE=ai-platform
+CLUSTER_NAME="<cluster-name>"
+SLIM_DEPLOY="${CLUSTER_NAME}-ai-platform-slim-slim-deployment"
+
+kubectl get aiservice -n "${NAMESPACE}"
+kubectl -n "${NAMESPACE}" set env "deploy/${SLIM_DEPLOY}" --list | grep -i splunk_issuers
+kubectl logs -n "${NAMESPACE}" "deploy/${SLIM_DEPLOY}" --tail=50
+```
+
+After an issuer change, users must sign in again so their tokens carry the new
+`iss` claim — the same rule described in
+[Shared Authentication and Management Transport](#shared-authentication-and-management-transport).
+
+**HTTP 404 from SLIM**
+
+Almost always a saved endpoint that is missing the `/tenant/slim-api/v1alpha1`
+suffix, or one that points at the metrics port 8088 instead of 8080. Re-check
+Step 1. Fine-tuning routes (`/cdtsm_ft/*`, `/aitk_algo/*`) are not enabled in
+this release and also answer 404.
+
+**HTTP 403 when saving the endpoint**
+
+The Splunk user lacks `edit_ai_commander_config` and `list_ai_commander_config`.
+See [Toolkit Prerequisites](#toolkit-prerequisites).
+
+**Endpoint saved but searches still fail**
+
+Saving performs no connectivity probe. Run the Step 2 `/health` check from
+inside the Splunk pod — a Splunk instance outside the cluster needs a routed
+path to the published NodePort or load-balancer address, which a laptop VPN or
+SOCKS tunnel does not provide. For external Splunk, see
+[EXTERNAL_SPLUNK_INTEGRATION.md](EXTERNAL_SPLUNK_INTEGRATION.md).
+
+---
+
 ## Troubleshooting
 
 Run the installer validation and collect a support bundle before changing the
@@ -2353,6 +2658,8 @@ Use the guide that matches the failing layer:
   [Troubleshooting with Events and Status](../splunk-ai-operator-docs/troubleshooting.md)
 - Splunk AI Assistant installation or SAIA connectivity:
   [Troubleshooting the App](#troubleshooting-the-app)
+- Splunk AI Toolkit installation, AI tier onboarding, or SLIM connectivity:
+  [Troubleshooting the Toolkit App](#troubleshooting-the-toolkit-app)
 
 The installer guide is the source of truth for operational commands. Keep
 app-specific checks here beside the onboarding workflow.
