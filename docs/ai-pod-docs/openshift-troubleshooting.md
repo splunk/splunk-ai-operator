@@ -3,7 +3,8 @@
 This guide diagnoses failures produced by `openshift_with_stack.sh` and the AI
 POD components it deploys on an existing OpenShift cluster. It applies to the
 OpenShift workflow only. Do not use the k0s-specific SSH, MetalLB, cluster
-bootstrap, or host-driver procedures from [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md).
+bootstrap, or host-driver procedures from
+[`troubleshooting.md`](../ai-tier-docs/troubleshooting.md).
 
 For installation requirements and configuration, see
 [`openshift-readme.md`](./openshift-readme.md). For AIPlatform conditions,

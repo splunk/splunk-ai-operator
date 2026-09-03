@@ -10,7 +10,7 @@ For the condensed installation checklist, see
 > The installer deploys AI POD workloads and supporting operators. It does not
 > create, upgrade, or remove the OpenShift cluster itself.
 
-For a k0s deployment, use [`K0S_README.md`](./K0S_README.md).
+For a k0s deployment, use [`k0s-readme.md`](../ai-tier-docs/k0s-readme.md).
 
 ## Contents
 
