@@ -52,7 +52,8 @@ standard and air-gapped deployment details.
 - **[k0s Deployment Quick Reference](docs/ai-tier-docs/k0s-quick-reference.md)** - Default installation workflow
 - **[Complete k0s Guide](docs/ai-tier-docs/k0s-readme.md)** - Configuration, installation, and operations
 - **[Deployment Guide](docs/ai-tier-docs/deployment-guide.md)** - Standard and air-gapped deployment details
-- **[OpenShift Guide](docs/ai-tier-docs/openshift-readme.md)** - OpenShift-specific deployment
+- **[OpenShift Deployment Quick Reference](docs/ai-pod-docs/openshift-quick-reference.md)** - Condensed AI POD installation workflow
+- **[OpenShift Guide](docs/ai-pod-docs/openshift-readme.md)** - OpenShift-specific deployment
 - **[AWS EKS Guide](docs/ai-tier-docs/eks-readme.md)** - AWS EKS deployment
 - **[API Reference](docs/splunk-ai-operator-docs/api-reference.md)** - Complete CRD specification
 - **[Configuration Guides](docs/splunk-ai-operator-docs/splunk-ai-operator-configuration/)** - Storage, ingress, and webhook configuration

@@ -1,44 +1,37 @@
-# =============================================================================
-# OpenShift Cluster Config for Splunk AI tier
-# =============================================================================
-# Used by openshift_with_stack.sh
-# =============================================================================
+# Splunk AI tier (AI POD) settings for OpenShift.
+# Copy this file, replace environment-specific values, and pass the copy through
+# CONFIG_FILE. Do not commit credentials.
 
-# Set airgap=true for an air-gapped deployment. The normal install command then
-# mirrors and configures installer-owned OpenShift dependencies automatically.
-# Air-gap installation must run on Linux because Red Hat oc-mirror is Linux-only.
+# false: standard deployment (internet-connected). true: air-gapped deployment.
+# An air-gapped deployment requires a Linux installer host with oc-mirror.
 cluster:
   airgap: false
 
 kubernetes:
   namespace: ai-platform
 
-# OpenShift-specific settings
 openshift:
-  # This installer pins the NFD operand and GPU Operator channel for OpenShift
-  # 4.21 and fails preflight on a different cluster minor.
+  # Qualified OpenShift minor. Changing this value does not add support.
   requiredVersion: "4.21"
 
-  # Grant privileged SCC to Ray worker and operator service accounts.
-  # Required when running GPU workloads (nvidia.com/gpu requests).
-  # Set to "false" only if your cluster policy already covers this.
+  # Controls the namespace-wide SCC grants for the AI workloads and Splunk AI
+  # Operator. Component-specific grants for cert-manager, Local Path
+  # Provisioner, OpenTelemetry, and Splunk Operator are always applied. Set
+  # false only when the cluster administrator provides equivalent AI workload
+  # and Splunk AI Operator permissions separately.
   grantPrivilegedSCC: "true"
 
-  # Node labeling for the splunk.ai/ai-tier-node scheduler selector.
-  # Both CPU and GPU workloads target this single AI-tier node pool; GPU workers
-  # are pinned to GPU-capable nodes by their nvidia.com/gpu resource request.
-  # Use "auto" to label all worker nodes automatically.
-  # Use "manual" to specify node names explicitly below.
+  # auto labels every worker node; manual labels only the nodes listed below.
   nodeLabelStrategy: "manual"
 
-  # Nodes that make up the AI-tier pool. List every node the AI platform should
-  # run on — CPU workloads (weaviate, ray-head, saia-api) and GPU workloads
-  # (ray-worker) both schedule here.
+  # AI-tier node pool used when nodeLabelStrategy is manual. CPU and GPU
+  # workloads share this pool; GPU resource requests select GPU-capable nodes.
   nodes:
     - cc-40-f3-9f-e2-3c
 
-  # OpenShift-native external exposure. Hosts default to
-  # <feature>.<default-ingress-domain>; set host explicitly to override.
+  # External HTTP Routes. If host is omitted, the installer uses
+  # <feature>.<default-ingress-domain>. HTTPS Route TLS and workload mTLS are
+  # not configured or qualified by this installation workflow.
   routes:
     saia:
       enabled: true
@@ -48,32 +41,35 @@ openshift:
       # host: "slim.apps.example.com"
 
 images:
-  # In an air-gapped install this is the internal registry that already contains
-  # the customer-provided images below. The installer automatically imports its
-  # OpenShift infrastructure and Operator content into this registry.
-  # Registry prefix applied to images that are not fully qualified.
-  registry: "658391232643.dkr.ecr.us-east-2.amazonaws.com"
-  # Lab/isolated-network option only. When true, the installer permits HTTP on
-  # a matching Route and configures OpenShift nodes for insecure image pulls.
+  # Optional prefix for image names that are not fully qualified. The release
+  # defaults below use Docker Hub and are therefore not rewritten by this
+  # value. For an air-gapped cluster, every image under images.* must already
+  # exist in the internal registry; replace each public image reference with
+  # its internal path.
+  registry: ""
+  # Keep false for a registry using trusted HTTPS. Set true only when insecure
+  # access is explicitly required; it permits plain-HTTP pulls, adds the host
+  # to OpenShift's insecureRegistries, and disables destination TLS verification
+  # during an air-gap oc-mirror import.
   registryInsecure: false
 
   operator:
-    image: "658391232643.dkr.ecr.us-east-2.amazonaws.com/kiran/splunk/splunk-ai-operator:openshift-0.10"
+    image: "docker.io/splunk/splunk-ai-operator:v1.0"
 
   ray:
-    headImage: "ml-platform/ray/ray-head:build-953"
-    workerImage: "ml-platform/ray/ray-worker-gpu:build-953"
+    headImage: "docker.io/splunk/ai-tier-ray-head:v1.0"
+    workerImage: "docker.io/splunk/ai-tier-ray-worker:v1.0"
 
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
 
   saia:
-    apiImage: "ml-platform/saia/saia-api:build-v2-main-c3b489d"
-    apiV2Image: "ml-platform/saia/saia-api-v2:build-v2-main-c3b489d"
-    dataLoaderImage: "ml-platform/saia/saia-data-loader:build-v2-main-c3b489d"
+    apiImage: "docker.io/splunk/ai-tier-saia-api:v1.0"
+    apiV2Image: "docker.io/splunk/ai-tier-saia-api-v2:v1.0"
+    dataLoaderImage: "docker.io/splunk/ai-tier-saia-data-loader:v1.0"
 
   slim:
-    apiImage: "arif/slim-api:v0.0.4"
+    apiImage: "docker.io/splunk/ai-tier-slim-service:v1.0"
 
   splunk:
     image: "docker.io/splunk/splunk:10.2-rhel9"
@@ -92,18 +88,13 @@ storage:
   storageClass: "local-path"
   vectorDbSize: "50Gi"
   minimumDiskSpace:
-    # Scale-factor-1 minimum available GiB on the shared AI-tier node filesystem
-    # backing /var/lib/containers and /opt/local-path-provisioner. The installer
-    # multiplies this value by aiPlatform.scaleFactor: 1024 GiB at scale 1 and
-    # 2048 GiB at scale 2.
+    # Available GiB required on each AI-tier node at scale 1. The installer
+    # multiplies it by aiPlatform.scaleFactor (1024 at scale 1; 2048 at 2).
     aiTierNode: 1024
   modelStaging:
-    # true checks every completion marker in the object store, skips models that
-    # are already current, and downloads/uploads only missing or changed models
-    # from the installer machine. Cluster nodes do not need internet access.
-    # Set false in air-gap mode only when every model is already staged; the
-    # installer then verifies all markers and fails before modifying the cluster
-    # if anything is missing.
+    # true stages only missing or changed models from the installer machine.
+    # false skips staging. Air-gapped installs verify completion markers before
+    # platform installation; standard installs do not perform that pre-check.
     enabled: true
   objectStore:
     type: "seaweedfs"           # aws | s3compat | minio | seaweedfs
@@ -115,22 +106,25 @@ storage:
 
 splunk:
   standaloneName: splunk-standalone
-  # Additional management/JWT issuers appended to the primary endpoint for
-  # both SAIA and SLIM.
+  # Additional management/JWT issuers accepted by SAIA and SLIM. The installer
+  # adds the primary short Splunk service URL automatically.
   trustedIssuers:
     - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 
 aiPlatform:
   name: "openshift-ai-platform"
+  # GPU profile supported by this OpenShift installer.
   defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
-  # Fresh-install capacity multiplier for both model replicas and GPU workers.
-  # Must be a YAML integer greater than or equal to 1.
+  # Scales model replica counts and corresponding GPU worker groups.
+  # It does not provision hardware. Ensure sufficient CPU, memory, GPU, and
+  # storage capacity before increasing this value.
+  # Disk preflight requirement:
+  # storage.minimumDiskSpace.aiTierNode × scaleFactor.
   scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""
   serviceTemplate:
-    # Routes above provide stable external access. Keep the backing feature
-    # Services internal unless NodePort or LoadBalancer is explicitly required.
+    # Keep feature Services internal when Routes provide external access.
     type: ClusterIP         # ClusterIP | NodePort | LoadBalancer
   features:
     - name: "saia"
@@ -144,24 +138,43 @@ aiPlatform:
         effect: "NoSchedule"
 
 operators:
-  # In an air-gapped install the installer assigns these stable names to the
-  # internally mirrored CatalogSources it creates automatically.
+  # Standard deployments use these OpenShift OLM CatalogSources. In air-gap mode,
+  # the installer mirrors the required catalogs and substitutes the generated
+  # internal CatalogSource names automatically.
   nfd:
     catalogSource: "redhat-operators"
   gpu:
     catalogSource: "certified-operators"
   ray:
+    # Ray Serve application-package version expected in object storage.
     modelVersion: "v0.3.14-36-g1549f5a"
+    # Ray runtime version; must match the Ray head and worker images.
     rayVersion: "2.56.0"
 
 files:
   aiPlatform: "./artifacts.yaml"
   splunkOperator: "./splunk-operator-cluster.yaml"
 
-# ECR pull secret — created automatically in all relevant namespaces during install.
-# Requires AWS credentials in the environment (e.g. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-# or an instance profile). Set enabled: false for non-ECR registries.
+# Optional authentication for a private registry. Air-gapped installs also use
+# this block to authenticate the oc-mirror destination. When that destination
+# is ECR, ecr.enabled alone is not enough for the earlier mirror import; provide
+# a current ECR token here, in the cluster pull secret, or in a registry auth
+# file. Leave disabled for public images. Do not commit real credentials.
+imagePullSecrets:
+  custom:
+    enabled: false
+    name: "custom-registry-secret"
+    server: "registry.example.com"
+    username: "<registry-username>"
+    password: "<registry-password-or-token>"
+    email: "<registry-account-email>"
+
+# Amazon ECR workload authentication. When enabled, the installer uses AWS
+# credentials from the environment or an instance profile to create pod pull
+# secrets after air-gap mirror import. For an air-gapped ECR destination, also
+# provide oc-mirror authentication as described under imagePullSecrets above.
+# Set enabled to false when using another registry.
 ecr:
-  enabled: true
-  account: "658391232643"
+  enabled: false
+  account: ""
   region: "us-east-2"
