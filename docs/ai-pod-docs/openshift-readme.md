@@ -308,7 +308,7 @@ Choose the deployment mode before running the installer:
 | Setting | Meaning |
 |---|---|
 | `cluster.airgap` | `false` for a standard deployment; `true` for an air-gapped deployment |
-| `kubernetes.namespace` | Workload namespace; default `ai-platform` |
+| `kubernetes.namespace` | Dedicated AI POD workload namespace; default `ai-platform` |
 | `openshift.requiredVersion` | Qualified OpenShift minor; must be `4.21` |
 | `openshift.grantPrivilegedSCC` | Control namespace-wide grants for AI workloads and the Splunk AI Operator; set to `false` only when a cluster administrator has already pre-granted the required SCC access; component-specific grants remain automatic |
 | `openshift.nodeLabelStrategy` | `manual` labels listed nodes; `auto` labels all workers |
@@ -979,9 +979,9 @@ Set `openshift.routes.<feature>.enabled: false` to keep that feature internal.
 - Keep registry and object-store credentials out of source control. Manage
   OpenShift secret encryption, RBAC, audit logging, and credential rotation
   according to the customer's cluster-security policy.
-- The installer requires cluster-admin privileges and records the shared
-  cluster resources and SCC grants it creates so `clean-all` preserves resources
-  it did not own.
+- The installer requires cluster-admin privileges and records whether it
+  created shared resources and namespaces. Use a dedicated AI POD namespace:
+  `clean-all` deletes that namespace in full when the installer created it.
 - Do not apply a generic deny-all NetworkPolicy without a tested allowlist. A
   policy must preserve OpenShift router ingress, DNS, Operator and webhook
   traffic, same-namespace service calls, object-store access, and the required
@@ -1004,5 +1004,9 @@ air-gap, workload, Route, and Splunk app troubleshooting workflow.
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all
 ```
 
-This removes resources owned by the installer and leaves the OpenShift cluster
-running.
+This leaves the OpenShift cluster and its nodes running. If the installer
+created the AI POD namespace, it deletes that namespace and everything later
+added to it. If the namespace existed before installation, it preserves the
+namespace but removes the configured AIPlatform, Splunk Standalone, SAIA and
+SLIM Routes, and installer-created configuration. Always use a dedicated AI POD
+namespace.

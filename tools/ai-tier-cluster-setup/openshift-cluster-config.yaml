@@ -115,8 +115,11 @@ aiPlatform:
   name: "openshift-ai-platform"
   # GPU profile supported by this OpenShift installer.
   defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
-  # Capacity multiplier for model replicas, GPU workers, and the disk check.
-  # Use an integer greater than or equal to 1.
+  # Scales model replica counts and corresponding GPU worker groups.
+  # It does not provision hardware. Ensure sufficient CPU, memory, GPU, and
+  # storage capacity before increasing this value.
+  # Disk preflight requirement:
+  # storage.minimumDiskSpace.aiTierNode × scaleFactor.
   scaleFactor: 1
   workerGroupConfig:
     imageRegistry: ""

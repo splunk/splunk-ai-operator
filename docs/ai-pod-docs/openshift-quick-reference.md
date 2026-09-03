@@ -8,7 +8,7 @@ see [openshift-troubleshooting.md](openshift-troubleshooting.md).
 ## Table of Contents
 
 1. [Step 1: Confirm prerequisites](#step-1-confirm-prerequisites)
-2. [Step 2: Confirm worker capacity](#step-2-confirm-worker-capacity)
+2. [Step 2: Confirm minimum worker capacity](#step-2-confirm-minimum-worker-capacity)
 3. [Step 3: Prepare the configuration](#step-3-prepare-the-configuration)
 4. [Step 4: Install the platform](#step-4-install-the-platform)
    - [Standard deployment](#standard-deployment)
@@ -34,9 +34,9 @@ upgrade, or remove OpenShift.
 
 | Installer machine OS | Installation type | OpenShift node OS | OpenShift version |
 |---|---|---|---|
-| macOS | Standard only | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
-| RHEL 9 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
-| RHEL 10 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| macOS 26.5.2 | Standard only | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| RHEL 9.8 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| RHEL 10.2 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
 
 Air-gapped installation requires Linux because Red Hat `oc-mirror` v2 is
 Linux-only. The installer machine also requires:
@@ -68,10 +68,11 @@ helm version
 jq --version
 ```
 
-For an air-gapped deployment, also verify `oc-mirror`:
+For an air-gapped deployment, verify that `oc-mirror` is installed and supports
+v2. Use a build compatible with OpenShift 4.21:
 
 ```bash
-oc-mirror --v2 version
+oc-mirror --v2 version --output=yaml
 ```
 
 Set the kubeconfig and confirm the exact permission checked by the installer:
@@ -80,7 +81,12 @@ Set the kubeconfig and confirm the exact permission checked by the installer:
 export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/openshift}"
 test -f "$KUBECONFIG"
 oc whoami
+# Expected: the authenticated OpenShift user, for example system:admin
+
 oc whoami --show-server
+# Expected: the intended cluster API URL, for example
+# https://api.<cluster-domain>:6443
+
 oc auth can-i create clusterrolebinding --all-namespaces
 ```
 
@@ -88,37 +94,72 @@ The final command must print `yes`.
 
 ---
 
-## Step 2: Confirm worker capacity
+## Step 2: Confirm minimum worker capacity
 
-CPU and GPU workloads use one shared AI-tier node pool. GPU resource requests
-place Ray GPU workers on GPU-capable nodes.
+The initial deployment requires at least:
 
-`aiPlatform.scaleFactor` selects the deployment capacity. Scale 1 is the
-baseline; scale 2 doubles the workload capacity and minimum hardware shown
-below.
+| Resource | Minimum requirement |
+|---|---:|
+| System RAM | 256 GiB |
+| Available workload disk | 1 TiB (1024 GiB) |
+| GPU memory | 2 × 96 GB VRAM |
+| CPU | 64 allocatable vCPU |
 
-| `scaleFactor` | System RAM | Available workload disk | GPU memory | CPU |
-|---:|---:|---:|---:|---:|
-| `1` | 256 GiB | 1 TiB (1024 GiB) | 2 × 96 GB VRAM | 64 allocatable vCPU |
-| `2` | 512 GiB | 2 TiB (2048 GiB) | 4 × 96 GB VRAM | 128 allocatable vCPU |
+CPU and GPU workloads use the shared AI-tier worker pool. Disk means usable
+capacity available before installation, including the filesystems backing
+`/var/lib/containers` and `/opt/local-path-provisioner`.
 
-Disk is usable space available before installation, not the drive's advertised
-size. Capacity must cover `/var/lib/containers` and
-`/opt/local-path-provisioner`, or equivalent filesystems backing both paths.
-
-The object store is separate from worker disk. It holds model artifacts and
-persistent SAIA runtime data and is not deployed by this installer.
+The object store is separate from worker storage and must be provisioned
+independently.
 
 ---
 
 ## Step 3: Prepare the configuration
 
-Clone the repository and create an environment-specific configuration:
+Download the installer files on the installer machine using one of these
+methods.
+
+<details>
+<summary><strong>Option 1: Setup via Git (Recommended)</strong></summary>
+
+Clone the supplied release branch or tag:
 
 ```bash
 git clone --branch <release-branch-or-tag> --single-branch \
   https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/ai-tier-cluster-setup
+```
+
+</details>
+
+<details>
+<summary><strong>Option 2: Setup via Browser ZIP Download</strong></summary>
+
+For a branch, download:
+
+```text
+https://github.com/splunk/splunk-ai-operator/archive/refs/heads/<release-branch>.zip
+```
+
+For a tag, download:
+
+```text
+https://github.com/splunk/splunk-ai-operator/archive/refs/tags/<release-tag>.zip
+```
+
+Alternatively, select the supplied branch or tag on GitHub, then choose
+**Code > Download ZIP**. Extract the archive and open the setup directory:
+
+```bash
+cd <extracted-directory>/tools/ai-tier-cluster-setup
+```
+
+</details>
+
+From `tools/ai-tier-cluster-setup`, create an environment-specific
+configuration:
+
+```bash
 cp openshift-cluster-config.yaml my-openshift-cluster-config.yaml
 export CONFIG_FILE="$PWD/my-openshift-cluster-config.yaml"
 chmod 600 "$CONFIG_FILE"
@@ -133,7 +174,7 @@ Edit the copy and confirm these settings:
 | Setting | Required decision |
 |---|---|
 | `cluster.airgap` | `false` for standard; `true` for air-gapped |
-| `kubernetes.namespace` | Workload namespace; default `ai-platform` |
+| `kubernetes.namespace` | Dedicated AI POD workload namespace; default `ai-platform` |
 | `openshift.nodeLabelStrategy` | `manual` for listed nodes or `auto` for all workers |
 | `openshift.nodes` | Exact AI-tier worker names when strategy is `manual` |
 | `openshift.routes.saia.enabled` | Create the HTTP SAIA Route |
@@ -144,7 +185,7 @@ Edit the copy and confirm these settings:
 | `storage.objectStore.*` | Type, bucket, endpoint where required, and credentials |
 | `storage.modelStaging.enabled` | Stage missing models from the installer when `true` |
 | `splunk.trustedIssuers` | Additional legitimate JWT issuer URLs, when required |
-| `aiPlatform.scaleFactor` | Integer capacity multiplier, minimum `1` |
+| `aiPlatform.scaleFactor` | Global workload scale; keep `1` for the minimum deployment |
 | `ecr.enabled` | Enable only when the workload registry is Amazon ECR |
 
 See the [full configuration reference](openshift-readme.md#configuration-reference)
@@ -157,22 +198,10 @@ aiPlatform:
   defaultAcceleratorType: "RTX_PRO_6000_BLACKWELL"
 ```
 
-Check the YAML and selected cluster values before installation:
+Validate the configuration before installation:
 
 ```bash
-yq eval '.' "$CONFIG_FILE" >/dev/null
-yq eval '.cluster.airgap, .openshift.nodes, .storage.objectStore.type, .aiPlatform.scaleFactor' \
-  "$CONFIG_FILE"
-oc get clusterversion version
-oc get nodes \
-  -o custom-columns=NAME:.metadata.name,OS:.status.nodeInfo.osImage,ARCH:.status.nodeInfo.architecture
-oc get storageclass
-```
-
-Run the read-only configuration check before installation:
-
-```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh validate
+./openshift_with_stack.sh validate
 ```
 
 `validate` checks the configuration without changing the cluster. `install`
@@ -201,7 +230,7 @@ cluster:
 Install:
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
+./openshift_with_stack.sh install
 ```
 
 The installer runs preflight, stages missing models when enabled, installs the
@@ -215,9 +244,11 @@ API, the internal registry, and the object store while preparing the install.
 
 Before starting:
 
-- Provide temporary installer-machine space for `oc-mirror` content and its
-  working files. Required capacity depends on the selected catalog content and
-  versions; see the
+- Provide sufficient installer-machine disk space for the generated air-gap
+  content and `oc-mirror` working files. This local staging space is separate
+  from the destination registry, which retains the mirrored images. Generated
+  local files remain until they are removed manually. Required capacity depends
+  on the selected catalog content and versions; see the
   [air-gap installer host requirements](openshift-readme.md#installer-host-requirements).
 - Put every application image configured under `images.*` in the internal
   registry and use those internal image references in the configuration.
@@ -236,7 +267,7 @@ cluster:
 Run:
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
+./openshift_with_stack.sh install
 ```
 
 The installer automatically prepares and imports its OpenShift-specific
@@ -255,7 +286,7 @@ export AI_PLATFORM_NAME="$(yq eval '.aiPlatform.name // "openshift-ai-platform"'
 
 oc get aiplatform,aiservice,raycluster,rayservice -n "$AI_NAMESPACE"
 oc get pods -n "$AI_NAMESPACE" -o wide
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify-pods
+./openshift_with_stack.sh verify-pods
 ```
 
 Print the default external endpoints:
@@ -275,14 +306,25 @@ configured by this installer. Ray dashboard diagnostics are documented in
 
 ## Step 6: Connect the Splunk apps
 
-Splunk Enterprise 10.2 is the tested version. Use Splunk AI Assistant 2.3.0
-and Splunk AI Toolkit 6.1.0 or later.
+Use the following versions for this release:
+
+| Component | Version |
+|---|---|
+| Splunk Enterprise | 10.2 |
+| Splunk AI Assistant | 2.3.0 or later |
+| Splunk AI Toolkit | 6.1.0 or later |
 
 The installer deploys a Splunk Standalone instance. An external Splunk
 Enterprise instance may instead use the published Routes when its network and
 JWT issuer are configured correctly.
 
 ### Open installer-deployed Splunk Web
+
+Run these commands on the machine where Splunk Web will be opened. This can be
+the installer machine or another administrative workstation with `oc`, the
+same kubeconfig and configuration file, and access to the OpenShift API. Set
+`KUBECONFIG`, `CONFIG_FILE`, and `AI_NAMESPACE` in that shell. The port-forward
+listens on that machine's localhost.
 
 Use this section for the Splunk Standalone instance created by the installer.
 The port-forward provides local access to its Splunk Web interface.
@@ -340,19 +382,36 @@ create a named Splunk AI tier LLM connection, and run the post-install `ai` and
 
 ## Step 7: Operate and troubleshoot
 
-Run commands from `tools/ai-tier-cluster-setup` with the same configuration:
+### Scale the deployment
+
+`aiPlatform.scaleFactor` increases model replica counts and corresponding GPU
+worker groups. It does not provision hardware. Ensure sufficient CPU, memory,
+GPU, and storage capacity before increasing it.
+
+| `scaleFactor` | System RAM | Available workload disk | GPU memory | CPU |
+|---:|---:|---:|---:|---:|
+| `1` | 256 GiB | 1 TiB | 2 × 96 GB VRAM | 64 allocatable vCPU |
+| `2` | 512 GiB | 2 TiB | 4 × 96 GB VRAM | 128 allocatable vCPU |
+
+Run commands from `tools/ai-tier-cluster-setup` with the `CONFIG_FILE` exported
+in Step 3:
 
 | Operation | Command |
 |---|---|
-| Validate the configuration | `CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh validate` |
-| Reconcile the installation | `CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install` |
-| Verify platform readiness | `CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify-pods` |
-| Create a support bundle | `CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh diagnose` |
-| Stage missing or changed models | `CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh stage-artifacts` |
-| Remove installer-owned AI POD resources | `CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all` |
+| Validate the configuration | `./openshift_with_stack.sh validate` |
+| Reconcile the installation | `./openshift_with_stack.sh install` |
+| Verify platform readiness | `./openshift_with_stack.sh verify-pods` |
+| Create a support bundle | `./openshift_with_stack.sh diagnose` |
+| Stage missing or changed models | `./openshift_with_stack.sh stage-artifacts` |
+| Remove installer-owned AI POD resources | `./openshift_with_stack.sh clean-all` |
 
-`clean-all` leaves the OpenShift cluster running and preserves shared components
-that were not created by the installer.
+> [!IMPORTANT]
+> Use a dedicated namespace for AI POD. If the installer created the namespace,
+> `clean-all` deletes the namespace and everything later added to it. If the
+> namespace existed before installation, `clean-all` preserves the namespace
+> but removes the configured AIPlatform, Splunk Standalone, SAIA and SLIM
+> Routes, and installer-created configuration. The OpenShift cluster and its
+> nodes are not removed.
 
 For the complete symptom-based command set, use
 [openshift-troubleshooting.md](openshift-troubleshooting.md). Start with:
@@ -360,7 +419,7 @@ For the complete symptom-based command set, use
 ```bash
 oc get aiplatform,aiservice,raycluster,rayservice -n "$AI_NAMESPACE"
 oc get pods -n "$AI_NAMESPACE" -o wide
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh diagnose
+./openshift_with_stack.sh diagnose
 ```
 
 The `diagnose` command prints the exact support-bundle path. Review the bundle
