@@ -387,10 +387,9 @@ Also provide ECR destination credentials through one of these methods:
 ### Installer host requirements
 
 > [!IMPORTANT]
-> The installer host must be Linux and have `oc-mirror` v2. Plan for
-> approximately **100 GiB of temporary free space** for mirror content and
-> working files. This is a planning recommendation, not an installer-enforced
-> minimum; actual usage depends on the selected catalog content and versions.
+> The installer host must be Linux and have `oc-mirror` v2. Provide temporary
+> free space for mirror content and working files. There is no fixed minimum:
+> actual usage depends on the selected catalog content and versions.
 
 During preparation, the host must reach the target OpenShift API, public source
 registries, the internal registry, and the object store. If model staging is
@@ -402,9 +401,10 @@ internal registry and object store.
 `images.registryInsecure: true` adds the registry host to OpenShift's
 `insecureRegistries`, permits plain-HTTP pulls, and passes
 `--dest-tls-verify=false` to the air-gap `oc-mirror` import. For an HTTPS
-registry, this skips destination certificate verification. Production
-deployments must leave it `false` and use a registry certificate trusted by the
-installer host and OpenShift nodes.
+registry, this skips destination certificate verification. Keep it `false`
+when the registry uses HTTPS with a certificate trusted by the installer host
+and OpenShift nodes; enable it only when insecure registry access is explicitly
+required.
 
 ## Installation flow
 
@@ -651,7 +651,7 @@ air-gapped deployment.
 | Setting | Release default | Purpose |
 |---|---|---|
 | `images.registry` | empty | Optional registry prefix for short image names |
-| `images.registryInsecure` | `false` | Must remain `false` in production; `true` permits plain HTTP and skips destination TLS verification during air-gap import |
+| `images.registryInsecure` | `false` | Keep `false` for trusted HTTPS; `true` permits plain HTTP and skips destination TLS verification during air-gap import |
 | `images.operator.image` | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator |
 | `images.ray.headImage` | `docker.io/splunk/ai-tier-ray-head:v1.0` | Ray head runtime |
 | `images.ray.workerImage` | `docker.io/splunk/ai-tier-ray-worker:v1.0` | Ray GPU worker runtime |
@@ -914,7 +914,7 @@ Set `openshift.routes.<feature>.enabled: false` to keep that feature internal.
   Routes. HTTPS Route TLS and workload mTLS are not configured, supported, or
   qualified by this installation workflow.
 - `images.registryInsecure` is unrelated to SAIA and SLIM transport. Keep it
-  `false` in production so registry TLS verification remains enabled.
+  `false` for trusted HTTPS so registry TLS verification remains enabled.
 - Keep registry and object-store credentials out of source control. Manage
   OpenShift secret encryption, RBAC, audit logging, and credential rotation
   according to the customer's cluster-security policy.

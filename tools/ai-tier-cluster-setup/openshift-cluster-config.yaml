@@ -4,7 +4,6 @@
 
 # false: standard deployment (internet-connected). true: air-gapped deployment.
 # An air-gapped deployment requires a Linux installer host with oc-mirror.
-# Images under images.* must already exist in the configured internal registry.
 cluster:
   airgap: false
 
@@ -44,12 +43,14 @@ openshift:
 images:
   # Optional prefix for image names that are not fully qualified. The release
   # defaults below use Docker Hub and are therefore not rewritten by this
-  # value. For an air-gapped cluster, replace each fully qualified image with
-  # its path in the customer-provided internal registry.
+  # value. For an air-gapped cluster, every image under images.* must already
+  # exist in the internal registry; replace each public image reference with
+  # its internal path.
   registry: ""
-  # Production deployments must leave this false. true permits plain-HTTP
-  # pulls, adds the host to OpenShift's insecureRegistries, and disables
-  # destination TLS verification during an air-gap oc-mirror import.
+  # Keep false for a registry using trusted HTTPS. Set true only when insecure
+  # access is explicitly required; it permits plain-HTTP pulls, adds the host
+  # to OpenShift's insecureRegistries, and disables destination TLS verification
+  # during an air-gap oc-mirror import.
   registryInsecure: false
 
   operator:

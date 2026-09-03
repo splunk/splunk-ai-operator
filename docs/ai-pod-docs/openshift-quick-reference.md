@@ -89,6 +89,10 @@ The final command must print `yes`.
 CPU and GPU workloads use one shared AI-tier node pool. GPU resource requests
 place Ray GPU workers on GPU-capable nodes.
 
+`aiPlatform.scaleFactor` selects the deployment capacity. Scale 1 is the
+baseline; scale 2 doubles the workload capacity and minimum hardware shown
+below.
+
 | `scaleFactor` | System RAM | Available workload disk | GPU memory | CPU |
 |---:|---:|---:|---:|---:|
 | `1` | 256 GiB | 1 TiB (1024 GiB) | 2 × 96 GB VRAM | 64 allocatable vCPU |
@@ -108,15 +112,17 @@ persistent SAIA runtime data and is not deployed by this installer.
 Clone the repository and create an environment-specific configuration:
 
 ```bash
-git clone https://github.com/splunk/splunk-ai-operator.git
+git clone --branch <release-branch-or-tag> --single-branch \
+  https://github.com/splunk/splunk-ai-operator.git
 cd splunk-ai-operator/tools/ai-tier-cluster-setup
 cp openshift-cluster-config.yaml my-openshift-cluster-config.yaml
 export CONFIG_FILE="$PWD/my-openshift-cluster-config.yaml"
 chmod 600 "$CONFIG_FILE"
 ```
 
-If the repository already exists, update the intended branch before copying
-the template.
+Replace `<release-branch-or-tag>` with the version supplied for the deployment.
+If the repository already exists, check out and update that version before
+copying the template.
 
 Edit the copy and confirm these settings:
 
@@ -129,13 +135,16 @@ Edit the copy and confirm these settings:
 | `openshift.routes.saia.enabled` | Create the HTTP SAIA Route |
 | `openshift.routes.slim.enabled` | Create the HTTP SLIM Route |
 | `images.*` | Tagged application and supporting images available to the cluster |
-| `images.registryInsecure` | Keep `false` in production |
+| `images.registryInsecure` | Keep `false` for trusted HTTPS; enable only when insecure registry access is explicitly required |
 | `storage.storageClass` | Existing class, or `local-path` managed by the installer |
 | `storage.objectStore.*` | Type, bucket, endpoint where required, and credentials |
 | `storage.modelStaging.enabled` | Stage missing models from the installer when `true` |
 | `splunk.trustedIssuers` | Additional legitimate JWT issuer URLs, when required |
 | `aiPlatform.scaleFactor` | Integer capacity multiplier, minimum `1` |
 | `ecr.enabled` | Enable only when the workload registry is Amazon ECR |
+
+See the [full configuration reference](openshift-readme.md#configuration-reference)
+for field behavior and supported values.
 
 The only supported accelerator profile for this OpenShift workflow is:
 
@@ -170,7 +179,7 @@ they fail.
 
 ## Step 4: Install the platform
 
-Choose one path. Both use the same installer command.
+Choose the section that matches the target environment.
 
 ### Standard deployment
 
@@ -194,12 +203,6 @@ CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
 The installer runs preflight, stages missing models when enabled, installs the
 operators and platform, waits for readiness, and prints the SAIA and SLIM URLs.
 
-For a non-interactive run using the completed configuration:
-
-```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install --silent
-```
-
 ### Air-gapped deployment
 
 Use this path when OpenShift nodes have no public internet access. The Linux
@@ -208,8 +211,10 @@ API, the internal registry, and the object store while preparing the install.
 
 Before starting:
 
-- Reserve approximately 100 GiB of temporary installer-machine space for
-  `oc-mirror` content and working files.
+- Provide temporary installer-machine space for `oc-mirror` content and its
+  working files. Required capacity depends on the selected catalog content and
+  versions; see the
+  [air-gap installer host requirements](openshift-readme.md#installer-host-requirements).
 - Put every application image configured under `images.*` in the internal
   registry and use those internal image references in the configuration.
 - Configure credentials that let `oc-mirror` pull source content and push to
@@ -224,7 +229,7 @@ cluster:
   airgap: true
 ```
 
-Then run the same install command:
+Run:
 
 ```bash
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
@@ -259,26 +264,27 @@ printf 'SLIM: http://%s/tenant/slim-api/v1alpha1\n' "$SLIM_HOST"
 ```
 
 The supported Routes use HTTP. HTTPS Route TLS and workload mutual TLS are not
-configured by this installer.
-
-To inspect Ray Serve, start a local port-forward:
-
-```bash
-oc port-forward -n "$AI_NAMESPACE" \
-  "svc/${AI_PLATFORM_NAME}-head-svc" 8265:8265
-```
-
-Open `http://localhost:8265` while the command is running.
+configured by this installer. Ray dashboard diagnostics are documented in
+[openshift-troubleshooting.md](openshift-troubleshooting.md#raycluster-or-rayservice-does-not-become-ready).
 
 ---
 
 ## Step 6: Connect the Splunk apps
 
-Splunk Enterprise 10.2 is the tested version. The installer deploys a bundled
-Splunk Standalone; an external Splunk Enterprise instance may also use the
-published Routes when its network and JWT issuer are configured correctly.
+| Component | Tested version |
+|---|---|
+| Splunk Enterprise | 10.2 |
+| Splunk AI Assistant | 2.3.0 |
+| Splunk AI Toolkit | 6.1.0 or later |
 
-### Open bundled Splunk Web
+The installer deploys a Splunk Standalone instance. An external Splunk
+Enterprise instance may instead use the published Routes when its network and
+JWT issuer are configured correctly.
+
+### Open installer-deployed Splunk Web
+
+Use this section for the Splunk Standalone instance created by the installer.
+The port-forward provides local access to its Splunk Web interface.
 
 Retrieve the generated password:
 
@@ -301,26 +307,32 @@ Open `http://localhost:18001` and log in as `admin`.
 
 ### Splunk AI Assistant
 
-1. Install Splunk AI Assistant 2.3.0.
-2. Enter the SAIA Route printed in Step 5.
-3. Confirm that the user's browser can resolve and reach that Route.
-4. Send a prompt and confirm a model response.
+1. Install [Splunk AI Assistant](https://splunkbase.splunk.com/app/7245)
+   version 2.3.0.
+2. Enter the SAIA Route printed in
+   [Step 5](#step-5-verify-and-access-the-platform) and save the configuration.
+3. Send a prompt and confirm a model response. A successful response verifies
+   that the browser can reach the Route and that SAIA is responding.
 
 ### Splunk AI Toolkit
 
-1. Install Python for Scientific Computing.
-2. Install Splunk AI Toolkit 6.1.0 or later.
-3. Create a **Splunk AI tier** endpoint connection.
-4. For bundled Splunk, use the internal SLIM endpoint printed by:
+1. Install the
+   [platform-appropriate Python for Scientific Computing app](https://splunkbase.splunk.com/collections/machine_learning).
+2. Install [Splunk AI Toolkit](https://splunkbase.splunk.com/app/2890)
+   version 6.1.0 or later.
+3. Create a **Splunk AI tier** endpoint connection as described in the
+   [full setup procedure](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
+4. For installer-deployed Splunk, use the internal SLIM endpoint printed by:
 
 ```bash
 printf 'http://%s-slim-slim-service.%s.svc.cluster.local:8080/tenant/slim-api/v1alpha1\n' \
   "$AI_PLATFORM_NAME" "$AI_NAMESPACE"
 ```
 
-For external Splunk, use the SLIM Route printed in Step 5. Confirm that models
-appear, create a named Splunk AI tier LLM connection, and run the `ai` and
-`apply CDTSM` smoke tests in
+For external Splunk, use the SLIM Route printed in
+[Step 5](#step-5-verify-and-access-the-platform). Confirm that models appear,
+create a named Splunk AI tier LLM connection, and run the post-install `ai` and
+`apply CDTSM` verification searches in
 [openshift-readme.md](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
 
 ---
