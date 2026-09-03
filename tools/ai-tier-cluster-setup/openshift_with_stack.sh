@@ -15,7 +15,7 @@ trap cleanup_tmp EXIT
 # KUBECONFIG pointing at the cluster.
 #
 # Usage:
-#   ./openshift_with_stack.sh [install|validate|stage-artifacts|delete|clean-all|verify-pods|diagnose]
+#   ./openshift_with_stack.sh [install|validate|stage-artifacts|clean-all|verify-pods|diagnose]
 #
 # The script reads openshift-cluster-config.yaml in the same directory.
 # Override with: CONFIG_FILE=/path/to/config.yaml ./openshift_with_stack.sh
@@ -3986,7 +3986,7 @@ main_install() {
 # ====== MAIN DELETE ======
 main_delete() {
   log "============================================"
-  log " Splunk AI tier — OpenShift Delete"
+  log " Splunk AI tier — OpenShift Cleanup"
   log "============================================"
 
   load_config
@@ -4163,7 +4163,7 @@ main_delete() {
   oc delete configmap "$(installer_state_name)" -n openshift-config --ignore-not-found=true 2>/dev/null || true
 
   log "============================================"
-  log " Delete complete"
+  log " Cleanup complete"
   log "============================================"
   log ""
   log "Only the AI Platform stack and shared components recorded as installer-owned were removed."
@@ -4375,29 +4375,27 @@ validate_config() {
 
 # OpenShift is an existing customer-managed cluster, so clean-all must never
 # reset hosts, remove OpenShift, or flush node networking as the k0s command
-# does. Keep the familiar command name as an ownership-aware delete alias.
+# does. It delegates to the ownership-aware platform cleanup implementation.
 clean_all() {
-  warn "On OpenShift, clean-all removes the same installer-owned resources as delete; the cluster and its nodes are preserved."
+  warn "clean-all removes installer-owned AI Platform resources; the OpenShift cluster and its nodes are preserved."
   main_delete
 }
 
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [install|validate|stage-artifacts|delete|clean-all|verify-pods|diagnose] [options]
+Usage: $(basename "$0") [install|validate|stage-artifacts|clean-all|verify-pods|diagnose] [options]
 
   install [--silent|-s]
                 Deploy the Splunk AI tier stack onto an existing OpenShift cluster.
                   --silent / -s  Non-interactive: skip all prompts (equivalent to SILENT_INSTALL=true).
   validate      Check configuration completeness without changing the cluster.
-  delete        Remove the Splunk AI tier stack (leaves the cluster intact).
-  clean-all     OpenShift-safe compatibility alias for delete. It does not reset
-                nodes or remove the customer-managed OpenShift cluster.
+  clean-all     Remove installer-owned resources without resetting nodes or
+                removing the customer-managed OpenShift cluster.
   diagnose      Collect a support bundle (logs, cluster state, config) into a tar.gz.
   stage-artifacts
                 Download model weights from HuggingFace and upload to the object store.
   verify-pods   Check AI Platform pods and workload resources; auto-diagnose on failure.
-  verify        Backward-compatible alias for verify-pods.
 
 Config file: ${CONFIG_FILE}
   Override with: CONFIG_FILE=/path/to/config.yaml $(basename "$0")
@@ -4654,9 +4652,6 @@ case "${_CMD}" in
   validate)
     validate_config
     ;;
-  delete)
-    main_delete
-    ;;
   clean-all)
     clean_all
     ;;
@@ -4671,7 +4666,7 @@ case "${_CMD}" in
     resolve_accelerator_type
     stage_model_artifacts
     ;;
-  verify|verify-pods)
+  verify-pods)
     _vpc_rc=0
     run_verify_pods || _vpc_rc=$?
     exit "${_vpc_rc}"

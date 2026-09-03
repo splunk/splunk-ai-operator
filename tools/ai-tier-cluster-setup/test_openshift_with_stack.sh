@@ -353,8 +353,12 @@ assert_eq "command dispatcher exposes validate" "1" \
   "$(grep -c '^  validate)$' "${SCRIPT}" | tr -d '[:space:]')"
 assert_eq "command dispatcher exposes OpenShift-safe clean-all" "1" \
   "$(grep -c '^  clean-all)$' "${SCRIPT}" | tr -d '[:space:]')"
-assert_eq "verify remains an alias for the canonical verify-pods command" "1" \
-  "$(grep -c '^  verify|verify-pods)$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "command dispatcher exposes verify-pods" "1" \
+  "$(grep -c '^  verify-pods)$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "command dispatcher no longer exposes legacy delete" "0" \
+  "$(grep -c '^  delete)$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "command dispatcher no longer exposes legacy verify" "0" \
+  "$(grep -c '^  verify)' "${SCRIPT}" | tr -d '[:space:]')"
 assert_eq "main install runs preflight before model downloads" "1" \
   "$(( preflight_line < staging_line ))"
 assert_eq "preflight has a fatal summary gate" "1" \
@@ -373,11 +377,11 @@ assert_eq "node-storage preflight derives one scale-aware shared AI-tier thresho
   "$(awk '/^preflight_check_node_storage\(\)/,/^}/' "${SCRIPT}" | grep -c 'MIN_DISK_AI_TIER_NODE' | tr -d '[:space:]')"
 assert_eq "node-storage preflight does not invent exclusive CPU/GPU roles" "0" \
   "$(awk '/^preflight_check_node_storage\(\)/,/^}/' "${SCRIPT}" | grep -c '0x10de' | tr -d '[:space:]')"
-assert_eq "delete protects shared components with ownership checks" "1" \
+assert_eq "cleanup protects shared components with ownership checks" "1" \
   "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -c 'component_is_owned cert_manager' | tr -d '[:space:]')"
-assert_eq "delete targets only this stack's named platform resources" "0" \
+assert_eq "cleanup targets only this stack's named platform resources" "0" \
   "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -Ec 'delete (aiplatform|standalone) --all' | tr -d '[:space:]')"
-assert_eq "delete removes both installer-managed feature Routes" "1" \
+assert_eq "cleanup removes both installer-managed feature Routes" "1" \
   "$(awk '/^main_delete\(\)/,/^}/' "${SCRIPT}" | grep -c 'delete route saia slim' | tr -d '[:space:]')"
 assert_eq "Splunk Operator restart does not delete all ReplicaSets" "0" \
   "$(awk '/^install_splunk_operator\(\)/,/^}/' "${SCRIPT}" | grep -Ec 'delete replicaset .*--all' | tr -d '[:space:]')"
