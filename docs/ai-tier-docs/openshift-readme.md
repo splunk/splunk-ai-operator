@@ -223,16 +223,19 @@ $EDITOR openshift-cluster-config.yaml
 #   - set openshift.nodes[] (manual strategy) to your node names
 #   - set ecr.account / ecr.region if using ECR
 
-# 3. Stage model weights to your object store.
+# 3. Validate the configuration without changing the cluster
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh validate
+
+# 4. Stage model weights to your object store.
 #    Required for a fresh object store — Ray workers fail to start if weights
 #    are missing. Skip only if the bucket is already staged from a prior run.
 CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh stage-artifacts
 
-# 4. Install the stack
+# 5. Install the stack
 CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
 
 # (Teardown, when needed) Remove the stack. Leaves the cluster and nodes intact.
-CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh delete
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh clean-all
 ```
 
 Because the installer uses your ambient `oc` login, make sure `oc whoami`
@@ -247,10 +250,11 @@ a non-interactive run.
 | Command | What it does |
 |---|---|
 | `install [--silent\|-s]` | Deploy the full stack |
-| `delete` | Remove the stack (leaves cluster nodes running) |
+| `validate` | Check configuration completeness without changing the cluster |
+| `clean-all` | Remove installer-owned resources while preserving the OpenShift cluster and nodes |
 | `diagnose` | Collect a support bundle (`tar.gz`) |
 | `stage-artifacts` | Stage model weights to object storage only |
-| `verify` | Check all pods are Running/Completed; auto-diagnoses on failure |
+| `verify-pods` | Check AI Platform pods and workload resources; auto-diagnose on failure |
 
 ---
 
@@ -560,22 +564,10 @@ AI worker nodes are labeled `splunk.ai/node-role=worker`.
 | `splunk-operator` | `privileged` | Operator pod adds `NET_BIND_SERVICE` |
 | `local-path-storage` | `privileged` | Helper pod mounts host paths |
 
-These group grants are added on `install` and removed on `delete` — but only
-when `openshift.grantPrivilegedSCC` is `"true"` **in the config used for that
-command**. The cleanup is conditional, so if you install with the grants
-enabled and later flip `grantPrivilegedSCC: "false"`, `delete` will **skip**
-the SCC cleanup and leave the `privileged`/`anyuid` group entries on the SCCs.
-Those stale entries re-apply to any workload that later reuses these namespace
-names. Run `delete` with the **same** `grantPrivilegedSCC` value you installed
-with, or remove the entries manually:
-
-```bash
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-ai-operator-system
-oc adm policy remove-scc-from-group anyuid     system:serviceaccounts:ai-platform
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:ai-platform
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-operator
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:local-path-storage
-```
+These group grants are added during installation. The installer records the
+grants it owns in cluster state, and `clean-all` removes those recorded grants
+independently of later configuration-file changes. It preserves SCC entries
+that were present before installation.
 
 ### OpenShift Routes (external access)
 SAIA and SLIM have independent OpenShift Routes:
@@ -823,8 +815,8 @@ re-runs skip already-staged artifacts (override with `SKIP_IF_STAGED=0`).
 # High-level status
 oc get aiplatform,aiservice,raycluster,rayservice -n ai-platform
 
-# Automated pod health check across all namespaces
-CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh verify
+# Automated AI Platform pod and workload health check
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh verify-pods
 
 # Watch Ray come up
 oc get raycluster,rayservice -n ai-platform -w
@@ -841,7 +833,7 @@ A healthy reference deployment shows:
   `vector-db-setup` post-hook job `Completed`.
 - Routes `saia` and `slim` resolving to your ingress domain.
 
-If `verify` finds unhealthy pods it automatically runs `diagnose` (unless
+If `verify-pods` finds unhealthy pods or workload resources, it automatically runs `diagnose` (unless
 `AUTO_DIAGNOSE=false`), producing a support bundle.
 
 ### Ray Dashboard UI
@@ -898,7 +890,7 @@ secret if the cluster has been idle.
 ## Uninstall
 
 ```bash
-CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh delete
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh clean-all
 ```
 
 This removes the AI Platform stack and reverses the SCC grants. It leaves the

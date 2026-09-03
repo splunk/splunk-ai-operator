@@ -15,7 +15,7 @@ trap cleanup_tmp EXIT
 # KUBECONFIG pointing at the cluster.
 #
 # Usage:
-#   ./openshift_with_stack.sh [install|delete]
+#   ./openshift_with_stack.sh [install|validate|stage-artifacts|clean-all|verify-pods|diagnose]
 #
 # The script reads openshift-cluster-config.yaml in the same directory.
 # Override with: CONFIG_FILE=/path/to/config.yaml ./openshift_with_stack.sh
@@ -3986,7 +3986,7 @@ main_install() {
 # ====== MAIN DELETE ======
 main_delete() {
   log "============================================"
-  log " Splunk AI tier — OpenShift Delete"
+  log " Splunk AI tier — OpenShift Cleanup"
   log "============================================"
 
   load_config
@@ -4163,7 +4163,7 @@ main_delete() {
   oc delete configmap "$(installer_state_name)" -n openshift-config --ignore-not-found=true 2>/dev/null || true
 
   log "============================================"
-  log " Delete complete"
+  log " Cleanup complete"
   log "============================================"
   log ""
   log "Only the AI Platform stack and shared components recorded as installer-owned were removed."
@@ -4281,19 +4281,121 @@ diagnose() {
   log "  Attach this file to your support ticket or share with the team."
 }
 
+# ====== VALIDATE SUBCOMMAND ======
+# Check configuration completeness without changing the OpenShift cluster.
+# Runtime reachability, capacity, and registry checks remain part of install's
+# preflight phase because some air-gap settings are converged by install first.
+validate_config() {
+  need yq
+  load_config
+
+  echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
+  local errors=0 warnings=0
+
+  _vcheck() {
+    local label="$1" value="$2" severity="${3:-error}" hint="${4:-}"
+    if [[ -z "${value}" || "${value}" == "null" || "${value}" == *\<* || "${value}" == *CHANGEME* || "${value}" == *changeme* ]]; then
+      if [[ "${severity}" == "warn" ]]; then
+        echo -e "  \033[1;33m!\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        warnings=$((warnings + 1))
+      else
+        echo -e "  \033[1;31m✖\033[0m ${label} is not set${hint:+  →  ${hint}}" >&2
+        errors=$((errors + 1))
+      fi
+    else
+      echo -e "  \033[1;32m✔\033[0m ${label}" >&2
+    fi
+  }
+
+  # Reuse the same image, scale-factor, and accelerator validation as install.
+  validate_image_config
+  resolve_accelerator_type
+
+  _vcheck "kubernetes.namespace" "${AI_NS}"
+  _vcheck "storage.objectStore.type" "${OBJ_STORE_TYPE}" "" "aws | s3compat | minio | seaweedfs"
+  _vcheck "storage.objectStore.bucket" "${OBJ_STORE_BUCKET}"
+  _vcheck "storage.objectStore.auth.rootUser" "${MINIO_ROOT_USER}"
+  _vcheck "storage.objectStore.auth.rootPassword" "${MINIO_ROOT_PASSWORD}"
+
+  case "${OBJ_STORE_TYPE}" in
+    aws) _vcheck "storage.objectStore.region" "${OBJ_STORE_REGION}" ;;
+    minio|s3compat|seaweedfs) _vcheck "storage.objectStore.endpoint" "${OBJ_STORE_ENDPOINT}" ;;
+    *)
+      echo -e "  \033[1;31m✖\033[0m storage.objectStore.type '${OBJ_STORE_TYPE}' is unsupported; use aws, minio, s3compat, or seaweedfs" >&2
+      errors=$((errors + 1))
+      ;;
+  esac
+
+  case "${NODE_LABEL_STRATEGY}" in
+    auto)
+      echo -e "  \033[1;32m✔\033[0m openshift.nodeLabelStrategy = auto" >&2
+      ;;
+    manual)
+      local configured_node_count
+      configured_node_count=$(yq eval '[.openshift.nodes[]? | select(. != null and . != "")] | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)
+      if [[ "${configured_node_count}" =~ ^[0-9]+$ ]] && (( configured_node_count > 0 )); then
+        echo -e "  \033[1;32m✔\033[0m openshift.nodes contains ${configured_node_count} node(s)" >&2
+      else
+        echo -e "  \033[1;31m✖\033[0m openshift.nodes must contain at least one node when nodeLabelStrategy is manual" >&2
+        errors=$((errors + 1))
+      fi
+      ;;
+    *)
+      echo -e "  \033[1;31m✖\033[0m openshift.nodeLabelStrategy must be auto or manual (got '${NODE_LABEL_STRATEGY}')" >&2
+      errors=$((errors + 1))
+      ;;
+  esac
+
+  [[ -f "${SPLUNK_AI_FILE}" ]] \
+    && echo -e "  \033[1;32m✔\033[0m files.aiPlatform exists: ${SPLUNK_AI_FILE}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.aiPlatform not found: ${SPLUNK_AI_FILE}" >&2; errors=$((errors + 1)); }
+  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] \
+    && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${SPLUNK_OPERATOR_FILE}" >&2 \
+    || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${SPLUNK_OPERATOR_FILE}" >&2; errors=$((errors + 1)); }
+
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    _vcheck "images.registry" "${IMAGE_REGISTRY}" "" "required for air-gapped installation"
+  elif [[ -z "${IMAGE_REGISTRY}" || "${IMAGE_REGISTRY}" == "null" ]]; then
+    echo -e "  \033[1;33m!\033[0m images.registry is empty; images must be fully qualified or available from public registries" >&2
+    warnings=$((warnings + 1))
+  else
+    echo -e "  \033[1;32m✔\033[0m images.registry = ${IMAGE_REGISTRY}" >&2
+  fi
+
+  echo "" >&2
+  if (( errors == 0 && warnings == 0 )); then
+    echo -e "  \033[1;32mConfiguration looks complete. Ready to run install.\033[0m" >&2
+  elif (( errors == 0 )); then
+    echo -e "  \033[1;33m${warnings} warning(s). Configuration is usable, but review the items above.\033[0m" >&2
+  else
+    echo -e "  \033[1;31m${errors} error(s), ${warnings} warning(s). Fix the errors above before running install.\033[0m" >&2
+    return 1
+  fi
+}
+
+# OpenShift is an existing customer-managed cluster, so clean-all must never
+# reset hosts, remove OpenShift, or flush node networking as the k0s command
+# does. It delegates to the ownership-aware platform cleanup implementation.
+clean_all() {
+  warn "clean-all removes installer-owned AI Platform resources; the OpenShift cluster and its nodes are preserved."
+  main_delete
+}
+
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [install|delete|diagnose|stage-artifacts|verify] [options]
+Usage: $(basename "$0") [install|validate|stage-artifacts|clean-all|verify-pods|diagnose] [options]
 
   install [--silent|-s]
                 Deploy the Splunk AI tier stack onto an existing OpenShift cluster.
                   --silent / -s  Non-interactive: skip all prompts (equivalent to SILENT_INSTALL=true).
-  delete        Remove the Splunk AI tier stack (leaves the cluster intact).
+  validate      Check configuration completeness without changing the cluster.
+  clean-all     Remove installer-owned resources without resetting nodes or
+                removing the customer-managed OpenShift cluster.
   diagnose      Collect a support bundle (logs, cluster state, config) into a tar.gz.
   stage-artifacts
                 Download model weights from HuggingFace and upload to the object store.
-  verify        Check that all pods are healthy and the platform is operational.
+  verify-pods   Check AI Platform pods and workload resources; auto-diagnose on failure.
 
 Config file: ${CONFIG_FILE}
   Override with: CONFIG_FILE=/path/to/config.yaml $(basename "$0")
@@ -4302,7 +4404,7 @@ Environment:
   AUTO_APPROVE=true      Skip confirmation prompts (for CI/CD use)
   SILENT_INSTALL=true    Non-interactive mode: no prompts, 5-second countdown before install.
                          Equivalent to --silent on the install subcommand.
-  AUTO_DIAGNOSE=false    Suppress automatic support-bundle collection on verify/install failure.
+  AUTO_DIAGNOSE=false    Suppress automatic support-bundle collection on verify-pods/install failure.
   SKIP_IF_STAGED=0       Force re-download/re-upload even if models are already staged.
 
 Prerequisites:
@@ -4432,6 +4534,18 @@ verify_all_pods_healthy() {
   return 1
 }
 
+# Run the OpenShift pod/workload readiness audit and collect a support bundle
+# after a failure unless automatic diagnostics were explicitly disabled.
+run_verify_pods() {
+  local verify_rc=0
+  verify_all_pods_healthy || verify_rc=$?
+  if (( verify_rc != 0 )) && [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+    log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
+    diagnose || true
+  fi
+  return "${verify_rc}"
+}
+
 # Automatically stage installer-owned content before an air-gapped install.
 # Users select only cluster.airgap=true; the generated transfer artifacts and
 # oc-mirror import remain internal implementation details.
@@ -4535,8 +4649,11 @@ case "${_CMD}" in
     done
     main_install
     ;;
-  delete)
-    main_delete
+  validate)
+    validate_config
+    ;;
+  clean-all)
+    clean_all
     ;;
   diagnose)
     diagnose
@@ -4549,13 +4666,9 @@ case "${_CMD}" in
     resolve_accelerator_type
     stage_model_artifacts
     ;;
-  verify)
+  verify-pods)
     _vpc_rc=0
-    verify_all_pods_healthy || _vpc_rc=$?
-    if (( _vpc_rc != 0 )) && [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
-      log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
-      diagnose || true
-    fi
+    run_verify_pods || _vpc_rc=$?
     exit "${_vpc_rc}"
     ;;
   *)
