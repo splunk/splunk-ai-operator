@@ -26,17 +26,21 @@ upgrade, or remove OpenShift.
 
 **OpenShift cluster:**
 
-- OpenShift Container Platform 4.21.x
-- Red Hat Enterprise Linux CoreOS `amd64` nodes
-- A standard three-node highly available control plane for production
 - At least one worker that meets the AI-tier capacity requirements
 - Cluster-admin access
 - A reachable image registry and supported object store
 
-**Installer machine:**
+**Compatibility matrix:**
 
-- Standard deployment: macOS or Linux
-- Air-gapped deployment: Linux; Red Hat `oc-mirror` v2 is Linux-only
+| Installer machine OS | Installation type | OpenShift node OS | OpenShift version |
+|---|---|---|---|
+| macOS | Standard only | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| RHEL 9 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| RHEL 10 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+
+Air-gapped installation requires Linux because Red Hat `oc-mirror` v2 is
+Linux-only. The installer machine also requires:
+
 - Network access to the OpenShift API, image registry, and object store
 - Access to Hugging Face when model staging is enabled and a model is missing
 - A Hugging Face token authorized for all gated models when staging is enabled
@@ -271,11 +275,8 @@ configured by this installer. Ray dashboard diagnostics are documented in
 
 ## Step 6: Connect the Splunk apps
 
-| Component | Tested version |
-|---|---|
-| Splunk Enterprise | 10.2 |
-| Splunk AI Assistant | 2.3.0 |
-| Splunk AI Toolkit | 6.1.0 or later |
+Splunk Enterprise 10.2 is the tested version. Use Splunk AI Assistant 2.3.0
+and Splunk AI Toolkit 6.1.0 or later.
 
 The installer deploys a Splunk Standalone instance. An external Splunk
 Enterprise instance may instead use the published Routes when its network and

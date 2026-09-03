@@ -106,11 +106,9 @@ flowchart TB
 ### OpenShift cluster
 
 - OpenShift Container Platform **4.21.x**.
-- Red Hat Enterprise Linux CoreOS (RHCOS) **amd64** control-plane and worker
-  nodes. The installer rejects other node operating systems and architectures.
+- Red Hat Enterprise Linux CoreOS (RHCOS) **amd64** nodes. The installer
+  rejects other node operating systems and architectures.
 - At least one OpenShift worker node.
-- A production cluster should use the standard three-node, highly available
-  control plane.
 - `cluster-admin` access. The installer creates cluster-scoped resources,
   installs operators, labels nodes, and grants Security Context Constraints.
 - Network connectivity from the installer machine to the OpenShift API,
@@ -137,7 +135,7 @@ GPU workloads. Provide at least:
 > `/var/lib/containers` and `/opt/local-path-provisioner`, or provide equivalent
 > capacity for both.
 
-### Reference hardware for the minimum deployment
+### Reference AI worker hardware for the minimum deployment
 
 **Shared AI-tier worker:** one Cisco UCS C845A M8 AI Server
 
@@ -148,14 +146,6 @@ GPU workloads. Provide at least:
 | GPU | 2 × `CAI-GPU-RTXP6000` — 192 GB total VRAM |
 | Boot storage | 2 × `CAI-M2-960G` with `CAI-M2-HWRAID`, RAID 1 — 1.92 TB raw / 960 GB usable |
 | Workload storage | Dedicated enterprise NVMe providing at least 1 TiB available |
-
-**OpenShift control plane:** three Cisco UCS C225 M8 SFF servers
-
-| Resource | Configuration per server |
-|---|---|
-| Memory | 8 × `UCS-MRX32G1RE3` — 256 GB installed |
-| CPU | 1 × `UCS-CPU-A9224` — 24 physical cores / 48 threads with SMT |
-| Boot storage | 2 × `UCS-M2-480G`, RAID 1 — 960 GB raw / 480 GB usable |
 
 The AI worker's boot pair does not satisfy the workload-disk requirement.
 Provide separate workload storage.
@@ -176,16 +166,16 @@ model deployments; individual model deployments cannot be scaled separately.
 | `1` | 256 GiB | 1 TiB (1024 GiB) | 2 × 96 GB (192 GB total) | 64 allocatable vCPU |
 | `2` | 512 GiB | 2 TiB (2048 GiB) | 4 × 96 GB (384 GB total) | 128 allocatable vCPU |
 
-### Installer machine
+### Installer and cluster compatibility
 
-| Installation type | Supported installer host |
-|---|---|
-| Standard (internet-connected) | macOS or Linux with the required tools |
-| Air-gapped | Linux host; `oc-mirror` is Linux-only |
+| Installer machine OS | Installation type | OpenShift node OS | OpenShift version |
+|---|---|---|---|
+| macOS | Standard only | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| RHEL 9 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| RHEL 10 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
 
-RHEL 9 and RHEL 10 can be used as installer hosts when all tools are available.
-They are installer machines, not supported OpenShift node operating systems for
-this deployment.
+Air-gapped installation requires Linux because Red Hat `oc-mirror` v2 is
+Linux-only. The installer machine is separate from the OpenShift nodes.
 
 Required tools:
 
