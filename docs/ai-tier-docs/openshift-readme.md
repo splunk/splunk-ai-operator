@@ -223,12 +223,15 @@ $EDITOR openshift-cluster-config.yaml
 #   - set openshift.nodes[] (manual strategy) to your node names
 #   - set ecr.account / ecr.region if using ECR
 
-# 3. Stage model weights to your object store.
+# 3. Validate the configuration without changing the cluster
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh validate
+
+# 4. Stage model weights to your object store.
 #    Required for a fresh object store — Ray workers fail to start if weights
 #    are missing. Skip only if the bucket is already staged from a prior run.
 CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh stage-artifacts
 
-# 4. Install the stack
+# 5. Install the stack
 CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
 
 # (Teardown, when needed) Remove the stack. Leaves the cluster and nodes intact.
@@ -247,10 +250,13 @@ a non-interactive run.
 | Command | What it does |
 |---|---|
 | `install [--silent\|-s]` | Deploy the full stack |
+| `validate` | Check configuration completeness without changing the cluster |
 | `delete` | Remove the stack (leaves cluster nodes running) |
+| `clean-all` | OpenShift-safe alias for `delete`; it does not reset nodes or remove the cluster |
 | `diagnose` | Collect a support bundle (`tar.gz`) |
 | `stage-artifacts` | Stage model weights to object storage only |
-| `verify` | Check all pods are Running/Completed; auto-diagnoses on failure |
+| `verify-pods` | Check AI Platform pods and workload resources; auto-diagnose on failure |
+| `verify` | Backward-compatible alias for `verify-pods` |
 
 ---
 
@@ -823,8 +829,8 @@ re-runs skip already-staged artifacts (override with `SKIP_IF_STAGED=0`).
 # High-level status
 oc get aiplatform,aiservice,raycluster,rayservice -n ai-platform
 
-# Automated pod health check across all namespaces
-CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh verify
+# Automated AI Platform pod and workload health check
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh verify-pods
 
 # Watch Ray come up
 oc get raycluster,rayservice -n ai-platform -w
@@ -841,7 +847,7 @@ A healthy reference deployment shows:
   `vector-db-setup` post-hook job `Completed`.
 - Routes `saia` and `slim` resolving to your ingress domain.
 
-If `verify` finds unhealthy pods it automatically runs `diagnose` (unless
+If `verify-pods` finds unhealthy pods or workload resources, it automatically runs `diagnose` (unless
 `AUTO_DIAGNOSE=false`), producing a support bundle.
 
 ### Ray Dashboard UI

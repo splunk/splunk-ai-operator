@@ -78,6 +78,9 @@ eval "$(extract_function openshift_allow_http_route)"
 eval "$(extract_function openshift_wait_for_insecure_registry)"
 eval "$(extract_function configure_openshift_insecure_endpoints)"
 eval "$(extract_function prepare_airgap_registry_auth_file)"
+eval "$(extract_function validate_config)"
+eval "$(extract_function clean_all)"
+eval "$(extract_function run_verify_pods)"
 eval "$(sed -n '/^qualified_additional_image()/,/^}/p' "${AIRGAP_PREPARE_SCRIPT}")"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
 
@@ -105,6 +108,69 @@ yq() {
   fi
 }
 CONFIG_FILE="test-config.yaml"
+
+echo "OpenShift command parity"
+_run_validate_config() (
+  local strategy="$1" node_count="$2" airgap="$3" registry="$4"
+  need() { :; }
+  load_config() {
+    AI_NS="ai-platform"
+    OBJ_STORE_TYPE="minio"
+    OBJ_STORE_BUCKET="models"
+    OBJ_STORE_ENDPOINT="http://minio.example:9000"
+    OBJ_STORE_REGION=""
+    MINIO_ROOT_USER="access-key"
+    MINIO_ROOT_PASSWORD="secret-key"
+    NODE_LABEL_STRATEGY="${strategy}"
+    SPLUNK_AI_FILE="${SCRIPT}"
+    SPLUNK_OPERATOR_FILE="${SCRIPT}"
+    AIRGAP_MODE="${airgap}"
+    IMAGE_REGISTRY="${registry}"
+  }
+  validate_image_config() { :; }
+  resolve_accelerator_type() { :; }
+  yq() {
+    case "${2:-}" in
+      *'.openshift.nodes'*) echo "${node_count}" ;;
+      *) echo "" ;;
+    esac
+  }
+  validate_config
+)
+assert_rc "validate accepts a complete manual-node configuration" 0 \
+  _run_validate_config manual 1 false registry.example.com
+assert_rc "validate rejects manual selection without nodes" 1 \
+  _run_validate_config manual 0 false registry.example.com
+assert_rc "validate rejects an unsupported node-label strategy" 1 \
+  _run_validate_config unsupported 0 false registry.example.com
+assert_rc "validate requires a registry for air-gapped installation" 1 \
+  _run_validate_config auto 0 true ""
+
+clean_output=$(
+  warn() { printf 'warning:%s\n' "$*"; }
+  main_delete() { echo "main-delete"; }
+  clean_all
+)
+assert_eq "clean-all delegates to the ownership-aware OpenShift delete" "1" \
+  "$(grep -c '^main-delete$' <<<"${clean_output}" || true)"
+assert_eq "clean-all explains that OpenShift nodes are preserved" "1" \
+  "$(grep -c 'cluster and its nodes are preserved' <<<"${clean_output}" || true)"
+
+_run_verify_pods() (
+  local desired_rc="$1" auto_diagnose="$2"
+  AUTO_DIAGNOSE="${auto_diagnose}"
+  verify_all_pods_healthy() { return "${desired_rc}"; }
+  diagnose() { echo "diagnose"; }
+  log() { :; }
+  run_verify_pods
+)
+assert_rc "verify-pods returns success for a ready platform" 0 _run_verify_pods 0 true
+verify_failure_output=$(_run_verify_pods 1 true 2>&1 || true)
+assert_eq "verify-pods diagnoses a readiness failure" "1" \
+  "$(grep -c '^diagnose$' <<<"${verify_failure_output}" || true)"
+verify_no_diagnose_output=$(_run_verify_pods 1 false 2>&1 || true)
+assert_eq "verify-pods honors AUTO_DIAGNOSE=false" "0" \
+  "$(grep -c '^diagnose$' <<<"${verify_no_diagnose_output}" || true)"
 
 echo "OpenShift SLIM feature detection"
 feature_names=$'saia\nslim'
@@ -283,6 +349,12 @@ assert_rc "rejects ambiguous effective HEC values" 1 _parse_ambiguous_hec
 echo "OpenShift installer safety contracts"
 preflight_line=$(grep -n '^[[:space:]]*preflight_checks$' "${SCRIPT}" | head -1 | cut -d: -f1)
 staging_line=$(grep -n '^[[:space:]]*stage_model_artifacts$' "${SCRIPT}" | head -1 | cut -d: -f1)
+assert_eq "command dispatcher exposes validate" "1" \
+  "$(grep -c '^  validate)$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "command dispatcher exposes OpenShift-safe clean-all" "1" \
+  "$(grep -c '^  clean-all)$' "${SCRIPT}" | tr -d '[:space:]')"
+assert_eq "verify remains an alias for the canonical verify-pods command" "1" \
+  "$(grep -c '^  verify|verify-pods)$' "${SCRIPT}" | tr -d '[:space:]')"
 assert_eq "main install runs preflight before model downloads" "1" \
   "$(( preflight_line < staging_line ))"
 assert_eq "preflight has a fatal summary gate" "1" \
