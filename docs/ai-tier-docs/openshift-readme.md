@@ -235,7 +235,7 @@ CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh stage-arti
 CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh install
 
 # (Teardown, when needed) Remove the stack. Leaves the cluster and nodes intact.
-CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh delete
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh clean-all
 ```
 
 Because the installer uses your ambient `oc` login, make sure `oc whoami`
@@ -251,12 +251,10 @@ a non-interactive run.
 |---|---|
 | `install [--silent\|-s]` | Deploy the full stack |
 | `validate` | Check configuration completeness without changing the cluster |
-| `delete` | Remove the stack (leaves cluster nodes running) |
-| `clean-all` | OpenShift-safe alias for `delete`; it does not reset nodes or remove the cluster |
+| `clean-all` | Remove installer-owned resources while preserving the OpenShift cluster and nodes |
 | `diagnose` | Collect a support bundle (`tar.gz`) |
 | `stage-artifacts` | Stage model weights to object storage only |
 | `verify-pods` | Check AI Platform pods and workload resources; auto-diagnose on failure |
-| `verify` | Backward-compatible alias for `verify-pods` |
 
 ---
 
@@ -566,22 +564,10 @@ AI worker nodes are labeled `splunk.ai/node-role=worker`.
 | `splunk-operator` | `privileged` | Operator pod adds `NET_BIND_SERVICE` |
 | `local-path-storage` | `privileged` | Helper pod mounts host paths |
 
-These group grants are added on `install` and removed on `delete` — but only
-when `openshift.grantPrivilegedSCC` is `"true"` **in the config used for that
-command**. The cleanup is conditional, so if you install with the grants
-enabled and later flip `grantPrivilegedSCC: "false"`, `delete` will **skip**
-the SCC cleanup and leave the `privileged`/`anyuid` group entries on the SCCs.
-Those stale entries re-apply to any workload that later reuses these namespace
-names. Run `delete` with the **same** `grantPrivilegedSCC` value you installed
-with, or remove the entries manually:
-
-```bash
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-ai-operator-system
-oc adm policy remove-scc-from-group anyuid     system:serviceaccounts:ai-platform
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:ai-platform
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-operator
-oc adm policy remove-scc-from-group privileged system:serviceaccounts:local-path-storage
-```
+These group grants are added during installation. The installer records the
+grants it owns in cluster state, and `clean-all` removes those recorded grants
+independently of later configuration-file changes. It preserves SCC entries
+that were present before installation.
 
 ### OpenShift Routes (external access)
 SAIA and SLIM have independent OpenShift Routes:
@@ -904,7 +890,7 @@ secret if the cluster has been idle.
 ## Uninstall
 
 ```bash
-CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh delete
+CONFIG_FILE=./openshift-cluster-config.yaml ./openshift_with_stack.sh clean-all
 ```
 
 This removes the AI Platform stack and reverses the SCC grants. It leaves the
