@@ -282,10 +282,10 @@ Verify the registry hostname, repository path, tag, and authentication:
 yq eval '.images.registry, .images.operator.image, .images.registryInsecure' "$CONFIG_FILE"
 ```
 
-For a private registry, configure the matching `imagePullSecrets` block. Set
-`images.registryInsecure: true` only for a registry intentionally using plain
-HTTP or unverified Transport Layer Security; production deployments should use
-a certificate trusted by the installer and OpenShift nodes.
+For a private registry, configure the matching `imagePullSecrets` block.
+`images.registryInsecure` defaults to `true` for a registry intentionally using
+plain HTTP. Set it to `false` for a registry using HTTPS with a certificate
+trusted by the installer and OpenShift nodes.
 
 ## Standard-deployment content failures
 

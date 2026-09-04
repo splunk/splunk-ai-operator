@@ -202,7 +202,8 @@ import_bundled_images() {
   target_registry="${target_registry%/}"
   [[ -n "${target_registry}" ]] || err "images.registry must name the disconnected internal registry"
 
-  insecure=$(yq eval '.images.registryInsecure // "false"' "${CONFIG_FILE}")
+  insecure=$(yq eval '.images.registryInsecure' "${CONFIG_FILE}" 2>/dev/null || echo true)
+  [[ -z "${insecure}" || "${insecure}" == "null" ]] && insecure="true"
   mirror_bin="${BUNDLE_DIR}/bin/oc-mirror"
   [[ -x "${mirror_bin}" ]] || err "Bundled oc-mirror executable is missing"
   # oc-mirror 4.21 requires selecting v2 even for its version command; plain

@@ -47,11 +47,11 @@ images:
   # exist in the internal registry; replace each public image reference with
   # its internal path.
   registry: ""
-  # Keep false for a registry using trusted HTTPS. Set true only when insecure
-  # access is explicitly required; it permits plain-HTTP pulls, adds the host
+  # Default true for a plain-HTTP registry. Set false for a registry using
+  # trusted HTTPS; true permits plain-HTTP pulls, adds the host
   # to OpenShift's insecureRegistries, and disables destination TLS verification
   # during an air-gap oc-mirror import.
-  registryInsecure: false
+  registryInsecure: true
 
   operator:
     image: "docker.io/splunk/splunk-ai-operator:v1.0"

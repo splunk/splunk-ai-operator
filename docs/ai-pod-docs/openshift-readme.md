@@ -10,8 +10,6 @@ For the condensed installation checklist, see
 > The installer deploys AI POD workloads and supporting operators. It does not
 > create, upgrade, or remove the OpenShift cluster itself.
 
-For a k0s deployment, use [`k0s-readme.md`](../ai-tier-docs/k0s-readme.md).
-
 ## Contents
 
 - [Overview](#overview)
@@ -106,8 +104,9 @@ flowchart TB
 ### OpenShift cluster
 
 - OpenShift Container Platform **4.21.x**.
-- Red Hat Enterprise Linux CoreOS (RHCOS) **amd64** nodes. The installer
-  rejects other node operating systems and architectures.
+- The qualified OpenShift node OS is Red Hat Enterprise Linux CoreOS (RHCOS)
+  **9.6.20260407-0 (Plow)** on **amd64**. The installer validates the RHCOS
+  operating-system family and amd64 architecture.
 - At least one OpenShift worker node.
 - `cluster-admin` access. The installer creates cluster-scoped resources,
   installs operators, labels nodes, and grants Security Context Constraints.
@@ -166,13 +165,13 @@ model deployments; individual model deployments cannot be scaled separately.
 | `1` | 256 GiB | 1 TiB (1024 GiB) | 2 × 96 GB (192 GB total) | 64 allocatable vCPU |
 | `2` | 512 GiB | 2 TiB (2048 GiB) | 4 × 96 GB (384 GB total) | 128 allocatable vCPU |
 
-### Installer and cluster compatibility
+### Qualified installer and cluster compatibility
 
-| Installer machine OS | Installation type | OpenShift node OS | OpenShift version |
+| Installer machine OS | Installation type | Qualified OpenShift node OS | OpenShift version |
 |---|---|---|---|
-| macOS | Standard only | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
-| RHEL 9 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
-| RHEL 10 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| macOS 26.5.2 | Standard only | Red Hat Enterprise Linux CoreOS 9.6.20260407-0 (Plow) `amd64` | 4.21.x |
+| RHEL 9.8 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS 9.6.20260407-0 (Plow) `amd64` | 4.21.x |
+| RHEL 10.2 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS 9.6.20260407-0 (Plow) `amd64` | 4.21.x |
 
 Air-gapped installation requires Linux because Red Hat `oc-mirror` v2 is
 Linux-only. The installer machine is separate from the OpenShift nodes.
@@ -430,7 +429,7 @@ air-gapped deployment.
 | Setting | Release default | Purpose |
 |---|---|---|
 | `images.registry` | empty | Optional registry prefix for short image names |
-| `images.registryInsecure` | `false` | Keep `false` for trusted HTTPS; `true` permits plain HTTP and skips destination TLS verification during air-gap import |
+| `images.registryInsecure` | `true` | Enables plain-HTTP pulls from `images.registry`. Set `false` for Amazon ECR, Docker Hub, Harbor, or another trusted HTTPS registry. |
 | `images.operator.image` | `docker.io/splunk/splunk-ai-operator:v1.0` | Splunk AI Operator |
 | `images.ray.headImage` | `docker.io/splunk/ai-tier-ray-head:v1.0` | Ray head runtime |
 | `images.ray.workerImage` | `docker.io/splunk/ai-tier-ray-worker:v1.0` | Ray GPU worker runtime |
@@ -463,8 +462,8 @@ the required namespaces during installation. This happens after air-gap mirror
 import, so an air-gapped ECR destination also requires the mirror
 authentication described under [Registry authentication for
 mirroring](#registry-authentication-for-mirroring). Amazon ECR tokens expire
-after 12 hours; customers using ECR must provide a credential-refresh process
-for long-running clusters.
+after 12 hours; customers using ECR should handle credential refresh for
+long-running clusters.
 
 For another private registry, disable ECR and configure only the matching
 `imagePullSecrets` block. Each enabled block is independent. The installer
@@ -636,13 +635,13 @@ enabled, it must also reach Hugging Face when a model is missing.
 The cluster nodes do not need public internet access. They must reach the
 internal registry and object store.
 
-`images.registryInsecure: true` adds the registry host to OpenShift's
+`images.registryInsecure` defaults to `true` for a plain-HTTP internal
+registry. When `images.registry` is set, `true` adds its host to OpenShift's
 `insecureRegistries`, permits plain-HTTP pulls, and passes
-`--dest-tls-verify=false` to the air-gap `oc-mirror` import. For an HTTPS
-registry, this skips destination certificate verification. Keep it `false`
-when the registry uses HTTPS with a certificate trusted by the installer host
-and OpenShift nodes; enable it only when insecure registry access is explicitly
-required.
+`--dest-tls-verify=false` to the air-gap `oc-mirror` import. Set it explicitly
+to `false` for Amazon ECR, Docker Hub, Harbor, or another HTTPS registry with a
+certificate trusted by the installer host and OpenShift nodes. Setting it to
+`true` for an HTTPS registry skips destination certificate verification.
 
 ## Model staging
 
@@ -788,20 +787,32 @@ Keep the port-forward running and open `http://localhost:18001`. Log in as
 ### Install and configure Splunk AI Assistant
 
 Use Splunk Enterprise 10.2 and install
-[Splunk AI Assistant](https://splunkbase.splunk.com/app/7245) version 2.3.0
+[Splunk AI Assistant](https://splunkbase.splunk.com/app/7245) version 2.3.2 or later
 (`Splunk_AI_Assistant_Cloud.tgz`):
+
+Before configuring the app, retrieve the Splunk AI Assistant Route. This
+procedure requires `openshift.routes.saia.enabled: true`.
+
+```bash
+oc get route saia \
+  -n "$(yq eval '.kubernetes.namespace // "ai-platform"' "$CONFIG_FILE")" \
+  -o jsonpath='http://{.spec.host}{"\n"}'
+```
 
 1. In Splunk Web, go to **Apps → Manage Apps → Install app from file**.
 2. Upload `Splunk_AI_Assistant_Cloud.tgz` and restart Splunk if prompted.
-3. Open **Splunk AI Assistant → Configuration**.
-4. Enter the SAIA Route printed by the installer, for example
-   `http://saia.<ingress-domain>`, and save it.
+3. Open **Splunk AI Assistant** to start the onboarding wizard. On **Getting
+   started**, select **AI tier** and click **Next**.
+4. On **Configure SOK and Splunk AI Assistant**, under **Enter Splunk AI
+   Assistant Service Details**, paste the full HTTP URL printed by the
+   preceding command, for example `http://saia.<ingress-domain>`, into
+   **Splunk AI Assistant Service URL**. Click **Complete Setup**.
 5. Send a prompt and confirm that the app returns a model response.
 
-The user's browser calls the configured SAIA URL directly. The HTTP Route must
-therefore be resolvable and reachable from the browser, not only from Splunk.
-Do not change the configured URL to `https://`; HTTPS is not supported by this
-installation workflow.
+The user's browser calls the configured Splunk AI Assistant Route directly. The
+HTTP Route must therefore be resolvable and reachable from the browser, not
+only from Splunk. Do not change the configured URL to `https://`; HTTPS is not
+supported by this installation workflow.
 
 ### Install and configure Splunk AI Toolkit
 
@@ -974,8 +985,9 @@ Set `openshift.routes.<feature>.enabled: false` to keep that feature internal.
 - The supported production deployment exposes SAIA and SLIM through HTTP
   Routes. HTTPS Route TLS and workload mTLS are not configured, supported, or
   qualified by this installation workflow.
-- `images.registryInsecure` is unrelated to SAIA and SLIM transport. Keep it
-  `false` for trusted HTTPS so registry TLS verification remains enabled.
+- `images.registryInsecure` is unrelated to SAIA and SLIM transport. It
+  defaults to `true` for a plain-HTTP registry; set it to `false` for a trusted
+  HTTPS registry so registry TLS verification remains enabled.
 - Keep registry and object-store credentials out of source control. Manage
   OpenShift secret encryption, RBAC, audit logging, and credential rotation
   according to the customer's cluster-security policy.
