@@ -1,4 +1,4 @@
-# Troubleshooting Splunk AI Tier on OpenShift (AI POD)
+# AI POD on OpenShift troubleshooting
 
 This guide diagnoses failures produced by `openshift_with_stack.sh` and the AI
 POD components it deploys on an existing OpenShift cluster. It applies to the
@@ -14,9 +14,11 @@ platforms, also see the
 
 ## Contents
 
+- [Quick triage](#quick-triage)
 - [Start here](#start-here)
 - [Installer and preflight failures](#installer-and-preflight-failures)
 - [Standard-deployment content failures](#standard-deployment-content-failures)
+- [Helm failures](#helm-failures)
 - [Air-gapped deployment failures](#air-gapped-deployment-failures)
 - [Operator Lifecycle Manager failures](#operator-lifecycle-manager-failures)
 - [Node Feature Discovery and GPU failures](#node-feature-discovery-and-gpu-failures)
@@ -25,12 +27,35 @@ platforms, also see the
 - [AIPlatform, Ray, and Weaviate failures](#aiplatform-ray-and-weaviate-failures)
 - [SAIA and SLIM Route failures](#saia-and-slim-route-failures)
 - [Splunk AI Assistant and AI Toolkit failures](#splunk-ai-assistant-and-ai-toolkit-failures)
-- [Delete and reinstall failures](#delete-and-reinstall-failures)
+- [Cleanup and reinstall failures](#cleanup-and-reinstall-failures)
 - [Diagnostic command reference](#diagnostic-command-reference)
+
+## Quick triage
+
+Start with the section that matches the first visible failure:
+
+| Symptom | Start here |
+|---|---|
+| Installer stops before creating resources | [Installer and preflight failures](#installer-and-preflight-failures) |
+| Manifest, chart, or container content cannot be retrieved | [Standard-deployment content failures](#standard-deployment-content-failures) |
+| Helm reports a failed release or upgrade | [Helm failures](#helm-failures) |
+| Air-gapped preparation or mirroring fails | [Air-gapped deployment failures](#air-gapped-deployment-failures) |
+| Subscription, InstallPlan, or operator pod is not ready | [Operator Lifecycle Manager failures](#operator-lifecycle-manager-failures) |
+| OpenShift does not expose an allocatable GPU | [Node Feature Discovery and GPU failures](#node-feature-discovery-and-gpu-failures) |
+| PersistentVolumeClaim is pending or a node reports disk pressure | [Storage failures](#storage-failures) |
+| Models are missing or the object store cannot be reached | [Object-store and model-staging failures](#object-store-and-model-staging-failures) |
+| AIPlatform, Ray, a model replica, or Weaviate is not ready | [AIPlatform, Ray, and Weaviate failures](#aiplatform-ray-and-weaviate-failures) |
+| SAIA or SLIM returns an HTTP error or cannot be reached | [SAIA and SLIM Route failures](#saia-and-slim-route-failures) |
+| Splunk AI Assistant or AI Toolkit fails after setup | [Splunk AI Assistant and AI Toolkit failures](#splunk-ai-assistant-and-ai-toolkit-failures) |
+
+Each issue heading describes the symptom. Run the diagnostic commands that
+follow it, compare the result with the explanation, and apply only the stated
+corrective action. Collect diagnostics before deleting or replacing resources.
 
 ## Start here
 
-Run diagnostics before patching or deleting resources.
+Run diagnostics before patching or deleting resources. Do not use `clean-all`
+as a diagnostic step: it removes installer-owned AI POD resources.
 Run installer commands from `tools/ai-tier-cluster-setup` unless a command says
 otherwise.
 
@@ -332,6 +357,30 @@ Amazon ECR authorization tokens expire after 12 hours. Refresh the credentials
 and rerun install to recreate the installer-managed pull secrets, then restart
 only the affected workload through its owning resource or operator.
 
+## Helm failures
+
+### Helm installation or upgrade fails
+
+The installer uses Helm for the OpenTelemetry and KubeRay Operators. A Helm
+failure can be caused by an unreachable chart source, an existing failed
+release, insufficient permissions, or an unavailable Kubernetes API.
+
+List the releases, then inspect only the release named in the installer error:
+
+```bash
+helm list --all-namespaces
+read -r -p "Helm release namespace: " HELM_NAMESPACE
+read -r -p "Helm release name: " HELM_RELEASE
+helm status "$HELM_RELEASE" -n "$HELM_NAMESPACE"
+helm history "$HELM_RELEASE" -n "$HELM_NAMESPACE"
+oc get events -n "$HELM_NAMESPACE" --sort-by='.lastTimestamp' | tail -100
+```
+
+Correct the reported chart-access, permission, API, or workload error, then
+rerun the installer so it can reconcile the release. Do not uninstall the
+release as a first troubleshooting step because that can remove resources and
+diagnostic evidence.
+
 ## Air-gapped deployment failures
 
 ### Air-gapped install is rejected on macOS
@@ -493,13 +542,13 @@ oc logs -n splunk-ai-operator-system \
 After the webhook is ready, rerun install. Do not disable webhook validation as
 a workaround.
 
-### Certificate is not yet valid
+### Operator webhook certificate is not yet valid
 
-This normally indicates clock skew between cluster nodes or between the
-installer and API server. Confirm node time synchronization through the
-customer's OpenShift infrastructure management. The installer retries
-transient cert-manager webhook errors, but it cannot repair the underlying
-time source.
+This error usually indicates clock skew between OpenShift nodes. Verify that
+control-plane and worker nodes synchronize with a reliable Network Time
+Protocol (NTP) source using the supported OpenShift time configuration. The
+installer retries transient cert-manager webhook errors, but it cannot correct
+the underlying node clocks.
 
 ## Node Feature Discovery and GPU failures
 
@@ -666,10 +715,10 @@ unquantized model.
 
 ### Hugging Face download returns 401 or 403
 
-Confirm that `HF_TOKEN` is available to the installer process and is authorized
-for every gated model. For gated repositories, the token owner must accept the
-repository's access terms. Do not place the token in the cluster configuration
-or commit it to Git.
+For gated Hugging Face models, confirm that the selected artifact profile
+contains valid Hugging Face credentials and that the account has accepted the
+model's license terms. Do not add these credentials to
+`openshift-cluster-config.yaml` or commit them to source control.
 
 ### Upload to AWS S3, MinIO, SeaweedFS, or S3-compatible storage fails
 
@@ -803,20 +852,62 @@ store.
 
 ### Re-run the vector database setup Job
 
-The setup Job is owned by the AIService and cannot be rerun in place. Find the
-completed or failed setup Job, inspect its logs, then delete only that Job so
-the operator can recreate it:
+The setup Job cannot be rerun in place. First rerun the installer and allow the
+operator to reconcile it. If the current Job remains failed, collect its logs
+and confirm its owner before considering deletion:
 
 ```bash
 oc get jobs -n "$AI_NAMESPACE"
 read -r -p "Vector database setup Job name: " JOB_NAME
 oc logs job/"$JOB_NAME" -n "$AI_NAMESPACE" --all-containers=true
+oc get job "$JOB_NAME" -n "$AI_NAMESPACE" \
+  -o jsonpath='{range .metadata.ownerReferences[*]}{.kind}{"/"}{.name}{"\n"}{end}'
+```
+
+Delete the Job only when it belongs to the current AI POD deployment and the
+owning operator is healthy enough to recreate it:
+
+```bash
 oc delete job "$JOB_NAME" -n "$AI_NAMESPACE"
 ```
 
-Do not delete unrelated Jobs.
+This is a destructive recovery action. Do not delete unrelated Jobs, and keep
+the collected logs because the deleted Job cannot provide them afterward.
 
 ## SAIA and SLIM Route failures
+
+### Interpret Route test responses
+
+On the installer machine, get the published HTTP endpoints:
+
+```bash
+SAIA_HOST="$(oc get route saia -n "$AI_NAMESPACE" -o jsonpath='{.spec.host}')"
+SLIM_HOST="$(oc get route slim -n "$AI_NAMESPACE" -o jsonpath='{.spec.host}')"
+
+printf 'SAIA: http://%s\nSLIM: http://%s/tenant/slim-api/v1alpha1\n' \
+  "$SAIA_HOST" "$SLIM_HOST"
+curl --include --show-error "http://${SAIA_HOST}/health"
+curl --include --show-error \
+  "http://${SLIM_HOST}/tenant/slim-api/v1alpha1"
+```
+
+These commands perform an initial check from the installer machine. Repeat the
+SAIA request from the user's browser network and the SLIM request from the
+Splunk Enterprise host network, using the same printed hostnames. Each caller
+needs its own Domain Name System and network path to the OpenShift router.
+
+Interpret the result before changing the deployment:
+
+| Result | Meaning and next action |
+|---|---|
+| SAIA `/health` returns HTTP 200 | The Route reaches SAIA. Continue with authentication or model-runtime checks if an application request still fails. |
+| SLIM returns HTTP 400 or 401 without request headers | The Route reached SLIM, but the unauthenticated diagnostic request is incomplete. Test through AI Toolkit with a valid Splunk JWT. |
+| HTTP 503 | The router has no ready backend endpoint. Continue with [Route returns HTTP 503](#route-returns-http-503). |
+| Name resolution or connection fails | Verify Domain Name System, routing, firewall, and VPN access from the calling system. |
+| TLS certificate verification fails | The caller used HTTPS or encountered a certificate that it does not trust. This installer publishes HTTP Routes; use the generated HTTP endpoint. |
+
+An HTTP response proves that the request reached a server; it does not by
+itself prove that JWT validation, model loading, or inference succeeded.
 
 ### Route returns HTTP 503
 
@@ -935,6 +1026,10 @@ different endpoint on port 8088.
 This is expected. `clean-all` removes the installer-owned AI POD stack and shared
 components recorded as installer-owned; it does not delete the OpenShift
 cluster.
+
+**Destructive action:** Do not run `clean-all` to diagnose an unhealthy
+deployment. Collect a support bundle first and use this command only when the
+AI POD deployment is intentionally being removed before a clean reinstall.
 
 ```bash
 CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all
