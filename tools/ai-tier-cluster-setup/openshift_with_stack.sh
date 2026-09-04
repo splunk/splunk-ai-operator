@@ -340,9 +340,10 @@ ${yq_err}"
 
   AI_NS=$(yq eval '.kubernetes.namespace // "ai-platform"' "${CONFIG_FILE}" 2>/dev/null || echo "ai-platform")
   IMAGE_REGISTRY=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
-  # Set to "true" only for plain-HTTP (no-TLS) registries such as a local mirror.
-  # Leave false (default) for ECR, Docker Hub, Harbor, or any HTTPS registry.
-  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure // "false"' "$CONFIG_FILE" 2>/dev/null || echo "false")"
+  # Default to "true" for plain-HTTP (no-TLS) registries such as a local mirror.
+  # Set false for ECR, Docker Hub, Harbor, or any HTTPS registry.
+  IMAGE_REGISTRY_INSECURE="$(yq eval '.images.registryInsecure' "$CONFIG_FILE" 2>/dev/null || echo "true")"
+  [[ -z "${IMAGE_REGISTRY_INSECURE}" || "${IMAGE_REGISTRY_INSECURE}" == "null" ]] && IMAGE_REGISTRY_INSECURE="true"
   OPERATOR_IMAGE=$(yq eval '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   RAY_HEAD_IMAGE=$(yq eval '.images.ray.headImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   RAY_WORKER_IMAGE=$(yq eval '.images.ray.workerImage // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -579,7 +580,7 @@ openshift_wait_for_insecure_registry() {
   return 1
 }
 
-# Apply the k0s-equivalent plain-HTTP design when explicitly requested. The
+# Apply the k0s-equivalent plain-HTTP design when enabled. The
 # registry is merged into OpenShift's insecureRegistries list, matching Routes
 # are allowed to serve HTTP, and existing registry policy entries are retained.
 configure_openshift_insecure_endpoints() {
@@ -587,7 +588,8 @@ configure_openshift_insecure_endpoints() {
   local image_json patch before_file node current changed="false"
 
   registry=$(yq eval '.images.registry // ""' "${config_file}" 2>/dev/null || echo "")
-  insecure=$(yq eval '.images.registryInsecure // "false"' "${config_file}" 2>/dev/null || echo false)
+  insecure=$(yq eval '.images.registryInsecure' "${config_file}" 2>/dev/null || echo true)
+  [[ -z "${insecure}" || "${insecure}" == "null" ]] && insecure="true"
   registry_host=$(openshift_endpoint_host "${registry}")
 
   if [[ "${insecure}" == "true" && -n "${registry_host}" ]]; then
@@ -1120,6 +1122,7 @@ preflight_check_object_store() {
 
 preflight_check_insecure_registry_policy() {
   [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] || return 0
+  [[ -n "${IMAGE_REGISTRY:-}" ]] || return 0
   pf_header "OpenShift insecure-registry policy"
   local configured registry_host
   registry_host=$(openshift_endpoint_host "${IMAGE_REGISTRY}")

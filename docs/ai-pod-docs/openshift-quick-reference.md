@@ -30,13 +30,13 @@ upgrade, or remove OpenShift.
 - Cluster-admin access
 - A reachable image registry and supported object store
 
-**Compatibility matrix:**
+**Qualified compatibility matrix:**
 
-| Installer machine OS | Installation type | OpenShift node OS | OpenShift version |
+| Installer machine OS | Installation type | Qualified OpenShift node OS | OpenShift version |
 |---|---|---|---|
-| macOS 26.5.2 | Standard only | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
-| RHEL 9.8 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
-| RHEL 10.2 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS `amd64` | 4.21.x |
+| macOS 26.5.2 | Standard only | Red Hat Enterprise Linux CoreOS 9.6.20260407-0 (Plow) `amd64` | 4.21.x |
+| RHEL 9.8 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS 9.6.20260407-0 (Plow) `amd64` | 4.21.x |
+| RHEL 10.2 `amd64` | Standard and air-gapped | Red Hat Enterprise Linux CoreOS 9.6.20260407-0 (Plow) `amd64` | 4.21.x |
 
 Air-gapped installation requires Linux because Red Hat `oc-mirror` v2 is
 Linux-only. The installer machine also requires:
@@ -180,7 +180,7 @@ Edit the copy and confirm these settings:
 | `openshift.routes.saia.enabled` | Create the HTTP SAIA Route |
 | `openshift.routes.slim.enabled` | Create the HTTP SLIM Route |
 | `images.*` | Tagged application and supporting images available to the cluster |
-| `images.registryInsecure` | Keep `false` for trusted HTTPS; enable only when insecure registry access is explicitly required |
+| `images.registryInsecure` | Defaults to `true` for a plain-HTTP registry; set `false` for Amazon ECR, Docker Hub, Harbor, or another trusted HTTPS registry |
 | `storage.storageClass` | Existing class, or `local-path` managed by the installer |
 | `storage.objectStore.*` | Type, bucket, endpoint where required, and credentials |
 | `storage.modelStaging.enabled` | Stage missing models from the installer when `true` |
@@ -311,7 +311,7 @@ Use the following versions for this release:
 | Component | Version |
 |---|---|
 | Splunk Enterprise | 10.2 |
-| Splunk AI Assistant | 2.3.0 or later |
+| Splunk AI Assistant | 2.3.2 or later |
 | Splunk AI Toolkit | 6.1.0 or later |
 
 The installer deploys a Splunk Standalone instance. An external Splunk
@@ -351,10 +351,13 @@ Open `http://localhost:18001` and log in as `admin`.
 ### Splunk AI Assistant
 
 1. Install [Splunk AI Assistant](https://splunkbase.splunk.com/app/7245)
-   version 2.3.0.
-2. Enter the SAIA Route printed in
-   [Step 5](#step-5-verify-and-access-the-platform) and save the configuration.
-3. Send a prompt and confirm a model response. A successful response verifies
+   version 2.3.2 or later.
+2. Open **Splunk AI Assistant** to start the onboarding wizard. On **Getting
+   started**, select **AI tier** and click **Next**.
+3. On **Configure SOK and Splunk AI Assistant**, enter the full Splunk AI
+   Assistant Route printed in [Step 5](#step-5-verify-and-access-the-platform)
+   in **Splunk AI Assistant Service URL**, then click **Complete Setup**.
+4. Send a prompt and confirm a model response. A successful response verifies
    that the browser can reach the Route and that SAIA is responding.
 
 ### Splunk AI Toolkit

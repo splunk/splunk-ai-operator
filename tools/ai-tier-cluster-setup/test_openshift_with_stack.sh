@@ -44,6 +44,7 @@ extract_function() {
 }
 
 eval "$(extract_function validate_scale_factor_config)"
+eval "$(extract_function load_config)"
 eval "$(extract_function required_ai_tier_disk_gib)"
 eval "$(extract_function openshift_feature_enabled)"
 eval "$(extract_function openshift_slim_feature_enabled)"
@@ -77,6 +78,7 @@ eval "$(extract_function openshift_configured_ai_nodes)"
 eval "$(extract_function openshift_allow_http_route)"
 eval "$(extract_function openshift_wait_for_insecure_registry)"
 eval "$(extract_function configure_openshift_insecure_endpoints)"
+eval "$(extract_function preflight_check_insecure_registry_policy)"
 eval "$(extract_function prepare_airgap_registry_auth_file)"
 eval "$(extract_function validate_config)"
 eval "$(extract_function clean_all)"
@@ -453,6 +455,8 @@ assert_eq "unified air-gap entry point prepares registry authentication" "1" \
   "$(awk '/^delegate_airgap_install_if_needed\(\)/,/^}/' "${SCRIPT}" | grep -c 'prepare_airgap_registry_auth_file' | tr -d '[:space:]')"
 assert_eq "OpenShift insecure registry configuration preserves existing entries" "1" \
   "$(awk '/^configure_openshift_insecure_endpoints\(\)/,/^}/' "${SCRIPT}" | grep -c 'insecureRegistries.*unique' | tr -d '[:space:]')"
+assert_eq "air-gap import defaults omitted registryInsecure to true" "1" \
+  "$(awk '/^import_bundled_images\(\)/,/^}/' "${AIRGAP_INSTALL_SCRIPT}" | grep -c "images.registryInsecure'.*echo true" | tr -d '[:space:]')"
 assert_eq "standard air-gap README does not require manual registry auth export" "0" \
   "$(grep -c '^export \(AIRGAP_\)\?REGISTRY_AUTH_FILE=' "${OPENSHIFT_README}" | tr -d '[:space:]')"
 assert_eq "Splunk Operator ownership checks every manifest resource" "1" \
@@ -570,7 +574,7 @@ assert_eq "normalizes a registry with scheme and repository prefix" \
   "$(openshift_endpoint_host 'https://registry.apps.example.com/team/images')"
 
 _exercise_insecure_endpoint_configuration() (
-  local tmp config route_trace image_patch previous argument
+  local registry_insecure="${1:-true}" tmp config route_trace image_patch previous argument
   tmp=$(mktemp -d)
   config="${tmp}/config.yaml"
   route_trace="${tmp}/routes"
@@ -578,7 +582,10 @@ _exercise_insecure_endpoint_configuration() (
   cat > "${config}" <<'YAML'
 images:
   registry: registry.apps.example.com
-  registryInsecure: true
+YAML
+  [[ "${registry_insecure}" == "omitted" ]] || \
+    printf '  registryInsecure: %s\n' "${registry_insecure}" >> "${config}"
+  cat >> "${config}" <<'YAML'
 storage:
   objectStore:
     endpoint: http://minio.apps.example.com
@@ -610,11 +617,60 @@ YAML
   }
   configure_openshift_insecure_endpoints "${config}"
   printf '%s ' "$(wc -l < "${route_trace}" | tr -d '[:space:]')"
-  jq -r '(.spec.registrySources.insecureRegistries | sort) == ["existing.example.com","registry.apps.example.com"]' "${image_patch}"
+  if [[ -s "${image_patch}" ]]; then
+    jq -r '(.spec.registrySources.insecureRegistries | sort) == ["existing.example.com","registry.apps.example.com"]' "${image_patch}"
+  else
+    printf '%s\n' false
+  fi
   rm -rf "${tmp}"
 )
 assert_eq "allows HTTP Routes and preserves existing OpenShift registry policy" \
   "2 true" "$(_exercise_insecure_endpoint_configuration)"
+assert_eq "omitted registryInsecure enables the OpenShift insecure registry policy" \
+  "2 true" "$(_exercise_insecure_endpoint_configuration omitted)"
+assert_eq "explicit registryInsecure false skips the OpenShift insecure registry policy" \
+  "1 false" "$(_exercise_insecure_endpoint_configuration false)"
+
+_load_registry_insecure_setting() (
+  local registry_insecure="$1" tmp config
+  tmp=$(mktemp -d)
+  config="${tmp}/config.yaml"
+  cat > "${config}" <<'YAML'
+images:
+  registry: registry.apps.example.com
+YAML
+  [[ "${registry_insecure}" == "omitted" ]] || \
+    printf '  registryInsecure: %s\n' "${registry_insecure}" >> "${config}"
+  yq() { "${REAL_YQ}" "$@"; }
+  oc() { printf '%s\n' "apps.example.com"; }
+  CONFIG_FILE="${config}"
+  QUALIFIED_RAY_RUNTIME_VERSION="2.56.0"
+  QUALIFIED_OPENSHIFT_MINOR="4.21"
+  AIRGAP_MODE="false"
+  load_config
+  printf '%s\n' "${IMAGE_REGISTRY_INSECURE}"
+  rm -rf "${tmp}"
+)
+assert_eq "load_config defaults omitted registryInsecure to true" "true" \
+  "$(_load_registry_insecure_setting omitted)"
+assert_eq "load_config preserves explicit registryInsecure false" "false" \
+  "$(_load_registry_insecure_setting false)"
+
+_preflight_insecure_registry_without_registry() (
+  local headers=0
+  pf_header() { headers=$((headers + 1)); }
+  pf_ok() { :; }
+  pf_fail() { :; }
+  openshift_endpoint_host() { :; }
+  oc() { printf '%s\n' '{"spec":{"registrySources":{"insecureRegistries":[]}}}'; }
+  jq() { :; }
+  IMAGE_REGISTRY_INSECURE="true"
+  IMAGE_REGISTRY=""
+  preflight_check_insecure_registry_policy
+  printf '%s\n' "${headers}"
+)
+assert_eq "insecure-registry preflight skips an empty registry" "0" \
+  "$(_preflight_insecure_registry_without_registry)"
 
 _exercise_auto_registry_auth() (
   local tmp config source_auth custom_auth
@@ -900,6 +956,8 @@ if [[ -n "${REAL_YQ}" ]]; then
     "$("${REAL_YQ}" eval '.openshift.routes.saia.enabled' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config enables the SLIM Route" "true" \
     "$("${REAL_YQ}" eval '.openshift.routes.slim.enabled' "${CONFIG_FILE}" 2>/dev/null)"
+  assert_eq "repository OpenShift config defaults registryInsecure to true" "true" \
+    "$("${REAL_YQ}" eval '.images.registryInsecure' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config pins the qualified cluster minor" "4.21" \
     "$("${REAL_YQ}" eval '.openshift.requiredVersion' "${CONFIG_FILE}" 2>/dev/null)"
   assert_eq "repository OpenShift config stages only missing or changed models by default" "true" \
