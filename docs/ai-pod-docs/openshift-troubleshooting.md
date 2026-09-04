@@ -144,7 +144,7 @@ operators can overwrite those changes.
 ### `Required tool not found`
 
 The installer always requires `oc`, Mike Farah `yq` v4, Helm v3, `curl`, `jq`,
-`base64`, `tar`, GNU `timeout`, and `python3`.
+`base64`, `tar`, GNU `timeout`, and Python 3.8 or later.
 
 It additionally requires:
 
@@ -171,8 +171,8 @@ machine. The macOS commands require [Homebrew](https://brew.sh/).
 |---|---|---|
 | OpenShift CLI (`oc`) | Download the OpenShift 4.21 macOS client for the Mac's architecture from **OpenShift web console → Help → Command Line Tools**. Extract it, then run `sudo install -m 0755 oc /usr/local/bin/oc`. | Download the OpenShift 4.21 Linux client from **OpenShift web console → Help → Command Line Tools**. Run `tar -xvf <downloaded-archive>` and `sudo install -m 0755 oc /usr/local/bin/oc`. |
 | Helm v3 | Run `brew install helm@3`, then `export PATH="$(brew --prefix helm@3)/bin:$PATH"`. Add the export to the shell profile to make it persistent. | Run `curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3`, inspect the script, then run `chmod 700 /tmp/get_helm.sh && sudo /tmp/get_helm.sh`. |
-| Mike Farah `yq` v4 | Run `brew install yq`. Do not install `python-yq`. | Run `sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && sudo chmod 0755 /usr/local/bin/yq`. Confirm that `yq --version` reports v4. |
-| `curl`, `jq`, `base64`, `tar`, GNU `timeout`, and `python3` | Run `brew install jq coreutils python`. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip`. `coreutils` provides `base64` and `timeout`. |
+| Mike Farah `yq` v4.48.1 | Set `YQ_VERSION=v4.48.1` and `YQ_ARCH=arm64` for Apple Silicon or `YQ_ARCH=amd64` for Intel. Run `curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_darwin_${YQ_ARCH}" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. Do not install `python-yq`. | Run `YQ_VERSION=v4.48.1; curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. |
+| `curl`, `jq`, `base64`, `tar`, GNU `timeout`, and Python 3.8+ | Run `brew install jq coreutils python`. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip`. `coreutils` provides `base64` and `timeout`. |
 
 Install conditional tools only when the configuration requires them:
 
@@ -181,7 +181,6 @@ Install conditional tools only when the configuration requires them:
 | The object store is MinIO, SeaweedFS, or generic S3-compatible storage | MinIO Client (`mc`) | `brew install minio/stable/mc` | `sudo curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && sudo chmod 0755 /usr/local/bin/mc` |
 | The object store is AWS S3, or automatic Amazon ECR authentication is enabled | AWS CLI v2 | Follow the [AWS CLI macOS installer](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html). | Download with `curl -fsSL https://awscli.amazonaws.com/v2/install.sh -o /tmp/aws-cli-install.sh`, review the script, then run `sudo bash /tmp/aws-cli-install.sh --system`. |
 | `cluster.airgap: true` | Red Hat `oc-mirror` v2 | Not supported; use a Linux installer machine. | Download the OpenShift 4.21 `oc-mirror` archive from the OpenShift download page, extract it, and run `sudo install -m 0755 oc-mirror /usr/local/bin/oc-mirror`. Confirm with `oc-mirror --v2 version --output=yaml`. |
-
 
 ### `Config file not found` or YAML syntax errors
 
@@ -269,8 +268,7 @@ oc debug node/"$NODE_NAME" --quiet -- chroot /host sh -c \
   'path=/var/lib/containers; [ -d "$path" ] || path=/; df -h "$path"'
 ```
 
-Freeing model data from the object store does not increase node container
-storage. Add or expand node storage, clean only confirmed-unused container
+Add or expand node storage, clean only confirmed-unused container
 content through supported OpenShift procedures, or select nodes that satisfy
 the requirement. Do not lower the minimum merely to bypass preflight.
 
@@ -288,9 +286,11 @@ uses `local-path`.
 ### Object-store configuration fails preflight
 
 Supported values for `storage.objectStore.type` are `aws`, `minio`,
-`seaweedfs`, and `s3compat`. `endpoint` is required for all except AWS S3.
-Permanent access and secret keys are required; temporary AWS STS keys beginning
-with `ASIA` are unsupported because the generated secret has no session-token
+`seaweedfs`, and `s3compat`. An explicit `endpoint` is required for `minio`,
+`seaweedfs`, and `s3compat`, but not for AWS S3. AI POD requires an access-key
+ID and secret access key for the configured object store. For AWS S3, these
+must be long-lived IAM credentials; temporary AWS STS credentials are
+unsupported because the generated Kubernetes secret has no session-token
 field.
 
 Check only the non-secret values:
@@ -403,7 +403,7 @@ Linux-only. A macOS laptop remains supported for a standard deployment but
 must run the air-gapped workflow through a Linux installer host or Linux
 container with sufficient storage and network access.
 
-### Bundle preparation consumes excessive disk space
+### Bundle preparation consumes disk space
 
 The unified installer stores prepared content below
 `airgap-bundle-openshift/` in the working directory by default and reuses the
@@ -481,22 +481,28 @@ Feature Discovery, the NVIDIA GPU Operator and operands, and the OpenShift
 Driver Toolkit. Application images under `images.*` are customer-provided and
 must already exist in the configured internal registry.
 
-### MachineConfigPool does not finish updating
+### Insecure-registry configuration does not finish applying
 
-Mirror policies and insecure-registry configuration can update node container
-runtime configuration. The installer waits for all MachineConfigPools to
-report `Updated=True` before installing dependent operators.
+When `images.registryInsecure: true`, the installer updates OpenShift's
+cluster image configuration. The Machine Config Operator then applies the
+generated container-runtime configuration to the configured AI POD nodes.
+This update can drain or restart affected nodes.
+
+The installer waits up to 45 minutes for every configured AI POD node to apply
+its desired MachineConfig before continuing with operator installation. For
+each node, `currentConfig` must equal `desiredConfig`, and the machine
+configuration state must be `Done`.
 
 ```bash
 oc get machineconfigpool
-read -r -p "MachineConfigPool name: " MACHINE_CONFIG_POOL
-oc describe machineconfigpool "$MACHINE_CONFIG_POOL"
 oc get nodes
+oc describe machineconfigpool <pool-name>
 ```
 
-Investigate degraded nodes and follow the cluster administrator's supported
-MachineConfig recovery procedure. Do not start Operator subscriptions while
-the affected pool is still updating or degraded.
+If a pool is updating or degraded, investigate the affected nodes and follow
+the supported OpenShift MachineConfig recovery procedure. Do not continue
+installing dependent operators until the configured AI POD nodes report the
+desired configuration with state `Done`.
 
 ## Operator Lifecycle Manager failures
 
@@ -992,15 +998,8 @@ issuer on port 8089. Confirm:
 
 The installer adds the primary short service URL. Add only legitimate
 alternate URLs under `splunk.trustedIssuers`, such as the namespace-qualified
-service URL when Splunk produces that issuer. Do not add arbitrary trusted
-issuers to suppress an authentication error.
+service URL when Splunk produces that issuer.
 
-### SAIA v2 works differently from SAIA v1
-
-Splunk AI Assistant browser traffic must reach the published SAIA Route
-directly. nginx sends `/saia-api-v2/` paths to SAIA v2 and other SAIA paths to
-v1. Confirm the browser is not attempting to send v2 traffic through a
-Splunk-server-only network path.
 
 ### AI Toolkit endpoint saves but no models appear
 
@@ -1036,21 +1035,27 @@ different endpoint on port 8088.
 
 ### Cleanup leaves the OpenShift cluster running
 
-This is expected. `clean-all` removes the installer-owned AI POD stack and shared
-components recorded as installer-owned; it does not delete the OpenShift
-cluster.
+This is expected. `clean-all` removes the configured AI POD resources and
+shared components recorded as installer-owned. It does not delete the
+OpenShift cluster or its nodes.
 
 **Destructive action:** Do not run `clean-all` to diagnose an unhealthy
-deployment. Collect a support bundle first and use this command only when the
-AI POD deployment is intentionally being removed before a clean reinstall.
+deployment. Collect a support bundle first. Run this command only when
+intentionally removing AI POD or preparing for a clean reinstall.
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all
+./openshift_with_stack.sh clean-all
 ```
 
-Use the same namespace and resource names used for install. Ownership is
-recorded in an installer state ConfigMap in `openshift-config`, and deletion
-preserves pre-existing shared components that were not owned by the installer.
+Use the same configuration file used for installation so the namespace and
+resource names match. Ownership is recorded in an installer-state ConfigMap in
+`openshift-config`.
+
+If the installer created the AI POD namespace, `clean-all` deletes the entire
+namespace and everything subsequently added to it. If the namespace existed
+before installation, the namespace and unrelated workloads are preserved,
+while the configured AI POD resources are removed. Pre-existing shared
+operators and components not recorded as installer-owned are preserved.
 
 ### A custom resource is stuck terminating
 
@@ -1062,8 +1067,11 @@ oc logs -n splunk-ai-operator-system \
   -l control-plane=controller-manager --tail=500
 ```
 
-Do not remove finalizers manually unless Splunk Support has confirmed that the
-owning controller cannot complete cleanup and has provided a recovery plan.
+Do not remove finalizers as the first recovery step. A customer OpenShift
+administrator may remove a finalizer after confirming that its owning
+controller cannot complete cleanup and after preparing a recovery plan for any
+resources that may be left behind. Contact Splunk Support if the cause or
+recovery impact is unclear.
 
 ### Reinstall does not redownload models or images
 
