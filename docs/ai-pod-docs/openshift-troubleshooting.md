@@ -103,26 +103,22 @@ else
 fi
 ```
 
-Fix the first concrete failure. Later readiness messages are often
-consequences of the same problem.
+Fix the first specific error in the installer log before investigating later readiness failures, because they may be caused by the same underlying issue.
 
 ### 3. Check platform readiness
 
 ```bash
 oc get aiplatform,aiservice,raycluster,rayservice -n "$AI_NAMESPACE"
 oc get pods -n "$AI_NAMESPACE" -o wide
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh verify-pods
+./openshift_with_stack.sh verify-pods
 ```
 
-`verify-pods` waits up to 30 minutes by default. It checks pods, AIPlatform,
-AIServices, RayCluster, RayService, and Ray Serve readiness. If verification
-fails, the installer automatically runs `diagnose` unless
-`AUTO_DIAGNOSE=false` is set.
+`verify-pods` waits up to 30 minutes by default for workload pods to become ready. It then checks the AIPlatform and AIService resources, RayCluster, RayService, and Ray Serve deployments. If verification fails, it automatically runs `diagnose` unless `AUTO_DIAGNOSE=false` is set.
 
 ### 4. Collect a support bundle
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh diagnose
+./openshift_with_stack.sh diagnose
 ```
 
 The command prints the exact generated bundle path. The bundle includes
@@ -136,7 +132,7 @@ logs can still contain operationally sensitive information.
 After correcting the root cause, run the same install command again:
 
 ```bash
-CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh install
+./openshift_with_stack.sh install
 ```
 
 The installer reconciles its resources. Do not permanently patch generated
@@ -167,17 +163,34 @@ yq --version
 helm version
 ```
 
-Use the dependency installation instructions in
-[`openshift-readme.md`](./openshift-readme.md#installer-machine). Do not use the
-Python-based `yq`; the installer requires Mike Farah `yq` v4 syntax.
+Install missing tools with the commands below. macOS is supported for standard
+deployments only; air-gapped installation requires an `amd64` Linux installer
+machine. The macOS commands require [Homebrew](https://brew.sh/).
+
+| Tool | macOS | RHEL 9 or RHEL 10 (`amd64`) |
+|---|---|---|
+| OpenShift CLI (`oc`) | Download the OpenShift 4.21 macOS client for the Mac's architecture from **OpenShift web console → Help → Command Line Tools**. Extract it, then run `sudo install -m 0755 oc /usr/local/bin/oc`. | Download the OpenShift 4.21 Linux client from **OpenShift web console → Help → Command Line Tools**. Run `tar -xvf <downloaded-archive>` and `sudo install -m 0755 oc /usr/local/bin/oc`. |
+| Helm v3 | Run `brew install helm@3`, then `export PATH="$(brew --prefix helm@3)/bin:$PATH"`. Add the export to the shell profile to make it persistent. | Run `curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3`, inspect the script, then run `chmod 700 /tmp/get_helm.sh && sudo /tmp/get_helm.sh`. |
+| Mike Farah `yq` v4 | Run `brew install yq`. Do not install `python-yq`. | Run `sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && sudo chmod 0755 /usr/local/bin/yq`. Confirm that `yq --version` reports v4. |
+| `curl`, `jq`, `base64`, `tar`, GNU `timeout`, and `python3` | Run `brew install jq coreutils python`. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip`. `coreutils` provides `base64` and `timeout`. |
+
+Install conditional tools only when the configuration requires them:
+
+| Required when | Tool | macOS | RHEL 9 or RHEL 10 (`amd64`) |
+|---|---|---|---|
+| The object store is MinIO, SeaweedFS, or generic S3-compatible storage | MinIO Client (`mc`) | `brew install minio/stable/mc` | `sudo curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && sudo chmod 0755 /usr/local/bin/mc` |
+| The object store is AWS S3, or automatic Amazon ECR authentication is enabled | AWS CLI v2 | Follow the [AWS CLI macOS installer](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html). | Download with `curl -fsSL https://awscli.amazonaws.com/v2/install.sh -o /tmp/aws-cli-install.sh`, review the script, then run `sudo bash /tmp/aws-cli-install.sh --system`. |
+| `cluster.airgap: true` | Red Hat `oc-mirror` v2 | Not supported; use a Linux installer machine. | Download the OpenShift 4.21 `oc-mirror` archive from the OpenShift download page, extract it, and run `sudo install -m 0755 oc-mirror /usr/local/bin/oc-mirror`. Confirm with `oc-mirror --v2 version --output=yaml`. |
+
 
 ### `Config file not found` or YAML syntax errors
 
 Use an absolute path and parse it before retrying:
 
 ```bash
-test -f "$CONFIG_FILE"
-yq eval '.' "$CONFIG_FILE" >/dev/null
+test -f "$CONFIG_FILE" &&
+  yq eval '.' "$CONFIG_FILE" >/dev/null &&
+  echo "Configuration file exists and contains valid YAML"
 ```
 
 Paths below `files.*` are resolved relative to the directory containing the
