@@ -389,10 +389,29 @@ helm history "$HELM_RELEASE" -n "$HELM_NAMESPACE"
 oc get events -n "$HELM_NAMESPACE" --sort-by='.lastTimestamp' | tail -100
 ```
 
-Correct the reported chart-access, permission, API, or workload error, then
-rerun the installer so it can reconcile the release. Do not uninstall the
-release as a first troubleshooting step because that can remove resources and
-diagnostic evidence.
+Correct the reported chart-access, permission, API, or workload error. If Helm
+did not create the release, rerun the installer.
+
+If the release already exists but its deployment remains unhealthy, rerunning
+the installer does not necessarily upgrade or repair it. If `helm history`
+shows an earlier healthy revision, roll back to that revision:
+
+```bash
+helm rollback "$HELM_RELEASE" <healthy-revision> \
+  -n "$HELM_NAMESPACE" --wait --timeout 10m
+```
+
+After a successful rollback, rerun the installer to validate the operator and
+continue installation. If no healthy revision exists, collect a support bundle
+before attempting a controlled repair or reinstall:
+
+```bash
+./openshift_with_stack.sh diagnose
+```
+
+Do not uninstall the release as the first troubleshooting step. Uninstalling
+an operator can interrupt reconciliation and remove diagnostic evidence. If a
+safe recovery plan is unclear, review the support bundle with Splunk Support.
 
 ## Air-gapped deployment failures
 
