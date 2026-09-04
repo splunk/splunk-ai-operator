@@ -179,15 +179,34 @@ Linux-only. The installer machine is separate from the OpenShift nodes.
 Required tools:
 
 - OpenShift CLI (`oc`), logged in to the target cluster
-- Mike Farah `yq` v4
+- Mike Farah `yq` v4.48.1
 - Helm v3+
-- `curl`, `jq`, `base64`, GNU `timeout`, `python3`, and `tar`
+- `curl`, `jq`, `base64`, GNU `timeout`, Python 3.8 or later, and `tar`
 - MinIO client (`mc`) for MinIO, SeaweedFS, or generic S3-compatible storage
 - AWS CLI only when using AWS S3 or automatic Amazon ECR authentication
 - `oc-mirror` v2 for an air-gapped deployment
 
-Exact client patch versions are not pinned. The installer pins these platform
-dependencies:
+Install missing tools with the commands below. macOS is supported for standard
+deployments only; air-gapped installation requires an `amd64` Linux installer
+machine. The macOS commands require [Homebrew](https://brew.sh/).
+
+| Tool | macOS | RHEL 9 or RHEL 10 (`amd64`) |
+|---|---|---|
+| OpenShift CLI (`oc`) | Download the OpenShift 4.21 macOS client for the Mac's architecture from **OpenShift web console → Help → Command Line Tools**. Extract it, then run `sudo install -m 0755 oc /usr/local/bin/oc`. | Download the OpenShift 4.21 Linux client from **OpenShift web console → Help → Command Line Tools**. Run `tar -xvf <downloaded-archive>` and `sudo install -m 0755 oc /usr/local/bin/oc`. |
+| Helm v3 | Run `brew install helm@3`, then `export PATH="$(brew --prefix helm@3)/bin:$PATH"`. Add the export to the shell profile to make it persistent. | Run `curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3`, inspect the script, then run `chmod 700 /tmp/get_helm.sh && sudo /tmp/get_helm.sh`. |
+| Mike Farah `yq` v4.48.1 | Set `YQ_VERSION=v4.48.1` and `YQ_ARCH=arm64` for Apple Silicon or `YQ_ARCH=amd64` for Intel. Run `curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_darwin_${YQ_ARCH}" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. Do not install `python-yq`. | Run `YQ_VERSION=v4.48.1; curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. |
+| `curl`, `jq`, `base64`, `tar`, GNU `timeout`, and Python 3.8+ | Run `brew install jq coreutils python`. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip`. `coreutils` provides `base64` and `timeout`. |
+
+Install conditional tools only when the configuration requires them:
+
+| Required when | Tool | macOS | RHEL 9 or RHEL 10 (`amd64`) |
+|---|---|---|---|
+| The object store is MinIO, SeaweedFS, or generic S3-compatible storage | MinIO Client (`mc`) | Run `brew install minio/stable/mc`. | Run `sudo curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && sudo chmod 0755 /usr/local/bin/mc`. |
+| The object store is AWS S3, or automatic Amazon ECR authentication is enabled | AWS CLI v2 | Follow the [AWS CLI macOS installer](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html). | Download with `curl -fsSL https://awscli.amazonaws.com/v2/install.sh -o /tmp/aws-cli-install.sh`, review the script, then run `sudo bash /tmp/aws-cli-install.sh --system`. |
+| `cluster.airgap: true` | Red Hat `oc-mirror` v2 | Not supported; use a Linux installer machine. | Download the OpenShift 4.21 `oc-mirror` archive from the OpenShift download page, extract it, and run `sudo install -m 0755 oc-mirror /usr/local/bin/oc-mirror`. Confirm with `oc-mirror --v2 version --output=yaml`. |
+
+Except for Mike Farah `yq` v4.48.1, exact client patch versions are not pinned.
+The installer pins these platform dependencies:
 
 | Dependency | Installer contract |
 |---|---|
