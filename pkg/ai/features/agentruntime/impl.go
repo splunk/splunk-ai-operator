@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -40,6 +41,17 @@ const (
 
 var defaultAgentModules = map[string]string{
 	"mltk": "agentcore_operations.loader:MLTKAgentLoader",
+}
+
+var agentModulePattern = regexp.MustCompile(
+	`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:` +
+		`[A-Za-z_][A-Za-z0-9_]*$`,
+)
+
+type agentRuntimeConfig struct {
+	BaseImage     string
+	ProviderImage string
+	AgentModule   string
 }
 
 type AgentRuntimeReconciler struct {
@@ -110,11 +122,7 @@ func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "provider must be set for agentruntime")
 		return fmt.Errorf("provider must be set for agentruntime")
 	}
-	if _, err := resolveBaseImage(ai); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
-		return err
-	}
-	if _, err := resolveProviderImage(ai); err != nil {
+	if _, err := resolveAgentRuntimeConfig(ai); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
 		return err
 	}
@@ -230,6 +238,11 @@ func (r *AgentRuntimeReconciler) reconcileServiceAccount(ctx context.Context, ai
 }
 
 func (r *AgentRuntimeReconciler) reconcileConfigMap(ctx context.Context, ai *aiv1.AIService) error {
+	config, err := resolveAgentRuntimeConfig(ai)
+	if err != nil {
+		return err
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ai.Name + "-agentruntime-config",
@@ -239,12 +252,12 @@ func (r *AgentRuntimeReconciler) reconcileConfigMap(ctx context.Context, ai *aiv
 	if err := controllerutil.SetControllerReference(ai, cm, r.Scheme); err != nil {
 		return fmt.Errorf("ownerref on ConfigMap: %w", err)
 	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
 		cm.Data = map[string]string{
 			"provider":       ai.Spec.Feature.Provider,
 			"featureVersion": ai.Spec.Version,
 			"runtimeVersion": ai.Spec.RuntimeVersion,
-			"agentModule":    resolveAgentModule(ai.Spec.Feature.Provider),
+			"agentModule":    config.AgentModule,
 		}
 		return nil
 	})
@@ -292,11 +305,7 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 }
 
 func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *aiv1.AIService) error {
-	baseImage, err := resolveBaseImage(ai)
-	if err != nil {
-		return err
-	}
-	providerImage, err := resolveProviderImage(ai)
+	config, err := resolveAgentRuntimeConfig(ai)
 	if err != nil {
 		return err
 	}
@@ -304,7 +313,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 	labels, annotations := labelsAndAnnotations(ai)
 	selectorLabels := agentRuntimeSelectorLabels(ai)
 	containerName := agentRuntimeWorkloadName(ai.Name)
-	env := buildAgentRuntimeEnv(ai)
+	env := buildAgentRuntimeEnv(ai, config.AgentModule)
 	sort.Slice(env, func(i, j int) bool { return env[i].Name < env[j].Name })
 	volumes := []corev1.Volume{{
 		Name: "provider-packages",
@@ -360,7 +369,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 				ServiceAccountName: ai.Spec.ServiceAccountName,
 				InitContainers: []corev1.Container{{
 					Name:            "fetch-provider-wheel",
-					Image:           providerImage,
+					Image:           config.ProviderImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					Command:         []string{"/bin/sh", "-c"},
 					Args:            []string{"cp -a /payload/. " + sharedPackagesPath + "/"},
@@ -370,7 +379,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 				}},
 				Containers: []corev1.Container{{
 					Name:            containerName,
-					Image:           baseImage,
+					Image:           config.BaseImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					Ports: []corev1.ContainerPort{
 						{Name: "http", ContainerPort: defaultAgentRuntimeHTTPPort},
@@ -601,10 +610,10 @@ func shortHash(value string) string {
 	return fmt.Sprintf("%08x", h.Sum32())
 }
 
-func buildAgentRuntimeEnv(ai *aiv1.AIService) []corev1.EnvVar {
+func buildAgentRuntimeEnv(ai *aiv1.AIService, agentModule string) []corev1.EnvVar {
 	platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
 	env := []corev1.EnvVar{
-		{Name: "AGENT_MODULE", Value: resolveAgentModule(ai.Spec.Feature.Provider)},
+		{Name: "AGENT_MODULE", Value: agentModule},
 		{Name: "CHECKPOINT_DB_SECRET_REF", Value: ai.Spec.CheckpointDbSecretRef},
 		{Name: "PLATFORM_URL", Value: platformURL},
 		{Name: "PYTHONPATH", Value: sharedPackagesPath},
@@ -665,34 +674,61 @@ func httpProbe(path string, port int32) *corev1.Probe {
 func resolveBaseImage(ai *aiv1.AIService) (string, error) {
 	if ai.Spec.RuntimeVersion != "" {
 		envName := "RELATED_IMAGE_AGENT_RUNTIME_BASE_" + normalizeEnvKeySegment(ai.Spec.RuntimeVersion)
-		if image := os.Getenv(envName); image != "" {
-			return image, nil
-		}
-		return "", fmt.Errorf("%s must be set when runtimeVersion %q is requested", envName, ai.Spec.RuntimeVersion)
+		return resolveRequiredRuntimeEnv(envName, fmt.Sprintf(" when runtimeVersion %q is requested", ai.Spec.RuntimeVersion))
 	}
-	if image := os.Getenv("RELATED_IMAGE_AGENT_RUNTIME_BASE"); image != "" {
-		return image, nil
-	}
-	return "", fmt.Errorf("RELATED_IMAGE_AGENT_RUNTIME_BASE must be set")
+	return resolveRequiredRuntimeEnv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "")
 }
 
 func resolveProviderImage(ai *aiv1.AIService) (string, error) {
 	envName := "RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_" + normalizeEnvKeySegment(ai.Spec.Feature.Provider)
-	if image := os.Getenv(envName); image != "" {
-		return image, nil
-	}
-	return "", fmt.Errorf("%s must be set", envName)
+	return resolveRequiredRuntimeEnv(envName, fmt.Sprintf(" for provider %q", ai.Spec.Feature.Provider))
 }
 
-func resolveAgentModule(provider string) string {
+func resolveAgentRuntimeConfig(ai *aiv1.AIService) (agentRuntimeConfig, error) {
+	baseImage, err := resolveBaseImage(ai)
+	if err != nil {
+		return agentRuntimeConfig{}, err
+	}
+	providerImage, err := resolveProviderImage(ai)
+	if err != nil {
+		return agentRuntimeConfig{}, err
+	}
+	agentModule, err := resolveAgentModule(ai.Spec.Feature.Provider)
+	if err != nil {
+		return agentRuntimeConfig{}, err
+	}
+	return agentRuntimeConfig{
+		BaseImage:     baseImage,
+		ProviderImage: providerImage,
+		AgentModule:   agentModule,
+	}, nil
+}
+
+func resolveRequiredRuntimeEnv(name, context string) (string, error) {
+	value := os.Getenv(name)
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s must be set%s", name, context)
+	}
+	if strings.ContainsAny(value, " \t\r\n") {
+		return "", fmt.Errorf("%s must not contain whitespace", name)
+	}
+	return value, nil
+}
+
+func resolveAgentModule(provider string) (string, error) {
 	envName := "RELATED_AGENT_RUNTIME_MODULE_PROVIDER_" + normalizeEnvKeySegment(provider)
-	if module := os.Getenv(envName); module != "" {
-		return module
+	module := os.Getenv(envName)
+	if module == "" {
+		if defaultModule, ok := defaultAgentModules[provider]; ok {
+			module = defaultModule
+		} else {
+			return "", fmt.Errorf("%s must be set for provider %q", envName, provider)
+		}
 	}
-	if module, ok := defaultAgentModules[provider]; ok {
-		return module
+	if !agentModulePattern.MatchString(module) {
+		return "", fmt.Errorf("%s has invalid value %q; expected package.module:ClassName", envName, module)
 	}
-	return fmt.Sprintf("%s.loader:AgentLoader", provider)
+	return module, nil
 }
 
 func normalizeEnvKeySegment(value string) string {
