@@ -70,33 +70,62 @@ The workload namespace is configurable and defaults to `ai-platform`.
 ## Architecture
 
 ```mermaid
-flowchart TB
-  ASSISTANT[Splunk AI Assistant] -->|HTTP| SAIA_ROUTE[SAIA Route]
-  AITK[Splunk AI Toolkit] -->|HTTP| SLIM_ROUTE[SLIM Route]
-
-  subgraph OCP[OpenShift cluster]
-    SAIA_ROUTE --> SAIA[SAIA API]
-    SLIM_ROUTE --> SLIM[SLIM API]
-    SAIA --> RAY[Ray model serving]
-    SLIM --> RAY
-    SAIA --> WEAVIATE[Weaviate]
-    SAIA -->|JWT validation| SPLUNK[Bundled Splunk Standalone]
-    SLIM -->|JWT validation| SPLUNK
-    OTEL[OpenTelemetry collectors] -->|HEC| SPLUNK
+flowchart LR
+  subgraph CUSTOMER[Customer environment]
+    USER[User browser]
+    SPLUNK[Existing Splunk Enterprise<br/>Splunk AI Assistant and Splunk AI Toolkit]
+    USER -->|opens Splunk Web| SPLUNK
   end
 
-  RAY -->|model weights| OBJECT_STORE[(Object store)]
+  subgraph OCP[AI POD on OpenShift]
+    subgraph INGRESS[OpenShift ingress]
+      SAIA_ROUTE[Published SAIA HTTP endpoint<br/>OpenShift Route]
+      SLIM_ROUTE[Published SLIM HTTP endpoint<br/>OpenShift Route]
+    end
+
+    subgraph SERVICES[AI services]
+      SAIA_SERVICE[SAIA ClusterIP Service]
+      SAIA[SAIA API]
+      SLIM_SERVICE[SLIM ClusterIP Service]
+      SLIM[SLIM API]
+      SAIA_SERVICE --> SAIA
+      SLIM_SERVICE --> SLIM
+    end
+
+    subgraph MODELS[Model and data services]
+      RAY[Ray model serving]
+      WEAVIATE[Weaviate vector database]
+    end
+
+    SAIA_ROUTE --> SAIA_SERVICE
+    SLIM_ROUTE --> SLIM_SERVICE
+    SAIA --> RAY
+    SLIM --> RAY
+    SAIA --> WEAVIATE
+  end
+
+  USER -->|AI Assistant browser request| SAIA_ROUTE
+  SPLUNK -->|AI Toolkit request| SLIM_ROUTE
+  SAIA -->|JWT validation, port 8089| SPLUNK
+  SLIM -->|JWT validation, port 8089| SPLUNK
+  RAY -->|model artifacts| OBJECT_STORE[(S3-compatible object store)]
   SAIA -->|runtime state| OBJECT_STORE
-  REGISTRY[(Image registry)] -.->|image pulls| OCP
+  REGISTRY[(OCI image registry)] -.->|deployment-time image pulls| OCP
 ```
 
+- **External Splunk:** Splunk AI Assistant and Splunk AI Toolkit run in the
+  existing customer-managed Splunk Enterprise deployment.
+- **Routes:** the published SAIA and SLIM endpoints are HTTP OpenShift Route
+  resources handled by the shared ingress router, not separate application
+  workloads. The user's browser calls the SAIA Route, while Splunk AI Toolkit
+  calls the SLIM Route from Splunk Enterprise.
 - **Ray** runs the model-serving head and GPU worker workloads.
 - **Weaviate** stores vector data and is initialized by a post-install job.
 - **SAIA** provides the Splunk AI Assistant API and retrieval-augmented
   generation workflow.
 - **SLIM** provides model discovery and inference for Splunk AI Toolkit.
-- **Splunk Standalone** provides JWT issuer validation and receives internal
-  telemetry through HTTP Event Collector.
+- **Splunk authentication:** SAIA and SLIM validate Splunk JWTs against the
+  configured external Splunk management issuer on port 8089.
 - **Object storage** contains model artifacts and persistent SAIA runtime data.
 
 ## Requirements
