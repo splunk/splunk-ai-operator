@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -28,6 +29,81 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	require.NoError(t, autoscalingv2.AddToScheme(s))
 	require.NoError(t, monitoringv1.AddToScheme(s))
 	return s
+}
+
+func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "lifecycle-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("lifecycle-ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature: aiv1.FeatureSpec{
+				Name:     "agentruntime",
+				Provider: "mltk",
+			},
+			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
+			CheckpointDbSecretRef: "mltk-postgres",
+			Replicas:              1,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	factory := &AgentRuntimeFactory{}
+	handler, err := factory.New(context.Background(), fakeClient, scheme, ai, record.NewFakeRecorder(20))
+	require.NoError(t, err)
+
+	require.NoError(t, handler.Reconcile(context.Background(), ai))
+	require.NoError(t, handler.Reconcile(context.Background(), ai))
+
+	for _, object := range []ctrlclient.Object{
+		&corev1.ServiceAccount{},
+		&corev1.ConfigMap{},
+		&appsv1.Deployment{},
+		&corev1.Service{},
+		&autoscalingv2.HorizontalPodAutoscaler{},
+	} {
+		key := types.NamespacedName{Namespace: "default"}
+		switch object.(type) {
+		case *corev1.ServiceAccount:
+			key.Name = ai.Name + "-sa"
+		case *corev1.ConfigMap:
+			key.Name = ai.Name + "-agentruntime-config"
+		case *appsv1.Deployment:
+			key.Name = ai.Name + "-agentruntime-deployment"
+		case *corev1.Service:
+			key.Name = agentRuntimeServiceName(ai.Name)
+		case *autoscalingv2.HorizontalPodAutoscaler:
+			key.Name = ai.Name + "-agentruntime-hpa"
+		}
+		require.NoError(t, fakeClient.Get(context.Background(), key, object))
+	}
+
+	assert.Equal(t, ai.Generation, ai.Status.ObservedGeneration)
+	assertConditionTrue(t, ai.Status.Conditions, "ValidateReady")
+	assertConditionTrue(t, ai.Status.Conditions, "ServiceAccountReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeConfigMapReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeDeploymentReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeServiceReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeHPAReady")
+	assertConditionTrue(t, ai.Status.Conditions, "Ready")
+}
+
+func assertConditionTrue(t *testing.T, conditions []metav1.Condition, conditionType string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if condition.Type == conditionType {
+			assert.Equal(t, metav1.ConditionTrue, condition.Status, conditionType)
+			return
+		}
+	}
+	t.Fatalf("missing condition %s", conditionType)
 }
 
 func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
