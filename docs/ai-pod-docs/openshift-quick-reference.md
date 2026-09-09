@@ -328,9 +328,8 @@ configured by this installer. Ray dashboard diagnostics are documented in
 [openshift-troubleshooting.md](openshift-troubleshooting.md#raycluster-or-rayservice-does-not-become-ready).
 
 If the SAIA Route is disabled, the documented browser-based Splunk AI Assistant
-connection is unavailable. If the SLIM Route is disabled, an external Splunk
-instance cannot use the documented SLIM endpoint; the installer-deployed
-Splunk instance can still use the internal SLIM service shown in Step 6.
+connection is unavailable. If the SLIM Route is disabled, Splunk AI Toolkit
+cannot use the documented SLIM endpoint.
 
 ---
 
@@ -403,18 +402,11 @@ Open `http://localhost:18001` and log in as `admin`.
    version 6.1.0.
 3. Create a **Splunk AI tier** endpoint connection as described in the
    [full setup procedure](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
-4. For installer-deployed Splunk, use the internal SLIM endpoint printed by:
-
-```bash
-printf 'http://%s-slim-slim-service.%s.svc.cluster.local:8080/tenant/slim-api/v1alpha1\n' \
-  "$AI_PLATFORM_NAME" "$AI_NAMESPACE"
-```
-
-For external Splunk, use the SLIM Route printed in
-[Step 5](#step-5-verify-and-access-the-platform). Confirm that models appear,
-create a named Splunk AI tier LLM connection, and run the post-install `ai` and
-`apply CDTSM` verification searches in
-[openshift-readme.md](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
+4. For both installer-deployed and external Splunk, use the SLIM Route printed
+   in [Step 5](#step-5-verify-and-access-the-platform).
+5. Confirm that models appear, create a named Splunk AI tier LLM connection,
+   and run the post-install `ai` and `apply CDTSM` verification searches in
+   [openshift-readme.md](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
 
 ---
 
