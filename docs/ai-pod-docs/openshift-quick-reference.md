@@ -43,14 +43,15 @@ Linux-only. The installer machine also requires:
 
 - Network access to the OpenShift API, image registry, and object store
 - Access to Hugging Face when model staging is enabled and a model is missing
-- A Hugging Face token authorized for all gated models when staging is enabled
+- Hugging Face credentials when model staging must download a missing gated
+  model
 
 **Required tools:**
 
 - OpenShift CLI (`oc`)
-- Mike Farah `yq` v4
+- Mike Farah `yq` v4.48.1
 - Helm v3+
-- `curl`, `jq`, `base64`, GNU `timeout`, `python3`, and `tar`
+- `curl`, `jq`, `base64`, GNU `timeout`, Python 3.8 or later, and `tar`
 - MinIO client (`mc`) for MinIO, SeaweedFS, or generic S3-compatible storage
 - AWS CLI only for AWS S3 or automatic Amazon ECR authentication
 - `oc-mirror` v2 only for an air-gapped deployment
@@ -96,18 +97,33 @@ The final command must print `yes`.
 
 ## Step 2: Confirm minimum worker capacity
 
-The initial deployment requires at least:
+The qualified minimum deployment uses one shared AI-tier worker node for CPU
+and GPU workloads. That node requires at least:
 
 | Resource | Minimum requirement |
 |---|---:|
 | System RAM | 256 GiB |
 | Available workload disk | 1 TiB (1024 GiB) |
-| GPU memory | 2 × 96 GB VRAM |
+| GPU | 2 × NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM each |
 | CPU | 64 allocatable vCPU |
 
-CPU and GPU workloads use the shared AI-tier worker pool. Disk means usable
-capacity available before installation, including the filesystems backing
-`/var/lib/containers` and `/opt/local-path-provisioner`.
+The supported accelerator profile is `RTX_PRO_6000_BLACKWELL`; other GPU models
+or equivalent aggregate VRAM configurations are not qualified for this
+workflow. When more than one AI-tier node is selected, CPU and GPU workloads
+still share one node pool. The 1 TiB disk requirement applies separately to
+every selected AI-tier node and means usable capacity available immediately
+before installation, including the filesystems backing `/var/lib/containers`
+and `/opt/local-path-provisioner`. A nominal 1-TB drive provides less than
+1024 GiB and does not meet this requirement. GPU capacity cannot be combined
+across nodes to satisfy one pod; a Ray worker requesting two GPUs must fit on
+one node with two GPUs available.
+
+Installer preflight verifies available space on the filesystem containing
+`/var/lib/containers`, or `/` when that directory is absent, on every selected
+AI-tier node. It does not separately measure `/opt/local-path-provisioner` when
+that path uses another filesystem. It also does not verify the required CPU,
+system RAM, physical GPU model, GPU count, or GPU memory; the customer must
+confirm those capacities before installation.
 
 The object store is separate from worker storage and must be provisioned
 independently.
@@ -179,7 +195,7 @@ Edit the copy and confirm these settings:
 | `openshift.nodes` | Exact AI-tier worker names when strategy is `manual` |
 | `openshift.routes.saia.enabled` | Create the HTTP SAIA Route |
 | `openshift.routes.slim.enabled` | Create the HTTP SLIM Route |
-| `images.*` | Tagged application and supporting images available to the cluster |
+| `images.*` | Tagged application and supporting images available to the cluster; use the [release-default image table](openshift-readme.md#image-pull-secrets-and-registry-access) |
 | `images.registryInsecure` | Defaults to `true` for a plain-HTTP registry; set `false` for Amazon ECR, Docker Hub, Harbor, or another trusted HTTPS registry |
 | `storage.storageClass` | Existing class, or `local-path` managed by the installer |
 | `storage.objectStore.*` | Type, bucket, endpoint where required, and credentials |
@@ -270,9 +286,15 @@ Run:
 ./openshift_with_stack.sh install
 ```
 
-The installer automatically prepares and imports its OpenShift-specific
-content, applies mirror policies and internal CatalogSources, and continues the
-normal installation. Do not run a separate manual bundle workflow.
+The installer uses `oc-mirror` to copy the OpenShift installation dependencies
+into `images.registry`. These dependencies include the selected Node Feature
+Discovery and NVIDIA GPU Operator packages and their related images, plus the
+cert-manager, Local Path Provisioner, KubeRay Operator, OpenTelemetry Operator,
+UBI helper, and OpenShift Driver Toolkit images. The installer then applies the
+generated mirror policies and internal CatalogSources and continues the normal
+installation. Application images configured under `images.*` and model
+artifacts remain separate customer-provided content. Do not run a separate
+manual bundle workflow.
 
 ---
 
@@ -291,6 +313,9 @@ oc get pods -n "$AI_NAMESPACE" -o wide
 
 Print the default external endpoints:
 
+The commands below require both `openshift.routes.saia.enabled: true` and
+`openshift.routes.slim.enabled: true` in the configuration.
+
 ```bash
 SAIA_HOST="$(oc get route saia -n "$AI_NAMESPACE" -o jsonpath='{.spec.host}')"
 SLIM_HOST="$(oc get route slim -n "$AI_NAMESPACE" -o jsonpath='{.spec.host}')"
@@ -302,6 +327,10 @@ The supported Routes use HTTP. HTTPS Route TLS and workload mutual TLS are not
 configured by this installer. Ray dashboard diagnostics are documented in
 [openshift-troubleshooting.md](openshift-troubleshooting.md#raycluster-or-rayservice-does-not-become-ready).
 
+If the SAIA Route is disabled, the documented browser-based Splunk AI Assistant
+connection is unavailable. If the SLIM Route is disabled, Splunk AI Toolkit
+cannot use the documented SLIM endpoint.
+
 ---
 
 ## Step 6: Connect the Splunk apps
@@ -311,12 +340,17 @@ Use the following versions for this release:
 | Component | Version |
 |---|---|
 | Splunk Enterprise | 10.2 |
-| Splunk AI Assistant | 2.3.2 or later |
-| Splunk AI Toolkit | 6.1.0 or later |
+| Splunk AI Assistant | 2.3.2 |
+| Splunk AI Toolkit | 6.1.0 |
 
-The installer deploys a Splunk Standalone instance. An external Splunk
-Enterprise instance may instead use the published Routes when its network and
-JWT issuer are configured correctly.
+These are the Splunk-side versions documented for this AI POD release. They are
+separate from the platform container-image versions listed in the
+[release-default image table](openshift-readme.md#image-pull-secrets-and-registry-access).
+
+AI POD supports two Splunk integration choices: a bundled Splunk Standalone or
+an existing externally managed Splunk Enterprise deployment. Use the procedure
+for the selected choice and ensure its network access and JWT issuer are
+configured correctly.
 
 ### Open installer-deployed Splunk Web
 
@@ -326,8 +360,8 @@ same kubeconfig and configuration file, and access to the OpenShift API. Set
 `KUBECONFIG`, `CONFIG_FILE`, and `AI_NAMESPACE` in that shell. The port-forward
 listens on that machine's localhost.
 
-Use this section for the Splunk Standalone instance created by the installer.
-The port-forward provides local access to its Splunk Web interface.
+Use this section when the bundled Splunk Standalone option is deployed. The
+port-forward provides local access to its Splunk Web interface.
 
 Retrieve the generated password:
 
@@ -351,7 +385,7 @@ Open `http://localhost:18001` and log in as `admin`.
 ### Splunk AI Assistant
 
 1. Install [Splunk AI Assistant](https://splunkbase.splunk.com/app/7245)
-   version 2.3.2 or later.
+   version 2.3.2.
 2. Open **Splunk AI Assistant** to start the onboarding wizard. On **Getting
    started**, select **AI tier** and click **Next**.
 3. On **Configure SOK and Splunk AI Assistant**, enter the full Splunk AI
@@ -365,25 +399,21 @@ Open `http://localhost:18001` and log in as `admin`.
 1. Install the
    [platform-appropriate Python for Scientific Computing app](https://splunkbase.splunk.com/collections/machine_learning).
 2. Install [Splunk AI Toolkit](https://splunkbase.splunk.com/app/2890)
-   version 6.1.0 or later.
+   version 6.1.0.
 3. Create a **Splunk AI tier** endpoint connection as described in the
    [full setup procedure](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
-4. For installer-deployed Splunk, use the internal SLIM endpoint printed by:
-
-```bash
-printf 'http://%s-slim-slim-service.%s.svc.cluster.local:8080/tenant/slim-api/v1alpha1\n' \
-  "$AI_PLATFORM_NAME" "$AI_NAMESPACE"
-```
-
-For external Splunk, use the SLIM Route printed in
-[Step 5](#step-5-verify-and-access-the-platform). Confirm that models appear,
-create a named Splunk AI tier LLM connection, and run the post-install `ai` and
-`apply CDTSM` verification searches in
-[openshift-readme.md](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
+4. For both installer-deployed and external Splunk, use the SLIM Route printed
+   in [Step 5](#step-5-verify-and-access-the-platform).
+5. Confirm that models appear, create a named Splunk AI tier LLM connection,
+   and run the post-install `ai` and `apply CDTSM` verification searches in
+   [openshift-readme.md](openshift-readme.md#install-and-configure-splunk-ai-toolkit).
 
 ---
 
 ## Step 7: Operate and troubleshoot
+
+For symptom-based diagnosis and recovery procedures, see the
+[OpenShift Troubleshooting Guide](openshift-troubleshooting.md).
 
 ### Scale the deployment
 
@@ -391,10 +421,10 @@ create a named Splunk AI tier LLM connection, and run the post-install `ai` and
 worker groups. It does not provision hardware. Ensure sufficient CPU, memory,
 GPU, and storage capacity before increasing it.
 
-| `scaleFactor` | System RAM | Available workload disk | GPU memory | CPU |
+| `scaleFactor` | System RAM | Available workload disk per selected AI-tier node | GPU | CPU |
 |---:|---:|---:|---:|---:|
-| `1` | 256 GiB | 1 TiB | 2 × 96 GB VRAM | 64 allocatable vCPU |
-| `2` | 512 GiB | 2 TiB | 4 × 96 GB VRAM | 128 allocatable vCPU |
+| `1` | 256 GiB | 1 TiB | 2 × NVIDIA RTX PRO 6000 Blackwell, 96 GB each | 64 allocatable vCPU |
+| `2` | 512 GiB | 2 TiB | 4 × NVIDIA RTX PRO 6000 Blackwell, 96 GB each | 128 allocatable vCPU |
 
 Run commands from `tools/ai-tier-cluster-setup` with the `CONFIG_FILE` exported
 in Step 3:
@@ -416,8 +446,7 @@ in Step 3:
 > Routes, and installer-created configuration. The OpenShift cluster and its
 > nodes are not removed.
 
-For the complete symptom-based command set, use
-[openshift-troubleshooting.md](openshift-troubleshooting.md). Start with:
+Start with:
 
 ```bash
 oc get aiplatform,aiservice,raycluster,rayservice -n "$AI_NAMESPACE"
