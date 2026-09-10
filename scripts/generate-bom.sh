@@ -2,7 +2,7 @@
 
 # Generate Bill of Materials (BOM) for Splunk AI Operator
 # This script extracts all Docker images used by the operator and its dependencies
-# Usage: ./scripts/generate-bom.sh [VERSION]
+# Usage: ./scripts/generate-bom.sh [VERSION] [OUTPUT_DIR]
 
 set -euo pipefail
 
@@ -43,6 +43,40 @@ declare -A IMAGES=(
     ["fluent-bit"]="${RELATED_IMAGE_FLUENT_BIT:-fluent/fluent-bit:1.9.6}"
     ["otel-collector"]="${RELATED_IMAGE_OTEL_COLLECTOR:-otel/opentelemetry-collector-contrib:0.122.1}"
 )
+
+# AgentRuntime images are wired into the operator through related-image
+# environment variables. Keep the BOM aligned with that contract rather than
+# maintaining a second hard-coded provider list here.
+IMAGES["agent-runtime-base"]="${RELATED_IMAGE_AGENT_RUNTIME_BASE:-docker.io/splunk/agent-runtime:latest}"
+
+# Include any runtime-version-specific base images that are configured in the
+# operator environment, for example RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0.
+while IFS= read -r env_name; do
+    [[ -z "${env_name}" ]] && continue
+    image="${!env_name:-}"
+    [[ -z "${image}" ]] && continue
+    version="${env_name#RELATED_IMAGE_AGENT_RUNTIME_BASE_}"
+    version_key="$(printf '%s' "${version}" | tr '[:upper:]' '[:lower:]')"
+    IMAGES["agent-runtime-base-${version_key}"]="${image}"
+done < <(compgen -v | grep '^RELATED_IMAGE_AGENT_RUNTIME_BASE_' || true)
+
+# Provider carrier images are keyed by feature.provider and therefore may grow
+# without a corresponding change to this script. The MLTK default matches the
+# provider entry shipped in tools/cluster_setup/artifacts.yaml.
+agent_runtime_provider_count=0
+while IFS= read -r env_name; do
+    [[ -z "${env_name}" ]] && continue
+    image="${!env_name:-}"
+    [[ -z "${image}" ]] && continue
+    provider="${env_name#RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_}"
+    provider_key="$(printf '%s' "${provider}" | tr '[:upper:]' '[:lower:]')"
+    IMAGES["agent-runtime-provider-${provider_key}"]="${image}"
+    agent_runtime_provider_count=$((agent_runtime_provider_count + 1))
+done < <(compgen -v | grep '^RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_' || true)
+
+if [[ "${agent_runtime_provider_count}" -eq 0 ]]; then
+    IMAGES["agent-runtime-provider-mltk"]="${RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK:-docker.io/splunk/agent-runtime-provider-mltk:latest}"
+fi
 
 # Additional metadata
 MODEL_VERSION="${MODEL_VERSION:-unknown}"
