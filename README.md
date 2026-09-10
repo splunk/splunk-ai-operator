@@ -128,6 +128,17 @@ docker pull splunk/splunk-ai-operator:v0.2.0
 kubectl apply -k config/samples/
 ```
 
+### AgentRuntime MVP consumption contract
+
+AgentRuntime exposes one ClusterIP Service per provider workload. Consumers in the
+same namespace should use:
+
+```text
+<platform>-agentruntime-<provider>-svc.<namespace>.svc.cluster.local
+```
+
+Cross-namespace and external exposure are outside the MVP contract.
+
 ### Uninstall
 
 **Helm:**
@@ -166,4 +177,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

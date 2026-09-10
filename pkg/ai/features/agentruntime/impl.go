@@ -392,28 +392,14 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 }
 
 func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.AIService) error {
-	serviceTemplate := ai.Spec.ServiceTemplate.DeepCopy()
-	cleanServiceTemplate(serviceTemplate)
-
 	ports := []corev1.ServicePort{
 		{Name: "http", Port: defaultAgentRuntimeHTTPPort, TargetPort: intstr.FromInt(int(defaultAgentRuntimeHTTPPort))},
 		{Name: "metrics", Port: defaultAgentRuntimeMetrics, TargetPort: intstr.FromInt(int(defaultAgentRuntimeMetrics))},
 	}
 
+	// AgentRuntime is an in-cluster MVP endpoint. Keep the Service ClusterIP-only
+	// until a future cross-namespace/external exposure contract is defined.
 	svcType := corev1.ServiceTypeClusterIP
-	switch serviceTemplate.Spec.Type {
-	case corev1.ServiceTypeLoadBalancer:
-		svcType = corev1.ServiceTypeLoadBalancer
-	case corev1.ServiceTypeNodePort:
-		svcType = corev1.ServiceTypeNodePort
-		for i, port := range ports {
-			for _, tplPort := range serviceTemplate.Spec.Ports {
-				if port.Name == tplPort.Name && tplPort.NodePort != 0 {
-					ports[i].NodePort = tplPort.NodePort
-				}
-			}
-		}
-	}
 
 	labels, _ := labelsAndAnnotations(ai)
 	selectorLabels := agentRuntimeSelectorLabels(ai)
@@ -549,7 +535,7 @@ func agentRuntimeSelectorLabels(ai *aiv1.AIService) map[string]string {
 }
 
 func agentRuntimeServiceName(aiServiceName string) string {
-	return dnsLabelName(aiServiceName, "agentruntime-service")
+	return dnsLabelName(aiServiceName, "svc")
 }
 
 func boundedDNSLabel(name string) string {
@@ -732,13 +718,4 @@ func normalizeEnvKeySegment(value string) string {
 		}
 	}
 	return strings.Trim(b.String(), "_")
-}
-
-func cleanServiceTemplate(svc *corev1.Service) {
-	if svc == nil {
-		return
-	}
-	svc.TypeMeta = metav1.TypeMeta{}
-	svc.ObjectMeta = metav1.ObjectMeta{}
-	svc.Status = corev1.ServiceStatus{}
 }
