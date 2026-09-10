@@ -1,0 +1,56 @@
+apiVersion: agent-runtime.splunk.com/v1alpha1
+kind: AgentRuntimeCompatibilityMatrix
+
+metadata:
+  name: agent-runtime
+  # Increment when the matrix policy or schema changes.
+  revision: "1"
+
+spec:
+  policy:
+    # A new carrier must pass on both supported base tracks.
+    carrierRequiredBaseTracks:
+      - current
+      - n-1
+    # A new base must pass against every carrier whose status is supported.
+    newBaseRequiresAllSupportedCarriers: true
+    # The matrix is documentation-only for AIP-4648.
+    enforcement: documentation-only
+    certificationRequiresImmutableDigests: true
+    supportedBaseTrackCount: 2
+    statuses:
+      - certified
+      - pending
+      - untested
+      - blocked
+      - deprecated
+
+  # The public runtime contract is independent of a particular image digest.
+  contractVersions:
+    v1:
+      status: supported
+      graphCompatibilityRequired: true
+
+  # Populate with one record for each supported base image. Do not mark a base
+  # current or n-1 until its required pair coverage has passed.
+  bases: []
+
+  # Populate with one record for each product-owned carrier image. A carrier
+  # record is not certified by itself; certification belongs to a base/carrier
+  # pair below.
+  carriers: []
+
+  # Populate with one record for every tested base/carrier combination.
+  #
+  # Example shape (illustrative only; not a certified pair):
+  # - id: base-v2-0-0--mltk-0-1-0
+  #   baseRef: agent-runtime-v2.0.0
+  #   carrierRef: mltk-0.1.0
+  #   contractVersion: v1
+  #   graphCompatibilityVersion: v1
+  #   status: pending
+  #   validation:
+  #     harnessVersion: ar-carrier-dev/0.1.0-g<short-sha>
+  #     testedAt: "2026-01-01T00:00:00Z"
+  #     reportRef: null
+  pairs: []
