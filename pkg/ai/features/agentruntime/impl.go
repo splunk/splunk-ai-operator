@@ -39,10 +39,6 @@ const (
 	sharedPackagesPath                = "/shared-packages"
 )
 
-var defaultAgentModules = map[string]string{
-	"mltk": "agentcore_operations.loader:MLTKAgentLoader",
-}
-
 var agentModulePattern = regexp.MustCompile(
 	`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:` +
 		`[A-Za-z_][A-Za-z0-9_]*$`,
@@ -629,6 +625,16 @@ func buildAgentRuntimeEnv(ai *aiv1.AIService, agentModule string) []corev1.EnvVa
 	if ai.Spec.VectorDbUrl != "" {
 		env = append(env, corev1.EnvVar{Name: "VECTOR_DB_URL", Value: ai.Spec.VectorDbUrl})
 	}
+	if len(ai.Spec.Feature.Env) > 0 {
+		extraNames := make([]string, 0, len(ai.Spec.Feature.Env))
+		for name := range ai.Spec.Feature.Env {
+			extraNames = append(extraNames, name)
+		}
+		sort.Strings(extraNames)
+		for _, name := range extraNames {
+			env = append(env, corev1.EnvVar{Name: name, Value: ai.Spec.Feature.Env[name]})
+		}
+	}
 	return env
 }
 
@@ -717,13 +723,9 @@ func resolveRequiredRuntimeEnv(name, context string) (string, error) {
 
 func resolveAgentModule(provider string) (string, error) {
 	envName := "RELATED_AGENT_RUNTIME_MODULE_PROVIDER_" + normalizeEnvKeySegment(provider)
-	module := os.Getenv(envName)
+	module := strings.TrimSpace(os.Getenv(envName))
 	if module == "" {
-		if defaultModule, ok := defaultAgentModules[provider]; ok {
-			module = defaultModule
-		} else {
-			return "", fmt.Errorf("%s must be set for provider %q", envName, provider)
-		}
+		return "", fmt.Errorf("%s must be set for provider %q", envName, provider)
 	}
 	if !agentModulePattern.MatchString(module) {
 		return "", fmt.Errorf("%s has invalid value %q; expected package.module:ClassName", envName, module)
