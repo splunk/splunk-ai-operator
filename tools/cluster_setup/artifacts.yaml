@@ -1067,6 +1067,14 @@ spec:
                       maxLength: 253
                       minLength: 1
                       type: string
+                    env:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        Env specifies additional environment variables for feature pods.
+                        For agentruntime, these are passed to the shared agent-runtime container,
+                        allowing image-specific settings to change without rebuilding the operator.
+                      type: object
                     maxReplicas:
                       description: MaxReplicas is the HPA ceiling for this feature.
                       format: int32
@@ -4174,6 +4182,14 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
+                  env:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Env specifies additional environment variables for feature pods.
+                      For agentruntime, these are passed to the shared agent-runtime container,
+                      allowing image-specific settings to change without rebuilding the operator.
+                    type: object
                   maxReplicas:
                     description: MaxReplicas is the HPA ceiling for this feature.
                     format: int32
