@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/assert"
@@ -17,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -27,7 +30,90 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	require.NoError(t, appsv1.AddToScheme(s))
 	require.NoError(t, autoscalingv2.AddToScheme(s))
 	require.NoError(t, monitoringv1.AddToScheme(s))
+	require.NoError(t, certmanagerv1.AddToScheme(s))
 	return s
+}
+
+func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "lifecycle-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("lifecycle-ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature: aiv1.FeatureSpec{
+				Name:     "agentruntime",
+				Provider: "mltk",
+			},
+			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
+			CheckpointDbSecretRef: "mltk-postgres",
+			Replicas:              1,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	factory := &AgentRuntimeFactory{}
+	handler, err := factory.New(context.Background(), fakeClient, scheme, ai, record.NewFakeRecorder(20))
+	require.NoError(t, err)
+
+	require.NoError(t, handler.Reconcile(context.Background(), ai))
+	require.NoError(t, handler.Reconcile(context.Background(), ai))
+
+	for _, object := range []ctrlclient.Object{
+		&corev1.ServiceAccount{},
+		&corev1.ConfigMap{},
+		&appsv1.Deployment{},
+		&corev1.Service{},
+		&autoscalingv2.HorizontalPodAutoscaler{},
+	} {
+		key := types.NamespacedName{Namespace: "default"}
+		switch object.(type) {
+		case *corev1.ServiceAccount:
+			key.Name = ai.Name + "-sa"
+		case *corev1.ConfigMap:
+			key.Name = ai.Name + "-agentruntime-config"
+		case *appsv1.Deployment:
+			key.Name = ai.Name + "-agentruntime-deployment"
+		case *corev1.Service:
+			key.Name = agentRuntimeServiceName(ai.Name)
+		case *autoscalingv2.HorizontalPodAutoscaler:
+			key.Name = ai.Name + "-agentruntime-hpa"
+		}
+		require.NoError(t, fakeClient.Get(context.Background(), key, object))
+	}
+
+	assert.Equal(t, ai.Generation, ai.Status.ObservedGeneration)
+	assertConditionTrue(t, ai.Status.Conditions, "ValidateReady")
+	assertConditionTrue(t, ai.Status.Conditions, "ServiceAccountReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeConfigMapReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeDeploymentReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeServiceReady")
+	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeHPAReady")
+	assertConditionTrue(t, ai.Status.Conditions, "Ready")
+
+	configMap := &corev1.ConfigMap{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      ai.Name + "-agentruntime-config",
+		Namespace: ai.Namespace,
+	}, configMap))
+	assert.Equal(t, "agentcore_operations.loader:MLTKAgentLoader", configMap.Data["agentModule"])
+}
+
+func assertConditionTrue(t *testing.T, conditions []metav1.Condition, conditionType string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if condition.Type == conditionType {
+			assert.Equal(t, metav1.ConditionTrue, condition.Status, conditionType)
+			return
+		}
+	}
+	t.Fatalf("missing condition %s", conditionType)
 }
 
 func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
@@ -49,6 +135,10 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 			Feature: aiv1.FeatureSpec{
 				Name:     "agentruntime",
 				Provider: "mltk",
+				Env: map[string]string{
+					"PG_DBNAME": "checkpoints",
+					"PG_HOST":   "postgres.default.svc.cluster.local",
+				},
 			},
 			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
 			VectorDbUrl:           "weaviate.default.svc.cluster.local",
@@ -89,6 +179,8 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	assertEnv(t, container.Env, "PYTHONPATH", sharedPackagesPath)
 	assertEnv(t, container.Env, "PLATFORM_URL", "http://ray-head.default.svc.cluster.local:8000")
 	assertEnv(t, container.Env, "VECTOR_DB_URL", "weaviate.default.svc.cluster.local")
+	assertEnv(t, container.Env, "PG_DBNAME", "checkpoints")
+	assertEnv(t, container.Env, "PG_HOST", "postgres.default.svc.cluster.local")
 	require.Len(t, deployment.Spec.Template.Spec.Volumes, 1)
 	assert.Equal(t, "provider-packages", deployment.Spec.Template.Spec.Volumes[0].Name)
 	assert.NotNil(t, deployment.Spec.Template.Spec.Volumes[0].EmptyDir)
@@ -167,6 +259,7 @@ func TestAgentRuntimeServiceName_StaysWithinDNSLabelLimit(t *testing.T) {
 func TestAgentRuntimeReconciler_BoundsSelectorsForLongAIServiceName(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	longName := "very-long-ai-platform-name-for-agent-runtime-provider-name-bounds-agentruntime-mltk"
@@ -232,6 +325,171 @@ func TestResolveBaseImageRequiresRequestedRuntimeVersion(t *testing.T) {
 	assert.Equal(t, "docker.io/splunk/agent-runtime:v2.0.0", image)
 }
 
+func TestResolveAgentRuntimeConfigResolvesBaseCarrierAndModule(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:default")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0", "docker.io/splunk/agent-runtime:v2.0.0")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+
+	ai := &aiv1.AIService{Spec: aiv1.AIServiceSpec{
+		Feature:        aiv1.FeatureSpec{Provider: "mltk"},
+		RuntimeVersion: "v2.0.0",
+	}}
+
+	config, err := resolveAgentRuntimeConfig(ai)
+
+	require.NoError(t, err)
+	assert.Equal(t, "docker.io/splunk/agent-runtime:v2.0.0", config.BaseImage)
+	assert.Equal(t, "docker.io/splunk/agent-runtime-provider-mltk:test", config.ProviderImage)
+	assert.Equal(t, "agentcore_operations.loader:MLTKAgentLoader", config.AgentModule)
+}
+
+func TestResolveAgentRuntimeConfigRequiresProviderCarrierImage(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+
+	ai := &aiv1.AIService{Spec: aiv1.AIServiceSpec{
+		Feature: aiv1.FeatureSpec{Provider: "mltk"},
+	}}
+
+	_, err := resolveAgentRuntimeConfig(ai)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK")
+}
+
+func TestResolveAgentModuleRequiresProviderMapping(t *testing.T) {
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "")
+
+	_, err := resolveAgentModule("mltk")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK must be set")
+}
+
+func TestResolveAgentModuleRejectsUnknownProviderWithoutMapping(t *testing.T) {
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_UNKNOWN", "")
+
+	_, err := resolveAgentModule("unknown")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RELATED_AGENT_RUNTIME_MODULE_PROVIDER_UNKNOWN")
+}
+
+func TestResolveAgentModuleRejectsMalformedMapping(t *testing.T) {
+	invalidModules := []string{
+		"agentcore_operations.loader",
+		"agentcore_operations.loader:",
+		":MLTKAgentLoader",
+		"agentcore_operations.loader:MLTK-AgentLoader",
+		"agentcore_operations.loader:MLTKAgentLoader extra",
+	}
+
+	for _, module := range invalidModules {
+		t.Run(module, func(t *testing.T) {
+			t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", module)
+
+			_, err := resolveAgentModule("mltk")
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "expected package.module:ClassName")
+		})
+	}
+}
+
+func TestAgentRuntimeReconcileStopsBeforeResourcesWhenValidationFails(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "invalid-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("invalid-ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
+			CheckpointDbSecretRef: "mltk-postgres",
+			Replicas:              1,
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	reconciler := &AgentRuntimeReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	err := reconciler.Reconcile(context.Background(), ai)
+
+	require.Error(t, err)
+	assertConditionFalse(t, ai.Status.Conditions, "ValidateReady")
+	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      ai.Name + "-sa",
+		Namespace: ai.Namespace,
+	}, &corev1.ServiceAccount{}))
+	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      ai.Name + "-agentruntime-config",
+		Namespace: ai.Namespace,
+	}, &corev1.ConfigMap{}))
+}
+
+func TestAgentRuntimeReconcileStopsBeforeResourcesWhenAgentModuleIsInvalid(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
+	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
+	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTK-AgentLoader")
+
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "invalid-module-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("invalid-module-ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
+			CheckpointDbSecretRef: "mltk-postgres",
+			Replicas:              1,
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	reconciler := &AgentRuntimeReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	err := reconciler.Reconcile(context.Background(), ai)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected package.module:ClassName")
+	assertConditionFalse(t, ai.Status.Conditions, "ValidateReady")
+	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      ai.Name + "-sa",
+		Namespace: ai.Namespace,
+	}, &corev1.ServiceAccount{}))
+	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      ai.Name + "-agentruntime-config",
+		Namespace: ai.Namespace,
+	}, &corev1.ConfigMap{}))
+}
+
+func assertConditionFalse(t *testing.T, conditions []metav1.Condition, conditionType string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if condition.Type == conditionType {
+			assert.Equal(t, metav1.ConditionFalse, condition.Status, conditionType)
+			return
+		}
+	}
+	t.Fatalf("missing condition %s", conditionType)
+}
+
 func int32PtrForAgentRuntimeTest(value int32) *int32 {
 	return &value
 }
@@ -245,4 +503,44 @@ func assertEnv(t *testing.T, env []corev1.EnvVar, name, value string) {
 		}
 	}
 	t.Fatalf("missing env %s", name)
+}
+
+func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stack-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("agent-runtime-ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			MTLS:          aiv1.MTLSConfig{Enabled: true, Termination: "operator", IssuerRef: cmmeta.ObjectReference{Name: "issuer", Kind: "ClusterIssuer"}},
+			Replicas:      1,
+			AIPlatformUrl: "http://platform:8000",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	reconciler := &AgentRuntimeReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	require.NoError(t, reconciler.reconcileCertificate(context.Background(), ai))
+	require.NoError(t, reconciler.reconcileCertificate(context.Background(), ai))
+
+	cert := &certmanagerv1.Certificate{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "stack-agentruntime-mltk-agentruntime-cert", Namespace: "default",
+	}, cert))
+	assert.Equal(t, "stack-agentruntime-mltk-tls", cert.Spec.SecretName)
+	assert.Equal(t, "issuer", cert.Spec.IssuerRef.Name)
+	assert.Equal(t, "ClusterIssuer", cert.Spec.IssuerRef.Kind)
+	assert.Equal(t, []string{
+		agentRuntimeWorkloadName(ai.Name),
+		agentRuntimeServiceName(ai.Name),
+		agentRuntimeServiceName(ai.Name) + ".default.svc",
+	}, cert.Spec.DNSNames)
+	assert.Equal(t, ai.UID, cert.OwnerReferences[0].UID)
 }

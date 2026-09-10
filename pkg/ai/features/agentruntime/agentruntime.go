@@ -10,9 +10,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+var _ common.FeatureFactory = (*AgentRuntimeFactory)(nil)
+var _ common.FeatureHandler = (*AgentRuntimeReconciler)(nil)
+
 type AgentRuntimeFactory struct{}
 
-func (f *AgentRuntimeFactory) New(ctx context.Context, c client.Client, scheme *runtime.Scheme, ai *aiv1.AIService, recorder record.EventRecorder) (common.FeatureHandler, error) {
+func (f *AgentRuntimeFactory) New(
+	ctx context.Context,
+	c client.Client,
+	scheme *runtime.Scheme,
+	ai *aiv1.AIService,
+	recorder record.EventRecorder,
+) (common.FeatureHandler, error) {
 	return &AgentRuntimeReconciler{
 		Client:   c,
 		Scheme:   scheme,

@@ -56,6 +56,7 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 		Name:               "feature1",
 		Version:            "v1",
 		ServiceAccountName: "svc-account",
+		Env:                map[string]string{"PG_HOST": "postgres.default.svc.cluster.local"},
 	}
 
 	r := &AIPlatformReconciler{Scheme: scheme}
@@ -67,6 +68,7 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	assert.Equal(t, "feature1", service.Spec.Feature.Name)
 	assert.Equal(t, "svc-account", service.Spec.ServiceAccountName)
 	assert.Equal(t, "weaviate-db", service.Spec.VectorDbUrl)
+	assert.Equal(t, map[string]string{"PG_HOST": "postgres.default.svc.cluster.local"}, service.Spec.Feature.Env)
 	assert.Equal(t, int32(1), service.Spec.Replicas)
 	assert.True(t, service.Spec.Metrics.Enabled)
 	assert.Equal(t, "/metrics", service.Spec.Metrics.Path)

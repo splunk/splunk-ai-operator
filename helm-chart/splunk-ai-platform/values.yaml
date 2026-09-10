@@ -74,6 +74,8 @@ features: []
 #   maxReplicas: 4
 #   targetCPUUtilization: 60
 #   checkpointDbSecretRef: "mltk-postgres-conn"
+#   env:
+#     PG_HOST: "postgres.example.com"
 
 # headGroupSpec:
 #   # Service account name for the Ray head group
