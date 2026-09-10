@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	agentRuntimeFeatureName = "agentruntime"
-	maxDNSLabelLength       = 63
-	ownerKey                = ".metadata.controller"
+	agentRuntimeFeatureName       = "agentruntime"
+	agentRuntimeMetricsPort int32 = 9090
+	maxDNSLabelLength             = 63
+	ownerKey                      = ".metadata.controller"
 )
 
 type AIPlatformReconciler struct {
@@ -285,7 +286,9 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 		serviceAccountName = name + "-sa"
 	}
 	resources := corev1.ResourceRequirements{}
+	metricsPort := int32(8080)
 	if feature.Name == agentRuntimeFeatureName {
+		metricsPort = agentRuntimeMetricsPort
 		resources = defaultAgentRuntimeResources()
 		if platform.Status.RayServiceName != "" {
 			aiPlatformURL = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
@@ -340,7 +343,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			RuntimeVersion:        feature.RuntimeVersion,
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
-				Port:    8080,
+				Port:    metricsPort,
 				Path:    "/metrics",
 			},
 			MTLS: platform.Spec.MTLS,
