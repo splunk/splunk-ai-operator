@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +30,7 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	require.NoError(t, appsv1.AddToScheme(s))
 	require.NoError(t, autoscalingv2.AddToScheme(s))
 	require.NoError(t, monitoringv1.AddToScheme(s))
+	require.NoError(t, certmanagerv1.AddToScheme(s))
 	return s
 }
 
@@ -500,4 +503,44 @@ func assertEnv(t *testing.T, env []corev1.EnvVar, name, value string) {
 		}
 	}
 	t.Fatalf("missing env %s", name)
+}
+
+func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stack-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("agent-runtime-ai-service-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			MTLS:          aiv1.MTLSConfig{Enabled: true, Termination: "operator", IssuerRef: cmmeta.ObjectReference{Name: "issuer", Kind: "ClusterIssuer"}},
+			Replicas:      1,
+			AIPlatformUrl: "http://platform:8000",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	reconciler := &AgentRuntimeReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	require.NoError(t, reconciler.reconcileCertificate(context.Background(), ai))
+	require.NoError(t, reconciler.reconcileCertificate(context.Background(), ai))
+
+	cert := &certmanagerv1.Certificate{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "stack-agentruntime-mltk-agentruntime-cert", Namespace: "default",
+	}, cert))
+	assert.Equal(t, "stack-agentruntime-mltk-tls", cert.Spec.SecretName)
+	assert.Equal(t, "issuer", cert.Spec.IssuerRef.Name)
+	assert.Equal(t, "ClusterIssuer", cert.Spec.IssuerRef.Kind)
+	assert.Equal(t, []string{
+		agentRuntimeWorkloadName(ai.Name),
+		agentRuntimeServiceName(ai.Name),
+		agentRuntimeServiceName(ai.Name) + ".default.svc",
+	}, cert.Spec.DNSNames)
+	assert.Equal(t, ai.UID, cert.OwnerReferences[0].UID)
 }

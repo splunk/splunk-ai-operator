@@ -216,17 +216,9 @@ func (r *AgentRuntimeReconciler) reconcileServiceAccount(ctx context.Context, ai
 		serviceAccountName = ai.Name + "-sa"
 	}
 
-	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceAccountName,
-			Namespace: ai.Namespace,
-		},
-	}
-	if err := controllerutil.SetControllerReference(ai, sa, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on ServiceAccount failed")
-		return fmt.Errorf("ownerref on ServiceAccount: %w", err)
-	}
-	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sa, func() error { return nil }); err != nil {
+	if _, err := common.ReconcileServiceAccount(ctx, r.Client, r.Scheme, ai, common.ServiceAccountOptions{
+		Name: serviceAccountName,
+	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update ServiceAccount failed")
 		return fmt.Errorf("create/update ServiceAccount: %w", err)
 	}
@@ -272,17 +264,9 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 	workloadName := agentRuntimeWorkloadName(ai.Name)
 	serviceName := agentRuntimeServiceName(ai.Name)
 
-	cert := &certmanagerv1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ai.Name + "-agentruntime-cert",
-			Namespace: ai.Namespace,
-		},
-	}
-	if err := controllerutil.SetControllerReference(ai, cert, r.Scheme); err != nil {
-		return fmt.Errorf("ownerref on Certificate: %w", err)
-	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
-		cert.Spec = certmanagerv1.CertificateSpec{
+	_, _, err := common.ReconcileCertificate(ctx, r.Client, r.Scheme, ai, common.CertificateOptions{
+		Name: ai.Name + "-agentruntime-cert",
+		Spec: certmanagerv1.CertificateSpec{
 			SecretName: secretName,
 			DNSNames: []string{
 				workloadName,
@@ -294,8 +278,7 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 				Kind:  ai.Spec.MTLS.IssuerRef.Kind,
 				Group: ai.Spec.MTLS.IssuerRef.Group,
 			},
-		}
-		return nil
+		},
 	})
 	return err
 }
