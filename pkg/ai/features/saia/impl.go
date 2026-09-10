@@ -3,6 +3,7 @@ package saia
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -288,30 +289,24 @@ func (r *SaiaReconciler) reconcileServiceAccount(
 	ctx context.Context,
 	ai *aiv1.AIService,
 ) error {
-	if ai.Spec.ServiceAccountName == "" {
-		// Clean ServiceTemplate before updating the spec
-		cleanServiceTemplate(&ai.Spec.ServiceTemplate)
+	if ai.Spec.ServiceAccountName != "" {
+		// Preserve SAIA's existing contract: an explicitly supplied ServiceAccount
+		// is managed outside this reconciler.
+		return nil
+	}
 
-		ai.Spec.ServiceAccountName = ai.Name + "-sa"
-		if err := r.Update(ctx, ai); err != nil {
-			return fmt.Errorf("updating SA name in spec: %w", err)
-		}
-		sa := &corev1.ServiceAccount{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      ai.Spec.ServiceAccountName,
-				Namespace: ai.Namespace,
-			},
-		}
-		if err := controllerutil.SetControllerReference(ai, sa, r.Scheme); err != nil {
-			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on SA failed")
-			return fmt.Errorf("ownerref on SA: %w", err)
-		}
-		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sa, func() error {
-			return nil
-		}); err != nil {
-			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update SA failed")
-			return fmt.Errorf("create/update SA: %w", err)
-		}
+	// Clean ServiceTemplate before updating the spec
+	cleanServiceTemplate(&ai.Spec.ServiceTemplate)
+
+	ai.Spec.ServiceAccountName = ai.Name + "-sa"
+	if err := r.Update(ctx, ai); err != nil {
+		return fmt.Errorf("updating SA name in spec: %w", err)
+	}
+	if _, err := common.ReconcileServiceAccount(ctx, r.Client, r.Scheme, ai, common.ServiceAccountOptions{
+		Name: ai.Spec.ServiceAccountName,
+	}); err != nil {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update SA failed")
+		return fmt.Errorf("create/update SA: %w", err)
 	}
 	return nil
 }
@@ -532,11 +527,8 @@ func (r *SaiaReconciler) reconcileCertificate(
 		}
 	}
 
-	cert := &certmanagerv1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ai.Name + "-tls",
-			Namespace: ai.Namespace,
-		},
+	cert, _, err := common.ReconcileCertificate(ctx, r.Client, r.Scheme, ai, common.CertificateOptions{
+		Name: ai.Name + "-tls",
 		Spec: certmanagerv1.CertificateSpec{
 			SecretName: ai.Spec.MTLS.SecretName,
 			IssuerRef:  ai.Spec.MTLS.IssuerRef,
@@ -546,24 +538,12 @@ func (r *SaiaReconciler) reconcileCertificate(
 				certmanagerv1.UsageClientAuth,
 			},
 		},
-	}
-	if err := controllerutil.SetControllerReference(ai, cert, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on Certificate")
-		return fmt.Errorf("ownerref on Certificate: %w", err)
-	}
-	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
-		// Update Certificate spec
-		cert.Spec = certmanagerv1.CertificateSpec{
-			SecretName: ai.Spec.MTLS.SecretName,
-			IssuerRef:  ai.Spec.MTLS.IssuerRef,
-			DNSNames:   ai.Spec.MTLS.DNSNames,
-			Usages: []certmanagerv1.KeyUsage{
-				certmanagerv1.UsageServerAuth,
-				certmanagerv1.UsageClientAuth,
-			},
+	})
+	if err != nil {
+		var alreadyOwned *controllerutil.AlreadyOwnedError
+		if errors.As(err, &alreadyOwned) {
+			r.Recorder.Event(ai, corev1.EventTypeWarning, "MTLSCertificateError", "Failed to set owner reference on Certificate")
 		}
-		return nil
-	}); err != nil {
 		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update Certificate: %v", err)
 		return fmt.Errorf("create/update Certificate: %w", err)
 	}

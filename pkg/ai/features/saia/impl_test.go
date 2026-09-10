@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func buildTestScheme(t *testing.T) *runtime.Scheme {
@@ -27,6 +30,8 @@ func buildTestScheme(t *testing.T) *runtime.Scheme {
 	err := aiv1.AddToScheme(s)
 	assert.NoError(t, err)
 	err = corev1.AddToScheme(s)
+	assert.NoError(t, err)
+	err = certmanagerv1.AddToScheme(s)
 	assert.NoError(t, err)
 	return s
 }
@@ -241,6 +246,77 @@ func newTestAIService() *aiv1.AIService {
 func mustParseQuantity(s string) *resource.Quantity {
 	q := resource.MustParse(s)
 	return &q
+}
+
+func Test_reconcileServiceAccount_UsesCommonReconciler(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.ServiceAccountName = ""
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileServiceAccount(context.Background(), ai))
+	require.NoError(t, r.reconcileServiceAccount(context.Background(), ai))
+
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-sa", Namespace: "default",
+	}, sa))
+	require.Len(t, sa.OwnerReferences, 1)
+	assert.Equal(t, ai.UID, sa.OwnerReferences[0].UID)
+}
+
+func Test_reconcileServiceAccount_PreservesExplicitServiceAccountContract(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileServiceAccount(context.Background(), ai))
+	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-sa", Namespace: "default",
+	}, &corev1.ServiceAccount{}))
+}
+
+func Test_reconcileCertificate_UsesCommonReconcilerAndPreservesSAIAContract(t *testing.T) {
+	scheme := buildFullTestScheme(t)
+	ai := newTestAIService()
+	ai.Spec.MTLS = aiv1.MTLSConfig{
+		Enabled:     true,
+		Termination: "operator",
+		SecretName:  "test-tls-secret",
+		IssuerRef:   cmmeta.ObjectReference{Name: "test-issuer", Kind: "ClusterIssuer"},
+		DNSNames:    []string{"test.example.com", "test.default.svc.cluster.local"},
+	}
+
+	existing := &certmanagerv1.Certificate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-tls", Namespace: "default"},
+		Spec:       certmanagerv1.CertificateSpec{SecretName: "old-secret"},
+		Status: certmanagerv1.CertificateStatus{
+			Conditions: []certmanagerv1.CertificateCondition{{
+				Type:   certmanagerv1.CertificateConditionReady,
+				Status: cmmeta.ConditionTrue,
+			}},
+		},
+	}
+	require.NoError(t, controllerutil.SetControllerReference(ai, existing, scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, existing).Build()
+	r := &SaiaReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	require.NoError(t, r.reconcileCertificate(context.Background(), ai))
+
+	cert := &certmanagerv1.Certificate{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-tls", Namespace: "default",
+	}, cert))
+	assert.Equal(t, "test-tls-secret", cert.Spec.SecretName)
+	assert.Equal(t, ai.Spec.MTLS.IssuerRef, cert.Spec.IssuerRef)
+	assert.Equal(t, ai.Spec.MTLS.DNSNames, cert.Spec.DNSNames)
+	assert.Equal(t, []certmanagerv1.KeyUsage{
+		certmanagerv1.UsageServerAuth,
+		certmanagerv1.UsageClientAuth,
+	}, cert.Spec.Usages)
+	assert.Equal(t, ai.UID, cert.OwnerReferences[0].UID)
 }
 
 func Test_reconcilePostInstallHook_SetsGRPCEnvForV2DataLoader(t *testing.T) {

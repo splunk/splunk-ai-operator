@@ -221,6 +221,11 @@ type FeatureSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
+	// Env specifies additional environment variables for feature pods.
+	// For agentruntime, these are passed to the shared agent-runtime container,
+	// allowing image-specific settings to change without rebuilding the operator.
+	// +kubebuilder:validation:Optional
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // WeaviateSpec defines the configuration for the Weaviate vector database

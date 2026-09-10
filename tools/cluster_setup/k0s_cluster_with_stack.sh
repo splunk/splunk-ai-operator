@@ -5188,7 +5188,7 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint
+      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint fenv_yaml
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -5198,6 +5198,7 @@ EOF
       fmax=$(yq eval ".aiPlatform.features[$i].maxReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       ftarget=$(yq eval ".aiPlatform.features[$i].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fcheckpoint=$(yq eval ".aiPlatform.features[$i].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fenv_yaml=$(yq eval ".aiPlatform.features[$i].env // {}" "${CONFIG_FILE}" 2>/dev/null || echo "{}")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
@@ -5208,6 +5209,12 @@ EOF
         [[ -n "$ftarget" && "$ftarget" != "null" ]] && features_yaml+="      targetCPUUtilization: ${ftarget}"$'\n'
         [[ -n "$fcheckpoint" && "$fcheckpoint" != "null" ]] && features_yaml+="      checkpointDbSecretRef: \"${fcheckpoint}\""$'\n'
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: ${fsa}"$'\n'
+        if [[ -n "$fenv_yaml" && "$fenv_yaml" != "{}" && "$fenv_yaml" != "null" ]]; then
+          features_yaml+="      env:"$'\n'
+          while IFS= read -r env_line; do
+            features_yaml+="        ${env_line}"$'\n'
+          done <<< "${fenv_yaml}"
+        fi
         log "  Feature: ${fname} v${fver}"
       fi
       i=$((i + 1))
