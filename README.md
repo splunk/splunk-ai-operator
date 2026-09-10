@@ -59,6 +59,16 @@ standard and air-gapped deployment details.
 - **[Configuration Guides](docs/splunk-ai-operator-docs/splunk-ai-operator-configuration/)** - Storage, ingress, and webhook configuration
 - **[Installer Troubleshooting](docs/ai-tier-docs/troubleshooting.md)** - k0s installation issues
 - **[Local Development](docs/splunk-ai-operator-docs/local-development.md)** - Build and development workflow
+### AgentRuntime MVP consumption contract
+
+AgentRuntime exposes one ClusterIP Service per provider workload. Consumers in the
+same namespace should use:
+
+```text
+<platform>-agentruntime-<provider>-svc.<namespace>.svc.cluster.local
+```
+
+Cross-namespace and external exposure are outside the MVP contract.
 
 ## License
 
