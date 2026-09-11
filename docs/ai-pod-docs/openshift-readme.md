@@ -156,6 +156,18 @@ flowchart TB
 > This installer is qualified for OpenShift 4.21. Setting another version in
 > the configuration does not add support for that OpenShift release.
 
+### Infrastructure references
+
+Provision the OpenShift cluster and Cisco UCS hardware before running the AI
+POD installer:
+
+- [Install OpenShift Container Platform 4.21 on bare metal](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html-single/installing_on_bare_metal/installing_on_bare_metal)
+- [Cisco UCS C845A M8 Rack Server](https://www.cisco.com/c/en/us/products/collateral/servers-unified-computing/ucs-c-series-rack-servers/ucs-c845a-m8-rack-server-ds.html)
+
+These references do not replace the AI POD requirements below. The qualified
+configuration uses a Cisco UCS C845A M8 with two NVIDIA RTX PRO 6000 Blackwell
+GPUs.
+
 ### Minimum deployment requirements
 
 The qualified minimum deployment uses one shared AI-tier worker node for CPU
