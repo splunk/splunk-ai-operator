@@ -161,12 +161,13 @@ flowchart TB
 Provision the OpenShift cluster and Cisco UCS hardware before running the AI
 POD installer:
 
-- [Install OpenShift Container Platform 4.21 on bare metal](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html-single/installing_on_bare_metal/installing_on_bare_metal)
+- [OpenShift installation and configuration](https://www.cisco.com/c/en/us/td/docs/unified_computing/ucs/UCS_CVDs/flexpod_aipod_training_manual.html#OpenShiftInstallationandConfiguration)
 - [Cisco UCS C845A M8 Rack Server](https://www.cisco.com/c/en/us/products/collateral/servers-unified-computing/ucs-c-series-rack-servers/ucs-c845a-m8-rack-server-ds.html)
 
-These references do not replace the AI POD requirements below. The qualified
-configuration uses a Cisco UCS C845A M8 with two NVIDIA RTX PRO 6000 Blackwell
-GPUs.
+The OpenShift reference includes an infrastructure example based on different
+GPU hardware. It does not replace the AI POD requirements below. The qualified
+AI POD configuration uses a Cisco UCS C845A M8 with two NVIDIA RTX PRO 6000
+Blackwell GPUs.
 
 ### Minimum deployment requirements
 
