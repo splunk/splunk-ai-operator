@@ -102,20 +102,54 @@ kubectl get nodes -o wide
 Record the `nodePort` (e.g. `30080`) and the full list of worker node IPs —
 these become the LB's backend targets.
 
+**Single-node clusters:** if `nodes.existingIPs.workers` is empty,
+`install_k0s_cluster` installs the controller with `--enable-worker` and
+removes its control-plane taint so SAIA/SLIM pods schedule there — there is
+no separate worker node. In this topology the backend target is
+`nodes.existingIPs.controllers[0]`, not an (empty) worker list.
+
 ### 2. Create the backend pool / target group on the enterprise LB
 
-- **Targets:** every worker node IP from step 1, port = `nodePort`.
-- **Protocol:** HTTP. For the supported profile, the LB (e.g. HAProxy)
-  terminates HTTPS at the frontend and forwards plain HTTP to the backend —
-  SAIA on `30080`, and SLIM on `30081` when the SLIM feature is enabled — per
-  the [TLS approach](#tls-termination-at-the-lb-passthrough-is-not-supported-for-k0s)
-  below. Do not configure the backend leg as TLS/passthrough — the NodePort
-  has no TLS listener to pass through to.
-- **Health check:** `GET /nginx_health` on the `nodePort` (e.g. `30080`),
-  expecting `200`. This is the same path the SAIA nginx container's own
-  Kubernetes readiness/liveness probes use — don't use the CORS `OPTIONS
-  .../metadata` request from [step 5](#5-verify-without-the-socks-tunnel) as
-  a health check; that's a browser CORS smoke test, not a liveness signal.
+- **Targets:** every node recorded in step 1 — worker nodes in a multi-node
+  cluster, or the controller in a single-node cluster — port = `nodePort`.
+- **Backend protocol:** for the HTTPS profile, the frontend terminates
+  HTTPS (per the [TLS
+  approach](#tls-termination-at-the-lb-passthrough-is-not-supported-for-k0s)
+  below), and how that maps to the backend leg differs by LB type (below).
+  If an internal HTTP listener is intentionally used instead (see step 3),
+  there's no termination decision to make — the backend is plain HTTP in
+  either case.
+  - **L7 LB (HAProxy, ALB, F5 in HTTP mode):** configure the backend pool
+    itself as HTTP, forwarding plain HTTP to SAIA `30080` / SLIM `30081`
+    (when enabled).
+  - **L4 LB (cloud NLB):** for this plain-HTTP backend profile, an L4 NLB
+    uses a **TCP** target group on the NodePort. TLS terminates at the NLB
+    listener, while HTTP health checks may be configured separately where
+    supported. This is still TLS termination, not TLS passthrough —
+    passthrough would mean forwarding the still-encrypted bytes to a backend
+    that itself holds the certificate, which the SAIA/SLIM NodePorts don't
+    support (see the TLS section below).
+  Either way, do not configure the backend leg as TLS/passthrough — the
+  NodePort has no TLS listener to pass through to.
+
+  **The two decisions are independent:** after TLS termination, the backend
+  payload is plain HTTP. An L7 LB forwards it as HTTP, while an L4 NLB
+  carries it in a TCP target group. Separately, whether one listener can
+  route multiple hostnames to different backend pools is an *L4-vs-L7*
+  question (answered in [Extending the pattern to
+  SLIM](#extending-the-pattern-to-slim)). An L4 NLB terminates TLS fine — it
+  just can't also do Host-header routing on a shared listener.
+- **Health check:**
+  - **SAIA:** `GET /nginx_health` on port `30080`, expecting `200`. This is
+    the same path the SAIA nginx container's own Kubernetes
+    readiness/liveness probes use — don't use the CORS `OPTIONS
+    .../metadata` request from [step 5](#5-verify-without-the-socks-tunnel)
+    as a health check; that's a browser CORS smoke test, not a liveness
+    signal.
+  - **SLIM:** `GET /health` on port `30081`, expecting `200`, when the SLIM
+    feature is enabled (see [Extending the pattern to
+    SLIM](#extending-the-pattern-to-slim)) — `/nginx_health` does not apply
+    to SLIM's backend pool.
   Mark a node unhealthy and drain it from rotation if the check fails — this
   is what gives you node-failure tolerance that the SOCKS tunnel never had.
 - **Node membership stays live:** if workers are added/removed (scaling,
@@ -126,9 +160,19 @@ these become the LB's backend targets.
 ### 3. Create the frontend listener
 
 - **Listener port:** whatever your organization standardizes on (e.g. `443`
-  for HTTPS, or a plain `80`/custom port for internal-only HTTP).
+  for HTTPS, or a plain `80`/custom port for internal-only HTTP). If you pick
+  a nonstandard port, include it explicitly in every onboarded URL in [step
+  4](#4-point-saia-onboarding-at-the-lbs-stable-url) — a bare
+  `https://saia.internal.example.com` connects to `:443` by default and will
+  not reach a listener on, say, `:8443`.
 - **VIP / DNS name:** assign a stable internal DNS name, e.g.
   `saia.internal.example.com`, pointing at the LB's frontend.
+- **HTTP frontends and Splunk Web HTTPS don't mix:** if Splunk Web is served
+  over HTTPS, browsers block the SAIA Assistant app's in-page calls to a
+  plain-HTTP SAIA endpoint as mixed content — the request never leaves the
+  browser. A plain-HTTP frontend here is only usable when Splunk Web itself
+  is also HTTP. If Splunk Web is HTTPS (or might become HTTPS later),
+  terminate TLS on this listener even for an internal-only endpoint.
 
 ### TLS: termination at the LB (passthrough is not supported for k0s)
 
@@ -172,7 +216,8 @@ HAProxy requirements for this deployment pattern:
 - Confirm the Search Head itself (not just user browsers) can resolve and
   reach the HAProxy DNS name — browser reachability alone is not sufficient,
   since Splunk backend onboarding calls originate from the Search Head. Run
-  from the Search Head itself:
+  from the Search Head itself. Append `:<listener-port>` to the hostname
+  when the HTTPS listener is not using port `443`:
 
   ```bash
   curl -fsS -o /dev/null -w '%{http_code}\n' https://saia.company.example/nginx_health
@@ -196,11 +241,13 @@ is configured — this replaces the `<worker-node-ip>:<nodePort>` value used in
 
 - **Splunk Web:** Splunk AI Assistant → Configuration → SAIA API URL =
   `https://saia.internal.example.com` (or `http://...` if not terminating
-  TLS at the LB).
+  TLS at the LB — see the mixed-content caveat in [step
+  3](#3-create-the-frontend-listener)). If the listener uses a nonstandard
+  port, include it: `https://saia.internal.example.com:8443`.
 - **Scripted / air-gapped (`splunkaiassistant.conf`):**
 
   ```bash
-  SAIA_URL="https://saia.internal.example.com"
+  SAIA_URL="https://saia.internal.example.com"   # add :<port> if nonstandard
   # ...same kubectl exec flow as in k0s-readme.md#onboarding-to-the-ai-tier,
   # substituting SAIA_URL above for the worker-node-ip:nodePort value.
   ```
@@ -209,6 +256,9 @@ Because this URL is now stable, onboarding does not need to be repeated when
 individual worker nodes are replaced.
 
 ### 5. Verify without the SOCKS tunnel
+
+Append `:<listener-port>` to the hostname when the HTTPS listener is not
+using port `443`:
 
 ```bash
 curl -i -X OPTIONS \
@@ -243,20 +293,39 @@ tunnel instructions to reference the LB DNS name instead.
 SLIM (consumed by the **Splunk AI Toolkit** app) is a **separate Kubernetes
 Service and NodePort** from SAIA (consumed by the **Splunk AI Assistant**
 app) — it needs its own backend pool and its own hostname on the LB, not a
-path appended to the SAIA one. Both can share the same HTTPS listener and
-wildcard certificate as the SAIA config above:
+path appended to the SAIA one.
+
+**On an L7 LB** (HAProxy, ALB, F5 in HTTP mode) — the kind that inspects the
+HTTP `Host` header — both hostnames can share one HTTPS listener and wildcard
+certificate, routing by `Host` to the matching backend pool:
 
 ```
-HTTPS :443 (wildcard cert)
+HTTPS :443 (wildcard cert, Host-header routing)
   ├── Host saia.company.example → SAIA pool → worker-1:30080, worker-2:30080, ...
   └── Host slim.company.example → SLIM pool → worker-1:30081, worker-2:30081, ...
 ```
+
+**On an L4 LB** (cloud NLB) — this doesn't work. An NLB forwards purely on
+IP:port and never reads the `Host` header, so both hostnames pointed at one
+`:443` listener would resolve to the same backend pool and misroute one of
+the two apps. Use two separate listeners/VIPs instead — e.g.
+`saia.company.example:443` → SAIA target group, and
+`slim.company.example:8443` (or a second VIP on `:443`) → SLIM target group.
+The same wildcard certificate can still be reused across both listeners —
+needing separate listeners is an L4 routing limitation, not a certificate
+limitation.
+
+**Single-node clusters:** the [single-node backend-target
+note](#1-confirm-the-nodeport-and-worker-ips) in step 1 applies to both
+NodePorts here — if `nodes.existingIPs.workers` is empty, both the SAIA
+(`30080`) and SLIM (`30081`) backend pools target
+`nodes.existingIPs.controllers[0]`, not an empty worker list.
 
 | | SAIA | SLIM |
 |---|---|---|
 | NodePort | `30080` (`nodePort` in `k0s-cluster-config.yaml`) | `30081` (`slimNodePort` in `k0s-cluster-config.yaml`) |
 | Health check | `GET /nginx_health` → `200` | `GET /health` → `200` |
-| Onboarded URL | `https://saia.company.example` | `https://slim.company.example/tenant/slim-api/v1alpha1` |
+| Onboarded URL | `https://saia.company.example` (add `:<port>` if nonstandard, e.g. `https://saia.company.example:8443`) | `https://slim.company.example/tenant/slim-api/v1alpha1` (add `:<port>` if nonstandard, e.g. `https://slim.company.example:8444/tenant/slim-api/v1alpha1`) |
 | Consumed by | Splunk AI Assistant app | Splunk AI Toolkit app |
 
 - SLIM's onboarded URL must include the `/tenant/slim-api/v1alpha1` path —
@@ -277,7 +346,9 @@ HTTPS :443 (wildcard cert)
   each app expects the other's response schema and neither works against
   the wrong endpoint.
 - As with SAIA, confirm from the Search Head itself (not just a browser)
-  that SLIM is reachable through the LB, when the SLIM feature is enabled:
+  that SLIM is reachable through the LB, when the SLIM feature is enabled.
+  Append `:<listener-port>` to the hostname when the HTTPS listener is not
+  using port `443`:
 
   ```bash
   curl -fsS -o /dev/null -w '%{http_code}\n' https://slim.company.example/health
