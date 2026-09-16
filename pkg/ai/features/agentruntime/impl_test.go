@@ -150,6 +150,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 			Replicas:              1,
 			NodeSelector:          map[string]string{"splunk.ai/workload-type": "cpu"},
 			Metrics:               aiv1.MetricsConfig{Enabled: true, Path: "/metrics"},
+			ServiceTemplate:       corev1.Service{Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort}},
 		},
 	}
 	defaultAgentRuntimeSpec(ai)
@@ -187,7 +188,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 
 	svc := &corev1.Service{}
 	require.NoError(t, fakeClient.Get(context.Background(),
-		types.NamespacedName{Name: "stack-agentruntime-mltk-agentruntime-service", Namespace: "default"}, svc))
+		types.NamespacedName{Name: "stack-agentruntime-mltk-svc", Namespace: "default"}, svc))
 	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
 	assert.Equal(t, map[string]string{"app": ai.Name, "component": ai.Name}, svc.Spec.Selector)
 
@@ -202,6 +203,46 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource)
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
 	assert.Equal(t, int32(60), *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
+}
+
+func TestAgentRuntimeReconciler_ReconcilesServiceMonitorLikeSAIA(t *testing.T) {
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stack-agentruntime-mltk",
+			Namespace: "default",
+			UID:       types.UID("agent-runtime-monitor-uid"),
+		},
+		Spec: aiv1.AIServiceSpec{
+			Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Metrics: aiv1.MetricsConfig{
+				Enabled: true,
+				Path:    "/custom-metrics",
+				Port:    12345,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	reconciler := &AgentRuntimeReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	require.NoError(t, reconciler.reconcileServiceMonitor(context.Background(), ai))
+
+	monitor := &monitoringv1.ServiceMonitor{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      ai.Name + "-agentruntime-metrics",
+		Namespace: ai.Namespace,
+	}, monitor))
+	assert.Equal(t, agentRuntimeSelectorLabels(ai), monitor.Spec.Selector.MatchLabels)
+	require.Len(t, monitor.Spec.Endpoints, 1)
+	assert.Equal(t, "metrics", monitor.Spec.Endpoints[0].Port)
+	assert.Equal(t, "/custom-metrics", monitor.Spec.Endpoints[0].Path)
+	assert.Equal(t, "http", monitor.Spec.Endpoints[0].Scheme)
+	assert.Equal(t, ai.UID, monitor.OwnerReferences[0].UID)
 }
 
 func TestAgentRuntimeReconciler_DefaultsOmittedHPAFields(t *testing.T) {
@@ -247,13 +288,13 @@ func TestAgentRuntimeReconciler_DefaultsOmittedHPAFields(t *testing.T) {
 
 func TestAgentRuntimeServiceName_StaysWithinDNSLabelLimit(t *testing.T) {
 	shortName := "stack-agentruntime-mltk"
-	assert.Equal(t, shortName+"-agentruntime-service", agentRuntimeServiceName(shortName))
+	assert.Equal(t, shortName+"-svc", agentRuntimeServiceName(shortName))
 
-	longName := "agentruntime-dev-ai-platform-agentruntime-mltk"
+	longName := "very-long-ai-platform-name-for-agent-runtime-provider-name-bounds-agentruntime-mltk"
 	serviceName := agentRuntimeServiceName(longName)
 	require.LessOrEqual(t, len(serviceName), 63)
-	assert.True(t, strings.HasSuffix(serviceName, "-agentruntime-service"))
-	assert.NotEqual(t, longName+"-agentruntime-service", serviceName)
+	assert.True(t, strings.HasSuffix(serviceName, "-svc"))
+	assert.NotEqual(t, longName+"-svc", serviceName)
 }
 
 func TestAgentRuntimeReconciler_BoundsSelectorsForLongAIServiceName(t *testing.T) {
