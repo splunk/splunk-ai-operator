@@ -168,7 +168,25 @@ pf_summary(){
 # ====== TEMP FILES ======
 TMP_FILES=()
 cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/null || true; }
-trap cleanup_tmp EXIT
+
+# Set true for the duration of main_install so an abort (any err()/exit call,
+# e.g. one of the many inside install_splunk_standalone/install_ai_platform_cr)
+# still collects a support bundle before the process exits. err() itself does
+# an unconditional `exit 1`, which otherwise skips straight past main_install's
+# own diagnostics block.
+_INSTALL_IN_PROGRESS=false
+
+_on_exit() {
+  local rc=$?
+  cleanup_tmp
+  if [[ ${rc} -ne 0 && "${_INSTALL_IN_PROGRESS}" == "true" && "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+    _INSTALL_IN_PROGRESS=false
+    warn "Install aborted (exit ${rc}) — collecting support bundle..."
+    diagnose || true
+    show_step_summary || true
+  fi
+}
+trap _on_exit EXIT
 
 # ====== STEP PROGRESS TRACKER ======
 # Usage: step_start "Install cert-manager"   → prints [STEP N/TOTAL] banner
@@ -6671,6 +6689,73 @@ patch_k0s_slim_public_service_workaround() {
   fi
 }
 
+# ====== PARALLEL PHASE RESULT HELPERS ======
+# Decide whether a parallel installation phase failed in a way that must
+# abort the stack install. Every named component is REQUIRED unless it
+# appears in optional_csv (comma-separated) — e.g. OTel and kube-prometheus
+# are advisory-only telemetry/observability add-ons, not install blockers.
+#
+# pairs: space-separated "<name>:<rc>" tokens. Echoes the space-separated
+# names of REQUIRED components whose rc was non-zero and returns 1; echoes
+# nothing and returns 0 when no required component failed (including when
+# pairs is empty).
+_phase_verdict() {
+  local pairs="$1" optional_csv="${2:-}"
+  local fatal=() pair name rc
+  for pair in ${pairs}; do
+    name="${pair%%:*}"
+    rc="${pair##*:}"
+    [[ "${rc}" == "0" ]] && continue
+    case ",${optional_csv}," in
+      *",${name},"*) continue ;;
+    esac
+    fatal+=("${name}")
+  done
+  if [[ ${#fatal[@]} -gt 0 ]]; then
+    echo "${fatal[*]}"
+    return 1
+  fi
+  return 0
+}
+
+# Wait for every background job in a parallel install phase, replay its log,
+# then apply _phase_verdict to decide whether a required component failed.
+#
+# Reads globals _PP_PIDS / _PP_NAMES, parallel arrays the caller populates
+# before invoking this (bash 3.2 on macOS has no `local -n`, so this script
+# uses fixed-name globals as out/in params throughout, e.g. POD_LINES).
+# Writes PHASE_FATAL_NAMES (space-separated names of failed required
+# components, empty on success). Returns 0 on success, 1 if a required
+# component failed — the caller decides whether/how to abort, so this
+# function never calls err() and diagnostics remain reachable.
+_await_parallel_phase() {
+  local label="$1" logdir="$2" optional_csv="${3:-}"
+  local pairs="" i name rc
+  PHASE_FATAL_NAMES=""
+  for i in "${!_PP_PIDS[@]}"; do
+    name="${_PP_NAMES[$i]}"
+    rc=0
+    wait "${_PP_PIDS[$i]}" || rc=$?
+    if [[ "${rc}" == "0" ]]; then
+      log "  ✓ ${name} completed"
+    else
+      warn "  ✗ ${name} had issues"
+    fi
+    pairs+="${name}:${rc} "
+    while IFS= read -r line; do
+      log "    [${name}] ${line}"
+    done < "${logdir}/${name}.log"
+  done
+
+  local fatal_names
+  if fatal_names=$(_phase_verdict "${pairs}" "${optional_csv}"); then
+    return 0
+  fi
+  PHASE_FATAL_NAMES="${fatal_names}"
+  warn "Required ${label} component(s) failed: ${PHASE_FATAL_NAMES}"
+  return 1
+}
+
 # ====== INSTALL FULL STACK ======
 install_ai_platform_stack() {
   log "Installing complete AI Platform stack..."
@@ -6679,75 +6764,63 @@ install_ai_platform_stack() {
 
   # --- Phase 1: Independent infrastructure (parallel) ---
   log "Phase 1: Installing independent infrastructure components in parallel..."
-  local phase1_pids=() phase1_names=() phase1_logdir
+  _PP_PIDS=() _PP_NAMES=()
+  local phase1_logdir
   phase1_logdir=$(mktemp -d)
 
   install_cert_manager > "${phase1_logdir}/cert-manager.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("cert-manager")
+  _PP_PIDS+=($!); _PP_NAMES+=("cert-manager")
 
   install_kube_prometheus > "${phase1_logdir}/kube-prometheus.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("kube-prometheus")
+  _PP_PIDS+=($!); _PP_NAMES+=("kube-prometheus")
 
   install_nvidia_host_drivers > "${phase1_logdir}/nvidia-drivers.log" 2>&1 &
-  phase1_pids+=($!); phase1_names+=("nvidia-drivers")
+  _PP_PIDS+=($!); _PP_NAMES+=("nvidia-drivers")
 
-  # Track required phase-1 tasks. cert-manager must be functional before any
-  # operator manifests containing Certificate/Issuer resources are applied;
-  # NVIDIA host drivers are required before the device plugin can start.
-  local phase1_fatal_failures=0
-  local phase1_fatal_names=()
-  for i in "${!phase1_pids[@]}"; do
-    if wait "${phase1_pids[$i]}"; then
-      log "  ✓ ${phase1_names[$i]} completed"
-    else
-      warn "  ✗ ${phase1_names[$i]} had issues"
-      case "${phase1_names[$i]}" in
-        cert-manager|nvidia-drivers)
-          phase1_fatal_failures=$((phase1_fatal_failures + 1))
-          phase1_fatal_names+=("${phase1_names[$i]}")
-          ;;
-      esac
-    fi
-    while IFS= read -r line; do
-      log "    [${phase1_names[$i]}] ${line}"
-    done < "${phase1_logdir}/${phase1_names[$i]}.log"
-  done
+  # cert-manager must be functional before any operator manifests containing
+  # Certificate/Issuer resources are applied; NVIDIA host drivers are
+  # required before the device plugin can start. kube-prometheus is
+  # monitoring-only and does not block the rest of the stack.
+  local phase1_rc=0
+  _await_parallel_phase "Phase 1" "${phase1_logdir}" "kube-prometheus" || phase1_rc=$?
   rm -rf "${phase1_logdir}"
 
-  if [[ ${phase1_fatal_failures} -gt 0 ]]; then
-    err "Required Phase 1 component(s) failed: ${phase1_fatal_names[*]}. Aborting before dependent operators are installed. Fix the errors above and re-run."
+  if [[ ${phase1_rc} -ne 0 ]]; then
+    warn "Aborting before dependent operators are installed. Fix the errors above and re-run."
+    return 1
   fi
 
   ensure_s3compat_credentials
 
   # --- Phase 2: cert-manager-dependent components (parallel) ---
   log "Phase 2: Installing cert-manager-dependent components in parallel..."
-  local phase2_pids=() phase2_names=() phase2_logdir
+  _PP_PIDS=() _PP_NAMES=()
+  local phase2_logdir
   phase2_logdir=$(mktemp -d)
 
   install_otel_operator_and_contrib_collector > "${phase2_logdir}/otel-operator.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("otel-operator")
+  _PP_PIDS+=($!); _PP_NAMES+=("otel-operator")
 
   install_ray_operator > "${phase2_logdir}/ray-operator.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("ray-operator")
+  _PP_PIDS+=($!); _PP_NAMES+=("ray-operator")
 
   install_splunk_operator > "${phase2_logdir}/splunk-operator.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("splunk-operator")
+  _PP_PIDS+=($!); _PP_NAMES+=("splunk-operator")
 
   install_nvidia_device_plugin > "${phase2_logdir}/nvidia-device-plugin.log" 2>&1 &
-  phase2_pids+=($!); phase2_names+=("nvidia-device-plugin")
+  _PP_PIDS+=($!); _PP_NAMES+=("nvidia-device-plugin")
 
-  for i in "${!phase2_pids[@]}"; do
-    if wait "${phase2_pids[$i]}"; then
-      log "  ✓ ${phase2_names[$i]} completed"
-    else
-      warn "  ✗ ${phase2_names[$i]} had issues"
-    fi
-    while IFS= read -r line; do
-      log "    [${phase2_names[$i]}] ${line}"
-    done < "${phase2_logdir}/${phase2_names[$i]}.log"
-  done
+  # KubeRay, the Splunk Operator, and the NVIDIA device plugin are required —
+  # the AIPlatform CR applied below cannot reconcile without their CRDs.
+  # OTel is advisory-only telemetry and remains a warning, not a blocker.
+  local phase2_rc=0
+  _await_parallel_phase "Phase 2" "${phase2_logdir}" "otel-operator" || phase2_rc=$?
   rm -rf "${phase2_logdir}"
+
+  if [[ ${phase2_rc} -ne 0 ]]; then
+    warn "Aborting before dependent workloads are installed. Fix the errors above and re-run."
+    return 1
+  fi
 
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
@@ -7550,6 +7623,7 @@ _check_workload_readiness() {
   # The Splunk AI Operator surfaces .status.phase = "Ready" or a structured
   # conditions list. We accept either.
   local crd_kind ai_resource
+  local saw_slim_aiservice=0
   for crd_kind in aiplatforms.ai.splunk.com aiservices.ai.splunk.com; do
     ai_resource="${crd_kind%%.*}"
     _wl_query_crd "${crd_kind}" "${ai_resource}" '
@@ -7566,12 +7640,24 @@ _check_workload_readiness() {
       [[ -z "${line}" ]] && continue
       local ai_ns ai_name ai_phase ai_ready
       IFS="${_POD_FS}" read -r ai_ns ai_name ai_phase ai_ready <<<"${line}"
+      if [[ "${crd_kind}" == "aiservices.ai.splunk.com" && "${ai_name}" == *-slim ]]; then
+        saw_slim_aiservice=1
+      fi
       # If neither phase nor a Ready condition surfaces success, treat as pending.
       if [[ "${ai_phase}" != "Ready" && "${ai_ready}" != "True" ]]; then
         missing+=("${ai_resource} ${ai_ns}/${ai_name}: phase=${ai_phase:-unknown} Ready=${ai_ready:-Unknown}")
       fi
     done <<<"${_wl_rows}"
   done
+
+  # k0s_slim_feature_enabled() gates this correctly even when the CRD is
+  # absent (kubectl get crd fails), since it reads intent from CONFIG_FILE
+  # rather than the cluster — the generic loop above is silent in that case,
+  # which would otherwise let an enabled-but-never-created slim AIService
+  # slip through as "nothing to check" instead of "not ready".
+  if k0s_slim_feature_enabled && [[ ${saw_slim_aiservice} -eq 0 ]]; then
+    missing+=("aiservice <platform>-slim: not created (slim feature enabled)")
+  fi
 
   if (( ${#missing[@]} > 0 )); then
     # local-scoped IFS so the join doesn't leak out of this function.
@@ -7933,7 +8019,20 @@ show_platform_access_info() {
 }
 
 # ====== MAIN INSTALL FLOW ======
+# Combine install_ai_platform_stack's rc with verify_all_pods_healthy's
+# VERIFY_RC into the single 0/1 status main_install returns. Collapsed to
+# 0/1 rather than propagating VERIFY_RC's richer 1..255 range — that range
+# is meaningful for the access-info banner, not as a process exit code
+# (255 in particular is easily confused with a signal-related exit status).
+_final_install_rc() {
+  [[ "${1:-0}" != "0" ]] && return 1
+  [[ "${2:-0}" != "0" ]] && return 1
+  return 0
+}
+
 main_install() {
+  _INSTALL_IN_PROGRESS=true
+
   # Sync SILENT_INSTALL ↔ AUTO_APPROVE so both paths are consistent.
   # AUTO_APPROVE=true (legacy CI env var) implies silent; --silent flag sets AUTO_APPROVE
   # so the existing delete/clean-all confirmation gates keep working unchanged.
@@ -8148,61 +8247,72 @@ main_install() {
   # Install AI Platform stack
   phase_start "AI Platform Stack"
   step_start "Install AI Platform stack"
-  install_ai_platform_stack
-  step_ok
+  local stack_rc=0
+  install_ai_platform_stack || stack_rc=$?
+  if [[ ${stack_rc} -ne 0 ]]; then
+    step_fail "required component(s) failed — see diagnostics above"
+  else
+    step_ok
+  fi
   phase_end "AI Platform Stack"
 
-  # Run health checks
-  phase_start "Health Verification"
-  step_start "Platform health checks"
-  if check_platform_health; then
-    step_ok
-  else
-    step_fail "some components still initializing"
-    warn "Some components may still be initializing"
-  fi
-
-  # Verify every pod across every namespace, capture diagnostics for failures,
-  # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
-  # errors as ignorable when the newest posthook pod has Succeeded.
-  #
-  # The exit code conveys structured information that the post-install banner
-  # consumes via VERIFY_RC (see show_platform_access_info):
-  #   0       all pods healthy AND all workload CRs Ready
-  #   1..254  N pods unhealthy (count is clamped to this range)
-  #   255     pods healthy but workload CRs not Ready (e.g. RayService still
-  #           initialising). Distinct from "0 unhealthy" so the banner can
-  #           remain honest even when no individual pod is failing.
-  step_start "Pod health verification"
-  VERIFY_RC=0
-  verify_all_pods_healthy || VERIFY_RC=$?
-  if (( VERIFY_RC != 0 )); then
-    step_fail "${VERIFY_RC} pod(s)/CR(s) not ready — see diagnostics above"
-    warn "Some components are not fully ready — see diagnostics above for remediation steps."
-    # Auto-collect a support bundle so customers have everything in one file.
-    # Set AUTO_DIAGNOSE=false to suppress (e.g. in CI where disk space is tight).
-    if [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
-      log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
-      diagnose || true
+  # A required component already failed, so the AIPlatform/AIService CRDs
+  # this section checks may not even exist yet (_check_workload_readiness is
+  # silent on a missing CRD, which would otherwise report a misleading "0
+  # unhealthy"). Skip straight to diagnostics/summary/return.
+  if [[ ${stack_rc} -eq 0 ]]; then
+    # Run health checks
+    phase_start "Health Verification"
+    step_start "Platform health checks"
+    if check_platform_health; then
+      step_ok
+    else
+      step_fail "some components still initializing"
+      warn "Some components may still be initializing"
     fi
-  else
-    step_ok
+
+    # Verify every pod across every namespace, capture diagnostics for failures,
+    # and emit targeted recommendations. Treats stale saia-vector-db-setup-posthook
+    # errors as ignorable when the newest posthook pod has Succeeded.
+    #
+    # The exit code conveys structured information that the post-install banner
+    # consumes via VERIFY_RC (see show_platform_access_info):
+    #   0       all pods healthy AND all workload CRs Ready
+    #   1..254  N pods unhealthy (count is clamped to this range)
+    #   255     pods healthy but workload CRs not Ready (e.g. RayService still
+    #           initialising). Distinct from "0 unhealthy" so the banner can
+    #           remain honest even when no individual pod is failing.
+    step_start "Pod health verification"
+    VERIFY_RC=0
+    verify_all_pods_healthy || VERIFY_RC=$?
+    if (( VERIFY_RC != 0 )); then
+      step_fail "${VERIFY_RC} pod(s)/CR(s) not ready — see diagnostics above"
+      warn "Some components are not fully ready — see diagnostics above for remediation steps."
+      # Auto-collect a support bundle so customers have everything in one file.
+      # Set AUTO_DIAGNOSE=false to suppress (e.g. in CI where disk space is tight).
+      if [[ "${AUTO_DIAGNOSE:-true}" != "false" ]]; then
+        log "Auto-collecting support bundle (set AUTO_DIAGNOSE=false to suppress)..."
+        diagnose || true
+      fi
+    else
+      step_ok
+    fi
+    phase_end "Health Verification"
   fi
-  phase_end "Health Verification"
 
   show_step_summary
 
   # Show platform access information. Reads VERIFY_RC to choose between a
   # success banner and a "partially ready" banner with an inline summary.
-  #
-  # show_platform_access_info itself returns nonzero when VERIFY_RC != 0,
-  # which is useful for sourced contexts (CI wrappers can branch on the
-  # function's return). But for the install CLI command we deliberately
-  # swallow that return — install completing with an actionable warning
-  # banner should NOT cause callers chaining via `&&` to silently abort.
-  # The banner already tells the operator what's wrong; failing the exit
-  # code on top of that just breaks automation.
   show_platform_access_info || true
+
+  _INSTALL_IN_PROGRESS=false
+
+  # install now faithfully reports failure: non-zero when a required
+  # component failed outright, or when AIPlatform/Ray/SAIA/Slim never
+  # reached Ready. Automation chaining `install && ...` relies on this —
+  # a partially-ready platform must not look like a successful install.
+  _final_install_rc "${stack_rc}" "${VERIFY_RC}"
 }
 
 # ====== MAIN DELETE FLOW ======
@@ -9042,7 +9152,9 @@ case "${_CMD}" in
         *) echo "Unknown install option: $1" >&2; usage >&2; exit 1 ;;
       esac
     done
-    main_install
+    _mi_rc=0
+    main_install || _mi_rc=$?
+    exit "${_mi_rc}"
     ;;
   validate)
     validate_config

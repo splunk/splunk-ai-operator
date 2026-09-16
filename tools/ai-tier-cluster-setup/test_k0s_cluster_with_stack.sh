@@ -865,8 +865,8 @@ assert_eq "cert-manager recovery waits on deployments instead of obsolete pod UI
 assert_eq "cert-manager admission probe is a non-persistent server dry run" \
   "1" "$(_extract_fn wait_for_cert_manager_webhook | grep -c 'kubectl create --dry-run=server' | tr -d '[:space:]')"
 
-assert_eq "cert-manager phase-one failure is fatal" \
-  "1" "$(grep -A50 'Track required phase-1 tasks' "${SCRIPT}" | grep -c 'cert-manager|nvidia-drivers' | tr -d '[:space:]')"
+assert_eq "cert-manager phase-one failure is fatal (only kube-prometheus is optional)" \
+  "1" "$(grep -A20 'Phase 1: Installing independent infrastructure' "${SCRIPT}" | grep -c '_await_parallel_phase "Phase 1" "\${phase1_logdir}" "kube-prometheus"' | tr -d '[:space:]')"
 
 # ── Tests: air-gap model staging contract ─────────────────────────────────────
 
@@ -1688,6 +1688,220 @@ assert_eq "read failure never applies a Standalone manifest" "" \
   "$(cat "${_forbidden_events}")"
 
 rm -rf "${_AIP4614_TMPDIR}"
+
+# ── Tests: script result semantics (fix/script-result-semantics) ──────────────
+# install must exit non-zero when a REQUIRED phase component fails or when a
+# workload CR never reaches Ready, while an OTel-only failure stays a warning.
+
+suite "_phase_verdict"
+echo "▶ _phase_verdict"
+
+_exercise_phase_verdict() (
+  eval "$(_extract_fn _phase_verdict)"
+  _phase_verdict "$1" "$2"
+)
+
+assert_rc "required component failure returns 1" 1 \
+  _exercise_phase_verdict "ray-operator:1" ""
+assert_eq "required component failure echoes its name" \
+  "ray-operator" "$(_exercise_phase_verdict "ray-operator:1" "")"
+
+assert_rc "optional-only failure returns 0" 0 \
+  _exercise_phase_verdict "otel-operator:1" "otel-operator"
+assert_eq "optional-only failure echoes nothing" \
+  "" "$(_exercise_phase_verdict "otel-operator:1" "otel-operator")"
+
+assert_rc "mixed required+optional failure returns 1" 1 \
+  _exercise_phase_verdict "otel-operator:1 ray-operator:1" "otel-operator"
+assert_eq "mixed required+optional failure names only the required component" \
+  "ray-operator" "$(_exercise_phase_verdict "otel-operator:1 ray-operator:1" "otel-operator")"
+
+assert_rc "all-zero pairs return 0" 0 \
+  _exercise_phase_verdict "cert-manager:0 nvidia-drivers:0" "kube-prometheus"
+assert_rc "empty pairs return 0 (bash 3.2 empty-array safety)" 0 \
+  _exercise_phase_verdict "" ""
+
+suite "_final_install_rc"
+echo "▶ _final_install_rc"
+
+_exercise_final_install_rc() (
+  eval "$(_extract_fn _final_install_rc)"
+  _final_install_rc "$1" "$2"
+)
+
+assert_rc "stack ok, verify ok → 0" 0 _exercise_final_install_rc 0 0
+assert_rc "stack failed, verify ok → 1" 1 _exercise_final_install_rc 1 0
+assert_rc "stack ok, verify CR-not-ready(255) → 1" 1 _exercise_final_install_rc 0 255
+assert_rc "stack ok, verify 3 unhealthy pods → 1" 1 _exercise_final_install_rc 0 3
+
+suite "install_ai_platform_stack required-vs-optional failure propagation"
+echo "▶ install_ai_platform_stack required-vs-optional failure propagation"
+
+# Drive the real install_ai_platform_stack with every installer/patcher
+# stubbed. _FAIL_LIST names the component(s) whose stub should fail; every
+# other stub succeeds and records its name to event_file so the test can
+# prove whether the sequential tail (Splunk Standalone onward) ran.
+_exercise_install_stack_phase() (
+  local fail_list="$1" event_file="$2"
+  : >"${event_file}"
+
+  eval "$(_extract_fn _phase_verdict)"
+  eval "$(_extract_fn _await_parallel_phase)"
+  eval "$(_extract_fn install_ai_platform_stack)"
+
+  log() { :; }
+  warn() { :; }
+  err() { exit 1; }
+  ensure_namespace() { :; }
+  ensure_s3compat_credentials() { :; }
+  create_image_pull_secrets() { :; }
+  install_metallb() { :; }
+  install_splunk_ai_operator() { :; }
+  patch_k0s_saia_public_service_workaround() { :; }
+  patch_k0s_slim_public_service_workaround() { :; }
+  wait_for_splunk_standalone() { :; }
+
+  _stub_component() {
+    local name="$1"
+    printf '%s\n' "${name}" >>"${event_file}"
+    case ",${fail_list}," in
+      *",${name},"*) return 1 ;;
+    esac
+    return 0
+  }
+
+  install_cert_manager() { _stub_component cert-manager; }
+  install_kube_prometheus() { _stub_component kube-prometheus; }
+  install_nvidia_host_drivers() { _stub_component nvidia-drivers; }
+  install_otel_operator_and_contrib_collector() { _stub_component otel-operator; }
+  install_ray_operator() { _stub_component ray-operator; }
+  install_splunk_operator() { _stub_component splunk-operator; }
+  install_nvidia_device_plugin() { _stub_component nvidia-device-plugin; }
+  install_splunk_standalone() { _stub_component install_splunk_standalone; }
+  install_ai_platform_cr() { _stub_component install_ai_platform_cr; }
+
+  AI_NS=fixture-ns
+  install_ai_platform_stack
+)
+
+_ray_fail_events="$(mktemp)"
+assert_rc "required Phase-2 failure (ray-operator) aborts the stack install" 1 \
+  _exercise_install_stack_phase "ray-operator" "${_ray_fail_events}"
+assert_eq "required Phase-2 failure skips the sequential tail (no AIPlatform CR applied)" \
+  "0" "$(grep -c '^install_ai_platform_cr$' "${_ray_fail_events}")"
+rm -f "${_ray_fail_events}"
+
+_otel_fail_events="$(mktemp)"
+assert_rc "OTel-only Phase-2 failure does not abort the stack install" 0 \
+  _exercise_install_stack_phase "otel-operator" "${_otel_fail_events}"
+assert_eq "OTel-only Phase-2 failure still runs the sequential tail" \
+  "1" "$(grep -c '^install_ai_platform_cr$' "${_otel_fail_events}")"
+rm -f "${_otel_fail_events}"
+
+_cert_fail_events="$(mktemp)"
+assert_rc "required Phase-1 failure (cert-manager) aborts before Phase 2 even starts" 1 \
+  _exercise_install_stack_phase "cert-manager" "${_cert_fail_events}"
+assert_eq "required Phase-1 failure never reaches Phase-2 installers" \
+  "0" "$(grep -c '^ray-operator$' "${_cert_fail_events}")"
+rm -f "${_cert_fail_events}"
+
+suite "_check_workload_readiness readiness-failure semantics"
+echo "▶ _check_workload_readiness readiness-failure semantics"
+
+_exercise_workload_readiness() (
+  local scenario="$1"
+  eval "$(grep '^_POD_FS=' "${SCRIPT}")"
+  eval "$(_extract_fn k0s_slim_feature_enabled)"
+  eval "$(_extract_fn _check_workload_readiness)"
+
+  CONFIG_FILE=/dev/null
+  yq() {
+    case "${scenario}" in
+      slim-enabled-not-created) echo "slim" ;;
+      *) echo "" ;;
+    esac
+  }
+
+  kubectl() {
+    local args=" $* "
+    if [[ "${args}" == *' get crd '* ]]; then
+      case "${scenario}" in
+        aiplatform-not-ready)
+          [[ "${args}" == *'aiplatforms.ai.splunk.com'* ]] && return 0
+          return 1
+          ;;
+        slim-enabled-not-created)
+          [[ "${args}" == *'aiservices.ai.splunk.com'* ]] && return 0
+          return 1
+          ;;
+        all-ready)
+          [[ "${args}" == *'aiplatforms.ai.splunk.com'* || "${args}" == *'aiservices.ai.splunk.com'* ]] && return 0
+          return 1
+          ;;
+      esac
+      return 1
+    fi
+    if [[ "${args}" == *' get aiplatforms '* ]]; then
+      case "${scenario}" in
+        aiplatform-not-ready)
+          echo '{"items":[{"metadata":{"namespace":"ai","name":"platform"},"status":{"phase":"Pending","conditions":[]}}]}'
+          ;;
+        all-ready)
+          echo '{"items":[{"metadata":{"namespace":"ai","name":"platform"},"status":{"phase":"Ready","conditions":[]}}]}'
+          ;;
+        *) echo '{"items":[]}' ;;
+      esac
+      return 0
+    fi
+    if [[ "${args}" == *' get aiservices '* ]]; then
+      case "${scenario}" in
+        slim-enabled-not-created)
+          echo '{"items":[{"metadata":{"namespace":"ai","name":"platform-saia"},"status":{"phase":"Ready","conditions":[]}}]}'
+          ;;
+        all-ready)
+          echo '{"items":[{"metadata":{"namespace":"ai","name":"platform-slim"},"status":{"phase":"Ready","conditions":[]}}]}'
+          ;;
+        *) echo '{"items":[]}' ;;
+      esac
+      return 0
+    fi
+    return 1
+  }
+
+  # Guarded exactly like the real call site (:7067) — _wl_query_crd's
+  # set -e/set +e toggling restores errexit unconditionally, so a bare
+  # unguarded call here would abort this subshell on the first non-zero
+  # return instead of letting us inspect WORKLOAD_PENDING_REASON.
+  local rc=0
+  _check_workload_readiness || rc=$?
+  printf 'rc=%s reason=%s' "${rc}" "${WORKLOAD_PENDING_REASON}"
+)
+
+assert_eq "not-Ready AIPlatform is reported as pending" "1" \
+  "$(_exercise_workload_readiness aiplatform-not-ready | grep -o 'rc=[0-9]*' | cut -d= -f2)"
+assert_eq "not-Ready AIPlatform reason names the AIPlatform" "1" \
+  "$(_exercise_workload_readiness aiplatform-not-ready | grep -c 'aiplatforms ai/platform')"
+
+assert_eq "slim enabled but never created is reported as pending" "1" \
+  "$(_exercise_workload_readiness slim-enabled-not-created | grep -o 'rc=[0-9]*' | cut -d= -f2)"
+assert_eq "slim gap reason mentions the slim AIService" "1" \
+  "$(_exercise_workload_readiness slim-enabled-not-created | grep -c 'slim')"
+
+assert_eq "fully-Ready AIPlatform/AIService(slim) reports success" "0" \
+  "$(_exercise_workload_readiness all-ready | grep -o 'rc=[0-9]*' | cut -d= -f2)"
+
+suite "install/CLI result propagation (structural)"
+echo "▶ install/CLI result propagation (structural)"
+
+assert_eq "main_install folds stack_rc and VERIFY_RC into a single return" "1" \
+  "$(grep -c '_final_install_rc "\${stack_rc}" "\${VERIFY_RC}"' "${SCRIPT}")"
+assert_eq "install) CLI dispatch captures and exits main_install's rc" "1" \
+  "$(awk '/^  install\)/{f=1} f && /main_install \|\| _mi_rc=\$\?/{print 1; exit} f && /^  [a-z-]+\)/ && !/^  install\)/{exit}' "${SCRIPT}")"
+assert_eq "otel-operator remains optional in Phase 2" "1" \
+  "$(grep -c '_await_parallel_phase "Phase 2" "\${phase2_logdir}" "otel-operator"' "${SCRIPT}")"
+assert_eq "kube-prometheus remains optional in Phase 1" "1" \
+  "$(grep -c '_await_parallel_phase "Phase 1" "\${phase1_logdir}" "kube-prometheus"' "${SCRIPT}")"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""
