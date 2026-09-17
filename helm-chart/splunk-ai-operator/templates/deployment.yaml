@@ -82,6 +82,8 @@ spec:
             value: {{ .Values.slimApiImage }}
           - name: RELATED_IMAGE_AGENT_RUNTIME_BASE
             value: {{ .Values.agentRuntimeBaseImage | quote }}
+          - name: RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP
+            value: {{ .Values.agentRuntimeSchemaSetupImage | quote }}
 {{- range $version, $image := .Values.agentRuntimeBaseImages }}
           - name: RELATED_IMAGE_AGENT_RUNTIME_BASE_{{ $version | upper | replace "." "_" | replace "-" "_" }}
             value: {{ $image | quote }}

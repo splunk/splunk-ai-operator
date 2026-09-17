@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,6 +30,7 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	require.NoError(t, corev1.AddToScheme(s))
 	require.NoError(t, appsv1.AddToScheme(s))
 	require.NoError(t, autoscalingv2.AddToScheme(s))
+	require.NoError(t, batchv1.AddToScheme(s))
 	require.NoError(t, monitoringv1.AddToScheme(s))
 	require.NoError(t, certmanagerv1.AddToScheme(s))
 	return s
@@ -38,6 +40,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	ai := &aiv1.AIService{
@@ -57,12 +60,31 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	checkpointSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "mltk-postgres", Namespace: "default", ResourceVersion: "1"},
+		Data: map[string][]byte{
+			"PG_HOST":     []byte("postgres.default.svc.cluster.local"),
+			"PG_PORT":     []byte("5432"),
+			"PG_USER":     []byte("user"),
+			"PG_PASSWORD": []byte("password"),
+			"PG_DBNAME":   []byte("checkpoints"),
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, checkpointSecret).Build()
 	factory := &AgentRuntimeFactory{}
 	handler, err := factory.New(context.Background(), fakeClient, scheme, ai, record.NewFakeRecorder(20))
 	require.NoError(t, err)
 
-	require.NoError(t, handler.Reconcile(context.Background(), ai))
+	require.ErrorContains(t, handler.Reconcile(context.Background(), ai), "waiting for completion")
+	job := &batchv1.Job{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: ai.Status.SchemaJobId, Namespace: ai.Namespace,
+	}, job))
+	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: ai.Name + "-agentruntime-deployment", Namespace: ai.Namespace,
+	}, &appsv1.Deployment{}))
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	require.NoError(t, fakeClient.Status().Update(context.Background(), job))
 	require.NoError(t, handler.Reconcile(context.Background(), ai))
 
 	for _, object := range []ctrlclient.Object{
@@ -92,6 +114,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	assertConditionTrue(t, ai.Status.Conditions, "ValidateReady")
 	assertConditionTrue(t, ai.Status.Conditions, "ServiceAccountReady")
 	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeConfigMapReady")
+	assertConditionTrue(t, ai.Status.Conditions, "PostgresSchemaSetupReady")
 	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeDeploymentReady")
 	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeServiceReady")
 	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeHPAReady")
@@ -443,6 +466,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenValidationFails(t *testing
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
+	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	ai := &aiv1.AIService{
@@ -483,6 +507,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenAgentModuleIsInvalid(t *te
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTK-AgentLoader")
+	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	ai := &aiv1.AIService{
@@ -544,6 +569,30 @@ func assertEnv(t *testing.T, env []corev1.EnvVar, name, value string) {
 		}
 	}
 	t.Fatalf("missing env %s", name)
+}
+
+func TestSchemaJobNeedsRerunRequiresBothFingerprintsToChange(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		schemaJobManagedAnnotation:        schemaJobManagedValue,
+		schemaJobDeploymentHashAnnotation: "deployment-old",
+		schemaJobInputHashAnnotation:      "input-old",
+	}}}
+
+	assert.False(t, schemaJobNeedsRerun(job, "deployment-new", "input-old"))
+	assert.False(t, schemaJobNeedsRerun(job, "deployment-old", "input-new"))
+	assert.True(t, schemaJobNeedsRerun(job, "deployment-new", "input-new"))
+}
+
+func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {
+	secret := &corev1.Secret{Data: map[string][]byte{"DATABASE_URL": []byte("postgresql://legacy")}}
+	featureEnv := map[string]string{
+		"PG_HOST":     "postgres",
+		"PG_USER":     "user",
+		"PG_PASSWORD": "password",
+		"PG_DBNAME":   "checkpoints",
+	}
+
+	require.NoError(t, validateSchemaSetupCredentials(secret, featureEnv))
 }
 
 func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {

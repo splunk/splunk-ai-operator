@@ -166,7 +166,8 @@ if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
   log "Generated MINIO_ROOT_PASSWORD (save it for cluster-config.yaml)"
 fi
 
-# Install MinIO binary (use stable "latest" URL; archive URLs can 404 and return HTML)
+# Install MinIO AIStor binaries. The community-edition download endpoint was
+# retired and now returns HTTP 410; AIStor is the current supported binary path.
 install_minio_binary() {
   local arch
   arch="$(uname -m)"
@@ -175,10 +176,10 @@ install_minio_binary() {
     aarch64|arm64) arch=arm64 ;;
     *) err "Unsupported arch: $arch"; exit 1 ;;
   esac
-  local url="https://dl.min.io/server/minio/release/linux-${arch}/minio"
+  local url="https://dl.min.io/aistor/minio/release/linux-${arch}/minio"
   local tmp="/tmp/minio.$$"
   log "Downloading MinIO (linux-${arch})..."
-  if ! curl -sSL -o "$tmp" "$url"; then
+  if ! curl -fsSL --retry 3 --connect-timeout 20 -o "$tmp" "$url"; then
     err "Download failed. Check network or try: curl -sSL -o /tmp/minio '$url'"
     rm -f "$tmp"
     exit 1
@@ -207,7 +208,8 @@ install_mc() {
   esac
   local tmp="/tmp/mc.$$"
   log "Downloading MinIO Client (mc)..."
-  if ! curl -sSL -o "$tmp" "https://dl.min.io/client/mc/release/linux-${arch}/mc"; then
+  local url="https://dl.min.io/aistor/mc/release/linux-${arch}/mc"
+  if ! curl -fsSL --retry 3 --connect-timeout 20 -o "$tmp" "$url"; then
     err "Download failed for mc."
     rm -f "$tmp"
     exit 1

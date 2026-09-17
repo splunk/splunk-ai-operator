@@ -2,6 +2,8 @@ package agentruntime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -16,7 +18,9 @@ import (
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,14 +33,20 @@ import (
 )
 
 const (
-	defaultMinReplicas          int32 = 1
-	defaultMaxReplicas          int32 = 4
-	defaultTargetCPUUtilization int32 = 60
-	defaultAgentRuntimeHTTPPort int32 = 8080
-	defaultAgentRuntimeMetrics  int32 = 9090
-	maxDNSLabelLength                 = 63
-	mtlsTerminationOperator           = "operator"
-	sharedPackagesPath                = "/shared-packages"
+	defaultMinReplicas                int32 = 1
+	defaultMaxReplicas                int32 = 4
+	defaultTargetCPUUtilization       int32 = 60
+	defaultAgentRuntimeHTTPPort       int32 = 8080
+	defaultAgentRuntimeMetrics        int32 = 9090
+	maxDNSLabelLength                       = 63
+	mtlsTerminationOperator                 = "operator"
+	sharedPackagesPath                      = "/shared-packages"
+	schemaSetupImageEnv                     = "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP"
+	schemaJobDeploymentHashAnnotation       = "ai.splunk.com/agentruntime-deployment-hash"
+	schemaJobInputHashAnnotation            = "ai.splunk.com/agentruntime-schema-input-hash"
+	schemaJobManagedAnnotation              = "ai.splunk.com/agentruntime-schema-job"
+	schemaJobManagedValue                   = "true"
+	schemaJobBackoffLimit             int32 = 1
 )
 
 var agentModulePattern = regexp.MustCompile(
@@ -74,6 +84,7 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 		{"ServiceAccount", r.reconcileServiceAccount},
 		{"AgentRuntimeConfigMap", r.reconcileConfigMap},
 		{"Certificate", r.reconcileCertificate},
+		{"PostgresSchemaSetup", r.reconcilePostgresSchemaSetup},
 		{"AgentRuntimeDeployment", r.reconcileDeployment},
 		{"AgentRuntimeService", r.reconcileService},
 		{"AgentRuntimeHPA", r.reconcileHPA},
@@ -119,6 +130,10 @@ func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1
 		return fmt.Errorf("provider must be set for agentruntime")
 	}
 	if _, err := resolveAgentRuntimeConfig(ai); err != nil {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
+		return err
+	}
+	if _, err := resolveSchemaSetupImage(); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
 		return err
 	}
@@ -281,6 +296,244 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 		},
 	})
 	return err
+}
+
+func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Context, ai *aiv1.AIService) error {
+	config, err := resolveAgentRuntimeConfig(ai)
+	if err != nil {
+		return err
+	}
+	schemaImage, err := resolveSchemaSetupImage()
+	if err != nil {
+		return err
+	}
+
+	checkpointSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      ai.Spec.CheckpointDbSecretRef,
+		Namespace: ai.Namespace,
+	}, checkpointSecret); err != nil {
+		return fmt.Errorf("get checkpoint DB Secret %q: %w", ai.Spec.CheckpointDbSecretRef, err)
+	}
+	if err := validateSchemaSetupCredentials(checkpointSecret, ai.Spec.Feature.Env); err != nil {
+		return err
+	}
+
+	deploymentHash := agentRuntimeDeploymentHash(ai, config)
+	inputHash := agentRuntimeSchemaInputHash(ai, schemaImage, checkpointSecret)
+	job := &batchv1.Job{}
+	if ai.Status.SchemaJobId != "" {
+		err := r.Get(ctx, types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, job)
+		if err == nil {
+			if !metav1.IsControlledBy(job, ai) {
+				return fmt.Errorf("postgres schema setup Job %q is not owned by AIService %q", job.Name, ai.Name)
+			}
+			if !schemaJobNeedsRerun(job, deploymentHash, inputHash) {
+				if schemaJobSucceeded(job) {
+					return nil
+				}
+				if schemaJobFailed(job) {
+					return fmt.Errorf("postgres schema setup Job %q failed", job.Name)
+				}
+				return fmt.Errorf("postgres schema setup Job %q is still running", job.Name)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get postgres schema setup Job %q: %w", ai.Status.SchemaJobId, err)
+		}
+		ai.Status.SchemaJobId = ""
+	}
+
+	labels, annotations := labelsAndAnnotations(ai)
+	labels["component"] = "agentruntime-schema-setup"
+	annotations[schemaJobDeploymentHashAnnotation] = deploymentHash
+	annotations[schemaJobInputHashAnnotation] = inputHash
+	annotations[schemaJobManagedAnnotation] = schemaJobManagedValue
+	job = &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        dnsLabelName(ai.Name, "schema-"+shortHash(deploymentHash+"-"+inputHash)),
+			Namespace:   ai.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+	}
+	if err := controllerutil.SetControllerReference(ai, job, r.Scheme); err != nil {
+		return fmt.Errorf("ownerref on postgres schema setup Job: %w", err)
+	}
+
+	featureEnv := buildSchemaSetupEnv(ai.Spec.Feature.Env)
+	job.Spec = batchv1.JobSpec{
+		BackoffLimit:            ptr(schemaJobBackoffLimit),
+		TTLSecondsAfterFinished: ptr(int32(86400)),
+		Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels},
+			Spec: corev1.PodSpec{
+				ServiceAccountName: ai.Spec.ServiceAccountName,
+				RestartPolicy:      corev1.RestartPolicyNever,
+				Containers: []corev1.Container{{
+					Name:            "schema-setup",
+					Image:           schemaImage,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Env:             featureEnv,
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: ai.Spec.CheckpointDbSecretRef},
+						},
+					}},
+				}},
+				Affinity:         &ai.Spec.Affinity,
+				Tolerations:      ai.Spec.Tolerations,
+				NodeSelector:     ai.Spec.NodeSelector,
+				ImagePullSecrets: ai.Spec.ImagePullSecrets,
+			},
+		},
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, job, func() error {
+		return nil
+	}); err != nil {
+		return fmt.Errorf("create postgres schema setup Job: %w", err)
+	}
+	ai.Status.SchemaJobId = job.Name
+	return fmt.Errorf("created postgres schema setup Job %q, waiting for completion", job.Name)
+}
+
+func validateSchemaSetupCredentials(secret *corev1.Secret, featureEnv map[string]string) error {
+	for _, name := range []string{"PG_HOST", "PG_USER", "PG_DBNAME", "PG_PASSWORD"} {
+		if strings.TrimSpace(featureEnv[name]) == "" && len(secret.Data[name]) == 0 {
+			return fmt.Errorf("postgres schema setup requires %s in checkpoint DB Secret or agentruntime feature env", name)
+		}
+	}
+	return nil
+}
+
+func buildFeatureEnv(values map[string]string) []corev1.EnvVar {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	env := make([]corev1.EnvVar, 0, len(names))
+	for _, name := range names {
+		env = append(env, corev1.EnvVar{Name: name, Value: values[name]})
+	}
+	return env
+}
+
+func buildSchemaSetupEnv(values map[string]string) []corev1.EnvVar {
+	schemaValues := make(map[string]string, len(values)+1)
+	for name, value := range values {
+		schemaValues[name] = value
+	}
+	// The runtime contract uses PG_SSLMODE, while libpq/psql consumes the
+	// standard PGSSLMODE variable. Keep the existing runtime key compatible and
+	// bridge it for the schema-setup image when the caller has not supplied the
+	// standard name explicitly.
+	if schemaValues["PGSSLMODE"] == "" && schemaValues["PG_SSLMODE"] != "" {
+		schemaValues["PGSSLMODE"] = schemaValues["PG_SSLMODE"]
+	}
+	return buildFeatureEnv(schemaValues)
+}
+
+func agentRuntimeDeploymentHash(ai *aiv1.AIService, config agentRuntimeConfig) string {
+	return stableHash(struct {
+		BaseImage        string
+		ProviderImage    string
+		AgentModule      string
+		Replicas         int32
+		ServiceAccount   string
+		Resources        corev1.ResourceRequirements
+		RuntimeEnv       []corev1.EnvVar
+		CheckpointSecret string
+		NodeSelector     map[string]string
+		Tolerations      []corev1.Toleration
+		Affinity         corev1.Affinity
+		ImagePullSecrets []corev1.LocalObjectReference
+	}{
+		BaseImage:        config.BaseImage,
+		ProviderImage:    config.ProviderImage,
+		AgentModule:      config.AgentModule,
+		Replicas:         ai.Spec.Replicas,
+		ServiceAccount:   ai.Spec.ServiceAccountName,
+		Resources:        ai.Spec.Resources,
+		RuntimeEnv:       buildRuntimeEnvFingerprint(ai, config.AgentModule),
+		CheckpointSecret: ai.Spec.CheckpointDbSecretRef,
+		NodeSelector:     ai.Spec.NodeSelector,
+		Tolerations:      ai.Spec.Tolerations,
+		Affinity:         ai.Spec.Affinity,
+		ImagePullSecrets: ai.Spec.ImagePullSecrets,
+	})
+}
+
+func agentRuntimeSchemaInputHash(ai *aiv1.AIService, schemaImage string, secret *corev1.Secret) string {
+	postgresEnv := map[string]string{}
+	for _, name := range []string{"PG_HOST", "PG_PORT", "PG_USER", "PG_DBNAME", "PG_SSLMODE", "PGSSLMODE", "PGSSLROOTCERT"} {
+		if value := ai.Spec.Feature.Env[name]; value != "" {
+			postgresEnv[name] = value
+		}
+	}
+	return stableHash(struct {
+		Image           string
+		SchemaSecretRef string
+		SecretVersion   string
+		PostgresEnv     map[string]string
+	}{
+		Image:           schemaImage,
+		SchemaSecretRef: ai.Spec.CheckpointDbSecretRef,
+		SecretVersion:   secret.ResourceVersion,
+		PostgresEnv:     postgresEnv,
+	})
+}
+
+func buildRuntimeEnvFingerprint(ai *aiv1.AIService, agentModule string) []corev1.EnvVar {
+	env := buildAgentRuntimeEnv(ai, agentModule)
+	for i := range env {
+		if isSensitiveEnvName(env[i].Name) {
+			env[i].Value = "<redacted>"
+		}
+	}
+	return env
+}
+
+func isSensitiveEnvName(name string) bool {
+	name = strings.ToUpper(name)
+	return strings.Contains(name, "PASSWORD") ||
+		strings.Contains(name, "TOKEN") ||
+		strings.Contains(name, "SECRET") ||
+		strings.Contains(name, "PRIVATE_KEY")
+}
+
+func stableHash(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "invalid"
+	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest[:8])
+}
+
+func schemaJobNeedsRerun(job *batchv1.Job, deploymentHash, inputHash string) bool {
+	if job.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
+		return false
+	}
+	return job.Annotations[schemaJobDeploymentHashAnnotation] != deploymentHash &&
+		job.Annotations[schemaJobInputHashAnnotation] != inputHash
+}
+
+func schemaJobSucceeded(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func schemaJobFailed(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *aiv1.AIService) error {
@@ -654,6 +907,10 @@ func resolveBaseImage(ai *aiv1.AIService) (string, error) {
 	return resolveRequiredRuntimeEnv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "")
 }
 
+func resolveSchemaSetupImage() (string, error) {
+	return resolveRequiredRuntimeEnv(schemaSetupImageEnv, "")
+}
+
 func resolveProviderImage(ai *aiv1.AIService) (string, error) {
 	envName := "RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_" + normalizeEnvKeySegment(ai.Spec.Feature.Provider)
 	return resolveRequiredRuntimeEnv(envName, fmt.Sprintf(" for provider %q", ai.Spec.Feature.Provider))
@@ -718,4 +975,8 @@ func normalizeEnvKeySegment(value string) string {
 		}
 	}
 	return strings.Trim(b.String(), "_")
+}
+
+func ptr[T any](value T) *T {
+	return &value
 }

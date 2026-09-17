@@ -30,10 +30,17 @@ Before a real run, update:
 - `images.operator.image` in `k0s-cluster-config-agentruntime.yaml` to an image
   built from this branch.
 - `images.agentRuntime.*` to reachable base/provider images.
+- `images.agentRuntime.schemaSetupImage` to an image containing the compatible
+  PostgreSQL schema and setup entrypoint.
 - `SPLUNK_HEC_TOKEN` to any non-empty value before install. It is only used to
   create the compatibility Secret for the dummy external Splunk endpoint.
 - `AGENT_RUNTIME_CHECKPOINT_DB_URL` if you want the script to create the
   `mltk-postgres-conn` checkpoint secret.
+
+The schema Job reads `PG_HOST`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME` from
+the referenced Secret or feature environment; `PG_PORT` is optional. It does
+not consume `DATABASE_URL`. The operator maps `PG_SSLMODE` to `PGSSLMODE` for
+the schema Job.
 
 The provisioner copies the selected cluster config template to the installer and
 creates `~/ai-tier-cluster-setup/my-k0s-config.yaml` from it. It patches only infra and
