@@ -780,6 +780,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   AGENT_RUNTIME_BASE_IMAGE="$(yq eval '.images.agentRuntime.baseImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  AGENT_RUNTIME_SCHEMA_SETUP_IMAGE="$(yq eval '.images.agentRuntime.schemaSetupImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   NGINX_IMAGE="$(yq eval '.images.nginx.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -938,6 +939,9 @@ validate_image_config() {
     if [[ -z "$AGENT_RUNTIME_BASE_IMAGE" || "$AGENT_RUNTIME_BASE_IMAGE" == "null" ]]; then
       err "REQUIRED: images.agentRuntime.baseImage must be specified in k0s-cluster-config.yaml when the 'agentruntime' feature is enabled"
     fi
+    if [[ -z "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" || "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" == "null" ]]; then
+      err "REQUIRED: images.agentRuntime.schemaSetupImage must be specified in k0s-cluster-config.yaml when the 'agentruntime' feature is enabled"
+    fi
     local agent_feature_count agent_i agent_provider agent_provider_image
     agent_feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
     for ((agent_i=0; agent_i<agent_feature_count; agent_i++)); do
@@ -1002,7 +1006,10 @@ validate_image_config() {
     "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
   )
   component_enabled otel && mutable_tag_images+=("images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}")
-  k0s_agentruntime_feature_enabled && mutable_tag_images+=("images.agentRuntime.baseImage:${AGENT_RUNTIME_BASE_IMAGE}")
+  k0s_agentruntime_feature_enabled && mutable_tag_images+=(
+    "images.agentRuntime.baseImage:${AGENT_RUNTIME_BASE_IMAGE}"
+    "images.agentRuntime.schemaSetupImage:${AGENT_RUNTIME_SCHEMA_SETUP_IMAGE}"
+  )
   if k0s_agentruntime_feature_enabled; then
     local _provider_keys _provider_key _provider_image
     _provider_keys="$(yq eval '.images.agentRuntime.providerImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
@@ -1186,6 +1193,13 @@ configure_images() {
     agent_runtime_base_full=$(build_image_url "$IMAGE_REGISTRY" "$AGENT_RUNTIME_BASE_IMAGE")
     upsert_ai_operator_env "RELATED_IMAGE_AGENT_RUNTIME_BASE" "$agent_runtime_base_full"
     log "  ✓ Updated RELATED_IMAGE_AGENT_RUNTIME_BASE: $agent_runtime_base_full"
+  fi
+
+  if [[ -n "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" && "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" != "null" ]]; then
+    local agent_runtime_schema_setup_full
+    agent_runtime_schema_setup_full=$(build_image_url "$IMAGE_REGISTRY" "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE")
+    upsert_ai_operator_env "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP" "$agent_runtime_schema_setup_full"
+    log "  ✓ Updated RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP: $agent_runtime_schema_setup_full"
   fi
 
   local agent_runtime_versions agent_runtime_version agent_runtime_version_image agent_runtime_version_full agent_runtime_env

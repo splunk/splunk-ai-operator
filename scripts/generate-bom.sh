@@ -48,6 +48,7 @@ declare -A IMAGES=(
 # environment variables. Keep the BOM aligned with that contract rather than
 # maintaining a second hard-coded provider list here.
 IMAGES["agent-runtime-base"]="${RELATED_IMAGE_AGENT_RUNTIME_BASE:-docker.io/splunk/agent-runtime:latest}"
+IMAGES["agent-runtime-schema-setup"]="${RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP:-docker.io/splunk/agent-runtime-schema-setup:latest}"
 
 # Include any runtime-version-specific base images that are configured in the
 # operator environment, for example RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0.

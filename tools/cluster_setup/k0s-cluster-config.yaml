@@ -144,6 +144,7 @@ images:
   # a pinned base image; providerImages are keyed by feature.provider.
   agentRuntime:
     baseImage: "docker.io/splunk/agent-runtime:latest"
+    schemaSetupImage: "docker.io/splunk/agent-runtime-schema-setup:latest"
     baseImages:
       # v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
     providerImages:
