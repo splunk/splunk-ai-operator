@@ -3,9 +3,10 @@
 ## Problem
 
 The SSH-bastion SOCKS tunnel documented under [k0s-readme.md → Finding the
-Splunk Web URL](k0s-readme.md#finding-the-splunk-web-url) is a workable path
-for a single engineer doing initial setup or debugging, but it does not hold
-up as the access method for an enterprise deployment:
+Splunk Web URL](k0s-readme.md#finding-the-splunk-web-url) is the right
+approach for a single engineer doing initial setup or debugging, and remains
+valid for that use case. It does not, however, scale to how an enterprise
+team needs to access these endpoints day-to-day:
 
 - **Not multi-user.** Every person who needs to reach the SAIA endpoint (or
   onboard Splunk to it) needs their own SSH key, their own tunnel, and their
@@ -25,7 +26,7 @@ up as the access method for an enterprise deployment:
   through a bastion.
 
 This doc describes replacing the SOCKS tunnel with a standard **bring-your-own
-external load balancer** (an existing enterprise LB — F5, cloud NLB/ALB, or
+external load balancer** (an existing enterprise LB — F5, AWS NLB/ALB, or
 equivalent) sitting in front of the cluster's worker nodes, so the SAIA
 endpoint is reachable at one stable, shared URL. The same pattern extends to
 SLIM (see [Extending the pattern to SLIM](#extending-the-pattern-to-slim))
@@ -122,23 +123,29 @@ no separate worker node. In this topology the backend target is
   - **L7 LB (HAProxy, ALB, F5 in HTTP mode):** configure the backend pool
     itself as HTTP, forwarding plain HTTP to SAIA `30080` / SLIM `30081`
     (when enabled).
-  - **L4 LB (cloud NLB):** for this plain-HTTP backend profile, an L4 NLB
-    uses a **TCP** target group on the NodePort. TLS terminates at the NLB
-    listener, while HTTP health checks may be configured separately where
-    supported. This is still TLS termination, not TLS passthrough —
-    passthrough would mean forwarding the still-encrypted bytes to a backend
-    that itself holds the certificate, which the SAIA/SLIM NodePorts don't
-    support (see the TLS section below).
+  - **L4 LB (AWS NLB, or an L4 proxy load balancer that supports TLS
+    termination):** not every L4 cloud load balancer terminates TLS — a
+    plain L4 passthrough LB (e.g. GCP's external Network LB, Azure Load
+    Balancer) has no certificate and cannot do this at all. For an L4 LB
+    that does support it, such as an AWS NLB with a TLS listener, this
+    plain-HTTP backend profile uses a **TCP** target group on the NodePort.
+    TLS terminates at the listener, while HTTP health checks may be
+    configured separately where supported. This is still TLS termination,
+    not TLS passthrough — passthrough would mean forwarding the
+    still-encrypted bytes to a backend that itself holds the certificate,
+    which the SAIA/SLIM NodePorts don't support (see the TLS section
+    below).
   Either way, do not configure the backend leg as TLS/passthrough — the
   NodePort has no TLS listener to pass through to.
 
   **The two decisions are independent:** after TLS termination, the backend
-  payload is plain HTTP. An L7 LB forwards it as HTTP, while an L4 NLB
-  carries it in a TCP target group. Separately, whether one listener can
-  route multiple hostnames to different backend pools is an *L4-vs-L7*
-  question (answered in [Extending the pattern to
-  SLIM](#extending-the-pattern-to-slim)). An L4 NLB terminates TLS fine — it
-  just can't also do Host-header routing on a shared listener.
+  payload is plain HTTP. An L7 LB forwards it as HTTP, while an L4 LB that
+  supports TLS termination (e.g. an AWS NLB) carries it in a TCP target
+  group. Separately, whether one listener can route multiple hostnames to
+  different backend pools is an *L4-vs-L7* question (answered in [Extending
+  the pattern to SLIM](#extending-the-pattern-to-slim)). An AWS NLB
+  terminates TLS fine — it just can't also do Host-header routing on a
+  shared listener.
 - **Health check:**
   - **SAIA:** `GET /nginx_health` on port `30080`, expecting `200`. This is
     the same path the SAIA nginx container's own Kubernetes
@@ -176,7 +183,7 @@ no separate worker node. In this topology the backend target is
 
 ### TLS: termination at the LB (passthrough is not supported for k0s)
 
-**TLS termination at the LB is the supported and validated approach.** The
+**TLS termination at the LB is the recommended deployment pattern.** The
 LB holds the certificate, the listener is HTTPS, and backend traffic to the
 NodePort stays plain HTTP — the SAIA nginx container only serves HTTP on the
 NodePort. This is fine as long as the LB-to-worker-node hop stays inside a
@@ -305,8 +312,8 @@ HTTPS :443 (wildcard cert, Host-header routing)
   └── Host slim.company.example → SLIM pool → worker-1:30081, worker-2:30081, ...
 ```
 
-**On an L4 LB** (cloud NLB) — this doesn't work. An NLB forwards purely on
-IP:port and never reads the `Host` header, so both hostnames pointed at one
+**On an L4 LB** (AWS NLB, or similar) — this doesn't work. An L4 LB forwards
+purely on IP:port and never reads the `Host` header, so both hostnames pointed at one
 `:443` listener would resolve to the same backend pool and misroute one of
 the two apps. Use two separate listeners/VIPs instead — e.g.
 `saia.company.example:443` → SAIA target group, and

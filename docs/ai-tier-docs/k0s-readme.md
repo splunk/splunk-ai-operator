@@ -1267,6 +1267,10 @@ aiPlatform:
 
 This generates a Kubernetes Service exposing port 8080 on the specified NodePort across all worker nodes.
 
+For fronting this NodePort with an existing enterprise load balancer instead
+of the SSH-bastion SOCKS tunnel, see
+[enterprise-loadbalancer.md](enterprise-loadbalancer.md).
+
 ### Air-Gapped Deployment
 
 For completely disconnected environments, see the [Air-Gapped Deployment](#air-gapped-deployment) reference section below.
