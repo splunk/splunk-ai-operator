@@ -49,6 +49,28 @@ const (
 	schemaJobBackoffLimit             int32 = 1
 )
 
+const schemaSetupCommand = `set -eu
+export PGSSLMODE="${PGSSLMODE:-${PG_SSLMODE:-}}"
+
+if [ -n "${PG_HOST:-}" ] && [ -n "${PG_USER:-}" ] && [ -n "${PG_DBNAME:-}" ] && [ -n "${PG_PASSWORD:-}" ]; then
+  until pg_isready -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DBNAME"; do
+    echo 'waiting for postgres...'
+    sleep 2
+  done
+  PGPASSWORD="$PG_PASSWORD" psql -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DBNAME" -v ON_ERROR_STOP=1 -f /schema.sql
+elif [ -n "${DATABASE_URL:-}" ]; then
+  until pg_isready -d "$DATABASE_URL"; do
+    echo 'waiting for postgres...'
+    sleep 2
+  done
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /schema.sql
+else
+  echo 'schema setup requires either PG_HOST/PG_USER/PG_DBNAME/PG_PASSWORD or DATABASE_URL' >&2
+  exit 1
+fi
+
+echo 'Schema setup complete.'`
+
 var agentModulePattern = regexp.MustCompile(
 	`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:` +
 		`[A-Za-z_][A-Za-z0-9_]*$`,
@@ -373,6 +395,8 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 					Name:            "schema-setup",
 					Image:           schemaImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"sh", "-c"},
+					Args:            []string{schemaSetupCommand},
 					Env:             featureEnv,
 					EnvFrom: []corev1.EnvFromSource{{
 						SecretRef: &corev1.SecretEnvSource{
@@ -397,6 +421,9 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 }
 
 func validateSchemaSetupCredentials(secret *corev1.Secret, featureEnv map[string]string) error {
+	if strings.TrimSpace(featureEnv["DATABASE_URL"]) != "" || len(secret.Data["DATABASE_URL"]) > 0 {
+		return nil
+	}
 	for _, name := range []string{"PG_HOST", "PG_USER", "PG_DBNAME", "PG_PASSWORD"} {
 		if strings.TrimSpace(featureEnv[name]) == "" && len(secret.Data[name]) == 0 {
 			return fmt.Errorf("postgres schema setup requires %s in checkpoint DB Secret or agentruntime feature env", name)
@@ -514,7 +541,9 @@ func schemaJobNeedsRerun(job *batchv1.Job, deploymentHash, inputHash string) boo
 	if job.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
 		return false
 	}
-	return job.Annotations[schemaJobDeploymentHashAnnotation] != deploymentHash &&
+	// A change to either the desired AgentRuntime deployment or schema input
+	// invalidates the completed schema preparation result.
+	return job.Annotations[schemaJobDeploymentHashAnnotation] != deploymentHash ||
 		job.Annotations[schemaJobInputHashAnnotation] != inputHash
 }
 

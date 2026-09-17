@@ -498,7 +498,7 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.features[].maxReplicas` | No | operator default | Maximum feature replicas |
 | `aiPlatform.features[].targetCPUUtilization` | No | operator default | HPA target CPU utilization |
 | `aiPlatform.features[].checkpointDbSecretRef` | Agent Runtime | — | Secret name containing checkpoint DB connection details |
-| `aiPlatform.features[].env` | Agent Runtime | — | Optional runtime environment overrides; the schema image requires `PG_HOST`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME` (with optional `PG_PORT`) from this map or the referenced Secret |
+| `aiPlatform.features[].env` | Agent Runtime | — | Optional runtime environment overrides; schema setup accepts either `DATABASE_URL` or `PG_HOST`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME` (with optional `PG_PORT`) from this map or the referenced Secret |
 | `aiPlatform.features[].serviceAccountName` | No | `""` | Service account override |
 | `aiPlatform.cpuScheduling.nodeSelector` | No | auto-generated | Node selector for CPU workloads |
 | `aiPlatform.cpuScheduling.tolerations` | No | `[]` | Tolerations for CPU workloads |
@@ -510,11 +510,11 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 Agent Runtime schema preparation runs as an AIService-owned Job before the
 AgentRuntime Deployment is created. The setup image is built from the
 AgentRuntime repository's `cicd/docker/schema-setup/Dockerfile` and must contain
-the compatible `schema.sql`. `DATABASE_URL` alone is not consumed by that image;
-use the structured `PG_*` keys in the referenced Secret or AgentRuntime feature
-environment. The operator also maps `PG_SSLMODE` to libpq's `PGSSLMODE` for the
-schema Job. SAIA does not require these keys and its existing data-loader flow
-is unchanged.
+the compatible `schema.sql`. The Job accepts either a `DATABASE_URL` in the
+referenced Secret or structured `PG_*` keys from the Secret/AgentRuntime feature
+environment, with structured keys taking precedence when both are present. The
+operator also maps `PG_SSLMODE` to libpq's `PGSSLMODE` for the schema Job. SAIA
+does not require these keys and its existing data-loader flow is unchanged.
 
 #### Optional Component Gates
 
