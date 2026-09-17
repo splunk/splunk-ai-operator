@@ -37,10 +37,11 @@ Before a real run, update:
 - `AGENT_RUNTIME_CHECKPOINT_DB_URL` if you want the script to create the
   `mltk-postgres-conn` checkpoint secret.
 
-The schema Job reads `PG_HOST`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME` from
-the referenced Secret or feature environment; `PG_PORT` is optional. It does
-not consume `DATABASE_URL`. The operator maps `PG_SSLMODE` to `PGSSLMODE` for
-the schema Job.
+The schema Job accepts either `DATABASE_URL` or `PG_HOST`, `PG_USER`,
+`PG_PASSWORD`, and `PG_DBNAME` from the referenced Secret or feature
+environment; `PG_PORT` is optional. If both forms are set, the structured
+`PG_*` values take precedence. The operator maps `PG_SSLMODE` to `PGSSLMODE`
+for the schema Job.
 
 The provisioner copies the selected cluster config template to the installer and
 creates `~/ai-tier-cluster-setup/my-k0s-config.yaml` from it. It patches only infra and

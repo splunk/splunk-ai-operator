@@ -80,6 +80,8 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: ai.Status.SchemaJobId, Namespace: ai.Namespace,
 	}, job))
+	assert.Equal(t, []string{"sh", "-c"}, job.Spec.Template.Spec.Containers[0].Command)
+	assert.Contains(t, job.Spec.Template.Spec.Containers[0].Args[0], "DATABASE_URL")
 	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: ai.Name + "-agentruntime-deployment", Namespace: ai.Namespace,
 	}, &appsv1.Deployment{}))
@@ -571,16 +573,17 @@ func assertEnv(t *testing.T, env []corev1.EnvVar, name, value string) {
 	t.Fatalf("missing env %s", name)
 }
 
-func TestSchemaJobNeedsRerunRequiresBothFingerprintsToChange(t *testing.T) {
+func TestSchemaJobNeedsRerunWhenEitherFingerprintChanges(t *testing.T) {
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
 		schemaJobManagedAnnotation:        schemaJobManagedValue,
 		schemaJobDeploymentHashAnnotation: "deployment-old",
 		schemaJobInputHashAnnotation:      "input-old",
 	}}}
 
-	assert.False(t, schemaJobNeedsRerun(job, "deployment-new", "input-old"))
-	assert.False(t, schemaJobNeedsRerun(job, "deployment-old", "input-new"))
+	assert.True(t, schemaJobNeedsRerun(job, "deployment-new", "input-old"))
+	assert.True(t, schemaJobNeedsRerun(job, "deployment-old", "input-new"))
 	assert.True(t, schemaJobNeedsRerun(job, "deployment-new", "input-new"))
+	assert.False(t, schemaJobNeedsRerun(job, "deployment-old", "input-old"))
 }
 
 func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {
@@ -593,6 +596,13 @@ func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {
 	}
 
 	require.NoError(t, validateSchemaSetupCredentials(secret, featureEnv))
+	require.NoError(t, validateSchemaSetupCredentials(secret, nil))
+	require.NoError(t, validateSchemaSetupCredentials(&corev1.Secret{Data: map[string][]byte{
+		"PG_HOST":     []byte("postgres"),
+		"PG_USER":     []byte("user"),
+		"PG_PASSWORD": []byte("password"),
+		"PG_DBNAME":   []byte("checkpoints"),
+	}}, nil))
 }
 
 func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {
