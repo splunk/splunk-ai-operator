@@ -5,6 +5,11 @@ metadata:
 type: Opaque
 stringData:
   DATABASE_URL: postgresql://user:password@postgres.default.svc.cluster.local:5432/checkpoints
+  PG_HOST: postgres.default.svc.cluster.local
+  PG_PORT: "5432"
+  PG_USER: user
+  PG_PASSWORD: password
+  PG_DBNAME: checkpoints
 ---
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform

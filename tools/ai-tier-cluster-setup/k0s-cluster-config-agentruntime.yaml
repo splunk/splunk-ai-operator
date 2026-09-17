@@ -51,6 +51,7 @@ images:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
   agentRuntime:
     baseImage: "docker.io/splunk/agent-runtime:latest"
+    schemaSetupImage: "docker.io/splunk/agent-runtime-schema-setup:latest"
     baseImages:
       v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
     providerImages:
