@@ -116,6 +116,7 @@ slimApiImage: "docker.io/splunk/slim-api:1.0.0"
 # Agent Runtime images. The base image is shared; provider images are carrier
 # payloads keyed by feature.provider.
 agentRuntimeBaseImage: "docker.io/splunk/agent-runtime:latest"
+agentRuntimeSchemaSetupImage: "docker.io/splunk/agent-runtime-schema-setup:latest"
 agentRuntimeBaseImages: {}
 # Example:
 #   v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"

@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -228,11 +229,19 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				common.AnnotationChangedPredicate(),
 			)),
 		).
+		// Watch the referenced checkpoint Secret because it is user-owned and not
+		// an AIService child resource.
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForCheckpointSecret),
+			builder.WithPredicates(checkpointSecretChangedPredicate()),
+		).
 		// Add predicates to filter events and avoid unnecessary reconciliations
 		WithEventFilter(predicate.Or(
 			common.GenerationChangedPredicate(),
 			common.AnnotationChangedPredicate(),
 			common.LabelChangedPredicate(),
+			checkpointSecretChangedPredicate(),
 		)).
 		// Configure concurrency control
 		WithOptions(controller.Options{
@@ -324,6 +333,46 @@ func (r *AIServiceReconciler) findAIServicesForPlatform(ctx context.Context, pla
 	}
 
 	return requests
+}
+
+// findAIServicesForCheckpointSecret maps a checkpoint Secret to AgentRuntime
+// AIService objects that reference it in the same namespace.
+func (r *AIServiceReconciler) findAIServicesForCheckpointSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+	var services aiv1.AIServiceList
+	if err := r.List(ctx, &services, client.InNamespace(secret.GetNamespace())); err != nil {
+		log.Error(err, "failed to list AIServices for checkpoint Secret", "secret", secret.GetName())
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0)
+	for _, svc := range services.Items {
+		if svc.Spec.Feature.Name == "agentruntime" && svc.Spec.CheckpointDbSecretRef == secret.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+				Name:      svc.Name,
+				Namespace: svc.Namespace,
+			}})
+		}
+	}
+	return requests
+}
+
+func checkpointSecretChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			_, ok := e.Object.(*corev1.Secret)
+			return ok
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldSecret, oldOK := e.ObjectOld.(*corev1.Secret)
+			newSecret, newOK := e.ObjectNew.(*corev1.Secret)
+			return oldOK && newOK && oldSecret.ResourceVersion != newSecret.ResourceVersion
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			_, ok := e.Object.(*corev1.Secret)
+			return ok
+		},
+	}
 }
 
 func containsString(slice []string, s string) bool {

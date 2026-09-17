@@ -5879,6 +5879,8 @@ spec:
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim/slim-api:build-1
         - name: RELATED_IMAGE_AGENT_RUNTIME_BASE
           value: docker.io/splunk/agent-runtime:latest
+        - name: RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP
+          value: docker.io/splunk/agent-runtime-schema-setup:latest
         - name: RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK
           value: docker.io/splunk/agent-runtime-provider-mltk:latest
         - name: RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK
