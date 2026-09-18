@@ -491,8 +491,8 @@ func TestScaleFactor_DefaultsToOne_Parity(t *testing.T) {
 	// worker-scale.yaml L40S base values migrated from features/saia.yaml.
 	wantL40S := map[string]int32{
 		"l40s-0-gpu": 1,
-		"l40s-1-gpu": 2,
-		"l40s-2-gpu": 1,
+		"l40s-1-gpu": 1,
+		"l40s-2-gpu": 2,
 		"l40s-4-gpu": 0,
 	}
 	for _, wg := range spec.WorkerGroupSpecs {
