@@ -224,6 +224,15 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 				"provider is only supported for agentruntime",
 			))
 		}
+		for _, ref := range []struct{ name, value string }{
+			{"licenseSecretRef", aiservice.Spec.Feature.LicenseSecretRef},
+			{"postgresSecretRef", aiservice.Spec.Feature.PostgresSecretRef},
+			{"redisSecretRef", aiservice.Spec.Feature.RedisSecretRef},
+		} {
+			if ref.value != "" {
+				allErrs = append(allErrs, field.Forbidden(fldPath.Child("features").Child(ref.name), ref.name+" is only supported for agentruntime"))
+			}
+		}
 		return allErrs
 	}
 
@@ -242,11 +251,18 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 		}
 	}
 
-	if aiservice.Spec.CheckpointDbSecretRef == "" {
-		allErrs = append(allErrs, field.Required(
-			fldPath.Child("checkpointDbSecretRef"),
-			"checkpointDbSecretRef must be specified for agentruntime",
-		))
+	for _, ref := range []struct{ name, value string }{
+		{"licenseSecretRef", aiservice.Spec.Feature.LicenseSecretRef},
+		{"postgresSecretRef", aiservice.Spec.Feature.PostgresSecretRef},
+		{"redisSecretRef", aiservice.Spec.Feature.RedisSecretRef},
+	} {
+		if ref.value == "" {
+			allErrs = append(allErrs, field.Required(fldPath.Child("features").Child(ref.name), ref.name+" must be specified for agentruntime"))
+		} else {
+			for _, msg := range apivalidation.IsDNS1123Subdomain(ref.value) {
+				allErrs = append(allErrs, field.Invalid(fldPath.Child("features").Child(ref.name), ref.value, msg))
+			}
+		}
 	}
 
 	if aiservice.Spec.MinReplicas != nil && aiservice.Spec.MaxReplicas != nil &&

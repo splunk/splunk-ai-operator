@@ -4,6 +4,8 @@
 **Purpose:** Validate the highest-risk parts of integrating standalone LangSmith Agent Server (LAS) into AI tier before committing to the full implementation.  
 **Target branch:** `agent-runtime/ai-tier`
 
+**Later outcome (2026-10-05):** This is the original planning brief. The POC was executed on `las-poc` and the later decision was to replace the existing `agentruntime` implementation with LAS, rather than introduce a second runtime type. See the [POC handoff](las-ai-tier-poc-handoff-20261005.md) and [post-POC implementation plan](las-ai-tier-implementation-plan-post-poc.md) for tested results and current direction.
+
 ## 1. POC objective
 
 Build a thin vertical slice in which the AI tier operator reconciles one `AIService` into one upstream LAS Helm release. Prove that LAS starts with customer-supplied PostgreSQL and Redis-compatible dependencies, serves an agent request, and follows the AIService lifecycle.

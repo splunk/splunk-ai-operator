@@ -11,7 +11,7 @@ import (
 )
 
 var _ common.FeatureFactory = (*AgentRuntimeFactory)(nil)
-var _ common.FeatureHandler = (*AgentRuntimeReconciler)(nil)
+var _ common.FeatureHandler = (*LASReconciler)(nil)
 
 type AgentRuntimeFactory struct{}
 
@@ -22,7 +22,7 @@ func (f *AgentRuntimeFactory) New(
 	ai *aiv1.AIService,
 	recorder record.EventRecorder,
 ) (common.FeatureHandler, error) {
-	return &AgentRuntimeReconciler{
+	return &LASReconciler{
 		Client:   c,
 		Scheme:   scheme,
 		Recorder: recorder,

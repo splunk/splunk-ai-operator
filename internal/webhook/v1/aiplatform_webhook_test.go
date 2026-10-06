@@ -192,14 +192,18 @@ var _ = Describe("AIPlatform Webhook", func() {
 			It("should accept multiple agentruntime features when providers differ", func() {
 				errs := validator.validateFeatures([]aiv1.FeatureSpec{
 					{
-						Name:                  "agentruntime",
-						Provider:              "mltk",
-						CheckpointDbSecretRef: "mltk-postgres",
+						Name:              "agentruntime",
+						Provider:          "mltk",
+						LicenseSecretRef:  "las-auth",
+						PostgresSecretRef: "mltk-postgres",
+						RedisSecretRef:    "las-redis",
 					},
 					{
-						Name:                  "agentruntime",
-						Provider:              "seca",
-						CheckpointDbSecretRef: "seca-postgres",
+						Name:              "agentruntime",
+						Provider:          "seca",
+						LicenseSecretRef:  "las-auth",
+						PostgresSecretRef: "seca-postgres",
+						RedisSecretRef:    "las-redis",
 					},
 				}, featuresPath)
 				Expect(errs).To(BeEmpty())
@@ -208,26 +212,32 @@ var _ = Describe("AIPlatform Webhook", func() {
 			It("should reject duplicate agentruntime providers", func() {
 				errs := validator.validateFeatures([]aiv1.FeatureSpec{
 					{
-						Name:                  "agentruntime",
-						Provider:              "mltk",
-						CheckpointDbSecretRef: "mltk-postgres",
+						Name:              "agentruntime",
+						Provider:          "mltk",
+						LicenseSecretRef:  "las-auth",
+						PostgresSecretRef: "mltk-postgres",
+						RedisSecretRef:    "las-redis",
 					},
 					{
-						Name:                  "agentruntime",
-						Provider:              "mltk",
-						CheckpointDbSecretRef: "other-postgres",
+						Name:              "agentruntime",
+						Provider:          "mltk",
+						LicenseSecretRef:  "las-auth",
+						PostgresSecretRef: "other-postgres",
+						RedisSecretRef:    "las-redis",
 					},
 				}, featuresPath)
 				Expect(errs).NotTo(BeEmpty())
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("Duplicate value"))
 			})
 
-			It("should require provider and checkpoint secret for agentruntime", func() {
+			It("should require provider and LAS Secrets for agentruntime", func() {
 				errs := validator.validateFeatures([]aiv1.FeatureSpec{
 					{Name: "agentruntime"},
 				}, featuresPath)
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("provider"))
-				Expect(errs.ToAggregate().Error()).To(ContainSubstring("checkpointDbSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("licenseSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("postgresSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("redisSecretRef"))
 			})
 
 			It("should continue to reject duplicate non-provider feature names", func() {

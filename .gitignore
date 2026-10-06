@@ -36,6 +36,7 @@ tools/cluster_setup/logs/
 
 # Helm build artifacts
 *.tgz
+!pkg/ai/features/agentruntime/chart/langgraph-cloud-0.3.4.tgz
 helm-chart/**/charts/
 !helm-chart/**/charts/.gitkeep
 

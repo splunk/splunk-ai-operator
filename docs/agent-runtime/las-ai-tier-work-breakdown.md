@@ -4,6 +4,8 @@
 **Estimate basis:** Staff Engineer using enterprise-grade AI development tools, including Codex.  
 **Effort unit:** Engineer-month (EM), approximately four weeks of focused engineering.
 
+**Planning update (2026-10-05):** This is the pre-POC estimate and task inventory. The [POC handoff](las-ai-tier-poc-handoff-20261005.md) records what was proved; the [post-POC implementation plan](las-ai-tier-implementation-plan-post-poc.md) reorganizes remaining work and release gates. Re-estimate after the open product and deployment contracts are decided.
+
 ## Scope baseline
 
 - Standalone LAS; no LangSmith deployment control plane.

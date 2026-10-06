@@ -126,7 +126,7 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Maximum=100
 	TargetCPUUtilization *int32 `json:"targetCPUUtilization,omitempty"`
 
-	// CheckpointDbSecretRef references a Secret containing Postgres checkpoint connection settings.
+	// CheckpointDbSecretRef is a legacy agentruntime setting. LAS uses Feature.PostgresSecretRef.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253

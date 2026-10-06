@@ -20,7 +20,7 @@ func TestAgentRuntimeFactory_NewReturnsConfiguredHandler(t *testing.T) {
 	handler, err := factory.New(context.Background(), client, scheme, &aiv1.AIService{}, recorder)
 
 	require.NoError(t, err)
-	reconciler, ok := handler.(*AgentRuntimeReconciler)
+	reconciler, ok := handler.(*LASReconciler)
 	require.True(t, ok)
 	assert.Same(t, client, reconciler.Client)
 	assert.Same(t, scheme, reconciler.Scheme)
