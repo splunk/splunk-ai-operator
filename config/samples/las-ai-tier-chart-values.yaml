@@ -1,0 +1,48 @@
+# Values for the standalone LAS POC release in ai-platform.
+# Secret names/keys are references only; no credentials belong in this file.
+
+images:
+  apiServerImage:
+    repository: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-sample-agent
+    tag: las-poc-20260930-115209
+    pullPolicy: IfNotPresent
+
+config:
+  # Existing Secret must contain langgraph_cloud_license_key.
+  # Add api_key only if this server also needs LangSmith access.
+  existingSecretName: las-auth
+
+# Split API and worker processes so the POC exercises queue/background runs.
+queue:
+  enabled: true
+
+apiServer:
+  deployment:
+    # The default one-second exec probe timed out on the POC k0s nodes even
+    # after the Agent Server had connected to PostgreSQL and Redis.
+    startupProbe:
+      timeoutSeconds: 5
+    readinessProbe:
+      timeoutSeconds: 5
+    livenessProbe:
+      timeoutSeconds: 5
+  service:
+    # Internal-only; access through in-cluster DNS or port-forwarding.
+    type: ClusterIP
+
+postgres:
+  external:
+    enabled: true
+    # Existing Secret key: postgres_connection_url
+    existingSecretName: las-postgres
+
+redis:
+  external:
+    enabled: true
+    # Existing Secret key: redis_connection_url
+    existingSecretName: las-redis
+
+# LAS uses PostgreSQL for application state in this POC; do not enable
+# MongoDB checkpointing.
+mongo:
+  enabled: false

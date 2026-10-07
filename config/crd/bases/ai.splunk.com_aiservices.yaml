@@ -1032,8 +1032,8 @@ spec:
                   use AIPlatformRef)
                 type: string
               checkpointDbSecretRef:
-                description: CheckpointDbSecretRef references a Secret containing
-                  Postgres checkpoint connection settings.
+                description: CheckpointDbSecretRef is a legacy agentruntime setting.
+                  LAS uses Feature.PostgresSecretRef.
                 maxLength: 253
                 minLength: 1
                 type: string
@@ -1051,8 +1051,8 @@ spec:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
                   checkpointDbSecretRef:
-                    description: CheckpointDbSecretRef references a Secret containing
-                      Postgres checkpoint connection settings.
+                    description: CheckpointDbSecretRef is a legacy agentruntime setting.
+                      LAS uses PostgresSecretRef.
                     maxLength: 253
                     minLength: 1
                     type: string
@@ -1061,16 +1061,24 @@ spec:
                       type: string
                     description: |-
                       Env specifies additional environment variables for feature pods.
-                      For agentruntime, these are passed to the shared agent-runtime container,
-                      allowing image-specific settings to change without rebuilding the operator.
+                      For agentruntime, this is a legacy setting and is not passed to LAS in this POC.
                     type: object
+                  licenseSecretRef:
+                    description: |-
+                      LicenseSecretRef names the existing LAS license Secret in this namespace.
+                      The Secret must contain langgraph_cloud_license_key.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
                   maxReplicas:
-                    description: MaxReplicas is the HPA ceiling for this feature.
+                    description: MaxReplicas is the legacy agentruntime HPA ceiling;
+                      LAS chart autoscaling is disabled in this POC.
                     format: int32
                     minimum: 1
                     type: integer
                   minReplicas:
-                    description: MinReplicas is the HPA floor for this feature.
+                    description: MinReplicas is the legacy agentruntime HPA floor;
+                      LAS chart autoscaling is disabled in this POC.
                     format: int32
                     minimum: 1
                     type: integer
@@ -1083,6 +1091,13 @@ spec:
                     - slim
                     - agentruntime
                     type: string
+                  postgresSecretRef:
+                    description: |-
+                      PostgresSecretRef names the existing LAS PostgreSQL Secret in this namespace.
+                      The Secret must contain postgres_connection_url.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
                   provider:
                     description: Provider identifies the product team for multi-provider
                       features such as agentruntime.
@@ -1090,17 +1105,24 @@ spec:
                     minLength: 1
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
+                  redisSecretRef:
+                    description: |-
+                      RedisSecretRef names the existing LAS Redis Secret in this namespace.
+                      The Secret must contain redis_connection_url.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
                   runtimeVersion:
-                    description: RuntimeVersion optionally pins the shared agent-runtime
-                      base image version.
+                    description: RuntimeVersion is a legacy direct-managed agentruntime
+                      setting; LAS uses the operator's pinned image.
                     type: string
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
                     type: string
                   targetCPUUtilization:
-                    description: TargetCPUUtilization is the target average CPU utilization
-                      percentage for HPA.
+                    description: TargetCPUUtilization is a legacy agentruntime HPA
+                      setting; LAS chart autoscaling is disabled in this POC.
                     format: int32
                     maximum: 100
                     minimum: 1

@@ -200,30 +200,47 @@ type FeatureSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
 	Version string `json:"version,omitempty"`
-	// RuntimeVersion optionally pins the shared agent-runtime base image version.
+	// RuntimeVersion is a legacy direct-managed agentruntime setting; LAS uses the operator's pinned image.
 	// +kubebuilder:validation:Optional
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
-	// MinReplicas is the HPA floor for this feature.
+	// MinReplicas is the legacy agentruntime HPA floor; LAS chart autoscaling is disabled in this POC.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas *int32 `json:"minReplicas,omitempty"`
-	// MaxReplicas is the HPA ceiling for this feature.
+	// MaxReplicas is the legacy agentruntime HPA ceiling; LAS chart autoscaling is disabled in this POC.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=1
 	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
-	// TargetCPUUtilization is the target average CPU utilization percentage for HPA.
+	// TargetCPUUtilization is a legacy agentruntime HPA setting; LAS chart autoscaling is disabled in this POC.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=100
 	TargetCPUUtilization *int32 `json:"targetCPUUtilization,omitempty"`
-	// CheckpointDbSecretRef references a Secret containing Postgres checkpoint connection settings.
+	// CheckpointDbSecretRef is a legacy agentruntime setting. LAS uses PostgresSecretRef.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
+	// LicenseSecretRef names the existing LAS license Secret in this namespace.
+	// The Secret must contain langgraph_cloud_license_key.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	LicenseSecretRef string `json:"licenseSecretRef,omitempty"`
+	// PostgresSecretRef names the existing LAS PostgreSQL Secret in this namespace.
+	// The Secret must contain postgres_connection_url.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	PostgresSecretRef string `json:"postgresSecretRef,omitempty"`
+	// RedisSecretRef names the existing LAS Redis Secret in this namespace.
+	// The Secret must contain redis_connection_url.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	RedisSecretRef string `json:"redisSecretRef,omitempty"`
 	// Env specifies additional environment variables for feature pods.
-	// For agentruntime, these are passed to the shared agent-runtime container,
-	// allowing image-specific settings to change without rebuilding the operator.
+	// For agentruntime, this is a legacy setting and is not passed to LAS in this POC.
 	// +kubebuilder:validation:Optional
 	Env map[string]string `json:"env,omitempty"`
 }

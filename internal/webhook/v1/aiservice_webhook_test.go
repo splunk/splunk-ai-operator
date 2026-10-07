@@ -161,17 +161,19 @@ var _ = Describe("AIService Webhook", func() {
 		Describe("agentruntime feature validation", func() {
 			fldPath := field.NewPath("spec")
 
-			It("should accept agentruntime fields when provider and checkpoint secret are set", func() {
+			It("should accept agentruntime fields when provider and LAS Secrets are set", func() {
 				aiservice := &aiv1.AIService{
 					Spec: aiv1.AIServiceSpec{
 						Feature: aiv1.FeatureSpec{
-							Name:     "agentruntime",
-							Provider: "mltk",
+							Name:              "agentruntime",
+							Provider:          "mltk",
+							LicenseSecretRef:  "las-auth",
+							PostgresSecretRef: "las-postgres",
+							RedisSecretRef:    "las-redis",
 						},
-						CheckpointDbSecretRef: "mltk-postgres",
-						MinReplicas:           int32PtrForWebhookTest(1),
-						MaxReplicas:           int32PtrForWebhookTest(4),
-						TargetCPUUtilization:  int32PtrForWebhookTest(60),
+						MinReplicas:          int32PtrForWebhookTest(1),
+						MaxReplicas:          int32PtrForWebhookTest(4),
+						TargetCPUUtilization: int32PtrForWebhookTest(60),
 					},
 				}
 
@@ -179,7 +181,7 @@ var _ = Describe("AIService Webhook", func() {
 				Expect(errs).To(BeEmpty())
 			})
 
-			It("should require provider and checkpoint secret for agentruntime", func() {
+			It("should require provider and LAS Secrets for agentruntime", func() {
 				aiservice := &aiv1.AIService{
 					Spec: aiv1.AIServiceSpec{
 						Feature: aiv1.FeatureSpec{Name: "agentruntime"},
@@ -188,7 +190,9 @@ var _ = Describe("AIService Webhook", func() {
 
 				errs := validator.validateAgentRuntimeFields(aiservice, fldPath)
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("spec.features.provider"))
-				Expect(errs.ToAggregate().Error()).To(ContainSubstring("checkpointDbSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("licenseSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("postgresSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("redisSecretRef"))
 			})
 
 			It("should reject provider on non-agentruntime features", func() {

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -69,6 +71,7 @@ type AIServiceReconciler struct {
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -77,6 +80,7 @@ type AIServiceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
 // +kubebuilder:rbac:groups="core",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="monitoring",resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;get;list;watch;update;patch;delete
@@ -139,17 +143,20 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if ai.DeletionTimestamp != nil {
 		// run feature specific finalization if needed
 		if containsString(ai.Finalizers, aiServiceFinalizer) {
-			if factory, ok := features.FeatureFactories[featureName]; ok {
-				if handler, err := factory.New(ctx, r.Client, r.Scheme, ai, r.Recorder); err == nil {
-					// TODO - define Finalize handlers
-					if f, ok := handler.(interface {
-						Finalize(context.Context, *aiv1.AIService) error
-					}); ok {
-						if err := f.Finalize(ctx, ai); err != nil {
-							telemetry.ObserveReconcileError(ctx, "finalize")
-							return ctrl.Result{}, err
-						}
-					}
+			factory, ok := features.FeatureFactories[featureName]
+			if !ok {
+				return ctrl.Result{}, fmt.Errorf("cannot finalize AIService: no factory for %q", featureName)
+			}
+			handler, err := factory.New(ctx, r.Client, r.Scheme, ai, r.Recorder)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if f, ok := handler.(interface {
+				Finalize(context.Context, *aiv1.AIService) error
+			}); ok {
+				if err := f.Finalize(ctx, ai); err != nil {
+					telemetry.ObserveReconcileError(ctx, "finalize")
+					return ctrl.Result{}, err
 				}
 			}
 			// remove finalizer
@@ -183,6 +190,11 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		telemetry.ObserveReconcileResult(ctx, "error")
 		return ctrl.Result{}, err
 	}
+	if featureName == "agentruntime" && controllerutil.AddFinalizer(ai, aiServiceFinalizer) {
+		if err := r.Update(ctx, ai); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// feature reconcile
 	featStart := time.Now()
@@ -202,6 +214,9 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	telemetry.ObserveReconcileResult(ctx, "success")
+	if featureName == "agentruntime" {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -229,11 +244,11 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				common.AnnotationChangedPredicate(),
 			)),
 		).
-		// Watch the referenced checkpoint Secret because it is user-owned and not
+		// Watch referenced LAS Secrets because they are user-owned and not
 		// an AIService child resource.
 		Watches(
 			&corev1.Secret{},
-			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForCheckpointSecret),
+			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForLASSecret),
 			builder.WithPredicates(checkpointSecretChangedPredicate()),
 		).
 		// Add predicates to filter events and avoid unnecessary reconciliations
@@ -335,19 +350,20 @@ func (r *AIServiceReconciler) findAIServicesForPlatform(ctx context.Context, pla
 	return requests
 }
 
-// findAIServicesForCheckpointSecret maps a checkpoint Secret to AgentRuntime
+// findAIServicesForLASSecret maps a dependency Secret to AgentRuntime
 // AIService objects that reference it in the same namespace.
-func (r *AIServiceReconciler) findAIServicesForCheckpointSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+func (r *AIServiceReconciler) findAIServicesForLASSecret(ctx context.Context, secret client.Object) []reconcile.Request {
 	log := logf.FromContext(ctx)
 	var services aiv1.AIServiceList
 	if err := r.List(ctx, &services, client.InNamespace(secret.GetNamespace())); err != nil {
-		log.Error(err, "failed to list AIServices for checkpoint Secret", "secret", secret.GetName())
+		log.Error(err, "failed to list AIServices for LAS Secret", "secret", secret.GetName())
 		return nil
 	}
 
 	requests := make([]reconcile.Request, 0)
 	for _, svc := range services.Items {
-		if svc.Spec.Feature.Name == "agentruntime" && svc.Spec.CheckpointDbSecretRef == secret.GetName() {
+		if svc.Spec.Feature.Name == "agentruntime" && (svc.Spec.Feature.LicenseSecretRef == secret.GetName() ||
+			svc.Spec.Feature.PostgresSecretRef == secret.GetName() || svc.Spec.Feature.RedisSecretRef == secret.GetName()) {
 			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
 				Name:      svc.Name,
 				Namespace: svc.Namespace,

@@ -520,11 +520,18 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 				}
 				identity = feature.Name + "/" + feature.Provider
 			}
-			if feature.CheckpointDbSecretRef == "" {
-				allErrs = append(allErrs, field.Required(
-					featurePath.Child("checkpointDbSecretRef"),
-					"checkpointDbSecretRef must be specified for agentruntime",
-				))
+			for _, ref := range []struct{ name, value string }{
+				{"licenseSecretRef", feature.LicenseSecretRef},
+				{"postgresSecretRef", feature.PostgresSecretRef},
+				{"redisSecretRef", feature.RedisSecretRef},
+			} {
+				if ref.value == "" {
+					allErrs = append(allErrs, field.Required(featurePath.Child(ref.name), ref.name+" must be specified for agentruntime"))
+				} else {
+					for _, msg := range apivalidation.IsDNS1123Subdomain(ref.value) {
+						allErrs = append(allErrs, field.Invalid(featurePath.Child(ref.name), ref.value, msg))
+					}
+				}
 			}
 			if feature.MinReplicas != nil && feature.MaxReplicas != nil && *feature.MinReplicas > *feature.MaxReplicas {
 				allErrs = append(allErrs, field.Invalid(
@@ -541,11 +548,19 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 					"targetCPUUtilization must be between 1 and 100 when set",
 				))
 			}
-		} else if feature.Provider != "" {
-			allErrs = append(allErrs, field.Forbidden(
-				featurePath.Child("provider"),
-				"provider is only supported for agentruntime",
-			))
+		} else {
+			if feature.Provider != "" {
+				allErrs = append(allErrs, field.Forbidden(featurePath.Child("provider"), "provider is only supported for agentruntime"))
+			}
+			for _, ref := range []struct{ name, value string }{
+				{"licenseSecretRef", feature.LicenseSecretRef},
+				{"postgresSecretRef", feature.PostgresSecretRef},
+				{"redisSecretRef", feature.RedisSecretRef},
+			} {
+				if ref.value != "" {
+					allErrs = append(allErrs, field.Forbidden(featurePath.Child(ref.name), ref.name+" is only supported for agentruntime"))
+				}
+			}
 		}
 
 		// Check for duplicate feature identities. agentruntime uses provider as
