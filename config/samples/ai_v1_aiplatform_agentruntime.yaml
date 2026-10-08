@@ -11,6 +11,12 @@ spec:
   features:
     - name: agentruntime
       provider: mltk
+      # Validation-only candidate; checkpoint metadata exposed fake context values.
+      las:
+        image:
+          repository: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-contract-fixture
+          tag: candidate-20261008-0810
+        assistantId: contract_fixture
       licenseSecretRef: las-auth
       postgresSecretRef: las-postgres
       redisSecretRef: las-redis

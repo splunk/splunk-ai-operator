@@ -1066,6 +1066,34 @@ spec:
                         Env specifies additional environment variables for feature pods.
                         For agentruntime, this is a legacy setting and is not passed to LAS in this POC.
                       type: object
+                    las:
+                      description: |-
+                        LAS selects the Agent Server image and default graph/assistant for agentruntime.
+                        Per-run model, MCP, and knowledge-base connection details are caller context.
+                      properties:
+                        assistantId:
+                          description: AssistantID is the graph ID or assistant ID
+                            used by the caller by default.
+                          minLength: 1
+                          type: string
+                        image:
+                          description: Image is the Agent Server image used by both
+                            API and queue workloads.
+                          properties:
+                            repository:
+                              minLength: 1
+                              type: string
+                            tag:
+                              minLength: 1
+                              type: string
+                          required:
+                          - repository
+                          - tag
+                          type: object
+                      required:
+                      - assistantId
+                      - image
+                      type: object
                     licenseSecretRef:
                       description: |-
                         LicenseSecretRef names the existing LAS license Secret in this namespace.

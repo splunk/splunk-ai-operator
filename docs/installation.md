@@ -301,11 +301,35 @@ kubectl get certificates -n splunk-ai-operator-system
 
 ### Upgrade Operator
 
+When upgrading an existing installation to a version that adds AIPlatform or
+AIService fields (including `features[].las`), apply the CRDs from that exact
+target chart **before** upgrading the operator. Helm installs files in `crds/`
+on first install but does not upgrade existing CRDs. Do not apply a different
+chart version's CRDs.
+Set `OPERATOR_CHART_VERSION` to the target release that contains the new
+schema before running these commands.
+
+```bash
+: "${OPERATOR_CHART_VERSION:?set to the target operator chart version}"
+CRD_STAGE_DIR=$(mktemp -d)
+helm pull oci://ghcr.io/splunk/charts/splunk-ai-operator \
+  --version "$OPERATOR_CHART_VERSION" --untar --untardir "$CRD_STAGE_DIR"
+kubectl apply --server-side -f "$CRD_STAGE_DIR/splunk-ai-operator/crds/ai.splunk.com_aiplatforms.yaml"
+kubectl apply --server-side -f "$CRD_STAGE_DIR/splunk-ai-operator/crds/ai.splunk.com_aiservices.yaml"
+kubectl wait --for=condition=Established \
+  crd/aiplatforms.ai.splunk.com crd/aiservices.ai.splunk.com --timeout=60s
+kubectl explain aiplatform.spec.features.las --api-version=ai.splunk.com/v1
+kubectl explain aiservice.spec.features.las --api-version=ai.splunk.com/v1
+```
+
+Stop if either CRD apply or schema check fails. Resolve any field-ownership
+conflict with the cluster administrator before continuing.
+
 ```bash
 # Upgrade to new version
 helm upgrade splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 1.1.0 \
+  --version "$OPERATOR_CHART_VERSION" \
   --namespace splunk-ai-operator-system
 ```
 

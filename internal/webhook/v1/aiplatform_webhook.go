@@ -505,6 +505,7 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 
 		identity := feature.Name
 		if feature.Name == "agentruntime" {
+			allErrs = append(allErrs, validateLASFeature(feature.LAS, featurePath.Child("las"))...)
 			if feature.Provider == "" {
 				allErrs = append(allErrs, field.Required(
 					featurePath.Child("provider"),
@@ -549,6 +550,9 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 				))
 			}
 		} else {
+			if feature.LAS != nil {
+				allErrs = append(allErrs, field.Forbidden(featurePath.Child("las"), "las is only supported for agentruntime"))
+			}
 			if feature.Provider != "" {
 				allErrs = append(allErrs, field.Forbidden(featurePath.Child("provider"), "provider is only supported for agentruntime"))
 			}
@@ -576,4 +580,22 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 	}
 
 	return allErrs
+}
+
+func validateLASFeature(las *aiv1.LASFeatureSpec, fldPath *field.Path) field.ErrorList {
+	if las == nil {
+		return field.ErrorList{field.Required(fldPath, "las image and assistantId must be specified for agentruntime")}
+	}
+	var errs field.ErrorList
+	for _, item := range []struct{ name, value string }{
+		{"image.repository", las.Image.Repository},
+		{"image.tag", las.Image.Tag},
+		{"assistantId", las.AssistantID},
+	} {
+		if strings.TrimSpace(item.value) == "" {
+			parts := strings.Split(item.name, ".")
+			errs = append(errs, field.Required(fldPath.Child(parts[0], parts[1:]...), item.name+" must be specified"))
+		}
+	}
+	return errs
 }

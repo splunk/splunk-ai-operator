@@ -34,8 +34,6 @@ const (
 	lasChartVersion = "0.3.4"
 	lasChartSHA256  = "31dab99c9b1c6ddfb8672a4a9a287a044d50bb628665c641eb2b1170833df953"
 	lasOwnerLabel   = "ai.splunk.com/aiservice-uid"
-	lasImageRepo    = "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-sample-agent"
-	lasImageTag     = "las-poc-20260930-115209"
 )
 
 //go:embed chart/langgraph-cloud-0.3.4.tgz
@@ -49,6 +47,9 @@ type LASReconciler struct {
 }
 
 func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error {
+	if ai.Spec.Feature.LAS == nil || ai.Spec.Feature.LAS.Image.Repository == "" || ai.Spec.Feature.LAS.Image.Tag == "" || ai.Spec.Feature.LAS.AssistantID == "" {
+		return r.fail(ctx, ai, "ConfigurationInvalid", errors.New("agentruntime requires las.image.repository, las.image.tag, and las.assistantId"))
+	}
 	if err := r.checkSecrets(ctx, ai); err != nil {
 		return r.fail(ctx, ai, "DependenciesUnavailable", err)
 	}
@@ -197,7 +198,7 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 	values := map[string]interface{}{
 		"fullnameOverride": lasReleaseName(ai.Name) + "-langgraph-cloud",
 		"images": map[string]interface{}{"apiServerImage": map[string]interface{}{
-			"repository": lasImageRepo, "tag": lasImageTag, "pullPolicy": "IfNotPresent",
+			"repository": ai.Spec.Feature.LAS.Image.Repository, "tag": ai.Spec.Feature.LAS.Image.Tag, "pullPolicy": "IfNotPresent",
 		}},
 		"config": map[string]interface{}{"existingSecretName": ai.Spec.Feature.LicenseSecretRef},
 		"queue":  map[string]interface{}{"enabled": true},

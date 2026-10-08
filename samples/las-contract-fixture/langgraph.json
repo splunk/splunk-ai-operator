@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "contract_fixture": "./agent.py:graph"
+  }
+}
