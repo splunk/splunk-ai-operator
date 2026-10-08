@@ -69,13 +69,11 @@ features: []
 # - name: "agentruntime"
 #   provider: "mltk"
 #   version: "0.1.0"
-#   runtimeVersion: "v2.0.0"
-#   minReplicas: 1
-#   maxReplicas: 4
-#   targetCPUUtilization: 60
-#   checkpointDbSecretRef: "mltk-postgres-conn"
-#   env:
-#     PG_HOST: "postgres.example.com"
+#   las:
+#     image:
+#       repository: "registry.example.com/agent-server"
+#       tag: "1.0.0"
+#     assistantId: "assistant-id"
 
 # headGroupSpec:
 #   # Service account name for the Ray head group

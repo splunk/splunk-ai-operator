@@ -506,6 +506,9 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 		identity := feature.Name
 		if feature.Name == "agentruntime" {
 			allErrs = append(allErrs, validateLASFeature(feature.LAS, featurePath.Child("las"))...)
+			if len(feature.Env) > 0 {
+				allErrs = append(allErrs, field.Forbidden(featurePath.Child("env"), "env is not supported for agentruntime"))
+			}
 			if feature.Provider == "" {
 				allErrs = append(allErrs, field.Required(
 					featurePath.Child("provider"),
@@ -533,21 +536,6 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 						allErrs = append(allErrs, field.Invalid(featurePath.Child(ref.name), ref.value, msg))
 					}
 				}
-			}
-			if feature.MinReplicas != nil && feature.MaxReplicas != nil && *feature.MinReplicas > *feature.MaxReplicas {
-				allErrs = append(allErrs, field.Invalid(
-					featurePath.Child("maxReplicas"),
-					*feature.MaxReplicas,
-					"maxReplicas must be greater than or equal to minReplicas",
-				))
-			}
-			if feature.TargetCPUUtilization != nil &&
-				(*feature.TargetCPUUtilization < 1 || *feature.TargetCPUUtilization > 100) {
-				allErrs = append(allErrs, field.Invalid(
-					featurePath.Child("targetCPUUtilization"),
-					*feature.TargetCPUUtilization,
-					"targetCPUUtilization must be between 1 and 100 when set",
-				))
 			}
 		} else {
 			if feature.LAS != nil {

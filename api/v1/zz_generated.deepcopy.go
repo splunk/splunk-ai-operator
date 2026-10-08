@@ -256,21 +256,6 @@ func (in *AIServiceSpec) DeepCopyInto(out *AIServiceSpec) {
 	}
 	in.Affinity.DeepCopyInto(&out.Affinity)
 	in.Resources.DeepCopyInto(&out.Resources)
-	if in.MinReplicas != nil {
-		in, out := &in.MinReplicas, &out.MinReplicas
-		*out = new(int32)
-		**out = **in
-	}
-	if in.MaxReplicas != nil {
-		in, out := &in.MaxReplicas, &out.MaxReplicas
-		*out = new(int32)
-		**out = **in
-	}
-	if in.TargetCPUUtilization != nil {
-		in, out := &in.TargetCPUUtilization, &out.TargetCPUUtilization
-		*out = new(int32)
-		**out = **in
-	}
 	out.Metrics = in.Metrics
 	in.MTLS.DeepCopyInto(&out.MTLS)
 	in.ServiceTemplate.DeepCopyInto(&out.ServiceTemplate)
@@ -316,21 +301,6 @@ func (in *FeatureSpec) DeepCopyInto(out *FeatureSpec) {
 	if in.LAS != nil {
 		in, out := &in.LAS, &out.LAS
 		*out = new(LASFeatureSpec)
-		**out = **in
-	}
-	if in.MinReplicas != nil {
-		in, out := &in.MinReplicas, &out.MinReplicas
-		*out = new(int32)
-		**out = **in
-	}
-	if in.MaxReplicas != nil {
-		in, out := &in.MaxReplicas, &out.MaxReplicas
-		*out = new(int32)
-		**out = **in
-	}
-	if in.TargetCPUUtilization != nil {
-		in, out := &in.TargetCPUUtilization, &out.TargetCPUUtilization
-		*out = new(int32)
 		**out = **in
 	}
 	if in.Env != nil {

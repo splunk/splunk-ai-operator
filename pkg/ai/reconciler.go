@@ -278,9 +278,6 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	aiPlatformScheme := "http"
 	aiPlatformURL := ""
 	replicas := int32(1)
-	if feature.Name == agentRuntimeFeatureName && feature.MinReplicas != nil {
-		replicas = *feature.MinReplicas
-	}
 	serviceAccountName := feature.ServiceAccountName
 	if feature.Name == agentRuntimeFeatureName && serviceAccountName == "" {
 		serviceAccountName = name + "-sa"
@@ -308,6 +305,12 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	if v2Image := os.Getenv("RELATED_IMAGE_SAIA_API_V2"); v2Image != "" {
 		v2.Image = v2Image
 	}
+	serviceFeature := feature
+	if feature.Name == agentRuntimeFeatureName {
+		// LAS takes configuration from its LAS block and Secrets; shared feature
+		// env is not part of the LAS contract.
+		serviceFeature.Env = nil
+	}
 
 	svc := &aiApi.AIService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -319,7 +322,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			},
 		},
 		Spec: aiApi.AIServiceSpec{
-			Feature: feature,
+			Feature: serviceFeature,
 			Version: feature.Version,
 			AIPlatformRef: corev1.ObjectReference{
 				APIVersion: "ai.splunk.com/v1",
@@ -327,20 +330,15 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				Name:       platform.Name,
 				Namespace:  platform.Namespace,
 			},
-			ServiceAccountName:    serviceAccountName,
-			TaskVolume:            taskObjectStorage,
-			SplunkConfiguration:   platform.Spec.SplunkConfiguration,
-			VectorDbUrl:           vectorDbUrl,
-			AIPlatformUrl:         aiPlatformURL,
-			AIPlatformScheme:      aiPlatformScheme,
-			Replicas:              replicas,
-			Port:                  80,
-			Resources:             resources,
-			MinReplicas:           cloneInt32Ptr(feature.MinReplicas),
-			MaxReplicas:           cloneInt32Ptr(feature.MaxReplicas),
-			TargetCPUUtilization:  cloneInt32Ptr(feature.TargetCPUUtilization),
-			CheckpointDbSecretRef: feature.CheckpointDbSecretRef,
-			RuntimeVersion:        feature.RuntimeVersion,
+			ServiceAccountName:  serviceAccountName,
+			TaskVolume:          taskObjectStorage,
+			SplunkConfiguration: platform.Spec.SplunkConfiguration,
+			VectorDbUrl:         vectorDbUrl,
+			AIPlatformUrl:       aiPlatformURL,
+			AIPlatformScheme:    aiPlatformScheme,
+			Replicas:            replicas,
+			Port:                80,
+			Resources:           resources,
 			Metrics: aiApi.MetricsConfig{
 				Enabled: true,
 				Port:    metricsPort,
@@ -389,14 +387,6 @@ func defaultAgentRuntimeResources() corev1.ResourceRequirements {
 			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 		},
 	}
-}
-
-func cloneInt32Ptr(value *int32) *int32 {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	return &cloned
 }
 
 func cleanServiceTemplate(svc *corev1.Service) {

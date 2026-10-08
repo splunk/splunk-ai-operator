@@ -171,14 +171,22 @@ var _ = Describe("AIService Webhook", func() {
 							PostgresSecretRef: "las-postgres",
 							RedisSecretRef:    "las-redis",
 						},
-						MinReplicas:          int32PtrForWebhookTest(1),
-						MaxReplicas:          int32PtrForWebhookTest(4),
-						TargetCPUUtilization: int32PtrForWebhookTest(60),
 					},
 				}
 
 				errs := validator.validateAgentRuntimeFields(aiservice, fldPath)
 				Expect(errs).To(BeEmpty())
+			})
+
+			It("should reject feature env for agentruntime", func() {
+				service := &aiv1.AIService{Spec: aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{
+					Name: "agentruntime", Provider: "mltk", Env: map[string]string{"FOO": "bar"},
+					LicenseSecretRef: "las-auth", PostgresSecretRef: "las-postgres", RedisSecretRef: "las-redis",
+				}}}
+
+				errs := validator.validateAgentRuntimeFields(service, fldPath)
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("features.env"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("Forbidden"))
 			})
 
 			It("should require provider and LAS Secrets for agentruntime", func() {

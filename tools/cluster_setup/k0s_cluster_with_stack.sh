@@ -111,24 +111,6 @@ config_bool() {
   [[ "${value}" == "true" ]] && echo "true" || echo "false"
 }
 
-normalize_env_key_segment() {
-  local value="$1" upper out="" char last_underscore=false i
-  upper="$(printf '%s' "${value}" | tr '[:lower:]' '[:upper:]')"
-  for ((i=0; i<${#upper}; i++)); do
-    char="${upper:i:1}"
-    if [[ "${char}" =~ [A-Z0-9] ]]; then
-      out+="${char}"
-      last_underscore=false
-    elif [[ "${last_underscore}" != "true" ]]; then
-      out+="_"
-      last_underscore=true
-    fi
-  done
-  out="${out##_}"
-  out="${out%%_}"
-  printf '%s' "${out}"
-}
-
 k0s_feature_enabled() {
   local feature="$1" names
   names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -779,8 +761,6 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
-  AGENT_RUNTIME_BASE_IMAGE="$(yq eval '.images.agentRuntime.baseImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
-  AGENT_RUNTIME_SCHEMA_SETUP_IMAGE="$(yq eval '.images.agentRuntime.schemaSetupImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   OTEL_COLLECTOR_IMAGE="$(yq eval '.images.otelCollector.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   NGINX_IMAGE="$(yq eval '.images.nginx.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -935,29 +915,6 @@ validate_image_config() {
       err "REQUIRED: images.slim.apiImage must be specified in k0s-cluster-config.yaml when the 'slim' feature is enabled"
     fi
   fi
-  if k0s_agentruntime_feature_enabled; then
-    if [[ -z "$AGENT_RUNTIME_BASE_IMAGE" || "$AGENT_RUNTIME_BASE_IMAGE" == "null" ]]; then
-      err "REQUIRED: images.agentRuntime.baseImage must be specified in k0s-cluster-config.yaml when the 'agentruntime' feature is enabled"
-    fi
-    if [[ -z "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" || "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" == "null" ]]; then
-      err "REQUIRED: images.agentRuntime.schemaSetupImage must be specified in k0s-cluster-config.yaml when the 'agentruntime' feature is enabled"
-    fi
-    local agent_feature_count agent_i agent_provider agent_provider_image
-    agent_feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
-    for ((agent_i=0; agent_i<agent_feature_count; agent_i++)); do
-      if [[ "$(yq eval ".aiPlatform.features[${agent_i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")" != "agentruntime" ]]; then
-        continue
-      fi
-      agent_provider="$(yq eval ".aiPlatform.features[${agent_i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-      if [[ -z "${agent_provider}" || "${agent_provider}" == "null" ]]; then
-        err "REQUIRED: aiPlatform.features[${agent_i}].provider must be specified when name=agentruntime"
-      fi
-      agent_provider_image="$(yq eval ".images.agentRuntime.providerImages.\"${agent_provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-      if [[ -z "${agent_provider_image}" || "${agent_provider_image}" == "null" ]]; then
-        err "REQUIRED: images.agentRuntime.providerImages.${agent_provider} must be specified for agentruntime provider '${agent_provider}'"
-      fi
-    done
-  fi
   if [[ -z "$SPLUNK_OPERATOR_IMAGE" || "$SPLUNK_OPERATOR_IMAGE" == "null" ]]; then
     SPLUNK_OPERATOR_IMAGE="docker.io/splunk/splunk-operator:3.0.0"
     log "Using default Splunk Operator image: $SPLUNK_OPERATOR_IMAGE"
@@ -1006,19 +963,6 @@ validate_image_config() {
     "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE}"
   )
   component_enabled otel && mutable_tag_images+=("images.otelCollector.image:${OTEL_COLLECTOR_IMAGE}")
-  k0s_agentruntime_feature_enabled && mutable_tag_images+=(
-    "images.agentRuntime.baseImage:${AGENT_RUNTIME_BASE_IMAGE}"
-    "images.agentRuntime.schemaSetupImage:${AGENT_RUNTIME_SCHEMA_SETUP_IMAGE}"
-  )
-  if k0s_agentruntime_feature_enabled; then
-    local _provider_keys _provider_key _provider_image
-    _provider_keys="$(yq eval '.images.agentRuntime.providerImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
-    while IFS= read -r _provider_key; do
-      [[ -z "${_provider_key}" || "${_provider_key}" == "null" ]] && continue
-      _provider_image="$(yq eval ".images.agentRuntime.providerImages.\"${_provider_key}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-      mutable_tag_images+=("images.agentRuntime.providerImages.${_provider_key}:${_provider_image}")
-    done <<< "${_provider_keys}"
-  fi
   # images.splunk.image and images.splunk.operatorImage are only patched into
   # the manifest (and only actually deployed) in internal mode — disabled/
   # external modes never run them.
@@ -1188,54 +1132,6 @@ configure_images() {
   # leave the stale image in place.
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^        image:/ s|^        image:.*|        image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
 
-  if [[ -n "$AGENT_RUNTIME_BASE_IMAGE" && "$AGENT_RUNTIME_BASE_IMAGE" != "null" ]]; then
-    local agent_runtime_base_full
-    agent_runtime_base_full=$(build_image_url "$IMAGE_REGISTRY" "$AGENT_RUNTIME_BASE_IMAGE")
-    upsert_ai_operator_env "RELATED_IMAGE_AGENT_RUNTIME_BASE" "$agent_runtime_base_full"
-    log "  ✓ Updated RELATED_IMAGE_AGENT_RUNTIME_BASE: $agent_runtime_base_full"
-  fi
-
-  if [[ -n "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" && "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE" != "null" ]]; then
-    local agent_runtime_schema_setup_full
-    agent_runtime_schema_setup_full=$(build_image_url "$IMAGE_REGISTRY" "$AGENT_RUNTIME_SCHEMA_SETUP_IMAGE")
-    upsert_ai_operator_env "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP" "$agent_runtime_schema_setup_full"
-    log "  ✓ Updated RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP: $agent_runtime_schema_setup_full"
-  fi
-
-  local agent_runtime_versions agent_runtime_version agent_runtime_version_image agent_runtime_version_full agent_runtime_env
-  agent_runtime_versions="$(yq eval '.images.agentRuntime.baseImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
-  while IFS= read -r agent_runtime_version; do
-    [[ -z "${agent_runtime_version}" || "${agent_runtime_version}" == "null" ]] && continue
-    agent_runtime_version_image="$(yq eval ".images.agentRuntime.baseImages.\"${agent_runtime_version}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-    [[ -z "${agent_runtime_version_image}" || "${agent_runtime_version_image}" == "null" ]] && continue
-    agent_runtime_version_full=$(build_image_url "$IMAGE_REGISTRY" "$agent_runtime_version_image")
-    agent_runtime_env="RELATED_IMAGE_AGENT_RUNTIME_BASE_$(normalize_env_key_segment "${agent_runtime_version}")"
-    upsert_ai_operator_env "${agent_runtime_env}" "${agent_runtime_version_full}"
-    log "  ✓ Updated ${agent_runtime_env}: ${agent_runtime_version_full}"
-  done <<< "${agent_runtime_versions}"
-
-  local agent_runtime_providers agent_runtime_provider agent_runtime_provider_image agent_runtime_provider_full agent_runtime_provider_env
-  agent_runtime_providers="$(yq eval '.images.agentRuntime.providerImages // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
-  while IFS= read -r agent_runtime_provider; do
-    [[ -z "${agent_runtime_provider}" || "${agent_runtime_provider}" == "null" ]] && continue
-    agent_runtime_provider_image="$(yq eval ".images.agentRuntime.providerImages.\"${agent_runtime_provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-    [[ -z "${agent_runtime_provider_image}" || "${agent_runtime_provider_image}" == "null" ]] && continue
-    agent_runtime_provider_full=$(build_image_url "$IMAGE_REGISTRY" "$agent_runtime_provider_image")
-    agent_runtime_provider_env="RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_$(normalize_env_key_segment "${agent_runtime_provider}")"
-    upsert_ai_operator_env "${agent_runtime_provider_env}" "${agent_runtime_provider_full}"
-    log "  ✓ Updated ${agent_runtime_provider_env}: ${agent_runtime_provider_full}"
-  done <<< "${agent_runtime_providers}"
-
-  local agent_runtime_module_providers agent_runtime_module_provider agent_runtime_module agent_runtime_module_env
-  agent_runtime_module_providers="$(yq eval '.images.agentRuntime.providerModules // {} | keys | .[]' "${CONFIG_FILE}" 2>/dev/null || true)"
-  while IFS= read -r agent_runtime_module_provider; do
-    [[ -z "${agent_runtime_module_provider}" || "${agent_runtime_module_provider}" == "null" ]] && continue
-    agent_runtime_module="$(yq eval ".images.agentRuntime.providerModules.\"${agent_runtime_module_provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-    [[ -z "${agent_runtime_module}" || "${agent_runtime_module}" == "null" ]] && continue
-    agent_runtime_module_env="RELATED_AGENT_RUNTIME_MODULE_PROVIDER_$(normalize_env_key_segment "${agent_runtime_module_provider}")"
-    upsert_ai_operator_env "${agent_runtime_module_env}" "${agent_runtime_module}"
-    log "  ✓ Updated ${agent_runtime_module_env}: ${agent_runtime_module}"
-  done <<< "${agent_runtime_module_providers}"
 
   [[ -n "$ray_head_full" ]] && log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
   [[ -n "$ray_worker_full" ]] && log "  ✓ Updated RELATED_IMAGE_RAY_WORKER: $ray_worker_full"
@@ -4943,43 +4839,6 @@ wait_for_splunk_standalone() {
 }
 
 # ====== INSTALL AI PLATFORM CR ======
-create_agentruntime_checkpoint_secrets() {
-  k0s_agentruntime_feature_enabled || return 0
-
-  local count
-  count=$(yq eval '.aiPlatform.agentRuntime.checkpointSecrets // [] | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
-  if [[ "${count}" == "0" ]]; then
-    warn "agentruntime feature enabled but aiPlatform.agentRuntime.checkpointSecrets is empty. The referenced checkpointDbSecretRef must already exist."
-    return 0
-  fi
-
-  local i name database_url env_var create_flag
-  for ((i=0; i<count; i++)); do
-    create_flag="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].create" "${CONFIG_FILE}" 2>/dev/null || echo "null")"
-    [[ -z "${create_flag}" || "${create_flag}" == "null" ]] && create_flag="true"
-    [[ "${create_flag}" == "false" ]] && continue
-
-    name="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-    database_url="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrl // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
-    env_var="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrlEnv // \"AGENT_RUNTIME_CHECKPOINT_DB_URL\"" "${CONFIG_FILE}" 2>/dev/null || echo "AGENT_RUNTIME_CHECKPOINT_DB_URL")"
-
-    [[ -z "${name}" || "${name}" == "null" ]] && err "aiPlatform.agentRuntime.checkpointSecrets[${i}].name is required"
-    if [[ -z "${database_url}" || "${database_url}" == "null" ]]; then
-      database_url="${!env_var:-}"
-    fi
-    if [[ -z "${database_url}" ]]; then
-      warn "Skipping checkpoint DB Secret/${name}: set aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrl or export ${env_var}."
-      continue
-    fi
-
-    log "Creating/updating agent-runtime checkpoint DB secret '${name}' in ${AI_NS} (value from config/env, not logged)..."
-    kubectl -n "${AI_NS}" create secret generic "${name}" \
-      --from-literal=DATABASE_URL="${database_url}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
-    log "✓ Agent-runtime checkpoint DB secret ready: ${name}"
-  done
-}
-
 install_ai_platform_cr() {
   log "============================================"
   log "Creating AIPlatform Custom Resource"
@@ -5111,8 +4970,6 @@ EOF
     log "✓ Object storage credentials secret ready"
   fi
 
-  create_agentruntime_checkpoint_secrets
-
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
   local secrets_yaml=""
@@ -5202,26 +5059,30 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint fenv_yaml
+      local fname fver fsa fprovider fenv_yaml flas_repository flas_tag fassistant_id las_ref las_value
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fprovider=$(yq eval ".aiPlatform.features[$i].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-      fruntime=$(yq eval ".aiPlatform.features[$i].runtimeVersion // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-      fmin=$(yq eval ".aiPlatform.features[$i].minReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-      fmax=$(yq eval ".aiPlatform.features[$i].maxReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-      ftarget=$(yq eval ".aiPlatform.features[$i].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-      fcheckpoint=$(yq eval ".aiPlatform.features[$i].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      flas_repository=$(yq eval ".aiPlatform.features[$i].las.image.repository // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      flas_tag=$(yq eval ".aiPlatform.features[$i].las.image.tag // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      fassistant_id=$(yq eval ".aiPlatform.features[$i].las.assistantId // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fenv_yaml=$(yq eval ".aiPlatform.features[$i].env // {}" "${CONFIG_FILE}" 2>/dev/null || echo "{}")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
         [[ -n "$fprovider" && "$fprovider" != "null" ]] && features_yaml+="      provider: \"${fprovider}\""$'\n'
-        [[ -n "$fruntime" && "$fruntime" != "null" ]] && features_yaml+="      runtimeVersion: \"${fruntime}\""$'\n'
-        [[ -n "$fmin" && "$fmin" != "null" ]] && features_yaml+="      minReplicas: ${fmin}"$'\n'
-        [[ -n "$fmax" && "$fmax" != "null" ]] && features_yaml+="      maxReplicas: ${fmax}"$'\n'
-        [[ -n "$ftarget" && "$ftarget" != "null" ]] && features_yaml+="      targetCPUUtilization: ${ftarget}"$'\n'
-        [[ -n "$fcheckpoint" && "$fcheckpoint" != "null" ]] && features_yaml+="      checkpointDbSecretRef: \"${fcheckpoint}\""$'\n'
+        for las_ref in licenseSecretRef postgresSecretRef redisSecretRef; do
+          las_value=$(yq eval ".aiPlatform.features[$i].${las_ref} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+          [[ -n "$las_value" && "$las_value" != "null" ]] && features_yaml+="      ${las_ref}: \"${las_value}\""$'\n'
+        done
+        if [[ -n "$flas_repository" && "$flas_repository" != "null" && -n "$flas_tag" && "$flas_tag" != "null" && -n "$fassistant_id" && "$fassistant_id" != "null" ]]; then
+          features_yaml+="      las:"$'\n'
+          features_yaml+="        image:"$'\n'
+          features_yaml+="          repository: \"${flas_repository}\""$'\n'
+          features_yaml+="          tag: \"${flas_tag}\""$'\n'
+          features_yaml+="        assistantId: \"${fassistant_id}\""$'\n'
+        fi
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: ${fsa}"$'\n'
         if [[ -n "$fenv_yaml" && "$fenv_yaml" != "{}" && "$fenv_yaml" != "null" ]]; then
           features_yaml+="      env:"$'\n'
@@ -7619,7 +7480,7 @@ validate_config() {
   echo -e "  \033[1;32m✔\033[0m components: cert-manager=${COMPONENT_CERT_MANAGER}, monitoring=${COMPONENT_MONITORING}, otel=${COMPONENT_OTEL}, kuberay=${COMPONENT_KUBERAY}, nvidia=${COMPONENT_NVIDIA}, splunkOperator=${COMPONENT_SPLUNK_OPERATOR}, splunkStandalone=${COMPONENT_SPLUNK_STANDALONE}, metallb=${COMPONENT_METALLB}, aiOperator=${COMPONENT_AI_OPERATOR}, aiPlatformCR=${COMPONENT_AI_PLATFORM_CR}" >&2
 
   if k0s_agentruntime_feature_enabled; then
-    local feature_count i fname provider provider_image
+    local feature_count i fname provider
     feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
     for ((i=0; i<feature_count; i++)); do
       fname=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -7630,9 +7491,7 @@ validate_config() {
         errors=$(( errors+1 ))
         continue
       fi
-      provider_image=$(yq eval ".images.agentRuntime.providerImages.\"${provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-      [[ -n "${provider_image}" && "${provider_image}" != "null" ]] && echo -e "  \033[1;32m✔\033[0m agentruntime provider image: ${provider}" >&2 \
-        || { echo -e "  \033[1;31m✖\033[0m images.agentRuntime.providerImages.${provider} missing" >&2; errors=$(( errors+1 )); }
+      echo -e "  \033[1;32m✔\033[0m agentruntime provider: ${provider}" >&2
     done
   fi
 

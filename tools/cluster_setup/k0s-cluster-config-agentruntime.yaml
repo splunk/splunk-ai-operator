@@ -49,14 +49,6 @@ images:
     workerImage: "docker.io/rayproject/ray:2.44.0"
   weaviate:
     image: "docker.io/semitechnologies/weaviate:stable-v1.28-007846a"
-  agentRuntime:
-    baseImage: "docker.io/splunk/agent-runtime:latest"
-    baseImages:
-      v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
-    providerImages:
-      mltk: "docker.io/splunk/agent-runtime-provider-mltk:latest"
-    providerModules:
-      mltk: "agentcore_operations.loader:MLTKAgentLoader"
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
   otelCollector:
@@ -112,16 +104,14 @@ aiPlatform:
     - name: "agentruntime"
       provider: "mltk"
       version: "0.1.0"
-      runtimeVersion: "v2.0.0"
-      minReplicas: 1
-      maxReplicas: 2
-      targetCPUUtilization: 60
-      checkpointDbSecretRef: "mltk-postgres-conn"
-  agentRuntime:
-    checkpointSecrets:
-      - name: "mltk-postgres-conn"
-        create: true
-        databaseUrlEnv: "AGENT_RUNTIME_CHECKPOINT_DB_URL"
+      licenseSecretRef: "las-auth"
+      postgresSecretRef: "las-postgres"
+      redisSecretRef: "las-redis"
+      las:
+        image:
+          repository: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-contract-fixture"
+          tag: "candidate-20261008-0810"
+        assistantId: "contract_fixture"
   cpuScheduling:
     nodeSelector: {}
     tolerations: []

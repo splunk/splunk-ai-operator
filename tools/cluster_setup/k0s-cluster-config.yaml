@@ -139,19 +139,6 @@ images:
   slim:
     apiImage: "splunk/slim/slim-api:latest"
 
-  # Agent Runtime images. Only needed when an "agentruntime" feature is enabled
-  # under aiPlatform.features[]. baseImages lets a feature runtimeVersion select
-  # a pinned base image; providerImages are keyed by feature.provider.
-  agentRuntime:
-    baseImage: "docker.io/splunk/agent-runtime:latest"
-    schemaSetupImage: "docker.io/splunk/agent-runtime-schema-setup:latest"
-    baseImages:
-      # v2.0.0: "docker.io/splunk/agent-runtime:v2.0.0"
-    providerImages:
-      # mltk: "docker.io/splunk/agent-runtime-provider-mltk:0.1.0"
-    providerModules:
-      # mltk: "agentcore_operations.loader:MLTKAgentLoader"
-
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
 

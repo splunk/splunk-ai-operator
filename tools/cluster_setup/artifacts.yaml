@@ -1061,30 +1061,48 @@ spec:
                 items:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
-                    checkpointDbSecretRef:
-                      description: CheckpointDbSecretRef references a Secret containing
-                        Postgres checkpoint connection settings.
-                      maxLength: 253
-                      minLength: 1
-                      type: string
                     env:
                       additionalProperties:
                         type: string
                       description: |-
-                        Env specifies additional environment variables for feature pods.
-                        For agentruntime, these are passed to the shared agent-runtime container,
-                        allowing image-specific settings to change without rebuilding the operator.
+                        Env contains feature-specific environment values for non-AgentRuntime features.
+                        AgentRuntime uses the explicit LAS configuration and Secret references instead.
                       type: object
-                    maxReplicas:
-                      description: MaxReplicas is the HPA ceiling for this feature.
-                      format: int32
-                      minimum: 1
-                      type: integer
-                    minReplicas:
-                      description: MinReplicas is the HPA floor for this feature.
-                      format: int32
-                      minimum: 1
-                      type: integer
+                    las:
+                      description: |-
+                        LAS selects the Agent Server image and default graph/assistant for agentruntime.
+                        Per-run model, MCP, and knowledge-base connection details are caller context.
+                      properties:
+                        assistantId:
+                          description: AssistantID is the graph ID or assistant ID
+                            used by the caller by default.
+                          minLength: 1
+                          type: string
+                        image:
+                          description: Image is the Agent Server image used by both
+                            API and queue workloads.
+                          properties:
+                            repository:
+                              minLength: 1
+                              type: string
+                            tag:
+                              minLength: 1
+                              type: string
+                          required:
+                          - repository
+                          - tag
+                          type: object
+                      required:
+                      - assistantId
+                      - image
+                      type: object
+                    licenseSecretRef:
+                      description: |-
+                        LicenseSecretRef names the existing LAS license Secret in this namespace.
+                        The Secret must contain langgraph_cloud_license_key.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
                     name:
                       description: Name of the feature, e.g. "saia", "seca", "slim",
                         or "agentruntime"
@@ -1094,6 +1112,13 @@ spec:
                       - slim
                       - agentruntime
                       type: string
+                    postgresSecretRef:
+                      description: |-
+                        PostgresSecretRef names the existing LAS PostgreSQL Secret in this namespace.
+                        The Secret must contain postgres_connection_url.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
                     provider:
                       description: Provider identifies the product team for multi-provider
                         features such as agentruntime.
@@ -1101,21 +1126,17 @@ spec:
                       minLength: 1
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
-                    runtimeVersion:
-                      description: RuntimeVersion optionally pins the shared agent-runtime
-                        base image version.
+                    redisSecretRef:
+                      description: |-
+                        RedisSecretRef names the existing LAS Redis Secret in this namespace.
+                        The Secret must contain redis_connection_url.
+                      maxLength: 253
+                      minLength: 1
                       type: string
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
                         to use for the feature
                       type: string
-                    targetCPUUtilization:
-                      description: TargetCPUUtilization is the target average CPU
-                        utilization percentage for HPA.
-                      format: int32
-                      maximum: 100
-                      minimum: 1
-                      type: integer
                     version:
                       description: Version of the feature, e.g. "1.0.0"
                       type: string
@@ -4157,12 +4178,6 @@ spec:
                 description: AIPlatformUrl specifies the URL for the AI Platform (deprecated,
                   use AIPlatformRef)
                 type: string
-              checkpointDbSecretRef:
-                description: CheckpointDbSecretRef references a Secret containing
-                  Postgres checkpoint connection settings.
-                maxLength: 253
-                minLength: 1
-                type: string
               clusterDomain:
                 default: cluster.local
                 description: ClusterDomain is the cluster domain for service DNS
@@ -4176,30 +4191,48 @@ spec:
               features:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
-                  checkpointDbSecretRef:
-                    description: CheckpointDbSecretRef references a Secret containing
-                      Postgres checkpoint connection settings.
-                    maxLength: 253
-                    minLength: 1
-                    type: string
                   env:
                     additionalProperties:
                       type: string
                     description: |-
-                      Env specifies additional environment variables for feature pods.
-                      For agentruntime, these are passed to the shared agent-runtime container,
-                      allowing image-specific settings to change without rebuilding the operator.
+                      Env contains feature-specific environment values for non-AgentRuntime features.
+                      AgentRuntime uses the explicit LAS configuration and Secret references instead.
                     type: object
-                  maxReplicas:
-                    description: MaxReplicas is the HPA ceiling for this feature.
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  minReplicas:
-                    description: MinReplicas is the HPA floor for this feature.
-                    format: int32
-                    minimum: 1
-                    type: integer
+                  las:
+                    description: |-
+                      LAS selects the Agent Server image and default graph/assistant for agentruntime.
+                      Per-run model, MCP, and knowledge-base connection details are caller context.
+                    properties:
+                      assistantId:
+                        description: AssistantID is the graph ID or assistant ID used
+                          by the caller by default.
+                        minLength: 1
+                        type: string
+                      image:
+                        description: Image is the Agent Server image used by both
+                          API and queue workloads.
+                        properties:
+                          repository:
+                            minLength: 1
+                            type: string
+                          tag:
+                            minLength: 1
+                            type: string
+                        required:
+                        - repository
+                        - tag
+                        type: object
+                    required:
+                    - assistantId
+                    - image
+                    type: object
+                  licenseSecretRef:
+                    description: |-
+                      LicenseSecretRef names the existing LAS license Secret in this namespace.
+                      The Secret must contain langgraph_cloud_license_key.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
                   name:
                     description: Name of the feature, e.g. "saia", "seca", "slim",
                       or "agentruntime"
@@ -4209,6 +4242,13 @@ spec:
                     - slim
                     - agentruntime
                     type: string
+                  postgresSecretRef:
+                    description: |-
+                      PostgresSecretRef names the existing LAS PostgreSQL Secret in this namespace.
+                      The Secret must contain postgres_connection_url.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
                   provider:
                     description: Provider identifies the product team for multi-provider
                       features such as agentruntime.
@@ -4216,21 +4256,17 @@ spec:
                     minLength: 1
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
-                  runtimeVersion:
-                    description: RuntimeVersion optionally pins the shared agent-runtime
-                      base image version.
+                  redisSecretRef:
+                    description: |-
+                      RedisSecretRef names the existing LAS Redis Secret in this namespace.
+                      The Secret must contain redis_connection_url.
+                    maxLength: 253
+                    minLength: 1
                     type: string
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
                     type: string
-                  targetCPUUtilization:
-                    description: TargetCPUUtilization is the target average CPU utilization
-                      percentage for HPA.
-                    format: int32
-                    maximum: 100
-                    minimum: 1
-                    type: integer
                   version:
                     description: Version of the feature, e.g. "1.0.0"
                     type: string
@@ -4257,12 +4293,6 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
-              maxReplicas:
-                description: MaxReplicas is the HPA ceiling for features that manage
-                  pod-level autoscaling.
-                format: int32
-                minimum: 1
-                type: integer
               metrics:
                 description: Metrics configuration for monitoring
                 properties:
@@ -4283,12 +4313,6 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
-              minReplicas:
-                description: MinReplicas is the HPA floor for features that manage
-                  pod-level autoscaling.
-                format: int32
-                minimum: 1
-                type: integer
               mtls:
                 description: MTLS configuration for secure communication
                 properties:
@@ -4412,10 +4436,6 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
-              runtimeVersion:
-                description: RuntimeVersion optionally pins the shared runtime image
-                  version for the feature.
-                type: string
               serviceAccountName:
                 description: ServiceAccountName specifies the service account to be
                   used by the AIService
@@ -5024,13 +5044,6 @@ spec:
                       the Splunk HEC token
                     type: string
                 type: object
-              targetCPUUtilization:
-                description: TargetCPUUtilization is the target average CPU utilization
-                  percentage for pod-level HPA.
-                format: int32
-                maximum: 100
-                minimum: 1
-                type: integer
               taskVolume:
                 description: TaskVolume specifies the object storage volume for tasks
                 properties:
@@ -5560,6 +5573,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
+- apiGroups:
   - ai.splunk.com
   resources:
   - aiplatforms
@@ -5600,6 +5621,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - autoscaling
@@ -5877,14 +5906,6 @@ spec:
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1
         - name: RELATED_IMAGE_SLIM_API
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim/slim-api:build-1
-        - name: RELATED_IMAGE_AGENT_RUNTIME_BASE
-          value: docker.io/splunk/agent-runtime:latest
-        - name: RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP
-          value: docker.io/splunk/agent-runtime-schema-setup:latest
-        - name: RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK
-          value: docker.io/splunk/agent-runtime-provider-mltk:latest
-        - name: RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK
-          value: agentcore_operations.loader:MLTKAgentLoader
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
           value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
         - name: RELATED_IMAGE_FLUENT_BIT
