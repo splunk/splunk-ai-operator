@@ -32,5 +32,5 @@ func TestFeatureFactories_AgentRuntimeCreatesHandler(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, handler)
-	assert.IsType(t, &agentruntime.AgentRuntimeReconciler{}, handler)
+	assert.IsType(t, &agentruntime.LASReconciler{}, handler)
 }

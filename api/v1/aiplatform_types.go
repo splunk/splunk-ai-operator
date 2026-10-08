@@ -196,6 +196,10 @@ type FeatureSpec struct {
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Provider string `json:"provider,omitempty"`
+	// LAS selects the Agent Server image and default graph/assistant for agentruntime.
+	// Per-run model, MCP, and knowledge-base connection details are caller context.
+	// +kubebuilder:validation:Optional
+	LAS *LASFeatureSpec `json:"las,omitempty"`
 	// ServiceAccountName is the name of the service account to use for the feature
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
@@ -243,6 +247,23 @@ type FeatureSpec struct {
 	// For agentruntime, this is a legacy setting and is not passed to LAS in this POC.
 	// +kubebuilder:validation:Optional
 	Env map[string]string `json:"env,omitempty"`
+}
+
+// LASFeatureSpec contains the deployable Agent Server artifact identity.
+type LASFeatureSpec struct {
+	// Image is the Agent Server image used by both API and queue workloads.
+	Image LASImageSpec `json:"image"`
+	// AssistantID is the graph ID or assistant ID used by the caller by default.
+	// +kubebuilder:validation:MinLength=1
+	AssistantID string `json:"assistantId"`
+}
+
+// LASImageSpec identifies a selectable Agent Server image.
+type LASImageSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Repository string `json:"repository"`
+	// +kubebuilder:validation:MinLength=1
+	Tag string `json:"tag"`
 }
 
 // WeaviateSpec defines the configuration for the Weaviate vector database

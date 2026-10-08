@@ -218,6 +218,9 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 	var allErrs field.ErrorList
 
 	if aiservice.Spec.Feature.Name != "agentruntime" {
+		if aiservice.Spec.Feature.LAS != nil {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("features").Child("las"), "las is only supported for agentruntime"))
+		}
 		if aiservice.Spec.Feature.Provider != "" {
 			allErrs = append(allErrs, field.Forbidden(
 				fldPath.Child("features").Child("provider"),
@@ -235,6 +238,7 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 		}
 		return allErrs
 	}
+	allErrs = append(allErrs, validateLASFeature(aiservice.Spec.Feature.LAS, fldPath.Child("features").Child("las"))...)
 
 	if aiservice.Spec.Feature.Provider == "" {
 		allErrs = append(allErrs, field.Required(
