@@ -700,17 +700,41 @@ sidecars:
 
 ### Upgrade Operator
 
+For an existing release, update the AIPlatform and AIService CRDs from the
+**same chart artifact** before the operator upgrade. Helm does not upgrade
+existing CRDs in `crds/`, so otherwise the API server can prune the new
+`features[].las` fields before admission. Set `OPERATOR_CHART_VERSION` to the
+target release containing the new schema. For the OCI route below:
+
+```bash
+: "${OPERATOR_CHART_VERSION:?set to the target operator chart version}"
+CRD_STAGE_DIR=$(mktemp -d)
+helm pull oci://ghcr.io/splunk/charts/splunk-ai-operator \
+  --version "$OPERATOR_CHART_VERSION" --untar --untardir "$CRD_STAGE_DIR"
+kubectl apply --server-side -f "$CRD_STAGE_DIR/splunk-ai-operator/crds/ai.splunk.com_aiplatforms.yaml"
+kubectl apply --server-side -f "$CRD_STAGE_DIR/splunk-ai-operator/crds/ai.splunk.com_aiservices.yaml"
+kubectl wait --for=condition=Established \
+  crd/aiplatforms.ai.splunk.com crd/aiservices.ai.splunk.com --timeout=60s
+kubectl explain aiplatform.spec.features.las --api-version=ai.splunk.com/v1
+kubectl explain aiservice.spec.features.las --api-version=ai.splunk.com/v1
+```
+
+Stop if either CRD apply or schema check fails. Resolve any field-ownership
+conflict with the cluster administrator before continuing. If upgrading from
+the GitHub Release archive instead, extract its `crds/` directory and apply
+those two files before upgrading from that same archive.
+
 ```bash
 # OCI Registry
 helm upgrade splunk-ai-operator \
   oci://ghcr.io/splunk/charts/splunk-ai-operator \
-  --version 0.2.0 \
+  --version "$OPERATOR_CHART_VERSION" \
   --namespace splunk-ai-operator-system \
   --reuse-values
 
 # Or from GitHub Release
 helm upgrade splunk-ai-operator \
-  https://github.com/splunk/splunk-ai-operator/releases/download/v0.2.0/splunk-ai-operator-0.2.0.tgz \
+  "https://github.com/splunk/splunk-ai-operator/releases/download/v${OPERATOR_CHART_VERSION}/splunk-ai-operator-${OPERATOR_CHART_VERSION}.tgz" \
   --namespace splunk-ai-operator-system \
   --reuse-values
 ```
