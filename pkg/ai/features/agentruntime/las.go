@@ -202,13 +202,21 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 			"repository": ai.Spec.Feature.LAS.Image.Repository, "tag": ai.Spec.Feature.LAS.Image.Tag, "pullPolicy": "IfNotPresent",
 		}},
 		"config": map[string]interface{}{"existingSecretName": ai.Spec.Feature.LicenseSecretRef},
-		"queue":  map[string]interface{}{"enabled": true},
+		"queue": map[string]interface{}{
+			"enabled": true,
+			"deployment": map[string]interface{}{
+				"resources":      lasWorkloadResources(ai.Spec.Feature.LAS.Queue, "1"),
+				"startupProbe":   lasProbeValues(ai.Spec.Feature.LAS.Queue.StartupProbe, false),
+				"readinessProbe": lasProbeValues(ai.Spec.Feature.LAS.Queue.ReadinessProbe, false),
+				"livenessProbe":  lasProbeValues(ai.Spec.Feature.LAS.Queue.LivenessProbe, false),
+			},
+		},
 		"apiServer": map[string]interface{}{
 			"deployment": map[string]interface{}{
-				"resources":      map[string]interface{}{"requests": map[string]interface{}{"cpu": "250m"}},
-				"startupProbe":   map[string]interface{}{"timeoutSeconds": 5},
-				"readinessProbe": map[string]interface{}{"timeoutSeconds": 5},
-				"livenessProbe":  map[string]interface{}{"timeoutSeconds": 5},
+				"resources":      lasWorkloadResources(ai.Spec.Feature.LAS.API, "250m"),
+				"startupProbe":   lasProbeValues(ai.Spec.Feature.LAS.API.StartupProbe, true),
+				"readinessProbe": lasProbeValues(ai.Spec.Feature.LAS.API.ReadinessProbe, true),
+				"livenessProbe":  lasProbeValues(ai.Spec.Feature.LAS.API.LivenessProbe, true),
 			},
 			"service": map[string]interface{}{"type": "ClusterIP"},
 		},
@@ -220,6 +228,10 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 		}},
 		"mongo": map[string]interface{}{"enabled": false},
 	}
+	apiDeployment := values["apiServer"].(map[string]interface{})["deployment"].(map[string]interface{})
+	applyLASWorkloadScheduling(apiDeployment, ai.Spec.Feature.LAS.API)
+	queueDeployment := values["queue"].(map[string]interface{})["deployment"].(map[string]interface{})
+	applyLASWorkloadScheduling(queueDeployment, ai.Spec.Feature.LAS.Queue)
 	if len(ai.Spec.ImagePullSecrets) > 0 {
 		refs := make([]map[string]string, 0, len(ai.Spec.ImagePullSecrets))
 		for _, ref := range ai.Spec.ImagePullSecrets {
@@ -228,6 +240,100 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 		values["images"].(map[string]interface{})["imagePullSecrets"] = refs
 	}
 	return values
+}
+
+func lasWorkloadResources(workload aiv1.LASWorkloadSpec, defaultCPURequest string) map[string]interface{} {
+	resources := map[string]interface{}{
+		"requests": map[string]interface{}{"cpu": defaultCPURequest, "memory": "2Gi"},
+		"limits":   map[string]interface{}{"cpu": "2", "memory": "4Gi"},
+	}
+	apply := func(name string, overrides corev1.ResourceList) {
+		if len(overrides) == 0 {
+			return
+		}
+		values := resources[name].(map[string]interface{})
+		for key, value := range overrides {
+			values[string(key)] = value.String()
+		}
+	}
+	apply("requests", workload.Resources.Requests)
+	apply("limits", workload.Resources.Limits)
+	return resources
+}
+
+func lasProbeValues(probe *corev1.Probe, apiWorkload bool) map[string]interface{} {
+	var defaults map[string]interface{}
+	if apiWorkload {
+		defaults = map[string]interface{}{
+			"exec":             map[string]interface{}{"command": []interface{}{"/bin/sh", "-c", "exec python /api/healthcheck.py"}},
+			"failureThreshold": 6,
+			"periodSeconds":    10,
+			"timeoutSeconds":   5,
+		}
+	} else {
+		defaults = map[string]interface{}{
+			"httpGet":          map[string]interface{}{"path": "/ok", "port": 8000},
+			"failureThreshold": 6,
+			"periodSeconds":    10,
+			"timeoutSeconds":   5,
+		}
+	}
+	if probe == nil {
+		return defaults
+	}
+	encoded, err := json.Marshal(probe)
+	if err != nil {
+		return defaults
+	}
+	var overrides map[string]interface{}
+	if err := json.Unmarshal(encoded, &overrides); err != nil {
+		return defaults
+	}
+	for _, handler := range []string{"exec", "httpGet", "tcpSocket", "grpc"} {
+		if overrides[handler] == nil {
+			continue
+		}
+		for _, other := range []string{"exec", "httpGet", "tcpSocket", "grpc"} {
+			if other != handler {
+				delete(defaults, other)
+			}
+		}
+	}
+	for key, value := range overrides {
+		defaults[key] = value
+	}
+	if timeout, ok := defaults["timeoutSeconds"].(float64); !ok || timeout <= 0 {
+		defaults["timeoutSeconds"] = 5
+	}
+	return defaults
+}
+
+func applyLASWorkloadScheduling(values map[string]interface{}, workload aiv1.LASWorkloadSpec) {
+	if len(workload.NodeSelector) > 0 {
+		nodeSelector := make(map[string]interface{}, len(workload.NodeSelector))
+		for key, value := range workload.NodeSelector {
+			nodeSelector[key] = value
+		}
+		values["nodeSelector"] = nodeSelector
+	}
+	if len(workload.Tolerations) > 0 {
+		encoded, err := json.Marshal(workload.Tolerations)
+		if err == nil {
+			var tolerations []interface{}
+			if json.Unmarshal(encoded, &tolerations) == nil {
+				values["tolerations"] = tolerations
+			}
+		}
+	}
+	if workload.Affinity != nil {
+		encoded, err := json.Marshal(workload.Affinity)
+		if err == nil {
+			var affinity map[string]interface{}
+			if json.Unmarshal(encoded, &affinity) == nil {
+				values["affinity"] = affinity
+			}
+		}
+	}
 }
 
 func sameValues(a, b map[string]interface{}) bool {
