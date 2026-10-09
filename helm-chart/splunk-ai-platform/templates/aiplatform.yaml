@@ -47,6 +47,22 @@ spec:
 {{- if .version }}
       version: {{ .version | quote }}
 {{- end }}
+{{- if .las }}
+      las:
+        image:
+          repository: {{ .las.image.repository | quote }}
+          tag: {{ .las.image.tag | quote }}
+        assistantId: {{ .las.assistantId | quote }}
+{{- end }}
+{{- if .licenseSecretRef }}
+      licenseSecretRef: {{ .licenseSecretRef | quote }}
+{{- end }}
+{{- if .postgresSecretRef }}
+      postgresSecretRef: {{ .postgresSecretRef | quote }}
+{{- end }}
+{{- if .redisSecretRef }}
+      redisSecretRef: {{ .redisSecretRef | quote }}
+{{- end }}
 {{- if .env }}
       env:
 {{- toYaml .env | nindent 8 }}
