@@ -235,6 +235,32 @@ type LASFeatureSpec struct {
 	// AssistantID is the graph ID or assistant ID used by the caller by default.
 	// +kubebuilder:validation:MinLength=1
 	AssistantID string `json:"assistantId"`
+	// API contains the typed API workload settings. Its replica count remains fixed at one.
+	// +kubebuilder:validation:Optional
+	API LASWorkloadSpec `json:"api,omitempty"`
+	// Queue contains the typed queue workload settings.
+	// +kubebuilder:validation:Optional
+	Queue LASWorkloadSpec `json:"queue,omitempty"`
+}
+
+// LASWorkloadSpec contains settings shared by one LAS workload. It intentionally
+// excludes arbitrary chart values, env and envFrom so caller context and credentials
+// cannot be injected into workload environment variables through the public API.
+type LASWorkloadSpec struct {
+	// Resources sets container requests and limits. Omitted values use the LAS defaults.
+	// +kubebuilder:validation:Optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	// StartupProbe overrides the workload startup health check.
+	// +kubebuilder:validation:Optional
+	StartupProbe *corev1.Probe `json:"startupProbe,omitempty"`
+	// ReadinessProbe overrides the workload readiness health check.
+	// +kubebuilder:validation:Optional
+	ReadinessProbe *corev1.Probe `json:"readinessProbe,omitempty"`
+	// LivenessProbe overrides the workload liveness health check.
+	// +kubebuilder:validation:Optional
+	LivenessProbe *corev1.Probe `json:"livenessProbe,omitempty"`
+	// SchedulingSpec applies Kubernetes node selection, tolerations and affinity.
+	SchedulingSpec `json:",inline"`
 }
 
 // LASImageSpec identifies a selectable Agent Server image.
