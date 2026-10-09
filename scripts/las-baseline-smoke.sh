@@ -134,10 +134,10 @@ except (ValueError, TypeError):
     sys.exit(1)
 PY
 )" || exit 2
-mapfile -t URL_PARTS <<<"$URL_DETAILS"
-URL_SCHEME="${URL_PARTS[0]}"
-URL_PATH="${URL_PARTS[1]}"
-ENDPOINT_HOST="${URL_PARTS[2]}"
+URL_REMAINDER="${URL_DETAILS#*$'\n'}"
+URL_SCHEME="${URL_DETAILS%%$'\n'*}"
+URL_PATH="${URL_REMAINDER%%$'\n'*}"
+ENDPOINT_HOST="${URL_REMAINDER#*$'\n'}"
 BASE_URL="${LAS_BASE_URL%/}"
 if [[ -n "$URL_PATH" ]]; then
   BASE_URL="${URL_SCHEME}://${ENDPOINT_HOST}${URL_PATH}"
@@ -250,6 +250,34 @@ except (OSError, ValueError):
 PY
 }
 
+has_expected_state_values() {
+  python3 - "$1" "$REQUEST_MARKER" "$EXPECTED_RESPONSE" <<'PY'
+import json
+import sys
+
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from strings(child)
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as response:
+        payload = json.load(response)
+    if not isinstance(payload, dict) or "values" not in payload:
+        sys.exit(1)
+    state_values = list(strings(payload["values"]))
+    marker, expected = sys.argv[2], sys.argv[3]
+    sys.exit(0 if marker in state_values and expected in state_values else 1)
+except (OSError, ValueError):
+    sys.exit(1)
+PY
+}
+
 # Health check
 if ! http_request GET "/ok" "$WORK_DIR/health.json"; then
   fail health connection_failed
@@ -301,7 +329,7 @@ fi
 if [[ "$HTTP_STATUS" != "200" ]]; then
   fail state "http_${HTTP_STATUS}"
 fi
-if ! has_expected_output "$WORK_DIR/state.json" "$REQUEST_MARKER" "$EXPECTED_RESPONSE"; then
+if ! has_expected_state_values "$WORK_DIR/state.json"; then
   fail state persisted_output_missing
 fi
 STATE_RESULT="PASS"
