@@ -74,6 +74,8 @@ Do not replace the existing runtime behavior as part of the POC unless required 
 
 **Exit evidence:** LAS pods become ready; health endpoint responds; a minimal agent request succeeds; a follow-up request can read persisted state; streaming/background behavior works if required by the chosen topology.
 
+For the repeatable health/thread/run/state baseline check, see the [LAS baseline smoke guide](las-baseline-smoke.md).
+
 ### Phase 2 — Add the operator vertical slice
 
 - Add the smallest AIService configuration needed to select the LAS provider and reference the dependency/license Secrets. Reuse existing fields if they represent the same contract; do not add generic fields speculatively.
