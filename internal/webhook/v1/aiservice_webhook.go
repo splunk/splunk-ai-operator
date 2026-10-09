@@ -239,6 +239,9 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 		return allErrs
 	}
 	allErrs = append(allErrs, validateLASFeature(aiservice.Spec.Feature.LAS, fldPath.Child("features").Child("las"))...)
+	if len(aiservice.Spec.Feature.Env) > 0 {
+		allErrs = append(allErrs, field.Forbidden(fldPath.Child("features").Child("env"), "env is not supported for agentruntime"))
+	}
 
 	if aiservice.Spec.Feature.Provider == "" {
 		allErrs = append(allErrs, field.Required(
@@ -267,24 +270,6 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 				allErrs = append(allErrs, field.Invalid(fldPath.Child("features").Child(ref.name), ref.value, msg))
 			}
 		}
-	}
-
-	if aiservice.Spec.MinReplicas != nil && aiservice.Spec.MaxReplicas != nil &&
-		*aiservice.Spec.MinReplicas > *aiservice.Spec.MaxReplicas {
-		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("maxReplicas"),
-			*aiservice.Spec.MaxReplicas,
-			"maxReplicas must be greater than or equal to minReplicas",
-		))
-	}
-
-	if aiservice.Spec.TargetCPUUtilization != nil &&
-		(*aiservice.Spec.TargetCPUUtilization < 1 || *aiservice.Spec.TargetCPUUtilization > 100) {
-		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("targetCPUUtilization"),
-			*aiservice.Spec.TargetCPUUtilization,
-			"targetCPUUtilization must be between 1 and 100 when set",
-		))
 	}
 
 	return allErrs

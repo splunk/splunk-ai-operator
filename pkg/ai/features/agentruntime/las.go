@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	lasChartVersion = "0.3.4"
-	lasChartSHA256  = "31dab99c9b1c6ddfb8672a4a9a287a044d50bb628665c641eb2b1170833df953"
-	lasOwnerLabel   = "ai.splunk.com/aiservice-uid"
+	lasChartVersion                   = "0.3.4"
+	lasChartSHA256                    = "31dab99c9b1c6ddfb8672a4a9a287a044d50bb628665c641eb2b1170833df953"
+	lasOwnerLabel                     = "ai.splunk.com/aiservice-uid"
+	defaultAgentRuntimeHTTPPort int32 = 8080
 )
 
 //go:embed chart/langgraph-cloud-0.3.4.tgz

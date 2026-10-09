@@ -1031,12 +1031,6 @@ spec:
                 description: AIPlatformUrl specifies the URL for the AI Platform (deprecated,
                   use AIPlatformRef)
                 type: string
-              checkpointDbSecretRef:
-                description: CheckpointDbSecretRef is a legacy agentruntime setting.
-                  LAS uses Feature.PostgresSecretRef.
-                maxLength: 253
-                minLength: 1
-                type: string
               clusterDomain:
                 default: cluster.local
                 description: ClusterDomain is the cluster domain for service DNS
@@ -1050,18 +1044,12 @@ spec:
               features:
                 description: Feature defines the features to be enabled for the AIService
                 properties:
-                  checkpointDbSecretRef:
-                    description: CheckpointDbSecretRef is a legacy agentruntime setting.
-                      LAS uses PostgresSecretRef.
-                    maxLength: 253
-                    minLength: 1
-                    type: string
                   env:
                     additionalProperties:
                       type: string
                     description: |-
-                      Env specifies additional environment variables for feature pods.
-                      For agentruntime, this is a legacy setting and is not passed to LAS in this POC.
+                        Env contains feature-specific environment values for non-AgentRuntime features.
+                        AgentRuntime uses the explicit LAS configuration and Secret references instead.
                     type: object
                   las:
                     description: |-
@@ -1098,18 +1086,6 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
-                  maxReplicas:
-                    description: MaxReplicas is the legacy agentruntime HPA ceiling;
-                      LAS chart autoscaling is disabled in this POC.
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  minReplicas:
-                    description: MinReplicas is the legacy agentruntime HPA floor;
-                      LAS chart autoscaling is disabled in this POC.
-                    format: int32
-                    minimum: 1
-                    type: integer
                   name:
                     description: Name of the feature, e.g. "saia", "seca", "slim",
                       or "agentruntime"
@@ -1140,21 +1116,10 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
-                  runtimeVersion:
-                    description: RuntimeVersion is a legacy direct-managed agentruntime
-                      setting; LAS uses the operator's pinned image.
-                    type: string
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
                       to use for the feature
                     type: string
-                  targetCPUUtilization:
-                    description: TargetCPUUtilization is a legacy agentruntime HPA
-                      setting; LAS chart autoscaling is disabled in this POC.
-                    format: int32
-                    maximum: 100
-                    minimum: 1
-                    type: integer
                   version:
                     description: Version of the feature, e.g. "1.0.0"
                     type: string
@@ -1181,12 +1146,6 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
-              maxReplicas:
-                description: MaxReplicas is the HPA ceiling for features that manage
-                  pod-level autoscaling.
-                format: int32
-                minimum: 1
-                type: integer
               metrics:
                 description: Metrics configuration for monitoring
                 properties:
@@ -1207,12 +1166,6 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
-              minReplicas:
-                description: MinReplicas is the HPA floor for features that manage
-                  pod-level autoscaling.
-                format: int32
-                minimum: 1
-                type: integer
               mtls:
                 description: MTLS configuration for secure communication
                 properties:
@@ -1336,10 +1289,6 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
-              runtimeVersion:
-                description: RuntimeVersion optionally pins the shared runtime image
-                  version for the feature.
-                type: string
               serviceAccountName:
                 description: ServiceAccountName specifies the service account to be
                   used by the AIService
@@ -1948,13 +1897,6 @@ spec:
                       the Splunk HEC token
                     type: string
                 type: object
-              targetCPUUtilization:
-                description: TargetCPUUtilization is the target average CPU utilization
-                  percentage for pod-level HPA.
-                format: int32
-                maximum: 100
-                minimum: 1
-                type: integer
               taskVolume:
                 description: TaskVolume specifies the object storage volume for tasks
                 properties:

@@ -204,27 +204,6 @@ type FeatureSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	// Version of the feature, e.g. "1.0.0"
 	Version string `json:"version,omitempty"`
-	// RuntimeVersion is a legacy direct-managed agentruntime setting; LAS uses the operator's pinned image.
-	// +kubebuilder:validation:Optional
-	RuntimeVersion string `json:"runtimeVersion,omitempty"`
-	// MinReplicas is the legacy agentruntime HPA floor; LAS chart autoscaling is disabled in this POC.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Minimum=1
-	MinReplicas *int32 `json:"minReplicas,omitempty"`
-	// MaxReplicas is the legacy agentruntime HPA ceiling; LAS chart autoscaling is disabled in this POC.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Minimum=1
-	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
-	// TargetCPUUtilization is a legacy agentruntime HPA setting; LAS chart autoscaling is disabled in this POC.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=100
-	TargetCPUUtilization *int32 `json:"targetCPUUtilization,omitempty"`
-	// CheckpointDbSecretRef is a legacy agentruntime setting. LAS uses PostgresSecretRef.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
 	// LicenseSecretRef names the existing LAS license Secret in this namespace.
 	// The Secret must contain langgraph_cloud_license_key.
 	// +kubebuilder:validation:Optional
@@ -243,8 +222,8 @@ type FeatureSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	RedisSecretRef string `json:"redisSecretRef,omitempty"`
-	// Env specifies additional environment variables for feature pods.
-	// For agentruntime, this is a legacy setting and is not passed to LAS in this POC.
+	// Env contains feature-specific environment values for non-AgentRuntime features.
+	// AgentRuntime uses the explicit LAS configuration and Secret references instead.
 	// +kubebuilder:validation:Optional
 	Env map[string]string `json:"env,omitempty"`
 }

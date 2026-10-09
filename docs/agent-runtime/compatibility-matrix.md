@@ -208,12 +208,9 @@ operator CRD field in this initial design.
 
 ## Relationship to the operator
 
-The operator currently selects the base image using `runtimeVersion` and the
-carrier/module using `provider`-derived related-image environment variables.
-Those selectors identify the images to test, but they do not yet enforce the
-matrix. The matrix therefore needs to resolve the exact image references and
-digests used during certification rather than relying on operator defaults or
-mutable tags.
+LAS selects its Agent Server image from the `las.image` configuration. The
+matrix must resolve the exact image references and digests used during
+certification rather than relying on mutable tags.
 
 The machine-readable starting point is
 [`config/agent-runtime/compatibility-matrix.yaml`](../../config/agent-runtime/compatibility-matrix.yaml).

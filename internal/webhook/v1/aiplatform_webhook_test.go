@@ -240,6 +240,15 @@ var _ = Describe("AIPlatform Webhook", func() {
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("redisSecretRef"))
 			})
 
+			It("should reject feature env for agentruntime", func() {
+				errs := validator.validateFeatures([]aiv1.FeatureSpec{{
+					Name: "agentruntime", Provider: "mltk", Env: map[string]string{"FOO": "bar"},
+					LicenseSecretRef: "las-auth", PostgresSecretRef: "las-postgres", RedisSecretRef: "las-redis",
+				}}, featuresPath)
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("features[0].env"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("Forbidden"))
+			})
+
 			It("should continue to reject duplicate non-provider feature names", func() {
 				errs := validator.validateFeatures([]aiv1.FeatureSpec{
 					{Name: "saia"},

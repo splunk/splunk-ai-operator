@@ -3,6 +3,8 @@ package agentruntime
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"strings"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -11,6 +13,28 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+const maxDNSLabelLength = 63
+
+func agentRuntimeServiceName(aiServiceName string) string {
+	name := aiServiceName + "-svc"
+	if len(name) <= maxDNSLabelLength {
+		return name
+	}
+	hash := shortHash(name)
+	maxBaseLength := maxDNSLabelLength - len("svc") - len(hash) - 2
+	base := strings.TrimRight(aiServiceName[:maxBaseLength], "-")
+	if base == "" {
+		base = aiServiceName[:maxBaseLength]
+	}
+	return base + "-" + hash + "-svc"
+}
+
+func shortHash(value string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(value))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
 
 // Delete only objects controlled by this AIService's former direct-managed
 // reconciler, after LAS is ready. Helm chart resources have no such owner ref.

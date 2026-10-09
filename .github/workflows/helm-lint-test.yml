@@ -93,6 +93,35 @@ jobs:
           echo "Chart templates generated successfully"
           echo "::endgroup::"
 
+      - name: Verify AgentRuntime values are rendered
+        run: |
+          helm template test-agent-runtime helm-chart/splunk-ai-platform \
+            --namespace ai-platform \
+            --set objectStorage.path="s3://test-bucket/artifacts" \
+            --set 'features[0].name=agentruntime' \
+            --set 'features[0].provider=mltk' \
+            --set 'features[0].las.image.repository=registry.example.com/agent-server' \
+            --set 'features[0].las.image.tag=1.0.0' \
+            --set 'features[0].las.assistantId=assistant-id' \
+            --set 'features[0].licenseSecretRef=las-auth' \
+            --set 'features[0].postgresSecretRef=las-postgres' \
+            --set 'features[0].redisSecretRef=las-redis' \
+            > /tmp/agent-runtime-platform-template.yaml
+          for expected in \
+            'name: "agentruntime"' \
+            'provider: "mltk"' \
+            'repository: "registry.example.com/agent-server"' \
+            'tag: "1.0.0"' \
+            'assistantId: "assistant-id"' \
+            'licenseSecretRef: "las-auth"' \
+            'postgresSecretRef: "las-postgres"' \
+            'redisSecretRef: "las-redis"'; do
+            grep -Fq "$expected" /tmp/agent-runtime-platform-template.yaml || {
+              echo "Expected AgentRuntime field was not rendered: $expected"
+              exit 1
+            }
+          done
+
       - name: Validate Kubernetes manifests
         run: |
           echo "::group::Validating Kubernetes manifests"

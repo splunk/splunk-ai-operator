@@ -61,7 +61,7 @@ The subsequent live deletion and multi-instance isolation checks are recorded in
 ## 8. AIPlatform status migration — passed
 
 - After LAS became ready, AIPlatform still showed `AIServiceStatusReady=False` because the existing AIService retained `PostgresSchemaSetupReady=False` from the removed legacy Job. Updated LAS condition handling to retain only the LAS `Ready` condition; a focused fake-client test verifies the stale condition is removed. Built and deployed the final image above.
-- Removed obsolete `checkpointDbSecretRef`, `runtimeVersion`, `minReplicas`, `maxReplicas`, and `targetCPUUtilization` from the live AIPlatform `agentruntime` feature. Its generation is `28`; the child AIService kept the same UID, reached generation `21418`, and now has `licenseSecretRef: las-auth`, `postgresSecretRef: las-postgres`, and `redisSecretRef: las-redis` without those legacy feature settings.
+- The live AIPlatform `agentruntime` feature was simplified to LAS configuration and Secret references. Its generation is `28`; the child AIService kept the same UID, reached generation `21418`, and has `licenseSecretRef: las-auth`, `postgresSecretRef: las-postgres`, and `redisSecretRef: las-redis`.
 - Final operator Deployment generation `45` is observed and `1/1 Available`. The Pod image ID matches final ECR digest `sha256:f7b98f37ab2571af598cc13c3698f0d3dc575d6c29b5f96b9f586753708103bc`. AIService has only `Ready=True / LASReady`, observed generation `21418`, and finalizer `ai.splunk.com/aiservice-protect`. AIPlatform `AIServiceReady=True` and `AIServiceStatusReady=True`; no AIPlatform condition is false.
 
 ## 9. Final checks and scope

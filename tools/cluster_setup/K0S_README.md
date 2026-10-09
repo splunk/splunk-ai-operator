@@ -438,11 +438,6 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.saia.apiImage` | **Yes** | — | SAIA API v1 image |
 | `images.saia.apiV2Image` | **Yes** | — | SAIA API v2 image |
 | `images.saia.dataLoaderImage` | **Yes** | — | SAIA data loader / post-install hook image |
-| `images.agentRuntime.baseImage` | When `agentruntime` enabled | — | Shared agent-runtime base image |
-| `images.agentRuntime.schemaSetupImage` | When `agentruntime` enabled | — | Published image containing the Agent Runtime PostgreSQL schema and setup entrypoint |
-| `images.agentRuntime.baseImages.<runtimeVersion>` | No | — | Optional runtime-version-specific base image override |
-| `images.agentRuntime.providerImages.<provider>` | When `agentruntime` enabled | — | Provider package image for each agent-runtime provider |
-| `images.agentRuntime.providerModules.<provider>` | No | provider default | Python loader module for each provider |
 | `images.nginx.image` | No | `docker.io/library/nginx:1.27-alpine` | Nginx reverse proxy for SAIA v1/v2 routing |
 | `images.fluentBit.image` | No | `fluent/fluent-bit:1.9.6` | Fluent Bit log forwarder |
 | `images.otelCollector.image` | No | `otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
@@ -471,11 +466,6 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `images.saia.apiImage` | `RELATED_IMAGE_SAIA_API` | `artifacts.yaml` |
 | `images.saia.apiV2Image` | `RELATED_IMAGE_SAIA_API_V2` | `artifacts.yaml` |
 | `images.saia.dataLoaderImage` | `RELATED_IMAGE_POST_INSTALL_HOOK` | `artifacts.yaml` |
-| `images.agentRuntime.baseImage` | `RELATED_IMAGE_AGENT_RUNTIME_BASE` | `artifacts.yaml` |
-| `images.agentRuntime.schemaSetupImage` | `RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP` | `artifacts.yaml` |
-| `images.agentRuntime.baseImages.<runtimeVersion>` | `RELATED_IMAGE_AGENT_RUNTIME_BASE_<RUNTIME_VERSION>` | `artifacts.yaml` |
-| `images.agentRuntime.providerImages.<provider>` | `RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_<PROVIDER>` | `artifacts.yaml` |
-| `images.agentRuntime.providerModules.<provider>` | `RELATED_AGENT_RUNTIME_MODULE_PROVIDER_<PROVIDER>` | `artifacts.yaml` |
 | `images.nginx.image` | `RELATED_IMAGE_NGINX` | `artifacts.yaml` |
 | `images.fluentBit.image` | `RELATED_IMAGE_FLUENT_BIT` | `artifacts.yaml` |
 | `images.otelCollector.image` | `RELATED_IMAGE_OTEL_COLLECTOR` | `artifacts.yaml` |
@@ -493,12 +483,8 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`) |
 | `aiPlatform.features[].version` | Yes | — | Feature version |
 | `aiPlatform.features[].provider` | Agent Runtime | — | Provider key for multi-provider features, e.g. `mltk` |
-| `aiPlatform.features[].runtimeVersion` | No | — | Agent-runtime base image selector |
-| `aiPlatform.features[].minReplicas` | No | operator default | Minimum feature replicas |
-| `aiPlatform.features[].maxReplicas` | No | operator default | Maximum feature replicas |
-| `aiPlatform.features[].targetCPUUtilization` | No | operator default | HPA target CPU utilization |
-| `aiPlatform.features[].checkpointDbSecretRef` | Agent Runtime | — | Secret name containing checkpoint DB connection details |
-| `aiPlatform.features[].env` | Agent Runtime | — | Optional runtime environment overrides; schema setup accepts either `DATABASE_URL` or `PG_HOST`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME` (with optional `PG_PORT`) from this map or the referenced Secret |
+| `aiPlatform.features[].las` | Agent Runtime | — | LAS image and default assistant ID |
+| `aiPlatform.features[].env` | Non-AgentRuntime | — | Optional feature-specific environment overrides |
 | `aiPlatform.features[].serviceAccountName` | No | `""` | Service account override |
 | `aiPlatform.cpuScheduling.nodeSelector` | No | auto-generated | Node selector for CPU workloads |
 | `aiPlatform.cpuScheduling.tolerations` | No | `[]` | Tolerations for CPU workloads |
@@ -506,15 +492,6 @@ Short image paths (without a FQDN) are automatically prefixed with `images.regis
 | `aiPlatform.gpuScheduling.tolerations` | No | GPU toleration | Tolerations for GPU workloads |
 | `aiPlatform.serviceTemplate.type` | No | — | Service type for SAIA exposure: `NodePort` or `LoadBalancer` |
 | `aiPlatform.serviceTemplate.nodePort` | No | — | Node port number (only when type=NodePort) |
-
-Agent Runtime schema preparation runs as an AIService-owned Job before the
-AgentRuntime Deployment is created. The setup image is built from the
-AgentRuntime repository's `cicd/docker/schema-setup/Dockerfile` and must contain
-the compatible `schema.sql`. The Job accepts either a `DATABASE_URL` in the
-referenced Secret or structured `PG_*` keys from the Secret/AgentRuntime feature
-environment, with structured keys taking precedence when both are present. The
-operator also maps `PG_SSLMODE` to libpq's `PGSSLMODE` for the schema Job. SAIA
-does not require these keys and its existing data-loader flow is unchanged.
 
 #### Optional Component Gates
 

@@ -47,20 +47,21 @@ spec:
 {{- if .version }}
       version: {{ .version | quote }}
 {{- end }}
-{{- if .runtimeVersion }}
-      runtimeVersion: {{ .runtimeVersion | quote }}
+{{- if .las }}
+      las:
+        image:
+          repository: {{ .las.image.repository | quote }}
+          tag: {{ .las.image.tag | quote }}
+        assistantId: {{ .las.assistantId | quote }}
 {{- end }}
-{{- if hasKey . "minReplicas" }}
-      minReplicas: {{ .minReplicas }}
+{{- if .licenseSecretRef }}
+      licenseSecretRef: {{ .licenseSecretRef | quote }}
 {{- end }}
-{{- if hasKey . "maxReplicas" }}
-      maxReplicas: {{ .maxReplicas }}
+{{- if .postgresSecretRef }}
+      postgresSecretRef: {{ .postgresSecretRef | quote }}
 {{- end }}
-{{- if hasKey . "targetCPUUtilization" }}
-      targetCPUUtilization: {{ .targetCPUUtilization }}
-{{- end }}
-{{- if .checkpointDbSecretRef }}
-      checkpointDbSecretRef: {{ .checkpointDbSecretRef | quote }}
+{{- if .redisSecretRef }}
+      redisSecretRef: {{ .redisSecretRef | quote }}
 {{- end }}
 {{- if .env }}
       env:

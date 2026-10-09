@@ -201,24 +201,16 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 		Spec: aiApi.AIPlatformSpec{
 			Features: []aiApi.FeatureSpec{
 				{
-					Name:                  "agentruntime",
-					Provider:              "mltk",
-					Version:               "0.1.0",
-					RuntimeVersion:        "v2.0.0",
-					MinReplicas:           int32PtrForReconcilerTest(1),
-					MaxReplicas:           int32PtrForReconcilerTest(4),
-					TargetCPUUtilization:  int32PtrForReconcilerTest(60),
-					CheckpointDbSecretRef: "mltk-postgres",
-					ServiceAccountName:    "mltk-sa",
+					Name:               "agentruntime",
+					Provider:           "mltk",
+					Version:            "0.1.0",
+					ServiceAccountName: "mltk-sa",
+					Env:                map[string]string{"LEGACY": "must-not-propagate"},
 				},
 				{
-					Name:                  "agentruntime",
-					Provider:              "seca",
-					Version:               "0.2.0",
-					MinReplicas:           int32PtrForReconcilerTest(2),
-					MaxReplicas:           int32PtrForReconcilerTest(5),
-					TargetCPUUtilization:  int32PtrForReconcilerTest(70),
-					CheckpointDbSecretRef: "seca-postgres",
+					Name:     "agentruntime",
+					Provider: "seca",
+					Version:  "0.2.0",
 				},
 			},
 			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
@@ -258,10 +250,7 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 	assert.Equal(t, "agentruntime", mltk.Spec.Feature.Name)
 	assert.Equal(t, "mltk", mltk.Spec.Feature.Provider)
 	assert.Equal(t, "mltk", mltk.Labels["provider"])
-	assert.Equal(t, "v2.0.0", mltk.Spec.RuntimeVersion)
-	assert.Equal(t, "mltk-postgres", mltk.Spec.CheckpointDbSecretRef)
-	require.NotNil(t, mltk.Spec.TargetCPUUtilization)
-	assert.Equal(t, int32(60), *mltk.Spec.TargetCPUUtilization)
+	assert.Nil(t, mltk.Spec.Feature.Env)
 	assert.Equal(t, int32(1), mltk.Spec.Replicas)
 	assert.Equal(t, int32(80), mltk.Spec.Port)
 	assert.Equal(t, "http", mltk.Spec.AIPlatformScheme)
@@ -276,8 +265,7 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 	seca := &aiApi.AIService{}
 	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "my-ai-agentruntime-seca", Namespace: "default"}, seca))
 	assert.Equal(t, "seca", seca.Spec.Feature.Provider)
-	assert.Equal(t, int32(2), seca.Spec.Replicas)
-	assert.Equal(t, "seca-postgres", seca.Spec.CheckpointDbSecretRef)
+	assert.Equal(t, int32(1), seca.Spec.Replicas)
 	assert.Equal(t, "my-ai-agentruntime-seca-sa", seca.Spec.ServiceAccountName)
 }
 
@@ -309,10 +297,6 @@ func TestBuildAIService_BoundsLongAIPlatformLabel(t *testing.T) {
 
 	require.LessOrEqual(t, len(service.Labels["aiplatform"]), maxDNSLabelLength)
 	assert.NotEqual(t, platform.Name, service.Labels["aiplatform"])
-}
-
-func int32PtrForReconcilerTest(value int32) *int32 {
-	return &value
 }
 
 func TestReconcileFeatures_DoesNotRecreateExistingAIService(t *testing.T) {
