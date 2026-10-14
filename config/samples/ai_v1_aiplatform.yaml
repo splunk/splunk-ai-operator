@@ -19,6 +19,9 @@ spec:
     - name: saia
       version: "1.1.0"
       serviceAccountName: saia-service-account
+    - name: seca
+      version: "1.0.0"
+      serviceAccountName: saia-secure-account
 
   # // storage allows to extend
   storage:

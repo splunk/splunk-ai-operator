@@ -1054,9 +1054,10 @@ spec:
                   description: FeatureSpec defines the features to enable in the AIPlatform
                   properties:
                     name:
-                      description: Name of the feature, e.g. "saia" or "slim"
+                      description: Name of the feature, e.g. "saia", "seca" or "slim"
                       enum:
                       - saia
+                      - seca
                       - slim
                       type: string
                     serviceAccountName:
