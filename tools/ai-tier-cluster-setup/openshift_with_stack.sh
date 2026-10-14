@@ -2936,8 +2936,12 @@ splunk_standalone_uses_jwt_signing_secret() {
   standalone_json=$(oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --ignore-not-found -o json) \
     || err "Cannot read Standalone ${AI_NS}/${AI_STANDALONE_NAME}; check cluster access"
   [[ -n "${standalone_json}" ]] || return 1
+  local rc=0
   jq -e --arg s "${secret_name}" '[.spec.volumes[]? | .secret.secretName?] | index($s) != null' \
-    <<<"${standalone_json}" >/dev/null 2>&1
+    <<<"${standalone_json}" >/dev/null 2>&1 || rc=$?
+  # jq -e: 0 = mounted, 1 = not mounted, anything else = unparseable response.
+  (( rc <= 1 )) || err "Cannot parse Standalone ${AI_NS}/${AI_STANDALONE_NAME}; refusing to create a new JWT signing key"
+  return "${rc}"
 }
 
 # Sets SPLUNK_JWT_SIGNER_FINGERPRINT. It is written into the Standalone spec, so
@@ -2995,7 +2999,10 @@ verify_splunk_jwt_signing() {
   local pod_name secret_name admin_secret password response token header payload signature work_dir rc=0
   pod_name="$(internal_splunk_pod_name)"
   secret_name="$(splunk_jwt_signing_secret_name)"
-  admin_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
+  # The Splunk Operator mounts the current versioned admin Secret (-v1, -v2, ...) here.
+  admin_secret=$(oc get pod "${pod_name}" -n "${AI_NS}" \
+    -o jsonpath='{.spec.volumes[?(@.name=="mnt-splunk-secrets")].secret.secretName}' 2>/dev/null) || admin_secret=""
+  [[ -n "${admin_secret}" ]] || err "Cannot find the admin Secret mounted by Splunk pod ${AI_NS}/${pod_name}; cannot verify JWT signing"
   password=$(oc get secret "${admin_secret}" -n "${AI_NS}" -o jsonpath='{.data.password}' 2>/dev/null | openshift_decode_base64) \
     || err "Cannot read Splunk admin password from ${AI_NS}/${admin_secret} to verify JWT signing"
   [[ -n "${password}" ]] || err "Splunk admin password in ${AI_NS}/${admin_secret} is empty; cannot verify JWT signing"

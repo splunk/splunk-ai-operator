@@ -1101,6 +1101,7 @@ if command -v openssl >/dev/null 2>&1; then
           case "${standalone}" in
             uses) echo '{"spec":{"volumes":[{"name":"jwt-signing","secret":{"secretName":"splunk-standalone-jwt-signing"}}]}}' ;;
             error) return 1 ;;
+            garbled) echo 'not-json' ;;
           esac ;;
         "create secret") : ;;
         "apply -n") cat >/dev/null; echo "applied" >> "${JWT_TMP}/creates" ;;
@@ -1118,6 +1119,9 @@ if command -v openssl >/dev/null 2>&1; then
   assert_rc "fails on an unusable existing Secret" 1 _run_ensure "${JWT_TMP}/wrongpass" uses
   assert_rc "requires restoration when a configured Splunk lost its Secret" 1 _run_ensure "" uses
   assert_rc "stops when the Standalone cannot be read" 1 _run_ensure "" error
+  assert_rc "stops when the Standalone response is not JSON" 1 _run_ensure "" garbled
+  _run_ensure "" error >/dev/null 2>&1; _run_ensure "" garbled >/dev/null 2>&1
+  assert_eq "failed Standalone lookups create no Secret" "0" "$(wc -l < "${JWT_TMP}/creates" | tr -d ' ')"
   assert_eq "creates exactly one Secret on a fresh install" "fp=new creates=1" \
     "$(_run_ensure "" fresh 2>/dev/null | tail -1)"
   assert_eq "rotation replaces an existing Secret with a new key" "fp=new creates=1" \
@@ -1139,14 +1143,36 @@ if command -v openssl >/dev/null 2>&1; then
     err() { exit 1; }
     oc() {
       case "$*" in
-        *standalone-secret-v1*) printf 'admin-password' | b64 ;;
-        *"exec -i"*) cat >/dev/null; printf '{"entry":[{"content":{"token":"%s"}}]}' "${STUB_JWT}" ;;
+        *mnt-splunk-secrets*) echo "splunk-splunk-standalone-standalone-secret-v2" ;;
+        *standalone-secret-v1*) printf 'stale-v1-password' | b64 ;;
+        *standalone-secret-v2*) printf 'rotated-v2-password' | b64 ;;
+        *"exec -i"*) cat > "${JWT_TMP}/curl-config"; printf '{"entry":[{"content":{"token":"%s"}}]}' "${STUB_JWT}" ;;
         *jwt-signing*) b64 < "${JWT_TMP}/good/signer.pem" ;;
       esac
     }
     verify_splunk_jwt_signing
   )
   assert_rc "a fresh JWT signed with the Secret key verifies" 0 _run_verify "$(_make_jwt "${JWT_TMP}/good")"
+  assert_eq "verification logs in with the admin Secret the pod mounts (v2, not stale v1)" "1" \
+    "$(grep -c 'admin:rotated-v2-password' "${JWT_TMP}/curl-config" || true)"
+
+  # Readiness must not accept a pod still running with an older signing key.
+  eval "$(extract_function _internal_splunk_runtime_matches_desired)"
+  _run_runtime_match() (
+    local pod_fp="$1"
+    AI_NS="ai-platform"; AI_STANDALONE_NAME="splunk-standalone"; SPLUNK_JWT_SIGNER_FINGERPRINT="AA:BB"
+    oc() {
+      case "$*" in
+        *"btool server list sslConfig"*) echo "enableSplunkdSSL = true" ;;
+        *"btool authentication list oauth2_settings"*)
+          printf 'issuer_uri = %s\ncertFile = %s/signer.pem\n' "$(internal_splunk_management_url)" "${SPLUNK_JWT_SIGNING_MOUNT}" ;;
+        *SPLUNK_JWT_SIGNER_FINGERPRINT*) echo "${pod_fp}" ;;
+      esac
+    }
+    _internal_splunk_runtime_matches_desired "splunk-splunk-standalone-standalone-0"
+  )
+  assert_rc "readiness accepts the pod started with the current signing key" 0 _run_runtime_match "AA:BB"
+  assert_rc "readiness waits while the pod still has the previous signing key" 1 _run_runtime_match "OLD:FP"
   assert_rc "a JWT signed with a different key is rejected" 1 _run_verify "$(_make_jwt "${JWT_TMP}/other")"
   assert_rc "a non-JWT token response is rejected" 1 _run_verify "not-a-jwt"
   rm -rf "${JWT_TMP}"

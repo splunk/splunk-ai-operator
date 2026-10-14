@@ -910,6 +910,8 @@ issues a fresh JWT and verifies it against the certificate in this Secret.
   `oc create secret generic <name>-jwt-signing -n <namespace> --from-file=jwt-signing-backup/`.
 - To replace the key, re-run with `ROTATE_JWT_SIGNER=true`. Splunk restarts with
   the new key; previously issued tokens stop validating, so users sign in again.
+  Set the flag for that one run only: if the run is interrupted, re-run without
+  it and the installer keeps the new key and still completes the Splunk restart.
 - `delete` and `clean-all` remove this Secret together with the installation.
 
 ### Open bundled Splunk Web
