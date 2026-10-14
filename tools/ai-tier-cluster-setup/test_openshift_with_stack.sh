@@ -80,11 +80,15 @@ eval "$(extract_function openshift_wait_for_insecure_registry)"
 eval "$(extract_function configure_openshift_insecure_endpoints)"
 eval "$(extract_function preflight_check_insecure_registry_policy)"
 eval "$(extract_function prepare_airgap_registry_auth_file)"
+eval "$(extract_function object_store_auth_looks_like_placeholder)"
+eval "$(extract_function object_store_auth_is_factory_default)"
+eval "$(extract_function require_object_store_credentials)"
 eval "$(extract_function validate_config)"
 eval "$(extract_function clean_all)"
 eval "$(extract_function run_verify_pods)"
 eval "$(sed -n '/^qualified_additional_image()/,/^}/p' "${AIRGAP_PREPARE_SCRIPT}")"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
+eval "$(grep '^readonly SPLUNK_JWT_SIGNING_MOUNT=' "${SCRIPT}")"
 
 log() { :; }
 warn() { :; }
@@ -114,6 +118,7 @@ CONFIG_FILE="test-config.yaml"
 echo "OpenShift command parity"
 _run_validate_config() (
   local strategy="$1" node_count="$2" airgap="$3" registry="$4"
+  local root_user="${5-access-key}" root_password="${6-secret-key}"
   need() { :; }
   load_config() {
     AI_NS="ai-platform"
@@ -121,8 +126,8 @@ _run_validate_config() (
     OBJ_STORE_BUCKET="models"
     OBJ_STORE_ENDPOINT="http://minio.example:9000"
     OBJ_STORE_REGION=""
-    MINIO_ROOT_USER="access-key"
-    MINIO_ROOT_PASSWORD="secret-key"
+    MINIO_ROOT_USER="${root_user}"
+    MINIO_ROOT_PASSWORD="${root_password}"
     NODE_LABEL_STRATEGY="${strategy}"
     SPLUNK_AI_FILE="${SCRIPT}"
     SPLUNK_OPERATOR_FILE="${SCRIPT}"
@@ -147,6 +152,37 @@ assert_rc "validate rejects an unsupported node-label strategy" 1 \
   _run_validate_config unsupported 0 false registry.example.com
 assert_rc "validate requires a registry for air-gapped installation" 1 \
   _run_validate_config auto 0 true ""
+assert_rc "validate rejects missing object-store credentials" 1 \
+  _run_validate_config manual 1 false registry.example.com "" ""
+assert_rc "validate rejects placeholder object-store credentials" 1 \
+  _run_validate_config manual 1 false registry.example.com "<ACCESS_KEY>" "CHANGEME"
+assert_rc "validate rejects the minioadmin/minioadmin factory pair" 1 \
+  _run_validate_config manual 1 false registry.example.com minioadmin minioadmin
+assert_rc "validate accepts a familiar username with a unique password" 0 \
+  _run_validate_config manual 1 false registry.example.com minioadmin "unique-not-a-default"
+
+echo "Object-store credential guards"
+_guard() ( MINIO_ROOT_USER="$1"; MINIO_ROOT_PASSWORD="$2"; "$3" )
+assert_rc "placeholder guard flags <...> values" 0 \
+  _guard "<ACCESS_KEY>" "x" object_store_auth_looks_like_placeholder
+assert_rc "factory-default guard flags minioadmin/minioadmin" 0 \
+  _guard minioadmin minioadmin object_store_auth_is_factory_default
+assert_rc "factory-default guard allows minioadmin with a unique password" 1 \
+  _guard minioadmin "unique-not-a-default" object_store_auth_is_factory_default
+assert_rc "early credential gate rejects missing credentials" 1 \
+  _guard "" "" require_object_store_credentials
+assert_rc "early credential gate rejects placeholders" 1 \
+  _guard "<ACCESS_KEY>" "CHANGEME" require_object_store_credentials
+assert_rc "early credential gate rejects the factory pair" 1 \
+  _guard minioadmin minioadmin require_object_store_credentials
+assert_rc "early credential gate accepts unique credentials" 0 \
+  _guard minioadmin "unique-not-a-default" require_object_store_credentials
+assert_eq "air-gap delegation runs the credential gate before any cluster change" "true" \
+  "$(awk '/^delegate_airgap_install_if_needed\(\)/,/^}/' "${SCRIPT}" | awk '/require_object_store_credentials/{g=NR} /configure_openshift_insecure_endpoints/{c=NR} END{print (g && c && g < c) ? "true" : "false"}')"
+assert_eq "install runs the credential gate before any cluster change" "true" \
+  "$(awk '/^main_install\(\)/,/^}/' "${SCRIPT}" | awk '/require_object_store_credentials/{g=NR} /configure_openshift_insecure_endpoints/{c=NR} END{print (g && c && g < c) ? "true" : "false"}')"
+assert_eq "air-gap install checks credentials before importing images" "true" \
+  "$(awk '/factory-default credentials/{g=NR} /^  import_bundled_images$/{if(!i)i=NR} END{print (g && i && g < i) ? "true" : "false"}' "${AIRGAP_INSTALL_SCRIPT}")"
 
 clean_output=$(
   warn() { printf 'warning:%s\n' "$*"; }
@@ -530,6 +566,8 @@ SCRIPT
   AIRGAP_STAGED="false"
   SILENT_INSTALL="false"
   uname() { echo Linux; }
+  load_config() { :; }
+  require_object_store_credentials() { :; }
   configure_openshift_insecure_endpoints() { :; }
   prepare_airgap_registry_auth_file() { :; }
   yq() {
@@ -1010,6 +1048,151 @@ if [[ -n "${REAL_YQ}" ]]; then
 else
   echo "  SKIP: yq not installed; YAML parse checks skipped"
 fi
+
+echo "Splunk JWT signing key"
+eval "$(extract_function splunk_jwt_signing_secret_name)"
+eval "$(extract_function validate_jwt_signing_material)"
+eval "$(extract_function generate_jwt_signing_material)"
+eval "$(extract_function splunk_standalone_uses_jwt_signing_secret)"
+eval "$(extract_function ensure_splunk_jwt_signing_secret)"
+eval "$(extract_function base64url_decode)"
+eval "$(extract_function verify_splunk_jwt_signing)"
+eval "$(extract_function internal_splunk_pod_name)"
+
+if command -v openssl >/dev/null 2>&1; then
+  JWT_TMP=$(mktemp -d)
+  b64() { openssl base64 -A; }
+  b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+  mkdir -p "${JWT_TMP}/good" "${JWT_TMP}/other"
+  generate_jwt_signing_material "${JWT_TMP}/good"
+  generate_jwt_signing_material "${JWT_TMP}/other"
+
+  assert_rc "generated signing material validates" 0 validate_jwt_signing_material "${JWT_TMP}/good"
+  mkdir -p "${JWT_TMP}/nopass" && cp "${JWT_TMP}/good/signer.pem" "${JWT_TMP}/nopass/"
+  assert_rc "rejects a Secret without a passphrase" 1 validate_jwt_signing_material "${JWT_TMP}/nopass"
+  mkdir -p "${JWT_TMP}/wrongpass" && cp "${JWT_TMP}/good/signer.pem" "${JWT_TMP}/wrongpass/"
+  echo "not-the-passphrase" > "${JWT_TMP}/wrongpass/passphrase"
+  assert_rc "rejects an incorrect passphrase" 1 validate_jwt_signing_material "${JWT_TMP}/wrongpass"
+  mkdir -p "${JWT_TMP}/mismatch"
+  { openssl x509 -in "${JWT_TMP}/other/signer.pem"; sed -n '/BEGIN ENCRYPTED PRIVATE KEY/,/END ENCRYPTED PRIVATE KEY/p' "${JWT_TMP}/good/signer.pem"; } > "${JWT_TMP}/mismatch/signer.pem"
+  cp "${JWT_TMP}/good/passphrase" "${JWT_TMP}/mismatch/"
+  assert_rc "rejects a key that does not match the certificate" 1 validate_jwt_signing_material "${JWT_TMP}/mismatch"
+  mkdir -p "${JWT_TMP}/ec"
+  echo "ec-pass-for-test" > "${JWT_TMP}/ec/passphrase"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -subj "/CN=t" \
+    -keyout "${JWT_TMP}/ec/key.pem" -passout "file:${JWT_TMP}/ec/passphrase" -out "${JWT_TMP}/ec/cert.pem" >/dev/null 2>&1
+  cat "${JWT_TMP}/ec/cert.pem" "${JWT_TMP}/ec/key.pem" > "${JWT_TMP}/ec/signer.pem"
+  assert_rc "rejects a non-RSA signing key" 1 validate_jwt_signing_material "${JWT_TMP}/ec"
+
+  # Stubbed cluster state for ensure_splunk_jwt_signing_secret.
+  good_fp=$(openssl x509 -in "${JWT_TMP}/good/signer.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+  # standalone: "uses" (mounts the Secret), "fresh" (no Standalone) or "error" (oc fails).
+  _run_ensure() (
+    local secret_dir="$1" standalone="$2"
+    AI_NS="ai-platform"; AI_STANDALONE_NAME="splunk-standalone"; SPLUNK_JWT_SIGNER_FINGERPRINT=""
+    err() { exit 1; }
+    oc() {
+      case "$1 $2" in
+        "get secret")
+          [[ -n "${secret_dir}" ]] || return 0
+          printf '{"data":{"signer.pem":"%s","passphrase":"%s"}}' \
+            "$(b64 < "${secret_dir}/signer.pem")" "$( [[ -f "${secret_dir}/passphrase" ]] && b64 < "${secret_dir}/passphrase")" ;;
+        "get standalone")
+          case "${standalone}" in
+            uses) echo '{"spec":{"volumes":[{"name":"jwt-signing","secret":{"secretName":"splunk-standalone-jwt-signing"}}]}}' ;;
+            error) return 1 ;;
+            garbled) echo 'not-json' ;;
+          esac ;;
+        "create secret") : ;;
+        "apply -n") cat >/dev/null; echo "applied" >> "${JWT_TMP}/creates" ;;
+      esac
+    }
+    : > "${JWT_TMP}/creates"
+    ensure_splunk_jwt_signing_secret || exit 1
+    local fp="new"
+    [[ -n "${SPLUNK_JWT_SIGNER_FINGERPRINT}" ]] || fp="empty"
+    [[ "${SPLUNK_JWT_SIGNER_FINGERPRINT}" == "${good_fp}" ]] && fp="same"
+    echo "fp=${fp} creates=$(wc -l < "${JWT_TMP}/creates" | tr -d ' ')"
+  )
+  assert_eq "reuses a valid existing Secret and keeps its fingerprint" "fp=same creates=0" \
+    "$(_run_ensure "${JWT_TMP}/good" uses 2>/dev/null | tail -1)"
+  assert_rc "fails on an unusable existing Secret" 1 _run_ensure "${JWT_TMP}/wrongpass" uses
+  assert_rc "requires restoration when a configured Splunk lost its Secret" 1 _run_ensure "" uses
+  assert_rc "stops when the Standalone cannot be read" 1 _run_ensure "" error
+  assert_rc "stops when the Standalone response is not JSON" 1 _run_ensure "" garbled
+  _run_ensure "" error >/dev/null 2>&1; _run_ensure "" garbled >/dev/null 2>&1
+  assert_eq "failed Standalone lookups create no Secret" "0" "$(wc -l < "${JWT_TMP}/creates" | tr -d ' ')"
+  assert_eq "creates exactly one Secret on a fresh install" "fp=new creates=1" \
+    "$(_run_ensure "" fresh 2>/dev/null | tail -1)"
+  assert_eq "rotation replaces an existing Secret with a new key" "fp=new creates=1" \
+    "$(ROTATE_JWT_SIGNER=true _run_ensure "${JWT_TMP}/good" uses 2>/dev/null | tail -1)"
+  assert_eq "rotation creates a key when a configured Splunk lost its Secret" "fp=new creates=1" \
+    "$(ROTATE_JWT_SIGNER=true _run_ensure "" uses 2>/dev/null | tail -1)"
+
+  # A JWT signed by <key_dir> and verified against the Secret in good/.
+  _make_jwt() {
+    local key_dir="$1" h p
+    h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+    p=$(printf '{"iss":"https://splunk:8089","exp":9999999999}' | b64url)
+    openssl pkey -in "${key_dir}/signer.pem" -passin "file:${key_dir}/passphrase" -out "${JWT_TMP}/k.pem" 2>/dev/null
+    printf '%s.%s.%s' "${h}" "${p}" "$(printf '%s.%s' "${h}" "${p}" | openssl dgst -sha256 -sign "${JWT_TMP}/k.pem" | b64url)"
+  }
+  _run_verify() (
+    STUB_JWT="$1"
+    AI_NS="ai-platform"; AI_STANDALONE_NAME="splunk-standalone"
+    err() { exit 1; }
+    oc() {
+      case "$*" in
+        *mnt-splunk-secrets*) echo "splunk-splunk-standalone-standalone-secret-v2" ;;
+        *standalone-secret-v1*) printf 'stale-v1-password' | b64 ;;
+        *standalone-secret-v2*) printf 'rotated-v2-password' | b64 ;;
+        *"exec -i"*) cat > "${JWT_TMP}/curl-config"; printf '{"entry":[{"content":{"token":"%s"}}]}' "${STUB_JWT}" ;;
+        *jwt-signing*) b64 < "${JWT_TMP}/good/signer.pem" ;;
+      esac
+    }
+    verify_splunk_jwt_signing
+  )
+  assert_rc "a fresh JWT signed with the Secret key verifies" 0 _run_verify "$(_make_jwt "${JWT_TMP}/good")"
+  assert_eq "verification logs in with the admin Secret the pod mounts (v2, not stale v1)" "1" \
+    "$(grep -c 'admin:rotated-v2-password' "${JWT_TMP}/curl-config" || true)"
+
+  # Readiness must not accept a pod still running with an older signing key.
+  eval "$(extract_function _internal_splunk_runtime_matches_desired)"
+  _run_runtime_match() (
+    local pod_fp="$1"
+    AI_NS="ai-platform"; AI_STANDALONE_NAME="splunk-standalone"; SPLUNK_JWT_SIGNER_FINGERPRINT="AA:BB"
+    oc() {
+      case "$*" in
+        *"btool server list sslConfig"*) echo "enableSplunkdSSL = true" ;;
+        *"btool authentication list oauth2_settings"*)
+          printf 'issuer_uri = %s\ncertFile = %s/signer.pem\n' "$(internal_splunk_management_url)" "${SPLUNK_JWT_SIGNING_MOUNT}" ;;
+        *SPLUNK_JWT_SIGNER_FINGERPRINT*) echo "${pod_fp}" ;;
+      esac
+    }
+    _internal_splunk_runtime_matches_desired "splunk-splunk-standalone-standalone-0"
+  )
+  assert_rc "readiness accepts the pod started with the current signing key" 0 _run_runtime_match "AA:BB"
+  assert_rc "readiness waits while the pod still has the previous signing key" 1 _run_runtime_match "OLD:FP"
+  assert_rc "a JWT signed with a different key is rejected" 1 _run_verify "$(_make_jwt "${JWT_TMP}/other")"
+  assert_rc "a non-JWT token response is rejected" 1 _run_verify "not-a-jwt"
+  rm -rf "${JWT_TMP}"
+else
+  echo "  SKIP: openssl not installed; JWT signing checks skipped"
+fi
+
+jwt_defaults=$(render_splunk_defaults_manifest)
+assert_eq "Splunk signs JWTs with the per-installation key" "1" \
+  "$(grep -c "certFile: ${SPLUNK_JWT_SIGNING_MOUNT}/signer.pem" <<<"${jwt_defaults}" || true)"
+assert_eq "Splunk defaults no longer use the built-in passphrase" "0" \
+  "$(grep -c 'sslPassword: password' <<<"${jwt_defaults}" || true)"
+assert_eq "JWT pre-task does not escalate privileges" "0" \
+  "$(grep -c 'become' <<<"${jwt_defaults}" || true)"
+assert_eq "JWT pre-task is skipped when the Secret is not mounted" "1" \
+  "$(grep -c "when: \"'${SPLUNK_JWT_SIGNING_MOUNT}/passphrase' is file\"" <<<"${jwt_defaults}" || true)"
+assert_eq "Standalone mounts the JWT signing Secret" "1" \
+  "$(grep -c 'secretName: $(splunk_jwt_signing_secret_name)' "${SCRIPT}" || true)"
+assert_eq "readiness requires the per-installation certFile" "1" \
+  "$(extract_function _internal_splunk_runtime_matches_desired | grep -c 'SPLUNK_JWT_SIGNING_MOUNT}/signer.pem' || true)"
 
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

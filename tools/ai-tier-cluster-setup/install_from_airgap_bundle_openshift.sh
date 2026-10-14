@@ -299,6 +299,18 @@ NFD_CATALOG_SOURCE=$(yq eval '.operators.nfd.catalogSource // "redhat-operators"
 GPU_CATALOG_SOURCE=$(yq eval '.operators.gpu.catalogSource // "certified-operators"' "${CONFIG_FILE}")
 
 if [[ "${SUBCOMMAND}" == "install" ]]; then
+  # Same object-store credential rules as openshift_with_stack.sh, checked before the image import.
+  obj_user=$(yq eval '.storage.objectStore.auth.rootUser // ""' "${CONFIG_FILE}")
+  obj_pass=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}")
+  [[ -n "${obj_user}" && -n "${obj_pass}" ]] \
+    || err "storage.objectStore.auth.rootUser and rootPassword are required in ${CONFIG_FILE}"
+  case "${obj_user}${obj_pass}" in
+    *\<*|*\>*|*CHANGEME*|*changeme*)
+      err "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace them in ${CONFIG_FILE}" ;;
+  esac
+  [[ "${obj_user}" == "minioadmin" && "${obj_pass}" == "minioadmin" ]] \
+    && err "objectStore.auth uses the factory-default credentials (minioadmin/minioadmin). Configure unique object-store credentials in ${CONFIG_FILE}"
+  unset obj_user obj_pass
   import_bundled_images
   export AIRGAP_NFD_CATALOG_SOURCE="${MIRRORED_NFD_CATALOG_SOURCE}"
   export AIRGAP_GPU_CATALOG_SOURCE="${MIRRORED_GPU_CATALOG_SOURCE}"

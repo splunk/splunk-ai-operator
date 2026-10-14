@@ -25,12 +25,6 @@ COPY pkg/ pkg/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 
-# Generate self-signed cert
-RUN mkdir -p /certs && \
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-    -keyout /certs/tls.key -out /certs/tls.crt \
-    -subj "/CN=local.svc"
-
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
@@ -42,8 +36,6 @@ COPY config/configs/applications.yaml applications.yaml
 COPY config/configs/model-scale.yaml model-scale.yaml
 COPY config/configs/worker-scale.yaml worker-scale.yaml
 COPY LICENSE LICENSE-2.0.txt
-COPY --from=builder /certs/tls.crt /certs/tls.crt
-COPY --from=builder /certs/tls.key /certs/tls.key
 
 # Run as non-root UID with GID 0 (root group). GID 0 is required on
 # RHEL / OpenShift / k0s nodes: the container runtime assigns a random

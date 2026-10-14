@@ -14,8 +14,18 @@ SOURCE_DIR="./model_artifacts"
 # they must match these values.
 OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-${SEAWEEDFS_ENDPOINT:-http://127.0.0.1:8333}}"
 OBJECT_STORE_BUCKET="${OBJECT_STORE_BUCKET:-${SEAWEEDFS_BUCKET:-ai-platform-bucket}}"
-OBJECT_STORE_ACCESS_KEY="${OBJECT_STORE_ACCESS_KEY:-${SEAWEEDFS_ACCESS_KEY:-minioadmin}}"
-OBJECT_STORE_SECRET_KEY="${OBJECT_STORE_SECRET_KEY:-${SEAWEEDFS_SECRET_KEY:-minioadmin}}"
+OBJECT_STORE_ACCESS_KEY="${OBJECT_STORE_ACCESS_KEY:-${SEAWEEDFS_ACCESS_KEY:-}}"
+OBJECT_STORE_SECRET_KEY="${OBJECT_STORE_SECRET_KEY:-${SEAWEEDFS_SECRET_KEY:-}}"
+if [[ -z "$OBJECT_STORE_ACCESS_KEY" || -z "$OBJECT_STORE_SECRET_KEY" ]]; then
+  echo "Error: object-store credentials are required."
+  echo "Set OBJECT_STORE_ACCESS_KEY and OBJECT_STORE_SECRET_KEY (or SEAWEEDFS_ACCESS_KEY and SEAWEEDFS_SECRET_KEY)."
+  exit 1
+fi
+if [[ "$OBJECT_STORE_ACCESS_KEY" == "minioadmin" && "$OBJECT_STORE_SECRET_KEY" == "minioadmin" ]]; then
+  echo "Error: refusing to use factory-default credentials (minioadmin/minioadmin)."
+  echo "Configure SeaweedFS S3 with unique credentials and pass them via OBJECT_STORE_ACCESS_KEY/OBJECT_STORE_SECRET_KEY."
+  exit 1
+fi
 # Bucket list to create (comma-separated). If unset, only primary bucket is created.
 SEAWEEDFS_BUCKETS="${SEAWEEDFS_BUCKETS:-$OBJECT_STORE_BUCKET}"
 # Retries for each artifact upload (large files can trigger transient "internal error").

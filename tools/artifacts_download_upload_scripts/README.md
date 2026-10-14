@@ -88,14 +88,14 @@ Uploads downloaded artifacts to MinIO or any S3-compatible storage (e.g. Seaweed
 - **Resume support** (`SKIP_IF_STAGED=1`): skips artifacts whose store marker already exists
 - Comprehensive dependency installation (mc via Homebrew on macOS or direct download on Linux)
 
-**Usage:**
+**Usage:** credentials are required and the factory pair `minioadmin`/`minioadmin` is refused.
 ```bash
-./upload_to_minio.sh
+OBJECT_STORE_ACCESS_KEY='<access-key>' OBJECT_STORE_SECRET_KEY='<secret-key>' ./upload_to_minio.sh
 ```
 
-Or with sudo if dependency installation fails:
+Or with sudo if dependency installation fails (pass the variables through sudo, which drops the environment):
 ```bash
-sudo ./upload_to_minio.sh
+sudo OBJECT_STORE_ACCESS_KEY='<access-key>' OBJECT_STORE_SECRET_KEY='<secret-key>' ./upload_to_minio.sh
 ```
 
 **Environment variables (S3-compatible target):**  
@@ -410,6 +410,7 @@ The staging pipeline is **resumable and idempotent**. Re-running after any failu
 
    **Option A — MinIO / S3-compatible (using mc):**
    ```bash
+   export OBJECT_STORE_ACCESS_KEY='<access-key>' OBJECT_STORE_SECRET_KEY='<secret-key>'
    ./upload_to_minio.sh
    # Resume: SKIP_IF_STAGED=1 ./upload_to_minio.sh
    ```
@@ -423,6 +424,7 @@ The staging pipeline is **resumable and idempotent**. Re-running after any failu
 
    **Option C — SeaweedFS (upload-only, server already running):**
    ```bash
+   export OBJECT_STORE_ACCESS_KEY='<access-key>' OBJECT_STORE_SECRET_KEY='<secret-key>'
    ./upload_to_seaweedfs_upload_only.sh
    ```
 
@@ -447,7 +449,7 @@ The staging pipeline is **resumable and idempotent**. Re-running after any failu
 - `SKIP_IF_STAGED=1` — skip artifacts whose `staging_state/<id>/.staging_complete` marker exists in the store
 - **Preferred (generic):** `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`, `OBJECT_STORE_ACCESS_KEY`, `OBJECT_STORE_SECRET_KEY`
 - **Backward compatibility:** `MINIO_ENDPOINT`, `MINIO_BUCKET`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` (or `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`)
-- Defaults: endpoint http://127.0.0.1:9000, bucket ai-platform-bucket, minioadmin/minioadmin
+- Defaults: endpoint http://127.0.0.1:9000, bucket ai-platform-bucket. Credentials have no default and `minioadmin`/`minioadmin` is refused.
 
 ### For S3-compatible Upload Script (using AWS CLI, `upload_to_minio_aws.sh`):
 - No config file needed - automatically uploads all artifacts from `./model_artifacts/`

@@ -6,8 +6,18 @@ SOURCE_DIR="./model_artifacts"
 # Generic names (preferred); fallback to MINIO_* for backward compatibility
 OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-${MINIO_ENDPOINT:-http://127.0.0.1:9000}}"
 OBJECT_STORE_BUCKET="${OBJECT_STORE_BUCKET:-${MINIO_BUCKET:-ai-platform-bucket-minio-us-east-2}}"
-OBJECT_STORE_ACCESS_KEY="${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-minioadmin}}}"
-OBJECT_STORE_SECRET_KEY="${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY:-minioadmin}}}"
+OBJECT_STORE_ACCESS_KEY="${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-}}}"
+OBJECT_STORE_SECRET_KEY="${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY:-}}}"
+if [[ -z "$OBJECT_STORE_ACCESS_KEY" || -z "$OBJECT_STORE_SECRET_KEY" ]]; then
+    echo "Error: object-store credentials are required."
+    echo "Set OBJECT_STORE_ACCESS_KEY and OBJECT_STORE_SECRET_KEY (or MINIO_ROOT_USER and MINIO_ROOT_PASSWORD)."
+    exit 1
+fi
+if [[ "$OBJECT_STORE_ACCESS_KEY" == "minioadmin" && "$OBJECT_STORE_SECRET_KEY" == "minioadmin" ]]; then
+    echo "Error: refusing to use the MinIO factory-default credentials (minioadmin/minioadmin)."
+    echo "Configure the object store with unique credentials and pass them via OBJECT_STORE_ACCESS_KEY/OBJECT_STORE_SECRET_KEY."
+    exit 1
+fi
 # Internal use (script uses one set)
 MINIO_ENDPOINT="${OBJECT_STORE_ENDPOINT}"
 MINIO_BUCKET="${OBJECT_STORE_BUCKET}"
@@ -168,7 +178,7 @@ else
     echo "Troubleshooting:"
     echo "  1. Check endpoint is correct and accessible"
     echo "  2. Verify MinIO is running"
-    echo "  3. Check credentials (default: minioadmin/minioadmin)"
+    echo "  3. Check the credentials match those configured on the object store"
     exit 1
 fi
 
@@ -197,11 +207,8 @@ if [ $CONNECTION_STATUS -ne 0 ]; then
         echo "Troubleshooting:"
         echo "  1. Check MINIO_ROOT_USER is correct (currently: $MINIO_ROOT_USER)"
         echo "  2. Check MINIO_ROOT_PASSWORD is correct"
-        echo "  3. Default MinIO credentials are usually:"
-        echo "     - Username: minioadmin"
-        echo "     - Password: minioadmin"
-        echo "  4. If you installed MinIO with a custom password (e.g. install_minio_ec2.sh --password 'xxx'), run:"
-        echo "     MINIO_ROOT_PASSWORD='your-password' ./upload_to_minio.sh"
+        echo "  3. Pass the credentials configured on the object store, e.g.:"
+        echo "     MINIO_ROOT_USER='<user>' MINIO_ROOT_PASSWORD='<password>' ./upload_to_minio.sh"
     elif echo "$CONNECTION_TEST" | grep -q "dial tcp\|connection refused\|no such host"; then
         echo "Error: Cannot reach MinIO endpoint"
         echo ""

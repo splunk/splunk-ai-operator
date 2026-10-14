@@ -450,6 +450,22 @@ Before installation, validate that the configured credentials can access the
 selected bucket with the required read and write permissions. Preflight does
 not verify bucket authorization or bucket-level permissions.
 
+The installer ships no default object-store credentials. `rootUser` and
+`rootPassword` must be unique values created for your object store. `validate`,
+`install` (including air-gapped installs), and `stage-artifacts` stop before any
+cluster change when:
+
+| Condition | `install` / `stage-artifacts` message | `validate` message |
+|---|---|---|
+| A value is empty | `storage.objectStore.auth.rootUser and rootPassword are required` | `storage.objectStore.auth.rootUser is not set` (or `rootPassword`) |
+| A value is still template text (`<...>` or `CHANGEME`) | `objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME)` | `storage.objectStore.auth.rootUser is not set` (or `rootPassword`) |
+| The pair is the MinIO/SeaweedFS factory default `minioadmin`/`minioadmin` | `objectStore.auth uses the factory-default credentials (minioadmin/minioadmin)` | same |
+
+A familiar username such as `minioadmin` is accepted with a unique password.
+When run directly, `upload_to_minio.sh` and `upload_to_seaweedfs_upload_only.sh`
+require `OBJECT_STORE_ACCESS_KEY` and `OBJECT_STORE_SECRET_KEY` and also reject
+the factory-default pair.
+
 ### Splunk issuers
 
 The installer adds the primary short Splunk management service URL to
@@ -872,6 +888,31 @@ an existing externally managed Splunk Enterprise deployment. For external
 Splunk, make sure its JWT issuer is listed under
 `splunk.trustedIssuers` and that both Splunk and the user's browser can reach
 the required Routes.
+
+### JWT signing key (bundled Splunk)
+
+The installer creates a unique RSA signing key and passphrase for each
+installation in the Secret `<splunk.standaloneName>-jwt-signing` (keys
+`signer.pem` and `passphrase`) and mounts it into Splunk at `/mnt/jwt-signing`.
+Splunk signs the JWTs that SAIA and SLIM verify with this key; Splunk's built-in
+`server.pem` is no longer used for signing. After Splunk is ready, the installer
+issues a fresh JWT and verifies it against the certificate in this Secret.
+
+- Back up the Secret with your other cluster secrets:
+  `oc extract secret/<name>-jwt-signing -n <namespace> --to=jwt-signing-backup`
+  (writes `signer.pem` and `passphrase`; keep the directory protected).
+- On every run, an existing Secret is reused only after its contents are
+  validated: both keys present, the passphrase decrypts the RSA key, the key
+  matches the certificate, the certificate has not expired, and a test signature
+  verifies. Otherwise the install stops with the reason.
+- If the Secret is lost on an installation that already uses it, the installer
+  stops and asks you to restore it:
+  `oc create secret generic <name>-jwt-signing -n <namespace> --from-file=jwt-signing-backup/`.
+- To replace the key, re-run with `ROTATE_JWT_SIGNER=true`. Splunk restarts with
+  the new key; previously issued tokens stop validating, so users sign in again.
+  Set the flag for that one run only: if the run is interrupted, re-run without
+  it and the installer keeps the new key and still completes the Splunk restart.
+- `delete` and `clean-all` remove this Secret together with the installation.
 
 ### Open bundled Splunk Web
 

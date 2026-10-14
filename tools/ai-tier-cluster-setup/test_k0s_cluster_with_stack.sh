@@ -106,6 +106,7 @@ _load_functions() {
   eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn validate_scale_factor_config)"
   eval "$(_extract_fn object_store_auth_looks_like_placeholder)"
+  eval "$(_extract_fn object_store_auth_is_factory_default)"
   eval "$(_extract_fn validate_single_controller_topology)"
   eval "$(_extract_fn _pod_is_healthy)"
   eval "$(_extract_fn _classify_pod_failure)"
@@ -265,6 +266,12 @@ assert_rc "detects changeme (lowercase)" 0 \
 
 assert_rc "accepts real credentials (returns 1)" 1 \
   bash -c "$(declare -f object_store_auth_looks_like_placeholder); MINIO_ROOT_USER='admin' MINIO_ROOT_PASSWORD='s3cr3t!' object_store_auth_looks_like_placeholder"
+
+assert_rc "detects the minioadmin/minioadmin factory pair" 0 \
+  bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER='minioadmin' MINIO_ROOT_PASSWORD='minioadmin' object_store_auth_is_factory_default"
+
+assert_rc "accepts username minioadmin with a unique password (returns 1)" 1 \
+  bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER='minioadmin' MINIO_ROOT_PASSWORD='s3cr3t!' object_store_auth_is_factory_default"
 
 # ── Tests: model artifact config selection ───────────────────────────────────
 
