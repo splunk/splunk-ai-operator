@@ -158,8 +158,6 @@ or empty — `AuthenticationRSAKeysManager` has no certificate to sign tokens wi
     $SPLUNK_HOME/bin/splunk show-decrypted --value '<encrypted value from server.conf>'
     ```
 
-    A typical default passphrase for a fresh Splunk install is `password`.
-
 4. Restart Splunk (see [Step 5](#step-5--restart-splunk-correctly) for the correct procedure).
 
 5. Verify the key is now loaded:

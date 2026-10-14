@@ -35,6 +35,8 @@ readonly LOCAL_PATH_PROVISIONER_VERSION="v0.0.26"
 readonly OTEL_OPERATOR_CHART_VERSION="0.121.0"
 readonly KUBERAY_OPERATOR_VERSION="1.2.2"
 readonly QUALIFIED_RAY_RUNTIME_VERSION="2.56.0"
+# Splunk Operator mounts Standalone spec.volumes at /mnt/<volume name>.
+readonly SPLUNK_JWT_SIGNING_MOUNT="/mnt/jwt-signing"
 
 # ====== CONFIG FILE LOCATION ======
 CONFIG_FILE="${CONFIG_FILE:-$(dirname "$0")/openshift-cluster-config.yaml}"
@@ -683,6 +685,26 @@ object_store_auth_looks_like_placeholder() {
     *CHANGEME*|*changeme*) return 0 ;;
   esac
   return 1
+}
+
+# True if objectStore.auth is a known factory-default pair. A familiar
+# username alone is allowed; only the published default pair is rejected.
+object_store_auth_is_factory_default() {
+  [[ "${MINIO_ROOT_USER}" == "minioadmin" && "${MINIO_ROOT_PASSWORD}" == "minioadmin" ]]
+}
+
+# Runs right after load_config so bad credentials fail before any cluster change.
+require_object_store_credentials() {
+  [[ -n "${MINIO_ROOT_USER}" && -n "${MINIO_ROOT_PASSWORD}" ]] \
+    || { err "storage.objectStore.auth.rootUser and rootPassword are required in ${CONFIG_FILE}"; return 1; }
+  if object_store_auth_looks_like_placeholder; then
+    err "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace them in ${CONFIG_FILE}"
+    return 1
+  fi
+  if object_store_auth_is_factory_default; then
+    err "objectStore.auth uses the factory-default credentials (minioadmin/minioadmin). Configure unique object-store credentials in ${CONFIG_FILE}"
+    return 1
+  fi
 }
 
 # ====== IMAGE HELPERS ======
@@ -1497,7 +1519,7 @@ preflight_checks() {
   fi
 
   pf_header "Required tools"
-  for tool in oc yq helm curl jq base64 tar timeout python3; do
+  for tool in oc yq helm curl jq base64 tar timeout python3 openssl; do
     command -v "$tool" >/dev/null 2>&1 && pf_ok "$tool found" || pf_fail "$tool not found in PATH"
   done
   if [[ -n "${_aws_reason}" ]]; then
@@ -1546,6 +1568,11 @@ preflight_checks() {
     pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace them in ${CONFIG_FILE}"
   else
     pf_ok "Object-store credentials do not contain template placeholders"
+  fi
+  if object_store_auth_is_factory_default; then
+    pf_fail "objectStore.auth uses the factory-default credentials (minioadmin/minioadmin). Configure unique object-store credentials in ${CONFIG_FILE}"
+  else
+    pf_ok "Object-store credentials are not factory defaults"
   fi
 
   preflight_check_openshift_compatibility
@@ -2757,10 +2784,13 @@ _internal_splunk_runtime_matches_desired() {
     awk '$1 == "enableSplunkdSSL" && $2 == "=" {v=tolower($3); n++} END {if(n != 1) exit 1; print v}') || return 1
   [[ "${splunkd_ssl}" == "true" || "${splunkd_ssl}" == "1" ]] || return 1
 
-  issuer_uri=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
-    /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null | \
-    awk '$1 == "issuer_uri" && $2 == "=" {v=$3; n++} END {if(n != 1) exit 1; print v}') || return 1
-  [[ "${issuer_uri}" == "${expected_issuer}" ]]
+  local oauth_settings cert_file
+  oauth_settings=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
+    /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null) || return 1
+  issuer_uri=$(awk '$1 == "issuer_uri" && $2 == "=" {v=$3; n++} END {if(n != 1) exit 1; print v}' <<<"${oauth_settings}") || return 1
+  [[ "${issuer_uri}" == "${expected_issuer}" ]] || return 1
+  cert_file=$(awk '$1 == "certFile" && $2 == "=" {v=$3; n++} END {if(n != 1) exit 1; print v}' <<<"${oauth_settings}") || return 1
+  [[ "${cert_file}" == "${SPLUNK_JWT_SIGNING_MOUNT}/signer.pem" ]]
 }
 
 wait_for_internal_splunk_ready() {
@@ -2799,16 +2829,24 @@ data:
   default.yml: |
     ansible_pre_tasks:
       - file:///mnt/defaults/remove-stale-installer-tls.yml
-    splunk:
-      conf:
-        - key: authentication
-          value:
-            directory: /opt/splunk/etc/system/local
-            content:
-              oauth2_settings:
-                issuer_uri: ${internal_splunk_url}
-                certFile: \$SPLUNK_HOME/etc/auth/server.pem
-                sslPassword: password
+      - file:///mnt/defaults/configure-jwt-signing.yml
+  configure-jwt-signing.yml: |
+    ---
+    - name: Configure the per-installation OAuth2 JWT signing key
+      ini_file:
+        path: /opt/splunk/etc/system/local/authentication.conf
+        section: oauth2_settings
+        option: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        mode: '0600'
+      with_dict:
+        issuer_uri: ${internal_splunk_url}
+        certFile: ${SPLUNK_JWT_SIGNING_MOUNT}/signer.pem
+        sslPassword: "{{ lookup('file', '${SPLUNK_JWT_SIGNING_MOUNT}/passphrase') | trim }}"
+      become: yes
+      become_user: "{{ splunk.user }}"
+      no_log: true
   remove-stale-installer-tls.yml: |
     ---
     - name: Restore built-in management TLS and keep Splunk Web on HTTP
@@ -2842,12 +2880,155 @@ data:
 YAML
 }
 
+# ====== SPLUNK JWT SIGNING KEY ======
+# Splunk signs the JWTs that SAIA and SLIM verify. Each installation gets its
+# own RSA signing key and passphrase in this Secret, instead of Splunk's
+# built-in server.pem and its well-known passphrase.
+splunk_jwt_signing_secret_name() {
+  printf '%s-jwt-signing' "${AI_STANDALONE_NAME}"
+}
+
+# Prints the reason and returns 1 unless <dir>/signer.pem (certificate + encrypted
+# RSA key) and <dir>/passphrase form a usable, unexpired signing identity.
+validate_jwt_signing_material() {
+  local dir="$1" cert_pub key_pub
+  [[ -s "${dir}/signer.pem" && -s "${dir}/passphrase" ]] \
+    || { echo "missing signer.pem or passphrase"; return 1; }
+  openssl x509 -in "${dir}/signer.pem" -noout >/dev/null 2>&1 \
+    || { echo "signer.pem has no certificate"; return 1; }
+  openssl x509 -in "${dir}/signer.pem" -noout -text 2>/dev/null | grep -q 'rsaEncryption' \
+    || { echo "the signing certificate is not RSA"; return 1; }
+  openssl x509 -in "${dir}/signer.pem" -noout -checkend 0 >/dev/null 2>&1 \
+    || { echo "the signing certificate has expired"; return 1; }
+  openssl pkey -in "${dir}/signer.pem" -passin "file:${dir}/passphrase" -noout >/dev/null 2>&1 \
+    || { echo "the private key is missing or the passphrase does not decrypt it"; return 1; }
+  cert_pub=$(openssl x509 -in "${dir}/signer.pem" -pubkey -noout 2>/dev/null)
+  key_pub=$(openssl pkey -in "${dir}/signer.pem" -passin "file:${dir}/passphrase" -pubout 2>/dev/null)
+  [[ -n "${cert_pub}" && "${cert_pub}" == "${key_pub}" ]] \
+    || { echo "the private key does not match the certificate"; return 1; }
+  printf 'jwt-signing-check' > "${dir}/probe"
+  openssl pkey -in "${dir}/signer.pem" -passin "file:${dir}/passphrase" -out "${dir}/probe.key" >/dev/null 2>&1 \
+    && openssl dgst -sha256 -sign "${dir}/probe.key" -out "${dir}/probe.sig" "${dir}/probe" >/dev/null 2>&1 \
+    && openssl dgst -sha256 -verify <(printf '%s\n' "${cert_pub}") -signature "${dir}/probe.sig" "${dir}/probe" >/dev/null 2>&1
+  local rc=$?
+  rm -f "${dir}/probe" "${dir}/probe.key" "${dir}/probe.sig"
+  (( rc == 0 )) || { echo "the key cannot produce a signature that verifies against the certificate"; return 1; }
+  if ! openssl x509 -in "${dir}/signer.pem" -noout -checkend 2592000 >/dev/null 2>&1; then
+    warn "JWT signing certificate expires within 30 days; rotate it with ROTATE_JWT_SIGNER=true"
+  fi
+}
+
+generate_jwt_signing_material() {
+  local dir="$1"
+  {
+    openssl rand -hex 32 > "${dir}/passphrase" \
+      && openssl req -x509 -newkey rsa:3072 -sha256 -days 825 -subj "/CN=Splunk AI Tier JWT signing" \
+           -keyout "${dir}/key.pem" -passout "file:${dir}/passphrase" -out "${dir}/cert.pem" \
+      && cat "${dir}/cert.pem" "${dir}/key.pem" > "${dir}/signer.pem"
+  } >/dev/null 2>&1
+  rm -f "${dir}/cert.pem" "${dir}/key.pem"
+  [[ -s "${dir}/signer.pem" ]]
+}
+
+# True if the existing Standalone already mounts the signing Secret, i.e. Splunk
+# has been configured with (and may have issued tokens from) that identity.
+splunk_standalone_uses_jwt_signing_secret() {
+  local secret_name="$1"
+  oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" -o json 2>/dev/null \
+    | jq -e --arg s "${secret_name}" '[.spec.volumes[]? | .secret.secretName?] | index($s) != null' >/dev/null 2>&1
+}
+
+# Sets JWT_SIGNER_ROTATED=true when a new key replaces one Splunk was already using.
+JWT_SIGNER_ROTATED=false
+ensure_splunk_jwt_signing_secret() {
+  local secret_name work_dir secret_json reason rc=0
+  secret_name="$(splunk_jwt_signing_secret_name)"
+  work_dir=$(mktemp -d)
+  chmod 700 "${work_dir}"
+  secret_json=$(oc get secret "${secret_name}" -n "${AI_NS}" --ignore-not-found -o json) \
+    || { rm -rf "${work_dir}"; err "Cannot read Secret ${AI_NS}/${secret_name}; check cluster access"; }
+
+  if [[ -n "${secret_json}" ]]; then
+    { jq -r '.data["signer.pem"] // ""' <<<"${secret_json}" | openshift_decode_base64 > "${work_dir}/signer.pem"; } 2>/dev/null || true
+    { jq -r '.data["passphrase"] // ""' <<<"${secret_json}" | openshift_decode_base64 > "${work_dir}/passphrase"; } 2>/dev/null || true
+    reason=$(validate_jwt_signing_material "${work_dir}") || rc=1
+    rm -rf "${work_dir}"
+    (( rc == 0 )) || err "JWT signing Secret ${AI_NS}/${secret_name} is not usable: ${reason}. Restore a valid copy from backup (keys signer.pem and passphrase), or delete it and re-run with ROTATE_JWT_SIGNER=true to create a new key (previously issued tokens stop validating)."
+    log "  ✓ Using validated JWT signing Secret ${secret_name}"
+    return 0
+  fi
+
+  if splunk_standalone_uses_jwt_signing_secret "${secret_name}"; then
+    if [[ "${ROTATE_JWT_SIGNER:-false}" != "true" ]]; then
+      rm -rf "${work_dir}"
+      err "JWT signing Secret ${AI_NS}/${secret_name} is missing, but Splunk ${AI_STANDALONE_NAME} is configured to use it. Restore it from backup and re-run, or re-run with ROTATE_JWT_SIGNER=true to create a new key (previously issued tokens stop validating)."
+    fi
+    JWT_SIGNER_ROTATED=true
+    warn "ROTATE_JWT_SIGNER=true: creating a new JWT signing key; Splunk will restart and previously issued tokens stop validating"
+  fi
+
+  generate_jwt_signing_material "${work_dir}" || rc=1
+  (( rc == 0 )) && { reason=$(validate_jwt_signing_material "${work_dir}") || rc=1; }
+  (( rc == 0 )) && { oc create secret generic "${secret_name}" -n "${AI_NS}" \
+    --from-file=signer.pem="${work_dir}/signer.pem" \
+    --from-file=passphrase="${work_dir}/passphrase" >/dev/null || rc=1; }
+  rm -rf "${work_dir}"
+  (( rc == 0 )) || err "Failed to create JWT signing Secret ${AI_NS}/${secret_name}${reason:+: ${reason}}"
+  log "  ✓ Created unique JWT signing Secret ${secret_name}"
+}
+
+base64url_decode() {
+  local s="${1//-/+}"
+  s="${s//_//}"
+  case $(( ${#s} % 4 )) in 2) s+="==" ;; 3) s+="=" ;; esac
+  printf '%s' "${s}" | openshift_decode_base64
+}
+
+# Mints a fresh interactive JWT inside the Splunk pod and verifies its RS256
+# signature against the certificate in the signing Secret. This proves Splunk
+# is actually signing with the per-installation key, not just configured to.
+verify_splunk_jwt_signing() {
+  local pod_name secret_name admin_secret password response token header payload signature work_dir rc=0
+  pod_name="$(internal_splunk_pod_name)"
+  secret_name="$(splunk_jwt_signing_secret_name)"
+  admin_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
+  password=$(oc get secret "${admin_secret}" -n "${AI_NS}" -o jsonpath='{.data.password}' 2>/dev/null | openshift_decode_base64) \
+    || err "Cannot read Splunk admin password from ${AI_NS}/${admin_secret} to verify JWT signing"
+  [[ -n "${password}" ]] || err "Splunk admin password in ${AI_NS}/${admin_secret} is empty; cannot verify JWT signing"
+  password="${password//\\/\\\\}"
+  password="${password//\"/\\\"}"
+  response=$(printf 'user = "admin:%s"\n' "${password}" | oc exec -i -n "${AI_NS}" "${pod_name}" -- \
+    curl --insecure --silent --show-error --max-time 30 --config - \
+      -X POST https://127.0.0.1:8089/services/authorization/tokens \
+      -d type=interactive -d output_mode=json 2>/dev/null) || rc=1
+  password=""
+  token=$(jq -r '.entry[0].content.token // empty' <<<"${response}" 2>/dev/null)
+  [[ ${rc} -eq 0 && -n "${token}" ]] \
+    || err "Splunk could not issue a JWT with the per-installation signing key. Check ${SPLUNK_JWT_SIGNING_MOUNT} and splunkd.log for 'Unable to load keys for signing interactive JWT'."
+  IFS=. read -r header payload signature <<<"${token}" || true
+  [[ -n "${header}" && -n "${payload}" && -n "${signature}" ]] || err "Splunk returned a token that is not a JWT"
+  [[ "$(base64url_decode "${header}" | jq -r '.alg // empty' 2>/dev/null)" == "RS256" ]] \
+    || err "Splunk JWT is not signed with RS256"
+
+  work_dir=$(mktemp -d)
+  chmod 700 "${work_dir}"
+  { oc get secret "${secret_name}" -n "${AI_NS}" -o jsonpath='{.data.signer\.pem}' | openshift_decode_base64 > "${work_dir}/signer.pem"; } 2>/dev/null || rc=1
+  openssl x509 -in "${work_dir}/signer.pem" -pubkey -noout > "${work_dir}/pub.pem" 2>/dev/null || rc=1
+  printf '%s.%s' "${header}" "${payload}" > "${work_dir}/signed"
+  base64url_decode "${signature}" > "${work_dir}/sig" 2>/dev/null || rc=1
+  (( rc == 0 )) && { openssl dgst -sha256 -verify "${work_dir}/pub.pem" -signature "${work_dir}/sig" "${work_dir}/signed" >/dev/null 2>&1 || rc=1; }
+  rm -rf "${work_dir}"
+  (( rc == 0 )) || err "A fresh Splunk JWT does not verify against the key in ${AI_NS}/${secret_name}; Splunk is not signing with the per-installation key"
+  log "  ✓ Fresh Splunk JWT verifies against the per-installation signing key"
+}
+
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
 
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
+  ensure_splunk_jwt_signing_secret
 
   # Wait for object store endpoint to be reachable before creating credentials secret
   if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
@@ -2934,6 +3115,10 @@ ${splunk_storage_yaml}
     - name: defaults
       configMap:
         name: splunk-defaults
+    - name: jwt-signing
+      secret:
+        secretName: $(splunk_jwt_signing_secret_name)
+        defaultMode: 0440
   defaultsUrl: /mnt/defaults/default.yml
   appRepo:
     appsRepoPollIntervalSeconds: 60
@@ -2955,7 +3140,15 @@ ${splunk_storage_yaml}
 YAML
 
   log "  ✓ Splunk Standalone CR applied"
+  if [[ "${JWT_SIGNER_ROTATED}" == "true" ]]; then
+    # The volume reference is unchanged on rotation, so the Splunk Operator does
+    # not roll the pod; restart it so Splunk loads the new key and passphrase.
+    log "  Restarting Splunk to load the rotated JWT signing key..."
+    oc delete pod "$(internal_splunk_pod_name)" -n "${AI_NS}" --wait=true --timeout=600s >/dev/null \
+      || err "Could not restart Splunk pod $(internal_splunk_pod_name) after rotating the JWT signing key"
+  fi
   wait_for_internal_splunk_ready 1200
+  verify_splunk_jwt_signing
 }
 
 # render_ai_platform_manifest prints only the AIPlatform resource. Keeping the
@@ -3589,6 +3782,10 @@ stage_model_artifacts() {
     err "Refusing to stage artifacts: objectStore.auth still contains template placeholders; fix ${CONFIG_FILE}"
     return 1
   fi
+  if object_store_auth_is_factory_default; then
+    err "Refusing to stage artifacts: objectStore.auth uses the factory-default credentials (minioadmin/minioadmin); fix ${CONFIG_FILE}"
+    return 1
+  fi
 
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
@@ -3823,6 +4020,7 @@ main_install() {
   [[ "${SILENT_INSTALL}" == "true" ]] && AUTO_APPROVE=true
 
   load_config
+  require_object_store_credentials
   validate_image_config
   configure_images
 
@@ -4319,6 +4517,10 @@ validate_config() {
   _vcheck "storage.objectStore.bucket" "${OBJ_STORE_BUCKET}"
   _vcheck "storage.objectStore.auth.rootUser" "${MINIO_ROOT_USER}"
   _vcheck "storage.objectStore.auth.rootPassword" "${MINIO_ROOT_PASSWORD}"
+  if object_store_auth_is_factory_default; then
+    echo -e "  \033[1;31m✖\033[0m storage.objectStore.auth uses the factory-default credentials (minioadmin/minioadmin)  →  configure unique object-store credentials" >&2
+    errors=$((errors + 1))
+  fi
 
   case "${OBJ_STORE_TYPE}" in
     aws) _vcheck "storage.objectStore.region" "${OBJ_STORE_REGION}" ;;
@@ -4409,10 +4611,12 @@ Environment:
                          Equivalent to --silent on the install subcommand.
   AUTO_DIAGNOSE=false    Suppress automatic support-bundle collection on verify-pods/install failure.
   SKIP_IF_STAGED=0       Force re-download/re-upload even if models are already staged.
+  ROTATE_JWT_SIGNER=true Replace a missing or unusable Splunk JWT signing Secret with a new key
+                         (restarts Splunk; previously issued tokens stop validating).
 
 Prerequisites:
   - Logged in to OpenShift: oc login <cluster-url>
-  - oc, yq v4, helm, jq, curl, timeout, python3, tar in PATH
+  - oc, yq v4, helm, jq, curl, timeout, python3, openssl, tar in PATH
   - mc for MinIO/SeaweedFS/S3-compatible model verification
   - aws only for AWS S3 model storage; automatic ECR secret creation also uses aws
   - Cluster-admin access to OpenShift ${REQUIRED_OPENSHIFT_MINOR:-4.21}; this installer is qualified on RHCOS amd64 nodes
@@ -4663,6 +4867,7 @@ case "${_CMD}" in
     ;;
   stage-artifacts)
     load_config
+    require_object_store_credentials
     # Running this subcommand is an explicit request to stage, so force staging
     # regardless of storage.modelStaging.enabled.
     MODEL_STAGING_ENABLED="true"

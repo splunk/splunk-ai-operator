@@ -60,7 +60,7 @@ gpuInstanceType: "g6.24xlarge"
 scaleFactor: 1
 
 # List of defined features to enable in the AI platform
-# Options include: saia, seca, slim
+# Options include: saia, slim
 features: []
 # Example:
 # - name: "saia"
