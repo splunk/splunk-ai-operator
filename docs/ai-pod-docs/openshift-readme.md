@@ -892,6 +892,52 @@ oc port-forward -n "$NAMESPACE" "svc/$SPLUNK_SERVICE" 18001:8000
 Keep the port-forward running and open `http://localhost:18001`. Log in as
 `admin` with the password printed above.
 
+### Password policy (bundled Splunk)
+
+AI POD services (operator, SAIA, SLIM) have no local user passwords. Requests
+are authenticated with JWTs issued by Splunk, and the object store, image
+registry, and OpenShift logins are managed in the customer's own systems. The
+only local user accounts are those of the bundled Splunk Standalone, and their
+password policy is Splunk Enterprise's native policy.
+
+Set the policy in Splunk Web under **Settings > Password Management**, or in the
+`[splunk_auth]` stanza of `authentication.conf`. See
+[Configure a Splunk Enterprise password policy](https://help.splunk.com/en/splunk-enterprise/administer/manage-users-and-security/10.6/manage-credentials-and-keys/configure-a-splunk-enterprise-password-policy-using-the-authentication.conf-configuration-file)
+for every supported setting and its default. The settings that cover password
+complexity, expiration, and reuse are:
+
+| Area | Settings |
+|---|---|
+| Complexity | `minPasswordLength`, `minPasswordUppercase`, `minPasswordLowercase`, `minPasswordDigit`, `minPasswordSpecial` |
+| Expiration | `expireUserAccounts`, `expirePasswordDays`, `expireAlertDays` |
+| Reuse | `enablePasswordHistory`, `passwordHistoryCount` |
+
+Example of a customer-selected policy. These values are an illustration, not
+product defaults; choose values that match your organization's policy:
+
+```ini
+[splunk_auth]
+minPasswordLength = 12
+minPasswordUppercase = 1
+minPasswordLowercase = 1
+minPasswordDigit = 1
+minPasswordSpecial = 1
+enablePasswordHistory = true
+passwordHistoryCount = 12
+```
+
+- The installer does not write `[splunk_auth]`, so it doesn't replace a policy
+  you set.
+- The Splunk Operator uses the `admin` account to manage Splunk. Change the
+  `admin` password only through the `password` key of the
+  `splunk-<namespace>-secret` Secret, never through Splunk Web or the CLI. See
+  the Splunk Operator
+  [password management](https://github.com/splunk/splunk-operator/blob/main/docs/PasswordManagement.md)
+  guide.
+- Expiration (`expireUserAccounts`) and `forceWeakPasswordChange` also apply to
+  the `admin` account. Test them before enabling, because an expired or forced
+  change on `admin` interrupts the operator.
+
 ### Install and configure Splunk AI Assistant
 
 Use Splunk Enterprise 10.2 and install
