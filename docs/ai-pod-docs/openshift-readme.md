@@ -894,7 +894,7 @@ Keep the port-forward running and open `http://localhost:18001`. Log in as
 
 ### Password policy (bundled Splunk)
 
-AI POD services (operator, SAIA, SLIM) have no local user passwords. Requests
+AI POD services have no local user passwords. Requests
 are authenticated with JWTs issued by Splunk, and the object store, image
 registry, and OpenShift logins are managed in the customer's own systems. The
 only local user accounts are those of the bundled Splunk Standalone, and their
