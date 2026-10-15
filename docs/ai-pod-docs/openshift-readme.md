@@ -901,10 +901,11 @@ only local user accounts are those of the bundled Splunk Standalone, and their
 password policy is Splunk Enterprise's native policy.
 
 Set the policy in Splunk Web under **Settings > Password Management**, or in the
-`[splunk_auth]` stanza of `authentication.conf`. See
-[Configure a Splunk Enterprise password policy](https://help.splunk.com/en/splunk-enterprise/administer/manage-users-and-security/10.6/manage-credentials-and-keys/configure-a-splunk-enterprise-password-policy-using-the-authentication.conf-configuration-file)
-for every supported setting and its default. The settings that cover password
-complexity, expiration, and reuse are:
+`[splunk_auth]` stanza of `authentication.conf`. For each setting's allowed
+values and default, see the `authentication.conf` reference in the Splunk
+Enterprise documentation for the version listed in the
+[version set](#splunk-integration-and-authentication) above. The settings that
+cover password complexity, expiration, and reuse are:
 
 | Area | Settings |
 |---|---|
