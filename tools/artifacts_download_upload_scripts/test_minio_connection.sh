@@ -13,7 +13,7 @@ echo ""
 echo "Configuration:"
 echo "  Endpoint: $MINIO_ENDPOINT"
 echo "  Username: $MINIO_ROOT_USER"
-echo "  Password: ${MINIO_ROOT_PASSWORD:0:3}***"
+echo "  Password: set"
 echo "  Bucket:   $MINIO_BUCKET"
 echo ""
 

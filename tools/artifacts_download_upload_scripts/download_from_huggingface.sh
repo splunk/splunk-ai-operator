@@ -206,7 +206,7 @@ HF_USERNAME=$("$YQ_CMD" -r '.hf-username' "$CONFIG_FILE")
 
 # SECURITY: Redact credentials in logs to prevent exposure
 if [[ "$HF_TOKEN" != "null" && -n "$HF_TOKEN" ]]; then
-    echo "HF_TOKEN: ${HF_TOKEN:0:3}...${HF_TOKEN: -4}"
+    echo "HF_TOKEN: set"
 else
     echo "HF_TOKEN: not set"
 fi

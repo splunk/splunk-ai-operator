@@ -187,7 +187,7 @@ else
         echo ""
         echo "Current configuration:"
         echo "  Access Key: $MINIO_ACCESS_KEY"
-        echo "  Secret Key: ${MINIO_SECRET_KEY:0:3}***"
+        echo "  Secret Key: set"
         echo ""
         echo "Troubleshooting:"
         echo "  1. Check MINIO_ACCESS_KEY is correct (currently: $MINIO_ACCESS_KEY)"

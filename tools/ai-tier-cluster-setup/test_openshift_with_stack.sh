@@ -56,6 +56,7 @@ eval "$(extract_function internal_splunk_management_url)"
 eval "$(extract_function internal_splunk_hec_url)"
 eval "$(extract_function _internal_splunk_btool_http_value)"
 eval "$(extract_function render_splunk_defaults_manifest)"
+eval "$(extract_function redact_secrets)"
 eval "$(extract_function render_ai_platform_manifest)"
 eval "$(extract_function normalize_openshift_clusterip_feature_services)"
 eval "$(extract_function patch_openshift_slim_public_service_workaround)"
@@ -921,6 +922,67 @@ assert_eq "renders a separate HEC telemetry endpoint" \
   "${rendered_hec_endpoint}"
 assert_eq "renders configured trusted issuers" "1" \
   "$(grep -c '^    trustedIssuers:$' <<<"${manifest}" || true)"
+assert_eq "Splunk defaults run the login-controls pre-task" "1" \
+  "$(grep -c '^      - file:///mnt/defaults/configure-login-controls.yml$' <<<"${splunk_defaults_manifest}" || true)"
+assert_eq "login-controls pre-task sets verboseLoginFailMsg false in splunk_auth" "1" \
+  "$(awk '/^  configure-login-controls.yml: \|$/{p=1;next} /^  [^ ]/{p=0} p' <<<"${splunk_defaults_manifest}" \
+      | grep -c -e 'section: splunk_auth' -e 'option: verboseLoginFailMsg' -e 'value: "false"' | grep -cx 3 || true)"
+assert_eq "Standalone extraEnv carries the login-controls restart marker" "1" \
+  "$(grep -c '"name":"SPLUNK_AI_LOGIN_CONTROLS","value":"verboseLoginFailMsg=false"' "${SCRIPT}" || true)"
+assert_eq "Splunk readiness checks the effective verboseLoginFailMsg" "1" \
+  "$(extract_function _internal_splunk_runtime_matches_desired | grep -c 'btool authentication list splunk_auth' || true)"
+assert_eq "Splunk defaults do not override customer password policy" "0" \
+  "$(grep -cE 'forceWeakPasswordChange|lockout|expire' <<<"${splunk_defaults_manifest}" || true)"
+
+echo "OpenShift diagnose credential redaction"
+redact_input=$(cat <<'EOF'
+storage:
+  objectStore:
+    endpoint: "https://minio.example:9000"
+    auth:
+      rootUser: "AKIAEXAMPLE"
+      rootPassword: "rootpw-secret"
+hf-token: hf_tokensecret
+hf-username: hfusersecret
+imagePullSecrets:
+  dockerHub:
+    username: "registry-user"
+    password: "dockerpw-secret"
+  gcr:
+    jsonKey: |
+      {"type": "service_account",
+       "private_key": "-----BEGIN PRIVATE KEY-----gcrsecret"}
+    enabled: true
+  custom:
+    password: 'custompw: secret'
+env:
+  - AWS_ACCESS_KEY_ID: AKIAENVSECRET
+  - AWS_SECRET_ACCESS_KEY: awssecret
+  - accessKey: accesssecret
+  - secretKey: secretkeysecret
+  - hec_token: hecsecret
+  - token: tokensecret
+  - ".dockerconfigjson": "dockerconfigsecret"
+  - "password": "jsonpwsecret"
+  - 'password': 'quotedpwsecret'
+  - maxTokens: 4096
+EOF
+)
+redacted=$(redact_secrets <<<"${redact_input}")
+assert_eq "redaction produces output" "1" "$([[ -n "${redacted}" ]] && echo 1 || echo 0)"
+assert_eq "redaction leaves no credential values" "0" \
+  "$(grep -ciE 'secret"?$|AKIA|gcrsecret|private_key' <<<"${redacted}" || true)"
+assert_eq "redaction marks every credential key" "16" \
+  "$(grep -c ': <REDACTED>$' <<<"${redacted}" || true)"
+assert_eq "redaction keeps non-secret lines unchanged" \
+  "$(grep -vE 'rootUser|rootPassword|hf-|password|jsonKey|"type"|private_key|AWS_|accessKey|secretKey|hec_token|token:|dockerconfigjson' <<<"${redact_input}")" \
+  "$(grep -v '<REDACTED>' <<<"${redacted}")"
+assert_eq "redaction preserves key indentation" "      rootPassword: <REDACTED>" \
+  "$(grep 'rootPassword' <<<"${redacted}")"
+assert_eq "diagnose redacts the config file through redact_secrets" "1" \
+  "$(grep -c 'redact_secrets "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"' "${SCRIPT}" || true)"
+assert_eq "artifact helper scripts print no partial secrets" "" \
+  "$(grep -nE '\$\{[A-Za-z_]*(TOKEN|PASSWORD|SECRET_KEY)[A-Za-z_]*:[[:space:]]*-?[0-9]' "${SCRIPT_DIR}"/../artifacts_download_upload_scripts/*.sh || true)"
 
 if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "rendered manifest is valid YAML" "3" \
@@ -939,6 +1001,9 @@ if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "rendered manifest preserves the configured trusted issuer" \
     "https://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8089" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration.trustedIssuers[0]' - 2>/dev/null)"
+  assert_eq "rendered login-controls pre-task sets splunk_auth.verboseLoginFailMsg" "splunk_auth verboseLoginFailMsg false" \
+    "$(printf '%s\n' "${splunk_defaults_manifest}" | "${REAL_YQ}" eval '.data."configure-login-controls.yml"' - 2>/dev/null \
+      | "${REAL_YQ}" eval '.[0].ini_file | .section + " " + .option + " " + .value' - 2>/dev/null)"
 
   unset -f yq
   CONFIG_FILE="${SCRIPT_DIR}/openshift-cluster-config.yaml"

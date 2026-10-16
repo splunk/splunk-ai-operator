@@ -2750,7 +2750,7 @@ _detect_internal_splunk_hec_url() {
 }
 
 _internal_splunk_runtime_matches_desired() {
-  local pod_name="${1:-$(internal_splunk_pod_name)}" splunkd_ssl issuer_uri expected_issuer
+  local pod_name="${1:-$(internal_splunk_pod_name)}" splunkd_ssl issuer_uri expected_issuer verbose_login_fail
   expected_issuer="$(internal_splunk_management_url)"
   splunkd_ssl=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
     /opt/splunk/bin/splunk btool server list sslConfig 2>/dev/null | \
@@ -2760,7 +2760,12 @@ _internal_splunk_runtime_matches_desired() {
   issuer_uri=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
     /opt/splunk/bin/splunk btool authentication list oauth2_settings 2>/dev/null | \
     awk '$1 == "issuer_uri" && $2 == "=" {v=$3; n++} END {if(n != 1) exit 1; print v}') || return 1
-  [[ "${issuer_uri}" == "${expected_issuer}" ]]
+  [[ "${issuer_uri}" == "${expected_issuer}" ]] || return 1
+
+  verbose_login_fail=$(oc exec -n "${AI_NS}" "${pod_name}" -- \
+    /opt/splunk/bin/splunk btool authentication list splunk_auth 2>/dev/null | \
+    awk '$1 == "verboseLoginFailMsg" && $2 == "=" {v=tolower($3); n++} END {if(n != 1) exit 1; print v}') || return 1
+  [[ "${verbose_login_fail}" == "false" || "${verbose_login_fail}" == "0" ]]
 }
 
 wait_for_internal_splunk_ready() {
@@ -2798,6 +2803,7 @@ metadata:
 data:
   default.yml: |
     ansible_pre_tasks:
+      - file:///mnt/defaults/configure-login-controls.yml
       - file:///mnt/defaults/remove-stale-installer-tls.yml
     splunk:
       conf:
@@ -2809,6 +2815,16 @@ data:
                 issuer_uri: ${internal_splunk_url}
                 certFile: \$SPLUNK_HOME/etc/auth/server.pem
                 sslPassword: password
+  configure-login-controls.yml: |
+    ---
+    - name: Show the same message for every failed login
+      ini_file:
+        path: /opt/splunk/etc/system/local/authentication.conf
+        section: splunk_auth
+        option: verboseLoginFailMsg
+        value: "false"
+        state: present
+        mode: '0600'
   remove-stale-installer-tls.yml: |
     ---
     - name: Restore built-in management TLS and keep Splunk Web on HTTP
@@ -2900,8 +2916,10 @@ install_splunk_standalone() {
       | jq -ec '(.spec.extraEnv // []) | if type == "array" then . else error("extraEnv is not an array") end') \
       || err "Existing Standalone spec.extraEnv is invalid; refusing to overwrite it"
   fi
+  # The login-controls marker changes the pod spec so upgraded pods restart and run the pre-task.
   desired_extra_env=$(printf '%s\n' "${existing_extra_env}" | jq -c \
-    '(map(select(.name != "SPLUNKD_SSL_ENABLE"))) + [{"name":"SPLUNKD_SSL_ENABLE","value":"true"}]') \
+    '(map(select(.name != "SPLUNKD_SSL_ENABLE" and .name != "SPLUNK_AI_LOGIN_CONTROLS")))
+     + [{"name":"SPLUNKD_SSL_ENABLE","value":"true"},{"name":"SPLUNK_AI_LOGIN_CONTROLS","value":"verboseLoginFailMsg=false"}]') \
     || err "Failed to preserve Standalone extraEnv"
   if [[ -n "${STORAGE_CLASS}" && "${STORAGE_CLASS}" != "null" ]]; then
     splunk_storage_yaml="  etcVolumeStorageConfig:"$'\n'"    storageClassName: ${STORAGE_CLASS}"$'\n'"  varVolumeStorageConfig:"$'\n'"    storageClassName: ${STORAGE_CLASS}"$'\n'
@@ -4174,6 +4192,26 @@ main_delete() {
 }
 
 # ====== DIAGNOSE SUBCOMMAND ======
+# POSIX awk (not GNU sed \|) so macOS redacts too; also drops block-scalar (|, >) bodies.
+redact_secrets() {
+  awk -v skip=-1 '
+    skip >= 0 {
+      match($0, /^[[:space:]]*/)
+      if ($0 ~ /^[[:space:]]*$/ || RLENGTH > skip) next
+      skip = -1
+    }
+    match($0, /^[[:space:]#-]*["\047]?[A-Za-z0-9_.-]*(rootUser|hf-username|[Pp]assword|PASSWORD|[Tt]oken|TOKEN|[Ss]ecretKey|secret_key|SECRET_KEY|[Aa]ccessKey|access_key|ACCESS_KEY|ACCESS_KEY_ID|jsonKey|dockerconfigjson)["\047]?[[:space:]]*:/) {
+      key = substr($0, 1, RLENGTH)
+      rest = substr($0, RLENGTH + 1)
+      if (rest ~ /^[[:space:]]*(#.*)?$/) { print; next }
+      if (rest ~ /^[[:space:]]*[|>]/) { match($0, /^[[:space:]#-]*/); skip = RLENGTH }
+      print key " <REDACTED>"
+      next
+    }
+    { print }
+  ' "$@"
+}
+
 diagnose() {
   load_config 2>/dev/null || true
 
@@ -4249,8 +4287,7 @@ diagnose() {
   # 3. Config file (redact credentials)
   if [[ -f "${CONFIG_FILE}" ]]; then
     log "Including config file (credentials redacted)..."
-    sed 's/\(rootUser\|rootPassword\|hf-token\|hf-username\|AWS_ACCESS_KEY_ID\|AWS_SECRET_ACCESS_KEY\|accessKey\|secretKey\|password\):.*/\1: <REDACTED>/g' \
-      "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
+    redact_secrets "${CONFIG_FILE}" > "${bundle_dir}/cluster-config-redacted.yaml"
   fi
 
   # 4. Tool versions

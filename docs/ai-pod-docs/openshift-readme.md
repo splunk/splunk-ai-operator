@@ -875,22 +875,97 @@ the required Routes.
 
 ### Open bundled Splunk Web
 
-Read the configured names, retrieve the generated admin password, and forward
-Splunk Web to the installer machine:
+Read the configured names and retrieve the current `admin` password from the
+namespace Secret `splunk-<namespace>-secret`. The commands below don't print
+the password to the terminal:
 
 ```bash
 NAMESPACE="$(yq eval '.kubernetes.namespace // "ai-platform"' "$CONFIG_FILE")"
 STANDALONE_NAME="$(yq eval '.splunk.standaloneName // "splunk-standalone"' "$CONFIG_FILE")"
-SPLUNK_SECRET="splunk-${STANDALONE_NAME}-standalone-secret-v1"
+SPLUNK_SECRET="splunk-${NAMESPACE}-secret"
 SPLUNK_SERVICE="splunk-${STANDALONE_NAME}-standalone-service"
 
+# macOS: copy the password to the clipboard.
 oc get secret "$SPLUNK_SECRET" -n "$NAMESPACE" \
-  -o jsonpath='{.data.password}' | base64 --decode && echo
+  -o jsonpath='{.data.password}' | base64 --decode | pbcopy
+
+# RHEL: write the password to a file readable only by you.
+(umask 077; oc get secret "$SPLUNK_SECRET" -n "$NAMESPACE" \
+  -o jsonpath='{.data.password}' | base64 --decode > ./splunk-admin-password)
+```
+
+Don't read the password from the versioned
+`splunk-<standalone>-standalone-secret-v<N>` Secrets. The operator creates a
+new version each time the password changes, so an older version holds a stale
+password. On RHEL, delete `./splunk-admin-password` after you log in.
+
+Forward Splunk Web to the installer machine:
+
+```bash
 oc port-forward -n "$NAMESPACE" "svc/$SPLUNK_SERVICE" 18001:8000
 ```
 
 Keep the port-forward running and open `http://localhost:18001`. Log in as
-`admin` with the password printed above.
+`admin` with the retrieved password.
+
+### Login and lockout controls (bundled Splunk)
+
+These controls apply only to local accounts on the bundled Splunk Standalone.
+AI POD services authenticate with JWTs issued by Splunk and have no local
+passwords. Object store, image registry, and OpenShift logins are managed in
+your own systems.
+
+Splunk Enterprise applies the following `[splunk_auth]` settings in
+`authentication.conf`, alongside the password policy settings in the same
+stanza:
+
+| Setting | Default | What it does | Recommendation |
+|---|---|---|---|
+| `lockoutUsers` | `true` | Locks an account after repeated failed logins | Keep `true` |
+| `lockoutAttempts` | `5` | Failed attempts that trigger a lockout | Keep or lower |
+| `lockoutThresholdMins` | `5` | Window, in minutes, in which failed attempts are counted | Keep or raise |
+| `lockoutMins` | `30` | Lockout duration in minutes (1–1440); the lockout clears automatically | Set to your policy |
+| `constantLoginTime` | `0` | Minimum duration, in seconds (up to 5.0), of a failed login, so response time doesn't reveal whether the username exists | Set, for example `1` |
+| `verboseLoginFailMsg` | `true` (the installer sets `false`) | When `false`, every failed login shows `Login failed`, including for locked-out or expired accounts | Don't override |
+| `forceWeakPasswordChange` | `false` | When `true`, checks the password entered at login against the current rules and forces a change if it doesn't meet them; this also applies to `admin` | Keep `false` |
+| `expireUserAccounts` | `false` | Enables password expiration. An expired account can't change its own password; an admin must reset it | Set to your policy |
+| `expireAlertDays` | `15` | Days before expiry that users see `Your password is set to expire in N days` | Keep or adjust |
+
+- **Lockout behavior:** Lockouts are counted per username, not per source IP,
+  and last a fixed period. There's no permanent lockout. An admin can unlock a
+  user earlier under **Settings > Users > Unlock**, or with REST
+  `POST /services/authentication/users/<user>` and `locked-out=false`.
+- **Failed logins:** An unknown user, a wrong password, and an empty field all
+  show `Login failed`. The installer writes `verboseLoginFailMsg = false` to
+  `/opt/splunk/etc/system/local/authentication.conf` and re-applies it each
+  time the Splunk pod starts. Upgrading an existing installation restarts
+  Splunk once to apply it. Users with a correct password who must change it
+  are still taken to the change-password screen, and expiry warnings still
+  appear after a successful login.
+- **Password entry and changes:** Splunk Web masks password entry and asks for
+  a new password twice. Users who change their own password must enter the old
+  one (REST `oldpassword`). Splunk Web shows a checklist of the configured
+  password rules and rejects a password that doesn't meet them. Rules are
+  checked when a password is set or changed.
+- **`admin` account:** The `admin` role has the `never_lockout` and
+  `never_expire` capabilities, so `admin` is never locked out and its password
+  never expires. Don't remove these capabilities: the Splunk Operator logs in
+  as `admin` to install apps, and a locked `admin` account breaks app
+  installation. Change the `admin` password only through the `password` key of
+  `splunk-<namespace>-secret`. A change made in Splunk Web or the CLI leaves the
+  operator with a stale password, and the Secret value is re-applied at the
+  next pod restart.
+- **Resets and first login:** The **New User** form selects **Require password
+  change on first login** by default. When you reset another user's password
+  in the **Edit User** form, select **Require password change on next login**;
+  it isn't selected by default. For user creation or resets through REST, pass
+  `force-change-pass=1`. Don't set it on `admin`.
+- **Exposure:** The installer doesn't create a Route or other external
+  Service for Splunk Web or the management port 8089. Access goes through
+  `oc port-forward`, so OpenShift RBAC controls who can reach the login page.
+  If you expose Splunk Web yourself, put it behind a proxy or WAF that limits
+  login attempts per source IP with increasing backoff. Splunk's lockout is
+  per user and doesn't cover `admin`.
 
 ### Install and configure Splunk AI Assistant
 
