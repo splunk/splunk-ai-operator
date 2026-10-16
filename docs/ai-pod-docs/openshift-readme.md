@@ -951,8 +951,9 @@ passwordHistoryCount = 12
   first set a compliant `admin` password through the Secret.
 - `expireUserAccounts`, `expirePasswordDays`, and `forceWeakPasswordChange` also
   apply to the `admin` account. An expired password or a forced change on
-  `admin` stops the operator from managing Splunk, so test these settings before
-  enabling them.
+  `admin` can interrupt the operator's management of Splunk unless the password
+  is rotated through the Secret first, so test these settings before enabling
+  them.
 
 ### Install and configure Splunk AI Assistant
 
