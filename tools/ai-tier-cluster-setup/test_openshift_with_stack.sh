@@ -1042,15 +1042,19 @@ if command -v openssl >/dev/null 2>&1; then
     ensure_splunk_namespace_secret
   )
   assert_rc "creates Splunk secrets on a fresh install" 0 _run_ns_secret absent
-  assert_eq "creates exactly the four non-HEC Splunk secret keys" "idxc_secret pass4SymmKey password shc_secret" \
+  assert_eq "creates exactly the five Splunk Operator secret keys" "hec_token idxc_secret pass4SymmKey password shc_secret" \
     "$(cut -d= -f1 "${NS_TMP}/created" | sort | tr '\n' ' ' | sed 's/ $//')"
-  assert_eq "each generated value is 32 alphanumeric characters" "4" \
-    "$(cut -d= -f2 "${NS_TMP}/created" | grep -cE '^[A-Za-z0-9]{32}$' || true)"
-  assert_eq "generated values are distinct" "4" "$(cut -d= -f2 "${NS_TMP}/created" | sort -u | wc -l | tr -d ' ')"
-  assert_eq "does not generate hec_token" "0" "$(grep -c 'hec_token' "${NS_TMP}/create-args" || true)"
-  _run_ns_secret present >/dev/null 2>&1
+  assert_eq "password and internal secrets are 32 alphanumeric characters" "4" \
+    "$(grep -v '^hec_token=' "${NS_TMP}/created" | cut -d= -f2 | grep -cE '^[A-Za-z0-9]{32}$' || true)"
+  assert_eq "hec_token uses the operator's UUID-like hex format" "1" \
+    "$(grep -cE '^hec_token=[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$' "${NS_TMP}/created" || true)"
+  assert_eq "generated values are distinct" "5" "$(cut -d= -f2 "${NS_TMP}/created" | sort -u | wc -l | tr -d ' ')"
+  assert_eq "secret values are passed as files, not command-line literals" "0" \
+    "$(grep -c -e '--from-literal' "${NS_TMP}/create-args" || true)"
+  assert_rc "succeeds when the Splunk namespace Secret already exists" 0 _run_ns_secret present
   assert_eq "leaves an existing Splunk namespace Secret unchanged" "0" "$(wc -l < "${NS_TMP}/created" | tr -d ' ')"
   assert_rc "keeps the operator's Secret when it was created concurrently" 0 _run_ns_secret race
+  assert_eq "a concurrent creation writes nothing of ours" "0" "$(wc -l < "${NS_TMP}/created" | tr -d ' ')"
   assert_rc "stops when the Secret cannot be read" 1 _run_ns_secret error
   rm -rf "${NS_TMP}"
 else

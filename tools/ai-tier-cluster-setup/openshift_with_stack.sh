@@ -4,7 +4,7 @@ set -euo pipefail
 # Temp files rendered during a run (e.g. patched manifest copies) are tracked
 # here and removed on exit so we never mutate committed manifests.
 TMP_FILES=()
-cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}" 2>/dev/null || true; }
+cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -rf "${TMP_FILES[@]}" 2>/dev/null || true; }
 trap cleanup_tmp EXIT
 
 # =============================================================================
@@ -2844,10 +2844,10 @@ YAML
 
 # Splunk Operator 3.0.0 generates missing Splunk secrets with math/rand seeded by
 # start time. Pre-creating its namespace Secret with openssl values makes the
-# operator use those instead. hec_token is left for the operator to generate.
-# An existing Secret (earlier install or customer-provided) is never changed.
+# operator use those instead. An existing Secret (earlier install or
+# customer-provided) is never changed.
 ensure_splunk_namespace_secret() {
-  local secret_name="splunk-${AI_NS}-secret" existing work_dir key value out rc=0
+  local secret_name="splunk-${AI_NS}-secret" existing work_dir key value hex out="" rc=0
   existing=$(oc get secret "${secret_name}" -n "${AI_NS}" --ignore-not-found -o name) \
     || err "Cannot read Secret ${AI_NS}/${secret_name}; check cluster access"
   if [[ -n "${existing}" ]]; then
@@ -2856,15 +2856,21 @@ ensure_splunk_namespace_secret() {
   fi
   work_dir=$(mktemp -d)
   chmod 700 "${work_dir}"
+  TMP_FILES+=("${work_dir}")  # removed by cleanup_tmp even if the run is interrupted
   # 32 characters from [A-Za-z0-9]: about 190 bits, same character set as the operator.
   for key in password pass4SymmKey idxc_secret shc_secret; do
     value=$(openssl rand -base64 96 2>/dev/null | tr -dc 'A-Za-z0-9') || rc=1
     (( ${#value} >= 32 )) || rc=1
     printf '%s' "${value:0:32}" > "${work_dir}/${key}"
   done
+  # HEC token: 128 random bits in the operator's UUID-like upper-case hex format.
+  hex=$(openssl rand -hex 16 2>/dev/null | tr 'a-f' 'A-F') || rc=1
+  [[ "${hex}" =~ ^[0-9A-F]{32}$ ]] || rc=1
+  printf '%s-%s-%s-%s-%s' "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}" > "${work_dir}/hec_token"
   if (( rc == 0 )); then
     # oc create (not apply): the later hec_token "oc apply" must not drop these keys.
     out=$(oc create secret generic "${secret_name}" -n "${AI_NS}" \
+      --from-file=hec_token="${work_dir}/hec_token" \
       --from-file=password="${work_dir}/password" \
       --from-file=pass4SymmKey="${work_dir}/pass4SymmKey" \
       --from-file=idxc_secret="${work_dir}/idxc_secret" \

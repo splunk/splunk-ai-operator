@@ -928,21 +928,31 @@ passwordHistoryCount = 12
 ```
 
 - The installer does not write `[splunk_auth]`, so it doesn't replace a policy
-  you set.
-- On a new installation, the installer generates the `admin` password and the
-  Splunk internal secrets (`pass4SymmKey`, `idxc_secret`, `shc_secret`) with a
-  cryptographic random generator and stores them in `splunk-<namespace>-secret`
-  before Splunk is created. If that Secret already exists, for example from an
-  earlier installation or because you created it, its values are kept.
+  you set. Policy settings are stored on the Splunk `etc` volume; check them
+  after upgrading Splunk.
+- On a new installation, the installer generates the `admin` password, the
+  Splunk internal secrets (`pass4SymmKey`, `idxc_secret`, `shc_secret`), and the
+  HEC token with a cryptographic random generator, and stores them in
+  `splunk-<namespace>-secret` before Splunk is created. The `admin` password and
+  internal secrets are 32 characters from `[A-Za-z0-9]` (about 190 bits); the
+  HEC token has 128 random bits. If that Secret already exists, for example from
+  an earlier installation or because you created it, its values are kept.
+  Installations created before this change keep the values the Splunk Operator
+  generated; rotate them as described in the password management guide below.
 - The Splunk Operator uses the `admin` account to manage Splunk. Change the
   `admin` password only through the `password` key of the
   `splunk-<namespace>-secret` Secret, never through Splunk Web or the CLI. See
   the Splunk Operator
   [password management](https://github.com/splunk/splunk-operator/blob/main/docs/PasswordManagement.md)
-  guide.
-- Expiration (`expireUserAccounts`) and `forceWeakPasswordChange` also apply to
-  the `admin` account. Test them before enabling, because an expired or forced
-  change on `admin` interrupts the operator.
+  guide for your operator version. A new value set in the Secret must also
+  satisfy your password policy and history.
+- The generated `admin` password contains only letters and digits. If your
+  policy requires special characters and you enable `forceWeakPasswordChange`,
+  first set a compliant `admin` password through the Secret.
+- `expireUserAccounts`, `expirePasswordDays`, and `forceWeakPasswordChange` also
+  apply to the `admin` account. An expired password or a forced change on
+  `admin` stops the operator from managing Splunk, so test these settings before
+  enabling them.
 
 ### Install and configure Splunk AI Assistant
 
