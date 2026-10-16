@@ -1497,7 +1497,7 @@ preflight_checks() {
   fi
 
   pf_header "Required tools"
-  for tool in oc yq helm curl jq base64 tar timeout python3; do
+  for tool in oc yq helm curl jq base64 tar timeout python3 openssl; do
     command -v "$tool" >/dev/null 2>&1 && pf_ok "$tool found" || pf_fail "$tool not found in PATH"
   done
   if [[ -n "${_aws_reason}" ]]; then
@@ -2842,12 +2842,49 @@ data:
 YAML
 }
 
+# Splunk Operator 3.0.0 generates missing Splunk secrets with math/rand seeded by
+# start time. Pre-creating its namespace Secret with openssl values makes the
+# operator use those instead. hec_token is left for the operator to generate.
+# An existing Secret (earlier install or customer-provided) is never changed.
+ensure_splunk_namespace_secret() {
+  local secret_name="splunk-${AI_NS}-secret" existing work_dir key value out rc=0
+  existing=$(oc get secret "${secret_name}" -n "${AI_NS}" --ignore-not-found -o name) \
+    || err "Cannot read Secret ${AI_NS}/${secret_name}; check cluster access"
+  if [[ -n "${existing}" ]]; then
+    log "  ✓ Using existing Splunk secrets in ${secret_name}"
+    return 0
+  fi
+  work_dir=$(mktemp -d)
+  chmod 700 "${work_dir}"
+  # 32 characters from [A-Za-z0-9]: about 190 bits, same character set as the operator.
+  for key in password pass4SymmKey idxc_secret shc_secret; do
+    value=$(openssl rand -base64 96 2>/dev/null | tr -dc 'A-Za-z0-9') || rc=1
+    (( ${#value} >= 32 )) || rc=1
+    printf '%s' "${value:0:32}" > "${work_dir}/${key}"
+  done
+  if (( rc == 0 )); then
+    # oc create (not apply): the later hec_token "oc apply" must not drop these keys.
+    out=$(oc create secret generic "${secret_name}" -n "${AI_NS}" \
+      --from-file=password="${work_dir}/password" \
+      --from-file=pass4SymmKey="${work_dir}/pass4SymmKey" \
+      --from-file=idxc_secret="${work_dir}/idxc_secret" \
+      --from-file=shc_secret="${work_dir}/shc_secret" 2>&1) || rc=1
+    # The operator may have created it in the meantime; its values are then kept.
+    (( rc == 0 )) || [[ "${out}" != *AlreadyExists* ]] || { rc=0; out="exists"; }
+  fi
+  rm -rf "${work_dir}"
+  (( rc == 0 )) || err "Failed to create Splunk secrets in ${AI_NS}/${secret_name}"
+  [[ "${out}" == "exists" ]] && log "  ✓ Using existing Splunk secrets in ${secret_name}" \
+    || log "  ✓ Created Splunk secrets in ${secret_name} with a cryptographic RNG"
+}
+
 # ====== INSTALL SPLUNK STANDALONE ======
 install_splunk_standalone() {
   log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
 
   ensure_namespace "${AI_NS}"
   wait_for_crd standalones.enterprise.splunk.com 600
+  ensure_splunk_namespace_secret
 
   # Wait for object store endpoint to be reachable before creating credentials secret
   if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
@@ -4412,7 +4449,7 @@ Environment:
 
 Prerequisites:
   - Logged in to OpenShift: oc login <cluster-url>
-  - oc, yq v4, helm, jq, curl, timeout, python3, tar in PATH
+  - oc, yq v4, helm, jq, curl, timeout, python3, openssl, tar in PATH
   - mc for MinIO/SeaweedFS/S3-compatible model verification
   - aws only for AWS S3 model storage; automatic ECR secret creation also uses aws
   - Cluster-admin access to OpenShift ${REQUIRED_OPENSHIFT_MINOR:-4.21}; this installer is qualified on RHCOS amd64 nodes

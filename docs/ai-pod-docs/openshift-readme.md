@@ -929,6 +929,11 @@ passwordHistoryCount = 12
 
 - The installer does not write `[splunk_auth]`, so it doesn't replace a policy
   you set.
+- On a new installation, the installer generates the `admin` password and the
+  Splunk internal secrets (`pass4SymmKey`, `idxc_secret`, `shc_secret`) with a
+  cryptographic random generator and stores them in `splunk-<namespace>-secret`
+  before Splunk is created. If that Secret already exists, for example from an
+  earlier installation or because you created it, its values are kept.
 - The Splunk Operator uses the `admin` account to manage Splunk. Change the
   `admin` password only through the `password` key of the
   `splunk-<namespace>-secret` Secret, never through Splunk Web or the CLI. See
