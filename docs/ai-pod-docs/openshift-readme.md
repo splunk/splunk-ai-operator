@@ -927,9 +927,14 @@ enablePasswordHistory = true
 passwordHistoryCount = 12
 ```
 
-- The installer does not write `[splunk_auth]`, so it doesn't replace a policy
-  you set. Policy settings are stored on the Splunk `etc` volume; check them
-  after upgrading Splunk.
+- The only `[splunk_auth]` setting the installer writes is
+  `verboseLoginFailMsg = false`, so that failed logins show a generic message.
+  A new installation applies it during provisioning; an existing installation
+  applies it the next time the Splunk pod starts. Updating the
+  `splunk-defaults` ConfigMap or restarting only the Splunk process doesn't
+  apply it. The installer doesn't change any password policy setting you set.
+  Policy settings are stored on the Splunk `etc` volume; check them after
+  upgrading Splunk.
 - On a new installation, the installer generates the `admin` password, the
   Splunk internal secrets (`pass4SymmKey`, `idxc_secret`, `shc_secret`), and the
   HEC token with a cryptographic random generator, and stores them in
@@ -949,11 +954,17 @@ passwordHistoryCount = 12
 - The generated `admin` password contains only letters and digits. If your
   policy requires special characters and you enable `forceWeakPasswordChange`,
   first set a compliant `admin` password through the Secret.
-- `expireUserAccounts`, `expirePasswordDays`, and `forceWeakPasswordChange` also
-  apply to the `admin` account. An expired password or a forced change on
-  `admin` can interrupt the operator's management of Splunk unless the password
-  is rotated through the Secret first, so test these settings before enabling
-  them.
+- `forceWeakPasswordChange` also applies to the `admin` account. A forced
+  change on `admin` can interrupt the operator's management of Splunk unless
+  the password is rotated through the Secret first, so test it before enabling
+  it. Password expiration and account lockout don't apply to users who hold the
+  `never_expire` and `never_lockout` capabilities. The `admin` role has both by
+  default, so this includes the `admin` account and any user you give the
+  `admin` role. Keep both capabilities on the operator-managed `admin` account:
+  the Splunk Operator logs in as `admin`.
+- The installer doesn't expose Splunk Web or the management port 8089 outside
+  the cluster. If you expose either, put it behind a proxy that limits login
+  attempts per source address, because Splunk's lockout is counted per account.
 
 ### Install and configure Splunk AI Assistant
 

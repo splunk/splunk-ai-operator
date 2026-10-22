@@ -922,6 +922,18 @@ assert_eq "renders a separate HEC telemetry endpoint" \
 assert_eq "renders configured trusted issuers" "1" \
   "$(grep -c '^    trustedIssuers:$' <<<"${manifest}" || true)"
 
+# Not skippable: the login-controls pre-task is only verifiable by parsing YAML.
+if [[ -z "${REAL_YQ}" ]]; then
+  assert_eq "yq is installed (required to validate the Splunk login-controls pre-task)" "installed" "missing"
+else
+  assert_eq "Splunk defaults pre-task sets splunk_auth verboseLoginFailMsg=false" \
+    "file:///mnt/defaults/configure-login-controls.yml|splunk_auth|verboseLoginFailMsg|false" \
+    "$(printf '%s\n' "${splunk_defaults_manifest}" | "${REAL_YQ}" eval '.data."default.yml"' - 2>/dev/null \
+        | "${REAL_YQ}" eval '.ansible_pre_tasks[] | select(. == "*configure-login-controls.yml")' - 2>/dev/null)|$(
+      printf '%s\n' "${splunk_defaults_manifest}" | "${REAL_YQ}" eval '.data."configure-login-controls.yml"' - 2>/dev/null \
+        | "${REAL_YQ}" eval '.[0].ini_file | .section + "|" + .option + "|" + .value' - 2>/dev/null)"
+fi
+
 if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "rendered manifest is valid YAML" "3" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.scaleFactor' - 2>/dev/null)"
