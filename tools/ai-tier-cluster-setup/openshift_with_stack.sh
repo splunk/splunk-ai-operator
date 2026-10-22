@@ -2798,6 +2798,7 @@ metadata:
 data:
   default.yml: |
     ansible_pre_tasks:
+      - file:///mnt/defaults/configure-login-controls.yml
       - file:///mnt/defaults/remove-stale-installer-tls.yml
     splunk:
       conf:
@@ -2809,6 +2810,16 @@ data:
                 issuer_uri: ${internal_splunk_url}
                 certFile: \$SPLUNK_HOME/etc/auth/server.pem
                 sslPassword: password
+  configure-login-controls.yml: |
+    ---
+    - name: Show the same message for every failed login
+      ini_file:
+        path: /opt/splunk/etc/system/local/authentication.conf
+        section: splunk_auth
+        option: verboseLoginFailMsg
+        value: "false"
+        state: present
+        mode: '0600'
   remove-stale-installer-tls.yml: |
     ---
     - name: Restore built-in management TLS and keep Splunk Web on HTTP
