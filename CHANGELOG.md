@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SECURITY.md with security policy and vulnerability reporting process
 - Comprehensive badge collection in README (25+ badges)
 - Workflow audit documentation for GHCR migration
+- k0s installer validates `aiPlatform.profile: cpuOnly` for every install, connected or air-gapped. Conflicting SAIA, GPU, model-staging, accelerator, sidecar, NVIDIA or KubeRay settings now fail `validate` and `install` before any cluster change instead of at AIPlatform admission.
 
 ### Changed
 - README badges reorganized into logical categories

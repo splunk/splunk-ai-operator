@@ -297,6 +297,52 @@ kubectl get certificates -n splunk-ai-operator-system
 
 ---
 
+## Selecting the `full` or `cpuOnly` profile (k0s)
+
+`aiPlatform.profile` selects the product profile. Omitting it, or setting
+`full`, keeps the full-feature path (SAIA, model serving, GPU capacity). Setting
+`cpuOnly` runs AITK/SLIM and AgentRuntime with a bring-your-own LLM and no SAIA,
+hosted models, or GPU requirement. Any other value is rejected with
+`aiPlatform.profile must be full or cpuOnly`. The profile does not depend on
+`cluster.airgap`.
+
+A `cpuOnly` file must not carry settings from the full-feature profile. Both
+`validate` and `install` check this before changing anything, in connected and
+air-gapped mode, and report every conflict at once:
+
+- no `saia` or `seca` feature, and a non-empty feature list (an empty list would
+  default to `saia`);
+- `nodes.gpuWorkers: 0`;
+- no `aiPlatform.defaultAcceleratorType`;
+- `storage.modelStaging.enabled: false` (it defaults to `true` when omitted);
+- `aiPlatform.sidecars.envoy`, `otel` and `prometheusOperator` all `false` (they
+  default from `components.otel` and `components.monitoring`);
+- `components.nvidia` and `components.kuberay` not set to `true`.
+
+```yaml
+nodes:
+  gpuWorkers: 0
+storage:
+  modelStaging:
+    enabled: false
+aiPlatform:
+  profile: cpuOnly
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  features:
+    - name: slim
+    - name: agentruntime
+      provider: mltk
+```
+
+The AIPlatform admission webhook rejects the same combinations, but only when the
+resource is applied, after the cluster and Secrets exist. Switching an existing
+full-feature AIPlatform to `cpuOnly` is not supported.
+
+---
+
 ## LAS deployment mode, credentials, and egress
 
 For k0s deployments, put LAS deployment credentials under the AgentRuntime

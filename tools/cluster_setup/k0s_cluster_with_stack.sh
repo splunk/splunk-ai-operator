@@ -896,6 +896,66 @@ validate_scale_factor_config() {
   return 0
 }
 
+# aiPlatform.profile: cpuOnly must not carry SAIA, model-serving, or GPU
+# settings. The AIPlatform webhook rejects the same combinations, but only when
+# the CR is applied, after the cluster, operators, and LAS Secrets already
+# exist. Checking here, for connected and air-gapped installs alike, makes a
+# conflicting file fail before the first cluster change. All conflicts are
+# reported together; messages name fields and never echo configuration values.
+validate_cpu_profile_consistency() {
+  [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" ]] || return 0
+
+  local conflicts=() feature_names feature_name feature_count=0
+  feature_names="$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  while IFS= read -r feature_name; do
+    [[ -z "${feature_name}" || "${feature_name}" == "null" ]] && continue
+    feature_count=$((feature_count + 1))
+    case "${feature_name}" in
+      saia|seca)
+        conflicts+=("aiPlatform.features: '${feature_name}' is not supported by cpuOnly; remove it or set aiPlatform.profile: full")
+        ;;
+    esac
+  done <<< "${feature_names}"
+  if (( feature_count == 0 )); then
+    conflicts+=("aiPlatform.features is empty, so the installer would default to saia, which cpuOnly does not support; list slim and agentruntime")
+  fi
+
+  if [[ "${GPU_WORKER_COUNT:-}" != "0" ]]; then
+    local gpu_workers="${GPU_WORKER_COUNT:-}"
+    [[ "${gpu_workers}" =~ ^[0-9]+$ ]] || gpu_workers="unset or not a number"
+    conflicts+=("nodes.gpuWorkers must be 0 for cpuOnly (got ${gpu_workers})")
+  fi
+  if [[ -n "${DEFAULT_ACCELERATOR:-}" ]]; then
+    conflicts+=("aiPlatform.defaultAcceleratorType must be empty for cpuOnly")
+  fi
+  # Omitted components are tolerated: nvidia is never installed with zero GPU
+  # workers. Only an explicit true contradicts the profile.
+  if [[ "$(config_bool '.components.nvidia' 'false')" == "true" ]]; then
+    conflicts+=("components.nvidia: true installs GPU support, which cpuOnly does not use; set it to false")
+  fi
+  if [[ "$(config_bool '.components.kuberay' 'false')" == "true" ]]; then
+    conflicts+=("components.kuberay: true installs the model-serving operator, which cpuOnly does not use; set it to false")
+  fi
+  # An omitted value defaults to true, which would stage model artifacts with
+  # no accelerator, so cpuOnly must disable staging explicitly.
+  if [[ "${MODEL_STAGING_ENABLED:-true}" != "false" ]]; then
+    conflicts+=("storage.modelStaging.enabled must be false for cpuOnly; it defaults to true when omitted")
+  fi
+  # Sidecar flags default from components.otel and components.monitoring (both
+  # true when omitted), so a bare cpuOnly file would be rejected by the webhook.
+  if [[ "${AI_SIDECAR_ENVOY:-false}" != "false" || "${AI_SIDECAR_OTEL:-false}" != "false" || "${AI_SIDECAR_PROMETHEUS:-false}" != "false" ]]; then
+    conflicts+=("cpuOnly does not support sidecars; set aiPlatform.sidecars.envoy, otel, and prometheusOperator to false (resolved: envoy=${AI_SIDECAR_ENVOY:-false}, otel=${AI_SIDECAR_OTEL:-false}, prometheusOperator=${AI_SIDECAR_PROMETHEUS:-false})")
+  fi
+
+  if (( ${#conflicts[@]} > 0 )); then
+    local message="aiPlatform.profile: cpuOnly conflicts with the configuration:" conflict
+    for conflict in "${conflicts[@]}"; do
+      message+=$'\n'"  - ${conflict}"
+    done
+    err "${message}"
+  fi
+}
+
 # The air-gapped CPU test profile must not silently fall back to the legacy
 # GPU stack, a public image, model download, or LangSmith configuration.
 airgap_cpu_profile_selected() {
@@ -7187,6 +7247,7 @@ main_install() {
 
   load_config
 
+  validate_cpu_profile_consistency
   validate_airgap_cpu_profile
   validate_airgap_cpu_bundle
 
@@ -7712,6 +7773,7 @@ diagnose() {
 # Config completeness check — catches problems before a 40-min install run.
 validate_config() {
   load_config
+  validate_cpu_profile_consistency
   validate_airgap_cpu_profile
 
   echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2

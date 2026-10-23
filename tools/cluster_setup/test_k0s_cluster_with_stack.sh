@@ -82,6 +82,10 @@ _load_functions() {
   pf_ok()   { :; }
   pf_warn() { :; }
   pf_fail() { :; }
+  # load_config tries to install yq and to discover an AWS account; neither may
+  # touch the host or the network from a unit test.
+  ensure_yq() { :; }
+  aws() { return 1; }
 
   # Extract _POD_FS assignment (single line, not a function)
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
@@ -93,6 +97,9 @@ _load_functions() {
   eval "$(_extract_fn validate_scale_factor_config)"
   eval "$(_extract_fn yaml_single_quote)"
   eval "$(_extract_fn resolve_airgap_mode)"
+  eval "$(_extract_fn config_bool)"
+  eval "$(_extract_fn load_config)"
+  eval "$(_extract_fn validate_cpu_profile_consistency)"
   eval "$(_extract_fn render_las_feature_yaml)"
   eval "$(_extract_fn render_las_secret_refs)"
   eval "$(_extract_fn check_las_metrics_prerequisite)"
@@ -295,6 +302,165 @@ kubectl() { return 1; }
 check_las_metrics_prerequisite "${_metric_config}"
 assert_eq "missing metrics API produces actionable queue autoscaling warning" "1" "$(grep -c 'Install/configure metrics-server' <<<"${_metric_warning}" || true)"
 rm -rf "${_las_tmpdir}"
+
+# ── Tests: aiPlatform.profile selection and cpuOnly consistency (MPR-3) ─────
+# Each case writes a real config, runs the real load_config, then the validator,
+# so omitted-field defaults behave as they do during an install.
+suite "validate_cpu_profile_consistency"
+echo "▶ validate_cpu_profile_consistency"
+_profile_tmpdir=$(mktemp -d)
+
+# Valid cpuOnly baseline. Extra arguments are yq expressions that mutate it.
+# The credential-shaped values must never appear in validator output.
+_write_cpu_profile_config() {
+  local path="$1" expr
+  shift
+  cat > "${path}" <<'YAML'
+cluster:
+  name: profile-test
+nodes:
+  gpuWorkers: 0
+  existingIPs:
+    controllers: ["10.0.0.1"]
+storage:
+  modelStaging:
+    enabled: false
+  objectStore:
+    auth:
+      rootPassword: DO_NOT_PRINT_STORAGE_CANARY
+components:
+  nvidia: false
+  kuberay: false
+aiPlatform:
+  profile: cpuOnly
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  features:
+    - name: slim
+    - name: agentruntime
+      provider: mltk
+      las:
+        credentials:
+          postgresUri: DO_NOT_PRINT_POSTGRES_CANARY
+YAML
+  for expr in "$@"; do
+    yq eval -i "${expr}" "${path}"
+  done
+}
+
+# Runs in a subshell because the real err() exits; prints stdout and stderr.
+_profile_check() {
+  ( CONFIG_FILE="$1"; load_config; validate_cpu_profile_consistency ) 2>&1
+}
+
+_expect_profile_ok() {
+  local desc="$1" file="$2" out rc=0
+  out=$(_profile_check "${file}") || rc=$?
+  assert_eq "${desc} is accepted" "0" "${rc}"
+  assert_eq "${desc} reports no profile conflict" "0" "$(grep -c 'conflicts with the configuration' <<<"${out}" || true)"
+}
+
+_expect_profile_conflict() {
+  local desc="$1" file="$2" expected="$3" out rc=0
+  out=$(_profile_check "${file}") || rc=$?
+  assert_eq "${desc} is rejected" "1" "${rc}"
+  assert_eq "${desc} names '${expected}'" "1" "$(grep -c -F -- "${expected}" <<<"${out}" || true)"
+}
+
+# Accepted configurations.
+_write_cpu_profile_config "${_profile_tmpdir}/valid-connected.yaml"
+_expect_profile_ok "cpuOnly with a consistent connected configuration" "${_profile_tmpdir}/valid-connected.yaml"
+_write_cpu_profile_config "${_profile_tmpdir}/valid-airgap.yaml" '.cluster.airgap = true'
+_expect_profile_ok "cpuOnly with a consistent air-gapped configuration" "${_profile_tmpdir}/valid-airgap.yaml"
+_write_cpu_profile_config "${_profile_tmpdir}/omitted-components.yaml" 'del(.components)'
+_expect_profile_ok "cpuOnly that omits components.nvidia and components.kuberay" "${_profile_tmpdir}/omitted-components.yaml"
+
+# Full-feature selection is untouched: GPU, SAIA, staging, and sidecar settings
+# that cpuOnly forbids must still pass when the profile is omitted or full.
+_full_overrides=(
+  '.nodes.gpuWorkers = 2'
+  '.aiPlatform.defaultAcceleratorType = "L40S"'
+  '.components.nvidia = true'
+  '.components.kuberay = true'
+  'del(.storage.modelStaging)'
+  '.aiPlatform.sidecars.otel = true'
+  '.aiPlatform.features = [{"name":"saia"},{"name":"slim"}]'
+)
+_write_cpu_profile_config "${_profile_tmpdir}/omitted-profile.yaml" 'del(.aiPlatform.profile)' "${_full_overrides[@]}"
+_expect_profile_ok "full-feature configuration with the profile omitted" "${_profile_tmpdir}/omitted-profile.yaml"
+_write_cpu_profile_config "${_profile_tmpdir}/explicit-full.yaml" '.aiPlatform.profile = "full"' "${_full_overrides[@]}"
+_expect_profile_ok "full-feature configuration with profile: full" "${_profile_tmpdir}/explicit-full.yaml"
+_omitted_profile_value=$( ( CONFIG_FILE="${_profile_tmpdir}/omitted-profile.yaml"; load_config; printf '%s' "${AI_PLATFORM_PROFILE-unset}" ) 2>&1 )
+assert_eq "omitted aiPlatform.profile resolves to the empty full-feature default" "" "${_omitted_profile_value}"
+
+# Unknown profile: load_config names the field and the allowed values.
+_write_cpu_profile_config "${_profile_tmpdir}/unknown-profile.yaml" '.aiPlatform.profile = "gpuOnly"'
+_unknown_rc=0
+_unknown_out=$(_profile_check "${_profile_tmpdir}/unknown-profile.yaml") || _unknown_rc=$?
+assert_eq "unknown aiPlatform.profile is rejected" "1" "${_unknown_rc}"
+assert_eq "unknown aiPlatform.profile names the field and allowed values" "1" \
+  "$(grep -c -F 'aiPlatform.profile must be full or cpuOnly' <<<"${_unknown_out}" || true)"
+
+# Conflicting cpuOnly selections fail, in connected and air-gapped modes.
+for _airgap_expr in 'del(.cluster.airgap)' '.cluster.airgap = true'; do
+  _mode="connected"; [[ "${_airgap_expr}" == *"= true" ]] && _mode="air-gapped"
+  _write_cpu_profile_config "${_profile_tmpdir}/saia-${_mode}.yaml" "${_airgap_expr}" '.aiPlatform.features += [{"name":"saia"}]'
+  _expect_profile_conflict "${_mode} cpuOnly with SAIA" "${_profile_tmpdir}/saia-${_mode}.yaml" "'saia' is not supported by cpuOnly"
+done
+_write_cpu_profile_config "${_profile_tmpdir}/seca.yaml" '.aiPlatform.features += [{"name":"seca"}]'
+_expect_profile_conflict "cpuOnly with SECA" "${_profile_tmpdir}/seca.yaml" "'seca' is not supported by cpuOnly"
+_write_cpu_profile_config "${_profile_tmpdir}/no-features.yaml" '.aiPlatform.features = []'
+_expect_profile_conflict "cpuOnly with no features (installer would default to saia)" "${_profile_tmpdir}/no-features.yaml" "aiPlatform.features is empty"
+_write_cpu_profile_config "${_profile_tmpdir}/gpu-workers.yaml" '.nodes.gpuWorkers = 1'
+_expect_profile_conflict "cpuOnly with a GPU worker" "${_profile_tmpdir}/gpu-workers.yaml" "nodes.gpuWorkers must be 0 for cpuOnly (got 1)"
+_write_cpu_profile_config "${_profile_tmpdir}/gpu-workers-omitted.yaml" 'del(.nodes.gpuWorkers)'
+_expect_profile_conflict "cpuOnly without nodes.gpuWorkers" "${_profile_tmpdir}/gpu-workers-omitted.yaml" "nodes.gpuWorkers must be 0 for cpuOnly (got unset or not a number)"
+_write_cpu_profile_config "${_profile_tmpdir}/gpu-workers-text.yaml" '.nodes.gpuWorkers = "two"'
+_expect_profile_conflict "cpuOnly with a non-numeric nodes.gpuWorkers" "${_profile_tmpdir}/gpu-workers-text.yaml" "(got unset or not a number)"
+_write_cpu_profile_config "${_profile_tmpdir}/accelerator.yaml" '.aiPlatform.defaultAcceleratorType = "L40S"'
+_expect_profile_conflict "cpuOnly with an accelerator type" "${_profile_tmpdir}/accelerator.yaml" "aiPlatform.defaultAcceleratorType must be empty"
+_write_cpu_profile_config "${_profile_tmpdir}/nvidia.yaml" '.components.nvidia = true'
+_expect_profile_conflict "cpuOnly with components.nvidia: true" "${_profile_tmpdir}/nvidia.yaml" "components.nvidia: true"
+_write_cpu_profile_config "${_profile_tmpdir}/kuberay.yaml" '.components.kuberay = true'
+_expect_profile_conflict "cpuOnly with components.kuberay: true" "${_profile_tmpdir}/kuberay.yaml" "components.kuberay: true"
+_write_cpu_profile_config "${_profile_tmpdir}/staging-true.yaml" '.storage.modelStaging.enabled = true'
+_expect_profile_conflict "cpuOnly with model staging enabled" "${_profile_tmpdir}/staging-true.yaml" "storage.modelStaging.enabled must be false"
+_write_cpu_profile_config "${_profile_tmpdir}/staging-omitted.yaml" 'del(.storage.modelStaging)'
+_expect_profile_conflict "cpuOnly with model staging omitted (defaults to true)" "${_profile_tmpdir}/staging-omitted.yaml" "storage.modelStaging.enabled must be false"
+_write_cpu_profile_config "${_profile_tmpdir}/sidecar-otel.yaml" '.aiPlatform.sidecars.otel = true'
+_expect_profile_conflict "cpuOnly with the OTel sidecar enabled" "${_profile_tmpdir}/sidecar-otel.yaml" "cpuOnly does not support sidecars"
+_write_cpu_profile_config "${_profile_tmpdir}/sidecar-default.yaml" 'del(.aiPlatform.sidecars)'
+_expect_profile_conflict "cpuOnly with sidecar flags left to their component defaults" "${_profile_tmpdir}/sidecar-default.yaml" "cpuOnly does not support sidecars"
+
+# All conflicts are reported together, and no configuration value is echoed.
+_write_cpu_profile_config "${_profile_tmpdir}/many.yaml" \
+  '.aiPlatform.features += [{"name":"saia"}]' '.nodes.gpuWorkers = 3' '.aiPlatform.defaultAcceleratorType = "H100"'
+_many_rc=0
+_many_out=$(_profile_check "${_profile_tmpdir}/many.yaml") || _many_rc=$?
+assert_eq "multiple cpuOnly conflicts are rejected" "1" "${_many_rc}"
+assert_eq "multiple conflicts are listed in one error" "3" \
+  "$(grep -c -E "is not supported by cpuOnly|nodes.gpuWorkers must be 0|defaultAcceleratorType must be empty" <<<"${_many_out}" || true)"
+assert_eq "conflict output does not echo the accelerator value" "0" "$(grep -c 'H100' <<<"${_many_out}" || true)"
+assert_eq "conflict output excludes the object-store credential" "0" "$(grep -c 'DO_NOT_PRINT_STORAGE_CANARY' <<<"${_many_out}" || true)"
+assert_eq "conflict output excludes the LAS credential" "0" "$(grep -c 'DO_NOT_PRINT_POSTGRES_CANARY' <<<"${_many_out}" || true)"
+
+# The check runs before any cluster change in both entry points.
+_install_body=$(_extract_fn main_install)
+_validate_body=$(_extract_fn validate_config)
+_line_of() { grep -n -m1 -E "$2" <<<"$1" | cut -d: -f1; }
+_check_line=$(_line_of "${_install_body}" '^  validate_cpu_profile_consistency$')
+_preflight_line=$(_line_of "${_install_body}" '^  preflight_checks$')
+_staging_line=$(_line_of "${_install_body}" 'stage_model_artifacts$')
+assert_eq "main_install runs the cpuOnly consistency check" "1" "$([[ -n "${_check_line}" ]] && echo 1 || echo 0)"
+assert_eq "main_install checks cpuOnly consistency before preflight" "1" \
+  "$([[ -n "${_check_line}" && -n "${_preflight_line}" ]] && (( _check_line < _preflight_line )) && echo 1 || echo 0)"
+assert_eq "main_install checks cpuOnly consistency before model staging" "1" \
+  "$([[ -n "${_check_line}" && -n "${_staging_line}" ]] && (( _check_line < _staging_line )) && echo 1 || echo 0)"
+assert_eq "validate runs the cpuOnly consistency check" "1" \
+  "$(grep -c -E '^  validate_cpu_profile_consistency$' <<<"${_validate_body}" || true)"
+rm -rf "${_profile_tmpdir}"
 
 # ── Tests: build_image_url ─────────────────────────────────────────────────────
 
