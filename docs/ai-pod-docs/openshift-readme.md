@@ -1084,6 +1084,12 @@ a Route `spec.tls` configuration.
 
 Set `openshift.routes.<feature>.enabled: false` to keep that feature internal.
 
+For the on-prem customer-managed FIPS gateway requirements and the distinction
+between gateway TLS and the HTTP Route backends, see the
+[customer-managed FIPS ingress reference](../splunk-ai-operator-docs/customer-managed-fips-ingress-requirements.md).
+For certificate ownership, validation, and rotation expectations, see the
+[customer-managed ingress certificate requirements](../splunk-ai-operator-docs/customer-managed-ingress-certificate-requirements.md).
+
 ## Security and production considerations
 
 - The supported production deployment exposes SAIA and SLIM through HTTP

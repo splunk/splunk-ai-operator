@@ -2,6 +2,14 @@
 
 This guide shows you how to expose your AI Platform services to the internet using Kubernetes Ingress.
 
+For on-prem customer-managed FIPS ingress to the **SAIA** and **SLIM** endpoints
+used by Splunk AI Assistant and Splunk AI Toolkit, see the
+[customer-managed ingress investigation findings](../customer-managed-fips-ingress-requirements.md).
+For gateway certificate ownership and verification requirements, see the
+[customer-managed ingress certificate guide](../customer-managed-ingress-certificate-requirements.md).
+The `AIPlatform.spec.ingress` configuration described here does not create the
+SAIA or SLIM routes.
+
 ## Quick Start
 
 **Enable external access with a custom domain:**

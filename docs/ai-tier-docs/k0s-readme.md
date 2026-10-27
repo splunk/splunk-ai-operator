@@ -2359,6 +2359,12 @@ AITK consumes the **SLIM service**, not SAIA. The Splunk AI Assistant app is
 onboarded against the SAIA endpoint; AITK is onboarded against the SLIM
 endpoint, and the two are configured independently. Once onboarded, AITK adds:
 
+For on-prem FIPS ingress requirements, including the customer gateway, DNS,
+certificate, and HTTP backend requirements for SAIA and SLIM, see the
+[customer-managed FIPS ingress reference](../splunk-ai-operator-docs/customer-managed-fips-ingress-requirements.md).
+For certificate ownership, validation, and rotation expectations, see the
+[customer-managed ingress certificate requirements](../splunk-ai-operator-docs/customer-managed-ingress-certificate-requirements.md).
+
 - `ai` — prompt Splunk-hosted LLMs from SPL. Requires an AI tier **LLM
   connection** (see [Step 4](#onboarding-to-the-ai-tier-splunk-ai-toolkit)).
 - `apply CDTSM` — forecasting, predictive alerting, and anomaly detection with

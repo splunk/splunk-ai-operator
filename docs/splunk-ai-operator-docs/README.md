@@ -22,6 +22,8 @@ Welcome to the Splunk AI Operator documentation!
 - **[Storage Configuration](splunk-ai-operator-configuration/storage-configuration.md)** - Persistent storage for Weaviate vector database
 - **[Storage Artifacts](splunk-ai-operator-configuration/storage-artifacts.md)** - S3/GCS/Azure storage for AI models
 - **[Ingress Configuration](splunk-ai-operator-configuration/ingress-configuration.md)** - Expose AI services externally
+- **[On-Prem Customer-Managed Ingress Investigation](customer-managed-fips-ingress-requirements.md)** - SAIA/SLIM routes, network prerequisites, and gateway-only TLS findings for on-prem deployments
+- **[Customer-Managed Ingress TLS Certificate Requirements](customer-managed-ingress-certificate-requirements.md)** - Customer certificate ownership, requirements, verification, and rotation
 - **[Webhook Certificates](splunk-ai-operator-configuration/webhook-certificates.md)** - Configure admission webhook TLS
 
 ## Project Documentation
