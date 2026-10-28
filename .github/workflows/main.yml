@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - ai-tier-ga
+      - feature/ai-pod-cra-1.1
   push:
     branches:
       - main
