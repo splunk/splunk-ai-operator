@@ -1011,6 +1011,58 @@ else
   echo "  SKIP: yq not installed; YAML parse checks skipped"
 fi
 
+echo "Splunk namespace secrets"
+eval "$(extract_function ensure_splunk_namespace_secret)"
+if command -v openssl >/dev/null 2>&1; then
+  NS_TMP=$(mktemp -d)
+  # state: "absent", "present", "race" (create returns AlreadyExists) or "error" (get fails).
+  _run_ns_secret() (
+    local state="$1"
+    AI_NS="ai-platform"
+    err() { exit 1; }
+    oc() {
+      case "$1 $2" in
+        "get secret")
+          case "${state}" in
+            present) echo "secret/splunk-ai-platform-secret" ;;
+            error) return 1 ;;
+          esac ;;
+        "create secret")
+          [[ "${state}" == "race" ]] && { echo 'Error from server (AlreadyExists): secrets "splunk-ai-platform-secret" already exists'; return 1; }
+          echo "$*" > "${NS_TMP}/create-args"
+          local arg file
+          for arg in "$@"; do
+            [[ "${arg}" == --from-file=* ]] || continue
+            file="${arg#*=}"; file="${file#*=}"
+            printf '%s=%s\n' "${arg#--from-file=}" "$(cat "${file}")" | sed 's/=.*=/=/' >> "${NS_TMP}/created"
+          done ;;
+      esac
+    }
+    : > "${NS_TMP}/created"
+    ensure_splunk_namespace_secret
+  )
+  assert_rc "creates Splunk secrets on a fresh install" 0 _run_ns_secret absent
+  assert_eq "creates exactly the five Splunk Operator secret keys" "hec_token idxc_secret pass4SymmKey password shc_secret" \
+    "$(cut -d= -f1 "${NS_TMP}/created" | sort | tr '\n' ' ' | sed 's/ $//')"
+  assert_eq "password and internal secrets are 32 alphanumeric characters" "4" \
+    "$(grep -v '^hec_token=' "${NS_TMP}/created" | cut -d= -f2 | grep -cE '^[A-Za-z0-9]{32}$' || true)"
+  assert_eq "hec_token uses the operator's UUID-like hex format" "1" \
+    "$(grep -cE '^hec_token=[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$' "${NS_TMP}/created" || true)"
+  assert_eq "generated values are distinct" "5" "$(cut -d= -f2 "${NS_TMP}/created" | sort -u | wc -l | tr -d ' ')"
+  assert_eq "secret values are passed as files, not command-line literals" "0" \
+    "$(grep -c -e '--from-literal' "${NS_TMP}/create-args" || true)"
+  assert_rc "succeeds when the Splunk namespace Secret already exists" 0 _run_ns_secret present
+  assert_eq "leaves an existing Splunk namespace Secret unchanged" "0" "$(wc -l < "${NS_TMP}/created" | tr -d ' ')"
+  assert_rc "keeps the operator's Secret when it was created concurrently" 0 _run_ns_secret race
+  assert_eq "a concurrent creation writes nothing of ours" "0" "$(wc -l < "${NS_TMP}/created" | tr -d ' ')"
+  assert_rc "stops when the Secret cannot be read" 1 _run_ns_secret error
+  rm -rf "${NS_TMP}"
+else
+  echo "  SKIP: openssl not installed; Splunk namespace secret checks skipped"
+fi
+assert_eq "Splunk secrets are created before the Standalone is applied" "true" \
+  "$(awk '/^install_splunk_standalone\(\)/,/^}/' "${SCRIPT}" | awk '/ensure_splunk_namespace_secret/{e=NR} /kind: Standalone/{s=NR} END{print (e && s && e < s) ? "true" : "false"}')"
+
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
 ((FAIL == 0))
