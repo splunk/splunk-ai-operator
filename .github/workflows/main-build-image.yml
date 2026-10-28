@@ -83,6 +83,18 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Build image for ASLR check
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          load: true
+          tags: splunk-ai-operator:aslr-check
+          cache-from: type=gha
+          platforms: linux/amd64
+
+      - name: Check image executables are position-independent (SEC-RUN-ASLR)
+        run: python3 scripts/check-image-pie.py splunk-ai-operator:aslr-check
+
       - name: Build and push image
         id: build
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5

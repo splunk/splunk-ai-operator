@@ -23,7 +23,9 @@ COPY pkg/ pkg/
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -buildmode=pie -o manager cmd/main.go
+# PSB SEC-RUN-ASLR: fail the build if manager is not position-independent.
+RUN readelf -h manager | grep -Eq 'Type:[[:space:]]+DYN' || { echo "manager is not a position-independent executable" >&2; exit 1; }
 
 # Generate self-signed cert
 RUN mkdir -p /certs && \
@@ -33,7 +35,8 @@ RUN mkdir -p /certs && \
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# base-nossl, unlike static, ships the dynamic loader that the PIE manager binary needs.
+FROM gcr.io/distroless/base-nossl-debian13:nonroot
 WORKDIR /
 
 COPY --from=builder /workspace/manager .
