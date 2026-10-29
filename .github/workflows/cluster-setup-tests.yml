@@ -23,6 +23,18 @@ jobs:
       - name: Run LAS deployment helper unit tests
         run: python3 tools/cluster_setup/test_las_deployment.py
 
+      - name: Run LAS runtime acceptance helper tests
+        run: |
+          python3 tools/cluster_setup/test_las_runtime_acceptance.py
+          python3 tools/cluster_setup/test_las_product_lifecycle_acceptance.py
+          python3 -m py_compile \
+            scripts/las-runtime-acceptance.py \
+            scripts/las-product-lifecycle-acceptance.py \
+            tools/cluster_setup/validation/aip5410_product_route_acceptance.py
+          bash -n \
+            scripts/las-restart-persistence-acceptance.sh \
+            scripts/las-credential-rotation-acceptance.sh
+
       - name: Run ECR refresh rollout tests
         run: bash tools/cluster_setup/test_refresh_ecr_credentials.sh
 
