@@ -18,18 +18,15 @@ package v1
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
@@ -41,7 +38,7 @@ var aiservicelog = logf.Log.WithName("aiservice-resource")
 
 // SetupAIServiceWebhookWithManager registers the webhook for AIService in the manager.
 func SetupAIServiceWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&aiv1.AIService{}).
+	return ctrl.NewWebhookManagedBy(mgr, &aiv1.AIService{}).
 		WithValidator(&AIServiceCustomValidator{}).
 		WithDefaulter(&AIServiceCustomDefaulter{}).
 		Complete()
@@ -60,15 +57,10 @@ type AIServiceCustomDefaulter struct {
 	Client client.Client
 }
 
-var _ webhook.CustomDefaulter = &AIServiceCustomDefaulter{}
+var _ admission.Defaulter[*aiv1.AIService] = &AIServiceCustomDefaulter{}
 
-// Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind AIService.
-func (d *AIServiceCustomDefaulter) Default(_ context.Context, obj runtime.Object) error {
-	aiservice, ok := obj.(*aiv1.AIService)
-
-	if !ok {
-		return fmt.Errorf("expected an AIService object but got %T", obj)
-	}
+// Default implements admission.Defaulter for the AIService type.
+func (d *AIServiceCustomDefaulter) Default(_ context.Context, aiservice *aiv1.AIService) error {
 	aiservicelog.Info("Defaulting for AIService", "name", aiservice.GetName())
 
 	// Clean ServiceTemplate metadata FIRST to prevent "unknown field" warnings
@@ -122,14 +114,10 @@ type AIServiceCustomValidator struct {
 	Client client.Client
 }
 
-var _ webhook.CustomValidator = &AIServiceCustomValidator{}
+var _ admission.Validator[*aiv1.AIService] = &AIServiceCustomValidator{}
 
-// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type AIService.
-func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	aiservice, ok := obj.(*aiv1.AIService)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIService object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator for the AIService type.
+func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, aiservice *aiv1.AIService) (admission.Warnings, error) {
 	aiservicelog.Info("Validation for AIService upon creation", "name", aiservice.GetName())
 
 	var allErrs field.ErrorList
@@ -209,24 +197,15 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 	return warnings, nil
 }
 
-// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type AIService.
-func (v *AIServiceCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	aiservice, ok := newObj.(*aiv1.AIService)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIService object for the newObj but got %T", newObj)
-	}
+// ValidateUpdate implements admission.Validator for the AIService type.
+func (v *AIServiceCustomValidator) ValidateUpdate(ctx context.Context, oldService, aiservice *aiv1.AIService) (admission.Warnings, error) {
 	aiservicelog.Info("Validation for AIService upon update", "name", aiservice.GetName())
-
-	oldService, ok := oldObj.(*aiv1.AIService)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIService object for the oldObj but got %T", oldObj)
-	}
 
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
 	// Run the same validations as create
-	if createWarnings, err := v.ValidateCreate(ctx, newObj); err != nil {
+	if createWarnings, err := v.ValidateCreate(ctx, aiservice); err != nil {
 		return createWarnings, err
 	} else {
 		warnings = append(warnings, createWarnings...)
@@ -254,12 +233,8 @@ func (v *AIServiceCustomValidator) ValidateUpdate(ctx context.Context, oldObj, n
 	return warnings, nil
 }
 
-// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type AIService.
-func (v *AIServiceCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	aiservice, ok := obj.(*aiv1.AIService)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIService object but got %T", obj)
-	}
+// ValidateDelete implements admission.Validator for the AIService type.
+func (v *AIServiceCustomValidator) ValidateDelete(ctx context.Context, aiservice *aiv1.AIService) (admission.Warnings, error) {
 	aiservicelog.Info("Validation for AIService upon deletion", "name", aiservice.GetName())
 
 	// No validation needed on deletion

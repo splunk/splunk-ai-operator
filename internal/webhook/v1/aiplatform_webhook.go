@@ -23,12 +23,10 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
@@ -40,7 +38,7 @@ var aiplatformlog = logf.Log.WithName("aiplatform-resource")
 
 // SetupAIPlatformWebhookWithManager registers the webhook for AIPlatform in the manager.
 func SetupAIPlatformWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&aiv1.AIPlatform{}).
+	return ctrl.NewWebhookManagedBy(mgr, &aiv1.AIPlatform{}).
 		WithValidator(&AIPlatformCustomValidator{}).
 		WithDefaulter(&AIPlatformCustomDefaulter{}).
 		Complete()
@@ -59,15 +57,10 @@ type AIPlatformCustomDefaulter struct {
 	Client client.Client
 }
 
-var _ webhook.CustomDefaulter = &AIPlatformCustomDefaulter{}
+var _ admission.Defaulter[*aiv1.AIPlatform] = &AIPlatformCustomDefaulter{}
 
-// Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind AIPlatform.
-func (d *AIPlatformCustomDefaulter) Default(_ context.Context, obj runtime.Object) error {
-	aiplatform, ok := obj.(*aiv1.AIPlatform)
-
-	if !ok {
-		return fmt.Errorf("expected an AIPlatform object but got %T", obj)
-	}
+// Default implements admission.Defaulter for the AIPlatform type.
+func (d *AIPlatformCustomDefaulter) Default(_ context.Context, aiplatform *aiv1.AIPlatform) error {
 	aiplatformlog.Info("Defaulting for AIPlatform", "name", aiplatform.GetName())
 
 	// Note: RayService spec cleaning is done in raybuilder since it's constructed dynamically
@@ -121,14 +114,10 @@ type AIPlatformCustomValidator struct {
 	Client client.Client
 }
 
-var _ webhook.CustomValidator = &AIPlatformCustomValidator{}
+var _ admission.Validator[*aiv1.AIPlatform] = &AIPlatformCustomValidator{}
 
-// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type AIPlatform.
-func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	aiplatform, ok := obj.(*aiv1.AIPlatform)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIPlatform object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator for the AIPlatform type.
+func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, aiplatform *aiv1.AIPlatform) (admission.Warnings, error) {
 	aiplatformlog.Info("Validation for AIPlatform upon creation", "name", aiplatform.GetName())
 
 	var allErrs field.ErrorList
@@ -178,24 +167,15 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 	return warnings, nil
 }
 
-// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type AIPlatform.
-func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	aiplatform, ok := newObj.(*aiv1.AIPlatform)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIPlatform object for the newObj but got %T", newObj)
-	}
+// ValidateUpdate implements admission.Validator for the AIPlatform type.
+func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldPlatform, aiplatform *aiv1.AIPlatform) (admission.Warnings, error) {
 	aiplatformlog.Info("Validation for AIPlatform upon update", "name", aiplatform.GetName())
-
-	oldPlatform, ok := oldObj.(*aiv1.AIPlatform)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIPlatform object for the oldObj but got %T", oldObj)
-	}
 
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
 	// Run the same validations as create
-	if createWarnings, err := v.ValidateCreate(ctx, newObj); err != nil {
+	if createWarnings, err := v.ValidateCreate(ctx, aiplatform); err != nil {
 		return createWarnings, err
 	} else {
 		warnings = append(warnings, createWarnings...)
@@ -216,12 +196,8 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 	return warnings, nil
 }
 
-// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type AIPlatform.
-func (v *AIPlatformCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	aiplatform, ok := obj.(*aiv1.AIPlatform)
-	if !ok {
-		return nil, fmt.Errorf("expected a AIPlatform object but got %T", obj)
-	}
+// ValidateDelete implements admission.Validator for the AIPlatform type.
+func (v *AIPlatformCustomValidator) ValidateDelete(ctx context.Context, aiplatform *aiv1.AIPlatform) (admission.Warnings, error) {
 	aiplatformlog.Info("Validation for AIPlatform upon deletion", "name", aiplatform.GetName())
 
 	// No validation needed on deletion
