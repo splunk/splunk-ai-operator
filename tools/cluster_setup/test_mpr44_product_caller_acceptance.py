@@ -17,6 +17,7 @@ from urllib import error
 
 
 SCRIPT = pathlib.Path(__file__).parent / "validation" / "mpr44_product_caller_acceptance.py"
+MANIFEST = pathlib.Path(__file__).parent / "validation" / "mpr44-slim-candidate.yaml"
 SPEC = importlib.util.spec_from_file_location("mpr44_product_caller_acceptance", SCRIPT)
 mpr44 = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = mpr44
@@ -154,6 +155,16 @@ class CallerRouteHandler(BaseHTTPRequestHandler):
 
 
 class MPR44CallerRouteTests(unittest.TestCase):
+    def test_candidate_does_not_mount_a_kubernetes_service_account_token(self):
+        manifest = MANIFEST.read_text(encoding="utf-8")
+        self.assertIn(
+            "automountServiceAccountToken: false",
+            manifest,
+        )
+        self.assertIn("${MPR44_SLIM_IMAGE_AT_DIGEST}", manifest)
+        self.assertIn("${MPR44_LAS_SERVICE_URL}", manifest)
+        self.assertNotRegex(manifest, r"[0-9]{12}\.dkr\.ecr\.")
+
     def test_scenario_json_rejects_nonfinite_and_duplicate_values(self):
         for document in (
             '{"cases":[],"value":NaN}',
@@ -187,24 +198,44 @@ class MPR44CallerRouteTests(unittest.TestCase):
 
     @staticmethod
     def scenario(*calls):
+        call_list = list(calls)
+        cases = [{"name": "representative", "calls": call_list}]
+        if len(call_list) == 1:
+            # Focused tests retain a real recall proof instead of satisfying the
+            # contract by merely duplicating one request.
+            cases.append(
+                {
+                    "name": "session-recall-proof",
+                    "calls": [
+                        {
+                            "task_prompt": "{{SESSION_MARKER}}",
+                            "expected_text": "{{SESSION_MARKER}}",
+                        },
+                        {
+                            "task_prompt": "recall the preceding marker",
+                            "expected_text": "{{SESSION_MARKER}}",
+                        },
+                    ],
+                }
+            )
         return {
             "scenario_version": 1,
             "sensitive_values": ["secret-canary"],
-            "cases": [{"name": "representative", "calls": list(calls)}],
+            "cases": cases,
         }
 
     def test_full_route_owns_ids_reuses_session_and_cleans_up(self):
         scenario = self.scenario(
             {
-                "task_prompt": "expected-marker",
+                "task_prompt": "{{SESSION_MARKER}}",
                 "system_prompt": "be concise",
                 "llm": {"provider": "test", "api_key": "secret-canary"},
-                "expected_text": "expected-marker",
+                "expected_text": "{{SESSION_MARKER}}",
             },
             {
                 "task_prompt": "recall",
                 "llm": {"provider": "test", "api_key": "secret-canary"},
-                "expected_text": "expected-marker",
+                "expected_text": "{{SESSION_MARKER}}",
             },
         )
         result = mpr44.execute(self.client, mpr44.validate_scenario(scenario), "test-caller-token", "qualification")
@@ -222,6 +253,8 @@ class MPR44CallerRouteTests(unittest.TestCase):
         self.assertEqual(second["agent_id"], result["assistant_id"])
         self.assertEqual(first["session_id"], second["session_id"])
         uuid.UUID(first["session_id"])
+        self.assertRegex(first["task_prompt"], r"^mpr44-session-[0-9a-f]{32}$")
+        self.assertNotIn(first["task_prompt"], second["task_prompt"])
         self.assertEqual(first["llm"]["api_key"], "secret-canary")
         self.assertTrue(all(request["request_id"] for request in self.state["requests"]))
 
@@ -231,6 +264,14 @@ class MPR44CallerRouteTests(unittest.TestCase):
             mpr44.execute(self.client, mpr44.validate_scenario(scenario), "test-caller-token", "qualification")
         self.assertEqual(self.state["assistants"], set())
         self.assertEqual(len([item for item in self.state["requests"] if item["method"] == "DELETE"]), 2)
+
+    def test_earlier_failure_event_cannot_be_overridden_by_later_completed(self):
+        events = [
+            {"status": "Error", "success": False},
+            {"status": "Completed", "success": True, "response": "looks-successful"},
+        ]
+        with self.assertRaisesRegex(mpr44.QualificationError, "terminal failure event"):
+            mpr44.terminal_response(events)
 
     def test_primary_and_cleanup_failures_are_both_reported(self):
         self.state["fail_cleanup"] = True
@@ -244,7 +285,7 @@ class MPR44CallerRouteTests(unittest.TestCase):
             headers = {"Content-Type": "application/json"}
 
             def read(self, _limit):
-                return b'{"detail":"s\\u00e9cret"'
+                return b'{"detail":"malformed"'
 
             def __enter__(self):
                 return self
@@ -376,6 +417,9 @@ class MPR44CallerRouteTests(unittest.TestCase):
         unicode_escaped = b'{"error":"s\\u00e9cret"}'
         with self.assertRaises(mpr44.QualificationError):
             mpr44.assert_body_absent(unicode_escaped, ["s\u00e9cret"], "escaped error")
+        alternate_escaped = b'{"error":"\\u0041\\/B"}'
+        with self.assertRaises(mpr44.QualificationError):
+            mpr44.assert_body_absent(alternate_escaped, ["A/B"], "escaped error")
         heartbeat = b'{"status":"Thinking","debug":"secret-canary"}\n'
         with self.assertRaises(mpr44.QualificationError):
             mpr44.assert_body_absent(heartbeat, ["secret-canary"], "heartbeat")
@@ -385,7 +429,8 @@ class MPR44CallerRouteTests(unittest.TestCase):
             "scenario_version": 1,
             "sensitive_values": ["representative"],
             "cases": [{"name": "representative", "calls": [
-                {"task_prompt": "safe-result", "expected_text": "safe-result"}
+                {"task_prompt": "{{SESSION_MARKER}}", "expected_text": "{{SESSION_MARKER}}"},
+                {"task_prompt": "recall the preceding result", "expected_text": "{{SESSION_MARKER}}"},
             ]}],
         }
         with self.assertRaisesRegex(mpr44.QualificationError, "sanitized evidence"):
@@ -398,6 +443,13 @@ class MPR44CallerRouteTests(unittest.TestCase):
             {"scenario_version": 1, "cases": [{"name": "safe", "calls": [{"task_prompt": "x"}]}]},
             {
                 "scenario_version": 1,
+                "cases": [{
+                    "name": "empty-shape",
+                    "calls": [{"task_prompt": "x", "expected_shape": {}}],
+                }],
+            },
+            {
+                "scenario_version": 1,
                 "unexpected": True,
                 "cases": [{"name": "safe", "calls": [{"task_prompt": "x", "expected_text": "x"}]}],
             },
@@ -405,6 +457,88 @@ class MPR44CallerRouteTests(unittest.TestCase):
         for scenario in invalid:
             with self.subTest(scenario=scenario), self.assertRaises(mpr44.ScenarioError):
                 mpr44.validate_scenario(scenario)
+
+        credential_case = {
+            "scenario_version": 1,
+            "cases": [{
+                "name": "credential-case",
+                "calls": [{
+                    "task_prompt": "test",
+                    "llm": {"provider": "test", "api_key": "synthetic"},
+                    "expected_text": "done",
+                }],
+            }],
+        }
+        with self.assertRaisesRegex(mpr44.ScenarioError, "require sensitive_values"):
+            mpr44.validate_scenario(credential_case)
+
+        one_call = {
+            "scenario_version": 1,
+            "sensitive_values": ["canary"],
+            "cases": [{
+                "name": "one-call",
+                "calls": [{"task_prompt": "test", "expected_text": "done"}],
+            }],
+        }
+        with self.assertRaisesRegex(mpr44.ScenarioError, "same-session recall probe"):
+            mpr44.validate_scenario(one_call)
+
+        duplicate_calls = {
+            "scenario_version": 1,
+            "sensitive_values": ["canary"],
+            "cases": [{
+                "name": "duplicate",
+                "calls": [
+                    {"task_prompt": "same", "expected_text": "same"},
+                    {"task_prompt": "same", "expected_text": "same"},
+                ],
+            }],
+        }
+        with self.assertRaisesRegex(mpr44.ScenarioError, "same-session recall probe"):
+            mpr44.validate_scenario(duplicate_calls)
+
+        stateless_constant = {
+            "scenario_version": 1,
+            "sensitive_values": ["canary"],
+            "cases": [{
+                "name": "constant",
+                "calls": [
+                    {"task_prompt": "first request", "expected_text": "constant-output"},
+                    {"task_prompt": "second request", "expected_text": "constant-output"},
+                ],
+            }],
+        }
+        with self.assertRaisesRegex(mpr44.ScenarioError, "same-session recall probe"):
+            mpr44.validate_scenario(stateless_constant)
+
+        echoed_then_constant = {
+            "scenario_version": 1,
+            "sensitive_values": ["canary"],
+            "cases": [{
+                "name": "echoed-constant",
+                "calls": [
+                    {"task_prompt": "hello", "expected_text": "hello"},
+                    {"task_prompt": "recall", "expected_text": "hello"},
+                ],
+            }],
+        }
+        with self.assertRaisesRegex(mpr44.ScenarioError, "same-session recall probe"):
+            mpr44.validate_scenario(echoed_then_constant)
+
+    def test_credential_values_are_derived_even_with_incomplete_canary_list(self):
+        scenario = self.scenario(
+            {
+                "task_prompt": "test",
+                "llm": {"provider": "test", "api_key": "derived-secret"},
+                "expected_text": "done",
+            }
+        )
+        scenario["sensitive_values"] = ["unrelated-canary"]
+        validated = mpr44.validate_scenario(scenario)
+        derived = list(mpr44.credential_values(validated))
+        self.assertIn("derived-secret", derived)
+        with self.assertRaisesRegex(mpr44.QualificationError, "sensitive marker"):
+            mpr44.assert_absent({"response": "derived-secret"}, derived, "response")
 
     def test_base_url_rejects_credentials_path_query_and_fragment(self):
         invalid = (
@@ -456,13 +590,25 @@ class MPR44CallerRouteTests(unittest.TestCase):
         assistant_id = str(uuid.uuid4())
 
         class UnexpectedSuccessClient:
-            def __init__(self):
+            def __init__(self, mode, leak=False):
+                self.mode = mode
+                self.leak = leak
                 self.deleted = []
 
             def request(self, method, path, **kwargs):
-                if method == "POST" and kwargs.get("raw_body") == b"{":
+                is_unexpected = (
+                    self.mode == "missing-bearer" and method == "POST" and kwargs.get("token") is None
+                ) or (
+                    self.mode == "malformed-json"
+                    and method == "POST"
+                    and kwargs.get("raw_body") == b"{"
+                )
+                if is_unexpected:
+                    body = {"runtime_id": assistant_id}
+                    if self.leak:
+                        body["leak"] = "token"
                     return mpr44.HTTPResult(
-                        201, json.dumps({"runtime_id": assistant_id}).encode(), "application/json"
+                        201, json.dumps(body).encode(), "application/json"
                     )
                 if method == "POST":
                     return mpr44.HTTPResult(401, b'{"error":"denied"}', "application/json")
@@ -471,10 +617,77 @@ class MPR44CallerRouteTests(unittest.TestCase):
                     return mpr44.HTTPResult(200, b'{"status":"DELETING"}', "application/json")
                 return mpr44.HTTPResult(200, b'{"status":"AGENT_NOT_FOUND"}', "application/json")
 
-        client = UnexpectedSuccessClient()
-        with self.assertRaisesRegex(mpr44.QualificationError, "malformed JSON was not safely rejected"):
-            mpr44.run_negative_checks(client, CallerRouteHandler.route, "token", ["token"])
-        self.assertEqual(len(client.deleted), 2)
+        cases = (
+            ("malformed-json", False, "malformed JSON was not safely rejected"),
+            ("malformed-json", True, "sensitive marker"),
+            ("missing-bearer", True, "sensitive marker"),
+        )
+        for mode, leak, expected_error in cases:
+            with self.subTest(mode=mode, leak=leak):
+                client = UnexpectedSuccessClient(mode, leak)
+                with self.assertRaisesRegex(mpr44.QualificationError, expected_error):
+                    mpr44.run_negative_checks(
+                        client, CallerRouteHandler.route, "token", ["token"]
+                    )
+                self.assertEqual(len(client.deleted), 2)
+
+    def test_cleanup_confirmation_requires_exact_absence(self):
+        class AmbiguousCleanupClient:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, *_args, **_kwargs):
+                self.calls += 1
+                status = "DELETING" if self.calls == 1 else "AGENT_NOT_FOUND_BUT_PRESENT"
+                return mpr44.HTTPResult(
+                    200,
+                    json.dumps({"status": status}).encode(),
+                    "application/json",
+                )
+
+        with self.assertRaisesRegex(mpr44.QualificationError, "did not report not found"):
+            mpr44.cleanup_assistant(
+                AmbiguousCleanupClient(),
+                CallerRouteHandler.route,
+                "token",
+                "assistant-id",
+                ["token"],
+            )
+
+    def test_create_validation_failure_recovers_and_cleans_runtime_id(self):
+        assistant_id = str(uuid.uuid4())
+
+        class InvalidCreateClient:
+            def __init__(self, body):
+                self.body = body
+                self.deleted = []
+
+            def request(self, method, path, **_kwargs):
+                if method == "POST":
+                    return mpr44.HTTPResult(201, self.body, "application/json")
+                self.deleted.append(path)
+                status = "DELETING" if len(self.deleted) == 1 else "AGENT_NOT_FOUND"
+                return mpr44.HTTPResult(
+                    200, json.dumps({"status": status}).encode(), "application/json"
+                )
+
+        bodies = (
+            f'{{"runtime_id":"{assistant_id}"'.encode(),
+            json.dumps({"runtime_id": assistant_id, "leak": "token"}).encode(),
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                client = InvalidCreateClient(body)
+                with self.assertRaises(mpr44.QualificationError):
+                    mpr44.create_assistant(
+                        client,
+                        CallerRouteHandler.route,
+                        "token",
+                        "create",
+                        "assistant",
+                        ["token"],
+                    )
+                self.assertEqual(len(client.deleted), 2)
 
     def test_main_emits_only_sanitized_failure(self):
         scenario = self.scenario({"task_prompt": "terminal-failure", "expected_text": "secret-canary"})

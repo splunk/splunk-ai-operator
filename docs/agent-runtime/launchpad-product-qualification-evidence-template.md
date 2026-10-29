@@ -49,7 +49,8 @@ Use only `PASS`, `FAIL`, `BLOCKED`, `KNOWN_FAIL`, or `NOT_RUN`.
 - API Deployment: `<name>`
 - Queue Deployment: `<name>`
 - Queue HPA: `<name>`
-- Stable Service: `<name>`
+- Stable Service name/UID/port: `<name>` / `<uid>` / `<port>`
+- Service selector and EndpointSlice Pod binding: `<verified evidence reference>`
 - SLIM/AITK image/digest: `<reference>` / `<sha256:...>`
 - Caller path tested: `<direct LAS|in-Pod SLIM|supported external route>`
 - PostgreSQL resource identity: `<sanitized name/version>`
@@ -69,6 +70,10 @@ Use only `PASS`, `FAIL`, `BLOCKED`, `KNOWN_FAIL`, or `NOT_RUN`.
 ## Surfaces inspected for synthetic canaries
 
 Record only status and a sanitized evidence location. Do not paste the canary.
+For every credential-bearing scenario, attest that a unique canary was declared
+and that the helper-derived scan set included every recognized credential field;
+an empty or partial manually declared list cannot omit recognized credentials
+from a redaction `PASS`.
 
 | Surface | Initial run | Resume | Notes |
 | --- | --- | --- | --- |
@@ -130,7 +135,11 @@ External-route or installed-AITK-origin limitation, if any: `<exact missing evid
 | --- | --- | --- | --- | --- | --- | --- |
 | Synchronous | `<route>` | `<ID>` | `<ID>` | `<terminal>` | `<yes/no>` | `<status>` |
 | Background/queued | `<route>` | `<ID>` | `<ID>` | `<terminal>` | `<yes/no>` | `<status>` |
-| SSE | `<route>` | `<ID>` | `<ID>` | `<ordered event names; terminal>` | `<yes/no>` | `<status>` |
+| SSE | `<route>` | `<ID>` | `<ID>` | `<ordered event names; explicit terminal event/status>` | `<yes/no>` | `<status>` |
+
+Response assertions used: `<known output fields or explicit expected_response_paths>`
+
+SSE completion contract: `<runtime version; exact terminal event/status, or EOF-after-values plus independent run-ID terminal poll; rerun evidence>`
 
 ### Restart chronology
 
@@ -167,7 +176,8 @@ External-route or installed-AITK-origin limitation, if any: `<exact missing evid
 - HPA current/desired samples: `<values>`
 - Queue ready-replica samples: `<values>`
 - CPU samples/availability: `<values>`
-- Observed product-load scaling: `<scaled|no_cpu_scale_observed|blocked>`
+- Observed product-load scaling:
+  `<cpu_scale_pass|replica_scale_observed_without_cpu_evidence|cpu_trigger_observed_without_replica_scale|no_cpu_scale_observed|blocked>`
 - Multi-worker execution attribution source: `<supported field or sanitized log correlation>`
 - Workers that executed jobs: `<sanitized worker IDs/count>`
 - Every run terminal and every marker present: `<yes/no; evidence reference>`
@@ -176,6 +186,7 @@ External-route or installed-AITK-origin limitation, if any: `<exact missing evid
 
 - HPA minimum/maximum: `<min>/<max>`
 - CPU utilization target: `<target>`
+- Peak causal CPU sample at/above target: `<sample/target and timestamp>`
 - Scale-down stabilization/policy: `<values>`
 - Starting current/desired/ready: `<values>`
 - Peak current/desired/ready: `<values>`
@@ -194,6 +205,10 @@ External-route or installed-AITK-origin limitation, if any: `<exact missing evid
 - Capacity conclusion: `<PASS|FAIL|BLOCKED>`
 
 MPR-49 conclusion: `<PASS|FAIL|BLOCKED>`
+
+Upgrade identity attestation: `<pre image/digest/chart verified before first product call; post image/digest/chart and API/queue Pod-template hashes verified before post-upgrade product call>`
+
+Rotation identity attestation: `<exact Helm release/chart and operator/API/queue identities verified before product calls; auth/PostgreSQL/Redis Secret names and required keys bound to API/queue Pod-template references>`
 
 Timeout/cancellation limitation, if any: `<MPR-48 status and missing evidence>`
 

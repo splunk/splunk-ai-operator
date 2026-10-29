@@ -34,8 +34,8 @@ Record these values before the run and re-read the deployed values afterward:
 - AIPlatform and AgentRuntime AIService names, generations and Ready conditions;
 - Launchpad Agent Server image and Pod `imageID` digest;
 - graph ID `agent` and stable LAS Service name;
-- SLIM candidate image:
-  `658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610152102-b7cb6e97e381`;
+- SLIM candidate image: the approved private-registry repository and reviewed
+  tag recorded in the restricted execution record;
 - required SLIM digest:
   `sha256:951ac687c0753399e9a636cd507ec541f55ecaade4717c19276d228115c003ef`.
 
@@ -87,9 +87,9 @@ manifest live if any identity differs.
 Resolve the immutable candidate identity explicitly:
 
 ```sh
-aws ecr describe-images --region us-west-2 \
-  --repository-name ml-platform/slim-api \
-  --image-ids imageTag=feature-las-202610152102-b7cb6e97e381 \
+aws ecr describe-images --region <region> \
+  --repository-name <candidate-repository> \
+  --image-ids imageTag=<reviewed-tag> \
   --query 'imageDetails[0].imageDigest' --output text
 ```
 
@@ -103,15 +103,23 @@ SLIM AIService. It sets:
 - authentication and authorization enabled;
 - `AGENT_SERVER_URL` to the stable LAS Service;
 - `LAS_GRAPH_ID=agent` explicitly;
-- the supplied image pinned by tag and digest.
+- the supplied image pinned by tag and digest;
+- `automountServiceAccountToken: false`, because the candidate does not use the
+  Kubernetes API.
 
+The committed fixture contains no internal registry or Service endpoint. Render
+its three `${MPR44_*}` placeholders into a permission-restricted temporary copy
+using the approved immutable image-at-digest, Splunk issuer URL, and stable LAS
+Service URL. Confirm the rendered file contains no unresolved `${MPR44_` token.
 After securely streaming a fresh ECR token into the temporary
-`mpr44-ecr-pull` Secret, run a server-side dry-run and then apply the manifest:
+`mpr44-ecr-pull` Secret, run a server-side dry-run and then apply only that
+rendered copy:
 
 ```sh
 kubectl apply --server-side --dry-run=server \
-  -f tools/cluster_setup/validation/mpr44-slim-candidate.yaml
-kubectl apply -f tools/cluster_setup/validation/mpr44-slim-candidate.yaml
+  -f /path/to/permission-restricted/mpr44-slim-candidate.rendered.yaml
+kubectl apply \
+  -f /path/to/permission-restricted/mpr44-slim-candidate.rendered.yaml
 kubectl -n ai-platform rollout status deployment/mpr44-slim-candidate --timeout=10m
 ```
 
@@ -162,12 +170,12 @@ shape is:
       "name": "launchpad-session-mapping",
       "calls": [
         {
-          "task_prompt": "Return the approved unique marker exactly.",
+          "task_prompt": "Return {{SESSION_MARKER}} exactly.",
           "system_prompt": "Follow the request and answer concisely.",
           "llm": {"<approved short-lived model configuration>": "<in-memory value>"},
           "mcps": [],
           "knowledge_bases": [],
-          "expected_text": "<approved unique marker>"
+          "expected_text": "{{SESSION_MARKER}}"
         },
         {
           "task_prompt": "Return the marker from the preceding request.",
@@ -175,13 +183,19 @@ shape is:
           "llm": {"<repeat the complete model configuration>": "<in-memory value>"},
           "mcps": [],
           "knowledge_bases": [],
-          "expected_text": "<approved unique marker>"
+          "expected_text": "{{SESSION_MARKER}}"
         }
       ]
     }
   ]
 }
 ```
+
+`{{SESSION_MARKER}}` is mandatory for the recall proof. The helper replaces it
+in memory with a fresh high-entropy value for each case. The first request and
+its expected response must contain the placeholder; a later expected response
+must contain it while the later request must not. This prevents a stateless
+constant response from being misclassified as same-session persistence.
 
 Do not save this example with real values. In the command below,
 `secure_scenario_producer` is a placeholder for the approved in-memory secret
@@ -200,7 +214,15 @@ secure_scenario_producer | \
 The helper also runs missing-bearer, malformed-bearer and malformed-JSON
 negative checks. A transport-level HTTP 200 does not pass an invocation when
 the terminal NDJSON event has `success=false` or lacks a completed response.
+At least one case must prove recall: a marker must be supplied in an earlier
+request, omitted from every field of the later request, and still be required
+in the later completed response. Repeating the same prompt or accepting the
+same constant output twice is not persistence evidence.
 Sensitive canaries must be absent from every inspected success/error body.
+Credential-bearing LLM, MCP, or knowledge-base calls require non-empty
+`sensitive_values`. The helper rejects missing canaries and automatically adds
+every recognized secret-bearing value from the in-memory LLM/MCP/KB config to
+the scan set, so an incomplete manual list cannot omit a recognized credential.
 
 At minimum, retain the sanitized helper result and record:
 
@@ -241,11 +263,14 @@ before reporting PASS. Stop the port-forward, then delete only the exact
 validation resources:
 
 ```sh
-kubectl delete -f tools/cluster_setup/validation/mpr44-slim-candidate.yaml
+kubectl delete \
+  -f /path/to/permission-restricted/mpr44-slim-candidate.rendered.yaml
 kubectl -n ai-platform delete secret mpr44-ecr-pull
 kubectl -n ai-platform get all,configmap,secret \
   -l validation.splunk.com/story=mpr-44
 ```
+
+Remove the permission-restricted rendered manifest after the absence check.
 
 The final label query must return no resources. Re-run the preflight health
 checks and confirm that the primary operator-owned LAS, queue and SLIM workloads

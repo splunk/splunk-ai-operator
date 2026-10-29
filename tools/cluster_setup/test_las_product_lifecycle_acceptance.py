@@ -1,6 +1,7 @@
 """Offline safety tests for the Launchpad lifecycle qualification helper."""
 
 import importlib.util
+import base64
 import io
 import json
 import os
@@ -38,6 +39,147 @@ class LifecycleAcceptanceTests(unittest.TestCase):
         for value in ("pod/postgres", "deployment", "deployment/Bad_Name"):
             with self.subTest(value=value), self.assertRaises(lifecycle.LifecycleError):
                 lifecycle.workload_ref(value, "dependency")
+
+    def test_dependency_binding_requires_exact_service_endpoint_and_workload_refs(self):
+        encoded = base64.b64encode(
+            b"postgresql://user:password@postgres.ai-platform.svc:5432/db"
+        ).decode()
+        objects = {
+            ("statefulset", "postgres"): {
+                "spec": {
+                    "selector": {"matchLabels": {"app": "postgres"}},
+                    "template": {"metadata": {"labels": {"app": "postgres"}}},
+                }
+            },
+            ("service", "postgres"): {
+                "metadata": {"uid": "service-uid"},
+                "spec": {"selector": {"app": "postgres"}},
+            },
+            ("secret", "postgres-connection"): {
+                "data": {"postgres_connection_url": encoded}
+            },
+        }
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "image": "registry/launchpad:test",
+                            "env": [{
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": "postgres-connection",
+                                        "key": "postgres_connection_url",
+                                    }
+                                }
+                            }]
+                        }]
+                    }
+                }
+            }
+        }
+        objects[("deployment", "api")] = deployment
+        objects[("deployment", "queue")] = deployment
+
+        class FakeKubectl:
+            dry_run = False
+
+            def get(self, kind, resource_name):
+                return objects[(kind, resource_name)]
+
+        result = lifecycle.dependency_binding(
+            FakeKubectl(), "ai-platform", "statefulset", "postgres",
+            "postgres", "service-uid", "postgres-connection",
+            "postgres_connection_url", "api", "queue", "registry/launchpad:test",
+        )
+        self.assertTrue(result["endpoint_reference_bound"])
+
+        objects[("service", "postgres")]["spec"]["selector"] = {"app": "unrelated"}
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "selector"):
+            lifecycle.dependency_binding(
+                FakeKubectl(), "ai-platform", "statefulset", "postgres",
+                "postgres", "service-uid", "postgres-connection",
+                "postgres_connection_url", "api", "queue", "registry/launchpad:test",
+            )
+
+        objects[("service", "postgres")]["spec"]["selector"] = {"app": "postgres"}
+        objects[("statefulset", "postgres")]["spec"]["selector"]["matchExpressions"] = [
+            {"key": "tier", "operator": "Exists"}
+        ]
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "matchExpressions"):
+            lifecycle.dependency_binding(
+                FakeKubectl(), "ai-platform", "statefulset", "postgres",
+                "postgres", "service-uid", "postgres-connection",
+                "postgres_connection_url", "api", "queue", "registry/launchpad:test",
+            )
+        objects[("statefulset", "postgres")]["spec"]["selector"]["matchExpressions"] = []
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "matchExpressions"):
+            lifecycle.dependency_binding(
+                FakeKubectl(), "ai-platform", "statefulset", "postgres",
+                "postgres", "service-uid", "postgres-connection",
+                "postgres_connection_url", "api", "queue", "registry/launchpad:test",
+            )
+        del objects[("statefulset", "postgres")]["spec"]["selector"]["matchExpressions"]
+
+        sidecar_only = json.loads(json.dumps(deployment))
+        sidecar_only["spec"]["template"]["spec"]["containers"] = [
+            {"image": "registry/launchpad:test"},
+            {
+                "image": "registry/sidecar:test",
+                "envFrom": [{"secretRef": {"name": "postgres-connection"}}],
+            },
+        ]
+        objects[("deployment", "api")] = sidecar_only
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "agent container"):
+            lifecycle.dependency_binding(
+                FakeKubectl(), "ai-platform", "statefulset", "postgres",
+                "postgres", "service-uid", "postgres-connection",
+                "postgres_connection_url", "api", "queue", "registry/launchpad:test",
+            )
+
+    def test_agent_secret_volume_requires_agent_mount_and_exact_exposed_key(self):
+        pod_spec = {
+            "volumes": [{
+                "name": "connection",
+                "secret": {
+                    "secretName": "postgres-connection",
+                    "items": [{"key": "other", "path": "other-url"}],
+                },
+            }]
+        }
+        container = {
+            "image": "registry/launchpad:test",
+            "volumeMounts": [{"name": "connection", "mountPath": "/connection"}],
+        }
+        self.assertFalse(
+            lifecycle._agent_container_references_secret_key(
+                pod_spec, container, "postgres-connection", "postgres_connection_url"
+            )
+        )
+
+        pod_spec["volumes"][0]["secret"]["items"] = [{
+            "key": "postgres_connection_url",
+            "path": "database-url",
+        }]
+        container["volumeMounts"][0]["subPath"] = "other-url"
+        self.assertFalse(
+            lifecycle._agent_container_references_secret_key(
+                pod_spec, container, "postgres-connection", "postgres_connection_url"
+            )
+        )
+        container["volumeMounts"][0]["subPath"] = "database-url"
+        self.assertTrue(
+            lifecycle._agent_container_references_secret_key(
+                pod_spec, container, "postgres-connection", "postgres_connection_url"
+            )
+        )
+
+        container["volumeMounts"] = []
+        self.assertFalse(
+            lifecycle._agent_container_references_secret_key(
+                pod_spec, container, "postgres-connection", "postgres_connection_url"
+            )
+        )
 
     def test_resolved_digest_is_mandatory(self):
         digest = "sha256:" + "a" * 64
@@ -113,6 +255,46 @@ class LifecycleAcceptanceTests(unittest.TestCase):
         with patch.dict("os.environ", {"LAS_BASE_URL": "http://127.0.0.1:2024"}):
             with self.assertRaisesRegex(lifecycle.LifecycleError, "requires --api-service"):
                 lifecycle.StableLASAccess(client, None, 2024, 300, True)
+
+        for unsafe_url in (
+            "http://user@127.0.0.1:2024",
+            "http://127.0.0.1:2024/unexpected",
+            "http://127.0.0.1:2024?target=other",
+        ):
+            with self.subTest(url=unsafe_url), patch.dict(
+                "os.environ", {"LAS_BASE_URL": unsafe_url}, clear=True
+            ), self.assertRaises(lifecycle.LifecycleError):
+                lifecycle.StableLASAccess(client, "launchpad-api", 2024, 300, True)
+
+    def test_helm_identity_binds_exact_chart_name_and_version(self):
+        good = SimpleNamespace(
+            stdout=json.dumps(
+                [{"name": "launchpad", "chart": "langgraph-cloud-0.3.5", "status": "deployed"}]
+            )
+        )
+        with patch.object(lifecycle.subprocess, "run", return_value=good):
+            result = lifecycle.helm_release_identity(
+                "helm", "ai-platform", "launchpad", "langgraph-cloud", "0.3.5", 30, False
+            )
+        self.assertEqual(result["chart"], "langgraph-cloud-0.3.5")
+        wrong_name = SimpleNamespace(
+            stdout=json.dumps(
+                [{"name": "launchpad", "chart": "other-chart-0.3.5", "status": "deployed"}]
+            )
+        )
+        with patch.object(lifecycle.subprocess, "run", return_value=wrong_name), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "chart version"
+        ):
+            lifecycle.helm_release_identity(
+                "helm", "ai-platform", "launchpad", "langgraph-cloud", "0.3.5", 30, False
+            )
+
+    def test_upgrade_rechecks_cluster_scope_immediately_after_installer(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        installer_call = source.index("run_installer(args.installer")
+        scope_check = source.index("verify_cluster_scope()", installer_call)
+        rollout = source.index("kubectl.rollout_status(api)", installer_call)
+        self.assertLess(scope_check, rollout)
 
     def test_protocol_timeout_accounts_for_every_mode_and_case(self):
         scenario = {
@@ -216,6 +398,111 @@ class LifecycleAcceptanceTests(unittest.TestCase):
                 api_one=True,
             )
 
+    def test_api_service_identity_binds_uid_selector_and_endpoint_pods(self):
+        digest = "sha256:" + "a" * 64
+        deployment = {
+            "spec": {
+                "selector": {"matchLabels": {"app": "launchpad-api"}},
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "api",
+                            "image": "registry/launchpad:test",
+                            "ports": [{"name": "http", "containerPort": 2024}],
+                        }]
+                    }
+                },
+            }
+        }
+        service = {
+            "metadata": {"uid": "service-uid"},
+            "spec": {
+                "selector": {"app": "launchpad-api"},
+                "ports": [{"port": 2024, "targetPort": "http"}],
+            },
+        }
+        pod = {
+            "metadata": {"name": "api-1", "uid": "pod-uid"},
+            "status": {
+                "containerStatuses": [{
+                    "name": "api",
+                    "imageID": f"registry/launchpad@{digest}",
+                }]
+            },
+        }
+        endpoint_slice = {
+            "metadata": {
+                "labels": {"kubernetes.io/service-name": "launchpad-api"},
+                "ownerReferences": [{
+                    "kind": "Service",
+                    "name": "launchpad-api",
+                    "uid": "service-uid",
+                }],
+            },
+            "ports": [{"name": "http", "port": 2024}],
+            "endpoints": [{
+                "conditions": {"ready": True},
+                "targetRef": {
+                    "kind": "Pod",
+                    "namespace": "ai-platform",
+                    "name": "api-1",
+                    "uid": "pod-uid",
+                },
+            }]
+        }
+
+        class FakeKubectl:
+            dry_run = False
+
+            def get_in_namespace(self, namespace, kind, resource_name):
+                return service if kind == "service" else deployment
+
+            def list_pods(self, namespace, selector):
+                return [pod]
+
+            def list_endpoint_slices(self, namespace, service_name):
+                return [endpoint_slice]
+
+        result = lifecycle.api_service_identity(
+            FakeKubectl(), "ai-platform", "launchpad-api", "service-uid",
+            2024, "api", "registry/launchpad:test", digest,
+        )
+        self.assertEqual(result["verified_endpoints"], 1)
+        self.assertEqual(result["target_port"], 2024)
+
+        endpoint_slice["endpoints"][0]["targetRef"]["uid"] = "other-pod"
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "did not match"):
+            lifecycle.api_service_identity(
+                FakeKubectl(), "ai-platform", "launchpad-api", "service-uid",
+                2024, "api", "registry/launchpad:test", digest,
+            )
+
+        endpoint_slice["endpoints"][0]["targetRef"]["uid"] = "pod-uid"
+        endpoint_slice["metadata"]["ownerReferences"][0]["uid"] = "replaced-service"
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "owned by"):
+            lifecycle.api_service_identity(
+                FakeKubectl(), "ai-platform", "launchpad-api", "service-uid",
+                2024, "api", "registry/launchpad:test", digest,
+            )
+
+        endpoint_slice["metadata"]["ownerReferences"][0]["uid"] = "service-uid"
+        pod["status"]["containerStatuses"][0]["imageID"] = (
+            "registry/launchpad@sha256:" + "b" * 64
+        )
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "attested image digest"):
+            lifecycle.api_service_identity(
+                FakeKubectl(), "ai-platform", "launchpad-api", "service-uid",
+                2024, "api", "registry/launchpad:test", digest,
+            )
+
+        pod["status"]["containerStatuses"][0]["imageID"] = f"registry/launchpad@{digest}"
+        service["spec"]["ports"][0]["targetPort"] = "sidecar"
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "targetPort"):
+            lifecycle.api_service_identity(
+                FakeKubectl(), "ai-platform", "launchpad-api", "service-uid",
+                2024, "api", "registry/launchpad:test", digest,
+            )
+
     def test_dry_run_records_exact_commands_without_mutating(self):
         client = lifecycle.Kubectl("ai-platform", "kubectl", 300, True)
         client.get("deployment", "launchpad-api")
@@ -247,8 +534,23 @@ class LifecycleAcceptanceTests(unittest.TestCase):
             lifecycle.run_helper(["protocol"], {"graph_id": "agent", "cases": [{}]}, 60)
         self.assertNotIn("LAS_DISPOSABLE_CLUSTER_CONFIRMED", passed_environment)
 
+        observation = SimpleNamespace(
+            returncode=0,
+            stdout='{"result":"OBSERVATION"}',
+            stderr="",
+        )
+        with patch.object(lifecycle.subprocess, "run", return_value=observation):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "expected result"):
+                lifecycle.run_helper(["product-load"], {}, 60)
+            self.assertEqual(
+                lifecycle.run_helper(
+                    ["product-load"], {}, 60, {"OBSERVATION"}
+                )["result"],
+                "OBSERVATION",
+            )
+
     def test_load_scale_evidence_distinguishes_observation_from_acceptance(self):
-        observed = {"result": "PASS", "scale_observation": "no_cpu_scale_observed"}
+        observed = {"result": "OBSERVATION", "scale_observation": "no_cpu_scale_observed"}
         self.assertEqual(
             lifecycle.validate_load_scale_evidence(observed, "observe"),
             "OBSERVATION_ONLY_NOT_HPA_ACCEPTANCE",
@@ -256,12 +558,32 @@ class LifecycleAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(lifecycle.LifecycleError, "required HPA scale-up"):
             lifecycle.validate_load_scale_evidence(observed, "required")
         self.assertEqual(
-            lifecycle.validate_load_scale_evidence({"scale_observation": "scaled"}, "required"),
+            lifecycle.validate_load_scale_evidence(
+                {"result": "OBSERVATION", "scale_observation": "cpu_scale_pass"},
+                "required",
+            ),
             "PASS",
         )
 
+    def test_product_load_helper_receives_the_attested_kube_context(self):
+        command = lifecycle.product_load_helper_args(
+            "ai-platform",
+            "launchpad-queue",
+            "launchpad-queue",
+            "launchpad-api",
+            "approved-k0s-context",
+            4,
+            "required",
+            600,
+            180,
+        )
+        self.assertEqual(
+            command[command.index("--expected-context") + 1],
+            "approved-k0s-context",
+        )
+
     def test_mutation_requires_explicit_confirmation(self):
-        argv = self.base_argv() + ["--restart-api"]
+        argv = self.base_argv() + ["--restart-api", "--run-protocol"]
         stderr = io.StringIO()
         with patch.object(sys, "argv", argv), patch.dict("os.environ", {}, clear=True), patch("sys.stderr", stderr):
             self.assertEqual(lifecycle.main(), 1)
@@ -283,7 +605,18 @@ class LifecycleAcceptanceTests(unittest.TestCase):
         with patch.object(sys, "argv", argv), patch("sys.stderr", stderr):
             self.assertEqual(lifecycle.main(), 1)
         result = json.loads(stderr.getvalue())
-        self.assertIn("post-upgrade API and queue", result["reason"])
+        self.assertIn("pre-upgrade image/digest", result["reason"])
+
+    def test_live_lifecycle_phase_requires_product_protocol(self):
+        argv = self.base_argv() + ["--restart-api"]
+        stderr = io.StringIO()
+        environment = {"LAS_LIFECYCLE_MUTATIONS_CONFIRMED": "true"}
+        with patch.object(sys, "argv", argv), patch.dict(
+            os.environ, environment, clear=True
+        ), patch("sys.stderr", stderr):
+            self.assertEqual(lifecycle.main(), 1)
+        result = json.loads(stderr.getvalue())
+        self.assertIn("requires --run-protocol", result["reason"])
 
     def test_rotation_rejects_invalid_secret_name_and_service_port_before_cluster_access(self):
         base_environment = {
@@ -300,14 +633,17 @@ class LifecycleAcceptanceTests(unittest.TestCase):
             "LAS_EXPECTED_NAMESPACE_UID": "uid",
             "LAS_BASE_URL": "http://127.0.0.1:2024",
             "LAS_API_SERVICE": "launchpad-api",
+            "LAS_API_SERVICE_UID": "service-uid",
             "LAS_OPERATOR_NAMESPACE": "operator-system",
             "LAS_OPERATOR_DEPLOYMENT": "operator",
             "LAS_OPERATOR_IMAGE": "registry/operator:test",
             "LAS_OPERATOR_IMAGE_DIGEST": "sha256:" + "a" * 64,
             "LAS_AGENT_SERVER_IMAGE": "registry/agent:test",
             "LAS_AGENT_SERVER_DIGEST": "sha256:" + "b" * 64,
+            "LAS_CHART_NAME": "langgraph-cloud",
             "LAS_CHART_VERSION": "0.3.5",
             "LAS_CHART_SHA256": "c" * 64,
+            "LAS_HELM_RELEASE": "launchpad",
         }
         invalid_secret = dict(base_environment, LAS_SECRET_NAMES="auth,Bad_Name,redis")
         result = subprocess.run(
@@ -331,18 +667,59 @@ class LifecycleAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("LAS_API_SERVICE_PORT", result.stderr)
+        unsafe_url = dict(
+            base_environment,
+            LAS_BASE_URL="http://user@127.0.0.1:2024/unexpected?target=other",
+            KUBECTL="printf",
+            HELM="printf",
+        )
+        result = subprocess.run(
+            ["bash", str(ROTATION_SCRIPT)],
+            input="{}",
+            text=True,
+            capture_output=True,
+            env=unsafe_url,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("uncredentialed HTTP loopback URL", result.stderr)
 
     def test_dry_run_reports_known_gates_and_selected_phases(self):
-        argv = self.base_argv() + ["--restart-api", "--postgres-workload", "statefulset/postgres", "--dry-run"]
+        argv = self.base_argv() + [
+            "--restart-api",
+            "--postgres-workload", "statefulset/postgres",
+            "--postgres-service", "postgres",
+            "--postgres-service-uid", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--postgres-secret", "postgres-connection",
+            "--dry-run",
+        ]
         stdout = io.StringIO()
         with patch.object(sys, "argv", argv), patch("sys.stdout", stdout):
             self.assertEqual(lifecycle.main(), 0)
         result = json.loads(stdout.getvalue())
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["external_gates"]["MPR-131"], "KNOWN_FAIL")
+        self.assertIn("RERUN REQUIRED", result["external_gates"]["MPR-44_EXTERNAL_SLIM_EDGE"])
         self.assertEqual([phase["name"] for phase in result["phases"]], ["restart_api", "recover_postgres"])
         serialized = json.dumps(result)
-        self.assertNotIn("secret", serialized.lower())
+        self.assertNotIn("postgresql://", serialized.lower())
+        self.assertNotIn("user:password", serialized.lower())
+
+    def test_external_caller_gate_requires_exact_recorded_digest(self):
+        digest = "sha256:" + "a" * 64
+        stdout = io.StringIO()
+        argv = self.base_argv() + [
+            "--recorded-mpr44-agent-digest", digest,
+            "--dry-run",
+        ]
+        with patch.object(sys, "argv", argv), patch("sys.stdout", stdout):
+            self.assertEqual(lifecycle.main(), 0)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(
+            result["external_gates"]["MPR-44_EXTERNAL_SLIM_EDGE"],
+            "DIGEST_MATCH_ONLY; EXTERNAL CALLER RESULT NOT INGESTED",
+        )
+        self.assertNotIn("PASS", result["external_gates"]["MPR-44_EXTERNAL_SLIM_EDGE"])
 
     @staticmethod
     def base_argv():
@@ -364,6 +741,7 @@ class LifecycleAcceptanceTests(unittest.TestCase):
             "--operator-image-digest", digest,
             "--agent-image", "registry/launchpad:test",
             "--agent-image-digest", digest,
+            "--chart-name", "langgraph-cloud",
             "--chart-version", "0.3.5-splunk.2",
             "--chart-sha256", "a" * 64,
             "--helm-release", "launchpad",

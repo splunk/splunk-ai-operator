@@ -24,18 +24,18 @@ The operator-owned SLIM AIService was not patched or replaced.
 
 | Item | Observed value |
 | --- | --- |
-| Installer host | `ip-10-0-35-244.splunkcorp.com` |
-| Kubernetes context / namespace | `Default` / `ai-platform` |
-| Namespace UID | `29d5efa1-04b4-4c95-86dc-992bc3f8761a` |
+| Installer host | Approved installer host; exact hostname retained in the restricted execution record |
+| Kubernetes context / namespace | Approved integration context and namespace; exact identifiers retained in the restricted execution record |
+| Namespace UID | Verified before execution; value retained in the restricted execution record |
 | Local branch base | `f590502127efaffd4a4688d52c778e059dfb027d` (`origin/agent-runtime/ai-tier`) |
-| AIPlatform | `agentruntime-dev-ai-platform`, UID `0ee6ab74-4d45-4fc6-95f9-d563f94e0622`, generation 37, `Ready=True` |
-| AgentRuntime AIService | `agentruntime-dev-ai-platform-agentruntime-mltk`, UID `39598b65-89e6-4b32-ba5b-547dc9902036`, generation 21436, `Ready=True` |
-| SLIM AIService | `agentruntime-dev-ai-platform-slim`, UID `0acaaa07-59be-4428-8ba8-5fe7fa0392b8`, generation 2435, `Ready=True` |
-| Stable LAS Service | `agentruntime-dev-ai-platform-agentruntime-mltk-svc:8080`, ready endpoint observed |
+| AIPlatform | Exact name/UID/generation retained in the restricted execution record; `Ready=True` |
+| AgentRuntime AIService | Exact name/UID/generation retained in the restricted execution record; `Ready=True` |
+| SLIM AIService | Exact name/UID/generation retained in the restricted execution record; `Ready=True` |
+| Stable LAS Service | Internal name omitted; ready endpoint observed |
 | Selected graph | `agent` |
-| Launchpad image | `658391232643.dkr.ecr.us-west-2.amazonaws.com/agent-launchpad:main-00f6ded-20261028` |
+| Launchpad image | Approved private-registry repository and reviewed tag; exact reference retained in the restricted execution record |
 | Launchpad running digest | `sha256:5cc1a49d2f3de8cd324e1ce42009216a617f95d162ff05462ac3f1163b63fccb` |
-| Candidate image | `658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610152102-b7cb6e97e381` |
+| Candidate image | Approved private-registry repository and reviewed tag; exact reference retained in the restricted execution record |
 | Candidate ECR/running digest | `sha256:951ac687c0753399e9a636cd507ec541f55ecaade4717c19276d228115c003ef` |
 | Deployed operator digest (not changed) | `sha256:1913af32312218a5343f084e86139cafd674534d8c219ab1bb187a5538794d12` |
 
@@ -48,8 +48,8 @@ manifest was applied. The running candidate Pod reported the same digest.
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Local caller-helper unit tests | **PASS** | 18 tests; strict scenario validation, auth denials, terminal NDJSON mapping, response-size bounds, no redirects/proxies, exact media type, strict JSON, secret scanning, cleanup, and failure paths |
-| Existing LAS runtime helper tests | **PASS** | 13 tests |
+| Local caller-helper unit tests | **PASS** | 24 tests; strict scenario validation, high-entropy same-session recall proof, auth denials, terminal NDJSON mapping, response-size bounds, no redirects/proxies, exact media type, strict JSON, derived/escaped secret scanning, confirmed cleanup, and failure paths |
+| Existing LAS runtime helper tests | **PASS** | 76 tests |
 | Existing cluster-setup regressions | **PASS** | 303 passed, 0 failed, 0 skipped |
 | Candidate manifest server dry-run | **PASS** | Both ConfigMaps, Deployment, and Service accepted by server-side dry-run |
 | Candidate health | **PASS** | `/health` returned HTTP 200 with `status=true`; Deployment reached 1/1 Ready and EndpointSlice was ready |
@@ -108,16 +108,17 @@ substituted without changing the product contract.
   were deleted. The final story-label query returned no resources.
 - The candidate Pod terminated, all loopback port-forwards stopped, and the
   story-scoped remote temporary directory was removed.
-- Temporary assistant `41badd05-2c64-4ce2-ac3b-d0916b5a9534` and derived
-  thread `15e08115-4199-57ba-a876-fe33547fe838` both returned HTTP 404 after
-  cleanup.
-- The exact temporary SSH ingress rule `sgr-0b0430dec2abf96cf` was revoked from
-  `sg-09b91f081efe3c4a3`; AWS readback returned an empty result.
-- The original Launchpad API and queue Deployments remained 1/1 Ready on
-  `agent-launchpad:main-00f6ded-20261028`.
-- The primary SLIM Deployment retained image
-  `slim-api:202609221216-80c31ac1a210`, with its pre-existing one Ready Pod and
-  one Pending Pod. Both AgentRuntime and SLIM AIServices remained `Ready=True`.
+- The temporary assistant and derived thread both returned HTTP 404 after
+  cleanup. Their generated identifiers are retained in the restricted execution
+  record.
+- The exact temporary SSH ingress rule was revoked from the approved security
+  group; cloud readback returned an empty result. Internal identifiers are
+  retained in the restricted execution record.
+- The original Launchpad API and queue Deployments remained 1/1 Ready on the
+  reviewed Launchpad digest.
+- The primary SLIM Deployment retained its original reviewed image, with its
+  pre-existing one Ready Pod and one Pending Pod. Both AgentRuntime and SLIM
+  AIServices remained `Ready=True`.
 
 ## Acceptance note
 

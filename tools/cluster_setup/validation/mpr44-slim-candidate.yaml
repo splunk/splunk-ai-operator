@@ -1,7 +1,9 @@
 # Isolated MPR-44 caller-route fixture for the agentruntime-dev test cluster.
 #
-# Apply only after confirming the stable Launchpad LAS Service below and
-# creating the temporary mpr44-ecr-pull Secret from a fresh ECR token. This
+# Render the MPR44_* placeholders from the approved immutable image and
+# environment-specific endpoints before applying. Apply only after confirming
+# the stable Launchpad LAS Service and creating the temporary mpr44-ecr-pull
+# Secret from a fresh ECR token. This
 # workload is deliberately separate from the operator-owned SLIM AIService.
 # It contains no caller, model, LAS, registry, or Splunk credential value.
 apiVersion: v1
@@ -15,7 +17,7 @@ data:
   DEPLOYMENT_TYPE: AITIER
   SERVICE_NAME: slim-api
   SERVICE_INTERNAL_NAME: SLIM
-  SPLUNK_ISSUERS: https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089
+  SPLUNK_ISSUERS: ${MPR44_SPLUNK_ISSUER_URL}
   ENABLE_AUTHN: "true"
   ENABLE_AUTHZ: "true"
   API_VERSION: v1alpha1
@@ -52,11 +54,12 @@ spec:
         app: mpr44-slim-candidate
         validation.splunk.com/story: mpr-44
     spec:
+      automountServiceAccountToken: false
       imagePullSecrets:
         - name: mpr44-ecr-pull
       containers:
         - name: slim-api
-          image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610152102-b7cb6e97e381@sha256:951ac687c0753399e9a636cd507ec541f55ecaade4717c19276d228115c003ef
+          image: ${MPR44_SLIM_IMAGE_AT_DIGEST}
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -68,7 +71,7 @@ spec:
                 name: mpr44-slim-candidate-config
           env:
             - name: AGENT_SERVER_URL
-              value: http://agentruntime-dev-ai-platform-agentruntime-mltk-svc.ai-platform.svc.cluster.local:8080
+              value: ${MPR44_LAS_SERVICE_URL}
             - name: LAS_GRAPH_ID
               value: agent
             - name: TLS_DISABLED

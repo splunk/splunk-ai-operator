@@ -28,6 +28,11 @@ MAX_TOKEN_BYTES = 64 * 1024
 MAX_EVENTS = 4096
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 SAFE_TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+SESSION_MARKER_PLACEHOLDER = "{{SESSION_MARKER}}"
+CREDENTIAL_KEY = re.compile(
+    r"(?:authorization|api[_-]?key|access[_-]?(?:key|token)|secret|token|password|credential|role[_-]?arn|private[_-]?key)",
+    re.IGNORECASE,
+)
 OPTIONAL_CALL_FIELDS = (
     "llm",
     "mcps",
@@ -45,6 +50,9 @@ JSON_TYPES = {
     "object": dict,
     "string": str,
 }
+RUNTIME_ID_PATTERN = re.compile(
+    r'"runtime_id"\s*:\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"'
+)
 
 
 class QualificationError(AssertionError):
@@ -93,16 +101,60 @@ def value_strings(value: Any) -> Iterable[str]:
             yield from value_strings(item)
 
 
+def credential_values(value: Any) -> Iterable[str]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and CREDENTIAL_KEY.search(key):
+                yield from (candidate for candidate in strings(item) if candidate)
+            else:
+                yield from credential_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from credential_values(item)
+
+
+def decoded_strings(value: Any) -> Iterable[str]:
+    for text in strings(value):
+        yield text
+        current = text
+        for _ in range(3):
+            wrapped = (
+                '"'
+                + current.replace('"', r'\"')
+                .replace("\n", r"\n")
+                .replace("\r", r"\r")
+                .replace("\t", r"\t")
+                + '"'
+            )
+            try:
+                decoded = json.loads(wrapped)
+            except (json.JSONDecodeError, ValueError):
+                break
+            if not isinstance(decoded, str) or decoded == current:
+                break
+            yield decoded
+            current = decoded
+
+
 def assert_absent(value: Any, secrets: list[str], source: str) -> None:
-    serialized = "\n".join(strings(value))
-    if any(secret and secret in serialized for secret in secrets):
+    candidates = list(decoded_strings(value))
+    variants = {
+        variant
+        for secret in secrets
+        for variant in (
+            secret,
+            json.dumps(secret, ensure_ascii=True)[1:-1],
+            json.dumps(secret, ensure_ascii=False)[1:-1],
+        )
+        if variant
+    }
+    if any(variant in candidate for variant in variants for candidate in candidates):
         raise QualificationError(f"sensitive marker appeared in {source}")
 
 
 def assert_body_absent(body: bytes, secrets: list[str], source: str) -> None:
     decoded = body.decode("utf-8", errors="replace")
-    if any(secret and secret in decoded for secret in secrets):
-        raise QualificationError(f"sensitive marker appeared in {source}")
+    assert_absent(decoded, secrets, source)
     parsed_values: list[Any] = []
     try:
         parsed_values.append(strict_json_loads(decoded))
@@ -237,6 +289,59 @@ def _validate_shape(shape: Any, location: str) -> None:
         isinstance(path, str) and path and kind in JSON_TYPES for path, kind in types.items()
     ):
         raise ScenarioError(f"{location} expected_shape.types contains an unsupported entry")
+    if not required and not types:
+        raise ScenarioError(
+            f"{location} expected_shape must assert at least one required path or type"
+        )
+
+
+def is_session_recall_case(case: dict[str, Any]) -> bool:
+    """Require a later call to recall a generated marker absent from its request."""
+    calls = case.get("calls", [])
+    if not isinstance(calls, list):
+        return False
+    for later_index, later in enumerate(calls[1:], start=1):
+        if not isinstance(later, dict):
+            continue
+        expected = later.get("expected_text")
+        if not isinstance(expected, str) or SESSION_MARKER_PLACEHOLDER not in expected:
+            continue
+        later_request = {
+            key: later[key]
+            for key in ("task_prompt", "system_prompt", *OPTIONAL_CALL_FIELDS)
+            if key in later
+        }
+        if any(SESSION_MARKER_PLACEHOLDER in value for value in strings(later_request)):
+            continue
+        for earlier in calls[:later_index]:
+            if not isinstance(earlier, dict):
+                continue
+            earlier_request = {
+                key: earlier[key]
+                for key in ("task_prompt", "system_prompt", *OPTIONAL_CALL_FIELDS)
+                if key in earlier
+            }
+            earlier_expected = earlier.get("expected_text")
+            if (
+                isinstance(earlier_expected, str)
+                and SESSION_MARKER_PLACEHOLDER in earlier_expected
+                and any(
+                    SESSION_MARKER_PLACEHOLDER in value
+                    for value in strings(earlier_request)
+                )
+            ):
+                return True
+    return False
+
+
+def substitute_session_marker(value: Any, marker: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(SESSION_MARKER_PLACEHOLDER, marker)
+    if isinstance(value, dict):
+        return {key: substitute_session_marker(item, marker) for key, item in value.items()}
+    if isinstance(value, list):
+        return [substitute_session_marker(item, marker) for item in value]
+    return value
 
 
 def validate_scenario(value: Any) -> dict[str, Any]:
@@ -255,6 +360,7 @@ def validate_scenario(value: Any) -> dict[str, Any]:
     if not isinstance(cases, list) or not cases:
         raise ScenarioError("stdin JSON must provide non-empty cases")
     names: set[str] = set()
+    sensitive_declaration_required = False
     call_fields = {
         "task_prompt",
         "system_prompt",
@@ -301,6 +407,16 @@ def validate_scenario(value: Any) -> dict[str, Any]:
                         json.dumps(call[optional], allow_nan=False)
                     except (TypeError, ValueError) as exc:
                         raise ScenarioError(f"{call_location} {optional} must be JSON-compatible") from exc
+            if any(field in call for field in ("llm", "mcps", "knowledge_bases")):
+                sensitive_declaration_required = True
+    if sensitive_declaration_required and not sensitive:
+        raise ScenarioError(
+            "credential-bearing llm/mcps/knowledge_bases cases require sensitive_values canaries"
+        )
+    if not any(is_session_recall_case(case) for case in cases):
+        raise ScenarioError(
+            "acceptance scenario requires a same-session recall probe whose expected marker is absent from the follow-up prompt"
+        )
     return value
 
 
@@ -417,6 +533,13 @@ def parse_ndjson(body: bytes) -> list[dict[str, Any]]:
 
 
 def terminal_response(events: list[dict[str, Any]]) -> Any:
+    failure_statuses = {"error", "failed", "cancelled", "timeout"}
+    if any(
+        event.get("success") is False
+        or str(event.get("status", "")).lower() in failure_statuses
+        for event in events[:-1]
+    ):
+        raise QualificationError("SLIM invoke response contained a terminal failure event")
     completed = [event for event in events if event.get("status") == "Completed"]
     if len(completed) != 1 or completed[0] is not events[-1]:
         raise QualificationError("SLIM invoke response lacked one final Completed event")
@@ -451,6 +574,8 @@ def _structured_response(value: Any) -> Any:
 
 
 def assert_expected_shape(response_value: Any, shape: dict[str, Any]) -> None:
+    if not shape.get("required") and not shape.get("types"):
+        raise QualificationError("expected structured shape did not assert any field or type")
     structured = _structured_response(response_value)
     for path in shape.get("required", []):
         _path_value(structured, path)
@@ -484,6 +609,19 @@ def route_root(tenant: str) -> str:
     return f"/{tenant}/slim-api/v1alpha1/agent/las"
 
 
+def recover_runtime_id(body: bytes) -> str | None:
+    """Recover only a canonical UUID tied to the runtime_id field for cleanup."""
+    matches = set(RUNTIME_ID_PATTERN.findall(body.decode("utf-8", errors="replace")))
+    if len(matches) != 1:
+        return None
+    candidate = next(iter(matches))
+    try:
+        parsed = uuid.UUID(candidate)
+    except ValueError:
+        return None
+    return str(parsed)
+
+
 def create_assistant(
     client: SlimHTTPClient,
     root: str,
@@ -499,16 +637,28 @@ def create_assistant(
         request_id=request_id,
         payload={"agent_name": name, "app_version": "mpr-44-acceptance"},
     )
-    assert_body_absent(result.body, secrets, "assistant create response")
-    if result.status != 201:
-        raise QualificationError(f"assistant create returned HTTP {result.status}")
-    body = parse_json_object(result.body, "assistant create")
-    assistant_id = body.get("runtime_id")
     try:
-        uuid.UUID(str(assistant_id))
-    except (ValueError, TypeError, AttributeError) as exc:
+        assert_body_absent(result.body, secrets, "assistant create response")
+        if result.status != 201:
+            raise QualificationError(f"assistant create returned HTTP {result.status}")
+        body = parse_json_object(result.body, "assistant create")
+        assistant_id = body.get("runtime_id")
+        parsed_id = uuid.UUID(str(assistant_id))
+        if str(parsed_id) != str(assistant_id).lower():
+            raise ValueError("runtime_id was not canonical")
+        return str(parsed_id)
+    except (QualificationError, ValueError, TypeError, AttributeError) as exc:
+        cleanup_id = recover_runtime_id(result.body) if 200 <= result.status < 300 else None
+        if cleanup_id is not None:
+            try:
+                cleanup_assistant(client, root, token, cleanup_id, secrets)
+            except Exception as cleanup_exc:
+                raise QualificationError(
+                    "assistant create validation failed and cleanup also failed"
+                ) from cleanup_exc
+        if isinstance(exc, QualificationError):
+            raise
         raise QualificationError("assistant create omitted a UUID runtime_id") from exc
-    return str(assistant_id)
 
 
 def invoke_call(
@@ -565,7 +715,11 @@ def cleanup_assistant(
         token=token,
         request_id="mpr44-cleanup",
     )
-    assert_body_absent(first.body, secrets, "assistant cleanup response")
+    scan_failed = False
+    try:
+        assert_body_absent(first.body, secrets, "assistant cleanup response")
+    except QualificationError:
+        scan_failed = True
     if not 200 <= first.status < 300:
         raise QualificationError(f"assistant cleanup returned HTTP {first.status}")
     second = client.request(
@@ -574,15 +728,22 @@ def cleanup_assistant(
         token=token,
         request_id="mpr44-cleanup-confirm",
     )
-    assert_body_absent(second.body, secrets, "assistant cleanup confirmation")
-    if second.status == 404 or second.status == 204:
+    try:
+        assert_body_absent(second.body, secrets, "assistant cleanup confirmation")
+    except QualificationError:
+        scan_failed = True
+    if second.status == 404:
+        if scan_failed:
+            raise QualificationError("sensitive marker appeared in assistant cleanup response")
         return
     if not 200 <= second.status < 300:
         raise QualificationError(f"assistant cleanup confirmation returned HTTP {second.status}")
     body = parse_json_object(second.body, "assistant cleanup confirmation")
     status_value = str(body.get("status", "")).upper()
-    if "NOT_FOUND" not in status_value and "NOTFOUND" not in status_value:
+    if status_value not in {"NOT_FOUND", "AGENT_NOT_FOUND", "NOTFOUND"}:
         raise QualificationError("assistant cleanup confirmation did not report not found")
+    if scan_failed:
+        raise QualificationError("sensitive marker appeared in assistant cleanup response")
 
 
 def _cleanup_unexpected_create(
@@ -594,10 +755,12 @@ def _cleanup_unexpected_create(
 ) -> None:
     if not 200 <= result.status < 300:
         return
-    body = parse_json_object(result.body, "unexpected authentication response")
-    assistant_id = body.get("runtime_id")
-    if assistant_id:
-        cleanup_assistant(client, root, token, str(assistant_id), secrets)
+    assistant_id = recover_runtime_id(result.body)
+    if assistant_id is None:
+        raise QualificationError(
+            "unexpected successful authentication response omitted a recoverable runtime_id"
+        )
+    cleanup_assistant(client, root, token, assistant_id, secrets)
 
 
 def run_negative_checks(
@@ -618,10 +781,11 @@ def run_negative_checks(
             request_id="mpr44-" + label,
             payload={"agent_name": "mpr44negative" + uuid.uuid4().hex[:8], "app_version": "mpr-44-negative"},
         )
-        assert_body_absent(result.body, secrets, f"{label} response")
         if result.status not in (401, 403):
             _cleanup_unexpected_create(client, root, token, result, secrets)
+            assert_body_absent(result.body, secrets, f"{label} response")
             raise QualificationError(f"{label} was not denied")
+        assert_body_absent(result.body, secrets, f"{label} response")
         denial_body = parse_json_object(result.body, f"{label} response")
         assert_absent(denial_body, secrets, f"{label} response")
         checks.append(label + "-denied")
@@ -632,10 +796,11 @@ def run_negative_checks(
         request_id="mpr44-malformed-json",
         raw_body=b"{",
     )
-    assert_body_absent(malformed.body, secrets, "malformed JSON response")
     if malformed.status not in (400, 422):
         _cleanup_unexpected_create(client, root, token, malformed, secrets)
+        assert_body_absent(malformed.body, secrets, "malformed JSON response")
         raise QualificationError("malformed JSON was not safely rejected")
+    assert_body_absent(malformed.body, secrets, "malformed JSON response")
     malformed_body = parse_json_object(malformed.body, "malformed JSON response")
     assert_absent(malformed_body, secrets, "malformed JSON response")
     checks.append("malformed-json-rejected")
@@ -650,6 +815,13 @@ def execute(
 ) -> dict[str, Any]:
     root = route_root(tenant)
     sensitive = list(scenario.get("sensitive_values", []))
+    sensitive.extend(
+        secret
+        for case in scenario["cases"]
+        for call in case["calls"]
+        for secret in credential_values(call)
+    )
+    sensitive = list(dict.fromkeys(sensitive))
     scan_values = sensitive + [token]
     checks = run_negative_checks(client, root, token, scan_values)
     assistant_id: str | None = None
@@ -670,7 +842,14 @@ def execute(
         for case_index, case in enumerate(scenario["cases"], start=1):
             session_id = str(uuid.uuid4())
             sessions.append({"case": case["name"], "session_id": session_id})
-            for call_index, call in enumerate(case["calls"], start=1):
+            session_marker = "mpr44-session-" + uuid.uuid4().hex
+            resolved_calls = substitute_session_marker(case["calls"], session_marker)
+            scan_values = list(
+                dict.fromkeys(
+                    [*scan_values, *credential_values(resolved_calls)]
+                )
+            )
+            for call_index, call in enumerate(resolved_calls, start=1):
                 invoke_call(
                     client,
                     root,
@@ -682,7 +861,7 @@ def execute(
                     scan_values,
                 )
                 checks.append(f"{case['name']}:call-{call_index}")
-            if len(case["calls"]) > 1:
+            if is_session_recall_case(case):
                 checks.append(f"{case['name']}:same-session-follow-up")
     except Exception as exc:  # preserve cleanup while main sanitizes unknown errors
         primary_error = exc

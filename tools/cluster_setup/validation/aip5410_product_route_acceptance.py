@@ -56,10 +56,16 @@ EXTERNAL_GATES = [
     }
 ]
 SAFE_CASE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+CREDENTIAL_KEY = re.compile(
+    r"(?:authorization|api[_-]?key|access[_-]?(?:key|token)|secret|token|password|credential|role[_-]?arn|private[_-]?key)",
+    re.IGNORECASE,
+)
 MAX_CALLER_RESPONSE_BYTES = 1024 * 1024
 MAX_CALLER_EVENTS = 1000
 OWNED_PAYLOAD_FIELDS = {"agent_id", "session_id"}
 ROUTE = "in-pod-slim-router"
+SAFE_RUNTIME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CREATE_RUNTIME_ID = re.compile(r'"runtime_id"\s*:\s*"([^"\\]{1,128})"')
 
 
 class QualificationError(AssertionError):
@@ -125,6 +131,18 @@ def strings(value: Any):
             yield from strings(item)
 
 
+def value_strings(value: Any):
+    """Yield state values without allowing a dictionary key to prove persistence."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from value_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from value_strings(item)
+
+
 def state_is_effectively_empty(value: Any) -> bool:
     """Treat only structurally empty/default graph containers as no side effect."""
     if value is None:
@@ -140,9 +158,54 @@ def is_not_found(exc: Exception) -> bool:
     return exception_http_status(exc) == 404
 
 
+def credential_values(value: Any):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and CREDENTIAL_KEY.search(key):
+                yield from (candidate for candidate in strings(item) if candidate)
+            else:
+                yield from credential_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from credential_values(item)
+
+
+def decoded_strings(value: Any):
+    for text in strings(value):
+        yield text
+        current = text
+        for _ in range(3):
+            wrapped = (
+                '"'
+                + current.replace('"', r'\"')
+                .replace("\n", r"\n")
+                .replace("\r", r"\r")
+                .replace("\t", r"\t")
+                + '"'
+            )
+            try:
+                decoded = json.loads(wrapped)
+            except (json.JSONDecodeError, ValueError):
+                break
+            if not isinstance(decoded, str) or decoded == current:
+                break
+            yield decoded
+            current = decoded
+
+
 def assert_absent(value: Any, secrets: list[str], source: str):
-    serialized = "\n".join(strings(value))
-    if any(secret and secret in serialized for secret in secrets):
+    candidates = list(decoded_strings(value))
+    variants = {
+        variant
+        for secret in secrets
+        for variant in (
+            secret,
+            json.dumps(secret, ensure_ascii=True)[1:-1],
+            json.dumps(secret, ensure_ascii=False)[1:-1],
+        )
+        if variant
+    }
+    if any(variant in candidate for variant in variants for candidate in candidates):
         raise QualificationError(f"sensitive marker appeared in {source}")
 
 
@@ -157,6 +220,8 @@ def _validate_shape(shape: Any, location: str) -> None:
         isinstance(path, str) and path and kind in PRIMITIVE_TYPES for path, kind in types.items()
     ):
         raise ScenarioError(f"{location} shape.types must map non-empty paths to supported types")
+    if not required and not types:
+        raise ScenarioError(f"{location} shape must assert at least one required path or type")
 
 
 def _normalize_http_statuses(value: Any, location: str) -> Optional[list[int]]:
@@ -236,6 +301,7 @@ def validate_scenario(config: Any) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(cases, list) or not cases:
         raise ScenarioError("stdin JSON must provide non-empty cases")
     names = set()
+    sensitive_declaration_required = False
     allowed_case = {"name", "calls", "check_state", "expect_empty_state"}
     allowed_call = {
         "task_prompt",
@@ -270,6 +336,7 @@ def validate_scenario(config: Any) -> tuple[list[dict[str, Any]], list[str]]:
         calls = case.get("calls")
         if not isinstance(calls, list) or not calls:
             raise ScenarioError(f"{location} needs one or more calls")
+        case_has_credentials = False
         for call_index, call in enumerate(calls):
             call_location = f"{location} call {call_index + 1}"
             if not isinstance(call, dict) or set(call) - allowed_call:
@@ -280,6 +347,9 @@ def validate_scenario(config: Any) -> tuple[list[dict[str, Any]], list[str]]:
                 raise ScenarioError(
                     f"{call_location} payload cannot set harness-owned agent_id or session_id"
                 )
+            if any(field in call for field in ("llm", "mcps", "knowledge_bases", "payload")):
+                sensitive_declaration_required = True
+                case_has_credentials = True
             timeout = call.get("agent_timeout", 120)
             if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 600:
                 raise ScenarioError(f"{call_location} agent_timeout must be 1..600")
@@ -288,7 +358,21 @@ def validate_scenario(config: Any) -> tuple[list[dict[str, Any]], list[str]]:
                 prompt = call.get("task_prompt")
                 if "payload" not in call and (not isinstance(prompt, str) or not prompt):
                     raise ScenarioError(f"{call_location} successful call needs task_prompt")
-    return cases, secrets
+        if case_has_credentials and case.get("check_state") is False:
+            raise ScenarioError(
+                f"{location} cannot disable state checks for credential-bearing calls"
+            )
+    if sensitive_declaration_required and not secrets:
+        raise ScenarioError(
+            "credential-bearing llm/mcps/knowledge_bases/payload cases require sensitive_values canaries"
+        )
+    derived = [
+        secret
+        for case in cases
+        for call in case["calls"]
+        for secret in credential_values(call)
+    ]
+    return cases, list(dict.fromkeys([*secrets, *derived]))
 
 
 async def all_checkpoints(client: Any, thread_id: str) -> list[Any]:
@@ -309,6 +393,93 @@ async def all_checkpoints(client: Any, thread_id: str) -> list[Any]:
             raise QualificationError("checkpoint history pagination did not advance")
         seen.add(cursor)
         before = checkpoint
+
+
+async def confirm_thread_absent(
+    client: Any, thread_id: str, secrets: list[str]
+) -> bool:
+    scan_failed = False
+    for _ in range(20):
+        try:
+            state = jsonable(await client.threads.get_state(thread_id))
+        except Exception as exc:
+            if is_not_found(exc):
+                return not scan_failed
+            raise
+        try:
+            assert_absent(state, secrets, "thread cleanup confirmation")
+        except QualificationError:
+            scan_failed = True
+        await asyncio.sleep(0.25)
+    raise QualificationError("thread cleanup was not confirmed")
+
+
+def assistant_delete_reports_absent(response: Any) -> bool:
+    if getattr(response, "status_code", None) == 404:
+        return True
+    if not 200 <= getattr(response, "status_code", 0) < 300:
+        return False
+    body = getattr(response, "body", b"")
+    if not body:
+        return False
+    try:
+        value = strict_json_loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return False
+    status = str(value.get("status", "")).upper() if isinstance(value, dict) else ""
+    return status in {"NOT_FOUND", "AGENT_NOT_FOUND", "NOTFOUND"}
+
+
+def assert_delete_response_absent(response: Any, secrets: list[str], source: str) -> None:
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body)
+    assert_absent(text, secrets, source)
+
+
+def recover_created_assistant_id(body: Any) -> Optional[str]:
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="ignore")
+    else:
+        text = str(body)
+    candidates = {
+        candidate
+        for candidate in CREATE_RUNTIME_ID.findall(text)
+        if SAFE_RUNTIME_ID.fullmatch(candidate)
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+async def cleanup_assistant_resource(
+    delete_agent: Any,
+    tenant: str,
+    assistant_id: str,
+    request: Any,
+    token: str,
+    secrets: list[str],
+) -> bool:
+    cleanup_failed = False
+    deleted = await delete_agent(tenant, assistant_id, request)
+    try:
+        assert_delete_response_absent(deleted, secrets, "assistant cleanup response")
+    except QualificationError:
+        cleanup_failed = True
+    if deleted.status_code < 200 or deleted.status_code >= 300:
+        return False
+    absent = await delete_agent(
+        tenant,
+        assistant_id,
+        SimpleNamespace(headers={"request_id": f"aip5410-{token}-cleanup-confirm"}),
+    )
+    try:
+        assert_delete_response_absent(
+            absent, secrets, "assistant cleanup confirmation"
+        )
+    except QualificationError:
+        cleanup_failed = True
+    return not cleanup_failed and assistant_delete_reports_absent(absent)
 
 
 async def collect(response: Any):
@@ -385,19 +556,37 @@ async def invoke(tenant: str, payload: Any, request_id: str):
     return status, events, {"stdout": stdout.getvalue(), "stderr": stderr.getvalue(), "logs": handler.records}
 
 
-def completed_responses(events: list[Any]) -> list[Any]:
-    return [
-        event["response"]
+def terminal_response(events: list[Any]) -> Any:
+    failure_statuses = {"error", "failed", "cancelled", "timeout"}
+    if any(
+        isinstance(event, dict)
+        and (
+            event.get("success") is False
+            or str(event.get("status", "")).lower() in failure_statuses
+        )
+        for event in events[:-1]
+    ):
+        raise QualificationError("caller response contained a terminal failure event")
+    completed = [
+        event
         for event in events
-        if isinstance(event, dict) and event.get("status") == "Completed" and "response" in event
+        if isinstance(event, dict) and event.get("status") == "Completed"
     ]
+    if len(completed) != 1 or completed[0] is not events[-1]:
+        raise QualificationError("caller response lacked one final Completed event")
+    terminal = completed[0]
+    if terminal.get("success") is not True:
+        raise QualificationError("caller terminal event reported failure")
+    if "response" not in terminal:
+        raise QualificationError("caller terminal event omitted the product response")
+    return terminal["response"]
 
 
 def assert_expected_result(events: list[Any], expected: Any, check: str) -> None:
     if not isinstance(expected, str) or not expected.strip():
         raise QualificationError(f"{check} needs a non-empty expected result")
-    result_values = [response for response in completed_responses(events) if isinstance(response, str)]
-    if expected not in "\n".join(result_values):
+    response = terminal_response(events)
+    if not isinstance(response, str) or expected not in response:
         raise QualificationError(f"{check} missed its expected text in the completed caller response")
 
 
@@ -412,21 +601,22 @@ def _path_value(value: Any, path: str) -> Any:
 
 
 def _structured_candidates(events: list[Any]) -> list[Any]:
-    candidates = []
-    for response in completed_responses(events):
-        if isinstance(response, (dict, list)):
-            candidates.append(response)
-        elif isinstance(response, str):
-            try:
-                parsed = strict_json_loads(response)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if isinstance(parsed, (dict, list)):
-                candidates.append(parsed)
-    return candidates
+    response = terminal_response(events)
+    if isinstance(response, (dict, list)):
+        return [response]
+    if isinstance(response, str):
+        try:
+            parsed = strict_json_loads(response)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if isinstance(parsed, (dict, list)):
+            return [parsed]
+    return []
 
 
 def assert_expected_shape(events: list[Any], shape: dict[str, Any], check: str) -> None:
+    if not shape.get("required") and not shape.get("types"):
+        raise QualificationError(f"{check} shape did not assert any field or type")
     candidates = _structured_candidates(events)
     if not candidates:
         raise QualificationError(f"{check} did not return a structured completed response")
@@ -568,20 +758,36 @@ async def main():
         CreateAgentPayload(agent_name=f"aip5410{token}", app_version="aip5410-acceptance"),
         request,
     )
-    if created.status_code != 201:
-        raise QualificationError(f"assistant create returned HTTP {created.status_code}")
+    cleanup_candidate = recover_created_assistant_id(created.body)
     try:
-        body = strict_json_loads(created.body)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise QualificationError("assistant create returned invalid JSON") from exc
-    assistant_id = body.get("runtime_id")
-    if not assistant_id:
-        raise QualificationError("assistant create omitted runtime_id")
-    client = get_las_client()
+        if created.status_code != 201:
+            raise QualificationError(f"assistant create returned HTTP {created.status_code}")
+        assert_delete_response_absent(created, secrets, "assistant create response")
+        try:
+            body = strict_json_loads(created.body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise QualificationError("assistant create returned invalid JSON") from exc
+        assistant_id = body.get("runtime_id") if isinstance(body, dict) else None
+        if not isinstance(assistant_id, str) or not SAFE_RUNTIME_ID.fullmatch(assistant_id):
+            raise QualificationError("assistant create omitted runtime_id")
+        if assistant_id != cleanup_candidate:
+            raise QualificationError("assistant create runtime_id was not uniquely recoverable")
+    except QualificationError as exc:
+        if 200 <= created.status_code < 300:
+            cleaned = cleanup_candidate is not None and await cleanup_assistant_resource(
+                delete_agent, tenant, cleanup_candidate, request, token, secrets
+            )
+            if not cleaned:
+                raise QualificationError(
+                    "assistant create validation failed and cleanup also failed"
+                ) from exc
+        raise
+    client = None
     check_names = []
     results = []
     thread_ids = []
     try:
+        client = get_las_client()
         for case_index, case in enumerate(cases):
             calls = case.get("calls")
             session_id = str(uuid.uuid4())
@@ -625,7 +831,13 @@ async def main():
                 check_names.append(f"{case['name']}:call-{call_index + 1}")
 
             expect_empty_state = case.get("expect_empty_state", False)
-            check_state = case.get("check_state", successful_calls > 0 or expect_empty_state)
+            case_has_credentials = any(
+                any(field in call for field in ("llm", "mcps", "knowledge_bases", "payload"))
+                for call in calls
+            )
+            check_state = case.get(
+                "check_state", successful_calls > 0 or expect_empty_state or case_has_credentials
+            )
             if check_state:
                 thread_missing = False
                 try:
@@ -636,7 +848,7 @@ async def main():
                     state = {"values": {}}
                     thread_missing = True
                 values = state.get("values", {}) if isinstance(state, dict) else {}
-                state_text = "\n".join(strings(values))
+                state_text = "\n".join(value_strings(values))
                 if expect_empty_state and not state_is_effectively_empty(values):
                     raise QualificationError(
                         f"case {case['name']} wrote graph state despite an expected failure"
@@ -645,7 +857,7 @@ async def main():
                     expected in state_text for expected in state_expectations
                 ):
                     raise QualificationError(f"case {case['name']} expected outputs were not in graph state values")
-                assert_absent(values, secrets, "graph state values")
+                assert_absent(state, secrets, "graph state")
                 history = [] if thread_missing else await all_checkpoints(client, thread_id)
                 assert_absent(history, secrets, "checkpoint history")
                 if state_expectations:
@@ -657,20 +869,31 @@ async def main():
                 check_names.append(f"{case['name']}:checkpoint-redaction")
     finally:
         cleanup_failed = False
-        for thread_id in dict.fromkeys(thread_ids):
-            try:
-                await client.threads.delete(thread_id)
-            except Exception as exc:
-                status_code = getattr(exc, "status_code", None)
-                if status_code is None:
-                    status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                if status_code != 404:
-                    cleanup_failed = True
-        deleted = await delete_agent(tenant, assistant_id, request)
-        if deleted.status_code < 200 or deleted.status_code >= 300:
+        cleanup_scan_failed = False
+        if client is not None:
+            for thread_id in dict.fromkeys(thread_ids):
+                try:
+                    deleted = jsonable(await client.threads.delete(thread_id))
+                    try:
+                        assert_absent(deleted, secrets, "thread cleanup response")
+                    except QualificationError:
+                        cleanup_scan_failed = True
+                    if not await confirm_thread_absent(client, thread_id, secrets):
+                        cleanup_scan_failed = True
+                except Exception as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    if status_code is None:
+                        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status_code != 404:
+                        cleanup_failed = True
+        if not await cleanup_assistant_resource(
+            delete_agent, tenant, assistant_id, request, token, secrets
+        ):
             cleanup_failed = True
         if cleanup_failed:
             raise QualificationError("qualification resource cleanup failed")
+        if cleanup_scan_failed:
+            raise QualificationError("sensitive marker appeared in thread cleanup evidence")
     print(
         json.dumps(
             {

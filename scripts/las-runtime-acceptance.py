@@ -24,10 +24,27 @@ from typing import Any
 
 
 MAX_BODY = 8 * 1024 * 1024
+THREAD_CLEANUP_TIMEOUT = 15.0
+THREAD_CLEANUP_INTERVAL = 0.25
 TERMINAL = {"success", "error", "failed", "cancelled", "timeout"}
+FAILURE_TERMINAL = TERMINAL - {"success"}
 SAFE_CASE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 SAFE_RUNTIME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SYNTHETIC_MARKER = re.compile(r"^mpr-qualification-[0-9a-f]{32}$")
+CREDENTIAL_KEY = re.compile(
+    r"(?:authorization|api[_-]?key|access[_-]?(?:key|token)|secret|token|password|credential|role[_-]?arn|private[_-]?key)",
+    re.IGNORECASE,
+)
+FORBIDDEN_RESPONSE_PATH_COMPONENTS = {
+    "checkpoint",
+    "config",
+    "context",
+    "input",
+    "metadata",
+    "parent_config",
+    "request",
+}
+SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 class AcceptanceError(RuntimeError):
@@ -86,8 +103,14 @@ class LASClient:
             raise AcceptanceError("LAS_BASE_URL must be an http(s) URL")
         if parsed.scheme == "http" and not _is_loopback(parsed.hostname):
             raise AcceptanceError("LAS_BASE_URL may use plaintext HTTP only for a loopback host")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise AcceptanceError("LAS_BASE_URL cannot contain credentials, query, or fragment")
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise AcceptanceError("LAS_BASE_URL cannot contain credentials, path, query, or fragment")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.api_key = os.environ.get("LAS_API_KEY", "")
@@ -165,30 +188,132 @@ def _sensitive_variants(secret: str) -> set[str]:
     }
 
 
+def credential_values(value: Any):
+    """Yield string credentials from recognized config fields without logging them."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and CREDENTIAL_KEY.search(key):
+                yield from (candidate for candidate in strings(item) if candidate)
+            else:
+                yield from credential_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from credential_values(item)
+
+
+def _json_unescaped_values(text: str):
+    """Yield parsed/JSON-unescaped text so alternate escapes cannot hide a secret."""
+    candidates = [text]
+    candidates.extend(
+        line[5:].lstrip() if line.startswith("data:") else line
+        for line in text.splitlines()
+        if line.strip()
+    )
+    for candidate in candidates:
+        try:
+            parsed = strict_json_loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            yield from strings(parsed)
+
+        current = candidate
+        for _ in range(3):
+            wrapped = (
+                '"'
+                + current.replace('"', r'\"')
+                .replace("\n", r"\n")
+                .replace("\r", r"\r")
+                .replace("\t", r"\t")
+                + '"'
+            )
+            try:
+                decoded = json.loads(wrapped)
+            except (json.JSONDecodeError, ValueError):
+                break
+            if not isinstance(decoded, str) or decoded == current:
+                break
+            yield decoded
+            current = decoded
+
+
 def assert_sensitive_absent(value: bytes | str, sensitive: list[str], location: str) -> None:
     text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
-    if any(variant and variant in text for secret in sensitive for variant in _sensitive_variants(secret)):
+    decoded_values = [text, *_json_unescaped_values(text)]
+    if any(
+        secret
+        and any(
+            secret in candidate
+            or any(variant in candidate for variant in _sensitive_variants(secret))
+            for candidate in decoded_values
+        )
+        for secret in sensitive
+    ):
         raise AcceptanceError(f"sensitive marker appeared in {location}")
 
 
-def graph_response_strings(value: Any) -> list[str]:
-    """Extract graph output while excluding transport/checkpoint metadata."""
+def _dotted_value(value: Any, path: str) -> Any:
+    current = value
+    for component in path.split("."):
+        if not isinstance(current, dict) or component not in current:
+            raise AcceptanceError("expected_response_paths referenced a missing graph output")
+        current = current[component]
+    return current
+
+
+def _known_output_strings(value: Any):
+    """Yield output values without allowing echoed user input to satisfy a check."""
+    if not isinstance(value, dict):
+        yield from strings(value)
+        return
+    handled: set[str] = set()
+    messages = value.get("messages")
+    if isinstance(messages, list):
+        handled.add("messages")
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or message.get("type") or "").lower()
+            if role in {"ai", "assistant"}:
+                yield from strings(message.get("content"))
+                yield from strings(message.get("additional_kwargs"))
+    for key in (
+        "answer",
+        "response",
+        "result",
+        "output",
+        "structured_response",
+        "structured_output",
+    ):
+        if key in value:
+            handled.add(key)
+            yield from strings(value[key])
+    # LangGraph update events are often nested under a node name. Recurse only
+    # into object containers; never treat arbitrary scalar state/input fields
+    # as product output.
+    for key, item in value.items():
+        if key in handled or key in FORBIDDEN_RESPONSE_PATH_COMPONENTS:
+            continue
+        if isinstance(item, dict):
+            yield from _known_output_strings(item)
+
+
+def graph_response_strings(value: Any, response_paths: list[str] | None = None) -> list[str]:
+    """Extract declared/known graph output while excluding input and metadata."""
     if isinstance(value, dict) and isinstance(value.get("values"), (dict, list)):
         target = value["values"]
-    elif isinstance(value, dict):
-        metadata_keys = {
-            "metadata",
-            "checkpoint",
-            "parent_config",
-            "config",
-            "created_at",
-            "tasks",
-            "interrupts",
-        }
-        target = {key: item for key, item in value.items() if key not in metadata_keys}
     else:
         target = value
-    return list(strings(target))
+    if response_paths:
+        output: list[str] = []
+        for path in response_paths:
+            selected = _dotted_value(target, path)
+            if path.split(".")[-1] == "messages":
+                output.extend(_known_output_strings({"messages": selected}))
+            else:
+                output.extend(strings(selected))
+        return output
+    return list(_known_output_strings(target))
 
 
 def path_segment(value: str) -> str:
@@ -209,26 +334,109 @@ def contains_marker_placeholder(value: Any, placeholder: str) -> bool:
     return any(placeholder in item for item in strings(value))
 
 
-def create_thread(client: LASClient) -> str:
+def recover_thread_id(body: bytes) -> str | None:
+    """Recover exactly one safe thread_id for cleanup after create validation."""
+    matches = {
+        match.decode("ascii")
+        for match in re.findall(
+            rb'"thread_id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})"',
+            body,
+        )
+    }
+    if len(matches) != 1:
+        return None
+    candidate = next(iter(matches))
+    return candidate if SAFE_RUNTIME_ID.fullmatch(candidate) else None
+
+
+def create_thread(client: LASClient, sensitive: list[str] | None = None) -> str:
     status, body, _ = client.request("POST", "/threads", {})
-    result = json_body(body)
-    thread_id = result.get("thread_id") if isinstance(result, dict) else None
-    if status not in (200, 201) or not isinstance(thread_id, str) or not thread_id:
-        raise AcceptanceError("thread creation failed")
-    return thread_id
+    scan_values = list(sensitive or [])
+    api_key = getattr(client, "api_key", "")
+    if api_key:
+        scan_values.append(api_key)
+    scan_values = list(dict.fromkeys(scan_values))
+    # A successful-but-malformed response may still have created a durable
+    # thread.  Recover only one unambiguous, safe identifier and clean it up
+    # before reporting the validation failure.
+    cleanup_id = recover_thread_id(body) if 200 <= status < 300 else None
+    try:
+        assert_sensitive_absent(body, scan_values, "thread creation response")
+        result = json_body(body)
+        thread_id = result.get("thread_id") if isinstance(result, dict) else None
+        if (
+            status not in (200, 201)
+            or not isinstance(thread_id, str)
+            or not SAFE_RUNTIME_ID.fullmatch(thread_id)
+        ):
+            raise AcceptanceError("thread creation failed")
+        return thread_id
+    except AcceptanceError as original_error:
+        if cleanup_id is not None:
+            try:
+                delete_thread(client, cleanup_id, scan_values)
+            except AcceptanceError:
+                raise AcceptanceError(
+                    "thread creation validation failed and cleanup also failed"
+                ) from original_error
+        raise
 
 
-def delete_thread(client: LASClient, thread_id: str) -> None:
-    status, _, _ = client.request(
+def delete_thread(
+    client: LASClient, thread_id: str, sensitive: list[str] | None = None
+) -> None:
+    scan_values = list(sensitive or [])
+    api_key = getattr(client, "api_key", "")
+    if api_key:
+        scan_values.append(api_key)
+    scan_values = list(dict.fromkeys(scan_values))
+    status, body, _ = client.request(
         "DELETE", f"/threads/{path_segment(thread_id)}", allow_http_error=True
     )
+    scan_failed = False
+    try:
+        assert_sensitive_absent(body, scan_values, "thread cleanup response")
+    except AcceptanceError:
+        scan_failed = True
     if status not in (200, 202, 204, 404):
         raise AcceptanceError("thread cleanup failed")
+    if status == 404:
+        if scan_failed:
+            raise AcceptanceError("sensitive marker appeared during thread cleanup")
+        return
+    deadline = time.monotonic() + THREAD_CLEANUP_TIMEOUT
+    while time.monotonic() < deadline:
+        status, body, _ = client.request(
+            "GET", f"/threads/{path_segment(thread_id)}", allow_http_error=True
+        )
+        try:
+            assert_sensitive_absent(body, scan_values, "thread cleanup confirmation")
+        except AcceptanceError:
+            scan_failed = True
+        if status == 404:
+            if scan_failed:
+                raise AcceptanceError("sensitive marker appeared during thread cleanup")
+            return
+        if status != 200:
+            raise AcceptanceError("thread cleanup confirmation failed")
+        time.sleep(THREAD_CLEANUP_INTERVAL)
+    raise AcceptanceError("thread cleanup was not confirmed before timeout")
 
 
-def assert_state(client: LASClient, thread_id: str, expected: list[str], sensitive: list[str]):
+def assert_state(
+    client: LASClient,
+    thread_id: str,
+    expected: list[str],
+    sensitive: list[str] | None = None,
+):
+    scan_values = list(sensitive or [])
+    api_key = getattr(client, "api_key", "")
+    if api_key:
+        scan_values.append(api_key)
     status, body, _ = client.request("GET", f"/threads/{path_segment(thread_id)}/state")
-    assert_sensitive_absent(body, sensitive, "persisted thread state")
+    assert_sensitive_absent(
+        body, list(dict.fromkeys(scan_values)), "persisted thread state"
+    )
     result = json_body(body)
     if status != 200 or not isinstance(result, dict) or not isinstance(result.get("values"), (dict, list)):
         raise AcceptanceError("thread state response omitted graph values")
@@ -236,6 +444,7 @@ def assert_state(client: LASClient, thread_id: str, expected: list[str], sensiti
     for item in expected:
         if not any(item in value for value in state_values):
             raise AcceptanceError("expected value was not persisted under graph state values")
+    return result
 
 
 def parse_sse(body: bytes, sensitive: list[str]) -> list[dict[str, str]]:
@@ -272,21 +481,48 @@ def ordered_subsequence(actual: list[str], expected: list[str]) -> bool:
     return all(any(item == wanted for item in cursor) for wanted in expected)
 
 
-def nested_status(value: Any) -> str | None:
+def authoritative_status(value: Any) -> str | None:
+    """Read only the authoritative top-level run/event status field."""
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    return status.lower() if isinstance(status, str) else None
+
+
+def nested_string_field(value: Any, field: str) -> str | None:
     if isinstance(value, dict):
-        status = value.get("status")
-        if isinstance(status, str):
-            return status
+        candidate = value.get(field)
+        if isinstance(candidate, str) and candidate:
+            return candidate
         for item in value.values():
-            found = nested_status(item)
+            found = nested_string_field(item, field)
             if found is not None:
                 return found
     elif isinstance(value, list):
         for item in value:
-            found = nested_status(item)
+            found = nested_string_field(item, field)
             if found is not None:
                 return found
     return None
+
+
+def sse_run_id(body: bytes, sensitive: list[str]) -> str:
+    run_ids: set[str] = set()
+    for event in parse_sse(body, sensitive):
+        if event["event"].lower() != "metadata":
+            continue
+        try:
+            value = strict_json_loads(event["data"])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        run_id = nested_string_field(value, "run_id")
+        if run_id:
+            run_ids.add(run_id)
+    if len(run_ids) > 1:
+        raise AcceptanceError("SSE metadata contained conflicting run IDs")
+    if run_ids:
+        return next(iter(run_ids))
+    raise AcceptanceError("SSE EOF completion omitted a run ID for terminal verification")
 
 
 def assert_sse(
@@ -296,14 +532,33 @@ def assert_sse(
     expected_sequence: list[str] | None = None,
     terminal_event: str | None = None,
     terminal_status: str | None = None,
+    response_paths: list[str] | None = None,
+    completion: str | None = None,
+    success_expected: bool = False,
 ) -> list[str]:
     events = parse_sse(body, sensitive)
     if not events:
         raise AcceptanceError("SSE stream contained no data events")
     # Metadata is transport/checkpoint context, not graph output. It must not
     # satisfy the product response assertion.
-    graph_events = [event for event in events if event["event"].lower() != "metadata"]
-    joined = "\n".join(event["data"] for event in graph_events)
+    graph_output: list[str] = []
+    observed_statuses: list[str] = []
+    for event in events:
+        try:
+            event_value = strict_json_loads(event["data"])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        event_status = authoritative_status(event_value)
+        if event_status is not None:
+            observed_statuses.append(event_status)
+        if event["event"].lower() == "metadata":
+            continue
+        graph_output.extend(graph_response_strings(event_value, response_paths))
+    if (success_expected or terminal_status == "success") and any(
+        status in FAILURE_TERMINAL for status in observed_statuses
+    ):
+        raise AcceptanceError("SSE stream contained a failed terminal status")
+    joined = "\n".join(graph_output)
     if not all(marker in joined for marker in expected_values):
         raise AcceptanceError("SSE stream omitted expected data")
     event_names = [event["event"] for event in events]
@@ -316,8 +571,13 @@ def assert_sse(
             terminal_payload = strict_json_loads(events[-1]["data"])
         except (json.JSONDecodeError, ValueError):
             raise AcceptanceError("SSE terminal event did not contain JSON") from None
-        if nested_status(terminal_payload) != terminal_status:
+        if authoritative_status(terminal_payload) != terminal_status:
             raise AcceptanceError("SSE terminal event had an unexpected status")
+    elif completion == "eof_after_expected_values":
+        if not expected_sequence or expected_sequence[-1].lower() == "metadata":
+            raise AcceptanceError("SSE EOF completion needs an output event sequence")
+        if event_names[-1] != expected_sequence[-1]:
+            raise AcceptanceError("SSE stream did not end after the expected output event")
     return event_names
 
 
@@ -340,7 +600,11 @@ def wait_for_run(
     sensitive: list[str] | None = None,
 ) -> str:
     accepted = accepted_statuses or {"success"}
-    sensitive_values = sensitive or []
+    sensitive_values = list(sensitive or [])
+    api_key = getattr(client, "api_key", "")
+    if api_key:
+        sensitive_values.append(api_key)
+    sensitive_values = list(dict.fromkeys(sensitive_values))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status, body, _ = client.request(
@@ -368,6 +632,7 @@ def run_protocol_case(
     run_input = case.get("input")
     expected = case.get("expected_state_values", [])
     expected_response = case.get("expected_response_values", expected)
+    expected_response_paths = case.get("expected_response_paths", [])
     sensitive = case.get("sensitive_values", [])
     modes = case.get("run_modes", ["sync", "queued", "stream"])
     expected_outcome = case.get("expected_outcome", "success")
@@ -376,6 +641,7 @@ def run_protocol_case(
     expected_sse_sequence = case.get("expected_sse_event_sequence", [])
     expected_sse_terminal_event = case.get("expected_sse_terminal_event")
     expected_sse_terminal_status = case.get("expected_sse_terminal_status")
+    expected_sse_completion = case.get("expected_sse_completion")
     placeholder = case.get("marker_placeholder", "{{RUN_MARKER}}")
     cleanup = case.get("cleanup", cleanup_default)
     run_options = case.get("run_options", {})
@@ -390,6 +656,16 @@ def run_protocol_case(
         raise AcceptanceError("expected_response_values must be a string list")
     if expected_outcome == "success" and not expected_response:
         raise AcceptanceError("successful cases need non-empty expected_response_values")
+    if not isinstance(expected_response_paths, list) or not all(
+        isinstance(path, str)
+        and path
+        and all(SAFE_PATH_COMPONENT.fullmatch(component) for component in path.split("."))
+        and not FORBIDDEN_RESPONSE_PATH_COMPONENTS.intersection(path.split("."))
+        for path in expected_response_paths
+    ):
+        raise AcceptanceError(
+            "expected_response_paths must be safe dotted paths and cannot select input/context/metadata"
+        )
     if not isinstance(sensitive, list) or not all(isinstance(v, str) for v in sensitive):
         raise AcceptanceError("sensitive_values must be a string list")
     if not isinstance(modes, list) or not modes or set(modes) - {"sync", "queued", "stream"}:
@@ -397,13 +673,15 @@ def run_protocol_case(
     if expected_outcome not in ("success", "failure"):
         raise AcceptanceError("expected_outcome must be success or failure")
     if not isinstance(expected_http_statuses, list) or not all(
-        isinstance(value, int) and 100 <= value <= 599 for value in expected_http_statuses
+        isinstance(value, int) and not isinstance(value, bool) and 400 <= value <= 599
+        for value in expected_http_statuses
     ):
-        raise AcceptanceError("expected_http_statuses must be a list of HTTP statuses")
+        raise AcceptanceError("expected_http_statuses must contain only 4xx/5xx statuses")
     if not isinstance(expected_run_statuses, list) or not expected_run_statuses or not all(
-        isinstance(value, str) and value in TERMINAL for value in expected_run_statuses
+        isinstance(value, str) and value in FAILURE_TERMINAL
+        for value in expected_run_statuses
     ):
-        raise AcceptanceError("expected_run_statuses must contain terminal run statuses")
+        raise AcceptanceError("expected_run_statuses must contain only failed terminal statuses")
     if not isinstance(expected_sse_sequence, list) or not all(
         isinstance(value, str) and value for value in expected_sse_sequence
     ):
@@ -416,8 +694,35 @@ def run_protocol_case(
         raise AcceptanceError(
             "expected_sse_terminal_event and expected_sse_terminal_status must be supplied together"
         )
-    if expected_outcome == "success" and "stream" in modes and expected_sse_terminal_status is None:
-        raise AcceptanceError("successful stream cases must declare an explicit terminal event and status")
+    if expected_sse_completion not in (None, "terminal_event", "eof_after_expected_values"):
+        raise AcceptanceError(
+            "expected_sse_completion must be terminal_event or eof_after_expected_values"
+        )
+    if expected_sse_terminal_status is not None:
+        if expected_sse_completion not in (None, "terminal_event"):
+            raise AcceptanceError("terminal SSE status conflicts with expected_sse_completion")
+        expected_sse_completion = "terminal_event"
+        if expected_outcome == "success" and expected_sse_terminal_status != "success":
+            raise AcceptanceError("successful SSE cases require a success terminal status")
+        if (
+            expected_outcome == "failure"
+            and expected_sse_terminal_status not in expected_run_statuses
+        ):
+            raise AcceptanceError(
+                "failure SSE terminal status must be an allowed failed run status"
+            )
+    if expected_sse_completion == "terminal_event" and (
+        not expected_sse_terminal_event or expected_sse_terminal_status is None
+    ):
+        raise AcceptanceError(
+            "terminal_event completion requires a non-empty terminal event and status"
+        )
+    if expected_outcome == "success" and "stream" in modes and expected_sse_completion is None:
+        raise AcceptanceError(
+            "successful stream cases must declare terminal_event or eof_after_expected_values completion"
+        )
+    if expected_sse_completion == "eof_after_expected_values" and not expected_sse_sequence:
+        raise AcceptanceError("eof_after_expected_values requires expected_sse_event_sequence")
     if not isinstance(placeholder, str) or not placeholder:
         raise AcceptanceError("marker_placeholder must be a non-empty string")
     if not isinstance(cleanup, bool):
@@ -426,6 +731,26 @@ def run_protocol_case(
         raise AcceptanceError("run_options must be an object and cannot replace assistant_id or input")
     if context is not None and not isinstance(context, dict):
         raise AcceptanceError("context must be an object")
+    if list(
+        credential_values(
+            {"input": run_input, "context": context, "run_options": run_options}
+        )
+    ) and not sensitive:
+        raise AcceptanceError(
+            "credential-bearing input/context requires sensitive_values canaries"
+        )
+    sensitive = list(
+        dict.fromkeys(
+            [
+                *sensitive,
+                *(
+                    [getattr(client, "api_key", "")]
+                    if getattr(client, "api_key", "")
+                    else []
+                ),
+            ]
+        )
+    )
 
     inject_request_marker = case.get("inject_request_marker")
     if inject_request_marker is None:
@@ -456,6 +781,8 @@ def run_protocol_case(
             )
 
     checks = []
+    retained_thread_ids: list[str] = []
+    retained_thread_sensitive: dict[str, list[str]] = {}
     for mode in modes:
         marker = f"aip-qualification-{uuid.uuid4().hex}"
         input_copy = substitute_marker(run_input, marker, placeholder)
@@ -467,11 +794,36 @@ def run_protocol_case(
         # given an unexpected `request` field.
         if inject_request_marker:
             input_copy.setdefault("request", marker)
-        thread_id = create_thread(client)
         payload = {"assistant_id": graph_id, "input": input_copy}
         if context is not None:
             payload["context"] = substitute_marker(context, marker, placeholder)
         payload.update(substitute_marker(run_options, marker, placeholder))
+        if expected_response_paths:
+            submitted_values = list(
+                strings(
+                    {
+                        "input": input_copy,
+                        "context": payload.get("context"),
+                        "run_options": {
+                            key: value
+                            for key, value in payload.items()
+                            if key not in {"assistant_id", "input", "context"}
+                        },
+                    }
+                )
+            )
+            if any(
+                expected_value in submitted
+                for expected_value in case_expected_response
+                for submitted in submitted_values
+            ):
+                raise AcceptanceError(
+                    "explicit response paths cannot prove a value already present in submitted input/context"
+                )
+        case_sensitive = list(
+            dict.fromkeys([*case_sensitive, *credential_values(payload)])
+        )
+        thread_id = create_thread(client, case_sensitive)
         thread_path = path_segment(thread_id)
         started = time.monotonic()
         status = None
@@ -494,11 +846,16 @@ def run_protocol_case(
                         raise AcceptanceError("synchronous run returned an unexpected HTTP status")
                 else:
                     result = json_body(body)
-                    output = "\n".join(graph_response_strings(result))
+                    result_status = authoritative_status(result)
+                    output = "\n".join(
+                        graph_response_strings(result, expected_response_paths)
+                    )
                     if expected_outcome == "failure":
-                        terminal_status = nested_status(result)
+                        terminal_status = result_status
                         if terminal_status not in expected_run_statuses:
                             raise AcceptanceError("synchronous run unexpectedly succeeded")
+                    elif result_status in FAILURE_TERMINAL:
+                        raise AcceptanceError("synchronous run returned a failed terminal status")
                     elif not all(item in output for item in case_expected_response):
                         raise AcceptanceError("synchronous response omitted an expected result")
             elif mode == "queued":
@@ -547,6 +904,9 @@ def run_protocol_case(
                         expected_sse_sequence,
                         expected_sse_terminal_event,
                         expected_sse_terminal_status,
+                        expected_response_paths,
+                        expected_sse_completion,
+                        expected_outcome == "success",
                     )
                     if expected_outcome == "failure":
                         parsed = parse_sse(body, case_sensitive)
@@ -554,29 +914,58 @@ def run_protocol_case(
                             terminal_payload = strict_json_loads(parsed[-1]["data"])
                         except (json.JSONDecodeError, ValueError):
                             terminal_payload = None
-                        terminal_status = nested_status(terminal_payload)
+                        terminal_status = authoritative_status(terminal_payload)
                         if terminal_status not in expected_run_statuses:
                             raise AcceptanceError("streaming run unexpectedly succeeded")
                     else:
-                        terminal_status = expected_sse_terminal_status
+                        if expected_sse_completion == "eof_after_expected_values":
+                            run_id = sse_run_id(body, case_sensitive)
+                            terminal_status = wait_for_run(
+                                client,
+                                thread_id,
+                                run_id,
+                                timeout,
+                                {"success"},
+                                case_sensitive,
+                            )
+                        else:
+                            terminal_status = expected_sse_terminal_status
 
             if expected_outcome == "success":
-                assert_state(client, thread_id, case_expected, case_sensitive)
+                state = assert_state(client, thread_id, case_expected, case_sensitive)
+                if mode == "queued":
+                    queued_output = "\n".join(
+                        graph_response_strings(state, expected_response_paths)
+                    )
+                    if not all(item in queued_output for item in case_expected_response):
+                        raise AcceptanceError("queued graph output omitted an expected result")
         except Exception as original_error:
             # A failed case is never useful persistence evidence. Clean it even
             # when successful cases are intentionally retained for restart
             # verification so a partially submitted credential-bearing run is
             # not orphaned.
-            try:
-                delete_thread(client, thread_id)
-            except AcceptanceError:
+            cleanup_failed = False
+            for cleanup_thread_id in dict.fromkeys([thread_id, *retained_thread_ids]):
+                try:
+                    cleanup_sensitive = (
+                        case_sensitive
+                        if cleanup_thread_id == thread_id
+                        else retained_thread_sensitive.get(cleanup_thread_id, [])
+                    )
+                    delete_thread(client, cleanup_thread_id, cleanup_sensitive)
+                except AcceptanceError:
+                    cleanup_failed = True
+            if cleanup_failed:
                 raise AcceptanceError(
-                    "qualification case failed and its thread cleanup also failed"
+                    "qualification case failed and cleanup also failed for one or more threads"
                 ) from original_error
             raise
 
         if cleanup:
-            delete_thread(client, thread_id)
+            delete_thread(client, thread_id, case_sensitive)
+        else:
+            retained_thread_ids.append(thread_id)
+            retained_thread_sensitive[thread_id] = case_sensitive
         check = {
             "case": name,
             "mode": mode,
@@ -610,6 +999,37 @@ def read_scenario() -> dict[str, Any]:
     return scenario
 
 
+def scenario_sensitive_values(scenario: dict[str, Any]) -> list[str]:
+    """Resolve configured canaries and credential values without returning them."""
+    resolved: list[str] = []
+    top_level = scenario.get("sensitive_values", [])
+    if not isinstance(top_level, list) or not all(
+        isinstance(value, str) for value in top_level
+    ):
+        raise AcceptanceError("scenario sensitive_values must be a string list")
+    resolved.extend(top_level)
+    candidates: list[Any] = []
+    cases = scenario.get("cases", [])
+    if cases is not None:
+        if not isinstance(cases, list):
+            raise AcceptanceError("scenario cases must be a list")
+        candidates.extend(cases)
+    for key in ("case", "active_run_case"):
+        if scenario.get(key) is not None:
+            candidates.append(scenario[key])
+    for case in candidates:
+        if not isinstance(case, dict):
+            raise AcceptanceError("scenario cases must be objects")
+        case_sensitive = case.get("sensitive_values", [])
+        if not isinstance(case_sensitive, list) or not all(
+            isinstance(value, str) for value in case_sensitive
+        ):
+            raise AcceptanceError("case sensitive_values must be a string list")
+        resolved.extend(case_sensitive)
+        resolved.extend(credential_values(case))
+    return list(dict.fromkeys(value for value in resolved if value))
+
+
 def protocol_command(args):
     scenario = read_scenario()
     graph_id = scenario.get("graph_id")
@@ -625,11 +1045,18 @@ def protocol_command(args):
     ):
         raise AcceptanceError("scenario sensitive_values must be a string list")
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
+    health_sensitive = list(
+        dict.fromkeys(
+            [*scenario_sensitive, *([client.api_key] if client.api_key else [])]
+        )
+    )
     health_status, health_body, _ = client.request("GET", "/ok")
+    assert_sensitive_absent(health_body, health_sensitive, "Agent Server health response")
     health = json_body(health_body)
     if health_status != 200 or not isinstance(health, dict) or health.get("ok") is not True:
         raise AcceptanceError("Agent Server health check failed")
     all_checks = []
+    cleanup_sensitive_by_thread: dict[str, list[str]] = {}
     try:
         for case in cases:
             if not isinstance(case, dict):
@@ -638,19 +1065,65 @@ def protocol_command(args):
             case_sensitive = case_copy.get("sensitive_values", [])
             if not isinstance(case_sensitive, list):
                 raise AcceptanceError("case sensitive_values must be a string list")
-            case_copy["sensitive_values"] = scenario_sensitive + case_sensitive
-            all_checks.extend(
-                run_protocol_case(client, graph_id, case_copy, args.run_timeout, cleanup_threads)
+            declared_sensitive = scenario_sensitive + case_sensitive
+            if list(credential_values(case_copy)) and not declared_sensitive:
+                raise AcceptanceError(
+                    "credential-bearing input/context requires sensitive_values canaries"
+                )
+            case_copy["sensitive_values"] = list(
+                dict.fromkeys(
+                    [
+                        *declared_sensitive,
+                        *([client.api_key] if client.api_key else []),
+                    ]
+                )
             )
+            case_checks = run_protocol_case(
+                client, graph_id, case_copy, args.run_timeout, cleanup_threads
+            )
+            all_checks.extend(case_checks)
+            for check in case_checks:
+                thread_id = check.get("thread_id")
+                marker = check.get("marker")
+                if not isinstance(thread_id, str) or not isinstance(marker, str):
+                    continue
+                placeholder = case_copy.get("marker_placeholder", "{{RUN_MARKER}}")
+                credential_source = substitute_marker(
+                    {
+                        "input": case_copy.get("input"),
+                        "context": case_copy.get("context"),
+                        "run_options": case_copy.get("run_options", {}),
+                    },
+                    marker,
+                    placeholder,
+                )
+                cleanup_sensitive_by_thread[thread_id] = list(
+                    dict.fromkeys(
+                        [
+                            *substitute_marker(
+                                case_copy.get("sensitive_values", []), marker, placeholder
+                            ),
+                            *credential_values(credential_source),
+                        ]
+                    )
+                )
     except Exception as original_error:
         cleanup_failed = False
-        if not cleanup_threads:
-            for thread_id in {check.get("thread_id") for check in all_checks}:
-                if isinstance(thread_id, str) and thread_id:
-                    try:
-                        delete_thread(client, thread_id)
-                    except AcceptanceError:
-                        cleanup_failed = True
+        retained_thread_ids = {
+            check.get("thread_id")
+            for check in all_checks
+            if check.get("thread_cleaned") is False
+        }
+        for thread_id in retained_thread_ids:
+            if isinstance(thread_id, str) and thread_id:
+                try:
+                    delete_thread(
+                        client,
+                        thread_id,
+                        cleanup_sensitive_by_thread.get(thread_id, scenario_sensitive),
+                    )
+                except AcceptanceError:
+                    cleanup_failed = True
         if cleanup_failed:
             raise AcceptanceError(
                 "protocol failed and one or more retained threads could not be cleaned up"
@@ -661,13 +1134,18 @@ def protocol_command(args):
 
 def state_command(args):
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
-    assert_state(client, args.thread_id, [args.expected_value], [])
+    sensitive = scenario_sensitive_values(read_scenario()) if args.scenario_stdin else []
+    assert_state(client, args.thread_id, [args.expected_value], sensitive)
     print(json.dumps({"result": "PASS", "check": "persisted_graph_state", "thread_id": args.thread_id}, sort_keys=True))
 
 
 def health_command(args):
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
     status, body, _ = client.request("GET", "/ok")
+    api_key = getattr(client, "api_key", "")
+    assert_sensitive_absent(
+        body, [api_key] if api_key else [], "Agent Server health response"
+    )
     health = json_body(body)
     if status != 200 or not isinstance(health, dict) or health.get("ok") is not True:
         raise AcceptanceError("Agent Server health check failed")
@@ -678,7 +1156,8 @@ def delete_thread_command(args):
     if not SAFE_RUNTIME_ID.fullmatch(args.thread_id):
         raise AcceptanceError("thread-id must be a safe runtime identifier")
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
-    delete_thread(client, args.thread_id)
+    sensitive = scenario_sensitive_values(read_scenario()) if args.scenario_stdin else []
+    delete_thread(client, args.thread_id, sensitive)
     print(
         json.dumps(
             {"result": "PASS", "check": "thread_cleanup", "thread_id": args.thread_id},
@@ -728,7 +1207,16 @@ def _active_product_case(scenario: dict[str, Any]):
         raise AcceptanceError(
             "active_run_case must use its marker placeholder in input/context and expected state"
         )
-    return graph_id, case, scenario_sensitive + case_sensitive, placeholder
+    sensitive = scenario_sensitive + case_sensitive
+    if list(
+        credential_values(
+            {"input": run_input, "context": context, "run_options": run_options}
+        )
+    ) and not sensitive:
+        raise AcceptanceError(
+            "credential-bearing active_run_case requires sensitive_values canaries"
+        )
+    return graph_id, case, sensitive, placeholder
 
 
 def submit_product_active_command(args):
@@ -738,7 +1226,8 @@ def submit_product_active_command(args):
     graph_id, case, sensitive, placeholder = _active_product_case(scenario)
     marker = f"mpr-qualification-{uuid.uuid4().hex}"
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
-    thread_id = create_thread(client)
+    thread_id: str | None = None
+    resolved_sensitive: list[str] = []
     try:
         payload = {
             "assistant_id": graph_id,
@@ -747,7 +1236,16 @@ def submit_product_active_command(args):
         if case.get("context") is not None:
             payload["context"] = substitute_marker(case["context"], marker, placeholder)
         payload.update(substitute_marker(case.get("run_options", {}), marker, placeholder))
-        resolved_sensitive = substitute_marker(sensitive, marker, placeholder)
+        resolved_sensitive = list(
+            dict.fromkeys(
+                [
+                    *substitute_marker(sensitive, marker, placeholder),
+                    *credential_values(payload),
+                    *([getattr(client, "api_key", "")] if getattr(client, "api_key", "") else []),
+                ]
+            )
+        )
+        thread_id = create_thread(client, resolved_sensitive)
         status, body, _ = client.request(
             "POST", f"/threads/{path_segment(thread_id)}/runs", payload
         )
@@ -784,12 +1282,13 @@ def submit_product_active_command(args):
             time.sleep(1)
         raise AcceptanceError("active product run did not enter running state before timeout")
     except Exception as original_error:
-        try:
-            delete_thread(client, thread_id)
-        except AcceptanceError:
-            raise AcceptanceError(
-                "active product submission failed and its thread cleanup also failed"
-            ) from original_error
+        if thread_id is not None:
+            try:
+                delete_thread(client, thread_id, resolved_sensitive)
+            except AcceptanceError:
+                raise AcceptanceError(
+                    "active product submission failed and its thread cleanup also failed"
+                ) from original_error
         raise
 
 
@@ -802,9 +1301,22 @@ def verify_product_active_command(args):
         raise AcceptanceError("active run identifiers or marker are invalid")
     scenario = read_scenario()
     _, case, sensitive, placeholder = _active_product_case(scenario)
-    resolved_sensitive = substitute_marker(sensitive, args.marker, placeholder)
     expected = substitute_marker(case["expected_state_values"], args.marker, placeholder)
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
+    credential_payload = {
+        "input": substitute_marker(case["input"], args.marker, placeholder),
+        "context": substitute_marker(case.get("context"), args.marker, placeholder),
+        "run_options": substitute_marker(case.get("run_options", {}), args.marker, placeholder),
+    }
+    resolved_sensitive = list(
+        dict.fromkeys(
+            [
+                *substitute_marker(sensitive, args.marker, placeholder),
+                *credential_values(credential_payload),
+                *([getattr(client, "api_key", "")] if getattr(client, "api_key", "") else []),
+            ]
+        )
+    )
     terminal = wait_for_run(
         client,
         args.thread_id,
@@ -815,7 +1327,7 @@ def verify_product_active_command(args):
     )
     assert_state(client, args.thread_id, expected, resolved_sensitive)
     if args.cleanup:
-        delete_thread(client, args.thread_id)
+        delete_thread(client, args.thread_id, resolved_sensitive)
     print(
         json.dumps(
             {
@@ -867,12 +1379,29 @@ def verify_run_command(args):
     print(json.dumps({"result": "PASS", "check": "active_run_survived_queue_replacement", "thread_id": args.thread_id, "run_id": args.run_id, "thread_cleaned": args.cleanup}, sort_keys=True))
 
 
-def kubectl_json(namespace: str, resource: str, name: str):
+def kubectl_json(
+    namespace: str, resource: str, name: str, expected_context: str | None = None
+):
     import subprocess
 
+    if expected_context is not None and (
+        not expected_context or "\n" in expected_context or "\r" in expected_context
+    ):
+        raise AcceptanceError("expected Kubernetes context must be a safe non-empty value")
+    context_args = ["--context", expected_context] if expected_context else []
     try:
         raw = subprocess.run(
-            [os.environ.get("KUBECTL", "kubectl"), "-n", namespace, "get", resource, name, "-o", "json"],
+            [
+                os.environ.get("KUBECTL", "kubectl"),
+                *context_args,
+                "-n",
+                namespace,
+                "get",
+                resource,
+                name,
+                "-o",
+                "json",
+            ],
             check=True, capture_output=True, text=True, timeout=20,
         ).stdout
         return json.loads(raw)
@@ -880,13 +1409,18 @@ def kubectl_json(namespace: str, resource: str, name: str):
         raise AcceptanceError(f"could not read Kubernetes {resource} {name}") from None
 
 
-def hpa_observation(namespace: str, hpa_name: str, deployment_name: str):
-    hpa = kubectl_json(namespace, "hpa", hpa_name)
+def hpa_observation(
+    namespace: str,
+    hpa_name: str,
+    deployment_name: str,
+    expected_context: str | None = None,
+):
+    hpa = kubectl_json(namespace, "hpa", hpa_name, expected_context)
     spec = hpa.get("spec", {})
     target = spec.get("scaleTargetRef", {})
     if target.get("kind") != "Deployment" or target.get("name") != deployment_name:
         raise AcceptanceError("HPA scale target does not match the supplied queue Deployment")
-    deployment = kubectl_json(namespace, "deployment", deployment_name)
+    deployment = kubectl_json(namespace, "deployment", deployment_name, expected_context)
     status = hpa.get("status", {})
     current_metrics = status.get("currentMetrics", [])
     cpu_metrics = [m for m in current_metrics if m.get("type") == "Resource" and m.get("resource", {}).get("name") == "cpu"]
@@ -913,10 +1447,12 @@ def hpa_observation(namespace: str, hpa_name: str, deployment_name: str):
 
 
 def wait_for_ready_scale_up(observe, futures, starting_replicas: int, starting_ready: int, timeout: int):
-    """Wait for both the HPA and ready worker count to rise, even after runs end."""
+    """Wait for causal CPU evidence plus HPA and ready-worker scale-up."""
     deadline = time.monotonic() + timeout
     peak_hpa = starting_replicas
     peak_ready = starting_ready
+    peak_cpu = None
+    cpu_trigger_observed = False
     last = None
     while time.monotonic() < deadline:
         for future in futures:
@@ -925,22 +1461,64 @@ def wait_for_ready_scale_up(observe, futures, starting_replicas: int, starting_r
         last = observe()
         peak_hpa = max(peak_hpa, last["current"] or 0, last["desired"] or 0)
         peak_ready = max(peak_ready, last["deployment_replicas"] or 0)
-        if all(future.done() for future in futures) and peak_hpa > starting_replicas and peak_ready > starting_ready:
-            return peak_hpa, peak_ready, last
+        cpu_average = last.get("cpu_average_utilization")
+        cpu_target = last.get("cpu_target_utilization")
+        if isinstance(cpu_average, (int, float)) and not isinstance(cpu_average, bool):
+            peak_cpu = cpu_average if peak_cpu is None else max(peak_cpu, cpu_average)
+        if (
+            isinstance(cpu_average, (int, float))
+            and not isinstance(cpu_average, bool)
+            and isinstance(cpu_target, (int, float))
+            and not isinstance(cpu_target, bool)
+            and cpu_target > 0
+            and cpu_average >= cpu_target
+        ):
+            cpu_trigger_observed = True
+        if (
+            all(future.done() for future in futures)
+            and peak_hpa > starting_replicas
+            and peak_ready > starting_ready
+            and cpu_trigger_observed
+        ):
+            return peak_hpa, peak_ready, last, peak_cpu
         time.sleep(min(5, max(0, deadline - time.monotonic())))
     for future in futures:
         if not future.done():
             raise AcceptanceError("bounded LAS runs did not complete before scale-up timeout")
         future.result()
-    raise AcceptanceError("queue HPA did not add a ready worker before scale-up timeout")
+    raise AcceptanceError(
+        "queue HPA did not provide causal CPU evidence and add a ready worker "
+        "before scale-up timeout"
+    )
 
 
-def deployment_replicas(namespace: str, name: str):
-    deployment = kubectl_json(namespace, "deployment", name)
+def deployment_replicas(
+    namespace: str, name: str, expected_context: str | None = None
+):
+    deployment = kubectl_json(namespace, "deployment", name, expected_context)
     return {
         "desired": deployment.get("spec", {}).get("replicas", 1),
         "ready": deployment.get("status", {}).get("readyReplicas", 0),
     }
+
+
+def require_stable_hpa_baseline(observation: dict[str, Any]) -> int:
+    """Reject a pre-existing scale event before attributing growth to this run."""
+    current = observation.get("current")
+    desired = observation.get("desired")
+    ready = observation.get("deployment_replicas")
+    minimum = observation.get("min")
+    maximum = observation.get("max")
+    replicas = (current, desired, ready, minimum, maximum)
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in replicas):
+        raise AcceptanceError("queue HPA baseline did not expose integer replica counts")
+    if not minimum <= current <= maximum:
+        raise AcceptanceError("queue HPA baseline was outside its configured bounds")
+    if current != desired or current != ready:
+        raise AcceptanceError(
+            "queue HPA baseline was not stable before qualification work started"
+        )
+    return current
 
 
 def observe_hpa_after_completion(args, started: float, samples: list[dict[str, Any]], seconds: float):
@@ -951,8 +1529,12 @@ def observe_hpa_after_completion(args, started: float, samples: list[dict[str, A
         if remaining <= 0:
             return
         time.sleep(min(args.sample_interval, remaining))
-        observation = hpa_observation(args.namespace, args.hpa, args.deployment)
-        api_now = deployment_replicas(args.namespace, args.api_deployment)
+        observation = hpa_observation(
+            args.namespace, args.hpa, args.deployment, args.expected_context
+        )
+        api_now = deployment_replicas(
+            args.namespace, args.api_deployment, args.expected_context
+        )
         if api_now["desired"] != 1:
             raise AcceptanceError("LAS API Deployment replica count changed after product load")
         samples.append(
@@ -962,6 +1544,7 @@ def observe_hpa_after_completion(args, started: float, samples: list[dict[str, A
                 "desired": observation["desired"],
                 "ready": observation["deployment_replicas"],
                 "cpu_average_utilization": observation["cpu_average_utilization"],
+                "cpu_target_utilization": observation["cpu_target_utilization"],
             }
         )
 
@@ -997,16 +1580,25 @@ def product_load_command(args):
         raise AcceptanceError("product-load requires a successful product case")
 
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), min(args.request_timeout, args.timeout))
-    before = hpa_observation(args.namespace, args.hpa, args.deployment)
-    api_before = deployment_replicas(args.namespace, args.api_deployment)
+    before = hpa_observation(
+        args.namespace, args.hpa, args.deployment, args.expected_context
+    )
+    api_before = deployment_replicas(
+        args.namespace, args.api_deployment, args.expected_context
+    )
     if api_before["desired"] != 1:
         raise AcceptanceError("LAS API Deployment is not configured for one replica")
     if before["max"] is None or before["max"] < before["min"]:
         raise AcceptanceError("HPA did not provide valid minimum and maximum bounds")
+    require_stable_hpa_baseline(before)
     if not before["cpu_metrics_present"]:
         raise AcceptanceError("HPA has no current CPU metrics")
-    if before["current"] is None or before["deployment_replicas"] < before["current"]:
-        raise AcceptanceError("queue HPA baseline does not have all current replicas ready")
+    if (
+        not isinstance(before["cpu_target_utilization"], (int, float))
+        or isinstance(before["cpu_target_utilization"], bool)
+        or before["cpu_target_utilization"] <= 0
+    ):
+        raise AcceptanceError("HPA has no valid CPU utilization target")
     if args.workers > before["max"] * 4:
         raise AcceptanceError("workload exceeds the bounded worker-to-HPA ratio")
 
@@ -1031,8 +1623,12 @@ def product_load_command(args):
         futures = [pool.submit(execute, index) for index in range(args.workers)]
         deadline = time.monotonic() + args.timeout
         while time.monotonic() < deadline:
-            observation = hpa_observation(args.namespace, args.hpa, args.deployment)
-            api_now = deployment_replicas(args.namespace, args.api_deployment)
+            observation = hpa_observation(
+                args.namespace, args.hpa, args.deployment, args.expected_context
+            )
+            api_now = deployment_replicas(
+                args.namespace, args.api_deployment, args.expected_context
+            )
             if api_now["desired"] != 1:
                 raise AcceptanceError("LAS API Deployment replica count changed during product load")
             samples.append(
@@ -1042,6 +1638,7 @@ def product_load_command(args):
                     "desired": observation["desired"],
                     "ready": observation["deployment_replicas"],
                     "cpu_average_utilization": observation["cpu_average_utilization"],
+                    "cpu_target_utilization": observation["cpu_target_utilization"],
                 }
             )
             for index, future in enumerate(futures):
@@ -1073,8 +1670,21 @@ def product_load_command(args):
         or peak_desired > (before["desired"] or 0)
         or peak_ready > (before["deployment_replicas"] or 0)
     )
-    if args.scale_expectation == "required" and not scaled:
-        raise AcceptanceError("representative product load did not trigger CPU scale-up")
+    cpu_trigger_observed = any(
+        isinstance(sample.get("cpu_average_utilization"), (int, float))
+        and not isinstance(sample.get("cpu_average_utilization"), bool)
+        and isinstance(sample.get("cpu_target_utilization"), (int, float))
+        and not isinstance(sample.get("cpu_target_utilization"), bool)
+        and sample["cpu_target_utilization"] > 0
+        and sample["cpu_average_utilization"] >= sample["cpu_target_utilization"]
+        for sample in samples
+    )
+    cpu_scale_pass = scaled and cpu_trigger_observed
+    if args.scale_expectation == "required" and not cpu_scale_pass:
+        raise AcceptanceError(
+            "representative product load did not produce both causal HPA CPU "
+            "evidence and replica scale-up"
+        )
     if args.scale_expectation == "none" and scaled:
         raise AcceptanceError("representative product load unexpectedly triggered CPU scale-up")
     durations = [check["duration_seconds"] for check in results]
@@ -1089,12 +1699,23 @@ def product_load_command(args):
         for sample in samples
         if isinstance(sample["cpu_average_utilization"], (int, float))
     ]
+    if cpu_scale_pass:
+        scale_observation = "cpu_scale_pass"
+    elif scaled:
+        scale_observation = "replica_scale_observed_without_cpu_evidence"
+    elif cpu_trigger_observed:
+        scale_observation = "cpu_trigger_observed_without_replica_scale"
+    else:
+        scale_observation = "no_cpu_scale_observed"
     print(
         json.dumps(
             {
-                "result": "PASS",
+                "result": "OBSERVATION",
+                "acceptance_scope": "requires_identity_bound_lifecycle_orchestrator",
                 "check": "representative_product_load",
-                "scale_observation": "scaled" if scaled else "no_cpu_scale_observed",
+                "scale_observation": scale_observation,
+                "cpu_scale_evidence": "OBSERVATION",
+                "cpu_trigger_observed": cpu_trigger_observed,
                 "workers": args.workers,
                 "completed_runs": len(results),
                 "duration_seconds": round(time.monotonic() - started, 3),
@@ -1132,20 +1753,27 @@ def scale_command(args):
     if args.timeout < 30 or args.timeout > 900 or args.downscale_timeout < 300 or args.downscale_timeout > 1200:
         raise AcceptanceError("timeout must be 30..900 and downscale-timeout 300..1200 seconds")
     client = LASClient(os.environ.get("LAS_BASE_URL", ""), min(args.timeout, 60))
-    before = hpa_observation(args.namespace, args.hpa, args.deployment)
-    api_before = deployment_replicas(args.namespace, args.api_deployment)
+    before = hpa_observation(
+        args.namespace, args.hpa, args.deployment, args.expected_context
+    )
+    api_before = deployment_replicas(
+        args.namespace, args.api_deployment, args.expected_context
+    )
     if api_before["desired"] != 1:
         raise AcceptanceError("LAS API Deployment is not configured for one replica")
     if before["max"] is None or before["max"] < before["min"]:
         raise AcceptanceError("HPA did not provide valid minimum and maximum bounds")
+    require_stable_hpa_baseline(before)
     if before["current"] is not None and before["current"] >= before["max"]:
         raise AcceptanceError("start below the HPA maximum to qualify scale-up")
     if not before["cpu_metrics_present"]:
         raise AcceptanceError("HPA has no current CPU metrics")
-    if before["current"] is None or before["deployment_replicas"] < before["current"]:
-        raise AcceptanceError("queue HPA baseline does not have all current replicas ready")
-    if before["deployment_replicas"] < before["min"]:
-        raise AcceptanceError("queue Deployment is below its ready worker floor before the test")
+    if (
+        not isinstance(before["cpu_target_utilization"], (int, float))
+        or isinstance(before["cpu_target_utilization"], bool)
+        or before["cpu_target_utilization"] <= 0
+    ):
+        raise AcceptanceError("HPA has no valid CPU utilization target")
     if args.workers > before["max"] * 4:
         raise AcceptanceError("workload exceeds the bounded worker-to-HPA ratio")
 
@@ -1157,8 +1785,10 @@ def scale_command(args):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(execute, index) for index in range(args.workers)]
-        peak_hpa, peak_ready, last = wait_for_ready_scale_up(
-            lambda: hpa_observation(args.namespace, args.hpa, args.deployment),
+        peak_hpa, peak_ready, last, peak_cpu = wait_for_ready_scale_up(
+            lambda: hpa_observation(
+                args.namespace, args.hpa, args.deployment, args.expected_context
+            ),
             futures,
             before["current"],
             before["deployment_replicas"],
@@ -1173,8 +1803,12 @@ def scale_command(args):
 
     downscale_deadline = time.monotonic() + args.downscale_timeout
     while time.monotonic() < downscale_deadline:
-        last = hpa_observation(args.namespace, args.hpa, args.deployment)
-        api_now = deployment_replicas(args.namespace, args.api_deployment)
+        last = hpa_observation(
+            args.namespace, args.hpa, args.deployment, args.expected_context
+        )
+        api_now = deployment_replicas(
+            args.namespace, args.api_deployment, args.expected_context
+        )
         if api_now["desired"] != 1:
             raise AcceptanceError("LAS API Deployment replica count changed during queue scaling")
         if (
@@ -1188,7 +1822,7 @@ def scale_command(args):
         raise AcceptanceError("queue HPA did not return to its minimum before downscale timeout")
     if last["deployment_replicas"] < last["min"]:
         raise AcceptanceError("queue Deployment did not restore its HPA minimum ready workers")
-    print(json.dumps({"result": "PASS", "check": "queue_scale_up_cap_downscale_floor_api_fixed", "workers": args.workers, "peak_replicas": peak_hpa, "peak_ready_workers": peak_ready, "hpa_min": last["min"], "hpa_max": last["max"], "ready_workers": last["deployment_replicas"], "api_replicas": api_now["desired"], "cpu_metrics_present": last["cpu_metrics_present"], "cpu_target_utilization": last["cpu_target_utilization"]}, sort_keys=True))
+    print(json.dumps({"result": "OBSERVATION", "acceptance_scope": "requires_identity_bound_lifecycle_orchestrator", "check": "queue_scale_up_cap_downscale_floor_api_fixed", "workers": args.workers, "peak_replicas": peak_hpa, "peak_ready_workers": peak_ready, "hpa_min": last["min"], "hpa_max": last["max"], "ready_workers": last["deployment_replicas"], "api_replicas": api_now["desired"], "cpu_metrics_present": last["cpu_metrics_present"], "peak_cpu_average_utilization": peak_cpu, "cpu_target_utilization": last["cpu_target_utilization"], "cpu_scale_evidence": "OBSERVATION"}, sort_keys=True))
 
 
 def main():
@@ -1202,6 +1836,7 @@ def main():
     state.add_argument("--thread-id", required=True)
     state.add_argument("--expected-value", required=True)
     state.add_argument("--request-timeout", type=float, default=45)
+    state.add_argument("--scenario-stdin", action="store_true")
     state.set_defaults(func=state_command)
     health = subparsers.add_parser("health", help="verify the Agent Server health endpoint")
     health.add_argument("--request-timeout", type=float, default=10)
@@ -1209,6 +1844,7 @@ def main():
     cleanup = subparsers.add_parser("delete-thread", help="delete one exact qualification thread")
     cleanup.add_argument("--thread-id", required=True)
     cleanup.add_argument("--request-timeout", type=float, default=45)
+    cleanup.add_argument("--scenario-stdin", action="store_true")
     cleanup.set_defaults(func=delete_thread_command)
     active = subparsers.add_parser("submit-active", help="start a bounded active queue run for replacement testing")
     active.add_argument("--graph-id", default="contract_fixture")
@@ -1249,6 +1885,7 @@ def main():
     product_load.add_argument("--hpa", required=True)
     product_load.add_argument("--deployment", required=True)
     product_load.add_argument("--api-deployment", required=True)
+    product_load.add_argument("--expected-context", required=True)
     product_load.add_argument("--workers", type=int, default=4)
     product_load.add_argument("--run-mode", choices=("sync", "queued"), default="queued")
     product_load.add_argument(
@@ -1269,6 +1906,7 @@ def main():
     scale.add_argument("--hpa", required=True)
     scale.add_argument("--deployment", required=True)
     scale.add_argument("--api-deployment", required=True)
+    scale.add_argument("--expected-context", required=True)
     scale.add_argument("--graph-id", default="contract_fixture")
     scale.add_argument("--workers", type=int, default=4)
     scale.add_argument("--cpu-seconds", type=int, default=10)

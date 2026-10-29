@@ -2,13 +2,17 @@
 """Run bounded, sanitized Launchpad lifecycle qualification phases.
 
 Product scenarios are accepted only on stdin and are forwarded to the runtime
-qualification helper without being written or printed. Kubernetes Secret data
-is never read. Mutating phases require LAS_LIFECYCLE_MUTATIONS_CONFIRMED=true.
+qualification helper without being written or printed. Dependency endpoint
+Secret values are decoded only in memory to bind a Service to its configured
+hostname and are never printed. Mutating phases require
+LAS_LIFECYCLE_MUTATIONS_CONFIRMED=true.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -27,11 +31,19 @@ DNS_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 WORKLOAD_KINDS = {"deployment", "statefulset"}
+SECRET_KEY = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
 RUNTIME_HELPER = pathlib.Path(__file__).with_name("las-runtime-acceptance.py")
 
 
 class LifecycleError(RuntimeError):
     pass
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward a qualification API key to a redirect destination."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
 
 
 def name(value: str, label: str) -> str:
@@ -76,15 +88,23 @@ def value_sha256(value: Any) -> str:
 
 
 class Kubectl:
-    def __init__(self, namespace: str, binary: str, timeout: int, dry_run: bool):
+    def __init__(
+        self,
+        namespace: str,
+        binary: str,
+        timeout: int,
+        dry_run: bool,
+        context: str | None = None,
+    ):
         self.namespace = name(namespace, "namespace")
         self.binary = binary
         self.timeout = timeout
         self.dry_run = dry_run
+        self.context_args = ["--context", safe_text(context, "Kubernetes context")] if context else []
         self.planned: list[list[str]] = []
 
     def _run(self, args: list[str], *, mutate: bool = False) -> str:
-        command = [self.binary, "-n", self.namespace, *args]
+        command = [self.binary, *self.context_args, "-n", self.namespace, *args]
         if self.dry_run:
             self.planned.append(command[1:])
             return ""
@@ -102,8 +122,8 @@ class Kubectl:
             raise LifecycleError("a bounded kubectl operation failed; inspect cluster events separately") from None
         return completed.stdout
 
-    def _run_global(self, args: list[str]) -> str:
-        command = [self.binary, *args]
+    def _run_global(self, args: list[str], *, scoped: bool = True) -> str:
+        command = [self.binary, *(self.context_args if scoped else []), *args]
         if self.dry_run:
             self.planned.append(command[1:])
             return ""
@@ -162,9 +182,9 @@ class Kubectl:
 
     def current_context(self) -> str:
         if self.dry_run:
-            self._run_global(["config", "current-context"])
+            self._run_global(["config", "current-context"], scoped=False)
             return ""
-        return self._run_global(["config", "current-context"]).strip()
+        return self._run_global(["config", "current-context"], scoped=False).strip()
 
     def list_pods(self, namespace: str, selector: str) -> list[dict[str, Any]]:
         if not selector or not re.fullmatch(r"[A-Za-z0-9_.\-/=,]+", selector):
@@ -181,6 +201,31 @@ class Kubectl:
         items = value.get("items") if isinstance(value, dict) else None
         if not isinstance(items, list):
             raise LifecycleError("kubectl returned an invalid Pod list")
+        return [item for item in items if isinstance(item, dict)]
+
+    def list_endpoint_slices(self, namespace: str, service: str) -> list[dict[str, Any]]:
+        service = name(service, "Service")
+        raw = self._run_global(
+            [
+                "-n",
+                name(namespace, "namespace"),
+                "get",
+                "endpointslices.discovery.k8s.io",
+                "-l",
+                f"kubernetes.io/service-name={service}",
+                "-o",
+                "json",
+            ]
+        )
+        if self.dry_run:
+            return []
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            raise LifecycleError("kubectl returned invalid EndpointSlice-list JSON") from None
+        items = value.get("items") if isinstance(value, dict) else None
+        if not isinstance(items, list):
+            raise LifecycleError("kubectl returned an invalid EndpointSlice list")
         return [item for item in items if isinstance(item, dict)]
 
     def restart(self, kind: str, resource_name: str) -> None:
@@ -224,13 +269,23 @@ class StableLASAccess:
         parsed = urllib.parse.urlsplit(self.base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise LifecycleError("LAS_BASE_URL must be an http(s) URL")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise LifecycleError("LAS_BASE_URL cannot contain credentials, query, or fragment")
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise LifecycleError("LAS_BASE_URL cannot contain credentials, path, query, or fragment")
         if parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.port is None:
             raise LifecycleError("script-managed port-forward requires a loopback LAS_BASE_URL with a port")
         if parsed.scheme != "http":
             raise LifecycleError("script-managed port-forward requires an http LAS_BASE_URL")
         self.local_port = parsed.port
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _RejectRedirects(),
+        )
 
     def close(self) -> None:
         if self.process is not None:
@@ -248,11 +303,13 @@ class StableLASAccess:
         if api_key:
             request.add_header("X-Api-Key", api_key)
         try:
-            with urllib.request.urlopen(request, timeout=3) as response:
+            with self.opener.open(request, timeout=3) as response:
                 body = response.read(65537)
                 if response.status != 200 or len(body) > 65536:
                     return False
                 value = json.loads(body)
+                if api_key and api_key in json.dumps(value, ensure_ascii=False):
+                    return False
                 return isinstance(value, dict) and value.get("ok") is True
         except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
             return False
@@ -274,6 +331,7 @@ class StableLASAccess:
             self.process = subprocess.Popen(
                 [
                     self.kubectl.binary,
+                    *self.kubectl.context_args,
                     "-n",
                     self.kubectl.namespace,
                     "port-forward",
@@ -301,7 +359,12 @@ class StableLASAccess:
 
 
 def selector_for_deployment(value: dict[str, Any]) -> str:
-    labels = value.get("spec", {}).get("selector", {}).get("matchLabels")
+    selector = value.get("spec", {}).get("selector", {})
+    if not isinstance(selector, dict):
+        raise LifecycleError("Deployment selector must be an object")
+    if "matchExpressions" in selector:
+        raise LifecycleError("Deployment selector matchExpressions are not supported")
+    labels = selector.get("matchLabels")
     if not isinstance(labels, dict) or not labels:
         raise LifecycleError("Deployment has no exact matchLabels selector")
     parts = []
@@ -385,21 +448,209 @@ def deployment_image_identity(
     }
 
 
+def api_service_identity(
+    kubectl: Kubectl,
+    namespace: str,
+    service_name: str,
+    expected_service_uid: str,
+    service_port: int,
+    deployment_name: str,
+    expected_image: str,
+    expected_digest: str,
+) -> dict[str, Any]:
+    """Bind product traffic to the exact Service and attested API Pod set."""
+    service_name = name(service_name, "LAS API Service")
+    expected_service_uid = safe_text(expected_service_uid, "LAS API Service UID")
+    if kubectl.dry_run:
+        kubectl.get_in_namespace(namespace, "service", service_name)
+        kubectl.get_in_namespace(namespace, "deployment", deployment_name)
+        kubectl.list_endpoint_slices(namespace, service_name)
+        return {
+            "namespace": namespace,
+            "service": service_name,
+            "service_uid": expected_service_uid,
+            "deployment": deployment_name,
+            "dry_run": True,
+        }
+
+    service = kubectl.get_in_namespace(namespace, "service", service_name)
+    if service.get("metadata", {}).get("uid") != expected_service_uid:
+        raise LifecycleError("LAS API Service UID did not match the approved identity")
+    service_selector = service.get("spec", {}).get("selector")
+    deployment = kubectl.get_in_namespace(namespace, "deployment", deployment_name)
+    deployment_selector = deployment.get("spec", {}).get("selector", {})
+    if not isinstance(deployment_selector, dict):
+        raise LifecycleError("LAS API Deployment selector must be an object")
+    if "matchExpressions" in deployment_selector:
+        raise LifecycleError("LAS API Deployment selector matchExpressions are not supported")
+    match_labels = deployment_selector.get("matchLabels")
+    if not isinstance(service_selector, dict) or not service_selector or service_selector != match_labels:
+        raise LifecycleError("LAS API Service selector did not match the attested Deployment")
+    service_ports = [
+        item
+        for item in service.get("spec", {}).get("ports", [])
+        if isinstance(item, dict) and item.get("port") == service_port
+    ]
+    if len(service_ports) != 1:
+        raise LifecycleError("LAS API Service omitted the approved port")
+
+    containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    matching_names = {
+        container.get("name")
+        for container in containers
+        if isinstance(container, dict)
+        and container.get("image") == expected_image
+        and isinstance(container.get("name"), str)
+    }
+    if not matching_names:
+        raise LifecycleError("LAS API Service Deployment omitted the attested agent image")
+    target_port = service_ports[0].get("targetPort", service_port)
+    matching_container_ports = [
+        port
+        for container in containers
+        if isinstance(container, dict) and container.get("name") in matching_names
+        for port in container.get("ports", [])
+        if isinstance(port, dict)
+    ]
+    if isinstance(target_port, int) and not isinstance(target_port, bool):
+        resolved_target_ports = {
+            port.get("containerPort")
+            for port in matching_container_ports
+            if port.get("containerPort") == target_port
+        }
+    elif isinstance(target_port, str) and target_port:
+        resolved_target_ports = {
+            port.get("containerPort")
+            for port in matching_container_ports
+            if port.get("name") == target_port
+            and isinstance(port.get("containerPort"), int)
+            and not isinstance(port.get("containerPort"), bool)
+        }
+    else:
+        resolved_target_ports = set()
+    if len(resolved_target_ports) != 1:
+        raise LifecycleError(
+            "LAS API Service targetPort did not resolve to the attested agent container"
+        )
+    resolved_target_port = next(iter(resolved_target_ports))
+    pods = kubectl.list_pods(namespace, selector_for_deployment(deployment))
+    pod_refs: set[tuple[str, str]] = set()
+    for pod in pods:
+        metadata = pod.get("metadata", {})
+        pod_name = metadata.get("name")
+        pod_uid = metadata.get("uid")
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or not isinstance(pod_uid, str)
+            or not pod_uid
+        ):
+            raise LifecycleError("an attested API Pod omitted its name or UID")
+        matching_statuses = [
+            status
+            for status in pod.get("status", {}).get("containerStatuses", [])
+            if isinstance(status, dict) and status.get("name") in matching_names
+        ]
+        if not matching_statuses or any(
+            not isinstance(status.get("imageID"), str)
+            or expected_digest not in status["imageID"]
+            for status in matching_statuses
+        ):
+            raise LifecycleError("an API Service Pod did not resolve to the attested image digest")
+        pod_refs.add((pod_name, pod_uid))
+    if not pod_refs:
+        raise LifecycleError("LAS API Service had no attested API Pods")
+
+    endpoint_refs: set[tuple[str, str]] = set()
+    slices = kubectl.list_endpoint_slices(namespace, service_name)
+    if not slices:
+        raise LifecycleError("LAS API Service had no EndpointSlices")
+    for endpoint_slice in slices:
+        slice_metadata = endpoint_slice.get("metadata", {})
+        if slice_metadata.get("labels", {}).get("kubernetes.io/service-name") != service_name:
+            raise LifecycleError("LAS API EndpointSlice did not name the approved Service")
+        owners = slice_metadata.get("ownerReferences", [])
+        if not any(
+            isinstance(owner, dict)
+            and owner.get("kind") == "Service"
+            and owner.get("name") == service_name
+            and owner.get("uid") == expected_service_uid
+            for owner in owners
+        ):
+            raise LifecycleError("LAS API EndpointSlice was not owned by the approved Service UID")
+        slice_ports = {
+            item.get("port")
+            for item in endpoint_slice.get("ports", [])
+            if isinstance(item, dict)
+        }
+        if resolved_target_port not in slice_ports:
+            raise LifecycleError(
+                "LAS API EndpointSlice port did not match the attested agent container"
+            )
+        for endpoint in endpoint_slice.get("endpoints", []):
+            if not isinstance(endpoint, dict):
+                raise LifecycleError("LAS API EndpointSlice contained an invalid endpoint")
+            if endpoint.get("conditions", {}).get("ready") is not True:
+                raise LifecycleError("LAS API Service contained a non-ready endpoint")
+            target = endpoint.get("targetRef", {})
+            target_name = target.get("name")
+            target_uid = target.get("uid")
+            if (
+                target.get("kind") != "Pod"
+                or target.get("namespace") not in (None, namespace)
+                or not isinstance(target_name, str)
+                or not target_name
+                or not isinstance(target_uid, str)
+                or not target_uid
+            ):
+                raise LifecycleError("LAS API endpoint did not target an identified Pod")
+            endpoint_refs.add((target_name, target_uid))
+    if endpoint_refs != pod_refs:
+        raise LifecycleError("LAS API Service endpoints did not match the attested API Pod set")
+    return {
+        "namespace": namespace,
+        "service": service_name,
+        "service_uid": expected_service_uid,
+        "deployment": deployment_name,
+        "target_port": resolved_target_port,
+        "verified_endpoints": len(endpoint_refs),
+    }
+
+
 def helm_release_identity(
     binary: str,
     namespace: str,
     release: str,
+    chart_name: str,
     chart_version: str,
     timeout: int,
     dry_run: bool,
+    context: str | None = None,
 ) -> dict[str, Any]:
     namespace = name(namespace, "Helm namespace")
     release = name(release, "Helm release")
+    chart_name = name(chart_name, "Helm chart name")
     if dry_run:
-        return {"namespace": namespace, "release": release, "chart_version": chart_version, "dry_run": True}
+        return {
+            "namespace": namespace,
+            "release": release,
+            "chart_name": chart_name,
+            "chart_version": chart_version,
+            "dry_run": True,
+        }
     try:
         completed = subprocess.run(
-            [binary, "list", "--namespace", namespace, "--filter", f"^{release}$", "--output", "json"],
+            [
+                binary,
+                *(["--kube-context", safe_text(context, "Kubernetes context")] if context else []),
+                "list",
+                "--namespace",
+                namespace,
+                "--filter",
+                f"^{release}$",
+                "--output",
+                "json",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -411,7 +662,7 @@ def helm_release_identity(
     if not isinstance(values, list) or len(values) != 1 or values[0].get("name") != release:
         raise LifecycleError("exact Helm release identity was not found")
     chart = values[0].get("chart")
-    if not isinstance(chart, str) or not chart.endswith("-" + chart_version):
+    if chart != chart_name + "-" + chart_version:
         raise LifecycleError("live Helm chart version does not match the declared identity")
     if values[0].get("status") != "deployed":
         raise LifecycleError("Helm release is not deployed")
@@ -475,6 +726,183 @@ def workload_snapshot(kubectl: Kubectl, kind: str, resource_name: str) -> dict[s
     }
     assert_ready(snapshot)
     return snapshot
+
+
+def _agent_container_references_secret_key(
+    pod_spec: dict[str, Any],
+    container: dict[str, Any],
+    secret_name: str,
+    secret_key: str,
+) -> bool:
+    for source in container.get("envFrom", []):
+        if not isinstance(source, dict):
+            continue
+        secret_ref = source.get("secretRef")
+        if isinstance(secret_ref, dict) and secret_ref.get("name") == secret_name:
+            return True
+    for variable in container.get("env", []):
+        if not isinstance(variable, dict):
+            continue
+        value_from = variable.get("valueFrom")
+        secret_ref = value_from.get("secretKeyRef") if isinstance(value_from, dict) else None
+        if (
+            isinstance(secret_ref, dict)
+            and secret_ref.get("name") == secret_name
+            and secret_ref.get("key") == secret_key
+        ):
+            return True
+
+    mounted = {
+        item.get("name"): item
+        for item in container.get("volumeMounts", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+
+    def exposes_key(items: Any, mount: dict[str, Any]) -> bool:
+        if mount.get("subPathExpr") is not None:
+            return False
+        key_path = secret_key
+        if items is not None:
+            if not isinstance(items, list):
+                return False
+            matching = [
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("key") == secret_key
+            ]
+            if not matching:
+                return False
+            path = matching[0].get("path")
+            if not isinstance(path, str) or not path:
+                return False
+            key_path = path
+        sub_path = mount.get("subPath")
+        return sub_path is None or sub_path == key_path
+
+    for volume in pod_spec.get("volumes", []):
+        if not isinstance(volume, dict):
+            continue
+        mount = mounted.get(volume.get("name"))
+        if not isinstance(mount, dict):
+            continue
+        direct = volume.get("secret", {})
+        if (
+            isinstance(direct, dict)
+            and direct.get("secretName") == secret_name
+            and exposes_key(direct.get("items"), mount)
+        ):
+            return True
+        projected_volume = volume.get("projected")
+        sources = projected_volume.get("sources", []) if isinstance(projected_volume, dict) else []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            projected = source.get("secret", {})
+            if (
+                isinstance(projected, dict)
+                and projected.get("name") == secret_name
+                and exposes_key(projected.get("items"), mount)
+            ):
+                return True
+    return False
+
+
+def dependency_binding(
+    kubectl: Kubectl,
+    namespace: str,
+    kind: str,
+    workload_name: str,
+    service_name: str,
+    expected_service_uid: str,
+    secret_name: str,
+    secret_key: str,
+    api_deployment: str,
+    queue_deployment: str,
+    expected_agent_image: str,
+) -> dict[str, str | bool]:
+    """Bind a recovery target to the exact LAS endpoint and workload references."""
+    if kubectl.dry_run:
+        for resource_kind, resource_name in (
+            (kind, workload_name),
+            ("service", service_name),
+            ("secret", secret_name),
+            ("deployment", api_deployment),
+            ("deployment", queue_deployment),
+        ):
+            kubectl.get(resource_kind, resource_name)
+        return {
+            "service": service_name,
+            "service_uid": expected_service_uid,
+            "endpoint_reference_planned": True,
+            "dry_run": True,
+        }
+
+    workload = kubectl.get(kind, workload_name)
+    service = kubectl.get("service", service_name)
+    service_uid = service.get("metadata", {}).get("uid")
+    if service_uid != expected_service_uid:
+        raise LifecycleError("dependency Service UID did not match the approved identity")
+    selector = service.get("spec", {}).get("selector")
+    workload_selector_spec = workload.get("spec", {}).get("selector", {})
+    if not isinstance(workload_selector_spec, dict):
+        raise LifecycleError("dependency workload selector must be an object")
+    if "matchExpressions" in workload_selector_spec:
+        raise LifecycleError("dependency workload selector matchExpressions are not supported")
+    workload_selector = workload_selector_spec.get("matchLabels")
+    labels = workload.get("spec", {}).get("template", {}).get("metadata", {}).get("labels", {})
+    if (
+        not isinstance(selector, dict)
+        or not selector
+        or selector != workload_selector
+        or not isinstance(labels, dict)
+        or any(labels.get(key) != value for key, value in selector.items())
+    ):
+        raise LifecycleError("dependency Service selector did not bind the selected workload")
+
+    secret = kubectl.get("secret", secret_name)
+    encoded = secret.get("data", {}).get(secret_key)
+    if not isinstance(encoded, str) or not encoded:
+        raise LifecycleError("dependency Secret omitted the required endpoint key")
+    try:
+        connection_url = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        raise LifecycleError("dependency endpoint Secret was not valid encoded text") from None
+    parsed = urllib.parse.urlsplit(connection_url)
+    approved_hosts = {
+        service_name,
+        f"{service_name}.{namespace}",
+        f"{service_name}.{namespace}.svc",
+        f"{service_name}.{namespace}.svc.cluster.local",
+    }
+    if not parsed.scheme or parsed.hostname not in approved_hosts:
+        raise LifecycleError("dependency endpoint Secret did not target the approved Service")
+
+    for deployment_name in (api_deployment, queue_deployment):
+        deployment = kubectl.get("deployment", deployment_name)
+        pod_spec = deployment.get("spec", {}).get("template", {}).get("spec", {})
+        agent_containers = [
+            container
+            for container in pod_spec.get("containers", [])
+            if isinstance(container, dict) and container.get("image") == expected_agent_image
+        ]
+        if not agent_containers:
+            raise LifecycleError("LAS workload omitted the attested agent-image container")
+        if any(
+            not _agent_container_references_secret_key(
+                pod_spec, container, secret_name, secret_key
+            )
+            for container in agent_containers
+        ):
+            raise LifecycleError(
+                "attested LAS agent container did not reference the approved dependency endpoint"
+            )
+
+    return {
+        "service": service_name,
+        "service_uid": expected_service_uid,
+        "endpoint_reference_bound": True,
+        "workload_bound": True,
+    }
 
 
 def hpa_snapshot(
@@ -593,7 +1021,38 @@ def protocol_helper_timeout(scenario: dict[str, Any], phase_timeout: int, reques
     return total
 
 
-def run_helper(command: list[str], scenario: dict[str, Any], timeout: int) -> dict[str, Any]:
+def product_load_helper_args(
+    namespace: str,
+    hpa: str,
+    queue: str,
+    api: str,
+    expected_context: str,
+    workers: int,
+    scale_expectation: str,
+    phase_timeout: int,
+    request_timeout: int,
+) -> list[str]:
+    """Build the nested load command with the already-attested cluster context."""
+    return [
+        "product-load",
+        "--namespace", namespace,
+        "--hpa", hpa,
+        "--deployment", queue,
+        "--api-deployment", api,
+        "--expected-context", expected_context,
+        "--workers", str(workers),
+        "--scale-expectation", scale_expectation,
+        "--timeout", str(phase_timeout),
+        "--request-timeout", str(request_timeout),
+    ]
+
+
+def run_helper(
+    command: list[str],
+    scenario: dict[str, Any],
+    timeout: int,
+    accepted_results: set[str] | None = None,
+) -> dict[str, Any]:
     environment = os.environ.copy()
     try:
         completed = subprocess.run(
@@ -612,16 +1071,19 @@ def run_helper(command: list[str], scenario: dict[str, Any], timeout: int) -> di
         value = json.loads(completed.stdout)
     except json.JSONDecodeError:
         raise LifecycleError("runtime qualification helper returned invalid evidence") from None
-    if not isinstance(value, dict) or value.get("result") != "PASS":
-        raise LifecycleError("runtime qualification helper did not report PASS")
+    expected_results = accepted_results or {"PASS"}
+    if not isinstance(value, dict) or value.get("result") not in expected_results:
+        raise LifecycleError("runtime qualification helper did not report an expected result")
     return value
 
 
 def validate_load_scale_evidence(result: dict[str, Any], expectation: str) -> str:
     """Classify HPA evidence without treating an observation-only run as acceptance."""
+    if result.get("result") != "OBSERVATION":
+        raise LifecycleError("product-load evidence was not a standalone observation")
     observation = result.get("scale_observation")
     if expectation == "required":
-        if observation != "scaled":
+        if observation != "cpu_scale_pass":
             raise LifecycleError("required HPA scale-up was not present in product-load evidence")
         return "PASS"
     if expectation == "none":
@@ -664,15 +1126,15 @@ def validate_upgrade_transition(
 def run_installer(installer: str, config: str, timeout: int) -> None:
     installer_path = pathlib.Path(installer)
     config_path = pathlib.Path(config)
-    if not installer_path.is_file() or not os.access(installer_path, os.X_OK):
-        raise LifecycleError("installer must be an executable file")
+    if not installer_path.is_file() or not os.access(installer_path, os.R_OK):
+        raise LifecycleError("installer must be a readable file")
     if not config_path.is_file() or not os.access(config_path, os.R_OK):
         raise LifecycleError("upgrade config must be a readable file")
     environment = os.environ.copy()
     environment.update({"AUTO_APPROVE": "true", "CONFIG_FILE": str(config_path)})
     try:
         subprocess.run(
-            [str(installer_path), "install", "--silent"],
+            ["bash", str(installer_path), "install", "--silent"],
             check=True,
             capture_output=True,
             text=True,
@@ -700,6 +1162,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--operator-image-digest", required=True)
     parser.add_argument("--agent-image", required=True)
     parser.add_argument("--agent-image-digest", required=True)
+    parser.add_argument("--recorded-mpr44-agent-digest")
+    parser.add_argument("--chart-name", required=True)
     parser.add_argument("--chart-version", required=True)
     parser.add_argument("--chart-sha256", required=True)
     parser.add_argument("--helm-release", required=True)
@@ -712,11 +1176,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--restart-api", action="store_true")
     parser.add_argument("--restart-queue", action="store_true")
     parser.add_argument("--postgres-workload")
+    parser.add_argument("--postgres-service")
+    parser.add_argument("--postgres-service-uid")
+    parser.add_argument("--postgres-secret")
+    parser.add_argument("--postgres-secret-key", default="postgres_connection_url")
     parser.add_argument("--redis-workload")
+    parser.add_argument("--redis-service")
+    parser.add_argument("--redis-service-uid")
+    parser.add_argument("--redis-secret")
+    parser.add_argument("--redis-secret-key", default="redis_connection_url")
     parser.add_argument("--upgrade-config")
+    parser.add_argument("--pre-upgrade-agent-image")
+    parser.add_argument("--pre-upgrade-agent-image-digest")
+    parser.add_argument("--pre-upgrade-chart-version")
     parser.add_argument("--post-upgrade-api-template-sha256")
     parser.add_argument("--post-upgrade-queue-template-sha256")
     parser.add_argument("--api-service")
+    parser.add_argument("--api-service-uid")
     parser.add_argument("--api-service-port", type=int, default=2024)
     parser.add_argument(
         "--installer",
@@ -750,9 +1226,15 @@ def main() -> int:
         helm_release = name(args.helm_release, "Helm release")
         require_digest(args.operator_image_digest, "operator image digest")
         require_digest(args.agent_image_digest, "agent image digest")
+        if args.recorded_mpr44_agent_digest:
+            require_digest(
+                args.recorded_mpr44_agent_digest,
+                "recorded MPR-44 agent image digest",
+            )
         require_sha256_hex(args.chart_sha256, "chart sha256")
         safe_text(args.operator_image, "operator image")
         safe_text(args.agent_image, "agent image")
+        name(args.chart_name, "chart name")
         safe_text(args.chart_version, "chart version")
         safe_text(args.runtime_version, "runtime version")
         safe_text(args.graph_id, "graph ID")
@@ -771,13 +1253,70 @@ def main() -> int:
         if not 1 <= args.api_service_port <= 65535:
             raise LifecycleError("API Service port must be between 1 and 65535")
 
-        if args.upgrade_config:
-            if not args.post_upgrade_api_template_sha256 or not args.post_upgrade_queue_template_sha256:
+        dependency_options: dict[str, tuple[str, Any, Any, Any, Any, Any]] = {
+            "postgres": (
+                "PostgreSQL",
+                args.postgres_workload,
+                args.postgres_service,
+                args.postgres_service_uid,
+                args.postgres_secret,
+                args.postgres_secret_key,
+            ),
+            "redis": (
+                "Redis",
+                args.redis_workload,
+                args.redis_service,
+                args.redis_service_uid,
+                args.redis_secret,
+                args.redis_secret_key,
+            ),
+        }
+        for role, values in dependency_options.items():
+            label, workload, service, service_uid, secret, secret_key = values
+            if workload and not all((service, service_uid, secret, secret_key)):
                 raise LifecycleError(
-                    "--upgrade-config requires exact post-upgrade API and queue Pod template sha256 values"
+                    f"--{role}-workload requires exact Service UID and endpoint Secret binding"
                 )
+            if any((service, service_uid, secret)) and not workload:
+                raise LifecycleError(f"{label} dependency binding requires its workload")
+            if workload:
+                workload_ref(workload, label)
+                name(service, f"{label} Service")
+                safe_text(service_uid, f"{label} Service UID")
+                name(secret, f"{label} Secret")
+                if not SECRET_KEY.fullmatch(secret_key):
+                    raise LifecycleError(f"{label} Secret key has an unsafe format")
+
+        if args.upgrade_config:
+            if (
+                not args.pre_upgrade_agent_image
+                or not args.pre_upgrade_agent_image_digest
+                or not args.post_upgrade_api_template_sha256
+                or not args.post_upgrade_queue_template_sha256
+            ):
+                raise LifecycleError(
+                    "--upgrade-config requires exact pre-upgrade image/digest and post-upgrade Pod template sha256 values"
+                )
+            safe_text(args.pre_upgrade_agent_image, "pre-upgrade agent image")
+            require_digest(args.pre_upgrade_agent_image_digest, "pre-upgrade agent image digest")
+            if args.pre_upgrade_chart_version:
+                safe_text(args.pre_upgrade_chart_version, "pre-upgrade chart version")
             require_sha256_hex(args.post_upgrade_api_template_sha256, "post-upgrade API Pod template sha256")
             require_sha256_hex(args.post_upgrade_queue_template_sha256, "post-upgrade queue Pod template sha256")
+
+        lifecycle_acceptance_phases = any(
+            (
+                args.restart_api,
+                args.restart_queue,
+                args.postgres_workload,
+                args.redis_workload,
+                args.upgrade_config,
+            )
+        )
+        if lifecycle_acceptance_phases and not args.dry_run and not args.run_protocol:
+            raise LifecycleError(
+                "live upgrade/restart/recovery acceptance requires --run-protocol and a trusted scenario"
+            )
 
         selected_mutation = any(
             (
@@ -803,10 +1342,14 @@ def main() -> int:
             raise LifecycleError("scenario graph_id does not match the recorded graph identity")
         if scenario is not None:
             scenario = cleanup_scenario(scenario)
-            if not args.api_service:
+            if not args.api_service or not args.api_service_uid:
                 raise LifecycleError(
-                    "--api-service is required for protocol/load qualification so traffic uses the verified cluster"
+                    "--api-service and --api-service-uid are required for protocol/load qualification"
                 )
+            name(args.api_service, "LAS API Service")
+            safe_text(args.api_service_uid, "LAS API Service UID")
+        elif args.api_service or args.api_service_uid:
+            raise LifecycleError("LAS API Service identity requires a protocol/load scenario")
         if args.run_load and scenario is not None:
             load_case = scenario.get("load_case")
             if not isinstance(load_case, dict):
@@ -814,14 +1357,27 @@ def main() -> int:
             if load_case.get("expected_outcome", "success") != "success":
                 raise LifecycleError("load_case must expect a successful product run")
 
-        kubectl = Kubectl(namespace, args.kubectl, args.phase_timeout, args.dry_run)
-        actual_context = kubectl.current_context()
-        namespace_object = kubectl.get_namespace()
-        actual_namespace_uid = namespace_object.get("metadata", {}).get("uid") if not args.dry_run else ""
-        if not args.dry_run and actual_context != args.expected_context:
-            raise LifecycleError("current Kubernetes context does not match --expected-context")
-        if not args.dry_run and actual_namespace_uid != args.namespace_uid:
-            raise LifecycleError("namespace UID does not match --namespace-uid")
+        kubectl = Kubectl(
+            namespace,
+            args.kubectl,
+            args.phase_timeout,
+            args.dry_run,
+            args.expected_context,
+        )
+        def verify_cluster_scope() -> None:
+            actual_context = kubectl.current_context()
+            namespace_object = kubectl.get_namespace()
+            actual_namespace_uid = (
+                namespace_object.get("metadata", {}).get("uid")
+                if not args.dry_run
+                else ""
+            )
+            if not args.dry_run and actual_context != args.expected_context:
+                raise LifecycleError("current Kubernetes context does not match --expected-context")
+            if not args.dry_run and actual_namespace_uid != args.namespace_uid:
+                raise LifecycleError("namespace UID does not match --namespace-uid")
+
+        verify_cluster_scope()
 
         access = StableLASAccess(
             kubectl,
@@ -830,8 +1386,6 @@ def main() -> int:
             args.phase_timeout,
             args.dry_run,
         ) if scenario is not None else None
-        if access is not None:
-            access.refresh()
 
         def hpa_state() -> dict[str, Any]:
             return hpa_snapshot(
@@ -856,8 +1410,12 @@ def main() -> int:
                 raise LifecycleError("queue Deployment and HPA replica status are not stable")
             return snapshot
 
-        def live_identity() -> dict[str, Any]:
-            return {
+        def live_identity(
+            agent_image: str,
+            agent_digest: str,
+            chart_version: str,
+        ) -> dict[str, Any]:
+            identity = {
                 "operator": deployment_image_identity(
                     kubectl,
                     operator_namespace,
@@ -869,28 +1427,58 @@ def main() -> int:
                     kubectl,
                     namespace,
                     api,
-                    args.agent_image,
-                    args.agent_image_digest,
+                    agent_image,
+                    agent_digest,
                     api_one=True,
                 ),
                 "queue": deployment_image_identity(
                     kubectl,
                     namespace,
                     queue,
-                    args.agent_image,
-                    args.agent_image_digest,
+                    agent_image,
+                    agent_digest,
                 ),
                 "helm": helm_release_identity(
                     args.helm,
                     helm_namespace,
                     helm_release,
-                    args.chart_version,
+                    args.chart_name,
+                    chart_version,
                     args.phase_timeout,
                     args.dry_run,
+                    args.expected_context,
                 ),
             }
+            if access is not None:
+                assert args.api_service is not None and args.api_service_uid is not None
+                identity["api_service"] = api_service_identity(
+                    kubectl,
+                    namespace,
+                    args.api_service,
+                    args.api_service_uid,
+                    args.api_service_port,
+                    api,
+                    agent_image,
+                    agent_digest,
+                )
+            return identity
 
         before_stack = stack_snapshot()
+        pre_upgrade_agent_image = args.pre_upgrade_agent_image or args.agent_image
+        pre_upgrade_agent_digest = args.pre_upgrade_agent_image_digest or args.agent_image_digest
+        pre_upgrade_chart_version = args.pre_upgrade_chart_version or args.chart_version
+        mpr44_gate = "NOT_RUN; DIGEST-BOUND EXTERNAL CALLER RERUN REQUIRED"
+        if args.recorded_mpr44_agent_digest:
+            mpr44_gate = (
+                "DIGEST_MATCH_ONLY; EXTERNAL CALLER RESULT NOT INGESTED"
+                if args.recorded_mpr44_agent_digest == args.agent_image_digest
+                else "NOT_RUN; RECORDED DIGEST DOES NOT MATCH DECLARED AGENT DIGEST"
+            )
+        before_live_identity = live_identity(
+            pre_upgrade_agent_image,
+            pre_upgrade_agent_digest,
+            pre_upgrade_chart_version,
+        )
         evidence: dict[str, Any] = {
             "result": "PASS",
             "identity": {
@@ -899,6 +1487,7 @@ def main() -> int:
                     "operator_image_digest": args.operator_image_digest,
                     "agent_image": args.agent_image,
                     "agent_image_digest": args.agent_image_digest,
+                    "chart_name": args.chart_name,
                     "chart_version": args.chart_version,
                     "chart_sha256": args.chart_sha256,
                     "runtime_version": args.runtime_version,
@@ -910,10 +1499,11 @@ def main() -> int:
                     "namespace": namespace,
                     "namespace_uid": args.namespace_uid,
                 },
+                "verified_live_before_calls": before_live_identity,
             },
             "external_gates": {
                 "MPR-131": "KNOWN_FAIL",
-                "MPR-44_EXTERNAL_SLIM_EDGE": "PASS_ON_RECORDED_IMMUTABLE_DIGESTS",
+                "MPR-44_EXTERNAL_SLIM_EDGE": mpr44_gate,
                 "INSTALLED_AITK_CALLER_ORIGIN": "NOT_RUN",
                 "MPR-48": "REQUIRED_FOR_TIMEOUT_CANCELLATION_ACCEPTANCE",
                 "in_flight_replacement": "NOT_CLAIMED_BY_THIS_ORCHESTRATOR",
@@ -923,7 +1513,18 @@ def main() -> int:
             "phases": [],
         }
 
-        def protocol_phase(phase_name: str) -> dict[str, Any]:
+        if access is not None:
+            # The API/queue/chart identities are verified above before the
+            # health probe is allowed to attach LAS_API_KEY to any request.
+            access.refresh()
+
+        def protocol_phase(
+            phase_name: str,
+            agent_image: str = args.agent_image,
+            agent_digest: str = args.agent_image_digest,
+            chart_version: str = args.chart_version,
+        ) -> dict[str, Any]:
+            verified_identity = live_identity(agent_image, agent_digest, chart_version)
             started = time.monotonic()
             result = run_helper(
                 [
@@ -934,13 +1535,30 @@ def main() -> int:
                 scenario,
                 protocol_helper_timeout(scenario, args.phase_timeout, args.request_timeout),
             )
-            return {"name": phase_name, "duration_seconds": round(time.monotonic() - started, 3), "evidence": result}
+            return {
+                "name": phase_name,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "verified_identity_before_call": verified_identity,
+                "evidence": result,
+            }
 
         if args.run_protocol and scenario is not None and not args.dry_run:
-            evidence["phases"].append(protocol_phase("product_protocol_before_lifecycle"))
+            evidence["phases"].append(
+                protocol_phase(
+                    "product_protocol_before_lifecycle",
+                    pre_upgrade_agent_image,
+                    pre_upgrade_agent_digest,
+                    pre_upgrade_chart_version,
+                )
+            )
 
         if args.run_load and scenario is not None and not args.dry_run:
             started = time.monotonic()
+            load_identity = live_identity(
+                pre_upgrade_agent_image,
+                pre_upgrade_agent_digest,
+                pre_upgrade_chart_version,
+            )
             load_case = scenario.get("load_case")
             # The scenario was validated before any cluster access.
             assert isinstance(load_case, dict)
@@ -951,24 +1569,26 @@ def main() -> int:
                 "cleanup_threads": True,
             }
             result = run_helper(
-                [
-                    "product-load",
-                    "--namespace", namespace,
-                    "--hpa", hpa,
-                    "--deployment", queue,
-                    "--api-deployment", api,
-                    "--workers", str(args.workers),
-                    "--scale-expectation", args.load_scale_expectation,
-                    "--timeout", str(args.phase_timeout),
-                    "--request-timeout", str(args.request_timeout),
-                ],
+                product_load_helper_args(
+                    namespace,
+                    hpa,
+                    queue,
+                    api,
+                    args.expected_context,
+                    args.workers,
+                    args.load_scale_expectation,
+                    args.phase_timeout,
+                    args.request_timeout,
+                ),
                 load_scenario,
                 args.phase_timeout + args.request_timeout,
+                {"OBSERVATION"},
             )
             evidence["phases"].append(
                 {
                     "name": "representative_load",
                     "duration_seconds": round(time.monotonic() - started, 3),
+                    "verified_identity_before_call": load_identity,
                     "scale_expectation": args.load_scale_expectation,
                     "hpa_scale_acceptance": validate_load_scale_evidence(
                         result, args.load_scale_expectation
@@ -982,11 +1602,14 @@ def main() -> int:
                 evidence["phases"].append({"name": "supported_installer_upgrade", "dry_run": True})
             else:
                 before = stack_snapshot()
+                verify_cluster_scope()
                 run_installer(args.installer, args.upgrade_config, args.phase_timeout)
+                # The installer is allowed to run kubectl internally. Rebind
+                # every subsequent read/mutation to the approved target before
+                # touching either rollout or product traffic.
+                verify_cluster_scope()
                 kubectl.rollout_status(api)
                 kubectl.rollout_status(queue)
-                if access is not None:
-                    access.refresh()
                 after = stack_snapshot()
                 validate_upgrade_transition(
                     before,
@@ -994,7 +1617,21 @@ def main() -> int:
                     args.post_upgrade_api_template_sha256,
                     args.post_upgrade_queue_template_sha256,
                 )
-                phase = {"name": "supported_installer_upgrade", "before": before, "after": after}
+                post_upgrade_identity = live_identity(
+                    args.agent_image,
+                    args.agent_image_digest,
+                    args.chart_version,
+                )
+                if access is not None:
+                    # Do not send the API key to the replacement until its
+                    # configured and running digest has been verified.
+                    access.refresh()
+                phase = {
+                    "name": "supported_installer_upgrade",
+                    "before": before,
+                    "after": after,
+                    "verified_identity_before_call": post_upgrade_identity,
+                }
                 if args.run_protocol and scenario is not None:
                     phase["verification"] = protocol_phase("post_upgrade_product_protocol")
                 evidence["phases"].append(phase)
@@ -1005,35 +1642,88 @@ def main() -> int:
         ):
             if resource_name:
                 before = workload_snapshot(kubectl, kind, resource_name)
+                verify_cluster_scope()
                 kubectl.restart(kind, resource_name)
+                replacement_identity = live_identity(
+                    args.agent_image,
+                    args.agent_image_digest,
+                    args.chart_version,
+                )
                 if phase_name == "restart_api" and access is not None:
                     access.refresh()
                 after = workload_snapshot(kubectl, kind, resource_name)
                 if not args.dry_run and before.get("revision") == after.get("revision"):
                     raise LifecycleError(f"{phase_name} did not advance the workload revision")
-                phase = {"name": phase_name, "before": before, "after": after}
+                phase = {
+                    "name": phase_name,
+                    "before": before,
+                    "after": after,
+                    "verified_identity_before_call": replacement_identity,
+                }
                 if args.run_protocol and scenario is not None and not args.dry_run:
                     phase["verification"] = protocol_phase(f"post_{phase_name}_product_protocol")
                 evidence["phases"].append(phase)
 
-        for phase_name, reference in (
-            ("recover_postgres", args.postgres_workload),
-            ("recover_redis", args.redis_workload),
+        for phase_name, reference, service, service_uid, secret, secret_key in (
+            (
+                "recover_postgres",
+                args.postgres_workload,
+                args.postgres_service,
+                args.postgres_service_uid,
+                args.postgres_secret,
+                args.postgres_secret_key,
+            ),
+            (
+                "recover_redis",
+                args.redis_workload,
+                args.redis_service,
+                args.redis_service_uid,
+                args.redis_secret,
+                args.redis_secret_key,
+            ),
         ):
             if reference:
                 kind, resource_name = workload_ref(reference, phase_name)
+                binding = dependency_binding(
+                    kubectl,
+                    namespace,
+                    kind,
+                    resource_name,
+                    service,
+                    service_uid,
+                    secret,
+                    secret_key,
+                    api,
+                    queue,
+                    args.agent_image,
+                )
                 before = workload_snapshot(kubectl, kind, resource_name)
+                verify_cluster_scope()
                 kubectl.restart(kind, resource_name)
                 after = workload_snapshot(kubectl, kind, resource_name)
                 if not args.dry_run and before.get("revision") == after.get("revision"):
                     raise LifecycleError(f"{phase_name} did not advance the workload revision")
-                phase = {"name": phase_name, "before": before, "after": after}
+                phase = {
+                    "name": phase_name,
+                    "dependency_binding": binding,
+                    "before": before,
+                    "after": after,
+                    "verified_identity_before_call": live_identity(
+                        args.agent_image,
+                        args.agent_image_digest,
+                        args.chart_version,
+                    ),
+                }
                 if args.run_protocol and scenario is not None and not args.dry_run:
                     phase["verification"] = protocol_phase(f"post_{phase_name}_product_protocol")
                 evidence["phases"].append(phase)
 
         evidence["after"] = stack_snapshot()
-        evidence["identity"]["verified_live"] = live_identity()
+        evidence["identity"]["verified_live_after_phases"] = live_identity(
+            args.agent_image,
+            args.agent_image_digest,
+            args.chart_version,
+        )
         if args.dry_run:
             evidence["dry_run"] = True
             evidence["planned_kubectl"] = kubectl.planned

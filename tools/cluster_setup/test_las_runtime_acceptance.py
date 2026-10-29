@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import subprocess
 import sys
 import types
 import unittest
@@ -49,6 +50,8 @@ class ProductProtocolClient:
         if method == "DELETE":
             self.deleted.append(path)
             return 204, b"", "application/json"
+        if method == "GET" and path == "/threads/thread-1":
+            return 404, b"", "application/json"
         if method == "POST" and "/runs" in path:
             self.payloads.append(payload)
             if self.failure_status is not None:
@@ -96,8 +99,85 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             with self.subTest(document=document), self.assertRaises(ValueError):
                 las.strict_json_loads(document)
 
+    def test_graph_response_does_not_accept_echoed_user_input(self):
+        snapshot = {
+            "values": {
+                "messages": [
+                    {"role": "user", "content": "expected-marker"},
+                    {"role": "assistant", "content": "actual-output"},
+                ]
+            }
+        }
+        self.assertNotIn("expected-marker", las.graph_response_strings(snapshot))
+        self.assertIn("actual-output", las.graph_response_strings(snapshot))
+        self.assertEqual(
+            las.graph_response_strings(snapshot, ["messages"]),
+            ["actual-output"],
+        )
+
+    def test_graph_response_does_not_accept_nested_transport_envelopes(self):
+        for key in ("input", "context", "request", "metadata", "checkpoint", "config"):
+            with self.subTest(key=key):
+                snapshot = {"values": {key: {"response": "submitted-marker"}}}
+                self.assertNotIn(
+                    "submitted-marker", las.graph_response_strings(snapshot)
+                )
+
+    def test_response_paths_cannot_reenable_input_or_metadata_matching(self):
+        base = {
+            "name": "unsafe-path",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {"llm_config": {"model": "test-model"}},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync"],
+        }
+        for path in ("request", "input.response", "metadata.answer"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                las.AcceptanceError, "safe dotted paths"
+            ):
+                las.run_protocol_case(
+                    ProductProtocolClient(),
+                    "agent",
+                    dict(base, expected_response_paths=[path]),
+                    30,
+                )
+
+        echoed = dict(base, expected_response_paths=["echo.response"])
+        with self.assertRaisesRegex(
+            las.AcceptanceError, "already present in submitted input/context"
+        ):
+            las.run_protocol_case(ProductProtocolClient(), "agent", echoed, 30)
+
+        class CustomOutputClient(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/wait"):
+                    self.payloads.append(payload)
+                    self.marker = next(
+                        value for value in las.strings(payload["input"]) if value.startswith("marker-")
+                    )
+                    return 200, b'{"final":{"text":"generated-output"}}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        custom = dict(
+            base,
+            expected_response_values=["generated-output"],
+            expected_response_paths=["final.text"],
+        )
+        checks = las.run_protocol_case(CustomOutputClient(), "agent", custom, 30)
+        self.assertEqual(checks[0]["result"], "PASS")
+
+    def test_sensitive_scan_decodes_alternate_json_escapes(self):
+        with self.assertRaisesRegex(las.AcceptanceError, "sensitive marker"):
+            las.assert_sensitive_absent(
+                br'{"token":"\u0041\/B"}', ["A/B"], "escaped response"
+            )
+
     def test_restart_wrapper_disables_xtrace_before_reading_scenario(self):
         source = RESTART_SCRIPT.read_text(encoding="utf-8")
+        service_binding = source[
+            source.index("verify_api_service_binding()") : source.index("verify_helm_identity()")
+        ]
         self.assertLess(source.index("set +x"), source.index('scenario="$(cat)"'))
         self.assertIn('"service/${LAS_API_SERVICE}"', source)
         self.assertIn("expected.replace(placeholder, marker)", source)
@@ -113,18 +193,154 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         )
         self.assertIn("qualification_thread_cleanup=FAIL", source)
         self.assertIn("cleanup_failed != 0 && original_status == 0", source)
+        self.assertIn("identity_verification=PASS", source)
+        self.assertIn("EXPECTED_CONTAINER_NAMES", source)
+        self.assertIn("EXPECTED_CHART_NAME", source)
+        self.assertIn("LAS_API_SERVICE_UID", source)
+        self.assertIn('service.get("metadata", {}).get("uid")', service_binding)
+        self.assertIn('service.get("spec", {}).get("selector") != selector', service_binding)
+        self.assertIn('service_ports[0].get("targetPort", expected_port)', service_binding)
+        self.assertIn('port.get("containerPort") == target_port', service_binding)
+        self.assertIn('port.get("name") == target_port', service_binding)
+        self.assertIn('resolved_port not in {', service_binding)
+        self.assertIn('endpoint_slice.get("ports", [])', service_binding)
+        self.assertIn('uid not in pod_uids', service_binding)
+        self.assertIn('ready_targets.issubset(ready_pod_uids)', service_binding)
+        self.assertLess(
+            source.index("verify_api_service_binding || return 1"),
+            source.index('port-forward \\\n    "service/${LAS_API_SERVICE}"'),
+        )
+        self.assertGreaterEqual(source.count("--scenario-stdin"), 3)
+        self.assertIn("kubectl_scoped", source)
+        self.assertIn("verify_cluster_scope || return 1", source)
+        self.assertLess(
+            source.index("verify_stack_identity ||"),
+            source.index("start_port_forward\nresult="),
+        )
+        api_restart = source.index('restart_and_wait "$LAS_API_DEPLOYMENT"')
+        self.assertLess(
+            source.index("verify_stack_identity ||", api_restart),
+            source.index('check_states api_restart'),
+        )
 
     def test_rotation_wrapper_proves_data_change_and_preserves_hpa(self):
         source = ROTATION_SCRIPT.read_text(encoding="utf-8")
+        service_binding = source[
+            source.index("verify_api_service_binding()") : source.index("verify_secret_references()")
+        ]
         self.assertLess(source.index("set +x"), source.index('scenario="$(cat)"'))
-        self.assertIn("secret_data_hash", source)
+        self.assertIn("secret_key_hash", source)
+        self.assertIn("langgraph_cloud_license_key", source)
+        self.assertIn("postgres_connection_url", source)
+        self.assertIn("redis_connection_url", source)
+        self.assertIn('encoded_value = value.get(key)', source)
+        self.assertNotIn('json.dumps(value, sort_keys=True', source)
+        self.assertIn('kubectl_scoped', source)
+        self.assertIn('--kube-context "$LAS_EXPECTED_KUBE_CONTEXT"', source)
         self.assertIn("initial_hashes", source)
         self.assertIn("queue_hpa_ownership_preserved=PASS", source)
         self.assertIn("product_protocol_before_rotation", source)
         self.assertIn("refresh_las_access", source)
-        self.assertIn('LAS_API_SERVICE\n', source)
+        self.assertIn('LAS_API_SERVICE LAS_API_SERVICE_UID\n', source)
         self.assertIn('kill -0 "$PORT_FORWARD_PID"', source)
         self.assertIn('case["cleanup"] = True', source)
+        self.assertIn("ProxyHandler({})", source)
+        self.assertIn("managed_secret_workload_references=PASS", source)
+        self.assertIn("live_helm_release_identity=PASS", source)
+        self.assertIn("EXPECTED_CONTAINER_NAMES", source)
+        self.assertIn("EXPECTED_CHART_NAME", source)
+        self.assertIn('service.get("metadata", {}).get("uid")', service_binding)
+        self.assertIn('service.get("spec", {}).get("selector") != selector', service_binding)
+        self.assertIn('service_ports[0].get("targetPort", expected_port)', service_binding)
+        self.assertIn('port.get("containerPort") == target_port', service_binding)
+        self.assertIn('port.get("name") == target_port', service_binding)
+        self.assertIn('resolved_port not in {', service_binding)
+        self.assertIn('endpoint_slice.get("ports", [])', service_binding)
+        self.assertIn('uid not in pod_uids', service_binding)
+        self.assertIn('ready_targets.issubset(ready_pod_uids)', service_binding)
+        self.assertIn('container.get("image") == os.environ["EXPECTED_IMAGE"]', source)
+        secret_check = source[source.index("verify_secret_references()") : source.index("verify_helm_identity()")]
+        self.assertIn("def exposes_key(items, mount, secret_key):", secret_check)
+        self.assertIn('mount.get("subPathExpr") is not None', secret_check)
+        self.assertIn('sub_path = mount.get("subPath")', secret_check)
+        self.assertIn("sub_path is None or sub_path == key_path", secret_check)
+        self.assertIn("references_secret_key(pod, container, name, key)", secret_check)
+        self.assertNotIn('initContainers', secret_check)
+        embedded_start = secret_check.index("python3 -c '") + len("python3 -c '")
+        embedded = secret_check[embedded_start : secret_check.rindex("\n'")]
+        base_mount = {"name": "credentials", "mountPath": "/var/run/credentials"}
+        pod_spec = {
+            "containers": [{
+                "name": "agent",
+                "image": "agent-image",
+                "volumeMounts": [dict(base_mount, subPath="unrelated")],
+            }],
+            "volumes": [{
+                "name": "credentials",
+                "secret": {
+                    "secretName": "auth-secret",
+                    "items": [{"key": "license-key", "path": "license"}],
+                },
+            }],
+        }
+        deployments = {
+            "items": [
+                {"metadata": {"name": name}, "spec": {"template": {"spec": pod_spec}}}
+                for name in ("api", "queue")
+            ]
+        }
+        env = {
+            "EXPECTED_SECRET_NAMES": "auth-secret",
+            "EXPECTED_SECRET_KEYS": "license-key",
+            "EXPECTED_IMAGE": "agent-image",
+            "EXPECTED_DEPLOYMENTS": "api,queue",
+        }
+        hidden_key = subprocess.run(
+            [sys.executable, "-c", embedded],
+            input=json.dumps(deployments),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(hidden_key.returncode, 0)
+        for deployment in deployments["items"]:
+            deployment["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0][
+                "subPath"
+            ] = "license"
+        exposed_key = subprocess.run(
+            [sys.executable, "-c", embedded],
+            input=json.dumps(deployments),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(exposed_key.returncode, 0, exposed_key.stderr)
+        self.assertLess(
+            source.index("phase=verify_initial_immutable_identity"),
+            source.index("phase=product_before_rotation"),
+        )
+        self.assertLess(
+            source.index("phase=verify_operator_before_initial_secret_install"),
+            source.index("phase=install_initial"),
+        )
+        initial_verify = source.index("phase=verify_initial_immutable_identity")
+        initial_refresh = source.index("refresh_las_access", initial_verify)
+        self.assertLess(initial_verify, initial_refresh)
+        rotated_verify = source.index("phase=verify_rotated_immutable_identity")
+        rotated_refresh = source.index("refresh_las_access", rotated_verify)
+        self.assertLess(rotated_verify, rotated_refresh)
+        initial_install = source.index('install_config "$LAS_INITIAL_CONFIG"')
+        self.assertLess(
+            source.index("verify_cluster_scope", initial_install),
+            source.index('wait_rollout "$LAS_API_DEPLOYMENT"', initial_install),
+        )
+        rotated_install = source.index('install_config "$LAS_ROTATED_CONFIG"')
+        self.assertLess(
+            source.index("verify_cluster_scope", rotated_install),
+            source.index("changed=0", rotated_install),
+        )
 
     def test_persistence_marker_must_be_inside_graph_values(self):
         marker = "run-marker"
@@ -188,6 +404,81 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         self.assertEqual(checks[0]["http_status"], 422)
         self.assertEqual(client.deleted, ["/threads/thread-1"])
 
+    def test_failure_contract_rejects_success_statuses(self):
+        base = {
+            "name": "invalid-failure-contract",
+            "input": {"request": "invalid"},
+            "expected_state_values": [],
+            "expected_response_values": [],
+            "run_modes": ["sync"],
+            "expected_outcome": "failure",
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "only 4xx/5xx"):
+            las.run_protocol_case(
+                ProductProtocolClient(),
+                "agent",
+                dict(base, expected_http_statuses=[204]),
+                30,
+            )
+        with self.assertRaisesRegex(las.AcceptanceError, "only failed terminal"):
+            las.run_protocol_case(
+                ProductProtocolClient(),
+                "agent",
+                dict(base, expected_run_statuses=["success"]),
+                30,
+            )
+
+    def test_sse_terminal_contract_cannot_invert_or_omit_completion(self):
+        base = {
+            "name": "invalid-sse-contract",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["stream"],
+            "expected_sse_event_sequence": ["metadata", "values", "updates"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "require a success terminal"):
+            las.run_protocol_case(
+                ProductProtocolClient(),
+                "agent",
+                dict(
+                    base,
+                    expected_sse_terminal_event="updates",
+                    expected_sse_terminal_status="error",
+                ),
+                30,
+            )
+        with self.assertRaisesRegex(las.AcceptanceError, "requires a non-empty"):
+            las.run_protocol_case(
+                ProductProtocolClient(),
+                "agent",
+                dict(base, expected_sse_completion="terminal_event"),
+                30,
+            )
+
+    def test_queued_success_requires_expected_graph_output(self):
+        class EchoOnlyState(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "GET" and path.endswith("/state"):
+                    body = {
+                        "values": {
+                            "messages": [{"role": "user", "content": self.marker}]
+                        }
+                    }
+                    return 200, json.dumps(body).encode(), "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        case = {
+            "name": "echo-only",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {"llm_config": {"model": "test-model"}},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["queued"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "queued graph output omitted"):
+            las.run_protocol_case(EchoOnlyState(), "agent", case, 30)
+
     def test_sse_sequence_and_terminal_status_are_enforced(self):
         client = ProductProtocolClient(mode="stream")
         case = {
@@ -206,6 +497,152 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         self.assertEqual(checks[0]["sse_events"], ["metadata", "values", "updates"])
         self.assertEqual(checks[0]["terminal_status"], "success")
 
+    def test_sse_can_use_versioned_eof_after_values_contract(self):
+        class EofStreamClient(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/stream"):
+                    self.payloads.append(payload)
+                    self.marker = next(
+                        value for value in las.strings(payload["input"]) if value.startswith("marker-")
+                    )
+                    body = (
+                        'event: metadata\ndata: {"run_id":"run-1"}\n\n'
+                        f'event: values\ndata: {{"response":"{self.marker}"}}\n\n'
+                    ).encode()
+                    return 200, body, "text/event-stream"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        case = {
+            "name": "launchpad-stream-eof",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {"llm_config": {"model": "test-model"}},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["stream"],
+            "expected_sse_event_sequence": ["metadata", "values"],
+            "expected_sse_completion": "eof_after_expected_values",
+        }
+        checks = las.run_protocol_case(EofStreamClient(), "agent", case, 30)
+        self.assertEqual(checks[0]["sse_events"], ["metadata", "values"])
+        self.assertEqual(checks[0]["terminal_status"], "success")
+        self.assertEqual(checks[0]["run_id"], "run-1")
+
+    def test_derived_credential_is_scanned_when_explicit_list_is_incomplete(self):
+        class LeakingCredentialClient(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/wait"):
+                    return 200, b'{"response":"derived-secret"}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        case = {
+            "name": "derived-secret",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {
+                "llm_config": {"model": "test-model", "api_key": "derived-secret"}
+            },
+            "sensitive_values": ["unrelated-canary"],
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "sensitive marker"):
+            las.run_protocol_case(LeakingCredentialClient(), "agent", case, 30)
+
+    def test_direct_credential_context_requires_declared_canary(self):
+        case = {
+            "name": "missing-canary",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {
+                "llm_config": {"model": "test-model", "api_key": "derived-secret"}
+            },
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "requires sensitive_values"):
+            las.run_protocol_case(ProductProtocolClient(), "agent", case, 30)
+
+    def test_runtime_api_key_is_always_in_the_scan_set(self):
+        class LeakingAPIKeyClient(ProductProtocolClient):
+            api_key = "runtime-api-secret"
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/wait"):
+                    return 200, b'{"response":"runtime-api-secret"}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        case = {
+            "name": "api-key-scan",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {"llm_config": {"model": "test-model"}},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "sensitive marker"):
+            las.run_protocol_case(LeakingAPIKeyClient(), "agent", case, 30)
+
+    def test_thread_create_response_is_scanned_before_any_product_run(self):
+        class LeakingCreateClient(ProductProtocolClient):
+            api_key = "runtime-api-secret"
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path == "/threads":
+                    return (
+                        201,
+                        b'{"thread_id":"thread-1","leak":"runtime-api-secret"}',
+                        "application/json",
+                    )
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        case = {
+            "name": "create-scan",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {"llm_config": {"model": "test-model"}},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "thread creation response"):
+            client = LeakingCreateClient()
+            las.run_protocol_case(client, "agent", case, 30)
+        self.assertEqual(client.deleted, ["/threads/thread-1"])
+
+    def test_malformed_thread_create_cleans_one_recoverable_identifier(self):
+        class MalformedCreateClient(ProductProtocolClient):
+            def __init__(self, body):
+                super().__init__()
+                self.body = body
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path == "/threads":
+                    return 202, self.body, "application/json"
+                if method == "GET" and path == "/threads/thread-recovered":
+                    return 404, b"", "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        for body in (
+            b'{"thread_id":"thread-recovered"',
+            b'{"thread_id":"thread-recovered","thread_id":"thread-recovered"}',
+        ):
+            with self.subTest(body=body):
+                client = MalformedCreateClient(body)
+                with self.assertRaises(las.AcceptanceError):
+                    las.create_thread(client)
+                self.assertEqual(client.deleted, ["/threads/thread-recovered"])
+
+    def test_ambiguous_thread_create_does_not_delete_an_identifier(self):
+        class AmbiguousCreateClient(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path == "/threads":
+                    return 201, b'{"thread_id":"thread-1","nested":{"thread_id":"thread-2"}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        client = AmbiguousCreateClient()
+        with self.assertRaisesRegex(las.AcceptanceError, "invalid JSON"):
+            las.create_thread(client)
+        self.assertEqual(client.deleted, [])
+
     def test_cleanup_runs_when_product_assertion_fails(self):
         client = ProductProtocolClient()
         case = {
@@ -220,6 +657,36 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(las.AcceptanceError, "expected result"):
             las.run_protocol_case(client, "agent", case, 30)
         self.assertEqual(client.deleted, ["/threads/thread-1"])
+
+    def test_later_mode_failure_cleans_previously_retained_threads(self):
+        class SecondModeFailure(ProductProtocolClient):
+            def __init__(self):
+                super().__init__()
+                self.thread_count = 0
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path == "/threads":
+                    self.thread_count += 1
+                    return 201, json.dumps({"thread_id": f"thread-{self.thread_count}"}).encode(), "application/json"
+                if method == "POST" and path.endswith("/runs"):
+                    return 500, b"", "application/json"
+                if method == "GET" and path in ("/threads/thread-1", "/threads/thread-2"):
+                    return 404, b"", "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        client = SecondModeFailure()
+        case = {
+            "name": "later-mode-failure",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "context": {"llm_config": {"model": "test-model"}},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync", "queued"],
+            "cleanup": False,
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "queued run returned"):
+            las.run_protocol_case(client, "agent", case, 30)
+        self.assertCountEqual(client.deleted, ["/threads/thread-1", "/threads/thread-2"])
 
     def test_success_requires_marker_in_request_and_expected_state(self):
         missing_request_marker = {
@@ -308,9 +775,240 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         self.assertTrue(verified["thread_cleaned"])
         self.assertEqual(verify_client.deleted, ["/threads/thread-1"])
 
+    def test_active_product_paths_derive_credentials_when_canary_list_is_incomplete(self):
+        scenario = {
+            "graph_id": "agent",
+            "sensitive_values": ["unrelated-canary"],
+            "active_run_case": {
+                "name": "active-product",
+                "input": {"messages": [{"role": "user", "content": "hold {{RUN_MARKER}}"}]},
+                "context": {"llm_config": {"api_key": "derived-secret"}},
+                "expected_state_values": ["{{RUN_MARKER}}"],
+            },
+        }
+
+        class SubmitLeakClient(ActiveProductClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/runs"):
+                    return 201, b'{"run_id":"run-1","leak":"derived-secret"}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        with patch.object(las, "LASClient", return_value=SubmitLeakClient()), patch(
+            "sys.stdin", io.StringIO(json.dumps(scenario))
+        ), self.assertRaisesRegex(las.AcceptanceError, "sensitive marker"):
+            las.submit_product_active_command(
+                SimpleNamespace(running_timeout=30, request_timeout=30)
+            )
+
+        class VerifyLeakClient(ActiveProductClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "GET" and "/runs/" in path:
+                    return 200, b'{"status":"success","leak":"derived-secret"}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        marker = "mpr-qualification-" + "a" * 32
+        verify_args = SimpleNamespace(
+            thread_id="thread-1",
+            run_id="run-1",
+            marker=marker,
+            run_timeout=30,
+            request_timeout=30,
+            cleanup=True,
+        )
+        with patch.object(las, "LASClient", return_value=VerifyLeakClient()), patch(
+            "sys.stdin", io.StringIO(json.dumps(scenario))
+        ), self.assertRaisesRegex(las.AcceptanceError, "sensitive marker"):
+            las.verify_product_active_command(verify_args)
+
     def test_delete_thread_command_rejects_unsafe_identifier(self):
         with self.assertRaisesRegex(las.AcceptanceError, "safe runtime identifier"):
             las.delete_thread_command(SimpleNamespace(thread_id="id\nsecret", request_timeout=30))
+
+    def test_thread_cleanup_waits_for_confirmed_absence(self):
+        class EventuallyDeleted:
+            def __init__(self):
+                self.reads = 0
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "DELETE":
+                    return 202, b"", "application/json"
+                self.reads += 1
+                return (200 if self.reads == 1 else 404), b"", "application/json"
+
+        client = EventuallyDeleted()
+        with patch.object(las.time, "sleep"):
+            las.delete_thread(client, "thread-1")
+        self.assertEqual(client.reads, 2)
+
+    def test_thread_cleanup_scans_delete_and_confirmation_bodies(self):
+        class CleanupLeak:
+            def __init__(self, leak_on):
+                self.leak_on = leak_on
+                self.reads = 0
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "DELETE":
+                    body = b'{"leak":"credential-value"}' if self.leak_on == "delete" else b"{}"
+                    return 202, body, "application/json"
+                self.reads += 1
+                body = (
+                    b'{"leak":"credential-value"}'
+                    if self.leak_on == "get" and self.reads == 1
+                    else b"{}"
+                )
+                return (200 if self.reads == 1 else 404), body, "application/json"
+
+        for leak_on in ("delete", "get"):
+            with self.subTest(leak_on=leak_on):
+                client = CleanupLeak(leak_on)
+                with patch.object(las.time, "sleep"), self.assertRaisesRegex(
+                    las.AcceptanceError, "sensitive marker"
+                ):
+                    las.delete_thread(client, "thread-1", ["credential-value"])
+                self.assertEqual(client.reads, 2)
+
+    def test_health_command_scans_runtime_api_key(self):
+        class HealthLeak:
+            api_key = "runtime-api-secret"
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                return 200, b'{"ok":true,"leak":"runtime-api-secret"}', "application/json"
+
+        with patch.object(las, "LASClient", return_value=HealthLeak()), self.assertRaisesRegex(
+            las.AcceptanceError, "sensitive marker"
+        ):
+            las.health_command(SimpleNamespace(request_timeout=5))
+
+    def test_sse_eof_run_id_must_come_from_consistent_metadata(self):
+        values_only = b'event: values\ndata: {"run_id":"run-1","response":"ok"}\n\n'
+        with self.assertRaisesRegex(las.AcceptanceError, "omitted a run ID"):
+            las.sse_run_id(values_only, [])
+
+        conflicting = (
+            b'event: metadata\ndata: {"run_id":"run-1"}\n\n'
+            b'event: metadata\ndata: {"run_id":"run-2"}\n\n'
+        )
+        with self.assertRaisesRegex(las.AcceptanceError, "conflicting run IDs"):
+            las.sse_run_id(conflicting, [])
+
+    def test_nested_status_cannot_satisfy_terminal_contract(self):
+        body = (
+            b'event: values\ndata: {"response":"expected"}\n\n'
+            b'event: updates\ndata: {"node":{"status":"success"}}\n\n'
+        )
+        with self.assertRaisesRegex(las.AcceptanceError, "unexpected status"):
+            las.assert_sse(
+                body,
+                ["expected"],
+                [],
+                ["values", "updates"],
+                "updates",
+                "success",
+            )
+        self.assertIsNone(las.authoritative_status({"input": {"status": "error"}}))
+
+        contradictory = (
+            b'event: values\ndata: {"response":"expected"}\n\n'
+            b'event: updates\ndata: {"status":"error"}\n\n'
+            b'event: updates\ndata: {"status":"success"}\n\n'
+        )
+        with self.assertRaisesRegex(las.AcceptanceError, "failed terminal status"):
+            las.assert_sse(
+                contradictory,
+                ["expected"],
+                [],
+                ["values", "updates"],
+                "updates",
+                "success",
+            )
+
+        class FailedSyncClient(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/wait"):
+                    self.payloads.append(payload)
+                    marker = next(
+                        value for value in las.strings(payload["input"])
+                        if value.startswith("marker-")
+                    )
+                    return (
+                        200,
+                        json.dumps({"status": "error", "response": marker}).encode(),
+                        "application/json",
+                    )
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        success_case = {
+            "name": "contradictory-sync-success",
+            "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+            "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            "expected_response_values": ["marker-{{RUN_MARKER}}"],
+            "run_modes": ["sync"],
+        }
+        client = FailedSyncClient()
+        with self.assertRaisesRegex(las.AcceptanceError, "failed terminal status"):
+            las.run_protocol_case(client, "agent", success_case, 30)
+        self.assertEqual(client.deleted, ["/threads/thread-1"])
+
+        class NestedFailureClient(ProductProtocolClient):
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "POST" and path.endswith("/wait"):
+                    return 200, b'{"input":{"status":"error"}}', "application/json"
+                return super().request(method, path, payload, accept, allow_http_error)
+
+        failure_case = {
+            "name": "nested-status-failure",
+            "input": {"request": "invalid"},
+            "expected_state_values": [],
+            "expected_response_values": [],
+            "run_modes": ["sync"],
+            "expected_outcome": "failure",
+            "expected_run_statuses": ["error"],
+        }
+        with self.assertRaisesRegex(las.AcceptanceError, "unexpectedly succeeded"):
+            las.run_protocol_case(NestedFailureClient(), "agent", failure_case, 30)
+
+    def test_protocol_failure_cleans_prior_per_case_retained_thread(self):
+        class CleanupClient:
+            api_key = ""
+
+            def __init__(self):
+                self.deleted = []
+
+            def request(self, method, path, payload=None, accept="application/json", allow_http_error=False):
+                if method == "GET" and path == "/ok":
+                    return 200, b'{"ok":true}', "application/json"
+                if method == "DELETE":
+                    self.deleted.append(path)
+                    return 204, b"", "application/json"
+                if method == "GET" and path == "/threads/retained-1":
+                    return 404, b"", "application/json"
+                raise AssertionError((method, path))
+
+        scenario = {
+            "graph_id": "agent",
+            "cleanup_threads": True,
+            "cases": [
+                {"name": "retained", "input": {}, "cleanup": False},
+                {"name": "fails", "input": {}},
+            ],
+        }
+        retained = [{
+            "case": "retained",
+            "mode": "sync",
+            "thread_id": "retained-1",
+            "thread_cleaned": False,
+            "marker": "aip-qualification-" + "a" * 32,
+        }]
+        client = CleanupClient()
+        with patch.object(las, "LASClient", return_value=client), patch.object(
+            las,
+            "run_protocol_case",
+            side_effect=[retained, las.AcceptanceError("later case failed")],
+        ), patch("sys.stdin", io.StringIO(json.dumps(scenario))), self.assertRaisesRegex(
+            las.AcceptanceError, "later case failed"
+        ):
+            las.protocol_command(SimpleNamespace(request_timeout=5, run_timeout=5))
+        self.assertEqual(client.deleted, ["/threads/retained-1"])
 
     def test_post_completion_observation_captures_delayed_hpa_sample(self):
         args = SimpleNamespace(
@@ -318,6 +1016,7 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             hpa="queue-hpa",
             deployment="queue",
             api_deployment="api",
+            expected_context="approved-context",
             sample_interval=1,
         )
         observation = {
@@ -325,6 +1024,7 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             "desired": 2,
             "deployment_replicas": 2,
             "cpu_average_utilization": 95,
+            "cpu_target_utilization": 80,
         }
         samples = []
         with patch.object(las.time, "monotonic", side_effect=[0, 0, 0.5, 1.1]), patch.object(
@@ -365,6 +1065,7 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             hpa="queue-hpa",
             deployment="queue",
             api_deployment="api",
+            expected_context="approved-context",
             run_mode="queued",
             scale_expectation="observe",
         )
@@ -372,15 +1073,83 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         output = io.StringIO()
         with patch.dict("os.environ", {"LAS_DISPOSABLE_CLUSTER_CONFIRMED": "true", "LAS_BASE_URL": "http://127.0.0.1:2024"}), \
              patch.object(las, "read_scenario", return_value=scenario), \
-             patch.object(las, "hpa_observation", return_value=observation), \
-             patch.object(las, "deployment_replicas", return_value={"desired": 1, "ready": 1}), \
+             patch.object(las, "hpa_observation", return_value=observation) as hpa, \
+             patch.object(las, "deployment_replicas", return_value={"desired": 1, "ready": 1}) as deployment, \
              patch.object(las, "run_protocol_case", return_value=run_result), \
              patch("sys.stdout", output):
             las.product_load_command(args)
         result = json.loads(output.getvalue())
+        self.assertEqual(result["result"], "OBSERVATION")
+        self.assertEqual(
+            result["acceptance_scope"],
+            "requires_identity_bound_lifecycle_orchestrator",
+        )
         self.assertEqual(result["scale_observation"], "no_cpu_scale_observed")
+        self.assertEqual(result["cpu_scale_evidence"], "OBSERVATION")
+        self.assertFalse(result["cpu_trigger_observed"])
         self.assertEqual(result["completed_runs"], 2)
         self.assertEqual(result["api_replicas"], 1)
+        self.assertTrue(all(call.args[-1] == "approved-context" for call in hpa.call_args_list))
+        self.assertTrue(all(call.args[-1] == "approved-context" for call in deployment.call_args_list))
+
+    def test_product_load_cannot_claim_required_cpu_scale_from_replicas_alone(self):
+        scenario = {
+            "graph_id": "agent",
+            "case": {
+                "name": "load",
+                "input": {"messages": [{"role": "user", "content": "marker-{{RUN_MARKER}}"}]},
+                "context": {"llm_config": {"model": "test-model"}},
+                "expected_state_values": ["marker-{{RUN_MARKER}}"],
+            },
+        }
+        baseline = {
+            "min": 1,
+            "max": 3,
+            "desired": 1,
+            "current": 1,
+            "cpu_metrics_present": True,
+            "cpu_average_utilization": 20,
+            "cpu_target_utilization": 80,
+            "deployment_replicas": 1,
+        }
+        replica_growth = dict(
+            baseline,
+            desired=2,
+            current=2,
+            deployment_replicas=2,
+            cpu_average_utilization=50,
+        )
+        args = SimpleNamespace(
+            workers=1,
+            timeout=30,
+            request_timeout=30,
+            sample_interval=1,
+            post_completion_observation=0,
+            namespace="ns",
+            hpa="queue-hpa",
+            deployment="queue",
+            api_deployment="api",
+            expected_context="approved-context",
+            run_mode="queued",
+            scale_expectation="required",
+        )
+        run_result = [{"case": "load", "mode": "queued", "duration_seconds": 0.1}]
+        with patch.dict(
+            "os.environ",
+            {
+                "LAS_DISPOSABLE_CLUSTER_CONFIRMED": "true",
+                "LAS_BASE_URL": "http://127.0.0.1:2024",
+            },
+        ), patch.object(las, "read_scenario", return_value=scenario), patch.object(
+            las, "hpa_observation", side_effect=[baseline, replica_growth]
+        ), patch.object(
+            las, "deployment_replicas", return_value={"desired": 1, "ready": 1}
+        ), patch.object(
+            las, "run_protocol_case", return_value=run_result
+        ), self.assertRaisesRegex(
+            las.AcceptanceError, "causal HPA CPU evidence"
+        ):
+            las.product_load_command(args)
 
     def test_product_load_rejects_expected_failure_case(self):
         scenario = {
@@ -483,7 +1252,7 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             "expected_state_values": ["marker-{{RUN_MARKER}}"],
             "run_modes": ["stream"],
         }
-        with self.assertRaisesRegex(las.AcceptanceError, "explicit terminal"):
+        with self.assertRaisesRegex(las.AcceptanceError, "terminal_event or eof_after_expected_values"):
             las.run_protocol_case(ProductProtocolClient(), "agent", case, 30)
 
     def test_failed_case_reports_cleanup_failure(self):
@@ -533,6 +1302,23 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         with patch.object(las, "kubectl_json", side_effect=[hpa, deployment]):
             observation = las.hpa_observation("ns", "queue-hpa", "queue")
         self.assertEqual(observation["deployment_replicas"], 1)
+        stable = {
+            "min": 1,
+            "max": 3,
+            "current": 1,
+            "desired": 1,
+            "deployment_replicas": 1,
+        }
+        self.assertEqual(las.require_stable_hpa_baseline(stable), 1)
+        for unstable in (
+            dict(stable, desired=2),
+            dict(stable, deployment_replicas=2),
+            dict(stable, current=0, desired=0, deployment_replicas=0),
+        ):
+            with self.subTest(unstable=unstable), self.assertRaisesRegex(
+                las.AcceptanceError, "baseline"
+            ):
+                las.require_stable_hpa_baseline(unstable)
 
     def test_scale_waits_for_a_ready_replica_after_runs_finish(self):
         class CompletedFuture:
@@ -543,14 +1329,15 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
                 return None
 
         observations = iter([
-            {"current": 2, "desired": 2, "deployment_replicas": 1},
-            {"current": 2, "desired": 2, "deployment_replicas": 2},
+            {"current": 2, "desired": 2, "deployment_replicas": 1, "cpu_average_utilization": 90, "cpu_target_utilization": 80},
+            {"current": 2, "desired": 2, "deployment_replicas": 2, "cpu_average_utilization": 70, "cpu_target_utilization": 80},
         ])
         with patch.object(las.time, "monotonic", return_value=0), patch.object(las.time, "sleep"):
-            peak_hpa, peak_ready, _ = las.wait_for_ready_scale_up(
+            peak_hpa, peak_ready, _, peak_cpu = las.wait_for_ready_scale_up(
                 lambda: next(observations), [CompletedFuture()], 1, 1, 30
             )
         self.assertEqual((peak_hpa, peak_ready), (2, 2))
+        self.assertEqual(peak_cpu, 90)
 
     def test_desired_replicas_without_ready_worker_does_not_pass_scale_up(self):
         class CompletedFuture:
@@ -563,9 +1350,39 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         with patch.object(las.time, "monotonic", side_effect=[0, 0, 0, 2]), patch.object(las.time, "sleep"):
             with self.assertRaisesRegex(las.AcceptanceError, "ready worker"):
                 las.wait_for_ready_scale_up(
-                    lambda: {"current": 2, "desired": 2, "deployment_replicas": 1},
+                    lambda: {"current": 2, "desired": 2, "deployment_replicas": 1, "cpu_average_utilization": 90, "cpu_target_utilization": 80},
                     [CompletedFuture()], 1, 1, 1,
                 )
+
+    def test_ready_replica_growth_without_cpu_trigger_is_only_observation(self):
+        class CompletedFuture:
+            def done(self):
+                return True
+
+            def result(self):
+                return None
+
+        observation = {
+            "current": 2,
+            "desired": 2,
+            "deployment_replicas": 2,
+            "cpu_average_utilization": 50,
+            "cpu_target_utilization": 80,
+        }
+        with patch.object(las.time, "monotonic", side_effect=[0, 0, 0, 2]), patch.object(
+            las.time, "sleep"
+        ):
+            with self.assertRaisesRegex(las.AcceptanceError, "causal CPU evidence"):
+                las.wait_for_ready_scale_up(
+                    lambda: observation, [CompletedFuture()], 1, 1, 1
+                )
+
+    def test_kubectl_json_pins_the_expected_context(self):
+        completed = SimpleNamespace(stdout="{}")
+        with patch("subprocess.run", return_value=completed) as run:
+            las.kubectl_json("ns", "deployment", "queue", "approved-context")
+        command = run.call_args.args[0]
+        self.assertEqual(command[1:3], ["--context", "approved-context"])
 
     def test_product_result_requires_nonempty_expected_text(self):
         for expected in (None, "", "   "):
@@ -577,12 +1394,32 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             {"status": "Thinking", "response": "expected output"},
             {"status": "Completed", "result": "expected output"},
             {"status": "Completed", "message": "expected output"},
+            {"status": "Completed", "success": False, "response": "expected output"},
         ):
-            with self.subTest(event=event), self.assertRaisesRegex(AssertionError, "completed caller response"):
+            with self.subTest(event=event), self.assertRaises(product.QualificationError):
                 product.assert_expected_result([event], "expected output", "product case")
         product.assert_expected_result(
-            [{"status": "Completed", "response": "the expected output"}], "expected output", "product case"
+            [{"status": "Completed", "success": True, "response": "the expected output"}],
+            "expected output",
+            "product case",
         )
+        contradictory = (
+            [
+                {"status": "Error", "success": False},
+                {"status": "Completed", "success": True, "response": "expected output"},
+            ],
+            [
+                {"status": "Completed", "success": True, "response": "expected output"},
+                {"status": "Completed", "success": True, "response": "expected output"},
+            ],
+            [
+                {"status": "Completed", "success": True, "response": "expected output"},
+                {"status": "Thinking"},
+            ],
+        )
+        for events in contradictory:
+            with self.subTest(events=events), self.assertRaises(product.QualificationError):
+                product.assert_expected_result(events, "expected output", "product case")
 
     def test_product_scenario_keeps_mpr131_as_known_failure(self):
         base = {
@@ -594,15 +1431,36 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(product.ScenarioError, "KNOWN_FAIL"):
             product.validate_scenario(base)
 
+        credential_case = {
+            "cases": [{
+                "name": "credential-case",
+                "calls": [{
+                    "task_prompt": "test",
+                    "llm": {"provider": "test", "api_key": "synthetic"},
+                    "expected_text": "done",
+                }],
+            }]
+        }
+        with self.assertRaisesRegex(product.ScenarioError, "require sensitive_values"):
+            product.validate_scenario(credential_case)
+
+        credential_case["sensitive_values"] = ["unrelated-canary"]
+        credential_case["cases"][0]["check_state"] = False
+        with self.assertRaisesRegex(product.ScenarioError, "cannot disable state checks"):
+            product.validate_scenario(credential_case)
+        del credential_case["cases"][0]["check_state"]
+        _, derived = product.validate_scenario(credential_case)
+        self.assertIn("synthetic", derived)
+
     def test_product_structured_shape_supports_native_and_json_responses(self):
         shape = {"required": ["answer", "meta.count"], "types": {"answer": "string", "meta.count": "integer"}}
-        native = [{"status": "Completed", "response": {"answer": "ok", "meta": {"count": 1}}}]
-        encoded = [{"status": "Completed", "response": '{"answer":"ok","meta":{"count":1}}'}]
+        native = [{"status": "Completed", "success": True, "response": {"answer": "ok", "meta": {"count": 1}}}]
+        encoded = [{"status": "Completed", "success": True, "response": '{"answer":"ok","meta":{"count":1}}'}]
         product.assert_expected_shape(native, shape, "native")
         product.assert_expected_shape(encoded, shape, "encoded")
         with self.assertRaisesRegex(product.QualificationError, "structured response shape"):
             product.assert_expected_shape(
-                [{"status": "Completed", "response": {"answer": "ok", "meta": {"count": True}}}],
+                [{"status": "Completed", "success": True, "response": {"answer": "ok", "meta": {"count": True}}}],
                 shape,
                 "wrong type",
             )
@@ -700,8 +1558,16 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         async def create_agent(_tenant, _payload, _request):
             return SimpleNamespace(status_code=201, body=b'{"runtime_id":"assistant-id"}')
 
+        assistant_delete_count = 0
+
         async def delete_agent(_tenant, _assistant_id, _request):
-            return SimpleNamespace(status_code=200)
+            nonlocal assistant_delete_count
+            assistant_delete_count += 1
+            status = "DELETING" if assistant_delete_count == 1 else "AGENT_NOT_FOUND"
+            return SimpleNamespace(
+                status_code=200,
+                body=json.dumps({"status": status}).encode(),
+            )
 
         async def invoke(_tenant, _payload, _request_id):
             return 200, [{"status": "Error", "success": False, "http_error_code": 422}], {}
@@ -746,6 +1612,127 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         self.assertEqual(result["case_results"][0]["reported_error_status"], 422)
         self.assertEqual(len(deleted_thread_ids), 1)
         self.assertTrue(deleted_thread_ids[0].startswith("mapped:product-qualification:"))
+
+    def test_product_create_failures_cleanup_when_runtime_id_is_recoverable(self):
+        config = {
+            "cases": [{
+                "name": "mock",
+                "calls": [{"task_prompt": "test", "expected_text": "done"}],
+            }]
+        }
+
+        for status_code, malformed, expected in (
+            (201, False, RuntimeError),
+            (201, True, product.QualificationError),
+            (200, False, product.QualificationError),
+            (202, False, product.QualificationError),
+        ):
+            with self.subTest(status_code=status_code, malformed_create_response=malformed):
+                deleted = []
+
+                async def create_agent(_tenant, _payload, _request):
+                    body = (
+                        b'{"runtime_id":"assistant-id"'
+                        if malformed
+                        else b'{"runtime_id":"assistant-id"}'
+                    )
+                    return SimpleNamespace(status_code=status_code, body=body)
+
+                async def delete_agent(_tenant, assistant_id, _request):
+                    deleted.append(assistant_id)
+                    status = "DELETING" if len(deleted) == 1 else "AGENT_NOT_FOUND"
+                    return SimpleNamespace(
+                        status_code=200,
+                        body=json.dumps({"status": status}).encode(),
+                    )
+
+                def get_las_client():
+                    raise RuntimeError("client construction failed")
+
+                modules = {}
+                for module_name in (
+                    "slim_api", "slim_api.models", "slim_api.models.aws", "slim_api.routers",
+                    "slim_api.routers.las_agent", "slim_api.util", "slim_api.util.las_client",
+                    "slim_api.util.las_utils",
+                ):
+                    modules[module_name] = types.ModuleType(module_name)
+                    parent, _, child = module_name.rpartition(".")
+                    if parent:
+                        setattr(modules[parent], child, modules[module_name])
+                modules["slim_api.models.aws"].CreateAgentPayload = (
+                    lambda **kwargs: SimpleNamespace(**kwargs)
+                )
+                modules["slim_api.routers.las_agent"].create_agent = create_agent
+                modules["slim_api.routers.las_agent"].delete_agent = delete_agent
+                modules["slim_api.util.las_client"].get_las_client = get_las_client
+                modules["slim_api.util.las_utils"].get_proper_thread_id = lambda *_args: "thread"
+
+                with patch.dict(sys.modules, modules), patch(
+                    "sys.stdin", io.StringIO(json.dumps(config))
+                ), self.assertRaises(expected):
+                    asyncio.run(product.main())
+                self.assertEqual(deleted, ["assistant-id", "assistant-id"])
+
+    def test_product_create_recovery_is_unique_and_cleanup_failure_is_fatal(self):
+        self.assertIsNone(
+            product.recover_created_assistant_id(
+                b'{"runtime_id":"assistant-one","other":{"runtime_id":"assistant-two"}}'
+            )
+        )
+
+        config = {
+            "sensitive_values": ["create-leak"],
+            "cases": [{
+                "name": "mock",
+                "calls": [{"task_prompt": "test", "expected_text": "done"}],
+            }],
+        }
+
+        async def create_agent(_tenant, _payload, _request):
+            return SimpleNamespace(
+                status_code=201,
+                body=b'{"runtime_id":"assistant-id","leak":"create-leak"}',
+            )
+
+        async def delete_agent(_tenant, _assistant_id, _request):
+            return SimpleNamespace(status_code=500, body=b'{}')
+
+        modules = {}
+        for module_name in (
+            "slim_api", "slim_api.models", "slim_api.models.aws", "slim_api.routers",
+            "slim_api.routers.las_agent", "slim_api.util", "slim_api.util.las_client",
+            "slim_api.util.las_utils",
+        ):
+            modules[module_name] = types.ModuleType(module_name)
+            parent, _, child = module_name.rpartition(".")
+            if parent:
+                setattr(modules[parent], child, modules[module_name])
+        modules["slim_api.models.aws"].CreateAgentPayload = (
+            lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        modules["slim_api.routers.las_agent"].create_agent = create_agent
+        modules["slim_api.routers.las_agent"].delete_agent = delete_agent
+        modules["slim_api.util.las_client"].get_las_client = lambda: None
+        modules["slim_api.util.las_utils"].get_proper_thread_id = lambda *_args: "thread"
+
+        with patch.dict(sys.modules, modules), patch(
+            "sys.stdin", io.StringIO(json.dumps(config))
+        ), self.assertRaisesRegex(
+            product.QualificationError,
+            "assistant create validation failed and cleanup also failed",
+        ):
+            asyncio.run(product.main())
+
+    def test_product_state_keys_and_empty_shapes_cannot_prove_acceptance(self):
+        marker = "state-marker"
+        self.assertNotIn(marker, list(product.value_strings({marker: "unrelated"})))
+        with self.assertRaisesRegex(product.ScenarioError, "assert at least one"):
+            product.normalize_expectation(
+                {"expect": {"outcome": "success", "shape": {}}},
+                "empty shape",
+            )
+        with self.assertRaisesRegex(product.QualificationError, "did not assert"):
+            product.assert_expected_shape([], {}, "empty shape")
 
     def test_product_router_value_error_is_not_fabricated_as_validation(self):
         class Payload:
@@ -814,7 +1801,7 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         shape = {"required": ["value"], "types": {"value": "number"}}
         with self.assertRaisesRegex(product.QualificationError, "structured response shape"):
             product.assert_expected_shape(
-                [{"status": "Completed", "response": {"value": float("nan")}}],
+                [{"status": "Completed", "success": True, "response": {"value": float("nan")}}],
                 shape,
                 "finite-number",
             )
@@ -889,21 +1876,50 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         self.assertEqual(product.EXTERNAL_GATES[0]["status"], "KNOWN_FAIL")
         with self.assertRaisesRegex(product.QualificationError, "sensitive marker"):
             product.assert_absent({"run": {"kwargs": "fake-canary"}}, ["fake-canary"], "run list")
+        with self.assertRaisesRegex(product.QualificationError, "sensitive marker"):
+            product.assert_absent(
+                {"log": r"s\u00e9cret"}, ["sécret"], "escaped log"
+            )
+        self.assertFalse(
+            product.assistant_delete_reports_absent(
+                SimpleNamespace(
+                    status_code=200,
+                    body=b'{"status":"AGENT_NOT_FOUND_BUT_PRESENT"}',
+                )
+            )
+        )
+        with self.assertRaisesRegex(product.QualificationError, "sensitive marker"):
+            product.assert_delete_response_absent(
+                SimpleNamespace(
+                    status_code=200,
+                    body=b'{"status":"AGENT_NOT_FOUND","leak":"fake-canary"}',
+                ),
+                ["fake-canary"],
+                "cleanup",
+            )
 
     def test_product_case_uses_valid_name_mapped_thread_and_retains_redaction_gate(self):
         config = {
             "sensitive_values": ["test-canary"],
-            "cases": [{"name": "mock", "calls": [{"task_prompt": "test", "expected_text": "expected output"}]}],
+            "cases": [{
+                "name": "mock",
+                "calls": [{
+                    "task_prompt": "test",
+                    "llm": {"provider": "test", "api_key": "test-canary"},
+                    "expected_text": "expected output",
+                }],
+            }],
         }
 
-        for leak in (False, True):
-            with self.subTest(checkpoint_contains_canary=leak):
+        for leak_surface in (None, "state", "history", "delete", "cleanup-state"):
+            with self.subTest(leak_surface=leak_surface):
                 created_names = []
                 invoked_payloads = []
                 state_ids = []
                 history_ids = []
                 deleted_ids = []
                 deleted_thread_ids = []
+                cleanup_observations = 0
 
                 async def create_agent(tenant, payload, request):
                     created_names.append(payload.agent_name)
@@ -911,22 +1927,44 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
 
                 async def delete_agent(tenant, assistant_id, request):
                     deleted_ids.append(assistant_id)
-                    return SimpleNamespace(status_code=200)
+                    status = "DELETING" if len(deleted_ids) == 1 else "AGENT_NOT_FOUND"
+                    return SimpleNamespace(
+                        status_code=200,
+                        body=json.dumps({"status": status}).encode(),
+                    )
 
                 async def invoke(tenant, payload, request_id):
                     invoked_payloads.append(payload)
                     return 200, [{"status": "Completed", "success": True, "response": "expected output"}], {}
 
                 async def get_state(thread_id):
+                    nonlocal cleanup_observations
                     state_ids.append(thread_id)
-                    return {"values": {"messages": [{"content": "expected output"}]}}
+                    if thread_id in deleted_thread_ids:
+                        if leak_surface == "cleanup-state" and cleanup_observations == 0:
+                            cleanup_observations += 1
+                            return {
+                                "values": {},
+                                "metadata": {"llm_config": {"api_key": "test-canary"}},
+                            }
+                        missing = RuntimeError("not found")
+                        missing.status_code = 404
+                        raise missing
+                    state = {"values": {"messages": [{"content": "expected output"}]}}
+                    if leak_surface == "state":
+                        state["metadata"] = {"llm_config": {"api_key": "test-canary"}}
+                    return state
 
                 async def all_checkpoints(client, thread_id):
                     history_ids.append(thread_id)
-                    return [{"metadata": {"llm_config": {"api_key": "test-canary" if leak else "redacted"}}}]
+                    value = "test-canary" if leak_surface == "history" else "redacted"
+                    return [{"metadata": {"llm_config": {"api_key": value}}}]
 
                 async def delete_thread(thread_id):
                     deleted_thread_ids.append(thread_id)
+                    if leak_surface == "delete":
+                        return {"status": "DELETING", "leak": "test-canary"}
+                    return {"status": "DELETING"}
 
                 modules = {}
                 for name in (
@@ -949,11 +1987,22 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
                 )
 
                 output = io.StringIO()
+                async def no_sleep(_delay):
+                    return None
+
                 with patch.dict(sys.modules, modules), patch.object(product, "invoke", invoke), patch.object(
                     product, "all_checkpoints", all_checkpoints
-                ), patch("sys.stdin", io.StringIO(json.dumps(config))), patch("sys.stdout", output):
-                    if leak:
-                        with self.assertRaisesRegex(AssertionError, "checkpoint history"):
+                ), patch.object(product.asyncio, "sleep", no_sleep), patch(
+                    "sys.stdin", io.StringIO(json.dumps(config))
+                ), patch("sys.stdout", output):
+                    if leak_surface:
+                        expected_source = {
+                            "state": "graph state",
+                            "history": "checkpoint history",
+                            "delete": "thread cleanup evidence",
+                            "cleanup-state": "thread cleanup evidence",
+                        }[leak_surface]
+                        with self.assertRaisesRegex(AssertionError, expected_source):
                             asyncio.run(product.main())
                     else:
                         asyncio.run(product.main())
@@ -961,11 +2010,15 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
                 self.assertRegex(created_names[0], r"^aip5410[A-Za-z0-9]+$")
                 self.assertEqual(invoked_payloads[0]["agent_id"], "assistant-id")
                 expected_thread = f"mapped:product-qualification:{invoked_payloads[0]['session_id']}"
-                self.assertEqual(state_ids, [expected_thread])
-                self.assertEqual(history_ids, [expected_thread])
-                self.assertEqual(deleted_ids, ["assistant-id"])
+                expected_state_reads = 3 if leak_surface == "cleanup-state" else 2
+                self.assertEqual(state_ids, [expected_thread] * expected_state_reads)
+                self.assertEqual(
+                    history_ids,
+                    [] if leak_surface == "state" else [expected_thread],
+                )
+                self.assertEqual(deleted_ids, ["assistant-id", "assistant-id"])
                 self.assertEqual(deleted_thread_ids, [expected_thread])
-                if not leak:
+                if leak_surface is None:
                     result = json.loads(output.getvalue())
                     self.assertEqual(result["result"], "PASS")
                     self.assertEqual(result["route"], "in-pod-slim-router")

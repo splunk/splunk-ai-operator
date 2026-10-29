@@ -54,15 +54,24 @@ per-invocation context does not need to be committed, written to a scenario file
 or placed in command-line arguments.
 
 - Start with unique synthetic canaries in LLM, MCP, and optional KB fields.
+- Every scenario that carries credentials must list a unique synthetic or real
+  `sensitive_values` canary. The helpers reject credential-bearing scenarios
+  without declared canaries and also derive every recognized secret-bearing
+  value (API/access keys, tokens, authorization headers, passwords, role ARNs,
+  and similar fields) from the in-memory config into the scan set. An empty or
+  partial manually declared list therefore cannot omit a recognized credential
+  from redaction checks.
 - Use owner-approved, short-lived, least-privilege non-production credentials
   only for the real dependency checks that need them.
 - Never put credentials in Git, Jira, shell history, process arguments, evidence
   files, test names, expected text, or environment snapshots.
 - Do not record raw model output. Record only the approved expectation name,
   structural outcome, status, timing, and sanitized identifiers.
-- Never decode, print, or copy Kubernetes Secret data into evidence. The
-  credential-rotation helper hashes the encoded `data` map in memory only so it
-  can prove that bytes changed; it emits neither the map nor the hash.
+- Never print or copy Kubernetes Secret data into evidence. Dependency binding
+  decodes only the approved endpoint URL in memory to compare its hostname with
+  the exact Service; rotation hashes only the three role-bound encoded values
+  (`langgraph_cloud_license_key`, `postgres_connection_url`, and
+  `redis_connection_url`). Neither helper emits a value or hash.
 - Treat logs, diagnostics, responses, event streams, state, checkpoint history,
   and run listings as sensitive inspection surfaces. Published evidence contains
   only whether each surface passed, failed, or was blocked.
@@ -155,16 +164,40 @@ objects. Do not add the sample graph's `request` field to the Launchpad graph.
 The Launchpad graph requires its actual message/system-prompt input and its LLM,
 MCP, and KB context shape.
 
+Use `expected_response_paths` only when the graph nests output under a reviewed
+product-specific dotted path. Paths that select
+request, input, context, checkpoint, or metadata fields are rejected. Without
+an explicit path, the helper searches only
+assistant/AI message content and known response/output fields; it deliberately
+does not search arbitrary state strings, request messages, or checkpoint
+metadata. This prevents an echoed input marker from satisfying a response
+assertion.
+For explicit paths, every expected response value must also be absent from the
+submitted input/context/run options; otherwise an echoed request could satisfy
+the assertion and the helper rejects the case.
+
+Every successful stream case must declare the exact event sequence and one of
+two reviewed terminal proofs. Prefer `expected_sse_terminal_event` plus
+`expected_sse_terminal_status`. For a pinned runtime that closes after its final
+values event, set `expected_sse_completion` to
+`eof_after_expected_values`; the helper then extracts the run ID from stream
+metadata and independently polls that run to terminal `success`. A clean HTTP
+200, connection close, or stream that merely contains a values event is never
+terminal-success evidence.
+
 ## Local verification
 
 Run these checks before copying any scripts to the installer host:
 
 ```sh
 python3 tools/cluster_setup/test_las_runtime_acceptance.py
+python3 tools/cluster_setup/test_las_product_lifecycle_acceptance.py
+python3 tools/cluster_setup/test_mpr44_product_caller_acceptance.py
 python3 -m py_compile \
   scripts/las-runtime-acceptance.py \
   scripts/las-product-lifecycle-acceptance.py \
-  tools/cluster_setup/validation/aip5410_product_route_acceptance.py
+  tools/cluster_setup/validation/aip5410_product_route_acceptance.py \
+  tools/cluster_setup/validation/mpr44_product_caller_acceptance.py
 bash -n \
   scripts/las-restart-persistence-acceptance.sh \
   scripts/las-credential-rotation-acceptance.sh
@@ -238,10 +271,11 @@ Pipe the actual product scenario into the runtime protocol helper and exercise:
 - synchronous completion;
 - background/queued completion and terminal run status;
 - ordered SSE event types and terminal success;
-- graph state containing a unique non-secret marker. Checkpoint-history
-  persistence is verified by the caller-route helper; if that route is not
-  available, record the history row as `BLOCKED` rather than inferring it from
-  `/state`.
+- graph state containing a unique non-secret marker;
+- same-session response recall through the caller route, when that route runs;
+- checkpoint-history persistence through an explicit supported history read.
+  Neither `/state` nor same-session recall proves checkpoint history, so record
+  that row as `BLOCKED` unless the history read actually runs.
 
 On the disposable integration deployment, run the restart helper with exact API
 and queue Deployment names and explicit confirmation:
@@ -256,25 +290,37 @@ LAS_EXPECTED_NAMESPACE_UID=<namespace-uid> \
 LAS_API_DEPLOYMENT=<api-deployment> \
 LAS_QUEUE_DEPLOYMENT=<queue-deployment> \
 LAS_API_SERVICE=<api-service> \
+LAS_API_SERVICE_UID=<immutable-service-uid> \
 LAS_API_SERVICE_PORT=<service-port> \
+LAS_OPERATOR_NAMESPACE=<operator-namespace> \
+LAS_OPERATOR_DEPLOYMENT=<operator-deployment> \
 LAS_OPERATOR_IMAGE=<operator-reference> \
 LAS_OPERATOR_IMAGE_DIGEST=<sha256:digest> \
+LAS_CHART_NAME=<chart-name> \
 LAS_CHART_VERSION=<chart-version> \
 LAS_CHART_SHA256=<archive-sha256> \
+LAS_HELM_RELEASE=<release> \
+LAS_HELM_NAMESPACE=<namespace> \
 LAS_AGENT_SERVER_IMAGE=<launchpad-reference> \
 LAS_AGENT_SERVER_DIGEST=<sha256:digest> \
 scripts/las-restart-persistence-acceptance.sh
 ```
 
-The direct-LAS scenario must set `cleanup_threads` to `false`, provide non-secret
+The restart helper verifies the exact operator/API/queue configured images and
+same-container running digests, the exact deployed Helm chart name/version, and
+the API Service UID/selector/port/EndpointSlice-to-Pod binding before its first
+product call and after each rollout. The direct-LAS scenario
+must set `cleanup_threads` to `false`, provide non-secret
 `expected_state_values`, and request `sync`, `queued`, and `stream` in every
 case. The helper seeds those modes, restarts the API, reads the existing state,
 restarts the queue, reads the same state, and repeats product protocol execution
 after recovery. Add `active_run_case` only when an owner-approved bounded
 product call is expected to remain `running` long enough to span queue
 replacement. The helper owns and recreates the Service port-forward and deletes
-all qualification threads in its exit trap. Keep the output sanitized. Do not
-run this against a shared or production cluster.
+all qualification threads in its exit trap. It pins Kubernetes calls to the
+approved context and feeds the trusted scenario to state/cleanup checks over
+stdin so cleanup-only credential exposure also fails the run. Keep the output
+sanitized. Do not run this against a shared or production cluster.
 
 ### 6. Run MPR-49 lifecycle and load checks
 
@@ -304,6 +350,9 @@ non-secret provider configuration and assertions:
 {
   "graph_id": "agent",
   "cleanup_threads": true,
+  "sensitive_values": [
+    "<unique synthetic or real credential canary for every supplied secret>"
+  ],
   "cases": [
     {
       "name": "product-protocol",
@@ -318,7 +367,10 @@ non-secret provider configuration and assertions:
       },
       "run_modes": ["sync", "queued", "stream"],
       "expected_state_values": ["{{RUN_MARKER}}"],
-      "expected_response_values": ["<non-sensitive expected response marker>"]
+      "expected_response_values": ["<non-sensitive expected response marker>"],
+      "expected_sse_event_sequence": ["metadata", "values", "end"],
+      "expected_sse_terminal_event": "end",
+      "expected_sse_terminal_status": "success"
     }
   ],
   "load_case": {
@@ -339,6 +391,11 @@ non-secret provider configuration and assertions:
 }
 ```
 
+The `end`/`success` stream contract above is illustrative, not a claim about a
+specific runtime. Replace it only with the exact reviewed contract for the
+deployed version. Add `expected_response_paths` only when it identifies a
+response-specific value and cannot select echoed user input.
+
 A representative live invocation is:
 
 ```sh
@@ -358,10 +415,12 @@ scripts/las-product-lifecycle-acceptance.py \
   --operator-deployment <operator-deployment> \
   --operator-image <reference> --operator-image-digest <sha256:digest> \
   --agent-image <reference> --agent-image-digest <sha256:digest> \
-  --chart-version <version> --chart-sha256 <archive-sha256> \
+  --chart-name <name> --chart-version <version> \
+  --chart-sha256 <archive-sha256> \
   --helm-release <release> --helm-namespace <namespace> \
   --runtime-version <version> --graph-id <graph> \
-  --api-service <service> --request-timeout 180 \
+  --api-service <service> --api-service-uid <immutable-service-uid> \
+  --request-timeout 180 \
   --run-protocol --run-load --load-scale-expectation observe
 ```
 
@@ -371,29 +430,47 @@ live execution requires both explicit confirmation variables shown above. Use
 observation; it is labeled non-acceptance. Omit it, or select `required`, when
 the scenario is expected to prove CPU scale-up. Add only the mutation flags
 explicitly approved for that execution. The lifecycle orchestrator supports
-Kubernetes Deployments/StatefulSets for dependency recovery. On the earlier EC2,
+Kubernetes Deployments/StatefulSets for dependency recovery only when each
+`--postgres-workload`/`--redis-workload` is accompanied by its exact Service,
+Service UID, endpoint Secret, and endpoint Secret key. The helper proves that
+the Service selector exactly matches that workload controller, the in-memory
+endpoint URL names that Service, and both LAS Deployments reference the same Secret/key before it can
+restart the dependency. On the earlier EC2,
 PostgreSQL and Redis are host Podman containers, so their interruption is
 `NOT_RUN` by this helper and must not be claimed. A separate disposable-host
 procedure and authorization are required before stopping either container.
 
 An installer upgrade additionally requires
+`--pre-upgrade-agent-image`, `--pre-upgrade-agent-image-digest`, and, when the
+chart changes, `--pre-upgrade-chart-version`, plus
 `--post-upgrade-api-template-sha256` and
 `--post-upgrade-queue-template-sha256`. Compute those values from the intended
 post-upgrade manifests before execution. The helper requires both Deployment
 revisions and both Pod-template identities to change and to match the declared
-values; a revision-only or unrelated rollout cannot count as an upgrade pass.
+values. It verifies the declared pre-upgrade image/digest and chart before any
+credential-bearing product request, then verifies the intended post-upgrade
+identity before the post-upgrade request. A revision-only or unrelated rollout
+cannot count as an upgrade pass.
 
 For managed credential rotation, use two owner-prepared installer configs and
 pipe a cleanup-enabled product scenario to
 `scripts/las-credential-rotation-acceptance.sh`. In addition to the exact
 Deployment/Service identity variables used above, provide the exact three Secret
-names, queue HPA, operator namespace/Deployment, expected kube context, and
-namespace UID. `LAS_API_SERVICE` is required: the helper owns and health-checks
-the local Service port-forward, and fails if that process exits. The helper runs
-the product before and after rotation, compares
-non-emitted in-memory hashes of the Secret `data` maps, verifies both Deployment
-revisions, preserves the HPA spec, verifies live Pod image digests, and cleans
-all product threads. Installer output is discarded because it may contain
+names in auth, PostgreSQL, Redis order, queue HPA, operator
+namespace/Deployment, expected kube context, and
+namespace UID. Also provide `LAS_CHART_NAME`, `LAS_HELM_RELEASE` (and
+`LAS_HELM_NAMESPACE` when it differs from the workload namespace).
+`LAS_API_SERVICE` and `LAS_API_SERVICE_UID` are required: the helper binds that
+Service's selector, port, EndpointSlices, Pod identities, and resolved agent
+digest to the attested API Deployment before using the local port-forward, and
+fails if that process exits. The helper runs
+the product before and after rotation, compares non-emitted hashes of the exact
+`langgraph_cloud_license_key`, `postgres_connection_url`, and
+`redis_connection_url` values, verifies both Deployment revisions, proves the
+API and queue Pod templates reference those role-bound Secret/key pairs,
+preserves the HPA spec, verifies the exact Helm release/chart and live Pod image
+digests before each credential-bearing call, and cleans all product threads.
+Installer output is discarded because it may contain
 credentials. Do not run this phase without disposable credentials and explicit
 installer authorization.
 
