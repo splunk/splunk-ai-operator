@@ -1,0 +1,121 @@
+# Isolated MPR-44 caller-route fixture for the agentruntime-dev test cluster.
+#
+# Apply only after confirming the stable Launchpad LAS Service below and
+# creating the temporary mpr44-ecr-pull Secret from a fresh ECR token. This
+# workload is deliberately separate from the operator-owned SLIM AIService.
+# It contains no caller, model, LAS, registry, or Splunk credential value.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mpr44-slim-candidate-config
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: mpr-44
+data:
+  DEPLOYMENT_TYPE: AITIER
+  SERVICE_NAME: slim-api
+  SERVICE_INTERNAL_NAME: SLIM
+  SPLUNK_ISSUERS: https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089
+  ENABLE_AUTHN: "true"
+  ENABLE_AUTHZ: "true"
+  API_VERSION: v1alpha1
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mpr44-slim-candidate-feature-config
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: mpr-44
+data:
+  features_config.yaml: |
+    customization:
+      enabled_by_default: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mpr44-slim-candidate
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: mpr-44
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mpr44-slim-candidate
+  template:
+    metadata:
+      labels:
+        app: mpr44-slim-candidate
+        validation.splunk.com/story: mpr-44
+    spec:
+      imagePullSecrets:
+        - name: mpr44-ecr-pull
+      containers:
+        - name: slim-api
+          image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610152102-b7cb6e97e381@sha256:951ac687c0753399e9a636cd507ec541f55ecaade4717c19276d228115c003ef
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 8088
+          envFrom:
+            - configMapRef:
+                name: mpr44-slim-candidate-config
+          env:
+            - name: AGENT_SERVER_URL
+              value: http://agentruntime-dev-ai-platform-agentruntime-mltk-svc.ai-platform.svc.cluster.local:8080
+            - name: LAS_GRAPH_ID
+              value: agent
+            - name: TLS_DISABLED
+              value: "true"
+          volumeMounts:
+            - name: feature-config
+              mountPath: /etc/config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+      volumes:
+        - name: feature-config
+          configMap:
+            name: mpr44-slim-candidate-feature-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mpr44-slim-candidate
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: mpr-44
+spec:
+  type: ClusterIP
+  selector:
+    app: mpr44-slim-candidate
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -57,6 +57,19 @@ one or more calls per case (including a caller resume when the case provides
 scans complete checkpoint history for supplied sensitive markers, and cleans
 up the assistant and its threads.
 
+This in-Pod helper validates SLIM's adapter and Launchpad mapping, but it
+bypasses HTTP route registration and the external authentication middleware.
+It therefore does not, by itself, satisfy the full caller-route requirement.
+Use `tools/cluster_setup/validation/mpr44_product_caller_acceptance.py` from
+outside the SLIM Pod against the supported Service endpoint for MPR-44 evidence;
+the MPR-44 helper covers authenticated HTTP create/invoke/delete, terminal
+NDJSON response mapping, same-session follow-up, negative authentication and
+malformed request handling. See
+[`mpr-44-caller-route-qualification.md`](mpr-44-caller-route-qualification.md).
+It qualifies the external SLIM edge, not an installed AITK application's own
+request construction; record that separate caller evidence when it is part of
+the accepted product boundary.
+
 Input shape:
 
 ```json

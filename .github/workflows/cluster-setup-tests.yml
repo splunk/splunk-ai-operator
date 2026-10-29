@@ -35,6 +35,9 @@ jobs:
             scripts/las-restart-persistence-acceptance.sh \
             scripts/las-credential-rotation-acceptance.sh
 
+      - name: Run MPR-44 caller helper unit tests
+        run: python3 tools/cluster_setup/test_mpr44_product_caller_acceptance.py
+
       - name: Run ECR refresh rollout tests
         run: bash tools/cluster_setup/test_refresh_ecr_credentials.sh
 
