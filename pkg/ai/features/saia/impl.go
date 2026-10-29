@@ -1547,6 +1547,10 @@ http {
         # Word boundary via "/saia-api-v2/" (not "saia-api-v2" substring)
         # prevents accidental matches like /foo/saia-api-v2-legacy/.
         location ~ /saia-api-v2/ {
+            # Dashboard and other personalization exports also use v2. Keep
+            # their request-body allowance bounded and consistent with v1.
+            client_max_body_size 100m;
+
             # CORS preflight short-circuit. Browser preflights are
             # unauthenticated by spec; SAIA v2's TenantConversationKeyMiddleware
             # rejects them with 400 before FastAPI's CORSMiddleware can respond,
@@ -1584,8 +1588,8 @@ http {
         # v1: everything else (including /health, /{tenant}/saia-api/v1alpha1/...)
         location / {
             # Splunk personalization metadata, especially dashboard exports, can
-            # exceed nginx's 1 MiB default. Keep a bounded v1 limit so legitimate
-            # uploads reach SAIA without widening the v2 request-body allowance.
+            # exceed nginx's 1 MiB default. Keep the same bounded allowance on
+            # both API routes so legitimate personalization uploads reach SAIA.
             client_max_body_size 100m;
 
             # Mirror the CORS preflight short-circuit for v1 routes; spl-copilot's

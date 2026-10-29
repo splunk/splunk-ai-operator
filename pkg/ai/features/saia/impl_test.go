@@ -956,15 +956,15 @@ func Test_reconcileNginxConfigMap(t *testing.T) {
 	assert.Contains(t, conf, "proxy_buffering off")
 	assert.Contains(t, conf, "proxy_http_version 1.1")
 
-	// Personalization bundles can exceed nginx's 1 MiB default (dashboard
-	// metadata was observed at ~6.7 MiB). Keep the production limit bounded.
-	assert.Equal(t, 1, strings.Count(conf, "client_max_body_size 100m;"))
+	// Personalization bundles can exceed nginx's 1 MiB default on either API
+	// route. Both v1 and v2 uploads must retain a bounded 100 MiB allowance.
+	assert.Equal(t, 2, strings.Count(conf, "client_max_body_size 100m;"))
 	v2LocationStart := strings.Index(conf, "location ~ /saia-api-v2/")
 	v1LocationStart := strings.Index(conf, "location / {")
 	require.Greater(t, v2LocationStart, -1)
 	require.Greater(t, v1LocationStart, v2LocationStart)
-	assert.NotContains(t, conf[v2LocationStart:v1LocationStart], "client_max_body_size",
-		"the raised request-body limit must not widen v2 routes")
+	assert.Contains(t, conf[v2LocationStart:v1LocationStart], "client_max_body_size 100m;",
+		"v2 personalization uploads must not fall back to nginx's 1 MiB default")
 	assert.Contains(t, conf[v1LocationStart:], "client_max_body_size 100m;",
 		"the raised request-body limit must apply to v1 personalization uploads")
 
