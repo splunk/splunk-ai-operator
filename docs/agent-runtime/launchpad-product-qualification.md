@@ -31,9 +31,11 @@ The following gates remain visible in every result:
 - **MPR-44 external SLIM edge is qualified.** The authenticated external SLIM
   contract, Bedrock invocation, same-session follow-up, malformed-input
   rejection, authentication failures, and cleanup passed on the recorded
-  immutable digests. An installed AITK application's own request construction
-  remains `NOT_RUN`; do not represent the external-edge result as an AITK UI or
-  backend-origin result.
+  immutable digests. See
+  [`mpr-44-caller-route-evidence-20261030.md`](mpr-44-caller-route-evidence-20261030.md).
+  An installed AITK application's own request construction remains `NOT_RUN`;
+  do not represent the external-edge result as an AITK UI or backend-origin
+  result.
 - **MPR-48 is not complete.** MPR-49 timeout, cancellation, and interruption
   acceptance remains partial until those semantics are agreed and verified.
 

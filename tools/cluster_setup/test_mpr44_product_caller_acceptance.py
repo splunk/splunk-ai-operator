@@ -154,6 +154,15 @@ class CallerRouteHandler(BaseHTTPRequestHandler):
 
 
 class MPR44CallerRouteTests(unittest.TestCase):
+    def test_scenario_json_rejects_nonfinite_and_duplicate_values(self):
+        for document in (
+            '{"cases":[],"value":NaN}',
+            '{"cases":[],"value":Infinity}',
+            '{"cases":[],"cases":[]}',
+        ):
+            with self.subTest(document=document), self.assertRaises(mpr44.ScenarioError):
+                mpr44.read_scenario(io.StringIO(document))
+
     def setUp(self):
         self.state = {
             "requests": [],

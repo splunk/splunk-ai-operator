@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
 import stat
@@ -121,8 +122,21 @@ def _reject_json_constant(_value: str) -> None:
     raise ValueError("non-standard JSON constant")
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
 def strict_json_loads(value: str | bytes) -> Any:
-    return json.loads(value, parse_constant=_reject_json_constant)
+    return json.loads(
+        value,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_unique_json_object,
+    )
 
 
 def validate_base_url(value: str | None) -> str:
@@ -293,8 +307,8 @@ def validate_scenario(value: Any) -> dict[str, Any]:
 def read_scenario(stream=None) -> dict[str, Any]:
     source = sys.stdin if stream is None else stream
     try:
-        value = json.load(source, parse_constant=_reject_json_constant)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        value = strict_json_loads(source.read())
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise ScenarioError("stdin did not contain valid JSON") from exc
     return validate_scenario(value)
 
@@ -445,7 +459,11 @@ def assert_expected_shape(response_value: Any, shape: dict[str, Any]) -> None:
         if expected == "integer":
             valid = isinstance(actual, int) and not isinstance(actual, bool)
         elif expected == "number":
-            valid = isinstance(actual, (int, float)) and not isinstance(actual, bool)
+            valid = (
+                isinstance(actual, (int, float))
+                and not isinstance(actual, bool)
+                and math.isfinite(actual)
+            )
         else:
             valid = isinstance(actual, JSON_TYPES[expected])
         if not valid:

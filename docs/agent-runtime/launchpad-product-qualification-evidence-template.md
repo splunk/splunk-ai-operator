@@ -238,5 +238,5 @@ Required rerun scope: `<cases/phases>`
 - [ ] No raw checkpoint, run kwargs, or unsanitized log content is present.
 - [ ] Every `PASS` maps to executed evidence for the exact immutable digest.
 - [ ] MPR-131 is represented as `KNOWN_FAIL`, not `PASS` or omitted.
-- [ ] Direct LAS, in-Pod SLIM, and full caller-route evidence are distinguished.
+- [ ] Direct LAS, in-Pod SLIM, external SLIM, and installed-AITK-origin evidence are distinguished.
 - [ ] Unmet installed-AITK-origin/MPR-48 gates are recorded as limitations.

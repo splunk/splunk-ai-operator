@@ -4,6 +4,10 @@ This record contains sanitized evidence from the earlier installer integration
 environment. It contains no credentials, request bodies, raw model output,
 connection URLs, Secret data, checkpoint contents, or unsanitized logs.
 
+The external caller rows below are supplemented by the immutable execution
+record in
+[`mpr-44-caller-route-evidence-20261030.md`](mpr-44-caller-route-evidence-20261030.md).
+
 ## Execution summary
 
 - Environment: approved installer EC2 integration cluster
@@ -102,7 +106,8 @@ LLM/MCP, and negative-validation rows passed.
   `PASS`.
 - The original in-Pod helper remained incompatible with the cluster's primary
   SLIM image. MPR-44 therefore used an isolated, digest-pinned candidate without
-  replacing the operator-owned SLIM AIService.
+  replacing the operator-owned SLIM AIService; its temporary cluster resources
+  and remote test artifacts were removed after the recorded checks.
 - Structured-output, MCP-tool, typed negative dependency, and HITL rows through
   the external edge: `NOT_RUN`; their direct/in-Pod supporting rows must not be
   relabeled as external-edge evidence.
@@ -180,6 +185,21 @@ persistence rows passed.
   trace credential redaction passed.
 - MPR-58 must be rerun against a fixed immutable digest before the credential
   gate can pass.
+
+## Repository regression verification — 2026-10-30
+
+- Cluster setup suite: `303 passed`, `0 failed`, `0 skipped`.
+- LAS deployment helper: `17 passed`.
+- Installer dry-run matrix: all `5` configurations passed.
+- Runtime/product-route helper: `48 passed`.
+- Lifecycle/rotation helper: `19 passed`.
+- External SLIM caller helper: `19 passed`.
+- Python compilation, Bash syntax, workflow YAML parsing, and `git diff --check`:
+  `PASS`.
+
+These are offline harness/regression results. They support the live evidence
+above but do not convert an unexecuted or dependency-blocked live row to
+`PASS`.
 
 ## Cleanup and restored state
 
