@@ -7,6 +7,13 @@ hf-token: <CHANGE ME>
 # Model artifacts configuration
 artifact-configs:
 
+  # MPR-115: BF16 reference checkpoint for Nemotron 3.5 Lightning. The same
+  # full-precision artifact is used on H100 and RTX PRO 6000 Blackwell; the
+  # serving recipe and per-hardware allocation are configured separately.
+  - artifact-id: nemotron-3-5-lightning-30b-a3b-bf16
+    hf-url: https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    is-a-gated-model: false
+
   - artifact-id: all-minilm-l6-v2
     hf-url: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
     is-a-gated-model: false

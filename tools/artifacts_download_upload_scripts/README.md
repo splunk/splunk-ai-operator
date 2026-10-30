@@ -341,6 +341,7 @@ The download script selects `model_artifacts_configs_unquantized.yaml` for L40S 
 **Artifact Configuration (`artifact-configs`):**
 
 The following artifacts are pre-configured and ready to download:
+- `nemotron-3-5-lightning-30b-a3b-bf16` - Nemotron 3.5 Lightning BF16 checkpoint for H100 and RTX PRO 6000 Blackwell
 - `gemma-4-31b-it` - Unquantized Gemma model for L40S
 - `gemma-4-31b-it-qat-w4a16-ct` - Quantized Gemma model for H100 and RTX Pro
 - `gpt-oss-20b` - Secondary LLM
