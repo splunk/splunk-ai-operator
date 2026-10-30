@@ -6,6 +6,7 @@ package raybuilder
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -148,10 +149,13 @@ func isAWSRegionalEndpoint(endpoint string) bool {
 type WorkerConfigs map[string][]InstanceDetail
 
 type InstanceDetail struct {
-	Tier       string                      `yaml:"tier"`
-	GPUsPerPod int32                       `yaml:"gpusPerPod"`
-	Env        map[string]string           `yaml:"env,omitempty"`
-	Resources  corev1.ResourceRequirements `yaml:"resources"`
+	Tier                string                      `yaml:"tier"`
+	GPUsPerPod          int32                       `yaml:"gpusPerPod"`
+	RequiresApplication string                      `yaml:"requiresApplication,omitempty"`
+	RayResources        map[string]int32            `yaml:"rayResources,omitempty"`
+	RayGPUResourceCount *int32                      `yaml:"rayGpuResourceCount,omitempty"`
+	Env                 map[string]string           `yaml:"env,omitempty"`
+	Resources           corev1.ResourceRequirements `yaml:"resources"`
 }
 
 // ScaleConfig models the two global scale files. model-scale.yaml supplies
@@ -803,6 +807,10 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	if err != nil {
 		return nil, err
 	}
+	modelScale, err := loadScaleConfig("MODEL_SCALE_FILE", "model-scale.yaml")
+	if err != nil {
+		return nil, err
+	}
 	scaleFactor := b.effectiveScaleFactor()
 
 	// initialize instanceScale to avoid nil map assignment panic
@@ -821,10 +829,40 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
 		replicas := instanceScale[cfg.Tier]
+		if cfg.RequiresApplication != "" {
+			applicationReplicas, ok := modelScale.ApplicationScale[cfg.RequiresApplication]
+			if !ok {
+				return nil, fmt.Errorf("worker tier %s requires application %s, which is missing from model-scale.yaml", cfg.Tier, cfg.RequiresApplication)
+			}
+			if applicationReplicas <= 0 {
+				replicas = 0
+			}
+		}
 
 		maxReplicas := replicas + 5
 		if cfg.GPUsPerPod > 0 {
 			maxReplicas = replicas
+		}
+
+		// Advertise a Ray resource that matches the worker's physical shape.
+		// A dedicated worker may replace the default gpu_count marker with a
+		// model-specific resource so unrelated fractional actors cannot land on it.
+		rayResources := map[string]int32{
+			fmt.Sprintf("accelerator_type:%s", acceleratorType): 1,
+		}
+		gpuResourceCount := cfg.GPUsPerPod
+		if cfg.RayGPUResourceCount != nil {
+			gpuResourceCount = *cfg.RayGPUResourceCount
+		}
+		if gpuResourceCount > 0 {
+			rayResources[fmt.Sprintf("gpu_count:%d", gpuResourceCount)] = 1
+		}
+		for name, count := range cfg.RayResources {
+			rayResources[name] = count
+		}
+		rayResourcesJSON, err := json.Marshal(rayResources)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode Ray resources for worker tier %s: %w", cfg.Tier, err)
 		}
 
 		wg := rayv1.WorkerGroupSpec{
@@ -834,7 +872,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 			MaxReplicas: int32Ptr(maxReplicas),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
-				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
+				"resources": fmt.Sprintf("%q", string(rayResourcesJSON)),
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{

@@ -3,9 +3,11 @@ package raybuilder
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"text/template"
@@ -212,6 +214,7 @@ func TestBuildClusterConfig_GlobalScaleFactor(t *testing.T) {
 	dir := writeScaleFixtures(t, modelScaleFixture, workerScaleFixture)
 	t.Chdir(dir)
 	os.Setenv("INSTANCE_FILE", instanceFile)
+	os.Setenv("MODEL_SCALE_FILE", filepath.Join(dir, "model-scale.yaml"))
 	os.Setenv("WORKER_SCALE_FILE", filepath.Join(dir, "worker-scale.yaml"))
 
 	s := scheme.Scheme
@@ -238,6 +241,100 @@ func TestBuildClusterConfig_GlobalScaleFactor(t *testing.T) {
 		}
 	}
 	require.True(t, found, "expected l40s-1-gpu worker group to be present")
+}
+
+func TestBuildClusterConfig_NemotronUsesDedicatedTwoGPUWorker(t *testing.T) {
+	os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
+	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
+	os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
+
+	instanceFile, err := filepath.Abs("../../../config/configs/instance.yaml")
+	require.NoError(t, err)
+	dir := writeScaleFixtures(t, `applicationScale:
+  Nemotron35Lightning30bA3bBf16: 1
+`, `instanceScale:
+  RTX_PRO_6000_BLACKWELL:
+    rtx-pro-6000-blackwell-2-gpu: 1
+    rtx-pro-6000-blackwell-nemotron-2-gpu: 1
+`)
+	t.Chdir(dir)
+	os.Setenv("INSTANCE_FILE", instanceFile)
+	os.Setenv("MODEL_SCALE_FILE", filepath.Join(dir, "model-scale.yaml"))
+	os.Setenv("WORKER_SCALE_FILE", filepath.Join(dir, "worker-scale.yaml"))
+
+	platform := newScaleFactorTestPlatform(int32PtrForTest(1))
+	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
+	s := scheme.Scheme
+	_ = aiv1.AddToScheme(s)
+	_ = rayv1.AddToScheme(s)
+	builder := New(platform, fake.NewClientBuilder().WithScheme(s).Build(), s, record.NewFakeRecorder(10))
+	spec, err := builder.buildClusterConfig(context.Background())
+	require.NoError(t, err)
+
+	groups := make(map[string]rayv1.WorkerGroupSpec, len(spec.WorkerGroupSpecs))
+	for _, group := range spec.WorkerGroupSpecs {
+		groups[group.GroupName] = group
+	}
+	general, ok := groups["rtx-pro-6000-blackwell-2-gpu"]
+	require.True(t, ok)
+	require.Equal(t, int32(1), *general.Replicas)
+	nemotron, ok := groups["rtx-pro-6000-blackwell-nemotron-2-gpu"]
+	require.True(t, ok)
+	require.Equal(t, int32(1), *nemotron.Replicas)
+	generalGPULimit := general.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
+	nemotronGPULimit := nemotron.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
+	require.Equal(t, "2", generalGPULimit.String())
+	require.Equal(t, "2", nemotronGPULimit.String())
+
+	var generalResources map[string]int32
+	generalJSON, err := strconv.Unquote(general.RayStartParams["resources"])
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(generalJSON), &generalResources))
+	require.Equal(t, int32(1), generalResources["gpu_count:2"])
+
+	var nemotronResources map[string]int32
+	nemotronJSON, err := strconv.Unquote(nemotron.RayStartParams["resources"])
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(nemotronJSON), &nemotronResources))
+	require.Equal(t, int32(1), nemotronResources["nemotron_worker"])
+	require.NotContains(t, nemotronResources, "gpu_count:2")
+}
+
+func TestBuildClusterConfig_DisablesNemotronWorkerInGemmaOnlyMode(t *testing.T) {
+	os.Setenv("RELATED_IMAGE_RAY_HEAD", "rayproject/ray:latest")
+	os.Setenv("RELATED_IMAGE_RAY_WORKER", "rayproject/ray:latest")
+	os.Setenv("RELATED_IMAGE_FLUENT_BIT", "fluent/fluent-bit:latest")
+
+	instanceFile, err := filepath.Abs("../../../config/configs/instance.yaml")
+	require.NoError(t, err)
+	dir := writeScaleFixtures(t, `applicationScale:
+  Nemotron35Lightning30bA3bBf16: 0
+`, `instanceScale:
+  RTX_PRO_6000_BLACKWELL:
+    rtx-pro-6000-blackwell-2-gpu: 1
+    rtx-pro-6000-blackwell-nemotron-2-gpu: 1
+`)
+	t.Chdir(dir)
+	os.Setenv("INSTANCE_FILE", instanceFile)
+	os.Setenv("MODEL_SCALE_FILE", filepath.Join(dir, "model-scale.yaml"))
+	os.Setenv("WORKER_SCALE_FILE", filepath.Join(dir, "worker-scale.yaml"))
+
+	platform := newScaleFactorTestPlatform(int32PtrForTest(1))
+	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
+	s := scheme.Scheme
+	_ = aiv1.AddToScheme(s)
+	_ = rayv1.AddToScheme(s)
+	builder := New(platform, fake.NewClientBuilder().WithScheme(s).Build(), s, record.NewFakeRecorder(10))
+	spec, err := builder.buildClusterConfig(context.Background())
+	require.NoError(t, err)
+
+	for _, group := range spec.WorkerGroupSpecs {
+		if group.GroupName == "rtx-pro-6000-blackwell-nemotron-2-gpu" {
+			require.Equal(t, int32(0), *group.Replicas)
+			return
+		}
+	}
+	t.Fatal("Nemotron worker group missing")
 }
 
 // TestApplicationsTemplate_ReferencesEveryModelScaleEntry keeps the global
@@ -314,7 +411,11 @@ func renderProductionApplications(t *testing.T, scaleFactor int32, acceleratorTy
 	for name, base := range modelScale.ApplicationScale {
 		replicas[name] = base * scaleFactor
 	}
+	return renderApplicationsWithReplicas(t, replicas, acceleratorType)
+}
 
+func renderApplicationsWithReplicas(t *testing.T, replicas map[string]int32, acceleratorType string) []renderedServeApplication {
+	t.Helper()
 	templateData, err := os.ReadFile("../../../config/configs/applications.yaml")
 	require.NoError(t, err)
 	tmpl, err := template.New("applications").Parse(string(templateData))
@@ -364,11 +465,13 @@ func TestApplicationsTemplate_ProductionDefaultsDisableOnlyBiEncoder(t *testing.
 
 	productionApps := indexRenderedApplications(renderProductionApplications(t, 1, "L40S"))
 	require.NotContains(t, productionApps, "BiEncoder")
-	require.Len(t, productionApps, len(modelScale.ApplicationScale)-1,
-		"disabling BiEncoder must be the only production application removal")
+	require.NotContains(t, productionApps, "Nemotron35Lightning30bA3bBf16",
+		"Nemotron is RTX-only until the H100 scheduling gate is resolved")
+	require.Len(t, productionApps, len(modelScale.ApplicationScale)-2,
+		"L40S production excludes the disabled BiEncoder and RTX-only Nemotron")
 
 	for name, baseReplicas := range modelScale.ApplicationScale {
-		if name == "BiEncoder" {
+		if name == "BiEncoder" || name == "Nemotron35Lightning30bA3bBf16" {
 			continue
 		}
 		require.Greater(t, baseReplicas, int32(0), "%s must remain enabled", name)
@@ -382,6 +485,30 @@ func TestApplicationsTemplate_ProductionDefaultsDisableOnlyBiEncoder(t *testing.
 	require.NoError(t, err)
 	require.Contains(t, string(applicationsData), "{{- if .Replicas.BiEncoder }}")
 	require.Contains(t, string(applicationsData), "route_prefix: /bi_encoder")
+}
+
+func TestApplicationsTemplate_NemotronReplicaAndWorkerMode(t *testing.T) {
+	modelScaleData, err := os.ReadFile("../../../config/configs/model-scale.yaml")
+	require.NoError(t, err)
+	var modelScale ScaleConfig
+	require.NoError(t, yaml.UnmarshalStrict(modelScaleData, &modelScale))
+	require.Equal(t, int32(1), modelScale.ApplicationScale["Nemotron35Lightning30bA3bBf16"])
+
+	rtxApps := indexRenderedApplications(renderProductionApplications(t, 1, "RTX_PRO_6000_BLACKWELL"))
+	nemotron, ok := rtxApps["Nemotron35Lightning30bA3bBf16"]
+	require.True(t, ok, "combined RTX mode includes Nemotron")
+	deployment := indexRenderedDeployments(nemotron.Deployments)["LLMDeploymentRTX_PRO_6000_BLACKWELL"]
+	require.Equal(t, int32(1), deployment.AutoscalingConfig["min_replicas"])
+	require.Equal(t, int32(1), deployment.AutoscalingConfig["max_replicas"])
+
+	gemmaOnly := make(map[string]int32, len(modelScale.ApplicationScale))
+	for name, replicas := range modelScale.ApplicationScale {
+		gemmaOnly[name] = replicas
+	}
+	gemmaOnly["Nemotron35Lightning30bA3bBf16"] = 0
+	gemmaOnlyApps := indexRenderedApplications(renderApplicationsWithReplicas(t, gemmaOnly, "RTX_PRO_6000_BLACKWELL"))
+	require.NotContains(t, gemmaOnlyApps, "Nemotron35Lightning30bA3bBf16",
+		"Gemma-only mode omits the Nemotron Serve application")
 }
 
 // TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides

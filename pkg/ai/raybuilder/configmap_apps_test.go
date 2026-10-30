@@ -95,9 +95,9 @@ func Test_ApplicationsYAML_DisableResponsesRedis(t *testing.T) {
 		}
 	}
 
-	expectedTextGenApps := []string{"Gemma431bIt", "GptOss20b"}
+	expectedTextGenApps := []string{"Gemma431bIt", "GptOss20b", "Nemotron35Lightning30bA3bBf16"}
 
-	// We expect exactly two text-gen apps today (Gemma431bIt, GptOss20b).
+	// We expect Gemma, GPT-OSS, and Nemotron text-gen apps today.
 	// If this count changes, someone added a new text-gen model; they MUST
 	// also add DISABLE_RESPONSES_API_REDIS to the new app.
 	require.Len(t, textGenApps, len(expectedTextGenApps),
@@ -116,7 +116,7 @@ func Test_ApplicationsYAML_DisableResponsesRedis(t *testing.T) {
 			a.Name)
 	}
 
-	// Sanity: assert the two canonical app names we expect. Keeps the test
+	// Sanity: assert the canonical app names we expect. Keeps the test
 	// readable if someone renames an app and forgets to re-check this.
 	var names []string
 	for _, a := range textGenApps {
@@ -134,6 +134,53 @@ func Test_ApplicationsYAML_DisableResponsesRedis(t *testing.T) {
 				"vllm_text_gen_model.VLLMTextGenModel.", a.Name, a.Args.DeploymentType)
 		}
 	}
+}
+
+func Test_ApplicationsYAML_NemotronUsesDedicatedRTXWorker(t *testing.T) {
+	type rayActorOptions struct {
+		NumGPUs   float64            `yaml:"num_gpus"`
+		Resources map[string]float64 `yaml:"resources"`
+	}
+	type gpuTypeOptions struct {
+		RayActorOptions rayActorOptions `yaml:"ray_actor_options"`
+	}
+	type deploymentConfig struct {
+		GPUTypeOptionsOverride map[string]gpuTypeOptions `yaml:"gpu_type_options_override"`
+	}
+	type app struct {
+		Name string `yaml:"name"`
+		Args struct {
+			DeploymentConfigs map[string]deploymentConfig `yaml:"deployment_configs"`
+			ModelDefinition   struct {
+				GPUTypeModelConfigOverride map[string]struct {
+					EngineArgs struct {
+						TensorParallelSize int `yaml:"tensor_parallel_size"`
+					} `yaml:"engine_args"`
+				} `yaml:"gpu_type_model_config_override"`
+			} `yaml:"model_definition"`
+		} `yaml:"args"`
+	}
+	var doc struct {
+		Applications []app `yaml:"applications"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(maskGoTemplates(readApplicationsYAMLFromRepo(t))), &doc))
+
+	for _, application := range doc.Applications {
+		if application.Name != "Nemotron35Lightning30bA3bBf16" {
+			continue
+		}
+		const accelerator = "RTX_PRO_6000_BLACKWELL"
+		deployment, ok := application.Args.DeploymentConfigs["LLMDeployment"]
+		require.True(t, ok)
+		rtxOptions, ok := deployment.GPUTypeOptionsOverride[accelerator]
+		require.True(t, ok)
+		require.Equal(t, float64(2), rtxOptions.RayActorOptions.NumGPUs)
+		require.Equal(t, float64(1), rtxOptions.RayActorOptions.Resources["nemotron_worker"])
+		require.NotContains(t, rtxOptions.RayActorOptions.Resources, "gpu_count:2")
+		require.Equal(t, 2, application.Args.ModelDefinition.GPUTypeModelConfigOverride[accelerator].EngineArgs.TensorParallelSize)
+		return
+	}
+	t.Fatal("Nemotron application not found")
 }
 
 // Test_ApplicationsYAML_IsWellFormed is a tiny smoke test that the bundled

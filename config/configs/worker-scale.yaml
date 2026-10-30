@@ -6,8 +6,12 @@ instanceScale:
     l40s-4-gpu: 0
   H100:
     h100-0-gpu: 1
+    # Keep the current H100 profile until its scheduling limitation is resolved.
     h100-1-gpu: 2
   RTX_PRO_6000_BLACKWELL:
     rtx-pro-6000-blackwell-0-gpu: 1
     rtx-pro-6000-blackwell-1-gpu: 0
+    # One 2-GPU worker remains for existing models. Nemotron gets its own
+    # 2-GPU worker so fractional reservations cannot land on its GPUs.
     rtx-pro-6000-blackwell-2-gpu: 1
+    rtx-pro-6000-blackwell-nemotron-2-gpu: 1
