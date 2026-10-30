@@ -55,21 +55,37 @@ negative-dependency evidence.
 
 ## MPR-47 — product regression qualification
 
-- Authenticated ordinary external call and same-session follow-up: `PASS`.
-- Missing bearer, malformed bearer, and malformed JSON denial: `PASS` in the
-  completed caller-route run.
-- External structured output using both candidate request field names returned
-  a plain non-JSON product response instead of the required object:
-  `FAIL (structured-output contract)`.
-- Typed invalid-request classification and empty-state proof:
-  `BLOCKED (environment/auth dependency)` as described above.
-- Direct-Agent-Server structured-output and negative supporting rows remain
-  useful regression evidence, but they are not relabeled as external-edge
-  evidence.
+- Authenticated ordinary external Bedrock call and same-session follow-up:
+  `PASS`. Both calls returned HTTP 200 terminal-success results, and the second
+  call recalled a generated non-secret marker that was absent from its request.
+- Missing bearer, malformed bearer, and malformed JSON denial: `PASS`.
+- Direct LAS Bedrock structured output: `PASS` in `9.313s`. The response and
+  persisted graph state matched the required object fields and types, the run
+  reached terminal `success`, and deletion of the temporary thread was
+  confirmed.
+- The same Bedrock structured-output contract through the authenticated SLIM
+  edge returned plain non-JSON product text: `FAIL`. Because the direct LAS
+  run passed against the same Launchpad image, graph, model and schema, this is
+  classified as a SLIM caller-field/response-mapping integration defect rather
+  than a Launchpad graph or Bedrock defect.
+- A wrong-type `task_prompt` through the authenticated SLIM edge returned an
+  HTTP 200 transport envelope whose reported product error was HTTP 500 with
+  category `platform`, instead of the expected HTTP 400/422 validation error:
+  `FAIL (negative error contract)`. The returned response contained no graph
+  state, and deletion of the temporary assistant was confirmed.
+- Intermittent SLIM-to-Splunk verification produced one HTTP 401 precondition
+  failure during the bounded reruns. It was not counted as a product result;
+  the subsequent authenticated run completed the functional and typed-negative
+  rows.
+- Credential values were supplied from a protected local profile, held only in
+  process memory, declared as leak canaries, and excluded from evidence output.
+  MPR-131 remains the separate credential-persistence defect.
 
-MPR-47 disposition: `BLOCKED`. Credential and cancellation deferral does not
-waive the independent external structured-output failure or the unexecuted
-typed-negative row.
+MPR-47 execution disposition: `COMPLETE_WITH_FAILURES`. Every executed
+functional and negative row now has a recorded expected/actual result and a
+concrete ownership reproduction. The product qualification result is not an
+all-pass result: external structured-output mapping and typed validation-error
+mapping both failed.
 
 ## MPR-50 — protocol and restart persistence
 
