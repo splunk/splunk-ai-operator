@@ -108,9 +108,27 @@ gate.
   `PASS`.
 - API and queue controlled restart recovery with state and checkpoint-history
   preservation: `PASS` through the MPR-50 matrix.
-- Lifecycle/load/HPA execution preflight: `BLOCKED`. The operator Deployment
-  had `0` Ready/Available replicas and was in `CrashLoopBackOff`; the API and
-  queue workloads remained `1/1` Ready.
+- Lifecycle/load/HPA execution preflight after operator recovery: `PASS`. The
+  operator, API, and queue Deployments were each `1/1` Ready/Available; their
+  configured and running digests, the API Service UID/EndpointSlice binding,
+  Helm release/chart, namespace UID, and HPA policy all matched the immutable
+  record.
+- A credential-free Ollama-compatible fixture exercised the actual Launchpad
+  graph without entering the known MPR-131 credential-exposure path. Sync,
+  queued, and SSE modes reached terminal success, persisted unique markers,
+  and confirmed all three thread deletions: `PASS`.
+- Controlled API and queue replacements completed and advanced generations
+  `30 -> 31` and `33 -> 34`; both returned to `1/1` Ready while the operator
+  remained `1/1`: `PASS`. Immediately after queue replacement, metrics-server
+  briefly reported `ScalingActive=False/FailedGetResourceMetric`; the CPU
+  metric recovered to `ScalingActive=True` before the final verification.
+- Post-replacement protocol verification repeated sync, queued, and SSE with
+  terminal success and confirmed cleanup: `PASS`.
+- The post-recovery representative load completed six of six concurrent queued
+  requests with zero failures and confirmed cleanup. Durations were
+  `2.164s` minimum, `2.165s` p50, `2.183s` p95/maximum. Queue CPU peaked at
+  `2%`, so replicas correctly remained at one; this is
+  `OBSERVATION_ONLY_NOT_HPA_ACCEPTANCE`, not deterministic scale evidence.
 - Representative product load from the earlier run completed six of six queued
   requests with no failures, but queue CPU stayed below the HPA threshold and
   no scale transition occurred. It remains an observation, not deterministic
@@ -121,7 +139,12 @@ gate.
 - Timeout/cancellation and in-flight replacement are deferred to MPR-48 and
   MPR-135, but that deferral does not waive the other lifecycle rows.
 
-MPR-49 disposition: `BLOCKED`.
+MPR-49 disposition: `BLOCKED`. Operator health, exact identity, controlled
+replacement recovery, post-replacement protocol, representative load, and
+cleanup are now verified. The remaining blockers are the intended
+image/config upgrade input, disposable Secret-rotation configs, separately
+authorized host-Podman dependency interruption, a CPU-control graph for causal
+HPA scale-up/down evidence, and supported worker attribution.
 
 ## Deferred qualification
 
@@ -153,8 +176,11 @@ convert a live `FAIL`, `BLOCKED`, or `NOT_RUN` row to `PASS`.
 - Loopback port-forwards created by this execution were stopped.
 - The digest-pinned candidate Deployment, Service, ConfigMaps, and temporary ECR
   pull Secret are removed during final cleanup.
-- Launchpad API and queue Deployments remained `1/1` Ready at the final pre-
-  cleanup check.
+- The temporary mock provider and copied validation helpers were stopped and
+  removed from the installer host.
+- The operator, Launchpad API, and queue Deployments were each `1/1`
+  Ready/Available at the final check. The queue HPA returned to current/desired
+  replica count `1`, CPU `0%`, and `ScalingActive=True`.
 - PostgreSQL and Redis were not interrupted by this execution.
-- The operator remained unavailable at the final lifecycle preflight, so no HPA
-  or lifecycle acceptance claim is made.
+- No deterministic HPA scale acceptance, upgrade, Secret rotation, or
+  PostgreSQL/Redis recovery claim is made by this rerun.
