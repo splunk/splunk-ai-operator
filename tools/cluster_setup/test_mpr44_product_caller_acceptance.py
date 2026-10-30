@@ -88,8 +88,38 @@ class CallerRouteHandler(BaseHTTPRequestHandler):
         self.state["invocations"].append(inner)
         self.state["session_assistants"][inner["session_id"]] = inner["agent_id"]
         prompt = inner.get("task_prompt", "")
+        if prompt == "http-dependency-failure":
+            self._write(
+                503,
+                b'{"error_category":"dependency","detail":"temporarily unavailable"}',
+            )
+            return
         if prompt == "terminal-failure":
             terminal = {"status": "Completed", "success": False, "response": "ignored"}
+        elif prompt == "expected-validation-failure" or not isinstance(prompt, str):
+            terminal = {
+                "status": "Completed",
+                "success": False,
+                "http_error_code": "422",
+                "error_category": "validation",
+                "state": {},
+            }
+        elif prompt == "failure-with-state":
+            terminal = {
+                "status": "Completed",
+                "success": False,
+                "http_error_code": "422",
+                "error_category": "validation",
+                "state": {"messages": [{"content": "written"}]},
+            }
+        elif prompt == "failure-with-secret":
+            terminal = {
+                "status": "Completed",
+                "success": False,
+                "http_error_code": "422",
+                "error_category": "validation",
+                "detail": "secret-canary",
+            }
         elif prompt == "key-only":
             terminal = {"status": "Completed", "success": True, "response": {"expected-marker": "wrong"}}
         elif prompt == "structured":
@@ -224,6 +254,18 @@ class MPR44CallerRouteTests(unittest.TestCase):
             "cases": cases,
         }
 
+    @staticmethod
+    def failure_call(prompt, status=422, category="validation", owner="caller"):
+        return {
+            "task_prompt": prompt,
+            "expect": {
+                "outcome": "failure",
+                "http_status": status,
+                "error_category": category,
+                "owner": owner,
+            },
+        }
+
     def test_full_route_owns_ids_reuses_session_and_cleans_up(self):
         scenario = self.scenario(
             {
@@ -257,6 +299,105 @@ class MPR44CallerRouteTests(unittest.TestCase):
         self.assertNotIn(first["task_prompt"], second["task_prompt"])
         self.assertEqual(first["llm"]["api_key"], "secret-canary")
         self.assertTrue(all(request["request_id"] for request in self.state["requests"]))
+
+    def test_expected_failure_is_typed_reported_and_response_state_is_empty(self):
+        scenario = self.scenario(self.failure_call("expected-validation-failure"))
+        scenario["cases"][0]["expect_empty_state"] = True
+        result = mpr44.execute(
+            self.client,
+            mpr44.validate_scenario(scenario),
+            "test-caller-token",
+            "qualification",
+        )
+        failure = result["case_results"][0]
+        self.assertEqual(failure["expected_outcome"], "failure")
+        self.assertEqual(failure["actual_outcome"], "failure")
+        self.assertEqual(failure["transport_http_status"], 200)
+        self.assertEqual(failure["reported_error_status"], 422)
+        self.assertEqual(failure["error_category"], "validation")
+        self.assertEqual(failure["owner"], "caller")
+        self.assertEqual(result["external_gates"], {"MPR-131": "KNOWN_FAIL"})
+        self.assertIn("representative:empty-response-state", result["checks"])
+        self.assertIn("session-recall-proof:same-session-follow-up", result["checks"])
+        self.assertEqual(self.state["assistants"], set())
+        self.assertEqual(self.state["sessions"], {})
+
+    def test_raw_product_payload_preserves_invalid_fields_but_owns_resource_ids(self):
+        scenario = self.scenario(
+            {
+                "payload": {"task_prompt": 7},
+                "expect": {
+                    "outcome": "failure",
+                    "http_status": 422,
+                    "error_category": "validation",
+                    "owner": "product",
+                },
+            }
+        )
+        scenario["cases"][0]["expect_empty_state"] = True
+        result = mpr44.execute(
+            self.client,
+            mpr44.validate_scenario(scenario),
+            "test-caller-token",
+            "qualification",
+        )
+        invocation = self.state["invocations"][0]
+        self.assertEqual(invocation["task_prompt"], 7)
+        self.assertEqual(invocation["agent_id"], result["assistant_id"])
+        uuid.UUID(invocation["session_id"])
+        self.assertEqual(result["case_results"][0]["reported_error_status"], 422)
+
+    def test_expected_failure_rejects_success_and_still_cleans_up(self):
+        scenario = self.scenario(self.failure_call("ordinary-success"))
+        with self.assertRaisesRegex(mpr44.QualificationError, "successful outcome"):
+            mpr44.execute(
+                self.client,
+                mpr44.validate_scenario(scenario),
+                "test-caller-token",
+                "qualification",
+            )
+        self.assertEqual(self.state["assistants"], set())
+        self.assertEqual(
+            len([item for item in self.state["requests"] if item["method"] == "DELETE"]),
+            2,
+        )
+
+    def test_expected_failure_accepts_typed_transport_error(self):
+        scenario = self.scenario(
+            self.failure_call("http-dependency-failure", 503, "dependency", "dependency")
+        )
+        result = mpr44.execute(
+            self.client,
+            mpr44.validate_scenario(scenario),
+            "test-caller-token",
+            "qualification",
+        )
+        failure = result["case_results"][0]
+        self.assertEqual(failure["transport_http_status"], 503)
+        self.assertEqual(failure["reported_error_status"], 503)
+        self.assertEqual(failure["error_category"], "dependency")
+
+    def test_expected_failure_rejects_nonempty_response_state_and_scans_errors(self):
+        scenario = self.scenario(self.failure_call("failure-with-state"))
+        scenario["cases"][0]["expect_empty_state"] = True
+        with self.assertRaisesRegex(mpr44.QualificationError, "non-empty state"):
+            mpr44.execute(
+                self.client,
+                mpr44.validate_scenario(scenario),
+                "test-caller-token",
+                "qualification",
+            )
+        self.assertEqual(self.state["assistants"], set())
+
+        scenario = self.scenario(self.failure_call("failure-with-secret"))
+        with self.assertRaisesRegex(mpr44.QualificationError, "sensitive marker"):
+            mpr44.execute(
+                self.client,
+                mpr44.validate_scenario(scenario),
+                "test-caller-token",
+                "qualification",
+            )
+        self.assertEqual(self.state["assistants"], set())
 
     def test_http_200_terminal_failure_is_not_a_pass_and_still_cleans_up(self):
         scenario = self.scenario({"task_prompt": "terminal-failure", "expected_text": "ignored"})
@@ -443,6 +584,11 @@ class MPR44CallerRouteTests(unittest.TestCase):
             {"scenario_version": 1, "cases": [{"name": "safe", "calls": [{"task_prompt": "x"}]}]},
             {
                 "scenario_version": 1,
+                "external_gates": {"MPR-131": "PASS"},
+                "cases": [{"name": "safe", "calls": [{"task_prompt": "x"}]}],
+            },
+            {
+                "scenario_version": 1,
                 "cases": [{
                     "name": "empty-shape",
                     "calls": [{"task_prompt": "x", "expected_shape": {}}],
@@ -524,6 +670,124 @@ class MPR44CallerRouteTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(mpr44.ScenarioError, "same-session recall probe"):
             mpr44.validate_scenario(echoed_then_constant)
+
+    def test_failure_expectations_require_typed_status_category_and_owner(self):
+        invalid_expectations = (
+            {"outcome": "failure", "error_category": "validation", "owner": "caller"},
+            {"outcome": "failure", "http_status": True, "error_category": "validation", "owner": "caller"},
+            {"outcome": "failure", "http_status": 200, "error_category": "validation", "owner": "caller"},
+            {"outcome": "failure", "http_status": 422, "owner": "caller"},
+            {"outcome": "failure", "http_status": 422, "error_category": "unknown", "owner": "caller"},
+            {"outcome": "failure", "http_status": 422, "error_category": "validation"},
+            {"outcome": "failure", "http_status": 422, "error_category": "validation", "owner": "unknown"},
+            {
+                "outcome": "failure",
+                "http_status": 422,
+                "error_category": "validation",
+                "owner": "caller",
+                "text": "must not be accepted",
+            },
+        )
+        for expectation in invalid_expectations:
+            with self.subTest(expectation=expectation):
+                scenario = self.scenario({"task_prompt": "invalid", "expect": expectation})
+                with self.assertRaises(mpr44.ScenarioError):
+                    mpr44.validate_scenario(scenario)
+
+        owned_payload = self.scenario(
+            {
+                "payload": {"agent_id": "pre-existing"},
+                "expect": {
+                    "outcome": "failure",
+                    "http_status": 422,
+                    "error_category": "validation",
+                    "owner": "caller",
+                },
+            }
+        )
+        with self.assertRaisesRegex(mpr44.ScenarioError, "harness-owned"):
+            mpr44.validate_scenario(owned_payload)
+
+        mixed_payload = self.scenario(
+            {
+                "payload": {},
+                "task_prompt": "ambiguous",
+                "expect": {
+                    "outcome": "failure",
+                    "http_status": 422,
+                    "error_category": "validation",
+                    "owner": "caller",
+                },
+            }
+        )
+        with self.assertRaisesRegex(mpr44.ScenarioError, "mapped request fields"):
+            mpr44.validate_scenario(mixed_payload)
+
+        success_with_empty_state = self.scenario(
+            {"task_prompt": "ok", "expected_text": "ok"}
+        )
+        success_with_empty_state["cases"][0]["expect_empty_state"] = True
+        with self.assertRaisesRegex(mpr44.ScenarioError, "expected-failure calls"):
+            mpr44.validate_scenario(success_with_empty_state)
+
+        no_recall = {
+            "scenario_version": 1,
+            "sensitive_values": ["canary"],
+            "cases": [{
+                "name": "only-failure",
+                "calls": [self.failure_call("invalid")],
+                "expect_empty_state": True,
+            }],
+        }
+        with self.assertRaisesRegex(mpr44.ScenarioError, "same-session recall probe"):
+            mpr44.validate_scenario(no_recall)
+
+    def test_expect_style_success_can_supply_the_mandatory_recall_probe(self):
+        scenario = {
+            "scenario_version": 1,
+            "sensitive_values": ["canary"],
+            "cases": [{
+                "name": "recall",
+                "calls": [
+                    {
+                        "task_prompt": "{{SESSION_MARKER}}",
+                        "expect": {"outcome": "success", "text": "{{SESSION_MARKER}}"},
+                    },
+                    {
+                        "task_prompt": "recall it",
+                        "expect": {"outcome": "success", "text": "{{SESSION_MARKER}}"},
+                    },
+                ],
+            }],
+        }
+        self.assertIs(mpr44.validate_scenario(scenario), scenario)
+
+    def test_failure_outcomes_cannot_hide_a_later_success(self):
+        surfaces = (
+            {"status": "Error", "success": False, "http_error_code": 422},
+            {"status": "Completed", "success": True, "response": "looks successful"},
+        )
+        with self.assertRaisesRegex(mpr44.QualificationError, "contradictory"):
+            mpr44.response_outcome(200, surfaces)
+
+    def test_empty_response_state_is_structural_and_response_headers_are_scanned(self):
+        mpr44.assert_empty_response_state(
+            ({"state": None, "nested": {"values": [], "checkpoint": {}}},),
+            "failure response",
+        )
+        with self.assertRaisesRegex(mpr44.QualificationError, "non-empty state"):
+            mpr44.assert_empty_response_state(
+                ({"nested": {"values": {"messages": ["written"]}}},),
+                "failure response",
+            )
+        response = mpr44.HTTPResult(
+            422,
+            b'{"error":"safe"}',
+            "application/json",
+            (("X-Debug", "secret-canary"),),
+        )
+        with self.assertRaisesRegex(mpr44.QualificationError, "headers"):
+            mpr44.assert_http_result_absent(response, ["secret-canary"], "failure response")
 
     def test_credential_values_are_derived_even_with_incomplete_canary_list(self):
         scenario = self.scenario(

@@ -175,7 +175,10 @@ shape is:
           "llm": {"<approved short-lived model configuration>": "<in-memory value>"},
           "mcps": [],
           "knowledge_bases": [],
-          "expected_text": "{{SESSION_MARKER}}"
+          "expect": {
+            "outcome": "success",
+            "text": "{{SESSION_MARKER}}"
+          }
         },
         {
           "task_prompt": "Return the marker from the preceding request.",
@@ -183,7 +186,25 @@ shape is:
           "llm": {"<repeat the complete model configuration>": "<in-memory value>"},
           "mcps": [],
           "knowledge_bases": [],
-          "expected_text": "{{SESSION_MARKER}}"
+          "expect": {
+            "outcome": "success",
+            "text": "{{SESSION_MARKER}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "invalid-product-field-type",
+      "expect_empty_state": true,
+      "calls": [
+        {
+          "payload": {"task_prompt": 7},
+          "expect": {
+            "outcome": "failure",
+            "http_status": [400, 422],
+            "error_category": "validation",
+            "owner": "product"
+          }
         }
       ]
     }
@@ -214,15 +235,33 @@ secure_scenario_producer | \
 The helper also runs missing-bearer, malformed-bearer and malformed-JSON
 negative checks. A transport-level HTTP 200 does not pass an invocation when
 the terminal NDJSON event has `success=false` or lacks a completed response.
+Product negative cases are separate authenticated invokes. Each failure
+expectation must declare a 4xx/5xx `http_status`, a supported
+`error_category`, and a likely `owner` (`product`, `caller`, `platform`, or
+`dependency`). The helper compares `http_status` with the terminal
+`http_error_code` when present, otherwise with the transport status. A declared
+failure cannot pass on a successful terminal event, and mixed failure/success
+terminal evidence is rejected.
+
+Use `payload` only for an intentionally invalid inner product request. The
+helper overwrites harness-owned assistant/session IDs and rejects a scenario
+that attempts to supply them. `expect_empty_state: true` scans all returned
+JSON/NDJSON event objects and accepts only absent or recursively empty
+state/values/checkpoint fields. That proves the external response contract; the
+SLIM route has no independent state read, so it does not establish that
+persisted LAS thread state is empty. Record a separate direct LAS state read if
+persisted-state absence is required.
+
 At least one case must prove recall: a marker must be supplied in an earlier
 request, omitted from every field of the later request, and still be required
 in the later completed response. Repeating the same prompt or accepting the
 same constant output twice is not persistence evidence.
-Sensitive canaries must be absent from every inspected success/error body.
-Credential-bearing LLM, MCP, or knowledge-base calls require non-empty
-`sensitive_values`. The helper rejects missing canaries and automatically adds
-every recognized secret-bearing value from the in-memory LLM/MCP/KB config to
-the scan set, so an incomplete manual list cannot omit a recognized credential.
+Sensitive canaries must be absent from every inspected success/error body and
+retained response header, including cleanup responses. Credential-bearing LLM,
+MCP, knowledge-base, or raw-payload calls require non-empty `sensitive_values`.
+The helper rejects missing canaries and automatically adds every recognized
+secret-bearing value from the in-memory call config to the scan set, so an
+incomplete manual list cannot omit a recognized credential.
 
 At minimum, retain the sanitized helper result and record:
 
@@ -230,6 +269,8 @@ At minimum, retain the sanitized helper result and record:
 - the first expected product response;
 - the expected same-session follow-up response;
 - terminal response mapping from `Completed.response`;
+- expected-failure status/category/owner classification and, when configured,
+  empty external response state;
 - safe denial of missing/malformed authentication and malformed JSON;
 - successful assistant deletion and its idempotent/not-found confirmation.
 

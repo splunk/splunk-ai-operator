@@ -155,9 +155,33 @@ For structured output, supply `structured_output` (or the caller version's
 answer in the schema. A resume case uses a second call in the same case with
 `hitl_response` and fresh per-invocation context.
 
+For an expected external-route product failure, `expect.outcome` must be
+`failure` and all three classification fields are mandatory:
+
+- `http_status`: one 4xx/5xx status or a non-empty list of allowed 4xx/5xx
+  statuses. The helper prefers the terminal event's `http_error_code` and falls
+  back to the transport status, so an HTTP 200 envelope cannot hide an
+  unexpected product error status.
+- `error_category`: one of `authentication`, `authorization`, `cancelled`,
+  `dependency`, `not_found`, `platform`, `timeout`, or `validation`.
+- `owner`: one of `product`, `caller`, `platform`, or `dependency`.
+
+Use a call-level `payload` object for intentional missing-field or wrong-type
+product requests. The helper injects its own `agent_id` and `session_id`; the
+scenario cannot select pre-existing resources or combine `payload` with mapped
+request fields. A declared failure does not turn an ordinary successful
+`Completed` event into a pass, and contradictory failure/success events fail the
+run.
+
 Set `expect_empty_state: true` only for a negative case whose contract says the
-request must not create graph state. A missing thread (HTTP 404) and structurally
-empty default containers count as empty; any persisted value fails the case.
+request must not return graph state. For the external HTTP helper, this assertion
+scans every returned NDJSON/JSON response object and requires state, values, and
+checkpoint surfaces to be absent or recursively empty. The external SLIM API
+does not expose an independent thread-state read, so this is response-contract
+evidence, not proof that persisted LAS state is empty. Use the direct/in-Pod
+helper or an explicitly recorded direct LAS state read before claiming persisted
+state absence. The external helper still confirms its assistant cascade delete
+with a second not-found/idempotent delete before it can report `PASS`.
 
 The direct LAS protocol helper accepts complete product `input` and `context`
 objects. Do not add the sample graph's `request` field to the Launchpad graph.

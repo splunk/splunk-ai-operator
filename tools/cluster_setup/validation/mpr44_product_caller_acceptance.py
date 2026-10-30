@@ -40,7 +40,23 @@ OPTIONAL_CALL_FIELDS = (
     "hitl_response",
     "skills",
     "structured_output",
+    "structured_response",
 )
+OWNED_PAYLOAD_FIELDS = {"agent_id", "session_id"}
+ALLOWED_OWNERS = {"product", "caller", "platform", "dependency"}
+ALLOWED_ERROR_CATEGORIES = {
+    "authentication",
+    "authorization",
+    "cancelled",
+    "dependency",
+    "not_found",
+    "platform",
+    "timeout",
+    "validation",
+}
+FAILURE_STATUSES = {"error", "failed", "cancelled", "timeout"}
+STATE_SURFACE_KEYS = {"state", "values", "checkpoint", "checkpoint_state", "graph_state"}
+REQUIRED_EXTERNAL_GATES = {"MPR-131": "KNOWN_FAIL"}
 JSON_TYPES = {
     "array": list,
     "boolean": bool,
@@ -68,6 +84,17 @@ class HTTPResult:
     status: int
     body: bytes
     content_type: str
+    headers: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class InvocationResult:
+    transport_status: int
+    reported_status: int
+    actual_outcome: str
+    error_category: str | None
+    response: Any | None
+    surfaces: tuple[Any, ...]
 
 
 class NoRedirect(request.HTTPRedirectHandler):
@@ -168,6 +195,42 @@ def assert_body_absent(body: bytes, secrets: list[str], source: str) -> None:
                 continue
     for value in parsed_values:
         assert_absent(value, secrets, source)
+
+
+def assert_http_result_absent(result: HTTPResult, secrets: list[str], source: str) -> None:
+    """Scan the bounded response body and every retained response header."""
+    assert_absent(result.headers, secrets, f"{source} headers")
+    assert_body_absent(result.body, secrets, source)
+
+
+def state_is_effectively_empty(value: Any) -> bool:
+    """Accept only absent or recursively empty/default JSON state containers."""
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return all(state_is_effectively_empty(item) for item in value.values())
+    if isinstance(value, list):
+        return all(state_is_effectively_empty(item) for item in value)
+    return False
+
+
+def state_surface_values(value: Any) -> Iterable[Any]:
+    """Yield state-like fields from every nested response/event object."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.lower() in STATE_SURFACE_KEYS:
+                yield item
+            yield from state_surface_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from state_surface_values(item)
+
+
+def assert_empty_response_state(surfaces: Iterable[Any], source: str) -> None:
+    """Require every state surface returned by SLIM to be absent or empty."""
+    for surface in surfaces:
+        if any(not state_is_effectively_empty(value) for value in state_surface_values(surface)):
+            raise QualificationError(f"{source} returned non-empty state for an expected failure")
 
 
 def _reject_json_constant(_value: str) -> None:
@@ -295,6 +358,85 @@ def _validate_shape(shape: Any, location: str) -> None:
         )
 
 
+def _normalize_http_statuses(value: Any, location: str, *, failure: bool) -> list[int]:
+    statuses = [value] if isinstance(value, int) and not isinstance(value, bool) else value
+    lower, upper = (400, 599) if failure else (200, 299)
+    if not isinstance(statuses, list) or not statuses or not all(
+        isinstance(status, int)
+        and not isinstance(status, bool)
+        and lower <= status <= upper
+        for status in statuses
+    ):
+        kind = "failure" if failure else "success"
+        raise ScenarioError(f"{location} {kind} http_status must contain valid HTTP statuses")
+    if len(statuses) != len(set(statuses)):
+        raise ScenarioError(f"{location} http_status must not contain duplicates")
+    return statuses
+
+
+def normalize_expectation(call: dict[str, Any], location: str) -> dict[str, Any]:
+    raw = call.get("expect")
+    if raw is not None and any(field in call for field in ("expected_text", "expected_shape")):
+        raise ScenarioError(f"{location} cannot mix expect with legacy expected fields")
+    if raw is None:
+        raw = {
+            "outcome": "success",
+            "text": call.get("expected_text"),
+            "shape": call.get("expected_shape"),
+        }
+    if not isinstance(raw, dict):
+        raise ScenarioError(f"{location} expect must be an object")
+    allowed = {"outcome", "text", "shape", "http_status", "error_category", "owner"}
+    if set(raw) - allowed:
+        raise ScenarioError(f"{location} expect contains unsupported fields")
+    outcome = raw.get("outcome", "success")
+    if outcome not in ("success", "failure"):
+        raise ScenarioError(f"{location} expect.outcome must be success or failure")
+    result = {key: item for key, item in raw.items() if item is not None}
+    result["outcome"] = outcome
+    if outcome == "success":
+        text = result.get("text")
+        shape = result.get("shape")
+        if text is not None and (not isinstance(text, str) or not text.strip()):
+            raise ScenarioError(f"{location} success text must be non-empty")
+        if shape is not None:
+            _validate_shape(shape, location)
+        if text is None and shape is None:
+            raise ScenarioError(f"{location} success expectation needs text or shape")
+        if "http_status" in result:
+            result["http_status"] = _normalize_http_statuses(
+                result["http_status"], location, failure=False
+            )
+        if "error_category" in result or "owner" in result:
+            raise ScenarioError(f"{location} success expectation cannot set failure metadata")
+        return result
+
+    if "text" in result or "shape" in result:
+        raise ScenarioError(f"{location} failure expectation cannot require successful output")
+    if "http_status" not in result:
+        raise ScenarioError(f"{location} failure expectation needs http_status")
+    result["http_status"] = _normalize_http_statuses(
+        result["http_status"], location, failure=True
+    )
+    category = result.get("error_category")
+    if category not in ALLOWED_ERROR_CATEGORIES:
+        raise ScenarioError(f"{location} failure expectation needs a supported error_category")
+    owner = result.get("owner")
+    if owner not in ALLOWED_OWNERS:
+        raise ScenarioError(f"{location} failure expectation needs a supported owner")
+    return result
+
+
+def _success_expected_text(call: dict[str, Any]) -> str | None:
+    raw = call.get("expect")
+    if isinstance(raw, dict):
+        if raw.get("outcome", "success") != "success":
+            return None
+        return raw.get("text") if isinstance(raw.get("text"), str) else None
+    expected = call.get("expected_text")
+    return expected if isinstance(expected, str) else None
+
+
 def is_session_recall_case(case: dict[str, Any]) -> bool:
     """Require a later call to recall a generated marker absent from its request."""
     calls = case.get("calls", [])
@@ -303,12 +445,12 @@ def is_session_recall_case(case: dict[str, Any]) -> bool:
     for later_index, later in enumerate(calls[1:], start=1):
         if not isinstance(later, dict):
             continue
-        expected = later.get("expected_text")
+        expected = _success_expected_text(later)
         if not isinstance(expected, str) or SESSION_MARKER_PLACEHOLDER not in expected:
             continue
         later_request = {
             key: later[key]
-            for key in ("task_prompt", "system_prompt", *OPTIONAL_CALL_FIELDS)
+            for key in ("payload", "task_prompt", "system_prompt", *OPTIONAL_CALL_FIELDS)
             if key in later
         }
         if any(SESSION_MARKER_PLACEHOLDER in value for value in strings(later_request)):
@@ -318,10 +460,10 @@ def is_session_recall_case(case: dict[str, Any]) -> bool:
                 continue
             earlier_request = {
                 key: earlier[key]
-                for key in ("task_prompt", "system_prompt", *OPTIONAL_CALL_FIELDS)
+                for key in ("payload", "task_prompt", "system_prompt", *OPTIONAL_CALL_FIELDS)
                 if key in earlier
             }
-            earlier_expected = earlier.get("expected_text")
+            earlier_expected = _success_expected_text(earlier)
             if (
                 isinstance(earlier_expected, str)
                 and SESSION_MARKER_PLACEHOLDER in earlier_expected
@@ -347,10 +489,12 @@ def substitute_session_marker(value: Any, marker: str) -> Any:
 def validate_scenario(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ScenarioError("stdin JSON must be an object")
-    if set(value) - {"scenario_version", "sensitive_values", "cases"}:
+    if set(value) - {"scenario_version", "sensitive_values", "cases", "external_gates"}:
         raise ScenarioError("stdin JSON contains unsupported top-level fields")
     if value.get("scenario_version", 1) != 1:
         raise ScenarioError("scenario_version must be 1")
+    if value.get("external_gates", REQUIRED_EXTERNAL_GATES) != REQUIRED_EXTERNAL_GATES:
+        raise ScenarioError("external_gates must retain MPR-131 as KNOWN_FAIL")
     sensitive = value.get("sensitive_values", [])
     if not isinstance(sensitive, list) or not all(isinstance(item, str) and item for item in sensitive):
         raise ScenarioError("sensitive_values must contain non-empty strings")
@@ -362,56 +506,91 @@ def validate_scenario(value: Any) -> dict[str, Any]:
     names: set[str] = set()
     sensitive_declaration_required = False
     call_fields = {
+        "payload",
         "task_prompt",
         "system_prompt",
         "agent_timeout",
         "expected_text",
         "expected_shape",
+        "expect",
         *OPTIONAL_CALL_FIELDS,
     }
     for case_index, case in enumerate(cases, start=1):
         location = f"case {case_index}"
-        if not isinstance(case, dict) or set(case) - {"name", "calls"}:
-            raise ScenarioError(f"{location} may contain only name and calls")
+        if not isinstance(case, dict) or set(case) - {"name", "calls", "expect_empty_state"}:
+            raise ScenarioError(
+                f"{location} may contain only name, calls, and expect_empty_state"
+            )
         name = case.get("name")
         if not isinstance(name, str) or not SAFE_NAME.fullmatch(name) or name in names:
             raise ScenarioError(f"{location} needs a unique safe name")
         names.add(name)
+        if "expect_empty_state" in case and not isinstance(case["expect_empty_state"], bool):
+            raise ScenarioError(f"{location} expect_empty_state must be boolean")
         calls = case.get("calls")
         if not isinstance(calls, list) or not calls:
             raise ScenarioError(f"{location} needs one or more calls")
+        outcomes: list[str] = []
         for call_index, call in enumerate(calls, start=1):
             call_location = f"{location} call {call_index}"
             if not isinstance(call, dict) or set(call) - call_fields:
                 raise ScenarioError(f"{call_location} contains unsupported fields")
-            if not isinstance(call.get("task_prompt"), str) or not call["task_prompt"].strip():
-                raise ScenarioError(f"{call_location} needs a non-empty task_prompt")
-            if "system_prompt" in call and not isinstance(call["system_prompt"], str):
-                raise ScenarioError(f"{call_location} system_prompt must be a string")
-            timeout = call.get("agent_timeout", DEFAULT_TIMEOUT)
-            if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 600:
-                raise ScenarioError(f"{call_location} agent_timeout must be between 1 and 600")
-            expected_text = call.get("expected_text")
-            expected_shape = call.get("expected_shape")
-            if expected_text is None and expected_shape is None:
-                raise ScenarioError(f"{call_location} needs expected_text or expected_shape")
-            if expected_text is not None and (
-                not isinstance(expected_text, str) or not expected_text.strip()
-            ):
-                raise ScenarioError(f"{call_location} expected_text must be non-empty")
-            if expected_shape is not None:
-                _validate_shape(expected_shape, call_location)
+            expectation = normalize_expectation(call, call_location)
+            outcomes.append(expectation["outcome"])
+            if "payload" in call:
+                if not isinstance(call["payload"], dict):
+                    raise ScenarioError(f"{call_location} payload must be an object")
+                if OWNED_PAYLOAD_FIELDS.intersection(call["payload"]):
+                    raise ScenarioError(
+                        f"{call_location} payload cannot set harness-owned agent_id or session_id"
+                    )
+                conflicting = {
+                    "task_prompt",
+                    "system_prompt",
+                    "agent_timeout",
+                    *OPTIONAL_CALL_FIELDS,
+                }.intersection(call)
+                if conflicting:
+                    raise ScenarioError(
+                        f"{call_location} payload cannot be combined with mapped request fields"
+                    )
+            elif expectation["outcome"] == "success":
+                if not isinstance(call.get("task_prompt"), str) or not call["task_prompt"].strip():
+                    raise ScenarioError(f"{call_location} needs a non-empty task_prompt")
+                if "system_prompt" in call and not isinstance(call["system_prompt"], str):
+                    raise ScenarioError(f"{call_location} system_prompt must be a string")
+                timeout = call.get("agent_timeout", DEFAULT_TIMEOUT)
+                if (
+                    not isinstance(timeout, int)
+                    or isinstance(timeout, bool)
+                    or not 1 <= timeout <= 600
+                ):
+                    raise ScenarioError(
+                        f"{call_location} agent_timeout must be between 1 and 600"
+                    )
+            for request_field in ("payload", "task_prompt", "system_prompt", "agent_timeout"):
+                if request_field in call:
+                    try:
+                        json.dumps(call[request_field], allow_nan=False)
+                    except (TypeError, ValueError) as exc:
+                        raise ScenarioError(
+                            f"{call_location} {request_field} must be JSON-compatible"
+                        ) from exc
             for optional in OPTIONAL_CALL_FIELDS:
                 if optional in call:
                     try:
                         json.dumps(call[optional], allow_nan=False)
                     except (TypeError, ValueError) as exc:
                         raise ScenarioError(f"{call_location} {optional} must be JSON-compatible") from exc
-            if any(field in call for field in ("llm", "mcps", "knowledge_bases")):
+            if any(field in call for field in ("llm", "mcps", "knowledge_bases", "payload")):
                 sensitive_declaration_required = True
+        if case.get("expect_empty_state") and any(outcome != "failure" for outcome in outcomes):
+            raise ScenarioError(
+                f"{location} expect_empty_state is valid only for expected-failure calls"
+            )
     if sensitive_declaration_required and not sensitive:
         raise ScenarioError(
-            "credential-bearing llm/mcps/knowledge_bases cases require sensitive_values canaries"
+            "credential-bearing llm/mcps/knowledge_bases/payload cases require sensitive_values canaries"
         )
     if not any(is_session_recall_case(case) for case in cases):
         raise ScenarioError(
@@ -481,17 +660,21 @@ class SlimHTTPClient:
         try:
             with self.opener.open(req, timeout=self.timeout) as response:
                 response_body = self._read(response)
+                response_headers = tuple(response.headers.items())
                 return HTTPResult(
                     status=response.status,
                     body=response_body,
                     content_type=response.headers.get("Content-Type", ""),
+                    headers=response_headers,
                 )
         except error.HTTPError as exc:
             response_body = self._read(exc)
+            response_headers = tuple(exc.headers.items()) if exc.headers else ()
             return HTTPResult(
                 status=exc.code,
                 body=response_body,
                 content_type=exc.headers.get("Content-Type", "") if exc.headers else "",
+                headers=response_headers,
             )
         except QualificationError:
             raise
@@ -499,11 +682,15 @@ class SlimHTTPClient:
             raise QualificationError("SLIM HTTP transport failed") from exc
 
 
-def parse_json_object(body: bytes, source: str) -> dict[str, Any]:
+def parse_json_value(body: bytes, source: str) -> Any:
     try:
-        value = strict_json_loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return strict_json_loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise QualificationError(f"{source} did not return valid JSON") from exc
+
+
+def parse_json_object(body: bytes, source: str) -> dict[str, Any]:
+    value = parse_json_value(body, source)
     if not isinstance(value, dict):
         raise QualificationError(f"{source} did not return a JSON object")
     return value
@@ -533,10 +720,9 @@ def parse_ndjson(body: bytes) -> list[dict[str, Any]]:
 
 
 def terminal_response(events: list[dict[str, Any]]) -> Any:
-    failure_statuses = {"error", "failed", "cancelled", "timeout"}
     if any(
         event.get("success") is False
-        or str(event.get("status", "")).lower() in failure_statuses
+        or str(event.get("status", "")).lower() in FAILURE_STATUSES
         for event in events[:-1]
     ):
         raise QualificationError("SLIM invoke response contained a terminal failure event")
@@ -595,12 +781,155 @@ def assert_expected_shape(response_value: Any, shape: dict[str, Any]) -> None:
             raise QualificationError("product response had an unexpected structured field type")
 
 
-def assert_expected(response_value: Any, call: dict[str, Any]) -> None:
-    expected_text = call.get("expected_text")
+def assert_expected(response_value: Any, expectation: dict[str, Any]) -> None:
+    expected_text = expectation.get("text")
     if expected_text is not None and expected_text not in "\n".join(value_strings(response_value)):
         raise QualificationError("Completed.response missed the expected product text")
-    if call.get("expected_shape") is not None:
-        assert_expected_shape(response_value, call["expected_shape"])
+    if expectation.get("shape") is not None:
+        assert_expected_shape(response_value, expectation["shape"])
+
+
+def _surface_objects(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+
+
+def _reported_status(status: int, surfaces: Iterable[Any]) -> int:
+    objects = [item for surface in surfaces for item in _surface_objects(surface)]
+    candidates: list[int] = []
+    for item in objects:
+        for field in ("http_error_code", "http_status", "status_code"):
+            value = item.get(field)
+            if isinstance(value, bool):
+                continue
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= candidate <= 599:
+                candidates.append(candidate)
+    if len(set(candidates)) > 1:
+        raise QualificationError("SLIM invoke returned conflicting HTTP/error statuses")
+    if candidates:
+        return candidates[-1]
+    return status
+
+
+def classify_error(status: int, surfaces: Iterable[Any]) -> str:
+    objects = [item for surface in surfaces for item in _surface_objects(surface)]
+    categories: list[str] = []
+    for item in objects:
+        category = item.get("error_category")
+        if category is not None:
+            if category not in ALLOWED_ERROR_CATEGORIES:
+                raise QualificationError("SLIM invoke returned an unsupported error category")
+            categories.append(category)
+        event_status = str(item.get("status", "")).lower()
+        if event_status in ("cancelled", "timeout"):
+            categories.append(event_status)
+    if len(set(categories)) > 1:
+        raise QualificationError("SLIM invoke returned conflicting error categories")
+    if categories:
+        return categories[-1]
+    code = _reported_status(status, surfaces)
+    if code in (400, 409, 422):
+        return "validation"
+    if code == 401:
+        return "authentication"
+    if code == 403:
+        return "authorization"
+    if code == 404:
+        return "not_found"
+    if code in (408, 504):
+        return "timeout"
+    if code in (502, 503):
+        return "dependency"
+    return "platform"
+
+
+def _is_failure_event(value: Any) -> bool:
+    return isinstance(value, dict) and (
+        value.get("success") is False
+        or str(value.get("status", "")).lower() in FAILURE_STATUSES
+    )
+
+
+def response_outcome(status: int, surfaces: tuple[Any, ...]) -> str:
+    failure = any(
+        _is_failure_event(item) for surface in surfaces for item in _surface_objects(surface)
+    )
+    successful_terminal = any(
+        item.get("status") == "Completed" and item.get("success") is True
+        for surface in surfaces
+        for item in _surface_objects(surface)
+    )
+    if failure and successful_terminal:
+        raise QualificationError("SLIM invoke response reported contradictory terminal outcomes")
+    if failure or not 200 <= status < 300:
+        return "failure"
+    events = [surface for surface in surfaces if isinstance(surface, dict)]
+    terminal_response(events)
+    return "success"
+
+
+def parse_invoke_surfaces(result: HTTPResult) -> tuple[Any, ...]:
+    media_type = result.content_type.split(";", 1)[0].strip().lower()
+    if media_type == "application/x-ndjson":
+        return tuple(parse_ndjson(result.body))
+    if 200 <= result.status < 300:
+        raise QualificationError("SLIM invoke returned an unexpected media type")
+    if not result.body:
+        return ()
+    if media_type == "application/json" or media_type.endswith("+json"):
+        return (parse_json_value(result.body, "SLIM invoke error response"),)
+    raise QualificationError("SLIM invoke error returned an unexpected media type")
+
+
+def assert_expected_outcome(
+    result: HTTPResult,
+    surfaces: tuple[Any, ...],
+    expectation: dict[str, Any],
+) -> InvocationResult:
+    expected = expectation["outcome"]
+    if expected == "success":
+        if not 200 <= result.status < 300:
+            raise QualificationError(f"SLIM invoke returned HTTP {result.status}")
+        events = [surface for surface in surfaces if isinstance(surface, dict)]
+        response_value = terminal_response(events)
+        statuses = expectation.get("http_status")
+        if statuses is not None and result.status not in statuses:
+            raise QualificationError("SLIM invoke returned an unexpected HTTP status")
+        assert_expected(response_value, expectation)
+        return InvocationResult(
+            transport_status=result.status,
+            reported_status=result.status,
+            actual_outcome="success",
+            error_category=None,
+            response=response_value,
+            surfaces=surfaces,
+        )
+
+    actual = response_outcome(result.status, surfaces)
+    if actual != "failure":
+        raise QualificationError("expected product failure returned a successful outcome")
+    reported_status = _reported_status(result.status, surfaces)
+    if reported_status not in expectation["http_status"]:
+        raise QualificationError("SLIM invoke returned an unexpected HTTP/error status")
+    category = classify_error(result.status, surfaces)
+    if category != expectation["error_category"]:
+        raise QualificationError("SLIM invoke returned an unexpected sanitized error category")
+    return InvocationResult(
+        transport_status=result.status,
+        reported_status=reported_status,
+        actual_outcome="failure",
+        error_category=category,
+        response=None,
+        surfaces=surfaces,
+    )
 
 
 def route_root(tenant: str) -> str:
@@ -638,7 +967,7 @@ def create_assistant(
         payload={"agent_name": name, "app_version": "mpr-44-acceptance"},
     )
     try:
-        assert_body_absent(result.body, secrets, "assistant create response")
+        assert_http_result_absent(result, secrets, "assistant create response")
         if result.status != 201:
             raise QualificationError(f"assistant create returned HTTP {result.status}")
         body = parse_json_object(result.body, "assistant create")
@@ -661,6 +990,30 @@ def create_assistant(
         raise QualificationError("assistant create omitted a UUID runtime_id") from exc
 
 
+def build_inner_payload(
+    call: dict[str, Any], assistant_id: str, session_id: str
+) -> dict[str, Any]:
+    if "payload" in call:
+        inner = dict(call["payload"])
+        # Keep every temporary resource owned by this harness even if a caller
+        # bypasses scenario validation and supplies its own identifiers.
+        inner["agent_id"] = assistant_id
+        inner["session_id"] = session_id
+        return inner
+    inner = {
+        "agent_id": assistant_id,
+        "session_id": session_id,
+        "system_prompt": call.get("system_prompt", ""),
+        "agent_timeout": call.get("agent_timeout", DEFAULT_TIMEOUT),
+    }
+    if "task_prompt" in call:
+        inner["task_prompt"] = call["task_prompt"]
+    for field in OPTIONAL_CALL_FIELDS:
+        if field in call:
+            inner[field] = call[field]
+    return inner
+
+
 def invoke_call(
     client: SlimHTTPClient,
     root: str,
@@ -670,17 +1023,8 @@ def invoke_call(
     session_id: str,
     call: dict[str, Any],
     secrets: list[str],
-) -> Any:
-    inner = {
-        "agent_id": assistant_id,
-        "session_id": session_id,
-        "task_prompt": call["task_prompt"],
-        "system_prompt": call.get("system_prompt", ""),
-        "agent_timeout": call.get("agent_timeout", DEFAULT_TIMEOUT),
-    }
-    for field in OPTIONAL_CALL_FIELDS:
-        if field in call:
-            inner[field] = call[field]
+) -> InvocationResult:
+    inner = build_inner_payload(call, assistant_id, session_id)
     result = client.request(
         "POST",
         root + "/invoke",
@@ -688,18 +1032,14 @@ def invoke_call(
         request_id=request_id,
         payload={"payload": json.dumps(inner, allow_nan=False)},
     )
-    assert_body_absent(result.body, secrets, "invoke response")
-    if not 200 <= result.status < 300:
-        raise QualificationError(f"SLIM invoke returned HTTP {result.status}")
-    media_type = result.content_type.split(";", 1)[0].strip().lower()
-    if media_type != "application/x-ndjson":
-        raise QualificationError("SLIM invoke returned an unexpected media type")
-    events = parse_ndjson(result.body)
-    assert_absent(events, secrets, "invoke events")
-    response_value = terminal_response(events)
-    assert_expected(response_value, call)
-    assert_absent(response_value, secrets, "Completed.response")
-    return response_value
+    assert_http_result_absent(result, secrets, "invoke response")
+    surfaces = parse_invoke_surfaces(result)
+    assert_absent(surfaces, secrets, "invoke response surfaces")
+    expectation = normalize_expectation(call, "invoke call")
+    outcome = assert_expected_outcome(result, surfaces, expectation)
+    if outcome.response is not None:
+        assert_absent(outcome.response, secrets, "Completed.response")
+    return outcome
 
 
 def cleanup_assistant(
@@ -717,7 +1057,7 @@ def cleanup_assistant(
     )
     scan_failed = False
     try:
-        assert_body_absent(first.body, secrets, "assistant cleanup response")
+        assert_http_result_absent(first, secrets, "assistant cleanup response")
     except QualificationError:
         scan_failed = True
     if not 200 <= first.status < 300:
@@ -729,7 +1069,7 @@ def cleanup_assistant(
         request_id="mpr44-cleanup-confirm",
     )
     try:
-        assert_body_absent(second.body, secrets, "assistant cleanup confirmation")
+        assert_http_result_absent(second, secrets, "assistant cleanup confirmation")
     except QualificationError:
         scan_failed = True
     if second.status == 404:
@@ -783,9 +1123,9 @@ def run_negative_checks(
         )
         if result.status not in (401, 403):
             _cleanup_unexpected_create(client, root, token, result, secrets)
-            assert_body_absent(result.body, secrets, f"{label} response")
+            assert_http_result_absent(result, secrets, f"{label} response")
             raise QualificationError(f"{label} was not denied")
-        assert_body_absent(result.body, secrets, f"{label} response")
+        assert_http_result_absent(result, secrets, f"{label} response")
         denial_body = parse_json_object(result.body, f"{label} response")
         assert_absent(denial_body, secrets, f"{label} response")
         checks.append(label + "-denied")
@@ -798,9 +1138,9 @@ def run_negative_checks(
     )
     if malformed.status not in (400, 422):
         _cleanup_unexpected_create(client, root, token, malformed, secrets)
-        assert_body_absent(malformed.body, secrets, "malformed JSON response")
+        assert_http_result_absent(malformed, secrets, "malformed JSON response")
         raise QualificationError("malformed JSON was not safely rejected")
-    assert_body_absent(malformed.body, secrets, "malformed JSON response")
+    assert_http_result_absent(malformed, secrets, "malformed JSON response")
     malformed_body = parse_json_object(malformed.body, "malformed JSON response")
     assert_absent(malformed_body, secrets, "malformed JSON response")
     checks.append("malformed-json-rejected")
@@ -826,6 +1166,7 @@ def execute(
     checks = run_negative_checks(client, root, token, scan_values)
     assistant_id: str | None = None
     sessions: list[dict[str, str]] = []
+    case_results: list[dict[str, Any]] = []
     primary_error: Exception | None = None
     cleanup_error: Exception | None = None
     try:
@@ -849,18 +1190,45 @@ def execute(
                     [*scan_values, *credential_values(resolved_calls)]
                 )
             )
+            case_surfaces: list[Any] = []
             for call_index, call in enumerate(resolved_calls, start=1):
-                invoke_call(
+                request_id = f"mpr44-{case_index}-{call_index}"
+                outcome = invoke_call(
                     client,
                     root,
                     token,
-                    f"mpr44-{case_index}-{call_index}",
+                    request_id,
                     assistant_id,
                     session_id,
                     call,
                     scan_values,
                 )
+                expectation = normalize_expectation(
+                    call, f"case {case_index} call {call_index}"
+                )
+                case_surfaces.extend(outcome.surfaces)
+                evidence = {
+                    "route": root,
+                    "case": case["name"],
+                    "call": call_index,
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "expected_outcome": expectation["outcome"],
+                    "actual_outcome": outcome.actual_outcome,
+                    "transport_http_status": outcome.transport_status,
+                    "owner": expectation.get("owner", "none"),
+                }
+                if expectation.get("http_status") is not None:
+                    evidence["expected_http_statuses"] = expectation["http_status"]
+                if outcome.error_category is not None:
+                    evidence["expected_error_category"] = expectation["error_category"]
+                    evidence["error_category"] = outcome.error_category
+                    evidence["reported_error_status"] = outcome.reported_status
+                case_results.append(evidence)
                 checks.append(f"{case['name']}:call-{call_index}")
+            if case.get("expect_empty_state"):
+                assert_empty_response_state(case_surfaces, "expected-failure invoke response")
+                checks.append(f"{case['name']}:empty-response-state")
             if is_session_recall_case(case):
                 checks.append(f"{case['name']}:same-session-follow-up")
     except Exception as exc:  # preserve cleanup while main sanitizes unknown errors
@@ -888,6 +1256,8 @@ def execute(
         "checks": checks,
         "assistant_id": assistant_id,
         "sessions": sessions,
+        "case_results": case_results,
+        "external_gates": REQUIRED_EXTERNAL_GATES,
     }
     assert_absent(result, scan_values, "sanitized evidence")
     return result
