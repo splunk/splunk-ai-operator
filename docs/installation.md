@@ -398,6 +398,11 @@ endpoint, and works on a cluster without the KubeRay CRDs.
 
 ## LAS deployment mode, credentials, and egress
 
+For the end-to-end customer/operator procedure, including profile selection,
+connected and air-gapped installation, network prerequisites, credential
+rotation, queue scaling, retention, telemetry, and troubleshooting, see
+[LAS single-product installation and operations](agent-runtime/las-single-product-installation-operations.md).
+
 For k0s deployments, put LAS deployment credentials under the AgentRuntime
 feature in the deployment configuration file. The installer validates the
 required PostgreSQL URI, Redis URI and license key, creates three namespace
