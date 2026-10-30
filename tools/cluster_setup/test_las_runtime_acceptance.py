@@ -36,6 +36,25 @@ class FakeClient:
         return 200, __import__("json").dumps(self.payload).encode(), "application/json"
 
 
+class PersistenceClient:
+    def __init__(self, state, history_pages, api_key=""):
+        self.state = state
+        self.history_pages = list(history_pages)
+        self.history_requests = []
+        self.api_key = api_key
+
+    def request(self, method, path, payload=None):
+        if method == "GET" and path.endswith("/state"):
+            return 200, json.dumps(self.state).encode(), "application/json"
+        if method == "POST" and path.endswith("/history"):
+            self.history_requests.append(payload)
+            if not self.history_pages:
+                raise AssertionError("unexpected checkpoint history page request")
+            page = self.history_pages.pop(0)
+            return 200, json.dumps(page).encode(), "application/json"
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+
 class ProductProtocolClient:
     def __init__(self, mode="sync", failure_status=None):
         self.mode = mode
@@ -222,6 +241,18 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
             source.index("verify_stack_identity ||", api_restart),
             source.index('check_states api_restart'),
         )
+        initial_history = source.index("check_history_persistence initial")
+        self.assertLess(initial_history, api_restart)
+        self.assertLess(
+            source.index("check_history_persistence api_restart", api_restart),
+            source.index('restart_and_wait "$LAS_QUEUE_DEPLOYMENT"'),
+        )
+        self.assertGreater(
+            source.index("check_history_persistence queue_restart"),
+            source.index('restart_and_wait "$LAS_QUEUE_DEPLOYMENT"'),
+        )
+        self.assertIn('python3 "$QUALIFIER" persistence --scenario-stdin', source)
+        self.assertIn("history_rows.append([thread_id, marker, name, mode])", source)
 
     def test_rotation_wrapper_proves_data_change_and_preserves_hpa(self):
         source = ROTATION_SCRIPT.read_text(encoding="utf-8")
@@ -357,6 +388,158 @@ class LASRuntimeAcceptanceTests(unittest.TestCase):
         client = FakeClient({"values": {"response": "secret-value"}})
         with self.assertRaisesRegex(las.AcceptanceError, "sensitive marker"):
             las.assert_state(client, "thread", [], ["secret-value"])
+
+    def test_persistence_requires_marker_in_current_state_and_history_graph_values(self):
+        marker = "known-non-secret-marker"
+        history = [{
+            "values": {"response": f"persisted {marker}"},
+            "checkpoint": {"checkpoint_id": "checkpoint-1"},
+        }]
+        client = PersistenceClient(
+            {"values": {"response": f"current {marker}"}}, [history]
+        )
+        state, count = las.assert_persistence(client, "thread", [marker], [])
+        self.assertEqual(state["values"]["response"], f"current {marker}")
+        self.assertEqual(count, 1)
+
+        history_only = PersistenceClient(
+            {"values": {"response": "other"}}, [history]
+        )
+        with self.assertRaisesRegex(las.AcceptanceError, "graph state values"):
+            las.assert_persistence(history_only, "thread", [marker], [])
+        self.assertEqual(history_only.history_requests, [])
+
+        metadata_only = PersistenceClient(
+            {"values": {"response": marker}},
+            [[{
+                "values": {"response": "other"},
+                "metadata": {"marker": marker},
+                "checkpoint": {"checkpoint_id": "checkpoint-1"},
+            }]],
+        )
+        with self.assertRaisesRegex(las.AcceptanceError, "history graph values"):
+            las.assert_persistence(metadata_only, "thread", [marker], [])
+
+    def test_checkpoint_history_paginates_to_exhaustion_with_supported_cursor(self):
+        marker = "known-history-marker"
+        first_page = [
+            {
+                "values": {"response": "old"},
+                "checkpoint": {"checkpoint_id": "checkpoint-3"},
+            },
+            {
+                "values": {"response": "older"},
+                "checkpoint": {"checkpoint_id": "checkpoint-2"},
+            },
+        ]
+        second_page = [{
+            "values": {"response": marker},
+            "checkpoint": {"checkpoint_id": "checkpoint-1"},
+        }]
+        client = PersistenceClient({}, [first_page, second_page])
+        count = las.assert_checkpoint_history(
+            client, "thread", [marker], [], page_size=2, max_snapshots=4
+        )
+        self.assertEqual(count, 3)
+        self.assertEqual(client.history_requests[0], {"limit": 2})
+        self.assertEqual(
+            client.history_requests[1],
+            {"limit": 2, "before": {"checkpoint_id": "checkpoint-2"}},
+        )
+
+    def test_checkpoint_history_scans_credentials_on_every_page(self):
+        first_page = [
+            {
+                "values": {"response": "known-history-marker"},
+                "checkpoint": {"checkpoint_id": "checkpoint-2"},
+            },
+            {
+                "values": {"response": "older"},
+                "checkpoint": {"checkpoint_id": "checkpoint-1"},
+            },
+        ]
+        leaked_page = [{
+            "values": {"response": "oldest"},
+            "metadata": {"api_key": "credential-canary"},
+            "checkpoint": {"checkpoint_id": "checkpoint-0"},
+        }]
+        client = PersistenceClient(
+            {}, [first_page, leaked_page], api_key="credential-canary"
+        )
+        with self.assertRaisesRegex(las.AcceptanceError, "checkpoint history"):
+            las.assert_checkpoint_history(
+                client,
+                "thread",
+                ["known-history-marker"],
+                [],
+                page_size=2,
+                max_snapshots=4,
+            )
+        self.assertEqual(len(client.history_requests), 2)
+
+    def test_checkpoint_history_fails_closed_at_snapshot_bound(self):
+        first_page = [
+            {
+                "values": {"response": "known-history-marker"},
+                "checkpoint": {"checkpoint_id": "checkpoint-2"},
+            },
+            {
+                "values": {"response": "older"},
+                "checkpoint": {"checkpoint_id": "checkpoint-1"},
+            },
+        ]
+        overflow = [{
+            "values": {"response": "oldest"},
+            "checkpoint": {"checkpoint_id": "checkpoint-0"},
+        }]
+        client = PersistenceClient({}, [first_page, overflow])
+        with self.assertRaisesRegex(las.AcceptanceError, "bounded snapshot limit"):
+            las.assert_checkpoint_history(
+                client,
+                "thread",
+                ["known-history-marker"],
+                [],
+                page_size=2,
+                max_snapshots=2,
+            )
+        self.assertEqual(client.history_requests[-1]["limit"], 1)
+
+    def test_persistence_command_emits_only_sanitized_summary(self):
+        marker = "known-non-secret-marker"
+        client = PersistenceClient(
+            {"values": {"response": marker}},
+            [[{
+                "values": {"response": marker},
+                "checkpoint": {"checkpoint_id": "checkpoint-1"},
+            }]],
+        )
+        scenario = {"sensitive_values": ["credential-canary"]}
+        output = io.StringIO()
+        with (
+            patch.object(las, "LASClient", return_value=client),
+            patch("sys.stdin", io.StringIO(json.dumps(scenario))),
+            patch("sys.stdout", output),
+        ):
+            las.persistence_command(
+                SimpleNamespace(
+                    request_timeout=5,
+                    scenario_stdin=True,
+                    thread_id="thread-1",
+                    expected_value=marker,
+                )
+            )
+        rendered = output.getvalue()
+        self.assertNotIn(marker, rendered)
+        self.assertNotIn("credential-canary", rendered)
+        self.assertEqual(
+            json.loads(rendered),
+            {
+                "result": "PASS",
+                "check": "persisted_graph_state_and_checkpoint_history",
+                "thread_id": "thread-1",
+                "checkpoint_count": 1,
+            },
+        )
 
     def test_sse_parser_checks_data_lines_only(self):
         self.assertTrue(las.sse_has_data(b"event: values\ndata: {\"response\":\"expected\"}\n\n", ["expected"], []))

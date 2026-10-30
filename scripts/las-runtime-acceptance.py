@@ -24,6 +24,8 @@ from typing import Any
 
 
 MAX_BODY = 8 * 1024 * 1024
+CHECKPOINT_HISTORY_PAGE_SIZE = 100
+MAX_CHECKPOINT_HISTORY_SNAPSHOTS = 1000
 THREAD_CLEANUP_TIMEOUT = 15.0
 THREAD_CLEANUP_INTERVAL = 0.25
 TERMINAL = {"success", "error", "failed", "cancelled", "timeout"}
@@ -445,6 +447,110 @@ def assert_state(
         if not any(item in value for value in state_values):
             raise AcceptanceError("expected value was not persisted under graph state values")
     return result
+
+
+def assert_checkpoint_history(
+    client: LASClient,
+    thread_id: str,
+    expected: list[str],
+    sensitive: list[str] | None = None,
+    page_size: int = CHECKPOINT_HISTORY_PAGE_SIZE,
+    max_snapshots: int = MAX_CHECKPOINT_HISTORY_SNAPSHOTS,
+) -> int:
+    """Scan complete supported history within a hard snapshot bound."""
+    if (
+        not isinstance(page_size, int)
+        or isinstance(page_size, bool)
+        or page_size < 1
+        or not isinstance(max_snapshots, int)
+        or isinstance(max_snapshots, bool)
+        or max_snapshots < 1
+    ):
+        raise AcceptanceError("checkpoint history bounds must be positive integers")
+    if not isinstance(expected, list) or not all(
+        isinstance(item, str) and item for item in expected
+    ):
+        raise AcceptanceError("checkpoint history expected values must be non-empty strings")
+
+    scan_values = list(sensitive or [])
+    api_key = getattr(client, "api_key", "")
+    if api_key:
+        scan_values.append(api_key)
+    scan_values = list(dict.fromkeys(scan_values))
+
+    missing_expected = set(expected)
+    before: dict[str, Any] | None = None
+    seen_cursors: set[str] = set()
+    snapshot_count = 0
+    while True:
+        # Request one item beyond the remaining allowance so oversized
+        # histories fail closed without reading an unbounded number of pages.
+        limit = min(page_size, max_snapshots - snapshot_count + 1)
+        payload: dict[str, Any] = {"limit": limit}
+        if before is not None:
+            payload["before"] = before
+        status, body, _ = client.request(
+            "POST",
+            f"/threads/{path_segment(thread_id)}/history",
+            payload,
+        )
+        assert_sensitive_absent(body, scan_values, "checkpoint history")
+        page = json_body(body)
+        if status != 200 or not isinstance(page, list):
+            raise AcceptanceError("checkpoint history response was not a snapshot list")
+        if len(page) > limit:
+            raise AcceptanceError("checkpoint history response exceeded its requested page size")
+        if snapshot_count + len(page) > max_snapshots:
+            raise AcceptanceError("checkpoint history exceeded the bounded snapshot limit")
+
+        for snapshot in page:
+            if not isinstance(snapshot, dict) or not isinstance(
+                snapshot.get("values"), (dict, list)
+            ):
+                raise AcceptanceError("checkpoint history snapshot omitted graph values")
+            snapshot_values = list(strings(snapshot["values"]))
+            missing_expected = {
+                item
+                for item in missing_expected
+                if not any(item in value for value in snapshot_values)
+            }
+        snapshot_count += len(page)
+
+        if len(page) < limit:
+            break
+        checkpoint = page[-1].get("checkpoint")
+        checkpoint_id = (
+            checkpoint.get("checkpoint_id") if isinstance(checkpoint, dict) else None
+        )
+        if (
+            not isinstance(checkpoint_id, str)
+            or not checkpoint_id
+            or checkpoint_id in seen_cursors
+        ):
+            raise AcceptanceError("checkpoint history pagination did not advance")
+        seen_cursors.add(checkpoint_id)
+        before = checkpoint
+
+    if snapshot_count == 0:
+        raise AcceptanceError("checkpoint history contained no snapshots")
+    if missing_expected:
+        raise AcceptanceError(
+            "expected value was not persisted under checkpoint history graph values"
+        )
+    return snapshot_count
+
+
+def assert_persistence(
+    client: LASClient,
+    thread_id: str,
+    expected: list[str],
+    sensitive: list[str] | None = None,
+) -> tuple[dict[str, Any], int]:
+    state = assert_state(client, thread_id, expected, sensitive)
+    snapshot_count = assert_checkpoint_history(
+        client, thread_id, expected, sensitive
+    )
+    return state, snapshot_count
 
 
 def parse_sse(body: bytes, sensitive: list[str]) -> list[dict[str, str]]:
@@ -1137,6 +1243,25 @@ def state_command(args):
     sensitive = scenario_sensitive_values(read_scenario()) if args.scenario_stdin else []
     assert_state(client, args.thread_id, [args.expected_value], sensitive)
     print(json.dumps({"result": "PASS", "check": "persisted_graph_state", "thread_id": args.thread_id}, sort_keys=True))
+
+
+def persistence_command(args):
+    client = LASClient(os.environ.get("LAS_BASE_URL", ""), args.request_timeout)
+    sensitive = scenario_sensitive_values(read_scenario()) if args.scenario_stdin else []
+    _, snapshot_count = assert_persistence(
+        client, args.thread_id, [args.expected_value], sensitive
+    )
+    print(
+        json.dumps(
+            {
+                "result": "PASS",
+                "check": "persisted_graph_state_and_checkpoint_history",
+                "thread_id": args.thread_id,
+                "checkpoint_count": snapshot_count,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def health_command(args):
@@ -1838,6 +1963,15 @@ def main():
     state.add_argument("--request-timeout", type=float, default=45)
     state.add_argument("--scenario-stdin", action="store_true")
     state.set_defaults(func=state_command)
+    persistence = subparsers.add_parser(
+        "persistence",
+        help="verify a marker in current graph state and complete bounded checkpoint history",
+    )
+    persistence.add_argument("--thread-id", required=True)
+    persistence.add_argument("--expected-value", required=True)
+    persistence.add_argument("--request-timeout", type=float, default=45)
+    persistence.add_argument("--scenario-stdin", action="store_true")
+    persistence.set_defaults(func=persistence_command)
     health = subparsers.add_parser("health", help="verify the Agent Server health endpoint")
     health.add_argument("--request-timeout", type=float, default=10)
     health.set_defaults(func=health_command)

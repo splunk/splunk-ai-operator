@@ -42,7 +42,8 @@ Optional:
 Pipe a trusted product protocol scenario to stdin. It must request sync,
 queued, and stream modes and set cleanup_threads=false. The script owns an
 exact Service port-forward, recreates it after the API rollout, verifies graph
-state after API and queue restarts, then deletes every thread it created.
+state and complete bounded checkpoint history before and after API and queue
+restarts, then deletes every thread it created.
 
 An optional active_run_case is submitted before queue replacement and verified
 after replacement. Use a bounded long-running product call. Use only on a
@@ -532,6 +533,7 @@ if result.get("result") != "PASS" or not isinstance(checks, list):
     raise SystemExit(1)
 actual_keys = []
 rows = []
+history_rows = []
 thread_ids = []
 for check in checks:
     if not isinstance(check, dict):
@@ -554,9 +556,14 @@ for check in checks:
     placeholder = case.get("marker_placeholder", "{{RUN_MARKER}}")
     for expected in case["expected_state_values"]:
         rows.append([thread_id, expected.replace(placeholder, marker), name, mode])
+    history_rows.append([thread_id, marker, name, mode])
 if len(actual_keys) != len(set(actual_keys)) or set(actual_keys) != expected_keys:
     raise SystemExit(1)
-print(json.dumps({"rows": rows, "thread_ids": list(dict.fromkeys(thread_ids))}, separators=(",", ":")))
+print(json.dumps({
+    "rows": rows,
+    "history_rows": history_rows,
+    "thread_ids": list(dict.fromkeys(thread_ids)),
+}, separators=(",", ":")))
 ' "$result")" || {
   printf 'Could not build the sanitized restart state plan.\n' >&2
   exit 1
@@ -568,10 +575,19 @@ import os
 for row in json.loads(os.environ["STATE_PLAN"])["rows"]:
     print("\t".join(row))
 ')
+mapfile -t history_checks < <(STATE_PLAN="$state_plan" python3 -c '
+import json
+import os
+for row in json.loads(os.environ["STATE_PLAN"])["history_rows"]:
+    print("\t".join(row))
+')
 expected_row_count="$(STATE_PLAN="$state_plan" python3 -c \
   'import json,os; print(len(json.loads(os.environ["STATE_PLAN"])["rows"]))')"
-if (( ${#state_checks[@]} != expected_row_count || expected_row_count < 3 )); then
-  printf 'Protocol qualification returned an incomplete state-check matrix.\n' >&2
+expected_history_count="$(STATE_PLAN="$state_plan" python3 -c \
+  'import json,os; print(len(json.loads(os.environ["STATE_PLAN"])["history_rows"]))')"
+if (( ${#state_checks[@]} != expected_row_count || expected_row_count < 3 \
+  || ${#history_checks[@]} != expected_history_count || expected_history_count < 3 )); then
+  printf 'Protocol qualification returned an incomplete persistence-check matrix.\n' >&2
   exit 1
 fi
 
@@ -584,6 +600,19 @@ check_states() {
       --thread-id "$thread_id" --expected-value "$expected_value" \
       --request-timeout "$LAS_REQUEST_TIMEOUT" >/dev/null
     printf 'persisted_state_after_%s=%s:%s:PASS\n' "$stage" "$case_name" "$mode"
+  done
+}
+
+check_history_persistence() {
+  local stage="$1" row thread_id marker case_name mode
+  for row in "${history_checks[@]}"; do
+    IFS=$'\t' read -r thread_id marker case_name mode <<<"$row"
+    printf '%s' "$scenario" | LAS_BASE_URL="$LAS_BASE_URL" \
+      python3 "$QUALIFIER" persistence --scenario-stdin \
+      --thread-id "$thread_id" --expected-value "$marker" \
+      --request-timeout "$LAS_REQUEST_TIMEOUT" >/dev/null
+    printf 'persisted_state_and_checkpoint_history_after_%s=%s:%s:PASS\n' \
+      "$stage" "$case_name" "$mode"
   done
 }
 
@@ -611,6 +640,8 @@ printf '%s\n' \
   "declared_agent_server_digest=${LAS_AGENT_SERVER_DIGEST}" \
   'identity_verification=PASS'
 
+check_history_persistence initial
+
 api_before="$(deployment_revision "$LAS_API_DEPLOYMENT")"
 if [[ -z "$api_before" ]]; then
   printf 'Could not read the initial API Deployment revision.\n' >&2
@@ -629,6 +660,7 @@ api_after="$(deployment_revision "$LAS_API_DEPLOYMENT")"
 start_port_forward
 printf 'api_rollout_revision=%s->%s:PASS\n' "$api_before" "$api_after"
 check_states api_restart
+check_history_persistence api_restart
 
 active_result=""
 if printf '%s' "$scenario" | python3 -c \
@@ -668,6 +700,7 @@ queue_after="$(deployment_revision "$LAS_QUEUE_DEPLOYMENT")"
 }
 printf 'queue_rollout_revision=%s->%s:PASS\n' "$queue_before" "$queue_after"
 check_states queue_restart
+check_history_persistence queue_restart
 if [[ -n "$active_result" ]]; then
   active_verification="$(printf '%s' "$scenario" | LAS_BASE_URL="$LAS_BASE_URL" python3 "$QUALIFIER" \
     verify-product-active --thread-id "$active_thread" --run-id "$active_run" \
