@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # install_from_airgap_bundle.sh
-# Run on the air-gapped install machine (needs kubectl/helm/ssh pre-installed,
-# but NO outbound internet). Extracts the bundle produced by
+# Run on the air-gapped install machine (a real install needs kubectl/helm/ssh
+# pre-installed, but NO outbound internet). Extracts the bundle produced by
 # prepare_airgap_bundle.sh, sets environment-variable overrides, then invokes
 # k0s_cluster_with_stack.sh.
 #
 # Usage:
 #   ./install_from_airgap_bundle.sh --bundle airgap-bundle-<date>.tar.gz \
-#       --config my-cluster-config.yaml [--extract-dir /opt/airgap]
+#       --config my-cluster-config.yaml [--extract-dir /opt/airgap] \
+#       [--validate-only]
 #
 # The installer (k0s_cluster_with_stack.sh) must be in the same directory as
 # this script, or pass --installer /path/to/k0s_cluster_with_stack.sh.
@@ -19,6 +20,8 @@ CONFIG_FILE="${CONFIG_FILE:-}"
 EXTRACT_DIR="${EXTRACT_DIR:-/opt/airgap}"
 INSTALLER_SCRIPT=""
 SUBCOMMAND="${SUBCOMMAND:-install}"
+VALIDATE_ONLY=false
+EXPECTED_BUNDLE_SHA256="${EXPECTED_BUNDLE_SHA256:-}"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -28,6 +31,8 @@ while [[ $# -gt 0 ]]; do
     --extract-dir) EXTRACT_DIR="$2"; shift 2 ;;
     --installer)   INSTALLER_SCRIPT="$2"; shift 2 ;;
     --subcommand)  SUBCOMMAND="$2"; shift 2 ;;
+    --expected-bundle-sha256) EXPECTED_BUNDLE_SHA256="$2"; shift 2 ;;
+    --validate-only) VALIDATE_ONLY=true; shift ;;
     -h|--help)
       cat <<'HELP'
 install_from_airgap_bundle.sh — extract an air-gap bundle and run the
@@ -57,15 +62,26 @@ OPTIONS
                         Default: install
                         Env: SUBCOMMAND
 
+  --expected-bundle-sha256 SHA256
+                        SHA-256 recorded on the connected build host. Required
+                        for CPU-only bundles and validation-only mode.
+                        Env: EXPECTED_BUNDLE_SHA256
+
+  --validate-only       Validate a CPU-only bundle and its selected config,
+                        then exit before privileged host or cluster changes.
+                        The bundle is still extracted into --extract-dir.
+
   -h, --help            Show this help text.
 
 WHAT THIS SCRIPT DOES
   1. Extracts the bundle into --extract-dir.
-  2. Verifies SHA-256 checksums of all bundled files.
-  3. Installs the bundled k0s binary to /usr/local/bin/k0s (if not already present).
-  4. Installs the bundled yq binary to /usr/local/bin/yq (if not already present).
-  5. Registers a local Helm chart repository pointing at the bundled .tgz files.
-  6. Exports the following environment variables so k0s_cluster_with_stack.sh
+  2. Verifies the external tarball SHA-256 and the complete internal checksum
+     manifest before using any bundled executable.
+  3. With --validate-only, stops after CPU-only artifact/config validation.
+  4. Installs the bundled k0s binary to /usr/local/bin/k0s (if not already present).
+  5. Installs the bundled yq binary to /usr/local/bin/yq (if not already present).
+  6. Registers a local Helm chart repository pointing at the bundled .tgz files.
+  7. Exports the following environment variables so k0s_cluster_with_stack.sh
      uses local files instead of downloading from the internet:
 
      K0S_INSTALL_URL                   → file://<bundle>/binaries/k0s
@@ -80,7 +96,7 @@ WHAT THIS SCRIPT DOES
      AIRGAP_PYYAML_WHEEL_PATH          → <bundle>/packages/PyYAML-*.whl (or .tar.gz)
      AIRGAP_MODE                       → true
 
-  7. Invokes k0s_cluster_with_stack.sh <subcommand>.
+  8. Invokes k0s_cluster_with_stack.sh <subcommand>.
 
   CPU-only bundles include the installer and matching operator manifests. The
   wrapper verifies their contents and the OCI image archive references before
@@ -108,7 +124,9 @@ NOTE ON GPU NODE PACKAGES
   See AIRGAP.md → 'GPU Node OS Packages' for full step-by-step instructions.
 
 PREREQUISITES ON THIS MACHINE (no internet needed)
-  kubectl, helm, tar, ssh — must be pre-installed.
+  A real install requires kubectl, helm, tar, python3 and ssh. Validation-only
+  requires tar and python3; it does not invoke kubectl, helm, ssh or network
+  clients.
   The installer will use the bundled k0s and yq binaries.
 
 EXAMPLES
@@ -118,8 +136,17 @@ EXAMPLES
   # Explicit config and extract path
   ./install_from_airgap_bundle.sh \
     --bundle /mnt/transfer/airgap-bundle-20260612-103000.tar.gz \
+    --expected-bundle-sha256 <sha256-recorded-before-transfer> \
     --config /etc/splunk-ai/my-cluster-config.yaml \
     --extract-dir /opt/airgap
+
+  # Validate a CPU-only bundle without installing binaries or touching a cluster
+  ./install_from_airgap_bundle.sh \
+    --bundle /mnt/transfer/airgap-bundle-20260612-103000.tar.gz \
+    --expected-bundle-sha256 <sha256-recorded-before-transfer> \
+    --config /etc/splunk-ai/my-cluster-config.yaml \
+    --extract-dir /tmp/airgap-validation \
+    --validate-only
 
   # Re-join workers after a failed or partial install
   ./install_from_airgap_bundle.sh \
@@ -156,10 +183,37 @@ require_cmd() {
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 [[ -n "${BUNDLE_TARBALL}" ]] || err "No bundle specified. Use --bundle airgap-bundle-<date>.tar.gz"
 [[ -f "${BUNDLE_TARBALL}" ]] || err "Bundle file not found: ${BUNDLE_TARBALL}"
-
+if [[ -n "${CONFIG_FILE}" ]]; then
+  [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
+fi
 require_cmd tar
-require_cmd helm
-require_cmd kubectl
+require_cmd python3
+if [[ "${VALIDATE_ONLY}" == "true" && -z "${EXPECTED_BUNDLE_SHA256}" ]]; then
+  err "--validate-only requires --expected-bundle-sha256"
+fi
+if [[ -n "${EXPECTED_BUNDLE_SHA256}" ]]; then
+  [[ "${EXPECTED_BUNDLE_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+    err "Expected bundle SHA-256 must be 64 lowercase hexadecimal characters"
+  ACTUAL_BUNDLE_SHA256="$(python3 - "${BUNDLE_TARBALL}" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+)"
+  [[ "${ACTUAL_BUNDLE_SHA256}" == "${EXPECTED_BUNDLE_SHA256}" ]] ||
+    err "Bundle tarball SHA-256 does not match the externally recorded value"
+  log "External bundle SHA-256 verified"
+fi
+
+if [[ "${VALIDATE_ONLY}" != "true" ]]; then
+  require_cmd helm
+  require_cmd kubectl
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -171,35 +225,196 @@ log "Subcommand      : ${SUBCOMMAND}"
 [[ -n "${CONFIG_FILE}" ]] && log "Config          : ${CONFIG_FILE}"
 log ""
 
-# ── Extract bundle ────────────────────────────────────────────────────────────
+# ── Validate and extract bundle ───────────────────────────────────────────────
+# Inspect with Python's tar parser before invoking tar extraction. This avoids
+# platform-specific parsing of `tar -tv` output and rejects paths or member
+# types that could escape or redirect extraction.
+if ! BUNDLE_METADATA="$(python3 - "${BUNDLE_TARBALL}" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive_path = sys.argv[1]
+roots = set()
+seen = set()
+members_by_name = {}
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        members = archive.getmembers()
+        if not members:
+            raise ValueError("bundle archive is empty")
+        for member in members:
+            raw_name = member.name
+            if any(ord(character) < 32 or ord(character) == 127 for character in raw_name):
+                raise ValueError(f"bundle archive contains a control character in member path: {raw_name!r}")
+            path = pathlib.PurePosixPath(raw_name)
+            if path.is_absolute() or not raw_name or ".." in path.parts:
+                raise ValueError(f"bundle archive contains unsafe member path: {raw_name!r}")
+            parts = tuple(part for part in path.parts if part not in ("", "."))
+            if not parts:
+                raise ValueError(f"bundle archive contains unsafe member path: {raw_name!r}")
+            normalized = "/".join(parts)
+            if normalized in seen:
+                raise ValueError(f"bundle archive contains duplicate member: {normalized!r}")
+            seen.add(normalized)
+            members_by_name[normalized] = member
+            root = parts[0]
+            if not root.startswith("airgap-bundle-") or root == "airgap-bundle-":
+                raise ValueError("bundle archive must contain exactly one airgap-bundle-* root")
+            roots.add(root)
+            if not (member.isfile() or member.isdir()):
+                raise ValueError(
+                    f"bundle archive contains unsupported member type for {raw_name!r}; "
+                    "only regular files and directories are allowed"
+                )
+        if len(roots) != 1:
+            raise ValueError("bundle archive must contain exactly one airgap-bundle-* root")
+        root = next(iter(roots))
+        profile = ""
+        profile_member = members_by_name.get(f"{root}/bundle-profile.txt")
+        if profile_member is not None:
+            if not profile_member.isfile() or profile_member.size > 64:
+                raise ValueError("bundle-profile.txt is not a small regular file")
+            stream = archive.extractfile(profile_member)
+            if stream is None:
+                raise ValueError("bundle-profile.txt could not be read")
+            profile = stream.read().decode("utf-8").strip()
+            if profile != "cpuOnly":
+                raise ValueError("unknown bundle profile")
+except (OSError, tarfile.TarError, ValueError) as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"{root}\t{profile}")
+PY
+)"; then
+  err "Bundle archive member validation failed"
+fi
+IFS=$'\t' read -r BUNDLE_NAME ARCHIVE_PROFILE <<< "${BUNDLE_METADATA}"
+
+# Determine whether the external config selects cpuOnly without executing any
+# file from the bundle. The bundled yq remains authoritative after the bundle's
+# externally recorded digest has been verified.
+CONFIG_PROFILE=""
+if [[ -n "${CONFIG_FILE}" ]]; then
+  CONFIG_PROFILE="$(python3 - "${CONFIG_FILE}" <<'PY'
+import re
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+section_indent = None
+for raw in lines:
+    if not raw.strip() or raw.lstrip().startswith("#"):
+        continue
+    if "\t" in raw:
+        print("unknown")
+        raise SystemExit
+    indent = len(raw) - len(raw.lstrip(" "))
+    content = raw.strip()
+    if section_indent is None:
+        if indent == 0 and re.match(r"aiPlatform\s*:", content):
+            if re.fullmatch(r"aiPlatform\s*:\s*(?:#.*)?", content):
+                section_indent = indent
+            else:
+                print("unknown")
+                raise SystemExit
+        continue
+    if indent <= section_indent:
+        break
+    match = re.fullmatch(r"profile\s*:\s*([^#]+?)\s*(?:#.*)?", content)
+    if match:
+        value = match.group(1).strip().strip("'\"")
+        print(value if value in {"cpuOnly", "full"} else "unknown")
+        raise SystemExit
+    if re.match(r"profile\s*:", content):
+        print("unknown")
+        raise SystemExit
+print("")
+PY
+)"
+fi
+
+CPU_ONLY_BUNDLE=false
+[[ "${ARCHIVE_PROFILE}" == "cpuOnly" ]] && CPU_ONLY_BUNDLE=true
+if [[ "${CPU_ONLY_BUNDLE}" == "true" || "${CONFIG_PROFILE}" == "cpuOnly" || "${CONFIG_PROFILE}" == "unknown" ]]; then
+  [[ -n "${EXPECTED_BUNDLE_SHA256}" ]] ||
+    err "CPU-only bundle or config requires --expected-bundle-sha256 before bundled tools can run"
+fi
+
 log "Extracting bundle..."
 mkdir -p "${EXTRACT_DIR}"
 EXTRACT_DIR="$(cd "${EXTRACT_DIR}" && pwd)"
-BUNDLE_NAME="$(tar -tzf "${BUNDLE_TARBALL}" | sed -n '1{s@/.*@@;p;}')"
-[[ "${BUNDLE_NAME}" == airgap-bundle-* ]] ||
-  err "Bundle archive does not start with an airgap-bundle directory"
+BUNDLE_DIR="${EXTRACT_DIR}/${BUNDLE_NAME}"
+[[ ! -e "${BUNDLE_DIR}" ]] ||
+  err "Bundle extraction destination already exists: ${BUNDLE_DIR}; use an empty --extract-dir"
 tar -xzf "${BUNDLE_TARBALL}" -C "${EXTRACT_DIR}"
 
-# Use the directory named by this archive; another bundle may already be here.
-BUNDLE_DIR="${EXTRACT_DIR}/${BUNDLE_NAME}"
 [[ -d "${BUNDLE_DIR}" ]] || err "Could not find extracted bundle directory in ${EXTRACT_DIR}"
 log "Bundle extracted to: ${BUNDLE_DIR}"
 
 # ── Verify checksums ──────────────────────────────────────────────────────────
-if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
-  log "Verifying checksums..."
-  (
-    cd "${BUNDLE_DIR}"
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum --check checksums.sha256 --quiet
-    else
-      shasum -a 256 --check checksums.sha256 --quiet
-    fi
-  ) || err "Checksum verification failed — bundle may be corrupt or tampered with."
-  log "Checksums verified OK"
-else
-  err "sha256sum or shasum is required to verify the offline bundle"
-fi
+# Do not delegate untrusted manifest paths to sha256sum. Require the manifest to
+# cover every regular bundle file exactly once, then hash those safe paths.
+log "Verifying complete checksum manifest..."
+python3 - "${BUNDLE_DIR}" <<'PY' || exit 1
+import hashlib
+import pathlib
+import re
+import sys
+
+bundle = pathlib.Path(sys.argv[1]).resolve()
+manifest = bundle / "checksums.sha256"
+line_re = re.compile(r"^([0-9a-f]{64})[ \t]+[*]?(.+)$")
+
+def fail(message):
+    print(f"ERROR: Checksum verification failed — {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not manifest.is_file() or manifest.is_symlink():
+    fail("checksums.sha256 is missing or unsafe")
+
+listed = {}
+for number, raw in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+    if not raw:
+        continue
+    match = line_re.fullmatch(raw)
+    if not match:
+        fail(f"invalid manifest line {number}")
+    expected, relative = match.groups()
+    path = pathlib.PurePosixPath(relative)
+    if (
+        path.is_absolute()
+        or not relative
+        or ".." in path.parts
+        or any(ord(character) < 32 or ord(character) == 127 for character in relative)
+    ):
+        fail(f"unsafe manifest path on line {number}")
+    normalized = pathlib.PurePosixPath(*[part for part in path.parts if part not in ("", ".")]).as_posix()
+    if normalized in listed:
+        fail(f"duplicate manifest path: {normalized}")
+    candidate = (bundle / normalized).resolve()
+    if bundle not in candidate.parents or not candidate.is_file() or candidate.is_symlink():
+        fail(f"listed artifact is missing or unsafe: {normalized}")
+    listed[normalized] = expected
+
+actual_files = {
+    path.relative_to(bundle).as_posix()
+    for path in bundle.rglob("*")
+    if path.is_file() and not path.is_symlink() and path != manifest
+}
+if set(listed) != actual_files:
+    missing = sorted(actual_files - set(listed))
+    extra = sorted(set(listed) - actual_files)
+    fail(f"manifest coverage mismatch (unlisted={missing}, nonexistent={extra})")
+
+for relative, expected in listed.items():
+    digest = hashlib.sha256()
+    with (bundle / relative).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        fail(f"checksum mismatch for {relative}")
+PY
+log "Checksums verified OK"
 
 # ── Read version manifest ─────────────────────────────────────────────────────
 VERSION_FILE="${BUNDLE_DIR}/bundle-versions.txt"
@@ -225,7 +440,6 @@ log "  otel        : ${OTEL_CHART_VERSION}"
 # Check the selected workload closure before modifying the installer host or
 # reaching any cluster node. A bundle prepared for another config must fail
 # here, rather than leaving a partially installed private cluster.
-CPU_ONLY_BUNDLE=false
 if [[ -f "${BUNDLE_DIR}/bundle-profile.txt" ]]; then
   [[ "$(cat "${BUNDLE_DIR}/bundle-profile.txt")" == "cpuOnly" ]] ||
     err "Unknown bundle profile"
@@ -234,7 +448,6 @@ if [[ -f "${BUNDLE_DIR}/bundle-profile.txt" ]]; then
     err "CPU-only bundle requires an explicit --config or CONFIG_FILE"
 fi
 if [[ -n "${CONFIG_FILE}" ]]; then
-  [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
   BUNDLE_YQ="${BUNDLE_DIR}/binaries/yq"
   [[ -x "${BUNDLE_YQ}" ]] || err "Bundled yq is missing or not executable"
   if [[ "$("${BUNDLE_YQ}" eval -r '.aiPlatform.profile // ""' "${CONFIG_FILE}")" == "cpuOnly" ]]; then
@@ -268,12 +481,19 @@ if [[ -n "${CONFIG_FILE}" ]]; then
 fi
 
 if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  [[ -n "${EXPECTED_BUNDLE_SHA256}" ]] ||
+    err "CPU-only bundle requires --expected-bundle-sha256"
   require_cmd cmp
-  for required in binaries/k0s binaries/yq manifests/cert-manager.yaml \
+  for required in source-commit.txt binaries/k0s binaries/yq manifests/cert-manager.yaml \
                   manifests/local-path-storage.yaml packages/pyyaml.filename; do
     [[ -s "${BUNDLE_DIR}/${required}" ]] ||
       err "Required CPU-only bundle artifact missing: ${required}"
   done
+  SOURCE_COMMIT="$(cat "${BUNDLE_DIR}/source-commit.txt")"
+  [[ "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+    err "Bundled source-commit.txt is not a 40-character Git commit"
+  [[ "$(get_version source_commit)" == "${SOURCE_COMMIT}" ]] ||
+    err "Bundled source commit does not match bundle-versions.txt"
   bundled_pyyaml="$(cat "${BUNDLE_DIR}/packages/pyyaml.filename")"
   [[ "${bundled_pyyaml}" == "$(basename "${bundled_pyyaml}")" &&
      -s "${BUNDLE_DIR}/packages/${bundled_pyyaml}" ]] ||
@@ -281,7 +501,7 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
   BUNDLED_SETUP="${BUNDLE_DIR}/cluster_setup"
   for required in k0s_cluster_with_stack.sh install_from_airgap_bundle.sh \
                   artifacts.yaml splunk-operator-cluster.yaml las_deployment.py \
-                  build_airgap_image_inventory.py; do
+                  build_airgap_image_inventory.py validate_cpu_airgap_runtime.py; do
     [[ -s "${BUNDLED_SETUP}/${required}" ]] ||
       err "Version-matched installer artifact missing: cluster_setup/${required}"
   done
@@ -361,6 +581,17 @@ else
   [[ -n "${INSTALLER_SCRIPT}" ]] ||
     INSTALLER_SCRIPT="${SCRIPT_DIR}/k0s_cluster_with_stack.sh"
 fi
+
+if [[ "${VALIDATE_ONLY}" == "true" ]]; then
+  [[ "${CPU_ONLY_BUNDLE}" == "true" ]] ||
+    err "--validate-only is supported only for CPU-only bundles"
+  PATH="${BUNDLE_DIR}/binaries:${PATH}" \
+    CONFIG_FILE="${CONFIG_FILE}" AIRGAP_MODE=true \
+    bash "${INSTALLER_SCRIPT}" validate-airgap-cpu-profile
+  log "CPU-only bundle validation completed; no privileged host or cluster changes made"
+  exit 0
+fi
+
 [[ -f "${INSTALLER_SCRIPT}" ]] ||
   err "Installer not found: ${INSTALLER_SCRIPT}"
 [[ -x "${INSTALLER_SCRIPT}" ]] || chmod +x "${INSTALLER_SCRIPT}"

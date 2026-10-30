@@ -35,7 +35,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
 CLUSTER_CONFIG=""
 MIRROR_REGISTRY="${MIRROR_REGISTRY:-}"
 CPU_ONLY_BUNDLE=false
+BUNDLE_PLATFORM="linux/amd64"
 LOCAL_PATH_HELPER_IMAGE="docker.io/library/busybox:1.36.1"
+SOURCE_COMMIT="${SOURCE_COMMIT:-}"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -62,7 +64,9 @@ OPTIONS
                         Splunk, operator, SLIM and LAS images and the matching
                         installer sources. Omit full-profile charts/GPU files.
                         Requires --k0s-version and PYYAML_VERSION to pin
-                        the remaining downloaded artifacts.
+                        the remaining downloaded artifacts. SOURCE_COMMIT must
+                        identify the reviewed 40-character Git commit when Git
+                        metadata is unavailable in the build container.
 
   --mirror-registry HOST
                         Optional internal registry prefix recorded in the
@@ -250,6 +254,17 @@ if [[ -n "${CLUSTER_CONFIG}" ]]; then
   require_cmd python3
   [[ "${K0S_VERSION}" != "latest" && -n "${PYYAML_VERSION}" ]] ||
     err "CPU-only bundle requires --k0s-version and PYYAML_VERSION"
+  if command -v git >/dev/null 2>&1 &&
+     git -C "${SCRIPT_DIR}/../.." rev-parse HEAD >/dev/null 2>&1; then
+    GIT_HEAD="$(git -C "${SCRIPT_DIR}/../.." rev-parse HEAD)"
+    [[ -z "${SOURCE_COMMIT}" || "${SOURCE_COMMIT}" == "${GIT_HEAD}" ]] ||
+      err "SOURCE_COMMIT does not match the checked-out Git HEAD"
+    SOURCE_COMMIT="${GIT_HEAD}"
+    [[ -z "$(git -C "${SCRIPT_DIR}/../.." status --porcelain --untracked-files=all)" ]] ||
+      err "CPU-only bundle source is not clean; commit, move, or remove every tracked and untracked change before building"
+  fi
+  [[ "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+    err "CPU-only bundle requires SOURCE_COMMIT to be the reviewed 40-character Git commit"
 fi
 
 log "=== Splunk AI Platform — Air-Gap Bundle Preparation ==="
@@ -303,6 +318,7 @@ if "${STAGE_DIR}/binaries/k0s" airgap list-images --all > "${STAGE_DIR}/images/k
   while IFS= read -r _img; do log "    ${_img}"; done < "${STAGE_DIR}/images/k0s-images.list"
   # --concurrency=1 makes the tarball reproducible (deterministic image order).
   "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    --platform "${BUNDLE_PLATFORM}" \
     -o "${STAGE_DIR}/images/k0s-images.tar" \
     < "${STAGE_DIR}/images/k0s-images.list" \
     || err "Failed to build k0s system-image bundle (k0s airgap bundle-artifacts)."
@@ -446,6 +462,7 @@ if [[ -s "${ADDON_LIST}" ]]; then
   while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
   log "Building add-on image bundle (pulls the images above, may take several minutes)..."
   "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    --platform "${BUNDLE_PLATFORM}" \
     -o "${STAGE_DIR}/images/addon-images.tar" \
     < "${ADDON_LIST}" \
     || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
@@ -484,6 +501,7 @@ if [[ -n "${CLUSTER_CONFIG}" ]]; then
   sort -u "${WORKLOAD_LIST}" -o "${WORKLOAD_LIST}"
   log "Building selected CPU-only workload image bundle from ${CLUSTER_CONFIG}..."
   "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    --platform "${BUNDLE_PLATFORM}" \
     -o "${STAGE_DIR}/images/workload-images.tar" < "${WORKLOAD_LIST}" \
     || err "Failed to bundle selected CPU-only workload images"
 fi
@@ -505,6 +523,7 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
     --images-file "${INVENTORY_IMAGES}" \
     --image-lists-dir "${STAGE_DIR}/images" \
     --profile cpuOnly \
+    --target-platform "${BUNDLE_PLATFORM}" \
     --mirror-registry "${MIRROR_REGISTRY}" \
     --embedded-chart "${STAGE_DIR}/charts/$(basename "${EMBEDDED_LAS_CHART}")" \
     --output "${STAGE_DIR}/image-inventory.json" \
@@ -715,12 +734,15 @@ if [[ -n "${CLUSTER_CONFIG}" ]]; then
 fi
 
 if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  printf '%s\n' "${SOURCE_COMMIT}" > "${STAGE_DIR}/source-commit.txt"
+
   # Keep the executable and the CRDs/manifests in the same checked-in source
   # revision as the image list. The private installer must use these copies.
   mkdir -p "${STAGE_DIR}/cluster_setup"
   for source_file in k0s_cluster_with_stack.sh install_from_airgap_bundle.sh \
                      artifacts.yaml splunk-operator-cluster.yaml las_deployment.py \
-                     build_airgap_image_inventory.py; do
+                     build_airgap_image_inventory.py \
+                     validate_cpu_airgap_runtime.py; do
     [[ -s "${SCRIPT_DIR}/${source_file}" ]] || err "Missing installer source: ${source_file}"
     cp "${SCRIPT_DIR}/${source_file}" "${STAGE_DIR}/cluster_setup/${source_file}"
   done
@@ -762,6 +784,7 @@ otel_chart_version=${OTEL_CHART_VERSION}
 gpu_node_os=${GPU_NODE_OS}
 epel_major=${EPEL_MAJOR}
 bundle_timestamp=${BUNDLE_TIMESTAMP}
+source_commit=${SOURCE_COMMIT}
 VEOF
 
 # ── 9. Checksums ──────────────────────────────────────────────────────────────
@@ -777,7 +800,10 @@ log "Checksums written to ${STAGE_DIR}/checksums.sha256"
 # ── 10. Pack the bundle ───────────────────────────────────────────────────────
 log "--- Creating tar.gz bundle ---"
 BUNDLE_TARBALL="${OUTPUT_DIR}/${BUNDLE_NAME}.tar.gz"
-tar -czf "${BUNDLE_TARBALL}" -C "${OUTPUT_DIR}" "${BUNDLE_NAME}"
+# macOS bsdtar otherwise adds AppleDouble ._ entries, which create a second
+# archive root and make strict pre-extraction validation fail. GNU tar ignores
+# this environment variable.
+COPYFILE_DISABLE=1 tar -czf "${BUNDLE_TARBALL}" -C "${OUTPUT_DIR}" "${BUNDLE_NAME}"
 
 BUNDLE_SIZE="$(du -sh "${BUNDLE_TARBALL}" | cut -f1)"
 BUNDLE_SHA="$(sha256 "${BUNDLE_TARBALL}")"

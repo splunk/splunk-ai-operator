@@ -100,6 +100,8 @@ _load_functions() {
   eval "$(_extract_fn config_bool)"
   eval "$(_extract_fn load_config)"
   eval "$(_extract_fn validate_cpu_profile_consistency)"
+  eval "$(_extract_fn validate_airgap_cpu_profile)"
+  eval "$(_extract_fn validate_airgap_cpu_config_only)"
   eval "$(_extract_fn resolve_model_staging)"
   eval "$(_extract_fn resolve_accelerator_type)"
   eval "$(_extract_fn stage_model_artifacts)"
@@ -118,6 +120,21 @@ _load_functions() {
 
 _load_functions
 eval "$(grep '^readonly SUPPORTED_ACCELERATORS=' "${SCRIPT}")"
+
+suite "validate_airgap_cpu_config_only"
+echo "- validate_airgap_cpu_config_only"
+
+_validation_only_reuses_install_profile_checks() (
+  local calls=""
+  load_config() { calls+="load "; }
+  validate_cpu_profile_consistency() { calls+="consistency "; }
+  validate_airgap_cpu_profile() { calls+="airgap"; }
+  validate_airgap_cpu_config_only
+  [[ "${calls}" == "load consistency airgap" ]]
+)
+
+assert_rc "reuses the same CPU and air-gap validators as install" 0 \
+  _validation_only_reuses_install_profile_checks
 
 # Tests: Splunk Standalone is discovered before readiness is awaited
 suite "wait_for_splunk_standalone"
