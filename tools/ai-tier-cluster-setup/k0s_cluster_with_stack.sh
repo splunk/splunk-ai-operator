@@ -863,7 +863,8 @@ validate_model_deployment_mode_config() {
     *) echo "aiPlatform.modelDeploymentMode must be gemma-only or gemma-nemotron (got ${mode:-null})"; return 1 ;;
   esac
   accelerator=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null) || return 1
-  if [[ "${accelerator}" != "RTX_PRO_6000_BLACKWELL" ]]; then
+  accelerator=$(printf '%s' "${accelerator}" | tr '[:upper:]' '[:lower:]')
+  if [[ "${accelerator}" != "rtx_pro_6000_blackwell" ]]; then
     echo "aiPlatform.modelDeploymentMode gemma-nemotron currently requires defaultAcceleratorType RTX_PRO_6000_BLACKWELL; H100 scheduling remains gated"
     return 1
   fi
@@ -8585,6 +8586,13 @@ validate_config() {
     errors=$(( errors + 1 ))
   else
     echo -e "  \033[1;32m✔\033[0m aiPlatform.scaleFactor is a positive integer (default: 1)" >&2
+  fi
+  local model_mode_error
+  if ! model_mode_error=$(validate_model_deployment_mode_config); then
+    echo -e "  \033[1;31m✖\033[0m ${model_mode_error}" >&2
+    errors=$(( errors + 1 ))
+  else
+    echo -e "  \033[1;32m✔\033[0m aiPlatform.modelDeploymentMode is valid for the selected accelerator" >&2
   fi
   if [[ -z "${img_reg}" ]]; then
     echo -e "  \033[1;33m!\033[0m images.registry is empty — using public registries. Set for air-gap/private deployments." >&2
