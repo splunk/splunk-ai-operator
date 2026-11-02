@@ -9,7 +9,7 @@ import (
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
-	//"k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	//"k8s.io/apimachinery/pkg/types"
@@ -41,6 +41,7 @@ func New(p *aiApi.AIPlatform, client client.Client, scheme *runtime.Scheme, reco
 func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatform) (reconcile.Result, error) {
 
 	var conditions []metav1.Condition
+	var reconcileErr error
 	defer func() {
 		// Fetch the latest version of the CR before updating the status
 		latest := &aiApi.AIPlatform{}
@@ -50,7 +51,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 			return
 		}
 		latest.Status = p.Status
-		latest.Status.Conditions = conditions
+		latest.Status.Conditions = finalizePlatformConditions(conditions, p.Status.Conditions, reconcileErr)
 		latest.Status.ObservedGeneration = p.Generation
 		latest.Status.RayServiceName = p.Status.RayServiceName
 		latest.Status.VectorDbServiceName = p.Status.VectorDbServiceName
@@ -105,20 +106,43 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		}
 		conditions = append(conditions, cond)
 		if err != nil {
+			reconcileErr = err
 			return reconcile.Result{}, err
 		}
 	}
 
-	// all done
-	conditions = append(conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "AllReconciled",
-		Message:            "all stages completed successfully",
-		LastTransitionTime: metav1.Now(),
-	})
-
 	return scaleResult, nil
+}
+
+// finalizePlatformConditions retains both stage results and conditions written
+// by status collectors. A successful reconcile stage only means that status
+// collection ran; it must not overwrite component readiness or the top-level
+// Ready result derived from those components.
+func finalizePlatformConditions(stageConditions, resourceConditions []metav1.Condition, reconcileErr error) []metav1.Condition {
+	var conditions []metav1.Condition
+	for _, condition := range append(append([]metav1.Condition(nil), stageConditions...), resourceConditions...) {
+		apiMeta.SetStatusCondition(&conditions, condition)
+	}
+
+	if reconcileErr != nil {
+		apiMeta.SetStatusCondition(&conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "ReconcileError",
+			Message:            reconcileErr.Error(),
+			LastTransitionTime: metav1.Now(),
+		})
+	} else if apiMeta.FindStatusCondition(conditions, "Ready") == nil {
+		apiMeta.SetStatusCondition(&conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			Reason:             "AllReconciled",
+			Message:            "all stages completed successfully",
+			LastTransitionTime: metav1.Now(),
+		})
+	}
+
+	return conditions
 }
 
 // ReconcileFeatures ensures each feature's AIService exists and is up to date.

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	//corev1 "k8s.io/api/core/v1"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	//"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -73,6 +74,63 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	// Labels should include platform and feature
 	assert.Equal(t, "my-ai", service.Labels["aiplatform"])
 	assert.Equal(t, "feature1", service.Labels["feature"])
+}
+
+func TestFinalizePlatformConditionsPreservesServeReadiness(t *testing.T) {
+	stageConditions := []metav1.Condition{{
+		Type:   "RayServiceStatusReady",
+		Status: metav1.ConditionTrue,
+		Reason: "Reconciled",
+	}}
+	resourceConditions := []metav1.Condition{
+		{
+			Type:    "RayServeApplicationsReady",
+			Status:  metav1.ConditionFalse,
+			Reason:  "ApplicationsNotReady",
+			Message: "Nemotron deployment is still loading",
+		},
+		{
+			Type:    "Ready",
+			Status:  metav1.ConditionFalse,
+			Reason:  "Degraded",
+			Message: "Degraded components: [RayServeApplications]",
+		},
+	}
+
+	conditions := finalizePlatformConditions(stageConditions, resourceConditions, nil)
+	assert.Equal(t, metav1.ConditionTrue, conditionStatus(conditions, "RayServiceStatusReady"))
+	assert.Equal(t, metav1.ConditionFalse, conditionStatus(conditions, "RayServeApplicationsReady"))
+	assert.Equal(t, metav1.ConditionFalse, conditionStatus(conditions, "Ready"))
+	serveReady := apiMeta.FindStatusCondition(conditions, "RayServeApplicationsReady")
+	require.NotNil(t, serveReady)
+	assert.Equal(t, resourceConditions[0].Message, serveReady.Message)
+}
+
+func TestFinalizePlatformConditionsMarksReadyFalseOnStageError(t *testing.T) {
+	stageConditions := []metav1.Condition{{
+		Type:   "RayServiceStatusReady",
+		Status: metav1.ConditionTrue,
+		Reason: "Reconciled",
+	}}
+	resourceConditions := []metav1.Condition{{
+		Type:   "Ready",
+		Status: metav1.ConditionTrue,
+		Reason: "AllHealthy",
+	}}
+
+	conditions := finalizePlatformConditions(stageConditions, resourceConditions, assert.AnError)
+	ready := apiMeta.FindStatusCondition(conditions, "Ready")
+	require.NotNil(t, ready)
+	assert.Equal(t, metav1.ConditionFalse, ready.Status)
+	assert.Equal(t, "ReconcileError", ready.Reason)
+}
+
+func conditionStatus(conditions []metav1.Condition, conditionType string) metav1.ConditionStatus {
+	condition := apiMeta.FindStatusCondition(conditions, conditionType)
+	if condition == nil {
+		return metav1.ConditionUnknown
+	}
+	return condition.Status
 }
 
 func TestBuildAIService_PropagatesServiceTemplate(t *testing.T) {
