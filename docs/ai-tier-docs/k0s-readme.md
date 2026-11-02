@@ -556,6 +556,7 @@ and replace the corresponding fields with the mirrored paths; setting only
 | `aiPlatform.name` | No | `${CLUSTER_NAME}-ai-platform` | Base name for the AIPlatform CR |
 | `aiPlatform.defaultAcceleratorType` | **Yes** | `""` | GPU accelerator type for k0s — `L40S` or `H100` |
 | `aiPlatform.scaleFactor` | No | `1` | AI workload capacity multiplier; use a whole number of 1 or higher |
+| `aiPlatform.modelDeploymentMode` | No | `gemma-only` | Persistent model selection; `gemma-nemotron` is currently gated to RTX PRO 6000 Blackwell |
 | `aiPlatform.workerGroupConfig.imageRegistry` | No | `""` | Override registry for Ray worker images |
 | `aiPlatform.features` | Yes | — | Array of features to deploy (read dynamically from config) |
 | `aiPlatform.features[].name` | Yes | — | Feature name (e.g., `saia`, `slim`) |

@@ -7,6 +7,7 @@ S3_REGION="${S3_REGION:-us-east-2}"
 S3_PREFIX="${S3_PREFIX:-model_artifacts}"
 # Set to 1 to skip artifacts whose .staging_complete marker already exists in S3.
 SKIP_IF_STAGED="${SKIP_IF_STAGED:-0}"
+MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}"
 
 # Convert bucket name to lowercase (S3 requirement)
 if [[ -n "$S3_BUCKET" ]]; then
@@ -231,6 +232,12 @@ for artifact_path in "$SOURCE_DIR"/*; do
     if [[ -e "$artifact_path" ]]; then
         id=$(basename "$artifact_path")
         echo "Processing: $id"
+
+        if [[ "$id" == "nemotron-3-5-lightning-30b-a3b-bf16" && "$MODEL_DEPLOYMENT_MODE" != "gemma-nemotron" ]]; then
+            echo "Skipping $id; modelDeploymentMode=${MODEL_DEPLOYMENT_MODE}."
+            echo "-----------------------------"
+            continue
+        fi
 
         s3_base="s3://$S3_BUCKET/$S3_PREFIX/$id"
         # Marker lives in staging_state/ — separate from model_artifacts/ —

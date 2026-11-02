@@ -6,6 +6,7 @@ package raybuilder
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -148,10 +149,13 @@ func isAWSRegionalEndpoint(endpoint string) bool {
 type WorkerConfigs map[string][]InstanceDetail
 
 type InstanceDetail struct {
-	Tier       string                      `yaml:"tier"`
-	GPUsPerPod int32                       `yaml:"gpusPerPod"`
-	Env        map[string]string           `yaml:"env,omitempty"`
-	Resources  corev1.ResourceRequirements `yaml:"resources"`
+	Tier                string                      `yaml:"tier"`
+	GPUsPerPod          int32                       `yaml:"gpusPerPod"`
+	RequiresApplication string                      `yaml:"requiresApplication,omitempty"`
+	RayResources        map[string]int32            `yaml:"rayResources,omitempty"`
+	RayGPUResourceCount *int32                      `yaml:"rayGpuResourceCount,omitempty"`
+	Env                 map[string]string           `yaml:"env,omitempty"`
+	Resources           corev1.ResourceRequirements `yaml:"resources"`
 }
 
 // ScaleConfig models the two global scale files. model-scale.yaml supplies
@@ -190,6 +194,52 @@ func (b *Builder) effectiveScaleFactor() int32 {
 		return *b.ai.Spec.ScaleFactor
 	}
 	return 1
+}
+
+func (b *Builder) effectiveModelDeploymentMode() enterpriseApi.AIModelDeploymentMode {
+	if b.ai.Spec.ModelDeploymentMode == "" {
+		return enterpriseApi.ModelDeploymentModeGemmaOnly
+	}
+	return b.ai.Spec.ModelDeploymentMode
+}
+
+// effectiveApplicationReplicas applies the persisted platform model mode to
+// the base model catalog, then applies the existing platform scale factor.
+func (b *Builder) effectiveApplicationReplicas() (map[string]int32, error) {
+	modelScale, err := loadScaleConfig("MODEL_SCALE_FILE", "model-scale.yaml")
+	if err != nil {
+		return nil, err
+	}
+	mode := b.effectiveModelDeploymentMode()
+	switch mode {
+	case enterpriseApi.ModelDeploymentModeGemmaOnly, enterpriseApi.ModelDeploymentModeGemmaNemotron:
+	default:
+		return nil, fmt.Errorf("unsupported modelDeploymentMode %q; expected %q or %q", mode,
+			enterpriseApi.ModelDeploymentModeGemmaOnly, enterpriseApi.ModelDeploymentModeGemmaNemotron)
+	}
+	if mode == enterpriseApi.ModelDeploymentModeGemmaNemotron {
+		if b.effectiveAcceleratorType() != "RTX_PRO_6000_BLACKWELL" {
+			return nil, fmt.Errorf("modelDeploymentMode %q is currently supported only on RTX_PRO_6000_BLACKWELL; H100 scheduling remains gated", mode)
+		}
+	}
+
+	replicas := make(map[string]int32, len(modelScale.ApplicationScale))
+	for appName, baseReplicas := range modelScale.ApplicationScale {
+		if appName == "Nemotron35Lightning30bA3bBf16" {
+			if mode == enterpriseApi.ModelDeploymentModeGemmaOnly {
+				baseReplicas = 0
+			} else if baseReplicas <= 0 {
+				return nil, fmt.Errorf("modelDeploymentMode %q requires Nemotron35Lightning30bA3bBf16 to have a positive base replica count in model-scale.yaml", mode)
+			}
+		}
+		replicas[appName] = baseReplicas * b.effectiveScaleFactor()
+	}
+	if mode == enterpriseApi.ModelDeploymentModeGemmaNemotron {
+		if _, ok := modelScale.ApplicationScale["Nemotron35Lightning30bA3bBf16"]; !ok {
+			return nil, fmt.Errorf("modelDeploymentMode %q requires Nemotron35Lightning30bA3bBf16 in model-scale.yaml", mode)
+		}
+	}
+	return replicas, nil
 }
 
 // loadScaleConfig reads a global scale file (model-scale.yaml or
@@ -235,22 +285,16 @@ func (b *Builder) ReconcileRayService(ctx context.Context, p *enterpriseApi.AIPl
 	// table, including AWS regional-endpoint detection.
 	cloudProvider, artifactsProvider, needsS3CompatCreds := classifyObjectStorage(u.Scheme, p.Spec.ObjectStorage.Endpoint)
 
-	// Build the model replica map from the global model-scale.yaml, scaled by
-	// the platform-wide scaleFactor. Every model in the catalog is always
-	// deployed; sizing no longer depends on spec.Features (which now drives
-	// only AIService creation in ReconcileFeatures).
-	modelScale, err := loadScaleConfig("MODEL_SCALE_FILE", "model-scale.yaml")
+	// Build the model replica map from the global model-scale.yaml and the
+	// persisted modelDeploymentMode. Features continues to drive AIService
+	// creation only, in ReconcileFeatures.
+	replicasMap, err := b.effectiveApplicationReplicas()
 	if err != nil {
-		logger.Error(err, "Failed to load model scale config")
+		logger.Error(err, "Failed to resolve model deployment mode and scale config")
 		return err
 	}
-	scaleFactor := b.effectiveScaleFactor()
-	logger.V(1).Info("Loaded model scale config", "scaleFactor", scaleFactor, "models", len(modelScale.ApplicationScale))
-
-	replicasMap := make(map[string]int32, len(modelScale.ApplicationScale))
-	for appName, baseReplicas := range modelScale.ApplicationScale {
-		replicasMap[appName] = baseReplicas * scaleFactor
-	}
+	logger.V(1).Info("Loaded model scale config", "scaleFactor", b.effectiveScaleFactor(),
+		"modelDeploymentMode", b.effectiveModelDeploymentMode(), "models", len(replicasMap))
 
 	// S3-compatible endpoint is only meaningful when the classifier picked the
 	// s3compat code path. For real AWS (cloudProvider=aws) we leave it empty so
@@ -667,6 +711,25 @@ func (b *Builder) ApplyNormalizedConditions(ctx context.Context, p *enterpriseAp
 		snap.ServeServiceHasBackend,
 	)
 
+	// A backed route can still serve errors while model replicas are loading.
+	// Require the selected applications and their deployments to report healthy
+	// before declaring the platform ready.
+	statusBuilder := *b
+	statusBuilder.ai = p
+	desiredApplications, appConfigErr := statusBuilder.effectiveApplicationReplicas()
+	applicationsReady := false
+	applicationsMsg := ""
+	if appConfigErr != nil {
+		applicationsMsg = fmt.Sprintf("unable to determine desired Serve applications: %v", appConfigErr)
+	} else {
+		applicationsReady, applicationsMsg = raystatus.CheckServeApplicationsReady(snap.ActiveApplications, desiredApplications)
+	}
+	set("RayServeApplicationsReady",
+		map[bool]string{true: "AllApplicationsHealthy", false: "ApplicationsNotReady"}[applicationsReady],
+		applicationsMsg,
+		applicationsReady,
+	)
+
 	// Check Weaviate status
 	weaviateErrors := raystatus.ExtractWeaviateErrors(ctx, b.Client, p.Namespace, p.Name)
 	weaviateReady := !weaviateErrors.HasError
@@ -695,8 +758,8 @@ func (b *Builder) ApplyNormalizedConditions(ctx context.Context, p *enterpriseAp
 	)
 
 	// Top-level Ready rollup
-	platformReady := rsReady && clusterReady && snap.ServeServiceHasBackend && weaviateReady
-	readyMsg := "All components healthy: Ray, RayServe, and Weaviate"
+	platformReady := rsReady && clusterReady && snap.ServeServiceHasBackend && applicationsReady && weaviateReady
+	readyMsg := "All components healthy: Ray, Ray Serve applications, and Weaviate"
 	if !platformReady {
 		failedComponents := []string{}
 		if !rsReady {
@@ -707,6 +770,9 @@ func (b *Builder) ApplyNormalizedConditions(ctx context.Context, p *enterpriseAp
 		}
 		if !snap.ServeServiceHasBackend {
 			failedComponents = append(failedComponents, "RayServe")
+		}
+		if !applicationsReady {
+			failedComponents = append(failedComponents, "RayServeApplications")
 		}
 		if !weaviateReady {
 			failedComponents = append(failedComponents, "Weaviate")
@@ -803,6 +869,10 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 	if err != nil {
 		return nil, err
 	}
+	applicationReplicas, err := b.effectiveApplicationReplicas()
+	if err != nil {
+		return nil, err
+	}
 	scaleFactor := b.effectiveScaleFactor()
 
 	// initialize instanceScale to avoid nil map assignment panic
@@ -821,10 +891,40 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 
 		cpuLimit := cfg.Resources.Limits[corev1.ResourceCPU]
 		replicas := instanceScale[cfg.Tier]
+		if cfg.RequiresApplication != "" {
+			requiredReplicas, ok := applicationReplicas[cfg.RequiresApplication]
+			if !ok {
+				return nil, fmt.Errorf("worker tier %s requires application %s, which is missing from model-scale.yaml", cfg.Tier, cfg.RequiresApplication)
+			}
+			if requiredReplicas <= 0 {
+				replicas = 0
+			}
+		}
 
 		maxReplicas := replicas + 5
 		if cfg.GPUsPerPod > 0 {
 			maxReplicas = replicas
+		}
+
+		// Advertise a Ray resource that matches the worker's physical shape.
+		// A dedicated worker may replace the default gpu_count marker with a
+		// model-specific resource so unrelated fractional actors cannot land on it.
+		rayResources := map[string]int32{
+			fmt.Sprintf("accelerator_type:%s", acceleratorType): 1,
+		}
+		gpuResourceCount := cfg.GPUsPerPod
+		if cfg.RayGPUResourceCount != nil {
+			gpuResourceCount = *cfg.RayGPUResourceCount
+		}
+		if gpuResourceCount > 0 {
+			rayResources[fmt.Sprintf("gpu_count:%d", gpuResourceCount)] = 1
+		}
+		for name, count := range cfg.RayResources {
+			rayResources[name] = count
+		}
+		rayResourcesJSON, err := json.Marshal(rayResources)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode Ray resources for worker tier %s: %w", cfg.Tier, err)
 		}
 
 		wg := rayv1.WorkerGroupSpec{
@@ -834,7 +934,7 @@ func (b *Builder) buildClusterConfig(ctx context.Context) (*rayv1.RayClusterSpec
 			MaxReplicas: int32Ptr(maxReplicas),
 			RayStartParams: map[string]string{
 				"num-cpus":  cpuLimit.String(),
-				"resources": fmt.Sprintf(`"{\"accelerator_type:%s\":1,\"gpu_count:%d\":1}"`, acceleratorType, cfg.GPUsPerPod),
+				"resources": fmt.Sprintf("%q", string(rayResourcesJSON)),
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{

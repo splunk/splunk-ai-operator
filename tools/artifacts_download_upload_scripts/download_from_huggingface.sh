@@ -12,13 +12,16 @@ set -o pipefail
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [--accelerator <type>] [--skip-if-staged] [--help]
+Usage: $(basename "$0") [--accelerator <type>] [--model-deployment-mode <mode>] [--skip-if-staged] [--help]
 
 Options:
   -a, --accelerator <type>  GPU accelerator type for which to download models.
                             Supported: l40s (default), h100, rtx_pro_6000_blackwell
                             (h100 and rtx_pro_6000_blackwell select the quantized
                             profile containing the w4a16 Gemma variant)
+  --model-deployment-mode <mode>
+                            Model set to stage: gemma-only (default) or gemma-nemotron.
+                            Nemotron artifacts are staged only in gemma-nemotron mode.
   --skip-if-staged          Check the configured object store first; skip
                             downloading (and uploading) any artifact that is
                             already fully staged there.
@@ -26,6 +29,7 @@ Options:
 
 Environment:
   ACCELERATOR           Fallback when --accelerator is not given (used by the k0s installer).
+  MODEL_DEPLOYMENT_MODE Fallback for --model-deployment-mode (default: gemma-only).
   SKIP_IF_EXISTS        Set to 1 to skip models that have a local completion marker.
   SKIP_IF_STAGED        Set to 1 to enable the object-store pre-check (same as --skip-if-staged).
   HF_DOWNLOAD_RETRIES   Number of retry attempts per model on failure (default: 2).
@@ -50,6 +54,7 @@ EOF
 }
 
 ACCEL_FLAG=""
+MODEL_MODE_FLAG=""
 SKIP_IF_STAGED="${SKIP_IF_STAGED:-0}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}"
 HF_DOWNLOAD_RETRIES="${HF_DOWNLOAD_RETRIES:-2}"
@@ -57,6 +62,7 @@ HF_DOWNLOAD_RETRIES="${HF_DOWNLOAD_RETRIES:-2}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -a|--accelerator) ACCEL_FLAG="${2:-}"; shift 2 ;;
+    --model-deployment-mode) MODEL_MODE_FLAG="${2:-}"; shift 2 ;;
     --skip-if-staged) SKIP_IF_STAGED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -79,10 +85,19 @@ if [[ -z "$ACCEL_FLAG" && -z "$ACCELERATOR" ]]; then
 fi
 
 ACCEL="$(printf '%s' "${ACCEL_FLAG:-${ACCELERATOR}}" | tr '[:upper:]' '[:lower:]')"
+MODEL_DEPLOYMENT_MODE="${MODEL_MODE_FLAG:-${MODEL_DEPLOYMENT_MODE:-gemma-only}}"
+case "${MODEL_DEPLOYMENT_MODE}" in
+  gemma-only|gemma-nemotron) ;;
+  *) echo "Error: unsupported model deployment mode '${MODEL_DEPLOYMENT_MODE}'. Supported values: gemma-only, gemma-nemotron" >&2; exit 1 ;;
+esac
+if [[ "${MODEL_DEPLOYMENT_MODE}" == "gemma-nemotron" && "${ACCEL}" != "rtx_pro_6000_blackwell" ]]; then
+  echo "Error: gemma-nemotron artifact staging currently requires rtx_pro_6000_blackwell" >&2
+  exit 1
+fi
 
 # Select the artifact profile from the normalized accelerator type. H100 and
-# RTX Pro currently share the quantized profile, while L40S uses unquantized
-# weights. Profile names describe the artifacts rather than a particular GPU.
+# RTX Pro share the quantized profile, while L40S uses unquantized weights.
+# Artifact-level model-deployment-modes below filter mode-specific weights.
 case "${ACCEL}" in
   l40s|"") CONFIG_FILE="./model_artifacts_configs_unquantized.yaml" ;;
   h100|rtx_pro_6000_blackwell) CONFIG_FILE="./model_artifacts_configs_quantized.yaml" ;;
@@ -92,7 +107,7 @@ case "${ACCEL}" in
     ;;
 esac
 
-echo "Accelerator: ${ACCEL} → config: ${CONFIG_FILE}"
+echo "Accelerator: ${ACCEL} → config: ${CONFIG_FILE} (mode: ${MODEL_DEPLOYMENT_MODE})"
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
   echo "Error: config file '${CONFIG_FILE}' not found in $(pwd)" >&2
@@ -502,12 +517,20 @@ if [[ -z "$artifact_count" || "$artifact_count" == "null" || "$artifact_count" -
     echo "ERROR: No artifacts found in '$CONFIG_FILE' (artifact-configs list is empty or missing)." >&2
     exit 1
 fi
-echo "Found $artifact_count artifacts to process"
+echo "Found $artifact_count manifest entries to inspect"
 echo ""
 
 failed_ids=()
 
 for ((idx=0; idx<artifact_count; idx++)); do
+    required_modes=$("$YQ_CMD" -r ".artifact-configs[$idx].model-deployment-modes[]?" "$CONFIG_FILE")
+    if [[ -n "$required_modes" && "$required_modes" != "null" ]] && ! grep -Fxq "$MODEL_DEPLOYMENT_MODE" <<< "$required_modes"; then
+        id=$("$YQ_CMD" -r ".artifact-configs[$idx].artifact-id" "$CONFIG_FILE")
+        echo "Skipping artifact $id; it is not selected for ${MODEL_DEPLOYMENT_MODE} mode."
+        echo "-----------------------------"
+        continue
+    fi
+
     id=$("$YQ_CMD" -r ".artifact-configs[$idx].artifact-id" "$CONFIG_FILE")
     hf_url=$("$YQ_CMD" -r ".artifact-configs[$idx].hf-url" "$CONFIG_FILE")
     files_to_exclude=$("$YQ_CMD" -r ".artifact-configs[$idx].files-to-exclude[]?" "$CONFIG_FILE")

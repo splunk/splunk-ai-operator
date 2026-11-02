@@ -3,6 +3,7 @@ package raystatus
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,6 +27,7 @@ type RaySnapshot struct {
 	ServiceStatusRunning bool // legacy/fallback
 	ActiveClusterName    string
 	ObservedGeneration   int64
+	ActiveApplications   map[string]rayv1.AppStatus
 
 	// From cluster discovery
 	HeadPodReady            bool
@@ -68,6 +70,7 @@ func CollectRaySnapshot(ctx context.Context, c client.Client, ns, name string) (
 		return nil, err
 	}
 	snap.ObservedGeneration = rs.Status.ObservedGeneration
+	snap.ActiveApplications = rs.Status.ActiveServiceStatus.Applications
 
 	// conditions (Ready, UpgradeInProgress) as before...
 	for _, cond := range rs.Status.Conditions {
@@ -121,6 +124,57 @@ func CollectRaySnapshot(ctx context.Context, c client.Client, ns, name string) (
 	}
 
 	return snap, nil
+}
+
+// CheckServeApplicationsReady verifies that every Serve application with a
+// positive desired replica count is active and that all of its deployments are
+// healthy. A running route alone does not guarantee that each model finished
+// loading its weights.
+func CheckServeApplicationsReady(applications map[string]rayv1.AppStatus, desiredReplicas map[string]int32) (bool, string) {
+	if len(desiredReplicas) == 0 {
+		return false, "no desired Serve applications are configured"
+	}
+
+	var pending []string
+	hasDesiredApplication := false
+	for appName, replicas := range desiredReplicas {
+		if replicas <= 0 {
+			continue
+		}
+		hasDesiredApplication = true
+		app, ok := applications[appName]
+		if !ok {
+			pending = append(pending, fmt.Sprintf("%s: status unavailable", appName))
+			continue
+		}
+		if app.Status != "RUNNING" {
+			pending = append(pending, fmt.Sprintf("%s: status %s", appName, valueOr(app.Status, "unknown")))
+			continue
+		}
+		if len(app.Deployments) == 0 {
+			pending = append(pending, fmt.Sprintf("%s: no deployment status reported", appName))
+			continue
+		}
+		for deploymentName, deployment := range app.Deployments {
+			if deployment.Status != "HEALTHY" {
+				pending = append(pending, fmt.Sprintf("%s/%s: status %s", appName, deploymentName, valueOr(deployment.Status, "unknown")))
+			}
+		}
+	}
+	if !hasDesiredApplication {
+		return false, "no Serve applications have a positive desired replica count"
+	}
+	if len(pending) > 0 {
+		return false, "Serve applications not ready: " + strings.Join(pending, "; ")
+	}
+	return true, "all desired Serve applications are RUNNING with HEALTHY deployments"
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func checkHeadPodReady(ctx context.Context, c client.Client, ns, clusterName string) (bool, error) {

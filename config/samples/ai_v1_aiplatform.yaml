@@ -10,6 +10,9 @@ spec:
     path: s3://ai-platform-dev
     region: us-west-2
   serviceAccountName: ray-head-sa
+  # gemma-nemotron is available on RTX PRO 6000 Blackwell; the default
+  # preserves the existing Gemma + GPT-OSS model set.
+  modelDeploymentMode: gemma-only
 
   serviceTemplate:
     spec:

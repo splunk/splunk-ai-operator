@@ -22,6 +22,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// AIModelDeploymentMode selects the language model set reconciled by an AIPlatform.
+type AIModelDeploymentMode string
+
+const (
+	// ModelDeploymentModeGemmaOnly preserves the established model set.
+	ModelDeploymentModeGemmaOnly AIModelDeploymentMode = "gemma-only"
+	// ModelDeploymentModeGemmaNemotron adds one Nemotron replica to the existing model set.
+	ModelDeploymentModeGemmaNemotron AIModelDeploymentMode = "gemma-nemotron"
+)
+
 // AIPlatform is the Schema for the AIPlatform API
 // +k8s:openapi-gen=true
 // +kubebuilder:object:root=true
@@ -74,6 +84,13 @@ type AIPlatformSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	ScaleFactor *int32 `json:"scaleFactor,omitempty"`
+
+	// ModelDeploymentMode selects Gemma-only or Gemma plus Nemotron serving.
+	// The default preserves the established model set.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=gemma-only;gemma-nemotron
+	// +kubebuilder:default="gemma-only"
+	ModelDeploymentMode AIModelDeploymentMode `json:"modelDeploymentMode,omitempty"`
 
 	// WorkerGroupConfig defines the Ray worker group configuration
 	// +kubebuilder:validation:Optional

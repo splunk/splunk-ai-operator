@@ -76,6 +76,10 @@ spec:
     rayHeadGroupImage: "rayproject/ray-head:latest"
     rayWorkerGroupImage: "rayproject/ray-worker:latest"
   defaultAcceleratorType: "L40S"
+  # gemma-only preserves the existing model set. gemma-nemotron adds one
+  # Nemotron replica and is currently supported on the k0s RTX PRO 6000 Blackwell profile.
+  modelDeploymentMode: "gemma-only"
+  scaleFactor: 1
   splunkConfiguration:
     crName: "splunk-standalone"
     crNamespace: "default"
@@ -147,6 +151,8 @@ The `AIPlatform` resource provides the following `Spec` configuration parameters
 | serviceAccountName   | string | Kubernetes [Service Account](https://kubernetes.io/docs/concepts/security/service-accounts/) name. Used for IAM roles (IRSA on AWS) to access cloud resources |
 | features   | array | List of AI features to enable (e.g., `saia` for Splunk AI Assistant) |
 | defaultAcceleratorType   | string | GPU type for AI workloads (e.g., `nvidia-tesla-t4`, `nvidia-a100`, `L40S`) |
+| modelDeploymentMode | string | Model set to reconcile: `gemma-only` (default; preserves Gemma, GPT-OSS, and support models) or `gemma-nemotron` (k0s RTX PRO 6000 Blackwell profile; adds Nemotron to the model set) |
+| scaleFactor | integer | Capacity multiplier for all model replicas and worker pods; minimum/default is `1`. It applies uniformly to the selected model set and its GPU worker pools. |
 | gpuInstanceType   | string | GPU instance type for Ray worker groups (e.g., `g6.24xlarge`, `p4d.24xlarge`) |
 | workerGroupConfig   | object | Ray worker node configuration (service account, image registry) |
 | sidecars   | object | Enable/disable sidecars: `envoy`, `otel`, `prometheusOperator` |
@@ -184,6 +190,7 @@ kubectl get aiplatform <name> -n <namespace> -o jsonpath='{.status.conditions[?(
 - `RayServiceReady` - Ray cluster status
 - `RayClusterReady` - Ray pods readiness
 - `RayServeRouteReady` - AI inference endpoint availability
+- `RayServeApplicationsReady` - every selected Serve application is `RUNNING` and its deployments are `HEALTHY`
 - `WeaviateDatabaseReady` - Vector database status
 - `IngressReady` - External access (if enabled)
 

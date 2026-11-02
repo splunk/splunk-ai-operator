@@ -138,8 +138,9 @@ splunk:
   standaloneName: "splunk-standalone"
 
 aiPlatform:
-  # Supported values in the current installer: L40S, H100
+  # Supported values in the current installer: L40S, H100, RTX_PRO_6000_BLACKWELL
   defaultAcceleratorType: "L40S"
+  modelDeploymentMode: "gemma-only"
 
   # NodePort exposes the SAIA and Slim public services without MetalLB. The two
   # enabled features require distinct NodePorts.

@@ -98,3 +98,19 @@ RTX_PRO_6000_BLACKWELL:
         memory: "96Gi"
         ephemeral-storage: "300Gi"
         nvidia.com/gpu: "2"
+  - tier: rtx-pro-6000-blackwell-nemotron-2-gpu
+    gpusPerPod: 2
+    requiresApplication: Nemotron35Lightning30bA3bBf16
+    # The dedicated Ray resource keeps existing fractional GPU actors off this
+    # worker. Its 2-GPU pod shape matches Nemotron's tensor-parallel allocation.
+    rayResources:
+      nemotron_worker: 1
+    rayGpuResourceCount: 0
+    resources:
+      requests:
+        cpu: "8"
+      limits:
+        cpu: "16"
+        memory: "128Gi"
+        ephemeral-storage: "300Gi"
+        nvidia.com/gpu: "2"
