@@ -7,6 +7,12 @@
       "minimum": 1,
       "default": 1,
       "description": "Platform-wide capacity multiplier for model replicas and worker pods."
+    },
+    "modelDeploymentMode": {
+      "type": "string",
+      "enum": ["gemma-only", "gemma-nemotron"],
+      "default": "gemma-only",
+      "description": "Persistent language-model selection for the AIPlatform."
     }
   }
 }

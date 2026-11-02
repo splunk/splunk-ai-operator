@@ -264,6 +264,7 @@ func TestBuildClusterConfig_NemotronUsesDedicatedTwoGPUWorker(t *testing.T) {
 
 	platform := newScaleFactorTestPlatform(int32PtrForTest(1))
 	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
+	platform.Spec.ModelDeploymentMode = aiv1.ModelDeploymentModeGemmaNemotron
 	s := scheme.Scheme
 	_ = aiv1.AddToScheme(s)
 	_ = rayv1.AddToScheme(s)
@@ -321,6 +322,7 @@ func TestBuildClusterConfig_DisablesNemotronWorkerInGemmaOnlyMode(t *testing.T) 
 
 	platform := newScaleFactorTestPlatform(int32PtrForTest(1))
 	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
+	platform.Spec.ModelDeploymentMode = aiv1.ModelDeploymentModeGemmaOnly
 	s := scheme.Scheme
 	_ = aiv1.AddToScheme(s)
 	_ = rayv1.AddToScheme(s)
@@ -400,6 +402,10 @@ type renderedServeApplication struct {
 }
 
 func renderProductionApplications(t *testing.T, scaleFactor int32, acceleratorType string) []renderedServeApplication {
+	return renderProductionApplicationsMode(t, scaleFactor, acceleratorType, aiv1.ModelDeploymentModeGemmaOnly)
+}
+
+func renderProductionApplicationsMode(t *testing.T, scaleFactor int32, acceleratorType string, mode aiv1.AIModelDeploymentMode) []renderedServeApplication {
 	t.Helper()
 
 	modelScaleData, err := os.ReadFile("../../../config/configs/model-scale.yaml")
@@ -409,6 +415,9 @@ func renderProductionApplications(t *testing.T, scaleFactor int32, acceleratorTy
 
 	replicas := make(map[string]int32, len(modelScale.ApplicationScale))
 	for name, base := range modelScale.ApplicationScale {
+		if name == "Nemotron35Lightning30bA3bBf16" && mode == aiv1.ModelDeploymentModeGemmaOnly {
+			base = 0
+		}
 		replicas[name] = base * scaleFactor
 	}
 	return renderApplicationsWithReplicas(t, replicas, acceleratorType)
@@ -494,21 +503,64 @@ func TestApplicationsTemplate_NemotronReplicaAndWorkerMode(t *testing.T) {
 	require.NoError(t, yaml.UnmarshalStrict(modelScaleData, &modelScale))
 	require.Equal(t, int32(1), modelScale.ApplicationScale["Nemotron35Lightning30bA3bBf16"])
 
-	rtxApps := indexRenderedApplications(renderProductionApplications(t, 1, "RTX_PRO_6000_BLACKWELL"))
+	rtxApps := indexRenderedApplications(renderProductionApplicationsMode(t, 1, "RTX_PRO_6000_BLACKWELL", aiv1.ModelDeploymentModeGemmaNemotron))
 	nemotron, ok := rtxApps["Nemotron35Lightning30bA3bBf16"]
 	require.True(t, ok, "combined RTX mode includes Nemotron")
 	deployment := indexRenderedDeployments(nemotron.Deployments)["LLMDeploymentRTX_PRO_6000_BLACKWELL"]
 	require.Equal(t, int32(1), deployment.AutoscalingConfig["min_replicas"])
 	require.Equal(t, int32(1), deployment.AutoscalingConfig["max_replicas"])
 
-	gemmaOnly := make(map[string]int32, len(modelScale.ApplicationScale))
-	for name, replicas := range modelScale.ApplicationScale {
-		gemmaOnly[name] = replicas
-	}
-	gemmaOnly["Nemotron35Lightning30bA3bBf16"] = 0
-	gemmaOnlyApps := indexRenderedApplications(renderApplicationsWithReplicas(t, gemmaOnly, "RTX_PRO_6000_BLACKWELL"))
+	gemmaOnlyApps := indexRenderedApplications(renderProductionApplications(t, 1, "RTX_PRO_6000_BLACKWELL"))
 	require.NotContains(t, gemmaOnlyApps, "Nemotron35Lightning30bA3bBf16",
 		"Gemma-only mode omits the Nemotron Serve application")
+}
+
+func TestEffectiveApplicationReplicas_ModelDeploymentModes(t *testing.T) {
+	modelScaleFile, err := filepath.Abs("../../../config/configs/model-scale.yaml")
+	require.NoError(t, err)
+	t.Setenv("MODEL_SCALE_FILE", modelScaleFile)
+
+	platform := newScaleFactorTestPlatform(int32PtrForTest(1))
+	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
+	builder := &Builder{ai: platform}
+
+	replicas, err := builder.effectiveApplicationReplicas()
+	require.NoError(t, err)
+	require.Equal(t, int32(0), replicas["Nemotron35Lightning30bA3bBf16"], "default mode preserves the existing Gemma-only model set")
+	require.Equal(t, int32(1), replicas["Gemma431bIt"])
+	require.Equal(t, int32(1), replicas["GptOss20b"])
+	require.Equal(t, int32(1), replicas["AllMinilmL6V2"])
+
+	platform.Spec.ModelDeploymentMode = aiv1.ModelDeploymentModeGemmaNemotron
+	replicas, err = builder.effectiveApplicationReplicas()
+	require.NoError(t, err)
+	require.Equal(t, int32(1), replicas["Nemotron35Lightning30bA3bBf16"])
+	require.Equal(t, int32(1), replicas["Gemma431bIt"])
+	require.Equal(t, int32(1), replicas["GptOss20b"])
+	require.Equal(t, int32(1), replicas["AllMinilmL6V2"])
+}
+
+func TestEffectiveApplicationReplicas_RejectsUnsupportedNemotronProfiles(t *testing.T) {
+	modelScaleFile, err := filepath.Abs("../../../config/configs/model-scale.yaml")
+	require.NoError(t, err)
+	t.Setenv("MODEL_SCALE_FILE", modelScaleFile)
+
+	platform := newScaleFactorTestPlatform(int32PtrForTest(1))
+	platform.Spec.ModelDeploymentMode = aiv1.ModelDeploymentModeGemmaNemotron
+	platform.Spec.DefaultAcceleratorType = "H100"
+	builder := &Builder{ai: platform}
+	_, err = builder.effectiveApplicationReplicas()
+	require.ErrorContains(t, err, "H100 scheduling remains gated")
+
+	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
+	platform.Spec.ScaleFactor = int32PtrForTest(2)
+	_, err = builder.effectiveApplicationReplicas()
+	require.ErrorContains(t, err, "requires scaleFactor 1")
+
+	platform.Spec.ScaleFactor = int32PtrForTest(1)
+	platform.Spec.ModelDeploymentMode = "unknown"
+	_, err = builder.effectiveApplicationReplicas()
+	require.ErrorContains(t, err, "unsupported modelDeploymentMode")
 }
 
 // TestApplicationsTemplate_ScaleFactorUsesLightweightDeploymentOverrides

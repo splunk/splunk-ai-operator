@@ -59,6 +59,9 @@ gpuInstanceType: "g6.24xlarge"
 # Must be an integer greater than or equal to 1.
 scaleFactor: 1
 
+# Persistent language-model set. Nemotron currently requires RTX PRO 6000 Blackwell.
+modelDeploymentMode: gemma-only
+
 # List of defined features to enable in the AI platform
 # Options include: saia, seca, slim
 features: []

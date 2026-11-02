@@ -222,6 +222,8 @@ splunk:
 aiPlatform:
   name: "splunk-ai-stack"
   defaultAcceleratorType: "L40S"
+  # gemma-nemotron currently requires RTX PRO 6000 Blackwell.
+  modelDeploymentMode: "gemma-only"
 
   # scaleFactor: 2
   #   Optional, platform-wide. Runs the whole platform at N times its normal

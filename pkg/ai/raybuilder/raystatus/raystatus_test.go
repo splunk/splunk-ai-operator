@@ -52,6 +52,44 @@ func TestCollectRaySnapshotKeepsStableRayServiceHeadName(t *testing.T) {
 	assert.Equal(t, "platform-raycluster-abc12-head-pod", snapshot.HeadPodName)
 }
 
+func TestCheckServeApplicationsReady(t *testing.T) {
+	desired := map[string]int32{"Gemma431bIt": 1, "Nemotron35Lightning30bA3bBf16": 1, "DisabledModel": 0}
+
+	applications := map[string]rayv1.AppStatus{
+		"Gemma431bIt": {
+			Status: "RUNNING",
+			Deployments: map[string]rayv1.ServeDeploymentStatus{
+				"LLMDeployment": {Status: "HEALTHY"},
+			},
+		},
+		"Nemotron35Lightning30bA3bBf16": {
+			Status: "RUNNING",
+			Deployments: map[string]rayv1.ServeDeploymentStatus{
+				"LLMDeployment": {Status: "HEALTHY"},
+			},
+		},
+	}
+
+	ready, message := CheckServeApplicationsReady(applications, desired)
+	assert.True(t, ready)
+	assert.Contains(t, message, "all desired Serve applications")
+
+	delete(applications, "Nemotron35Lightning30bA3bBf16")
+	ready, message = CheckServeApplicationsReady(applications, desired)
+	assert.False(t, ready)
+	assert.Contains(t, message, "Nemotron35Lightning30bA3bBf16: status unavailable")
+
+	applications["Nemotron35Lightning30bA3bBf16"] = rayv1.AppStatus{
+		Status: "RUNNING",
+		Deployments: map[string]rayv1.ServeDeploymentStatus{
+			"LLMDeployment": {Status: "UPDATING"},
+		},
+	}
+	ready, message = CheckServeApplicationsReady(applications, desired)
+	assert.False(t, ready)
+	assert.Contains(t, message, "Nemotron35Lightning30bA3bBf16/LLMDeployment: status UPDATING")
+}
+
 // TestCollectRaySnapshotNormalizesLongNames guards against a regression where
 // the stable RayService names diverge from KubeRay's actual (CheckName-normalized)
 // Service names once the AIPlatform name is long enough to be front-truncated.

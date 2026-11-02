@@ -7,8 +7,8 @@ applicationScale:
   FmTimeseries: 1
   Gemma431bIt: 1
   GptOss20b: 1
-  # Set to 0 for Gemma-only mode; the dedicated Nemotron worker is disabled
-  # with it. Base replica count is one for the combined RTX PRO 6000 profile.
+  # Base replica count for gemma-nemotron mode; modelDeploymentMode in the
+  # AIPlatform CR selects whether this application and its worker are enabled.
   Nemotron35Lightning30bA3bBf16: 1
   MbartTranslator: 1
   PromptInjectionClassifier: 1

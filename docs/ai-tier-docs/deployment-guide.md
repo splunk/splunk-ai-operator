@@ -264,6 +264,23 @@ ask your cluster administrator to add the required GPU capacity first.
 > downtime while workloads are resized. Plan downscaling during a maintenance
 > window.
 
+### Selecting the Model Deployment Mode
+
+`aiPlatform.modelDeploymentMode` persists the model set on the AIPlatform custom
+resource. It defaults to `gemma-only`, which preserves the established Gemma,
+GPT-OSS, and supporting-model set. In the k0s RTX PRO 6000 Blackwell profile, set it to
+`gemma-nemotron` to add one Nemotron replica on its dedicated two-GPU worker.
+The existing models and their replica counts stay unchanged. Combined mode
+requires `scaleFactor: 1`; H100 is not enabled until its scheduling gate is
+resolved.
+
+```yaml
+aiPlatform:
+  defaultAcceleratorType: RTX_PRO_6000_BLACKWELL
+  modelDeploymentMode: gemma-nemotron
+  scaleFactor: 1
+```
+
 ---
 
 ## Standard Deployment (Internet-Connected)

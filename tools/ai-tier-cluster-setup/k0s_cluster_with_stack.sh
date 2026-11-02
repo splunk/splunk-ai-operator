@@ -849,12 +849,40 @@ validate_scale_factor_config() {
   return 0
 }
 
+validate_model_deployment_mode_config() {
+  local mode accelerator scale_factor
+  if ! mode=$(yq eval '.aiPlatform.modelDeploymentMode // "gemma-only"' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "Unable to read aiPlatform.modelDeploymentMode from ${CONFIG_FILE}"
+    return 1
+  fi
+  case "${mode}" in
+    gemma-only) return 0 ;;
+    gemma-nemotron) ;;
+    *) echo "aiPlatform.modelDeploymentMode must be gemma-only or gemma-nemotron (got ${mode:-null})"; return 1 ;;
+  esac
+  accelerator=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null) || return 1
+  if [[ "${accelerator}" != "RTX_PRO_6000_BLACKWELL" ]]; then
+    echo "aiPlatform.modelDeploymentMode gemma-nemotron currently requires defaultAcceleratorType RTX_PRO_6000_BLACKWELL; H100 scheduling remains gated"
+    return 1
+  fi
+  scale_factor=$(yq eval '.aiPlatform.scaleFactor // 1' "${CONFIG_FILE}" 2>/dev/null) || return 1
+  if [[ "${scale_factor}" != "1" ]]; then
+    echo "aiPlatform.modelDeploymentMode gemma-nemotron currently requires aiPlatform.scaleFactor 1"
+    return 1
+  fi
+  return 0
+}
+
 validate_image_config() {
   log "Validating image configuration..."
 
   local scale_factor_error
   if ! scale_factor_error=$(validate_scale_factor_config); then
     err "${scale_factor_error}"
+  fi
+  local model_mode_error
+  if ! model_mode_error=$(validate_model_deployment_mode_config); then
+    err "${model_mode_error}"
   fi
 
   if [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" == "null" ]]; then
@@ -6207,6 +6235,11 @@ EOF
     log "  scaleFactor: ${ai_scale_factor}"
   fi
 
+  local model_mode_yaml="" ai_model_deployment_mode
+  ai_model_deployment_mode=$(yq eval '.aiPlatform.modelDeploymentMode // "gemma-only"' "${CONFIG_FILE}" 2>/dev/null || echo "gemma-only")
+  model_mode_yaml="  modelDeploymentMode: ${ai_model_deployment_mode}"$'\n'
+  log "  modelDeploymentMode: ${ai_model_deployment_mode}"
+
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
   local feature_count
@@ -6256,6 +6289,7 @@ ${image_pull_secrets}
 
   # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
 ${scale_factor_yaml}
+${model_mode_yaml}
   # Features from config (aiPlatform.features)
   features:
 ${features_yaml}

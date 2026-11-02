@@ -2278,6 +2278,15 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
+              modelDeploymentMode:
+                default: gemma-only
+                description: |-
+                  ModelDeploymentMode selects Gemma-only or Gemma plus Nemotron serving.
+                  The default preserves the established model set.
+                enum:
+                - gemma-only
+                - gemma-nemotron
+                type: string
               serviceAccountName:
                 description: |-
                   ServiceAccountName is the name of the service account to use for the AIPlatform
