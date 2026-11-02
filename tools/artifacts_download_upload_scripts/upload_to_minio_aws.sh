@@ -7,6 +7,7 @@ MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
 MINIO_BUCKET="${MINIO_BUCKET:-ai-platform-artifacts-bucket}"
 MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
 MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
+MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}"
 
 # Convert bucket name to lowercase (S3/MinIO requirement)
 ORIGINAL_BUCKET="$MINIO_BUCKET"
@@ -258,6 +259,11 @@ for artifact_path in "$SOURCE_DIR"/*; do
     if [[ -e "$artifact_path" ]]; then
         id=$(basename "$artifact_path")
         echo "Processing: $id"
+
+        if [[ "$id" == "nemotron-3-5-lightning-30b-a3b-bf16" && "$MODEL_DEPLOYMENT_MODE" != "gemma-nemotron" ]]; then
+            echo "Skipping $id; modelDeploymentMode=${MODEL_DEPLOYMENT_MODE}."
+            continue
+        fi
         
         if [[ -d "$artifact_path" ]]; then
             # It's a directory - upload recursively

@@ -554,10 +554,11 @@ func TestEffectiveApplicationReplicas_RejectsUnsupportedNemotronProfiles(t *test
 
 	platform.Spec.DefaultAcceleratorType = "RTX_PRO_6000_BLACKWELL"
 	platform.Spec.ScaleFactor = int32PtrForTest(2)
-	_, err = builder.effectiveApplicationReplicas()
-	require.ErrorContains(t, err, "requires scaleFactor 1")
+	replicas, err := builder.effectiveApplicationReplicas()
+	require.NoError(t, err, "the global scale factor applies uniformly in combined mode")
+	require.Equal(t, int32(2), replicas["Nemotron35Lightning30bA3bBf16"])
+	require.Equal(t, int32(2), replicas["Gemma431bIt"])
 
-	platform.Spec.ScaleFactor = int32PtrForTest(1)
 	platform.Spec.ModelDeploymentMode = "unknown"
 	_, err = builder.effectiveApplicationReplicas()
 	require.ErrorContains(t, err, "unsupported modelDeploymentMode")

@@ -23,7 +23,7 @@ This directory contains scripts for downloading model artifacts from Hugging Fac
 Downloads model artifacts from Hugging Face repositories. Supports resumable, idempotent downloads — safe to re-run after any failure.
 
 **Features:**
-- Reads `model_artifacts_configs_unquantized.yaml` for L40S or `model_artifacts_configs_quantized.yaml` for H100 and RTX Pro
+- Reads `model_artifacts_configs_unquantized.yaml` for L40S or `model_artifacts_configs_quantized.yaml` for H100 and RTX Pro; artifacts tagged with `model-deployment-modes` are included only for the selected mode
 - **GPU type selection**: pass `--accelerator l40s`, `--accelerator h100`, or `--accelerator rtx_pro_6000_blackwell`; if omitted and `ACCELERATOR` is not set, prompts interactively
 - Supports both public and gated Hugging Face models
 - Automatically installs dependencies (wget, yq, git-lfs)
@@ -43,6 +43,9 @@ Downloads model artifacts from Hugging Face repositories. Supports resumable, id
 ```bash
 # Explicit GPU type
 ./download_from_huggingface.sh --accelerator l40s   # or h100 / rtx_pro_6000_blackwell
+
+# Stage Nemotron only for the RTX Pro combined model mode
+MODEL_DEPLOYMENT_MODE=gemma-nemotron ./download_from_huggingface.sh --accelerator rtx_pro_6000_blackwell
 
 # Interactive — prompted when no flag and no ACCELERATOR env var
 ./download_from_huggingface.sh
@@ -317,7 +320,7 @@ sudo ./test_minio_connection.sh
 
 ## Configuration
 
-The download script selects `model_artifacts_configs_unquantized.yaml` for L40S and `model_artifacts_configs_quantized.yaml` for H100 or RTX Pro.
+The download script selects `model_artifacts_configs_unquantized.yaml` for L40S and `model_artifacts_configs_quantized.yaml` for H100 or RTX Pro. The Nemotron BF16 checkpoint in the quantized profile is included only when `MODEL_DEPLOYMENT_MODE=gemma-nemotron`; all other modes omit it.
 
 ### ⚠️ What You Need to Change:
 

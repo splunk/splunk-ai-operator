@@ -221,9 +221,6 @@ func (b *Builder) effectiveApplicationReplicas() (map[string]int32, error) {
 		if b.effectiveAcceleratorType() != "RTX_PRO_6000_BLACKWELL" {
 			return nil, fmt.Errorf("modelDeploymentMode %q is currently supported only on RTX_PRO_6000_BLACKWELL; H100 scheduling remains gated", mode)
 		}
-		if b.effectiveScaleFactor() != 1 {
-			return nil, fmt.Errorf("modelDeploymentMode %q requires scaleFactor 1; model autoscaling is not supported for this deployment mode", mode)
-		}
 	}
 
 	replicas := make(map[string]int32, len(modelScale.ApplicationScale))

@@ -447,6 +447,7 @@ show_install_plan() {
   echo -e "  \033[1mController nodes :\033[0m ${EXISTING_CONTROLLER_IPS}" >&2
   echo -e "  \033[1mWorker nodes     :\033[0m ${EXISTING_WORKER_IPS:-none configured}" >&2
   echo -e "  \033[1mAccelerator type :\033[0m ${DEFAULT_ACCELERATOR:-<none — CPU only>}" >&2
+  echo -e "  \033[1mModel mode       :\033[0m ${MODEL_DEPLOYMENT_MODE:-gemma-only}" >&2
   echo "" >&2
   echo -e "  \033[1mObject store     :\033[0m type=$(yq eval '.storage.objectStore.type // "?"' "${CONFIG_FILE}" 2>/dev/null)  bucket=$(yq eval '.storage.objectStore.bucket // "?"' "${CONFIG_FILE}" 2>/dev/null)" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m $(yq eval '.storage.objectStore.endpoint // "<default>"' "${CONFIG_FILE}" 2>/dev/null)" >&2
@@ -736,6 +737,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
 
   # AI Platform CR configuration
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  MODEL_DEPLOYMENT_MODE=$(yq eval '.aiPlatform.modelDeploymentMode // "gemma-only"' "${CONFIG_FILE}" 2>/dev/null || echo "gemma-only")
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # NVIDIA device plugin version
@@ -850,7 +852,7 @@ validate_scale_factor_config() {
 }
 
 validate_model_deployment_mode_config() {
-  local mode accelerator scale_factor
+  local mode accelerator
   if ! mode=$(yq eval '.aiPlatform.modelDeploymentMode // "gemma-only"' "${CONFIG_FILE}" 2>/dev/null); then
     echo "Unable to read aiPlatform.modelDeploymentMode from ${CONFIG_FILE}"
     return 1
@@ -863,11 +865,6 @@ validate_model_deployment_mode_config() {
   accelerator=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null) || return 1
   if [[ "${accelerator}" != "RTX_PRO_6000_BLACKWELL" ]]; then
     echo "aiPlatform.modelDeploymentMode gemma-nemotron currently requires defaultAcceleratorType RTX_PRO_6000_BLACKWELL; H100 scheduling remains gated"
-    return 1
-  fi
-  scale_factor=$(yq eval '.aiPlatform.scaleFactor // 1' "${CONFIG_FILE}" 2>/dev/null) || return 1
-  if [[ "${scale_factor}" != "1" ]]; then
-    echo "aiPlatform.modelDeploymentMode gemma-nemotron currently requires aiPlatform.scaleFactor 1"
     return 1
   fi
   return 0
@@ -3062,8 +3059,8 @@ ensure_s3compat_credentials() {
 
 # ====== MODEL ARTIFACT STAGING ======
 
-# Return the model-artifact profile used by an accelerator. Keep this selection
-# in one place so pre-staging and post-upload verification cannot drift apart.
+# Return the model-artifact profile used by an accelerator. Mode-specific
+# artifacts are filtered from this shared accelerator profile.
 model_artifacts_config_name() {
   local accel
   accel=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
@@ -3074,7 +3071,13 @@ model_artifacts_config_name() {
   esac
 }
 
-# all_models_staged <staging_dir> <accel>
+# Print artifact-id|hf-url rows eligible for the selected model deployment mode.
+model_artifact_entries() {
+  local config_file="$1" mode="${2:-gemma-only}"
+  yq eval -r ".artifact-configs[] | select(.\"model-deployment-modes\" == null or (.\"model-deployment-modes\" | contains([\"${mode}\"]))) | .artifact-id + \"|\" + .hf-url" "${config_file}" 2>/dev/null
+}
+
+# all_models_staged <staging_dir> <accel> <model_deployment_mode>
 # Checks whether every artifact in the selected model profile already has a
 # staging_state/<id>/.staging_complete marker in the object store and that its
 # hf_url= field matches the selected profile. This permits H100 and RTX Pro to
@@ -3085,6 +3088,7 @@ model_artifacts_config_name() {
 all_models_staged() {
   local staging_dir="$1"
   local accel="$2"
+  local mode="${3:-gemma-only}"
   local config_file
 
   config_file="${staging_dir}/$(model_artifacts_config_name "${accel}")"
@@ -3098,21 +3102,16 @@ all_models_staged() {
   # not GPU type, so a model staged for any accelerator is reused as long as
   # the source URL hasn't changed.
   local ids=() hf_urls=()
-  local raw_ids raw_urls
-  raw_ids=$(yq eval '.artifact-configs[].artifact-id' "${config_file}" 2>/dev/null) || {
-    warn "all_models_staged: could not read artifact IDs from ${config_file} — skipping pre-check."
+  local raw_entries
+  raw_entries=$(model_artifact_entries "${config_file}" "${mode}") || {
+    warn "all_models_staged: could not read mode-filtered artifacts from ${config_file} — skipping pre-check."
     return 1
   }
-  raw_urls=$(yq eval '.artifact-configs[].hf-url' "${config_file}" 2>/dev/null) || {
-    warn "all_models_staged: could not read hf-url fields from ${config_file} — skipping pre-check."
-    return 1
-  }
-  while IFS= read -r id; do
-    [[ -n "${id}" ]] && ids+=("${id}")
-  done <<< "${raw_ids}"
-  while IFS= read -r url; do
+  while IFS='|' read -r id url; do
+    [[ -n "${id}" ]] || continue
+    ids+=("${id}")
     hf_urls+=("${url}")
-  done <<< "${raw_urls}"
+  done <<< "${raw_entries}"
 
   if [[ ${#ids[@]} -eq 0 ]]; then
     warn "all_models_staged: no artifact IDs found in ${config_file} — skipping pre-check."
@@ -3213,7 +3212,7 @@ stage_model_artifacts() {
 
   # ---- Fast-path: skip everything if all models already staged ----
   # Guarded by _skip_staged so SKIP_IF_STAGED=0 can force a full re-stage.
-  if [[ "${_skip_staged}" != "0" ]] && all_models_staged "${staging_dir}" "${_accel}"; then
+  if [[ "${_skip_staged}" != "0" ]] && all_models_staged "${staging_dir}" "${_accel}" "${MODEL_DEPLOYMENT_MODE:-gemma-only}"; then
     return 0
   fi
 
@@ -3227,9 +3226,10 @@ stage_model_artifacts() {
     300
 
   # ---- Download from Hugging Face ----
-  log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."
+  log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, mode: ${MODEL_DEPLOYMENT_MODE:-gemma-only}, skip-if-staged: ${_skip_staged})..."
   ( cd "${staging_dir}" && \
       ACCELERATOR="${_accel}" \
+      MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}" \
       SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-0}" \
       SKIP_IF_STAGED="${_skip_staged}" \
       OBJ_STORE_TYPE="${OBJ_STORE_TYPE}" \
@@ -3251,6 +3251,7 @@ stage_model_artifacts() {
     aws)
       ( cd "${staging_dir}" && \
         S3_BUCKET="${OBJ_STORE_BUCKET}" \
+        MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}" \
         S3_REGION="${REGION:-us-east-2}" \
         AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
         AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
@@ -3261,6 +3262,7 @@ stage_model_artifacts() {
     minio)
       ( cd "${staging_dir}" && \
         OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}" \
         OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
         OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
         OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
@@ -3271,6 +3273,7 @@ stage_model_artifacts() {
     seaweedfs)
       ( cd "${staging_dir}" && \
         OBJECT_STORE_ENDPOINT="${OBJ_STORE_ENDPOINT}" \
+        MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}" \
         OBJECT_STORE_BUCKET="${OBJ_STORE_BUCKET}" \
         OBJECT_STORE_ACCESS_KEY="${MINIO_ROOT_USER}" \
         OBJECT_STORE_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
@@ -3305,7 +3308,7 @@ stage_model_artifacts() {
                      AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
                      aws s3 cp "${_marker_path}" - --region "${REGION:-us-east-2}" 2>/dev/null) || { _missing_ids+=("${_id}"); continue; }
           echo "${_content}" | grep -q "^hf_url=${_hf_url}$" || _missing_ids+=("${_id}")
-        done < <(yq eval '.artifact-configs[] | .artifact-id + "|" + .hf-url' "${_config_for_verify}" 2>/dev/null)
+        done < <(model_artifact_entries "${_config_for_verify}" "${MODEL_DEPLOYMENT_MODE:-gemma-only}")
       else
         warn "aws CLI not available — skipping post-stage verification."
         _verify_ok=0
@@ -3322,7 +3325,7 @@ stage_model_artifacts() {
           local _content
           _content=$(mc cat "${_marker_path}" 2>/dev/null) || { _missing_ids+=("${_id}"); continue; }
           echo "${_content}" | grep -q "^hf_url=${_hf_url}$" || _missing_ids+=("${_id}")
-        done < <(yq eval '.artifact-configs[] | .artifact-id + "|" + .hf-url' "${_config_for_verify}" 2>/dev/null)
+        done < <(model_artifact_entries "${_config_for_verify}" "${MODEL_DEPLOYMENT_MODE:-gemma-only}")
       else
         warn "mc / OBJ_STORE_ENDPOINT not available — skipping post-stage verification."
         _verify_ok=0
@@ -3354,7 +3357,7 @@ verify_pre_staged_model_artifacts() {
   local _accel
   _accel=$(printf '%s' "${DEFAULT_ACCELERATOR}" | tr '[:upper:]' '[:lower:]')
 
-  if all_models_staged "${staging_dir}" "${_accel}"; then
+  if all_models_staged "${staging_dir}" "${_accel}" "${MODEL_DEPLOYMENT_MODE:-gemma-only}"; then
     log "✓ Verified pre-staged model artifacts in ${OBJ_STORE_BUCKET}"
     return 0
   fi

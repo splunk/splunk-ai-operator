@@ -29,6 +29,7 @@ SEAWEEDFS_ERROR_LOG="${SEAWEEDFS_ERROR_LOG:-./seaweedfs_upload_errors.log}"
 SEAWEEDFS_SKIP_EXISTING="${SEAWEEDFS_SKIP_EXISTING:-0}"
 # Set to 1 to skip artifacts whose .staging_complete marker already exists in SeaweedFS.
 SKIP_IF_STAGED="${SKIP_IF_STAGED:-0}"
+MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}"
 
 # Normalize primary bucket to lowercase
 OBJECT_STORE_BUCKET=$(echo "$OBJECT_STORE_BUCKET" | tr '[:upper:]' '[:lower:]')
@@ -150,6 +151,11 @@ upload_artifact_dir() {
 artifact_paths=()
 for artifact_path in "$SOURCE_DIR"/*; do
   [[ -e "$artifact_path" ]] || continue
+  id=$(basename "$artifact_path")
+  if [[ "$id" == "nemotron-3-5-lightning-30b-a3b-bf16" && "$MODEL_DEPLOYMENT_MODE" != "gemma-nemotron" ]]; then
+    echo "Skipping $id; modelDeploymentMode=${MODEL_DEPLOYMENT_MODE}."
+    continue
+  fi
   artifact_paths+=("$artifact_path")
 done
 

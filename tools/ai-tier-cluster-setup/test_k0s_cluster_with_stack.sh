@@ -101,6 +101,7 @@ _load_functions() {
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
 
   eval "$(_extract_fn model_artifacts_config_name)"
+  eval "$(_extract_fn model_artifact_entries)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
@@ -196,13 +197,23 @@ for _profile in \
   model_artifacts_configs_unquantized.yaml \
   model_artifacts_configs_quantized.yaml; do
   _profile_path="${SCRIPT_DIR}/../artifacts_download_upload_scripts/${_profile}"
-  assert_eq "${_profile} contains exactly 10 model artifacts" \
-    "10" "$("${YQ_BIN}" eval '.artifact-configs | length' "${_profile_path}")"
+  _expected_artifact_count=10
+  [[ "${_profile}" == "model_artifacts_configs_quantized.yaml" ]] && _expected_artifact_count=11
+  assert_eq "${_profile} contains the expected model artifact count" \
+    "${_expected_artifact_count}" "$("${YQ_BIN}" eval '.artifact-configs | length' "${_profile_path}")"
   assert_eq "${_profile} excludes the disabled BiEncoder model" \
     "0" "$("${YQ_BIN}" eval '[.artifact-configs[] | select(.artifact-id == "bi-encoder" or .hf-url == "https://huggingface.co/BAAI/bge-small-en-v1.5")] | length' "${_profile_path}")"
   assert_eq "${_profile} retains the supported UAE embedding model" \
     "1" "$("${YQ_BIN}" eval '[.artifact-configs[] | select(.artifact-id == "uae-large")] | length' "${_profile_path}")"
 done
+
+_quantized_profile="${SCRIPT_DIR}/../artifacts_download_upload_scripts/model_artifacts_configs_quantized.yaml"
+assert_eq "Gemma-only staging excludes the Nemotron checkpoint" \
+  "0" "$(model_artifact_entries "${_quantized_profile}" gemma-only | cut -d'|' -f1 | grep -c '^nemotron-3-5-lightning-30b-a3b-bf16$' || true)"
+assert_eq "Gemma-plus-Nemotron staging includes the Nemotron checkpoint" \
+  "1" "$(model_artifact_entries "${_quantized_profile}" gemma-nemotron | cut -d'|' -f1 | grep -c '^nemotron-3-5-lightning-30b-a3b-bf16$' || true)"
+assert_eq "Gemma-only staging keeps all other quantized artifacts" \
+  "10" "$(model_artifact_entries "${_quantized_profile}" gemma-only | wc -l | tr -d '[:space:]')"
 
 # ── Tests: validate_scale_factor_config ──────────────────────────────────────
 
@@ -548,6 +559,7 @@ _run_validate_image_config() {
     err()  { echo \"ERR: \$*\"; exit 1; }
     warn() { echo \"WARN: \$*\"; }
     validate_scale_factor_config() { return 0; }
+    validate_model_deployment_mode_config() { return 0; }
     k0s_slim_feature_enabled() { return 1; }
     validate_image_config
   "

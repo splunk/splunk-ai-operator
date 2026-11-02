@@ -6,6 +6,7 @@
 set -e
 
 SOURCE_DIR="./model_artifacts"
+MODEL_DEPLOYMENT_MODE="${MODEL_DEPLOYMENT_MODE:-gemma-only}"
 SEAWEEDFS_PORT="${SEAWEEDFS_PORT:-8333}"
 
 # Endpoint and credentials (prefer generic OBJECT_STORE_*, then SEAWEEDFS_*).
@@ -228,6 +229,11 @@ upload_artifact_dir() {
 artifact_paths=()
 for artifact_path in "$SOURCE_DIR"/*; do
   [[ -e "$artifact_path" ]] || continue
+  id=$(basename "$artifact_path")
+  if [[ "$id" == "nemotron-3-5-lightning-30b-a3b-bf16" && "$MODEL_DEPLOYMENT_MODE" != "gemma-nemotron" ]]; then
+    echo "Skipping $id; modelDeploymentMode=${MODEL_DEPLOYMENT_MODE}."
+    continue
+  fi
   artifact_paths+=("$artifact_path")
 done
 

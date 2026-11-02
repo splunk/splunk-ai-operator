@@ -270,9 +270,8 @@ ask your cluster administrator to add the required GPU capacity first.
 resource. It defaults to `gemma-only`, which preserves the established Gemma,
 GPT-OSS, and supporting-model set. In the k0s RTX PRO 6000 Blackwell profile, set it to
 `gemma-nemotron` to add one Nemotron replica on its dedicated two-GPU worker.
-The existing models and their replica counts stay unchanged. Combined mode
-requires `scaleFactor: 1`; H100 is not enabled until its scheduling gate is
-resolved.
+The existing models use the same global `scaleFactor` behavior as the rest of
+AI Tier. H100 is not enabled until its scheduling gate is resolved.
 
 ```yaml
 aiPlatform:
