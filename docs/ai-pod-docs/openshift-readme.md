@@ -251,7 +251,7 @@ Required tools:
 - OpenShift CLI (`oc`), logged in to the target cluster
 - Mike Farah `yq` v4.48.1
 - Helm v3+
-- `curl`, `jq`, `base64`, GNU `timeout`, Python 3.8 or later, and `tar`
+- `curl`, `jq`, `base64`, GNU `timeout`, Python 3.8 or later, `openssl`, and `tar`
 - MinIO client (`mc`) for MinIO, SeaweedFS, or generic S3-compatible storage
 - AWS CLI only when using AWS S3 or automatic Amazon ECR authentication
 - `oc-mirror` v2 for an air-gapped deployment
@@ -265,7 +265,7 @@ machine. The macOS commands require [Homebrew](https://brew.sh/).
 | OpenShift CLI (`oc`) | Download the OpenShift 4.21 macOS client for the Mac's architecture from **OpenShift web console → Help → Command Line Tools**. Extract it, then run `sudo install -m 0755 oc /usr/local/bin/oc`. | Download the OpenShift 4.21 Linux client from **OpenShift web console → Help → Command Line Tools**. Run `tar -xvf <downloaded-archive>` and `sudo install -m 0755 oc /usr/local/bin/oc`. |
 | Helm v3 | Run `brew install helm@3`, then `export PATH="$(brew --prefix helm@3)/bin:$PATH"`. Add the export to the shell profile to make it persistent. | Run `curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3`, inspect the script, then run `chmod 700 /tmp/get_helm.sh && sudo /tmp/get_helm.sh`. |
 | Mike Farah `yq` v4.48.1 | Set `YQ_VERSION=v4.48.1` and `YQ_ARCH=arm64` for Apple Silicon or `YQ_ARCH=amd64` for Intel. Run `curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_darwin_${YQ_ARCH}" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. Do not install `python-yq`. | Run `YQ_VERSION=v4.48.1; curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. |
-| `curl`, `jq`, `base64`, `tar`, GNU `timeout`, and Python 3.8+ | Run `brew install jq coreutils python`. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip`. `coreutils` provides `base64` and `timeout`. |
+| `curl`, `jq`, `base64`, `tar`, GNU `timeout`, Python 3.8+, and `openssl` | Run `brew install jq coreutils python openssl@3`, then `export PATH="$(brew --prefix openssl@3)/bin:$PATH"`. Add the export to the shell profile to make it persistent. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip openssl`. `coreutils` provides `base64` and `timeout`. |
 
 Install conditional tools only when the configuration requires them:
 
@@ -891,6 +891,69 @@ oc port-forward -n "$NAMESPACE" "svc/$SPLUNK_SERVICE" 18001:8000
 
 Keep the port-forward running and open `http://localhost:18001`. Log in as
 `admin` with the password printed above.
+
+### Password policy (bundled Splunk)
+
+AI POD services have no local user passwords. Requests
+are authenticated with JWTs issued by Splunk, and the object store, image
+registry, and OpenShift logins are managed in the customer's own systems. The
+only local user accounts are those of the bundled Splunk Standalone, and their
+password policy is Splunk Enterprise's native policy.
+
+Set the policy in Splunk Web under **Settings > Password Management**, or in the
+`[splunk_auth]` stanza of `authentication.conf`. For each setting's allowed
+values and default, see the `authentication.conf` reference in the Splunk
+Enterprise documentation for the version listed in the
+[version set](#splunk-integration-and-authentication) above. The settings that
+cover password complexity, expiration, and reuse are:
+
+| Area | Settings |
+|---|---|
+| Complexity | `minPasswordLength`, `minPasswordUppercase`, `minPasswordLowercase`, `minPasswordDigit`, `minPasswordSpecial` |
+| Expiration | `expireUserAccounts`, `expirePasswordDays`, `expireAlertDays` |
+| Reuse | `enablePasswordHistory`, `passwordHistoryCount` |
+
+Example of a customer-selected policy. These values are an illustration, not
+product defaults; choose values that match your organization's policy:
+
+```ini
+[splunk_auth]
+minPasswordLength = 12
+minPasswordUppercase = 1
+minPasswordLowercase = 1
+minPasswordDigit = 1
+minPasswordSpecial = 1
+enablePasswordHistory = true
+passwordHistoryCount = 12
+```
+
+- The installer does not write `[splunk_auth]`, so it doesn't replace a policy
+  you set. Policy settings are stored on the Splunk `etc` volume; check them
+  after upgrading Splunk.
+- On a new installation, the installer generates the `admin` password, the
+  Splunk internal secrets (`pass4SymmKey`, `idxc_secret`, `shc_secret`), and the
+  HEC token with a cryptographic random generator, and stores them in
+  `splunk-<namespace>-secret` before Splunk is created. The `admin` password and
+  internal secrets are 32 characters from `[A-Za-z0-9]` (about 190 bits); the
+  HEC token has 128 random bits. If that Secret already exists, for example from
+  an earlier installation or because you created it, its values are kept.
+  Installations created before this change keep the values the Splunk Operator
+  generated; rotate them as described in the password management guide below.
+- The Splunk Operator uses the `admin` account to manage Splunk. Change the
+  `admin` password only through the `password` key of the
+  `splunk-<namespace>-secret` Secret, never through Splunk Web or the CLI. See
+  the Splunk Operator
+  [password management](https://github.com/splunk/splunk-operator/blob/main/docs/PasswordManagement.md)
+  guide for your operator version. A new value set in the Secret must also
+  satisfy your password policy and history.
+- The generated `admin` password contains only letters and digits. If your
+  policy requires special characters and you enable `forceWeakPasswordChange`,
+  first set a compliant `admin` password through the Secret.
+- `expireUserAccounts`, `expirePasswordDays`, and `forceWeakPasswordChange` also
+  apply to the `admin` account. An expired password or a forced change on
+  `admin` can interrupt the operator's management of Splunk unless the password
+  is rotated through the Secret first, so test these settings before enabling
+  them.
 
 ### Install and configure Splunk AI Assistant
 
