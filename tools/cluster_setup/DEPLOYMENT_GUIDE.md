@@ -4,6 +4,11 @@ End-to-end customer experience guide for deploying the Splunk AI Platform on
 k0s Kubernetes. Covers both standard (internet-connected) and air-gapped
 (fully disconnected) deployments.
 
+For the LAS and SLIM single-product path, including `full` versus `cpuOnly`,
+credential rotation, LAS egress and Splunk MCP ingress, queue scaling, retained
+data, and support boundaries, see
+[LAS single-product installation and operations](../../docs/agent-runtime/las-single-product-installation-operations.md).
+
 ---
 
 ## Table of Contents

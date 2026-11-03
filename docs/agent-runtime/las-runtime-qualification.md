@@ -57,6 +57,19 @@ one or more calls per case (including a caller resume when the case provides
 scans complete checkpoint history for supplied sensitive markers, and cleans
 up the assistant and its threads.
 
+This in-Pod helper validates SLIM's adapter and Launchpad mapping, but it
+bypasses HTTP route registration and the external authentication middleware.
+It therefore does not, by itself, satisfy the full caller-route requirement.
+Use `tools/cluster_setup/validation/mpr44_product_caller_acceptance.py` from
+outside the SLIM Pod against the supported Service endpoint for MPR-44 evidence;
+the MPR-44 helper covers authenticated HTTP create/invoke/delete, terminal
+NDJSON response mapping, same-session follow-up, negative authentication and
+malformed request handling. See
+[`mpr-44-caller-route-qualification.md`](mpr-44-caller-route-qualification.md).
+It qualifies the external SLIM edge, not an installed AITK application's own
+request construction; record that separate caller evidence when it is part of
+the accepted product boundary.
+
 Input shape:
 
 ```json
@@ -94,15 +107,24 @@ the product graph in the final acceptance record.
 ## AIP-5411: queue HPA runtime behavior
 
 The deterministic fixture accepts `cpu_seconds` from 1 to 15 and burns CPU in
-the Agent Server worker. The scale command sends bounded concurrent synchronous
+the Agent Server worker. The standalone scale command sends bounded concurrent synchronous
 runs while reading HPA and Deployment status with read-only `kubectl get`. It
 confirms the HPA targets the named queue Deployment and that the starting
 replicas are ready, then keeps observing after requests finish until both the
 HPA count and ready worker count rise above their starting values or the
-scale-up timeout expires. It also checks for current CPU metrics, the configured
+scale-up timeout expires. A positive CPU/replica observation additionally requires an observed
+queue CPU utilization sample at or above the configured HPA target, so an
+unrelated replica change cannot be attributed to this load. It also checks for current CPU metrics, the configured
 replica cap, return to the minimum after the chart's 300-second stabilization
 window, the ready worker floor, and an API Deployment configured for one
 replica.
+
+The standalone command deliberately reports `OBSERVATION`, never acceptance:
+its loopback `LAS_BASE_URL` is not by itself proof that product traffic and HPA
+reads came from the same Service and cluster. For acceptance evidence, invoke
+the product load through `scripts/las-product-lifecycle-acceptance.py`; that
+orchestrator verifies the exact Service UID, EndpointSlices, workload image
+digests, context, and namespace and owns the Service port-forward.
 
 Example for an isolated disposable cluster:
 
@@ -111,6 +133,7 @@ LAS_DISPOSABLE_CLUSTER_CONFIRMED=true \
 LAS_BASE_URL=http://127.0.0.1:18083 \
 python3 scripts/las-runtime-acceptance.py scale \
   --namespace ai-platform \
+  --expected-context <exact-kubectl-context> \
   --hpa <exact-queue-hpa-name> \
   --deployment <exact-queue-deployment-name> \
   --api-deployment <exact-api-deployment-name> \
@@ -129,7 +152,8 @@ policy. After the run, record HPA current/desired replicas, conditions, events,
 queue Pod readiness, run terminal states, and persisted request markers. The
 static Go tests cover configuration bounds, CPU-only metrics, replica
 ownership, API fixed replica, and scale-down policy; the runtime command
-supplies cluster evidence. Connection-budget qualification must also compare
+supplies observation data that the identity-bound lifecycle orchestrator can
+promote to cluster evidence. Connection-budget qualification must also compare
 the configured PostgreSQL connection limit and Redis client capacity against
 the maximum API + queue workload and any other users of those services. The
 operator cannot infer server-side limits from the Secrets, and this harness
