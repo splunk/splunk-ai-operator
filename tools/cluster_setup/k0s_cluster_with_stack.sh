@@ -7942,6 +7942,15 @@ validate_config() {
   fi
 }
 
+# Narrow, read-only entry point used by the signed air-gap bundle wrapper. Keep
+# this on the same validators as install so --validate-only cannot drift from
+# the constraints that the actual deployment will enforce.
+validate_airgap_cpu_config_only() {
+  load_config
+  validate_cpu_profile_consistency
+  validate_airgap_cpu_profile
+}
+
 # ====== USAGE ======
 usage() {
   cat <<EOF
@@ -8340,6 +8349,9 @@ case "${_CMD}" in
     ;;
   validate)
     validate_config
+    ;;
+  validate-airgap-cpu-profile)
+    validate_airgap_cpu_config_only
     ;;
   stage-artifacts)
     load_config
