@@ -556,6 +556,9 @@ oc get pods -n splunk-ai-operator-system -o wide
 oc get pods -n splunk-operator -o wide
 ```
 
+The `splunk-operator` namespace is optional when `splunk.enabled: false`.
+Its absence is expected in an installation without bundled Splunk.
+
 Describe the failing pod and read both current and previous container logs:
 
 ```bash
@@ -1015,9 +1018,30 @@ issuer on port 8089. Confirm:
 3. All cluster nodes and Splunk use synchronized time.
 4. The issuer's signing keys are available.
 
-The installer adds the primary short service URL. Add only legitimate
-alternate URLs under `splunk.trustedIssuers`, such as the namespace-qualified
-service URL when Splunk produces that issuer.
+When bundled Splunk is enabled, the installer adds its primary short service
+URL. Add only legitimate alternate URLs under `splunk.trustedIssuers`, such as
+the namespace-qualified service URL when Splunk produces that issuer. For
+external Splunk only, set `splunk.enabled: false` and list its exact management
+issuer on port 8089 under `splunk.trustedIssuers`.
+
+### Bundled Splunk is unexpectedly installed or skipped
+
+Check the setting in the configuration file used by the command:
+
+```bash
+yq eval '.splunk.enabled, .splunk.trustedIssuers' "$CONFIG_FILE"
+```
+
+Bundled Splunk is opt-in, as in the k0s installer. Only `splunk.enabled: true`
+installs the Splunk Operator and Splunk Enterprise Standalone. An omitted key,
+`false`, `null`, or any other value skips both. The Splunk AI Operator remains
+required and is still installed.
+
+With bundled Splunk disabled, no internal HEC secret is awaited and no internal
+Splunk endpoint is added to the AIPlatform. Configured `trustedIssuers` provide
+JWT-only external authentication; without them, `splunkConfiguration` is
+omitted. Changing the setting to `false` skips installation but does not remove
+previously deployed Splunk resources.
 
 
 ### AI Toolkit endpoint saves but no models appear
@@ -1038,6 +1062,10 @@ inference test. Confirm that models appear when creating an LLM connection,
 then run the documented `ai` and `apply CDTSM` smoke tests.
 
 ### Bundled Splunk is not ready
+
+This section applies when `splunk.enabled: true` is set. For an
+external-only deployment, use `splunk.enabled: false` and configure its JWT
+issuer instead; no internal Standalone or HEC token is required.
 
 ```bash
 oc get standalone,pods,svc -n "$AI_NAMESPACE" | grep -i splunk
@@ -1070,11 +1098,24 @@ Use the same configuration file used for installation so the namespace and
 resource names match. Ownership is recorded in an installer-state ConfigMap in
 `openshift-config`.
 
-If the installer created the AI POD namespace, `clean-all` deletes the entire
-namespace and everything subsequently added to it. If the namespace existed
-before installation, the namespace and unrelated workloads are preserved,
-while the configured AI POD resources are removed. Pre-existing shared
-operators and components not recorded as installer-owned are preserved.
+If the installer created the AI POD namespace, `clean-all` normally deletes the
+entire namespace and everything subsequently added to it. If the namespace
+existed before installation, the namespace and unrelated workloads are
+preserved while the configured AI POD resources are removed. Pre-existing
+shared operators and components not recorded as installer-owned are preserved.
+
+Cleanup removes Splunk resources only when the installer recorded them as
+installer-owned; the current `splunk.enabled` value does not matter. It
+preserves unowned Splunk Standalone, defaults, and derived HEC resources with
+the configured names. When these resources exist, it also preserves the AI POD
+namespace, Splunk Operator and its namespace/CRDs, required SCC grants, and
+shared configuration including `minio-credentials`, and keeps their ownership
+records. These dependencies remain so cleanup cannot indirectly delete or break
+the retained Splunk installation. This preservation is expected. Installer
+versions before this change did not record bundled Splunk, so cleanup also
+keeps the Splunk they installed. To remove it, delete the Standalone,
+`splunk-defaults`, and the `splunk-<namespace>-secret` Secret, then run
+`clean-all` again.
 
 ### A custom resource is stuck terminating
 

@@ -452,13 +452,38 @@ not verify bucket authorization or bucket-level permissions.
 
 ### Splunk issuers
 
-The installer adds the primary short Splunk management service URL to
-`SPLUNK_ISSUERS`. Values under `splunk.trustedIssuers` are additional accepted
-management/JWT issuer URLs; use them when a client token contains a different,
-valid service URL such as the namespace-qualified service name.
+`splunk.enabled` controls the bundled Splunk Enterprise deployment. It is
+opt-in, as in the k0s installer: only `true` installs the Splunk Operator and
+Splunk Standalone. An omitted key, `false`, or any other value skips them. The
+Splunk AI Operator and the AI platform still deploy. Existing configurations
+that omit the key must add `splunk.enabled: true` to keep bundled Splunk.
 
-An external Splunk integration requires the appropriate JWT issuer under
-`splunk.trustedIssuers` and network access to the enabled SAIA and SLIM Routes.
+When bundled Splunk is enabled, the installer adds its primary short management
+service URL to `SPLUNK_ISSUERS`. Values under `splunk.trustedIssuers` are
+additional accepted management/JWT issuer URLs; use them when a client token
+contains a different, valid service URL such as the namespace-qualified service
+name.
+
+For an existing externally managed Splunk deployment without bundled Splunk,
+configure:
+
+```yaml
+splunk:
+  enabled: false
+  trustedIssuers:
+    - "https://splunk.example.com:8089"
+```
+
+Use the exact management/JWKS issuer from the external Splunk instance, and
+allow that instance and the user's browser to reach the required SAIA and SLIM
+Routes. This integration is JWT-only; no external HEC endpoint or HEC token is
+required. With `enabled: false`, the AIPlatform contains only the configured
+trusted issuers in `splunkConfiguration`. If no issuers are supplied, that block
+is omitted. Splunk images and the Splunk Operator manifest are not required
+when bundled Splunk is disabled.
+
+Setting `enabled: false` on a later install skips bundled deployment; it does
+not remove an existing Splunk installation.
 
 ### AI Platform
 
@@ -525,8 +550,8 @@ air-gapped deployment.
 | `images.saia.apiV2Image` | `docker.io/splunk/ai-tier-saia-api-v2:v1.0` | SAIA API v2 |
 | `images.saia.dataLoaderImage` | `docker.io/splunk/ai-tier-saia-data-loader:v1.0` | SAIA post-install data loader |
 | `images.slim.apiImage` | `docker.io/splunk/ai-tier-slim-service:v1.0` | SLIM API used by AITK |
-| `images.splunk.image` | `docker.io/splunk/splunk:10.2-rhel9` | Bundled Splunk Enterprise |
-| `images.splunk.operatorImage` | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator |
+| `images.splunk.image` | `docker.io/splunk/splunk:10.2-rhel9` | Bundled Splunk Enterprise; used only when `splunk.enabled: true` |
+| `images.splunk.operatorImage` | `docker.io/splunk/splunk-operator:3.0.0` | Splunk Operator; used only when `splunk.enabled: true` |
 | `images.fluentBit.image` | `docker.io/fluent/fluent-bit:1.9.6` | Fluent Bit sidecar |
 | `images.otelCollector.image` | `docker.io/otel/opentelemetry-collector-contrib:0.122.1` | OpenTelemetry Collector |
 | `images.nginx.image` | `docker.io/library/nginx:1.27-alpine` | SAIA reverse proxy |
@@ -559,8 +584,9 @@ long-running clusters.
 
 For another private registry, disable ECR and configure only the matching
 `imagePullSecrets` block. Each enabled block is independent. The installer
-creates its secret in `ai-platform`, `splunk-ai-operator-system`, and
-`splunk-operator`, then attaches it to the relevant service accounts.
+creates its secret in `ai-platform` and `splunk-ai-operator-system`, then
+attaches it to the relevant service accounts. It also configures
+`splunk-operator` when bundled Splunk is enabled.
 
 ```yaml
 ecr:
@@ -619,9 +645,11 @@ not require authentication needs no pull-secret block.
    Operators, label nodes, install Local Path Provisioner, and apply the SELinux
    relabeling required for local volumes.
 6. **Operators** — install cert-manager, OpenTelemetry Operator, KubeRay
-   Operator, registry pull secrets, Splunk AI Operator, and Splunk Operator.
-7. **AI Platform stack** — create Splunk Standalone and AIPlatform resources,
-   normalize feature Services, and create the enabled HTTP Routes.
+   Operator, registry pull secrets, and Splunk AI Operator. Install Splunk
+   Operator when bundled Splunk is enabled.
+7. **AI Platform stack** — create the optional bundled Splunk Standalone and
+   the AIPlatform resource, normalize feature Services, and create the enabled
+   HTTP Routes.
 8. **Readiness and summary** — wait for platform resources and pods to become
    ready, then print the SAIA and SLIM endpoints.
 
@@ -693,7 +721,8 @@ installation. It mirrors:
 
 The customer must provide separately:
 
-- every application image configured under `images.*` in the internal registry
+- every application image used by the selected deployment in the internal
+  registry; `images.splunk.*` is excluded when `splunk.enabled: false`
 - object-store and registry credentials
 - model weights, unless the installer machine can download missing models
 
@@ -868,15 +897,17 @@ Use this Splunk-side version set with this release:
 | Splunk AI Toolkit | 6.1.0 |
 
 AI POD supports two Splunk integration choices: a bundled Splunk Standalone or
-an existing externally managed Splunk Enterprise deployment. For external
-Splunk, make sure its JWT issuer is listed under
-`splunk.trustedIssuers` and that both Splunk and the user's browser can reach
-the required Routes.
+an existing externally managed Splunk Enterprise deployment. Bundled Splunk is
+opt-in: set `splunk.enabled: true` to install it. For external Splunk only, omit
+the key or set `splunk.enabled: false`, list
+its JWT issuer under `splunk.trustedIssuers`, and ensure that both Splunk and
+the user's browser can reach the required Routes. See [Splunk
+issuers](#splunk-issuers) for the configuration example.
 
 ### Open bundled Splunk Web
 
-Read the configured names, retrieve the generated admin password, and forward
-Splunk Web to the installer machine:
+With `splunk.enabled: true`, read the configured names, retrieve the generated
+admin password, and forward Splunk Web to the installer machine:
 
 ```bash
 NAMESPACE="$(yq eval '.kubernetes.namespace // "ai-platform"' "$CONFIG_FILE")"
@@ -1004,17 +1035,19 @@ Set `openshift.grantPrivilegedSCC: false` only when a cluster administrator has
 already granted the required SCC access. This setting disables the installer's
 namespace-wide SCC grants; it does not remove the workloads' SCC requirements.
 
-This setting is not a global SCC switch. The installer always applies the
-following component-specific grants required by its current manifests:
+This setting is not a global SCC switch. The installer applies the following
+component-specific grants when deploying the corresponding components:
 
 | Component | Grant |
 |---|---|
 | cert-manager service accounts | `anyuid` |
 | Local Path Provisioner and helper | `privileged` SCC ClusterRoleBindings |
 | OpenTelemetry Operator | `privileged` SCC ClusterRoleBinding |
-| Splunk Operator namespace | `privileged` |
+| Splunk Operator namespace, when bundled Splunk is enabled | `privileged` |
 
 The installer records the grants it owns and removes them during `clean-all`.
+When cleanup preserves unowned Splunk resources, it also preserves the AI
+namespace and Splunk Operator SCC grants needed by those resources.
 
 Use the same namespace and resource names for install and cleanup. SCC cleanup
 uses ownership recorded by the installer in `openshift-config` and is
@@ -1127,8 +1160,21 @@ CONFIG_FILE="$CONFIG_FILE" ./openshift_with_stack.sh clean-all
 ```
 
 This leaves the OpenShift cluster and its nodes running. If the installer
-created the AI POD namespace, it deletes that namespace and everything later
-added to it. If the namespace existed before installation, it preserves the
-namespace but removes the configured AIPlatform, Splunk Standalone, SAIA and
-SLIM Routes, and installer-created configuration. Always use a dedicated AI POD
+created the AI POD namespace, cleanup normally deletes that namespace and
+everything later added to it. If the namespace existed before installation,
+cleanup preserves it while removing the configured AIPlatform, SAIA and SLIM
+Routes, and installer-created configuration. Always use a dedicated AI POD
 namespace.
+
+Cleanup removes the configured Splunk Standalone only when the installer
+recorded it as installer-owned, whatever the current `splunk.enabled` value.
+Unowned Standalone, Splunk defaults, or derived HEC resources with the
+configured names are preserved. Their presence also preserves the AI POD
+namespace, Splunk Operator and its namespace/CRDs, required SCC grants, and
+shared configuration (`splunk-defaults`, the derived HEC secret, and
+`minio-credentials`), and cleanup keeps their ownership records. This avoids
+indirectly deleting or breaking the retained Splunk installation. Other
+installer-owned components are cleaned up normally. Installer versions before
+this change did not record bundled Splunk; to remove that Splunk, delete the
+Standalone, `splunk-defaults`, and the derived HEC secret, then run `clean-all`
+again.

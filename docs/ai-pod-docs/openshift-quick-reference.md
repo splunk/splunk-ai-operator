@@ -200,7 +200,8 @@ Edit the copy and confirm these settings:
 | `storage.storageClass` | Existing class, or `local-path` managed by the installer |
 | `storage.objectStore.*` | Type, bucket, endpoint where required, and credentials |
 | `storage.modelStaging.enabled` | Stage missing models from the installer when `true` |
-| `splunk.trustedIssuers` | Additional legitimate JWT issuer URLs, when required |
+| `splunk.enabled` | Deploy bundled Splunk Operator and Enterprise Standalone; only an explicit `true` installs them; omitted, `false`, or any other value skips them (same as k0s) |
+| `splunk.trustedIssuers` | Legitimate management/JWT issuer URLs; required for external Splunk authentication when bundled Splunk is disabled |
 | `aiPlatform.scaleFactor` | Global workload scale; keep `1` for the minimum deployment |
 | `ecr.enabled` | Enable only when the workload registry is Amazon ECR |
 
@@ -266,8 +267,9 @@ Before starting:
   local files remain until they are removed manually. Required capacity depends
   on the selected catalog content and versions; see the
   [air-gap installer host requirements](openshift-readme.md#installer-host-requirements).
-- Put every application image configured under `images.*` in the internal
+- Put every application image used by the selected deployment in the internal
   registry and use those internal image references in the configuration.
+  `images.splunk.*` is not required when `splunk.enabled: false`.
 - Configure credentials that let `oc-mirror` pull source content and push to
   `images.registry`.
 - Ensure all required models are already in the object store, or enable model
@@ -348,9 +350,22 @@ separate from the platform container-image versions listed in the
 [release-default image table](openshift-readme.md#image-pull-secrets-and-registry-access).
 
 AI POD supports two Splunk integration choices: a bundled Splunk Standalone or
-an existing externally managed Splunk Enterprise deployment. Use the procedure
-for the selected choice and ensure its network access and JWT issuer are
-configured correctly.
+an existing externally managed Splunk Enterprise deployment. Bundled Splunk is
+opt-in and installs only with `splunk.enabled: true`. To use only an existing
+external Splunk instance:
+
+```yaml
+splunk:
+  enabled: false
+  trustedIssuers:
+    - "https://splunk.example.com:8089"
+```
+
+Replace the example with the exact external management/JWKS issuer. This skips
+the bundled Splunk Operator and Standalone while retaining the Splunk AI
+Operator. External integration uses JWT authentication only; no HEC token is
+required. Ensure the required Routes are reachable from Splunk and the user's
+browser. See [Splunk issuers](openshift-readme.md#splunk-issuers) for details.
 
 ### Open installer-deployed Splunk Web
 
@@ -440,11 +455,14 @@ in Step 3:
 
 > [!IMPORTANT]
 > Use a dedicated namespace for AI POD. If the installer created the namespace,
-> `clean-all` deletes the namespace and everything later added to it. If the
-> namespace existed before installation, `clean-all` preserves the namespace
-> but removes the configured AIPlatform, Splunk Standalone, SAIA and SLIM
-> Routes, and installer-created configuration. The OpenShift cluster and its
-> nodes are not removed.
+> `clean-all` normally deletes the namespace and everything later added to it.
+> If the namespace existed before installation, cleanup preserves it while
+> removing the configured AI POD resources. Splunk Standalone, defaults, and
+> derived HEC resources not recorded as installer-owned are preserved;
+> their presence also preserves the AI POD namespace, Splunk Operator/CRDs,
+> shared configuration, and SCC grants needed by those resources. The OpenShift
+> cluster and its nodes are not removed. See the [cleanup
+> details](openshift-readme.md#uninstall) before running this command.
 
 Start with:
 

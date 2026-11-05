@@ -46,8 +46,9 @@ BUNDLED AUTOMATICALLY
   - the oc-mirror binary used to import the image archives
 
 NOT BUNDLED
-  - application images listed under images.* in the cluster config; the customer
-    must provide those in the configured internal registry
+  - application images used by the selected components under images.* in the
+    cluster config; the customer must provide those in the internal registry
+    (images.splunk.* is excluded when splunk.enabled is false)
   - model weights; install-time model staging checks the configured object store,
     skips current models, and downloads/uploads only missing or changed models
   - registry credentials, object-store credentials, or Hugging Face tokens
@@ -121,6 +122,41 @@ resolved_application_image() {
   fi
 }
 
+# Match the installer: bundled Splunk is opt-in. Only an explicit
+# splunk.enabled: true includes it. An absent key or any other value disables it.
+load_airgap_splunk_config() {
+  SPLUNK_ENABLED=$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")
+  [[ "${SPLUNK_ENABLED}" == "true" ]] || SPLUNK_ENABLED=false
+}
+
+# Record only application images used by this installation. The customer does
+# not need to supply Splunk Enterprise or its Operator when bundled Splunk is off.
+append_customer_application_images() {
+  local output="$1" path image
+  for path in \
+    '.images.operator.image' \
+    '.images.ray.headImage' \
+    '.images.ray.workerImage' \
+    '.images.weaviate.image' \
+    '.images.saia.apiImage' \
+    '.images.saia.apiV2Image' \
+    '.images.saia.dataLoaderImage' \
+    '.images.slim.apiImage' \
+    '.images.splunk.image' \
+    '.images.splunk.operatorImage' \
+    '.images.fluentBit.image' \
+    '.images.otelCollector.image' \
+    '.images.nginx.image'; do
+    if [[ "${SPLUNK_ENABLED:-false}" != "true" && "${path}" == .images.splunk.* ]]; then
+      continue
+    fi
+    image=$(yq eval "${path} // \"\"" "${CONFIG_FILE}")
+    if [[ -n "${image}" && "${image}" != "null" ]]; then
+      resolved_application_image "${image}" "${IMAGE_REGISTRY}" >> "${output}"
+    fi
+  done
+}
+
 # oc-mirror v2 requires an explicit registry hostname for additionalImages.
 # Kubernetes treats unqualified names as Docker Hub references; record that
 # expansion directly so the mirror mapping is deterministic.
@@ -164,6 +200,7 @@ require_cmd oc-mirror
 for tool in curl helm jq oc tar yq; do require_cmd "${tool}"; done
 [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
 yq eval '.' "${CONFIG_FILE}" >/dev/null || err "Invalid YAML: ${CONFIG_FILE}"
+load_airgap_splunk_config
 oc whoami >/dev/null 2>&1 || err "oc is not logged in to the target OpenShift cluster"
 
 CONFIG_FILE=$(absolute_path "${CONFIG_FILE}")
@@ -212,24 +249,7 @@ chmod +x "${STAGE_DIR}/bin/oc-mirror"
 
 APPLICATION_RAW="${STAGE_DIR}/.application-images.raw"
 : > "${APPLICATION_RAW}"
-for path in \
-  '.images.operator.image' \
-  '.images.ray.headImage' \
-  '.images.ray.workerImage' \
-  '.images.weaviate.image' \
-  '.images.saia.apiImage' \
-  '.images.saia.apiV2Image' \
-  '.images.saia.dataLoaderImage' \
-  '.images.slim.apiImage' \
-  '.images.splunk.image' \
-  '.images.splunk.operatorImage' \
-  '.images.fluentBit.image' \
-  '.images.otelCollector.image' \
-  '.images.nginx.image'; do
-  image=$(yq eval "${path} // \"\"" "${CONFIG_FILE}")
-  [[ -n "${image}" && "${image}" != "null" ]] \
-    && resolved_application_image "${image}" "${IMAGE_REGISTRY}" >> "${APPLICATION_RAW}"
-done
+append_customer_application_images "${APPLICATION_RAW}"
 sort -u "${APPLICATION_RAW}" > "${STAGE_DIR}/customer-provided-images.txt"
 rm -f "${APPLICATION_RAW}"
 
@@ -266,11 +286,16 @@ mirror:
     - catalog: registry.redhat.io/redhat/redhat-operator-index:v${OPENSHIFT_VERSION}
       packages:
         - name: nfd
+          defaultChannel: ${NFD_CHANNEL}
           channels:
             - name: ${NFD_CHANNEL}
     - catalog: registry.redhat.io/redhat/certified-operator-index:v${OPENSHIFT_VERSION}
       packages:
         - name: gpu-operator-certified
+          # The catalog default channel moves (now v26.7). oc-mirror rejects the
+          # package when its default channel is filtered out, so pin it to the
+          # one channel this installer qualifies.
+          defaultChannel: ${GPU_CHANNEL}
           channels:
             - name: ${GPU_CHANNEL}
   additionalImages:

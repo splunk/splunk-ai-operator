@@ -36,14 +36,17 @@ assert_rc() {
 }
 
 extract_function() {
-  local name="$1" start end
-  start=$(grep -n "^${name}()" "${SCRIPT}" | cut -d: -f1)
+  local name="$1" source_file="${2:-${SCRIPT}}" start end
+  start=$(grep -n "^${name}()" "${source_file}" | cut -d: -f1)
   [[ -n "${start}" ]] || return 1
-  end=$(awk -v start="${start}" 'NR > start && /^}$/ { print NR; exit }' "${SCRIPT}")
-  sed -n "${start},${end}p" "${SCRIPT}"
+  end=$(awk -v start="${start}" 'NR > start && /^}$/ { print NR; exit }' "${source_file}")
+  sed -n "${start},${end}p" "${source_file}"
 }
 
 eval "$(extract_function validate_scale_factor_config)"
+eval "$(extract_function load_splunk_config)"
+eval "$(extract_function bundled_splunk_enabled)"
+eval "$(extract_function splunk_standalone_component)"
 eval "$(extract_function load_config)"
 eval "$(extract_function required_ai_tier_disk_gib)"
 eval "$(extract_function openshift_feature_enabled)"
@@ -56,7 +59,18 @@ eval "$(extract_function internal_splunk_management_url)"
 eval "$(extract_function internal_splunk_hec_url)"
 eval "$(extract_function _internal_splunk_btool_http_value)"
 eval "$(extract_function render_splunk_defaults_manifest)"
+eval "$(extract_function render_splunk_configuration)"
 eval "$(extract_function render_ai_platform_manifest)"
+eval "$(extract_function install_ai_platform_cr)"
+eval "$(extract_function install_splunk_operator)"
+eval "$(extract_function install_splunk_standalone)"
+eval "$(extract_function main_install)"
+eval "$(extract_function main_delete)"
+eval "$(extract_function retain_splunk_ownership_records)"
+eval "$(extract_function load_install_state_snapshot)"
+eval "$(extract_function component_is_owned)"
+eval "$(extract_function splunk_resource_may_exist)"
+eval "$(extract_function preflight_check_registry)"
 eval "$(extract_function normalize_openshift_clusterip_feature_services)"
 eval "$(extract_function patch_openshift_slim_public_service_workaround)"
 eval "$(extract_function openshift_route_enabled)"
@@ -84,6 +98,9 @@ eval "$(extract_function validate_config)"
 eval "$(extract_function clean_all)"
 eval "$(extract_function run_verify_pods)"
 eval "$(sed -n '/^qualified_additional_image()/,/^}/p' "${AIRGAP_PREPARE_SCRIPT}")"
+eval "$(extract_function load_airgap_splunk_config "${AIRGAP_PREPARE_SCRIPT}")"
+eval "$(extract_function append_customer_application_images "${AIRGAP_PREPARE_SCRIPT}")"
+eval "$(extract_function resolved_application_image "${AIRGAP_PREPARE_SCRIPT}")"
 eval "$(grep '^readonly OPENSHIFT_ACCELERATOR=' "${SCRIPT}")"
 
 log() { :; }
@@ -114,6 +131,8 @@ CONFIG_FILE="test-config.yaml"
 echo "OpenShift command parity"
 _run_validate_config() (
   local strategy="$1" node_count="$2" airgap="$3" registry="$4"
+  local operator_manifest="${6:-${SCRIPT}}"
+  SPLUNK_ENABLED="${5:-true}"
   need() { :; }
   load_config() {
     AI_NS="ai-platform"
@@ -125,7 +144,7 @@ _run_validate_config() (
     MINIO_ROOT_PASSWORD="secret-key"
     NODE_LABEL_STRATEGY="${strategy}"
     SPLUNK_AI_FILE="${SCRIPT}"
-    SPLUNK_OPERATOR_FILE="${SCRIPT}"
+    SPLUNK_OPERATOR_FILE="${operator_manifest}"
     AIRGAP_MODE="${airgap}"
     IMAGE_REGISTRY="${registry}"
   }
@@ -183,6 +202,7 @@ assert_rc "does not enable SLIM for a SAIA-only config" 1 openshift_slim_feature
 
 _run_validate_image_config() (
   local slim_enabled="$1" slim_image="$2"
+  SPLUNK_ENABLED="${3:-true}"
   OPERATOR_IMAGE="operator:v1"
   RAY_HEAD_IMAGE="ray-head:v1"
   RAY_WORKER_IMAGE="ray-worker:v1"
@@ -191,7 +211,8 @@ _run_validate_image_config() (
   SAIA_API_V2_IMAGE="saia-v2:v1"
   SAIA_DATALOADER_IMAGE="loader:v1"
   SLIM_API_IMAGE="${slim_image}"
-  SPLUNK_IMAGE="splunk:v1"
+  SPLUNK_IMAGE="${4-splunk:v1}"
+  SPLUNK_OPERATOR_IMAGE="${5-splunk-operator:v1}"
   MODEL_VERSION="model-v1"
   validate_scale_factor_config() { return 0; }
   openshift_slim_feature_enabled() { [[ "${slim_enabled}" == "true" ]]; }
@@ -205,6 +226,189 @@ echo "OpenShift SLIM image validation"
 assert_rc "SAIA-only config does not require a SLIM image" 0 _run_validate_image_config false ""
 assert_rc "SLIM-enabled config requires images.slim.apiImage" 1 _run_validate_image_config true ""
 assert_rc "SLIM-enabled config accepts its configured image" 0 _run_validate_image_config true "slim-api:v1"
+
+
+echo "OpenShift optional bundled Splunk validation"
+assert_rc "disabled bundled Splunk does not require either Splunk image" 0 \
+  _run_validate_image_config false "" false "" ""
+assert_rc "enabled bundled Splunk requires its Enterprise image" 1 \
+  _run_validate_image_config false "" true "" "splunk-operator:v1"
+assert_rc "enabled bundled Splunk requires its Operator image" 1 \
+  _run_validate_image_config false "" true "splunk:v1" ""
+assert_rc "disabled bundled Splunk does not require its Operator manifest" 0 \
+  _run_validate_config auto 0 false registry.example.com false /missing/splunk-operator.yaml
+assert_rc "enabled bundled Splunk requires its Operator manifest" 1 \
+  _run_validate_config auto 0 false registry.example.com true /missing/splunk-operator.yaml
+
+_disabled_splunk_install_calls() (
+  SPLUNK_ENABLED=false
+  err() { exit 1; }
+  oc() { printf 'unexpected API call: %s\n' "$*"; return 1; }
+  ensure_namespace() { printf 'unexpected namespace: %s\n' "$*"; return 1; }
+  install_splunk_operator || return
+  install_splunk_standalone
+)
+assert_eq "disabled Splunk installers return without cluster or namespace operations" "" \
+  "$(_disabled_splunk_install_calls)"
+
+_optional_splunk_install_flow() (
+  local enabled="$1" helper
+  for helper in load_config validate_image_config configure_images resolve_accelerator_type \
+    resolve_model_staging show_install_plan configure_openshift_insecure_endpoints \
+    phase_start phase_end step_start step_ok step_skip preflight_checks \
+    initialize_install_state install_nfd install_nvidia_gpu_operator label_nodes \
+    install_local_path_provisioner relabel_worker_nodes_for_selinux install_cert_manager \
+    install_otel_operator install_ray_operator ensure_ecr_pull_secret \
+    apply_openshift_service_annotations normalize_openshift_clusterip_feature_services \
+    patch_openshift_slim_public_service_workaround show_step_summary; do
+    eval "${helper}() { :; }"
+  done
+  install_splunk_ai_operator() { echo ai-operator; }
+  install_splunk_operator() { echo splunk-operator; }
+  install_splunk_standalone() { echo splunk-standalone; }
+  install_ai_platform_cr() { echo aiplatform; }
+  create_image_pull_secrets() {
+    [[ "$1" != splunk-operator ]] || echo splunk-operator-pull-secrets
+    return 0
+  }
+  openshift_route_enabled() { return 1; }
+  verify_all_pods_healthy() { return 0; }
+  AUTO_APPROVE=true
+  MODEL_STAGING_ENABLED=false
+  AIRGAP_MODE=false
+  AI_NS=ai-platform
+  LOG_FILE=test.log
+  SPLUNK_ENABLED="${enabled}"
+  main_install
+)
+assert_eq "disabled install still deploys the AI Operator and AIPlatform" \
+  $'ai-operator\naiplatform' "$(_optional_splunk_install_flow false)"
+assert_eq "enabled install retains bundled Splunk and its pull-secret setup" \
+  $'splunk-operator-pull-secrets\nai-operator\nsplunk-operator\nsplunk-standalone\naiplatform' \
+  "$(_optional_splunk_install_flow true)"
+
+
+# CLEANUP_SPLUNK_ENABLED sets the delete-time config. CLEANUP_STATE_READ makes
+# the ownership state read succeed (ok), fail (error) or return bad JSON
+# (invalid); CLEANUP_STATE_JSON replaces the state it returns. CLEANUP_PROBE=error
+# makes the Splunk existence probes fail. CLEANUP_SHOW=state prints what happened
+# to the installer state ConfigMap, with the record keys sent to oc replace.
+_optional_splunk_cleanup() (
+  local owned="$1" namespace_owned="$2" dependencies_owned="${4:-false}" tmp
+  # Not named state_json: the real loader's local of that name would hide it.
+  local show="${CLEANUP_SHOW:-deletes}" mock_state='{"data":{"aiNamespace":"ai-platform"}}'
+  [[ -z "${CLEANUP_STATE_JSON:-}" ]] || mock_state="${CLEANUP_STATE_JSON}"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "${tmp}"' EXIT
+  SPLUNK_ENABLED="${CLEANUP_SPLUNK_ENABLED:-false}"
+  AUTO_APPROVE=true
+  AI_NS=ai-platform
+  AI_PLATFORM_NAME=test-platform
+  AI_STANDALONE_NAME="${3:-splunk}"
+  SPLUNK_OPERATOR_FILE="${SCRIPT}"
+  LOG_FILE=test.log
+  load_config() { :; }
+  verify_install_state_cluster() { :; }
+  restore_installer_node_labels() { :; }
+  installer_state_name() { echo test-state; }
+  manifest_without_namespaces() { echo mocked-splunk-operator-manifest; }
+  err() { exit 1; }
+  component_is_owned() {
+    case "$1" in
+      namespace_ai-platform) [[ "${namespace_owned}" == true ]] ;;
+      splunk_standalone_splunk|splunk_defaults|splunk_hec_secret) [[ "${owned}" == true ]] ;;
+      splunk_operator_bundle_v2|namespace_splunk-operator|scc_anyuid_ai_namespace|scc_privileged_ai_namespace|scc_privileged_splunk_operator)
+        [[ "${dependencies_owned}" == true ]]
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  force_delete_namespace() { printf 'namespace %s\n' "$1" >> "${tmp}/deletes"; }
+  oc() {
+    case "$*" in
+      'get configmap test-state -n openshift-config --ignore-not-found -o json')
+        case "${CLEANUP_STATE_READ:-ok}" in
+          ok) printf '%s\n' "${mock_state}" ;;
+          invalid) echo 'not-json' ;;
+          *) return 1 ;;
+        esac
+        ;;
+      # All probed Splunk resources exist, including unowned ones.
+      'get '*' --ignore-not-found -o name')
+        [[ "${CLEANUP_PROBE:-ok}" == ok ]] || return 1
+        echo found
+        ;;
+      'delete standalone '*) echo standalone >> "${tmp}/deletes" ;;
+      'delete configmap splunk-defaults '*) echo defaults >> "${tmp}/deletes" ;;
+      'delete secret splunk-ai-platform-secret '*) echo hec >> "${tmp}/deletes" ;;
+      'delete secret minio-credentials '*) echo object-store >> "${tmp}/deletes" ;;
+      'delete configmap test-state '*) echo state-deleted >> "${tmp}/state" ;;
+      'replace -f -') { echo state-pruned; jq -r '.data | keys | join(",")'; } >> "${tmp}/state" ;;
+      'delete -f - '*) echo splunk-operator-bundle >> "${tmp}/deletes" ;;
+      'adm policy remove-scc-from-group anyuid system:serviceaccounts:ai-platform')
+        echo ai-anyuid-scc >> "${tmp}/deletes"
+        ;;
+      'adm policy remove-scc-from-group privileged system:serviceaccounts:ai-platform')
+        echo ai-privileged-scc >> "${tmp}/deletes"
+        ;;
+      'adm policy remove-scc-from-group privileged system:serviceaccounts:splunk-operator')
+        echo splunk-operator-scc >> "${tmp}/deletes"
+        ;;
+    esac
+    return 0
+  }
+  main_delete || return
+  [[ ! -f "${tmp}/${show}" ]] || cat "${tmp}/${show}"
+)
+assert_eq "disabled cleanup preserves unowned Splunk resources and their previously marked namespace" "" \
+  "$(_optional_splunk_cleanup false true)"
+assert_eq "disabled cleanup can remove previously recorded owned Splunk resources" \
+  $'standalone\ndefaults\nhec\nobject-store' "$(_optional_splunk_cleanup true false)"
+assert_eq "changing the configured Standalone name preserves it and its configuration dependencies" "" \
+  "$(_optional_splunk_cleanup true true different-splunk)"
+assert_eq "retaining an unowned Standalone also preserves owned Splunk CRDs, namespaces, SCC grants and object storage credentials" "" \
+  "$(_optional_splunk_cleanup false true splunk true)"
+assert_eq "owned Splunk cleanup still removes its bundle, SCC grants and object storage credentials" \
+  $'standalone\ndefaults\nhec\nobject-store\nsplunk-operator-bundle\nnamespace splunk-operator\nai-anyuid-scc\nai-privileged-scc\nsplunk-operator-scc' \
+  "$(_optional_splunk_cleanup true false splunk true)"
+assert_eq "an enabled delete-time config does not remove unowned Splunk resources" "" \
+  "$(CLEANUP_SPLUNK_ENABLED=true _optional_splunk_cleanup false true)"
+assert_eq "state without Splunk records does not authorize deleting unrecorded Splunk from older installers" "" \
+  "$(_optional_splunk_cleanup false false)"
+
+# Ownership read failures must abort cleanup, not read as "not owned".
+_cleanup_with_state_read() { CLEANUP_STATE_READ="$1" _optional_splunk_cleanup true true; }
+assert_rc "an unreadable ownership state refuses deletion" 1 _cleanup_with_state_read error
+assert_eq "an unreadable ownership state deletes nothing" "" "$(_cleanup_with_state_read error)"
+assert_rc "an invalid ownership state refuses deletion" 1 _cleanup_with_state_read invalid
+assert_eq "an invalid ownership state deletes nothing" "" "$(_cleanup_with_state_read invalid)"
+assert_eq "a failed Splunk existence probe keeps the namespace and Splunk dependencies" "" \
+  "$(CLEANUP_PROBE=error _optional_splunk_cleanup false true)"
+
+_owned_from_snapshot() (
+  INSTALL_STATE_SNAPSHOT="$1"
+  installer_state_name() { echo test-state; }
+  oc() { echo unexpected-oc-call; return 1; }
+  if component_is_owned "$2"; then echo owned; else echo not-owned; fi
+)
+assert_eq "delete-time ownership comes from the validated snapshot" owned \
+  "$(_owned_from_snapshot '{"data":{"kuberay_operator":"true"}}' kuberay_operator)"
+assert_eq "a missing installer state owns nothing" not-owned \
+  "$(_owned_from_snapshot none kuberay_operator)"
+
+assert_eq "retained Splunk keeps a pruned installer state instead of deleting it" $'state-pruned\naiNamespace' \
+  "$(CLEANUP_SHOW=state _optional_splunk_cleanup false true splunk true)"
+assert_eq "full cleanup still deletes the installer state" "state-deleted" \
+  "$(CLEANUP_SHOW=state _optional_splunk_cleanup true false)"
+# Owned Standalone A survives when the config names unowned Standalone B.
+assert_eq "pruning keeps the ownership record of a surviving owned Standalone" \
+  $'state-pruned\naiNamespace,splunk_standalone_splunk' \
+  "$(CLEANUP_SHOW=state CLEANUP_STATE_JSON='{"data":{"aiNamespace":"ai-platform","splunk_standalone_splunk":"true","kuberay_operator":"true"}}' \
+    _optional_splunk_cleanup true true different-splunk)"
+assert_eq "pruned installer state keeps records of retained resources and drops the deleted Standalone" \
+  "aiNamespace,namespace_ai-platform,scc_privileged_ai_namespace,splunk_operator_bundle_v2,splunk_standalone_other" \
+  "$(printf '%s' '{"data":{"aiNamespace":"ai-platform","namespace_ai-platform":"true","scc_privileged_ai_namespace":"true","splunk_operator_bundle_v2":"true","kuberay_operator":"true","cert_manager":"true","splunk_standalone_splunk":"true","splunk_standalone_other":"true"}}' \
+    | retain_splunk_ownership_records namespace_ai-platform splunk_standalone_splunk | jq -r '.data | keys | join(",")')"
 
 _mutable_image_warnings() (
   SLIM_API_IMAGE="$1"
@@ -656,6 +860,104 @@ assert_eq "load_config defaults omitted registryInsecure to true" "true" \
 assert_eq "load_config preserves explicit registryInsecure false" "false" \
   "$(_load_registry_insecure_setting false)"
 
+
+_load_optional_splunk_setting() (
+  local setting="$1" loader="${2:-load_splunk_config}" tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "${tmp}"' EXIT
+  CONFIG_FILE="${tmp}/config.yaml"
+  if [[ "${setting}" == omitted ]]; then
+    printf '{}\n' > "${CONFIG_FILE}"
+  else
+    printf 'splunk:\n  enabled: %s\n' "${setting}" > "${CONFIG_FILE}"
+  fi
+  yq() { "${REAL_YQ}" "$@"; }
+  SPLUNK_ENABLED=stale
+  QUALIFIED_RAY_RUNTIME_VERSION=2.56.0
+  QUALIFIED_OPENSHIFT_MINOR=4.21
+  AIRGAP_MODE=false
+  oc() { printf '%s\n' apps.example.com; }
+  "${loader}" || return
+  printf '%s\n' "${SPLUNK_ENABLED}"
+)
+
+if [[ -n "${REAL_YQ}" ]]; then
+  for splunk_loader in load_splunk_config load_config load_airgap_splunk_config; do
+    # Same opt-in rule as k0s_cluster_with_stack.sh: only "true" enables Splunk.
+    assert_eq "${splunk_loader} defaults omitted enabled to false" false \
+      "$(_load_optional_splunk_setting omitted "${splunk_loader}")"
+    assert_eq "${splunk_loader} preserves explicit false" false \
+      "$(_load_optional_splunk_setting false "${splunk_loader}")"
+    assert_eq "${splunk_loader} preserves explicit true" true \
+      "$(_load_optional_splunk_setting true "${splunk_loader}")"
+    for disabled_setting in '"false"' null 1 True; do
+      assert_eq "${splunk_loader} treats ${disabled_setting} as disabled" false \
+        "$(_load_optional_splunk_setting "${disabled_setting}" "${splunk_loader}")"
+    done
+  done
+fi
+
+_airgap_customer_inventory() (
+  local enabled="$1" tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "${tmp}"' EXIT
+  CONFIG_FILE="${tmp}/config.yaml"
+  cat > "${CONFIG_FILE}" <<'YAML'
+images:
+  operator:
+    image: platform/operator:v1
+  splunk:
+    image: platform/splunk:v1
+    operatorImage: platform/splunk-operator:v1
+YAML
+  [[ "${enabled}" == omitted ]] || \
+    printf 'splunk:\n  enabled: %s\n' "${enabled}" >> "${CONFIG_FILE}"
+  yq() { "${REAL_YQ}" "$@"; }
+  IMAGE_REGISTRY=registry.example.com
+  load_airgap_splunk_config || return
+  append_customer_application_images "${tmp}/images.txt" || return
+  sort "${tmp}/images.txt"
+)
+if [[ -n "${REAL_YQ}" ]]; then
+  assert_eq "air-gap inventory excludes both disabled Splunk images" \
+    registry.example.com/platform/operator:v1 "$(_airgap_customer_inventory false)"
+  assert_eq "air-gap inventory retains both enabled Splunk images" \
+    $'registry.example.com/platform/operator:v1\nregistry.example.com/platform/splunk-operator:v1\nregistry.example.com/platform/splunk:v1' \
+    "$(_airgap_customer_inventory true)"
+  assert_eq "air-gap inventory excludes Splunk images when enabled is omitted" \
+    "$(_airgap_customer_inventory false)" "$(_airgap_customer_inventory omitted)"
+fi
+
+_registry_splunk_probe() (
+  local enabled="$1" variable tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "${tmp}"' EXIT
+  for variable in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE \
+    SLIM_API_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE \
+    NGINX_IMAGE OPERATOR_IMAGE; do
+    printf -v "${variable}" '%s' quay.io/platform/other:v1
+  done
+  SPLUNK_ENABLED="${enabled}"
+  SPLUNK_IMAGE=platform/splunk:v1
+  SPLUNK_OPERATOR_IMAGE=platform/splunk-operator:v1
+  IMAGE_REGISTRY=registry.example.com
+  IMAGE_REGISTRY_INSECURE=false
+  IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED=false
+  IMAGE_PULL_SECRETS_ACR_ENABLED=false
+  IMAGE_PULL_SECRETS_CUSTOM_ENABLED=false
+  pf_header() { :; }
+  pf_ok() { :; }
+  pf_warn() { :; }
+  pf_fail() { return 1; }
+  curl() { printf '%s\n' "$*" >> "${tmp}/curl.log"; printf 200; }
+  preflight_check_registry
+  grep -c '/manifests/' "${tmp}/curl.log" || true
+)
+assert_eq "disabled Splunk images are excluded from private-registry manifest probes" 0 \
+  "$(_registry_splunk_probe false)"
+assert_eq "enabled Splunk images remain eligible for private-registry manifest probes" 1 \
+  "$(_registry_splunk_probe true)"
+
 _preflight_insecure_registry_without_registry() (
   local headers=0
   pf_header() { headers=$((headers + 1)); }
@@ -763,6 +1065,8 @@ assert_rc "allows exclusive ownership only when no manifest resource exists" 1 \
 
 _exercise_platform_snapshot() (
   local mode="$1"
+  SPLUNK_ENABLED="${2:-true}"
+  AI_STANDALONE_NAME=test-splunk
   AI_NS="ai-platform"
   AI_PLATFORM_NAME="test-platform"
   CONFIG_FILE="test-config.yaml"
@@ -779,6 +1083,10 @@ _exercise_platform_snapshot() (
       pods)
         if [[ "${mode}" == "ready" ]]; then
           printf '%s\n' '{"items":[{"metadata":{"name":"ready-pod"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]}'
+        elif [[ "${mode}" == splunk-pending ]]; then
+          printf '%s\n' '{"items":[{"metadata":{"name":"existing-splunk","labels":{"app.kubernetes.io/managed-by":"splunk-operator"}},"status":{"phase":"Pending","containerStatuses":[{"ready":false}]}}]}'
+        elif [[ "${mode}" == standalone-pending ]]; then
+          printf '%s\n' '{"items":[{"metadata":{"name":"existing-splunk","ownerReferences":[{"kind":"StatefulSet","name":"splunk-test-splunk-standalone"}]},"status":{"phase":"Pending","containerStatuses":[{"ready":false}]}}]}'
         else
           printf '%s\n' '{"items":[{"metadata":{"name":"pending-pod"},"status":{"phase":"Pending","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}]}'
         fi
@@ -815,6 +1123,14 @@ assert_rc "accepts a fully Ready platform snapshot" 0 _exercise_platform_snapsho
 assert_rc "rejects a Pending pod despite Ready CRs" 1 _exercise_platform_snapshot pending
 assert_rc "rejects stale AIPlatform status from a prior generation" 1 _exercise_platform_snapshot stale-platform
 assert_rc "rejects stale AIService status from a prior generation" 1 _exercise_platform_snapshot stale-service
+assert_rc "disabled readiness ignores pre-existing Splunk Operator-managed pods" 0 \
+  _exercise_platform_snapshot splunk-pending false
+assert_rc "disabled readiness ignores pods owned by the configured Splunk Standalone" 0 \
+  _exercise_platform_snapshot standalone-pending false
+assert_rc "enabled readiness still checks bundled Splunk pods" 1 \
+  _exercise_platform_snapshot splunk-pending true
+assert_rc "disabled readiness still rejects unhealthy AI workload pods" 1 \
+  _exercise_platform_snapshot pending false
 
 echo "OpenShift accelerator validation"
 DEFAULT_ACCELERATOR=""
@@ -873,6 +1189,7 @@ echo "OpenShift AIPlatform manifest render"
 AI_PLATFORM_NAME="test-platform"
 AI_NS="ai-platform"
 AI_STANDALONE_NAME="splunk"
+SPLUNK_ENABLED=true
 AI_SCALE_FACTOR="3"
 DEFAULT_ACCELERATOR="RTX_PRO_6000_BLACKWELL"
 OBJ_STORE_REGION="us-east-2"
@@ -939,6 +1256,90 @@ if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "rendered manifest preserves the configured trusted issuer" \
     "https://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8089" \
     "$(printf '%s\n' "${manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration.trustedIssuers[0]' - 2>/dev/null)"
+
+
+  SPLUNK_ENABLED=false
+  disabled_manifest=$(render_ai_platform_manifest)
+  assert_eq "disabled bundled Splunk renders only the external JWT issuer list" trustedIssuers \
+    "$(printf '%s\n' "${disabled_manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration | keys | .[]' -)"
+  assert_eq "disabled bundled Splunk preserves its configured external issuer" \
+    "https://splunk-splunk-standalone-service.ai-platform.svc.cluster.local:8089" \
+    "$(printf '%s\n' "${disabled_manifest}" | "${REAL_YQ}" eval '.spec.splunkConfiguration.trustedIssuers[0]' -)"
+  trusted_issuers_yaml=""
+  no_splunk_manifest=$(render_ai_platform_manifest)
+  assert_eq "disabled Splunk without external issuers omits splunkConfiguration" false \
+    "$(printf '%s\n' "${no_splunk_manifest}" | "${REAL_YQ}" eval '.spec | has("splunkConfiguration")' -)"
+  SPLUNK_ENABLED=true
+
+  _install_disabled_ai_platform() (
+    local tmp trace rendered
+    tmp=$(mktemp -d)
+    trap 'rm -rf "${tmp}"' EXIT
+    trace="${tmp}/calls"
+    rendered="${tmp}/aiplatform.yaml"
+    CONFIG_FILE="${tmp}/config.yaml"
+    cat > "${CONFIG_FILE}" <<'YAML'
+splunk:
+  enabled: false
+  trustedIssuers:
+    - https://external-splunk.example.com:8089
+aiPlatform:
+  features:
+    - name: saia
+      version: 1.1.0
+YAML
+    SPLUNK_ENABLED=false
+    OBJ_STORE_TYPE=minio
+    OBJ_STORE_BUCKET=models
+    OBJ_STORE_ENDPOINT=http://object-store.example.com:9000
+    STORAGE_CLASS=""
+    AI_NS=ai-platform
+    AI_PLATFORM_NAME=test-platform
+    yq() { "${REAL_YQ}" "$@"; }
+    ensure_namespace() { :; }
+    ensure_object_store_credentials_secret() { echo object-store >> "${trace}"; }
+    sleep() { echo unexpected-wait >&2; exit 42; }
+    err() { echo "$*" >&2; exit 1; }
+    oc() {
+      printf 'oc %s\n' "$*" >> "${trace}"
+      case "$*" in
+        'get secrets -n ai-platform '*) return 0 ;;
+        'get secret splunk-'*) return 1 ;;
+        # Only failed-ai is both failed and owned by an ai.splunk.com resource.
+        'get jobs -n ai-platform -o json')
+          printf '%s\n' '{"items":[
+            {"metadata":{"name":"running-ai","ownerReferences":[{"apiVersion":"ai.splunk.com/v1","kind":"AIService"}]},"status":{"active":1}},
+            {"metadata":{"name":"pending-ai","ownerReferences":[{"apiVersion":"ai.splunk.com/v1","kind":"AIService"}]},"status":{}},
+            {"metadata":{"name":"failed-ai","ownerReferences":[{"apiVersion":"ai.splunk.com/v1","kind":"AIService"}]},"status":{"conditions":[{"type":"Failed","status":"True"}]}},
+            {"metadata":{"name":"complete-ai","ownerReferences":[{"apiVersion":"ai.splunk.com/v1","kind":"AIService"}]},"status":{"conditions":[{"type":"Complete","status":"True"}]}},
+            {"metadata":{"name":"failed-customer"},"status":{"conditions":[{"type":"Failed","status":"True"}]}},
+            {"metadata":{"name":"failed-cronjob","ownerReferences":[{"apiVersion":"batch/v1","kind":"CronJob"}]},"status":{"conditions":[{"type":"Failed","status":"True"}]}}
+          ]}'
+          ;;
+        '-n ai-platform apply --server-side --force-conflicts -f -')
+          cat > "${rendered}"
+          ;;
+        'apply --dry-run=server -f '*|'get aiplatform '*|'delete '*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    install_ai_platform_cr || return
+    if [[ "${1:-}" == cleanup ]]; then
+      grep -E '^oc delete (job|jobs|pods) ' "${trace}"
+      return
+    fi
+    [[ -f "${rendered}" ]] || return 1
+    grep '^object-store$' "${trace}" || return 1
+    if grep -q 'oc get secret splunk-' "${trace}"; then
+      return 1
+    fi
+    "${REAL_YQ}" eval '.spec.splunkConfiguration | keys | .[]' "${rendered}"
+  )
+  assert_eq "disabled AIPlatform ensures object storage and external JWT config without polling Splunk HEC" \
+    $'object-store\ntrustedIssuers' "$(_install_disabled_ai_platform)"
+  assert_eq "AIPlatform rerun removes only failed AI-owned Jobs and keeps running, pending and customer Jobs" \
+    $'oc delete job failed-ai -n ai-platform --wait=false\noc delete pods -n ai-platform --field-selector status.phase=Failed --selector app.kubernetes.io/managed-by!=splunk-operator --wait=false' \
+    "$(_install_disabled_ai_platform cleanup)"
 
   unset -f yq
   CONFIG_FILE="${SCRIPT_DIR}/openshift-cluster-config.yaml"
