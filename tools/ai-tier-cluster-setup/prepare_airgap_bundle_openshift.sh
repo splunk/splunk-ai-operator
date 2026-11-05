@@ -266,11 +266,16 @@ mirror:
     - catalog: registry.redhat.io/redhat/redhat-operator-index:v${OPENSHIFT_VERSION}
       packages:
         - name: nfd
+          defaultChannel: ${NFD_CHANNEL}
           channels:
             - name: ${NFD_CHANNEL}
     - catalog: registry.redhat.io/redhat/certified-operator-index:v${OPENSHIFT_VERSION}
       packages:
         - name: gpu-operator-certified
+          # The catalog default channel moves (now v26.7). oc-mirror rejects the
+          # package when its default channel is filtered out, so pin it to the
+          # one channel this installer qualifies.
+          defaultChannel: ${GPU_CHANNEL}
           channels:
             - name: ${GPU_CHANNEL}
   additionalImages:
