@@ -28,7 +28,6 @@ type SecaReconciler struct {
 func (h *SecaReconciler) BuildResources(namespace, name string) []client.Object {
 	return []client.Object{
 		ConfigMap(namespace, name),
-		Secret(namespace, name),
 		Deployment(namespace, name),
 		Service(namespace, name),
 	}

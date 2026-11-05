@@ -251,6 +251,7 @@ Required tools:
 - OpenShift CLI (`oc`), logged in to the target cluster
 - Mike Farah `yq` v4.48.1
 - Helm v3+
+- OpenSSL for JWT signing-key generation and validation
 - `curl`, `jq`, `base64`, GNU `timeout`, Python 3.8 or later, and `tar`
 - MinIO client (`mc`) for MinIO, SeaweedFS, or generic S3-compatible storage
 - AWS CLI only when using AWS S3 or automatic Amazon ECR authentication
@@ -265,6 +266,7 @@ machine. The macOS commands require [Homebrew](https://brew.sh/).
 | OpenShift CLI (`oc`) | Download the OpenShift 4.21 macOS client for the Mac's architecture from **OpenShift web console → Help → Command Line Tools**. Extract it, then run `sudo install -m 0755 oc /usr/local/bin/oc`. | Download the OpenShift 4.21 Linux client from **OpenShift web console → Help → Command Line Tools**. Run `tar -xvf <downloaded-archive>` and `sudo install -m 0755 oc /usr/local/bin/oc`. |
 | Helm v3 | Run `brew install helm@3`, then `export PATH="$(brew --prefix helm@3)/bin:$PATH"`. Add the export to the shell profile to make it persistent. | Run `curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3`, inspect the script, then run `chmod 700 /tmp/get_helm.sh && sudo /tmp/get_helm.sh`. |
 | Mike Farah `yq` v4.48.1 | Set `YQ_VERSION=v4.48.1` and `YQ_ARCH=arm64` for Apple Silicon or `YQ_ARCH=amd64` for Intel. Run `curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_darwin_${YQ_ARCH}" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. Do not install `python-yq`. | Run `YQ_VERSION=v4.48.1; curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq`. |
+| OpenSSL | Run `brew install openssl@3`, then `export PATH="$(brew --prefix openssl@3)/bin:$PATH"`. | Run `sudo dnf install -y openssl`. |
 | `curl`, `jq`, `base64`, `tar`, GNU `timeout`, and Python 3.8+ | Run `brew install jq coreutils python`. macOS already provides `curl`, `base64`, and `tar`. | Run `sudo dnf install -y curl jq coreutils python3 tar gzip`. `coreutils` provides `base64` and `timeout`. |
 
 Install conditional tools only when the configuration requires them:
@@ -449,6 +451,26 @@ during a reinstall.
 Before installation, validate that the configured credentials can access the
 selected bucket with the required read and write permissions. Preflight does
 not verify bucket authorization or bucket-level permissions.
+
+The installer ships no default object-store credentials. `rootUser` and
+`rootPassword` must be unique values created for your object store. `validate`,
+`install` (including air-gapped installs), and `stage-artifacts` stop before any
+cluster change when:
+
+| Condition | `install` / `stage-artifacts` message | `validate` message |
+|---|---|---|
+| A value is empty | `storage.objectStore.auth.rootUser and rootPassword are required` | `storage.objectStore.auth.rootUser is not set` (or `rootPassword`) |
+| A value is still template text (`<...>` or `CHANGEME`) | `objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME)` | `storage.objectStore.auth.rootUser is not set` (or `rootPassword`) |
+| The secret key is `minioadmin` or `seaweedfs` in any letter case, regardless of the access key | `objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive)` | same |
+
+A familiar access-key identifier such as `minioadmin` or `seaweedfs` is accepted
+with a unique secret. Both known predictable secrets are rejected regardless of
+the identifier. `seaweedfs` is rejected as a predictable secret, not
+identified as a SeaweedFS vendor default. This check does not replace choosing
+a strong, unpredictable secret and configuring it on the object store.
+When run directly, `upload_to_minio.sh` and `upload_to_seaweedfs_upload_only.sh`
+require `OBJECT_STORE_ACCESS_KEY` and `OBJECT_STORE_SECRET_KEY` and also reject
+both predictable secrets, case-insensitively.
 
 ### Splunk issuers
 
@@ -872,6 +894,31 @@ an existing externally managed Splunk Enterprise deployment. For external
 Splunk, make sure its JWT issuer is listed under
 `splunk.trustedIssuers` and that both Splunk and the user's browser can reach
 the required Routes.
+
+### JWT signing key (bundled Splunk)
+
+The installer creates a unique RSA signing key and passphrase for each
+installation in the Secret `<splunk.standaloneName>-jwt-signing` (keys
+`signer.pem` and `passphrase`) and mounts it into Splunk at `/mnt/jwt-signing`.
+Splunk signs the JWTs that SAIA and SLIM verify with this key; Splunk's built-in
+`server.pem` is no longer used for signing. After Splunk is ready, the installer
+issues a fresh JWT and verifies it against the certificate in this Secret.
+
+- Back up the Secret with your other cluster secrets:
+  `oc extract secret/<name>-jwt-signing -n <namespace> --to=jwt-signing-backup`
+  (writes `signer.pem` and `passphrase`; keep the directory protected).
+- On every run, an existing Secret is reused only after its contents are
+  validated: both keys present, the passphrase decrypts the RSA key, the key
+  matches the certificate, the certificate has not expired, and a test signature
+  verifies. Otherwise the install stops with the reason.
+- If the Secret is lost on an installation that already uses it, the installer
+  stops and asks you to restore it:
+  `oc create secret generic <name>-jwt-signing -n <namespace> --from-file=jwt-signing-backup/`.
+- To replace the key, re-run with `ROTATE_JWT_SIGNER=true`. Splunk restarts with
+  the new key; previously issued tokens stop validating, so users sign in again.
+  Set the flag for that one run only: if the run is interrupted, re-run without
+  it and the installer keeps the new key and still completes the Splunk restart.
+- `clean-all` removes this Secret together with the installation.
 
 ### Open bundled Splunk Web
 
