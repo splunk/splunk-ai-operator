@@ -819,18 +819,17 @@ _load_optional_splunk_setting() (
 
 if [[ -n "${REAL_YQ}" ]]; then
   for splunk_loader in load_splunk_config load_config load_airgap_splunk_config; do
-    assert_eq "${splunk_loader} defaults omitted enabled to true" true \
+    # Same opt-in rule as k0s_cluster_with_stack.sh: only "true" enables Splunk.
+    assert_eq "${splunk_loader} defaults omitted enabled to false" false \
       "$(_load_optional_splunk_setting omitted "${splunk_loader}")"
     assert_eq "${splunk_loader} preserves explicit false" false \
       "$(_load_optional_splunk_setting false "${splunk_loader}")"
     assert_eq "${splunk_loader} preserves explicit true" true \
       "$(_load_optional_splunk_setting true "${splunk_loader}")"
-    assert_rc "${splunk_loader} rejects a quoted boolean" 1 \
-      _load_optional_splunk_setting '"false"' "${splunk_loader}"
-    assert_rc "${splunk_loader} rejects explicit null" 1 \
-      _load_optional_splunk_setting null "${splunk_loader}"
-    assert_rc "${splunk_loader} rejects a non-boolean value" 1 \
-      _load_optional_splunk_setting 1 "${splunk_loader}"
+    for disabled_setting in '"false"' null 1 True; do
+      assert_eq "${splunk_loader} treats ${disabled_setting} as disabled" false \
+        "$(_load_optional_splunk_setting "${disabled_setting}" "${splunk_loader}")"
+    done
   done
 fi
 
@@ -861,8 +860,8 @@ if [[ -n "${REAL_YQ}" ]]; then
   assert_eq "air-gap inventory retains both enabled Splunk images" \
     $'registry.example.com/platform/operator:v1\nregistry.example.com/platform/splunk-operator:v1\nregistry.example.com/platform/splunk:v1' \
     "$(_airgap_customer_inventory true)"
-  assert_eq "air-gap inventory retains existing behavior when enabled is omitted" \
-    "$(_airgap_customer_inventory true)" "$(_airgap_customer_inventory omitted)"
+  assert_eq "air-gap inventory excludes Splunk images when enabled is omitted" \
+    "$(_airgap_customer_inventory false)" "$(_airgap_customer_inventory omitted)"
 fi
 
 _registry_splunk_probe() (
@@ -1126,6 +1125,7 @@ echo "OpenShift AIPlatform manifest render"
 AI_PLATFORM_NAME="test-platform"
 AI_NS="ai-platform"
 AI_STANDALONE_NAME="splunk"
+SPLUNK_ENABLED=true
 AI_SCALE_FACTOR="3"
 DEFAULT_ACCELERATOR="RTX_PRO_6000_BLACKWELL"
 OBJ_STORE_REGION="us-east-2"

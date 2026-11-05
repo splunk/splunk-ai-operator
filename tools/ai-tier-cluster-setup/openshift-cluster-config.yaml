@@ -107,8 +107,8 @@ storage:
       rootPassword: "<S3_SECRET_ACCESS_KEY>"
 
 splunk:
-  # false skips the bundled Splunk Operator and Enterprise Standalone.
-  # Omitted defaults to true for existing OpenShift configurations.
+  # true installs the bundled Splunk Operator and Enterprise Standalone.
+  # Omitted, false, or any other value skips them (same as the k0s installer).
   enabled: true
   standaloneName: splunk-standalone
   # Additional management/JWT issuers accepted by SAIA and SLIM. The installer

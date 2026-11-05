@@ -452,11 +452,11 @@ not verify bucket authorization or bucket-level permissions.
 
 ### Splunk issuers
 
-`splunk.enabled` controls the bundled Splunk Enterprise deployment. It defaults
-to `true` when omitted, preserving existing OpenShift installations. Set it to
-`false` to skip the Splunk Operator and Splunk Standalone. The Splunk AI
-Operator and the AI platform still deploy. The setting must be a YAML boolean;
-quoted strings and `null` are rejected.
+`splunk.enabled` controls the bundled Splunk Enterprise deployment. It is
+opt-in, as in the k0s installer: only `true` installs the Splunk Operator and
+Splunk Standalone. An omitted key, `false`, or any other value skips them. The
+Splunk AI Operator and the AI platform still deploy. Existing configurations
+that omit the key must add `splunk.enabled: true` to keep bundled Splunk.
 
 When bundled Splunk is enabled, the installer adds its primary short management
 service URL to `SPLUNK_ISSUERS`. Values under `splunk.trustedIssuers` are

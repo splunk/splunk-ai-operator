@@ -122,26 +122,11 @@ resolved_application_image() {
   fi
 }
 
-# Match the installer's backward-compatible bundled Splunk setting. An absent
-# key keeps bundled Splunk enabled; an explicit value must be a YAML boolean.
+# Match the installer: bundled Splunk is opt-in. Only an explicit
+# splunk.enabled: true includes it. An absent key or any other value disables it.
 load_airgap_splunk_config() {
-  local present value_tag
-  if ! present=$(yq eval '(.splunk // {}) | has("enabled")' "${CONFIG_FILE}" 2>/dev/null); then
-    err "Unable to read splunk.enabled from ${CONFIG_FILE}"
-    return 1
-  fi
-  SPLUNK_ENABLED="true"
-  [[ "${present}" == "false" ]] && return 0
-  if [[ "${present}" != "true" ]]; then
-    err "Unable to read splunk.enabled from ${CONFIG_FILE}"
-    return 1
-  fi
-  if ! value_tag=$(yq eval '.splunk.enabled | tag' "${CONFIG_FILE}" 2>/dev/null) || \
-     [[ "${value_tag}" != "!!bool" ]]; then
-    err "splunk.enabled must be a YAML boolean (true or false)"
-    return 1
-  fi
-  SPLUNK_ENABLED=$(yq eval '.splunk.enabled' "${CONFIG_FILE}")
+  SPLUNK_ENABLED=$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")
+  [[ "${SPLUNK_ENABLED}" == "true" ]] || SPLUNK_ENABLED=false
 }
 
 # Record only application images used by this installation. The customer does
@@ -162,7 +147,7 @@ append_customer_application_images() {
     '.images.fluentBit.image' \
     '.images.otelCollector.image' \
     '.images.nginx.image'; do
-    if [[ "${SPLUNK_ENABLED:-true}" != "true" && "${path}" == .images.splunk.* ]]; then
+    if [[ "${SPLUNK_ENABLED:-false}" != "true" && "${path}" == .images.splunk.* ]]; then
       continue
     fi
     image=$(yq eval "${path} // \"\"" "${CONFIG_FILE}")

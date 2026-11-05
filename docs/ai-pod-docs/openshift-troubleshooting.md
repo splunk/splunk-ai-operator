@@ -1032,10 +1032,10 @@ Check the setting in the configuration file used by the command:
 yq eval '.splunk.enabled, .splunk.trustedIssuers' "$CONFIG_FILE"
 ```
 
-An omitted `splunk.enabled` defaults to `true` for compatibility. Set the YAML
-boolean `false` to skip both the Splunk Operator and Splunk Enterprise
-Standalone. Quoted strings and explicit `null` are invalid. The Splunk AI
-Operator remains required and is still installed.
+Bundled Splunk is opt-in, as in the k0s installer. Only `splunk.enabled: true`
+installs the Splunk Operator and Splunk Enterprise Standalone. An omitted key,
+`false`, `null`, or any other value skips both. The Splunk AI Operator remains
+required and is still installed.
 
 With bundled Splunk disabled, no internal HEC secret is awaited and no internal
 Splunk endpoint is added to the AIPlatform. Configured `trustedIssuers` provide

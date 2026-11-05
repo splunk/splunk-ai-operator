@@ -266,7 +266,7 @@ resolve_accelerator_type() {
 
 # ====== BUNDLED SPLUNK CONFIGURATION ======
 bundled_splunk_enabled() {
-  [[ "${SPLUNK_ENABLED:-true}" == "true" ]]
+  [[ "${SPLUNK_ENABLED:-false}" == "true" ]]
 }
 
 # Ownership follows the exact Standalone identity if standaloneName changes.
@@ -274,21 +274,11 @@ splunk_standalone_component() {
   printf 'splunk_standalone_%s' "$(printf '%s' "${AI_STANDALONE_NAME}" | tr -c 'a-zA-Z0-9._-' '_')"
 }
 
-# Existing configurations install bundled Splunk unless explicitly disabled.
-# Check the YAML type so quoted strings and explicit null cannot silently opt in.
+# Bundled Splunk is opt-in, as in k0s_cluster_with_stack.sh: only an explicit
+# splunk.enabled: true installs it. An absent key or any other value disables it.
 load_splunk_config() {
-  local present value value_tag
-  present=$(yq eval '(.splunk // {}) | has("enabled")' "${CONFIG_FILE}") || return 1
-  SPLUNK_ENABLED=true
-  if [[ "${present}" == "true" ]]; then
-    value=$(yq eval '.splunk.enabled' "${CONFIG_FILE}") || return 1
-    value_tag=$(yq eval '.splunk.enabled | tag' "${CONFIG_FILE}") || return 1
-    if [[ "${value_tag}" != "!!bool" || ( "${value}" != "true" && "${value}" != "false" ) ]]; then
-      err "splunk.enabled must be a YAML boolean (true or false)"
-      return 1
-    fi
-    SPLUNK_ENABLED="${value}"
-  fi
+  SPLUNK_ENABLED=$(yq eval '.splunk.enabled' "${CONFIG_FILE}" 2>/dev/null || echo "null")
+  [[ "${SPLUNK_ENABLED}" == "true" ]] || SPLUNK_ENABLED=false
 }
 
 # ====== SHOW INSTALL PLAN ======
@@ -308,7 +298,7 @@ show_install_plan() {
   echo -e "  \033[1mImage registry   :\033[0m ${IMAGE_REGISTRY:-<none>}" >&2
   echo -e "  \033[1mECR enabled      :\033[0m ${ECR_ENABLED}" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
-  echo -e "  \033[1mBundled Splunk   :\033[0m ${SPLUNK_ENABLED:-true}" >&2
+  echo -e "  \033[1mBundled Splunk   :\033[0m ${SPLUNK_ENABLED:-false}" >&2
   echo "" >&2
   echo -e "  \033[1mObject store     :\033[0m type=${OBJ_STORE_TYPE}  bucket=${OBJ_STORE_BUCKET:-<unset>}" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m ${OBJ_STORE_ENDPOINT:-<default>}" >&2
@@ -4567,7 +4557,7 @@ platform_readiness_snapshot() {
     return 1
   }
   bad_pods=$(printf '%s\n' "${pod_json}" | jq -r \
-    --arg bundled "${SPLUNK_ENABLED:-true}" \
+    --arg bundled "${SPLUNK_ENABLED:-false}" \
     --arg standalone "splunk-${AI_STANDALONE_NAME:-splunk-standalone}-standalone" '
     .items[]
     | select($bundled == "true" or (

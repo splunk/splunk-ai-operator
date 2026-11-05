@@ -200,7 +200,7 @@ Edit the copy and confirm these settings:
 | `storage.storageClass` | Existing class, or `local-path` managed by the installer |
 | `storage.objectStore.*` | Type, bucket, endpoint where required, and credentials |
 | `storage.modelStaging.enabled` | Stage missing models from the installer when `true` |
-| `splunk.enabled` | Deploy bundled Splunk Operator and Enterprise Standalone; defaults to `true` when omitted; set `false` for an external-only deployment |
+| `splunk.enabled` | Deploy bundled Splunk Operator and Enterprise Standalone; only an explicit `true` installs them; omitted, `false`, or any other value skips them (same as k0s) |
 | `splunk.trustedIssuers` | Legitimate management/JWT issuer URLs; required for external Splunk authentication when bundled Splunk is disabled |
 | `aiPlatform.scaleFactor` | Global workload scale; keep `1` for the minimum deployment |
 | `ecr.enabled` | Enable only when the workload registry is Amazon ECR |
