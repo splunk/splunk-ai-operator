@@ -1,6 +1,6 @@
 # On-prem customer setup: FIPS-mode Traefik ingress for AI-Tier
 
-**Status:** This guide records the setup and paths exercised in the in-house test through 2026-11-04: browser ingress to SAIA and Slim, AITK connection/model-list and inference through Slim, and SAIA token-validation routes to external Splunk. Search API routes were verified individually at the routing layer. The test did not establish FIPS certification for the exact Traefik image or cryptographic module.
+**Status:** This guide records the setup and paths exercised in the in-house test through 2026-11-05: browser ingress to SAIA and Slim, AITK connection/model-list and inference through Slim, and token-validation callbacks from SAIA and Slim to external Splunk through Traefik. Search API routes were verified individually at the routing layer. The test did not establish FIPS certification for the exact Traefik image or cryptographic module.
 
 ## In this guide
 
@@ -18,13 +18,13 @@
 
 This reference uses a **standalone Traefik gateway outside the k0s cluster**, configured with static and file providers. It is the network entry point for AI-Tier APIs and reaches SAIA and Slim through private NodePorts.
 
-For the SAIA Splunk callbacks verified in this test, SAIA connects to the gateway's private listener; the file-provider service points directly to `https://<SPLUNK_PRIVATE_IP>:8089`, and Traefik's `serversTransport` verifies the configured CA and server identity. This gateway is outside k0s and uses Traefik's file provider. The test confirmed the same public ingress pattern for SAIA and Slim. The callback sequence below is specifically the SAIA path.
+For the Splunk token-validation callbacks, SAIA and Slim connect to the gateway's private listener. The file-provider service points directly to `https://<SPLUNK_PRIVATE_IP>:8089`, and Traefik's `serversTransport` verifies the configured CA and server identity. This gateway is outside k0s and uses Traefik's file provider. The 2026-11-05 AITK inference test correlated with successful JWKS and current-context responses through this route from the node hosting Slim. The access log records the node address, and that node also hosted SAIA, so this is time-correlated evidence rather than a pod-identity log entry.
 
 For the tested ingress, client-facing TLS ends at the Traefik listener. Traefik forwards requests to SAIA and Slim over HTTP; no TLS is used on these Traefik-to-service backend hops.
 
-SAIA retrieved Splunk signing keys and validated interactive tokens through the private HTTP listener on the Traefik gateway at port 8080 (`jwks`). The tested Splunk management and search API routes, including search-job result retrieval, use this listener. Traefik then connects to the external Splunk management endpoint over verified HTTPS. That separate gateway-to-Splunk TLS session terminates at Splunk. The public HTTPS listener on port 443 (`websecure`) is for client traffic to SAIA/Slim; unmatched paths there fall through to the SAIA catch-all and are not the Splunk management route.
+SAIA and Slim retrieved Splunk signing keys and validated interactive tokens through the private HTTP listener on the Traefik gateway at port 8080 (`jwks`). The tested Splunk management and search API routes, including search-job result retrieval, use this listener. Traefik then connects to the external Splunk management endpoint over verified HTTPS. That separate gateway-to-Splunk TLS session terminates at Splunk. The public HTTPS listener on port 443 (`websecure`) is for client traffic to SAIA/Slim; unmatched paths there fall through to the SAIA catch-all and are not the Splunk management route.
 
-This tested profile covers the same browser-facing ingress pattern to SAIA and Slim, plus the SAIA token-validation and Splunk management/search routes listed below.
+This tested profile covers the same browser-facing ingress pattern to SAIA and Slim, plus SAIA and Slim token-validation callbacks and the Splunk management/search routes listed below.
 
 ~~~mermaid
 flowchart LR
@@ -38,12 +38,13 @@ flowchart LR
   T -->|HTTP NodePort 30080| A
   T -->|HTTP NodePort 30081| L
   A -->|SAIA callback: HTTP private 8080| T
-  T -->|SAIA callback: HTTPS 8089; verify CA and SAN| S
+  L -->|Slim/AITK callback: HTTP private 8080| T
+  T -->|Verified HTTPS 8089 for both callbacks| S
 ~~~
 
 ### SAIA browser ingress and Splunk callback sequence
 
-The browser-facing ingress pattern shown here is the same for SAIA and Slim: HTTPS terminates at public Traefik, which forwards HTTP to the corresponding private NodePort. The callback sequence below shows the SAIA token-validation path that was verified in this test. These are separate connections: SAIA uses a private, plain-HTTP listener on Traefik, and Traefik creates a new, certificate-verified HTTPS session to Splunk. Responses return along their corresponding request paths.
+The browser-facing ingress pattern shown here is the same for SAIA and Slim: HTTPS terminates at public Traefik, which forwards HTTP to the corresponding private NodePort. The sequence below details the SAIA token-validation flow. The AITK/Slim inference test also exercised the same private callback listener and verified HTTPS upstream to Splunk. These are separate connections: each workload uses a private, plain-HTTP listener on Traefik, and Traefik creates a new, certificate-verified HTTPS session to Splunk.
 
 ~~~mermaid
 sequenceDiagram
@@ -72,10 +73,10 @@ sequenceDiagram
 |---|---|---|---|
 | Browser ingress | Browser → Traefik `:443` → SAIA NodePort `:30080` | HTTPS to Traefik; HTTP to SAIA | Browser-to-Traefik TLS terminates at Traefik. Traefik-to-SAIA is HTTP inside the private network. |
 | Browser ingress | Browser/Splunk app → Traefik `:443` → Slim NodePort `:30081` | HTTPS to Traefik; HTTP to Slim | Same TLS boundary. AITK connection/model-list and inference were verified through this route. |
-| Token/JWKS callback | SAIA → private Traefik `:8080` → Splunk `:8089`, `GET /services/authorization/tokens-keys` | HTTP to Traefik; HTTPS to Splunk | Verified in the test with the configured test CA and the Splunk certificate SAN. |
-| Current-context callback | SAIA → private Traefik `:8080` → Splunk `:8089`, `GET /services/authentication/current-context` | HTTP to Traefik; HTTPS to Splunk | SAIA token-validation flow was verified through the private listener and verified Splunk upstream. |
+| Token/JWKS callback | SAIA and Slim (AITK) → private Traefik `:8080` → Splunk `:8089`, `GET /services/authorization/tokens-keys` | HTTP to Traefik; HTTPS to Splunk | Both paths returned HTTP 200 in the SAIA check and in the time-correlated AITK/Slim run; Traefik uses the configured test CA and Splunk certificate SAN. |
+| Current-context callback | SAIA and Slim (AITK) → private Traefik `:8080` → Splunk `:8089`, `GET /services/authentication/current-context` | HTTP to Traefik; HTTPS to Splunk | Both paths returned HTTP 200 during authenticated token validation. An unauthenticated Slim pod probe returned the expected HTTP 401. |
 
-Here, “callback” means a server-side SAIA request to Splunk's REST API for token validation or search operations. It is a request/response flow initiated by the workload, not an unsolicited webhook. The two token-validation paths above and the search paths below use the private listener in the tested configuration. Do not send these Splunk management paths through the public `:443` SAIA catch-all.
+Here, “callback” means a server-side SAIA or Slim request to Splunk's REST API for token validation; the search operations tested here were initiated by SAIA. It is a request/response flow initiated by the workload, not an unsolicited webhook. The two token-validation paths above and the search paths below use the private listener in the tested configuration. Do not send these Splunk management paths through the public `:443` SAIA catch-all.
 
 The following method/path pairs were configured on the private HTTP listener on port 8080 to reach Splunk's verified HTTPS management endpoint on port 8089:
 
@@ -429,12 +430,13 @@ Do not add the direct external Splunk `:8089` URL to the validated SAIA proxy pa
 
 1. Confirm the Traefik process has `GODEBUG=fips140=only`; record the tested image ID and version.
 2. From a client that trusts the Traefik CA, request https://<TRAEFIK_FQDN>/health. Expected result: HTTP 200 with TLS certificate validation enabled.
-3. From an SAIA pod, request the private HTTP JWKS URL. Expected result: HTTP 200. The validated SAIA-to-gateway leg uses HTTP.
+3. From SAIA and Slim pods, request the private HTTP JWKS URL. Expected result: HTTP 200. An unauthenticated `current-context` probe may return HTTP 401; the authenticated application flow should return HTTP 200. Both workloads use HTTP to the private gateway listener.
 4. From the Traefik host, verify the Splunk upstream with the configured CA and hostname/IP checks. Expected result: HTTP 200.
 5. Mint a fresh Splunk interactive JWT without printing or saving it. Confirm its `iss` matches `http://<TRAEFIK_PRIVATE_IP>:8080`.
 6. From Splunk Web, perform the authenticated app checks through the public Traefik URL, one at a time:
    - **SAIA:** Open **Splunk AI Assistant → Configuration**, set the SAIA API URL to `https://<TRAEFIK_FQDN>` with no trailing slash and save. The SAIA 2.3.6 setup check appends `/health`; the tested gateway health request returned HTTP 200 with certificate validation enabled.
    - **Slim:** In **Splunk AI Toolkit → Connections**, set the Splunk AI tier endpoint to `https://<TRAEFIK_FQDN>/tenant/slim-api/v1alpha1`. Create or test a **Splunk AI tier LLM** connection and select a model. This exercises the authenticated `chat/models` request. Expected result: the models load and the connection succeeds. Use an account with the AITK role required by customer policy.
+   - **AITK inference and Slim callback:** In Splunk AI Toolkit Search, run `| makeresults | ai prompt="Reply exactly: Slim callback check" connection="gemma"`. Confirm the answer returns and correlate the run time with Traefik access-log `200` responses for `/services/authorization/tokens-keys` and `/services/authentication/current-context` from the k0s node hosting Slim.
    The apps mint and send their own interactive tokens; do not copy tokens into a terminal or share them.
    **Check the browser path separately from the Splunk-side connection test.** The browser requests were tested with `https://saia-test.mpr70.test`: the laptop resolved it to the public Traefik address, and the Splunk host resolved it to the private Traefik address. The browser trusted the test CA. A request to the private IP from the HTTP Splunk Web origin was blocked by Chrome before reaching Traefik; CORS headers did not change that result.
 7. Confirm direct connection from an SAIA pod to Splunk port 8089 is blocked.
@@ -457,7 +459,9 @@ The 2026-11-02 test passed the following:
 - The user confirmed the AITK connection/model-list check succeeded through the public Traefik route to Slim.
 - Direct SAIA-pod access to Splunk port 8089 was blocked after security-group tightening.
 
-On 2026-11-04, an AITK inference call was also verified end to end from Splunk through Traefik to Slim: the same request ID appeared in Splunk's `mlspl.log` and Slim's log, `POST /tenant/slim-api/v1alpha1/chat/completions` returned HTTP 200, and AITK recorded `execution_status=success`. This confirms the inference path to Slim; it does not prove the separate SAIA search-tool flow or identify how Slim performs its own Splunk token checks.
+On 2026-11-04, an AITK inference call was verified end to end from Splunk through Traefik to Slim: the same request ID appeared in Splunk's `mlspl.log` and Slim's log, `POST /tenant/slim-api/v1alpha1/chat/completions` returned HTTP 200, and AITK recorded `execution_status=success`.
+
+On 2026-11-05, the user ran the minimal AITK inference SPL above and received a result. At `07:54:07 UTC`, Traefik logged HTTP 200 responses for both `/services/authorization/tokens-keys` and `/services/authentication/current-context` from node `10.0.38.66`, which hosted the Slim pod. The Slim pod's unauthenticated probe to the same private listener returned HTTP 200 for JWKS and HTTP 401 for current-context, as expected without a token. The live Traefik route points to `https://10.0.39.253:8089` and uses the configured CA and `serverName`. Together these checks validate the callback path for the AITK/Slim run. Traefik's access log identifies the source node rather than the pod, and SAIA also ran on that node; the log is therefore correlated with the isolated AITK run but is not a pod-identity record.
 
 ### Search-route checks
 
