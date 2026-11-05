@@ -1661,10 +1661,13 @@ initialize_install_state() {
   cluster_uid=$(oc get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
   [[ -n "${cluster_uid}" ]] || err "Cannot read kube-system UID for installer ownership state"
   if ! oc get configmap "${state_name}" -n openshift-config &>/dev/null; then
+    # splunk_ownership_tracked marks state that records Splunk resources one by
+    # one. main_delete treats state without it as a legacy bundled-Splunk install.
     oc create configmap "${state_name}" -n openshift-config \
       --from-literal=aiNamespace="${AI_NS}" \
       --from-literal=clusterUID="${cluster_uid}" \
-      --from-literal=createdAt="$(_ts)" >/dev/null \
+      --from-literal=createdAt="$(_ts)" \
+      --from-literal=splunk_ownership_tracked=true >/dev/null \
       || err "Could not create installer ownership state openshift-config/${state_name}"
   else
     recorded_uid=$(oc get configmap "${state_name}" -n openshift-config -o jsonpath='{.data.clusterUID}' 2>/dev/null || true)
@@ -1689,6 +1692,18 @@ record_owned_component() {
   oc patch configmap "${state_name}" -n openshift-config --type=merge \
     -p "{\"data\":{\"${component}\":\"true\"}}" >/dev/null \
     || err "Could not record installer ownership for ${component}"
+}
+
+# Filter installer state JSON (stdin) down to the records of resources that
+# main_delete keeps with retained Splunk: the AI namespace ($1), its SCC grants,
+# the Splunk Operator and the Splunk configuration dependencies.
+retain_splunk_ownership_records() {
+  jq --arg ns "$1" '.data |= with_entries(select(.key as $k | [
+    "aiNamespace", "clusterUID", "createdAt", "splunk_ownership_tracked", $ns,
+    "scc_anyuid_ai_namespace", "scc_privileged_ai_namespace",
+    "scc_privileged_splunk_operator", "splunk_operator_bundle_v2",
+    "namespace_splunk-operator", "splunk_defaults", "splunk_hec_secret"
+  ] | index($k)))'
 }
 
 component_is_owned() {
@@ -3078,11 +3093,14 @@ install_ai_platform_cr() {
   ensure_namespace "${AI_NS}"
   ensure_object_store_credentials_secret
 
-  # Keep existing Splunk workloads untouched when bundled Splunk is disabled.
-  if bundled_splunk_enabled; then
-    oc delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
-    oc delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
-  fi
+  # Remove failed Jobs and pods from earlier runs so a rerun can recreate them.
+  # When bundled Splunk is disabled, skip pods managed by the Splunk Operator
+  # so customer-managed Splunk workloads stay untouched.
+  local failed_pod_selector="app.kubernetes.io/managed-by!=splunk-operator"
+  bundled_splunk_enabled && failed_pod_selector=""
+  oc delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
+  oc delete pods -n "${AI_NS}" --field-selector status.phase=Failed \
+    --selector "${failed_pod_selector}" --wait=false 2>/dev/null || true
 
   # Build imagePullSecrets block — include every docker-registry secret that
   # exists in the namespace, covering ECR, DockerHub, GCR, ACR, and custom
@@ -4118,17 +4136,22 @@ main_delete() {
 
   log "Removing AIPlatform CR and waiting for finalizers..."
   oc delete aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" --timeout=120s 2>/dev/null || true
-  # Preserve legacy cleanup for enabled installs. A disabled configuration may
-  # share this namespace with customer-managed Splunk, so only remove Splunk
-  # resources explicitly recorded by an earlier installer run in that mode.
-  local preserve_splunk_namespace=false
-  if bundled_splunk_enabled || component_is_owned "$(splunk_standalone_component)"; then
+  # Splunk cleanup follows the recorded ownership, not the current
+  # splunk.enabled value: the namespace may hold customer-managed Splunk. Legacy
+  # state (no splunk_ownership_tracked marker) comes from installers that always
+  # deployed bundled Splunk, so those installs keep the old full cleanup.
+  local preserve_splunk_namespace=false legacy_bundled_splunk=false
+  if oc get configmap "$(installer_state_name)" -n openshift-config &>/dev/null \
+    && ! component_is_owned splunk_ownership_tracked; then
+    legacy_bundled_splunk=true
+  fi
+  if [[ "${legacy_bundled_splunk}" == "true" ]] || component_is_owned "$(splunk_standalone_component)"; then
     oc delete standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=60s 2>/dev/null || true
   elif oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" &>/dev/null; then
     log "Preserving pre-existing Splunk Standalone ${AI_STANDALONE_NAME}."
     preserve_splunk_namespace=true
   fi
-  if ! bundled_splunk_enabled; then
+  if [[ "${legacy_bundled_splunk}" != "true" ]]; then
     if ! component_is_owned splunk_defaults && oc get configmap splunk-defaults -n "${AI_NS}" &>/dev/null; then
       preserve_splunk_namespace=true
     fi
@@ -4149,10 +4172,10 @@ main_delete() {
     # Retained Standalones can still reference the defaults ConfigMap and shared
     # object-store credentials; keep their configuration dependencies together.
     if [[ "${preserve_splunk_namespace}" != "true" ]]; then
-      if bundled_splunk_enabled || component_is_owned splunk_defaults; then
+      if [[ "${legacy_bundled_splunk}" == "true" ]] || component_is_owned splunk_defaults; then
         oc delete configmap splunk-defaults -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
       fi
-      if bundled_splunk_enabled || component_is_owned splunk_hec_secret; then
+      if [[ "${legacy_bundled_splunk}" == "true" ]] || component_is_owned splunk_hec_secret; then
         oc delete secret "splunk-${AI_NS}-secret" -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
       fi
       oc delete secret minio-credentials -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
@@ -4285,7 +4308,17 @@ main_delete() {
       oc delete clusterrolebinding "${crb}" --ignore-not-found=true 2>/dev/null || true
   done
 
-  oc delete configmap "$(installer_state_name)" -n openshift-config --ignore-not-found=true 2>/dev/null || true
+  if [[ "${preserve_splunk_namespace}" == "true" ]]; then
+    # Keep the records of resources retained with Splunk so a later clean-all,
+    # run after that Splunk is gone, can still remove them.
+    log "Keeping ownership records for resources retained with Splunk."
+    oc get configmap "$(installer_state_name)" -n openshift-config -o json 2>/dev/null \
+      | retain_splunk_ownership_records "${ai_namespace_component}" \
+      | oc replace -f - >/dev/null 2>&1 \
+      || warn "Could not update installer ownership state $(installer_state_name)"
+  else
+    oc delete configmap "$(installer_state_name)" -n openshift-config --ignore-not-found=true 2>/dev/null || true
+  fi
 
   log "============================================"
   log " Cleanup complete"

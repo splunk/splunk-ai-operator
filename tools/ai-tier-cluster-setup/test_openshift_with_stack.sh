@@ -66,6 +66,7 @@ eval "$(extract_function install_splunk_operator)"
 eval "$(extract_function install_splunk_standalone)"
 eval "$(extract_function main_install)"
 eval "$(extract_function main_delete)"
+eval "$(extract_function retain_splunk_ownership_records)"
 eval "$(extract_function preflight_check_registry)"
 eval "$(extract_function normalize_openshift_clusterip_feature_services)"
 eval "$(extract_function patch_openshift_slim_public_service_workaround)"
@@ -284,11 +285,15 @@ assert_eq "enabled install retains bundled Splunk and its pull-secret setup" \
   "$(_optional_splunk_install_flow true)"
 
 
+# CLEANUP_SPLUNK_ENABLED sets the delete-time config, CLEANUP_LEGACY_STATE drops
+# the ownership-tracking marker, and CLEANUP_SHOW=state prints what happened to
+# the installer state ConfigMap instead of the resource deletes.
 _optional_splunk_cleanup() (
   local owned="$1" namespace_owned="$2" dependencies_owned="${4:-false}" tmp
+  local legacy="${CLEANUP_LEGACY_STATE:-false}" show="${CLEANUP_SHOW:-deletes}"
   tmp=$(mktemp -d)
   trap 'rm -rf "${tmp}"' EXIT
-  SPLUNK_ENABLED=false
+  SPLUNK_ENABLED="${CLEANUP_SPLUNK_ENABLED:-false}"
   AUTO_APPROVE=true
   AI_NS=ai-platform
   AI_PLATFORM_NAME=test-platform
@@ -302,6 +307,7 @@ _optional_splunk_cleanup() (
   manifest_without_namespaces() { echo mocked-splunk-operator-manifest; }
   component_is_owned() {
     case "$1" in
+      splunk_ownership_tracked) [[ "${legacy}" != true ]] ;;
       namespace_ai-platform) [[ "${namespace_owned}" == true ]] ;;
       splunk_standalone_splunk|splunk_defaults|splunk_hec_secret) [[ "${owned}" == true ]] ;;
       splunk_operator_bundle_v2|namespace_splunk-operator|scc_anyuid_ai_namespace|scc_privileged_ai_namespace|scc_privileged_splunk_operator)
@@ -317,6 +323,8 @@ _optional_splunk_cleanup() (
       'delete configmap splunk-defaults '*) echo defaults >> "${tmp}/deletes" ;;
       'delete secret splunk-ai-platform-secret '*) echo hec >> "${tmp}/deletes" ;;
       'delete secret minio-credentials '*) echo object-store >> "${tmp}/deletes" ;;
+      'delete configmap test-state '*) echo state-deleted >> "${tmp}/state" ;;
+      'replace -f -') echo state-pruned >> "${tmp}/state" ;;
       'delete -f - '*) echo splunk-operator-bundle >> "${tmp}/deletes" ;;
       'adm policy remove-scc-from-group anyuid system:serviceaccounts:ai-platform')
         echo ai-anyuid-scc >> "${tmp}/deletes"
@@ -332,7 +340,7 @@ _optional_splunk_cleanup() (
     return 0
   }
   main_delete || return
-  [[ ! -f "${tmp}/deletes" ]] || cat "${tmp}/deletes"
+  [[ ! -f "${tmp}/${show}" ]] || cat "${tmp}/${show}"
 )
 assert_eq "disabled cleanup preserves unowned Splunk resources and their previously marked namespace" "" \
   "$(_optional_splunk_cleanup false true)"
@@ -345,6 +353,18 @@ assert_eq "retaining an unowned Standalone also preserves owned Splunk CRDs, nam
 assert_eq "owned Splunk cleanup still removes its bundle, SCC grants and object storage credentials" \
   $'standalone\ndefaults\nhec\nobject-store\nsplunk-operator-bundle\nnamespace splunk-operator\nai-anyuid-scc\nai-privileged-scc\nsplunk-operator-scc' \
   "$(_optional_splunk_cleanup true false splunk true)"
+assert_eq "an enabled delete-time config does not remove unowned Splunk resources" "" \
+  "$(CLEANUP_SPLUNK_ENABLED=true _optional_splunk_cleanup false true)"
+assert_eq "legacy installer state without the tracking marker keeps full bundled Splunk cleanup" \
+  $'standalone\ndefaults\nhec\nobject-store' "$(CLEANUP_LEGACY_STATE=true _optional_splunk_cleanup false false)"
+assert_eq "retained Splunk keeps a pruned installer state instead of deleting it" "state-pruned" \
+  "$(CLEANUP_SHOW=state _optional_splunk_cleanup false true splunk true)"
+assert_eq "full cleanup still deletes the installer state" "state-deleted" \
+  "$(CLEANUP_SHOW=state _optional_splunk_cleanup true false)"
+assert_eq "pruned installer state keeps only records of resources retained with Splunk" \
+  "aiNamespace,namespace_ai-platform,scc_privileged_ai_namespace,splunk_operator_bundle_v2,splunk_ownership_tracked" \
+  "$(printf '%s' '{"data":{"aiNamespace":"ai-platform","splunk_ownership_tracked":"true","namespace_ai-platform":"true","scc_privileged_ai_namespace":"true","splunk_operator_bundle_v2":"true","kuberay_operator":"true","cert_manager":"true","splunk_standalone_splunk":"true"}}' \
+    | retain_splunk_ownership_records namespace_ai-platform | jq -r '.data | keys | join(",")')"
 
 _mutable_image_warnings() (
   SLIM_API_IMAGE="$1"
@@ -1249,6 +1269,10 @@ YAML
       esac
     }
     install_ai_platform_cr || return
+    if [[ "${1:-}" == cleanup ]]; then
+      grep -E '^oc delete (jobs|pods) ' "${trace}"
+      return
+    fi
     [[ -f "${rendered}" ]] || return 1
     grep '^object-store$' "${trace}" || return 1
     if grep -q 'oc get secret splunk-' "${trace}"; then
@@ -1258,6 +1282,9 @@ YAML
   )
   assert_eq "disabled AIPlatform ensures object storage and external JWT config without polling Splunk HEC" \
     $'object-store\ntrustedIssuers' "$(_install_disabled_ai_platform)"
+  assert_eq "disabled AIPlatform still removes failed Jobs and failed non-Splunk pods" \
+    $'oc delete jobs -n ai-platform --field-selector status.successful=0 --wait=false\noc delete pods -n ai-platform --field-selector status.phase=Failed --selector app.kubernetes.io/managed-by!=splunk-operator --wait=false' \
+    "$(_install_disabled_ai_platform cleanup)"
 
   unset -f yq
   CONFIG_FILE="${SCRIPT_DIR}/openshift-cluster-config.yaml"
