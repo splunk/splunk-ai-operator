@@ -35,8 +35,8 @@ flowchart LR
   S[External Splunk Enterprise]
 
   C -->|HTTPS 443; TLS ends at Traefik| T
-  T -->|HTTP NodePort 30080| A
-  T -->|HTTP NodePort 30081| L
+  T -->|HTTP NodePort <SAIA_NODEPORT>| A
+  T -->|HTTP NodePort <SLIM_NODEPORT>| L
   A -->|SAIA callback: HTTP private 8080| T
   L -->|Slim/AITK callback: HTTP private 8080| T
   T -->|Verified HTTPS 8089 for both callbacks| S
@@ -55,7 +55,7 @@ sequenceDiagram
   participant S as External Splunk :8089
   B->>T: HTTPS request to SAIA API path
   Note over B,T: TLS terminates at Traefik
-  T->>A: HTTP to SAIA NodePort :30080
+  T->>A: HTTP to SAIA NodePort :<SAIA_NODEPORT>
   A->>P: HTTP GET /services/authorization/tokens-keys
   P->>S: Verified HTTPS GET /services/authorization/tokens-keys
   Note over P,S: Validate Splunk CA chain and certificate SAN / server name
@@ -71,8 +71,8 @@ sequenceDiagram
 
 | Leg | Initiator and destination | Protocol | TLS behavior |
 |---|---|---|---|
-| Browser ingress | Browser → Traefik `:443` → SAIA NodePort `:30080` | HTTPS to Traefik; HTTP to SAIA | Browser-to-Traefik TLS terminates at Traefik. Traefik-to-SAIA is HTTP inside the private network. |
-| Browser ingress | Browser/Splunk app → Traefik `:443` → Slim NodePort `:30081` | HTTPS to Traefik; HTTP to Slim | Same TLS boundary. AITK connection/model-list and inference were verified through this route. |
+| Browser ingress | Browser → Traefik `:443` → SAIA NodePort `:<SAIA_NODEPORT>` | HTTPS to Traefik; HTTP to SAIA | Browser-to-Traefik TLS terminates at Traefik. Traefik-to-SAIA is HTTP inside the private network. |
+| Browser ingress | Browser/Splunk app → Traefik `:443` → Slim NodePort `:<SLIM_NODEPORT>` | HTTPS to Traefik; HTTP to Slim | Same TLS boundary. AITK connection/model-list and inference were verified through this route. |
 | Token/JWKS callback | SAIA and Slim (AITK) → private Traefik `:8080` → Splunk `:8089`, `GET /services/authorization/tokens-keys` | HTTP to Traefik; HTTPS to Splunk | Both paths returned HTTP 200 in the SAIA check and in the time-correlated AITK/Slim run; Traefik uses the configured test CA and Splunk certificate SAN. |
 | Current-context callback | SAIA and Slim (AITK) → private Traefik `:8080` → Splunk `:8089`, `GET /services/authentication/current-context` | HTTP to Traefik; HTTPS to Splunk | Both paths returned HTTP 200 during authenticated token validation. An unauthenticated Slim pod probe returned the expected HTTP 401. |
 
@@ -223,14 +223,22 @@ Expected result: HTTP 200 with certificate verification enabled.
 
 ### 2. Restrict network paths
 
-Apply these rules using the customer's actual security groups or CIDRs:
+Before writing firewall rules or Traefik upstreams, read the NodePorts from the deployed Services; do not assume the defaults because an existing installation can override them:
+
+~~~bash
+kubectl get svc -n ai-platform
+kubectl get svc <SAIA_SERVICE_NAME> <SLIM_SERVICE_NAME> -n ai-platform \
+  -o custom-columns='NAME:.metadata.name,TYPE:.spec.type,PORTS:.spec.ports[*].port,NODEPORTS:.spec.ports[*].nodePort'
+~~~
+
+Use the reported NodePorts as `<SAIA_NODEPORT>` and `<SLIM_NODEPORT>` below. Apply these rules using the customer's actual security groups or CIDRs:
 
 | Destination | Port | Allowed source |
 |---|---:|---|
 | Traefik gateway | 443/TCP | Customer browser/app client CIDRs and external Splunk host if it calls the API |
 | Traefik gateway private address | 8080/TCP | k0s node security group only |
-| k0s SAIA NodePort | 30080/TCP | Traefik gateway security group only |
-| k0s Slim NodePort | 30081/TCP | Traefik gateway security group only |
+| k0s SAIA NodePort | `<SAIA_NODEPORT>`/TCP | Traefik gateway security group only |
+| k0s Slim NodePort | `<SLIM_NODEPORT>`/TCP | Traefik gateway security group only |
 | External Splunk management | 8089/TCP | Traefik gateway security group only |
 | Splunk Web | 8000/TCP | Administrator/customer CIDR only |
 | SSH administration | 22/TCP | Administrator CIDR or approved access path only |
@@ -293,7 +301,9 @@ tls:
 
 See Traefik's official [file-provider](https://doc.traefik.io/traefik/reference/routing-configuration/other-providers/file/), [TLS certificate](https://doc.traefik.io/traefik/reference/routing-configuration/http/tls/tls-certificates/), and [TLS option](https://doc.traefik.io/traefik/reference/routing-configuration/http/tls/tls-options/) references for the static/dynamic configuration split.
 
-Add the tested application routers to the file provider. SAIA and Slim services use HTTP backends. The in-house browser origin was `http://3.16.83.158:8000`; that exact origin was allowlisted on both SAIA and Slim routers. The Slim router needed the same CORS middleware, including `request_id` in allowed headers, so Traefik could answer the AITK `OPTIONS` preflight before it reached Slim. Do not replace this with a wildcard origin when credentials are enabled. The private routers expose the tested Splunk routes and share a verified HTTPS service transport:
+Add the application routers to the file provider. SAIA and Slim services use HTTP backends. Set `<SPLUNK_WEB_ORIGIN>` to the exact browser origin of the customer's Splunk Web, including scheme, hostname, and non-default port (for example, `https://splunk.example.com` or `http://splunk.example.com:8000`). Do not use the in-house test address as a customer value, and do not use a wildcard origin when credentials are enabled.
+
+The Traefik CORS middleware answers browser `OPTIONS` preflights directly instead of forwarding them to SAIA or Slim. Its allow-header list below includes the fallback headers supported by the current SAIA Nginx configuration and `request_id` used by the tested AITK flow. Before deployment, compare it with the browser's `Access-Control-Request-Headers` for the installed app versions and add any additional requested names, including app-specific headers such as `X-CSRF-Token` or `X-Splunk-*` if they appear. Traefik's list is static and must be kept in sync. The Slim router uses the same middleware so Traefik can answer the AITK preflight. See Traefik's [Headers middleware CORS behavior](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/headers/). The private routers expose the tested Splunk routes and share a verified HTTPS service transport:
 
 ~~~yaml
 http:
@@ -301,7 +311,7 @@ http:
     saia-browser-cors:
       headers:
         accessControlAllowOriginList:
-          - http://3.16.83.158:8000
+          - <SPLUNK_WEB_ORIGIN>
         accessControlAllowMethods:
           - GET
           - POST
@@ -312,26 +322,39 @@ http:
         accessControlAllowHeaders:
           - Authorization
           - Content-Type
+          - X-EC-Token
+          - X-ES-Tenant-Bearer
+          - X-Conversation-Key
+          - X-Request-ID
+          - X-Stack-URL-Legacy
           - Splunk-Client
           - X-Stack-URL
           - X-Requested-With
+          - X-Admin-Preferences-Filename
           - request_id
         accessControlAllowCredentials: true
         addVaryHeader: true
   routers:
     saia-api-cors:
-      rule: PathPrefix(`/tenant-id-sok/saia-api-v2`)
+      rule: Host(`<TRAEFIK_FQDN>`) && PathPrefix(`/tenant-id-sok/saia-api-v2`)
       priority: 110
       entryPoints: [websecure]
       middlewares: [saia-browser-cors]
       service: saia
       tls: {}
     slim:
-      rule: PathPrefix(`/tenant/slim-api`)
+      rule: Host(`<TRAEFIK_FQDN>`) && PathPrefix(`/tenant/slim-api`)
       priority: 100
       entryPoints: [websecure]
       middlewares: [saia-browser-cors]
       service: slim
+      tls: {}
+    saia-fallback:
+      rule: Host(`<TRAEFIK_FQDN>`) && PathPrefix(`/`)
+      priority: 1
+      entryPoints: [websecure]
+      middlewares: [saia-browser-cors]
+      service: saia
       tls: {}
     splunk-jwks:
       rule: Method("GET") && Path("/services/authorization/tokens-keys")
@@ -389,11 +412,11 @@ http:
     saia:
       loadBalancer:
         servers:
-          - url: http://<K0S_NODE_OR_LB>:30080
+          - url: http://<K0S_NODE_OR_LB>:<SAIA_NODEPORT>
     slim:
       loadBalancer:
         servers:
-          - url: http://<K0S_NODE_OR_LB>:30081
+          - url: http://<K0S_NODE_OR_LB>:<SLIM_NODEPORT>
     splunk-jwks:
       loadBalancer:
         serversTransport: splunk-mgmt
@@ -411,7 +434,7 @@ The callback service uses the URL scheme and port to open a new HTTPS connection
 
 In the test, the upstream identity was Splunk private IP `10.0.39.253`, covered by its certificate IP SAN and the configured test CA. The `serverName` value is the identity only; it has no URL scheme or path.
 
-The public routers above use the tested SAIA path prefix `/tenant-id-sok/saia-api-v2` and Slim path prefix `/tenant/slim-api` on the TLS entrypoint. The browser-facing test used the certificate-covered gateway hostname and the browser trusted the test CA. The private-IP browser request from the HTTP Splunk Web origin was blocked by Chrome before it reached Traefik, even when CORS was configured.
+The public routers use the tested SAIA path prefix `/tenant-id-sok/saia-api-v2` and Slim path prefix `/tenant/slim-api` on the TLS entrypoint. The higher-priority SAIA v2 and Slim routers take precedence; the lower-priority SAIA fallback sends `/health` and other otherwise-unmatched paths on this host to SAIA. Keep the Host match so requests for unrelated hostnames do not enter these services. The browser-facing test used the certificate-covered gateway hostname and the browser trusted the test CA. The private-IP browser request from the HTTP Splunk Web origin was blocked by Chrome before it reached Traefik, even when CORS was configured.
 
 ### 4. Configure AI-Tier's trusted issuer
 
