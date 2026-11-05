@@ -898,7 +898,8 @@ Use this Splunk-side version set with this release:
 
 AI POD supports two Splunk integration choices: a bundled Splunk Standalone or
 an existing externally managed Splunk Enterprise deployment. Bundled Splunk is
-enabled by default. For external Splunk only, set `splunk.enabled: false`, list
+opt-in: set `splunk.enabled: true` to install it. For external Splunk only, omit
+the key or set `splunk.enabled: false`, list
 its JWT issuer under `splunk.trustedIssuers`, and ensure that both Splunk and
 the user's browser can reach the required Routes. See [Splunk
 issuers](#splunk-issuers) for the configuration example.
@@ -1165,11 +1166,15 @@ cleanup preserves it while removing the configured AIPlatform, SAIA and SLIM
 Routes, and installer-created configuration. Always use a dedicated AI POD
 namespace.
 
-With bundled Splunk enabled, cleanup removes the configured Splunk Standalone.
-With `splunk.enabled: false`, it removes that Standalone only when recorded as
-installer-owned. Unowned Standalone, Splunk defaults, or derived HEC resources
-with the configured names are preserved. Their presence also preserves the AI
-POD namespace, Splunk Operator and its namespace/CRDs, required SCC grants, and
+Cleanup removes the configured Splunk Standalone only when the installer
+recorded it as installer-owned, whatever the current `splunk.enabled` value.
+Unowned Standalone, Splunk defaults, or derived HEC resources with the
+configured names are preserved. Their presence also preserves the AI POD
+namespace, Splunk Operator and its namespace/CRDs, required SCC grants, and
 shared configuration (`splunk-defaults`, the derived HEC secret, and
-`minio-credentials`). This avoids indirectly deleting or breaking the retained
-Splunk installation. Other installer-owned components are cleaned up normally.
+`minio-credentials`), and cleanup keeps their ownership records. This avoids
+indirectly deleting or breaking the retained Splunk installation. Other
+installer-owned components are cleaned up normally. Installer versions before
+this change did not record bundled Splunk; to remove that Splunk, delete the
+Standalone, `splunk-defaults`, and the derived HEC secret, then run `clean-all`
+again.

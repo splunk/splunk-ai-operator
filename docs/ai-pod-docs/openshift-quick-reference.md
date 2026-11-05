@@ -350,8 +350,9 @@ separate from the platform container-image versions listed in the
 [release-default image table](openshift-readme.md#image-pull-secrets-and-registry-access).
 
 AI POD supports two Splunk integration choices: a bundled Splunk Standalone or
-an existing externally managed Splunk Enterprise deployment. Bundled Splunk
-defaults to enabled. To use only an existing external Splunk instance:
+an existing externally managed Splunk Enterprise deployment. Bundled Splunk is
+opt-in and installs only with `splunk.enabled: true`. To use only an existing
+external Splunk instance:
 
 ```yaml
 splunk:
@@ -456,8 +457,8 @@ in Step 3:
 > Use a dedicated namespace for AI POD. If the installer created the namespace,
 > `clean-all` normally deletes the namespace and everything later added to it.
 > If the namespace existed before installation, cleanup preserves it while
-> removing the configured AI POD resources. With `splunk.enabled: false`,
-> unowned Splunk Standalone, defaults, and derived HEC resources are preserved;
+> removing the configured AI POD resources. Splunk Standalone, defaults, and
+> derived HEC resources not recorded as installer-owned are preserved;
 > their presence also preserves the AI POD namespace, Splunk Operator/CRDs,
 > shared configuration, and SCC grants needed by those resources. The OpenShift
 > cluster and its nodes are not removed. See the [cleanup

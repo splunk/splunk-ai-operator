@@ -1063,7 +1063,7 @@ then run the documented `ai` and `apply CDTSM` smoke tests.
 
 ### Bundled Splunk is not ready
 
-This section applies when `splunk.enabled: true` (the default). For an
+This section applies when `splunk.enabled: true` is set. For an
 external-only deployment, use `splunk.enabled: false` and configure its JWT
 issuer instead; no internal Standalone or HEC token is required.
 
@@ -1104,14 +1104,18 @@ existed before installation, the namespace and unrelated workloads are
 preserved while the configured AI POD resources are removed. Pre-existing
 shared operators and components not recorded as installer-owned are preserved.
 
-With `splunk.enabled: false`, cleanup preserves unowned Splunk Standalone,
-defaults, and derived HEC resources with the configured names. When these
-resources exist, it also preserves the AI POD namespace, Splunk Operator and
-its namespace/CRDs, required SCC grants, and shared configuration including
-`minio-credentials`. These dependencies remain so cleanup cannot indirectly
-delete or break the retained Splunk installation. This preservation is
-expected. With bundled Splunk enabled, cleanup retains its existing behavior
-of removing the configured Standalone.
+Cleanup removes Splunk resources only when the installer recorded them as
+installer-owned; the current `splunk.enabled` value does not matter. It
+preserves unowned Splunk Standalone, defaults, and derived HEC resources with
+the configured names. When these resources exist, it also preserves the AI POD
+namespace, Splunk Operator and its namespace/CRDs, required SCC grants, and
+shared configuration including `minio-credentials`, and keeps their ownership
+records. These dependencies remain so cleanup cannot indirectly delete or break
+the retained Splunk installation. This preservation is expected. Installer
+versions before this change did not record bundled Splunk, so cleanup also
+keeps the Splunk they installed. To remove it, delete the Standalone,
+`splunk-defaults`, and the `splunk-<namespace>-secret` Secret, then run
+`clean-all` again.
 
 ### A custom resource is stuck terminating
 
