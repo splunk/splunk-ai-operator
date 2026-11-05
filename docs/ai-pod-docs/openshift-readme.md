@@ -918,7 +918,7 @@ issues a fresh JWT and verifies it against the certificate in this Secret.
   the new key; previously issued tokens stop validating, so users sign in again.
   Set the flag for that one run only: if the run is interrupted, re-run without
   it and the installer keeps the new key and still completes the Splunk restart.
-- `delete` and `clean-all` remove this Secret together with the installation.
+- `clean-all` removes this Secret together with the installation.
 
 ### Open bundled Splunk Web
 
