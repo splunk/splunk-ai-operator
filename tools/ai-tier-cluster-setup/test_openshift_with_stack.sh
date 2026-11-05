@@ -144,6 +144,10 @@ _run_validate_config() (
   }
   validate_config
 )
+PREDICTABLE_OBJECT_STORE_SECRETS=(minioadmin MinioAdmin MINIOADMIN seaweedfs SeaweedFS SEAWEEDFS)
+FAMILIAR_OBJECT_STORE_IDENTIFIERS=(minioadmin MINIOADMIN seaweedfs SEAWEEDFS)
+NEAR_MATCH_OBJECT_STORE_SECRETS=(unique-MinioAdmin-suffix unique-SeaweedFS-suffix)
+
 assert_rc "validate accepts a complete manual-node configuration" 0 \
   _run_validate_config manual 1 false registry.example.com
 assert_rc "validate rejects manual selection without nodes" 1 \
@@ -158,8 +162,20 @@ assert_rc "validate rejects placeholder object-store credentials" 1 \
   _run_validate_config manual 1 false registry.example.com "<ACCESS_KEY>" "CHANGEME"
 assert_rc "validate rejects the minioadmin/minioadmin factory pair" 1 \
   _run_validate_config manual 1 false registry.example.com minioadmin minioadmin
-assert_rc "validate accepts a familiar username with a unique password" 0 \
-  _run_validate_config manual 1 false registry.example.com minioadmin "unique-not-a-default"
+assert_rc "validate rejects seaweedfs as both identifier and secret" 1 \
+  _run_validate_config manual 1 false registry.example.com seaweedfs seaweedfs
+for predictable_secret in "${PREDICTABLE_OBJECT_STORE_SECRETS[@]}"; do
+  assert_rc "validate rejects secret ${predictable_secret} with a different identifier" 1 \
+    _run_validate_config manual 1 false registry.example.com access-key "${predictable_secret}"
+done
+for familiar_identifier in "${FAMILIAR_OBJECT_STORE_IDENTIFIERS[@]}"; do
+  assert_rc "validate accepts identifier ${familiar_identifier} with a unique secret" 0 \
+    _run_validate_config manual 1 false registry.example.com "${familiar_identifier}" "unique-not-a-default"
+done
+for near_match_secret in "${NEAR_MATCH_OBJECT_STORE_SECRETS[@]}"; do
+  assert_rc "validate accepts longer secret ${near_match_secret}" 0 \
+    _run_validate_config manual 1 false registry.example.com access-key "${near_match_secret}"
+done
 
 echo "Object-store credential guards"
 _guard() ( MINIO_ROOT_USER="$1"; MINIO_ROOT_PASSWORD="$2"; "$3" )
@@ -167,22 +183,103 @@ assert_rc "placeholder guard flags <...> values" 0 \
   _guard "<ACCESS_KEY>" "x" object_store_auth_looks_like_placeholder
 assert_rc "factory-default guard flags minioadmin/minioadmin" 0 \
   _guard minioadmin minioadmin object_store_auth_is_factory_default
-assert_rc "factory-default guard allows minioadmin with a unique password" 1 \
-  _guard minioadmin "unique-not-a-default" object_store_auth_is_factory_default
+for predictable_secret in "${PREDICTABLE_OBJECT_STORE_SECRETS[@]}"; do
+  assert_rc "credential guard flags predictable secret ${predictable_secret} with a different identifier" 0 \
+    _guard access-key "${predictable_secret}" object_store_auth_is_factory_default
+  assert_rc "early credential gate rejects predictable secret ${predictable_secret}" 1 \
+    _guard access-key "${predictable_secret}" require_object_store_credentials
+done
+for familiar_identifier in "${FAMILIAR_OBJECT_STORE_IDENTIFIERS[@]}"; do
+  assert_rc "credential guard allows identifier ${familiar_identifier} with a unique secret" 1 \
+    _guard "${familiar_identifier}" "unique-not-a-default" object_store_auth_is_factory_default
+  assert_rc "early credential gate accepts identifier ${familiar_identifier} with a unique secret" 0 \
+    _guard "${familiar_identifier}" "unique-not-a-default" require_object_store_credentials
+done
+for near_match_secret in "${NEAR_MATCH_OBJECT_STORE_SECRETS[@]}"; do
+  assert_rc "credential guard allows complete non-default secret ${near_match_secret}" 1 \
+    _guard access-key "${near_match_secret}" object_store_auth_is_factory_default
+  assert_rc "early credential gate accepts longer secret ${near_match_secret}" 0 \
+    _guard access-key "${near_match_secret}" require_object_store_credentials
+done
 assert_rc "early credential gate rejects missing credentials" 1 \
   _guard "" "" require_object_store_credentials
 assert_rc "early credential gate rejects placeholders" 1 \
   _guard "<ACCESS_KEY>" "CHANGEME" require_object_store_credentials
 assert_rc "early credential gate rejects the factory pair" 1 \
   _guard minioadmin minioadmin require_object_store_credentials
-assert_rc "early credential gate accepts unique credentials" 0 \
-  _guard minioadmin "unique-not-a-default" require_object_store_credentials
+
+# Execute the direct wrapper's real credential block without importing images.
+_run_airgap_credential_guard() (
+  local root_user="$1" root_password="$2"
+  err() { exit 1; }
+  yq() {
+    case "${2:-}" in
+      *rootUser*) printf '%s\n' "${root_user}" ;;
+      *rootPassword*) printf '%s\n' "${root_password}" ;;
+    esac
+  }
+  eval "$(awk '/^  # Same object-store credential rules/{guard=1} guard && /^  import_bundled_images$/{exit} guard{print}' "${AIRGAP_INSTALL_SCRIPT}")"
+)
+assert_rc "direct air-gap guard still rejects the factory pair" 1 \
+  _run_airgap_credential_guard minioadmin minioadmin
+for predictable_secret in "${PREDICTABLE_OBJECT_STORE_SECRETS[@]}"; do
+  assert_rc "direct air-gap guard rejects predictable secret ${predictable_secret}" 1 \
+    _run_airgap_credential_guard access-key "${predictable_secret}"
+done
+for familiar_identifier in "${FAMILIAR_OBJECT_STORE_IDENTIFIERS[@]}"; do
+  assert_rc "direct air-gap guard accepts identifier ${familiar_identifier} with a unique secret" 0 \
+    _run_airgap_credential_guard "${familiar_identifier}" "unique-not-a-default"
+done
+for near_match_secret in "${NEAR_MATCH_OBJECT_STORE_SECRETS[@]}"; do
+  assert_rc "direct air-gap guard accepts longer secret ${near_match_secret}" 0 \
+    _run_airgap_credential_guard access-key "${near_match_secret}"
+done
+
+# Execute each real helper prefix, ending before any external operation.
+_run_upload_credential_guard() (
+  local helper="$1" access_key="$2" secret_key="$3" mode="${4:-generic}"
+  unset OBJECT_STORE_ACCESS_KEY OBJECT_STORE_SECRET_KEY MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+  unset MINIO_ACCESS_KEY MINIO_SECRET_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY
+  if [[ "${mode}" == "legacy" ]]; then
+    MINIO_ROOT_USER="${access_key}"; MINIO_ROOT_PASSWORD="${secret_key}"
+    SEAWEEDFS_ACCESS_KEY="${access_key}"; SEAWEEDFS_SECRET_KEY="${secret_key}"
+  else
+    OBJECT_STORE_ACCESS_KEY="${access_key}"; OBJECT_STORE_SECRET_KEY="${secret_key}"
+    MINIO_ROOT_USER="legacy-key"; MINIO_ROOT_PASSWORD="MinioAdmin"
+    SEAWEEDFS_ACCESS_KEY="legacy-key"; SEAWEEDFS_SECRET_KEY="SeaweedFS"
+  fi
+  eval "$(awk '/^# Internal use|^# Bucket list/{exit} {print}' "${SCRIPT_DIR}/../artifacts_download_upload_scripts/${helper}")"
+)
+for upload_helper in upload_to_minio.sh upload_to_seaweedfs_upload_only.sh; do
+  assert_rc "${upload_helper} rejects the existing factory pair" 1 \
+    _run_upload_credential_guard "${upload_helper}" minioadmin minioadmin
+  assert_rc "${upload_helper} rejects seaweedfs as identifier and secret" 1 \
+    _run_upload_credential_guard "${upload_helper}" seaweedfs seaweedfs
+  for predictable_secret in "${PREDICTABLE_OBJECT_STORE_SECRETS[@]}"; do
+    assert_rc "${upload_helper} rejects secret ${predictable_secret} with a different identifier" 1 \
+      _run_upload_credential_guard "${upload_helper}" access-key "${predictable_secret}"
+  done
+  for predictable_secret in MinioAdmin SeaweedFS; do
+    assert_rc "${upload_helper} rejects secret ${predictable_secret} through legacy aliases" 1 \
+      _run_upload_credential_guard "${upload_helper}" access-key "${predictable_secret}" legacy
+  done
+  for familiar_identifier in "${FAMILIAR_OBJECT_STORE_IDENTIFIERS[@]}"; do
+    assert_rc "${upload_helper} accepts identifier ${familiar_identifier} and generic-secret precedence" 0 \
+      _run_upload_credential_guard "${upload_helper}" "${familiar_identifier}" "unique-not-a-default"
+    assert_rc "${upload_helper} accepts identifier ${familiar_identifier} through legacy aliases" 0 \
+      _run_upload_credential_guard "${upload_helper}" "${familiar_identifier}" "unique-not-a-default" legacy
+  done
+  for near_match_secret in "${NEAR_MATCH_OBJECT_STORE_SECRETS[@]}"; do
+    assert_rc "${upload_helper} accepts longer secret ${near_match_secret}" 0 \
+      _run_upload_credential_guard "${upload_helper}" access-key "${near_match_secret}"
+  done
+done
 assert_eq "air-gap delegation runs the credential gate before any cluster change" "true" \
   "$(awk '/^delegate_airgap_install_if_needed\(\)/,/^}/' "${SCRIPT}" | awk '/require_object_store_credentials/{g=NR} /configure_openshift_insecure_endpoints/{c=NR} END{print (g && c && g < c) ? "true" : "false"}')"
 assert_eq "install runs the credential gate before any cluster change" "true" \
   "$(awk '/^main_install\(\)/,/^}/' "${SCRIPT}" | awk '/require_object_store_credentials/{g=NR} /configure_openshift_insecure_endpoints/{c=NR} END{print (g && c && g < c) ? "true" : "false"}')"
 assert_eq "air-gap install checks credentials before importing images" "true" \
-  "$(awk '/factory-default credentials/{g=NR} /^  import_bundled_images$/{if(!i)i=NR} END{print (g && i && g < i) ? "true" : "false"}' "${AIRGAP_INSTALL_SCRIPT}")"
+  "$(awk '/^  # Same object-store credential rules/{g=NR} /^  import_bundled_images$/{if(!i)i=NR} END{print (g && i && g < i) ? "true" : "false"}' "${AIRGAP_INSTALL_SCRIPT}")"
 
 clean_output=$(
   warn() { printf 'warning:%s\n' "$*"; }

@@ -461,12 +461,16 @@ cluster change when:
 |---|---|---|
 | A value is empty | `storage.objectStore.auth.rootUser and rootPassword are required` | `storage.objectStore.auth.rootUser is not set` (or `rootPassword`) |
 | A value is still template text (`<...>` or `CHANGEME`) | `objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME)` | `storage.objectStore.auth.rootUser is not set` (or `rootPassword`) |
-| The pair is the MinIO/SeaweedFS factory default `minioadmin`/`minioadmin` | `objectStore.auth uses the factory-default credentials (minioadmin/minioadmin)` | same |
+| The secret key is `minioadmin` or `seaweedfs` in any letter case, regardless of the access key | `objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive)` | same |
 
-A familiar username such as `minioadmin` is accepted with a unique password.
+A familiar access-key identifier such as `minioadmin` or `seaweedfs` is accepted
+with a unique secret. Both known predictable secrets are rejected regardless of
+the identifier. `seaweedfs` is rejected as a predictable secret, not
+identified as a SeaweedFS vendor default. This check does not replace choosing
+a strong, unpredictable secret and configuring it on the object store.
 When run directly, `upload_to_minio.sh` and `upload_to_seaweedfs_upload_only.sh`
 require `OBJECT_STORE_ACCESS_KEY` and `OBJECT_STORE_SECRET_KEY` and also reject
-the factory-default pair.
+both predictable secrets, case-insensitively.
 
 ### Splunk issuers
 

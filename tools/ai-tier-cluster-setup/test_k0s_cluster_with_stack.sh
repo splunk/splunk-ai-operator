@@ -270,8 +270,35 @@ assert_rc "accepts real credentials (returns 1)" 1 \
 assert_rc "detects the minioadmin/minioadmin factory pair" 0 \
   bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER='minioadmin' MINIO_ROOT_PASSWORD='minioadmin' object_store_auth_is_factory_default"
 
-assert_rc "accepts username minioadmin with a unique password (returns 1)" 1 \
-  bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER='minioadmin' MINIO_ROOT_PASSWORD='s3cr3t!' object_store_auth_is_factory_default"
+for predictable_secret in minioadmin MinIOAdmin MINIOADMIN mInIoAdMiN seaweedfs SeaweedFS SEAWEEDFS sEaWeEdFs; do
+  assert_rc "rejects predictable secret ${predictable_secret} with a different identifier" 0 \
+    bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER=\"\$1\" MINIO_ROOT_PASSWORD=\"\$2\" object_store_auth_is_factory_default" \
+      _factory_default_test 'fixture-access-key' "${predictable_secret}"
+done
+assert_rc "rejects seaweedfs as both identifier and secret" 0 \
+  bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER='seaweedfs' MINIO_ROOT_PASSWORD='seaweedfs' object_store_auth_is_factory_default"
+
+for identifier in minioadmin MiNiOaDmIn seaweedfs SeAwEeDfS; do
+  assert_rc "accepts identifier ${identifier} with a unique secret (returns 1)" 1 \
+    bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER=\"\$1\" MINIO_ROOT_PASSWORD=\"\$2\" object_store_auth_is_factory_default" \
+      _factory_default_test "${identifier}" 'Fixture-Unique-Secret-42!'
+done
+
+for near_match in minioadmin-unique unique-MINIOADMIN unique-MiNiOaDmIn-suffix \
+  seaweedfs-unique unique-SEAWEEDFS unique-SeAwEeDfS-suffix \
+  ' minioadmin' 'MINIOADMIN ' ' seaweedfs' 'SEAWEEDFS '; do
+  assert_rc "requires a complete secret match: '${near_match}' (returns 1)" 1 \
+    bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER=\"\$1\" MINIO_ROOT_PASSWORD=\"\$2\" object_store_auth_is_factory_default" \
+      _factory_default_test 'fixture-access-key' "${near_match}"
+done
+
+for secret in MiNiOaDmIn SeAwEeDfS Fixture-MiXeD-Secret-42!; do
+  expected_factory_rc=0
+  [[ "${secret}" == 'Fixture-MiXeD-Secret-42!' ]] && expected_factory_rc=1
+  assert_rc "does not rewrite identifier or secret: ${secret}" 0 \
+    bash -c "$(declare -f object_store_auth_is_factory_default); MINIO_ROOT_USER=\"\$1\"; MINIO_ROOT_PASSWORD=\"\$2\"; object_store_auth_is_factory_default; rc=\$?; [[ \$rc == \$3 && \$MINIO_ROOT_USER == \"\$1\" && \$MINIO_ROOT_PASSWORD == \"\$2\" ]]" \
+      _factory_default_test 'Fixture-MiXeD-Access-Key' "${secret}" "${expected_factory_rc}"
+done
 
 # ── Tests: model artifact config selection ───────────────────────────────────
 

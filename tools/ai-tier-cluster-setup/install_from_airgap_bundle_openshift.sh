@@ -308,8 +308,9 @@ if [[ "${SUBCOMMAND}" == "install" ]]; then
     *\<*|*\>*|*CHANGEME*|*changeme*)
       err "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace them in ${CONFIG_FILE}" ;;
   esac
-  [[ "${obj_user}" == "minioadmin" && "${obj_pass}" == "minioadmin" ]] \
-    && err "objectStore.auth uses the factory-default credentials (minioadmin/minioadmin). Configure unique object-store credentials in ${CONFIG_FILE}"
+  [[ "${obj_pass}" == [mM][iI][nN][iI][oO][aA][dD][mM][iI][nN] ||
+     "${obj_pass}" == [sS][eE][aA][wW][eE][eE][dD][fF][sS] ]] \
+    && err "objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive). Configure unique object-store credentials in ${CONFIG_FILE}"
   unset obj_user obj_pass
   import_bundled_images
   export AIRGAP_NFD_CATALOG_SOURCE="${MIRRORED_NFD_CATALOG_SOURCE}"

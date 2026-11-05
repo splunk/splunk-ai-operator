@@ -21,8 +21,9 @@ if [[ -z "$OBJECT_STORE_ACCESS_KEY" || -z "$OBJECT_STORE_SECRET_KEY" ]]; then
   echo "Set OBJECT_STORE_ACCESS_KEY and OBJECT_STORE_SECRET_KEY (or SEAWEEDFS_ACCESS_KEY and SEAWEEDFS_SECRET_KEY)."
   exit 1
 fi
-if [[ "$OBJECT_STORE_ACCESS_KEY" == "minioadmin" && "$OBJECT_STORE_SECRET_KEY" == "minioadmin" ]]; then
-  echo "Error: refusing to use factory-default credentials (minioadmin/minioadmin)."
+if [[ "$OBJECT_STORE_SECRET_KEY" == [mM][iI][nN][iI][oO][aA][dD][mM][iI][nN] ||
+     "$OBJECT_STORE_SECRET_KEY" == [sS][eE][aA][wW][eE][eE][dD][fF][sS] ]]; then
+  echo "Error: refusing factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive)."
   echo "Configure SeaweedFS S3 with unique credentials and pass them via OBJECT_STORE_ACCESS_KEY/OBJECT_STORE_SECRET_KEY."
   exit 1
 fi

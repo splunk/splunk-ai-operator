@@ -1116,10 +1116,11 @@ object_store_auth_looks_like_placeholder() {
   return 1
 }
 
-# True if objectStore.auth is the MinIO/SeaweedFS factory-default pair, which the
-# shared upload helpers refuse. A familiar username alone is allowed.
+# Reject known predictable secrets (any casing), matching the shared upload helpers.
+# A familiar access-key identifier with a unique secret is allowed.
 object_store_auth_is_factory_default() {
-  [[ "${MINIO_ROOT_USER}" == "minioadmin" && "${MINIO_ROOT_PASSWORD}" == "minioadmin" ]]
+  [[ "${MINIO_ROOT_PASSWORD}" == [mM][iI][nN][iI][oO][aA][dD][mM][iI][nN] ||
+     "${MINIO_ROOT_PASSWORD}" == [sS][eE][aA][wW][eE][eE][dD][fF][sS] ]]
 }
 
 # ====== PREFLIGHT CHECKS ======
@@ -1227,7 +1228,7 @@ preflight_checks() {
     pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace with a real access key and secret in your config (keep secrets in a Git-ignored file such as tools/ai-tier-cluster-setup/k0s-config.local.yaml)."
   fi
   if object_store_auth_is_factory_default; then
-    pf_fail "objectStore.auth uses the factory-default credentials (minioadmin/minioadmin). Configure unique object-store credentials in ${CONFIG_FILE}"
+    pf_fail "objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive). Configure unique object-store credentials in ${CONFIG_FILE}"
   fi
   # Reject STS temporary credentials early — the minio-credentials Secret schema
   # has no AWS_SESSION_TOKEN field, so ASIA* keys silently fail at SAIA startup
@@ -3181,14 +3182,14 @@ stage_model_artifacts() {
     return 1
   fi
   # The MinIO/SeaweedFS upload helpers require credentials and refuse the
-  # factory pair; fail here, before the Hugging Face download.
+  # known predictable secrets; fail before the Hugging Face download.
   if [[ "${OBJ_STORE_TYPE}" != "aws" ]]; then
     if [[ -z "${MINIO_ROOT_USER}" || -z "${MINIO_ROOT_PASSWORD}" ]]; then
       err "Refusing to stage artifacts: objectStore.auth.rootUser and rootPassword are required for ${OBJ_STORE_TYPE}; fix ${CONFIG_FILE}"
       return 1
     fi
     if object_store_auth_is_factory_default; then
-      err "Refusing to stage artifacts: objectStore.auth uses the factory-default credentials (minioadmin/minioadmin); fix ${CONFIG_FILE}"
+      err "Refusing to stage artifacts: objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive); fix ${CONFIG_FILE}"
       return 1
     fi
   fi

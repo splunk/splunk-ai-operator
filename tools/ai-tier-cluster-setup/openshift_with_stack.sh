@@ -687,10 +687,11 @@ object_store_auth_looks_like_placeholder() {
   return 1
 }
 
-# True if objectStore.auth is a known factory-default pair. A familiar
-# username alone is allowed; only the published default pair is rejected.
+# Reject known predictable secrets (any casing), regardless of the access-key identifier.
+# A familiar access-key identifier with a unique secret is allowed.
 object_store_auth_is_factory_default() {
-  [[ "${MINIO_ROOT_USER}" == "minioadmin" && "${MINIO_ROOT_PASSWORD}" == "minioadmin" ]]
+  [[ "${MINIO_ROOT_PASSWORD}" == [mM][iI][nN][iI][oO][aA][dD][mM][iI][nN] ||
+     "${MINIO_ROOT_PASSWORD}" == [sS][eE][aA][wW][eE][eE][dD][fF][sS] ]]
 }
 
 # Runs right after load_config so bad credentials fail before any cluster change.
@@ -702,7 +703,7 @@ require_object_store_credentials() {
     return 1
   fi
   if object_store_auth_is_factory_default; then
-    err "objectStore.auth uses the factory-default credentials (minioadmin/minioadmin). Configure unique object-store credentials in ${CONFIG_FILE}"
+    err "objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive). Configure unique object-store credentials in ${CONFIG_FILE}"
     return 1
   fi
 }
@@ -4520,7 +4521,7 @@ validate_config() {
   _vcheck "storage.objectStore.auth.rootUser" "${MINIO_ROOT_USER}"
   _vcheck "storage.objectStore.auth.rootPassword" "${MINIO_ROOT_PASSWORD}"
   if object_store_auth_is_factory_default; then
-    echo -e "  \033[1;31m✖\033[0m storage.objectStore.auth uses the factory-default credentials (minioadmin/minioadmin)  →  configure unique object-store credentials" >&2
+    echo -e "  \033[1;31m✖\033[0m storage.objectStore.auth uses factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive)  →  configure unique object-store credentials" >&2
     errors=$((errors + 1))
   fi
 
