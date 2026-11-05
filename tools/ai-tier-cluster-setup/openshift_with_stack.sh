@@ -264,6 +264,33 @@ resolve_accelerator_type() {
   log "Accelerator type: ${DEFAULT_ACCELERATOR}"
 }
 
+# ====== BUNDLED SPLUNK CONFIGURATION ======
+bundled_splunk_enabled() {
+  [[ "${SPLUNK_ENABLED:-true}" == "true" ]]
+}
+
+# Ownership follows the exact Standalone identity if standaloneName changes.
+splunk_standalone_component() {
+  printf 'splunk_standalone_%s' "$(printf '%s' "${AI_STANDALONE_NAME}" | tr -c 'a-zA-Z0-9._-' '_')"
+}
+
+# Existing configurations install bundled Splunk unless explicitly disabled.
+# Check the YAML type so quoted strings and explicit null cannot silently opt in.
+load_splunk_config() {
+  local present value value_tag
+  present=$(yq eval '(.splunk // {}) | has("enabled")' "${CONFIG_FILE}") || return 1
+  SPLUNK_ENABLED=true
+  if [[ "${present}" == "true" ]]; then
+    value=$(yq eval '.splunk.enabled' "${CONFIG_FILE}") || return 1
+    value_tag=$(yq eval '.splunk.enabled | tag' "${CONFIG_FILE}") || return 1
+    if [[ "${value_tag}" != "!!bool" || ( "${value}" != "true" && "${value}" != "false" ) ]]; then
+      err "splunk.enabled must be a YAML boolean (true or false)"
+      return 1
+    fi
+    SPLUNK_ENABLED="${value}"
+  fi
+}
+
 # ====== SHOW INSTALL PLAN ======
 show_install_plan() {
   echo -e "\n\033[1;34m╔══════════════════════════════════════════════════════════╗\033[0m" >&2
@@ -281,6 +308,7 @@ show_install_plan() {
   echo -e "  \033[1mImage registry   :\033[0m ${IMAGE_REGISTRY:-<none>}" >&2
   echo -e "  \033[1mECR enabled      :\033[0m ${ECR_ENABLED}" >&2
   echo -e "  \033[1mAir-gap mode     :\033[0m ${AIRGAP_MODE:-false}" >&2
+  echo -e "  \033[1mBundled Splunk   :\033[0m ${SPLUNK_ENABLED:-true}" >&2
   echo "" >&2
   echo -e "  \033[1mObject store     :\033[0m type=${OBJ_STORE_TYPE}  bucket=${OBJ_STORE_BUCKET:-<unset>}" >&2
   echo -e "  \033[1mObject endpoint  :\033[0m ${OBJ_STORE_ENDPOINT:-<default>}" >&2
@@ -303,8 +331,13 @@ show_install_plan() {
   echo -e "    8.  KubeRay Operator (Helm)" >&2
   echo -e "    9.  Image pull secrets (ECR / DockerHub / GCR / ACR / custom)" >&2
   echo -e "    10. Splunk AI Operator" >&2
-  echo -e "    11. Splunk Operator" >&2
-  echo -e "    12. Splunk Standalone CR" >&2
+  if bundled_splunk_enabled; then
+    echo -e "    11. Splunk Operator" >&2
+    echo -e "    12. Splunk Standalone CR" >&2
+  else
+    echo -e "    11. Splunk Operator [SKIPPED — splunk.enabled=false]" >&2
+    echo -e "    12. Splunk Standalone CR [SKIPPED — splunk.enabled=false]" >&2
+  fi
   echo -e "    13. AIPlatform CR" >&2
   echo "" >&2
 
@@ -409,6 +442,7 @@ ${yq_err}"
   MINIO_ROOT_USER=$(yq eval '.storage.objectStore.auth.rootUser // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   MINIO_ROOT_PASSWORD=$(yq eval '.storage.objectStore.auth.rootPassword // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   AI_STANDALONE_NAME=$(yq eval '.splunk.standaloneName // "splunk-standalone"' "${CONFIG_FILE}" 2>/dev/null || echo "splunk-standalone")
+  load_splunk_config || return 1
 
   # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
   local _yaml_airgap
@@ -778,12 +812,13 @@ warn_on_mutable_image_tags() {
     "images.saia.apiV2Image:${SAIA_API_V2_IMAGE:-}"
     "images.saia.dataLoaderImage:${SAIA_DATALOADER_IMAGE:-}"
     "images.slim.apiImage:${SLIM_API_IMAGE:-}"
-    "images.splunk.image:${SPLUNK_IMAGE:-}"
-    "images.splunk.operatorImage:${SPLUNK_OPERATOR_IMAGE:-}"
     "images.fluentBit.image:${FLUENT_BIT_IMAGE:-}"
     "images.nginx.image:${NGINX_IMAGE:-}"
     "images.otelCollector.image:${OTEL_COLLECTOR_IMAGE:-}"
   )
+  if bundled_splunk_enabled; then
+    mutable_tag_images+=("images.splunk.image:${SPLUNK_IMAGE:-}" "images.splunk.operatorImage:${SPLUNK_OPERATOR_IMAGE:-}")
+  fi
 
   local entry key image last_segment tag
   for entry in "${mutable_tag_images[@]}"; do
@@ -825,7 +860,10 @@ validate_image_config() {
     [[ -z "$SLIM_API_IMAGE" || "$SLIM_API_IMAGE" == "null" ]] && \
       err "REQUIRED: images.slim.apiImage must be set in config when the 'slim' feature is enabled"
   fi
-  [[ -z "$SPLUNK_IMAGE"          || "$SPLUNK_IMAGE"          == "null" ]] && err "REQUIRED: images.splunk.image must be set in config"
+  if bundled_splunk_enabled; then
+    [[ -z "${SPLUNK_IMAGE:-}" || "${SPLUNK_IMAGE}" == "null" ]] && err "REQUIRED: images.splunk.image must be set in config when splunk.enabled is true"
+    [[ -z "${SPLUNK_OPERATOR_IMAGE:-}" || "${SPLUNK_OPERATOR_IMAGE}" == "null" ]] && err "REQUIRED: images.splunk.operatorImage must be set in config when splunk.enabled is true"
+  fi
   [[ -z "$MODEL_VERSION"         || "$MODEL_VERSION"         == "null" ]] && { MODEL_VERSION="v0.3.14-36-g1549f5a"; log "Using default MODEL_VERSION: $MODEL_VERSION"; }
   warn_on_mutable_image_tags
   log "✓ Image configuration validated"
@@ -848,7 +886,7 @@ configure_images() {
   TMP_FILES+=("$ai_rendered")
   SPLUNK_AI_FILE="$ai_rendered"
 
-  if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
+  if bundled_splunk_enabled && [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
     operator_rendered=$(mktemp) || err "failed to create temp manifest"
     cp "${SPLUNK_OPERATOR_FILE}" "$operator_rendered"
     TMP_FILES+=("$operator_rendered")
@@ -912,7 +950,7 @@ configure_images() {
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|"                 "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "s|image: .*splunk.*ai.*operator.*|image: ${operator_esc}|I"                             "$SPLUNK_AI_FILE"
 
-  if [[ -f "${SPLUNK_OPERATOR_FILE}" && -n "${SPLUNK_OPERATOR_IMAGE:-}" && "${SPLUNK_OPERATOR_IMAGE}" != "null" ]]; then
+  if bundled_splunk_enabled && [[ -f "${SPLUNK_OPERATOR_FILE}" && -n "${SPLUNK_OPERATOR_IMAGE:-}" && "${SPLUNK_OPERATOR_IMAGE}" != "null" ]]; then
     local splunk_op_full splunk_op_esc
     splunk_op_full=$(build_image_url "$IMAGE_REGISTRY" "$SPLUNK_OPERATOR_IMAGE")
     splunk_op_esc=$(echo "$splunk_op_full" | sed 's/[\/&]/\\&/g')
@@ -942,7 +980,9 @@ configure_images() {
   # Patch splunk-operator-cluster.yaml with images from config.
   # Without this, the Splunk Operator pod and all Splunk Standalone pods use the
   # account-specific ECR URLs baked into the committed manifest file.
-  if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
+  if ! bundled_splunk_enabled; then
+    log "Bundled Splunk disabled — skipping Splunk Operator manifest rewrite"
+  elif [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
     log "Patching image references in ${SPLUNK_OPERATOR_FILE}..."
     # SPLUNK_OPERATOR_FILE already points at the rendered temp from the first
     # block; patch it in place (no backup/restore needed).
@@ -1339,7 +1379,9 @@ preflight_check_registry() {
 
   local probe_ref=""
   local probe_source=""
-  for _candidate_var in SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE SLIM_API_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE OPERATOR_IMAGE; do
+  local registry_candidates=(SAIA_API_IMAGE RAY_HEAD_IMAGE SAIA_API_V2_IMAGE SAIA_DATALOADER_IMAGE SLIM_API_IMAGE RAY_WORKER_IMAGE WEAVIATE_IMAGE FLUENT_BIT_IMAGE OTEL_COLLECTOR_IMAGE NGINX_IMAGE OPERATOR_IMAGE)
+  bundled_splunk_enabled && registry_candidates+=(SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE)
+  for _candidate_var in "${registry_candidates[@]}"; do
     local _val="${!_candidate_var:-}"
     local _ref
     if _ref=$(_image_targets_registry "${_val}"); then
@@ -1540,7 +1582,9 @@ preflight_checks() {
   fi
 
   [[ -f "${SPLUNK_AI_FILE}" ]] && pf_ok "Manifest: ${SPLUNK_AI_FILE}" || pf_fail "Manifest not found: ${SPLUNK_AI_FILE}"
-  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Manifest: ${SPLUNK_OPERATOR_FILE}" || pf_fail "Manifest not found: ${SPLUNK_OPERATOR_FILE}"
+  if bundled_splunk_enabled; then
+    [[ -f "${SPLUNK_OPERATOR_FILE}" ]] && pf_ok "Manifest: ${SPLUNK_OPERATOR_FILE}" || pf_fail "Manifest not found: ${SPLUNK_OPERATOR_FILE}"
+  fi
 
   if object_store_auth_looks_like_placeholder; then
     pf_fail "objectStore.auth still contains template placeholders (e.g. <...> or CHANGEME). Replace them in ${CONFIG_FILE}"
@@ -1795,9 +1839,11 @@ grant_privileged_scc() {
   ensure_owned_scc_group anyuid "system:serviceaccounts:${AI_NS}" scc_anyuid_ai_namespace
   ensure_owned_scc_group privileged "system:serviceaccounts:${AI_NS}" scc_privileged_ai_namespace
   # Splunk Operator pod adds NET_BIND_SERVICE capability which anyuid blocks; needs privileged.
-  ensure_owned_scc_group privileged "system:serviceaccounts:splunk-operator" scc_privileged_splunk_operator
+  if bundled_splunk_enabled; then
+    ensure_owned_scc_group privileged "system:serviceaccounts:splunk-operator" scc_privileged_splunk_operator
+  fi
 
-  log "  ✓ anyuid + privileged SCC granted to all SAs in ${AI_NS} and splunk-operator"
+  log "  ✓ AI workload SCC grants configured"
 }
 
 # ====== INSTALL NFD (Node Feature Discovery) via OLM ======
@@ -2604,6 +2650,10 @@ install_splunk_ai_operator() {
 
 # ====== INSTALL SPLUNK OPERATOR ======
 install_splunk_operator() {
+  if ! bundled_splunk_enabled; then
+    log "Bundled Splunk disabled — skipping Splunk Operator install"
+    return 0
+  fi
   log "Installing Splunk Operator..."
 
   [[ -f "${SPLUNK_OPERATOR_FILE}" ]] || err "Splunk operator manifest not found: ${SPLUNK_OPERATOR_FILE}"
@@ -2842,21 +2892,8 @@ data:
 YAML
 }
 
-# ====== INSTALL SPLUNK STANDALONE ======
-install_splunk_standalone() {
-  log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
-
-  ensure_namespace "${AI_NS}"
-  wait_for_crd standalones.enterprise.splunk.com 600
-
-  # Wait for object store endpoint to be reachable before creating credentials secret
-  if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
-    wait_for_dependency \
-      "object store (${OBJ_STORE_TYPE}) at ${OBJ_STORE_ENDPOINT}" \
-      "curl -sL --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' '${OBJ_STORE_ENDPOINT}' 2>/dev/null | grep -qE '^[0-9]'" \
-      300
-  fi
-
+# Object storage is required by AI workloads even when bundled Splunk is off.
+ensure_object_store_credentials_secret() {
   # Object storage credentials secret
   oc -n "${AI_NS}" create secret generic minio-credentials \
     --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
@@ -2866,6 +2903,30 @@ install_splunk_standalone() {
     --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
     --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
     --dry-run=client -o yaml | oc -n "${AI_NS}" apply -f -
+}
+
+# ====== INSTALL SPLUNK STANDALONE ======
+install_splunk_standalone() {
+  if ! bundled_splunk_enabled; then
+    log "Bundled Splunk disabled — skipping Splunk Standalone install"
+    return 0
+  fi
+  log "Installing Splunk Standalone: ${AI_STANDALONE_NAME} in ${AI_NS}..."
+
+  ensure_namespace "${AI_NS}"
+  wait_for_crd standalones.enterprise.splunk.com 600
+  local standalone_existed=false
+  oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" &>/dev/null && standalone_existed=true
+
+  # Wait for object store endpoint to be reachable before creating credentials secret
+  if [[ -n "${OBJ_STORE_ENDPOINT}" ]]; then
+    wait_for_dependency \
+      "object store (${OBJ_STORE_TYPE}) at ${OBJ_STORE_ENDPOINT}" \
+      "curl -sL --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' '${OBJ_STORE_ENDPOINT}' 2>/dev/null | grep -qE '^[0-9]'" \
+      300
+  fi
+
+  ensure_object_store_credentials_secret
 
   # Derive S3 endpoint for Splunk appRepo (endpoint is required by the Splunk Operator)
   local minio_endpoint="${OBJ_STORE_ENDPOINT}" cluster_local_object_endpoint="" splunk_app_repo_provider="aws"
@@ -2889,7 +2950,11 @@ install_splunk_standalone() {
 
   # This issuer becomes the JWT "iss" claim and must match
   # AIPlatform.spec.splunkConfiguration.endpoint exactly.
-  render_splunk_defaults_manifest | oc -n "${AI_NS}" apply -f -
+  local defaults_existed=false
+  oc get configmap splunk-defaults -n "${AI_NS}" &>/dev/null && defaults_existed=true
+  render_splunk_defaults_manifest | oc -n "${AI_NS}" apply -f - \
+    || { err "Splunk defaults manifest apply failed"; return 1; }
+  [[ "${defaults_existed}" == "true" ]] || record_owned_component splunk_defaults
 
   # Preserve customer/operator-provided environment entries while explicitly
   # converging management traffic to native HTTPS. This also repairs PVC-backed
@@ -2907,7 +2972,7 @@ install_splunk_standalone() {
     splunk_storage_yaml="  etcVolumeStorageConfig:"$'\n'"    storageClassName: ${STORAGE_CLASS}"$'\n'"  varVolumeStorageConfig:"$'\n'"    storageClassName: ${STORAGE_CLASS}"$'\n'
   fi
 
-  oc apply --server-side --force-conflicts -f - <<YAML
+  oc apply --server-side --force-conflicts -f - <<YAML || { err "Splunk Standalone manifest apply failed"; return 1; }
 apiVersion: enterprise.splunk.com/v4
 kind: Standalone
 metadata:
@@ -2954,17 +3019,38 @@ ${splunk_storage_yaml}
         secretRef: minio-credentials
 YAML
 
+  [[ "${standalone_existed}" == "true" ]] || record_owned_component "$(splunk_standalone_component)"
   log "  ✓ Splunk Standalone CR applied"
   wait_for_internal_splunk_ready 1200
+}
+
+# Disabled bundled Splunk can still accept external JWT issuers. Its manifest
+# deliberately omits internal service URLs and HEC credentials in that mode.
+render_splunk_configuration() {
+  if ! bundled_splunk_enabled; then
+    if [[ -n "${trusted_issuers_yaml:-}" ]]; then
+      printf '  splunkConfiguration:\n%s\n' "${trusted_issuers_yaml}"
+    fi
+    return 0
+  fi
+  local internal_splunk_url internal_splunk_hec_url_value
+  internal_splunk_url="$(internal_splunk_management_url)"
+  internal_splunk_hec_url_value="$(internal_splunk_hec_url)"
+  cat <<YAML
+  splunkConfiguration:
+    endpoint: ${internal_splunk_url}
+    hecEndpoint: ${internal_splunk_hec_url_value}
+    secretRef:
+      name: ${splunk_ns_secret}
+      namespace: ${AI_NS}
+${trusted_issuers_yaml:-}
+YAML
 }
 
 # render_ai_platform_manifest prints only the AIPlatform resource. Keeping the
 # renderer side-effect free makes the exact manifest testable without an
 # OpenShift cluster.
 render_ai_platform_manifest() {
-  local internal_splunk_url internal_splunk_hec_url_value
-  internal_splunk_url="$(internal_splunk_management_url)"
-  internal_splunk_hec_url_value="$(internal_splunk_hec_url)"
   cat <<YAML
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
@@ -2991,13 +3077,7 @@ ${svc_template_yaml}${storage_yaml}
   gpuScheduler:
     nodeSelector:
       splunk.ai/ai-tier-node: "true"
-  splunkConfiguration:
-    endpoint: ${internal_splunk_url}
-    hecEndpoint: ${internal_splunk_hec_url_value}
-    secretRef:
-      name: ${splunk_ns_secret}
-      namespace: ${AI_NS}
-${trusted_issuers_yaml:-}
+$(render_splunk_configuration)
 YAML
 }
 
@@ -3006,10 +3086,13 @@ install_ai_platform_cr() {
   log "Installing AIPlatform CR: ${AI_PLATFORM_NAME}..."
 
   ensure_namespace "${AI_NS}"
+  ensure_object_store_credentials_secret
 
-  # Clean up stuck pods from previous runs
-  oc delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
-  oc delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
+  # Keep existing Splunk workloads untouched when bundled Splunk is disabled.
+  if bundled_splunk_enabled; then
+    oc delete jobs -n "${AI_NS}" --field-selector status.successful=0 --wait=false 2>/dev/null || true
+    oc delete pods -n "${AI_NS}" --field-selector status.phase=Failed --wait=false 2>/dev/null || true
+  fi
 
   # Build imagePullSecrets block — include every docker-registry secret that
   # exists in the namespace, covering ECR, DockerHub, GCR, ACR, and custom
@@ -3076,46 +3159,51 @@ install_ai_platform_cr() {
   # The operator looks up splunk-<namespace>-secret for the HEC token.
   # Extract it from the Splunk standalone secret created by the Splunk Operator.
   local splunk_ns_secret="splunk-${AI_NS}-secret"
-  local standalone_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
-  log "  Waiting for Splunk standalone secret ${standalone_secret}..."
-  local retries=0
-  while (( retries < 60 )); do
-    if oc get secret "${standalone_secret}" -n "${AI_NS}" &>/dev/null; then
-      local hec_token
-      hec_token=$(oc get secret "${standalone_secret}" -n "${AI_NS}" \
-        -o jsonpath='{.data.hec_token}' 2>/dev/null || echo "")
-      if [[ -n "${hec_token}" ]]; then
-        oc -n "${AI_NS}" create secret generic "${splunk_ns_secret}" \
-          --from-literal=hec_token="$(echo "${hec_token}" | base64 -d)" \
-          --dry-run=client -o yaml | oc apply -f -
-        log "  ✓ ${splunk_ns_secret} created"
-        break
+  if bundled_splunk_enabled; then
+    local standalone_secret="splunk-${AI_STANDALONE_NAME}-standalone-secret-v1"
+    log "  Waiting for Splunk standalone secret ${standalone_secret}..."
+    local retries=0
+    while (( retries < 60 )); do
+      if oc get secret "${standalone_secret}" -n "${AI_NS}" &>/dev/null; then
+        local hec_token
+        hec_token=$(oc get secret "${standalone_secret}" -n "${AI_NS}" \
+          -o jsonpath='{.data.hec_token}' 2>/dev/null || echo "")
+        if [[ -n "${hec_token}" ]]; then
+          local hec_secret_existed=false
+          oc get secret "${splunk_ns_secret}" -n "${AI_NS}" &>/dev/null && hec_secret_existed=true
+          oc -n "${AI_NS}" create secret generic "${splunk_ns_secret}" \
+            --from-literal=hec_token="$(echo "${hec_token}" | base64 -d)" \
+            --dry-run=client -o yaml | oc apply -f - \
+            || { err "Splunk HEC secret apply failed"; return 1; }
+          [[ "${hec_secret_existed}" == "true" ]] || record_owned_component splunk_hec_secret
+          log "  ✓ ${splunk_ns_secret} created"
+          break
+        fi
       fi
+      sleep 10
+      retries=$(( retries + 1 ))
+      log "  Waiting for Splunk secret... (${retries}/60)"
+    done
+    if (( retries >= 60 )); then
+      err "Splunk source secret ${standalone_secret} did not contain hec_token after 10 minutes; the derived ${splunk_ns_secret} Secret cannot be created automatically later."
     fi
-    sleep 10
-    retries=$(( retries + 1 ))
-    log "  Waiting for Splunk secret... (${retries}/60)"
-  done
-  if (( retries >= 60 )); then
-    err "Splunk source secret ${standalone_secret} did not contain hec_token after 10 minutes; the derived ${splunk_ns_secret} Secret cannot be created automatically later."
   fi
 
-  # Optional additional JWT issuers. The in-cluster issuer remains first via
-  # splunkConfiguration.endpoint; configured issuers are appended by the
-  # SAIA/SLIM reconcilers. This matches the k0s installer design.
+  # Configured JWT issuers are also supported without bundled Splunk.
   local trusted_issuers_yaml=""
+  local trusted_issuer_values=""
   local trusted_issuers_count
   trusted_issuers_count=$(yq eval '.splunk.trustedIssuers | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
   if [[ "${trusted_issuers_count}" =~ ^[0-9]+$ ]] && (( trusted_issuers_count > 0 )); then
-    trusted_issuers_yaml="    trustedIssuers:"$'\n'
     local trusted_issuer_index=0 trusted_issuer_url
     while (( trusted_issuer_index < trusted_issuers_count )); do
       trusted_issuer_url=$(yq eval ".splunk.trustedIssuers[${trusted_issuer_index}]" "${CONFIG_FILE}" 2>/dev/null || echo "")
       if [[ -n "${trusted_issuer_url}" && "${trusted_issuer_url}" != "null" ]]; then
-        trusted_issuers_yaml+="      - \"${trusted_issuer_url}\""$'\n'
+        trusted_issuer_values+="      - \"${trusted_issuer_url}\""$'\n'
       fi
       trusted_issuer_index=$((trusted_issuer_index + 1))
     done
+    [[ -z "${trusted_issuer_values}" ]] || trusted_issuers_yaml="    trustedIssuers:"$'\n'"${trusted_issuer_values}"
   fi
 
   local storage_yaml=""
@@ -3894,7 +3982,9 @@ main_install() {
   ensure_ecr_pull_secret
   create_image_pull_secrets "${AI_NS}"
   create_image_pull_secrets "splunk-ai-operator-system"
-  create_image_pull_secrets "splunk-operator"
+  if bundled_splunk_enabled; then
+    create_image_pull_secrets "splunk-operator"
+  fi
   step_ok
 
   step_start "Splunk AI Operator"
@@ -3902,14 +3992,22 @@ main_install() {
   step_ok
 
   step_start "Splunk Operator"
-  install_splunk_operator
-  step_ok
+  if bundled_splunk_enabled; then
+    install_splunk_operator
+    step_ok
+  else
+    step_skip "splunk.enabled=false"
+  fi
   phase_end "Operators"
 
   phase_start "AI Platform Stack"
   step_start "Splunk Standalone CR"
-  install_splunk_standalone
-  step_ok
+  if bundled_splunk_enabled; then
+    install_splunk_standalone
+    step_ok
+  else
+    step_skip "splunk.enabled=false"
+  fi
 
   step_start "AIPlatform CR"
   install_ai_platform_cr
@@ -4030,17 +4128,45 @@ main_delete() {
 
   log "Removing AIPlatform CR and waiting for finalizers..."
   oc delete aiplatform "${AI_PLATFORM_NAME}" -n "${AI_NS}" --timeout=120s 2>/dev/null || true
-  oc delete standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=60s 2>/dev/null || true
+  # Preserve legacy cleanup for enabled installs. A disabled configuration may
+  # share this namespace with customer-managed Splunk, so only remove Splunk
+  # resources explicitly recorded by an earlier installer run in that mode.
+  local preserve_splunk_namespace=false
+  if bundled_splunk_enabled || component_is_owned "$(splunk_standalone_component)"; then
+    oc delete standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=60s 2>/dev/null || true
+  elif oc get standalone "${AI_STANDALONE_NAME}" -n "${AI_NS}" &>/dev/null; then
+    log "Preserving pre-existing Splunk Standalone ${AI_STANDALONE_NAME}."
+    preserve_splunk_namespace=true
+  fi
+  if ! bundled_splunk_enabled; then
+    if ! component_is_owned splunk_defaults && oc get configmap splunk-defaults -n "${AI_NS}" &>/dev/null; then
+      preserve_splunk_namespace=true
+    fi
+    if ! component_is_owned splunk_hec_secret && oc get secret "splunk-${AI_NS}-secret" -n "${AI_NS}" &>/dev/null; then
+      preserve_splunk_namespace=true
+    fi
+  fi
 
+  # Even an installer-created namespace must remain when deletion would also
+  # remove unowned Splunk resources retained above.
   # ── 2. AI Platform namespace (only when this installer created it) ──
   local ai_namespace_component="namespace_$(printf '%s' "${AI_NS}" | tr -c 'a-zA-Z0-9._-' '_')"
-  if component_is_owned "${ai_namespace_component}"; then
+  if [[ "${preserve_splunk_namespace}" != "true" ]] && component_is_owned "${ai_namespace_component}"; then
     log "Deleting installer-owned namespace ${AI_NS}..."
     force_delete_namespace "${AI_NS}" 180
   else
-    log "Preserving pre-existing namespace ${AI_NS}; removing installer-created configuration only."
-    oc delete configmap splunk-defaults -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
-    oc delete secret minio-credentials "splunk-${AI_NS}-secret" -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+    log "Preserving namespace ${AI_NS}; removing installer-created configuration only."
+    # Retained Standalones can still reference the defaults ConfigMap and shared
+    # object-store credentials; keep their configuration dependencies together.
+    if [[ "${preserve_splunk_namespace}" != "true" ]]; then
+      if bundled_splunk_enabled || component_is_owned splunk_defaults; then
+        oc delete configmap splunk-defaults -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+      fi
+      if bundled_splunk_enabled || component_is_owned splunk_hec_secret; then
+        oc delete secret "splunk-${AI_NS}-secret" -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+      fi
+      oc delete secret minio-credentials -n "${AI_NS}" --ignore-not-found=true 2>/dev/null || true
+    fi
   fi
 
   # ── 3. Splunk AI Operator ──
@@ -4056,7 +4182,11 @@ main_delete() {
   fi
 
   # ── 4. Splunk Operator ──
-  if component_is_owned splunk_operator_bundle_v2; then
+  # The bundle includes Splunk CRDs: removing it would cascade-delete retained
+  # customer Standalones even when their namespace itself is preserved.
+  if [[ "${preserve_splunk_namespace}" == "true" ]]; then
+    log "Preserving Splunk Operator and CRDs for retained Splunk resources."
+  elif component_is_owned splunk_operator_bundle_v2; then
     log "Removing installer-owned Splunk Operator..."
     if [[ -f "${SPLUNK_OPERATOR_FILE}" ]]; then
       manifest_without_namespaces "${SPLUNK_OPERATOR_FILE}" \
@@ -4151,9 +4281,11 @@ main_delete() {
 
   # ── 12. SCC grants added during install ──
   component_is_owned scc_privileged_ai_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${ai_operator_ns}" 2>/dev/null || true
-  component_is_owned scc_anyuid_ai_namespace && oc adm policy remove-scc-from-group anyuid "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-  component_is_owned scc_privileged_ai_namespace && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-  component_is_owned scc_privileged_splunk_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${splunk_operator_ns}" 2>/dev/null || true
+  if [[ "${preserve_splunk_namespace}" != "true" ]]; then
+    component_is_owned scc_anyuid_ai_namespace && oc adm policy remove-scc-from-group anyuid "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
+    component_is_owned scc_privileged_ai_namespace && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
+    component_is_owned scc_privileged_splunk_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${splunk_operator_ns}" 2>/dev/null || true
+  fi
   component_is_owned scc_anyuid_cert_manager && oc adm policy remove-scc-from-user anyuid -z cert-manager -n cert-manager 2>/dev/null || true
   component_is_owned scc_anyuid_cert_manager_cainjector && oc adm policy remove-scc-from-user anyuid -z cert-manager-cainjector -n cert-manager 2>/dev/null || true
   component_is_owned scc_anyuid_cert_manager_webhook && oc adm policy remove-scc-from-user anyuid -z cert-manager-webhook -n cert-manager 2>/dev/null || true
@@ -4352,9 +4484,11 @@ validate_config() {
   [[ -f "${SPLUNK_AI_FILE}" ]] \
     && echo -e "  \033[1;32m✔\033[0m files.aiPlatform exists: ${SPLUNK_AI_FILE}" >&2 \
     || { echo -e "  \033[1;31m✖\033[0m files.aiPlatform not found: ${SPLUNK_AI_FILE}" >&2; errors=$((errors + 1)); }
-  [[ -f "${SPLUNK_OPERATOR_FILE}" ]] \
-    && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${SPLUNK_OPERATOR_FILE}" >&2 \
-    || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${SPLUNK_OPERATOR_FILE}" >&2; errors=$((errors + 1)); }
+  if bundled_splunk_enabled; then
+    [[ -f "${SPLUNK_OPERATOR_FILE}" ]] \
+      && echo -e "  \033[1;32m✔\033[0m files.splunkOperator exists: ${SPLUNK_OPERATOR_FILE}" >&2 \
+      || { echo -e "  \033[1;31m✖\033[0m files.splunkOperator not found: ${SPLUNK_OPERATOR_FILE}" >&2; errors=$((errors + 1)); }
+  fi
 
   if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
     _vcheck "images.registry" "${IMAGE_REGISTRY}" "" "required for air-gapped installation"
@@ -4432,8 +4566,14 @@ platform_readiness_snapshot() {
     PLATFORM_PENDING_REASON="Cannot list pods in ${AI_NS}"
     return 1
   }
-  bad_pods=$(printf '%s\n' "${pod_json}" | jq -r '
+  bad_pods=$(printf '%s\n' "${pod_json}" | jq -r \
+    --arg bundled "${SPLUNK_ENABLED:-true}" \
+    --arg standalone "splunk-${AI_STANDALONE_NAME:-splunk-standalone}-standalone" '
     .items[]
+    | select($bundled == "true" or (
+        ((.metadata.labels["app.kubernetes.io/managed-by"] // "") != "splunk-operator") and
+        (any(.metadata.ownerReferences[]?; .kind == "StatefulSet" and .name == $standalone) | not)
+      ))
     | (.status.containerStatuses // []) as $cs
     | select(
         (.status.phase != "Succeeded") and
@@ -4579,6 +4719,7 @@ delegate_airgap_install_if_needed() {
   [[ -f "${CONFIG_FILE}" ]] || err "Air-gap mode requires a cluster configuration file: ${CONFIG_FILE}"
   [[ "$(uname -s)" == "Linux" ]] \
     || err "OpenShift air-gap installation requires a Linux installer machine because Red Hat oc-mirror is Linux-only."
+  load_splunk_config || return 1
   configure_openshift_insecure_endpoints "${CONFIG_FILE}" \
     || err "Could not configure OpenShift insecure registry/object-store access"
   prepare_airgap_registry_auth_file "${CONFIG_FILE}" \

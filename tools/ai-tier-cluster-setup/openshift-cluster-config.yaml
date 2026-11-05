@@ -16,9 +16,10 @@ openshift:
 
   # Controls the namespace-wide SCC grants for the AI workloads and Splunk AI
   # Operator. Component-specific grants for cert-manager, Local Path
-  # Provisioner, OpenTelemetry, and Splunk Operator are always applied. Set
-  # false only when the cluster administrator provides equivalent AI workload
-  # and Splunk AI Operator permissions separately.
+  # Provisioner, OpenTelemetry, and Splunk Operator are applied when deploying
+  # the corresponding component; Splunk Operator grants require splunk.enabled.
+  # Set false only when the cluster administrator provides equivalent AI
+  # workload and Splunk AI Operator permissions separately.
   grantPrivilegedSCC: "true"
 
   # auto labels every worker node; manual labels only the nodes listed below.
@@ -43,9 +44,10 @@ openshift:
 images:
   # Optional prefix for image names that are not fully qualified. The release
   # defaults below use Docker Hub and are therefore not rewritten by this
-  # value. For an air-gapped cluster, every image under images.* must already
-  # exist in the internal registry; replace each public image reference with
-  # its internal path.
+  # value. For an air-gapped cluster, images used by the selected components
+  # must already exist in the internal registry; replace their public image
+  # references with internal paths. images.splunk.* is excluded when
+  # splunk.enabled is false.
   registry: ""
   # Default true for a plain-HTTP registry. Set false for a registry using
   # trusted HTTPS; true permits plain-HTTP pulls, adds the host
@@ -105,9 +107,14 @@ storage:
       rootPassword: "<S3_SECRET_ACCESS_KEY>"
 
 splunk:
+  # false skips the bundled Splunk Operator and Enterprise Standalone.
+  # Omitted defaults to true for existing OpenShift configurations.
+  enabled: true
   standaloneName: splunk-standalone
   # Additional management/JWT issuers accepted by SAIA and SLIM. The installer
-  # adds the primary short Splunk service URL automatically.
+  # adds the primary short Splunk service URL automatically when enabled=true.
+  # For external Splunk only, use enabled=false and replace these issuers with
+  # the exact external management/JWKS URL on port 8089. No HEC token is needed.
   trustedIssuers:
     - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 

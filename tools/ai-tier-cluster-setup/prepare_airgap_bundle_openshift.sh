@@ -46,8 +46,9 @@ BUNDLED AUTOMATICALLY
   - the oc-mirror binary used to import the image archives
 
 NOT BUNDLED
-  - application images listed under images.* in the cluster config; the customer
-    must provide those in the configured internal registry
+  - application images used by the selected components under images.* in the
+    cluster config; the customer must provide those in the internal registry
+    (images.splunk.* is excluded when splunk.enabled is false)
   - model weights; install-time model staging checks the configured object store,
     skips current models, and downloads/uploads only missing or changed models
   - registry credentials, object-store credentials, or Hugging Face tokens
@@ -121,6 +122,56 @@ resolved_application_image() {
   fi
 }
 
+# Match the installer's backward-compatible bundled Splunk setting. An absent
+# key keeps bundled Splunk enabled; an explicit value must be a YAML boolean.
+load_airgap_splunk_config() {
+  local present value_tag
+  if ! present=$(yq eval '(.splunk // {}) | has("enabled")' "${CONFIG_FILE}" 2>/dev/null); then
+    err "Unable to read splunk.enabled from ${CONFIG_FILE}"
+    return 1
+  fi
+  SPLUNK_ENABLED="true"
+  [[ "${present}" == "false" ]] && return 0
+  if [[ "${present}" != "true" ]]; then
+    err "Unable to read splunk.enabled from ${CONFIG_FILE}"
+    return 1
+  fi
+  if ! value_tag=$(yq eval '.splunk.enabled | tag' "${CONFIG_FILE}" 2>/dev/null) || \
+     [[ "${value_tag}" != "!!bool" ]]; then
+    err "splunk.enabled must be a YAML boolean (true or false)"
+    return 1
+  fi
+  SPLUNK_ENABLED=$(yq eval '.splunk.enabled' "${CONFIG_FILE}")
+}
+
+# Record only application images used by this installation. The customer does
+# not need to supply Splunk Enterprise or its Operator when bundled Splunk is off.
+append_customer_application_images() {
+  local output="$1" path image
+  for path in \
+    '.images.operator.image' \
+    '.images.ray.headImage' \
+    '.images.ray.workerImage' \
+    '.images.weaviate.image' \
+    '.images.saia.apiImage' \
+    '.images.saia.apiV2Image' \
+    '.images.saia.dataLoaderImage' \
+    '.images.slim.apiImage' \
+    '.images.splunk.image' \
+    '.images.splunk.operatorImage' \
+    '.images.fluentBit.image' \
+    '.images.otelCollector.image' \
+    '.images.nginx.image'; do
+    if [[ "${SPLUNK_ENABLED:-true}" != "true" && "${path}" == .images.splunk.* ]]; then
+      continue
+    fi
+    image=$(yq eval "${path} // \"\"" "${CONFIG_FILE}")
+    if [[ -n "${image}" && "${image}" != "null" ]]; then
+      resolved_application_image "${image}" "${IMAGE_REGISTRY}" >> "${output}"
+    fi
+  done
+}
+
 # oc-mirror v2 requires an explicit registry hostname for additionalImages.
 # Kubernetes treats unqualified names as Docker Hub references; record that
 # expansion directly so the mirror mapping is deterministic.
@@ -164,6 +215,7 @@ require_cmd oc-mirror
 for tool in curl helm jq oc tar yq; do require_cmd "${tool}"; done
 [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
 yq eval '.' "${CONFIG_FILE}" >/dev/null || err "Invalid YAML: ${CONFIG_FILE}"
+load_airgap_splunk_config
 oc whoami >/dev/null 2>&1 || err "oc is not logged in to the target OpenShift cluster"
 
 CONFIG_FILE=$(absolute_path "${CONFIG_FILE}")
@@ -212,24 +264,7 @@ chmod +x "${STAGE_DIR}/bin/oc-mirror"
 
 APPLICATION_RAW="${STAGE_DIR}/.application-images.raw"
 : > "${APPLICATION_RAW}"
-for path in \
-  '.images.operator.image' \
-  '.images.ray.headImage' \
-  '.images.ray.workerImage' \
-  '.images.weaviate.image' \
-  '.images.saia.apiImage' \
-  '.images.saia.apiV2Image' \
-  '.images.saia.dataLoaderImage' \
-  '.images.slim.apiImage' \
-  '.images.splunk.image' \
-  '.images.splunk.operatorImage' \
-  '.images.fluentBit.image' \
-  '.images.otelCollector.image' \
-  '.images.nginx.image'; do
-  image=$(yq eval "${path} // \"\"" "${CONFIG_FILE}")
-  [[ -n "${image}" && "${image}" != "null" ]] \
-    && resolved_application_image "${image}" "${IMAGE_REGISTRY}" >> "${APPLICATION_RAW}"
-done
+append_customer_application_images "${APPLICATION_RAW}"
 sort -u "${APPLICATION_RAW}" > "${STAGE_DIR}/customer-provided-images.txt"
 rm -f "${APPLICATION_RAW}"
 

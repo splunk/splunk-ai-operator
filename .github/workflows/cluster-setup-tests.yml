@@ -20,5 +20,8 @@ jobs:
       - name: Run ai-tier-cluster-setup unit tests
         run: bash tools/ai-tier-cluster-setup/test_k0s_cluster_with_stack.sh
 
+      - name: Run OpenShift installer tests
+        run: bash tools/ai-tier-cluster-setup/test_openshift_with_stack.sh
+
       - name: Run Splunk-optional installer dry-run tests
         run: bash tools/ai-tier-cluster-setup/test_installer_dry_run.sh
