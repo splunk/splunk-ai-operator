@@ -2919,14 +2919,15 @@ validate_jwt_signing_material() {
 }
 
 generate_jwt_signing_material() {
-  local dir="$1"
+  local dir="$1" rc=0
   {
     openssl rand -hex 32 > "${dir}/passphrase" \
       && openssl req -x509 -newkey rsa:3072 -sha256 -days 825 -subj "/CN=Splunk AI Tier JWT signing" \
            -keyout "${dir}/key.pem" -passout "file:${dir}/passphrase" -out "${dir}/cert.pem" \
       && cat "${dir}/cert.pem" "${dir}/key.pem" > "${dir}/signer.pem"
-  } >/dev/null 2>&1
+  } >/dev/null 2>&1 || rc=$?
   rm -f "${dir}/cert.pem" "${dir}/key.pem"
+  (( rc == 0 )) || return "${rc}"
   [[ -s "${dir}/signer.pem" ]]
 }
 
@@ -2949,7 +2950,7 @@ splunk_standalone_uses_jwt_signing_secret() {
 # the Splunk Operator restarts Splunk whenever the signing key changes.
 SPLUNK_JWT_SIGNER_FINGERPRINT=""
 ensure_splunk_jwt_signing_secret() {
-  local secret_name work_dir secret_json reason rc=0
+  local secret_name work_dir secret_json reason="" rc=0
   secret_name="$(splunk_jwt_signing_secret_name)"
   work_dir=$(mktemp -d)
   chmod 700 "${work_dir}"
@@ -2976,13 +2977,17 @@ ensure_splunk_jwt_signing_secret() {
     && warn "ROTATE_JWT_SIGNER=true: creating a new JWT signing key; Splunk will restart and previously issued tokens stop validating"
 
   generate_jwt_signing_material "${work_dir}" || rc=1
+  # Validate before replacing an existing identity, even if generation reported success.
+  if (( rc == 0 )); then
+    reason=$(validate_jwt_signing_material "${work_dir}") || rc=1
+  fi
   (( rc == 0 )) && SPLUNK_JWT_SIGNER_FINGERPRINT=$(openssl x509 -in "${work_dir}/signer.pem" -noout -fingerprint -sha256 | cut -d= -f2)
   (( rc == 0 )) && { oc create secret generic "${secret_name}" -n "${AI_NS}" \
     --from-file=signer.pem="${work_dir}/signer.pem" \
     --from-file=passphrase="${work_dir}/passphrase" --dry-run=client -o yaml \
     | oc apply -n "${AI_NS}" -f - >/dev/null || rc=1; }
   rm -rf "${work_dir}"
-  (( rc == 0 )) || err "Failed to create JWT signing Secret ${AI_NS}/${secret_name}"
+  (( rc == 0 )) || err "Failed to create JWT signing Secret ${AI_NS}/${secret_name}${reason:+: ${reason}}"
   log "  ✓ Created unique JWT signing Secret ${secret_name}"
 }
 

@@ -1174,6 +1174,10 @@ if command -v openssl >/dev/null 2>&1; then
   { openssl x509 -in "${JWT_TMP}/other/signer.pem"; sed -n '/BEGIN ENCRYPTED PRIVATE KEY/,/END ENCRYPTED PRIVATE KEY/p' "${JWT_TMP}/good/signer.pem"; } > "${JWT_TMP}/mismatch/signer.pem"
   cp "${JWT_TMP}/good/passphrase" "${JWT_TMP}/mismatch/"
   assert_rc "rejects a key that does not match the certificate" 1 validate_jwt_signing_material "${JWT_TMP}/mismatch"
+  mkdir -p "${JWT_TMP}/cert-only"
+  openssl x509 -in "${JWT_TMP}/good/signer.pem" -out "${JWT_TMP}/cert-only/signer.pem"
+  cp "${JWT_TMP}/good/passphrase" "${JWT_TMP}/cert-only/"
+  assert_rc "rejects a certificate without its private key" 1 validate_jwt_signing_material "${JWT_TMP}/cert-only"
   mkdir -p "${JWT_TMP}/ec"
   echo "ec-pass-for-test" > "${JWT_TMP}/ec/passphrase"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -subj "/CN=t" \
@@ -1225,6 +1229,99 @@ if command -v openssl >/dev/null 2>&1; then
     "$(ROTATE_JWT_SIGNER=true _run_ensure "${JWT_TMP}/good" uses 2>/dev/null | tail -1)"
   assert_eq "rotation creates a key when a configured Splunk lost its Secret" "fp=new creates=1" \
     "$(ROTATE_JWT_SIGNER=true _run_ensure "" uses 2>/dev/null | tail -1)"
+
+  # Model a failed concatenation after the certificate was already written.
+  # No disk exhaustion or production validator stub is needed.
+  _partial_signer_cat() {
+    if [[ "$#" == 2 && "$1" == */cert.pem && "$2" == */key.pem ]]; then
+      command cat "$1" || return 1
+      local partial_signer="${1%/cert.pem}/signer.pem"
+      if [[ -s "${partial_signer}" ]] && openssl x509 -in "${partial_signer}" -noout >/dev/null 2>&1; then
+        printf 'true' > "${PARTIAL_CAT_MARKER}"
+      fi
+      return 1
+    fi
+    command cat "$@"
+  }
+  _run_partial_generator() (
+    local dir="${JWT_TMP}/partial-generator"
+    mkdir -p "${dir}"
+    PARTIAL_CAT_MARKER="${JWT_TMP}/partial-generator-observed"
+    cat() { _partial_signer_cat "$@"; }
+    generate_jwt_signing_material "${dir}"
+  )
+  assert_rc "generator fails when cat leaves a nonempty valid certificate but no key" 1 _run_partial_generator
+  assert_eq "partial cat fault reached a valid nonempty signer certificate" "true" \
+    "$(command cat "${JWT_TMP}/partial-generator-observed" 2>/dev/null)"
+
+  _run_ensure_generation_failure() (
+    local mode="$1" fixture="${2:-}" case_dir="${JWT_TMP}/generation-${1}"
+    mkdir -p "${case_dir}"
+    : > "${case_dir}/creates"
+    : > "${case_dir}/applies"
+    printf 'unchanged' > "${case_dir}/old-secret-state"
+    AI_NS="ai-platform"; AI_STANDALONE_NAME="splunk-standalone"
+    ROTATE_JWT_SIGNER=true; SPLUNK_JWT_SIGNER_FINGERPRINT=""
+    err() { exit 1; }
+    mktemp() {
+      local dir
+      dir=$(command mktemp -d "${case_dir}/work.XXXXXX") || return 1
+      printf '%s' "${dir}" > "${case_dir}/workdir"
+      printf '%s\n' "${dir}"
+    }
+    oc() {
+      case "$1 $2" in
+        "get secret")
+          printf '{"data":{"signer.pem":"%s","passphrase":"%s"}}' \
+            "$(b64 < "${JWT_TMP}/good/signer.pem")" "$(b64 < "${JWT_TMP}/good/passphrase")" ;;
+        "create secret")
+          echo create >> "${case_dir}/creates"
+          printf 'new-secret-manifest\n' ;;
+        "apply -n")
+          command cat >/dev/null
+          echo apply >> "${case_dir}/applies"
+          printf 'replaced' > "${case_dir}/old-secret-state" ;;
+        *) return 1 ;;
+      esac
+    }
+    if [[ "${mode}" == partial ]]; then
+      PARTIAL_CAT_MARKER="${case_dir}/partial-cat-observed"
+      cat() { _partial_signer_cat "$@"; }
+    else
+      generate_jwt_signing_material() {
+        cp "${fixture}/signer.pem" "$1/signer.pem" \
+          && cp "${fixture}/passphrase" "$1/passphrase" || return 1
+        printf 'true' > "${case_dir}/generator-returned-zero"
+        return 0
+      }
+    fi
+    ensure_splunk_jwt_signing_secret
+  )
+  _assert_generation_not_published() {
+    local mode="$1" fixture="${2:-}" case_dir="${JWT_TMP}/generation-${1}" workdir
+    assert_rc "rotation fails closed for generated ${mode} material" 1 \
+      _run_ensure_generation_failure "${mode}" "${fixture}"
+    assert_eq "${mode} failure attempts zero Secret creates" "0" \
+      "$(wc -l < "${case_dir}/creates" | tr -d ' ')"
+    assert_eq "${mode} failure attempts zero Secret applies" "0" \
+      "$(wc -l < "${case_dir}/applies" | tr -d ' ')"
+    assert_eq "${mode} failure preserves the old Secret state" "unchanged" \
+      "$(command cat "${case_dir}/old-secret-state")"
+    workdir=$(command cat "${case_dir}/workdir")
+    assert_eq "${mode} failure removes its work directory" "true" \
+      "$( [[ -n "${workdir}" && ! -e "${workdir}" ]] && echo true || echo false )"
+    if [[ "${mode}" == partial ]]; then
+      assert_eq "rotation exercised the actual generator partial-cat failure" "true" \
+        "$(command cat "${case_dir}/partial-cat-observed" 2>/dev/null)"
+    else
+      assert_eq "${mode} generator returned success before real validation rejected it" "true" \
+        "$(command cat "${case_dir}/generator-returned-zero" 2>/dev/null)"
+    fi
+  }
+  _assert_generation_not_published partial
+  for invalid_generated in cert-only wrongpass mismatch; do
+    _assert_generation_not_published "${invalid_generated}" "${JWT_TMP}/${invalid_generated}"
+  done
 
   # A JWT signed by <key_dir> and verified against the Secret in good/.
   _make_jwt() {
