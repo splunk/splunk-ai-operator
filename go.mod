@@ -1,6 +1,6 @@
 module github.com/splunk/splunk-ai-operator
 
-go 1.25.0
+go 1.26.10
 
 godebug default=go1.23
 
