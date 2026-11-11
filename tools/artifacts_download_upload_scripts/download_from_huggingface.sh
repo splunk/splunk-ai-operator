@@ -566,4 +566,4 @@ if [[ ${#failed_ids[@]} -gt 0 ]]; then
 fi
 
 echo "Download complete! Artifacts are located in: $DOWNLOAD_DIR"
-echo "To upload to MinIO, run: ./upload_to_minio.sh"
+echo "To upload to MinIO, run: OBJECT_STORE_ACCESS_KEY=<access-key> OBJECT_STORE_SECRET_KEY=<secret-key> ./upload_to_minio.sh"

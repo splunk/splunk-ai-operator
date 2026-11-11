@@ -28,12 +28,6 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -gcflags="all=-N -l" \
     -o manager cmd/main.go
 
-# Generate self-signed cert
-RUN mkdir -p /certs && \
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-    -keyout /certs/tls.key -out /certs/tls.crt \
-    -subj "/CN=local.svc"
-
 # Use a more complete base image for debugging
 FROM gcr.io/distroless/base-debian12:debug
 WORKDIR /
@@ -49,8 +43,6 @@ COPY config/configs/instance.yaml instance.yaml
 COPY config/configs/applications.yaml applications.yaml
 COPY config/configs/model-scale.yaml model-scale.yaml
 COPY config/configs/worker-scale.yaml worker-scale.yaml
-COPY --from=builder /certs/tls.crt /certs/tls.crt
-COPY --from=builder /certs/tls.key /certs/tls.key
 
 USER 65532:65532
 

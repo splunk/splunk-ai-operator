@@ -20,18 +20,6 @@ func ConfigMap(namespace, name string) *corev1.ConfigMap {
 	}
 }
 
-func Secret(namespace, name string) *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-seca-secret", name),
-			Namespace: namespace,
-		},
-		StringData: map[string]string{
-			"API_TOKEN": "replace-me",
-		},
-	}
-}
-
 func Deployment(namespace, name string) *appsv1.Deployment {
 	labels := map[string]string{"app": "seca"}
 

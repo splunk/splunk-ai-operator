@@ -15,15 +15,6 @@ func TestConfigMap(t *testing.T) {
 	assert.Equal(t, "true", cm.Data["TOAD_FEATURE_ENABLED"])
 }
 
-func TestSecret(t *testing.T) {
-	secret := Secret("test-namespace", "test-service")
-
-	assert.NotNil(t, secret)
-	assert.Equal(t, "test-service-seca-secret", secret.Name)
-	assert.Equal(t, "test-namespace", secret.Namespace)
-	assert.Equal(t, "replace-me", secret.StringData["API_TOKEN"])
-}
-
 func TestDeployment(t *testing.T) {
 	deployment := Deployment("test-namespace", "test-service")
 
