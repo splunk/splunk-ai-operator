@@ -50,7 +50,15 @@ const (
 )
 
 const schemaSetupCommand = `set -eu
-export PGSSLMODE="${PGSSLMODE:-${PG_SSLMODE:-}}"
+# libpq rejects an exported but empty PGSSLMODE with "no attempt". Leave it
+# unset unless one of the supported settings actually supplies a value.
+if [ -n "${PGSSLMODE:-}" ]; then
+  export PGSSLMODE
+elif [ -n "${PG_SSLMODE:-}" ]; then
+  export PGSSLMODE="$PG_SSLMODE"
+else
+  unset PGSSLMODE
+fi
 
 if [ -n "${PG_HOST:-}" ] && [ -n "${PG_USER:-}" ] && [ -n "${PG_DBNAME:-}" ] && [ -n "${PG_PASSWORD:-}" ]; then
   until pg_isready -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DBNAME"; do
@@ -382,7 +390,7 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 		return fmt.Errorf("ownerref on postgres schema setup Job: %w", err)
 	}
 
-	featureEnv := buildSchemaSetupEnv(ai.Spec.Feature.Env)
+	featureEnv := buildFeatureEnv(ai.Spec.Feature.Env)
 	job.Spec = batchv1.JobSpec{
 		BackoffLimit:            ptr(schemaJobBackoffLimit),
 		TTLSecondsAfterFinished: ptr(int32(86400)),
@@ -443,21 +451,6 @@ func buildFeatureEnv(values map[string]string) []corev1.EnvVar {
 		env = append(env, corev1.EnvVar{Name: name, Value: values[name]})
 	}
 	return env
-}
-
-func buildSchemaSetupEnv(values map[string]string) []corev1.EnvVar {
-	schemaValues := make(map[string]string, len(values)+1)
-	for name, value := range values {
-		schemaValues[name] = value
-	}
-	// The runtime contract uses PG_SSLMODE, while libpq/psql consumes the
-	// standard PGSSLMODE variable. Keep the existing runtime key compatible and
-	// bridge it for the schema-setup image when the caller has not supplied the
-	// standard name explicitly.
-	if schemaValues["PGSSLMODE"] == "" && schemaValues["PG_SSLMODE"] != "" {
-		schemaValues["PGSSLMODE"] = schemaValues["PG_SSLMODE"]
-	}
-	return buildFeatureEnv(schemaValues)
 }
 
 func agentRuntimeDeploymentHash(ai *aiv1.AIService, config agentRuntimeConfig) string {

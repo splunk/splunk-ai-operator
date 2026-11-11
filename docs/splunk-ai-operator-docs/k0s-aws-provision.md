@@ -35,13 +35,21 @@ Before a real run, update:
 - `SPLUNK_HEC_TOKEN` to any non-empty value before install. It is only used to
   create the compatibility Secret for the dummy external Splunk endpoint.
 - `AGENT_RUNTIME_CHECKPOINT_DB_URL` if you want the script to create the
-  `mltk-postgres-conn` checkpoint secret.
+  `mltk-postgres-conn` checkpoint secret. The installer parses this URL into
+  `DATABASE_URL`, `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME`
+  in the Secret. A URL `sslmode` parameter also becomes `PG_SSLMODE`. The
+  optional `checkpointSecrets[].pgSslMode` overrides that URL parameter; the
+  Agent Runtime dev profile sets it to `disable` for its non-SSL PostgreSQL.
+  When neither setting is supplied, the runtime's SSL default applies.
 
 The schema Job accepts either `DATABASE_URL` or `PG_HOST`, `PG_USER`,
 `PG_PASSWORD`, and `PG_DBNAME` from the referenced Secret or feature
 environment; `PG_PORT` is optional. If both forms are set, the structured
-`PG_*` values take precedence. The operator maps `PG_SSLMODE` to `PGSSLMODE`
-for the schema Job.
+`PG_*` values take precedence. The current Agent Runtime base image requires
+the structured `PG_HOST`, `PG_USER`, `PG_PASSWORD`, and `PG_DBNAME` fields, so
+pre-created checkpoint Secrets must include them even if they also have
+`DATABASE_URL`. The schema Job maps a nonempty `PG_SSLMODE` to libpq's
+`PGSSLMODE` when the standard variable is not already supplied.
 
 The provisioner copies the selected cluster config template to the installer and
 creates `~/ai-tier-cluster-setup/my-k0s-config.yaml` from it. It patches only infra and

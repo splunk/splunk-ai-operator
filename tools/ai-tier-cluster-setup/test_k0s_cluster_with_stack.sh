@@ -101,6 +101,7 @@ _load_functions() {
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
 
   eval "$(_extract_fn model_artifacts_config_name)"
+  eval "$(_extract_fn render_agentruntime_checkpoint_secret_manifest)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
@@ -114,6 +115,59 @@ _load_functions() {
 }
 
 _load_functions
+
+# ── Tests: Agent Runtime checkpoint Secret ──────────────────────────────────
+
+suite "Agent Runtime checkpoint Secret"
+echo "▶ Agent Runtime checkpoint Secret"
+
+_checkpoint_url='postgresql://alice%40example:p%40ss%3Aword@db.example:5440/check%2Fpoints?sslmode=require'
+_checkpoint_manifest=$(printf '%s' "${_checkpoint_url}" | render_agentruntime_checkpoint_secret_manifest "mltk-postgres" "ai-platform")
+assert_eq "manifest targets the requested Secret" "mltk-postgres" \
+  "$(printf '%s' "${_checkpoint_manifest}" | jq -r '.metadata.name')"
+assert_eq "encoded username is decoded for the runtime" "alice@example" \
+  "$(printf '%s' "${_checkpoint_manifest}" | jq -r '.data.PG_USER | @base64d')"
+assert_eq "encoded password is decoded for the runtime" "p@ss:word" \
+  "$(printf '%s' "${_checkpoint_manifest}" | jq -r '.data.PG_PASSWORD | @base64d')"
+assert_eq "database name and port are passed to the runtime" $'check/points\n5440' \
+  "$(printf '%s' "${_checkpoint_manifest}" | jq -r '(.data.PG_DBNAME | @base64d), (.data.PG_PORT | @base64d)')"
+assert_eq "URL sslmode is passed to the runtime" "require" \
+  "$(printf '%s' "${_checkpoint_manifest}" | jq -r '.data.PG_SSLMODE | @base64d')"
+_checkpoint_override_manifest=$(printf '%s' "${_checkpoint_url}" | \
+  render_agentruntime_checkpoint_secret_manifest "mltk-postgres" "ai-platform" "disable")
+assert_eq "profile SSL mode overrides the URL mode for the dev database" "disable" \
+  "$(printf '%s' "${_checkpoint_override_manifest}" | jq -r '.data.PG_SSLMODE | @base64d')"
+assert_eq "Agent Runtime dev profile selects the non-SSL database mode" "disable" \
+  "$("${YQ_BIN}" eval '.aiPlatform.agentRuntime.checkpointSecrets[0].pgSslMode' "${SCRIPT_DIR}/k0s-cluster-config-agentruntime.yaml")"
+_checkpoint_profile_manifest=$(
+  eval "$(_extract_fn create_agentruntime_checkpoint_secrets)"
+  k0s_agentruntime_feature_enabled() { return 0; }
+  need() { :; }
+  yq() { "${YQ_BIN}" "$@"; }
+  local_secret_capture="$(mktemp)"
+  kubectl() { cat >"${local_secret_capture}"; }
+  CONFIG_FILE="${SCRIPT_DIR}/k0s-cluster-config-agentruntime.yaml"
+  AI_NS="ai-platform"
+  AGENT_RUNTIME_CHECKPOINT_DB_URL='postgresql://user:password@db.example/checkpoints'
+  create_agentruntime_checkpoint_secrets
+  cat "${local_secret_capture}"
+  rm -f "${local_secret_capture}"
+)
+assert_eq "installer applies the dev profile SSL mode to its Secret" "disable" \
+  "$(printf '%s' "${_checkpoint_profile_manifest}" | jq -r '.data.PG_SSLMODE | @base64d')"
+assert_eq "schema setup retains the original URL" "${_checkpoint_url}" \
+  "$(printf '%s' "${_checkpoint_manifest}" | jq -r '.data.DATABASE_URL | @base64d')"
+
+_checkpoint_default_manifest=$(printf '%s' 'postgres://user:password@db.example/checkpoints' | \
+  render_agentruntime_checkpoint_secret_manifest "mltk-postgres" "ai-platform")
+assert_eq "omitted port defaults to 5432" "5432" \
+  "$(printf '%s' "${_checkpoint_default_manifest}" | jq -r '.data.PG_PORT | @base64d')"
+assert_eq "omitted SSL mode remains absent" "false" \
+  "$(printf '%s' "${_checkpoint_default_manifest}" | jq -r '.data | has("PG_SSLMODE")')"
+assert_rc "malformed URL is rejected before Secret creation" 1 \
+  bash -c "$(declare -f render_agentruntime_checkpoint_secret_manifest); printf '%s' 'postgresql://user@db.example/checkpoints' | render_agentruntime_checkpoint_secret_manifest mltk-postgres ai-platform"
+assert_rc "invalid SSL mode is rejected before Secret creation" 1 \
+  bash -c "$(declare -f render_agentruntime_checkpoint_secret_manifest); printf '%s' 'postgresql://user:password@db.example/checkpoints' | render_agentruntime_checkpoint_secret_manifest mltk-postgres ai-platform insecure"
 
 # ── Tests: build_image_url ─────────────────────────────────────────────────────
 

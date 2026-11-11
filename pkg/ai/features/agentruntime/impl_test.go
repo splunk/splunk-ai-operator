@@ -3,6 +3,8 @@ package agentruntime
 import (
 	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -53,6 +55,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 			Feature: aiv1.FeatureSpec{
 				Name:     "agentruntime",
 				Provider: "mltk",
+				Env:      map[string]string{"PG_SSLMODE": "require"},
 			},
 			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
 			CheckpointDbSecretRef: "mltk-postgres",
@@ -68,6 +71,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 			"PG_USER":     []byte("user"),
 			"PG_PASSWORD": []byte("password"),
 			"PG_DBNAME":   []byte("checkpoints"),
+			"PGSSLMODE":   []byte("verify-full"),
 		},
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, checkpointSecret).Build()
@@ -82,6 +86,10 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	}, job))
 	assert.Equal(t, []string{"sh", "-c"}, job.Spec.Template.Spec.Containers[0].Command)
 	assert.Contains(t, job.Spec.Template.Spec.Containers[0].Args[0], "DATABASE_URL")
+	assertEnv(t, job.Spec.Template.Spec.Containers[0].Env, "PG_SSLMODE", "require")
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		assert.NotEqual(t, "PGSSLMODE", env.Name, "feature env must not override the Secret's PGSSLMODE")
+	}
 	assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: ai.Name + "-agentruntime-deployment", Namespace: ai.Namespace,
 	}, &appsv1.Deployment{}))
@@ -603,6 +611,48 @@ func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {
 		"PG_PASSWORD": []byte("password"),
 		"PG_DBNAME":   []byte("checkpoints"),
 	}}, nil))
+}
+
+func TestSchemaSetupCommandDoesNotExportEmptyPGSSLMODE(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{name: "no SSL setting", want: "unset"},
+		{name: "empty standard setting", env: []string{"PGSSLMODE="}, want: "unset"},
+		{name: "runtime setting", env: []string{"PG_SSLMODE=require"}, want: "set:require"},
+		{name: "standard setting wins", env: []string{"PGSSLMODE=verify-full", "PG_SSLMODE=require"}, want: "set:verify-full"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			capture := filepath.Join(dir, "sslmode")
+			pgIsReady := `#!/bin/sh
+if [ "${PGSSLMODE+x}" = x ]; then
+  printf 'set:%s\n' "$PGSSLMODE" > "$SSL_MODE_CAPTURE"
+else
+  printf 'unset\n' > "$SSL_MODE_CAPTURE"
+fi
+exit 0
+`
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "pg_isready"), []byte(pgIsReady), 0755))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "psql"), []byte("#!/bin/sh\nexit 0\n"), 0755))
+
+			cmd := exec.Command("sh", "-c", schemaSetupCommand)
+			cmd.Env = append([]string{
+				"PATH=" + dir + ":" + os.Getenv("PATH"),
+				"DATABASE_URL=postgresql://user:password@localhost/checkpoints",
+				"SSL_MODE_CAPTURE=" + capture,
+			}, tt.env...)
+			output, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(output))
+			observed, err := os.ReadFile(capture)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, strings.TrimSpace(string(observed)))
+		})
+	}
 }
 
 func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {

@@ -123,6 +123,7 @@ aiPlatform:
       - name: "mltk-postgres-conn"
         create: true
         databaseUrlEnv: "AGENT_RUNTIME_CHECKPOINT_DB_URL"
+        pgSslMode: "disable"
   cpuScheduling:
     nodeSelector: {}
     tolerations: []

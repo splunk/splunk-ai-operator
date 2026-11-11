@@ -6234,6 +6234,62 @@ wait_for_splunk_standalone() {
 }
 
 # ====== INSTALL AI PLATFORM CR ======
+render_agentruntime_checkpoint_secret_manifest() {
+  local name="$1" namespace="$2" pg_ssl_mode="${3:-}"
+  # Read the URL from stdin so it does not appear in process arguments or logs.
+  # The runtime image requires structured PG_* settings, while the schema Job
+  # also accepts DATABASE_URL. Emit both forms in one Secret.
+  python3 -c '
+import base64
+import json
+import sys
+from urllib.parse import parse_qs, unquote, urlsplit
+
+url = sys.stdin.read().strip()
+try:
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("postgres", "postgresql"):
+        raise ValueError()
+    host = parsed.hostname
+    port = parsed.port or 5432
+    user = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    dbname = unquote(parsed.path[1:] if parsed.path.startswith("/") else "")
+    if not all((host, user, password, dbname)):
+        raise ValueError()
+    ssl_modes = parse_qs(parsed.query, keep_blank_values=True).get("sslmode", [])
+    if len(ssl_modes) > 1:
+        raise ValueError()
+except ValueError:
+    print("Invalid PostgreSQL checkpoint URL: expected a postgres/postgresql URL with host, user, password, and database", file=sys.stderr)
+    sys.exit(1)
+
+values = {
+    "DATABASE_URL": url,
+    "PG_HOST": host,
+    "PG_PORT": str(port),
+    "PG_USER": user,
+    "PG_PASSWORD": password,
+    "PG_DBNAME": dbname,
+}  # values
+ssl_mode = sys.argv[3] or (ssl_modes[0] if ssl_modes else "")
+if ssl_mode:
+    if ssl_mode not in ("disable", "allow", "prefer", "require", "verify-ca", "verify-full"):
+        print("Invalid PostgreSQL checkpoint SSL mode", file=sys.stderr)
+        sys.exit(1)
+    values["PG_SSLMODE"] = ssl_mode
+encoded = {key: base64.b64encode(value.encode()).decode() for key, value in values.items()}
+manifest = {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {"name": sys.argv[1], "namespace": sys.argv[2]},
+    "type": "Opaque",
+    "data": encoded,
+}  # manifest
+print(json.dumps(manifest, separators=(",", ":")))
+' "$name" "$namespace" "$pg_ssl_mode"
+}
+
 create_agentruntime_checkpoint_secrets() {
   k0s_agentruntime_feature_enabled || return 0
 
@@ -6244,7 +6300,9 @@ create_agentruntime_checkpoint_secrets() {
     return 0
   fi
 
-  local i name database_url env_var create_flag
+  need python3
+
+  local i name database_url env_var create_flag pg_ssl_mode
   for ((i=0; i<count; i++)); do
     create_flag="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].create" "${CONFIG_FILE}" 2>/dev/null || echo "null")"
     [[ -z "${create_flag}" || "${create_flag}" == "null" ]] && create_flag="true"
@@ -6253,6 +6311,7 @@ create_agentruntime_checkpoint_secrets() {
     name="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
     database_url="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrl // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
     env_var="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrlEnv // \"AGENT_RUNTIME_CHECKPOINT_DB_URL\"" "${CONFIG_FILE}" 2>/dev/null || echo "AGENT_RUNTIME_CHECKPOINT_DB_URL")"
+    pg_ssl_mode="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].pgSslMode // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
 
     [[ -z "${name}" || "${name}" == "null" ]] && err "aiPlatform.agentRuntime.checkpointSecrets[${i}].name is required"
     if [[ -z "${database_url}" || "${database_url}" == "null" ]]; then
@@ -6264,9 +6323,11 @@ create_agentruntime_checkpoint_secrets() {
     fi
 
     log "Creating/updating agent-runtime checkpoint DB secret '${name}' in ${AI_NS} (value from config/env, not logged)..."
-    kubectl -n "${AI_NS}" create secret generic "${name}" \
-      --from-literal=DATABASE_URL="${database_url}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f - >/dev/null
+    if ! printf '%s' "${database_url}" | \
+        render_agentruntime_checkpoint_secret_manifest "${name}" "${AI_NS}" "${pg_ssl_mode}" | \
+        kubectl -n "${AI_NS}" apply -f - >/dev/null; then
+      err "Failed to create agent-runtime checkpoint DB Secret/${name}"
+    fi
     log "✓ Agent-runtime checkpoint DB secret ready: ${name}"
   done
 }
