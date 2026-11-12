@@ -56,12 +56,14 @@ The resolved profile is published on the CR as `status.profile` (and the
 
 Image references and the snapshot manifest must not contain whitespace, quotes
 or backslashes. Because the installer splices feature fields into the CR, each
-`aiPlatform.features[]` field is checked as a safe scalar: `name` and
-`serviceAccountName` are DNS-1123 labels, `provider` is a DNS-1123 label,
-`checkpointDbSecretRef` is a Kubernetes Secret name (`[a-z0-9.-]`), `version` and
-`runtimeVersion` are version strings, `minReplicas` and `maxReplicas` are
-positive integers with min at most max, and `targetCPUUtilization` is an integer
-from 1 to 100. Values are never echoed in error messages. `aiPlatform.scaleFactor`, when set, must be a
+`aiPlatform.features[]` field is checked as a safe scalar: `name` is one of the
+CRD enum values (`saia`, `seca`, `slim`, `agentruntime`); `provider` is a
+DNS-1123 label; `serviceAccountName` and `checkpointDbSecretRef` are Kubernetes
+names, i.e. DNS-1123 subdomains (dot-separated lowercase labels of at most 63
+characters, at most 253 overall, so `a..b` and `a.-b` are rejected); `version`
+and `runtimeVersion` are version strings; `minReplicas` and `maxReplicas` are
+positive integers with min at most max; and `targetCPUUtilization` is an integer
+from 1 to 100. Rejected values are never echoed in error messages (an unsupported profile name is shown only when it is a short plain name, otherwise "(value not shown)"). `aiPlatform.scaleFactor`, when set, must be a
 YAML integer of at least 1 (the same rule `install` enforces). Duplicate feature
 identities (`agentruntime` is keyed by provider) are rejected, as in the webhook.
 
@@ -113,12 +115,19 @@ uses Ray. When KubeRay and the AIPlatform CR are enabled it also requires
 that `validate` and `render-profile` agree with `install`. CPU/GPU placement and
 resource semantics are MPR-186's.
 
-CRD defaulting trap: the CRD defaults `sidecars.otel` and
-`sidecars.prometheusOperator` to `true`, and `storage.vectorDB.size` to `50Gi`,
-whenever the parent object is present. A `cpuOnly` CR must therefore either omit
-`sidecars` and `storage.vectorDB` entirely or set every sidecar flag to `false`
-explicitly (the installer does the latter). `sidecars: {envoy: false}` alone is
-rejected because it picks up the other two defaults. The error message says so.
+CRD defaulting: the CRD defaults `sidecars.otel` and `sidecars.prometheusOperator`
+to `true`, and `storage.vectorDB.size` to `50Gi`, whenever the parent object is
+present. The webhook re-marshals the spec into a JSON patch, and Go writes empty
+value-typed structs, so a spec that omits `storage` and `sidecars` would come
+back as `storage: {vectorDB: {}}` and `sidecars: {}` and then pick up those
+defaults. For `cpuOnly` that would make every CR invalid, so
+`AIPlatformSpec.MarshalJSON` leaves empty `storage` and `sidecars` out of a
+`cpuOnly` spec (verified against a real API server in the envtest specs). Other
+profiles marshal exactly as before and keep their defaults. A `cpuOnly` CR may
+therefore omit `sidecars` and `storage.vectorDB` entirely, or set every sidecar
+flag to `false`. A partial object such as `sidecars: {envoy: false}` or
+`storage: {vectorDB: {}}` is present, so it picks up the defaults and is
+rejected; the error message says so.
 
 The webhook also rejects switching an existing platform (omitted, `full` or
 `fullfeature`) to `cpuOnly`. An omitted profile and `fullfeature` are the same

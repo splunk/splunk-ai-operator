@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -125,4 +126,59 @@ func TestValidateProfileReportsEveryConflictDeterministically(t *testing.T) {
 	assert.Equal(t, first, second)
 	// gpuInstanceType, three images and sidecars: every conflict is reported.
 	assert.Len(t, a.ValidateProfile(field.NewPath("spec")), 5)
+}
+
+func marshalKeys(t *testing.T, spec AIPlatformSpec) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(spec)
+	require.NoError(t, err)
+	var m map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &m))
+	return m
+}
+
+// The mutating webhook returns the re-marshalled spec as a JSON patch. For
+// cpuOnly the empty storage and sidecars objects must not be materialized,
+// otherwise the API server's CRD defaults turn them into forbidden settings.
+func TestAIPlatformSpecMarshalJSON_CPUOnlyOmitsEmptyStorageAndSidecars(t *testing.T) {
+	m := marshalKeys(t, AIPlatformSpec{Profile: AIPlatformProfileCPUOnly})
+	assert.NotContains(t, m, "storage")
+	assert.NotContains(t, m, "sidecars")
+	assert.Contains(t, m, "profile")
+}
+
+func TestAIPlatformSpecMarshalJSON_CPUOnlyKeepsNonEmptyValues(t *testing.T) {
+	m := marshalKeys(t, AIPlatformSpec{
+		Profile:  AIPlatformProfileCPUOnly,
+		Sidecars: SidecarSpec{Otel: true},
+		Storage:  StorageSpec{VectorDB: VectorDBStorageSpec{Size: "1Gi"}},
+	})
+	assert.Contains(t, m, "sidecars", "a real setting must still be sent so validation can reject it")
+	assert.Contains(t, m, "storage")
+}
+
+// Every profile other than cpuOnly marshals exactly as before: empty storage
+// and sidecars objects are still written, and keep picking up the CRD defaults.
+func TestAIPlatformSpecMarshalJSON_OtherProfilesAreUnchanged(t *testing.T) {
+	for _, p := range []AIPlatformProfile{"", AIPlatformProfileLegacyFull, AIPlatformProfileFullFeature} {
+		m := marshalKeys(t, AIPlatformSpec{Profile: p})
+		assert.Contains(t, m, "storage", "profile %q", p)
+		assert.Contains(t, m, "sidecars", "profile %q", p)
+		assert.JSONEq(t, `{}`, string(m["sidecars"]), "profile %q", p)
+	}
+}
+
+func TestAIPlatformSpecMarshalJSON_RoundTrips(t *testing.T) {
+	in := AIPlatformSpec{
+		Profile:     AIPlatformProfileCPUOnly,
+		ScaleFactor: i32(1),
+		Features:    []FeatureSpec{{Name: "slim"}},
+	}
+	raw, err := json.Marshal(in)
+	require.NoError(t, err)
+	var out AIPlatformSpec
+	require.NoError(t, json.Unmarshal(raw, &out))
+	assert.Equal(t, in.Profile, out.Profile)
+	assert.Equal(t, in.Features, out.Features)
+	assert.Equal(t, *in.ScaleFactor, *out.ScaleFactor)
 }

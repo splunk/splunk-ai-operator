@@ -17,6 +17,9 @@ limitations under the License.
 package v1
 
 import (
+	"encoding/json"
+	"reflect"
+
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
@@ -138,4 +141,35 @@ func (s *AIPlatformSpec) ValidateProfile(specPath *field.Path) field.ErrorList {
 			unsupported("sidecars")+"; omit sidecars or set envoy, otel and prometheusOperator to false (the CRD defaults otel and prometheusOperator to true whenever the object is present)"))
 	}
 	return errs
+}
+
+// MarshalJSON leaves empty storage and sidecars objects out of a cpuOnly spec.
+//
+// Storage and Sidecars are value-typed, so encoding/json always writes them,
+// even when empty. The mutating webhook returns the re-marshalled object as a
+// JSON patch, which materializes "storage: {vectorDB: {}}" and "sidecars: {}".
+// The API server then applies the CRD defaults to those new objects
+// (vectorDB.size 50Gi, sidecars.otel and prometheusOperator true) and
+// ValidateProfile rejects the result, so no cpuOnly CR could ever be admitted
+// (reproduced against a real API server). An absent parent object receives no
+// nested defaults, so omitting the empty ones keeps a cpuOnly spec valid.
+//
+// Every other profile marshals exactly as before: the legacy behaviour of
+// materializing those objects, and the defaults they pick up, is unchanged.
+func (s AIPlatformSpec) MarshalJSON() ([]byte, error) {
+	type plain AIPlatformSpec // no methods, so no recursion
+	out := struct {
+		plain
+		Storage  *StorageSpec `json:"storage,omitempty"`
+		Sidecars *SidecarSpec `json:"sidecars,omitempty"`
+	}{plain: plain(s)}
+
+	omitEmpty := s.ResolvedProfile() == AIPlatformProfileCPUOnly
+	if !omitEmpty || !reflect.ValueOf(s.Storage).IsZero() {
+		out.Storage = &s.Storage
+	}
+	if !omitEmpty || !reflect.ValueOf(s.Sidecars).IsZero() {
+		out.Sidecars = &s.Sidecars
+	}
+	return json.Marshal(out)
 }

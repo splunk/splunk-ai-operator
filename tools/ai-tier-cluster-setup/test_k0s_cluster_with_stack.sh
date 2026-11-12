@@ -110,6 +110,8 @@ _load_functions() {
   eval "$(_extract_fn _profile_q)"
   eval "$(_extract_fn _profile_ref_missing)"
   eval "$(_extract_fn _profile_ref_check)"
+  eval "$(_extract_fn _profile_is_dns_subdomain)"
+  eval "$(_extract_fn _profile_feature_subdomain_check)"
   eval "$(_extract_fn _profile_feature_field_check)"
   eval "$(_extract_fn ai_platform_profile_feature_problems)"
   eval "$(_extract_fn ai_platform_profile_problems)"
@@ -1829,7 +1831,8 @@ _profile_run() {
     for _f in load_config config_bool normalize_env_key_segment build_image_url \
               component_enabled validate_scale_factor_config _profile_value_unsafe _profile_q \
               ai_platform_profile_resolved ai_platform_profile_explicit ai_platform_profile_set \
-              _profile_ref_missing _profile_ref_check _profile_feature_field_check \
+              _profile_ref_missing _profile_ref_check _profile_is_dns_subdomain \
+              _profile_feature_subdomain_check _profile_feature_field_check \
               ai_platform_profile_feature_problems ai_platform_profile_problems \
               validate_ai_platform_profile_config _profile_image_url \
               render_ai_platform_profile_values; do
@@ -1915,6 +1918,15 @@ for _bad in gpu cpuonly CPUOnly FullFeature; do
   assert_problem "unsupported profile '${_bad}' is rejected" \
     "$(_profile_cfg cpuonly "bad-${_bad:-empty}" ".aiPlatform.profile = \"${_bad}\"")" "[PROFILE_UNSUPPORTED] aiPlatform.profile"
 done
+# A rejected profile value is never allowed to forge extra problem lines.
+_forge="$(_profile_problems "$(_profile_cfg cpuonly forge '.aiPlatform.profile = "x\n[PROFILE_CONFLICT] fake.field: injected"')")"
+assert_eq "a multi-line profile value yields exactly one problem line" "1" "$(printf '%s\n' "${_forge}" | grep -c '^\[PROFILE_')"
+assert_eq "the rejected multi-line profile value is not echoed" "0" "$(printf '%s' "${_forge}" | grep -c 'fake.field')"
+assert_contains "the multi-line profile value is reported as not shown" "(value not shown)" "${_forge}"
+_esc="$(_profile_problems "$(_profile_cfg cpuonly escseq '.aiPlatform.profile = "\u001b[31mred"')")"
+assert_eq "a profile value with an escape sequence is not echoed" "0" "$(printf '%s' "${_esc}" | grep -c $'\033')"
+assert_contains "a short plain unsupported profile is still echoed" "unsupported value 'gpu'" \
+  "$(_profile_problems "$(_profile_cfg cpuonly gpuprofile '.aiPlatform.profile = "gpu"')")"
 assert_problem "non-string profile (list) is an invalid value" \
   "$(_profile_cfg cpuonly list '.aiPlatform.profile = ["cpuOnly"]')" "[PROFILE_INVALID_VALUE] aiPlatform.profile"
 assert_problem "non-string profile (number) is an invalid value" \
@@ -2010,7 +2022,7 @@ assert_problem "a backslash in an image reference is rejected" \
 # Feature fields are spliced into the CR, so they must be safe scalars.
 _inj_name="$(_profile_cfg cpuonly injname '.aiPlatform.features += [{"name": "x\n    - name: saia\n      version: \"1\""}]')"
 assert_problem "newline-injected feature name is rejected" "${_inj_name}" "[PROFILE_INVALID_VALUE] aiPlatform.features[2].name"
-assert_eq "injected feature name is never echoed" "0" "$(_profile_problems "${_inj_name}" | grep -c 'saia')"
+assert_eq "injected feature name is never echoed" "0" "$(_profile_problems "${_inj_name}" | grep -c -e '- name: saia' -e 'version: ')"
 assert_problem "newline-injected version is rejected" \
   "$(_profile_cfg cpuonly injver '.aiPlatform.features[1].version = "1\"\n  x: y"')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].version"
 assert_problem "newline-injected minReplicas is rejected" \
@@ -2023,6 +2035,23 @@ assert_problem "minReplicas above maxReplicas is rejected" \
   "$(_profile_cfg cpuonly minmax '.aiPlatform.features[1].minReplicas = 5 | .aiPlatform.features[1].maxReplicas = 2')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
 assert_problem "targetCPUUtilization above 100 is rejected" \
   "$(_profile_cfg cpuonly cpu101 '.aiPlatform.features[1].targetCPUUtilization = 101')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].targetCPUUtilization"
+assert_problem "a feature entry without a name is rejected" \
+  "$(_profile_cfg cpuonly noname '.aiPlatform.features += [{"version": "1.0.0"}]')" "[PROFILE_INVALID_VALUE] aiPlatform.features[2].name"
+# The feature name is a CRD enum; the Kubernetes name rules are applied exactly.
+for _fname in unknown Saia agentruntime2 ''; do
+  assert_problem "feature name '${_fname}' outside the CRD enum is rejected" \
+    "$(_profile_cfg cpuonly "fname-${_fname:-empty}" ".aiPlatform.features += [{\"name\": \"${_fname}\"}]")" "[PROFILE_INVALID_VALUE] aiPlatform.features[2].name: must be one of saia, seca, slim, agentruntime"
+done
+_long_label="$(printf 'a%.0s' $(seq 1 64))"
+for _bad_sub in 'a..b' 'a.-b' 'a.b.' '.a' 'A.b' "${_long_label}" "x.${_long_label}" 'a_b'; do
+  assert_problem "checkpointDbSecretRef '${_bad_sub:0:14}' is not a Kubernetes name" \
+    "$(_profile_cfg cpuonly "sub-ck-${#_bad_sub}-${_bad_sub//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].checkpointDbSecretRef = \"${_bad_sub}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].checkpointDbSecretRef"
+  assert_problem "serviceAccountName '${_bad_sub:0:14}' is not a Kubernetes name" \
+    "$(_profile_cfg cpuonly "sub-sa-${#_bad_sub}-${_bad_sub//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].serviceAccountName = \"${_bad_sub}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].serviceAccountName"
+done
+_good_label63="$(printf 'a%.0s' $(seq 1 63))"
+assert_eq "valid dotted and 63-character-label names are accepted" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly goodsubs ".aiPlatform.features[1].checkpointDbSecretRef = \"${_good_label63}.b-c.d\" | .aiPlatform.features[1].serviceAccountName = \"my.sa-1\"")")"
 assert_problem "serviceAccountName must be a DNS label" \
   "$(_profile_cfg cpuonly badsa '.aiPlatform.features[1].serviceAccountName = "Bad_SA"')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].serviceAccountName"
 for _secret in 'Bad_Secret:1' 'UPPER' '-lead' 'a b'; do

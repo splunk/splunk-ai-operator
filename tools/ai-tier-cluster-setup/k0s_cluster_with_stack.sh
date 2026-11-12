@@ -1032,6 +1032,31 @@ _profile_ref_check() {
   fi
 }
 
+# True for a Kubernetes DNS-1123 subdomain: dot-separated DNS-1123 labels, each
+# at most 63 characters, at most 253 overall. A single regex cannot express the
+# per-label length, so the structure is checked first and the labels second.
+_profile_is_dns_subdomain() {
+  local v="${1:-}" label
+  local re='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+  (( ${#v} >= 1 && ${#v} <= 253 )) || return 1
+  [[ "${v}" =~ ${re} ]] || return 1
+  local IFS='.'
+  for label in ${v}; do
+    (( ${#label} <= 63 )) || return 1
+  done
+  return 0
+}
+
+# Subdomain-typed scalar field of aiPlatform.features[i] (ServiceAccount and
+# Secret names are DNS subdomains in Kubernetes, not labels).
+_profile_feature_subdomain_check() {
+  local i="$1" key="$2" hint="$3" value
+  value=$(yq eval ".aiPlatform.features[${i}].${key} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -z "${value}" || "${value}" == "null" ]] && return 0
+  _profile_is_dns_subdomain "${value}" || echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].${key}: ${hint}"
+  return 0
+}
+
 # Checks one scalar field of aiPlatform.features[i] against a regex and a
 # length bound. The install script splices these values into the AIPlatform CR
 # unquoted or with bare quotes, so an opted-in profile must only accept safe
@@ -1047,16 +1072,20 @@ _profile_feature_field_check() {
 
 # Validates every field the installer splices into the CR for each feature.
 ai_platform_profile_feature_problems() {
-  local count="$1" i fmin fmax ftarget
-  local dns_label='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
-  local dns_subdomain='^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+  local count="$1" i fmin fmax ftarget fname_value
   local version_re='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
   for ((i=0; i<count; i++)); do
-    _profile_feature_field_check "${i}" name "${dns_label}" 63 "must be a DNS-1123 label (lowercase alphanumerics and '-', at most 63 characters)"
+    # FeatureSpec.name is an enum in the CRD; anything else is rejected by
+    # kubectl apply only after the installer has already changed the cluster.
+    fname_value=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    case "${fname_value}" in
+      saia|seca|slim|agentruntime) ;;
+      *) echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].name: must be one of saia, seca, slim, agentruntime" ;;
+    esac
     _profile_feature_field_check "${i}" version "${version_re}" 64 "must be a version string (letters, digits, '.', '_', '+', '-'; at most 64 characters)"
     _profile_feature_field_check "${i}" runtimeVersion "${version_re}" 64 "must be a version string (letters, digits, '.', '_', '+', '-'; at most 64 characters)"
-    _profile_feature_field_check "${i}" serviceAccountName "${dns_label}" 253 "must be a DNS-1123 label (lowercase alphanumerics and '-')"
-    _profile_feature_field_check "${i}" checkpointDbSecretRef "${dns_subdomain}" 253 "must be a Kubernetes Secret name (lowercase alphanumerics, '-' and '.')"
+    _profile_feature_subdomain_check "${i}" serviceAccountName "must be a DNS-1123 subdomain (dot-separated lowercase labels of at most 63 characters, at most 253 overall)"
+    _profile_feature_subdomain_check "${i}" checkpointDbSecretRef "must be a Kubernetes Secret name (a DNS-1123 subdomain: dot-separated lowercase labels of at most 63 characters, at most 253 overall)"
     _profile_feature_field_check "${i}" minReplicas '^[1-9][0-9]{0,5}$' 6 "must be a positive integer"
     _profile_feature_field_check "${i}" maxReplicas '^[1-9][0-9]{0,5}$' 6 "must be a positive integer"
     _profile_feature_field_check "${i}" targetCPUUtilization '^[1-9][0-9]{0,2}$' 3 "must be an integer from 1 to 100"
@@ -1082,7 +1111,12 @@ ai_platform_profile_problems() {
   case "${profile}" in
     cpuOnly|fullfeature|full) ;;
     *)
-      echo "[PROFILE_UNSUPPORTED] aiPlatform.profile: unsupported value '${profile}'; supported values: cpuOnly, fullfeature (legacy alias: full)"
+      # Echo the rejected value only when it is plainly a short name; anything
+      # else (newlines, escape sequences, very long text) could forge extra
+      # "[CODE] field: message" lines in CI output.
+      local shown="(value not shown)"
+      [[ "${profile}" =~ ^[A-Za-z0-9._-]{1,32}$ ]] && shown="'${profile}'"
+      echo "[PROFILE_UNSUPPORTED] aiPlatform.profile: unsupported value ${shown}; supported values: cpuOnly, fullfeature (legacy alias: full)"
       return 0
       ;;
   esac
