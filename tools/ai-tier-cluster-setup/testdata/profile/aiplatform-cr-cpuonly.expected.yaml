@@ -1,0 +1,40 @@
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: launchpad-cpuonly-ai-platform
+spec:
+  profile: cpuOnly
+  objectStorage:
+    path: minio://ai-platform
+    region: us-east-1
+    endpoint: "http://192.0.2.20:9000"
+    secretRef: minio-credentials
+  # Image configuration (including pull secrets for private registries)
+  images:
+    imagePullSecrets:
+      - name: ecr-registry-secret
+      - name: docker-hub-secret
+      - name: gcr-secret
+      - name: acr-secret
+      - name: custom-registry-secret
+  # Sidecar injection configuration
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  # Features from config (aiPlatform.features)
+  features:
+    - name: slim
+      version: "1.0.0"
+    - name: agentruntime
+      version: "0.1.0"
+      provider: "launchpad"
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilization: 60
+      checkpointDbSecretRef: "launchpad-postgres-conn"
+  # CPU scheduler
+  cpuScheduler:
+    nodeSelector:
+      splunk.ai/workload-type: cpu
+    tolerations: []

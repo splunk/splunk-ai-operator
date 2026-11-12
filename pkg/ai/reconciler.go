@@ -58,6 +58,9 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		latest.Status = p.Status
 		latest.Status.Conditions = conditions
 		latest.Status.ObservedGeneration = p.Generation
+		// Publish the effective profile so it is observable without re-deriving
+		// the omitted/legacy-"full" compatibility rule.
+		latest.Status.Profile = p.Spec.ResolvedProfile()
 		latest.Status.RayServiceName = p.Status.RayServiceName
 		latest.Status.VectorDbServiceName = p.Status.VectorDbServiceName
 		_ = r.Status().Update(ctx, latest)

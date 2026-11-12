@@ -424,6 +424,12 @@ _check_node_os() {
 # In Full (interactive) mode: always prompts; answer overrides storage.modelStaging.enabled.
 # In Silent mode: honours the config value with no prompt.
 resolve_model_staging() {
+  # cpuOnly stages no models; validate_ai_platform_profile_config already
+  # required storage.modelStaging.enabled: false, so never prompt.
+  if [[ "$(ai_platform_profile_resolved)" == "cpuOnly" ]]; then
+    MODEL_STAGING_ENABLED=false
+    return 0
+  fi
   if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
     log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
@@ -457,6 +463,11 @@ readonly SUPPORTED_ACCELERATORS=("L40S" "H100" "RTX_PRO_6000_BLACKWELL")
 # Prompts when defaultAcceleratorType is missing OR set to an unsupported value,
 # since the CR always requires this field and stage_model_artifacts needs a valid type.
 resolve_accelerator_type() {
+  # cpuOnly runs no GPU workload, so there is no accelerator to resolve.
+  if [[ "$(ai_platform_profile_resolved)" == "cpuOnly" ]]; then
+    DEFAULT_ACCELERATOR=""
+    return 0
+  fi
   # Return early only if already set to a valid supported type (case-insensitive).
   # Normalize to the canonical casing from SUPPORTED_ACCELERATORS so the CR value
   # matches the Ray builder's instanceMap keys exactly (e.g. L40S, H100).
@@ -527,7 +538,7 @@ show_install_plan() {
   echo -e "    1. Preflight checks (SSH, disk, tools)" >&2
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
     echo -e "    2. Model artifact staging (installer host: HuggingFace → object store)" >&2
-  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+  elif model_artifacts_verification_applies; then
     echo -e "    2. Verify pre-staged model artifacts in object store" >&2
   else
     echo -e "    2. Model artifact staging  [SKIPPED — modelStaging.enabled=false]" >&2
@@ -808,6 +819,18 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   AI_SIDECAR_OTEL="$(config_bool '.aiPlatform.sidecars.otel' "${COMPONENT_OTEL}")"
   AI_SIDECAR_PROMETHEUS="$(config_bool '.aiPlatform.sidecars.prometheusOperator' "${COMPONENT_MONITORING}")"
 
+  # Deployment profile (cpuOnly | fullfeature | legacy full). The tag tells an
+  # omitted field (!!null) from an explicit one; validation happens in
+  # validate_ai_platform_profile_config, not here, so every problem is reported.
+  AI_PLATFORM_PROFILE_TAG="$(yq eval '.aiPlatform.profile | tag' "$CONFIG_FILE" 2>/dev/null || echo "!!null")"
+  AI_PLATFORM_PROFILE=""
+  if [[ "${AI_PLATFORM_PROFILE_TAG}" == "!!str" ]]; then
+    AI_PLATFORM_PROFILE="$(yq eval '.aiPlatform.profile' "$CONFIG_FILE" 2>/dev/null || echo "")"
+    # An empty string is ignored here (treated as omitted). A CR with
+    # spec.profile: "" is rejected by the CRD enum, so this is installer-only.
+    [[ -n "${AI_PLATFORM_PROFILE}" ]] || AI_PLATFORM_PROFILE_TAG="!!null"
+  fi
+
   # Container images
   IMAGE_REGISTRY="$(yq eval '.images.registry // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   # Default to "true" for plain-HTTP (no-TLS) registries such as a local mirror.
@@ -824,6 +847,9 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  AITK_IMAGE="$(yq eval '.images.aitk.image // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  # Per-run image snapshot manifest (output of the MPR-187 mirror step); optional.
+  SNAPSHOT_MANIFEST="$(yq eval '.images.snapshotManifest // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   AGENT_RUNTIME_BASE_IMAGE="$(yq eval '.images.agentRuntime.baseImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   AGENT_RUNTIME_SCHEMA_SETUP_IMAGE="$(yq eval '.images.agentRuntime.schemaSetupImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   FLUENT_BIT_IMAGE="$(yq eval '.images.fluentBit.image' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -920,6 +946,396 @@ build_image_url() {
   fi
 }
 
+# ====== DEPLOYMENT PROFILE (MPR-184) ======
+# aiPlatform.profile selects the AI Tier deployment profile. Canonical values
+# are cpuOnly and fullfeature. An omitted value and the legacy value "full"
+# both resolve to fullfeature. An omitted value and the legacy value "full" keep
+# the pre-profile behaviour: only the value itself is validated, no Launchpad
+# requirement applies, and no profile is rendered into the CR, so existing
+# configurations are unchanged. Setting the canonical cpuOnly or fullfeature
+# opts in to the Agent Launchpad path, where both profiles require the slim and
+# agentruntime features and their image references.
+#
+# Problems are reported as "[CODE] field: message" lines. The codes are part of
+# the handoff contract (docs/agent-runtime/profile-contract.md):
+#   PROFILE_INVALID_VALUE      wrong value shape (not a string, whitespace in a reference)
+#   PROFILE_UNSUPPORTED        unknown profile name
+#   PROFILE_CONFLICT           a setting contradicts the selected profile
+#   PROFILE_MISSING_REFERENCE  a required image, feature or Secret reference is absent
+# Messages name fields and never echo credentials or Secret contents.
+
+# Prints the canonical profile: cpuOnly or fullfeature. Anything else is
+# printed unchanged so the caller can reject it; it is never mapped to a
+# supported profile.
+ai_platform_profile_resolved() {
+  case "${AI_PLATFORM_PROFILE:-}" in
+    ""|full|fullfeature) echo "fullfeature" ;;
+    *)                   echo "${AI_PLATFORM_PROFILE}" ;;
+  esac
+}
+
+# Air-gapped installs verify that the model artifacts already sit in the object
+# store. cpuOnly hosts no local model, so there is nothing to verify; applying
+# the check anyway would fail an otherwise valid cpuOnly install after staging
+# (and advise enabling model staging, which cpuOnly forbids).
+model_artifacts_verification_applies() {
+  [[ "${AIRGAP_MODE:-false}" == "true" ]] && [[ "$(ai_platform_profile_resolved)" != "cpuOnly" ]]
+}
+
+# True when aiPlatform.profile is present with any value (it is then validated).
+ai_platform_profile_set() {
+  [[ "${AI_PLATFORM_PROFILE_TAG:-!!null}" != "!!null" ]]
+}
+
+# True only for the canonical names, which opt in to the Launchpad path. The
+# legacy "full" is set but not explicit: it keeps pre-profile behaviour.
+ai_platform_profile_explicit() {
+  [[ "${AI_PLATFORM_PROFILE_TAG:-!!null}" == "!!str" ]] || return 1
+  case "${AI_PLATFORM_PROFILE:-}" in
+    cpuOnly|fullfeature) return 0 ;;
+  esac
+  return 1
+}
+
+# True when a value cannot be rendered safely into YAML or a yq path.
+_profile_value_unsafe() {
+  case "${1:-}" in
+    *[[:space:]]*|*\"*|*\'*|*\\*) return 0 ;;
+  esac
+  return 1
+}
+
+# Escapes a value for a double-quoted YAML scalar (backslash, quote and the
+# control characters that would otherwise end the scalar or the line).
+_profile_q() {
+  local v="${1:-}"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  v="${v//$'\n'/\\n}"
+  v="${v//$'\r'/\\r}"
+  v="${v//$'\t'/\\t}"
+  printf '%s' "${v}"
+}
+
+_profile_ref_missing() {
+  [[ -z "${1:-}" || "${1}" == "null" ]]
+}
+
+_profile_ref_check() {
+  # _profile_ref_check <field> <value>: emits a problem for a missing or
+  # whitespace-containing image reference.
+  local field="$1" value="${2:-}"
+  if _profile_ref_missing "${value}"; then
+    echo "[PROFILE_MISSING_REFERENCE] ${field}: required by aiPlatform.profile"
+  elif _profile_value_unsafe "${value}"; then
+    echo "[PROFILE_INVALID_VALUE] ${field}: must not contain whitespace, quotes or backslashes"
+  fi
+}
+
+# Checks one scalar field of aiPlatform.features[i] against a regex and a
+# length bound. The install script splices these values into the AIPlatform CR
+# unquoted or with bare quotes, so an opted-in profile must only accept safe
+# scalars. Prints nothing for an absent field; never echoes the value.
+_profile_feature_field_check() {
+  local i="$1" key="$2" regex="$3" maxlen="$4" hint="$5" value
+  value=$(yq eval ".aiPlatform.features[${i}].${key} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -z "${value}" || "${value}" == "null" ]] && return 0
+  if [[ ! "${value}" =~ ${regex} ]] || (( ${#value} > maxlen )); then
+    echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].${key}: ${hint}"
+  fi
+}
+
+# Validates every field the installer splices into the CR for each feature.
+ai_platform_profile_feature_problems() {
+  local count="$1" i fmin fmax ftarget
+  local dns_label='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+  local dns_subdomain='^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+  local version_re='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+  for ((i=0; i<count; i++)); do
+    _profile_feature_field_check "${i}" name "${dns_label}" 63 "must be a DNS-1123 label (lowercase alphanumerics and '-', at most 63 characters)"
+    _profile_feature_field_check "${i}" version "${version_re}" 64 "must be a version string (letters, digits, '.', '_', '+', '-'; at most 64 characters)"
+    _profile_feature_field_check "${i}" runtimeVersion "${version_re}" 64 "must be a version string (letters, digits, '.', '_', '+', '-'; at most 64 characters)"
+    _profile_feature_field_check "${i}" serviceAccountName "${dns_label}" 253 "must be a DNS-1123 label (lowercase alphanumerics and '-')"
+    _profile_feature_field_check "${i}" checkpointDbSecretRef "${dns_subdomain}" 253 "must be a Kubernetes Secret name (lowercase alphanumerics, '-' and '.')"
+    _profile_feature_field_check "${i}" minReplicas '^[1-9][0-9]{0,5}$' 6 "must be a positive integer"
+    _profile_feature_field_check "${i}" maxReplicas '^[1-9][0-9]{0,5}$' 6 "must be a positive integer"
+    _profile_feature_field_check "${i}" targetCPUUtilization '^[1-9][0-9]{0,2}$' 3 "must be an integer from 1 to 100"
+    fmin=$(yq eval ".aiPlatform.features[${i}].minReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    fmax=$(yq eval ".aiPlatform.features[${i}].maxReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    ftarget=$(yq eval ".aiPlatform.features[${i}].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ "${ftarget}" =~ ^[1-9][0-9]{0,2}$ ]] && (( ftarget > 100 )); then
+      echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].targetCPUUtilization: must be an integer from 1 to 100"
+    fi
+    if [[ "${fmin}" =~ ^[1-9][0-9]{0,5}$ && "${fmax}" =~ ^[1-9][0-9]{0,5}$ ]] && (( fmin > fmax )); then
+      echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].maxReplicas: must be greater than or equal to minReplicas"
+    fi
+  done
+}
+
+ai_platform_profile_problems() {
+  local tag="${AI_PLATFORM_PROFILE_TAG:-!!null}" profile="${AI_PLATFORM_PROFILE:-}"
+  [[ "${tag}" == "!!null" ]] && return 0   # omitted: legacy behaviour, nothing to check
+  if [[ "${tag}" != "!!str" ]]; then
+    echo "[PROFILE_INVALID_VALUE] aiPlatform.profile: must be a string, one of: cpuOnly, fullfeature (legacy alias: full)"
+    return 0
+  fi
+  case "${profile}" in
+    cpuOnly|fullfeature|full) ;;
+    *)
+      echo "[PROFILE_UNSUPPORTED] aiPlatform.profile: unsupported value '${profile}'; supported values: cpuOnly, fullfeature (legacy alias: full)"
+      return 0
+      ;;
+  esac
+
+  # Legacy "full": valid, but keeps pre-profile behaviour (no further checks).
+  [[ "${profile}" == "full" ]] && return 0
+
+  # The same scale-factor rule install enforces, so render-profile and validate
+  # never accept a value install would reject.
+  local scale_error
+  if ! scale_error=$(validate_scale_factor_config); then
+    echo "[PROFILE_INVALID_VALUE] ${scale_error}"
+  fi
+
+  local resolved i name count has_slim=false has_agentruntime=false seen="|" identity prov
+  resolved="$(ai_platform_profile_resolved)"
+
+  count=$(yq eval '(.aiPlatform.features // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  for ((i=0; i<count; i++)); do
+    name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    # Same identity rule as the webhook: agentruntime is keyed by provider.
+    identity="${name}"
+    if [[ "${name}" == "agentruntime" ]]; then
+      prov=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      identity="agentruntime/${prov}"
+    fi
+    if [[ -n "${name}" && "${seen}" == *"|${identity}|"* ]]; then
+      echo "[PROFILE_CONFLICT] aiPlatform.features[${i}].name: duplicate feature '${identity}'"
+    fi
+    seen+="${identity}|"
+    case "${name}" in
+      slim) has_slim=true ;;
+      agentruntime) has_agentruntime=true ;;
+      saia|seca)
+        if [[ "${resolved}" == "cpuOnly" ]]; then
+          echo "[PROFILE_CONFLICT] aiPlatform.features[${i}].name: '${name}' is not supported by cpuOnly; remove it or set aiPlatform.profile: fullfeature"
+        fi
+        ;;
+    esac
+  done
+
+  ai_platform_profile_feature_problems "${count}"
+
+  if [[ "${resolved}" == "cpuOnly" ]]; then
+    local gpu_workers="${GPU_WORKER_COUNT:-}"
+    # An omitted nodes.gpuWorkers means no GPU workers.
+    [[ -z "${gpu_workers}" || "${gpu_workers}" == "null" ]] && gpu_workers=0
+    if [[ "${gpu_workers}" != "0" ]]; then
+      [[ "${gpu_workers}" =~ ^[0-9]+$ ]] || gpu_workers="not a number"
+      echo "[PROFILE_CONFLICT] nodes.gpuWorkers: must be 0 for cpuOnly (got ${gpu_workers})"
+    fi
+    if [[ -n "${DEFAULT_ACCELERATOR:-}" && "${DEFAULT_ACCELERATOR}" != "null" ]]; then
+      echo "[PROFILE_CONFLICT] aiPlatform.defaultAcceleratorType: must be empty for cpuOnly"
+    fi
+    # aiPlatform.scaleFactor multiplies GPU capacity; the installer drops it
+    # for cpuOnly, so a value above 1 would be silently ignored.
+    local scale_factor
+    scale_factor="$(yq eval '.aiPlatform.scaleFactor // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    if [[ "${scale_factor}" =~ ^[0-9]+$ ]] && { (( ${#scale_factor} > 9 )) || (( 10#${scale_factor} > 1 )); }; then
+      echo "[PROFILE_CONFLICT] aiPlatform.scaleFactor: must be 1 or omitted for cpuOnly; it multiplies GPU capacity"
+    fi
+    # An omitted nvidia component is never installed with zero GPU workers, so
+    # only an explicit true contradicts the profile.
+    if [[ "$(config_bool '.components.nvidia' 'false')" == "true" ]]; then
+      echo "[PROFILE_CONFLICT] components.nvidia: true installs GPU support, which cpuOnly does not use; set it to false"
+    fi
+    # An omitted kuberay component resolves to true (Ray images demanded, model
+    # serving operator deployed), so cpuOnly needs an explicit false.
+    if [[ "${COMPONENT_KUBERAY:-true}" != "false" ]]; then
+      echo "[PROFILE_CONFLICT] components.kuberay: must be explicitly false for cpuOnly (an omitted value defaults to true)"
+    fi
+    # An omitted value defaults to true, which would stage model artifacts with
+    # no accelerator.
+    if [[ "${MODEL_STAGING_ENABLED:-true}" != "false" ]]; then
+      echo "[PROFILE_CONFLICT] storage.modelStaging.enabled: must be false for cpuOnly (an omitted value defaults to true)"
+    fi
+    # Ray, Weaviate and SAIA images would still be injected into the operator
+    # Deployment (RELATED_IMAGE_*) even though cpuOnly deploys none of them.
+    local leaked_key leaked_value
+    for leaked_key in images.ray.headImage images.ray.workerImage images.weaviate.image \
+                      images.saia.apiImage images.saia.apiV2Image images.saia.dataLoaderImage; do
+      leaked_value="$(yq eval ".${leaked_key} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+      if [[ -n "${leaked_value}" && "${leaked_value}" != "null" ]]; then
+        echo "[PROFILE_CONFLICT] ${leaked_key}: not supported by cpuOnly (it would be injected into the operator but nothing uses it); remove it"
+      fi
+    done
+    # Sidecar flags default from components.otel and components.monitoring (true
+    # when omitted), which the AIPlatform webhook rejects for cpuOnly.
+    local sidecar
+    for sidecar in "envoy:${AI_SIDECAR_ENVOY:-false}" "otel:${AI_SIDECAR_OTEL:-false}" "prometheusOperator:${AI_SIDECAR_PROMETHEUS:-false}"; do
+      if [[ "${sidecar#*:}" != "false" ]]; then
+        echo "[PROFILE_CONFLICT] aiPlatform.sidecars.${sidecar%%:*}: must be false for cpuOnly (an omitted value defaults from components.otel / components.monitoring)"
+      fi
+    done
+  else
+    # fullfeature serves models through Ray, so disabling KubeRay contradicts it.
+    if [[ "${COMPONENT_KUBERAY:-true}" == "false" ]]; then
+      echo "[PROFILE_CONFLICT] components.kuberay: false contradicts fullfeature, which serves models through Ray; set it to true or use aiPlatform.profile: cpuOnly"
+    else
+      # install requires these when KubeRay and the AIPlatform CR are enabled;
+      # report them here so validate and render-profile agree with install.
+      _profile_ref_check "images.ray.headImage" "${RAY_HEAD_IMAGE:-}"
+      _profile_ref_check "images.ray.workerImage" "${RAY_WORKER_IMAGE:-}"
+    fi
+    if component_enabled ai-platform-cr; then
+      _profile_ref_check "images.weaviate.image" "${WEAVIATE_IMAGE:-}"
+    fi
+  fi
+
+  # Both profiles route AITK -> SLIM -> AgentRuntime.
+  "${has_slim}" || echo "[PROFILE_MISSING_REFERENCE] aiPlatform.features: the 'slim' feature is required by aiPlatform.profile"
+  "${has_agentruntime}" || echo "[PROFILE_MISSING_REFERENCE] aiPlatform.features: the 'agentruntime' feature is required by aiPlatform.profile"
+
+  _profile_ref_check "images.agentRuntime.baseImage" "${AGENT_RUNTIME_BASE_IMAGE:-}"
+  _profile_ref_check "images.agentRuntime.schemaSetupImage" "${AGENT_RUNTIME_SCHEMA_SETUP_IMAGE:-}"
+  _profile_ref_check "images.slim.apiImage" "${SLIM_API_IMAGE:-}"
+  # images.aitk.image is optional for now: nothing in the operator or the
+  # air-gap bundle consumes it yet (to be decided with MPR-188). When given it
+  # must still be a safe scalar, because it is rendered into the values file.
+  if ! _profile_ref_missing "${AITK_IMAGE:-}" && _profile_value_unsafe "${AITK_IMAGE}"; then
+    echo "[PROFILE_INVALID_VALUE] images.aitk.image: must not contain whitespace, quotes or backslashes"
+  fi
+  if [[ -n "${SNAPSHOT_MANIFEST:-}" && "${SNAPSHOT_MANIFEST}" != "null" ]] && _profile_value_unsafe "${SNAPSHOT_MANIFEST}"; then
+    echo "[PROFILE_INVALID_VALUE] images.snapshotManifest: must not contain whitespace, quotes or backslashes"
+  fi
+
+  local provider provider_image checkpoint_ref agent_module
+  # Same shape the operator enforces for RELATED_AGENT_RUNTIME_MODULE_PROVIDER_*.
+  local agent_module_re='^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$'
+  for ((i=0; i<count; i++)); do
+    name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ "${name}" == "agentruntime" ]] || continue
+    provider=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if _profile_ref_missing "${provider}"; then
+      echo "[PROFILE_MISSING_REFERENCE] aiPlatform.features[${i}].provider: required for agentruntime"
+    elif [[ ! "${provider}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || (( ${#provider} > 63 )); then
+      echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].provider: must be a DNS-1123 label (lowercase alphanumerics and '-', at most 63 characters)"
+    else
+      provider_image=$(yq eval ".images.agentRuntime.providerImages.\"${provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      _profile_ref_check "images.agentRuntime.providerImages.${provider}" "${provider_image}"
+      # The operator needs the loader module for every provider and rejects
+      # anything but package.module:ClassName (RELATED_AGENT_RUNTIME_MODULE_PROVIDER_*).
+      agent_module=$(yq eval ".images.agentRuntime.providerModules.\"${provider}\" // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      if _profile_ref_missing "${agent_module}"; then
+        echo "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerModules.${provider}: required by aiPlatform.profile (the AGENT_MODULE loader, package.module:ClassName)"
+      elif [[ ! "${agent_module}" =~ ${agent_module_re} ]]; then
+        echo "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.${provider}: must look like package.module:ClassName"
+      fi
+    fi
+    checkpoint_ref=$(yq eval ".aiPlatform.features[${i}].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if _profile_ref_missing "${checkpoint_ref}"; then
+      echo "[PROFILE_MISSING_REFERENCE] aiPlatform.features[${i}].checkpointDbSecretRef: required for agentruntime (external Secret reference)"
+    fi
+  done
+  return 0
+}
+
+# Prints every problem and returns 1 when there is at least one. Safe to call
+# before any cluster change.
+validate_ai_platform_profile_config() {
+  local problems
+  problems="$(ai_platform_profile_problems)"
+  [[ -z "${problems}" ]] && return 0
+  printf '%s\n' "${problems}"
+  return 1
+}
+
+# Prints the effective profile values consumed by downstream stories
+# (MPR-186 placement, MPR-190/MPR-192 CI jobs). Output is deterministic: no
+# timestamps, stable key order, only references and names (never Secret
+# contents). Call validate_ai_platform_profile_config first.
+render_ai_platform_profile_values() {
+  local resolved explicit=false configured="" i count name provider checkpoint gpu_workers
+  resolved="$(ai_platform_profile_resolved)"
+  ai_platform_profile_explicit && explicit=true
+  ai_platform_profile_set && configured="${AI_PLATFORM_PROFILE}"
+
+  echo "# Generated by k0s_cluster_with_stack.sh render-profile. Do not edit."
+  echo "schemaVersion: 1"
+  echo "profile:"
+  echo "  configured: \"$(_profile_q "${configured}")\""
+  echo "  effective: ${resolved}"
+  echo "  explicit: ${explicit}"
+  echo "aiPlatformSpec:"
+  if [[ "${explicit}" == "true" ]]; then
+    echo "  profile: ${resolved}"
+  else
+    echo "  profile: \"\"   # omitted in the CR; resolves to fullfeature"
+  fi
+  echo "images:"
+  echo "  snapshotManifest: \"$(_profile_q "${SNAPSHOT_MANIFEST:-}")\""
+  echo "  operator: \"$(_profile_q "$(_profile_image_url "${OPERATOR_IMAGE:-}")")\""
+  echo "  agentRuntime:"
+  echo "    base: \"$(_profile_q "$(_profile_image_url "${AGENT_RUNTIME_BASE_IMAGE:-}")")\""
+  echo "    schemaSetup: \"$(_profile_q "$(_profile_image_url "${AGENT_RUNTIME_SCHEMA_SETUP_IMAGE:-}")")\""
+  echo "    providers:"
+  count=$(yq eval '(.aiPlatform.features // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  for ((i=0; i<count; i++)); do
+    name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ "${name}" == "agentruntime" ]] || continue
+    provider=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ -n "${provider}" && "${provider}" != "null" ]] || continue
+    # Look the image up with the key passed as data, never spliced into the path.
+    echo "      \"$(_profile_q "${provider}")\": \"$(_profile_q "$(_profile_image_url "$(P="${provider}" yq eval '.images.agentRuntime.providerImages[strenv(P)] // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")")")\""
+  done
+  echo "    modules:"
+  for ((i=0; i<count; i++)); do
+    name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ "${name}" == "agentruntime" ]] || continue
+    provider=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ -n "${provider}" && "${provider}" != "null" ]] || continue
+    echo "      \"$(_profile_q "${provider}")\": \"$(_profile_q "$(P="${provider}" yq eval '.images.agentRuntime.providerModules[strenv(P)] // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")")\""
+  done
+  echo "  slim: \"$(_profile_q "$(_profile_image_url "${SLIM_API_IMAGE:-}")")\""
+  echo "  aitk: \"$(_profile_q "$(_profile_image_url "${AITK_IMAGE:-}")")\""
+  echo "features:"
+  for ((i=0; i<count; i++)); do
+    name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ -n "${name}" && "${name}" != "null" ]] && echo "  - \"$(_profile_q "${name}")\""
+  done
+  echo "checkpointDbSecretRefs:"
+  for ((i=0; i<count; i++)); do
+    name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ "${name}" == "agentruntime" ]] || continue
+    checkpoint=$(yq eval ".aiPlatform.features[${i}].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    echo "  - \"$(_profile_q "${checkpoint}")\""
+  done
+  # Effective component set: what the installer will actually act on
+  # (component_enabled), not the raw flags. nvidia, for example, is skipped
+  # when there are no GPU workers whatever the flag says.
+  echo "components:"
+  echo "  certManager: $(component_enabled cert-manager && echo true || echo false)"
+  echo "  monitoring: $(component_enabled monitoring && echo true || echo false)"
+  echo "  otel: $(component_enabled otel && echo true || echo false)"
+  echo "  kuberay: $(component_enabled kuberay && echo true || echo false)"
+  echo "  nvidia: $(component_enabled nvidia && echo true || echo false)"
+  echo "  aiOperator: $(component_enabled ai-operator && echo true || echo false)"
+  echo "  aiPlatformCR: $(component_enabled ai-platform-cr && echo true || echo false)"
+  gpu_workers="${GPU_WORKER_COUNT:-}"
+  [[ -z "${gpu_workers}" || "${gpu_workers}" == "null" ]] && gpu_workers=0
+  echo "nodes:"
+  echo "  gpuWorkers: ${gpu_workers}"
+}
+
+_profile_image_url() {
+  local ref="${1:-}"
+  if [[ -z "${ref}" || "${ref}" == "null" ]]; then
+    echo ""
+  else
+    build_image_url "${IMAGE_REGISTRY:-}" "${ref}"
+  fi
+}
+
 # validate_scale_factor_config validates the user-facing k0s setting before
 # any installation work begins. An omitted value is valid and uses the CRD
 # default of 1; an explicitly configured value must be a YAML integer >= 1.
@@ -953,6 +1369,13 @@ validate_scale_factor_config() {
 validate_image_config() {
   log "Validating image configuration..."
 
+  # Deployment profile first: a contradictory or incomplete profile must fail
+  # before any other work, with every problem listed.
+  local profile_problems
+  if ! profile_problems=$(validate_ai_platform_profile_config); then
+    err "aiPlatform.profile configuration is invalid. No installation changes were made:"$'\n'"${profile_problems}"
+  fi
+
   local scale_factor_error
   if ! scale_factor_error=$(validate_scale_factor_config); then
     err "${scale_factor_error}"
@@ -977,7 +1400,8 @@ validate_image_config() {
       err "REQUIRED: images.ray.workerImage must be specified in k0s-cluster-config.yaml when components.kuberay=true"
     fi
   fi
-  if component_enabled ai-platform-cr; then
+  # cpuOnly runs no Weaviate, so it needs no Weaviate image.
+  if component_enabled ai-platform-cr && [[ "$(ai_platform_profile_resolved)" != "cpuOnly" ]]; then
     if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
       err "REQUIRED: images.weaviate.image must be specified in k0s-cluster-config.yaml when components.aiPlatformCR=true"
     fi
@@ -1064,7 +1488,7 @@ validate_image_config() {
     "images.ray.headImage:${RAY_HEAD_IMAGE}"
     "images.ray.workerImage:${RAY_WORKER_IMAGE}"
   )
-  component_enabled ai-platform-cr && mutable_tag_images+=("images.weaviate.image:${WEAVIATE_IMAGE}")
+  component_enabled ai-platform-cr && [[ "$(ai_platform_profile_resolved)" != "cpuOnly" ]] && mutable_tag_images+=("images.weaviate.image:${WEAVIATE_IMAGE}")
   k0s_saia_feature_enabled && mutable_tag_images+=(
     "images.saia.apiImage:${SAIA_API_IMAGE}"
     "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
@@ -6601,6 +7025,24 @@ EOF
     features_yaml="    - name: saia"$'\n'"      version: \"1.1.0\""$'\n'
   fi
 
+  # Deployment profile. An explicit profile is rendered in its canonical form;
+  # an omitted one stays omitted (the operator resolves it to fullfeature).
+  # cpuOnly runs no model serving, so the GPU, Ray worker and vector DB
+  # sections that the AIPlatform webhook rejects for it are not rendered.
+  local profile_yaml="" accelerator_yaml="" scale_comment="" storage_yaml="" worker_yaml="" gpu_scheduler_yaml=""
+  if ai_platform_profile_explicit; then
+    profile_yaml="  profile: $(ai_platform_profile_resolved)"$'\n'
+  fi
+  if [[ "$(ai_platform_profile_resolved)" == "cpuOnly" ]]; then
+    scale_factor_yaml=""
+  else
+    accelerator_yaml="  # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)"$'\n'"  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}"$'\n'
+    scale_comment="  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)"$'\n'
+    storage_yaml="  # Storage configuration"$'\n'"  storage:"$'\n'"    vectorDB:"$'\n'"      size: ${VECTORDB_SIZE}"$'\n'"      storageClassName: ${STORAGE_CLASS}"$'\n'
+    worker_yaml=$'\n'"  # Worker configuration"$'\n'"  workerGroupConfig:"$'\n'"    imageRegistry: \"${WORKER_IMAGE_REGISTRY}\""$'\n'
+    gpu_scheduler_yaml="  # GPU scheduler"$'\n'"  gpuScheduler:"$'\n'"    nodeSelector:"$'\n'"      splunk.ai/workload-type: gpu"$'\n'"    tolerations:"$'\n'"      - key: \"nvidia.com/gpu\""$'\n'"        operator: \"Equal\""$'\n'"        value: \"true\""$'\n'"        effect: \"NoSchedule\""$'\n'
+  fi
+
   # Apply AIPlatform CR (matching EKS script pattern)
   log "Applying AIPlatform CR: ${CLUSTER_NAME}-ai-platform"
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
@@ -6609,7 +7051,7 @@ kind: AIPlatform
 metadata:
   name: ${CLUSTER_NAME}-ai-platform
 spec:
-  objectStorage:
+${profile_yaml}  objectStorage:
     path: ${obj_path}
     region: ${REGION:-${ECR_REGION:-us-east-1}}
     $( [[ -n "$obj_endpoint" ]] && echo "endpoint: \"${obj_endpoint}\"" )
@@ -6619,11 +7061,7 @@ spec:
   images:
 ${image_pull_secrets}
 
-  # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
-  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
-
-  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
-${scale_factor_yaml}
+${accelerator_yaml}${scale_comment}${scale_factor_yaml}
   # Sidecar injection configuration
   sidecars:
     envoy: ${AI_SIDECAR_ENVOY}
@@ -6634,32 +7072,14 @@ ${scale_factor_yaml}
   features:
 ${features_yaml}
 ${svc_template_yaml}
-  # Storage configuration
-  storage:
-    vectorDB:
-      size: ${VECTORDB_SIZE}
-      storageClassName: ${STORAGE_CLASS}
-
-  # Worker configuration
-  workerGroupConfig:
-    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
-
+${storage_yaml}${worker_yaml}
   # CPU scheduler
   cpuScheduler:
     nodeSelector:
       splunk.ai/workload-type: cpu
     tolerations: []
 
-  # GPU scheduler
-  gpuScheduler:
-    nodeSelector:
-      splunk.ai/workload-type: gpu
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
-${splunk_config_yaml}
+${gpu_scheduler_yaml}${splunk_config_yaml}
 YAML
 
   log "AIPlatform CR created successfully"
@@ -8412,7 +8832,7 @@ main_install() {
     log "Model staging enabled — downloading from Hugging Face and uploading to object store…"
     stage_model_artifacts
     step_ok
-  elif [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+  elif model_artifacts_verification_applies; then
     step_start "Verify pre-staged model artifacts"
     log "Model staging disabled — verifying required models already exist in the configured object store..."
     verify_pre_staged_model_artifacts
@@ -8972,9 +9392,28 @@ validate_config() {
   img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
   img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
   _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
+  local _profile_problems _profile_line
+  if ai_platform_profile_set; then
+    if _profile_problems=$(validate_ai_platform_profile_config); then
+      if ai_platform_profile_explicit; then
+        echo -e "  \033[1;32m✔\033[0m aiPlatform.profile = $(ai_platform_profile_resolved)" >&2
+      else
+        echo -e "  \033[1;32m✔\033[0m aiPlatform.profile = ${AI_PLATFORM_PROFILE} (legacy; resolves to fullfeature, pre-profile behaviour)" >&2
+      fi
+    else
+      while IFS= read -r _profile_line; do
+        echo -e "  \033[1;31m✖\033[0m ${_profile_line}" >&2
+        errors=$(( errors + 1 ))
+      done <<< "${_profile_problems}"
+    fi
+  else
+    echo -e "  \033[1;32m✔\033[0m aiPlatform.profile omitted (resolves to fullfeature; pre-profile behaviour)" >&2
+  fi
+  if [[ "$(ai_platform_profile_resolved)" != "cpuOnly" ]]; then
   _vcheck "aiPlatform.defaultAcceleratorType" \
     "$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null)" \
     "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
+  fi
   local _accel_val
   _accel_val=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
   if [[ -n "${_accel_val}" ]]; then
@@ -9053,7 +9492,7 @@ validate_config() {
 # ====== USAGE ======
 usage() {
   cat <<EOF
-Usage: $0 [install|validate|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
+Usage: $0 [install|validate|render-profile|stage-artifacts|delete|clean-all|join-workers|verify-pods|diagnose]
 
 Deploys Splunk AI tier on k0s cluster using pre-provisioned nodes.
 Requires nodes.existingIPs in the config YAML.
@@ -9075,6 +9514,12 @@ Commands:
   validate         - Check config file completeness before a full install.
                      Catches missing IPs, unset credentials, missing manifest files.
                      Safe to run any time — makes no changes.
+  render-profile [--output FILE]
+                   - Validate aiPlatform.profile (cpuOnly | fullfeature) and write the
+                     effective profile values as YAML to FILE (default:
+                     profile-values.generated.yaml next to the config). Makes no
+                     cluster changes. Failures are "[CODE] field: message" lines,
+                     a nonzero exit, and no file.
   stage-artifacts  - Download model artifacts from Hugging Face and upload them to
                      the configured object store. Useful to re-stage or to
                      pre-load before install. Requires nodes.existingIPs in the
@@ -9491,6 +9936,26 @@ if [[ "${AIRGAP_STAGED:-false}" != "true" ]]; then
           echo "  That script downloads the artifacts a sealed cluster cannot fetch itself." >&2
           exit 1
         fi
+        # Fail on an invalid aiPlatform.profile BEFORE the long staging step, not
+        # after ~15 minutes of downloads. Needs yq (often absent on a sealed
+        # host); without it the profile is still validated by install itself.
+        # The check runs as a child process with its own log directory so it
+        # neither shares this run's log file nor adds a second "Session log" line.
+        if command -v yq >/dev/null 2>&1 && [[ -f "${CONFIG_FILE}" ]] && \
+           [[ "$(yq eval '.aiPlatform.profile | tag' "${CONFIG_FILE}" 2>/dev/null || echo '!!null')" != "!!null" ]]; then
+          _pf_rc=0
+          _pf_out="$(CONFIG_FILE="${CONFIG_FILE}" AIRGAP_STAGED=true LOG_DIR="${LOG_DIR:-${_sd}/logs}/preflight" \
+            bash "${BASH_SOURCE[0]}" render-profile --output /dev/null 2>&1)" || _pf_rc=$?
+          if [[ "${_pf_rc}" != "0" ]]; then
+            printf '%s\n' "${_pf_out}" | grep -v 'Session log:' >&2
+            if printf '%s' "${_pf_out}" | grep -q '\[PROFILE_'; then
+              echo "ERROR: aiPlatform.profile is invalid; nothing was staged. Fix the problems above and re-run." >&2
+            else
+              echo "ERROR: the configuration could not be loaded for the pre-staging check; nothing was staged. Fix the error above and re-run." >&2
+            fi
+            exit 1
+          fi
+        fi
         echo "[LOG] Air-gap mode — staging artifacts before ${_CMD} (see airgap_install.sh)."
         # exec: replace this process so there is exactly one installer in the
         # tree and the staged run's exit status surfaces directly to the caller.
@@ -9521,6 +9986,29 @@ case "${_CMD}" in
     ;;
   validate)
     validate_config
+    ;;
+  render-profile)
+    # render-profile [--output FILE]: validate the deployment profile and write
+    # the effective profile values (YAML) to FILE. Makes no cluster changes.
+    # This script tees stdout and stderr into the session log, so the document
+    # is written to a file, never to stdout. Default FILE is
+    # profile-values.generated.yaml next to the config file.
+    _profile_out=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --output|-o) _profile_out="${2:-}"; [[ -n "${_profile_out}" ]] || { echo "--output needs a file" >&2; exit 1; }; shift 2 ;;
+        *) echo "Unknown render-profile option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+    done
+    [[ -n "${_profile_out}" ]] || _profile_out="$(dirname "${CONFIG_FILE}")/profile-values.generated.yaml"
+    load_config
+    if ! _profile_problems=$(validate_ai_platform_profile_config); then
+      echo "aiPlatform.profile configuration is invalid. No file was written:" >&2
+      printf '%s\n' "${_profile_problems}" >&2
+      exit 1
+    fi
+    render_ai_platform_profile_values > "${_profile_out}"
+    log "Wrote effective profile values (profile=$(ai_platform_profile_resolved)) to ${_profile_out}"
     ;;
   stage-artifacts)
     load_config
