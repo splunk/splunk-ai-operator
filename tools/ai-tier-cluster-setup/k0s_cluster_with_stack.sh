@@ -1000,7 +1000,7 @@ ai_platform_profile_explicit() {
 # True when a value cannot be rendered safely into YAML or a yq path.
 _profile_value_unsafe() {
   case "${1:-}" in
-    *[[:space:]]*|*\"*|*\'*|*\\*) return 0 ;;
+    *[[:space:]]*|*[[:cntrl:]]*|*\"*|*\'*|*\\*) return 0 ;;
   esac
   return 1
 }
@@ -1014,6 +1014,20 @@ _profile_q() {
   v="${v//$'\n'/\\n}"
   v="${v//$'\r'/\\r}"
   v="${v//$'\t'/\\t}"
+  # Any other control character (ESC, DEL, ...) is invalid inside a YAML
+  # scalar: write it as a \uXXXX escape.
+  if [[ "${v}" == *[[:cntrl:]]* ]]; then
+    local out="" ch i
+    for ((i=0; i<${#v}; i++)); do
+      ch="${v:i:1}"
+      if [[ "${ch}" == [[:cntrl:]] ]]; then
+        out+="$(printf '\\u%04x' "'${ch}")"
+      else
+        out+="${ch}"
+      fi
+    done
+    v="${out}"
+  fi
   printf '%s' "${v}"
 }
 
@@ -1028,7 +1042,7 @@ _profile_ref_check() {
   if _profile_ref_missing "${value}"; then
     echo "[PROFILE_MISSING_REFERENCE] ${field}: required by aiPlatform.profile"
   elif _profile_value_unsafe "${value}"; then
-    echo "[PROFILE_INVALID_VALUE] ${field}: must not contain whitespace, quotes or backslashes"
+    echo "[PROFILE_INVALID_VALUE] ${field}: must not contain whitespace, control characters, quotes or backslashes"
   fi
 }
 
@@ -1072,7 +1086,7 @@ _profile_feature_field_check() {
 
 # Validates every field the installer splices into the CR for each feature.
 ai_platform_profile_feature_problems() {
-  local count="$1" i fmin fmax ftarget fname_value
+  local count="$1" i fmin fmax ftarget fname_value env_tag env_bad
   local version_re='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
   for ((i=0; i<count; i++)); do
     # FeatureSpec.name is an enum in the CRD; anything else is rejected by
@@ -1092,6 +1106,17 @@ ai_platform_profile_feature_problems() {
     fmin=$(yq eval ".aiPlatform.features[${i}].minReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
     fmax=$(yq eval ".aiPlatform.features[${i}].maxReplicas // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
     ftarget=$(yq eval ".aiPlatform.features[${i}].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    # features[].env is map[string]string in the CRD: a non-map value, or a value
+    # that YAML reads as a number or boolean (PORT: 8080), fails kubectl apply.
+    env_tag=$(yq eval ".aiPlatform.features[${i}].env | tag" "${CONFIG_FILE}" 2>/dev/null || echo "!!null")
+    if [[ "${env_tag}" != "!!null" && "${env_tag}" != "!!map" ]]; then
+      echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].env: must be a map of string values"
+    elif [[ "${env_tag}" == "!!map" ]]; then
+      env_bad=$(yq eval "[.aiPlatform.features[${i}].env | to_entries | .[] | select((.value | tag) != \"!!str\")] | length" "${CONFIG_FILE}" 2>/dev/null || echo "0")
+      if [[ "${env_bad}" != "0" ]]; then
+        echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].env: every value must be a string (quote numbers and booleans)"
+      fi
+    fi
     if [[ "${ftarget}" =~ ^[1-9][0-9]{0,2}$ ]] && (( ftarget > 100 )); then
       echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].targetCPUUtilization: must be an integer from 1 to 100"
     fi
@@ -1128,23 +1153,36 @@ ai_platform_profile_problems() {
   # never accept a value install would reject.
   local scale_error
   if ! scale_error=$(validate_scale_factor_config); then
-    echo "[PROFILE_INVALID_VALUE] ${scale_error}"
+    # The shared validator appends "(got <value>)"; rejected values are not echoed.
+    echo "[PROFILE_INVALID_VALUE] ${scale_error%% (got *}"
   fi
 
   local resolved i name count has_slim=false has_agentruntime=false seen="|" identity prov
   resolved="$(ai_platform_profile_resolved)"
 
   count=$(yq eval '(.aiPlatform.features // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  # The CRD limits spec.features to 10 items; kubectl apply would otherwise
+  # reject the CR only after the installer has changed the cluster.
+  if [[ "${count}" =~ ^[0-9]+$ ]] && (( count > 10 )); then
+    echo "[PROFILE_INVALID_VALUE] aiPlatform.features: at most 10 features are allowed (got ${count})"
+  fi
   for ((i=0; i<count; i++)); do
     name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
     # Same identity rule as the webhook: agentruntime is keyed by provider.
     identity="${name}"
+    # provider is only supported for agentruntime (the webhook rejects it elsewhere).
+    if [[ "${name}" != "agentruntime" ]]; then
+      prov=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+      if [[ -n "${prov}" && "${prov}" != "null" ]]; then
+        echo "[PROFILE_CONFLICT] aiPlatform.features[${i}].provider: only supported for the agentruntime feature"
+      fi
+    fi
     if [[ "${name}" == "agentruntime" ]]; then
       prov=$(yq eval ".aiPlatform.features[${i}].provider // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       identity="agentruntime/${prov}"
     fi
     if [[ -n "${name}" && "${seen}" == *"|${identity}|"* ]]; then
-      echo "[PROFILE_CONFLICT] aiPlatform.features[${i}].name: duplicate feature '${identity}'"
+      echo "[PROFILE_CONFLICT] aiPlatform.features[${i}].name: duplicate feature entry (same name, or same provider for agentruntime)"
     fi
     seen+="${identity}|"
     case "${name}" in
@@ -1159,6 +1197,7 @@ ai_platform_profile_problems() {
   done
 
   ai_platform_profile_feature_problems "${count}"
+  ai_platform_profile_cr_input_problems "${resolved}"
 
   if [[ "${resolved}" == "cpuOnly" ]]; then
     local gpu_workers="${GPU_WORKER_COUNT:-}"
@@ -1226,6 +1265,17 @@ ai_platform_profile_problems() {
     fi
   fi
 
+  # Sidecar flags are read as booleans; config_bool maps anything that is not the
+  # word true to false, so a typo ("ture", "yes") would silently pass the cpuOnly
+  # "explicit false" rule. Require a real YAML boolean.
+  local sc_key sc_tag
+  for sc_key in envoy otel prometheusOperator; do
+    sc_tag=$(yq eval ".aiPlatform.sidecars.${sc_key} | tag" "${CONFIG_FILE}" 2>/dev/null || echo "!!null")
+    if [[ "${sc_tag}" != "!!null" && "${sc_tag}" != "!!bool" ]]; then
+      echo "[PROFILE_INVALID_VALUE] aiPlatform.sidecars.${sc_key}: must be true or false"
+    fi
+  done
+
   # Both profiles route AITK -> SLIM -> AgentRuntime.
   "${has_slim}" || echo "[PROFILE_MISSING_REFERENCE] aiPlatform.features: the 'slim' feature is required by aiPlatform.profile"
   "${has_agentruntime}" || echo "[PROFILE_MISSING_REFERENCE] aiPlatform.features: the 'agentruntime' feature is required by aiPlatform.profile"
@@ -1237,10 +1287,10 @@ ai_platform_profile_problems() {
   # air-gap bundle consumes it yet (to be decided with MPR-188). When given it
   # must still be a safe scalar, because it is rendered into the values file.
   if ! _profile_ref_missing "${AITK_IMAGE:-}" && _profile_value_unsafe "${AITK_IMAGE}"; then
-    echo "[PROFILE_INVALID_VALUE] images.aitk.image: must not contain whitespace, quotes or backslashes"
+    echo "[PROFILE_INVALID_VALUE] images.aitk.image: must not contain whitespace, control characters, quotes or backslashes"
   fi
   if [[ -n "${SNAPSHOT_MANIFEST:-}" && "${SNAPSHOT_MANIFEST}" != "null" ]] && _profile_value_unsafe "${SNAPSHOT_MANIFEST}"; then
-    echo "[PROFILE_INVALID_VALUE] images.snapshotManifest: must not contain whitespace, quotes or backslashes"
+    echo "[PROFILE_INVALID_VALUE] images.snapshotManifest: must not contain whitespace, control characters, quotes or backslashes"
   fi
 
   local provider provider_image checkpoint_ref agent_module
@@ -1272,6 +1322,85 @@ ai_platform_profile_problems() {
     fi
   done
   return 0
+}
+
+# Generic installer inputs that are written into the AIPlatform CR but are not
+# profile settings: the CR name, object store, region, namespace, serviceTemplate
+# and Splunk block (and, for fullfeature, the vector DB size and storage class).
+# A value the CRD or webhook rejects would otherwise surface only at kubectl apply,
+# after the installer has changed the cluster. Checked for the canonical profiles
+# only; legacy and omitted-profile configs keep their existing behaviour.
+ai_platform_profile_cr_input_problems() {
+  local resolved="$1" v tag n i url
+  local dns_label='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+  local url_re='^https?://[^[:space:][:cntrl:]"\\'"'"']+$'
+
+  # CR name: <cluster.name>-ai-platform must itself be a DNS label (63 characters).
+  if [[ -z "${CLUSTER_NAME:-}" || "${CLUSTER_NAME}" == "null" ]]; then
+    echo "[PROFILE_MISSING_REFERENCE] cluster.name: required (the CR is named <cluster.name>-ai-platform)"
+  elif [[ ! "${CLUSTER_NAME}" =~ ${dns_label} ]] || (( ${#CLUSTER_NAME} > 51 )); then
+    echo "[PROFILE_INVALID_VALUE] cluster.name: must be a DNS-1123 label of at most 51 characters (the CR is named <cluster.name>-ai-platform)"
+  fi
+
+  # Object store.
+  case "${OBJ_STORE_TYPE:-}" in
+    aws|minio|seaweedfs) ;;
+    *) echo "[PROFILE_INVALID_VALUE] storage.objectStore.type: must be one of aws, minio, seaweedfs" ;;
+  esac
+  if [[ ! "${OBJ_STORE_BUCKET:-}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "[PROFILE_INVALID_VALUE] storage.objectStore.bucket: may contain only letters, digits, '.', '_' and '-'"
+  fi
+  if [[ "${OBJ_STORE_TYPE:-}" != "aws" && -n "${OBJ_STORE_ENDPOINT:-}" && "${OBJ_STORE_ENDPOINT}" != "null" ]] \
+     && [[ ! "${OBJ_STORE_ENDPOINT}" =~ ${url_re} ]]; then
+    echo "[PROFILE_INVALID_VALUE] storage.objectStore.endpoint: must be an http:// or https:// URL without spaces, quotes or backslashes"
+  fi
+
+  # Region is written unquoted-safe: letters, digits, '.', '_' and '-'.
+  v="${REGION:-${ECR_REGION:-us-east-1}}"
+  if [[ "${v}" == "null" || ! "${v}" =~ ^[A-Za-z0-9._-]{1,63}$ ]]; then
+    echo "[PROFILE_INVALID_VALUE] cluster.region: may contain only letters, digits, '.', '_' and '-' (at most 63 characters)"
+  fi
+
+  # Namespace (read raw, so an omitted key prints "null": that is the existing default).
+  if [[ -n "${AI_NS:-}" && "${AI_NS}" != "null" ]] && { [[ ! "${AI_NS}" =~ ${dns_label} ]] || (( ${#AI_NS} > 63 )); }; then
+    echo "[PROFILE_INVALID_VALUE] kubernetes.namespace: must be a DNS-1123 label"
+  fi
+
+  # serviceTemplate is copied into the CR unquoted.
+  v=$(yq eval '.aiPlatform.serviceTemplate.type // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  case "${v}" in
+    ""|null|ClusterIP|NodePort|LoadBalancer) ;;
+    *) echo "[PROFILE_INVALID_VALUE] aiPlatform.serviceTemplate.type: must be one of ClusterIP, NodePort, LoadBalancer" ;;
+  esac
+  for n in nodePort slimNodePort; do
+    v=$(yq eval ".aiPlatform.serviceTemplate.${n} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${v}" && "${v}" != "null" ]] && { [[ ! "${v}" =~ ^[0-9]{5}$ ]] || (( v < 30000 || v > 32767 )); }; then
+      echo "[PROFILE_INVALID_VALUE] aiPlatform.serviceTemplate.${n}: must be an integer from 30000 to 32767"
+    fi
+  done
+
+  # Splunk block: an external endpoint, its Secret, and the trusted issuers.
+  if [[ -n "${SPLUNK_EXTERNAL_ENDPOINT:-}" && "${SPLUNK_EXTERNAL_ENDPOINT}" != "null" && "${SPLUNK_ENABLED:-}" == "true" ]]; then
+    [[ "${SPLUNK_EXTERNAL_ENDPOINT}" =~ ${url_re} ]] \
+      || echo "[PROFILE_INVALID_VALUE] splunk.external.endpoint: must be an http:// or https:// URL without spaces, quotes or backslashes"
+    _profile_is_dns_subdomain "${SPLUNK_EXTERNAL_SECRET_NAME:-}" \
+      || echo "[PROFILE_INVALID_VALUE] splunk.external.secretName: must be a Kubernetes Secret name (a DNS-1123 subdomain)"
+  fi
+  n=$(yq eval '(.splunk.trustedIssuers // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  [[ "${n}" =~ ^[0-9]+$ ]] || n=0
+  for ((i=0; i<n; i++)); do
+    url=$(yq eval ".splunk.trustedIssuers[${i}] // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
+    [[ "${url}" =~ ${url_re} ]] \
+      || echo "[PROFILE_INVALID_VALUE] splunk.trustedIssuers[${i}]: must be an http:// or https:// URL without spaces, quotes or backslashes"
+  done
+
+  # fullfeature renders the vector DB; cpuOnly does not.
+  if [[ "${resolved}" == "fullfeature" ]]; then
+    [[ "${VECTORDB_SIZE:-}" =~ ^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E|m)?$ ]] \
+      || echo "[PROFILE_INVALID_VALUE] storage.vectorDbSize: must be a Kubernetes quantity such as 50Gi"
+    _profile_is_dns_subdomain "${STORAGE_CLASS:-}" \
+      || echo "[PROFILE_INVALID_VALUE] storage.storageClass: must be a Kubernetes StorageClass name (a DNS-1123 subdomain)"
+  fi
 }
 
 # Prints every problem and returns 1 when there is at least one. Safe to call
@@ -7043,7 +7172,7 @@ EOF
         [[ -n "$fmax" && "$fmax" != "null" ]] && features_yaml+="      maxReplicas: ${fmax}"$'\n'
         [[ -n "$ftarget" && "$ftarget" != "null" ]] && features_yaml+="      targetCPUUtilization: ${ftarget}"$'\n'
         [[ -n "$fcheckpoint" && "$fcheckpoint" != "null" ]] && features_yaml+="      checkpointDbSecretRef: \"${fcheckpoint}\""$'\n'
-        [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: ${fsa}"$'\n'
+        [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: \"${fsa}\""$'\n'
         if [[ -n "$fenv_yaml" && "$fenv_yaml" != "{}" && "$fenv_yaml" != "null" ]]; then
           features_yaml+="      env:"$'\n'
           while IFS= read -r env_line; do
@@ -7063,6 +7192,13 @@ EOF
   # an omitted one stays omitted (the operator resolves it to fullfeature).
   # cpuOnly runs no model serving, so the GPU, Ray worker and vector DB
   # sections that the AIPlatform webhook rejects for it are not rendered.
+  # For the canonical profiles region and storageClassName are written as quoted
+  # strings, so a value such as "no" or "yes" cannot be re-typed as a boolean.
+  local cr_region="${REGION:-${ECR_REGION:-us-east-1}}" cr_storage_class="${STORAGE_CLASS}"
+  if ai_platform_profile_explicit; then
+    cr_region="\"${cr_region}\""
+    cr_storage_class="\"${cr_storage_class}\""
+  fi
   local profile_yaml="" accelerator_yaml="" scale_comment="" storage_yaml="" worker_yaml="" gpu_scheduler_yaml=""
   if ai_platform_profile_explicit; then
     profile_yaml="  profile: $(ai_platform_profile_resolved)"$'\n'
@@ -7072,7 +7208,7 @@ EOF
   else
     accelerator_yaml="  # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)"$'\n'"  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}"$'\n'
     scale_comment="  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)"$'\n'
-    storage_yaml="  # Storage configuration"$'\n'"  storage:"$'\n'"    vectorDB:"$'\n'"      size: ${VECTORDB_SIZE}"$'\n'"      storageClassName: ${STORAGE_CLASS}"$'\n'
+    storage_yaml="  # Storage configuration"$'\n'"  storage:"$'\n'"    vectorDB:"$'\n'"      size: ${VECTORDB_SIZE}"$'\n'"      storageClassName: ${cr_storage_class}"$'\n'
     worker_yaml=$'\n'"  # Worker configuration"$'\n'"  workerGroupConfig:"$'\n'"    imageRegistry: \"${WORKER_IMAGE_REGISTRY}\""$'\n'
     gpu_scheduler_yaml="  # GPU scheduler"$'\n'"  gpuScheduler:"$'\n'"    nodeSelector:"$'\n'"      splunk.ai/workload-type: gpu"$'\n'"    tolerations:"$'\n'"      - key: \"nvidia.com/gpu\""$'\n'"        operator: \"Equal\""$'\n'"        value: \"true\""$'\n'"        effect: \"NoSchedule\""$'\n'
   fi
@@ -7087,7 +7223,7 @@ metadata:
 spec:
 ${profile_yaml}  objectStorage:
     path: ${obj_path}
-    region: ${REGION:-${ECR_REGION:-us-east-1}}
+    region: ${cr_region}
     $( [[ -n "$obj_endpoint" ]] && echo "endpoint: \"${obj_endpoint}\"" )
     $( [[ -n "$obj_secret" ]] && echo "secretRef: ${obj_secret}" )
 
@@ -10041,7 +10177,19 @@ case "${_CMD}" in
       printf '%s\n' "${_profile_problems}" >&2
       exit 1
     fi
-    render_ai_platform_profile_values > "${_profile_out}"
+    if [[ "${_profile_out}" == "/dev/null" ]]; then
+      render_ai_platform_profile_values > /dev/null
+    else
+      # Write to a sibling temp file and move it into place, so a failure never
+      # leaves a truncated values file behind.
+      _profile_tmp="${_profile_out}.tmp.$$"
+      if ! { render_ai_platform_profile_values > "${_profile_tmp}"; } 2>/dev/null; then
+        rm -f "${_profile_tmp}" 2>/dev/null || true
+        echo "ERROR: cannot write the profile values to ${_profile_out} (is the directory present and writable?)" >&2
+        exit 1
+      fi
+      mv -f "${_profile_tmp}" "${_profile_out}"
+    fi
     log "Wrote effective profile values (profile=$(ai_platform_profile_resolved)) to ${_profile_out}"
     ;;
   stage-artifacts)

@@ -6,7 +6,7 @@ spec:
   profile: cpuOnly
   objectStorage:
     path: minio://ai-platform
-    region: us-east-1
+    region: "us-east-1"
     endpoint: "http://192.0.2.20:9000"
     secretRef: minio-credentials
   # Image configuration (including pull secrets for private registries)

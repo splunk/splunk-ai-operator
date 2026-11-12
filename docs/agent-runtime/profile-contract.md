@@ -63,7 +63,7 @@ names, i.e. DNS-1123 subdomains (dot-separated lowercase labels of at most 63
 characters, at most 253 overall, so `a..b` and `a.-b` are rejected); `version`
 and `runtimeVersion` are version strings; `minReplicas` and `maxReplicas` are
 positive integers with min at most max; and `targetCPUUtilization` is an integer
-from 1 to 100. Rejected values are never echoed in error messages (an unsupported profile name is shown only when it is a short plain name, otherwise "(value not shown)"). `aiPlatform.scaleFactor`, when set, must be a
+from 1 to 100. Rejected values are not echoed in error messages: an unsupported profile name is shown only when it is a short plain name (otherwise "(value not shown)"), the scale-factor message omits the value, and duplicate-feature messages name only the position. `aiPlatform.scaleFactor`, when set, must be a
 YAML integer of at least 1 (the same rule `install` enforces). Duplicate feature
 identities (`agentruntime` is keyed by provider) are rejected, as in the webhook.
 
@@ -103,7 +103,7 @@ checks only what would otherwise take effect:
   `storage.modelStaging.enabled` anything other than an explicit `false`
 - `images.ray.*`, `images.weaviate.image` and `images.saia.*`, which `install`
   would otherwise inject into the operator Deployment as `RELATED_IMAGE_*`
-- any sidecar flag that is not an explicit `false`
+- any sidecar flag that is not an explicit `false` (every sidecar flag must be a real YAML boolean; a typo such as `"ture"` is rejected rather than read as false)
 
 For `cpuOnly` the installer also skips the air-gap model-artifact verification
 (there is no local model to verify) and never prompts for model staging or an
@@ -196,6 +196,16 @@ Golden outputs (rendered values and the applied `AIPlatform` CR) are in
 `UPDATE_GOLDEN=1 tools/ai-tier-cluster-setup/test_k0s_cluster_with_stack.sh`.
 
 ## Not covered here
+
+- **Generic CR inputs that are not profile settings.** The installer also writes
+  values from `cluster.name` (the CR name), `cluster.region`,
+  `storage.objectStore.{bucket,endpoint}`, `aiPlatform.serviceTemplate`, the
+  `splunk` block and (for `fullfeature`) `storage.vectorDbSize` /
+  `storage.storageClass` into the AIPlatform CR. They are not validated by the
+  profile checks, so a value the CRD or webhook rejects (for example a region of
+  `"no"`, a bucket containing `#`, an endpoint without a scheme, or a cluster
+  name with an underscore) is caught only when the CR is applied. Whether to
+  extend the profile validation to these is an open decision.
 
 - Reconcile behaviour per profile (a separate story). The platform reconciler still runs its Ray,
   Weaviate and ingress stages, and the agentruntime handler waits for

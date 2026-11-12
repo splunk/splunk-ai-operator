@@ -114,6 +114,7 @@ _load_functions() {
   eval "$(_extract_fn _profile_feature_subdomain_check)"
   eval "$(_extract_fn _profile_feature_field_check)"
   eval "$(_extract_fn ai_platform_profile_feature_problems)"
+  eval "$(_extract_fn ai_platform_profile_cr_input_problems)"
   eval "$(_extract_fn ai_platform_profile_problems)"
   eval "$(_extract_fn validate_ai_platform_profile_config)"
   eval "$(_extract_fn config_bool)"
@@ -1833,7 +1834,8 @@ _profile_run() {
               ai_platform_profile_resolved ai_platform_profile_explicit ai_platform_profile_set \
               _profile_ref_missing _profile_ref_check _profile_is_dns_subdomain \
               _profile_feature_subdomain_check _profile_feature_field_check \
-              ai_platform_profile_feature_problems ai_platform_profile_problems \
+              ai_platform_profile_feature_problems ai_platform_profile_cr_input_problems \
+              ai_platform_profile_problems \
               validate_ai_platform_profile_config _profile_image_url \
               render_ai_platform_profile_values; do
       eval "$(_extract_fn "${_f}")"
@@ -2005,9 +2007,9 @@ done
 assert_eq "omitted nodes.gpuWorkers counts as 0 for cpuOnly" "" \
   "$(_profile_problems "$(_profile_cfg cpuonly nogpukey 'del(.nodes.gpuWorkers)')")"
 assert_problem "duplicate agentruntime provider is a conflict" \
-  "$(_profile_cfg cpuonly dupprov '.aiPlatform.features += [.aiPlatform.features[1]]')" "duplicate feature 'agentruntime/launchpad'"
+  "$(_profile_cfg cpuonly dupprov '.aiPlatform.features += [.aiPlatform.features[1]]')" "[PROFILE_CONFLICT] aiPlatform.features[2].name: duplicate feature entry"
 assert_problem "duplicate slim feature is a conflict" \
-  "$(_profile_cfg cpuonly dupslim '.aiPlatform.features += [.aiPlatform.features[0]]')" "duplicate feature 'slim'"
+  "$(_profile_cfg cpuonly dupslim '.aiPlatform.features += [.aiPlatform.features[0]]')" "[PROFILE_CONFLICT] aiPlatform.features[2].name: duplicate feature entry"
 assert_eq "two different agentruntime providers are not duplicates" "" \
   "$(_profile_problems "$(_profile_cfg cpuonly twoprov '.aiPlatform.features += [{"name": "agentruntime", "provider": "other", "checkpointDbSecretRef": "x"}] | .images.agentRuntime.providerImages.other = "splunk/other:1" | .images.agentRuntime.providerModules.other = "other.loader:Loader"')")"
 for _prov in 'Bad_Name' 'a.b' 'a"b' '-lead' "$(printf 'a%.0s' $(seq 1 64))"; do
@@ -2018,6 +2020,78 @@ assert_problem "a quote in the snapshot manifest is rejected" \
   "$(_profile_cfg cpuonly snapquote '.images.snapshotManifest = "a\"b"')" "[PROFILE_INVALID_VALUE] images.snapshotManifest"
 assert_problem "a backslash in an image reference is rejected" \
   "$(_profile_cfg cpuonly imgbs '.images.slim.apiImage = "a\\b"')" "[PROFILE_INVALID_VALUE] images.slim.apiImage"
+
+# Generic installer inputs that end up in the CR are validated for the canonical
+# profiles too (the CRD or webhook would otherwise reject them after the cluster
+# has already been changed).
+_cr_input_cases() { # <profile> : "<yq edit>|<expected field>"
+  cat <<'CASES'
+.cluster.name = "Bad_Name" => cluster.name
+.cluster.name = "a-very-long-cluster-name-that-exceeds-the-fifty-one-character-limit" => cluster.name
+.storage.objectStore.type = "gcs" => storage.objectStore.type
+.storage.objectStore.bucket = "a#b" => storage.objectStore.bucket
+.storage.objectStore.bucket = "bad!bucket" => storage.objectStore.bucket
+.storage.objectStore.endpoint = "host:9000" => storage.objectStore.endpoint
+.storage.objectStore.endpoint = "http://a\"b" => storage.objectStore.endpoint
+.storage.objectStore.endpoint = "http://a b" => storage.objectStore.endpoint
+.cluster.region = "no yes" => cluster.region
+.cluster.region = "eu/west" => cluster.region
+.kubernetes.namespace = "Bad_NS" => kubernetes.namespace
+.aiPlatform.serviceTemplate.type = "Bogus" => aiPlatform.serviceTemplate.type
+.aiPlatform.serviceTemplate.type = "true" => aiPlatform.serviceTemplate.type
+.aiPlatform.serviceTemplate.nodePort = "abc" => aiPlatform.serviceTemplate.nodePort
+.aiPlatform.serviceTemplate.nodePort = 99999 => aiPlatform.serviceTemplate.nodePort
+.aiPlatform.serviceTemplate.nodePort = 80 => aiPlatform.serviceTemplate.nodePort
+.aiPlatform.serviceTemplate.slimNodePort = 40000 => aiPlatform.serviceTemplate.slimNodePort
+.splunk.enabled = true | .splunk.external.endpoint = "yes" => splunk.external.endpoint
+.splunk.enabled = true | .splunk.external.endpoint = "https://splunk.example:8088" | .splunk.external.secretName = "Bad_Secret" => splunk.external.secretName
+.splunk.trustedIssuers = ["https://a\"b"] => splunk.trustedIssuers[0]
+.splunk.trustedIssuers = ["not-a-url"] => splunk.trustedIssuers[0]
+CASES
+}
+_cr_input_i=0
+while IFS= read -r _case_line; do
+  [[ -z "${_case_line}" ]] && continue
+  _edit="${_case_line%% => *}"; _field="${_case_line##* => }"
+  for _p in cpuonly fullfeature; do
+    _cr_input_i=$((_cr_input_i + 1))
+    assert_problem "${_p}: ${_field} is validated up front (${_edit:0:48})" \
+      "$(_profile_cfg "${_p}" "crin-${_cr_input_i}" "${_edit}")" "[PROFILE_INVALID_VALUE] ${_field}"
+  done
+done < <(_cr_input_cases)
+assert_problem "fullfeature: storage.vectorDbSize must be a quantity" \
+  "$(_profile_cfg fullfeature vdb-size '.storage.vectorDbSize = "50 Gi"')" "[PROFILE_INVALID_VALUE] storage.vectorDbSize"
+assert_problem "fullfeature: storage.storageClass must be a Kubernetes name" \
+  "$(_profile_cfg fullfeature vdb-sc '.storage.storageClass = "Bad Class"')" "[PROFILE_INVALID_VALUE] storage.storageClass"
+assert_eq "cpuOnly does not validate the vector DB settings it never renders" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly vdb-ignored '.storage.vectorDbSize = "50 Gi" | .storage.storageClass = "Bad Class"')")"
+assert_problem "a missing cluster.name is reported" \
+  "$(_profile_cfg cpuonly noclustername 'del(.cluster.name)')" "[PROFILE_MISSING_REFERENCE] cluster.name"
+assert_eq "valid generic inputs are accepted (NodePort, Splunk external, trusted issuer)" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly genericok '.aiPlatform.serviceTemplate.type = "NodePort" | .aiPlatform.serviceTemplate.nodePort = 30080 | .aiPlatform.serviceTemplate.slimNodePort = 30081 | .splunk.enabled = true | .splunk.external.endpoint = "https://splunk.example:8088" | .splunk.external.secretName = "splunk-hec.external" | .splunk.trustedIssuers = ["https://issuer.example/oauth2"] | .cluster.region = "eu-west-1" | .storage.objectStore.type = "aws"')")"
+assert_eq "an aws object store does not require an endpoint to be valid" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly awsnoendpoint '.storage.objectStore.type = "aws" | .storage.objectStore.endpoint = "not a url"')")"
+assert_eq "the generic-input rules do not apply to legacy full" "" \
+  "$(_profile_problems "$(_profile_cfg fullfeature legacygeneric '.aiPlatform.profile = "full" | .cluster.name = "Bad_Name" | .cluster.region = "no yes"')")"
+
+# Rejected values are not echoed back, and sidecar flags must be real booleans.
+for _sf in '"2x"' '0' '"<script>"'; do
+  _sf_out="$(_profile_problems "$(_profile_cfg cpuonly "sfecho-${_sf//[^a-z0-9]/}" ".aiPlatform.scaleFactor = ${_sf}")")"
+  assert_eq "scaleFactor ${_sf} is reported without echoing the value" "0" \
+    "$(printf '%s' "${_sf_out}" | grep -c -e '(got ' -e '2x' -e 'script')"
+done
+for _sc in '"ture"' '"yes"' '1' '"on"'; do
+  assert_problem "a non-boolean sidecar flag ${_sc} is rejected" \
+    "$(_profile_cfg cpuonly "sidecar-${_sc//[^a-z0-9]/}" ".aiPlatform.sidecars.otel = ${_sc}")" "[PROFILE_INVALID_VALUE] aiPlatform.sidecars.otel: must be true or false"
+done
+assert_eq "real boolean sidecar flags are accepted for fullfeature" "" \
+  "$(_profile_problems "$(_profile_cfg fullfeature sidecar-ok '.aiPlatform.sidecars.otel = true | .aiPlatform.sidecars.envoy = false')")"
+# An unwritable --output gives a clear message, not a raw shell redirect error.
+_bad_dest_out="$(CONFIG_FILE="${_PROFILE_DIR}/profile-cpuonly.yaml" LOG_DIR="${_PROFILE_TMP}/dlogs" bash "${SCRIPT}" render-profile --output /nonexistent-dir-mpr184/out.yaml 2>&1)"; _bad_dest_rc=$?
+assert_eq "an unwritable --output exits nonzero" "1" "${_bad_dest_rc}"
+assert_contains "an unwritable --output explains itself" "cannot write the profile values to /nonexistent-dir-mpr184/out.yaml" "${_bad_dest_out}"
+assert_eq "an unwritable --output shows no raw shell error" "0" "$(printf '%s' "${_bad_dest_out}" | grep -c 'No such file or directory')"
+assert_eq "a failed render leaves no temp file behind" "0" "$(ls "${_PROFILE_TMP}" | grep -c '\.tmp\.')"
 
 # Feature fields are spliced into the CR, so they must be safe scalars.
 _inj_name="$(_profile_cfg cpuonly injname '.aiPlatform.features += [{"name": "x\n    - name: saia\n      version: \"1\""}]')"
@@ -2060,6 +2134,41 @@ for _secret in 'Bad_Secret:1' 'UPPER' '-lead' 'a b'; do
 done
 assert_eq "valid feature fields are accepted (incl. a dotted Secret name)" "" \
   "$(_profile_problems "$(_profile_cfg cpuonly goodfields '.aiPlatform.features[1].checkpointDbSecretRef = "pg.conn-1" | .aiPlatform.features[1].version = "0.2.0-rc.1+build" | .aiPlatform.features[1].serviceAccountName = "launchpad-sa" | .aiPlatform.features[1].minReplicas = 2 | .aiPlatform.features[1].maxReplicas = 8 | .aiPlatform.features[1].targetCPUUtilization = 100')")"
+# Rules the webhook or the CRD enforce, which must not wait for kubectl apply
+# (that happens after the installer has already changed the cluster).
+assert_problem "a provider on a non-agentruntime feature is rejected" \
+  "$(_profile_cfg cpuonly slimprov '.aiPlatform.features[0].provider = "x"')" "[PROFILE_CONFLICT] aiPlatform.features[0].provider: only supported for the agentruntime feature"
+_extra_features() { # <n>: n additional unique agentruntime providers
+  local expr='' k
+  for ((k=1; k<=$1; k++)); do
+    expr+=".aiPlatform.features += [{\"name\": \"agentruntime\", \"provider\": \"p${k}\", \"checkpointDbSecretRef\": \"s\"}] | .images.agentRuntime.providerImages.p${k} = \"splunk/p:1\" | .images.agentRuntime.providerModules.p${k} = \"m.x:C\" | "
+  done
+  printf '%s' "${expr% | }"
+}
+assert_problem "more than 10 features exceeds the CRD limit" \
+  "$(_profile_cfg cpuonly feat11 "$(_extra_features 9)")" "[PROFILE_INVALID_VALUE] aiPlatform.features: at most 10 features are allowed (got 11)"
+assert_eq "exactly 10 features is accepted" "" "$(_profile_problems "$(_profile_cfg cpuonly feat10 "$(_extra_features 8)")")"
+for _env in '{"PORT": 8080}' '{"DEBUG": true}' '{"RATIO": 1.5}' '{"NOTHING": null}' '["a"]' '"text"'; do
+  assert_problem "features[].env ${_env} is rejected (CRD: map of strings)" \
+    "$(_profile_cfg cpuonly "env-${_env//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].env = ${_env}")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].env"
+done
+assert_eq "features[].env with quoted string values is accepted" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly envok '.aiPlatform.features[1].env = {"PORT": "8080", "DEBUG": "true"}')")"
+# Control characters other than whitespace are rejected, and never reach a rendered
+# YAML scalar. The values are passed as real bytes through the environment (a yq
+# expression does not interpret \u escapes, so it would only store a literal backslash).
+_ctrl_img_cfg="$(CTRLV=$'a\033b' _profile_cfg cpuonly ctrl-img '.images.slim.apiImage = strenv(CTRLV)')"
+assert_eq "the test config really holds an ESC byte (not a literal backslash)" \
+  "$(printf '"a\\u001bb"')" "$(command yq eval -o=json '.images.slim.apiImage' "${_ctrl_img_cfg}")"
+assert_problem "an escape character in an image reference is rejected" "${_ctrl_img_cfg}" "[PROFILE_INVALID_VALUE] images.slim.apiImage: must not contain whitespace, control characters"
+_ctrl_del_cfg="$(CTRLV=$'a\177b' _profile_cfg cpuonly ctrl-del '.images.snapshotManifest = strenv(CTRLV)')"
+assert_problem "a DEL character in the snapshot manifest is rejected" "${_ctrl_del_cfg}" "[PROFILE_INVALID_VALUE] images.snapshotManifest"
+_ctrl_out="${_PROFILE_TMP}/ctrl.yaml"
+_ctrl_legacy_cfg="$(CTRLV=$'a\033b\177c' _profile_cfg fullfeature ctrl-legacy '.aiPlatform.profile = "full" | .images.slim.apiImage = strenv(CTRLV)')"
+_profile_run "${_ctrl_legacy_cfg}" render_ai_platform_profile_values > "${_ctrl_out}"
+assert_rc "a control character in a legacy-profile reference still renders valid YAML" 0 command yq eval '.' "${_ctrl_out}"
+assert_eq "the control characters round-trip through the rendered YAML" \
+  "$(printf '"registry.example.internal/a\\u001bb\177c"')" "$(command yq eval -o=json '.images.slim' "${_ctrl_out}")"
 # Legacy (not opted in) configs keep their own field handling: nothing is imposed.
 assert_eq "legacy 'full' does not validate feature fields" "" \
   "$(_profile_problems "$(_profile_cfg fullfeature legacyfields '.aiPlatform.profile = "full" | .aiPlatform.features[1].minReplicas = "x"')")"
@@ -2216,6 +2325,21 @@ for _p in cpuonly fullfeature; do
   assert_eq "${_p}: rendered AIPlatform CR matches the golden file" \
     "$(cat "${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml" 2>/dev/null)" "${_cr}"
 done
+# A numeric-only ServiceAccount name is a valid DNS name but must stay a YAML string in the CR.
+_num_sa="$(_profile_cfg cpuonly numsa '.aiPlatform.features[1].serviceAccountName = "123"')"
+assert_eq "a numeric-only serviceAccountName passes validation" "" "$(_profile_problems "${_num_sa}")"
+_num_cr="${_PROFILE_TMP}/numsa-cr.yaml"
+_render_cr "${_num_sa}" > "${_num_cr}"
+assert_eq "a numeric-only serviceAccountName is rendered as a YAML string" "!!str" "$(command yq eval '.spec.features[1].serviceAccountName | tag' "${_num_cr}")"
+# "no" / "yes" must stay YAML strings in the CR for the canonical profiles.
+_bool_region="$(_profile_cfg cpuonly boolregion '.cluster.region = "no"')"
+_render_cr "${_bool_region}" > "${_PROFILE_TMP}/boolregion-cr.yaml"
+assert_eq "region \"no\" is rendered as a YAML string for cpuOnly" "!!str" "$(command yq eval '.spec.objectStorage.region | tag' "${_PROFILE_TMP}/boolregion-cr.yaml")"
+_bool_sc="$(_profile_cfg fullfeature boolsc '.storage.storageClass = "yes"')"
+_render_cr "${_bool_sc}" > "${_PROFILE_TMP}/boolsc-cr.yaml"
+assert_eq "storageClass \"yes\" is rendered as a YAML string for fullfeature" "!!str" "$(command yq eval '.spec.storage.vectorDB.storageClassName | tag' "${_PROFILE_TMP}/boolsc-cr.yaml")"
+_legacy_region="$(_profile_cfg fullfeature legacyregion '.aiPlatform.profile = "full"')"
+assert_contains "legacy configs keep the unquoted region (output unchanged)" "    region: us-east-1" "$(_render_cr "${_legacy_region}")"
 _cpu_cr="$(_render_cr "${_PROFILE_DIR}/profile-cpuonly.yaml")"
 assert_contains "cpuOnly CR carries spec.profile: cpuOnly" "  profile: cpuOnly" "${_cpu_cr}"
 for _forbidden in defaultAcceleratorType scaleFactor vectorDB workerGroupConfig gpuScheduler; do

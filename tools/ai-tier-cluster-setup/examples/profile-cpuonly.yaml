@@ -86,7 +86,7 @@ files:
 splunk:
   enabled: false
 aiPlatform:
-  name: "launchpad-cpuonly"
+  name: "launchpad-cpuonly"   # informational only: the CR is named <cluster.name>-ai-platform
   profile: cpuOnly       # canonical name; the only profile selector
   sidecars:              # cpuOnly: all must be explicitly false
     envoy: false

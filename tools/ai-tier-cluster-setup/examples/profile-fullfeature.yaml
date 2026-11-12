@@ -89,7 +89,7 @@ files:
 splunk:
   enabled: false
 aiPlatform:
-  name: "launchpad-fullfeature"
+  name: "launchpad-fullfeature"   # informational only: the CR is named <cluster.name>-ai-platform
   profile: fullfeature   # canonical name
   defaultAcceleratorType: "L40S"
   scaleFactor: 1
