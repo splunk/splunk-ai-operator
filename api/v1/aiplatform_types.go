@@ -27,6 +27,7 @@ import (
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:path=aiplatforms,scope=Namespaced,shortName=spai;aiplatform
+// +kubebuilder:printcolumn:name="Profile",type="string",JSONPath=".status.profile",description="Resolved deployment profile"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Platform ready status"
 // +kubebuilder:printcolumn:name="RayService",type="string",JSONPath=".status.conditions[?(@.type=='RayServiceReady')].status",description="Ray service status"
 // +kubebuilder:printcolumn:name="VectorDB",type="string",JSONPath=".status.conditions[?(@.type=='WeaviateDatabaseReady')].status",description="VectorDB status"
@@ -42,6 +43,14 @@ type AIPlatform struct {
 
 // AIPlatformSpec defines the desired state
 type AIPlatformSpec struct {
+	// Profile selects the AI Tier deployment profile. The canonical values are
+	// "cpuOnly" and "fullfeature". An omitted value and the legacy value "full"
+	// both resolve to "fullfeature" (see ResolvedProfile). No other profile
+	// exists.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=cpuOnly;fullfeature;full
+	Profile AIPlatformProfile `json:"profile,omitempty"`
+
 	// ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
 	// Supported providers: S3, GCS, Azure Blob Storage, MinIO
 	// +kubebuilder:validation:Required
@@ -514,6 +523,10 @@ type IngressTLS struct {
 
 // AIPlatformStatus defines observed state
 type AIPlatformStatus struct {
+	// Profile is the effective deployment profile the operator resolved from
+	// spec.profile: cpuOnly or fullfeature. An omitted spec.profile and the
+	// legacy value "full" both show as fullfeature.
+	Profile             AIPlatformProfile          `json:"profile,omitempty"`
 	RayServiceName      string                     `json:"rayServiceName,omitempty"`
 	VectorDbServiceName string                     `json:"vectorDbServiceName,omitempty"`
 	RayServiceStatus    rayv1.ServiceStatus        `json:"rayServiceStatus,omitempty"`

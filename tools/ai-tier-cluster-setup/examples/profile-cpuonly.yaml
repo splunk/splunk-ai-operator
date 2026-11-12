@@ -1,0 +1,108 @@
+# ===================================================================
+# AI Tier deployment profile: cpuOnly  (Agent Launchpad, ai-agent-runtime)
+# ===================================================================
+# Minimum installer input for the cpuOnly profile. Sanitized: every value is a
+# placeholder, no live credential is embedded, and sensitive settings are
+# external Kubernetes Secret references created by the customer.
+#
+#   CONFIG_FILE=./profile-cpuonly.yaml ./k0s_cluster_with_stack.sh validate
+#   CONFIG_FILE=./profile-cpuonly.yaml ./k0s_cluster_with_stack.sh render-profile
+#
+# cpuOnly: runtime pods on CPU capacity, no GPU node, GPU driver, Ray or
+# Weaviate. Models and tools are reached over the customer's BYO LLM endpoint
+# and Splunk MCP. Expected enabled components (see components below):
+# cert-manager, monitoring, ai-operator and the AIPlatform CR; kuberay and
+# nvidia off.
+#
+# Image references are CANDIDATE builds (MPR-188): tags may advance while the
+# image owners harden them. The immutable digest of each is resolved per run by
+# the mirror step (MPR-187) and recorded in images.snapshotManifest.
+# The provider key and AGENT_MODULE below are TBD until the image owners supply
+# a validated Launchpad contract (ERD 14.4.6).
+# ===================================================================
+
+cluster:
+  name: launchpad-cpuonly
+  sshKeyPath: ~/.ssh/REPLACE_ME
+  sshUser: ec2-user
+  airgap: false          # set true for the air-gapped path (MPR-190)
+nodes:
+  controllers: 1
+  cpuWorkers: 1
+  gpuWorkers: 0          # cpuOnly: must be 0
+  existingIPs:
+    controllers:
+      - 192.0.2.10
+    workers:
+      - 192.0.2.11
+storage:
+  storageClass: "local-path"
+  modelStaging:
+    enabled: false       # cpuOnly: must be explicitly false
+  objectStore:
+    type: "minio"
+    bucket: "ai-platform"
+    endpoint: "http://192.0.2.20:9000"
+    auth:
+      rootUser: "REPLACE_ME"
+      rootPassword: "CHANGEME"
+images:
+  registry: "registry.example.internal"
+  # Per-run output of the image mirror/snapshot step (MPR-187). Optional here.
+  snapshotManifest: "snapshots/launchpad/REPLACE_WITH_RUN_ID/manifest.json"
+  operator:
+    image: "splunk/splunk-ai-operator:candidate-1"
+  slim:
+    apiImage: "splunk/ai-tier-slim-service:candidate-1"
+  aitk:        # optional for now: nothing consumes it yet (decide with MPR-188)
+    image: "splunk/ai-tier-aitk:candidate-1"
+  agentRuntime:
+    baseImage: "splunk/ai-agent-runtime:candidate-1"
+    schemaSetupImage: "splunk/ai-agent-runtime-schema-setup:candidate-1"
+    providerImages:
+      launchpad: "splunk/ai-agent-runtime-provider-launchpad:candidate-1"
+    providerModules:
+      launchpad: "REPLACE_WITH_VALIDATED.module:LaunchpadAgentLoader"   # TBD
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+components:
+  certManager: true
+  monitoring: true
+  otel: false
+  kuberay: false         # cpuOnly: must be explicitly false
+  nvidia: false
+  splunkOperator: false
+  splunkStandalone: false
+  metallb: false
+  aiOperator: true
+  aiPlatformCR: true
+kubernetes:
+  namespace: ai-platform
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"
+splunk:
+  enabled: false
+aiPlatform:
+  name: "launchpad-cpuonly"   # informational only: the CR is named <cluster.name>-ai-platform
+  profile: cpuOnly       # canonical name; the only profile selector
+  sidecars:              # cpuOnly: all must be explicitly false
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  features:
+    - name: "slim"
+      version: "1.0.0"
+    - name: "agentruntime"
+      provider: "launchpad"
+      version: "0.1.0"
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilization: 60
+      checkpointDbSecretRef: "launchpad-postgres-conn"   # external Secret, created by the customer
+  agentRuntime:
+    checkpointSecrets:
+      - name: "launchpad-postgres-conn"
+        create: false    # never created or modified by the installer

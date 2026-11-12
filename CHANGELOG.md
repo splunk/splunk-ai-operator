@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AIPlatform `spec.profile` (`cpuOnly` | `fullfeature`; omitted and legacy `full` resolve to `fullfeature`) with shared webhook/operator validation, installer `aiPlatform.profile` validation, `render-profile` command, `status.profile` and example values (MPR-184); see docs/agent-runtime/profile-contract.md
 - Comprehensive Helm chart testing with lint, template validation, and install/upgrade/uninstall tests
 - GitHub issue templates (bug report, feature request)
 - Pull request template with detailed checklist

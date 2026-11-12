@@ -103,6 +103,21 @@ _load_functions() {
   eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn render_agentruntime_checkpoint_secret_manifest)"
   eval "$(_extract_fn build_image_url)"
+  eval "$(_extract_fn ai_platform_profile_resolved)"
+  eval "$(_extract_fn ai_platform_profile_explicit)"
+  eval "$(_extract_fn ai_platform_profile_set)"
+  eval "$(_extract_fn _profile_value_unsafe)"
+  eval "$(_extract_fn _profile_q)"
+  eval "$(_extract_fn _profile_ref_missing)"
+  eval "$(_extract_fn _profile_ref_check)"
+  eval "$(_extract_fn _profile_is_dns_subdomain)"
+  eval "$(_extract_fn _profile_feature_subdomain_check)"
+  eval "$(_extract_fn _profile_feature_field_check)"
+  eval "$(_extract_fn ai_platform_profile_feature_problems)"
+  eval "$(_extract_fn ai_platform_profile_cr_input_problems)"
+  eval "$(_extract_fn ai_platform_profile_problems)"
+  eval "$(_extract_fn validate_ai_platform_profile_config)"
+  eval "$(_extract_fn config_bool)"
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn validate_scale_factor_config)"
@@ -1783,6 +1798,602 @@ assert_eq "read failure never applies a Standalone manifest" "" \
   "$(cat "${_forbidden_events}")"
 
 rm -rf "${_AIP4614_TMPDIR}"
+
+# ── Tests: Deployment profile (MPR-184) ────────────────────────────────────────
+# aiPlatform.profile: cpuOnly | fullfeature (legacy "full", or omitted, resolves
+# to fullfeature). Pure logic: no cluster, SSH, kubectl or network.
+
+suite "deployment profile"
+
+# Earlier suites leave stubbed yq/kubectl/sleep functions behind. This suite never
+# unsets them globally (so nothing appended after it loses its stubs): it calls
+# the real binary with `command yq` and strips the stubs only inside the
+# subshell that _profile_run opens.
+if ! type -P yq >/dev/null 2>&1; then
+  echo "  ⚠️  yq not installed; deployment profile tests skipped" >&2
+  SKIP=$(( SKIP + 1 ))
+  FILTER="__no_profile_tests__"
+fi
+
+_PROFILE_DIR="${SCRIPT_DIR}/examples"
+_PROFILE_GOLDEN="${SCRIPT_DIR}/testdata/profile"
+_PROFILE_TMP="$(mktemp -d)"
+
+# Runs <fn...> in a subshell against config file $1 with load_config's real
+# parsing, so the tests exercise the same variables the installer uses.
+_profile_run() {
+  local cfg="$1"; shift
+  (
+    unset -f yq kubectl sleep jq 2>/dev/null || true
+    SCRIPT="${SCRIPT}"
+    CONFIG_FILE="${cfg}"
+    log() { :; }; warn() { :; }; err() { echo "ERR: $*" >&2; exit 1; }
+    ensure_yq() { :; }; ensure_namespace() { :; }
+    for _f in load_config config_bool normalize_env_key_segment build_image_url \
+              component_enabled validate_scale_factor_config _profile_value_unsafe _profile_q \
+              ai_platform_profile_resolved ai_platform_profile_explicit ai_platform_profile_set \
+              _profile_ref_missing _profile_ref_check _profile_is_dns_subdomain \
+              _profile_feature_subdomain_check _profile_feature_field_check \
+              ai_platform_profile_feature_problems ai_platform_profile_cr_input_problems \
+              ai_platform_profile_problems \
+              validate_ai_platform_profile_config _profile_image_url \
+              render_ai_platform_profile_values; do
+      eval "$(_extract_fn "${_f}")"
+    done
+    load_config >/dev/null 2>"${_PROFILE_TMP}/load.err" || { cat "${_PROFILE_TMP}/load.err" >&2; exit 97; }
+    "$@"
+  )
+}
+
+# _profile_cfg <example> <name> [yq expr...]: copy an example to a temp file
+# after applying yq edits; prints the path.
+_profile_cfg() {
+  local example="$1" name="$2" out expr; shift 2
+  out="${_PROFILE_TMP}/${name}.yaml"
+  cp "${_PROFILE_DIR}/profile-${example}.yaml" "${out}"
+  for expr in "$@"; do
+    # A failed or no-op edit would leave the valid example in place and make a
+    # positive assertion pass without testing anything, so record it. (This runs
+    # in a command substitution, hence a marker file instead of a counter.)
+    if ! command yq -i "${expr}" "${out}" >/dev/null 2>"${out}.err"; then
+      echo "${name}: yq edit failed: ${expr}: $(head -c 200 "${out}.err")" >> "${_PROFILE_TMP}/setup-failures"
+    fi
+  done
+  # Compare yq-normalised documents: yq -i also rewrites comment spacing, so a
+  # byte comparison would call a no-op edit a change.
+  if [[ $# -gt 0 ]] && [[ "$(command yq eval '.' "${_PROFILE_DIR}/profile-${example}.yaml")" == "$(command yq eval '.' "${out}")" ]]; then
+    echo "${name}: edit changed nothing: $*" >> "${_PROFILE_TMP}/setup-failures"
+  fi
+  echo "${out}"
+}
+
+_profile_problems() { _profile_run "$1" ai_platform_profile_problems 2>&1; }
+
+# Asserts that the problem list for a config contains the given text.
+assert_problem() {
+  local desc="$1" cfg="$2" want="$3" out
+  out="$(_profile_problems "${cfg}")"
+  if [[ "${out}" == *"${want}"* ]]; then
+    assert_eq "${desc}" "ok" "ok"
+  else
+    assert_eq "${desc}" "contains: ${want}" "${out:-<no problems>}"
+  fi
+}
+
+# Valid inputs for both profiles produce no problems.
+for _p in cpuonly fullfeature; do
+  assert_eq "valid ${_p} example has no problems" "" "$(_profile_problems "${_PROFILE_DIR}/profile-${_p}.yaml")"
+  assert_rc "valid ${_p} example passes validate_ai_platform_profile_config" 0 \
+    _profile_run "${_PROFILE_DIR}/profile-${_p}.yaml" validate_ai_platform_profile_config
+done
+
+# cpuOnly contradictions: each is reported with a stable code and field name.
+assert_problem "cpuOnly rejects nodes.gpuWorkers > 0" \
+  "$(_profile_cfg cpuonly gpu '.nodes.gpuWorkers = 1')" "[PROFILE_CONFLICT] nodes.gpuWorkers"
+assert_problem "cpuOnly rejects an accelerator type" \
+  "$(_profile_cfg cpuonly accel '.aiPlatform.defaultAcceleratorType = "L40S"')" "[PROFILE_CONFLICT] aiPlatform.defaultAcceleratorType"
+assert_problem "cpuOnly rejects scaleFactor above 1" \
+  "$(_profile_cfg cpuonly scale '.aiPlatform.scaleFactor = 2')" "[PROFILE_CONFLICT] aiPlatform.scaleFactor"
+assert_problem "cpuOnly rejects components.nvidia: true" \
+  "$(_profile_cfg cpuonly nvidia '.components.nvidia = true')" "[PROFILE_CONFLICT] components.nvidia"
+assert_problem "cpuOnly rejects components.kuberay: true" \
+  "$(_profile_cfg cpuonly kuberay '.components.kuberay = true')" "[PROFILE_CONFLICT] components.kuberay"
+assert_problem "cpuOnly rejects an omitted components.kuberay (defaults to true)" \
+  "$(_profile_cfg cpuonly kuberay-omit 'del(.components.kuberay)')" "[PROFILE_CONFLICT] components.kuberay"
+assert_problem "cpuOnly rejects an omitted storage.modelStaging.enabled" \
+  "$(_profile_cfg cpuonly staging 'del(.storage.modelStaging)')" "[PROFILE_CONFLICT] storage.modelStaging.enabled"
+assert_problem "cpuOnly rejects an enabled sidecar" \
+  "$(_profile_cfg cpuonly sidecar '.aiPlatform.sidecars.otel = true')" "[PROFILE_CONFLICT] aiPlatform.sidecars.otel"
+assert_problem "cpuOnly rejects the saia feature" \
+  "$(_profile_cfg cpuonly saia '.aiPlatform.features += [{"name": "saia", "version": "1.1.0"}]')" "[PROFILE_CONFLICT] aiPlatform.features[2].name"
+assert_problem "cpuOnly rejects the seca feature" \
+  "$(_profile_cfg cpuonly seca '.aiPlatform.features += [{"name": "seca"}]')" "'seca' is not supported by cpuOnly"
+assert_problem "fullfeature rejects components.kuberay: false" \
+  "$(_profile_cfg fullfeature noray '.components.kuberay = false')" "[PROFILE_CONFLICT] components.kuberay"
+
+# All conflicts are reported together, never just the first.
+_multi="$(_profile_problems "$(_profile_cfg cpuonly multi '.nodes.gpuWorkers = 2 | .components.nvidia = true | .aiPlatform.sidecars.envoy = true')")"
+assert_eq "all cpuOnly conflicts are reported together" "3" "$(printf '%s\n' "${_multi}" | grep -c 'PROFILE_CONFLICT')"
+
+# Unsupported and malformed profile values.
+for _bad in gpu cpuonly CPUOnly FullFeature; do
+  assert_problem "unsupported profile '${_bad}' is rejected" \
+    "$(_profile_cfg cpuonly "bad-${_bad:-empty}" ".aiPlatform.profile = \"${_bad}\"")" "[PROFILE_UNSUPPORTED] aiPlatform.profile"
+done
+# A rejected profile value is never allowed to forge extra problem lines.
+_forge="$(_profile_problems "$(_profile_cfg cpuonly forge '.aiPlatform.profile = "x\n[PROFILE_CONFLICT] fake.field: injected"')")"
+assert_eq "a multi-line profile value yields exactly one problem line" "1" "$(printf '%s\n' "${_forge}" | grep -c '^\[PROFILE_')"
+assert_eq "the rejected multi-line profile value is not echoed" "0" "$(printf '%s' "${_forge}" | grep -c 'fake.field')"
+assert_contains "the multi-line profile value is reported as not shown" "(value not shown)" "${_forge}"
+_esc="$(_profile_problems "$(_profile_cfg cpuonly escseq '.aiPlatform.profile = "\u001b[31mred"')")"
+assert_eq "a profile value with an escape sequence is not echoed" "0" "$(printf '%s' "${_esc}" | grep -c $'\033')"
+assert_contains "a short plain unsupported profile is still echoed" "unsupported value 'gpu'" \
+  "$(_profile_problems "$(_profile_cfg cpuonly gpuprofile '.aiPlatform.profile = "gpu"')")"
+assert_problem "non-string profile (list) is an invalid value" \
+  "$(_profile_cfg cpuonly list '.aiPlatform.profile = ["cpuOnly"]')" "[PROFILE_INVALID_VALUE] aiPlatform.profile"
+assert_problem "non-string profile (number) is an invalid value" \
+  "$(_profile_cfg cpuonly num '.aiPlatform.profile = 1')" "[PROFILE_INVALID_VALUE] aiPlatform.profile"
+
+# Missing required references, for both profiles.
+for _p in cpuonly fullfeature; do
+  assert_eq "${_p}: the AITK image is optional for now (MPR-188)" "" \
+    "$(_profile_problems "$(_profile_cfg "${_p}" "${_p}-aitk" 'del(.images.aitk)')")"
+  assert_problem "${_p}: missing SLIM image" \
+    "$(_profile_cfg "${_p}" "${_p}-slim" 'del(.images.slim)')" "[PROFILE_MISSING_REFERENCE] images.slim.apiImage"
+  assert_problem "${_p}: missing runtime base image" \
+    "$(_profile_cfg "${_p}" "${_p}-base" 'del(.images.agentRuntime.baseImage)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.baseImage"
+  assert_problem "${_p}: missing schema image" \
+    "$(_profile_cfg "${_p}" "${_p}-schema" 'del(.images.agentRuntime.schemaSetupImage)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.schemaSetupImage"
+  assert_problem "${_p}: missing provider/carrier image" \
+    "$(_profile_cfg "${_p}" "${_p}-provider" 'del(.images.agentRuntime.providerImages)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerImages.launchpad"
+  assert_problem "${_p}: missing checkpoint Secret reference" \
+    "$(_profile_cfg "${_p}" "${_p}-ckpt" 'del(.aiPlatform.features[1].checkpointDbSecretRef)')" "[PROFILE_MISSING_REFERENCE] aiPlatform.features[1].checkpointDbSecretRef"
+  assert_problem "${_p}: missing provider loader module" \
+    "$(_profile_cfg "${_p}" "${_p}-mod" 'del(.images.agentRuntime.providerModules)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerModules.launchpad"
+  assert_problem "${_p}: malformed provider loader module" \
+    "$(_profile_cfg "${_p}" "${_p}-badmod" '.images.agentRuntime.providerModules.launchpad = "no_colon_here"')" "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.launchpad"
+  assert_problem "${_p}: provider loader module with a path is malformed" \
+    "$(_profile_cfg "${_p}" "${_p}-pathmod" '.images.agentRuntime.providerModules.launchpad = "a/b:C"')" "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.launchpad"
+  assert_problem "${_p}: missing provider key" \
+    "$(_profile_cfg "${_p}" "${_p}-prov" 'del(.aiPlatform.features[1].provider)')" "[PROFILE_MISSING_REFERENCE] aiPlatform.features[1].provider"
+  assert_problem "${_p}: missing slim feature" \
+    "$(_profile_cfg "${_p}" "${_p}-noslim" 'del(.aiPlatform.features[0])')" "the 'slim' feature is required"
+  assert_problem "${_p}: missing agentruntime feature" \
+    "$(_profile_cfg "${_p}" "${_p}-noar" 'del(.aiPlatform.features[1])')" "the 'agentruntime' feature is required"
+  assert_problem "${_p}: whitespace in an image reference" \
+    "$(_profile_cfg "${_p}" "${_p}-ws" '.images.aitk.image = "bad ref"')" "[PROFILE_INVALID_VALUE] images.aitk.image"
+done
+
+# Messages name fields and never echo credentials.
+_creds="$(_profile_problems "$(_profile_cfg cpuonly creds '.storage.objectStore.auth.rootPassword = "s3cr3t-value" | .nodes.gpuWorkers = 1')")"
+assert_eq "problem messages never echo credentials" "0" "$(printf '%s' "${_creds}" | grep -c 's3cr3t-value')"
+
+# Compatibility rule: an omitted profile keeps pre-profile behaviour; "full"
+# is the legacy spelling of fullfeature.
+_legacy="$(_profile_cfg fullfeature legacy 'del(.aiPlatform.profile) | del(.images.aitk) | del(.aiPlatform.features)')"
+assert_eq "omitted profile: no profile checks apply" "" "$(_profile_problems "${_legacy}")"
+assert_eq "omitted profile resolves to fullfeature" "fullfeature" "$(_profile_run "${_legacy}" ai_platform_profile_resolved)"
+assert_rc "omitted profile is not explicit" 1 _profile_run "${_legacy}" ai_platform_profile_explicit
+assert_eq "legacy 'full' resolves to fullfeature" "fullfeature" \
+  "$(_profile_run "$(_profile_cfg fullfeature fullalias '.aiPlatform.profile = "full"')" ai_platform_profile_resolved)"
+assert_contains() { assert_eq "$1" "yes" "$([[ "$3" == *"$2"* ]] && echo yes || echo no)"; }
+# Legacy "full" is valid but keeps pre-profile behaviour: it does not opt in to
+# the Launchpad requirements, so an existing SAIA configuration that spells it
+# keeps working.
+_full_saia="$(_profile_cfg fullfeature full-saia '.aiPlatform.profile = "full" | del(.images.aitk) | del(.images.slim) | del(.images.agentRuntime) | .aiPlatform.features = [{"name": "saia", "version": "1.1.0"}]')"
+assert_eq "legacy 'full' with an existing SAIA config has no problems" "" "$(_profile_problems "${_full_saia}")"
+assert_rc "legacy 'full' is set" 0 _profile_run "${_full_saia}" ai_platform_profile_set
+assert_rc "legacy 'full' is not an opt-in (not explicit)" 1 _profile_run "${_full_saia}" ai_platform_profile_explicit
+assert_contains "legacy 'full' records the configured spelling" 'configured: "full"' \
+  "$(_profile_run "${_full_saia}" render_ai_platform_profile_values)"
+assert_contains "legacy 'full' leaves the CR field omitted" 'profile: ""   # omitted in the CR' \
+  "$(_profile_run "${_full_saia}" render_ai_platform_profile_values)"
+assert_contains "omitted profile renders an empty CR field" 'profile: ""   # omitted in the CR' \
+  "$(_profile_run "${_legacy}" render_ai_platform_profile_values)"
+# An unknown value is still rejected even though "full" is lenient.
+assert_problem "legacy-looking typo 'Full' is rejected" \
+  "$(_profile_cfg fullfeature fulltypo '.aiPlatform.profile = "Full"')" "[PROFILE_UNSUPPORTED]"
+# An empty string is "omitted", exactly as for the operator.
+_empty="$(_profile_cfg cpuonly emptyprofile '.aiPlatform.profile = ""')"
+assert_eq "empty-string profile is treated as omitted" "" "$(_profile_problems "${_empty}")"
+assert_rc "empty-string profile is not set" 1 _profile_run "${_empty}" ai_platform_profile_set
+assert_eq "empty-string profile resolves to fullfeature" "fullfeature" "$(_profile_run "${_empty}" ai_platform_profile_resolved)"
+
+# Review fixes: scale factor, gpuWorkers, duplicates, unsafe values.
+for _sf in '0' '2.0' '0x2' '["a"]' '"two"'; do
+  assert_problem "scaleFactor ${_sf} is rejected for an opted-in profile" \
+    "$(_profile_cfg cpuonly "sf-${#_sf}-${_sf//[^a-z0-9]/}" ".aiPlatform.scaleFactor = ${_sf}")" "[PROFILE_INVALID_VALUE] aiPlatform.scaleFactor"
+done
+assert_eq "omitted nodes.gpuWorkers counts as 0 for cpuOnly" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly nogpukey 'del(.nodes.gpuWorkers)')")"
+assert_problem "duplicate agentruntime provider is a conflict" \
+  "$(_profile_cfg cpuonly dupprov '.aiPlatform.features += [.aiPlatform.features[1]]')" "[PROFILE_CONFLICT] aiPlatform.features[2].name: duplicate feature entry"
+assert_problem "duplicate slim feature is a conflict" \
+  "$(_profile_cfg cpuonly dupslim '.aiPlatform.features += [.aiPlatform.features[0]]')" "[PROFILE_CONFLICT] aiPlatform.features[2].name: duplicate feature entry"
+assert_eq "two different agentruntime providers are not duplicates" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly twoprov '.aiPlatform.features += [{"name": "agentruntime", "provider": "other", "checkpointDbSecretRef": "x"}] | .images.agentRuntime.providerImages.other = "splunk/other:1" | .images.agentRuntime.providerModules.other = "other.loader:Loader"')")"
+for _prov in 'Bad_Name' 'a.b' 'a"b' '-lead' "$(printf 'a%.0s' $(seq 1 64))"; do
+  assert_problem "provider '${_prov:0:12}' must be a DNS-1123 label" \
+    "$(_profile_cfg cpuonly "prov-${#_prov}-${_prov//[^a-zA-Z0-9]/}" ".aiPlatform.features[1].provider = \"${_prov//\"/\\\"}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].provider"
+done
+assert_problem "a quote in the snapshot manifest is rejected" \
+  "$(_profile_cfg cpuonly snapquote '.images.snapshotManifest = "a\"b"')" "[PROFILE_INVALID_VALUE] images.snapshotManifest"
+assert_problem "a backslash in an image reference is rejected" \
+  "$(_profile_cfg cpuonly imgbs '.images.slim.apiImage = "a\\b"')" "[PROFILE_INVALID_VALUE] images.slim.apiImage"
+
+# Generic installer inputs that end up in the CR are validated for the canonical
+# profiles too (the CRD or webhook would otherwise reject them after the cluster
+# has already been changed).
+_cr_input_cases() { # <profile> : "<yq edit>|<expected field>"
+  cat <<'CASES'
+.cluster.name = "Bad_Name" => cluster.name
+.cluster.name = "a-very-long-cluster-name-that-exceeds-the-fifty-one-character-limit" => cluster.name
+.storage.objectStore.type = "gcs" => storage.objectStore.type
+.storage.objectStore.bucket = "a#b" => storage.objectStore.bucket
+.storage.objectStore.bucket = "bad!bucket" => storage.objectStore.bucket
+.storage.objectStore.endpoint = "host:9000" => storage.objectStore.endpoint
+.storage.objectStore.endpoint = "http://a\"b" => storage.objectStore.endpoint
+.storage.objectStore.endpoint = "http://a b" => storage.objectStore.endpoint
+.cluster.region = "no yes" => cluster.region
+.cluster.region = "eu/west" => cluster.region
+.kubernetes.namespace = "Bad_NS" => kubernetes.namespace
+.aiPlatform.serviceTemplate.type = "Bogus" => aiPlatform.serviceTemplate.type
+.aiPlatform.serviceTemplate.type = "true" => aiPlatform.serviceTemplate.type
+.aiPlatform.serviceTemplate.nodePort = "abc" => aiPlatform.serviceTemplate.nodePort
+.aiPlatform.serviceTemplate.nodePort = 99999 => aiPlatform.serviceTemplate.nodePort
+.aiPlatform.serviceTemplate.nodePort = 80 => aiPlatform.serviceTemplate.nodePort
+.aiPlatform.serviceTemplate.slimNodePort = 40000 => aiPlatform.serviceTemplate.slimNodePort
+.splunk.enabled = true | .splunk.external.endpoint = "yes" => splunk.external.endpoint
+.splunk.enabled = true | .splunk.external.endpoint = "https://splunk.example:8088" | .splunk.external.secretName = "Bad_Secret" => splunk.external.secretName
+.splunk.trustedIssuers = ["https://a\"b"] => splunk.trustedIssuers[0]
+.splunk.trustedIssuers = ["not-a-url"] => splunk.trustedIssuers[0]
+CASES
+}
+_cr_input_i=0
+while IFS= read -r _case_line; do
+  [[ -z "${_case_line}" ]] && continue
+  _edit="${_case_line%% => *}"; _field="${_case_line##* => }"
+  for _p in cpuonly fullfeature; do
+    _cr_input_i=$((_cr_input_i + 1))
+    assert_problem "${_p}: ${_field} is validated up front (${_edit:0:48})" \
+      "$(_profile_cfg "${_p}" "crin-${_cr_input_i}" "${_edit}")" "[PROFILE_INVALID_VALUE] ${_field}"
+  done
+done < <(_cr_input_cases)
+assert_problem "fullfeature: storage.vectorDbSize must be a quantity" \
+  "$(_profile_cfg fullfeature vdb-size '.storage.vectorDbSize = "50 Gi"')" "[PROFILE_INVALID_VALUE] storage.vectorDbSize"
+assert_problem "fullfeature: storage.storageClass must be a Kubernetes name" \
+  "$(_profile_cfg fullfeature vdb-sc '.storage.storageClass = "Bad Class"')" "[PROFILE_INVALID_VALUE] storage.storageClass"
+assert_eq "cpuOnly does not validate the vector DB settings it never renders" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly vdb-ignored '.storage.vectorDbSize = "50 Gi" | .storage.storageClass = "Bad Class"')")"
+assert_problem "a missing cluster.name is reported" \
+  "$(_profile_cfg cpuonly noclustername 'del(.cluster.name)')" "[PROFILE_MISSING_REFERENCE] cluster.name"
+assert_eq "valid generic inputs are accepted (NodePort, Splunk external, trusted issuer)" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly genericok '.aiPlatform.serviceTemplate.type = "NodePort" | .aiPlatform.serviceTemplate.nodePort = 30080 | .aiPlatform.serviceTemplate.slimNodePort = 30081 | .splunk.enabled = true | .splunk.external.endpoint = "https://splunk.example:8088" | .splunk.external.secretName = "splunk-hec.external" | .splunk.trustedIssuers = ["https://issuer.example/oauth2"] | .cluster.region = "eu-west-1" | .storage.objectStore.type = "aws"')")"
+assert_eq "an aws object store does not require an endpoint to be valid" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly awsnoendpoint '.storage.objectStore.type = "aws" | .storage.objectStore.endpoint = "not a url"')")"
+assert_eq "the generic-input rules do not apply to legacy full" "" \
+  "$(_profile_problems "$(_profile_cfg fullfeature legacygeneric '.aiPlatform.profile = "full" | .cluster.name = "Bad_Name" | .cluster.region = "no yes"')")"
+
+# Rejected values are not echoed back, and sidecar flags must be real booleans.
+for _sf in '"2x"' '0' '"<script>"'; do
+  _sf_out="$(_profile_problems "$(_profile_cfg cpuonly "sfecho-${_sf//[^a-z0-9]/}" ".aiPlatform.scaleFactor = ${_sf}")")"
+  assert_eq "scaleFactor ${_sf} is reported without echoing the value" "0" \
+    "$(printf '%s' "${_sf_out}" | grep -c -e '(got ' -e '2x' -e 'script')"
+done
+for _sc in '"ture"' '"yes"' '1' '"on"'; do
+  assert_problem "a non-boolean sidecar flag ${_sc} is rejected" \
+    "$(_profile_cfg cpuonly "sidecar-${_sc//[^a-z0-9]/}" ".aiPlatform.sidecars.otel = ${_sc}")" "[PROFILE_INVALID_VALUE] aiPlatform.sidecars.otel: must be true or false"
+done
+assert_eq "real boolean sidecar flags are accepted for fullfeature" "" \
+  "$(_profile_problems "$(_profile_cfg fullfeature sidecar-ok '.aiPlatform.sidecars.otel = true | .aiPlatform.sidecars.envoy = false')")"
+# An unwritable --output gives a clear message, not a raw shell redirect error.
+_bad_dest_out="$(CONFIG_FILE="${_PROFILE_DIR}/profile-cpuonly.yaml" LOG_DIR="${_PROFILE_TMP}/dlogs" bash "${SCRIPT}" render-profile --output /nonexistent-dir-mpr184/out.yaml 2>&1)"; _bad_dest_rc=$?
+assert_eq "an unwritable --output exits nonzero" "1" "${_bad_dest_rc}"
+assert_contains "an unwritable --output explains itself" "cannot write the profile values to /nonexistent-dir-mpr184/out.yaml" "${_bad_dest_out}"
+assert_eq "an unwritable --output shows no raw shell error" "0" "$(printf '%s' "${_bad_dest_out}" | grep -c 'No such file or directory')"
+assert_eq "a failed render leaves no temp file behind" "0" "$(ls "${_PROFILE_TMP}" | grep -c '\.tmp\.')"
+
+# Feature fields are spliced into the CR, so they must be safe scalars.
+_inj_name="$(_profile_cfg cpuonly injname '.aiPlatform.features += [{"name": "x\n    - name: saia\n      version: \"1\""}]')"
+assert_problem "newline-injected feature name is rejected" "${_inj_name}" "[PROFILE_INVALID_VALUE] aiPlatform.features[2].name"
+assert_eq "injected feature name is never echoed" "0" "$(_profile_problems "${_inj_name}" | grep -c -e '- name: saia' -e 'version: ')"
+assert_problem "newline-injected version is rejected" \
+  "$(_profile_cfg cpuonly injver '.aiPlatform.features[1].version = "1\"\n  x: y"')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].version"
+assert_problem "newline-injected minReplicas is rejected" \
+  "$(_profile_cfg cpuonly injmin '.aiPlatform.features[1].minReplicas = "1\n  injected: true"')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].minReplicas"
+assert_problem "non-integer maxReplicas is rejected" \
+  "$(_profile_cfg cpuonly maxstr '.aiPlatform.features[1].maxReplicas = "four"')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
+assert_problem "zero minReplicas is rejected" \
+  "$(_profile_cfg cpuonly min0 '.aiPlatform.features[1].minReplicas = 0')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].minReplicas"
+assert_problem "minReplicas above maxReplicas is rejected" \
+  "$(_profile_cfg cpuonly minmax '.aiPlatform.features[1].minReplicas = 5 | .aiPlatform.features[1].maxReplicas = 2')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
+assert_problem "targetCPUUtilization above 100 is rejected" \
+  "$(_profile_cfg cpuonly cpu101 '.aiPlatform.features[1].targetCPUUtilization = 101')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].targetCPUUtilization"
+assert_problem "a feature entry without a name is rejected" \
+  "$(_profile_cfg cpuonly noname '.aiPlatform.features += [{"version": "1.0.0"}]')" "[PROFILE_INVALID_VALUE] aiPlatform.features[2].name"
+# The feature name is a CRD enum; the Kubernetes name rules are applied exactly.
+for _fname in unknown Saia agentruntime2 ''; do
+  assert_problem "feature name '${_fname}' outside the CRD enum is rejected" \
+    "$(_profile_cfg cpuonly "fname-${_fname:-empty}" ".aiPlatform.features += [{\"name\": \"${_fname}\"}]")" "[PROFILE_INVALID_VALUE] aiPlatform.features[2].name: must be one of saia, seca, slim, agentruntime"
+done
+_long_label="$(printf 'a%.0s' $(seq 1 64))"
+for _bad_sub in 'a..b' 'a.-b' 'a.b.' '.a' 'A.b' "${_long_label}" "x.${_long_label}" 'a_b'; do
+  assert_problem "checkpointDbSecretRef '${_bad_sub:0:14}' is not a Kubernetes name" \
+    "$(_profile_cfg cpuonly "sub-ck-${#_bad_sub}-${_bad_sub//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].checkpointDbSecretRef = \"${_bad_sub}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].checkpointDbSecretRef"
+  assert_problem "serviceAccountName '${_bad_sub:0:14}' is not a Kubernetes name" \
+    "$(_profile_cfg cpuonly "sub-sa-${#_bad_sub}-${_bad_sub//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].serviceAccountName = \"${_bad_sub}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].serviceAccountName"
+done
+_good_label63="$(printf 'a%.0s' $(seq 1 63))"
+assert_eq "valid dotted and 63-character-label names are accepted" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly goodsubs ".aiPlatform.features[1].checkpointDbSecretRef = \"${_good_label63}.b-c.d\" | .aiPlatform.features[1].serviceAccountName = \"my.sa-1\"")")"
+assert_problem "serviceAccountName must be a DNS label" \
+  "$(_profile_cfg cpuonly badsa '.aiPlatform.features[1].serviceAccountName = "Bad_SA"')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].serviceAccountName"
+for _secret in 'Bad_Secret:1' 'UPPER' '-lead' 'a b'; do
+  assert_problem "checkpointDbSecretRef '${_secret}' must be a Secret name" \
+    "$(_profile_cfg cpuonly "secret-${_secret//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].checkpointDbSecretRef = \"${_secret}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].checkpointDbSecretRef"
+done
+assert_eq "valid feature fields are accepted (incl. a dotted Secret name)" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly goodfields '.aiPlatform.features[1].checkpointDbSecretRef = "pg.conn-1" | .aiPlatform.features[1].version = "0.2.0-rc.1+build" | .aiPlatform.features[1].serviceAccountName = "launchpad-sa" | .aiPlatform.features[1].minReplicas = 2 | .aiPlatform.features[1].maxReplicas = 8 | .aiPlatform.features[1].targetCPUUtilization = 100')")"
+# Rules the webhook or the CRD enforce, which must not wait for kubectl apply
+# (that happens after the installer has already changed the cluster).
+assert_problem "a provider on a non-agentruntime feature is rejected" \
+  "$(_profile_cfg cpuonly slimprov '.aiPlatform.features[0].provider = "x"')" "[PROFILE_CONFLICT] aiPlatform.features[0].provider: only supported for the agentruntime feature"
+_extra_features() { # <n>: n additional unique agentruntime providers
+  local expr='' k
+  for ((k=1; k<=$1; k++)); do
+    expr+=".aiPlatform.features += [{\"name\": \"agentruntime\", \"provider\": \"p${k}\", \"checkpointDbSecretRef\": \"s\"}] | .images.agentRuntime.providerImages.p${k} = \"splunk/p:1\" | .images.agentRuntime.providerModules.p${k} = \"m.x:C\" | "
+  done
+  printf '%s' "${expr% | }"
+}
+assert_problem "more than 10 features exceeds the CRD limit" \
+  "$(_profile_cfg cpuonly feat11 "$(_extra_features 9)")" "[PROFILE_INVALID_VALUE] aiPlatform.features: at most 10 features are allowed (got 11)"
+assert_eq "exactly 10 features is accepted" "" "$(_profile_problems "$(_profile_cfg cpuonly feat10 "$(_extra_features 8)")")"
+for _env in '{"PORT": 8080}' '{"DEBUG": true}' '{"RATIO": 1.5}' '{"NOTHING": null}' '["a"]' '"text"'; do
+  assert_problem "features[].env ${_env} is rejected (CRD: map of strings)" \
+    "$(_profile_cfg cpuonly "env-${_env//[^a-zA-Z0-9]/_}" ".aiPlatform.features[1].env = ${_env}")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].env"
+done
+assert_eq "features[].env with quoted string values is accepted" "" \
+  "$(_profile_problems "$(_profile_cfg cpuonly envok '.aiPlatform.features[1].env = {"PORT": "8080", "DEBUG": "true"}')")"
+# Control characters other than whitespace are rejected, and never reach a rendered
+# YAML scalar. The values are passed as real bytes through the environment (a yq
+# expression does not interpret \u escapes, so it would only store a literal backslash).
+_ctrl_img_cfg="$(CTRLV=$'a\033b' _profile_cfg cpuonly ctrl-img '.images.slim.apiImage = strenv(CTRLV)')"
+assert_eq "the test config really holds an ESC byte (not a literal backslash)" \
+  "$(printf '"a\\u001bb"')" "$(command yq eval -o=json '.images.slim.apiImage' "${_ctrl_img_cfg}")"
+assert_problem "an escape character in an image reference is rejected" "${_ctrl_img_cfg}" "[PROFILE_INVALID_VALUE] images.slim.apiImage: must not contain whitespace, control characters"
+_ctrl_del_cfg="$(CTRLV=$'a\177b' _profile_cfg cpuonly ctrl-del '.images.snapshotManifest = strenv(CTRLV)')"
+assert_problem "a DEL character in the snapshot manifest is rejected" "${_ctrl_del_cfg}" "[PROFILE_INVALID_VALUE] images.snapshotManifest"
+_ctrl_out="${_PROFILE_TMP}/ctrl.yaml"
+_ctrl_legacy_cfg="$(CTRLV=$'a\033b\177c' _profile_cfg fullfeature ctrl-legacy '.aiPlatform.profile = "full" | .images.slim.apiImage = strenv(CTRLV)')"
+_profile_run "${_ctrl_legacy_cfg}" render_ai_platform_profile_values > "${_ctrl_out}"
+assert_rc "a control character in a legacy-profile reference still renders valid YAML" 0 command yq eval '.' "${_ctrl_out}"
+assert_eq "the control characters round-trip through the rendered YAML" \
+  "$(printf '"registry.example.internal/a\\u001bb\177c"')" "$(command yq eval -o=json '.images.slim' "${_ctrl_out}")"
+# Legacy (not opted in) configs keep their own field handling: nothing is imposed.
+assert_eq "legacy 'full' does not validate feature fields" "" \
+  "$(_profile_problems "$(_profile_cfg fullfeature legacyfields '.aiPlatform.profile = "full" | .aiPlatform.features[1].minReplicas = "x"')")"
+
+# Effective components follow component_enabled, not the raw flags.
+_nv_omit="$(_profile_cfg cpuonly nvomit 'del(.components.nvidia)')"
+assert_contains "cpuOnly with nvidia omitted renders nvidia: false" "  nvidia: false" "$(_profile_run "${_nv_omit}" render_ai_platform_profile_values)"
+_nv_on="$(_profile_cfg fullfeature nvon 'del(.components.nvidia)')"
+assert_contains "fullfeature with GPU workers and nvidia omitted renders nvidia: true (default)" "  nvidia: true" "$(_profile_run "${_nv_on}" render_ai_platform_profile_values)"
+_nv_nogpu="$(_profile_cfg fullfeature nvnogpu '.nodes.gpuWorkers = 0')"
+assert_contains "nvidia flag is ignored when there are no GPU workers" "  nvidia: false" "$(_profile_run "${_nv_nogpu}" render_ai_platform_profile_values)"
+
+# Rendered YAML escapes values, so a quote can never produce invalid YAML.
+_esc_out="${_PROFILE_TMP}/esc.yaml"
+_profile_run "$(_profile_cfg fullfeature escq '.aiPlatform.profile = "full" | .images.snapshotManifest = "a\"b\\c"')" render_ai_platform_profile_values > "${_esc_out}"
+assert_rc "rendered values with quotes and backslashes are valid YAML" 0 command yq eval '.' "${_esc_out}"
+assert_eq "escaped snapshot manifest round-trips" 'a"b\c' "$(command yq eval '.images.snapshotManifest' "${_esc_out}")"
+
+# Rendered output: deterministic and equal to the checked-in golden files.
+for _p in cpuonly fullfeature; do
+  _r1="$(_profile_run "${_PROFILE_DIR}/profile-${_p}.yaml" render_ai_platform_profile_values)"
+  _r2="$(_profile_run "${_PROFILE_DIR}/profile-${_p}.yaml" render_ai_platform_profile_values)"
+  assert_eq "${_p}: same input renders the same output" "${_r1}" "${_r2}"
+  [[ "${UPDATE_GOLDEN:-}" == "1" ]] && printf '%s\n' "${_r1}" > "${_PROFILE_GOLDEN}/profile-values-${_p}.expected.yaml"
+  assert_eq "${_p}: rendered values match the golden file" \
+    "$(cat "${_PROFILE_GOLDEN}/profile-values-${_p}.expected.yaml" 2>/dev/null)" "${_r1}"
+done
+_changed_keys() {
+  diff <(command yq eval -o=props '.' "$1") <(command yq eval -o=props '.' "$2") \
+    | grep '^[<>]' | sed 's/^[<>] //; s/ = .*//' | sort -u | tr '\n' ' '
+}
+assert_eq "cpuOnly and fullfeature values differ exactly where the profiles differ" \
+  "aiPlatformSpec.profile components.kuberay components.nvidia nodes.gpuWorkers profile.configured profile.effective " \
+  "$(_changed_keys "${_PROFILE_GOLDEN}/profile-values-cpuonly.expected.yaml" "${_PROFILE_GOLDEN}/profile-values-fullfeature.expected.yaml")"
+
+# cpuOnly must not carry Ray, Weaviate or SAIA images: install would inject them
+# into the operator Deployment although nothing deploys them.
+for _leak in 'ray.headImage:rayproject/ray:2.44.0' 'ray.workerImage:rayproject/ray:2.44.0' 'weaviate.image:weaviate:1' 'saia.apiImage:s/a:1' 'saia.apiV2Image:s/a2:1' 'saia.dataLoaderImage:s/dl:1'; do
+  assert_problem "cpuOnly rejects images.${_leak%%:*}" \
+    "$(_profile_cfg cpuonly "leak-${_leak%%:*}" ".images.${_leak%%:*} = \"${_leak#*:}\"")" "[PROFILE_CONFLICT] images.${_leak%%:*}"
+done
+# fullfeature: validate/render-profile must agree with install about Ray and Weaviate images.
+assert_problem "fullfeature without a Ray head image is reported (as install does)" \
+  "$(_profile_cfg fullfeature noheadimg 'del(.images.ray.headImage)')" "[PROFILE_MISSING_REFERENCE] images.ray.headImage"
+assert_problem "fullfeature without a Ray worker image is reported" \
+  "$(_profile_cfg fullfeature noworkerimg 'del(.images.ray.workerImage)')" "[PROFILE_MISSING_REFERENCE] images.ray.workerImage"
+assert_problem "fullfeature without a Weaviate image is reported" \
+  "$(_profile_cfg fullfeature noweaviate 'del(.images.weaviate)')" "[PROFILE_MISSING_REFERENCE] images.weaviate.image"
+
+# Air-gap model verification does not apply to cpuOnly (it hosts no model).
+_verify_applies() { # <profile> <airgap>
+  ( eval "$(_extract_fn ai_platform_profile_resolved)"; eval "$(_extract_fn model_artifacts_verification_applies)"
+    AI_PLATFORM_PROFILE="$1"; AIRGAP_MODE="$2"; model_artifacts_verification_applies )
+}
+assert_rc "air-gap verification does not apply to cpuOnly" 1 _verify_applies cpuOnly true
+assert_rc "air-gap verification applies to fullfeature" 0 _verify_applies fullfeature true
+assert_rc "air-gap verification applies to an omitted profile" 0 _verify_applies "" true
+assert_rc "air-gap verification applies to legacy full" 0 _verify_applies full true
+assert_rc "verification never applies outside air-gap mode" 1 _verify_applies fullfeature false
+
+# validate_image_config, the staging/accelerator bypasses and the validate command
+# with a profile set. These are the install-path entry points the pure-function
+# tests above do not reach.
+_vic() {
+  _profile_run "$1" _vic_inner
+}
+_vic_inner() {
+  for _f in validate_image_config k0s_feature_enabled k0s_saia_feature_enabled k0s_slim_feature_enabled k0s_agentruntime_feature_enabled; do
+    eval "$(_extract_fn "${_f}")"
+  done
+  validate_image_config
+}
+assert_rc "validate_image_config accepts the cpuOnly example (no Weaviate or Ray image)" 0 _vic "${_PROFILE_DIR}/profile-cpuonly.yaml"
+assert_rc "validate_image_config accepts the fullfeature example" 0 _vic "${_PROFILE_DIR}/profile-fullfeature.yaml"
+assert_rc "validate_image_config rejects a cpuOnly profile conflict" 1 \
+  _vic "$(_profile_cfg cpuonly vic-conflict '.nodes.gpuWorkers = 2')"
+assert_contains "validate_image_config names the profile problem" "[PROFILE_CONFLICT] nodes.gpuWorkers" \
+  "$(_vic "$(_profile_cfg cpuonly vic-conflict2 '.nodes.gpuWorkers = 2')" 2>&1)"
+assert_rc "validate_image_config rejects a fullfeature config without Ray images" 1 \
+  _vic "$(_profile_cfg fullfeature vic-noray 'del(.images.ray)')"
+
+_resolve_inner() {
+  for _f in resolve_model_staging resolve_accelerator_type; do eval "$(_extract_fn "${_f}")"; done
+  SILENT_INSTALL=false
+  resolve_model_staging </dev/null && resolve_accelerator_type </dev/null && echo "staging=${MODEL_STAGING_ENABLED} accelerator=[${DEFAULT_ACCELERATOR}]"
+}
+assert_eq "cpuOnly never prompts for model staging or an accelerator" "staging=false accelerator=[]" \
+  "$(_profile_run "${_PROFILE_DIR}/profile-cpuonly.yaml" _resolve_inner 2>&1)"
+assert_rc "fullfeature without an accelerator still errors (the bypass is cpuOnly-only)" 1 \
+  _profile_run "$(_profile_cfg fullfeature noaccel 'del(.aiPlatform.defaultAcceleratorType)')" _resolve_inner
+
+_validate_cmd() { CONFIG_FILE="$1" LOG_DIR="${_PROFILE_TMP}/vlogs" bash "${SCRIPT}" validate 2>&1; }
+_vout="$(_validate_cmd "$(_profile_cfg cpuonly vcmd-bad '.nodes.gpuWorkers = 2')")"; _vrc=$?
+assert_contains "validate command reports the profile conflict" "[PROFILE_CONFLICT] nodes.gpuWorkers" "${_vout}"
+assert_rc "validate command fails on a profile conflict" 1 bash -c 'CONFIG_FILE="$1" LOG_DIR="$2" bash "$3" validate' _ \
+  "$(_profile_cfg cpuonly vcmd-bad2 '.nodes.gpuWorkers = 2')" "${_PROFILE_TMP}/vlogs" "${SCRIPT}"
+assert_rc "validate command passes the cpuOnly example" 0 bash -c 'CONFIG_FILE="$1" LOG_DIR="$2" bash "$3" validate' _ \
+  "${_PROFILE_DIR}/profile-cpuonly.yaml" "${_PROFILE_TMP}/vlogs" "${SCRIPT}"
+
+# Golden files are regenerated by UPDATE_GOLDEN=1, so a bad regeneration would
+# otherwise pass. These invariants read the golden files directly and do not
+# depend on the render under test.
+for _p in cpuonly fullfeature; do
+  _g="${_PROFILE_GOLDEN}/profile-values-${_p}.expected.yaml"
+  _gc="${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml"
+  _want_profile="cpuOnly"; _want_gpu="0"; _want_ray="false"
+  [[ "${_p}" == "fullfeature" ]] && { _want_profile="fullfeature"; _want_gpu="1"; _want_ray="true"; }
+  assert_eq "golden ${_p} values: valid YAML" "0" "$(command yq eval '.' "${_g}" >/dev/null 2>&1; echo $?)"
+  assert_eq "golden ${_p} values: effective profile" "${_want_profile}" "$(command yq eval '.profile.effective' "${_g}")"
+  assert_eq "golden ${_p} values: explicit" "true" "$(command yq eval '.profile.explicit' "${_g}")"
+  assert_eq "golden ${_p} values: CR field" "${_want_profile}" "$(command yq eval '.aiPlatformSpec.profile' "${_g}")"
+  assert_eq "golden ${_p} values: GPU workers" "${_want_gpu}" "$(command yq eval '.nodes.gpuWorkers' "${_g}")"
+  assert_eq "golden ${_p} values: kuberay" "${_want_ray}" "$(command yq eval '.components.kuberay' "${_g}")"
+  assert_eq "golden ${_p} values: nvidia follows GPU workers" "${_want_ray}" "$(command yq eval '.components.nvidia' "${_g}")"
+  assert_eq "golden ${_p} values: no null or empty reference" "0" "$(grep -cE ': "(null)?"$' "${_g}" | tr -d ' ')" 
+  for _k in .images.agentRuntime.base .images.agentRuntime.schemaSetup .images.slim .images.aitk; do
+    assert_eq "golden ${_p} values: ${_k} is a registry reference" "yes" \
+      "$([[ "$(command yq eval "${_k}" "${_g}")" == registry.example.internal/* ]] && echo yes || echo no)"
+  done
+  assert_eq "golden ${_p} values: provider image present" "yes" \
+    "$([[ "$(command yq eval '.images.agentRuntime.providers.launchpad' "${_g}")" == */ai-agent-runtime-provider-launchpad:* ]] && echo yes || echo no)"
+  assert_eq "golden ${_p} values: provider module present" "yes" \
+    "$([[ "$(command yq eval '.images.agentRuntime.modules.launchpad' "${_g}")" == *:* ]] && echo yes || echo no)"
+  assert_eq "golden ${_p} values: no credential-looking keys" "0" "$(grep -ciE 'password|token|secretkey|apikey' "${_g}" | tr -d ' ')"
+  assert_eq "golden ${_p} CR: valid YAML" "0" "$(command yq eval '.' "${_gc}" >/dev/null 2>&1; echo $?)"
+  assert_eq "golden ${_p} CR: spec.profile" "${_want_profile}" "$(command yq eval '.spec.profile' "${_gc}")"
+  assert_eq "golden ${_p} CR: kind" "AIPlatform" "$(command yq eval '.kind' "${_gc}")"
+  assert_eq "golden ${_p} CR: has the slim and agentruntime features" "slim,agentruntime" "$(command yq eval '[.spec.features[].name] | join(",")' "${_gc}")"
+done
+for _k in .spec.defaultAcceleratorType .spec.gpuScheduler .spec.workerGroupConfig .spec.storage; do
+  assert_eq "golden cpuOnly CR: ${_k} is absent" "null" "$(command yq eval "${_k}" "${_PROFILE_GOLDEN}/aiplatform-cr-cpuonly.expected.yaml")"
+done
+assert_eq "golden fullfeature CR: keeps accelerator and storage" "L40S,50Gi" \
+  "$(command yq eval '[.spec.defaultAcceleratorType, .spec.storage.vectorDB.size] | join(",")' "${_PROFILE_GOLDEN}/aiplatform-cr-fullfeature.expected.yaml")"
+[[ "${UPDATE_GOLDEN:-}" == "1" ]] && echo "  ⚠️  UPDATE_GOLDEN=1: golden files were rewritten; review 'git diff tools/ai-tier-cluster-setup/testdata' before committing." >&2
+
+# The AIPlatform CR the installer applies: render install_ai_platform_cr with a
+# stubbed kubectl and compare to the golden CR (also validated by the Go
+# tests against the operator's profile rules).
+_render_cr() {
+  _profile_run "$1" _render_cr_inner
+}
+_render_cr_inner() {
+  eval "$(_extract_fn install_ai_platform_cr)"
+  sleep() { :; }
+  jq() { :; }
+  kubectl() { if [[ " $* " == *" apply "* && " $* " == *" -f - "* ]]; then cat; fi; return 0; }
+  SPLUNK_MODE=disabled
+  install_ai_platform_cr 2>&1 | sed -n '/^apiVersion: ai.splunk.com/,$p' | grep -v '^[[:space:]]*$'
+}
+for _p in cpuonly fullfeature; do
+  _cr="$(_render_cr "${_PROFILE_DIR}/profile-${_p}.yaml")"
+  [[ "${UPDATE_GOLDEN:-}" == "1" ]] && printf '%s\n' "${_cr}" > "${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml"
+  assert_eq "${_p}: rendered AIPlatform CR matches the golden file" \
+    "$(cat "${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml" 2>/dev/null)" "${_cr}"
+done
+# A numeric-only ServiceAccount name is a valid DNS name but must stay a YAML string in the CR.
+_num_sa="$(_profile_cfg cpuonly numsa '.aiPlatform.features[1].serviceAccountName = "123"')"
+assert_eq "a numeric-only serviceAccountName passes validation" "" "$(_profile_problems "${_num_sa}")"
+_num_cr="${_PROFILE_TMP}/numsa-cr.yaml"
+_render_cr "${_num_sa}" > "${_num_cr}"
+assert_eq "a numeric-only serviceAccountName is rendered as a YAML string" "!!str" "$(command yq eval '.spec.features[1].serviceAccountName | tag' "${_num_cr}")"
+# "no" / "yes" must stay YAML strings in the CR for the canonical profiles.
+_bool_region="$(_profile_cfg cpuonly boolregion '.cluster.region = "no"')"
+_render_cr "${_bool_region}" > "${_PROFILE_TMP}/boolregion-cr.yaml"
+assert_eq "region \"no\" is rendered as a YAML string for cpuOnly" "!!str" "$(command yq eval '.spec.objectStorage.region | tag' "${_PROFILE_TMP}/boolregion-cr.yaml")"
+_bool_sc="$(_profile_cfg fullfeature boolsc '.storage.storageClass = "yes"')"
+_render_cr "${_bool_sc}" > "${_PROFILE_TMP}/boolsc-cr.yaml"
+assert_eq "storageClass \"yes\" is rendered as a YAML string for fullfeature" "!!str" "$(command yq eval '.spec.storage.vectorDB.storageClassName | tag' "${_PROFILE_TMP}/boolsc-cr.yaml")"
+_legacy_region="$(_profile_cfg fullfeature legacyregion '.aiPlatform.profile = "full"')"
+assert_contains "legacy configs keep the unquoted region (output unchanged)" "    region: us-east-1" "$(_render_cr "${_legacy_region}")"
+_cpu_cr="$(_render_cr "${_PROFILE_DIR}/profile-cpuonly.yaml")"
+assert_contains "cpuOnly CR carries spec.profile: cpuOnly" "  profile: cpuOnly" "${_cpu_cr}"
+for _forbidden in defaultAcceleratorType scaleFactor vectorDB workerGroupConfig gpuScheduler; do
+  assert_eq "cpuOnly CR omits ${_forbidden}" "0" "$(printf '%s\n' "${_cpu_cr}" | grep -c "${_forbidden}:")"
+done
+_full_cr="$(_render_cr "${_PROFILE_DIR}/profile-fullfeature.yaml")"
+assert_contains "fullfeature CR carries spec.profile: fullfeature" "  profile: fullfeature" "${_full_cr}"
+assert_contains "fullfeature CR keeps the GPU scheduler" "gpuScheduler:" "${_full_cr}"
+assert_eq "omitted profile leaves spec.profile out of the CR" "0" \
+  "$(_render_cr "${_legacy}" | grep -c '^  profile:')"
+assert_eq "legacy 'full' leaves spec.profile out of the CR" "0" \
+  "$(_render_cr "${_full_saia}" | grep -c '^  profile:')"
+assert_eq "cpuOnly CR has no orphaned GPU/scale comments" "0" \
+  "$(printf '%s\n' "${_cpu_cr}" | grep -c 'GPU accelerator type\|Platform-wide capacity')"
+assert_contains "fullfeature CR keeps the accelerator comment" "GPU accelerator type" "${_full_cr}"
+
+# The command-line contract: a bad profile fails before any output, nonzero,
+# and is never converted into the other profile.
+_bad_cfg="$(_profile_cfg cpuonly cli-bad '.nodes.gpuWorkers = 1')"
+_bad_file="${_PROFILE_TMP}/bad-values.yaml"
+_bad_out="$(CONFIG_FILE="${_bad_cfg}" bash "${SCRIPT}" render-profile --output "${_bad_file}" 2>&1)"; _bad_rc=$?
+assert_eq "render-profile exits nonzero on a conflicting profile" "1" "${_bad_rc}"
+assert_eq "render-profile writes no file for an invalid profile" "no" "$([[ -e "${_bad_file}" ]] && echo yes || echo no)"
+assert_contains "render-profile names the failing field and code" "[PROFILE_CONFLICT] nodes.gpuWorkers" "${_bad_out}"
+assert_contains "render-profile does not convert the profile" "cpuOnly" "${_bad_out}"
+_ok_file="${_PROFILE_TMP}/ok-values.yaml"
+assert_rc "render-profile succeeds for the cpuOnly example" 0 \
+  env CONFIG_FILE="${_PROFILE_DIR}/profile-cpuonly.yaml" bash "${SCRIPT}" render-profile --output "${_ok_file}"
+assert_eq "render-profile --output equals the golden file" \
+  "$(cat "${_PROFILE_GOLDEN}/profile-values-cpuonly.expected.yaml")" "$(cat "${_ok_file}" 2>/dev/null)"
+_unsupported="$(_profile_cfg cpuonly cli-unsupported '.aiPlatform.profile = "gpu"')"
+_unsupported_out="$(CONFIG_FILE="${_unsupported}" bash "${SCRIPT}" render-profile --output "${_PROFILE_TMP}/u.yaml" 2>&1)"; _unsupported_rc=$?
+assert_eq "render-profile rejects an unsupported profile" "1" "${_unsupported_rc}"
+assert_contains "unsupported profile reports PROFILE_UNSUPPORTED" "[PROFILE_UNSUPPORTED] aiPlatform.profile" "${_unsupported_out}"
+
+# Air-gap: an invalid profile must fail BEFORE the staging step (which would
+# otherwise download for ~15 minutes). The install command is run against a bad
+# profile with cluster.airgap: true; it must stop at once and say nothing was staged.
+_ag_cfg="$(_profile_cfg cpuonly airgap-bad '.cluster.airgap = true | .nodes.gpuWorkers = 2')"
+_ag_out="$(CONFIG_FILE="${_ag_cfg}" LOG_DIR="${_PROFILE_TMP}/aglogs" bash "${SCRIPT}" install 2>&1)"; _ag_rc=$?
+assert_eq "air-gapped install with an invalid profile exits nonzero" "1" "${_ag_rc}"
+assert_contains "air-gapped install names the failing field before staging" "[PROFILE_CONFLICT] nodes.gpuWorkers" "${_ag_out}"
+assert_contains "air-gapped install reports that nothing was staged" "nothing was staged" "${_ag_out}"
+assert_eq "air-gapped install never starts staging" "0" "$(printf '%s' "${_ag_out}" | grep -c 'staging artifacts before')"
+assert_eq "air-gapped preflight prints one Session log line" "1" "$(printf '%s' "${_ag_out}" | grep -c 'Session log:')"
+_ag2_cfg="$(_profile_cfg cpuonly airgap-noip '.cluster.airgap = true | del(.nodes.existingIPs)')"
+_ag2_out="$(CONFIG_FILE="${_ag2_cfg}" LOG_DIR="${_PROFILE_TMP}/aglogs2" bash "${SCRIPT}" install 2>&1)"; _ag2_rc=$?
+assert_eq "an unrelated config error also stops before staging" "1" "${_ag2_rc}"
+assert_contains "unrelated config error is reported as such" "could not be loaded for the pre-staging check" "${_ag2_out}"
+assert_eq "unrelated config error is not blamed on the profile" "0" "$(printf '%s' "${_ag2_out}" | grep -c 'aiPlatform.profile is invalid')"
+
+assert_eq "every deployment-profile test edit applied and changed its config" "" \
+  "$(cat "${_PROFILE_TMP}/setup-failures" 2>/dev/null)"
+rm -rf "${_PROFILE_TMP}"
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""

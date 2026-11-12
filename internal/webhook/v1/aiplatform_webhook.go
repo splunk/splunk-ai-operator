@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	apivalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -76,7 +77,9 @@ func (d *AIPlatformCustomDefaulter) Default(_ context.Context, aiplatform *aiv1.
 	// This allows users to disable sidecars by setting them to false
 
 	// Default Storage size for VectorDB if not specified
-	if aiplatform.Spec.Storage.VectorDB.Size == "" && aiplatform.Spec.Storage.VectorDB.PVCName == "" {
+	// cpuOnly runs no vector DB, so its vectorDB storage must stay unset.
+	if aiplatform.Spec.ResolvedProfile() != aiv1.AIPlatformProfileCPUOnly &&
+		aiplatform.Spec.Storage.VectorDB.Size == "" && aiplatform.Spec.Storage.VectorDB.PVCName == "" {
 		aiplatform.Spec.Storage.VectorDB.Size = "50Gi"
 	}
 
@@ -156,6 +159,9 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, aiplatfo
 		allErrs = append(allErrs, errs...)
 	}
 
+	// Validate the deployment profile and settings that contradict it
+	allErrs = append(allErrs, aiplatform.Spec.ValidateProfile(field.NewPath("spec"))...)
+
 	// Validate top-level ScaleFactor
 	if errs := v.validateScaleFactor(aiplatform.Spec.ScaleFactor, field.NewPath("spec").Child("scaleFactor")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
@@ -175,9 +181,12 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldPlatf
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
-	// Run the same validations as create
+	// Run the same validations as create. A failure is kept, not returned at
+	// once, so the update-only rules below (immutable region, switch to cpuOnly)
+	// are reported together with it instead of being masked.
+	var createErr error
 	if createWarnings, err := v.ValidateCreate(ctx, aiplatform); err != nil {
-		return createWarnings, err
+		createErr = err
 	} else {
 		warnings = append(warnings, createWarnings...)
 	}
@@ -190,8 +199,23 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldPlatf
 		))
 	}
 
-	if len(allErrs) > 0 {
-		return warnings, allErrs.ToAggregate()
+	// An existing model-serving platform (omitted, full or fullfeature) cannot be
+	// switched to cpuOnly: its Ray and Weaviate resources would be orphaned.
+	if oldPlatform.Spec.ResolvedProfile() != aiv1.AIPlatformProfileCPUOnly &&
+		aiplatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly {
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec").Child("profile"),
+			"switching an existing model-serving AIPlatform to cpuOnly is not supported"))
+	}
+
+	if createErr != nil || len(allErrs) > 0 {
+		var errs []error
+		if createErr != nil {
+			errs = append(errs, createErr)
+		}
+		if len(allErrs) > 0 {
+			errs = append(errs, allErrs.ToAggregate())
+		}
+		return warnings, utilerrors.NewAggregate(errs)
 	}
 
 	return warnings, nil

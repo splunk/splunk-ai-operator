@@ -1,0 +1,61 @@
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: launchpad-fullfeature-ai-platform
+spec:
+  profile: fullfeature
+  objectStorage:
+    path: minio://ai-platform
+    region: "us-east-1"
+    endpoint: "http://192.0.2.20:9000"
+    secretRef: minio-credentials
+  # Image configuration (including pull secrets for private registries)
+  images:
+    imagePullSecrets:
+      - name: ecr-registry-secret
+      - name: docker-hub-secret
+      - name: gcr-secret
+      - name: acr-secret
+      - name: custom-registry-secret
+  # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
+  defaultAcceleratorType: L40S
+  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
+  scaleFactor: 1
+  # Sidecar injection configuration
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  # Features from config (aiPlatform.features)
+  features:
+    - name: slim
+      version: "1.0.0"
+    - name: agentruntime
+      version: "0.1.0"
+      provider: "launchpad"
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilization: 60
+      checkpointDbSecretRef: "launchpad-postgres-conn"
+  # Storage configuration
+  storage:
+    vectorDB:
+      size: 50Gi
+      storageClassName: "local-path"
+  # Worker configuration
+  workerGroupConfig:
+    imageRegistry: ""
+  # CPU scheduler
+  cpuScheduler:
+    nodeSelector:
+      splunk.ai/workload-type: cpu
+    tolerations: []
+  # GPU scheduler
+  gpuScheduler:
+    nodeSelector:
+      splunk.ai/workload-type: gpu
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
