@@ -33,6 +33,7 @@ skaffold.env.local
 
 # Logs
 tools/ai-tier-cluster-setup/logs/
+tools/ai-tier-cluster-setup/profile-values.generated.yaml
 
 # Local cluster configuration may contain object-store credentials.
 my-cluster-config.yaml

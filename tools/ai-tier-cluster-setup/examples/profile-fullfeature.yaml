@@ -1,0 +1,113 @@
+# ===================================================================
+# AI Tier deployment profile: fullfeature  (Agent Launchpad, ai-agent-runtime)
+# ===================================================================
+# Minimum installer input for the fullfeature profile. Sanitized: every value is
+# a placeholder, no live credential is embedded, and sensitive settings are
+# external Kubernetes Secret references created by the customer.
+#
+#   CONFIG_FILE=./profile-fullfeature.yaml ./k0s_cluster_with_stack.sh validate
+#   CONFIG_FILE=./profile-fullfeature.yaml ./k0s_cluster_with_stack.sh render-profile
+#
+# fullfeature: runtime pods stay on CPU capacity; supplied hosted-model
+# workloads run on GPU capacity through Ray. Expected enabled components:
+# cert-manager, monitoring, kuberay, nvidia, ai-operator and the AIPlatform CR.
+# "fullfeature" is canonical; an omitted profile and the legacy value "full"
+# resolve to it. CPU/GPU placement and resource budgets belong to MPR-186.
+#
+# Image references are CANDIDATE builds (MPR-188); see profile-cpuonly.yaml for
+# how digests are resolved per run. The provider key and AGENT_MODULE are TBD.
+# ===================================================================
+
+cluster:
+  name: launchpad-fullfeature
+  sshKeyPath: ~/.ssh/REPLACE_ME
+  sshUser: ec2-user
+  airgap: false
+nodes:
+  controllers: 1
+  cpuWorkers: 1
+  gpuWorkers: 1
+  existingIPs:
+    controllers:
+      - 192.0.2.10
+    workers:
+      - 192.0.2.11
+      - 192.0.2.12
+storage:
+  storageClass: "local-path"
+  vectorDbSize: "50Gi"
+  modelStaging:
+    enabled: true
+  objectStore:
+    type: "minio"
+    bucket: "ai-platform"
+    endpoint: "http://192.0.2.20:9000"
+    auth:
+      rootUser: "REPLACE_ME"
+      rootPassword: "CHANGEME"
+images:
+  registry: "registry.example.internal"
+  snapshotManifest: "snapshots/launchpad/REPLACE_WITH_RUN_ID/manifest.json"
+  operator:
+    image: "splunk/splunk-ai-operator:candidate-1"
+  ray:
+    headImage: "rayproject/ray:2.44.0"
+    workerImage: "rayproject/ray:2.44.0"
+  weaviate:
+    image: "semitechnologies/weaviate:stable-v1.28-007846a"
+  slim:
+    apiImage: "splunk/ai-tier-slim-service:candidate-1"
+  aitk:        # optional for now: nothing consumes it yet (decide with MPR-188)
+    image: "splunk/ai-tier-aitk:candidate-1"
+  agentRuntime:
+    baseImage: "splunk/ai-agent-runtime:candidate-1"
+    schemaSetupImage: "splunk/ai-agent-runtime-schema-setup:candidate-1"
+    providerImages:
+      launchpad: "splunk/ai-agent-runtime-provider-launchpad:candidate-1"
+    providerModules:
+      launchpad: "REPLACE_WITH_VALIDATED.module:LaunchpadAgentLoader"   # TBD
+  fluentBit:
+    image: "docker.io/fluent/fluent-bit:1.9.6"
+  nginx:
+    image: "docker.io/library/nginx:1.27-alpine"
+components:
+  certManager: true
+  monitoring: true
+  otel: false
+  kuberay: true
+  nvidia: true
+  splunkOperator: false
+  splunkStandalone: false
+  metallb: false
+  aiOperator: true
+  aiPlatformCR: true
+kubernetes:
+  namespace: ai-platform
+files:
+  splunkOperator: "./splunk-operator-cluster.yaml"
+  aiPlatform: "./artifacts.yaml"
+splunk:
+  enabled: false
+aiPlatform:
+  name: "launchpad-fullfeature"   # informational only: the CR is named <cluster.name>-ai-platform
+  profile: fullfeature   # canonical name
+  defaultAcceleratorType: "L40S"
+  scaleFactor: 1
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  features:
+    - name: "slim"
+      version: "1.0.0"
+    - name: "agentruntime"
+      provider: "launchpad"
+      version: "0.1.0"
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilization: 60
+      checkpointDbSecretRef: "launchpad-postgres-conn"   # external Secret, created by the customer
+  agentRuntime:
+    checkpointSecrets:
+      - name: "launchpad-postgres-conn"
+        create: false

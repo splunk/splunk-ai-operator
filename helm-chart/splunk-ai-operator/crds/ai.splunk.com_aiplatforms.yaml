@@ -18,6 +18,10 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - description: Resolved deployment profile
+      jsonPath: .status.profile
+      name: Profile
+      type: string
     - description: Platform ready status
       jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: Ready
@@ -2303,6 +2307,17 @@ spec:
                 - path
                 - region
                 type: object
+              profile:
+                description: |-
+                  Profile selects the AI Tier deployment profile. The canonical values are
+                  "cpuOnly" and "fullfeature". An omitted value and the legacy value "full"
+                  both resolve to "fullfeature" (see ResolvedProfile). No other profile
+                  exists.
+                enum:
+                - cpuOnly
+                - fullfeature
+                - full
+                type: string
               scaleFactor:
                 default: 1
                 description: |-
@@ -3111,6 +3126,12 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              profile:
+                description: |-
+                  Profile is the effective deployment profile the operator resolved from
+                  spec.profile: cpuOnly or fullfeature. An omitted spec.profile and the
+                  legacy value "full" both show as fullfeature.
+                type: string
               rayServiceName:
                 type: string
               rayServiceStatus:

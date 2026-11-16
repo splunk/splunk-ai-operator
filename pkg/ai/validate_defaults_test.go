@@ -5,6 +5,8 @@ import (
 	"os"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -255,4 +257,66 @@ func TestSetImageRegistry_ReturnsDefaultValue(t *testing.T) {
 
 	val := SetImageRegistry(key, defaultVal)
 	assert.Equal(t, defaultVal, val, "should return default value if env var not set")
+}
+
+// The operator rejects an unknown or contradictory profile even when the CR
+// was applied without the admission webhook.
+func TestValidate_Profile(t *testing.T) {
+	base := func(profile aiApi.AIPlatformProfile) *aiApi.AIPlatform {
+		return &aiApi.AIPlatform{Spec: aiApi.AIPlatformSpec{
+			Profile:       profile,
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "s3://bucket"},
+		}}
+	}
+	for _, profile := range []aiApi.AIPlatformProfile{"", "full", "fullfeature", "cpuOnly"} {
+		require.NoError(t, newFakeReconciler().validate(context.Background(), base(profile)), "profile %q", profile)
+	}
+
+	err := newFakeReconciler().validate(context.Background(), base("gpu"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "spec.profile")
+
+	p := base(aiApi.AIPlatformProfileCPUOnly)
+	p.Spec.GpuInstanceType = "g6.24xlarge"
+	err = newFakeReconciler().validate(context.Background(), p)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "spec.gpuInstanceType")
+}
+
+// status.profile publishes the resolved profile, including when reconcile stops
+// at validation, so it is observable without re-deriving the compatibility rule.
+func TestReconcile_PublishesResolvedProfileInStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		profile aiApi.AIPlatformProfile
+		mutate  func(*aiApi.AIPlatform)
+		want    aiApi.AIPlatformProfile
+	}{
+		{"cpuOnly rejected at validation", aiApi.AIPlatformProfileCPUOnly, func(p *aiApi.AIPlatform) { p.Spec.GpuInstanceType = "g6" }, aiApi.AIPlatformProfileCPUOnly},
+		{"omitted resolves to fullfeature", "", func(p *aiApi.AIPlatform) { p.Spec.ObjectStorage.Path = "" }, aiApi.AIPlatformProfileFullFeature},
+		{"legacy full resolves to fullfeature", aiApi.AIPlatformProfileLegacyFull, func(p *aiApi.AIPlatform) { p.Spec.ObjectStorage.Path = "" }, aiApi.AIPlatformProfileFullFeature},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, aiApi.AddToScheme(scheme))
+			p := &aiApi.AIPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"},
+				Spec: aiApi.AIPlatformSpec{
+					Profile:       tc.profile,
+					ObjectStorage: aiApi.ObjectStorageSpec{Path: "s3://bucket"},
+				},
+			}
+			tc.mutate(p)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(p).WithStatusSubresource(&aiApi.AIPlatform{}).Build()
+			r := New(p.DeepCopy(), c, scheme, record.NewFakeRecorder(10))
+
+			_, err := r.Reconcile(context.Background(), p.DeepCopy())
+			require.Error(t, err, "validation must stop the reconcile")
+
+			var got aiApi.AIPlatform
+			require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(p), &got))
+			assert.Equal(t, tc.want, got.Status.Profile)
+		})
+	}
 }

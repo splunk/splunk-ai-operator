@@ -9,6 +9,7 @@ import (
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	//"k8s.io/apimachinery/pkg/api/resource"
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	splunkutils "github.com/splunk/splunk-ai-operator/pkg/splunkutils"
@@ -16,6 +17,11 @@ import (
 
 // Validate checks required fields and backfills defaults on the AIPlatform spec.
 func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform) error {
+	// Reject an unknown profile or settings that contradict it, even when the
+	// CR was applied without the admission webhook.
+	if errs := p.Spec.ValidateProfile(field.NewPath("spec")); len(errs) > 0 {
+		return fmt.Errorf("invalid AIPlatform profile configuration: %w", errs.ToAggregate())
+	}
 	// Required volume paths
 	if p.Spec.ObjectStorage.Path == "" {
 		return fmt.Errorf("object storage is required")
