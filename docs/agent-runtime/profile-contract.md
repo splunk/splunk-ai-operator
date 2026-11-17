@@ -88,6 +88,8 @@ errors.
 Operator and webhook (`spec.*`):
 
 - features `saia` or `seca`
+- a `slim` feature without an `agentruntime` feature (under `cpuOnly` SLIM routes
+  to AgentRuntime, so it would otherwise fail on every reconcile)
 - GPU settings: `gpuInstanceType`, `defaultAcceleratorType`, `gpuScheduler`,
   `workerGroupConfig`, `scaleFactor` above 1
 - Ray, Weaviate or SAIA image overrides, `vectorDB` storage, enabled ingress
@@ -129,9 +131,11 @@ flag to `false`. A partial object such as `sidecars: {envoy: false}` or
 `storage: {vectorDB: {}}` is present, so it picks up the defaults and is
 rejected; the error message says so.
 
-The webhook also rejects switching an existing platform (omitted, `full` or
-`fullfeature`) to `cpuOnly`. An omitted profile and `fullfeature` are the same
-profile on update.
+The webhook rejects changing the profile of an existing platform between
+`cpuOnly` and `fullfeature`, in both directions (an omitted profile and legacy
+`full` count as `fullfeature`). The profile decides which infrastructure exists,
+so there is no supported live migration and no partial conversion is possible.
+Staying on the same profile, including spelling it differently, is fine.
 
 An unknown or malformed profile is never converted into the other profile.
 
@@ -195,22 +199,41 @@ Golden outputs (rendered values and the applied `AIPlatform` CR) are in
 `tools/ai-tier-cluster-setup/testdata/profile/`. Regenerate with
 `UPDATE_GOLDEN=1 tools/ai-tier-cluster-setup/test_k0s_cluster_with_stack.sh`.
 
+## Reconcile behaviour per profile
+
+Added by MPR-229.
+
+| | `cpuOnly` | `fullfeature` (and omitted, legacy `full`) |
+|---|---|---|
+| Platform stages | Validate, AIService, AIServiceStatus | unchanged: Validate, Sidecars, rayAutoscalerRBAC, RayService, ActiveClusterScale, WeaviateDatabase, Ingress, the three status stages, AIService, AIServiceStatus |
+| Ray, Weaviate, ingress, sidecar monitoring | none created, none reported | unchanged |
+| Operator without KubeRay | starts and reconciles: the `RayService` and `RayCluster` watches are registered only when those APIs exist | unchanged (watches registered when KubeRay is installed) |
+| AgentRuntime handler | no wait for Ray, no platform URL required; no `PLATFORM_URL`, no `VECTOR_DB_URL` | waits for Ray, derives the platform URL, sets `PLATFORM_URL` |
+| SLIM handler | no wait for Ray; no `PLATFORM_URL`; `AI_TIER_AGENT_RUNTIME_URL` = the AgentRuntime Service URL | waits for Ray, `PLATFORM_URL` set, no `AI_TIER_AGENT_RUNTIME_URL` |
+| AIService `vectorDbUrl` | may be empty (no vector database) | required, as before |
+
+`AI_TIER_AGENT_RUNTIME_URL` is computed by the platform controller from the
+first `agentruntime` feature (in spec order), using the Service name and port
+the AgentRuntime handler defines (`agentruntime.ServiceURL`), and handed to the
+SLIM AIService as `spec.agentRuntimeUrl`. The exact variable and endpoint shape
+may be refined by the MPR-188 contract.
+
+### Cluster prerequisites
+
+KubeRay is **not** required for `cpuOnly`: the operator starts and reconciles
+without the `ray.io` CRDs. The AIService controller does, however, watch
+`Certificate` (cert-manager) and `ServiceMonitor` (Prometheus operator), and the
+AgentRuntime and SLIM handlers create them, so those two CRDs must exist in the
+cluster for every profile. The installer's `components.certManager` and
+`components.monitoring` (both `true` in the shipped examples) install them. A
+cluster without them keeps that controller from starting, exactly as a missing
+KubeRay did for the platform controller; making those two watches optional is a
+separate piece of work.
+
 ## Not covered here
 
-- **Generic CR inputs that are not profile settings.** The installer also writes
-  values from `cluster.name` (the CR name), `cluster.region`,
-  `storage.objectStore.{bucket,endpoint}`, `aiPlatform.serviceTemplate`, the
-  `splunk` block and (for `fullfeature`) `storage.vectorDbSize` /
-  `storage.storageClass` into the AIPlatform CR. They are not validated by the
-  profile checks, so a value the CRD or webhook rejects (for example a region of
-  `"no"`, a bucket containing `#`, an endpoint without a scheme, or a cluster
-  name with an underscore) is caught only when the CR is applied. Whether to
-  extend the profile validation to these is an open decision.
-
-- Reconcile behaviour per profile (a separate story). The platform reconciler still runs its Ray,
-  Weaviate and ingress stages, and the agentruntime handler waits for
-  `RayServiceStatusReady`. A `cpuOnly` platform therefore cannot become Ready
-  until the reconcile stages and readiness gating are made profile-aware.
+- Readiness gating of AgentRuntime itself (schema, pods, endpoints, probe): MPR-191.
+- SLIM and AITK routing and trust configuration: MPR-199.
 - The install waits that assume Ray and Weaviate after the CR is applied.
 - Placement, resource budgets, mirroring and image digest resolution.
 

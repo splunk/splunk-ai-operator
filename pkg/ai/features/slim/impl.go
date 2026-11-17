@@ -109,22 +109,29 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		return fmt.Errorf("either AIPlatformRef.Name or AIPlatformUrl must be set")
 	}
 
+	// cpuOnly has no Ray platform: SLIM routes to the AgentRuntime Service instead
+	// (AI_TIER_AGENT_RUNTIME_URL, set by the AIPlatform controller) and has no
+	// PLATFORM_URL, so it must not wait for Ray or require a platform URL.
+	cpuOnly := false
 	if ai.Spec.AIPlatformRef.Name != "" {
 		aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
 		if err != nil {
 			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "fetching AIPlatform failed")
 			return fmt.Errorf("fetching AIPlatform: %w", err)
 		}
+		cpuOnly = aiPlatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly
 
-		if err := r.validateAIPlatformReady(ctx, aiPlatform); err != nil {
-			return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)
+		if !cpuOnly {
+			if err := r.validateAIPlatformReady(ctx, aiPlatform); err != nil {
+				return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)
+			}
 		}
 
 		clusterDomain := ai.Spec.ClusterDomain
 		if clusterDomain == "" {
 			clusterDomain = "cluster.local"
 		}
-		if ai.Spec.AIPlatformUrl == "" {
+		if !cpuOnly && ai.Spec.AIPlatformUrl == "" {
 			scheme := ai.Spec.AIPlatformScheme
 			if scheme == "" {
 				scheme = "http"
@@ -134,7 +141,12 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		}
 	}
 
-	if ai.Spec.AIPlatformUrl == "" {
+	if cpuOnly {
+		if ai.Spec.AgentRuntimeUrl == "" {
+			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AgentRuntimeUrl is not set")
+			return fmt.Errorf("AgentRuntimeUrl must be set for the cpuOnly profile (the AIPlatform controller sets it from its agentruntime feature)")
+		}
+	} else if ai.Spec.AIPlatformUrl == "" {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformUrl is not set")
 		return fmt.Errorf("AIPlatformUrl must be set (either from AIPlatformRef or explicitly)")
 	}
@@ -485,8 +497,15 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
 	platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
 
-	env := []corev1.EnvVar{
-		{Name: "PLATFORM_URL", Value: platformURL},
+	// PLATFORM_URL is the Ray serve root: present whenever there is a platform URL
+	// (every profile except cpuOnly). AI_TIER_AGENT_RUNTIME_URL is the AgentRuntime
+	// Service, present when the controller set it (cpuOnly).
+	env := []corev1.EnvVar{}
+	if platformURL != "" {
+		env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
+	}
+	if ai.Spec.AgentRuntimeUrl != "" {
+		env = append(env, corev1.EnvVar{Name: "AI_TIER_AGENT_RUNTIME_URL", Value: strings.TrimRight(ai.Spec.AgentRuntimeUrl, "/")})
 	}
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {

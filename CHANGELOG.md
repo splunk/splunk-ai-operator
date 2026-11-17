@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- cpuOnly AIPlatforms now reconcile without Ray, Weaviate or KubeRay: per-profile reconcile stages, conditional Ray watches, profile-aware AgentRuntime and SLIM preconditions (`AI_TIER_AGENT_RUNTIME_URL` for SLIM), `AIService.spec.agentRuntimeUrl`, and a webhook that rejects changing between cpuOnly and fullfeature (MPR-229)
 - AIPlatform `spec.profile` (`cpuOnly` | `fullfeature`; omitted and legacy `full` resolve to `fullfeature`) with shared webhook/operator validation, installer `aiPlatform.profile` validation, `render-profile` command, `status.profile` and example values (MPR-184); see docs/agent-runtime/profile-contract.md
 - Comprehensive Helm chart testing with lint, template validation, and install/upgrade/uninstall tests
 - GitHub issue templates (bug report, feature request)

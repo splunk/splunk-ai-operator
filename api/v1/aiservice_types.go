@@ -53,6 +53,13 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Optional
 	AIPlatformUrl string `json:"aiPlatformUrl,omitempty"`
 
+	// AgentRuntimeUrl is the in-cluster URL of the AgentRuntime Service that the SLIM
+	// feature routes to. The AIPlatform controller sets it for the cpuOnly profile,
+	// where there is no Ray platform URL; SLIM then receives it as
+	// AI_TIER_AGENT_RUNTIME_URL and no PLATFORM_URL.
+	// +kubebuilder:validation:Optional
+	AgentRuntimeUrl string `json:"agentRuntimeUrl,omitempty"`
+
 	// AIPlatformScheme specifies the URL scheme for the AI Platform service ("http" or "https")
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default="http"

@@ -109,6 +109,62 @@ var _ = Describe("AIPlatform profile admission through a real API server", func(
 		Expect(err.Error()).To(ContainSubstring("spec.storage.vectorDB"))
 	})
 
+	It("does not allow a live cpuOnly platform to change profile, in either direction", func() {
+		cpu := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-immutable-cpuonly}\nspec:\n  profile: cpuOnly\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		Expect(create(cpu)).To(Succeed())
+		// cpuOnly -> fullfeature
+		Expect(unstructured.SetNestedField(cpu.Object, "fullfeature", "spec", "profile")).To(Succeed())
+		err := k8sClient.Update(ctx, cpu)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("switching an existing cpuOnly AIPlatform to fullfeature is not supported"))
+		// cpuOnly -> omitted (which resolves to fullfeature)
+		Expect(k8sClient.Get(ctx, clientKey(cpu), cpu)).To(Succeed())
+		unstructured.RemoveNestedField(cpu.Object, "spec", "profile")
+		err = k8sClient.Update(ctx, cpu)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.profile"))
+
+		full := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-immutable-full}\nspec:\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		Expect(create(full)).To(Succeed())
+		Expect(unstructured.SetNestedField(full.Object, "cpuOnly", "spec", "profile")).To(Succeed())
+		err = k8sClient.Update(ctx, full)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("switching an existing model-serving AIPlatform to cpuOnly is not supported"))
+	})
+
+	It("admits an AIService without a vectorDbUrl for a cpuOnly platform only", func() {
+		cpu := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-svc-cpuonly}\nspec:\n  profile: cpuOnly\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		Expect(create(cpu)).To(Succeed())
+		full := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-svc-full}\nspec:\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		Expect(create(full)).To(Succeed())
+
+		service := func(name, platform string) *unstructured.Unstructured {
+			svc := &unstructured.Unstructured{}
+			Expect(yaml.Unmarshal([]byte("apiVersion: ai.splunk.com/v1\nkind: AIService\nmetadata: {name: "+name+"}\nspec:\n  features: {name: slim}\n  vectorDbUrl: \"\"\n  taskVolume: {path: s3://bucket, region: us-west-2}\n  aiPlatformRef: {name: "+platform+", namespace: default}\n"), &svc.Object)).To(Succeed())
+			svc.SetGroupVersionKind(schema.GroupVersionKind{Group: "ai.splunk.com", Version: "v1", Kind: "AIService"})
+			svc.SetNamespace("default")
+			return svc
+		}
+		ok := service("profile-svc-ok", "profile-svc-cpuonly")
+		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, ok) })
+
+		denied := service("profile-svc-denied", "profile-svc-full")
+		err := k8sClient.Create(ctx, denied)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.vectorDbUrl"))
+	})
+
+	It("rejects cpuOnly with slim but no agentruntime feature, and admits both together", func() {
+		bad := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-slim-only}\nspec:\n  profile: cpuOnly\n  features: [{name: slim}]\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		err := create(bad)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("agentruntime feature is required"))
+
+		good := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-slim-agent}\nspec:\n  profile: cpuOnly\n  features: [{name: slim}, {name: agentruntime, provider: launchpad, checkpointDbSecretRef: pg}]\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		Expect(create(good)).To(Succeed())
+	})
+
 	It("rejects cpuOnly with a GPU setting (the webhook is live)", func() {
 		obj := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-bad-cpuonly}\nspec:\n  profile: cpuOnly\n  defaultAcceleratorType: L40S\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
 		err := create(obj)

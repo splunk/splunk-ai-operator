@@ -4130,6 +4130,13 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
+              agentRuntimeUrl:
+                description: |-
+                  AgentRuntimeUrl is the in-cluster URL of the AgentRuntime Service that the SLIM
+                  feature routes to. The AIPlatform controller sets it for the cpuOnly profile,
+                  where there is no Ray platform URL; SLIM then receives it as
+                  AI_TIER_AGENT_RUNTIME_URL and no PLATFORM_URL.
+                type: string
               aiPlatformRef:
                 description: AIPlatformRef is a reference to the AIPlatform resource
                 properties:

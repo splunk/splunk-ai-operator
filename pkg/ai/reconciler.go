@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
@@ -65,35 +66,8 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		latest.Status.VectorDbServiceName = p.Status.VectorDbServiceName
 		_ = r.Status().Update(ctx, latest)
 	}()
-	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
-	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
 	var scaleResult reconcile.Result
-
-	stages := []struct {
-		name string
-		fn   func(context.Context, *aiApi.AIPlatform) error
-	}{
-		{"Validate", r.validate},
-		//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
-		//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
-		//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
-		{"Sidecars", sidecarBuilder.Reconcile},
-		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
-		{"RayService", raybuilder.ReconcileRayService},
-		{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
-			var err error
-			scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
-			return err
-		}},
-		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
-		{"Ingress", r.ReconcileIngress},
-		// collect status of each stage
-		{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
-		{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
-		{"IngressStatus", r.UpdateIngressStatus},
-		{"AIService", r.ReconcileFeatures},
-		{"AIServiceStatus", r.CheckAIServiceStatus},
-	}
+	stages := r.stagesFor(p, &scaleResult)
 
 	for _, stage := range stages {
 		err := stage.fn(ctx, p)
@@ -128,6 +102,56 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	})
 
 	return scaleResult, nil
+}
+
+// reconcileStage is one named step of the platform reconcile.
+type reconcileStage struct {
+	name string
+	fn   func(context.Context, *aiApi.AIPlatform) error
+}
+
+// stagesFor returns the ordered reconcile stages for the platform's resolved
+// profile.
+//
+// cpuOnly has no Ray, no vector database and no Ray-backed ingress, and its
+// cluster has no KubeRay (or necessarily Prometheus operator) APIs, so it runs
+// only the stages that create its feature services. The Sidecars stage is left
+// out too: its monitoring resources are Ray-specific even when every sidecar
+// flag is false, and cpuOnly rejects sidecars anyway.
+//
+// fullfeature (including an omitted or legacy "full" profile) keeps exactly the
+// stage list it had before profiles existed.
+func (r *AIPlatformReconciler) stagesFor(p *aiApi.AIPlatform, scaleResult *reconcile.Result) []reconcileStage {
+	stages := []reconcileStage{{"Validate", r.validate}}
+	if p.Spec.ResolvedProfile() == aiApi.AIPlatformProfileCPUOnly {
+		return append(stages,
+			reconcileStage{"AIService", r.ReconcileFeatures},
+			reconcileStage{"AIServiceStatus", r.CheckAIServiceStatus},
+		)
+	}
+	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
+	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
+	return append(stages, []reconcileStage{
+		//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
+		//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
+		//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
+		{"Sidecars", sidecarBuilder.Reconcile},
+		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
+		{"RayService", raybuilder.ReconcileRayService},
+		{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
+			var err error
+			*scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
+			return err
+		}},
+		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
+		{"Ingress", r.ReconcileIngress},
+		// collect status of each stage
+		{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
+		{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
+		{"IngressStatus", r.UpdateIngressStatus},
+		{"AIService", r.ReconcileFeatures},
+		{"AIServiceStatus", r.CheckAIServiceStatus},
+	}...)
 }
 
 // ReconcileFeatures ensures each feature's AIService exists and is up to date.
@@ -305,6 +329,18 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				aiPlatformScheme, platform.Status.RayServiceName, platform.Namespace, clusterDomain)
 		}
 	}
+	// cpuOnly has no Ray platform URL; SLIM routes to the AgentRuntime Service
+	// instead. With several agentruntime features the first one in spec order is
+	// used, so the choice is deterministic.
+	agentRuntimeURL := ""
+	if feature.Name == "slim" && platform.Spec.ResolvedProfile() == aiApi.AIPlatformProfileCPUOnly {
+		for _, f := range platform.Spec.Features {
+			if f.Name == agentRuntimeFeatureName {
+				agentRuntimeURL = agentruntime.ServiceURL(featureServiceName(platform.Name, f), platform.Namespace, clusterDomain)
+				break
+			}
+		}
+	}
 	serviceTemplate := *platform.Spec.ServiceTemplate.DeepCopy()
 	cleanServiceTemplate(&serviceTemplate)
 
@@ -342,6 +378,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			SplunkConfiguration:   platform.Spec.SplunkConfiguration,
 			VectorDbUrl:           vectorDbUrl,
 			AIPlatformUrl:         aiPlatformURL,
+			AgentRuntimeUrl:       agentRuntimeURL,
 			AIPlatformScheme:      aiPlatformScheme,
 			Replicas:              replicas,
 			Port:                  80,

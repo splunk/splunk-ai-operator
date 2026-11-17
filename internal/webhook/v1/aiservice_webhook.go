@@ -40,7 +40,7 @@ var aiservicelog = logf.Log.WithName("aiservice-resource")
 // SetupAIServiceWebhookWithManager registers the webhook for AIService in the manager.
 func SetupAIServiceWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &aiv1.AIService{}).
-		WithValidator(&AIServiceCustomValidator{}).
+		WithValidator(&AIServiceCustomValidator{Client: mgr.GetClient()}).
 		WithDefaulter(&AIServiceCustomDefaulter{}).
 		Complete()
 }
@@ -117,6 +117,24 @@ type AIServiceCustomValidator struct {
 
 var _ admission.Validator[*aiv1.AIService] = &AIServiceCustomValidator{}
 
+// platformIsCPUOnly reports whether the AIPlatform the service references uses
+// the cpuOnly profile. It answers false when it cannot tell (no client, platform
+// not found), which keeps the stricter existing rule.
+func (v *AIServiceCustomValidator) platformIsCPUOnly(ctx context.Context, aiservice *aiv1.AIService) bool {
+	if v.Client == nil || aiservice.Spec.AIPlatformRef.Name == "" {
+		return false
+	}
+	ns := aiservice.Spec.AIPlatformRef.Namespace
+	if ns == "" {
+		ns = aiservice.Namespace
+	}
+	var platform aiv1.AIPlatform
+	if err := v.Client.Get(ctx, client.ObjectKey{Namespace: ns, Name: aiservice.Spec.AIPlatformRef.Name}, &platform); err != nil {
+		return false
+	}
+	return platform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly
+}
+
 // ValidateCreate implements admission.Validator for the AIService type.
 func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, aiservice *aiv1.AIService) (admission.Warnings, error) {
 	aiservicelog.Info("Validation for AIService upon creation", "name", aiservice.GetName())
@@ -132,8 +150,9 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, aiservice
 		))
 	}
 
-	// Validate VectorDbUrl is required
-	if aiservice.Spec.VectorDbUrl == "" {
+	// Validate VectorDbUrl is required, except for a cpuOnly platform: it runs
+	// no vector database, so there is nothing to point at.
+	if aiservice.Spec.VectorDbUrl == "" && !v.platformIsCPUOnly(ctx, aiservice) {
 		allErrs = append(allErrs, field.Required(
 			field.NewPath("spec").Child("vectorDbUrl"),
 			"vectorDbUrl must be specified",

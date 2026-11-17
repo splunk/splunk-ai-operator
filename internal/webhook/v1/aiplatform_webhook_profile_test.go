@@ -196,14 +196,26 @@ func TestAIPlatformWebhook_UpdateReportsAllErrorsTogether(t *testing.T) {
 	}
 }
 
-// Pins the directions an update may take. Switching an existing platform TO
-// cpuOnly is rejected (covered above); moving away from cpuOnly is allowed by
-// admission (what the reconciler does with it is MPR-229).
-func TestAIPlatformWebhook_UpdateDirectionsFromCPUOnly(t *testing.T) {
+// The profile decides which infrastructure exists, so it cannot change on a live
+// platform in either direction. An omitted profile and legacy "full" are
+// fullfeature, so they are the same profile for this rule.
+func TestAIPlatformWebhook_ProfileCannotChangeBetweenCPUOnlyAndFullfeature(t *testing.T) {
 	v := &AIPlatformCustomValidator{}
-	for _, next := range []aiv1.AIPlatformProfile{"", "full", "fullfeature"} {
-		_, err := v.ValidateUpdate(context.Background(), profilePlatform("cpuOnly"), profilePlatform(next))
-		assert.NoError(t, err, "cpuOnly -> %q", next)
+	cpu := aiv1.AIPlatformProfileCPUOnly
+	for _, other := range []aiv1.AIPlatformProfile{"", "full", "fullfeature"} {
+		_, err := v.ValidateUpdate(context.Background(), profilePlatform(cpu), profilePlatform(other))
+		require.Error(t, err, "cpuOnly -> %q", other)
+		assert.Contains(t, err.Error(), "switching an existing cpuOnly AIPlatform to fullfeature is not supported")
+		assert.Contains(t, err.Error(), "spec.profile")
+
+		_, err = v.ValidateUpdate(context.Background(), profilePlatform(other), profilePlatform(cpu))
+		require.Error(t, err, "%q -> cpuOnly", other)
+		assert.Contains(t, err.Error(), "switching an existing model-serving AIPlatform to cpuOnly is not supported")
+	}
+	// Staying on the same profile (including spelling it differently) is fine.
+	for _, same := range [][2]aiv1.AIPlatformProfile{{cpu, cpu}, {"", "fullfeature"}, {"full", ""}, {"fullfeature", "full"}} {
+		_, err := v.ValidateUpdate(context.Background(), profilePlatform(same[0]), profilePlatform(same[1]))
+		assert.NoError(t, err, "%q -> %q", same[0], same[1])
 	}
 }
 
