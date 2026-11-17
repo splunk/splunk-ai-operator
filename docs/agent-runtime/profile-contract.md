@@ -230,6 +230,13 @@ cluster without them keeps that controller from starting, exactly as a missing
 KubeRay did for the platform controller; making those two watches optional is a
 separate piece of work.
 
+Private-registry images need the pull secret on every pod, even when the image
+is already cached on the node. Verified on a live k0s cluster: the AgentRuntime
+schema Job stayed in `ImagePullBackOff` until `ecr-registry-secret` was present
+in the namespace and listed in `spec.images.imagePullSecrets`. The operator
+passes `imagePullSecrets` to the schema Job and the Deployments, so the install
+path must always set it for private images (MPR-193, MPR-190).
+
 ## Not covered here
 
 - Readiness gating of AgentRuntime itself (schema, pods, endpoints, probe): MPR-191.
