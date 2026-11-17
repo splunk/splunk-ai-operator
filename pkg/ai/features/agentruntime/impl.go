@@ -177,21 +177,28 @@ func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1
 		return fmt.Errorf("either AIPlatformRef.Name or AIPlatformUrl must be set")
 	}
 
+	// cpuOnly has no Ray platform and no vector database: the runtime reaches its
+	// LLM and MCP endpoints directly, so it must not wait for, or require a URL
+	// to, a model-serving platform that does not exist.
+	cpuOnly := false
 	if ai.Spec.AIPlatformRef.Name != "" {
 		aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
 		if err != nil {
 			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "fetching AIPlatform failed")
 			return fmt.Errorf("fetching AIPlatform: %w", err)
 		}
-		if err := r.validateAIPlatformReady(aiPlatform); err != nil {
-			return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)
+		cpuOnly = aiPlatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly
+		if !cpuOnly {
+			if err := r.validateAIPlatformReady(aiPlatform); err != nil {
+				return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)
+			}
 		}
 
 		clusterDomain := ai.Spec.ClusterDomain
 		if clusterDomain == "" {
 			clusterDomain = "cluster.local"
 		}
-		if ai.Spec.AIPlatformUrl == "" {
+		if !cpuOnly && ai.Spec.AIPlatformUrl == "" {
 			scheme := ai.Spec.AIPlatformScheme
 			if scheme == "" {
 				scheme = "http"
@@ -205,7 +212,7 @@ func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1
 		}
 	}
 
-	if ai.Spec.AIPlatformUrl == "" {
+	if !cpuOnly && ai.Spec.AIPlatformUrl == "" {
 		return fmt.Errorf("AIPlatformUrl must be set")
 	}
 
@@ -809,6 +816,16 @@ func agentRuntimeSelectorLabels(ai *aiv1.AIService) map[string]string {
 	return map[string]string{"app": workloadName, "component": workloadName}
 }
 
+// ServiceURL is the in-cluster URL of the Service the AgentRuntime handler creates
+// for the AIService named aiServiceName. Other components (the AIPlatform
+// controller, for SLIM) use it so the Service name and port are defined in one place.
+func ServiceURL(aiServiceName, namespace, clusterDomain string) string {
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d", agentRuntimeServiceName(aiServiceName), namespace, clusterDomain, defaultAgentRuntimeHTTPPort)
+}
+
 func agentRuntimeServiceName(aiServiceName string) string {
 	return dnsLabelName(aiServiceName, "svc")
 }
@@ -855,9 +872,18 @@ func buildAgentRuntimeEnv(ai *aiv1.AIService, agentModule string) []corev1.EnvVa
 	env := []corev1.EnvVar{
 		{Name: "AGENT_MODULE", Value: agentModule},
 		{Name: "CHECKPOINT_DB_SECRET_REF", Value: ai.Spec.CheckpointDbSecretRef},
-		{Name: "PLATFORM_URL", Value: platformURL},
-		{Name: "PYTHONPATH", Value: sharedPackagesPath},
 	}
+	// PLATFORM_URL is the Ray head endpoint. It is set whenever there is one
+	// (fullfeature always has one) and omitted for cpuOnly, which has no Ray.
+	//
+	// Keep it in this position: this list feeds the deployment hash
+	// (buildRuntimeEnvFingerprint), which decides whether the Postgres schema Job
+	// is re-run. Reordering it would change the hash of every existing service and
+	// re-run its schema Job on operator upgrade.
+	if platformURL != "" {
+		env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
+	}
+	env = append(env, corev1.EnvVar{Name: "PYTHONPATH", Value: sharedPackagesPath})
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == mtlsTerminationOperator {
 		env = append(env,
 			corev1.EnvVar{Name: "TLS_CERT_FILE", Value: "/etc/tls/tls.crt"},

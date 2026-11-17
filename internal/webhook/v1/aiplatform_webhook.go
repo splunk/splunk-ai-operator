@@ -207,6 +207,17 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldPlatf
 			"switching an existing model-serving AIPlatform to cpuOnly is not supported"))
 	}
 
+	// The profile selects which infrastructure exists (Ray and Weaviate, or
+	// none), so it cannot change for a live platform in either direction:
+	// there is no supported migration, and a partial conversion must never be
+	// possible. An omitted profile and legacy "full" are fullfeature, so they
+	// are the same profile for this rule.
+	if oldPlatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly &&
+		aiplatform.Spec.ResolvedProfile() != aiv1.AIPlatformProfileCPUOnly {
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec").Child("profile"),
+			"switching an existing cpuOnly AIPlatform to fullfeature is not supported"))
+	}
+
 	if createErr != nil || len(allErrs) > 0 {
 		var errs []error
 		if createErr != nil {

@@ -102,6 +102,22 @@ func (s *AIPlatformSpec) ValidateProfile(specPath *field.Path) field.ErrorList {
 				unsupported("feature "+feature.Name)+"; remove it or set profile: fullfeature"))
 		}
 	}
+	// Under cpuOnly SLIM has no Ray platform to talk to: it routes to the
+	// AgentRuntime Service. A slim feature without an agentruntime feature would
+	// be created and then fail on every reconcile, so reject it up front.
+	hasSlim, hasAgentRuntime := false, false
+	for _, feature := range s.Features {
+		switch feature.Name {
+		case "slim":
+			hasSlim = true
+		case "agentruntime":
+			hasAgentRuntime = true
+		}
+	}
+	if hasSlim && !hasAgentRuntime {
+		errs = append(errs, field.Required(specPath.Child("features"),
+			"profile cpuOnly routes the slim feature to AgentRuntime, so an agentruntime feature is required alongside it"))
+	}
 	if s.GpuInstanceType != "" {
 		errs = append(errs, field.Forbidden(specPath.Child("gpuInstanceType"), unsupported("GPU settings")))
 	}

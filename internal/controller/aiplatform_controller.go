@@ -29,8 +29,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -188,9 +190,7 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			DeleteFunc: func(e event.DeleteEvent) bool { return !e.DeleteStateUnknown },
 		})).
 		// Infra owned by AIPlatform itself - with specific predicates
-		// Ray resources - only reconcile on generation changes
-		Owns(&rayv1.RayService{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&rayv1.RayCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// (the Ray resources are registered below, only when KubeRay is installed)
 		// Weaviate pieces - whatever we create at the platform level
 		Owns(&appsv1.StatefulSet{}, builder.WithPredicates(common.StatefulSetChangedPredicate())). // if platform creates Weaviate as a StatefulSet
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(common.DeploymentChangedPredicate())).   // or a Deployment, if that's how we run it
@@ -211,7 +211,44 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: aiv1.TotalWorker,
 		})
 
+	// A cpuOnly installation does not install KubeRay, so the ray.io APIs do not
+	// exist. Watching a kind whose API is missing keeps the controller from ever
+	// starting (no matches for kind "RayService"), so the Ray watches are
+	// registered only when the API is present. Installations with KubeRay keep
+	// exactly the watches they had before.
+	for _, optional := range []struct {
+		kind string
+		obj  client.Object
+	}{
+		{"RayService", &rayv1.RayService{}},
+		{"RayCluster", &rayv1.RayCluster{}},
+	} {
+		present, err := optionalResourcePresent(mgr, "ray.io", "v1", optional.kind)
+		if err != nil {
+			return err
+		}
+		if present {
+			b = b.Owns(optional.obj, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+		} else {
+			ctrl.Log.WithName("setup").Info("API not installed; not watching it (expected for the cpuOnly profile)",
+				"group", "ray.io", "kind", optional.kind)
+		}
+	}
+
 	return b.Complete(r)
+}
+
+// optionalResourcePresent reports whether the API server serves group/version/kind.
+// A missing API is not an error; any other discovery failure is.
+func optionalResourcePresent(mgr ctrl.Manager, group, version, kind string) (bool, error) {
+	_, err := mgr.GetRESTMapper().RESTMapping(schema.GroupKind{Group: group, Kind: kind}, version)
+	if meta.IsNoMatchError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // finalizePlatform deletes platform‑owned children and waits until they are gone.

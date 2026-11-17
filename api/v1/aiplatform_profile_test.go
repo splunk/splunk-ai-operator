@@ -70,8 +70,10 @@ func TestValidateProfileCPUOnlyRejectsContradictions(t *testing.T) {
 		mutate func(*AIPlatformSpec)
 		field  string
 	}{
-		"saia feature":  {func(s *AIPlatformSpec) { s.Features = []FeatureSpec{{Name: "saia"}} }, "spec.features[0].name"},
-		"seca feature":  {func(s *AIPlatformSpec) { s.Features = []FeatureSpec{{Name: "slim"}, {Name: "seca"}} }, "spec.features[1].name"},
+		"saia feature": {func(s *AIPlatformSpec) { s.Features = []FeatureSpec{{Name: "saia"}} }, "spec.features[0].name"},
+		"seca feature": {func(s *AIPlatformSpec) {
+			s.Features = []FeatureSpec{{Name: "slim"}, {Name: "agentruntime"}, {Name: "seca"}}
+		}, "spec.features[2].name"},
 		"gpu instance":  {func(s *AIPlatformSpec) { s.GpuInstanceType = "g6" }, "spec.gpuInstanceType"},
 		"accelerator":   {func(s *AIPlatformSpec) { s.DefaultAcceleratorType = "L40S" }, "spec.defaultAcceleratorType"},
 		"gpu scheduler": {func(s *AIPlatformSpec) { s.GPUSchedulingSpec = &SchedulingSpec{} }, "spec.gpuScheduler"},
@@ -181,4 +183,34 @@ func TestAIPlatformSpecMarshalJSON_RoundTrips(t *testing.T) {
 	assert.Equal(t, in.Profile, out.Profile)
 	assert.Equal(t, in.Features, out.Features)
 	assert.Equal(t, *in.ScaleFactor, *out.ScaleFactor)
+}
+
+func TestValidateProfileCPUOnlySlimRequiresAgentRuntime(t *testing.T) {
+	cpu := func(features ...FeatureSpec) AIPlatformSpec {
+		return AIPlatformSpec{Profile: AIPlatformProfileCPUOnly, Features: features}
+	}
+	slim := FeatureSpec{Name: "slim"}
+	agent := FeatureSpec{Name: "agentruntime", Provider: "launchpad"}
+
+	s := cpu(slim)
+	errs := s.ValidateProfile(field.NewPath("spec"))
+	require.Len(t, errs, 1)
+	assert.Equal(t, "spec.features", errs[0].Field)
+	assert.Equal(t, field.ErrorTypeRequired, errs[0].Type)
+	assert.Contains(t, errs[0].Detail, "agentruntime feature is required")
+
+	for name, ok := range map[string]AIPlatformSpec{
+		"slim and agentruntime":  cpu(slim, agent),
+		"agentruntime only":      cpu(agent),
+		"no features":            cpu(),
+		"agentruntime then slim": cpu(agent, slim),
+	} {
+		assert.Empty(t, ok.ValidateProfile(field.NewPath("spec")), name)
+	}
+
+	// The rule is cpuOnly's: every other profile keeps accepting slim on its own.
+	for _, p := range []AIPlatformProfile{"", AIPlatformProfileLegacyFull, AIPlatformProfileFullFeature} {
+		other := AIPlatformSpec{Profile: p, Features: []FeatureSpec{slim}}
+		assert.Empty(t, other.ValidateProfile(field.NewPath("spec")), "profile %q", p)
+	}
 }
