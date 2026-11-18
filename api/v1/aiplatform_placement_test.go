@@ -236,13 +236,30 @@ func TestFullFeaturePlacement(t *testing.T) {
 		assert.Contains(t, errs[0].Error(), "spec.cpuScheduler: Forbidden: the CPU scheduler places the agent runtime on CPU nodes")
 	})
 
-	t.Run("identical selectors", func(t *testing.T) {
-		s := good()
-		s.GPUSchedulingSpec = &SchedulingSpec{NodeSelector: map[string]string{WorkloadTypeLabel: "cpu"}}
+	// Two schedulers are only in conflict when they place workloads on the very same
+	// nodes: selector, affinity and tolerations all travel to the workloads, so a
+	// shared broad selector says nothing by itself.
+	t.Run("identical placement is refused", func(t *testing.T) {
+		shared := &SchedulingSpec{NodeSelector: map[string]string{WorkloadTypeLabel: "pool"}}
+		s := AIPlatformSpec{Profile: AIPlatformProfileFullFeature, CPUSchedulingSpec: shared.DeepCopy(), GPUSchedulingSpec: shared.DeepCopy(), GpuInstanceType: "g6e.xlarge"}
 		errs := s.ValidatePlacement(specPath)
 		require.Len(t, errs, 1)
-		assert.Contains(t, errs[0].Error(), "spec.gpuScheduler.nodeSelector: Invalid value")
-		assert.Contains(t, errs[0].Error(), "identical to cpuScheduler.nodeSelector")
+		assert.Contains(t, errs[0].Error(), "spec.gpuScheduler: Invalid value")
+		assert.Contains(t, errs[0].Error(), "identical to cpuScheduler")
+	})
+
+	t.Run("a shared broad selector is fine when required affinity separates the pools (review finding)", func(t *testing.T) {
+		cpu := &SchedulingSpec{NodeSelector: map[string]string{"kubernetes.io/os": "linux"}, Affinity: nodeAffinity("pool", "cpu")}
+		gpu := &SchedulingSpec{NodeSelector: map[string]string{"kubernetes.io/os": "linux"}, Affinity: nodeAffinity("pool", "gpu")}
+		s := AIPlatformSpec{Profile: AIPlatformProfileFullFeature, CPUSchedulingSpec: cpu, GPUSchedulingSpec: gpu}
+		assert.Empty(t, s.ValidatePlacement(specPath))
+	})
+
+	t.Run("a shared broad selector is fine when a taint separates the pools", func(t *testing.T) {
+		cpu := &SchedulingSpec{NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}
+		gpu := &SchedulingSpec{NodeSelector: map[string]string{"kubernetes.io/os": "linux"}, Tolerations: gpuSched().Tolerations}
+		s := AIPlatformSpec{Profile: AIPlatformProfileFullFeature, CPUSchedulingSpec: cpu, GPUSchedulingSpec: gpu}
+		assert.Empty(t, s.ValidatePlacement(specPath))
 	})
 
 	t.Run("problems are reported together", func(t *testing.T) {

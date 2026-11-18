@@ -213,7 +213,8 @@ func (s *AIPlatformSpec) hasGPUCapacitySelection() bool {
 //   - fullfeature: GPU capacity must be identifiable (a gpuScheduler selector,
 //     affinity or GPU toleration, gpuInstanceType or defaultAcceleratorType); the
 //     CPU scheduler, which places the agent runtime, must not select GPU capacity;
-//     and the two schedulers must not select the same non-empty node set.
+//     and the two schedulers must not place workloads identically (same selector,
+//     tolerations and affinity).
 //
 // The admission webhook enforces these as errors when a platform is created and
 // reports them as warnings when one is updated. They are deliberately not part of
@@ -237,11 +238,32 @@ func (s *AIPlatformSpec) ValidatePlacement(specPath *field.Path) field.ErrorList
 			errs = append(errs, field.Forbidden(specPath.Child("cpuScheduler"),
 				"the CPU scheduler places the agent runtime on CPU nodes and must not select GPU capacity ("+why+")"))
 		}
-		if c, g := s.CPUSchedulingSpec, s.GPUSchedulingSpec; c != nil && g != nil &&
-			len(c.NodeSelector) > 0 && reflect.DeepEqual(c.NodeSelector, g.NodeSelector) {
-			errs = append(errs, field.Invalid(specPath.Child("gpuScheduler").Child("nodeSelector"), g.NodeSelector,
-				"identical to cpuScheduler.nodeSelector: the agent runtime and the GPU workloads would share the same nodes"))
+		if samePlacement(s.CPUSchedulingSpec, s.GPUSchedulingSpec) {
+			errs = append(errs, field.Invalid(specPath.Child("gpuScheduler"), s.GPUSchedulingSpec.NodeSelector,
+				"identical to cpuScheduler (same nodeSelector, tolerations and affinity): the agent runtime and the GPU workloads would share the same nodes"))
 		}
 	}
 	return errs
+}
+
+// samePlacement reports whether two schedulers pin workloads to exactly the same
+// nodes: a non-empty node selector, and the same tolerations and affinity. The
+// selector alone proves nothing, because affinity and tolerations travel with it
+// to the workloads: two schedulers with the same broad selector (kubernetes.io/os)
+// are disjoint when required affinity separates the pools or when only the GPU
+// scheduler tolerates the GPU taint.
+func samePlacement(c, g *SchedulingSpec) bool {
+	if c == nil || g == nil || len(c.NodeSelector) == 0 {
+		return false
+	}
+	emptyAffinity := corev1.Affinity{}
+	affinity := func(a *corev1.Affinity) corev1.Affinity {
+		if a == nil {
+			return emptyAffinity
+		}
+		return *a
+	}
+	return reflect.DeepEqual(c.NodeSelector, g.NodeSelector) &&
+		(len(c.Tolerations) == 0 && len(g.Tolerations) == 0 || reflect.DeepEqual(c.Tolerations, g.Tolerations)) &&
+		reflect.DeepEqual(affinity(c.Affinity), affinity(g.Affinity))
 }

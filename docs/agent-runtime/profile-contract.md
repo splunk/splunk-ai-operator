@@ -315,7 +315,9 @@ resource ownership; the agent runtime stays on CPU nodes. For an *explicit*
 `profile: fullfeature` the operator checks that GPU capacity is identifiable
 (`gpuScheduler` node selector, affinity or a toleration of the GPU taint, or
 `gpuInstanceType`, or `defaultAcceleratorType`), that `cpuScheduler` does not select
-GPU capacity, and that the two node selectors are not identical. Same split: an
+GPU capacity, and that the two schedulers do not place workloads identically (same
+node selector, tolerations and affinity; a shared broad selector is fine when required
+affinity or a taint separates the pools). Same split: an
 error on create, a warning on update. An omitted profile and legacy `full` are the
 same profile but are not checked at all.
 

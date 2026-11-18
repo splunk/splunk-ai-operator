@@ -37,6 +37,38 @@ func TestAIPlatformWebhook_FullFeatureCreateRequiresGPUCapacity(t *testing.T) {
 	assert.Contains(t, err.Error(), "spec.cpuScheduler: Forbidden")
 }
 
+// Codex review finding: two schedulers that share a broad selector are not in
+// conflict when required affinity or a taint separates their nodes, so creating
+// such a platform must work. Only fully identical placement is refused.
+func TestAIPlatformWebhook_FullFeatureSharedSelectorIsFineUnlessPlacementIsIdentical(t *testing.T) {
+	v := &AIPlatformCustomValidator{}
+	linux := func() map[string]string { return map[string]string{"kubernetes.io/os": "linux"} }
+	affinityFor := func(pool string) *corev1.Affinity {
+		return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{
+				{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{pool}}}}}}}}
+	}
+	create := func(cpu, gpu *aiv1.SchedulingSpec) error {
+		p := profilePlatform(aiv1.AIPlatformProfileFullFeature)
+		p.Spec.CPUSchedulingSpec, p.Spec.GPUSchedulingSpec = cpu, gpu
+		_, err := v.ValidateCreate(context.Background(), p)
+		return err
+	}
+
+	assert.NoError(t, create(
+		&aiv1.SchedulingSpec{NodeSelector: linux(), Affinity: affinityFor("cpu")},
+		&aiv1.SchedulingSpec{NodeSelector: linux(), Affinity: affinityFor("gpu")}),
+		"required affinity separates the pools")
+	assert.NoError(t, create(
+		&aiv1.SchedulingSpec{NodeSelector: linux()},
+		&aiv1.SchedulingSpec{NodeSelector: linux(), Tolerations: []corev1.Toleration{{Key: aiv1.GPUTaintKey, Operator: corev1.TolerationOpExists}}}),
+		"only the GPU scheduler tolerates the GPU taint")
+
+	err := create(&aiv1.SchedulingSpec{NodeSelector: linux()}, &aiv1.SchedulingSpec{NodeSelector: linux()})
+	require.Error(t, err, "truly identical placement is still refused")
+	assert.Contains(t, err.Error(), "identical to cpuScheduler")
+}
+
 // The same problems never block an update: an existing platform stays editable
 // (the operator's own finalizer and metadata writes go through this webhook),
 // and the user is told instead.
