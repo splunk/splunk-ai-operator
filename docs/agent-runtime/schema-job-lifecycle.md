@@ -9,8 +9,10 @@ image from the candidate contract; the operator does not produce SQL or an image
 Supply `RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP` as a full, immutable
 `registry/path@sha256:<64 hex digits>` reference from the candidate or mirror
 snapshot. A mutable tag is rejected before a Job is created. The resolved
-digest is recorded on the Job and in `AIService.status.schemaImageDigest` after
-success.
+digest is recorded on the Job and in
+`AIService.status.featureStatus.agentRuntime.schema.imageDigest` after success.
+AgentRuntime keeps its schema lifecycle state under this feature-specific
+status path, leaving unrelated AIService statuses unchanged.
 
 The Job identity includes the pinned schema image, checkpoint Secret reference
 and resource version, schema related PostgreSQL feature environment, and
@@ -40,8 +42,8 @@ at eight seconds. SQL execution is also bounded by the Job deadline.
 `PostgresSchemaSetupReady` reports `Pending`, `Succeeded`, `TimedOut`, `Failed`,
 or `Superseded` as its reason. Terminal status uses fixed diagnostic text and
 does not copy database URLs, SQL, Kubernetes Job messages, or credentials into
-the condition. `status.schemaAppliedHash` and the terminal failure hash keep
-reuse and retry decisions stable after Job TTL cleanup.
+the condition. The feature-specific `schema.appliedHash` and
+`schema.failedHash` keep reuse and retry decisions stable after Job TTL cleanup.
 
 Focused local tests cover rendered Job bounds and image, status reasons,
 successful reuse after TTL cleanup, failure persistence, retry nonce changes,

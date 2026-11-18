@@ -84,7 +84,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	require.ErrorContains(t, handler.Reconcile(context.Background(), ai), "waiting for schema Job completion")
 	job := &batchv1.Job{}
 	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
-		Name: ai.Status.SchemaJobId, Namespace: ai.Namespace,
+		Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace,
 	}, job))
 	assert.Equal(t, []string{"sh", "-c"}, job.Spec.Template.Spec.Containers[0].Command)
 	assert.Contains(t, job.Spec.Template.Spec.Containers[0].Args[0], "DATABASE_URL")

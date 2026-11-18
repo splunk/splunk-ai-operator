@@ -58,8 +58,16 @@ func schemaTestReconciler(t *testing.T) (*AgentRuntimeReconciler, *aiv1.AIServic
 	r := &AgentRuntimeReconciler{Client: client, Scheme: buildAgentRuntimeTestScheme(t), Recorder: record.NewFakeRecorder(10)}
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	job := &batchv1.Job{}
-	require.NoError(t, client.Get(context.Background(), types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, job))
+	require.NoError(t, client.Get(context.Background(), types.NamespacedName{Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace}, job))
 	return r, ai, job
+}
+
+func agentRuntimeSchemaStatus(t *testing.T, ai *aiv1.AIService) *aiv1.AgentRuntimeSchemaStatus {
+	t.Helper()
+	require.NotNil(t, ai.Status.FeatureStatus)
+	require.NotNil(t, ai.Status.FeatureStatus.AgentRuntime)
+	require.NotNil(t, ai.Status.FeatureStatus.AgentRuntime.Schema)
+	return ai.Status.FeatureStatus.AgentRuntime.Schema
 }
 
 func schemaCondition(t *testing.T, ai *aiv1.AIService) metav1.Condition {
@@ -107,11 +115,11 @@ func TestSchemaJobBoundedAndReusableAfterTTL(t *testing.T) {
 	require.NoError(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Succeeded", schemaCondition(t, ai).Reason)
 	t.Logf("completed schema Job: condition=%s", schemaCondition(t, ai).Reason)
-	assert.NotEmpty(t, ai.Status.SchemaAppliedHash)
-	assert.Equal(t, "sha256:"+strings.Repeat("a", 64), ai.Status.SchemaImageDigest)
+	assert.NotEmpty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
+	assert.Equal(t, "sha256:"+strings.Repeat("a", 64), agentRuntimeSchemaStatus(t, ai).ImageDigest)
 	require.NoError(t, r.Delete(context.Background(), job)) // TTL cleanup
 	require.NoError(t, r.Reconcile(context.Background(), ai))
-	assert.Empty(t, ai.Status.SchemaJobId)
+	assert.Empty(t, agentRuntimeSchemaStatus(t, ai).JobName)
 	var jobs batchv1.JobList
 	require.NoError(t, r.List(context.Background(), &jobs))
 	assert.Empty(t, jobs.Items)
@@ -146,7 +154,7 @@ func TestSchemaFailurePersistsAndNonceRetries(t *testing.T) {
 	ai.Spec.Feature.SchemaRetryNonce = "retry-1"
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-	assert.NotEqual(t, job.Name, ai.Status.SchemaJobId)
+	assert.NotEqual(t, job.Name, agentRuntimeSchemaStatus(t, ai).JobName)
 	var jobs batchv1.JobList
 	require.NoError(t, r.List(context.Background(), &jobs))
 	assert.Len(t, jobs.Items, 1)
@@ -190,7 +198,7 @@ func TestSchemaInputChangeStopsActiveJobBeforeReplacement(t *testing.T) {
 	assert.Empty(t, jobs.Items) // fake client completes foreground deletion immediately
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-	assert.NotEqual(t, old.Name, ai.Status.SchemaJobId)
+	assert.NotEqual(t, old.Name, agentRuntimeSchemaStatus(t, ai).JobName)
 	require.NoError(t, r.List(context.Background(), &jobs))
 	assert.Len(t, jobs.Items, 1)
 }
@@ -215,13 +223,13 @@ func TestSchemaDigestAndSecretVersionRerunAfterSuccess(t *testing.T) {
 			}
 			require.Error(t, r.Reconcile(context.Background(), ai))
 			assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-			assert.NotEqual(t, old.Name, ai.Status.SchemaJobId)
-			assert.Empty(t, ai.Status.SchemaAppliedHash, "a new attempt invalidates the previous success")
-			assert.Empty(t, ai.Status.SchemaImageDigest)
+			assert.NotEqual(t, old.Name, agentRuntimeSchemaStatus(t, ai).JobName)
+			assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash, "a new attempt invalidates the previous success")
+			assert.Empty(t, agentRuntimeSchemaStatus(t, ai).ImageDigest)
 			var jobs batchv1.JobList
 			require.NoError(t, r.List(context.Background(), &jobs))
 			assert.Len(t, jobs.Items, 2) // completed history plus exactly one new Job
-			t.Logf("input change %s: condition=%s totalJobs=%d newJob=%s", changed, schemaCondition(t, ai).Reason, len(jobs.Items), ai.Status.SchemaJobId)
+			t.Logf("input change %s: condition=%s totalJobs=%d newJob=%s", changed, schemaCondition(t, ai).Reason, len(jobs.Items), agentRuntimeSchemaStatus(t, ai).JobName)
 		})
 	}
 }
@@ -231,30 +239,30 @@ func TestSchemaDigestRevertRunsAgainBeforeHistoricalJobTTL(t *testing.T) {
 	first.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	require.NoError(t, r.Status().Update(context.Background(), first))
 	require.NoError(t, r.Reconcile(context.Background(), ai))
-	firstHash := ai.Status.SchemaAppliedHash
+	firstHash := agentRuntimeSchemaStatus(t, ai).AppliedHash
 
 	secondImage := "docker.io/splunk/agent-runtime-schema-setup@sha256:" + strings.Repeat("b", 64)
 	t.Setenv(schemaSetupImageEnv, secondImage)
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	second := &batchv1.Job{}
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, second))
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace}, second))
 	second.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	require.NoError(t, r.Status().Update(context.Background(), second))
 	require.NoError(t, r.Reconcile(context.Background(), ai))
-	assert.NotEqual(t, firstHash, ai.Status.SchemaAppliedHash)
-	secondHash := ai.Status.SchemaAppliedHash
+	assert.NotEqual(t, firstHash, agentRuntimeSchemaStatus(t, ai).AppliedHash)
+	secondHash := agentRuntimeSchemaStatus(t, ai).AppliedHash
 
 	t.Setenv(schemaSetupImageEnv, testSchemaImage)
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-	assert.Equal(t, secondHash, ai.Status.SchemaAppliedHash, "the historical success must not become the current result")
+	assert.Equal(t, secondHash, agentRuntimeSchemaStatus(t, ai).AppliedHash, "the historical success must not become the current result")
 	missingFirst := &batchv1.Job{}
 	assert.Error(t, r.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, missingFirst))
 
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-	assert.Equal(t, first.Name, ai.Status.SchemaJobId)
-	assert.Empty(t, ai.Status.SchemaAppliedHash)
+	assert.Equal(t, first.Name, agentRuntimeSchemaStatus(t, ai).JobName)
+	assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 	replayedFirst := &batchv1.Job{}
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, replayedFirst))
 	assert.Empty(t, replayedFirst.Status.Conditions, "the reverted input must get a fresh Job")
@@ -266,24 +274,24 @@ func TestSchemaDigestRevertRunsAgainBeforeIntermediateOutcomeObserved(t *testing
 	first.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	require.NoError(t, r.Status().Update(context.Background(), first))
 	require.NoError(t, r.Reconcile(context.Background(), ai))
-	assert.NotEmpty(t, ai.Status.SchemaAppliedHash)
+	assert.NotEmpty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 
 	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup@sha256:"+strings.Repeat("b", 64))
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	second := &batchv1.Job{}
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, second))
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace}, second))
 	second.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	require.NoError(t, r.Status().Update(context.Background(), second))
 	// The SQL ran, but the controller has not observed the B Job's completion.
-	assert.Empty(t, ai.Status.SchemaAppliedHash)
+	assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 
 	t.Setenv(schemaSetupImageEnv, testSchemaImage)
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-	assert.Empty(t, ai.Status.SchemaAppliedHash)
+	assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 	assert.Error(t, r.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, &batchv1.Job{}))
 	require.Error(t, r.Reconcile(context.Background(), ai))
-	assert.Equal(t, first.Name, ai.Status.SchemaJobId)
+	assert.Equal(t, first.Name, agentRuntimeSchemaStatus(t, ai).JobName)
 	replayedFirst := &batchv1.Job{}
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, replayedFirst))
 	assert.Empty(t, replayedFirst.Status.Conditions)
@@ -303,12 +311,12 @@ func TestSchemaRevertedAttemptCannotReuseHistoricalSuccessAfterTTL(t *testing.T)
 			first.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 			require.NoError(t, r.Status().Update(context.Background(), first))
 			require.NoError(t, r.Reconcile(context.Background(), ai))
-			assert.NotEmpty(t, ai.Status.SchemaAppliedHash)
+			assert.NotEmpty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 
 			t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup@sha256:"+strings.Repeat("b", 64))
 			require.Error(t, r.Reconcile(context.Background(), ai))
 			second := &batchv1.Job{}
-			require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, second))
+			require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace}, second))
 			second.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"}}
 			require.NoError(t, r.Status().Update(context.Background(), second))
 			require.Error(t, r.Reconcile(context.Background(), ai))
@@ -318,8 +326,8 @@ func TestSchemaRevertedAttemptCannotReuseHistoricalSuccessAfterTTL(t *testing.T)
 			require.Error(t, r.Reconcile(context.Background(), ai)) // remove historical A Job
 			require.Error(t, r.Reconcile(context.Background(), ai)) // create fresh A Job
 			assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-			assert.Empty(t, ai.Status.SchemaAppliedHash)
-			assert.Empty(t, ai.Status.SchemaImageDigest)
+			assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
+			assert.Empty(t, agentRuntimeSchemaStatus(t, ai).ImageDigest)
 			replay := &batchv1.Job{}
 			require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, replay))
 			if outcome.observeFailure {
@@ -332,7 +340,7 @@ func TestSchemaRevertedAttemptCannotReuseHistoricalSuccessAfterTTL(t *testing.T)
 			require.Error(t, r.Reconcile(context.Background(), ai))
 			assert.Equal(t, outcome.expectedReason, schemaCondition(t, ai).Reason)
 			assert.NotEqual(t, "Succeeded", schemaCondition(t, ai).Reason)
-			assert.Empty(t, ai.Status.SchemaAppliedHash)
+			assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 		})
 	}
 }
@@ -346,7 +354,7 @@ func TestSchemaRetainedJobAlreadyExistsIsNotAdopted(t *testing.T) {
 	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup@sha256:"+strings.Repeat("b", 64))
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	second := &batchv1.Job{}
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, second))
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace}, second))
 	second.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"}}
 	require.NoError(t, r.Status().Update(context.Background(), second))
 	require.Error(t, r.Reconcile(context.Background(), ai))
@@ -355,8 +363,8 @@ func TestSchemaRetainedJobAlreadyExistsIsNotAdopted(t *testing.T) {
 	r.Client = &staleSchemaJobClient{Client: r.Client, jobName: first.Name, miss: true}
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
-	assert.Equal(t, second.Name, ai.Status.SchemaJobId, "a retained Job must not become the new attempt")
-	assert.Empty(t, ai.Status.SchemaAppliedHash)
+	assert.Equal(t, second.Name, agentRuntimeSchemaStatus(t, ai).JobName, "a retained Job must not become the new attempt")
+	assert.Empty(t, agentRuntimeSchemaStatus(t, ai).AppliedHash)
 
 	require.Error(t, r.Reconcile(context.Background(), ai)) // re-read and remove historical A Job
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)

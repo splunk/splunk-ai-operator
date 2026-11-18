@@ -128,8 +128,12 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	if err == nil || !strings.Contains(err.Error(), "waiting for schema Job completion") {
 		return nil, fmt.Errorf("render.schemaSetup: expected schema Job gate")
 	}
+	featureStatus := runtimeService.Status.FeatureStatus
+	if featureStatus == nil || featureStatus.AgentRuntime == nil || featureStatus.AgentRuntime.Schema == nil || featureStatus.AgentRuntime.Schema.JobName == "" {
+		return nil, fmt.Errorf("render.schemaSetup: schema Job not recorded")
+	}
 	job := &batchv1.Job{}
-	if err := c.Get(ctx, client.ObjectKey{Name: runtimeService.Status.SchemaJobId, Namespace: namespace}, job); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Name: featureStatus.AgentRuntime.Schema.JobName, Namespace: namespace}, job); err != nil {
 		return nil, fmt.Errorf("render.schemaSetup: %w", err)
 	}
 	// This is a render fixture, not evidence of migration execution.

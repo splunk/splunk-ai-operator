@@ -40,6 +40,9 @@ event delivery, and the first watch test failed: a completed Job produced no
 AIService reconcile request. The controller-wide event filter excluded status
 updates even though the owned-Job filter admitted them. The corrected filter
 and regression test now cover succeeded and failed Jobs and ready Deployments.
+The API-server test also confirms that AgentRuntime schema state persists under
+`status.featureStatus.agentRuntime.schema`, while AgentRuntime leaves the
+legacy SAIA `schemaJobId` empty and the SLIM service has no feature status.
 The candidate renderer uses a synthetic digest solely for in-memory tests; the
 live test resolved the supplied image tag through ECR and used its real digest.
 The supplied `/schema.sql` was reviewed in the

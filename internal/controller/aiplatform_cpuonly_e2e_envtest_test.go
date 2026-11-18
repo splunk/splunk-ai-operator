@@ -176,10 +176,11 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-agentruntime-launchpad"}, &ai); err != nil {
 				return err
 			}
-			if ai.Status.SchemaJobId == "" {
+			featureStatus := ai.Status.FeatureStatus
+			if featureStatus == nil || featureStatus.AgentRuntime == nil || featureStatus.AgentRuntime.Schema == nil || featureStatus.AgentRuntime.Schema.JobName == "" {
 				return fmt.Errorf("schema Job not recorded yet")
 			}
-			return k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: ai.Status.SchemaJobId}, &schemaJob)
+			return k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: featureStatus.AgentRuntime.Schema.JobName}, &schemaJob)
 		}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
 		finishedAt := metav1.Now()
 		schemaJob.Status.StartTime = &finishedAt
@@ -201,6 +202,14 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			}
 			return false
 		}, 3*time.Second, 100*time.Millisecond).Should(BeTrue(), "completed schema Job must wake AIService promptly")
+		Expect(ai.Status.FeatureStatus).NotTo(BeNil(), "AgentRuntime status must survive the API server status update")
+		Expect(ai.Status.FeatureStatus.AgentRuntime).NotTo(BeNil())
+		Expect(ai.Status.FeatureStatus.AgentRuntime.Schema).NotTo(BeNil())
+		Expect(ai.Status.FeatureStatus.AgentRuntime.Schema.AppliedHash).NotTo(BeEmpty())
+		Expect(ai.Status.SchemaJobId).To(BeEmpty(), "AgentRuntime must not use the legacy SAIA schema Job field")
+		var slimAI aiv1.AIService
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-slim"}, &slimAI)).To(Succeed())
+		Expect(slimAI.Status.FeatureStatus).To(BeNil(), "SLIM must not acquire AgentRuntime status")
 
 		// Nothing Ray or Weaviate was ever created.
 		var deps appsv1.DeploymentList

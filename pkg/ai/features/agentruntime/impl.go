@@ -112,6 +112,19 @@ func (e *schemaStageError) Error() string { return e.message }
 
 func schemaState(reason, message string) error { return &schemaStageError{reason, message} }
 
+func ensureAgentRuntimeSchemaStatus(ai *aiv1.AIService) *aiv1.AgentRuntimeSchemaStatus {
+	if ai.Status.FeatureStatus == nil {
+		ai.Status.FeatureStatus = &aiv1.AIServiceFeatureStatus{}
+	}
+	if ai.Status.FeatureStatus.AgentRuntime == nil {
+		ai.Status.FeatureStatus.AgentRuntime = &aiv1.AgentRuntimeStatus{}
+	}
+	if ai.Status.FeatureStatus.AgentRuntime.Schema == nil {
+		ai.Status.FeatureStatus.AgentRuntime.Schema = &aiv1.AgentRuntimeSchemaStatus{}
+	}
+	return ai.Status.FeatureStatus.AgentRuntime.Schema
+}
+
 func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
 	log := log.FromContext(ctx)
 
@@ -375,6 +388,7 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 	if err := validateSchemaSetupCredentials(checkpointSecret, ai.Spec.Feature.Env); err != nil {
 		return err
 	}
+	state := ensureAgentRuntimeSchemaStatus(ai)
 
 	inputHash := agentRuntimeSchemaInputHash(ai, schemaImage, checkpointSecret)
 	jobName := dnsLabelName(ai.Name, "schema-"+inputHash)
@@ -409,7 +423,7 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 			// different schema has run. Its retained Job is historical evidence,
 			// not proof that the current transition has applied SQL. Remove it
 			// before creating a fresh Job with the same input-derived name.
-			if ai.Status.SchemaJobId != job.Name {
+			if state.JobName != job.Name {
 				if job.DeletionTimestamp == nil {
 					if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
 						return fmt.Errorf("remove historical schema Job: %w", err)
@@ -417,51 +431,51 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 				}
 				return schemaState("Pending", "waiting for historical schema Job removal")
 			}
-			ai.Status.SchemaJobId = job.Name
-			ai.Status.SchemaAppliedHash = inputHash
-			ai.Status.SchemaFailedHash = ""
-			ai.Status.SchemaFailureReason = ""
-			ai.Status.SchemaImageDigest = strings.SplitN(schemaImage, "@", 2)[1]
+			state.JobName = job.Name
+			state.AppliedHash = inputHash
+			state.FailedHash = ""
+			state.FailureReason = ""
+			state.ImageDigest = strings.SplitN(schemaImage, "@", 2)[1]
 			return nil
 		}
 		// A Job may have been created before its attempt status was persisted.
 		// Observing it invalidates any success from an earlier run of this input.
-		ai.Status.SchemaAppliedHash = ""
-		ai.Status.SchemaImageDigest = ""
-		ai.Status.SchemaJobId = job.Name
+		state.AppliedHash = ""
+		state.ImageDigest = ""
+		state.JobName = job.Name
 		if schemaJobFailed(job) {
-			ai.Status.SchemaFailedHash = inputHash
+			state.FailedHash = inputHash
 			for _, condition := range job.Status.Conditions {
 				if condition.Type == batchv1.JobFailed && condition.Reason == "DeadlineExceeded" {
-					ai.Status.SchemaFailureReason = "TimedOut"
+					state.FailureReason = "TimedOut"
 					return schemaState("TimedOut", "schema Job exceeded its deadline; change schemaRetryNonce to retry")
 				}
 				if condition.Type == batchv1.JobFailed && condition.Reason == "BackoffLimitExceeded" {
-					ai.Status.SchemaFailureReason = "Failed"
+					state.FailureReason = "Failed"
 					return schemaState("Failed", "schema Job exhausted its retry limit; change schemaRetryNonce to retry")
 				}
 			}
-			ai.Status.SchemaFailureReason = "Failed"
+			state.FailureReason = "Failed"
 			return schemaState("Failed", "schema Job failed; change schemaRetryNonce to retry")
 		}
-		ai.Status.SchemaFailedHash = ""
-		ai.Status.SchemaFailureReason = ""
+		state.FailedHash = ""
+		state.FailureReason = ""
 		return schemaState("Pending", "waiting for schema Job completion")
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get postgres schema setup Job: %w", err)
 	}
-	if ai.Status.SchemaFailedHash == inputHash {
-		if ai.Status.SchemaFailureReason == "TimedOut" {
+	if state.FailedHash == inputHash {
+		if state.FailureReason == "TimedOut" {
 			return schemaState("TimedOut", "schema Job exceeded its deadline; change schemaRetryNonce to retry")
 		}
 		return schemaState("Failed", "schema Job failed; change schemaRetryNonce to retry")
 	}
-	if ai.Status.SchemaAppliedHash == inputHash && (ai.Status.SchemaJobId == jobName || ai.Status.SchemaJobId == "") {
-		ai.Status.SchemaJobId = ""
+	if state.AppliedHash == inputHash && (state.JobName == jobName || state.JobName == "") {
+		state.JobName = ""
 		return nil // The TTL controller may have removed the successful Job.
 	}
-	if ai.Status.SchemaJobId == jobName {
+	if state.JobName == jobName {
 		// A Job may expire while the operator is offline. Its outcome is then
 		// unknown, so require an explicit retry instead of silently reapplying SQL.
 		return schemaState("Failed", "schema Job outcome was lost; change schemaRetryNonce to retry")
@@ -524,11 +538,11 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 	}
 	// The new attempt is the only result eligible for reuse after Job TTL
 	// cleanup. Clear historical success before recording this attempt's name.
-	ai.Status.SchemaAppliedHash = ""
-	ai.Status.SchemaImageDigest = ""
-	ai.Status.SchemaFailedHash = ""
-	ai.Status.SchemaFailureReason = ""
-	ai.Status.SchemaJobId = job.Name
+	state.AppliedHash = ""
+	state.ImageDigest = ""
+	state.FailedHash = ""
+	state.FailureReason = ""
+	state.JobName = job.Name
 	return schemaState("Pending", "waiting for schema Job completion")
 }
 
