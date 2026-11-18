@@ -95,7 +95,7 @@ func deploymentEnv(t *testing.T, r *SlimReconciler, ai *aiv1.AIService) map[stri
 	return env
 }
 
-func TestSlimDeploymentEnv_CPUOnlyHasAgentRuntimeURLAndBlankPlatformURL(t *testing.T) {
+func TestSlimDeploymentEnv_CPUOnlyPropagatesTheProvidedURLs(t *testing.T) {
 	r, _ := slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
 	ai := slimService(testAgentRuntimeURL + "/")
 	require.NoError(t, r.validateAIService(context.Background(), ai))
@@ -103,7 +103,7 @@ func TestSlimDeploymentEnv_CPUOnlyHasAgentRuntimeURLAndBlankPlatformURL(t *testi
 	env := deploymentEnv(t, r, ai)
 	assert.Equal(t, testAgentRuntimeURL, env["AI_TIER_AGENT_RUNTIME_URL"], "a trailing slash is trimmed")
 	assert.Contains(t, env, "PLATFORM_URL")
-	assert.Empty(t, env["PLATFORM_URL"], "cpuOnly SLIM receives a blank PLATFORM_URL")
+	assert.Empty(t, env["PLATFORM_URL"], "PLATFORM_URL reflects this fixture's empty input")
 }
 
 func TestSlimDeploymentEnv_FullfeatureIsUnchanged(t *testing.T) {

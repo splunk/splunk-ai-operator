@@ -48,8 +48,7 @@ spec:
       evidence: Synthetic local refresh fixture; no image is published or pulled
       requiredEnvironment:
       - name: PLATFORM_URL
-        fullfeature: ray-service-origin
-        cpuOnly: ''
+        value: platform-url-origin
       - name: AI_TIER_AGENT_RUNTIME_URL
         value: agentruntime-service-origin
     aitk:

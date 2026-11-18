@@ -46,8 +46,7 @@ spec:
       evidence: candidate reference and AI_TIER_AGENT_RUNTIME_URL support confirmed by story owner
       requiredEnvironment:
         - name: PLATFORM_URL
-          fullfeature: ray-service-origin
-          cpuOnly: ""
+          value: platform-url-origin
         - name: AI_TIER_AGENT_RUNTIME_URL
           value: agentruntime-service-origin
     aitk:

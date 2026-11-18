@@ -43,7 +43,8 @@
           "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
         }
       },
-      "resourceCount": 5
+      "resourceCount": 5,
+      "platformUrlInput": ""
     },
     {
       "case": "initial-fullfeature",
@@ -85,7 +86,8 @@
           "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
         }
       },
-      "resourceCount": 5
+      "resourceCount": 5,
+      "platformUrlInput": "http://candidate-ray-head.candidate-validation.svc.cluster.local:8000"
     },
     {
       "case": "refresh-cpuOnly",
@@ -127,7 +129,8 @@
           "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
         }
       },
-      "resourceCount": 5
+      "resourceCount": 5,
+      "platformUrlInput": ""
     },
     {
       "case": "refresh-fullfeature",
@@ -169,7 +172,8 @@
           "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
         }
       },
-      "resourceCount": 5
+      "resourceCount": 5,
+      "platformUrlInput": "http://candidate-ray-head.candidate-validation.svc.cluster.local:8000"
     }
   ],
   "goVet": "passed",
@@ -184,25 +188,33 @@
       {
         "package": "github.com/splunk/splunk-ai-operator/pkg/ai/features/slim",
         "result": "pass",
-        "elapsedSeconds": 1.065
+        "elapsedSeconds": 1.064
       },
       {
         "package": "github.com/splunk/splunk-ai-operator/internal/candidatecontract",
         "result": "pass",
-        "elapsedSeconds": 1.203
-      },
-      {
-        "package": "github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime",
-        "result": "pass",
-        "elapsedSeconds": 3.831
+        "elapsedSeconds": 1.181
       },
       {
         "package": "github.com/splunk/splunk-ai-operator/pkg/ai",
         "result": "pass",
-        "elapsedSeconds": 0.893
+        "elapsedSeconds": 0.885
+      },
+      {
+        "package": "github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime",
+        "result": "pass",
+        "elapsedSeconds": 3.757
       }
     ],
-    "passedTestCases": 121,
+    "passedTestCases": 124,
     "failedTestCases": 0
+  },
+  "platformURLPolicy": "Propagate the resolved AIService URL regardless of profile; an empty CPU-only input is a current system observation, not a constraint.",
+  "platformURLRegression": {
+    "profile": "cpuOnly",
+    "input": "http://future-platform.example.invalid:8000/ai-platform-models/v1/",
+    "expectedOutput": "http://future-platform.example.invalid:8000",
+    "test": "TestCPUOnlyPreservesSuppliedPlatformURL",
+    "result": "passed"
   }
 }

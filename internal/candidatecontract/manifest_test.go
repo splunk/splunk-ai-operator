@@ -80,6 +80,15 @@ func TestEveryImageRefreshBothProfiles(t *testing.T) {
 	}
 }
 
+func TestCPUOnlyPreservesSuppliedPlatformURL(t *testing.T) {
+	m, matrix := initial(t)
+	const input = "http://future-platform.example.invalid:8000/ai-platform-models/v1/"
+	snapshot, err := renderWithPlatformURL(m, "cpuOnly", matrix, input)
+	require.NoError(t, err)
+	require.Equal(t, input, snapshot.PlatformURLInput, "validation must preserve a supplied CPU-only URL")
+	require.NoError(t, snapshot.Check(m))
+}
+
 func TestSavedSyntheticRefreshFixture(t *testing.T) {
 	m, matrix := initial(t)
 	var next Manifest
@@ -126,9 +135,9 @@ func TestInvalidContractsFailBeforeRenderingWithoutValues(t *testing.T) {
 		{"wrong health API", "spec.contract.readinessAndHealth", func(m *Manifest) { m.Spec.Contract.ReadinessAndHealth.Path = "/service/ready" }},
 		{"schema entry point", "spec.contract.schemaEntryPoint", func(m *Manifest) { m.Spec.Contract.SchemaEntryPoint.SQLPath = "/other.sql" }},
 		{"missing Secret key", "spec.contract.secretKeys", func(m *Manifest) { m.Spec.Contract.SecretKeys.Required = m.Spec.Contract.SecretKeys.Required[:5] }},
-		{"conflicting SLIM CPU URL", "spec.components.slim.requiredEnvironment", func(m *Manifest) {
+		{"wrong SLIM binding", "spec.components.slim.requiredEnvironment", func(m *Manifest) {
 			e := m.Spec.Components["slim"]
-			e.RequiredEnvironment[0].CPUOnly = "http://unexpected.invalid"
+			e.RequiredEnvironment[0].Name = "UNSUPPORTED_PLATFORM_URL"
 			m.Spec.Components["slim"] = e
 		}},
 		{"missing SLIM binding", "spec.components.slim.requiredEnvironment", func(m *Manifest) {

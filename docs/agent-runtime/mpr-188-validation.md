@@ -23,6 +23,8 @@ All five criteria have implementation and local acceptance evidence. Code review
 | Revision 6, synthetic SLIM refresh | `cpuOnly` | Present, empty | Runtime Service origin on port 8080 | Passed |
 | Revision 6, synthetic SLIM refresh | `fullfeature` | Ray Service origin on port 8000 | Runtime Service origin on port 8080 | Passed |
 
+The table records the current fixture inputs, not profile constraints. An additional regression supplies a nonempty `AIPlatformUrl` under `cpuOnly` and verifies that validation preserves it and rendering propagates its normalized value. The system's current CPU-only URL happens to be empty; the contract does not require that fact to remain true.
+
 Revision 5 selects SLIM `es-runtime-sync-create-ready-21d4bf15f-20261116-amd64`. The synthetic revision changes only that image to the explicitly synthetic tag `mpr188-synthetic-refresh-20261118`, increments the revision, and retains the previous reference in history. Five resources are collected per run: Runtime Deployment/Service, schema Job, and SLIM Deployment/Service. The CLI also returns the selected operator environment, Runtime prefix, and AITK contract.
 
 The [machine-readable results](validation/mpr-188-results.json) record exact image inputs, profiles, revision numbers, service variables, probe paths, Secret reference, AITK source, matrix status, and package test results.
@@ -45,7 +47,7 @@ go run ./cmd/candidate-contract --profile fullfeature \
   --previous config/agent-runtime/candidate-manifest.yaml
 ```
 
-Go 1.26.10 on darwin/arm64. `GOCACHE=/private/tmp/mpr188-go-cache` was used. The focused run recorded 121 passing test/subtest events, zero failures; the CLI package compiled and its behavior was exercised by the four standalone runs. `go vet` passed.
+Go 1.26.10 on darwin/arm64. `GOCACHE=/private/tmp/mpr188-go-cache` was used. The focused run recorded 124 passing test/subtest events, zero failures; the CLI package compiled and its behavior was exercised by the four standalone runs. `go vet` passed.
 
 Negative cases include missing/invalid/unqualified image references, invalid YAML, loader conflicts, incompatible prefix/ports/health/schema routes, missing Secret keys, contradictory SLIM bindings, incomplete AITK metadata/routes, unsupported or blocked matrix records, and missing refresh history. Invalid loader values are also omitted from the operator's diagnostics.
 

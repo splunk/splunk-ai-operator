@@ -110,9 +110,8 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		return fmt.Errorf("either AIPlatformRef.Name or AIPlatformUrl must be set")
 	}
 
-	// cpuOnly has no Ray platform: SLIM routes to the AgentRuntime Service instead
-	// (AI_TIER_AGENT_RUNTIME_URL, set by the AIPlatform controller) and has no
-	// PLATFORM_URL, so it must not wait for Ray or require a platform URL.
+	// cpuOnly does not depend on Ray readiness or require a platform URL.
+	// Preserve an explicitly supplied URL regardless of the profile.
 	cpuOnly := false
 	if ai.Spec.AIPlatformRef.Name != "" {
 		aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
@@ -121,10 +120,6 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 			return fmt.Errorf("fetching AIPlatform: %w", err)
 		}
 		cpuOnly = aiPlatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly
-		if cpuOnly {
-			ai.Spec.AIPlatformUrl = ""
-		}
-
 		if !cpuOnly {
 			if err := r.validateAIPlatformReady(ctx, aiPlatform); err != nil {
 				return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)

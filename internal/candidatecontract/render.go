@@ -32,6 +32,7 @@ type Snapshot struct {
 	MatrixPairStatus    string                 `json:"matrixPairStatus"`
 	OperatorEnvironment map[string]string      `json:"operatorEnvironment"`
 	RuntimePrefix       string                 `json:"runtimePrefix"`
+	PlatformURLInput    string                 `json:"platformUrlInput"`
 	AITK                Component              `json:"aitk"`
 	Resources           []runtime.RawExtension `json:"resources"`
 }
@@ -41,6 +42,10 @@ type Snapshot struct {
 var renderMu sync.Mutex
 
 func Render(m *Manifest, profile string, matrix *Matrix) (*Snapshot, error) {
+	return renderWithPlatformURL(m, profile, matrix, "")
+}
+
+func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platformURL string) (*Snapshot, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
@@ -81,6 +86,9 @@ func Render(m *Manifest, profile string, matrix *Matrix) (*Snapshot, error) {
 	if profile == "fullfeature" {
 		platform.Status.RayServiceName = "candidate-ray-head"
 		platform.Status.Conditions = []metav1.Condition{{Type: "RayServiceStatusReady", Status: metav1.ConditionTrue}}
+		if platformURL == "" {
+			platformURL = "http://candidate-ray-head.candidate-validation.svc.cluster.local:8000"
+		}
 	}
 	runtimeService := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "candidate-agentruntime-" + carrier.Provider, Namespace: namespace, UID: "offline-runtime"},
@@ -89,11 +97,12 @@ func Render(m *Manifest, profile string, matrix *Matrix) (*Snapshot, error) {
 			RuntimeVersion:        m.Spec.RuntimeVersion,
 			CheckpointDbSecretRef: m.Spec.Contract.SecretKeys.Name,
 			AIPlatformRef:         corev1.ObjectReference{Name: platform.Name, Namespace: namespace},
+			AIPlatformUrl:         platformURL,
 		},
 	}
 	slimService := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "candidate-slim", Namespace: namespace, UID: "offline-slim"},
-		Spec:       aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "slim"}, AIPlatformRef: corev1.ObjectReference{Name: platform.Name, Namespace: namespace}},
+		Spec:       aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "slim"}, AIPlatformRef: corev1.ObjectReference{Name: platform.Name, Namespace: namespace}, AIPlatformUrl: platformURL},
 	}
 	if profile == "cpuOnly" {
 		slimService.Spec.AgentRuntimeUrl = agentruntime.ServiceURL(runtimeService.Name, namespace, "")
@@ -128,6 +137,7 @@ func Render(m *Manifest, profile string, matrix *Matrix) (*Snapshot, error) {
 		return nil, fmt.Errorf("render.slim: %w", err)
 	}
 	result := &Snapshot{Revision: m.Spec.Revision, Profile: profile, Scope: "offline operator render; schema Job completion simulated; no cluster, registry, database, or product calls", Qualification: "pending", MatrixPairStatus: status, OperatorEnvironment: m.OperatorEnvironment(), RuntimePrefix: m.Spec.Contract.RuntimeAPI.Prefix, AITK: m.Spec.Components["aitk"]}
+	result.PlatformURLInput = platformURL
 	for _, kind := range []string{"runtimeDeployment", "runtimeService", "schemaJob", "slimDeployment", "slimService"} {
 		var object client.Object
 		var name string
@@ -268,7 +278,8 @@ func (s *Snapshot) Check(m *Manifest) error {
 	if !hasRuntime || url != "http://"+runtimeService.Name+"."+runtimeService.Namespace+".svc.cluster.local:8080" {
 		return fieldError("render.slim.env.AI_TIER_AGENT_RUNTIME_URL")
 	}
-	if !hasPlatform || s.Profile == "cpuOnly" && platform != "" || s.Profile == "fullfeature" && platform != "http://candidate-ray-head.candidate-validation.svc.cluster.local:8000" {
+	expectedPlatformURL := strings.TrimSuffix(strings.TrimRight(s.PlatformURLInput, "/"), "/ai-platform-models/v1")
+	if !hasPlatform || platform != expectedPlatformURL {
 		return fieldError("render.slim.env.PLATFORM_URL")
 	}
 	return nil

@@ -52,10 +52,8 @@ type Component struct {
 }
 
 type EnvironmentBinding struct {
-	Name        string `json:"name"`
-	Fullfeature string `json:"fullfeature,omitempty"`
-	CPUOnly     string `json:"cpuOnly"`
-	Value       string `json:"value,omitempty"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type API struct {
@@ -201,7 +199,7 @@ func (m *Manifest) Validate() error {
 		return fieldError("spec.contract.secretKeys")
 	}
 	bindings := m.Spec.Components["slim"].RequiredEnvironment
-	if len(bindings) != 2 || bindings[0].Name != "PLATFORM_URL" || bindings[0].Fullfeature != "ray-service-origin" || bindings[0].CPUOnly != "" || bindings[1].Name != "AI_TIER_AGENT_RUNTIME_URL" || bindings[1].Value != "agentruntime-service-origin" {
+	if len(bindings) != 2 || bindings[0].Name != "PLATFORM_URL" || bindings[0].Value != "platform-url-origin" || bindings[1].Name != "AI_TIER_AGENT_RUNTIME_URL" || bindings[1].Value != "agentruntime-service-origin" {
 		return fieldError("spec.components.slim.requiredEnvironment")
 	}
 	app := m.Spec.Components["aitk"]

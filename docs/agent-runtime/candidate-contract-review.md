@@ -9,7 +9,7 @@ This draft combines the two Agent Runtime ERDs, the historical deployment handof
 - All HTTP services in this candidate set use `GET /health` for startup, liveness, and readiness probes. The operator already targets `/health` on port 8080 for Runtime and SLIM, so no probe implementation change is required.
 - Periodic PostgreSQL connectivity checks are not required. Keep schema setup and Runtime startup database initialization checks.
 - The supplied SLIM image accepts `AI_TIER_AGENT_RUNTIME_URL`. Disregard the previously inspected SLIM commit when determining this candidate's environment contract.
-- Supply SLIM both `PLATFORM_URL` and `AI_TIER_AGENT_RUNTIME_URL`. Keep the existing Ray-derived `PLATFORM_URL` for `fullfeature`; use an empty value for `cpuOnly`.
+- Supply SLIM both `PLATFORM_URL` and `AI_TIER_AGENT_RUNTIME_URL`. Propagate the resolved `AIService.spec.aiPlatformUrl` using the existing URL normalization. The current CPU-only system naturally leaves this URL empty; that observation is not a profile constraint. Preserve a supplied URL under either profile.
 - Skip image provenance, owners, architectures, and current registry digest checks for all images in MPR-188. Previously recorded historical digests may remain in the manifest; these metadata items are not open requirements for this story.
 - Schema setup comes from `ai/ai-agent-runtime` commit `5a91e680` (full SHA `5a91e68028ebfa9503963a983c967104fb6a8e92`). Its Dockerfile and SQL confirm the `/schema.sql` entry point.
 - The schema setup image is `658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e`. All four candidate image references are now recorded.
@@ -60,7 +60,7 @@ The operator change for this story supplies both variables to SLIM:
 
 | Variable | Confirmed value |
 |---|---|
-| `PLATFORM_URL` | Keep the existing derivation from the AIPlatform Ray service for `fullfeature`; supply an empty string for `cpuOnly`, as directed by the story owner. |
+| `PLATFORM_URL` | Propagate the resolved `AIService.spec.aiPlatformUrl`, stripping a trailing slash and `/ai-platform-models/v1`. Its value is not constrained by the profile. |
 | `AI_TIER_AGENT_RUNTIME_URL` | Supply the AIPlatform Agent Runtime feature/provider Service URL for both profiles. |
 
 The ERDs support the CPU/full-feature split: Runtime remains CPU in both; full-feature adds GPU model service/Ray-related integration, while CPU-only does not require Ray and can use the private/BYO LLM path. `AI_TIER_AGENT_RUNTIME_URL` supplies the Runtime Service origin (`http://<service>.<namespace>.svc.<cluster-domain>:8080`); the downstream API prefix is `/system/ai-agent-runtime/v1`.
