@@ -1945,15 +1945,15 @@ for _p in cpuonly fullfeature; do
   assert_problem "${_p}: missing schema image" \
     "$(_profile_cfg "${_p}" "${_p}-schema" 'del(.images.agentRuntime.schemaSetupImage)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.schemaSetupImage"
   assert_problem "${_p}: missing provider/carrier image" \
-    "$(_profile_cfg "${_p}" "${_p}-provider" 'del(.images.agentRuntime.providerImages)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerImages.launchpad"
+    "$(_profile_cfg "${_p}" "${_p}-provider" 'del(.images.agentRuntime.providerImages)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerImages.mltk"
   assert_problem "${_p}: missing checkpoint Secret reference" \
     "$(_profile_cfg "${_p}" "${_p}-ckpt" 'del(.aiPlatform.features[1].checkpointDbSecretRef)')" "[PROFILE_MISSING_REFERENCE] aiPlatform.features[1].checkpointDbSecretRef"
   assert_problem "${_p}: missing provider loader module" \
-    "$(_profile_cfg "${_p}" "${_p}-mod" 'del(.images.agentRuntime.providerModules)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerModules.launchpad"
+    "$(_profile_cfg "${_p}" "${_p}-mod" 'del(.images.agentRuntime.providerModules)')" "[PROFILE_MISSING_REFERENCE] images.agentRuntime.providerModules.mltk"
   assert_problem "${_p}: malformed provider loader module" \
-    "$(_profile_cfg "${_p}" "${_p}-badmod" '.images.agentRuntime.providerModules.launchpad = "no_colon_here"')" "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.launchpad"
+    "$(_profile_cfg "${_p}" "${_p}-badmod" '.images.agentRuntime.providerModules.mltk = "no_colon_here"')" "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.mltk"
   assert_problem "${_p}: provider loader module with a path is malformed" \
-    "$(_profile_cfg "${_p}" "${_p}-pathmod" '.images.agentRuntime.providerModules.launchpad = "a/b:C"')" "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.launchpad"
+    "$(_profile_cfg "${_p}" "${_p}-pathmod" '.images.agentRuntime.providerModules.mltk = "a/b:C"')" "[PROFILE_INVALID_VALUE] images.agentRuntime.providerModules.mltk"
   assert_problem "${_p}: missing provider key" \
     "$(_profile_cfg "${_p}" "${_p}-prov" 'del(.aiPlatform.features[1].provider)')" "[PROFILE_MISSING_REFERENCE] aiPlatform.features[1].provider"
   assert_problem "${_p}: missing slim feature" \
@@ -2289,14 +2289,27 @@ for _p in cpuonly fullfeature; do
       "$([[ "$(command yq eval "${_k}" "${_g}")" == registry.example.internal/* ]] && echo yes || echo no)"
   done
   assert_eq "golden ${_p} values: provider image present" "yes" \
-    "$([[ "$(command yq eval '.images.agentRuntime.providers.launchpad' "${_g}")" == */ai-agent-runtime-provider-launchpad:* ]] && echo yes || echo no)"
+    "$([[ "$(command yq eval '.images.agentRuntime.providers.mltk' "${_g}")" == */ai-agent-runtime-provider-mltk:* ]] && echo yes || echo no)"
   assert_eq "golden ${_p} values: provider module present" "yes" \
-    "$([[ "$(command yq eval '.images.agentRuntime.modules.launchpad' "${_g}")" == *:* ]] && echo yes || echo no)"
+    "$([[ "$(command yq eval '.images.agentRuntime.modules.mltk' "${_g}")" == *:* ]] && echo yes || echo no)"
   assert_eq "golden ${_p} values: no credential-looking keys" "0" "$(grep -ciE 'password|token|secretkey|apikey' "${_g}" | tr -d ' ')"
   assert_eq "golden ${_p} CR: valid YAML" "0" "$(command yq eval '.' "${_gc}" >/dev/null 2>&1; echo $?)"
   assert_eq "golden ${_p} CR: spec.profile" "${_want_profile}" "$(command yq eval '.spec.profile' "${_gc}")"
   assert_eq "golden ${_p} CR: kind" "AIPlatform" "$(command yq eval '.kind' "${_gc}")"
   assert_eq "golden ${_p} CR: has the slim and agentruntime features" "slim,agentruntime" "$(command yq eval '[.spec.features[].name] | join(",")' "${_gc}")"
+  # The examples must agree with the merged MPR-188 candidate contract (the
+  # authority for the provider, its loader module and the checkpoint Secret), so
+  # they cannot drift from it unnoticed.
+  _cm="${SCRIPT_DIR}/../../config/agent-runtime/candidate-manifest.yaml"
+  assert_eq "golden ${_p} CR: provider is the contract's provider" \
+    "$(command yq eval '.spec.components.launchpadCarrier.provider' "${_cm}")" \
+    "$(command yq eval '.spec.features[] | select(.name == "agentruntime") | .provider' "${_gc}")"
+  assert_eq "golden ${_p} CR: checkpoint Secret is the contract's Secret" \
+    "$(command yq eval '.spec.contract.secretKeys.name' "${_cm}")" \
+    "$(command yq eval '.spec.features[] | select(.name == "agentruntime") | .checkpointDbSecretRef' "${_gc}")"
+  assert_eq "golden ${_p} values: provider module is the contract's AGENT_MODULE" \
+    "$(command yq eval '.spec.components.launchpadCarrier.agentModule' "${_cm}")" \
+    "$(command yq eval '.images.agentRuntime.modules.mltk' "${_g}")"
 done
 for _k in .spec.defaultAcceleratorType .spec.gpuScheduler .spec.workerGroupConfig .spec.storage; do
   assert_eq "golden cpuOnly CR: ${_k} is absent" "null" "$(command yq eval "${_k}" "${_PROFILE_GOLDEN}/aiplatform-cr-cpuonly.expected.yaml")"

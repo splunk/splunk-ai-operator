@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -217,6 +218,16 @@ func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1
 	}
 
 	defaultAgentRuntimeSpec(ai)
+
+	// The runtime runs on CPU nodes under every profile: it needs positive CPU,
+	// memory and ephemeral-storage budgets, requests within limits, and no GPU.
+	// Checked after defaulting so a request above a defaulted limit is reported
+	// here, with the field, instead of as a rejected Deployment.
+	if errs := aiv1.ValidateWorkloadResources(field.NewPath("spec").Child("resources"), ai.Spec.Resources, true, true); len(errs) > 0 {
+		err := errs.ToAggregate()
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
+		return fmt.Errorf("invalid agentruntime resources: %w", err)
+	}
 	return nil
 }
 
@@ -246,19 +257,59 @@ func defaultAgentRuntimeSpec(ai *aiv1.AIService) {
 	if ai.Spec.ServiceAccountName == "" {
 		ai.Spec.ServiceAccountName = ai.Name + "-sa"
 	}
-	if ai.Spec.Resources.Requests == nil {
-		ai.Spec.Resources.Requests = corev1.ResourceList{
+	completeResourceBudgets(&ai.Spec.Resources)
+}
+
+// DefaultResources is the compute budget of the AgentRuntime container when the
+// AIService does not set one. It is the single definition: the platform
+// controller seeds new AIServices with it and the handler completes any budget
+// left out. Every profile uses it, because the runtime always runs on CPU nodes.
+func DefaultResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("500m"),
 			corev1.ResourceMemory:           resource.MustParse("512Mi"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-		}
-	}
-	if ai.Spec.Resources.Limits == nil {
-		ai.Spec.Resources.Limits = corev1.ResourceList{
+		},
+		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("1"),
 			corev1.ResourceMemory:           resource.MustParse("1Gi"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+		},
+	}
+}
+
+// completeResourceBudgets makes sure the container carries an explicit cpu,
+// memory and ephemeral-storage limit, without changing anything that already
+// worked.
+//
+//   - Requests are defaulted only when the whole map is unset, exactly as before.
+//     A request left out of a map the user set is not invented: Kubernetes then
+//     defaults it to the limit.
+//   - A missing limit is the larger of the default and the request for that
+//     resource, so a default can never fall below something the user asked for.
+//     (Taking the default alone would turn requests.cpu: 2 with no limit into an
+//     inverted 2 > 1.)
+//
+// Values the user set are never changed, and an input with both maps unset ends
+// up exactly as DefaultResources.
+func completeResourceBudgets(r *corev1.ResourceRequirements) {
+	def := DefaultResources()
+	if r.Requests == nil {
+		r.Requests = def.Requests
+	}
+	if r.Limits == nil {
+		r.Limits = corev1.ResourceList{}
+	}
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+		if _, ok := r.Limits[name]; ok {
+			continue
 		}
+		limit := def.Limits[name]
+		if req, ok := r.Requests[name]; ok && req.Cmp(limit) > 0 {
+			limit = req.DeepCopy()
+		}
+		r.Limits[name] = limit
 	}
 }
 

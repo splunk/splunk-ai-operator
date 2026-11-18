@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
@@ -141,9 +142,17 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 	}
 
 	if cpuOnly {
-		if ai.Spec.AgentRuntimeUrl == "" {
-			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AgentRuntimeUrl is not set")
-			return fmt.Errorf("AgentRuntimeUrl must be set for the cpuOnly profile (the AIPlatform controller sets it from its agentruntime feature)")
+		// cpuOnly SLIM exists to route to the AgentRuntime, so it must resolve one.
+		// The URL is spec.agentRuntimeUrl when set, otherwise it is derived from the
+		// platform's single agentruntime feature, the same as for every profile.
+		url, err := r.agentRuntimeURL(ctx, ai)
+		if err != nil {
+			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
+			return err
+		}
+		if url == "" {
+			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AI_TIER_AGENT_RUNTIME_URL cannot be resolved")
+			return fmt.Errorf("profile cpuOnly routes SLIM to AgentRuntime but no agentruntime URL can be resolved: set spec.agentRuntimeUrl or add an agentruntime feature to the AIPlatform")
 		}
 	} else if ai.Spec.AIPlatformUrl == "" {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformUrl is not set")
@@ -164,6 +173,16 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 	}
 	if ai.Spec.Replicas == 0 {
 		ai.Spec.Replicas = 1
+	}
+
+	// No negative quantities and requests within limits for every profile. Under
+	// cpuOnly SLIM is a CPU workload on a cluster with no GPU use, so an
+	// accelerator resource is refused there; on other platforms SLIM is an
+	// existing component and its resources are left as the administrator set them.
+	if errs := aiv1.ValidateWorkloadResources(field.NewPath("spec").Child("resources"), ai.Spec.Resources, false, cpuOnly); len(errs) > 0 {
+		err := errs.ToAggregate()
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
+		return fmt.Errorf("invalid slim resources: %w", err)
 	}
 
 	return nil
@@ -209,6 +228,8 @@ func (r *SlimReconciler) agentRuntimeURL(ctx context.Context, ai *aiv1.AIService
 	if runtimeFeature == nil {
 		return "", nil
 	}
+	// An empty clusterDomain (a platform read without CRD defaulting) becomes
+	// cluster.local inside ServiceURL, so it is not repeated here.
 	return agentruntime.FeatureServiceURL(platform.Name, runtimeFeature.Provider, platform.Namespace, platform.Spec.ClusterDomain), nil
 }
 
@@ -653,9 +674,13 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 				ServiceAccountName: ai.Spec.ServiceAccountName,
 				Containers:         containers,
 				Volumes:            volumes,
-				Affinity:           &ai.Spec.Affinity,
-				Tolerations:        ai.Spec.Tolerations,
-				ImagePullSecrets:   ai.Spec.ImagePullSecrets,
+				// NodeSelector was never copied here, so a selector on the AIService was
+				// silently dropped and SLIM could land on any node. A platform sets none
+				// for fullfeature, so the default Deployment is unchanged.
+				NodeSelector:     ai.Spec.NodeSelector,
+				Affinity:         &ai.Spec.Affinity,
+				Tolerations:      ai.Spec.Tolerations,
+				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
 		return nil

@@ -28,7 +28,12 @@ func profilePlatform(profile aiv1.AIPlatformProfile) *aiv1.AIPlatform {
 func TestAIPlatformWebhook_ProfileAccepted(t *testing.T) {
 	v := &AIPlatformCustomValidator{}
 	for _, profile := range []aiv1.AIPlatformProfile{"", "full", "fullfeature", "cpuOnly"} {
-		_, err := v.ValidateCreate(context.Background(), profilePlatform(profile))
+		p := profilePlatform(profile)
+		if profile == aiv1.AIPlatformProfileFullFeature {
+			// An explicit fullfeature must say where its GPU capacity is.
+			p.Spec.GPUSchedulingSpec = &aiv1.SchedulingSpec{NodeSelector: map[string]string{"splunk.ai/workload-type": "gpu"}}
+		}
+		_, err := v.ValidateCreate(context.Background(), p)
 		assert.NoError(t, err, "profile %q", profile)
 	}
 }

@@ -57,11 +57,11 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 	It("creates the SLIM and AgentRuntime workloads wired to each other, with no Ray", func() {
 		waitForAPIAbsent("ray.io/v1") // KubeRay must really be absent, whatever spec ran before
 		for k, v := range map[string]string{
-			"RELATED_IMAGE_SLIM_API":                          "docker.io/splunk/slim:test",
-			"RELATED_IMAGE_AGENT_RUNTIME_BASE":                "docker.io/splunk/agent-runtime:test",
-			"RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_LAUNCHPAD":  "docker.io/splunk/agent-runtime-provider-launchpad:test",
-			"RELATED_AGENT_RUNTIME_MODULE_PROVIDER_LAUNCHPAD": "launchpad.loader:LaunchpadLoader",
-			"RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP":        "docker.io/splunk/agent-runtime-schema-setup:test",
+			"RELATED_IMAGE_SLIM_API":                     "docker.io/splunk/slim:test",
+			"RELATED_IMAGE_AGENT_RUNTIME_BASE":           "docker.io/splunk/agent-runtime:test",
+			"RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK":  "docker.io/splunk/agent-runtime-provider-mltk:test",
+			"RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK": "agentcore_operations.loader:MLTKAgentLoader",
+			"RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP":   "docker.io/splunk/agent-runtime-schema-setup:test",
 		} {
 			Expect(os.Setenv(k, v)).To(Succeed())
 			DeferCleanup(func(key string) { _ = os.Unsetenv(key) }, k)
@@ -123,7 +123,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 				ObjectStorage: aiv1.ObjectStorageSpec{Path: "s3://bucket", Region: "us-west-2"},
 				Features: []aiv1.FeatureSpec{
 					{Name: "slim", Version: "1.0.0"},
-					{Name: "agentruntime", Provider: "launchpad", CheckpointDbSecretRef: "e2e-pg"},
+					{Name: "agentruntime", Provider: "mltk", CheckpointDbSecretRef: "e2e-pg"},
 				},
 			},
 		}
@@ -149,15 +149,19 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			return m
 		}
 		slimEnv := envOf(&slimDep)
-		Expect(slimEnv).NotTo(HaveKey("PLATFORM_URL"), "cpuOnly SLIM has no Ray platform URL")
+		// MPR-188: SLIM always receives both variables. With no Ray platform behind a
+		// cpuOnly platform PLATFORM_URL carries the (empty) resolved input, which is an
+		// observation of this fixture, not a constraint: a supplied value is kept.
+		Expect(slimEnv).To(HaveKey("PLATFORM_URL"))
+		Expect(slimEnv["PLATFORM_URL"]).To(BeEmpty(), "no Ray platform URL exists to derive")
 		Expect(slimEnv).To(HaveKey("AI_TIER_AGENT_RUNTIME_URL"))
-		Expect(slimEnv["AI_TIER_AGENT_RUNTIME_URL"]).To(MatchRegexp(`^http://%s-agentruntime-launchpad-svc\.default\.svc\.cluster\.local:8080$`, name))
+		Expect(slimEnv["AI_TIER_AGENT_RUNTIME_URL"]).To(MatchRegexp(`^http://%s-agentruntime-mltk-svc\.default\.svc\.cluster\.local:8080$`, name))
 
 		// AgentRuntime passes validation (no Ray wait, no platform URL) and reaches the
 		// schema Job, the first stage after validation, rather than failing on Ray.
 		var ai aiv1.AIService
 		Eventually(func() bool {
-			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-agentruntime-launchpad"}, &ai); err != nil {
+			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-agentruntime-mltk"}, &ai); err != nil {
 				return false
 			}
 			for _, c := range ai.Status.Conditions {

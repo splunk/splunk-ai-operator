@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -61,7 +62,6 @@ func buildCPUOnlyPlatform() *aiApi.AIPlatform {
 			Features: []aiApi.FeatureSpec{
 				{Name: "slim", Version: "1.0.0"},
 				{Name: "agentruntime", Provider: "launchpad", CheckpointDbSecretRef: "pg"},
-				{Name: "agentruntime", Provider: "second", CheckpointDbSecretRef: "pg"},
 			},
 		},
 	}
@@ -80,7 +80,7 @@ func TestBuildAIService_SlimGetsAgentRuntimeURLOnlyForCPUOnly(t *testing.T) {
 	// The URL comes from the first agentruntime feature, using the Service name and
 	// port the AgentRuntime handler defines (never a hard-coded copy).
 	slim := build(platform, platform.Spec.Features[0])
-	want := agentruntime.ServiceURL("lp-agentruntime-launchpad", "ns1", "cluster.local")
+	want := agentruntime.FeatureServiceURL("lp", "launchpad", "ns1", "cluster.local")
 	assert.Equal(t, want, slim.Spec.AgentRuntimeUrl)
 	assert.Contains(t, want, ":8080")
 	assert.Contains(t, want, ".ns1.svc.cluster.local")
@@ -141,7 +141,7 @@ func TestReconcile_CPUOnlyTouchesNoRayOrWeaviateAndIsStable(t *testing.T) {
 
 	var children aiApi.AIServiceList
 	require.NoError(t, c.List(context.Background(), &children, client.InNamespace("ns1")))
-	require.Len(t, children.Items, 3, "slim plus the two agentruntime providers")
+	require.Len(t, children.Items, 2, "slim plus the one agentruntime provider")
 	resourceVersions := map[string]string{}
 	for _, child := range children.Items {
 		resourceVersions[child.Name] = child.ResourceVersion
@@ -160,4 +160,22 @@ func TestReconcile_CPUOnlyTouchesNoRayOrWeaviateAndIsStable(t *testing.T) {
 	for _, child := range children.Items {
 		assert.Equal(t, resourceVersions[child.Name], child.ResourceVersion, "a repeated reconcile must not rewrite %s", child.Name)
 	}
+}
+
+// With several agentruntime features there is no single Service to point SLIM at.
+// The platform controller leaves the URL empty (it does not pick one) and the SLIM
+// handler then reports the ambiguity, the same as it does for the other profiles.
+func TestBuildAIService_SeveralAgentRuntimeFeaturesLeaveSlimUnresolved(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, aiApi.AddToScheme(scheme))
+	p := buildCPUOnlyPlatform()
+	p.Spec.Features = append(p.Spec.Features, aiApi.FeatureSpec{Name: "agentruntime", Provider: "second", CheckpointDbSecretRef: "pg"})
+	r := New(p, fake.NewClientBuilder().WithScheme(scheme).Build(), scheme, record.NewFakeRecorder(10))
+	slim := r.buildAIService(context.Background(), p, p.Spec.Features[0], featureServiceName(p.Name, p.Spec.Features[0]))
+	assert.Empty(t, slim.Spec.AgentRuntimeUrl)
+
+	// Admission refuses it earlier, so a webhook-fronted cluster never gets here.
+	errs := p.Spec.ValidateProfile(field.NewPath("spec"))
+	require.NotEmpty(t, errs)
+	assert.Contains(t, errs.ToAggregate().Error(), "only one agentruntime feature may be defined alongside it")
 }

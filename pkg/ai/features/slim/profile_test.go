@@ -52,19 +52,49 @@ func slimReconciler(t *testing.T, objs ...*aiv1.AIPlatform) (*SlimReconciler, st
 	return &SlimReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}, struct{}{}
 }
 
-// cpuOnly SLIM has no Ray: it validates without Ray or a platform URL, and it
-// needs the AgentRuntime URL the platform controller sets.
-func TestValidateAIService_CPUOnlySlimNeedsAgentRuntimeURLNotRay(t *testing.T) {
-	r, _ := slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
+// cpuOnly SLIM has no Ray: it validates without Ray, and it must resolve an
+// AgentRuntime URL, either supplied on the AIService or derived from the
+// platform's single agentruntime feature (the same rule as every other profile).
+func TestValidateAIService_CPUOnlySlimResolvesTheAgentRuntimeURLNotRay(t *testing.T) {
+	ctx := context.Background()
 
+	r, _ := slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
 	ai := slimService(testAgentRuntimeURL)
-	require.NoError(t, r.validateAIService(context.Background(), ai))
+	require.NoError(t, r.validateAIService(ctx, ai))
 	assert.Empty(t, ai.Spec.AIPlatformUrl, "no Ray platform URL is derived for cpuOnly")
 
-	missing := slimService("")
-	err := r.validateAIService(context.Background(), missing)
+	// Not supplied: derived from the platform's one agentruntime feature.
+	withRuntime := slimPlatform(aiv1.AIPlatformProfileCPUOnly, false)
+	withRuntime.Spec.ClusterDomain = "cluster.local"
+	withRuntime.Spec.Features = []aiv1.FeatureSpec{{Name: "slim"}, {Name: "agentruntime", Provider: "mltk"}}
+	r, _ = slimReconciler(t, withRuntime)
+	derived := slimService("")
+	require.NoError(t, r.validateAIService(ctx, derived))
+	url, err := r.agentRuntimeURL(ctx, derived)
+	require.NoError(t, err)
+	assert.Equal(t, "http://lp-agentruntime-mltk-svc.default.svc.cluster.local:8080", url)
+
+	// A platform read without defaulting (empty clusterDomain) still gets a valid URL.
+	withRuntime.Spec.ClusterDomain = ""
+	r, _ = slimReconciler(t, withRuntime)
+	url, err = r.agentRuntimeURL(ctx, slimService(""))
+	require.NoError(t, err)
+	assert.Equal(t, "http://lp-agentruntime-mltk-svc.default.svc.cluster.local:8080", url, "empty clusterDomain falls back to cluster.local")
+
+	// No agentruntime feature and nothing supplied: refused, naming the way out.
+	r, _ = slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
+	err = r.validateAIService(ctx, slimService(""))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AgentRuntimeUrl must be set for the cpuOnly profile")
+	assert.Contains(t, err.Error(), "profile cpuOnly routes SLIM to AgentRuntime")
+	assert.Contains(t, err.Error(), "spec.agentRuntimeUrl")
+
+	// Several agentruntime features: ambiguous, refused rather than guessed.
+	multi := slimPlatform(aiv1.AIPlatformProfileCPUOnly, false)
+	multi.Spec.Features = []aiv1.FeatureSpec{{Name: "agentruntime", Provider: "a"}, {Name: "agentruntime", Provider: "b"}}
+	r, _ = slimReconciler(t, multi)
+	err = r.validateAIService(ctx, slimService(""))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multiple agentruntime features")
 }
 
 // Every other profile keeps waiting for Ray and deriving its platform URL.
