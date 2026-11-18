@@ -250,11 +250,15 @@ type MTLSConfig struct {
 
 // AIServiceStatus defines the observed state of AIService
 type AIServiceStatus struct {
-	SchemaJobId        string             `json:"schemaJobId,omitempty"`
-	VectorDbStatus     string             `json:"vectorDbStatus,omitempty"`
-	PlatformStatus     string             `json:"platformStatus,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	SchemaJobId         string             `json:"schemaJobId,omitempty"`
+	SchemaAppliedHash   string             `json:"schemaAppliedHash,omitempty"`
+	SchemaFailedHash    string             `json:"schemaFailedHash,omitempty"`
+	SchemaFailureReason string             `json:"schemaFailureReason,omitempty"`
+	SchemaImageDigest   string             `json:"schemaImageDigest,omitempty"`
+	VectorDbStatus      string             `json:"vectorDbStatus,omitempty"`
+	PlatformStatus      string             `json:"platformStatus,omitempty"`
+	Conditions          []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration  int64              `json:"observedGeneration,omitempty"`
 }
 
 // AIService is the Schema for the aiservices API

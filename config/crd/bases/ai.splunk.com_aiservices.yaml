@@ -1063,6 +1063,10 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
+                  schemaRetryNonce:
+                    description: SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
+                    maxLength: 128
+                    type: string
                   env:
                     additionalProperties:
                       type: string
@@ -2221,6 +2225,14 @@ spec:
                 format: int64
                 type: integer
               platformStatus:
+                type: string
+              schemaAppliedHash:
+                type: string
+              schemaFailedHash:
+                type: string
+              schemaFailureReason:
+                type: string
+              schemaImageDigest:
                 type: string
               schemaJobId:
                 type: string

@@ -16,6 +16,7 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,7 +62,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			"RELATED_IMAGE_AGENT_RUNTIME_BASE":                "docker.io/splunk/agent-runtime:test",
 			"RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_LAUNCHPAD":  "docker.io/splunk/agent-runtime-provider-launchpad:test",
 			"RELATED_AGENT_RUNTIME_MODULE_PROVIDER_LAUNCHPAD": "launchpad.loader:LaunchpadLoader",
-			"RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP":        "docker.io/splunk/agent-runtime-schema-setup:test",
+			"RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP":        "docker.io/splunk/agent-runtime-schema-setup@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		} {
 			Expect(os.Setenv(k, v)).To(Succeed())
 			DeferCleanup(func(key string) { _ = os.Unsetenv(key) }, k)
@@ -149,7 +150,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			return m
 		}
 		slimEnv := envOf(&slimDep)
-		Expect(slimEnv).NotTo(HaveKey("PLATFORM_URL"), "cpuOnly SLIM has no Ray platform URL")
+		Expect(slimEnv).To(HaveKeyWithValue("PLATFORM_URL", ""), "cpuOnly SLIM has no Ray platform URL")
 		Expect(slimEnv).To(HaveKey("AI_TIER_AGENT_RUNTIME_URL"))
 		Expect(slimEnv["AI_TIER_AGENT_RUNTIME_URL"]).To(MatchRegexp(`^http://%s-agentruntime-launchpad-svc\.default\.svc\.cluster\.local:8080$`, name))
 
@@ -167,6 +168,39 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			}
 			return false
 		}, 60*time.Second, time.Second).Should(BeTrue(), "AgentRuntime validation must pass without Ray; conditions: %+v", ai.Status.Conditions)
+
+		// The real API server emits a Job status-only update. Completion must
+		// wake the AIService controller promptly, without waiting for error backoff.
+		var schemaJob batchv1.Job
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-agentruntime-launchpad"}, &ai); err != nil {
+				return err
+			}
+			if ai.Status.SchemaJobId == "" {
+				return fmt.Errorf("schema Job not recorded yet")
+			}
+			return k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: ai.Status.SchemaJobId}, &schemaJob)
+		}, 30*time.Second, 100*time.Millisecond).Should(Succeed())
+		finishedAt := metav1.Now()
+		schemaJob.Status.StartTime = &finishedAt
+		schemaJob.Status.CompletionTime = &finishedAt
+		schemaJob.Status.Succeeded = 1
+		schemaJob.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastTransitionTime: finishedAt},
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: finishedAt},
+		}
+		Expect(k8sClient.Status().Update(ctx, &schemaJob)).To(Succeed())
+		Eventually(func() bool {
+			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: ai.Name}, &ai); err != nil {
+				return false
+			}
+			for _, c := range ai.Status.Conditions {
+				if c.Type == "PostgresSchemaSetupReady" && c.Status == metav1.ConditionTrue {
+					return true
+				}
+			}
+			return false
+		}, 3*time.Second, 100*time.Millisecond).Should(BeTrue(), "completed schema Job must wake AIService promptly")
 
 		// Nothing Ray or Weaviate was ever created.
 		var deps appsv1.DeploymentList
