@@ -20,6 +20,9 @@ through its 24 hour TTL. Runtime replica or placement changes do not rerun SQL.
 If a previously used digest or PostgreSQL configuration becomes current again
 after a different schema run, the operator removes its historical completed Job
 and creates a fresh one for that transition.
+Starting or observing a fresh Job invalidates the previous applied result.
+If the new Job later fails or its outcome is lost before observation, TTL
+cleanup cannot turn that historical success into a current one.
 
 After a terminal failure, change `schemaRetryNonce` to a new value on the
 AgentRuntime feature in the AIPlatform manifest and apply the manifest. The

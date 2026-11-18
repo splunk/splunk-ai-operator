@@ -424,6 +424,10 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 			ai.Status.SchemaImageDigest = strings.SplitN(schemaImage, "@", 2)[1]
 			return nil
 		}
+		// A Job may have been created before its attempt status was persisted.
+		// Observing it invalidates any success from an earlier run of this input.
+		ai.Status.SchemaAppliedHash = ""
+		ai.Status.SchemaImageDigest = ""
 		ai.Status.SchemaJobId = job.Name
 		if schemaJobFailed(job) {
 			ai.Status.SchemaFailedHash = inputHash
@@ -440,20 +444,22 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 			ai.Status.SchemaFailureReason = "Failed"
 			return schemaState("Failed", "schema Job failed; change schemaRetryNonce to retry")
 		}
+		ai.Status.SchemaFailedHash = ""
+		ai.Status.SchemaFailureReason = ""
 		return schemaState("Pending", "waiting for schema Job completion")
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get postgres schema setup Job: %w", err)
-	}
-	if ai.Status.SchemaAppliedHash == inputHash && (ai.Status.SchemaJobId == jobName || ai.Status.SchemaJobId == "") {
-		ai.Status.SchemaJobId = ""
-		return nil // The TTL controller may have removed the successful Job.
 	}
 	if ai.Status.SchemaFailedHash == inputHash {
 		if ai.Status.SchemaFailureReason == "TimedOut" {
 			return schemaState("TimedOut", "schema Job exceeded its deadline; change schemaRetryNonce to retry")
 		}
 		return schemaState("Failed", "schema Job failed; change schemaRetryNonce to retry")
+	}
+	if ai.Status.SchemaAppliedHash == inputHash && (ai.Status.SchemaJobId == jobName || ai.Status.SchemaJobId == "") {
+		ai.Status.SchemaJobId = ""
+		return nil // The TTL controller may have removed the successful Job.
 	}
 	if ai.Status.SchemaJobId == jobName {
 		// A Job may expire while the operator is offline. Its outcome is then
@@ -508,9 +514,20 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 			},
 		},
 	}
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, job); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// A cached NotFound can race with a retained historical Job. Re-read
+			// it before adopting this name as the current attempt.
+			return schemaState("Pending", "waiting for schema Job observation")
+		}
 		return fmt.Errorf("create postgres schema setup Job: %w", err)
 	}
+	// The new attempt is the only result eligible for reuse after Job TTL
+	// cleanup. Clear historical success before recording this attempt's name.
+	ai.Status.SchemaAppliedHash = ""
+	ai.Status.SchemaImageDigest = ""
+	ai.Status.SchemaFailedHash = ""
+	ai.Status.SchemaFailureReason = ""
 	ai.Status.SchemaJobId = job.Name
 	return schemaState("Pending", "waiting for schema Job completion")
 }

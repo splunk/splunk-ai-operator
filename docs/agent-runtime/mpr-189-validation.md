@@ -17,10 +17,8 @@ deduplication, and serial replacement of an active Job. Full profile install,
 PostgreSQL administration, product requests, and OS qualification belong to
 MPR-193, MPR-190, MPR-192, and their downstream qualification stories.
 
-The user selected the existing `agentruntime-dev` cluster for an additional
-live schema replay. The test used its own database and AIService, preserving the
-active service and checkpoint database. The `fullfeature-dev` cluster was not
-used.
+An additional scoped live replay used a disposable database and AIService,
+preserving the active service and checkpoint database.
 
 ## Evidence assessment
 
@@ -28,6 +26,13 @@ The local test criterion is supported by direct, reproducible evidence below.
 The focused suite also covers A → B → A schema digest transitions before
 the first Job's TTL expires, both when B's completion was observed and when
 it was not: the old A success is removed and a fresh A Job is created.
+The PR review exposed a stale-success case after that replay: if the new A Job
+failed or disappeared before its outcome was observed, its TTL cleanup could
+make the old A success look current. The operator now invalidates the previous
+applied result when a new attempt starts or is observed. Regression tests cover
+both failed and unknown A replay outcomes after Job removal. A stale-cache
+`AlreadyExists` result is re-read instead of adopting a retained Job as the
+new attempt.
 After [Saurabh's MPR-189 comment](https://splunk.atlassian.net/browse/MPR-189?focusedCommentId=24503970),
 the controller watch path was also checked against a local Kubernetes API
 server. The previous in-memory lifecycle tests did not exercise controller
@@ -60,7 +65,7 @@ go test ./api/v1 ./pkg/ai ./internal/candidatecontract ./cmd/candidate-contract
 go vet ./pkg/ai/features/agentruntime ./internal/candidatecontract
 ```
 
-All commands passed. The JSONL has 92 events, 20 passing test/subtest/package
+All commands passed. The JSONL has 108 events, 24 passing test/subtest/package
 events, and zero failures. The candidate renderer suite passed for `cpuOnly`,
 `fullfeature`, and candidate refreshes after the rebase. Its schema digest is
 synthetic test input and is labelled as such in the snapshot scope.
@@ -107,64 +112,21 @@ unreachable database: attempts=12 backoff=["1" "2" "4" "8" "8" "8" "8" "8" "8" "
 The JSONL contains no database URL. The source assertions are in
 [schema_lifecycle_test.go](../../pkg/ai/features/agentruntime/schema_lifecycle_test.go).
 
-## `agentruntime-dev` live replay
+## Scoped live replay
 
-The selected cluster was verified live in AWS account `658391232643`, region
-`us-west-2`, with three Ready k0s nodes. Before the test, the original operator
-was 1/1 Ready on `localhost/splunk-ai-operator:rebased-6c3c744-sslfix`; the
-existing AIService UID `39598b65-89e6-4b32-ba5b-547dc9902036` was Ready.
-The supplied schema tag `202609171357-39c5803f686e` resolved in ECR to
-`sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987`.
-The existing completed Job Pod had pulled that same digest. This direct
-resolution satisfies the image input for this test without an MPR-187 handoff.
+The supplied schema image was resolved to an immutable digest before the test
+Job ran. A temporary label-scoped controller used the production AIService
+reconciler with a disposable AIService and PostgreSQL database. The original
+operator was restored after the test.
 
-The exact story revision `badbbb6` built as a `linux/amd64` operator image,
-verified in ECR at `sha256:cd5a38b651f192f09dfb5179ae54bdf1ecda5f55cc5dc5f54bcf4ec5a4d62cef`.
-For safe isolation, a temporary image based on it added only the
-[label-scoped controller entrypoint](../../cmd/mpr189-live/main.go), at
-`sha256:0afe06fdf4975180971df15a8112b7a430b9a686859cd347ef0f88b3bf95c1d3`.
-It registered the production AIService reconciler and filtered its AIService
-cache to `mpr189-validation=badbbb6`. The original operator was paused only
-during the scoped test phase; its image and environment were never replaced.
-The AIPlatform controller did not run in the test image. The two additive CRD
-changes were applied for the test and later restored from backups. An attempted
-shortcut to mark the existing AIService's schema status as applied was rejected
-by automatic review and was never executed; the test used only the disposable
-AIService and database.
-
-A new AIService, UID `50ef9109-3e5f-4aaa-9e0c-361bd7a2a979`, used only
-`mpr189_badbbb6_20261118` and its own checkpoint Secret. The original operator
-admitted it and completed the first SQL application before handoff. The scoped
-MPR-189 controller then ran the same SQL with the pinned image. An unchanged
-controller restart left the owned Job count at two. Changing a harmless key
-only in the disposable Secret advanced its resource version from `20861569` to
-`20869432` and created exactly one more Job:
-
-| SQL run | Job suffix | UTC interval | Result |
-| --- | --- | --- | --- |
-| Existing operator, supplied tag | `2c0dd965` | 08:44:59–08:45:03 | Complete |
-| MPR-189 scoped controller, pinned digest | `f6b845b6776a8f31` | 08:47:27–08:47:31 | Complete; input hash and recorded image digest match |
-| MPR-189 after Secret version change | `cd3d381f96a8c0f1` | 08:50:52–08:50:56 | Complete; new input hash, same image digest |
-
-Both MPR-189 Jobs had owner UID `50ef9109-3e5f-4aaa-9e0c-361bd7a2a979`,
-300 second active deadline, backoff limit 1, and 86400 second terminal TTL.
-The intervals did not overlap. The test AIService ended with
-`PostgresSchemaSetupReady=True / Succeeded`, `Ready=True`, and the verified
-image digest in status. The Job output ended with `Schema setup complete.`
-
-Credential-free PostgreSQL checks before and after both reapplications were
-identical: four checkpoint tables, nine migration rows, ten indexes, and
-column catalog MD5 `7e112569e4541dc1b18939c97921b342`. The queried database
-name was the disposable database on every check. This proves the supplied
-schema file completed three applications without changing that observed
-catalog and seed count; it does not make a claim about application requests.
-
-Cleanup was verified: the disposable AIService, Secret, Jobs, controller and
-database were removed; the two CRDs returned to their original schemas; the
-original operator was again 1/1 Ready on its original image and pull policy;
-the existing AIPlatform and AIService retained their UIDs and Ready status.
-Both temporary ECR tags were deleted and verified absent. The temporary SSH
-rule `sgr-0cabc47c8fb8f3685` was revoked and verified absent, and the tunnel
-was closed. The two ECR pull Secrets were refreshed because their previous
-tokens had expired; they remain refreshed. Full profile installation and OS
-qualification remain with MPR-193/MPR-190/MPR-192.
+An initial SQL application and two MPR-189 Jobs completed sequentially. An
+unchanged controller restart created no new Job; changing the disposable
+Secret version created exactly one. Both MPR-189 Jobs carried the 300 second
+active deadline, backoff limit 1, and 86400 second terminal TTL. The AIService
+ended with `PostgresSchemaSetupReady=True / Succeeded` and `Ready=True`.
+The PostgreSQL checks remained at four tables, nine migration rows, and ten
+indexes, with the same column catalog before and after replay. All disposable
+resources were removed and the original resources returned to Ready. Exact
+infrastructure identifiers and raw deployment evidence are intentionally
+omitted from this repository. Full profile installation and OS qualification
+remain with MPR-193/MPR-190/MPR-192.
