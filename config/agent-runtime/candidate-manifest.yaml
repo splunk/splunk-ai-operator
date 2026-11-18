@@ -1,0 +1,156 @@
+recordType: launchpad-candidate-set
+manifestVersion: 1
+metadata:
+  name: mpr-188-initial
+spec:
+  revision: 5
+  updated: "2026-11-18"
+  runtimeVersion: v2.0.0
+  contractVersion: v1
+  compatibilityPair: mpr188-initial
+  qualification: pending
+  # Story-owner review excludes these metadata checks from MPR-188.
+  skippedChecks:
+    - image provenance
+    - image owners
+    - image architectures
+    - current registry digests
+  components:
+    runtimeBase:
+      role: Agent Runtime base image
+      image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5
+      digest: sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219
+      evidence: historical deployment handoff; not a current registry verification
+    launchpadCarrier:
+      role: Agent Launchpad carrier and MLTK provider image
+      image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd
+      digest: sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5
+      evidence: historical deployment handoff; not a current registry verification
+      provider: mltk
+      agentModule: agentcore_operations.loader:MLTKAgentLoader
+    schemaSetup:
+      role: Agent Runtime schema setup image
+      image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e
+      historicalTag: 202609171357-39c5803f686e
+      digest: sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987
+      evidence: full image reference supplied by story owner; digest retained from historical deployment handoff
+      source:
+        repository: https://cd.splunkdev.com/ai/ai-agent-runtime
+        commit: 5a91e68028ebfa9503963a983c967104fb6a8e92
+        dockerfile: cicd/docker/schema-setup/Dockerfile
+        schema: agent-runtime/db/schema.sql
+        evidence: source commit supplied by story owner; Dockerfile and SQL inspected at that commit
+    slim:
+      role: SLIM API image
+      image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:es-runtime-sync-create-ready-21d4bf15f-20261116-amd64
+      evidence: candidate reference and AI_TIER_AGENT_RUNTIME_URL support confirmed by story owner
+      requiredEnvironment:
+        - name: PLATFORM_URL
+          fullfeature: ray-service-origin
+          cpuOnly: ""
+        - name: AI_TIER_AGENT_RUNTIME_URL
+          value: agentruntime-service-origin
+    aitk:
+      role: AITK application dependency; not a container image
+      delivery: Splunk app installed on Splunk
+      appId: Splunk_ML_Toolkit
+      appLabel: AI Toolkit
+      appVersion: 6.2.0
+      build: generated-at-package-time
+      buildPolicy: gulpfile.js replaces @build@ with new Date().valueOf(); githash records the source commit
+      source:
+        repository: https://cd.splunkdev.com/ML/mltk/mltk
+        branch: pmitra/aitk_app_runtime
+        commit: 82ee65f54f210887740c3d594cc5609de92d39f2
+      endpointContract:
+        settingsPath: /services/mltk/ai_tier_settings
+        basePath: /tenant/slim-api/v1alpha1
+        agentPath: /agent/agent_runtime
+        configuration: Connections > AI Tier saves the shared endpoint; GET/POST/DELETE settings handler
+        authentication: Splunk authentication and config capabilities; Bearer interactive token from AITK to SLIM
+  contract:
+    runtimeAPI:
+      prefix: /system/ai-agent-runtime/v1
+      httpPort: 8080
+      metricsPort: 9090
+    slimAPI:
+      basePath: /tenant/slim-api/v1alpha1
+      agentPath: /agent/agent_runtime
+      httpPort: 8080
+      metricsPort: 8088
+    loaderSelection:
+      environmentVariable: AGENT_MODULE
+      value: agentcore_operations.loader:MLTKAgentLoader
+      evidence: story owner confirms this is the only required loader selection variable
+    schemaEntryPoint:
+      baseImage: postgres:16-alpine
+      sqlPath: /schema.sql
+      startup: wait for PostgreSQL with pg_isready, then apply SQL with psql
+      operatorCommand: sh -c
+      operatorSqlArguments:
+        - -v
+        - ON_ERROR_STOP=1
+        - -f
+        - /schema.sql
+      idempotent: true
+      evidence: schema setup Dockerfile and SQL at ai/ai-agent-runtime commit 5a91e680
+    readinessAndHealth:
+      appliesTo:
+        - Agent Runtime
+        - SLIM
+      method: GET
+      path: /health
+      probes:
+        - startup
+        - liveness
+        - readiness
+      evidence: story-owner decision; existing operator probes already use this endpoint
+      postgresConnectivity:
+        startup: retain schema setup and runtime initialization checks
+        periodic: not required
+    tlsAndAuthentication:
+      slimToRuntime: no application JWT or Authorization header required; internal ClusterIP route
+      postgresAuthentication: password supplied through checkpoint DB Secret
+      postgresTLS: provided Secret fields connect directly; no additional TLS mode or certificate configuration required
+    secretKeys:
+      referenceField: checkpointDbSecretRef
+      name: mltk-postgres-conn
+      type: Opaque
+      namespace: same namespace as the AIService and schema setup Job
+      delivery: envFrom to Runtime and schema setup Job
+      required:
+        - DATABASE_URL
+        - PG_HOST
+        - PG_PORT
+        - PG_USER
+        - PG_PASSWORD
+        - PG_DBNAME
+      exampleManifest: config/samples/ai_v1_aiplatform_agentruntime.yaml
+      evidence: story-owner supplied Secret; existing sample matches the confirmed contract
+  history:
+    - revision: 1
+      date: "2026-11-16"
+      change: Corrected inventory to four container images plus the AITK Splunk app; recorded the SLIM candidate tag and known provider contract.
+      source: MPR-188 story-owner clarification and 2026-11-11 historical deployment handoff
+    - revision: 2
+      date: "2026-11-16"
+      change: Confirmed shared GET /health probes and SLIM runtime URL support; periodic PostgreSQL checks are not required; skipped image provenance, owners, architectures, and current registry digest checks.
+      source: MPR-188 story-owner review
+    - revision: 3
+      date: "2026-11-16"
+      change: Recorded schema source commit and SQL entry point; confirmed AGENT_MODULE for loader selection and the checkpoint Secret contract.
+      source: MPR-188 story-owner review and schema source at commit 5a91e680
+    - revision: 4
+      date: "2026-11-16"
+      change: Completed the schema setup image reference supplied by the story owner; all four candidate image references are recorded.
+      source: MPR-188 story-owner clarification
+    - revision: 5
+      date: "2026-11-18"
+      change: Confirmed Runtime prefix and direct PostgreSQL Secret contract; completed AITK identity, package build policy, and endpoint contract; selected the updated SLIM image.
+      source: MPR-188 story-owner clarification and ML/mltk/mltk branch pmitra/aitk_app_runtime
+      previousImages:
+        slim: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:es-agent-runtime-mixed-mode-20261112-v2-amd64
+      validation:
+        scope: local contract and operator rendering
+        result: passed
+        report: docs/agent-runtime/mpr-188-validation.md

@@ -826,6 +826,16 @@ func ServiceURL(aiServiceName, namespace, clusterDomain string) string {
 	return fmt.Sprintf("http://%s.%s.svc.%s:%d", agentRuntimeServiceName(aiServiceName), namespace, clusterDomain, defaultAgentRuntimeHTTPPort)
 }
 
+// FeatureServiceURL resolves a provider feature before the generated AIService
+// exists, using the same DNS length bound as the AIPlatform's feature name.
+func FeatureServiceURL(platformName, provider, namespace, clusterDomain string) string {
+	name := platformName + "-agentruntime"
+	if provider != "" {
+		name += "-" + provider
+	}
+	return ServiceURL(boundedDNSLabel(name), namespace, clusterDomain)
+}
+
 func agentRuntimeServiceName(aiServiceName string) string {
 	return dnsLabelName(aiServiceName, "svc")
 }
@@ -1002,7 +1012,7 @@ func resolveAgentModule(provider string) (string, error) {
 		return "", fmt.Errorf("%s must be set for provider %q", envName, provider)
 	}
 	if !agentModulePattern.MatchString(module) {
-		return "", fmt.Errorf("%s has invalid value %q; expected package.module:ClassName", envName, module)
+		return "", fmt.Errorf("%s has invalid value; expected package.module:ClassName", envName)
 	}
 	return module, nil
 }

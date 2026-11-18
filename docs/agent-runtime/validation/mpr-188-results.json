@@ -1,0 +1,208 @@
+{
+  "story": "MPR-188",
+  "date": "2026-11-18",
+  "featureBaseline": "80ef4f3b1215a8f35517a64148d9c05a8b25bc22",
+  "cases": [
+    {
+      "case": "initial-cpuOnly",
+      "result": "passed",
+      "revision": 5,
+      "profile": "cpuOnly",
+      "qualification": "pending",
+      "matrixPairStatus": "pending",
+      "scope": "offline operator render; schema Job completion simulated; no cluster, registry, database, or product calls",
+      "runtimePrefix": "/system/ai-agent-runtime/v1",
+      "images": {
+        "runtimeBase": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5",
+        "launchpadCarrier": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd",
+        "schemaSetup": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e",
+        "slim": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:es-runtime-sync-create-ready-21d4bf15f-20261116-amd64"
+      },
+      "slimEnvironment": {
+        "PLATFORM_URL": "",
+        "AI_TIER_AGENT_RUNTIME_URL": "http://candidate-agentruntime-mltk-svc.candidate-validation.svc.cluster.local:8080"
+      },
+      "probePaths": {
+        "startupProbe": "/health",
+        "livenessProbe": "/health",
+        "readinessProbe": "/health"
+      },
+      "checkpointSecretRef": "mltk-postgres-conn",
+      "aitk": {
+        "appId": "Splunk_ML_Toolkit",
+        "appVersion": "6.2.0",
+        "build": "generated-at-package-time",
+        "endpointContract": {
+          "agentPath": "/agent/agent_runtime",
+          "basePath": "/tenant/slim-api/v1alpha1",
+          "settingsPath": "/services/mltk/ai_tier_settings"
+        },
+        "source": {
+          "branch": "pmitra/aitk_app_runtime",
+          "commit": "82ee65f54f210887740c3d594cc5609de92d39f2",
+          "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
+        }
+      },
+      "resourceCount": 5
+    },
+    {
+      "case": "initial-fullfeature",
+      "result": "passed",
+      "revision": 5,
+      "profile": "fullfeature",
+      "qualification": "pending",
+      "matrixPairStatus": "pending",
+      "scope": "offline operator render; schema Job completion simulated; no cluster, registry, database, or product calls",
+      "runtimePrefix": "/system/ai-agent-runtime/v1",
+      "images": {
+        "runtimeBase": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5",
+        "launchpadCarrier": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd",
+        "schemaSetup": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e",
+        "slim": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:es-runtime-sync-create-ready-21d4bf15f-20261116-amd64"
+      },
+      "slimEnvironment": {
+        "PLATFORM_URL": "http://candidate-ray-head.candidate-validation.svc.cluster.local:8000",
+        "AI_TIER_AGENT_RUNTIME_URL": "http://candidate-agentruntime-mltk-svc.candidate-validation.svc.cluster.local:8080"
+      },
+      "probePaths": {
+        "startupProbe": "/health",
+        "livenessProbe": "/health",
+        "readinessProbe": "/health"
+      },
+      "checkpointSecretRef": "mltk-postgres-conn",
+      "aitk": {
+        "appId": "Splunk_ML_Toolkit",
+        "appVersion": "6.2.0",
+        "build": "generated-at-package-time",
+        "endpointContract": {
+          "agentPath": "/agent/agent_runtime",
+          "basePath": "/tenant/slim-api/v1alpha1",
+          "settingsPath": "/services/mltk/ai_tier_settings"
+        },
+        "source": {
+          "branch": "pmitra/aitk_app_runtime",
+          "commit": "82ee65f54f210887740c3d594cc5609de92d39f2",
+          "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
+        }
+      },
+      "resourceCount": 5
+    },
+    {
+      "case": "refresh-cpuOnly",
+      "result": "passed",
+      "revision": 6,
+      "profile": "cpuOnly",
+      "qualification": "pending",
+      "matrixPairStatus": "pending",
+      "scope": "offline operator render; schema Job completion simulated; no cluster, registry, database, or product calls",
+      "runtimePrefix": "/system/ai-agent-runtime/v1",
+      "images": {
+        "runtimeBase": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5",
+        "launchpadCarrier": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd",
+        "schemaSetup": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e",
+        "slim": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:mpr188-synthetic-refresh-20261118"
+      },
+      "slimEnvironment": {
+        "PLATFORM_URL": "",
+        "AI_TIER_AGENT_RUNTIME_URL": "http://candidate-agentruntime-mltk-svc.candidate-validation.svc.cluster.local:8080"
+      },
+      "probePaths": {
+        "startupProbe": "/health",
+        "livenessProbe": "/health",
+        "readinessProbe": "/health"
+      },
+      "checkpointSecretRef": "mltk-postgres-conn",
+      "aitk": {
+        "appId": "Splunk_ML_Toolkit",
+        "appVersion": "6.2.0",
+        "build": "generated-at-package-time",
+        "endpointContract": {
+          "agentPath": "/agent/agent_runtime",
+          "basePath": "/tenant/slim-api/v1alpha1",
+          "settingsPath": "/services/mltk/ai_tier_settings"
+        },
+        "source": {
+          "branch": "pmitra/aitk_app_runtime",
+          "commit": "82ee65f54f210887740c3d594cc5609de92d39f2",
+          "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
+        }
+      },
+      "resourceCount": 5
+    },
+    {
+      "case": "refresh-fullfeature",
+      "result": "passed",
+      "revision": 6,
+      "profile": "fullfeature",
+      "qualification": "pending",
+      "matrixPairStatus": "pending",
+      "scope": "offline operator render; schema Job completion simulated; no cluster, registry, database, or product calls",
+      "runtimePrefix": "/system/ai-agent-runtime/v1",
+      "images": {
+        "runtimeBase": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5",
+        "launchpadCarrier": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd",
+        "schemaSetup": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e",
+        "slim": "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:mpr188-synthetic-refresh-20261118"
+      },
+      "slimEnvironment": {
+        "PLATFORM_URL": "http://candidate-ray-head.candidate-validation.svc.cluster.local:8000",
+        "AI_TIER_AGENT_RUNTIME_URL": "http://candidate-agentruntime-mltk-svc.candidate-validation.svc.cluster.local:8080"
+      },
+      "probePaths": {
+        "startupProbe": "/health",
+        "livenessProbe": "/health",
+        "readinessProbe": "/health"
+      },
+      "checkpointSecretRef": "mltk-postgres-conn",
+      "aitk": {
+        "appId": "Splunk_ML_Toolkit",
+        "appVersion": "6.2.0",
+        "build": "generated-at-package-time",
+        "endpointContract": {
+          "agentPath": "/agent/agent_runtime",
+          "basePath": "/tenant/slim-api/v1alpha1",
+          "settingsPath": "/services/mltk/ai_tier_settings"
+        },
+        "source": {
+          "branch": "pmitra/aitk_app_runtime",
+          "commit": "82ee65f54f210887740c3d594cc5609de92d39f2",
+          "repository": "https://cd.splunkdev.com/ML/mltk/mltk"
+        }
+      },
+      "resourceCount": 5
+    }
+  ],
+  "goVet": "passed",
+  "productQualification": "pending; not exercised by local contract/render validation",
+  "goTests": {
+    "packages": [
+      {
+        "package": "github.com/splunk/splunk-ai-operator/cmd/candidate-contract",
+        "result": "skip",
+        "elapsedSeconds": 0
+      },
+      {
+        "package": "github.com/splunk/splunk-ai-operator/pkg/ai/features/slim",
+        "result": "pass",
+        "elapsedSeconds": 1.065
+      },
+      {
+        "package": "github.com/splunk/splunk-ai-operator/internal/candidatecontract",
+        "result": "pass",
+        "elapsedSeconds": 1.203
+      },
+      {
+        "package": "github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime",
+        "result": "pass",
+        "elapsedSeconds": 3.831
+      },
+      {
+        "package": "github.com/splunk/splunk-ai-operator/pkg/ai",
+        "result": "pass",
+        "elapsedSeconds": 0.893
+      }
+    ],
+    "passedTestCases": 121,
+    "failedTestCases": 0
+  }
+}

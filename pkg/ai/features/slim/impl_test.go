@@ -159,6 +159,76 @@ func Test_reconcileSlimConfigMap_MainCompatibleEndpointMode(t *testing.T) {
 		"Slim must consume the same short native-HTTPS endpoint as SAIA")
 }
 
+func Test_reconcileSlimDeployment_InjectsPlatformAndAgentRuntimeURLs(t *testing.T) {
+	scheme := buildTestScheme(t)
+	platform := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+		Spec: aiv1.AIPlatformSpec{
+			Profile:  aiv1.AIPlatformProfileFullFeature,
+			Features: []aiv1.FeatureSpec{{Name: "agentruntime", Provider: "mltk"}},
+		},
+	}
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-platform-slim", Namespace: "default"},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef: corev1.ObjectReference{Name: platform.Name, Namespace: platform.Namespace},
+			AIPlatformUrl: "http://ray-head.default.svc.cluster.local:8000/ai-platform-models/v1/",
+			Replicas:      1,
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(platform, ai).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	t.Setenv("RELATED_IMAGE_SLIM_API", "example.invalid/slim:candidate")
+
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: ai.Name + "-slim-deployment", Namespace: ai.Namespace,
+	}, deployment))
+	env := map[string]string{}
+	for _, variable := range deployment.Spec.Template.Spec.Containers[0].Env {
+		env[variable.Name] = variable.Value
+	}
+	assert.Equal(t, "http://ray-head.default.svc.cluster.local:8000", env["PLATFORM_URL"])
+	assert.Equal(t, "http://test-platform-agentruntime-mltk-svc.default.svc.cluster.local:8080", env["AI_TIER_AGENT_RUNTIME_URL"])
+}
+
+func Test_validateAIService_CPUOnlyAllowsBlankPlatformURL(t *testing.T) {
+	scheme := buildTestScheme(t)
+	platform := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "cpu-platform", Namespace: "default"},
+		Spec: aiv1.AIPlatformSpec{
+			Profile:  aiv1.AIPlatformProfileCPUOnly,
+			Features: []aiv1.FeatureSpec{{Name: "agentruntime", Provider: "mltk"}},
+		},
+	}
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "cpu-platform-slim", Namespace: "default"},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef:   corev1.ObjectReference{Name: platform.Name, Namespace: platform.Namespace},
+			AgentRuntimeUrl: "http://cpu-platform-agentruntime-mltk-svc.default.svc.cluster.local:8080",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(platform, ai).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	t.Setenv("RELATED_IMAGE_SLIM_API", "example.invalid/slim:candidate")
+
+	require.NoError(t, r.validateAIService(context.Background(), ai))
+	assert.Empty(t, ai.Spec.AIPlatformUrl)
+	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: ai.Name + "-slim-deployment", Namespace: ai.Namespace,
+	}, deployment))
+	env := map[string]string{}
+	for _, variable := range deployment.Spec.Template.Spec.Containers[0].Env {
+		env[variable.Name] = variable.Value
+	}
+	assert.Contains(t, env, "PLATFORM_URL")
+	assert.Empty(t, env["PLATFORM_URL"])
+	assert.Equal(t, "http://cpu-platform-agentruntime-mltk-svc.default.svc.cluster.local:8080", env["AI_TIER_AGENT_RUNTIME_URL"])
+}
+
 // sanitize turns a free-form subtest name into a valid k8s resource name.
 func sanitize(s string) string {
 	s = strings.ToLower(s)

@@ -33,12 +33,22 @@ spec:
 
   # Populate with one record for each supported base image. Do not mark a base
   # current or n-1 until its required pair coverage has passed.
-  bases: []
+  bases:
+    - id: mpr188-runtime-initial
+      version: v2.0.0
+      image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5
+      contractVersion: v1
+      status: pending
 
   # Populate with one record for each product-owned carrier image. A carrier
   # record is not certified by itself; certification belongs to a base/carrier
   # pair below.
-  carriers: []
+  carriers:
+    - id: mpr188-mltk-initial
+      provider: mltk
+      image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd
+      loader: agentcore_operations.loader:MLTKAgentLoader
+      status: pending
 
   # Populate with one record for every tested base/carrier combination.
   #
@@ -53,4 +63,14 @@ spec:
   #     harnessVersion: ar-carrier-dev/0.1.0-g<short-sha>
   #     testedAt: "2026-01-01T00:00:00Z"
   #     reportRef: null
-  pairs: []
+  pairs:
+    - id: mpr188-initial
+      baseRef: mpr188-runtime-initial
+      carrierRef: mpr188-mltk-initial
+      contractVersion: v1
+      status: pending
+      validation:
+        scope: local contract and operator rendering only
+        candidateManifestRevision: 5
+        reportRef: docs/agent-runtime/mpr-188-validation.md
+        productQualification: not run

@@ -95,15 +95,15 @@ func deploymentEnv(t *testing.T, r *SlimReconciler, ai *aiv1.AIService) map[stri
 	return env
 }
 
-func TestSlimDeploymentEnv_CPUOnlyHasAgentRuntimeURLAndNoPlatformURL(t *testing.T) {
+func TestSlimDeploymentEnv_CPUOnlyHasAgentRuntimeURLAndBlankPlatformURL(t *testing.T) {
 	r, _ := slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
 	ai := slimService(testAgentRuntimeURL + "/")
 	require.NoError(t, r.validateAIService(context.Background(), ai))
 
 	env := deploymentEnv(t, r, ai)
 	assert.Equal(t, testAgentRuntimeURL, env["AI_TIER_AGENT_RUNTIME_URL"], "a trailing slash is trimmed")
-	_, hasPlatform := env["PLATFORM_URL"]
-	assert.False(t, hasPlatform, "cpuOnly SLIM has no PLATFORM_URL")
+	assert.Contains(t, env, "PLATFORM_URL")
+	assert.Empty(t, env["PLATFORM_URL"], "cpuOnly SLIM receives a blank PLATFORM_URL")
 }
 
 func TestSlimDeploymentEnv_FullfeatureIsUnchanged(t *testing.T) {
@@ -113,6 +113,6 @@ func TestSlimDeploymentEnv_FullfeatureIsUnchanged(t *testing.T) {
 
 	env := deploymentEnv(t, r, ai)
 	assert.Equal(t, "http://ray-svc.default.svc.cluster.local:8000", env["PLATFORM_URL"])
-	_, hasRuntime := env["AI_TIER_AGENT_RUNTIME_URL"]
-	assert.False(t, hasRuntime, "fullfeature SLIM does not get the AgentRuntime URL")
+	assert.Contains(t, env, "AI_TIER_AGENT_RUNTIME_URL")
+	assert.Empty(t, env["AI_TIER_AGENT_RUNTIME_URL"], "a model-only platform has no runtime feature")
 }
