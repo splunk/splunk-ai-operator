@@ -2,6 +2,12 @@
 
 Status: initial policy for AIP-4648
 
+MPR-188 adds a pending development base/carrier pair and an offline contract/render
+checker. Its [local acceptance record](mpr-188-validation.md) covers candidate
+configuration and refresh behavior. Image metadata verification was excluded
+from that story; the pending records do not satisfy the certification policy
+below and do not select a current or N-1 supported track.
+
 This document defines how the AI-Tier platform records compatibility between
 the shared Agent Runtime base image and product-owned provider carrier images.
 It is documentation and data only for the initial AIP-4648 scope. It does not

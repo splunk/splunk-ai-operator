@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
 	common "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/splunk/splunk-ai-operator/pkg/splunkutils"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -109,9 +110,8 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		return fmt.Errorf("either AIPlatformRef.Name or AIPlatformUrl must be set")
 	}
 
-	// cpuOnly has no Ray platform: SLIM routes to the AgentRuntime Service instead
-	// (AI_TIER_AGENT_RUNTIME_URL, set by the AIPlatform controller) and has no
-	// PLATFORM_URL, so it must not wait for Ray or require a platform URL.
+	// cpuOnly does not depend on Ray readiness or require a platform URL.
+	// Preserve an explicitly supplied URL regardless of the profile.
 	cpuOnly := false
 	if ai.Spec.AIPlatformRef.Name != "" {
 		aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
@@ -120,7 +120,6 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 			return fmt.Errorf("fetching AIPlatform: %w", err)
 		}
 		cpuOnly = aiPlatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly
-
 		if !cpuOnly {
 			if err := r.validateAIPlatformReady(ctx, aiPlatform); err != nil {
 				return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)
@@ -180,6 +179,37 @@ func (r *SlimReconciler) getAIPlatform(ctx context.Context, ref corev1.ObjectRef
 		return nil, err
 	}
 	return &aiPlatform, nil
+}
+
+// agentRuntimeURL also resolves the runtime for fullfeature: the platform
+// controller populates AgentRuntimeUrl for cpuOnly, while both profiles need
+// the runtime endpoint when the agentruntime feature is present.
+func (r *SlimReconciler) agentRuntimeURL(ctx context.Context, ai *aiv1.AIService) (string, error) {
+	if ai.Spec.AgentRuntimeUrl != "" {
+		return strings.TrimRight(ai.Spec.AgentRuntimeUrl, "/"), nil
+	}
+	if ai.Spec.AIPlatformRef.Name == "" {
+		return "", nil // Standalone model-only SLIM has no runtime dependency.
+	}
+	platform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	if err != nil {
+		return "", fmt.Errorf("resolving AI_TIER_AGENT_RUNTIME_URL: %w", err)
+	}
+	var runtimeFeature *aiv1.FeatureSpec
+	for i := range platform.Spec.Features {
+		feature := &platform.Spec.Features[i]
+		if feature.Name != "agentruntime" {
+			continue
+		}
+		if runtimeFeature != nil {
+			return "", fmt.Errorf("spec.features: multiple agentruntime features cannot resolve AI_TIER_AGENT_RUNTIME_URL")
+		}
+		runtimeFeature = feature
+	}
+	if runtimeFeature == nil {
+		return "", nil
+	}
+	return agentruntime.FeatureServiceURL(platform.Name, runtimeFeature.Provider, platform.Namespace, platform.Spec.ClusterDomain), nil
 }
 
 func (r *SlimReconciler) validateAIPlatformReady(ctx context.Context, aiPlatform *aiv1.AIPlatform) error {
@@ -496,16 +526,13 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	// not serve model traffic, so the suffix must NOT be present here.
 	platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
 	platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
-
-	// PLATFORM_URL is the Ray serve root: present whenever there is a platform URL
-	// (every profile except cpuOnly). AI_TIER_AGENT_RUNTIME_URL is the AgentRuntime
-	// Service, present when the controller set it (cpuOnly).
-	env := []corev1.EnvVar{}
-	if platformURL != "" {
-		env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
+	agentRuntimeURL, err := r.agentRuntimeURL(ctx, ai)
+	if err != nil {
+		return err
 	}
-	if ai.Spec.AgentRuntimeUrl != "" {
-		env = append(env, corev1.EnvVar{Name: "AI_TIER_AGENT_RUNTIME_URL", Value: strings.TrimRight(ai.Spec.AgentRuntimeUrl, "/")})
+	env := []corev1.EnvVar{
+		{Name: "PLATFORM_URL", Value: platformURL},
+		{Name: "AI_TIER_AGENT_RUNTIME_URL", Value: agentRuntimeURL},
 	}
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {

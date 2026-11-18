@@ -468,6 +468,7 @@ func TestResolveAgentModuleRejectsMalformedMapping(t *testing.T) {
 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "expected package.module:ClassName")
+			assert.NotContains(t, err.Error(), module, "invalid input is not echoed in diagnostics")
 		})
 	}
 }
