@@ -18,7 +18,7 @@ func profileTestEnv(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_LAUNCHPAD", "docker.io/splunk/agent-runtime-provider-launchpad:test")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_LAUNCHPAD", "launchpad.loader:LaunchpadLoader")
-	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
+	t.Setenv(schemaSetupImageEnv, testSchemaImage)
 }
 
 func profileAIService() *aiv1.AIService {
@@ -101,29 +101,20 @@ func TestServiceURL_MatchesTheServiceTheHandlerCreates(t *testing.T) {
 	assert.Contains(t, ServiceURL(long, "ns", "cluster.local"), agentRuntimeServiceName(long))
 }
 
-// The env list feeds the deployment hash, and the hash decides whether the
-// Postgres schema Job is re-run. For every existing (fullfeature) service the
-// list, its order and therefore the hash must be exactly what they were before
-// profiles existed, or an operator upgrade would re-run every schema Job.
-func TestRuntimeEnvFingerprint_FullfeatureOrderAndHashAreUnchanged(t *testing.T) {
+func TestRuntimeEnvFullfeatureOrderIsUnchanged(t *testing.T) {
 	ai := profileAIService()
 	ai.Spec.AIPlatformUrl = "http://ray-svc.default.svc.cluster.local:8000"
 	ai.Spec.VectorDbUrl = "weaviate.default.svc.cluster.local"
 	module := "launchpad.loader:LaunchpadLoader"
 
-	// The list as it was built before this change, written out literally. The
-	// fingerprint redacts sensitive names, hence the redacted Secret reference.
 	before := []corev1.EnvVar{
 		{Name: "AGENT_MODULE", Value: module},
-		{Name: "CHECKPOINT_DB_SECRET_REF", Value: "<redacted>"},
+		{Name: "CHECKPOINT_DB_SECRET_REF", Value: "pg"},
 		{Name: "PLATFORM_URL", Value: "http://ray-svc.default.svc.cluster.local:8000"},
 		{Name: "PYTHONPATH", Value: sharedPackagesPath},
 		{Name: "TLS_DISABLED", Value: "true"},
 		{Name: "VECTOR_DB_URL", Value: "weaviate.default.svc.cluster.local"},
 	}
-	got := buildRuntimeEnvFingerprint(ai, module)
+	got := buildAgentRuntimeEnv(ai, module)
 	assert.Equal(t, before, got, "fullfeature env list and order must not change")
-	assert.Equal(t, stableHash(before), stableHash(got))
-	// Computed with the code from the base branch (before MPR-229) for this fixture.
-	assert.Equal(t, "d453b32b74c7390b", stableHash(got), "the hash existing services already carry")
 }

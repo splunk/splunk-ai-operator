@@ -230,6 +230,11 @@ type FeatureSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
+	// SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
+	// Reusing the same value never retries the migration.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxLength=128
+	SchemaRetryNonce string `json:"schemaRetryNonce,omitempty"`
 	// Env specifies additional environment variables for feature pods.
 	// For agentruntime, these are passed to the shared agent-runtime container,
 	// allowing image-specific settings to change without rebuilding the operator.

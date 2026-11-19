@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -40,7 +41,13 @@ func TestInitialCandidateBothProfiles(t *testing.T) {
 			require.Equal(t, m.Spec.Revision, snapshot.Revision)
 			require.Equal(t, "pending", snapshot.Qualification)
 			require.Equal(t, "pending", snapshot.MatrixPairStatus)
+			require.Contains(t, snapshot.Scope, "synthetic schema image digest")
 			require.Len(t, snapshot.Resources, 5)
+			for _, resource := range snapshot.Resources {
+				if job, ok := resource.Object.(*batchv1.Job); ok {
+					require.Equal(t, syntheticSchemaImageForRender(m.Spec.Components["schemaSetup"].Image), job.Spec.Template.Spec.Containers[0].Image)
+				}
+			}
 			data, err := yaml.Marshal(snapshot)
 			require.NoError(t, err)
 			require.NotContains(t, string(data), "offline-placeholder")

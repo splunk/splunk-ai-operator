@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -34,23 +35,38 @@ import (
 )
 
 const (
-	defaultMinReplicas                int32 = 1
-	defaultMaxReplicas                int32 = 4
-	defaultTargetCPUUtilization       int32 = 60
-	defaultAgentRuntimeHTTPPort       int32 = 8080
-	defaultAgentRuntimeMetrics        int32 = 9090
-	maxDNSLabelLength                       = 63
-	mtlsTerminationOperator                 = "operator"
-	sharedPackagesPath                      = "/shared-packages"
-	schemaSetupImageEnv                     = "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP"
-	schemaJobDeploymentHashAnnotation       = "ai.splunk.com/agentruntime-deployment-hash"
-	schemaJobInputHashAnnotation            = "ai.splunk.com/agentruntime-schema-input-hash"
-	schemaJobManagedAnnotation              = "ai.splunk.com/agentruntime-schema-job"
-	schemaJobManagedValue                   = "true"
-	schemaJobBackoffLimit             int32 = 1
+	defaultMinReplicas           int32 = 1
+	defaultMaxReplicas           int32 = 4
+	defaultTargetCPUUtilization  int32 = 60
+	defaultAgentRuntimeHTTPPort  int32 = 8080
+	defaultAgentRuntimeMetrics   int32 = 9090
+	maxDNSLabelLength                  = 63
+	mtlsTerminationOperator            = "operator"
+	sharedPackagesPath                 = "/shared-packages"
+	schemaSetupImageEnv                = "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP"
+	schemaJobInputHashAnnotation       = "ai.splunk.com/agentruntime-schema-input-hash"
+	schemaJobManagedAnnotation         = "ai.splunk.com/agentruntime-schema-job"
+	schemaJobManagedValue              = "true"
+	schemaJobBackoffLimit        int32 = 1
+	schemaJobDeadlineSeconds     int64 = 300
+	schemaJobTTLSeconds          int32 = 86400
 )
 
 const schemaSetupCommand = `set -eu
+export PGCONNECT_TIMEOUT=5
+wait_for_postgres() {
+  attempt=0
+  delay=1
+  until pg_isready -t 2 "$@" >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 12 ]; then
+      echo 'postgres unavailable after bounded wait' >&2
+      return 1
+    fi
+    sleep "$delay"
+    if [ "$delay" -lt 8 ]; then delay=$((delay * 2)); fi
+  done
+}
 # libpq rejects an exported but empty PGSSLMODE with "no attempt". Leave it
 # unset unless one of the supported settings actually supplies a value.
 if [ -n "${PGSSLMODE:-}" ]; then
@@ -62,16 +78,10 @@ else
 fi
 
 if [ -n "${PG_HOST:-}" ] && [ -n "${PG_USER:-}" ] && [ -n "${PG_DBNAME:-}" ] && [ -n "${PG_PASSWORD:-}" ]; then
-  until pg_isready -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DBNAME"; do
-    echo 'waiting for postgres...'
-    sleep 2
-  done
+  wait_for_postgres -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DBNAME"
   PGPASSWORD="$PG_PASSWORD" psql -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DBNAME" -v ON_ERROR_STOP=1 -f /schema.sql
 elif [ -n "${DATABASE_URL:-}" ]; then
-  until pg_isready -d "$DATABASE_URL"; do
-    echo 'waiting for postgres...'
-    sleep 2
-  done
+  wait_for_postgres -d "$DATABASE_URL"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /schema.sql
 else
   echo 'schema setup requires either PG_HOST/PG_USER/PG_DBNAME/PG_PASSWORD or DATABASE_URL' >&2
@@ -95,6 +105,25 @@ type AgentRuntimeReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+}
+
+type schemaStageError struct{ reason, message string }
+
+func (e *schemaStageError) Error() string { return e.message }
+
+func schemaState(reason, message string) error { return &schemaStageError{reason, message} }
+
+func ensureAgentRuntimeSchemaStatus(ai *aiv1.AIService) *aiv1.AgentRuntimeSchemaStatus {
+	if ai.Status.FeatureStatus == nil {
+		ai.Status.FeatureStatus = &aiv1.AIServiceFeatureStatus{}
+	}
+	if ai.Status.FeatureStatus.AgentRuntime == nil {
+		ai.Status.FeatureStatus.AgentRuntime = &aiv1.AgentRuntimeStatus{}
+	}
+	if ai.Status.FeatureStatus.AgentRuntime.Schema == nil {
+		ai.Status.FeatureStatus.AgentRuntime.Schema = &aiv1.AgentRuntimeSchemaStatus{}
+	}
+	return ai.Status.FeatureStatus.AgentRuntime.Schema
 }
 
 func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
@@ -136,6 +165,14 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 			cond.Status = metav1.ConditionFalse
 			cond.Reason = "Error"
 			cond.Message = err.Error()
+			var schemaErr *schemaStageError
+			if errors.As(err, &schemaErr) {
+				cond.Reason = schemaErr.reason
+				cond.Message = schemaErr.message
+			}
+		} else if stage.name == "PostgresSchemaSetup" {
+			cond.Reason = "Succeeded"
+			cond.Message = "schema setup completed for the current inputs"
 		}
 		conditions = append(conditions, cond)
 		if err != nil {
@@ -387,10 +424,6 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 }
 
 func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Context, ai *aiv1.AIService) error {
-	config, err := resolveAgentRuntimeConfig(ai)
-	if err != nil {
-		return err
-	}
 	schemaImage, err := resolveSchemaSetupImage()
 	if err != nil {
 		return err
@@ -406,39 +439,107 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 	if err := validateSchemaSetupCredentials(checkpointSecret, ai.Spec.Feature.Env); err != nil {
 		return err
 	}
+	state := ensureAgentRuntimeSchemaStatus(ai)
 
-	deploymentHash := agentRuntimeDeploymentHash(ai, config)
 	inputHash := agentRuntimeSchemaInputHash(ai, schemaImage, checkpointSecret)
-	job := &batchv1.Job{}
-	if ai.Status.SchemaJobId != "" {
-		err := r.Get(ctx, types.NamespacedName{Name: ai.Status.SchemaJobId, Namespace: ai.Namespace}, job)
-		if err == nil {
-			if !metav1.IsControlledBy(job, ai) {
-				return fmt.Errorf("postgres schema setup Job %q is not owned by AIService %q", job.Name, ai.Name)
-			}
-			if !schemaJobNeedsRerun(job, deploymentHash, inputHash) {
-				if schemaJobSucceeded(job) {
-					return nil
-				}
-				if schemaJobFailed(job) {
-					return fmt.Errorf("postgres schema setup Job %q failed", job.Name)
-				}
-				return fmt.Errorf("postgres schema setup Job %q is still running", job.Name)
-			}
-		} else if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("get postgres schema setup Job %q: %w", ai.Status.SchemaJobId, err)
+	jobName := dnsLabelName(ai.Name, "schema-"+inputHash)
+	// An old Job must be fully removed, including its Pod, before a changed
+	// input or explicit retry can start applying SQL to this service's database.
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(ai.Namespace)); err != nil {
+		return fmt.Errorf("list postgres schema setup Jobs: %w", err)
+	}
+	for i := range jobs.Items {
+		old := &jobs.Items[i]
+		if !metav1.IsControlledBy(old, ai) || old.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
+			continue
 		}
-		ai.Status.SchemaJobId = ""
+		if old.Name != jobName && (old.Status.Active > 0 || (!schemaJobSucceeded(old) && !schemaJobFailed(old))) {
+			if old.DeletionTimestamp == nil {
+				if err := r.Delete(ctx, old, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("stop superseded schema Job: %w", err)
+				}
+			}
+			return schemaState("Superseded", "waiting for the previous schema Job to stop")
+		}
+	}
+	job := &batchv1.Job{}
+	err = r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ai.Namespace}, job)
+	if err == nil {
+		if !metav1.IsControlledBy(job, ai) || job.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
+			return schemaState("Failed", "schema Job name is occupied by an unmanaged resource")
+		}
+		if schemaJobSucceeded(job) {
+			// A previously successful input can become desired again after a
+			// different schema has run. Its retained Job is historical evidence,
+			// not proof that the current transition has applied SQL. Remove it
+			// before creating a fresh Job with the same input-derived name.
+			if state.JobName != job.Name {
+				if job.DeletionTimestamp == nil {
+					if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
+						return fmt.Errorf("remove historical schema Job: %w", err)
+					}
+				}
+				return schemaState("Pending", "waiting for historical schema Job removal")
+			}
+			state.JobName = job.Name
+			state.AppliedHash = inputHash
+			state.FailedHash = ""
+			state.FailureReason = ""
+			state.ImageDigest = strings.SplitN(schemaImage, "@", 2)[1]
+			return nil
+		}
+		// A Job may have been created before its attempt status was persisted.
+		// Observing it invalidates any success from an earlier run of this input.
+		state.AppliedHash = ""
+		state.ImageDigest = ""
+		state.JobName = job.Name
+		if schemaJobFailed(job) {
+			state.FailedHash = inputHash
+			for _, condition := range job.Status.Conditions {
+				if condition.Type == batchv1.JobFailed && condition.Reason == "DeadlineExceeded" {
+					state.FailureReason = "TimedOut"
+					return schemaState("TimedOut", "schema Job exceeded its deadline; change schemaRetryNonce to retry")
+				}
+				if condition.Type == batchv1.JobFailed && condition.Reason == "BackoffLimitExceeded" {
+					state.FailureReason = "Failed"
+					return schemaState("Failed", "schema Job exhausted its retry limit; change schemaRetryNonce to retry")
+				}
+			}
+			state.FailureReason = "Failed"
+			return schemaState("Failed", "schema Job failed; change schemaRetryNonce to retry")
+		}
+		state.FailedHash = ""
+		state.FailureReason = ""
+		return schemaState("Pending", "waiting for schema Job completion")
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get postgres schema setup Job: %w", err)
+	}
+	if state.FailedHash == inputHash {
+		if state.FailureReason == "TimedOut" {
+			return schemaState("TimedOut", "schema Job exceeded its deadline; change schemaRetryNonce to retry")
+		}
+		return schemaState("Failed", "schema Job failed; change schemaRetryNonce to retry")
+	}
+	if state.AppliedHash == inputHash && (state.JobName == jobName || state.JobName == "") {
+		state.JobName = ""
+		return nil // The TTL controller may have removed the successful Job.
+	}
+	if state.JobName == jobName {
+		// A Job may expire while the operator is offline. Its outcome is then
+		// unknown, so require an explicit retry instead of silently reapplying SQL.
+		return schemaState("Failed", "schema Job outcome was lost; change schemaRetryNonce to retry")
 	}
 
 	labels, annotations := labelsAndAnnotations(ai)
 	labels["component"] = "agentruntime-schema-setup"
-	annotations[schemaJobDeploymentHashAnnotation] = deploymentHash
 	annotations[schemaJobInputHashAnnotation] = inputHash
+	annotations["ai.splunk.com/agentruntime-schema-image-digest"] = strings.SplitN(schemaImage, "@", 2)[1]
 	annotations[schemaJobManagedAnnotation] = schemaJobManagedValue
 	job = &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        dnsLabelName(ai.Name, "schema-"+shortHash(deploymentHash+"-"+inputHash)),
+			Name:        jobName,
 			Namespace:   ai.Namespace,
 			Labels:      labels,
 			Annotations: annotations,
@@ -451,7 +552,8 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 	featureEnv := buildFeatureEnv(ai.Spec.Feature.Env)
 	job.Spec = batchv1.JobSpec{
 		BackoffLimit:            ptr(schemaJobBackoffLimit),
-		TTLSecondsAfterFinished: ptr(int32(86400)),
+		ActiveDeadlineSeconds:   ptr(schemaJobDeadlineSeconds),
+		TTLSecondsAfterFinished: ptr(schemaJobTTLSeconds),
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: labels},
 			Spec: corev1.PodSpec{
@@ -477,13 +579,22 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 			},
 		},
 	}
-	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, job, func() error {
-		return nil
-	}); err != nil {
+	if err := r.Create(ctx, job); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// A cached NotFound can race with a retained historical Job. Re-read
+			// it before adopting this name as the current attempt.
+			return schemaState("Pending", "waiting for schema Job observation")
+		}
 		return fmt.Errorf("create postgres schema setup Job: %w", err)
 	}
-	ai.Status.SchemaJobId = job.Name
-	return fmt.Errorf("created postgres schema setup Job %q, waiting for completion", job.Name)
+	// The new attempt is the only result eligible for reuse after Job TTL
+	// cleanup. Clear historical success before recording this attempt's name.
+	state.AppliedHash = ""
+	state.ImageDigest = ""
+	state.FailedHash = ""
+	state.FailureReason = ""
+	state.JobName = job.Name
+	return schemaState("Pending", "waiting for schema Job completion")
 }
 
 func validateSchemaSetupCredentials(secret *corev1.Secret, featureEnv map[string]string) error {
@@ -511,40 +622,10 @@ func buildFeatureEnv(values map[string]string) []corev1.EnvVar {
 	return env
 }
 
-func agentRuntimeDeploymentHash(ai *aiv1.AIService, config agentRuntimeConfig) string {
-	return stableHash(struct {
-		BaseImage        string
-		ProviderImage    string
-		AgentModule      string
-		Replicas         int32
-		ServiceAccount   string
-		Resources        corev1.ResourceRequirements
-		RuntimeEnv       []corev1.EnvVar
-		CheckpointSecret string
-		NodeSelector     map[string]string
-		Tolerations      []corev1.Toleration
-		Affinity         corev1.Affinity
-		ImagePullSecrets []corev1.LocalObjectReference
-	}{
-		BaseImage:        config.BaseImage,
-		ProviderImage:    config.ProviderImage,
-		AgentModule:      config.AgentModule,
-		Replicas:         ai.Spec.Replicas,
-		ServiceAccount:   ai.Spec.ServiceAccountName,
-		Resources:        ai.Spec.Resources,
-		RuntimeEnv:       buildRuntimeEnvFingerprint(ai, config.AgentModule),
-		CheckpointSecret: ai.Spec.CheckpointDbSecretRef,
-		NodeSelector:     ai.Spec.NodeSelector,
-		Tolerations:      ai.Spec.Tolerations,
-		Affinity:         ai.Spec.Affinity,
-		ImagePullSecrets: ai.Spec.ImagePullSecrets,
-	})
-}
-
 func agentRuntimeSchemaInputHash(ai *aiv1.AIService, schemaImage string, secret *corev1.Secret) string {
 	postgresEnv := map[string]string{}
-	for _, name := range []string{"PG_HOST", "PG_PORT", "PG_USER", "PG_DBNAME", "PG_SSLMODE", "PGSSLMODE", "PGSSLROOTCERT"} {
-		if value := ai.Spec.Feature.Env[name]; value != "" {
+	for name, value := range ai.Spec.Feature.Env {
+		if value != "" && (name == "DATABASE_URL" || strings.HasPrefix(name, "PG")) {
 			postgresEnv[name] = value
 		}
 	}
@@ -553,30 +634,14 @@ func agentRuntimeSchemaInputHash(ai *aiv1.AIService, schemaImage string, secret 
 		SchemaSecretRef string
 		SecretVersion   string
 		PostgresEnv     map[string]string
+		RetryNonce      string
 	}{
 		Image:           schemaImage,
 		SchemaSecretRef: ai.Spec.CheckpointDbSecretRef,
 		SecretVersion:   secret.ResourceVersion,
 		PostgresEnv:     postgresEnv,
+		RetryNonce:      ai.Spec.Feature.SchemaRetryNonce,
 	})
-}
-
-func buildRuntimeEnvFingerprint(ai *aiv1.AIService, agentModule string) []corev1.EnvVar {
-	env := buildAgentRuntimeEnv(ai, agentModule)
-	for i := range env {
-		if isSensitiveEnvName(env[i].Name) {
-			env[i].Value = "<redacted>"
-		}
-	}
-	return env
-}
-
-func isSensitiveEnvName(name string) bool {
-	name = strings.ToUpper(name)
-	return strings.Contains(name, "PASSWORD") ||
-		strings.Contains(name, "TOKEN") ||
-		strings.Contains(name, "SECRET") ||
-		strings.Contains(name, "PRIVATE_KEY")
 }
 
 func stableHash(value any) string {
@@ -586,16 +651,6 @@ func stableHash(value any) string {
 	}
 	digest := sha256.Sum256(encoded)
 	return fmt.Sprintf("%x", digest[:8])
-}
-
-func schemaJobNeedsRerun(job *batchv1.Job, deploymentHash, inputHash string) bool {
-	if job.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
-		return false
-	}
-	// A change to either the desired AgentRuntime deployment or schema input
-	// invalidates the completed schema preparation result.
-	return job.Annotations[schemaJobDeploymentHashAnnotation] != deploymentHash ||
-		job.Annotations[schemaJobInputHashAnnotation] != inputHash
 }
 
 func schemaJobSucceeded(job *batchv1.Job) bool {
@@ -937,10 +992,6 @@ func buildAgentRuntimeEnv(ai *aiv1.AIService, agentModule string) []corev1.EnvVa
 	// PLATFORM_URL is the Ray head endpoint. It is set whenever there is one
 	// (fullfeature always has one) and omitted for cpuOnly, which has no Ray.
 	//
-	// Keep it in this position: this list feeds the deployment hash
-	// (buildRuntimeEnvFingerprint), which decides whether the Postgres schema Job
-	// is re-run. Reordering it would change the hash of every existing service and
-	// re-run its schema Job on operator upgrade.
 	if platformURL != "" {
 		env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
 	}
@@ -1017,7 +1068,14 @@ func resolveBaseImage(ai *aiv1.AIService) (string, error) {
 }
 
 func resolveSchemaSetupImage() (string, error) {
-	return resolveRequiredRuntimeEnv(schemaSetupImageEnv, "")
+	image, err := resolveRequiredRuntimeEnv(schemaSetupImageEnv, "")
+	if err != nil {
+		return "", err
+	}
+	if !regexp.MustCompile(`^[^@]+@sha256:[a-f0-9]{64}$`).MatchString(image) {
+		return "", schemaState("ImageDigestRequired", "schema setup image must be supplied by immutable sha256 digest")
+	}
+	return image, nil
 }
 
 func resolveProviderImage(ai *aiv1.AIService) (string, error) {
