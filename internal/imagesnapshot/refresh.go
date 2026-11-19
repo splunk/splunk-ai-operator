@@ -109,25 +109,17 @@ func Refresh(ctx context.Context, reg Registry, prev *Snapshot, inv *Inventory, 
 		return nil, fmt.Errorf("the new snapshot needs its own ID: %q is the previous snapshot", prev.Metadata.ID)
 	}
 
-	// An entry is identified by its component. Where several images share a component
-	// name (the images of one add-on, for example) the source repository tells them apart,
-	// so a refresh matches each image with its own predecessor.
-	prevCount, newCount := map[string]int{}, map[string]int{}
-	for _, e := range prev.Spec.Entries {
-		prevCount[e.Component]++
-	}
-	for _, img := range inv.Images {
-		newCount[img.Component]++
-	}
-	key := func(component, source string) string {
-		if prevCount[component] <= 1 && newCount[component] <= 1 {
-			return component
+	// Pair each new image with its predecessor. Several images can share one component
+	// name (the images of one add-on, or two tags of one repository), so the pairing is
+	// done in three passes, each using only what is still unpaired: the same component and
+	// source; then the same component and repository (a tag change), when exactly one
+	// remains on each side; then the only image left of a component (a source change).
+	pairs := pairEntries(prev.Spec.Entries, inv.Images)
+	paired := map[int]bool{}
+	for _, pi := range pairs {
+		if pi >= 0 {
+			paired[pi] = true
 		}
-		return component + "\x00" + repositoryOf(source)
-	}
-	prevBy := map[string]Entry{}
-	for _, e := range prev.Spec.Entries {
-		prevBy[key(e.Component, e.Source)] = e
 	}
 
 	cache := map[string]resolution{}
@@ -147,10 +139,12 @@ func Refresh(ctx context.Context, reg Registry, prev *Snapshot, inv *Inventory, 
 		return e
 	}
 
-	for _, img := range inv.Images {
-		k := key(img.Component, img.Source)
-		old, existed := prevBy[k]
-		delete(prevBy, k)
+	for n, img := range inv.Images {
+		existed := pairs[n] >= 0
+		var old Entry
+		if existed {
+			old = prev.Spec.Entries[pairs[n]]
+		}
 		if existed && old.Source == img.Source && !opts.RecheckTags {
 			snap.Spec.Entries = append(snap.Spec.Entries, carry(old, img))
 			continue
@@ -174,7 +168,10 @@ func Refresh(ctx context.Context, reg Registry, prev *Snapshot, inv *Inventory, 
 		}
 		snap.Spec.Entries = append(snap.Spec.Entries, e)
 	}
-	for _, old := range prevBy {
+	for i, old := range prev.Spec.Entries {
+		if paired[i] {
+			continue
+		}
 		res.Changes = append(res.Changes, Change{Component: old.Component, Reason: ChangeRemoved, PreviousSource: old.Source,
 			PreviousDigest: old.Digest, Profiles: old.Profiles})
 	}
@@ -249,4 +246,55 @@ func repositoryOf(source string) string {
 		return source
 	}
 	return p.Registry + "/" + p.Repository
+}
+
+// pairEntries returns, for each image, the index of the previous entry it replaces or
+// continues, or -1. See Refresh for the order of the passes.
+func pairEntries(prev []Entry, images []Image) []int {
+	pairs := make([]int, len(images))
+	for i := range pairs {
+		pairs[i] = -1
+	}
+	taken := make([]bool, len(prev))
+	prevTotal, newTotal := map[string]int{}, map[string]int{}
+	for _, e := range prev {
+		prevTotal[e.Component]++
+	}
+	for _, img := range images {
+		newTotal[img.Component]++
+	}
+	pass := func(same func(e Entry, img Image) bool, needUnique bool) {
+		for n, img := range images {
+			if pairs[n] >= 0 {
+				continue
+			}
+			candidate, count := -1, 0
+			for i, e := range prev {
+				if !taken[i] && e.Component == img.Component && same(e, img) {
+					candidate, count = i, count+1
+				}
+			}
+			if count == 0 || (needUnique && count != 1) {
+				continue
+			}
+			if needUnique {
+				// The reverse must be unique too: no other unpaired image claims it.
+				others := 0
+				for m, o := range images {
+					if pairs[m] < 0 && o.Component == img.Component && same(prev[candidate], o) {
+						others++
+					}
+				}
+				if others != 1 {
+					continue
+				}
+			}
+			pairs[n], taken[candidate] = candidate, true
+		}
+	}
+	pass(func(e Entry, img Image) bool { return e.Source == img.Source }, false)
+	pass(func(e Entry, img Image) bool { return repositoryOf(e.Source) == repositoryOf(img.Source) }, true)
+	// A component with exactly one image on each side is one image whose source changed.
+	pass(func(e Entry, img Image) bool { return prevTotal[e.Component] == 1 && newTotal[img.Component] == 1 }, true)
+	return pairs
 }

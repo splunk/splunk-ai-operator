@@ -107,7 +107,11 @@ func (r *Remote) Describe(ctx context.Context, ref string) (*Described, error) {
 			return nil, err
 		}
 		if cfg.OS != "" && cfg.Architecture != "" {
-			out.PlatformDigests[cfg.OS+"/"+cfg.Architecture] = desc.Digest.String()
+			key := cfg.OS + "/" + cfg.Architecture
+			if cfg.Variant != "" {
+				key += "/" + cfg.Variant // a linux/amd64/v3 image is not a linux/amd64 image
+			}
+			out.PlatformDigests[key] = desc.Digest.String()
 		}
 		out.Labels = cfg.Config.Labels
 	default:

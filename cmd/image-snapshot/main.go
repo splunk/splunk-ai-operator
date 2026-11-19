@@ -131,6 +131,9 @@ func (f *inputFlags) load() (imagesnapshot.InventoryInput, error) {
 		if err := imagesnapshot.ReadFile(f.config, &in.Installer); err != nil {
 			return in, fmt.Errorf("installer config: %w", err)
 		}
+	} else {
+		// With no installer configuration there is no installer whose defaults apply.
+		in.NoInstallerDefaults = true
 	}
 	in.Values = map[string]*imagesnapshot.RenderedValues{}
 	for profile, path := range map[string]string{imagesnapshot.ProfileCPUOnly: f.cpuOnlyValues, imagesnapshot.ProfileFullFeature: f.fullFeatureValues} {

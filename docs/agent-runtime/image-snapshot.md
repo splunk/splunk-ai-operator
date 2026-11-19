@@ -24,11 +24,51 @@ go run ./cmd/image-snapshot <command> [flags]
 | Input | Flag | Used for |
 |---|---|---|
 | MPR-188 candidate manifest | `--candidate` (default `config/agent-runtime/candidate-manifest.yaml`) | the four candidate images; validated first, so a contradictory record fails |
-| Installer configuration | `--config` | images outside the candidate set: operator, Ray, Weaviate, SAIA, Fluent Bit, nginx, OpenTelemetry, Splunk |
+| Installer configuration | `--config` | images outside the candidate set: operator, Ray, Weaviate, SAIA, Fluent Bit, nginx, OpenTelemetry, Splunk; also its `components` switches and `images.registry` (see below) |
 | Rendered values per profile | `--values-cpuonly`, `--values-fullfeature` (output of `k0s_cluster_with_stack.sh render-profile`) | the effective `components`, which switch add-on images on and off per profile |
 | Add-on images | `--addon-list` (`addon-images.list` from `airgap_install.sh`) | cert-manager, Prometheus, KubeRay, NVIDIA device plugin, local-path, MetalLB, ... |
 | k0s system images | `--k0s-list` (`k0s airgap list-images`) | Kubernetes components |
 | Owners | `--owners` (YAML map of component to owner) | the component owner recorded for each image |
+
+## How this relates to the existing air-gap process
+
+The installer already has a mirroring recipe (deployment guide, Phase 2: `crane copy`
+each image into your registry, then set `images.registry` and relative image paths) and
+the air-gap bundle (`airgap_install.sh`) for add-on and k0s images. This tool does not
+replace either. It adds a verified, digest-pinned record of that mirror and reads the
+installer configuration **the way the installer does**, so the inventory names the images
+an install will really pull:
+
+- **Defaults.** An omitted `images.splunk.operatorImage`, `images.fluentBit.image`,
+  `images.otelCollector.image` or `images.nginx.image` takes the installer's default
+  (`docker.io/splunk/splunk-operator:3.0.0`, `fluent/fluent-bit:1.9.6`,
+  `otel/opentelemetry-collector-contrib:0.122.1`, `docker.io/library/nginx:1.27-alpine`),
+  gated as the installer gates it: the Splunk Operator (and the Standalone image) only in
+  the installer's *internal* Splunk mode (`splunk.enabled: true` and no
+  `splunk.external.endpoint`) with `components.splunkOperator` on; the collector with
+  `otel`; nginx is read only by the SAIA feature (`RELATED_IMAGE_NGINX`), so `fullfeature`
+  only. A `null` or blank image counts as omitted. Run
+  without `--config` and no installer default is assumed.
+- **`images.registry`.** `build_image_url` puts it in front of any image path that does not
+  already begin with a registry host (a dotted host or IPv4, an optional port, then a path
+  and a tag or digest). The same rule is applied here, including its quirks: `localhost:5000/x:1`
+  (no dot) and `quay.io/x` (no tag) are *not* treated as qualified. Rendered values and
+  the add-on and k0s lists already hold final references and are used as they are. A test
+  runs the installer's own function against the Go copy to catch drift.
+- **Component switches.** The rendered `components` of each profile decide first; without
+  rendered values the configuration's own `components.*` apply, an omitted switch being on,
+  as in the installer. The AI operator image is an install reference only when
+  `aiOperator` is on. One difference: the installer also skips the NVIDIA device plugin
+  when there are no GPU workers; without rendered values this tool cannot see the node
+  count and keeps the plugin's images in `fullfeature`, which over-includes rather than
+  omits. Supply the rendered values to get the exact set.
+
+Give `create` the configuration that names where images come **from** (the public or
+candidate references). Give `compare` the configuration the air-gapped install will use,
+which names the mirror references from the snapshot. The snapshot's own layout
+(`<mirror>/<source host>/<repo>@<digest>`) is digest-pinned, which the operator requires for
+the schema setup image; the Phase 2 recipe's tag-based layout remains valid for the images
+this tool does not govern.
 
 ## The inventory
 
@@ -88,7 +128,9 @@ a snapshot's entry can be used as it is.
 ### Digest and platform
 
 The AI Tier runs on `linux/amd64`. For each source the tool resolves the reference,
-selects the linux/amd64 manifest and pins that digest. An image with no linux/amd64
+selects the linux/amd64 manifest and pins that digest. A platform variant is part of the
+platform, for an index entry and a single manifest alike: `linux/amd64/v3` is not
+`linux/amd64`. An image with no linux/amd64
 manifest is **incompatible**; an image that cannot be resolved is **unresolved**.
 Either fails the snapshot **before anything is copied**, as an external blocker that
 names the component. The image is never replaced by a public one.
@@ -173,7 +215,10 @@ installer `--config` and the rendered `--values-<profile>` the install will use.
 ## Refresh
 
 When an external team replaces a candidate build, `refresh` derives a new snapshot
-from the stored one. Entries whose source is unchanged are carried forward with no
+from the stored one. Images are paired with their predecessors by component and source;
+where several images share a component (an add-on's images, two tags of one repository),
+an image is paired by repository only when exactly one remains on each side, and is
+otherwise reported as new and removed rather than guessed. Entries whose source is unchanged are carried forward with no
 registry calls; only new or replaced entries are resolved, mirrored and verified. Each
 changed entry records the digest it replaces, and the report lists the install jobs
 and qualification cells that must rerun: a change to an image only `fullfeature` uses

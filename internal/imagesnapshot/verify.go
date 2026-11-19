@@ -47,8 +47,12 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 			refs = append(refs, InstallRef{component, ref})
 		}
 	}
+	// The operator image is an install reference only where the AI operator is installed.
+	operatorOn := in.componentOn(profile, "aiOperator")
 	if v := in.Values[profile]; v != nil {
-		add("splunk-ai-operator", v.Images.Operator)
+		if operatorOn {
+			add("splunk-ai-operator", v.Images.Operator)
+		}
 		add("slim", v.Images.Slim)
 		add("agent-runtime-base", v.Images.AgentRuntime.Base)
 		add("agent-runtime-schema-setup", v.Images.AgentRuntime.SchemaSetup)
@@ -56,17 +60,24 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 			add("agent-runtime-provider-"+p, v.Images.AgentRuntime.Providers[p])
 		}
 	} else {
+		// No rendered values: take the configured references the way the installer does.
 		cfg := in.Installer.Images
-		add("splunk-ai-operator", cfg.Operator.Image)
-		add("slim", cfg.Slim.APIImage)
-		add("agent-runtime-base", cfg.AgentRuntime.BaseImage)
-		add("agent-runtime-schema-setup", cfg.AgentRuntime.SchemaSetupImage)
+		url := func(ref string) string {
+			if ref = strings.TrimSpace(ref); ref == "" || ref == "null" {
+				return ""
+			}
+			return buildImageURL(cfg.Registry, ref)
+		}
+		add("slim", url(cfg.Slim.APIImage))
+		add("agent-runtime-base", url(cfg.AgentRuntime.BaseImage))
+		add("agent-runtime-schema-setup", url(cfg.AgentRuntime.SchemaSetupImage))
 		for _, p := range sortedKeys(cfg.AgentRuntime.ProviderImages) {
-			add("agent-runtime-provider-"+p, cfg.AgentRuntime.ProviderImages[p])
+			add("agent-runtime-provider-"+p, url(cfg.AgentRuntime.ProviderImages[p]))
 		}
 	}
-	for _, img := range installerConfigImages(in.Installer, in.Values) {
-		if img.Component == "splunk-ai-operator" || !hasProfile(img.Profiles, profile) {
+	for _, img := range installerConfigImages(in) {
+		// With rendered values the operator reference came from them, above.
+		if (img.Component == "splunk-ai-operator" && in.Values[profile] != nil) || !hasProfile(img.Profiles, profile) {
 			continue
 		}
 		add(img.Component, img.Source)
@@ -76,7 +87,7 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 			continue
 		}
 		component, profiles, gate := classifyAddon(ref)
-		if hasProfile(profiles, profile) && (gate == "" || componentEnabled(in.Values[profile], profile, gate)) {
+		if hasProfile(profiles, profile) && (gate == "" || in.componentOn(profile, gate)) {
 			add(component, ref)
 		}
 	}

@@ -336,6 +336,6 @@ func TestBuildInventory_IgnoresNullAndBlankConfiguredImages(t *testing.T) {
 	require.NoError(t, err)
 	c := components(inv.Images)
 	assert.NotContains(t, c, "weaviate")
-	assert.NotContains(t, c, "nginx")
+	assert.Equal(t, DefaultNginxImage, c["nginx"].Source, "a blank image is an omitted one: the installer's default applies")
 	assert.Contains(t, c, "ray-head")
 }

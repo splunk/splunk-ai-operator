@@ -19,7 +19,22 @@ import (
 // InstallerConfig is the part of the installer's configuration file that names
 // images. The key names are the ones k0s_cluster_with_stack.sh reads.
 type InstallerConfig struct {
+	// Components are the installer's own component switches (`components.*`). The
+	// installer treats an omitted switch as on. Rendered values, when supplied, win.
+	Components map[string]any `json:"components"`
+	// Splunk decides the installer's Splunk mode: the in-cluster Splunk Operator and
+	// Standalone are installed only when splunk.enabled is true and no external
+	// endpoint is set ("internal" mode).
+	Splunk struct {
+		Enabled  any `json:"enabled"`
+		External struct {
+			Endpoint string `json:"endpoint"`
+		} `json:"external"`
+	} `json:"splunk"`
 	Images struct {
+		// Registry is `images.registry`: the installer puts it in front of every image
+		// path that does not start with a registry host (see buildImageURL).
+		Registry string `json:"registry"`
 		Operator struct {
 			Image string `json:"image"`
 		} `json:"operator"`
@@ -88,6 +103,10 @@ type InventoryInput struct {
 	// Installer is the installer configuration naming the images outside the
 	// candidate set (operator, Ray, Weaviate, SAIA, Fluent Bit, ...).
 	Installer InstallerConfig
+	// NoInstallerDefaults leaves the images the installer would default (Splunk
+	// Operator, Fluent Bit, OpenTelemetry, nginx) out when the configuration omits
+	// them. It is for a run given no installer configuration at all.
+	NoInstallerDefaults bool
 	// Values holds the rendered values per profile. The effective component set in
 	// them switches add-ons and optional images on and off. A profile without
 	// rendered values falls back to the profile's defaults.
@@ -155,10 +174,7 @@ func BuildInventory(in InventoryInput) (*Inventory, error) {
 		images = append(images, i)
 	}
 	enabled := func(profile, gate string) bool {
-		if gate == "" {
-			return true
-		}
-		return componentEnabled(in.Values[profile], profile, gate)
+		return gate == "" || in.componentOn(profile, gate)
 	}
 	profilesFor := func(candidates []string, gate string) []string {
 		var out []string
@@ -199,7 +215,7 @@ func BuildInventory(in InventoryInput) (*Inventory, error) {
 	}
 
 	// 2. Images the installer configuration names outside the candidate set.
-	for _, img := range installerConfigImages(in.Installer, in.Values) {
+	for _, img := range installerConfigImages(in) {
 		add(img)
 	}
 
@@ -253,17 +269,31 @@ func BuildInventory(in InventoryInput) (*Inventory, error) {
 // installerConfigImages returns the images the installer configuration names outside
 // the candidate set, with the profiles that install each. An image whose gating
 // component is off for a profile does not apply to that profile.
-func installerConfigImages(installer InstallerConfig, values map[string]*RenderedValues) []Image {
+//
+// It applies what the installer applies: an omitted Splunk Operator, Fluent Bit,
+// OpenTelemetry or nginx image takes the installer's default, and `images.registry` is
+// put in front of a path with no registry host, exactly as build_image_url does. The
+// returned sources are therefore the references the installer pulls from.
+func installerConfigImages(in InventoryInput) []Image {
 	profilesFor := func(candidates []string, gate string) []string {
 		var out []string
 		for _, p := range candidates {
-			if gate == "" || componentEnabled(values[p], p, gate) {
+			if gate == "" || in.componentOn(p, gate) {
 				out = append(out, p)
 			}
 		}
 		return out
 	}
-	cfg := installer.Images
+	cfg := in.Installer.Images
+	orDefault := func(ref, def string) string {
+		if ref = strings.TrimSpace(ref); ref == "" || ref == "null" {
+			if in.NoInstallerDefaults {
+				return ""
+			}
+			return def
+		}
+		return ref
+	}
 	var images []Image
 	for _, r := range []struct {
 		rule
@@ -276,20 +306,88 @@ func installerConfigImages(installer InstallerConfig, values map[string]*Rendere
 		{rule{"saia-api", "SAIA API image", CategoryModelServing, fullOnly, ""}, cfg.Saia.APIImage, "images.saia.apiImage"},
 		{rule{"saia-api-v2", "SAIA API v2 image", CategoryModelServing, fullOnly, ""}, cfg.Saia.APIV2Image, "images.saia.apiV2Image"},
 		{rule{"saia-data-loader", "SAIA data loader image", CategoryModelServing, fullOnly, ""}, cfg.Saia.DataLoaderImage, "images.saia.dataLoaderImage"},
-		{rule{"nginx", "Nginx image (SAIA front end)", CategoryPlatform, fullOnly, ""}, cfg.Nginx.Image, "images.nginx.image"},
-		{rule{"fluent-bit", "Fluent Bit image", CategoryPlatform, bothProfiles, ""}, cfg.FluentBit.Image, "images.fluentBit.image"},
-		{rule{"otel-collector", "OpenTelemetry collector image", CategoryPlatform, bothProfiles, "otel"}, cfg.OtelCollector.Image, "images.otelCollector.image"},
+		{rule{"nginx", "Nginx image (SAIA front end)", CategoryPlatform, fullOnly, ""}, orDefault(cfg.Nginx.Image, DefaultNginxImage), "images.nginx.image"},
+		{rule{"fluent-bit", "Fluent Bit image", CategoryPlatform, bothProfiles, ""}, orDefault(cfg.FluentBit.Image, DefaultFluentBitImage), "images.fluentBit.image"},
+		{rule{"otel-collector", "OpenTelemetry collector image", CategoryPlatform, bothProfiles, "otel"}, orDefault(cfg.OtelCollector.Image, DefaultOtelCollectorImage), "images.otelCollector.image"},
 		{rule{"splunk-standalone", "Splunk Enterprise image", CategoryPlatform, bothProfiles, "splunkStandalone"}, cfg.Splunk.Image, "images.splunk.image"},
-		{rule{"splunk-operator", "Splunk operator image", CategoryPlatform, bothProfiles, "splunkOperator"}, cfg.Splunk.OperatorImage, "images.splunk.operatorImage"},
+		{rule{"splunk-operator", "Splunk operator image", CategoryPlatform, bothProfiles, "splunkOperator"}, orDefault(cfg.Splunk.OperatorImage, DefaultSplunkOperatorImage), "images.splunk.operatorImage"},
 	} {
 		profiles := profilesFor(r.profiles, r.gate)
 		if len(profiles) == 0 || strings.TrimSpace(r.ref) == "" || r.ref == "null" {
 			continue
 		}
 		images = append(images, Image{Component: r.component, Role: r.role, Category: r.category, Profiles: profiles,
-			Source: r.ref, Origin: "installer-config:" + r.key})
+			Source: buildImageURL(cfg.Registry, strings.TrimSpace(r.ref)), Origin: "installer-config:" + r.key})
 	}
 	return images
+}
+
+// The images the installer uses when the configuration omits them
+// (k0s_cluster_with_stack.sh, "Using default ... image").
+const (
+	DefaultSplunkOperatorImage = "docker.io/splunk/splunk-operator:3.0.0"
+	DefaultFluentBitImage      = "fluent/fluent-bit:1.9.6"
+	DefaultOtelCollectorImage  = "otel/opentelemetry-collector-contrib:0.122.1"
+	DefaultNginxImage          = "docker.io/library/nginx:1.27-alpine"
+)
+
+// qualifiedImage is the test build_image_url uses for "already names a registry host":
+// a dotted host or an IPv4 address, an optional port, a slash, and a tag or digest
+// somewhere after it. Notably a host without a dot (localhost:5000) and a reference
+// with no tag are NOT treated as qualified, so the installer prefixes them.
+var qualifiedImage = regexp.MustCompile(`^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/.*:.+`)
+
+// buildImageURL mirrors build_image_url in k0s_cluster_with_stack.sh: a qualified
+// reference is used as it is, anything else is placed under images.registry when one is set.
+func buildImageURL(registry, image string) string {
+	if qualifiedImage.MatchString(image) {
+		return image
+	}
+	if registry = strings.TrimSpace(registry); registry != "" && registry != "null" {
+		return registry + "/" + image
+	}
+	return image
+}
+
+// componentOn reports whether a component is installed for a profile: the rendered
+// switch, else the installer configuration's own switch, else the profile's default.
+// splunkInternal mirrors the installer's SPLUNK_MODE == internal: splunk.enabled is
+// exactly true and there is no external endpoint. With no installer configuration there
+// is no Splunk mode, so only an explicit configuration turns it on.
+func (in InventoryInput) splunkInternal() bool {
+	enabled := false
+	switch x := in.Installer.Splunk.Enabled.(type) {
+	case bool:
+		enabled = x
+	case string:
+		enabled = x == "true"
+	}
+	ep := strings.TrimSpace(in.Installer.Splunk.External.Endpoint)
+	return enabled && (ep == "" || ep == "null")
+}
+
+func (in InventoryInput) componentOn(profile, name string) bool {
+	// The in-cluster Splunk components exist only in "internal" Splunk mode, whatever
+	// the component switches say (component_enabled in the installer).
+	if (name == "splunkOperator" || name == "splunkStandalone") && !in.splunkInternal() {
+		return false
+	}
+	if v := in.Values[profile]; v != nil && v.Components != nil {
+		if on, ok := v.Components[name]; ok {
+			return on
+		}
+	}
+	if raw, ok := in.Installer.Components[name]; ok && raw != nil {
+		switch x := raw.(type) {
+		case bool:
+			return x
+		case string:
+			return x == "true" // config_bool: anything but "true" is false
+		default:
+			return false
+		}
+	}
+	return componentEnabled(nil, profile, name)
 }
 
 func (inv *Inventory) computeChecksum() (string, error) {

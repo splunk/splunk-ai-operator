@@ -98,15 +98,34 @@ func newEnv(t *testing.T) *env {
 	e.src.push("splunk/splunk-ai-operator", "candidate-1", "amd64")
 	e.src.push("rayproject/ray", "2.44.0", "amd64")
 	e.src.push("semitechnologies/weaviate", "stable", "amd64")
+	e.pushDefaults()
 	e.config = e.write("config.yaml", fmt.Sprintf(`
 images:
   operator: {image: %[1]s/splunk/splunk-ai-operator:candidate-1}
   ray: {headImage: %[1]s/rayproject/ray:2.44.0, workerImage: %[1]s/rayproject/ray:2.44.0}
   weaviate: {image: %[1]s/semitechnologies/weaviate:stable}
-`, e.src.Host))
+%[2]ssplunk: {enabled: true}
+`, e.src.Host, e.defaultsYAML()))
 	e.cpuValues = e.write("values-cpuonly.yaml", "profile: {effective: cpuOnly}\ncomponents: {aiOperator: true, kuberay: false, nvidia: false}\n")
 	e.fullValue = e.write("values-fullfeature.yaml", "profile: {effective: fullfeature}\ncomponents: {aiOperator: true, kuberay: true, nvidia: true}\n")
 	return e
+}
+
+// pushDefaults puts local stand-ins for the images the installer defaults when a
+// configuration omits them, so no test reaches a public registry; defaultsYAML names them.
+func (e *env) pushDefaults() {
+	e.src.push("fluent/fluent-bit", "1.9.6", "amd64")
+	e.src.push("otel/collector", "0.122.1", "amd64")
+	e.src.push("library/nginx", "1.27", "amd64")
+	e.src.push("splunk/splunk-operator", "3.0.0", "amd64")
+}
+
+func (e *env) defaultsYAML() string {
+	return fmt.Sprintf(`  fluentBit: {image: %[1]s/fluent/fluent-bit:1.9.6}
+  otelCollector: {image: %[1]s/otel/collector:0.122.1}
+  nginx: {image: %[1]s/library/nginx:1.27}
+  splunk: {operatorImage: %[1]s/splunk/splunk-operator:3.0.0}
+`, e.src.Host)
 }
 
 // writeSnapshot writes a snapshot and its checksum file, as a stored one has, so a test can
@@ -241,16 +260,24 @@ func TestEndToEnd_CreateVerifyCompareAndRefresh(t *testing.T) {
 	require.NoError(t, json.Unmarshal(mustRead(t, manifest), &s))
 	slimMirror := entry(&s, "slim").MirrorRef
 	values := e.write("values-mirrored.yaml", "profile: {effective: cpuOnly}\ncomponents: {aiOperator: true, kuberay: false, nvidia: false}\nimages:\n  slim: \""+slimMirror+"\"\n")
+	// The installer configuration an air-gapped install would use names the mirror.
+	mirroredCfg := e.write("config-mirrored.yaml", fmt.Sprintf("images:\n  operator: {image: %s}\n  fluentBit: {image: %s}\n  otelCollector: {image: %s}\n  splunk: {operatorImage: %s}\nsplunk: {enabled: true}\n",
+		entry(&s, "splunk-ai-operator").MirrorRef, entry(&s, "fluent-bit").MirrorRef, entry(&s, "otel-collector").MirrorRef, entry(&s, "splunk-operator").MirrorRef))
 	code, out, errs = e.run("compare", "--store", e.store, "--id", "run-1", "--profile", "cpuOnly",
-		"--candidate", e.candidate, "--config", e.config, "--values-cpuonly", values)
+		"--candidate", e.candidate, "--config", mirroredCfg, "--values-cpuonly", values)
 	require.Equal(t, 0, code, errs)
 	assert.Contains(t, out, "OK:")
 	// ...and one that uses an unknown image is named.
 	rogue := e.write("values-rogue.yaml", "profile: {effective: cpuOnly}\ncomponents: {aiOperator: true, kuberay: false, nvidia: false}\nimages:\n  slim: \"docker.io/library/busybox:latest\"\n")
 	code, _, errs = e.run("compare", "--store", e.store, "--id", "run-1", "--profile", "cpuOnly",
-		"--candidate", e.candidate, "--config", e.config, "--values-cpuonly", rogue)
+		"--candidate", e.candidate, "--config", mirroredCfg, "--values-cpuonly", rogue)
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "[UNACCOUNTED_REFERENCE] slim")
+	// An install configuration still naming the sources (and defaults) is not accounted for.
+	code, _, errs = e.run("compare", "--store", e.store, "--id", "run-1", "--profile", "cpuOnly",
+		"--candidate", e.candidate, "--config", e.config, "--values-cpuonly", values)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errs, "[SOURCE_REGISTRY_REFERENCE] fluent-bit")
 
 	// refresh: replace SLIM's candidate tag with a new build.
 	e.src.push("ml-platform/slim-api", "v2", "amd64")
@@ -296,7 +323,8 @@ func TestEndToEnd_CreateVerifyCompareAndRefresh(t *testing.T) {
 func TestCreate_ABlockedImageStoresNothingAndCopiesNothing(t *testing.T) {
 	e := newEnv(t)
 	e.src.push("splunk/arm-only", "v1", "arm64")
-	cfg := e.write("config-arm.yaml", fmt.Sprintf("images:\n  operator: {image: %s/splunk/arm-only:v1}\n  weaviate: {image: %s/not/there:v1}\n", e.src.Host, e.src.Host))
+	e.pushDefaults()
+	cfg := e.write("config-arm.yaml", fmt.Sprintf("images:\n  operator: {image: %s/splunk/arm-only:v1}\n  weaviate: {image: %s/not/there:v1}\n%s", e.src.Host, e.src.Host, e.defaultsYAML()))
 	report := filepath.Join(e.dir, "report.json")
 	code, _, errs := e.run("create", "--mirror", e.dst.Host, "--store", e.store, "--candidate", e.candidate, "--config", cfg,
 		"--values-fullfeature", e.fullValue, "--report", report)
@@ -376,7 +404,7 @@ func TestInventory_ReadsOwnersAndTheAddonAndK0sLists(t *testing.T) {
 	assert.Equal(t, "addon-list", byComponent["cert-manager"].Origin)
 	assert.Contains(t, byComponent, "k0s-pause")
 	assert.Equal(t, imagesnapshot.CategoryKubernetes, byComponent["k0s-pause"].Category)
-	assert.Len(t, inv.Images, 8+2, "no entry is made from a comment or a blank line")
+	assert.Len(t, inv.Images, 8+2+4, "no entry is made from a comment or a blank line")
 }
 
 // Add-on and k0s images are resolved, mirrored and verified like every other image.
@@ -394,7 +422,7 @@ func TestCreate_MirrorsAddonAndK0sImagesToo(t *testing.T) {
 	assert.Contains(t, out, "k0s-pause")
 	snap, err := (imagesnapshot.Store{Dir: e.store}).Get("full")
 	require.NoError(t, err)
-	assert.Len(t, snap.Spec.Entries, 10)
+	assert.Len(t, snap.Spec.Entries, 14)
 	for _, en := range snap.Spec.Entries {
 		assert.Equal(t, imagesnapshot.StatusVerified, en.Status, en.Component)
 	}
@@ -514,7 +542,8 @@ func TestACommandRefusesASnapshotWithoutItsChecksumFile(t *testing.T) {
 func TestCreate_AReportThatCannotBeWrittenDoesNotChangeTheExitCode(t *testing.T) {
 	e := newEnv(t)
 	e.src.push("splunk/arm-only", "v1", "arm64")
-	cfg := e.write("config-arm.yaml", fmt.Sprintf("images:\n  operator: {image: %s/splunk/arm-only:v1}\n", e.src.Host))
+	e.pushDefaults()
+	cfg := e.write("config-arm.yaml", fmt.Sprintf("images:\n  operator: {image: %s/splunk/arm-only:v1}\n%s", e.src.Host, e.defaultsYAML()))
 	code, _, errs := e.run("create", "--mirror", e.dst.Host, "--store", e.store, "--candidate", e.candidate, "--config", cfg,
 		"--values-fullfeature", e.fullValue, "--report", filepath.Join(e.dir, "no", "such", "dir", "report.json"))
 	assert.Equal(t, 1, code, "still the blocked-snapshot status, not a file error")

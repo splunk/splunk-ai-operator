@@ -111,6 +111,28 @@ regression test, before this was proposed:
   ID clash was found only after a long mirror run; and a report that could not be written
   changed the exit code.
 
+## PR #283 review fixes
+
+Five review findings were fixed so the tool reads the installer configuration the way
+`k0s_cluster_with_stack.sh` does (see "How this relates to the existing air-gap process" in
+[image-snapshot.md](image-snapshot.md)):
+
+- omitted Splunk Operator, Fluent Bit, OpenTelemetry and nginx images take the installer's
+  defaults, gated as the installer gates them (the Splunk images only in internal Splunk mode);
+- `images.registry` is applied with the same rule as `build_image_url`, checked by a test that
+  runs the installer's own function, and the defaults are checked against the script's literals;
+- the AI operator install reference is gated on `aiOperator`, and without rendered values the
+  configuration's own `components` switches apply;
+- refresh pairs the images of a shared component by source, then by repository or as a lone
+  image only when unambiguous, and otherwise reports new and removed;
+- a single-manifest image keeps its platform variant (`linux/amd64/v3` is not `linux/amd64`).
+
+After the fixes the two packages pass 125 tests and subtests (3 live tests skipped), the race
+detector is clean, coverage is 92.8% (package) and 85.7% (CLI), and 18 further mutations
+targeting the fixes are each caught. An independent review of the fixes found that the
+Splunk Operator default ignored the Splunk mode; that was fixed with a test over eight
+Splunk configurations before this was proposed.
+
 ## Sample run
 
 [validation/mpr-187-sample-run.txt](validation/mpr-187-sample-run.txt) is the captured
