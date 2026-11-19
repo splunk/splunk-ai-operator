@@ -1,0 +1,40 @@
+Read-only resolution of the four MPR-188 candidate images in ECR (MPR-187)
+==========================================================================
+Date:        2026-11-19
+Command:     image-snapshot create --resolve-only --mirror mirror.invalid --candidate config/agent-runtime/candidate-manifest.yaml
+Registry:    658391232643.dkr.ecr.us-west-2.amazonaws.com (AWS account 658391232643)
+Credentials: a short-lived ECR token requested with a developer AWS profile and held
+             in a temporary DOCKER_CONFIG (mode 0600) that was deleted afterwards. Nothing was
+             copied, mirrored, stored or created; the registry was only read.
+
+resolved  agent-runtime-base             658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5
+          digest    sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219
+          platforms linux/amd64
+          build     202609221052-eae3b33005a5
+resolved  agent-runtime-provider-mltk    658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd
+          digest    sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5
+          platforms linux/amd64
+          build     202609221517-f4466f2ccd
+resolved  agent-runtime-schema-setup     658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e
+          digest    sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987
+          platforms linux/amd64
+          build     202609171357-39c5803f686e
+resolved  slim                           658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:es-runtime-sync-create-ready-21d4bf15f-20261116-amd64
+          digest    sha256:f4ea9e5f9e9a8f2d09e3349a5cb5a462661793b69816bd9f2e1d45eececf8710  (index sha256:c413762ccdc11709bf2cd895677861ba7f45945007ebf03722a698fea688756d)
+          platforms linux/amd64
+resolved 4 images for snapshot rev5-09254bced200 (nothing copied, nothing stored)
+
+Cross-check against the digests MPR-188 recorded in config/agent-runtime/candidate-manifest.yaml
+as historical evidence (MPR-188 explicitly did not verify them against the registry):
+
+  agent-runtime-base           sha256:ddedf855e6751625...   recorded sha256:ddedf855e6751625...   MATCH
+  agent-runtime-provider-mltk  sha256:d73301133cf67ce5...   recorded sha256:d73301133cf67ce5...   MATCH
+  agent-runtime-schema-setup   sha256:5877fcbdea301b94...   recorded sha256:5877fcbdea301b94...   MATCH
+  slim                         sha256:f4ea9e5f9e9a8f2d...   (no digest recorded)                  pinned now
+
+Notes
+  - Every candidate image is linux/amd64 only.
+  - The SLIM tag is an index (sha256:c413762c...) with a provenance entry; the tool pins the
+    linux/amd64 manifest and does not count the provenance entry as a platform.
+  - The carrier's own OCI revision label is the placeholder string "unknown"; its build ID is
+    taken from the build-stamp tag instead.
