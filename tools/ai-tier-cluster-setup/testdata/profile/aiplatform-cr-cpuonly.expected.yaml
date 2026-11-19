@@ -28,11 +28,11 @@ spec:
       version: "1.0.0"
     - name: agentruntime
       version: "0.1.0"
-      provider: "launchpad"
+      provider: "mltk"
       minReplicas: 1
       maxReplicas: 4
       targetCPUUtilization: 60
-      checkpointDbSecretRef: "launchpad-postgres-conn"
+      checkpointDbSecretRef: "mltk-postgres-conn"
   # CPU scheduler
   cpuScheduler:
     nodeSelector:

@@ -12,7 +12,6 @@ import (
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -24,6 +23,7 @@ import (
 
 const (
 	agentRuntimeFeatureName       = "agentruntime"
+	slimFeatureName               = "slim"
 	agentRuntimeMetricsPort int32 = 9090
 	maxDNSLabelLength             = 63
 	ownerKey                      = ".metadata.controller"
@@ -323,22 +323,28 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	metricsPort := int32(8080)
 	if feature.Name == agentRuntimeFeatureName {
 		metricsPort = agentRuntimeMetricsPort
-		resources = defaultAgentRuntimeResources()
+		resources = agentruntime.DefaultResources()
 		if platform.Status.RayServiceName != "" {
 			aiPlatformURL = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
 				aiPlatformScheme, platform.Status.RayServiceName, platform.Namespace, clusterDomain)
 		}
 	}
-	// cpuOnly has no Ray platform URL; SLIM routes to the AgentRuntime Service
-	// instead. With several agentruntime features the first one in spec order is
-	// used, so the choice is deterministic.
+	// Under cpuOnly there is no Ray platform URL; SLIM routes to the AgentRuntime
+	// Service. Both profiles hand SLIM that URL (the SLIM handler resolves it for
+	// the others); this only sets it explicitly for cpuOnly, using the same single
+	// definition of the Service URL. With more than one agentruntime feature there
+	// is no unambiguous Service, so it is left empty and the SLIM handler reports
+	// that, exactly as it does for the other profiles.
 	agentRuntimeURL := ""
-	if feature.Name == "slim" && platform.Spec.ResolvedProfile() == aiApi.AIPlatformProfileCPUOnly {
+	if feature.Name == slimFeatureName && platform.Spec.ResolvedProfile() == aiApi.AIPlatformProfileCPUOnly {
+		var runtimeFeatures []aiApi.FeatureSpec
 		for _, f := range platform.Spec.Features {
 			if f.Name == agentRuntimeFeatureName {
-				agentRuntimeURL = agentruntime.ServiceURL(featureServiceName(platform.Name, f), platform.Namespace, clusterDomain)
-				break
+				runtimeFeatures = append(runtimeFeatures, f)
 			}
+		}
+		if len(runtimeFeatures) == 1 {
+			agentRuntimeURL = agentruntime.FeatureServiceURL(platform.Name, runtimeFeatures[0].Provider, platform.Namespace, clusterDomain)
 		}
 	}
 	serviceTemplate := *platform.Spec.ServiceTemplate.DeepCopy()
@@ -412,7 +418,13 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 		svc.Labels["provider"] = feature.Provider
 	}
 
-	if feature.Name == agentRuntimeFeatureName && platform.Spec.CPUSchedulingSpec != nil {
+	// The agent runtime always runs on CPU nodes. Under cpuOnly every workload is
+	// CPU-only, so SLIM follows the CPU scheduler too: on a cluster that also has
+	// GPU nodes it must not depend on a taint to stay off them. fullfeature leaves
+	// SLIM unplaced exactly as before, so an operator upgrade does not roll it.
+	if platform.Spec.CPUSchedulingSpec != nil &&
+		(feature.Name == agentRuntimeFeatureName ||
+			(feature.Name == slimFeatureName && platform.Spec.ResolvedProfile() == aiApi.AIPlatformProfileCPUOnly)) {
 		svc.Spec.NodeSelector = cloneStringMap(platform.Spec.CPUSchedulingSpec.NodeSelector)
 		svc.Spec.Tolerations = append([]corev1.Toleration(nil), platform.Spec.CPUSchedulingSpec.Tolerations...)
 		if platform.Spec.CPUSchedulingSpec.Affinity != nil {
@@ -421,21 +433,6 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	}
 
 	return svc
-}
-
-func defaultAgentRuntimeResources() corev1.ResourceRequirements {
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("500m"),
-			corev1.ResourceMemory:           resource.MustParse("512Mi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("1"),
-			corev1.ResourceMemory:           resource.MustParse("1Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
-		},
-	}
 }
 
 func cloneInt32Ptr(value *int32) *int32 {

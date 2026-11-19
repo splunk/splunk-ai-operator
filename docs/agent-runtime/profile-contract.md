@@ -49,7 +49,7 @@ The resolved profile is published on the CR as `status.profile` (and the
 | Runtime base image | `images.agentRuntime.baseImage` |
 | Schema image | `images.agentRuntime.schemaSetupImage` |
 | Provider/carrier image, one per agentruntime feature | `images.agentRuntime.providerImages.<provider>` |
-| Provider loader module, one per provider (`package.module:ClassName`, the `AGENT_MODULE` value; TBD for Launchpad) | `images.agentRuntime.providerModules.<provider>` |
+| Provider loader module, one per provider (`package.module:ClassName`, the `AGENT_MODULE` value; `agentcore_operations.loader:MLTKAgentLoader` for the `mltk` provider) | `images.agentRuntime.providerModules.<provider>` |
 | Provider key (DNS-1123 label, at most 63 characters; unique per feature) | `aiPlatform.features[].provider` |
 | Checkpoint Secret (external reference) | `aiPlatform.features[].checkpointDbSecretRef` |
 | SLIM image | `images.slim.apiImage` |
@@ -67,18 +67,28 @@ from 1 to 100. Rejected values are not echoed in error messages: an unsupported 
 YAML integer of at least 1 (the same rule `install` enforces). Duplicate feature
 identities (`agentruntime` is keyed by provider) are rejected, as in the webhook.
 
-Optional: `images.aitk.image`. Nothing in the operator or the air-gap bundle
-consumes the AITK image yet, so it is not required; whether it becomes required
-is to be decided with MPR-188. When given it is validated as a safe scalar and
-rendered into the values file.
+Optional: `images.aitk.image`. The MPR-188 contract settles this: AITK is the Splunk
+app `Splunk_ML_Toolkit` (label "AI Toolkit", version 6.2.0) installed on Splunk,
+not a container image, so the key is not required and nothing in the operator or
+the air-gap bundle consumes it. It is kept as an optional pass-through (validated
+as a safe scalar and rendered into the values file) so existing configurations
+keep working.
 
 Optional: `images.snapshotManifest`, the per-run image snapshot manifest
 (MPR-187 output). It is passed through to the rendered values unchanged. A
 final release digest is not required.
 
-The exact Launchpad provider key and `AGENT_MODULE` value are TBD until the
-image owners supply a validated contract (ERD 14.4.6). The examples use a
-placeholder.
+Provider key and loader module are settled by the MPR-188 candidate contract
+(`config/agent-runtime/candidate-manifest.yaml`, the authority for image
+references, ports, probes and the Secret contract; see
+`docs/agent-runtime/candidate-contract-review.md`): the provider key is `mltk`,
+`AGENT_MODULE` is `agentcore_operations.loader:MLTKAgentLoader`, and that is the
+only loader selection required (no `AGENT_LOADERS` map). The checkpoint Secret
+the examples reference is `mltk-postgres-conn`, a Secret of type `Opaque` in the
+AIService namespace with the keys `DATABASE_URL`, `PG_HOST`, `PG_PORT`, `PG_USER`,
+`PG_PASSWORD` and `PG_DBNAME`; the installer never creates or changes it. Image
+references in the examples stay sanitized placeholders; the immutable digests of
+the candidate images are resolved by the mirror step (MPR-187).
 
 ## Rules by profile
 
@@ -115,7 +125,7 @@ accelerator.
 uses Ray. When KubeRay and the AIPlatform CR are enabled it also requires
 `images.ray.headImage`, `images.ray.workerImage` and `images.weaviate.image`, so
 that `validate` and `render-profile` agree with `install`. CPU/GPU placement and
-resource semantics are MPR-186's.
+resource budgets are described in "Placement and resource budgets" below.
 
 CRD defaulting: the CRD defaults `sidecars.otel` and `sidecars.prometheusOperator`
 to `true`, and `storage.vectorDB.size` to `50Gi`, whenever the parent object is
@@ -209,14 +219,27 @@ Added by MPR-229.
 | Ray, Weaviate, ingress, sidecar monitoring | none created, none reported | unchanged |
 | Operator without KubeRay | starts and reconciles: the `RayService` and `RayCluster` watches are registered only when those APIs exist | unchanged (watches registered when KubeRay is installed) |
 | AgentRuntime handler | no wait for Ray, no platform URL required; no `PLATFORM_URL`, no `VECTOR_DB_URL` | waits for Ray, derives the platform URL, sets `PLATFORM_URL` |
-| SLIM handler | no wait for Ray; no `PLATFORM_URL`; `AI_TIER_AGENT_RUNTIME_URL` = the AgentRuntime Service URL | waits for Ray, `PLATFORM_URL` set, no `AI_TIER_AGENT_RUNTIME_URL` |
+| SLIM handler | no wait for Ray; `PLATFORM_URL` carries the resolved `spec.aiPlatformUrl` (empty when none is supplied; a supplied value is kept); `AI_TIER_AGENT_RUNTIME_URL` = the AgentRuntime Service URL | waits for Ray; `PLATFORM_URL` = the Ray serve root; `AI_TIER_AGENT_RUNTIME_URL` = the AgentRuntime Service URL when the platform has an `agentruntime` feature, otherwise empty |
 | AIService `vectorDbUrl` | may be empty (no vector database) | required, as before |
 
-`AI_TIER_AGENT_RUNTIME_URL` is computed by the platform controller from the
-first `agentruntime` feature (in spec order), using the Service name and port
-the AgentRuntime handler defines (`agentruntime.ServiceURL`), and handed to the
-SLIM AIService as `spec.agentRuntimeUrl`. The exact variable and endpoint shape
-may be refined by the MPR-188 contract.
+SLIM always receives both `PLATFORM_URL` and `AI_TIER_AGENT_RUNTIME_URL`, under
+both profiles (MPR-188). `PLATFORM_URL` is the resolved `spec.aiPlatformUrl` with the
+existing trailing-slash and `/ai-platform-models/v1` normalization applied,
+independent of the profile; an empty value under `cpuOnly` is just what that
+platform has to give, not a rule, and a supplied non-empty value is preserved.
+`AI_TIER_AGENT_RUNTIME_URL` is the origin of the AgentRuntime Service,
+`http://<service>.<namespace>.svc.<cluster-domain>:8080`; the Runtime's own API
+prefix `/system/ai-agent-runtime/v1` is not part of it, and no application JWT or
+Authorization header is used on this internal hop.
+
+The URL is `spec.agentRuntimeUrl` when set, otherwise it is derived from the
+platform's `agentruntime` feature, with the Service name and port defined once
+(`agentruntime.FeatureServiceURL`). The platform controller also sets
+`spec.agentRuntimeUrl` explicitly for `cpuOnly`. There is no way to choose between
+several `agentruntime` features, so the SLIM handler refuses to guess (it reports
+"multiple agentruntime features") and `cpuOnly` admission rejects a `slim` feature
+alongside more than one `agentruntime` feature. An empty `clusterDomain` falls back
+to the CRD default `cluster.local`.
 
 ### Cluster prerequisites
 
@@ -237,12 +260,94 @@ in the namespace and listed in `spec.images.imagePullSecrets`. The operator
 passes `imagePullSecrets` to the schema Job and the Deployments, so the install
 path must always set it for private images (MPR-193, MPR-190).
 
+## Placement and resource budgets
+
+No new API fields: placement comes from `spec.cpuScheduler` and `spec.gpuScheduler`
+(node selector, tolerations, affinity) and budgets from the AIService
+`spec.resources`. The operator never invents a node selector or toleration, so a
+CPU-only host without node labels still places every workload; it only refuses
+settings that contradict the profile.
+
+**Agent runtime (both profiles).** Always on CPU nodes, never a GPU.
+
+- It follows `spec.cpuScheduler`.
+- Its budget defaults to requests `cpu 500m`, `memory 512Mi`, `ephemeral-storage 1Gi`
+  and limits `cpu 1`, `memory 1Gi`, `ephemeral-storage 2Gi`
+  (`agentruntime.DefaultResources`, the single definition). Requests are defaulted
+  only when the whole map is unset, as before. Every cpu, memory and
+  ephemeral-storage limit that is missing is added, as the larger of the default
+  and the request for that resource, so the Deployment always has an explicit
+  limit for each and a default never falls below something you asked for. Values
+  you set are never changed.
+- Refused, with the field in the message: a negative quantity, a request above its
+  limit, a zero cpu, memory or ephemeral-storage budget, and any accelerator
+  resource (`nvidia.com/*`, `amd.com/gpu`, `gpu.intel.com/*`). The admission webhook
+  and the handler apply the same rules, so a CR applied without the webhook gets
+  the same answer.
+
+**SLIM.** Under `cpuOnly` it follows `spec.cpuScheduler` too, since every workload
+there is a CPU workload, and an accelerator resource is refused. Under
+`fullfeature` (and omitted or `full`) it stays unplaced as before and its
+resources are not checked for accelerators: it is an existing component whose
+resources an administrator may have set freely. Its default budget is unchanged
+(`cpu 4`, `memory 5Gi`, requests equal to limits), and negative quantities and
+requests above limits are refused under every profile. The SLIM Deployment now
+honours `spec.nodeSelector`; before, only affinity and tolerations were copied.
+The platform controller sets no selector for SLIM under `fullfeature`, so only a
+selector patched directly onto a SLIM AIService takes effect where it was
+silently ignored before.
+
+**What "selects GPU capacity" means.** A node selector on any `nvidia.com/*` label
+or on `splunk.ai/workload-type=gpu`; a required node affinity that matches such a
+label with `In` (or `Exists` for an `nvidia.com/*` key); or a toleration of the
+`nvidia.com/gpu` taint. An affinity that keeps a workload *off* GPU nodes
+(`NotIn`, `DoesNotExist`) is not a selection, and neither is a toleration with an
+empty key, which tolerates every taint but is not GPU-specific. Preferred
+(soft) affinity is not examined.
+
+**`cpuOnly`.** Renders no GPU workload, request or toleration. Besides the GPU
+settings listed above, `spec.cpuScheduler` must not select GPU capacity. That check
+is an error when the platform is created and an admission warning when it is
+updated, so a platform made before the rule stays editable.
+
+**`fullfeature`.** Hosted models run on GPU capacity through Ray and keep their own
+resource ownership; the agent runtime stays on CPU nodes. For an *explicit*
+`profile: fullfeature` the operator checks that GPU capacity is identifiable
+(`gpuScheduler` node selector, affinity or a toleration of the GPU taint, or
+`gpuInstanceType`, or `defaultAcceleratorType`), that `cpuScheduler` does not select
+GPU capacity, and that the two schedulers do not place workloads identically (same
+node selector, tolerations and affinity; a shared broad selector is fine when required
+affinity or a taint separates the pools). Same split: an
+error on create, a warning on update. An omitted profile and legacy `full` are the
+same profile but are not checked at all.
+
+**Why updates only warn, and deletion is never blocked.** The operator's own
+finalizer removal is an update that goes through the webhook, and the operator runs
+the profile validation on every reconcile. A placement rule that refused updates or
+failed a reconcile could leave an existing platform uneditable or stuck in
+Terminating over a setting that worked before the rule existed. So these rules
+never fail a reconcile, only create refuses, and the AIPlatform and AIService
+update webhooks allow any update of an object that is being deleted.
+
+**Upgrade notes.** Every CR with the agent-runtime budget unset, or with requests
+and limits both fully set, renders byte-identically to before (checked by rendering
+the same inputs with the previous release). The only change to an existing
+workload is a CR that sets *some* limits but not all of cpu, memory and
+ephemeral-storage: the missing ones are added, which changes that Deployment's
+hash, rolls its pods and re-runs its schema Job once. A CR that previously failed
+because it set `requests.cpu` above the defaulted limit now works, with the limit
+raised to the request.
+
+Not in this section: the GPU requests and limits of the hosted-model workloads
+(the MPR-188 contract covers the runtime, carrier, schema and SLIM images and AITK, not hosted models, so these stay an external input supplied with the model images), HPA replica control (MPR-197), and
+NetworkPolicy and PDB (MPR-205).
+
 ## Not covered here
 
 - Readiness gating of AgentRuntime itself (schema, pods, endpoints, probe): MPR-191.
 - SLIM and AITK routing and trust configuration: MPR-199.
 - The install waits that assume Ray and Weaviate after the CR is applied.
-- Placement, resource budgets, mirroring and image digest resolution.
+- Hosted-model GPU requests and limits (supplied with the hosted-model images, outside the MPR-188 contract), mirroring and image digest resolution (MPR-187).
 
 ## Reused code from `agent-runtime/ai-tier`
 

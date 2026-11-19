@@ -17,8 +17,8 @@
 # Image references are CANDIDATE builds (MPR-188): tags may advance while the
 # image owners harden them. The immutable digest of each is resolved per run by
 # the mirror step (MPR-187) and recorded in images.snapshotManifest.
-# The provider key and AGENT_MODULE below are TBD until the image owners supply
-# a validated Launchpad contract (ERD 14.4.6).
+# The provider key (mltk) and its AGENT_MODULE are the values confirmed by the
+# MPR-188 candidate contract (config/agent-runtime/candidate-manifest.yaml).
 # ===================================================================
 
 cluster:
@@ -54,15 +54,15 @@ images:
     image: "splunk/splunk-ai-operator:candidate-1"
   slim:
     apiImage: "splunk/ai-tier-slim-service:candidate-1"
-  aitk:        # optional for now: nothing consumes it yet (decide with MPR-188)
+  aitk:        # optional pass-through; AITK is a Splunk app (Splunk_ML_Toolkit), not a container image (MPR-188), and nothing consumes this
     image: "splunk/ai-tier-aitk:candidate-1"
   agentRuntime:
     baseImage: "splunk/ai-agent-runtime:candidate-1"
     schemaSetupImage: "splunk/ai-agent-runtime-schema-setup:candidate-1"
     providerImages:
-      launchpad: "splunk/ai-agent-runtime-provider-launchpad:candidate-1"
+      mltk: "splunk/ai-agent-runtime-provider-mltk:candidate-1"
     providerModules:
-      launchpad: "REPLACE_WITH_VALIDATED.module:LaunchpadAgentLoader"   # TBD
+      mltk: "agentcore_operations.loader:MLTKAgentLoader"
   fluentBit:
     image: "docker.io/fluent/fluent-bit:1.9.6"
   nginx:
@@ -96,13 +96,13 @@ aiPlatform:
     - name: "slim"
       version: "1.0.0"
     - name: "agentruntime"
-      provider: "launchpad"
+      provider: "mltk"
       version: "0.1.0"
       minReplicas: 1
       maxReplicas: 4
       targetCPUUtilization: 60
-      checkpointDbSecretRef: "launchpad-postgres-conn"   # external Secret, created by the customer
+      checkpointDbSecretRef: "mltk-postgres-conn"   # external Secret, created by the customer
   agentRuntime:
     checkpointSecrets:
-      - name: "launchpad-postgres-conn"
+      - name: "mltk-postgres-conn"
         create: false    # never created or modified by the installer

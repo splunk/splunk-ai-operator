@@ -150,9 +150,11 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, aiservice
 		))
 	}
 
+	platformIsCPUOnly := v.platformIsCPUOnly(ctx, aiservice)
+
 	// Validate VectorDbUrl is required, except for a cpuOnly platform: it runs
 	// no vector database, so there is nothing to point at.
-	if aiservice.Spec.VectorDbUrl == "" && !v.platformIsCPUOnly(ctx, aiservice) {
+	if aiservice.Spec.VectorDbUrl == "" && !platformIsCPUOnly {
 		allErrs = append(allErrs, field.Required(
 			field.NewPath("spec").Child("vectorDbUrl"),
 			"vectorDbUrl must be specified",
@@ -211,6 +213,10 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, aiservice
 	}
 
 	if errs := v.validateAgentRuntimeFields(aiservice, field.NewPath("spec")); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+
+	if errs := validateWorkloadResources(aiservice, field.NewPath("spec"), platformIsCPUOnly); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
@@ -280,6 +286,12 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 // ValidateUpdate implements admission.Validator for the AIService type.
 func (v *AIServiceCustomValidator) ValidateUpdate(ctx context.Context, oldService, aiservice *aiv1.AIService) (admission.Warnings, error) {
 	aiservicelog.Info("Validation for AIService upon update", "name", aiservice.GetName())
+
+	// Never block an object that is being deleted: removing the finalizer is an
+	// update, and refusing it would leave the service stuck in Terminating.
+	if aiservice.GetDeletionTimestamp() != nil {
+		return nil, nil
+	}
 
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
@@ -529,4 +541,22 @@ func cleanServiceTemplateMetadata(template *corev1.Service) {
 
 	// Clear status - it's not used in templates
 	template.Status = corev1.ServiceStatus{}
+}
+
+// validateWorkloadResources rejects compute budgets that cannot work: negative
+// quantities and requests above limits for every feature. The agentruntime
+// feature, which always runs on CPU nodes, additionally refuses accelerator
+// resources and zero cpu, memory or ephemeral-storage budgets. SLIM refuses
+// accelerator resources only under a cpuOnly platform: on any other platform it
+// is an existing component whose resources an administrator may have set freely.
+// Only values that are set are checked: the handler fills in the rest and
+// re-checks the result, so a CR applied without this webhook gets the same
+// answer.
+func validateWorkloadResources(aiservice *aiv1.AIService, specPath *field.Path, platformIsCPUOnly bool) field.ErrorList {
+	name := aiservice.Spec.Feature.Name
+	forbidGPU := name == "agentruntime" || (name == "slim" && platformIsCPUOnly)
+	errs := aiv1.ValidateWorkloadResources(specPath.Child("resources"), aiservice.Spec.Resources, name == "agentruntime", forbidGPU)
+	errs = append(errs, aiv1.ValidateWorkloadResources(specPath.Child("v2").Child("resources"), aiservice.Spec.V2.Resources, false, false)...)
+	errs = append(errs, aiv1.ValidateWorkloadResources(specPath.Child("v2Worker").Child("resources"), aiservice.Spec.V2Worker.Resources, false, false)...)
+	return errs
 }

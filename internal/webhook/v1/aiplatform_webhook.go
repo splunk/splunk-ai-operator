@@ -123,7 +123,17 @@ var _ admission.Validator[*aiv1.AIPlatform] = &AIPlatformCustomValidator{}
 // ValidateCreate implements admission.Validator for the AIPlatform type.
 func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, aiplatform *aiv1.AIPlatform) (admission.Warnings, error) {
 	aiplatformlog.Info("Validation for AIPlatform upon creation", "name", aiplatform.GetName())
+	return v.validate(aiplatform, true)
+}
 
+// validate holds the checks shared by create and update. A placement problem (a
+// cpuOnly CPU scheduler that selects GPU nodes; for an explicit fullfeature, no
+// identifiable GPU capacity, a CPU scheduler that selects GPU nodes, or identical
+// CPU and GPU selectors) is an error when the platform is created and a warning
+// when it is updated: an existing platform must stay editable, and even the
+// operator's own metadata updates, including removing its finalizer, pass through
+// here.
+func (v *AIPlatformCustomValidator) validate(aiplatform *aiv1.AIPlatform, enforceFullFeaturePlacement bool) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
@@ -161,6 +171,13 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, aiplatfo
 
 	// Validate the deployment profile and settings that contradict it
 	allErrs = append(allErrs, aiplatform.Spec.ValidateProfile(field.NewPath("spec"))...)
+	if placement := aiplatform.Spec.ValidatePlacement(field.NewPath("spec")); enforceFullFeaturePlacement {
+		allErrs = append(allErrs, placement...)
+	} else {
+		for _, e := range placement {
+			warnings = append(warnings, e.Error())
+		}
+	}
 
 	// Validate top-level ScaleFactor
 	if errs := v.validateScaleFactor(aiplatform.Spec.ScaleFactor, field.NewPath("spec").Child("scaleFactor")); len(errs) > 0 {
@@ -178,6 +195,13 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, aiplatfo
 func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldPlatform, aiplatform *aiv1.AIPlatform) (admission.Warnings, error) {
 	aiplatformlog.Info("Validation for AIPlatform upon update", "name", aiplatform.GetName())
 
+	// An object that is being deleted must always be allowed to finish: removing
+	// the finalizer is an update, and refusing it would leave the platform stuck
+	// in Terminating whatever its spec says.
+	if aiplatform.GetDeletionTimestamp() != nil {
+		return nil, nil
+	}
+
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
@@ -185,7 +209,7 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldPlatf
 	// once, so the update-only rules below (immutable region, switch to cpuOnly)
 	// are reported together with it instead of being masked.
 	var createErr error
-	if createWarnings, err := v.ValidateCreate(ctx, aiplatform); err != nil {
+	if createWarnings, err := v.validate(aiplatform, false); err != nil {
 		createErr = err
 	} else {
 		warnings = append(warnings, createWarnings...)
