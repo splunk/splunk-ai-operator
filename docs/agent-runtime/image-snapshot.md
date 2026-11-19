@@ -78,6 +78,16 @@ It is deterministic and carries a checksum over the candidate record and the ima
 
 - **The candidate manifest is authoritative** for the Agent Runtime base, the
   Launchpad carrier and provider, schema setup and SLIM images.
+- **Versioned base pins and other providers.** The installer sets every
+  `images.agentRuntime.baseImages` entry (`RELATED_IMAGE_AGENT_RUNTIME_BASE_<VERSION>`) and
+  every `images.agentRuntime.providerImages` entry on the operator, which uses a pin when a
+  feature sets `runtimeVersion`. Each is inventoried for both profiles, under
+  `agent-runtime-base-<version>` and `agent-runtime-provider-<name>`, unless it is the
+  candidate's own: the pin for the candidate's `runtimeVersion` and the candidate's provider
+  are the candidate images, and `compare` requires the install to point them at those images'
+  mirror references (MPR-188 renders the same mapping). This follows FR-16 and §14.4.4 of the
+  Agent-Runtime / AI-Tier Integration ERD: the inventory is complete for what the operator
+  can select.
 - **AITK is not in the inventory.** It is the Splunk app `Splunk_ML_Toolkit`, not a
   container image (MPR-188).
 - **`cpuOnly` never needs** Ray, Weaviate, SAIA, nginx, the KubeRay operator or the

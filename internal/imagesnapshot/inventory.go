@@ -64,13 +64,17 @@ type InstallerConfig struct {
 			OperatorImage string `json:"operatorImage"`
 		} `json:"splunk"`
 		// The agent-runtime images below are also named by the candidate manifest,
-		// which is authoritative for the selected revision. They are read only to be
-		// compared with it by Compare.
+		// which is authoritative for the selected revision. The default base, schema
+		// setup, SLIM and the candidate's own provider are read only to be compared with
+		// it by Compare. BaseImages (versioned base pins, RELATED_IMAGE_AGENT_RUNTIME_BASE_<V>)
+		// and providers the candidate does not name are images the installer hands the
+		// operator, so they are inventoried too.
 		Slim struct {
 			APIImage string `json:"apiImage"`
 		} `json:"slim"`
 		AgentRuntime struct {
 			BaseImage        string            `json:"baseImage"`
+			BaseImages       map[string]string `json:"baseImages"`
 			SchemaSetupImage string            `json:"schemaSetupImage"`
 			ProviderImages   map[string]string `json:"providerImages"`
 		} `json:"agentRuntime"`
@@ -216,6 +220,14 @@ func BuildInventory(in InventoryInput) (*Inventory, error) {
 
 	// 2. Images the installer configuration names outside the candidate set.
 	for _, img := range installerConfigImages(in) {
+		add(img)
+	}
+
+	// 2b. Agent-runtime images the installer configures beyond the candidate set: the
+	// versioned base pins and providers the candidate does not name. A pin for the
+	// candidate's own runtimeVersion is the candidate base (the candidate is
+	// authoritative), so it adds nothing here; Compare holds it to that image.
+	for _, img := range agentRuntimeConfigImages(in) {
 		add(img)
 	}
 
@@ -388,6 +400,88 @@ func (in InventoryInput) componentOn(profile, name string) bool {
 		}
 	}
 	return componentEnabled(nil, profile, name)
+}
+
+// agentRuntimeConfigImages returns the configured agent-runtime images outside the
+// candidate set. The installer sets every configured pin and provider on the operator
+// (RELATED_IMAGE_AGENT_RUNTIME_BASE_<V>, RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_<P>)
+// whatever the features, so each one is an image the operator may pull, in either profile.
+func agentRuntimeConfigImages(in InventoryInput) []Image {
+	cfg := in.Installer.Images
+	var out []Image
+	if !in.componentOn(ProfileCPUOnly, "aiOperator") && !in.componentOn(ProfileFullFeature, "aiOperator") {
+		return nil
+	}
+	profiles := func() []string {
+		var ps []string
+		for _, p := range bothProfiles {
+			if in.componentOn(p, "aiOperator") {
+				ps = append(ps, p)
+			}
+		}
+		return ps
+	}()
+	for _, v := range sortedKeys(cfg.AgentRuntime.BaseImages) {
+		ref := configuredRef(cfg.Registry, cfg.AgentRuntime.BaseImages[v])
+		if ref == "" || in.isCandidateRuntimeVersion(v) {
+			continue
+		}
+		out = append(out, Image{Component: baseVersionComponent(v), Role: "Agent Runtime base image pinned for runtimeVersion " + v,
+			Category: CategoryAgentRuntime, Profiles: profiles, Source: ref,
+			Origin: "installer-config:images.agentRuntime.baseImages." + v})
+	}
+	for _, p := range sortedKeys(cfg.AgentRuntime.ProviderImages) {
+		ref := configuredRef(cfg.Registry, cfg.AgentRuntime.ProviderImages[p])
+		if ref == "" || in.isCandidateProvider(p) {
+			continue
+		}
+		out = append(out, Image{Component: "agent-runtime-provider-" + p, Role: "Agent Runtime " + p + " provider image (not in the candidate set)",
+			Category: CategoryAgentRuntime, Profiles: profiles, Source: ref,
+			Origin: "installer-config:images.agentRuntime.providerImages." + p})
+	}
+	return out
+}
+
+// configuredRef is a configured image as the installer resolves it, or "" when unset.
+func configuredRef(registry, ref string) string {
+	if ref = strings.TrimSpace(ref); ref == "" || ref == "null" {
+		return ""
+	}
+	return buildImageURL(registry, ref)
+}
+
+// envSegment is the operator's normalizeEnvKeySegment: the version or provider part of
+// a RELATED_IMAGE_* name. Two keys with the same segment select the same variable.
+func envSegment(v string) string {
+	var b strings.Builder
+	last := false
+	for _, r := range strings.ToUpper(v) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			last = false
+		} else if !last {
+			b.WriteByte('_')
+			last = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+// baseVersionComponent names the component of a pinned base: agent-runtime-base-v2-0-0.
+func baseVersionComponent(version string) string {
+	return "agent-runtime-base-" + strings.ToLower(strings.ReplaceAll(envSegment(version), "_", "-"))
+}
+
+func (in InventoryInput) isCandidateRuntimeVersion(v string) bool {
+	return in.Candidate != nil && in.Candidate.Spec.RuntimeVersion != "" && envSegment(v) == envSegment(in.Candidate.Spec.RuntimeVersion)
+}
+
+func (in InventoryInput) isCandidateProvider(p string) bool {
+	if in.Candidate == nil {
+		return false
+	}
+	c, ok := in.Candidate.Spec.Components["launchpadCarrier"]
+	return ok && strings.TrimSpace(c.Image) != "" && envSegment(c.Provider) == envSegment(p)
 }
 
 func (inv *Inventory) computeChecksum() (string, error) {

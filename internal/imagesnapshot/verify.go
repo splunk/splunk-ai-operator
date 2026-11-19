@@ -59,6 +59,13 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 		for _, p := range sortedKeys(v.Images.AgentRuntime.Providers) {
 			add("agent-runtime-provider-"+p, v.Images.AgentRuntime.Providers[p])
 		}
+		// The installer also sets every configured provider on the operator, with or
+		// without a feature for it; the rendered values list only the featured ones.
+		for _, p := range sortedKeys(in.Installer.Images.AgentRuntime.ProviderImages) {
+			if _, rendered := v.Images.AgentRuntime.Providers[p]; !rendered {
+				add("agent-runtime-provider-"+p, configuredRef(in.Installer.Images.Registry, in.Installer.Images.AgentRuntime.ProviderImages[p]))
+			}
+		}
 	} else {
 		// No rendered values: take the configured references the way the installer does.
 		cfg := in.Installer.Images
@@ -73,6 +80,19 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 		add("agent-runtime-schema-setup", url(cfg.AgentRuntime.SchemaSetupImage))
 		for _, p := range sortedKeys(cfg.AgentRuntime.ProviderImages) {
 			add("agent-runtime-provider-"+p, url(cfg.AgentRuntime.ProviderImages[p]))
+		}
+	}
+	// The versioned base pins are not in the rendered values: the installer reads them
+	// from the configuration. The pin for the candidate's runtimeVersion is the
+	// candidate base, so it must be that image's mirror reference.
+	cfg := in.Installer.Images
+	for _, v := range sortedKeys(cfg.AgentRuntime.BaseImages) {
+		component := baseVersionComponent(v)
+		if in.isCandidateRuntimeVersion(v) {
+			component = "agent-runtime-base"
+		}
+		if operatorOn {
+			add(component, configuredRef(cfg.Registry, cfg.AgentRuntime.BaseImages[v]))
 		}
 	}
 	for _, img := range installerConfigImages(in) {

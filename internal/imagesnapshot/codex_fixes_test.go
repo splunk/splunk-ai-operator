@@ -525,3 +525,94 @@ func TestInventory_NoInstallerDefaultsAlsoAppliesToAConfigurationThatOmitsImages
 	assert.NotContains(t, components(inv.Images), "splunk-operator")
 	assert.NotContains(t, refMap(InstallRefs(ProfileFullFeature, in)), "fluent-bit")
 }
+
+// ---- ERD FR-16 / §14.4.4: versioned base pins and providers beyond the candidate ----
+
+func pinsInput(t *testing.T, values bool) InventoryInput {
+	return inputWith(t, func(c *InstallerConfig) {
+		c.Images.Registry = "registry.airgap.local"
+		c.Images.AgentRuntime.BaseImages = map[string]string{
+			"v1.9.0": "docker.io/splunk/agent-runtime:v1.9.0", // an older supported pin
+			"v2.0.0": "docker.io/splunk/agent-runtime:v2.0.0", // the candidate's runtimeVersion
+			"v3-rc":  "splunk/agent-runtime:v3-rc",            // relative: images.registry applies
+			"blank":  "null",
+		}
+		c.Images.AgentRuntime.ProviderImages = map[string]string{
+			"mltk": "docker.io/splunk/agent-runtime-provider-mltk:0.1.0", // the candidate's provider
+			"seca": "docker.io/splunk/agent-runtime-provider-seca:0.2.0", // not in the candidate
+		}
+	}, values)
+}
+
+func TestInventory_VersionedBasePinsAndExtraProvidersAreInventoried(t *testing.T) {
+	for _, withValues := range []bool{true, false} {
+		in := pinsInput(t, withValues)
+		require.Equal(t, "v2.0.0", in.Candidate.Spec.RuntimeVersion, "fixture assumption")
+		inv, err := BuildInventory(in)
+		require.NoError(t, err)
+		c := components(inv.Images)
+
+		assert.Equal(t, "docker.io/splunk/agent-runtime:v1.9.0", c["agent-runtime-base-v1-9-0"].Source, "values=%v", withValues)
+		assert.Equal(t, "registry.airgap.local/splunk/agent-runtime:v3-rc", c["agent-runtime-base-v3-rc"].Source)
+		assert.Equal(t, Profiles, c["agent-runtime-base-v1-9-0"].Profiles, "the operator may select a pin in either profile")
+		assert.Equal(t, "installer-config:images.agentRuntime.baseImages.v1.9.0", c["agent-runtime-base-v1-9-0"].Origin)
+		assert.NotContains(t, c, "agent-runtime-base-v2-0-0", "the candidate's own runtimeVersion is the candidate base image")
+		assert.NotContains(t, c, "agent-runtime-base-blank")
+
+		assert.Equal(t, "docker.io/splunk/agent-runtime-provider-seca:0.2.0", c["agent-runtime-provider-seca"].Source)
+		assert.Equal(t, "candidate-manifest:components.launchpadCarrier", c["agent-runtime-provider-mltk"].Origin,
+			"the candidate stays authoritative for its own provider")
+	}
+}
+
+func TestInstallRefs_VersionedBasePinsAreCheckedAndTheCandidatePinIsTheCandidateBase(t *testing.T) {
+	for _, withValues := range []bool{true, false} {
+		in := pinsInput(t, withValues)
+		for _, p := range Profiles {
+			refs := InstallRefs(p, in)
+			got := map[string][]string{}
+			for _, r := range refs {
+				got[r.Component] = append(got[r.Component], r.Ref)
+			}
+			assert.Equal(t, []string{"docker.io/splunk/agent-runtime:v1.9.0"}, got["agent-runtime-base-v1-9-0"], "values=%v %s", withValues, p)
+			assert.Contains(t, got["agent-runtime-base"], "docker.io/splunk/agent-runtime:v2.0.0",
+				"the v2.0.0 pin is checked as the candidate base, so a pin to another image is caught")
+			assert.Equal(t, []string{"docker.io/splunk/agent-runtime-provider-seca:0.2.0"}, got["agent-runtime-provider-seca"],
+				"a configured provider without a feature is still set on the operator")
+		}
+	}
+}
+
+func TestInventory_PinsFollowTheAIOperator(t *testing.T) {
+	in := pinsInput(t, false)
+	in.Installer.Components = map[string]any{"aiOperator": false}
+	inv, err := BuildInventory(in)
+	require.NoError(t, err)
+	assert.NotContains(t, components(inv.Images), "agent-runtime-base-v1-9-0")
+	assert.NotContains(t, components(inv.Images), "agent-runtime-provider-seca")
+	assert.NotContains(t, refMap(InstallRefs(ProfileCPUOnly, in)), "agent-runtime-base-v1-9-0")
+}
+
+// The pin for the candidate's runtimeVersion pointing at a different image (or at the
+// public registry) is a finding, not a pass.
+func TestCompare_ACandidatePinToAnotherImageIsAFinding(t *testing.T) {
+	src, dst := newTestRegistry(t), newTestRegistry(t)
+	src.pushImage("ml/agent-runtime", "c1", "linux", "amd64", nil)
+	src.pushImage("ml/agent-runtime", "old", "linux", "amd64", nil)
+	inv := inventoryOf(imageOf("agent-runtime-base", src.ref("ml/agent-runtime", "c1")))
+	snap, err := Create(context.Background(), newCounting(), inv, Options{Mirror: dst.Host, ID: "pins"})
+	require.NoError(t, err)
+	mirror := snap.Spec.Entries[0].MirrorRef
+
+	assert.Empty(t, Compare(snap, ProfileCPUOnly, []InstallRef{{"agent-runtime-base", mirror}}))
+	got := Compare(snap, ProfileCPUOnly, []InstallRef{{"agent-runtime-base", src.ref("ml/agent-runtime", "old")}})
+	require.Len(t, got, 1)
+	assert.Equal(t, FindingSourceRegistry, got[0].Code)
+}
+
+func TestEnvSegment_MatchesTheOperatorsNormalisation(t *testing.T) {
+	for in, want := range map[string]string{"v2.0.0": "V2_0_0", "v1.9.0-rc.1": "V1_9_0_RC_1", "--x..y--": "X_Y", "mltk": "MLTK", "a__b": "A_B"} {
+		assert.Equal(t, want, envSegment(in), in)
+	}
+	assert.Equal(t, "agent-runtime-base-v2-0-0", baseVersionComponent("v2.0.0"))
+}

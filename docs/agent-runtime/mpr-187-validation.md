@@ -127,8 +127,15 @@ Five review findings were fixed so the tool reads the installer configuration th
   image only when unambiguous, and otherwise reports new and removed;
 - a single-manifest image keeps its platform variant (`linux/amd64/v3` is not `linux/amd64`).
 
-After the fixes the two packages pass 125 tests and subtests (3 live tests skipped), the race
-detector is clean, coverage is 92.8% (package) and 85.7% (CLI), and 18 further mutations
+Checking the work against the Agent-Runtime / AI-Tier Integration ERD (FR-16, §14.4.4) then
+found that versioned base pins (`images.agentRuntime.baseImages`) and providers outside the
+candidate set were not inventoried, although the installer sets them on the operator and the
+candidate's `runtimeVersion` selects one. They are now inventoried and checked by `compare`,
+and the pin for the candidate's own version is held to the candidate base image. Nine more
+mutations target this change, and a CLI test mirrors a pin and an extra provider.
+
+After the fixes the two packages pass 131 tests and subtests (3 live tests skipped), the race
+detector is clean, coverage is 93.3% (package) and 85.7% (CLI), and 27 further mutations
 targeting the fixes are each caught. An independent review of the fixes found that the
 Splunk Operator default ignored the Splunk mode; that was fixed with a test over eight
 Splunk configurations before this was proposed.

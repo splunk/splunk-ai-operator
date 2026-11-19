@@ -550,3 +550,37 @@ func TestCreate_AReportThatCannotBeWrittenDoesNotChangeTheExitCode(t *testing.T)
 	assert.Contains(t, errs, "warning: could not write the report")
 	assert.Contains(t, errs, "incompatible: no linux/amd64 image")
 }
+
+// Versioned base pins and providers beyond the candidate set are mirrored, and an
+// install whose candidate-version pin points elsewhere is caught by compare.
+func TestCreate_MirrorsVersionedBasePinsAndExtraProviders(t *testing.T) {
+	e := newEnv(t)
+	e.src.push("ml-platform/agent-runtime", "v1.9.0", "amd64")
+	e.src.push("ml-platform/agent-runtime-provider-seca", "0.2.0", "amd64")
+	body := strings.Replace(string(mustRead(t, e.config)), "images:\n", fmt.Sprintf(`images:
+  agentRuntime:
+    baseImages:
+      v1.9.0: %[1]s/ml-platform/agent-runtime:v1.9.0
+    providerImages:
+      seca: %[1]s/ml-platform/agent-runtime-provider-seca:0.2.0
+`, e.src.Host), 1)
+	cfg := e.write("config-pins.yaml", body)
+
+	code, _, errs := e.run("create", "--mirror", e.dst.Host, "--store", e.store, "--id", "pins", "--candidate", e.candidate,
+		"--config", cfg, "--values-cpuonly", e.cpuValues, "--values-fullfeature", e.fullValue)
+	require.Equal(t, 0, code, errs)
+	snap, err := (imagesnapshot.Store{Dir: e.store}).Get("pins")
+	require.NoError(t, err)
+	pin, seca := entry(snap, "agent-runtime-base-v1-9-0"), entry(snap, "agent-runtime-provider-seca")
+	assert.Equal(t, imagesnapshot.StatusVerified, pin.Status)
+	assert.Equal(t, imagesnapshot.StatusVerified, seca.Status)
+
+	// The candidate's runtimeVersion (v2.0.0) pinned to some other image is a finding.
+	values := e.write("values-pins.yaml", "profile: {effective: cpuOnly}\ncomponents: {aiOperator: true, kuberay: false, nvidia: false}\n")
+	wrongPin := e.write("config-wrong-pin.yaml", fmt.Sprintf("images:\n  agentRuntime:\n    baseImages:\n      v2.0.0: %s\n", pin.MirrorRef))
+	code, _, errs = e.run("compare", "--store", e.store, "--id", "pins", "--profile", "cpuOnly", "--candidate", e.candidate,
+		"--config", wrongPin, "--values-cpuonly", values)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errs, "agent-runtime-base: ")
+	assert.Contains(t, errs, "is the image of component agent-runtime-base-v1-9-0, not of agent-runtime-base")
+}
