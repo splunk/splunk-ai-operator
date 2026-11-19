@@ -18,6 +18,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,6 +33,7 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	require.NoError(t, aiv1.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
+	require.NoError(t, discoveryv1.AddToScheme(s))
 	require.NoError(t, appsv1.AddToScheme(s))
 	require.NoError(t, autoscalingv2.AddToScheme(s))
 	require.NoError(t, batchv1.AddToScheme(s))
@@ -76,7 +78,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 			"PGSSLMODE":   []byte("verify-full"),
 		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, checkpointSecret).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai, checkpointSecret).Build()
 	factory := &AgentRuntimeFactory{}
 	handler, err := factory.New(context.Background(), fakeClient, scheme, ai, record.NewFakeRecorder(20))
 	require.NoError(t, err)
@@ -127,10 +129,9 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	assertConditionTrue(t, ai.Status.Conditions, "ServiceAccountReady")
 	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeConfigMapReady")
 	assertConditionTrue(t, ai.Status.Conditions, "PostgresSchemaSetupReady")
-	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeDeploymentReady")
-	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeServiceReady")
+	assertConditionFalse(t, ai.Status.Conditions, "AgentRuntimeDeploymentReady")
 	assertConditionTrue(t, ai.Status.Conditions, "AgentRuntimeHPAReady")
-	assertConditionTrue(t, ai.Status.Conditions, "Ready")
+	assertConditionFalse(t, ai.Status.Conditions, "Ready")
 
 	configMap := &corev1.ConfigMap{}
 	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
@@ -190,7 +191,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	}
 	defaultAgentRuntimeSpec(ai)
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
@@ -258,7 +259,7 @@ func TestAgentRuntimeReconciler_ReconcilesServiceMonitorLikeSAIA(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
@@ -297,7 +298,7 @@ func TestAgentRuntimeReconciler_DefaultsOmittedHPAFields(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
@@ -357,7 +358,7 @@ func TestAgentRuntimeReconciler_BoundsSelectorsForLongAIServiceName(t *testing.T
 	}
 	defaultAgentRuntimeSpec(ai)
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
@@ -495,7 +496,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenValidationFails(t *testing
 			Replicas:              1,
 		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
@@ -536,7 +537,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenAgentModuleIsInvalid(t *te
 			Replicas:              1,
 		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
@@ -660,7 +661,7 @@ func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {
 			AIPlatformUrl: "http://platform:8000",
 		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai).Build()
 	reconciler := &AgentRuntimeReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,

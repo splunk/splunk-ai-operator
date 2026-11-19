@@ -41,11 +41,13 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/internal/controller/common"
 	telemetry "github.com/splunk/splunk-ai-operator/internal/telemetry"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features"
+	featurecommon "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/splunk/splunk-ai-operator/pkg/config"
 )
 
@@ -69,6 +71,8 @@ type AIServiceReconciler struct {
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -194,6 +198,21 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 	telemetry.ObserveReconcileStage(ctx, "feature_reconcile", featStart)
+	if featureName == "agentruntime" {
+		// The feature owns and persists its conditions, including all error paths.
+		// A second generic write would churn status or manufacture Ready=True.
+		telemetry.SetObservedGeneration(ctx, ai.Status.ObservedGeneration)
+		for _, c := range ai.Status.Conditions {
+			if c.Type == "Ready" {
+				telemetry.SetCondition(ctx, "Ready", string(c.Status))
+			}
+		}
+		if !featurecommon.IsCurrentServiceReady(ai) {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		telemetry.ObserveReconcileResult(ctx, "success")
+		return ctrl.Result{}, nil
+	}
 
 	// status update
 	if err := r.reconcileStatus(ctx, ai); err != nil {
@@ -227,11 +246,19 @@ func aiServiceGlobalEventFilter() predicate.Predicate {
 		checkpointSecretChangedPredicate(),
 		common.JobChangedPredicate(),
 		common.DeploymentChangedPredicate(),
+		runtimeBackendChangedPredicate(),
 	)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeWorkloadIndex, runtimeWorkloadKeys); err != nil {
+		return err
+	}
+	return r.setupController(mgr)
+}
+
+func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aiv1.AIService{}).
 		Named("aiservice").
@@ -243,8 +270,11 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&batchv1.Job{}, builder.WithPredicates(common.JobChangedPredicate())).
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(common.DeploymentChangedPredicate())).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&corev1.Service{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&corev1.Service{}, builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, runtimeBackendChangedPredicate()))).
 		Owns(&monitoringv1.ServiceMonitor{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
+		Watches(&appsv1.ReplicaSet{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		// Watch referenced AIPlatform (not owned by AIService)
 		Watches(
 			&aiv1.AIPlatform{},
@@ -272,6 +302,9 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // --- 8️⃣ reconcileStatus: update CR status/conditions ---
 func (r *AIServiceReconciler) reconcileStatus(ctx context.Context, p *aiv1.AIService) error {
+	if p.Spec.Feature.Name == "agentruntime" {
+		return nil
+	} // The feature owns its readiness and persistence.
 	// reflect observedGeneration
 	p.Status.ObservedGeneration = p.Generation
 

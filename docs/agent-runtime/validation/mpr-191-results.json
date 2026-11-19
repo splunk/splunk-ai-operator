@@ -1,0 +1,363 @@
+{
+  "scope": "local tests and in-memory status fixtures only; live results are in mpr-191-live-results.json",
+  "baseCommit": "bac158828b34ac574354153f76539f54b9f96986",
+  "command": "go test -json ./pkg/ai/features/agentruntime -run '^TestRuntime|^TestSchema' -count=1",
+  "exitCode": 0,
+  "passedTests": [
+    "TestSchemaSetupCommandDoesNotExportEmptyPGSSLMODE/no_SSL_setting",
+    "TestSchemaSetupCommandDoesNotExportEmptyPGSSLMODE/empty_standard_setting",
+    "TestSchemaSetupCommandDoesNotExportEmptyPGSSLMODE/runtime_setting",
+    "TestSchemaSetupCommandDoesNotExportEmptyPGSSLMODE/standard_setting_wins",
+    "TestSchemaSetupCommandDoesNotExportEmptyPGSSLMODE",
+    "TestRuntimeEnvFullfeatureOrderIsUnchanged",
+    "TestRuntimeReadinessGates/healthy",
+    "TestRuntimeReadinessGates/missing_deployment",
+    "TestRuntimeReadinessGates/zero_replicas",
+    "TestRuntimeReadinessGates/stale_deployment",
+    "TestRuntimeReadinessGates/partial_update",
+    "TestRuntimeReadinessGates/partial_availability",
+    "TestRuntimeReadinessGates/old_ready_pods_with_new_rollout",
+    "TestRuntimeReadinessGates/deployment_selector",
+    "TestRuntimeReadinessGates/old_replica_set",
+    "TestRuntimeReadinessGates/foreign_replica_set",
+    "TestRuntimeReadinessGates/probe_failing",
+    "TestRuntimeReadinessGates/pod_readiness_gate_failing",
+    "TestRuntimeReadinessGates/missing_container_status",
+    "TestRuntimeReadinessGates/missing_probe",
+    "TestRuntimeReadinessGates/terminating_pod",
+    "TestRuntimeReadinessGates/missing_service",
+    "TestRuntimeReadinessGates/service_selector",
+    "TestRuntimeReadinessGates/headless_service",
+    "TestRuntimeReadinessGates/service_port",
+    "TestRuntimeReadinessGates/no_slices",
+    "TestRuntimeReadinessGates/no_endpoints",
+    "TestRuntimeReadinessGates/nonready_endpoints",
+    "TestRuntimeReadinessGates/unknown_endpoint_readiness",
+    "TestRuntimeReadinessGates/metrics_only",
+    "TestRuntimeReadinessGates/foreign_service_uid",
+    "TestRuntimeReadinessGates/foreign_pod_uid",
+    "TestRuntimeReadinessGates/wrong_target_namespace",
+    "TestRuntimeReadinessGates/wrong_address",
+    "TestRuntimeReadinessGates/terminating_endpoints",
+    "TestRuntimeReadinessGates/publish_not_ready_cannot_bypass_probe",
+    "TestRuntimeReadinessGates/stale_schema_condition",
+    "TestRuntimeReadinessGates",
+    "TestRuntimeReadinessObservationErrorIsNotHealthyOrLeaked",
+    "TestRuntimeReadinessTransitionsAreStable",
+    "TestRuntimeReadySurvivesSchemaTTLAndUnrelatedGeneration",
+    "TestRuntimeStatusPersistenceFailureIsReturned",
+    "TestRuntimeDeploymentPreservesControllerRevisionWithoutTemplateChurn",
+    "TestSchemaJobBoundedAndReusableAfterTTL",
+    "TestSchemaImageMustComeFromResolvedDigest",
+    "TestSchemaFailurePersistsAndNonceRetries",
+    "TestSchemaRetryLimitReportsSafeFailure",
+    "TestSchemaJobLostBeforeOutcomeRequiresExplicitRetry",
+    "TestSchemaInputChangeStopsActiveJobBeforeReplacement",
+    "TestSchemaDigestAndSecretVersionRerunAfterSuccess/digest",
+    "TestSchemaDigestAndSecretVersionRerunAfterSuccess/secret_version",
+    "TestSchemaDigestAndSecretVersionRerunAfterSuccess/postgres_config",
+    "TestSchemaDigestAndSecretVersionRerunAfterSuccess",
+    "TestSchemaDigestRevertRunsAgainBeforeHistoricalJobTTL",
+    "TestSchemaDigestRevertRunsAgainBeforeIntermediateOutcomeObserved",
+    "TestSchemaRevertedAttemptCannotReuseHistoricalSuccessAfterTTL/failed_replay",
+    "TestSchemaRevertedAttemptCannotReuseHistoricalSuccessAfterTTL/lost_replay_outcome",
+    "TestSchemaRevertedAttemptCannotReuseHistoricalSuccessAfterTTL",
+    "TestSchemaRetainedJobAlreadyExistsIsNotAdopted",
+    "TestSchemaInputFingerprintIgnoresUnrelatedConfig",
+    "TestSchemaCommandStopsWaitingWithoutPrintingDatabaseURL"
+  ],
+  "failedTests": [],
+  "conditionSnapshots": [
+    {
+      "phase": "healthy",
+      "generation": 0,
+      "status": {
+        "featureStatus": {
+          "agentRuntime": {
+            "schema": {
+              "jobName": "schema-lifecycle-schema-a85004b3375edd8e",
+              "appliedHash": "a85004b3375edd8e",
+              "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          }
+        },
+        "conditions": [
+          {
+            "type": "ValidateReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "ServiceAccountReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "AgentRuntimeConfigMapReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "CertificateReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "PostgresSchemaSetupReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Succeeded",
+            "message": "schema setup completed for the current inputs"
+          },
+          {
+            "type": "AgentRuntimeDeploymentReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Available",
+            "message": "all desired runtime replicas are updated, ready and available"
+          },
+          {
+            "type": "AgentRuntimeServiceReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Configured",
+            "message": "runtime application Service and selector are configured"
+          },
+          {
+            "type": "AgentRuntimeHPAReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "ServiceMonitorReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "AgentRuntimeEndpointReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Available",
+            "message": "runtime Service has a matching ready application endpoint"
+          },
+          {
+            "type": "Ready",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Available",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready"
+          }
+        ]
+      }
+    },
+    {
+      "phase": "schema-job-removed-after-success",
+      "generation": 0,
+      "status": {
+        "featureStatus": {
+          "agentRuntime": {
+            "schema": {
+              "appliedHash": "a85004b3375edd8e",
+              "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          }
+        },
+        "conditions": [
+          {
+            "type": "ValidateReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "ServiceAccountReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "AgentRuntimeConfigMapReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "CertificateReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "PostgresSchemaSetupReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Succeeded",
+            "message": "schema setup completed for the current inputs"
+          },
+          {
+            "type": "AgentRuntimeDeploymentReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Available",
+            "message": "all desired runtime replicas are updated, ready and available"
+          },
+          {
+            "type": "AgentRuntimeServiceReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Configured",
+            "message": "runtime application Service and selector are configured"
+          },
+          {
+            "type": "AgentRuntimeHPAReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "ServiceMonitorReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "AgentRuntimeEndpointReady",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Available",
+            "message": "runtime Service has a matching ready application endpoint"
+          },
+          {
+            "type": "Ready",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Available",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready"
+          }
+        ]
+      }
+    },
+    {
+      "phase": "changed-schema-inputs",
+      "generation": 1,
+      "status": {
+        "featureStatus": {
+          "agentRuntime": {
+            "schema": {
+              "jobName": "schema-lifecycle-schema-65fdc419b8319bcd"
+            }
+          }
+        },
+        "conditions": [
+          {
+            "type": "ValidateReady",
+            "status": "True",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "ServiceAccountReady",
+            "status": "True",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "AgentRuntimeConfigMapReady",
+            "status": "True",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "CertificateReady",
+            "status": "True",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Reconciled",
+            "message": "stage succeeded"
+          },
+          {
+            "type": "PostgresSchemaSetupReady",
+            "status": "False",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Pending",
+            "message": "waiting for schema Job completion"
+          },
+          {
+            "type": "AgentRuntimeDeploymentReady",
+            "status": "Unknown",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Blocked",
+            "message": "waiting for PostgresSchemaSetup"
+          },
+          {
+            "type": "AgentRuntimeServiceReady",
+            "status": "Unknown",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Blocked",
+            "message": "waiting for PostgresSchemaSetup"
+          },
+          {
+            "type": "AgentRuntimeHPAReady",
+            "status": "Unknown",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Blocked",
+            "message": "waiting for PostgresSchemaSetup"
+          },
+          {
+            "type": "ServiceMonitorReady",
+            "status": "Unknown",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Blocked",
+            "message": "waiting for PostgresSchemaSetup"
+          },
+          {
+            "type": "AgentRuntimeEndpointReady",
+            "status": "Unknown",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Blocked",
+            "message": "waiting for PostgresSchemaSetup"
+          },
+          {
+            "type": "Ready",
+            "status": "False",
+            "observedGeneration": 1,
+            "lastTransitionTime": "2026-11-19T11:12:46Z",
+            "reason": "Pending",
+            "message": "waiting for schema Job completion"
+          }
+        ],
+        "observedGeneration": 1
+      }
+    }
+  ]
+}

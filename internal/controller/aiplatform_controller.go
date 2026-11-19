@@ -180,15 +180,12 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("aiplatform").
 		For(&aiv1.AIPlatform{}).
-		// AIPlatform is the source of truth for AIService spec, so child updates
-		// must not wake the parent into a spec-write loop. Reconcile on delete so
-		// missing children are recreated; primary AIPlatform changes still flow
-		// through the .For(AIPlatform) watch above.
-		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Funcs{
+		// Admit the runtime readiness projection, not arbitrary child updates.
+		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Or(agentRuntimeReadyChangedPredicate(), predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool { return false },
 			UpdateFunc: func(e event.UpdateEvent) bool { return false },
 			DeleteFunc: func(e event.DeleteEvent) bool { return !e.DeleteStateUnknown },
-		})).
+		}))).
 		// Infra owned by AIPlatform itself - with specific predicates
 		// (the Ray resources are registered below, only when KubeRay is installed)
 		// Weaviate pieces - whatever we create at the platform level
@@ -203,6 +200,7 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.RoleBinding{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Keep platform predicates light and scoped to the primary resource
 		WithEventFilter(predicate.Or(
+			agentRuntimeReadyChangedPredicate(),
 			common.GenerationChangedPredicate(),
 			common.AnnotationChangedPredicate(),
 			common.LabelChangedPredicate(),

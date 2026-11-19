@@ -54,7 +54,7 @@ func schemaTestReconciler(t *testing.T) (*AgentRuntimeReconciler, *aiv1.AIServic
 		ObjectMeta: metav1.ObjectMeta{Name: "checkpoint", Namespace: "default", ResourceVersion: "1"},
 		Data:       map[string][]byte{"DATABASE_URL": []byte("postgresql://user:secret@db/checkpoint?sslmode=disable")},
 	}
-	client := fake.NewClientBuilder().WithScheme(buildAgentRuntimeTestScheme(t)).WithObjects(ai, secret).Build()
+	client := fake.NewClientBuilder().WithScheme(buildAgentRuntimeTestScheme(t)).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai, secret).Build()
 	r := &AgentRuntimeReconciler{Client: client, Scheme: buildAgentRuntimeTestScheme(t), Recorder: record.NewFakeRecorder(10)}
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	job := &batchv1.Job{}
@@ -74,6 +74,10 @@ func schemaCondition(t *testing.T, ai *aiv1.AIService) metav1.Condition {
 	t.Helper()
 	for _, condition := range ai.Status.Conditions {
 		if condition.Type == "PostgresSchemaSetupReady" {
+			if condition.Status == metav1.ConditionFalse {
+				assertConditionFalse(t, ai.Status.Conditions, "Ready")
+			}
+			assert.Equal(t, ai.Generation, condition.ObservedGeneration)
 			return condition
 		}
 	}
@@ -152,9 +156,11 @@ func TestSchemaFailurePersistsAndNonceRetries(t *testing.T) {
 	assert.Equal(t, "TimedOut", schemaCondition(t, ai).Reason)
 
 	ai.Spec.Feature.SchemaRetryNonce = "retry-1"
+	require.NoError(t, r.Update(context.Background(), ai))
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
 	assert.NotEqual(t, job.Name, agentRuntimeSchemaStatus(t, ai).JobName)
+	assert.Contains(t, schemaCondition(t, ai).Message, "previous outcome: TimedOut")
 	var jobs batchv1.JobList
 	require.NoError(t, r.List(context.Background(), &jobs))
 	assert.Len(t, jobs.Items, 1)
@@ -183,6 +189,7 @@ func TestSchemaJobLostBeforeOutcomeRequiresExplicitRetry(t *testing.T) {
 	require.NoError(t, r.List(context.Background(), &jobs))
 	assert.Empty(t, jobs.Items)
 	ai.Spec.Feature.SchemaRetryNonce = "after-unknown-outcome"
+	require.NoError(t, r.Update(context.Background(), ai))
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
 }
@@ -190,6 +197,7 @@ func TestSchemaJobLostBeforeOutcomeRequiresExplicitRetry(t *testing.T) {
 func TestSchemaInputChangeStopsActiveJobBeforeReplacement(t *testing.T) {
 	r, ai, old := schemaTestReconciler(t)
 	ai.Spec.Feature.SchemaRetryNonce = "new-attempt"
+	require.NoError(t, r.Update(context.Background(), ai))
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	assert.Equal(t, "Superseded", schemaCondition(t, ai).Reason)
 	t.Logf("input change during active Job: condition=%s", schemaCondition(t, ai).Reason)
@@ -220,6 +228,7 @@ func TestSchemaDigestAndSecretVersionRerunAfterSuccess(t *testing.T) {
 				require.NoError(t, r.Update(context.Background(), secret))
 			case "postgres config":
 				ai.Spec.Feature.Env = map[string]string{"PG_SSLMODE": "require"}
+				require.NoError(t, r.Update(context.Background(), ai))
 			}
 			require.Error(t, r.Reconcile(context.Background(), ai))
 			assert.Equal(t, "Pending", schemaCondition(t, ai).Reason)
