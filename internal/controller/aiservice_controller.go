@@ -218,6 +218,18 @@ func aiServiceEventFilter() predicate.Predicate {
 	)
 }
 
+func aiServiceGlobalEventFilter() predicate.Predicate {
+	// WithEventFilter is combined with each Owns predicate. Status-only updates
+	// must pass both filters so completed Jobs and ready Deployments wake the
+	// AIService without waiting for an error-backoff retry.
+	return predicate.Or(
+		aiServiceEventFilter(),
+		checkpointSecretChangedPredicate(),
+		common.JobChangedPredicate(),
+		common.DeploymentChangedPredicate(),
+	)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -250,10 +262,7 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(checkpointSecretChangedPredicate()),
 		).
 		// Add predicates to filter events and avoid unnecessary reconciliations
-		WithEventFilter(predicate.Or(
-			aiServiceEventFilter(),
-			checkpointSecretChangedPredicate(),
-		)).
+		WithEventFilter(aiServiceGlobalEventFilter()).
 		// Configure concurrency control
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,

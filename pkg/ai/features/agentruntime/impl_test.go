@@ -26,6 +26,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+const testSchemaImage = "docker.io/splunk/agent-runtime-schema-setup@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	require.NoError(t, aiv1.AddToScheme(s))
@@ -42,7 +44,7 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
-	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
+	t.Setenv(schemaSetupImageEnv, testSchemaImage)
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	ai := &aiv1.AIService{
@@ -79,10 +81,10 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 	handler, err := factory.New(context.Background(), fakeClient, scheme, ai, record.NewFakeRecorder(20))
 	require.NoError(t, err)
 
-	require.ErrorContains(t, handler.Reconcile(context.Background(), ai), "waiting for completion")
+	require.ErrorContains(t, handler.Reconcile(context.Background(), ai), "waiting for schema Job completion")
 	job := &batchv1.Job{}
 	require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{
-		Name: ai.Status.SchemaJobId, Namespace: ai.Namespace,
+		Name: agentRuntimeSchemaStatus(t, ai).JobName, Namespace: ai.Namespace,
 	}, job))
 	assert.Equal(t, []string{"sh", "-c"}, job.Spec.Template.Spec.Containers[0].Command)
 	assert.Contains(t, job.Spec.Template.Spec.Containers[0].Args[0], "DATABASE_URL")
@@ -477,7 +479,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenValidationFails(t *testing
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
-	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
+	t.Setenv(schemaSetupImageEnv, testSchemaImage)
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	ai := &aiv1.AIService{
@@ -518,7 +520,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenAgentModuleIsInvalid(t *te
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTK-AgentLoader")
-	t.Setenv(schemaSetupImageEnv, "docker.io/splunk/agent-runtime-schema-setup:test")
+	t.Setenv(schemaSetupImageEnv, testSchemaImage)
 
 	scheme := buildAgentRuntimeTestScheme(t)
 	ai := &aiv1.AIService{
@@ -580,19 +582,6 @@ func assertEnv(t *testing.T, env []corev1.EnvVar, name, value string) {
 		}
 	}
 	t.Fatalf("missing env %s", name)
-}
-
-func TestSchemaJobNeedsRerunWhenEitherFingerprintChanges(t *testing.T) {
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-		schemaJobManagedAnnotation:        schemaJobManagedValue,
-		schemaJobDeploymentHashAnnotation: "deployment-old",
-		schemaJobInputHashAnnotation:      "input-old",
-	}}}
-
-	assert.True(t, schemaJobNeedsRerun(job, "deployment-new", "input-old"))
-	assert.True(t, schemaJobNeedsRerun(job, "deployment-old", "input-new"))
-	assert.True(t, schemaJobNeedsRerun(job, "deployment-new", "input-new"))
-	assert.False(t, schemaJobNeedsRerun(job, "deployment-old", "input-old"))
 }
 
 func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {

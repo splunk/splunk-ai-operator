@@ -250,11 +250,13 @@ type MTLSConfig struct {
 
 // AIServiceStatus defines the observed state of AIService
 type AIServiceStatus struct {
-	SchemaJobId        string             `json:"schemaJobId,omitempty"`
-	VectorDbStatus     string             `json:"vectorDbStatus,omitempty"`
-	PlatformStatus     string             `json:"platformStatus,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	// SchemaJobId is retained for the SAIA post-install hook.
+	SchemaJobId        string                  `json:"schemaJobId,omitempty"`
+	FeatureStatus      *AIServiceFeatureStatus `json:"featureStatus,omitempty"`
+	VectorDbStatus     string                  `json:"vectorDbStatus,omitempty"`
+	PlatformStatus     string                  `json:"platformStatus,omitempty"`
+	Conditions         []metav1.Condition      `json:"conditions,omitempty"`
+	ObservedGeneration int64                   `json:"observedGeneration,omitempty"`
 }
 
 // AIService is the Schema for the aiservices API

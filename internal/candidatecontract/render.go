@@ -2,6 +2,7 @@ package candidatecontract
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strings"
@@ -58,7 +59,14 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	}
 	renderMu.Lock()
 	defer renderMu.Unlock()
-	for key, value := range m.OperatorEnvironment() {
+	operatorEnv := m.OperatorEnvironment()
+	for key, value := range operatorEnv {
+		if key == "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP" {
+			// MPR-188 accepts candidate tags without resolving a registry digest.
+			// A deterministic fixture digest exercises the MPR-189 Job renderer
+			// without presenting that value as an actual registry resolution.
+			value = syntheticSchemaImageForRender(value)
+		}
 		previous, exists := os.LookupEnv(key)
 		if err := os.Setenv(key, value); err != nil {
 			return nil, fieldError("operatorEnvironment." + key)
@@ -117,11 +125,15 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	ctx := context.Background()
 	runtimeHandler := &agentruntime.AgentRuntimeReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(50)}
 	err = runtimeHandler.Reconcile(ctx, runtimeService)
-	if err == nil || !strings.Contains(err.Error(), "waiting for completion") {
+	if err == nil || !strings.Contains(err.Error(), "waiting for schema Job completion") {
 		return nil, fmt.Errorf("render.schemaSetup: expected schema Job gate")
 	}
+	featureStatus := runtimeService.Status.FeatureStatus
+	if featureStatus == nil || featureStatus.AgentRuntime == nil || featureStatus.AgentRuntime.Schema == nil || featureStatus.AgentRuntime.Schema.JobName == "" {
+		return nil, fmt.Errorf("render.schemaSetup: schema Job not recorded")
+	}
 	job := &batchv1.Job{}
-	if err := c.Get(ctx, client.ObjectKey{Name: runtimeService.Status.SchemaJobId, Namespace: namespace}, job); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Name: featureStatus.AgentRuntime.Schema.JobName, Namespace: namespace}, job); err != nil {
 		return nil, fmt.Errorf("render.schemaSetup: %w", err)
 	}
 	// This is a render fixture, not evidence of migration execution.
@@ -136,7 +148,7 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	if err := slimHandler.Reconcile(ctx, slimService); err != nil {
 		return nil, fmt.Errorf("render.slim: %w", err)
 	}
-	result := &Snapshot{Revision: m.Spec.Revision, Profile: profile, Scope: "offline operator render; schema Job completion simulated; no cluster, registry, database, or product calls", Qualification: "pending", MatrixPairStatus: status, OperatorEnvironment: m.OperatorEnvironment(), RuntimePrefix: m.Spec.Contract.RuntimeAPI.Prefix, AITK: m.Spec.Components["aitk"]}
+	result := &Snapshot{Revision: m.Spec.Revision, Profile: profile, Scope: "offline operator render with synthetic schema image digest and simulated Job completion; no cluster, registry, database, or product calls", Qualification: "pending", MatrixPairStatus: status, OperatorEnvironment: operatorEnv, RuntimePrefix: m.Spec.Contract.RuntimeAPI.Prefix, AITK: m.Spec.Components["aitk"]}
 	result.PlatformURLInput = platformURL
 	for _, kind := range []string{"runtimeDeployment", "runtimeService", "schemaJob", "slimDeployment", "slimService"} {
 		var object client.Object
@@ -202,8 +214,11 @@ func (s *Snapshot) Check(m *Manifest) error {
 				return fieldError("render.schemaSetup.containers")
 			}
 			container := object.Spec.Template.Spec.Containers[0]
-			if container.Image != m.Spec.Components["schemaSetup"].Image || len(container.Args) != 1 || !strings.Contains(container.Args[0], "-v ON_ERROR_STOP=1 -f "+m.Spec.Contract.SchemaEntryPoint.SQLPath) {
+			if container.Image != syntheticSchemaImageForRender(m.Spec.Components["schemaSetup"].Image) || len(container.Args) != 1 || !strings.Contains(container.Args[0], "-v ON_ERROR_STOP=1 -f "+m.Spec.Contract.SchemaEntryPoint.SQLPath) {
 				return fieldError("render.schemaSetup")
+			}
+			if object.Spec.ActiveDeadlineSeconds == nil || *object.Spec.ActiveDeadlineSeconds <= 0 || object.Spec.BackoffLimit == nil || object.Spec.TTLSecondsAfterFinished == nil {
+				return fieldError("render.schemaSetup.bounds")
 			}
 			if !secretReference(container, m.Spec.Contract.SecretKeys.Name) {
 				return fieldError("render.schemaSetup.envFrom")
@@ -283,6 +298,16 @@ func (s *Snapshot) Check(m *Manifest) error {
 		return fieldError("render.slim.env.PLATFORM_URL")
 	}
 	return nil
+}
+
+func syntheticSchemaImageForRender(candidate string) string {
+	if strings.Contains(candidate, "@sha256:") {
+		return candidate
+	}
+	// Candidate refs are validated before this helper runs. The digest is
+	// deliberately synthetic and only used for in-memory rendering.
+	digest := sha256.Sum256([]byte(candidate))
+	return fmt.Sprintf("%s@sha256:%x", candidate[:strings.LastIndex(candidate, ":")], digest)
 }
 
 func secretReference(c corev1.Container, name string) bool {

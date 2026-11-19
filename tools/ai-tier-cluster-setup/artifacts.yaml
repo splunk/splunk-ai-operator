@@ -1071,6 +1071,10 @@ spec:
                       maxLength: 253
                       minLength: 1
                       type: string
+                    schemaRetryNonce:
+                      description: SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
+                      maxLength: 128
+                      type: string
                     env:
                       additionalProperties:
                         type: string
@@ -4217,6 +4221,10 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
+                  schemaRetryNonce:
+                    description: SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
+                    maxLength: 128
+                    type: string
                   env:
                     additionalProperties:
                       type: string
@@ -5371,6 +5379,31 @@ spec:
                   - type
                   type: object
                 type: array
+              featureStatus:
+                description: AIServiceFeatureStatus holds status owned by individual
+                  AIService features.
+                properties:
+                  agentRuntime:
+                    description: AgentRuntimeStatus holds AgentRuntime-specific observed
+                      state.
+                    properties:
+                      schema:
+                        description: AgentRuntimeSchemaStatus tracks the current schema
+                          Job attempt and its result.
+                        properties:
+                          appliedHash:
+                            type: string
+                          failedHash:
+                            type: string
+                          failureReason:
+                            type: string
+                          imageDigest:
+                            type: string
+                          jobName:
+                            type: string
+                        type: object
+                    type: object
+                type: object
               observedGeneration:
                 format: int64
                 type: integer
