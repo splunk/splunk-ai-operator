@@ -26,12 +26,16 @@ const (
 	endpointReady   = "AgentRuntimeEndpointReady"
 )
 
+// setRuntimeCondition updates one gate without replacing unrelated conditions.
+// SetStatusCondition retains its transition time while the status is unchanged.
 func setRuntimeCondition(ai *aiv1.AIService, kind string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&ai.Status.Conditions, metav1.Condition{
 		Type: kind, Status: status, Reason: reason, Message: message, ObservedGeneration: ai.Generation,
 	})
 }
 
+// blockRuntimeCondition marks a gate that could not be evaluated in this pass.
+// Historical success must not appear current when a prerequisite stops progress.
 func blockRuntimeCondition(ai *aiv1.AIService, kind, stage string) {
 	message := "waiting for " + stage
 	if old := meta.FindStatusCondition(ai.Status.Conditions, kind); old != nil {
@@ -63,6 +67,9 @@ func (r *AgentRuntimeReconciler) observeReadiness(ctx context.Context, ai *aiv1.
 	} else {
 		blockRuntimeCondition(ai, endpointReady, "Deployment and Service observation")
 	}
+	// The schema stage has already checked the current input identity, including
+	// recorded success after Job cleanup. Consume that result rather than
+	// requiring the completed Job to remain present or replaying schema work.
 	for _, kind := range []string{schemaReady, deploymentReady, serviceReady, endpointReady} {
 		c := meta.FindStatusCondition(ai.Status.Conditions, kind)
 		if c == nil || c.Status != metav1.ConditionTrue || c.ObservedGeneration != ai.Generation {
@@ -78,6 +85,8 @@ func (r *AgentRuntimeReconciler) observeReadiness(ctx context.Context, ai *aiv1.
 	return nil
 }
 
+// Missing or unhealthy workloads are normal waiting states. Only failed API
+// observations return errors; readiness conditions describe both cases.
 func firstObservationError(errs ...error) error {
 	for _, err := range errs {
 		if err != nil {
@@ -87,6 +96,8 @@ func firstObservationError(errs ...error) error {
 	return nil
 }
 
+// observeDeployment also returns the healthy current Pods that endpoints may
+// target. Replica counts alone cannot establish ownership or probe health.
 func (r *AgentRuntimeReconciler) observeDeployment(ctx context.Context, ai *aiv1.AIService) (map[types.UID]*corev1.Pod, error) {
 	pods := map[types.UID]*corev1.Pod{}
 	fail := func(reason, message string) {
@@ -118,6 +129,9 @@ func (r *AgentRuntimeReconciler) observeDeployment(ctx context.Context, ai *aiv1
 		fail("SelectorMismatch", "runtime Deployment selector must match the runtime workload labels")
 		return pods, nil
 	}
+	// Rolling updates can retain available old replicas while replacements fail.
+	// Require the entire desired rollout to converge, including removal of surplus
+	// old replicas, before that capacity can satisfy readiness.
 	if dep.Status.UpdatedReplicas != want || dep.Status.Replicas != want || dep.Status.ReadyReplicas < want || dep.Status.AvailableReplicas < want || dep.Status.UnavailableReplicas != 0 {
 		fail("RolloutPending", fmt.Sprintf("waiting for all %d desired runtime replicas: %d updated, %d ready, %d available, %d total", want, dep.Status.UpdatedReplicas, dep.Status.ReadyReplicas, dep.Status.AvailableReplicas, dep.Status.Replicas))
 		return pods, nil
@@ -129,6 +143,8 @@ func (r *AgentRuntimeReconciler) observeDeployment(ctx context.Context, ai *aiv1
 		fail("ObservationFailed", "cannot list runtime ReplicaSets; check operator permissions and API availability")
 		return pods, fmt.Errorf("observe runtime ReplicaSets: %w", err)
 	}
+	// Labels narrow the search but can also match old or unrelated workloads.
+	// Follow controller UIDs and the desired template before counting any Pod.
 	current := map[types.UID]bool{}
 	for i := range replicaSets.Items {
 		rs := &replicaSets.Items[i]
@@ -155,6 +171,8 @@ func (r *AgentRuntimeReconciler) observeDeployment(ctx context.Context, ai *aiv1
 	return pods, nil
 }
 
+// The Deployment controller adds a hash label to ReplicaSet templates. Ignore
+// only that label; every other template difference identifies another rollout.
 func sameRuntimeTemplate(a, b corev1.PodTemplateSpec) bool {
 	x, y := a.DeepCopy(), b.DeepCopy()
 	delete(x.Labels, appsv1.DefaultDeploymentUniqueLabelKey)
@@ -162,6 +180,8 @@ func sameRuntimeTemplate(a, b corev1.PodTemplateSpec) bool {
 	return equality.Semantic.DeepEqual(x, y)
 }
 
+// PodReady includes readiness gates and sidecars. Also require the named runtime
+// container to be running and ready with the expected application probe.
 func healthyRuntimePod(pod *corev1.Pod, containerName string) bool {
 	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 		return false
@@ -190,6 +210,8 @@ func healthyRuntimePod(pod *corev1.Pod, containerName string) bool {
 	return false
 }
 
+// observeService checks routing configuration separately from backend health.
+// A valid selector and application port do not prove any endpoint is usable.
 func (r *AgentRuntimeReconciler) observeService(ctx context.Context, ai *aiv1.AIService) (*corev1.Service, error) {
 	fail := func(reason, message string) {
 		setRuntimeCondition(ai, serviceReady, metav1.ConditionFalse, reason, message)
@@ -221,6 +243,9 @@ func (r *AgentRuntimeReconciler) observeService(ctx context.Context, ai *aiv1.AI
 	return nil, nil
 }
 
+// observeEndpoints cross-checks advertised routing with independently verified
+// Pod health. Endpoint readiness alone can be misleading when a Service publishes
+// unready addresses or cached slices still refer to replaced workloads.
 func (r *AgentRuntimeReconciler) observeEndpoints(ctx context.Context, ai *aiv1.AIService, svc *corev1.Service, pods map[types.UID]*corev1.Pod) error {
 	fail := func(reason, message string) {
 		setRuntimeCondition(ai, endpointReady, metav1.ConditionFalse, reason, message)
@@ -236,6 +261,8 @@ func (r *AgentRuntimeReconciler) observeEndpoints(ctx context.Context, ai *aiv1.
 		if slice.DeletionTimestamp != nil {
 			continue
 		}
+		// A Service can be recreated under the same name. Its UID distinguishes
+		// current slices from backends left over from the previous instance.
 		if !metav1.IsControlledBy(slice, svc) {
 			fail("EndpointSliceMismatch", "runtime EndpointSlices must belong to the current Service UID")
 			return nil
@@ -253,6 +280,8 @@ func (r *AgentRuntimeReconciler) observeEndpoints(ctx context.Context, ai *aiv1.
 			if endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready || (endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating) {
 				continue
 			}
+			// Every advertised ready application backend must be safe to route to;
+			// one valid target cannot mask another stale or foreign ready target.
 			ref := endpoint.TargetRef
 			if ref == nil || ref.Kind != "Pod" || ref.Namespace != ai.Namespace || (ref.APIVersion != "" && ref.APIVersion != "v1") {
 				fail("EndpointTargetMismatch", "a ready application endpoint does not reference a current runtime Pod")
@@ -274,6 +303,8 @@ func (r *AgentRuntimeReconciler) observeEndpoints(ctx context.Context, ai *aiv1.
 	return nil
 }
 
+// Check every advertised address against the current Pod's assigned addresses,
+// including its secondary IPs on dual-stack clusters.
 func endpointAddressesMatch(addresses []string, pod *corev1.Pod) bool {
 	if len(addresses) == 0 {
 		return false

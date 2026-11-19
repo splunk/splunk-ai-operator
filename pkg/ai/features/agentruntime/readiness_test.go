@@ -35,6 +35,8 @@ type readinessFixture struct {
 	slice *discoveryv1.EndpointSlice
 }
 
+// Build a healthy observed ownership chain so each case can invalidate one gate
+// without depending on a running kubelet or workload controller.
 func newReadinessFixture(t *testing.T) *readinessFixture {
 	t.Helper()
 	ai := &aiv1.AIService{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "default", UID: "ai-uid", Generation: 3}, Spec: aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"}, Replicas: 2}}

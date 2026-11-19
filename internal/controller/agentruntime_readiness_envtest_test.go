@@ -21,7 +21,7 @@ func stringPtr(value string) *string { return &value }
 
 // Called with both production controllers running in the cpuOnly/no-Ray spec.
 // Status writes emulate workload controllers and kubelet observations only;
-// actual probe execution remains a subsequent live-cluster check.
+// the local API server does not execute probes or populate workload status.
 func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AIPlatform) {
 	By("keeping runtime and parent unready after object creation")
 	ready := func(obj client.Object) metav1.ConditionStatus {

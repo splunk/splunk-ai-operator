@@ -53,12 +53,16 @@ func New(p *aiApi.AIPlatform, client client.Client, scheme *runtime.Scheme, reco
 func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatform) (result reconcile.Result, retErr error) {
 	before := p.DeepCopy().Status
 	setCondition := func(kind string, status metav1.ConditionStatus, reason, message string) {
+		// Preserve transition times and unrelated conditions so repeated child
+		// observations can settle without producing further status events.
 		meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{Type: kind, Status: status, Reason: reason, Message: message, ObservedGeneration: p.Generation})
 	}
 	defer func() {
 		p.Status.ObservedGeneration = p.Generation
 		p.Status.Profile = p.Spec.ResolvedProfile()
 		if !equality.Semantic.DeepEqual(before, p.Status) {
+			// Keep the resourceVersion from this observation. A conflict must cause
+			// a fresh evaluation rather than copying old results onto a newer spec.
 			retErr = errors.Join(retErr, r.Status().Update(ctx, p))
 		}
 	}()
@@ -70,6 +74,8 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		if err != nil {
 			var pending *agentRuntimeNotReadyError
 			if errors.As(err, &pending) {
+				// An unhealthy child is an observed waiting state, not a failed API
+				// operation. Publish it and retry without error-driven backoff.
 				setCondition(stage.name+"Ready", metav1.ConditionFalse, "AgentRuntimeNotReady", pending.Error())
 				setCondition("Ready", metav1.ConditionFalse, "AgentRuntimeNotReady", pending.Error())
 				return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
@@ -432,6 +438,8 @@ func cleanServiceTemplate(svc *corev1.Service) {
 	svc.Status = corev1.ServiceStatus{}
 }
 
+// Keep ordinary child health waiting distinct from failures to read or reconcile
+// resources so the caller can use a bounded readiness retry.
 type agentRuntimeNotReadyError struct{ name string }
 
 func (e *agentRuntimeNotReadyError) Error() string {
@@ -457,6 +465,8 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 	for i := range children.Items {
 		byName[children.Items[i].Name] = &children.Items[i]
 	}
+	// Check configured runtimes even when they are absent from the child list;
+	// deletion must not make the remaining children appear collectively healthy.
 	for _, feature := range platform.Spec.Features {
 		if feature.Name != agentRuntimeFeatureName {
 			continue
@@ -472,6 +482,8 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 	for i := range children.Items {
 		child := &children.Items[i]
 		if child.Spec.Feature.Name == agentRuntimeFeatureName {
+			// Runtime health was checked above using current Ready, regardless of
+			// reason text. Retain the legacy error-reason rule for other features.
 			continue
 		}
 

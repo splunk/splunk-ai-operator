@@ -89,6 +89,8 @@ func TestRuntimeReadinessRBACMatchesHelm(t *testing.T) {
 	load := func(path string) rbacv1.ClusterRole {
 		raw, err := os.ReadFile(path)
 		require.NoError(t, err)
+		// Only the role name is templated. Substitute it so the actual permission
+		// rules can be compared without depending on Helm rendering or defaults.
 		text := strings.ReplaceAll(string(raw), `{{ include "splunk-ai-operator.fullname" . }}-manager-role`, "manager-role")
 		var role rbacv1.ClusterRole
 		require.NoError(t, yaml.Unmarshal([]byte(text), &role))

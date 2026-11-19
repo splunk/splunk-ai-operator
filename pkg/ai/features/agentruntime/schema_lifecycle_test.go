@@ -54,6 +54,8 @@ func schemaTestReconciler(t *testing.T) (*AgentRuntimeReconciler, *aiv1.AIServic
 		ObjectMeta: metav1.ObjectMeta{Name: "checkpoint", Namespace: "default", ResourceVersion: "1"},
 		Data:       map[string][]byte{"DATABASE_URL": []byte("postgresql://user:secret@db/checkpoint?sslmode=disable")},
 	}
+	// Match the API server's separate spec and status writes; otherwise a fake
+	// status update could also persist an unsubmitted retry or input change.
 	client := fake.NewClientBuilder().WithScheme(buildAgentRuntimeTestScheme(t)).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai, secret).Build()
 	r := &AgentRuntimeReconciler{Client: client, Scheme: buildAgentRuntimeTestScheme(t), Recorder: record.NewFakeRecorder(10)}
 	require.Error(t, r.Reconcile(context.Background(), ai))

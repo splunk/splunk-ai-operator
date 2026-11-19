@@ -130,6 +130,8 @@ func ensureAgentRuntimeSchemaStatus(ai *aiv1.AIService) *aiv1.AgentRuntimeSchema
 
 func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) (retErr error) {
 	previousStatus := aiservice.DeepCopy().Status
+	// Persist progress on early returns as well as success. Joining errors keeps
+	// a failed status write visible without hiding the original stage failure.
 	defer func() {
 		aiservice.Status.ObservedGeneration = aiservice.Generation
 		if !equality.Semantic.DeepEqual(previousStatus, aiservice.Status) {
@@ -163,6 +165,8 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 				reason, message = schemaErr.reason, schemaErr.message
 			}
 			if stage.name == "PostgresSchemaSetup" && reason == "Pending" {
+				// Keep the last terminal outcome useful during a retry without
+				// presenting it as the outcome of the new schema attempt.
 				if old := meta.FindStatusCondition(aiservice.Status.Conditions, schemaReady); old != nil {
 					if old.Reason == "Failed" || old.Reason == "TimedOut" {
 						message += "; previous outcome: " + old.Reason
@@ -172,6 +176,8 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 				}
 			}
 			setRuntimeCondition(aiservice, stage.name+"Ready", metav1.ConditionFalse, reason, message)
+			// Later gates were not evaluated for these inputs. Clear their apparent
+			// success while retaining bounded context about prior failures.
 			for _, later := range stages[index+1:] {
 				blockRuntimeCondition(aiservice, later.name+"Ready", stage.name)
 			}

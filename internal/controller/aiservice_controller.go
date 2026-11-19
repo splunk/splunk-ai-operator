@@ -208,6 +208,8 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 		if !featurecommon.IsCurrentServiceReady(ai) {
+			// Backend watches drive normal progress. This bounded fallback covers
+			// missed observations and stops once the current generation is ready.
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		telemetry.ObserveReconcileResult(ctx, "success")
@@ -239,8 +241,8 @@ func aiServiceEventFilter() predicate.Predicate {
 
 func aiServiceGlobalEventFilter() predicate.Predicate {
 	// WithEventFilter is combined with each Owns predicate. Status-only updates
-	// must pass both filters so completed Jobs and ready Deployments wake the
-	// AIService without waiting for an error-backoff retry.
+	// must pass both filters so schema completion, rollout progress and backend
+	// health changes wake the AIService without waiting for a retry.
 	return predicate.Or(
 		aiServiceEventFilter(),
 		checkpointSecretChangedPredicate(),
@@ -252,6 +254,7 @@ func aiServiceGlobalEventFilter() predicate.Predicate {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Register the reverse lookup before watches start using it to map events.
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeWorkloadIndex, runtimeWorkloadKeys); err != nil {
 		return err
 	}
@@ -272,6 +275,8 @@ func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.Service{}, builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, runtimeBackendChangedPredicate()))).
 		Owns(&monitoringv1.ServiceMonitor{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// These resources belong to Services, ReplicaSets or Deployments rather
+		// than directly to the AIService; map their observations explicitly.
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&appsv1.ReplicaSet{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
@@ -302,9 +307,11 @@ func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 
 // --- 8️⃣ reconcileStatus: update CR status/conditions ---
 func (r *AIServiceReconciler) reconcileStatus(ctx context.Context, p *aiv1.AIService) error {
+	// The runtime feature persists its health-based conditions on every path.
+	// This generic object-reconciliation fallback must not replace that result.
 	if p.Spec.Feature.Name == "agentruntime" {
 		return nil
-	} // The feature owns its readiness and persistence.
+	}
 	// reflect observedGeneration
 	p.Status.ObservedGeneration = p.Generation
 

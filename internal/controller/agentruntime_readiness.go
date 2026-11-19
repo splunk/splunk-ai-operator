@@ -20,6 +20,8 @@ import (
 
 const runtimeWorkloadIndex = "agentruntime.backend"
 
+// Index the rendered names so backend events can find their AIService without
+// guessing names from labels that may have been shortened for Kubernetes limits.
 func runtimeWorkloadKeys(obj client.Object) []string {
 	ai := obj.(*aiv1.AIService)
 	if ai.Spec.Feature.Name != "agentruntime" {
@@ -28,6 +30,10 @@ func runtimeWorkloadKeys(obj client.Object) []string {
 	return []string{"service/" + agentruntime.ServiceName(ai.Name), "pod/" + agentruntime.WorkloadName(ai.Name)}
 }
 
+// Pods and EndpointSlices have intermediate owners, so direct AIService Owns
+// watches cannot map them. Use metadata carried by the event, even on deletion,
+// without fetching an owner that may already be gone. Reconciliation validates
+// actual ownership; these labels only select which AIService to wake.
 func (r *AIServiceReconciler) findRuntimeServicesForBackend(ctx context.Context, obj client.Object) []reconcile.Request {
 	key := ""
 	switch o := obj.(type) {
@@ -59,6 +65,8 @@ func (r *AIServiceReconciler) findRuntimeServicesForBackend(ctx context.Context,
 	return requests
 }
 
+// Health and routing changes need not advance metadata.generation. Admit the
+// relevant observations and ownership changes while filtering unchanged writes.
 func runtimeBackendChangedPredicate() predicate.Predicate {
 	isBackend := func(obj client.Object) bool {
 		switch obj.(type) {
@@ -108,6 +116,8 @@ func agentRuntimeReadyChangedPredicate() predicate.Predicate {
 		c := metav1.Condition{}
 		if condition := meta.FindStatusCondition(ai.Status.Conditions, "Ready"); condition != nil {
 			c = *condition
+			// A timestamp-only write does not change what the parent can conclude
+			// about readiness, so it must not trigger another parent reconcile.
 			c.LastTransitionTime = metav1.Time{}
 		}
 		return struct {

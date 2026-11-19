@@ -6,7 +6,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// IsCurrentServiceReady excludes historical success after a spec change.
+// IsCurrentServiceReady requires both the overall status and its Ready condition
+// to describe the current spec generation. If either is stale, the parent must
+// keep waiting for the newer spec to be applied.
 func IsCurrentServiceReady(ai *aiv1.AIService) bool {
 	c := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
 	return ai.DeletionTimestamp == nil && c != nil && c.Status == metav1.ConditionTrue &&

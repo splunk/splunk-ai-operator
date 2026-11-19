@@ -180,7 +180,8 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("aiplatform").
 		For(&aiv1.AIPlatform{}).
-		// Admit the runtime readiness projection, not arbitrary child updates.
+		// The parent owns child specs, so arbitrary child writes could feed a spec
+		// reconciliation loop. Observe runtime readiness and child deletion only.
 		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Or(agentRuntimeReadyChangedPredicate(), predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool { return false },
 			UpdateFunc: func(e event.UpdateEvent) bool { return false },
@@ -198,7 +199,8 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// RBAC resources for Ray autoscaler
 		Owns(&rbacv1.Role{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&rbacv1.RoleBinding{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		// Keep platform predicates light and scoped to the primary resource
+		// A child readiness event must pass both this global filter and its Owns
+		// predicate; generation-only filtering here would discard health changes.
 		WithEventFilter(predicate.Or(
 			agentRuntimeReadyChangedPredicate(),
 			common.GenerationChangedPredicate(),

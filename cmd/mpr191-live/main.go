@@ -72,6 +72,7 @@ func main() {
 	namespace := flag.String("namespace", "", "existing disposable mpr191-* namespace")
 	faultPath := flag.String("fault-file", "", "optional local validation fault-mode file")
 	flag.Parse()
+	// Require an explicit test namespace before constructing any clients.
 	if !strings.HasPrefix(*namespace, "mpr191-") || len(*namespace) < len("mpr191-")+1 {
 		panic("an explicit disposable mpr191-* namespace is required")
 	}
@@ -86,6 +87,9 @@ func main() {
 		}
 	}
 	cfg := ctrl.GetConfigOrDie()
+	// Namespace-scoped caching limits observations; impersonation also makes API
+	// requests exercise the test ServiceAccount's permissions instead of admin
+	// permissions from the kubeconfig used to start this process.
 	cfg.Impersonate.UserName = "system:serviceaccount:" + *namespace + ":mpr191-controller"
 	cfg.Impersonate.Groups = []string{"system:serviceaccounts", "system:serviceaccounts:" + *namespace, "system:authenticated"}
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
@@ -103,6 +107,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// Register both controllers so the fixture exercises child health events and
+	// their effect on parent readiness through the normal production watches.
 	if err := (&controller.AIPlatformReconciler{Client: mgr.GetClient(), Scheme: scheme, Recorder: mgr.GetEventRecorderFor("mpr191-platform"), Config: &config.OperatorConfig{Mode: config.ModeNormal}}).SetupWithManager(mgr); err != nil {
 		panic(err)
 	}
