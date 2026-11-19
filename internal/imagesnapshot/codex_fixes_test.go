@@ -616,3 +616,35 @@ func TestEnvSegment_MatchesTheOperatorsNormalisation(t *testing.T) {
 	}
 	assert.Equal(t, "agent-runtime-base-v2-0-0", baseVersionComponent("v2.0.0"))
 }
+
+// PR #283 review (262eaa4): configuration-only providers feed only the operator's
+// environment, so with the operator off they are not install references, matching the
+// inventory; otherwise compare reports a correctly mirrored install as unaccounted.
+func TestInstallRefs_ConfigurationOnlyProvidersFollowTheAIOperator(t *testing.T) {
+	for _, withValues := range []bool{true, false} {
+		in := pinsInput(t, withValues)
+		if withValues {
+			for _, p := range Profiles {
+				in.Values[p].Components["aiOperator"] = false
+			}
+		} else {
+			in.Installer.Components = map[string]any{"aiOperator": false}
+		}
+		inv, err := BuildInventory(in)
+		require.NoError(t, err)
+		require.NotContains(t, components(inv.Images), "agent-runtime-provider-seca", "values=%v", withValues)
+		for _, p := range Profiles {
+			refs := refMap(InstallRefs(p, in))
+			assert.NotContains(t, refs, "agent-runtime-provider-seca", "values=%v %s", withValues, p)
+			assert.NotContains(t, refs, "agent-runtime-base-v1-9-0", "values=%v %s", withValues, p)
+			if !withValues {
+				// The candidate's own provider is a candidate image, checked like the
+				// candidate base, schema setup and SLIM references whatever the operator.
+				assert.Equal(t, "docker.io/splunk/agent-runtime-provider-mltk:0.1.0", refs["agent-runtime-provider-mltk"], p)
+			}
+		}
+	}
+	// With the operator on they are references, as before.
+	on := pinsInput(t, false)
+	assert.Contains(t, refMap(InstallRefs(ProfileCPUOnly, on)), "agent-runtime-provider-seca")
+}

@@ -60,9 +60,11 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 			add("agent-runtime-provider-"+p, v.Images.AgentRuntime.Providers[p])
 		}
 		// The installer also sets every configured provider on the operator, with or
-		// without a feature for it; the rendered values list only the featured ones.
+		// without a feature for it; the rendered values list only the featured ones. Such
+		// a configuration-only provider exists only as operator environment, so it is a
+		// reference only where the operator is installed (as in the inventory).
 		for _, p := range sortedKeys(in.Installer.Images.AgentRuntime.ProviderImages) {
-			if _, rendered := v.Images.AgentRuntime.Providers[p]; !rendered {
+			if _, rendered := v.Images.AgentRuntime.Providers[p]; !rendered && operatorOn {
 				add("agent-runtime-provider-"+p, configuredRef(in.Installer.Images.Registry, in.Installer.Images.AgentRuntime.ProviderImages[p]))
 			}
 		}
@@ -79,7 +81,11 @@ func InstallRefs(profile string, in InventoryInput) []InstallRef {
 		add("agent-runtime-base", url(cfg.AgentRuntime.BaseImage))
 		add("agent-runtime-schema-setup", url(cfg.AgentRuntime.SchemaSetupImage))
 		for _, p := range sortedKeys(cfg.AgentRuntime.ProviderImages) {
-			add("agent-runtime-provider-"+p, url(cfg.AgentRuntime.ProviderImages[p]))
+			// The candidate's own provider is a candidate image; any other is
+			// configuration-only and follows the operator, as in the inventory.
+			if in.isCandidateProvider(p) || operatorOn {
+				add("agent-runtime-provider-"+p, url(cfg.AgentRuntime.ProviderImages[p]))
+			}
 		}
 	}
 	// The versioned base pins are not in the rendered values: the installer reads them
