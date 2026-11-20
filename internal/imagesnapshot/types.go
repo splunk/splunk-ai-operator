@@ -1,11 +1,11 @@
 // Package imagesnapshot builds the image inventory of an AI Tier install, resolves
 // every image to an immutable digest, mirrors it to a private registry, and keeps a
-// versioned, machine-readable snapshot of the result (MPR-187).
+// versioned, machine-readable snapshot of the result.
 //
 // It owns the source-to-mirror process only. Bundling and importing the images onto
-// nodes, installing from them, and wiring the inputs into CI belong to other stories
-// (MPR-193, MPR-183). Nothing here builds or modifies an image, and nothing written
-// to disk carries a credential.
+// nodes, installing from them, and wiring the inputs into CI are done elsewhere (the
+// offline bundle and the CI pipeline), which consume the snapshot. Nothing here builds
+// or modifies an image, and nothing written to disk carries a credential.
 package imagesnapshot
 
 // Profile names, as in the AIPlatform spec and the installer.
@@ -53,7 +53,7 @@ type Image struct {
 	Owner string `json:"owner"`
 }
 
-// CandidateRef links an inventory or snapshot to the MPR-188 candidate record it
+// CandidateRef links an inventory or snapshot to the candidate record it
 // was derived from.
 type CandidateRef struct {
 	Name     string `json:"name"`

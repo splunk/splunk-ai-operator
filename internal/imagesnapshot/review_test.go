@@ -96,7 +96,7 @@ func TestRefresh_ProfileChangesAndStalePreviousDigestsWithRecheckTags(t *testing
 		require.NoError(t, err, "recheck=%v", recheck)
 		require.Len(t, res.Changes, 1, "recheck=%v", recheck)
 		assert.Equal(t, ChangeProfiles, res.Changes[0].Reason, "recheck=%v", recheck)
-		assert.Contains(t, res.Rerun, "MPR-190 cpuOnly install job", "recheck=%v: cpuOnly now depends on it", recheck)
+		assert.Contains(t, res.Rerun, "cpuOnly install job", "recheck=%v: cpuOnly now depends on it", recheck)
 		assert.Empty(t, entryOf(res.Snapshot, "slim").PreviousDigest, "recheck=%v: an unchanged entry does not keep an old previousDigest", recheck)
 	}
 }

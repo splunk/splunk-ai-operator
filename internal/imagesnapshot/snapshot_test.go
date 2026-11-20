@@ -189,7 +189,7 @@ func TestBuildID(t *testing.T) {
 	assert.Equal(t, "abc123", buildID(map[string]string{"org.opencontainers.image.revision": "abc123", "org.opencontainers.image.created": "2026"}, stamp), "revision label wins")
 	assert.Equal(t, "2026-11-16T00:00:00Z", buildID(map[string]string{"org.opencontainers.image.created": "2026-11-16T00:00:00Z"}, stamp), "then the created label")
 	assert.Equal(t, "202609221052-eae3b33005a5", buildID(nil, stamp), "then a build-stamp tag")
-	// Found on the real MPR-188 carrier image: its revision label is the string "unknown".
+	// Found on the real candidate carrier image: its revision label is the string "unknown".
 	for _, placeholder := range []string{"unknown", "Unknown", " none ", "N/A", "-", "<none>", ""} {
 		assert.Equal(t, "202609221517-f4466f2ccd",
 			buildID(map[string]string{"org.opencontainers.image.revision": placeholder}, ParsedRef{Tag: "202609221517-f4466f2ccd"}),

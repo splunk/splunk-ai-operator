@@ -117,18 +117,19 @@ func TestRefresh_NamesTheDownstreamJobsAndCellsToRerun(t *testing.T) {
 	res, err := Refresh(context.Background(), newCounting(), f.prev, f.with("ray-head", f.src.ref("tier/ray", "v2")), RefreshOptions{ID: "run-2"})
 	require.NoError(t, err)
 	assert.Equal(t, []string{
-		"MPR-192 fullfeature install job",
-		"MPR-209 fullfeature on RHEL 9.8",
-		"MPR-211 fullfeature on RHEL 10.2",
-		"MPR-213 fullfeature on Ubuntu 24.04",
+		"fullfeature install job",
+		"fullfeature on RHEL 9.8",
+		"fullfeature on RHEL 10.2",
+		"fullfeature on Ubuntu 24.04",
 	}, res.Rerun)
 
 	// An image both profiles use reruns all six cells and both jobs.
 	res, err = Refresh(context.Background(), newCounting(), f.prev, f.with("slim", f.src.ref("tier/slim", "v2")), RefreshOptions{ID: "run-3"})
 	require.NoError(t, err)
-	assert.Len(t, res.Rerun, 8, "two jobs and six cells: %v", res.Rerun)
-	assert.Contains(t, res.Rerun, "MPR-190 cpuOnly install job")
-	assert.Contains(t, res.Rerun, "MPR-207 cpuOnly on RHEL 9.8")
+	assert.Equal(t, []string{
+		"cpuOnly install job", "cpuOnly on RHEL 9.8", "cpuOnly on RHEL 10.2", "cpuOnly on Ubuntu 24.04",
+		"fullfeature install job", "fullfeature on RHEL 9.8", "fullfeature on RHEL 10.2", "fullfeature on Ubuntu 24.04",
+	}, res.Rerun, "two jobs and six cells, profile by profile, in a fixed order")
 }
 
 // A moved tag is only noticed when the sources are re-resolved.
@@ -209,7 +210,7 @@ func TestRefresh_ChangedProfileApplicabilityIsAChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.Changes, 1)
 	assert.Equal(t, ChangeProfiles, res.Changes[0].Reason)
-	assert.Contains(t, res.Rerun, "MPR-190 cpuOnly install job", "cpuOnly now depends on it")
+	assert.Contains(t, res.Rerun, "cpuOnly install job", "cpuOnly now depends on it")
 }
 
 func TestRefresh_Refusals(t *testing.T) {

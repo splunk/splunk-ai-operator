@@ -69,7 +69,7 @@ func newEnv(t *testing.T) *env {
 	e := &env{t: t, src: newReg(t), dst: newReg(t), dir: t.TempDir()}
 	e.store = filepath.Join(e.dir, "snapshots")
 
-	// The real MPR-188 manifest, with its four image references repointed locally.
+	// The real candidate manifest, with its four image references repointed locally.
 	raw, err := os.ReadFile("../../config/agent-runtime/candidate-manifest.yaml")
 	require.NoError(t, err)
 	local := []string{
@@ -288,8 +288,8 @@ func TestEndToEnd_CreateVerifyCompareAndRefresh(t *testing.T) {
 	code, out, errs = e.run(args...)
 	require.Equal(t, 0, code, errs)
 	assert.Regexp(t, `changed\s+slim\s+candidate reference replaced\s+sha256:[0-9a-f]+ -> sha256:[0-9a-f]+`, out)
-	assert.Contains(t, out, "MPR-190 cpuOnly install job")
-	assert.Contains(t, out, "MPR-213 fullfeature on Ubuntu 24.04")
+	assert.Contains(t, out, "cpuOnly install job")
+	assert.Contains(t, out, "fullfeature on Ubuntu 24.04")
 	assert.NotContains(t, out, "changed   agent-runtime-base", "only the replaced image changed")
 	require.FileExists(t, filepath.Join(e.store, "run-2", "manifest.json"))
 

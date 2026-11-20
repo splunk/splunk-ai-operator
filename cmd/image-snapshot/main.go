@@ -1,5 +1,5 @@
 // Command image-snapshot builds, verifies and refreshes the snapshot of the container
-// images an AI Tier install needs (MPR-187).
+// images an AI Tier install needs.
 //
 //	image-snapshot inventory --candidate FILE [--config FILE] ...
 //	image-snapshot create    --mirror HOST[/PREFIX] --store DIR ...
@@ -103,7 +103,7 @@ type inputFlags struct {
 }
 
 func (f *inputFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.candidate, "candidate", defaultCandidate, "MPR-188 candidate manifest")
+	fs.StringVar(&f.candidate, "candidate", defaultCandidate, "agent-runtime candidate manifest")
 	fs.StringVar(&f.config, "config", "", "installer configuration file (images outside the candidate set)")
 	fs.StringVar(&f.cpuOnlyValues, "values-cpuonly", "", "render-profile output for cpuOnly")
 	fs.StringVar(&f.fullFeatureValues, "values-fullfeature", "", "render-profile output for fullfeature")
@@ -119,7 +119,7 @@ func (f *inputFlags) load() (imagesnapshot.InventoryInput, error) {
 		return in, fmt.Errorf("candidate manifest: %w", err)
 	}
 	if err := m.Validate(); err != nil {
-		return in, fmt.Errorf("candidate manifest %s is not a valid MPR-188 record: %w", f.candidate, err)
+		return in, fmt.Errorf("candidate manifest %s is not a valid candidate record: %w", f.candidate, err)
 	}
 	raw, err := os.ReadFile(f.candidate)
 	if err != nil {

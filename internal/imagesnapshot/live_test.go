@@ -83,21 +83,21 @@ func TestLive_MirrorsARealImageIntact(t *testing.T) {
 	assert.Empty(t, Preflight(ctx, &Remote{}, snap, nil, ProfileCPUOnly), "the preflight passes on what was just mirrored")
 }
 
-// TestLive_MirrorsTheMPR188CandidatesFromECR copies the four real candidate images from
+// TestLive_MirrorsTheCandidatesFromECR copies the four real candidate images from
 // ECR into a throwaway local registry, then pulls every one back with each blob checked
 // against its digest. It needs registry credentials for the candidates in the Docker
 // configuration (for ECR: log in with `aws ecr get-login-password`), downloads about 2 GB,
 // and keeps the mirror on disk in a temporary directory that is removed afterwards.
 //
-//	IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheMPR188Candidates -v -timeout 60m ./internal/imagesnapshot
-func TestLive_MirrorsTheMPR188CandidatesFromECR(t *testing.T) {
+//	IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheCandidates -v -timeout 60m ./internal/imagesnapshot
+func TestLive_MirrorsTheCandidatesFromECR(t *testing.T) {
 	if os.Getenv("IMAGE_SNAPSHOT_LIVE_CANDIDATES") != "1" {
-		t.Skip("set IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 (and log in to the candidate registry) to mirror the real MPR-188 candidates")
+		t.Skip("set IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 (and log in to the candidate registry) to mirror the real candidate images")
 	}
 	m, sum := loadCandidate(t)
 	inv, err := BuildInventory(InventoryInput{Candidate: m, CandidateChecksum: sum})
 	require.NoError(t, err)
-	require.Len(t, inv.Images, 4, "the four MPR-188 candidate images")
+	require.Len(t, inv.Images, 4, "the four candidate images")
 
 	// A registry that keeps its blobs on disk, so gigabytes never sit in memory.
 	blobs := t.TempDir()

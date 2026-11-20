@@ -77,7 +77,7 @@ func components(images []Image) map[string]Image {
 	return out
 }
 
-func TestBuildInventory_CandidateImagesComeFromTheMPR188Manifest(t *testing.T) {
+func TestBuildInventory_CandidateImagesComeFromTheCandidateManifest(t *testing.T) {
 	inv, err := BuildInventory(fullInput(t))
 	require.NoError(t, err)
 	c := components(inv.Images)

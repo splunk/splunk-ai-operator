@@ -101,7 +101,7 @@ type RenderedValues struct {
 
 // InventoryInput gathers everything an inventory is derived from.
 type InventoryInput struct {
-	// Candidate is the selected MPR-188 candidate record and the checksum of its file.
+	// Candidate is the selected candidate record and the checksum of its file.
 	Candidate         *candidatecontract.Manifest
 	CandidateChecksum string
 	// Installer is the installer configuration naming the images outside the
@@ -190,7 +190,7 @@ func BuildInventory(in InventoryInput) (*Inventory, error) {
 		return out
 	}
 
-	// 1. The candidate set selected by MPR-188 is authoritative for its four images.
+	// 1. The selected candidate set is authoritative for its four images.
 	// AITK is a Splunk app, not an image, so it is not part of the inventory.
 	for _, key := range sortedKeys(in.Candidate.Spec.Components) {
 		c := in.Candidate.Spec.Components[key]

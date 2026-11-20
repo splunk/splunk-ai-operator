@@ -129,7 +129,7 @@ var buildStamp = regexp.MustCompile(`^\d{10,14}-[0-9a-f]{7,40}$`)
 
 // placeholderLabel reports a label value that only says "nothing here": build systems
 // that cannot find a revision often write "unknown" into the label instead of leaving
-// it out (the real MPR-188 carrier image does).
+// it out (the real candidate carrier image does).
 func placeholderLabel(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "", "unknown", "none", "null", "nil", "n/a", "na", "-", "undefined", "<none>":

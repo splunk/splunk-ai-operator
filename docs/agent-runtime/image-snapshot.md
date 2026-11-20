@@ -1,7 +1,7 @@
-# Image snapshots: source to private mirror (MPR-187)
+# Image snapshots: source to private mirror
 
 An air-gapped install must not depend on an external registry at install time. This
-tool takes the images of an MPR-188 candidate revision, works out which images each
+tool takes the images of an agent-runtime candidate revision, works out which images each
 profile needs, resolves every one to an immutable digest, copies it to a private
 mirror, and keeps a versioned, checksummed record of the result: a **snapshot**. A
 preflight then checks the mirror against that record before an install starts.
@@ -11,9 +11,9 @@ What it owns, and what it does not:
 | Owned here | Owned elsewhere |
 |---|---|
 | inventory, digest and platform resolution, mirroring, the snapshot manifest, preflight, comparison, refresh | building or changing any image (external teams) |
-| | importing images onto nodes, the offline bundle and install behaviour (MPR-193) |
-| | wiring the inputs into CI (MPR-183) and the install jobs (MPR-190, MPR-192) |
-| | final release digests and certification (MPR-216) |
+| | importing images onto nodes, the offline bundle and install behaviour |
+| | wiring the inputs into CI and the install jobs |
+| | final release digests and certification |
 
 ```
 go run ./cmd/image-snapshot <command> [flags]
@@ -23,7 +23,7 @@ go run ./cmd/image-snapshot <command> [flags]
 
 | Input | Flag | Used for |
 |---|---|---|
-| MPR-188 candidate manifest | `--candidate` (default `config/agent-runtime/candidate-manifest.yaml`) | the four candidate images; validated first, so a contradictory record fails |
+| Candidate manifest | `--candidate` (default `config/agent-runtime/candidate-manifest.yaml`) | the four candidate images; validated first, so a contradictory record fails |
 | Installer configuration | `--config` | images outside the candidate set: operator, Ray, Weaviate, SAIA, Fluent Bit, nginx, OpenTelemetry, Splunk; also its `components` switches and `images.registry` (see below) |
 | Rendered values per profile | `--values-cpuonly`, `--values-fullfeature` (output of `k0s_cluster_with_stack.sh render-profile`) | the effective `components`, which switch add-on images on and off per profile |
 | Add-on images | `--addon-list` (`addon-images.list` from `airgap_install.sh`) | cert-manager, Prometheus, KubeRay, NVIDIA device plugin, local-path, MetalLB, ... |
@@ -85,11 +85,11 @@ It is deterministic and carries a checksum over the candidate record and the ima
   `agent-runtime-base-<version>` and `agent-runtime-provider-<name>`, unless it is the
   candidate's own: the pin for the candidate's `runtimeVersion` and the candidate's provider
   are the candidate images, and `compare` requires the install to point them at those images'
-  mirror references (MPR-188 renders the same mapping). This follows FR-16 and §14.4.4 of the
+  mirror references (the candidate renderer uses the same mapping). This follows FR-16 and §14.4.4 of the
   Agent-Runtime / AI-Tier Integration ERD: the inventory is complete for what the operator
   can select.
 - **AITK is not in the inventory.** It is the Splunk app `Splunk_ML_Toolkit`, not a
-  container image (MPR-188).
+  container image; it ships separately.
 - **`cpuOnly` never needs** Ray, Weaviate, SAIA, nginx, the KubeRay operator or the
   NVIDIA device plugin. A component switched off in a profile's rendered `components`
   (for example `otel: false`) drops its images from that profile.
@@ -132,7 +132,7 @@ bytes.
 
 The digest-pinned `mirrorRef` is the form the operator now requires for the schema
 setup image: `RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP` must be a full, immutable
-`registry/path@sha256:<digest>` reference (see `schema-job-lifecycle.md`, MPR-189), so
+`registry/path@sha256:<digest>` reference (see `schema-job-lifecycle.md`), so
 a snapshot's entry can be used as it is.
 
 ### Digest and platform
@@ -232,8 +232,9 @@ otherwise reported as new and removed rather than guessed. Entries whose source 
 registry calls; only new or replaced entries are resolved, mirrored and verified. Each
 changed entry records the digest it replaces, and the report lists the install jobs
 and qualification cells that must rerun: a change to an image only `fullfeature` uses
-reruns MPR-192 and the three `fullfeature` cells, a change to a shared image reruns
-both jobs and all six cells. `--recheck-tags` re-resolves every source to catch a tag
+reruns the `fullfeature` install job and the three `fullfeature` cells (RHEL 9.8,
+RHEL 10.2, Ubuntu 24.04), a change to a shared image reruns both install jobs and all six
+cells. `--recheck-tags` re-resolves every source to catch a tag
 that now points at a different digest. If nothing changed it says so and stores
 nothing; if the replacement is unavailable it fails as an external blocker and stores
 nothing.
@@ -243,12 +244,12 @@ nothing.
 The registry client is tested against real in-memory OCI registries, and opt-in tests
 read real ones: `IMAGE_SNAPSHOT_LIVE=1 go test -run TestLive ./internal/imagesnapshot`
 resolves public images anonymously and mirrors one into a local registry, and
-`IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheMPR188Candidates`
-copies the four MPR-188 candidate images from ECR into a throwaway local registry and
+`IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheCandidates`
+copies the four candidate images from ECR into a throwaway local registry and
 pulls them back with every blob verified (see `validation/mpr-187-ecr-mirror.txt`).
 Copying to a customer or CI mirror that needs credentials or sits behind a proxy has not
-been done: the story lists mirror access as an external input.
-An air-gapped host, the offline bundle and the import onto nodes are MPR-193. The add-on
+been done: access to such a mirror is an external input.
+An air-gapped host, the offline bundle and the import onto nodes are out of scope here. The add-on
 and k0s image lists are produced by the existing air-gap bundle mechanism and are
 consumed as they are; the hand-written `container-images.txt` in `airgap_install.sh` is
 not changed.

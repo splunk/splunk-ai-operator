@@ -82,7 +82,7 @@ registry protocol; layers 5 and 6 are opt-in and read real registries.
      carrier, 12 for the schema setup image and 14 for SLIM. The preflight passes for both
      profiles and the snapshot is stored and checksummed. Output:
      [validation/mpr-187-ecr-mirror.txt](validation/mpr-187-ecr-mirror.txt). Repeat it with
-     `IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheMPR188Candidates -v
+     `IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheCandidates -v
      -timeout 60m ./internal/imagesnapshot` after logging in to the candidate registry.
 
 ## Independent review
@@ -146,7 +146,7 @@ Splunk configurations before this was proposed.
 output of a full flow against two in-memory registries (registry addresses replaced by
 placeholders; digests differ on every run because the test images are random):
 
-1. `create` mirrors eight images and stores snapshot `run-1`; a second `create` with the
+1. `create` mirrors twelve images (the four candidate images, the operator, Ray head and worker, Weaviate and the four installer defaults) and stores snapshot `run-1`; a second `create` with the
    same ID is refused.
 2. `verify` passes for both profiles; against a copy whose `slim` mirror reference points
    at an image the mirror never received it exits 1 with `[MIRROR_MISSING_IMAGE] slim`.

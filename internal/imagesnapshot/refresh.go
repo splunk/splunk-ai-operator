@@ -7,29 +7,31 @@ import (
 	"sort"
 )
 
-// Cell is one OS and profile combination that is qualified on its own, and the story
-// that tracks it. A changed image means every cell of a profile that uses it reruns.
-type Cell struct{ Profile, OS, Story string }
+// Cell is one OS and profile combination that is qualified on its own. A changed image
+// means every cell of a profile that uses it reruns.
+type Cell struct{ Profile, OS string }
 
-// Cells are the six qualification cells and Jobs the two install jobs that consume a
-// snapshot (MPR-190, MPR-192). They change only when the story map changes.
+// Cells are the six supported OS and profile combinations that are qualified, and Jobs
+// the install job of each profile, which consumes a snapshot. They change only when the
+// set of supported operating systems or profiles changes.
 var Cells = []Cell{
-	{ProfileCPUOnly, "RHEL 9.8", "MPR-207"},
-	{ProfileFullFeature, "RHEL 9.8", "MPR-209"},
-	{ProfileCPUOnly, "RHEL 10.2", "MPR-210"},
-	{ProfileFullFeature, "RHEL 10.2", "MPR-211"},
-	{ProfileCPUOnly, "Ubuntu 24.04", "MPR-212"},
-	{ProfileFullFeature, "Ubuntu 24.04", "MPR-213"},
+	{ProfileCPUOnly, "RHEL 9.8"},
+	{ProfileFullFeature, "RHEL 9.8"},
+	{ProfileCPUOnly, "RHEL 10.2"},
+	{ProfileFullFeature, "RHEL 10.2"},
+	{ProfileCPUOnly, "Ubuntu 24.04"},
+	{ProfileFullFeature, "Ubuntu 24.04"},
 }
 
 // Jobs maps a profile to the install job that consumes the snapshot.
 var Jobs = map[string]string{
-	ProfileCPUOnly:     "MPR-190 cpuOnly install job",
-	ProfileFullFeature: "MPR-192 fullfeature install job",
+	ProfileCPUOnly:     "cpuOnly install job",
+	ProfileFullFeature: "fullfeature install job",
 }
 
 // RerunTargets lists the jobs and cells that must rerun when images used by the given
-// profiles change, without duplicates.
+// profiles change, without duplicates: for each affected profile, its install job and
+// then its cells in the order of Cells.
 func RerunTargets(profiles []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -46,12 +48,11 @@ func RerunTargets(profiles []string) []string {
 		add(Jobs[p])
 		for _, c := range Cells {
 			if c.Profile == p {
-				add(fmt.Sprintf("%s %s on %s", c.Story, c.Profile, c.OS))
+				add(fmt.Sprintf("%s on %s", c.Profile, c.OS))
 			}
 		}
 	}
-	sort.Strings(out)
-	return out
+	return out // in the fixed order of Profiles, then Cells
 }
 
 // Reasons a snapshot entry changed in a refresh.
