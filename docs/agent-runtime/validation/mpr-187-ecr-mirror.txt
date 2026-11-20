@@ -1,0 +1,22 @@
+Real mirror of the four MPR-188 candidate images from ECR (MPR-187)
+===================================================================
+Date:        2026-11-19
+Test:        IMAGE_SNAPSHOT_LIVE_CANDIDATES=1 go test -run TestLive_MirrorsTheMPR188CandidatesFromECR -v ./internal/imagesnapshot
+Source:      658391232643.dkr.ecr.us-west-2.amazonaws.com (read only), via a short-lived ECR token held in a
+             temporary DOCKER_CONFIG (mode 0600) that was deleted afterwards
+Mirror:      a throwaway local registry with its blobs on disk in a temporary directory, removed afterwards
+Size:        about 2.0 GB compressed (base 1.2 GB, SLIM 0.65 GB, schema 0.12 GB, carrier 0.07 GB)
+
+    live_test.go:111: agent-runtime-base             verified  sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219  mirror mirror.local/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime@sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219
+    live_test.go:111: agent-runtime-provider-mltk    verified  sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5  mirror mirror.local/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk@sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5
+    live_test.go:111: agent-runtime-schema-setup     verified  sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987  mirror mirror.local/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987
+    live_test.go:111: slim                           verified  sha256:f4ea9e5f9e9a8f2d09e3349a5cb5a462661793b69816bd9f2e1d45eececf8710  mirror mirror.local/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api@sha256:f4ea9e5f9e9a8f2d09e3349a5cb5a462661793b69816bd9f2e1d45eececf8710
+    live_test.go:114: mirrored 4 images in 9m11s
+    live_test.go:121: pulled back agent-runtime-base           config sha256:eae3b33005a5  49 layers, every blob verified
+    live_test.go:121: pulled back agent-runtime-provider-mltk  config sha256:1ed2996dd623  2 layers, every blob verified
+    live_test.go:121: pulled back agent-runtime-schema-setup   config sha256:39c5803f686e  12 layers, every blob verified
+    live_test.go:121: pulled back slim                         config sha256:0631be797d0b  14 layers, every blob verified
+    live_test.go:128: snapshot stored and checksummed: live-candidates
+--- PASS: TestLive_MirrorsTheMPR188CandidatesFromECR (553.45s)
+PASS
+ok  	github.com/splunk/splunk-ai-operator/internal/imagesnapshot	553.811s

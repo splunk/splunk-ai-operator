@@ -16,7 +16,7 @@ Runtime's prefix is `/system/ai-agent-runtime/v1`. AITK uses `/tenant/slim-api/v
 4. Re-render the operator configuration against the updated candidate record and run the focused local contract/render checks. Confirm SLIM receives both `PLATFORM_URL` and `AI_TIER_AGENT_RUNTIME_URL`; `PLATFORM_URL` propagates the resolved `AIService.spec.aiPlatformUrl` through the existing normalization. A currently empty CPU-only input is a system observation, not a constraint; a supplied URL must be preserved under either profile. The story owner confirms the selected SLIM image accepts `AI_TIER_AGENT_RUNTIME_URL`; the previously inspected SLIM commit does not define this candidate's contract.
 5. Record the validation command/scope, outcome, and any defect or build reference next to the new history entry. A passing local render/contract check establishes compatibility evidence only; it does not qualify the candidate for product release.
 
-Final immutable release selection and certification remain in MPR-216. Image mirroring and execution are covered by MPR-187.
+Final immutable release selection and certification remain in MPR-216. Image mirroring and execution are covered by the image snapshot tool: see [image-snapshot.md](image-snapshot.md) for how a candidate revision is resolved to digests, mirrored, verified and refreshed.
 
 ## Local validation and rendering
 

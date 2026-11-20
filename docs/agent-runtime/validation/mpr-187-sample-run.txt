@@ -1,0 +1,114 @@
+$ image-snapshot create --mirror mirror.example:5000/ai-tier --store <work>/snapshots --id run-1 --candidate <work>/candidate-manifest.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+verified  agent-runtime-base             source.example:5000/ml-platform/agent-runtime:build-1
+          digest    sha256:62f542ed65ec92773a80760ec263b4209e8b0739ac463300e03fd367a59c9cac
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/ml-platform/agent-runtime@sha256:62f542ed65ec92773a80760ec263b4209e8b0739ac463300e03fd367a59c9cac
+verified  agent-runtime-provider-mltk    source.example:5000/ml-platform/agent-runtime-provider-mltk:build-1
+          digest    sha256:e73058323d80dc73141673cf6d5693a733be6105d8f4e83b74acb54bdc51ca84
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/ml-platform/agent-runtime-provider-mltk@sha256:e73058323d80dc73141673cf6d5693a733be6105d8f4e83b74acb54bdc51ca84
+verified  agent-runtime-schema-setup     source.example:5000/ml-platform/agent-runtime-schema-setup:build-1
+          digest    sha256:629713bfcd3e4e4ba1ab4191abd74ac2f32983123d160afc1ae17b2697bb56a1
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/ml-platform/agent-runtime-schema-setup@sha256:629713bfcd3e4e4ba1ab4191abd74ac2f32983123d160afc1ae17b2697bb56a1
+verified  fluent-bit                     source.example:5000/fluent/fluent-bit:1.9.6
+          digest    sha256:0fc835945e8144f9fb007e1a101de9bb8dcb3ad133af0d5f7311106c71f72ed8
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/fluent/fluent-bit@sha256:0fc835945e8144f9fb007e1a101de9bb8dcb3ad133af0d5f7311106c71f72ed8
+verified  nginx                          source.example:5000/library/nginx:1.27
+          digest    sha256:5c0c3c18a66804a52601137295e468286b3149ced28406dcf083d45502d7ce16
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/library/nginx@sha256:5c0c3c18a66804a52601137295e468286b3149ced28406dcf083d45502d7ce16
+verified  otel-collector                 source.example:5000/otel/collector:0.122.1
+          digest    sha256:ca50b19f017dc0836eda8237b49af9aeb5c856222544f0fabf40d3d544ca33d0
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/otel/collector@sha256:ca50b19f017dc0836eda8237b49af9aeb5c856222544f0fabf40d3d544ca33d0
+verified  ray-head                       source.example:5000/rayproject/ray:2.44.0
+          digest    sha256:2986f55515bc665df1f54c69bd093a20ffd634642eb7aa5eb30d90dab2592828
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/rayproject/ray@sha256:2986f55515bc665df1f54c69bd093a20ffd634642eb7aa5eb30d90dab2592828
+verified  ray-worker                     source.example:5000/rayproject/ray:2.44.0
+          digest    sha256:2986f55515bc665df1f54c69bd093a20ffd634642eb7aa5eb30d90dab2592828
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/rayproject/ray@sha256:2986f55515bc665df1f54c69bd093a20ffd634642eb7aa5eb30d90dab2592828
+verified  slim                           source.example:5000/ml-platform/slim-api:v1
+          digest    sha256:8a191bfd27da26d5a103fbf2a9d2cb7ec14dcf68ef52aed1cc070c2df5497c84
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/ml-platform/slim-api@sha256:8a191bfd27da26d5a103fbf2a9d2cb7ec14dcf68ef52aed1cc070c2df5497c84
+verified  splunk-ai-operator             source.example:5000/splunk/splunk-ai-operator:candidate-1
+          digest    sha256:f85f1199d1c70b11cbd0e3ba53351c536e22e3a44a06900c16dab3b128426fb6
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/splunk/splunk-ai-operator@sha256:f85f1199d1c70b11cbd0e3ba53351c536e22e3a44a06900c16dab3b128426fb6
+verified  splunk-operator                source.example:5000/splunk/splunk-operator:3.0.0
+          digest    sha256:ca933e42e0672ee1e5c099a47ac33f0599c48e6caa9671b6ae68e02d58993a6d
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/splunk/splunk-operator@sha256:ca933e42e0672ee1e5c099a47ac33f0599c48e6caa9671b6ae68e02d58993a6d
+verified  weaviate                       source.example:5000/semitechnologies/weaviate:stable
+          digest    sha256:da64ef395254d168235a32483bed077a0e7242c0fe1167f9ed475e1b0f5ddb3b
+          platforms linux/amd64
+          mirror    mirror.example:5000/ai-tier/source.example-5000/semitechnologies/weaviate@sha256:da64ef395254d168235a32483bed077a0e7242c0fe1167f9ed475e1b0f5ddb3b
+snapshot run-1: 12 images mirrored and verified
+manifest: <work>/snapshots/run-1/manifest.json
+sha256:   c5afa493844801086906b61ef31f12df3a317e053ccd9edfe03a49ce84f94b25
+(exit 0)
+
+$ image-snapshot create --mirror mirror.example:5000/ai-tier --store <work>/snapshots --id run-1 --candidate <work>/candidate-manifest.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+error: snapshot "run-1" already exists in <work>/snapshots: snapshots are never rewritten, choose a new --id
+(exit 2)
+
+$ image-snapshot verify --store <work>/snapshots --id run-1 --profile cpuOnly --candidate <work>/candidate-manifest.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+OK: preflight for cpuOnly from snapshot run-1: no problems found
+(exit 0)
+
+$ image-snapshot verify --store <work>/snapshots --id run-1 --profile fullfeature --candidate <work>/candidate-manifest.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+OK: preflight for fullfeature from snapshot run-1: no problems found
+(exit 0)
+
+$ image-snapshot verify --snapshot <work>/broken.json --profile cpuOnly --candidate <work>/candidate-manifest.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+[MIRROR_MISSING_IMAGE] slim: mirror.example:5000/ai-tier/never/pushed@sha256:8a191bfd27da26d5a103fbf2a9d2cb7ec14dcf68ef52aed1cc070c2df5497c84 is not available in the mirror: GET http://mirror.example:5000/v2/ai-tier/never/pushed/manifests/sha256:8a191bfd27da26d5a103fbf2a9d2cb7ec14dcf68ef52aed1cc070c2df5497c84: NAME_UNKNOWN: Unknown name
+FAILED: preflight for cpuOnly from snapshot run-1: 1 problem(s) found
+(exit 1)
+
+$ image-snapshot compare --store <work>/snapshots --id run-1 --profile cpuOnly --candidate <work>/candidate-manifest.yaml --config <work>/config-mirrored.yaml --values-cpuonly <work>/values-mirrored.yaml
+OK: 4 install references for cpuOnly against snapshot run-1: no problems found
+(exit 0)
+
+$ image-snapshot compare --store <work>/snapshots --id run-1 --profile cpuOnly --candidate <work>/candidate-manifest.yaml --config <work>/config-mirrored.yaml --values-cpuonly <work>/values-rogue.yaml
+[UNACCOUNTED_REFERENCE] slim: docker.io/library/busybox:latest is not an image of this snapshot (profile cpuOnly)
+FAILED: 4 install references for cpuOnly against snapshot run-1: 1 problem(s) found
+(exit 1)
+
+$ image-snapshot compare --store <work>/snapshots --id run-1 --profile cpuOnly --candidate <work>/candidate-manifest.yaml --config <work>/config.yaml --values-cpuonly <work>/values-mirrored.yaml
+[SOURCE_REGISTRY_REFERENCE] fluent-bit: source.example:5000/fluent/fluent-bit:1.9.6 pulls from the source registry; install from the mirror reference mirror.example:5000/ai-tier/source.example-5000/fluent/fluent-bit@sha256:0fc835945e8144f9fb007e1a101de9bb8dcb3ad133af0d5f7311106c71f72ed8
+[SOURCE_REGISTRY_REFERENCE] otel-collector: source.example:5000/otel/collector:0.122.1 pulls from the source registry; install from the mirror reference mirror.example:5000/ai-tier/source.example-5000/otel/collector@sha256:ca50b19f017dc0836eda8237b49af9aeb5c856222544f0fabf40d3d544ca33d0
+[SOURCE_REGISTRY_REFERENCE] splunk-operator: source.example:5000/splunk/splunk-operator:3.0.0 pulls from the source registry; install from the mirror reference mirror.example:5000/ai-tier/source.example-5000/splunk/splunk-operator@sha256:ca933e42e0672ee1e5c099a47ac33f0599c48e6caa9671b6ae68e02d58993a6d
+FAILED: 4 install references for cpuOnly against snapshot run-1: 3 problem(s) found
+(exit 1)
+
+$ image-snapshot refresh --store <work>/snapshots --previous run-1 --id run-2 --candidate <work>/candidate-2.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+changed   slim                             candidate reference replaced  sha256:8a191bfd27da26d5a103fbf2a9d2cb7ec14dcf68ef52aed1cc070c2df5497c84 -> sha256:1555273f79b20abc45befa157552ab5b02810666846b9d789f5dc865e9fed1ab
+rerun:
+   cpuOnly install job
+   cpuOnly on RHEL 9.8
+   cpuOnly on RHEL 10.2
+   cpuOnly on Ubuntu 24.04
+   fullfeature install job
+   fullfeature on RHEL 9.8
+   fullfeature on RHEL 10.2
+   fullfeature on Ubuntu 24.04
+snapshot run-2 refreshes run-1
+manifest: <work>/snapshots/run-2/manifest.json
+sha256:   1a407cc2986992e3b6524a7ba0028094e4999bdb488a8af012e78c1173b3a040
+(exit 0)
+
+$ image-snapshot refresh --store <work>/snapshots --previous run-2 --id run-3 --candidate <work>/candidate-2.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml
+no change: nothing changed: the inventory and every digest match the previous snapshot
+(exit 0)
+
+$ image-snapshot refresh --store <work>/snapshots --previous run-2 --id run-4 --candidate <work>/candidate-3.yaml --config <work>/config.yaml --values-cpuonly <work>/values-cpuonly.yaml --values-fullfeature <work>/values-fullfeature.yaml --report <work>/blockers.json
+snapshot blocked: 1 image(s) are external blockers, nothing was stored:
+  slim  source.example:5000/ml-platform/slim-api:not-built
+      unresolved: GET http://source.example:5000/v2/ml-platform/slim-api/manifests/not-built: MANIFEST_UNKNOWN: Unknown manifest
+FAILED: 1 image(s) could not be resolved or mirrored
+(exit 1)
+
