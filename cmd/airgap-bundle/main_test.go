@@ -93,7 +93,7 @@ func newEnv(t *testing.T) *env {
 	k0s := []string{"registry.k8s.io/pause:3.9"}
 	addon := []string{"quay.io/kuberay/operator:v1.2.2"}
 	for rel, body := range map[string]string{
-		"bundle/binaries/k0s": "k0s", "bundle/binaries/yq": "yq",
+		"bundle/binaries/k0s": "k0s", "bundle/binaries/yq": "yq", "bundle/binaries/airgap-bundle": "tool",
 		"bundle/images/k0s-images.list": strings.Join(k0s, "\n") + "\n", "bundle/images/addon-images.list": strings.Join(addon, "\n") + "\n",
 		"bundle/manifests/cert-manager.yaml": "x", "bundle/manifests/local-path-storage.yaml": "x", "bundle/manifests/nvidia-device-plugin.yml": "x",
 		"bundle/charts/kube-prometheus-stack-65.1.0.tgz": "c", "bundle/charts/opentelemetry-operator-0.70.0.tgz": "c",
@@ -116,6 +116,11 @@ func newEnv(t *testing.T) *env {
 	require.NoError(t, err)
 	e.snapshot, _, err = (imagesnapshot.Store{Dir: filepath.Join(e.dir, "snapshots")}).Put(e.snap)
 	require.NoError(t, err)
+	for _, name := range []string{"manifest.json", "manifest.json.sha256"} {
+		b, err := os.ReadFile(filepath.Join(filepath.Dir(e.snapshot), name))
+		require.NoError(t, err)
+		e.write(filepath.Join("bundle/snapshot", name), string(b))
+	}
 	// The install configuration names every configured image by its mirror digest.
 	cfg, err := imagesnapshot.InstallConfig(e.snap, in.Candidate.Spec.RuntimeVersion)
 	require.NoError(t, err)
@@ -153,7 +158,7 @@ func TestEndToEnd_ManifestVerifyImport(t *testing.T) {
 	e := newEnv(t)
 	code, out, errs := e.run("manifest", "--bundle", e.bundle, "--snapshot", e.snapshot, "--model-config", filepath.Join(e.dir, "models.yaml"))
 	require.Equal(t, 0, code, errs)
-	assert.Regexp(t, `bundle snap-1-[0-9a-f]{12}: 15 files, 2 archive images, 1 model artifacts, snapshot snap-1`, out)
+	assert.Regexp(t, `bundle snap-1-[0-9a-f]{12}: 18 files, 2 archive images, 1 model artifacts, snapshot snap-1`, out)
 	require.FileExists(t, filepath.Join(e.bundle, airgapbundle.ManifestFile))
 
 	// The staging-host check needs only the bundle.
@@ -174,7 +179,7 @@ func TestEndToEnd_ManifestVerifyImport(t *testing.T) {
 	dest := filepath.Join(e.dir, "imported")
 	code, out, errs = e.run("import", "--from", e.bundle, "--to", dest)
 	require.Equal(t, 0, code, errs)
-	assert.Regexp(t, `imported at .* \(15 files copied, 0 reused`, out)
+	assert.Regexp(t, `imported at .* \(18 files copied, 0 reused`, out)
 	code, out, _ = e.run("import", "--from", e.bundle, "--to", dest)
 	require.Equal(t, 0, code)
 	assert.Contains(t, out, "is already imported")
@@ -233,7 +238,7 @@ func TestUsageErrorsExitTwo(t *testing.T) {
 		{},
 		{"bogus"},
 		{"manifest"},
-		{"manifest", "--bundle", e.bundle},
+		{"manifest", "--bundle", t.TempDir()}, // no --snapshot, and the bundle carries none
 		{"verify", "--bundle", e.bundle},
 		{"verify", "--bundle", e.bundle, "--profile", "gpuOnly"},
 		{"verify", "--bundle", e.bundle, "--profile", "cpuOnly", "--scope", "everything"},
@@ -277,4 +282,15 @@ func TestVerify_WithoutTheInstallConfigurationFails(t *testing.T) {
 	code, _, errs = e.run("verify", "--bundle", e.bundle, "--profile", "cpuOnly", "--snapshot", e.snapshot, "--candidate", candidate, "--facts", e.facts(false, false))
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "[INSTALL_CONFIG_MISSING] install-config")
+}
+
+// The bundle carries its snapshot, so manifest and verify need no --snapshot.
+func TestTheBundlesOwnSnapshotIsTheDefault(t *testing.T) {
+	e := newEnv(t)
+	code, out, errs := e.run("manifest", "--bundle", e.bundle)
+	require.Equal(t, 0, code, errs)
+	assert.Contains(t, out, "snapshot snap-1")
+	code, _, errs = e.run("verify", "--bundle", e.bundle, "--profile", "cpuOnly", "--candidate", candidate,
+		"--config", e.installConfig, "--facts", e.facts(false, false))
+	assert.Equal(t, 0, code, errs)
 }

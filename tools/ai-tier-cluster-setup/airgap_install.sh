@@ -184,6 +184,8 @@ WHAT IS STAGED
   binaries/
     k0s          — k0s Kubernetes binary (linux/amd64)
     yq           — YAML processor used by the installer
+    airgap-bundle — the bundle's preflight and import tool (built from this repository,
+                    or AIRGAP_BUNDLE_BINARY)
 
   manifests/
     cert-manager.yaml          — cert-manager CRDs + controller
@@ -222,6 +224,10 @@ WHAT IS STAGED
   container-images.txt  — List of container images to mirror to your internal registry
   bundle-versions.txt   — Records all component versions for reproducibility
   checksums.sha256      — SHA-256 checksums for every staged file
+  snapshot/             — the MPR-187 image snapshot the install uses (manifest.json + .sha256)
+  bundle-manifest.json  — every file with its role, size and sha256, the image-archive
+                          digests, the model artifacts and the snapshot; written and checked
+                          by binaries/airgap-bundle (see docs/agent-runtime/airgap-bundle.md)
 
 ENVIRONMENT VARIABLE OVERRIDES
   This script exports all of these automatically before invoking the installer.
@@ -661,6 +667,73 @@ mkdir -p \
 # file://./relative/path with "URL using bad/illegal format".
 STAGE_DIR="$(cd "${STAGE_DIR}" && pwd)"
 
+# ── Air-gap bundle tool, snapshot and manifest (MPR-193) ────────────────────────
+# The bundle carries the airgap-bundle tool, the image snapshot the install uses, and a
+# manifest of every file; the tool checks the bundle here and again on the install host.
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+AIRGAP_BUNDLE_BINARY="${AIRGAP_BUNDLE_BINARY:-}"
+AIRGAP_SNAPSHOT_MANIFEST="${AIRGAP_SNAPSHOT_MANIFEST:-}"
+
+# stage_airgap_bundle_tool <dest>: copy a prebuilt AIRGAP_BUNDLE_BINARY, or build the
+# tool for linux/amd64 from this repository. Fails rather than staging a bundle the
+# install host cannot verify.
+stage_airgap_bundle_tool() {
+  local dest="$1"
+  if [[ -n "${AIRGAP_BUNDLE_BINARY}" ]]; then
+    [[ -f "${AIRGAP_BUNDLE_BINARY}" && -x "${AIRGAP_BUNDLE_BINARY}" ]] \
+      || err "AIRGAP_BUNDLE_BINARY=${AIRGAP_BUNDLE_BINARY} is not an executable file."
+    cp "${AIRGAP_BUNDLE_BINARY}" "${dest}"
+  elif command -v go >/dev/null 2>&1 && [[ -f "${REPO_ROOT}/go.mod" && -d "${REPO_ROOT}/cmd/airgap-bundle" ]]; then
+    ( cd "${REPO_ROOT}" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "${dest}" ./cmd/airgap-bundle ) \
+      || err "Building the airgap-bundle tool failed (go build ./cmd/airgap-bundle in ${REPO_ROOT})."
+  else
+    err "Cannot stage the airgap-bundle tool: install Go to build it from ${REPO_ROOT}, or set AIRGAP_BUNDLE_BINARY to a prebuilt linux/amd64 binary."
+  fi
+  chmod +x "${dest}"
+  "${dest}" --help >/dev/null 2>&1 || err "The staged airgap-bundle tool does not run on this host (it must be linux/amd64)."
+}
+
+# resolve_snapshot_manifest: AIRGAP_SNAPSHOT_MANIFEST, else images.snapshotManifest from
+# the cluster config (relative to the config file). The snapshot is required: the
+# install pulls every image from its mirror references (ERD FR-16).
+resolve_snapshot_manifest() {
+  local p="${AIRGAP_SNAPSHOT_MANIFEST}"
+  if [[ -z "${p}" && -n "${CONFIG_FILE:-}" ]]; then
+    p="$(yq eval '.images.snapshotManifest // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ "${p}" == "null" ]] && p=""
+    if [[ -n "${p}" && "${p}" != /* ]]; then
+      p="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)/${p}"
+    fi
+  fi
+  [[ -n "${p}" ]] || err "An image snapshot is required: set images.snapshotManifest in the cluster config or AIRGAP_SNAPSHOT_MANIFEST.
+    Create one with: go run ./cmd/image-snapshot create --mirror <registry> --store snapshots/launchpad ...
+    (see docs/agent-runtime/image-snapshot.md)."
+  [[ -f "${p}" && -f "${p}.sha256" ]] || err "Image snapshot ${p} or its checksum file ${p}.sha256 is missing."
+  printf '%s\n' "${p}"
+}
+
+# bundle_profile: the effective deployment profile of the cluster config (omitted or
+# legacy full is fullfeature).
+bundle_profile() {
+  local p=""
+  [[ -n "${CONFIG_FILE:-}" ]] && p="$(yq eval '.aiPlatform.profile // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${p}" == "cpuOnly" ]] && echo "cpuOnly" || echo "fullfeature"
+}
+
+# bundle_model_config: the model artifact configuration fullfeature loads for the
+# configured accelerator, chosen exactly as k0s_cluster_with_stack.sh chooses it.
+bundle_model_config() {
+  local accel=""
+  [[ -n "${CONFIG_FILE:-}" ]] && accel="$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ "${accel}" == "null" ]] && accel=""
+  accel="$(printf '%s' "${accel}" | tr '[:upper:]' '[:lower:]')"
+  case "${accel}" in
+    l40s|"")                     echo "${REPO_ROOT}/tools/artifacts_download_upload_scripts/model_artifacts_configs_unquantized.yaml" ;;
+    h100|rtx_pro_6000_blackwell) echo "${REPO_ROOT}/tools/artifacts_download_upload_scripts/model_artifacts_configs_quantized.yaml" ;;
+    *) err "Unsupported aiPlatform.defaultAcceleratorType '${accel}' for the model artifact inventory." ;;
+  esac
+}
+
 # ── 1. k0s binary ─────────────────────────────────────────────────────────────
 log "--- Downloading k0s binary ---"
 if [[ "${K0S_VERSION}" == "latest" ]]; then
@@ -705,6 +778,10 @@ log "--- Downloading yq binary ---"
 YQ_URL="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
 download "${YQ_URL}" "${STAGE_DIR}/binaries/yq"
 chmod +x "${STAGE_DIR}/binaries/yq"
+
+# ── 2b. airgap-bundle tool ────────────────────────────────────────────────────
+log "--- Staging the airgap-bundle tool ---"
+stage_airgap_bundle_tool "${STAGE_DIR}/binaries/airgap-bundle"
 
 # ── 3. Static Kubernetes manifests ────────────────────────────────────────────
 log "--- Downloading static manifests ---"
@@ -1668,6 +1745,15 @@ nvidia_driver_version=${NVIDIA_DRIVER_VERSION:-latest}
 bundle_timestamp=${BUNDLE_TIMESTAMP}
 VEOF
 
+# ── 8b. Image snapshot ────────────────────────────────────────────────────────
+# Carried in the bundle so the sealed install host verifies against exactly the
+# snapshot this bundle was made for.
+log "--- Adding the image snapshot ---"
+SNAPSHOT_SRC="$(resolve_snapshot_manifest)"
+mkdir -p "${STAGE_DIR}/snapshot"
+cp "${SNAPSHOT_SRC}" "${STAGE_DIR}/snapshot/manifest.json"
+cp "${SNAPSHOT_SRC}.sha256" "${STAGE_DIR}/snapshot/manifest.json.sha256"
+
 # ── 9. Checksums ──────────────────────────────────────────────────────────────
 log "--- Computing checksums ---"
 (
@@ -1677,6 +1763,21 @@ log "--- Computing checksums ---"
   done
 ) > "${STAGE_DIR}/checksums.sha256"
 log "Checksums written to ${STAGE_DIR}/checksums.sha256"
+
+# ── 9b. Bundle manifest ───────────────────────────────────────────────────────
+log "--- Writing the bundle manifest ---"
+BUNDLE_PROFILE="$(bundle_profile)"
+_manifest_args=(manifest --bundle "${STAGE_DIR}")
+[[ "${BUNDLE_PROFILE}" == "fullfeature" ]] && _manifest_args+=(--model-config "$(bundle_model_config)")
+"${STAGE_DIR}/binaries/airgap-bundle" "${_manifest_args[@]}" \
+  || err "Writing the bundle manifest failed."
+
+# ── 9c. Check the bundle before it is transferred ─────────────────────────────
+log "--- Checking the bundle for ${BUNDLE_PROFILE} ---"
+_bundle_check=(verify --bundle "${STAGE_DIR}" --profile "${BUNDLE_PROFILE}" --scope bundle)
+[[ -n "${CONFIG_FILE:-}" ]] && _bundle_check+=(--config "${CONFIG_FILE}")
+"${STAGE_DIR}/binaries/airgap-bundle" "${_bundle_check[@]}" \
+  || err "The bundle is incomplete for ${BUNDLE_PROFILE}; nothing was transferred or installed. Fix the findings above and re-run."
 
 STAGE_SIZE="$(du -sh "${STAGE_DIR}" | cut -f1)"
 log ""

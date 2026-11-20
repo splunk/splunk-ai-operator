@@ -105,14 +105,20 @@ func parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 func cmdManifest(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("manifest", flag.ContinueOnError)
 	bundle := fs.String("bundle", "", "staged bundle directory (airgap_install.sh --download-only output)")
-	snapshot := fs.String("snapshot", "", "image snapshot manifest.json the install pulls from")
+	snapshot := fs.String("snapshot", "", "image snapshot manifest.json the install pulls from (default: the bundle's "+airgapbundle.SnapshotFile+")")
 	modelConfig := fs.String("model-config", "", "model artifact configuration fullfeature loads (model_artifacts_configs_*.yaml)")
 	id := fs.String("id", "", "bundle ID (default: <snapshot id>-<content checksum>)")
 	if err := parse(fs, args, stderr); err != nil {
 		return err
 	}
-	if *bundle == "" || *snapshot == "" {
-		return errors.New("--bundle and --snapshot are required")
+	if *bundle == "" {
+		return errors.New("--bundle is required")
+	}
+	if *snapshot == "" {
+		*snapshot = filepath.Join(*bundle, filepath.FromSlash(airgapbundle.SnapshotFile))
+		if !fileExists(*snapshot) {
+			return fmt.Errorf("--snapshot is required, or the bundle must carry its snapshot at %s", airgapbundle.SnapshotFile)
+		}
 	}
 	var models []airgapbundle.Model
 	if *modelConfig != "" {
@@ -140,7 +146,7 @@ func cmdVerify(ctx context.Context, args []string, stdout, stderr io.Writer, new
 	bundle := fs.String("bundle", "", "bundle directory")
 	profile := fs.String("profile", "", "cpuOnly or fullfeature")
 	scope := fs.String("scope", airgapbundle.ScopeInstall, "bundle: the bundle alone (staging host); install: also the snapshot, mirror and target")
-	snapshot := fs.String("snapshot", "", "image snapshot manifest.json (install scope)")
+	snapshot := fs.String("snapshot", "", "image snapshot manifest.json (install scope; default: the bundle's "+airgapbundle.SnapshotFile+")")
 	factsPath := fs.String("facts", "", "host facts JSON the installer collected (install scope)")
 	gpus := fs.Int("gpus", 0, "schedulable GPUs fullfeature needs (default 1)")
 	insecure := fs.Bool("insecure", false, "allow plain HTTP to the mirror on an isolated network")
@@ -163,6 +169,11 @@ func cmdVerify(ctx context.Context, args []string, stdout, stderr io.Writer, new
 	}
 	if *scope != airgapbundle.ScopeBundle && *scope != airgapbundle.ScopeInstall {
 		return fmt.Errorf("--scope must be %s or %s", airgapbundle.ScopeBundle, airgapbundle.ScopeInstall)
+	}
+	if *snapshot == "" {
+		if p := filepath.Join(*bundle, filepath.FromSlash(airgapbundle.SnapshotFile)); fileExists(p) {
+			*snapshot = p
+		}
 	}
 	// The inventory is derived from the bundle's own image lists unless told otherwise,
 	// so it is the inventory the snapshot was made from.

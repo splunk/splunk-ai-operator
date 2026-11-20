@@ -1015,6 +1015,78 @@ assert_eq "k0s system image bundle uses retry helper" \
 assert_eq "add-on image bundle uses retry helper" \
   "1" "$(grep -A12 'Building add-on image bundle (pulls' "${AIRGAP_SCRIPT}" | grep -c 'build_k0s_airgap_bundle' | tr -d '[:space:]')"
 
+# ── MPR-193: the bundle carries its tool, snapshot and manifest ───────────────
+suite "air-gap bundle staging (MPR-193)"
+
+# _ab_has <description> <haystack> <needle>
+_ab_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+
+# Runs one staging helper from airgap_install.sh in a subshell, with err() exiting as it does
+# there. Prints the helper's output, then "rc=<status>".
+_airgap_stage_helper() (
+  local fn="$1"; shift
+  log() { :; }; warn() { :; }; err() { echo "ERR: $*"; exit 1; }
+  # Earlier suites stub yq with a function; these helpers read real config files.
+  yq() { "${YQ_BIN}" "$@"; }
+  REPO_ROOT="${AIRGAP_TEST_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+  AIRGAP_BUNDLE_BINARY="${AIRGAP_BUNDLE_BINARY:-}"
+  AIRGAP_SNAPSHOT_MANIFEST="${AIRGAP_SNAPSHOT_MANIFEST:-}"
+  eval "$(_extract_airgap_fn "${fn}")"
+  "${fn}" "$@"
+  echo "rc=$?"
+)
+
+_ab_dir="$(mktemp -d)"
+mkdir -p "${_ab_dir}/cfg/snapshots/run-1"
+printf '{}' > "${_ab_dir}/cfg/snapshots/run-1/manifest.json"
+printf 'x  manifest.json\n' > "${_ab_dir}/cfg/snapshots/run-1/manifest.json.sha256"
+printf 'images:\n  snapshotManifest: snapshots/run-1/manifest.json\naiPlatform:\n  profile: cpuOnly\n' > "${_ab_dir}/cfg/cpu.yaml"
+printf 'aiPlatform:\n  defaultAcceleratorType: H100\n' > "${_ab_dir}/cfg/full.yaml"
+
+assert_eq "snapshot: images.snapshotManifest is resolved relative to the config file" \
+  "${_ab_dir}/cfg/snapshots/run-1/manifest.json" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper resolve_snapshot_manifest | head -1)"
+assert_eq "snapshot: AIRGAP_SNAPSHOT_MANIFEST wins over the config" \
+  "${_ab_dir}/cfg/snapshots/run-1/manifest.json" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" AIRGAP_SNAPSHOT_MANIFEST="${_ab_dir}/cfg/snapshots/run-1/manifest.json" _airgap_stage_helper resolve_snapshot_manifest | head -1)"
+_out="$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" _airgap_stage_helper resolve_snapshot_manifest)"
+_ab_has "snapshot: none configured fails closed" "${_out}" "ERR: An image snapshot is required"
+rm "${_ab_dir}/cfg/snapshots/run-1/manifest.json.sha256"
+_out="$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper resolve_snapshot_manifest)"
+_ab_has "snapshot: a missing checksum file fails closed" "${_out}" "its checksum file"
+
+assert_eq "profile: cpuOnly is read from the config" "cpuOnly" "$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper bundle_profile | head -1)"
+assert_eq "profile: omitted is fullfeature" "fullfeature" "$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" _airgap_stage_helper bundle_profile | head -1)"
+_ab_has "models: H100 uses the quantized configuration" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" _airgap_stage_helper bundle_model_config | head -1)" "model_artifacts_configs_quantized.yaml"
+_ab_has "models: no accelerator uses the unquantized configuration (as the installer does)" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper bundle_model_config | head -1)" "model_artifacts_configs_unquantized.yaml"
+printf 'aiPlatform:\n  defaultAcceleratorType: tpu\n' > "${_ab_dir}/cfg/tpu.yaml"
+_ab_has "models: an unknown accelerator fails" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/tpu.yaml" _airgap_stage_helper bundle_model_config)" "ERR: Unsupported aiPlatform.defaultAcceleratorType 'tpu'"
+
+printf '#!/usr/bin/env bash\nexit 0\n' > "${_ab_dir}/prebuilt"; chmod +x "${_ab_dir}/prebuilt"
+_ab_has "tool: a prebuilt AIRGAP_BUNDLE_BINARY is staged" \
+  "$(AIRGAP_BUNDLE_BINARY="${_ab_dir}/prebuilt" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/staged")" "rc=0"
+assert_eq "tool: the staged copy is executable" "yes" "$([[ -x "${_ab_dir}/staged" ]] && echo yes || echo no)"
+printf 'not executable' > "${_ab_dir}/noexec"
+_ab_has "tool: a non-executable AIRGAP_BUNDLE_BINARY is refused" \
+  "$(AIRGAP_BUNDLE_BINARY="${_ab_dir}/noexec" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/x")" "is not an executable file"
+printf '#!/usr/bin/env bash\nexit 3\n' > "${_ab_dir}/broken"; chmod +x "${_ab_dir}/broken"
+_ab_has "tool: a binary that does not run here is refused" \
+  "$(AIRGAP_BUNDLE_BINARY="${_ab_dir}/broken" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/y")" "does not run on this host"
+_ab_has "tool: without Go or a prebuilt binary staging fails closed" \
+  "$(AIRGAP_TEST_REPO_ROOT="${_ab_dir}/no-repo" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/z")" "Cannot stage the airgap-bundle tool"
+rm -rf "${_ab_dir}"
+
+# The order matters: the snapshot is staged before the checksums, the manifest after them,
+# and the bundle is checked before anything is transferred or installed.
+_line() { grep -n "$1" "${AIRGAP_SCRIPT}" | head -1 | cut -d: -f1; }
+assert_eq "order: snapshot before checksums" "yes" "$([[ $(_line '^# ── 8b. Image snapshot') -lt $(_line '^# ── 9. Checksums') ]] && echo yes || echo no)"
+assert_eq "order: manifest after checksums" "yes" "$([[ $(_line '^# ── 9. Checksums') -lt $(_line '^# ── 9b. Bundle manifest') ]] && echo yes || echo no)"
+assert_eq "order: bundle check before the installer runs" "yes" "$([[ $(_line '^# ── 9c. Check the bundle') -lt $(_line '^# ── 12. Run the installer') ]] && echo yes || echo no)"
+assert_eq "the bundle check fails closed" "1" "$(grep -A6 '^# ── 9c. Check the bundle' "${AIRGAP_SCRIPT}" | grep -c 'nothing was transferred or installed' | tr -d '[:space:]')"
+
 _exercise_airgap_bundle_helpers() (
   local mode="$1" fixture_dir
   fixture_dir=$(mktemp -d)

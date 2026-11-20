@@ -147,6 +147,8 @@ func Classify(rel string) (role, name string) {
 	parts := strings.Split(rel, "/")
 	base := parts[len(parts)-1]
 	switch {
+	case len(parts) == 2 && parts[0] == "snapshot":
+		return RoleSnapshot, "snapshot"
 	case len(parts) == 2 && parts[0] == "binaries":
 		if strings.HasSuffix(base, ".version") {
 			return RoleMetadata, strings.TrimSuffix(base, ".version")

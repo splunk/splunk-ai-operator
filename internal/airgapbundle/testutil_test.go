@@ -103,8 +103,12 @@ func ociArchiveWithDigests(t *testing.T, p string, refs []string, digests map[st
 	}
 	idx.SchemaVersion = 2
 	for _, r := range refs {
-		idx.Manifests = append(idx.Manifests, desc{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: pick(digests, r), Size: 100,
-			Annotations: map[string]string{"io.containerd.image.name": r, "org.opencontainers.image.ref.name": r[strings.LastIndex(r, ":")+1:]}})
+		// Exactly what `k0s airgap bundle-artifacts` (v1.36) writes: one index entry per
+		// spelling of the reference, named only by org.opencontainers.image.ref.name.
+		for _, name := range k0sRefNames(r) {
+			idx.Manifests = append(idx.Manifests, desc{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: pick(digests, r), Size: 100,
+				Annotations: map[string]string{"org.opencontainers.image.ref.name": name}})
+		}
 	}
 	b, err := json.Marshal(idx)
 	require.NoError(t, err)
@@ -147,6 +151,7 @@ func stageBundle(t *testing.T, dir string) {
 	write(t, filepath.Join(dir, "binaries/k0s"), "k0s binary")
 	write(t, filepath.Join(dir, "binaries/k0s.version"), "v1.36.1+k0s.0\n")
 	write(t, filepath.Join(dir, "binaries/yq"), "yq binary")
+	write(t, filepath.Join(dir, "binaries/airgap-bundle"), "airgap-bundle binary")
 	ociArchive(t, filepath.Join(dir, "images/k0s-images.tar"), k0sImages)
 	write(t, filepath.Join(dir, "images/k0s-images.list"), strings.Join(k0sImages, "\n")+"\n")
 	ociArchive(t, filepath.Join(dir, "images/addon-images.tar"), addonImages)
@@ -172,6 +177,16 @@ func stageBundle(t *testing.T, dir string) {
 	write(t, filepath.Join(dir, "checksums.sha256"), "deadbeef  binaries/k0s\n")
 }
 
+// carrySnapshot puts the snapshot (and its checksum file) where the bundle carries it.
+func carrySnapshot(t *testing.T, dir, snapshot string) {
+	t.Helper()
+	for _, name := range []string{"manifest.json", "manifest.json.sha256"} {
+		b, err := os.ReadFile(filepath.Join(filepath.Dir(snapshot), name))
+		require.NoError(t, err)
+		write(t, filepath.Join(dir, "snapshot", name), string(b))
+	}
+}
+
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	root := t.TempDir()
@@ -191,6 +206,7 @@ func newFixture(t *testing.T) *fixture {
 	require.NoError(t, err)
 	f.snapshot, _, err = (imagesnapshot.Store{Dir: filepath.Join(root, "snapshots")}).Put(f.snap)
 	require.NoError(t, err)
+	carrySnapshot(t, f.dir, f.snapshot)
 	// The install uses the generated configuration: every image from the mirror, by digest.
 	f.installConfig = filepath.Join(root, "install-config.yaml")
 	cfg, err := imagesnapshot.InstallConfig(f.snap, srcInput.Candidate.Spec.RuntimeVersion)
@@ -253,6 +269,22 @@ func hasCode(findings []Finding, code string) bool {
 		}
 	}
 	return false
+}
+
+// k0sRefNames mirrors targetRefNamesFor in k0s pkg/airgap: the reference as given, then
+// name:tag, then name@digest, without duplicates.
+func k0sRefNames(ref string) []string {
+	names := []string{ref}
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	if hasDigest {
+		names = append(names, name) // name:tag
+		repo := name
+		if i := strings.LastIndex(name, ":"); i > strings.LastIndex(name, "/") {
+			repo = name[:i]
+		}
+		names = append(names, repo+"@"+digest)
+	}
+	return names
 }
 
 func pick(digests map[string]string, ref string) string {

@@ -174,7 +174,7 @@ func TestVerify_RequirementsFollowTheProfileAndComponents(t *testing.T) {
 		assert.Empty(t, Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileCPUOnly)))
 		got := codes(Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileFullFeature)))
 		assert.Equal(t, FindingArtifactMissing, got["manifest:nvidia-device-plugin"])
-		assert.Equal(t, FindingArtifactMissing, got["package:nvidia-closure"])
+		assert.NotContains(t, got, "package:nvidia-closure", "the GPU node has its driver and toolkit, so it needs no closure")
 		assert.Equal(t, FindingArtifactMissing, got["chart:kuberay-operator"])
 	})
 	t.Run("an add-on that is switched off is not required", func(t *testing.T) {
@@ -192,9 +192,16 @@ func TestVerify_RequirementsFollowTheProfileAndComponents(t *testing.T) {
 		assert.Equal(t, map[string]string{"chart:metallb": FindingArtifactMissing}, codes(Verify(ctx, f.dir, o)))
 	})
 	t.Run("the always-required artifacts", func(t *testing.T) {
-		f := strip(t, "binaries/yq", "manifests/local-path-storage.yaml", "packages/pyyaml-6.0.2-cp311-manylinux_x86_64.whl")
+		f := strip(t, "binaries/yq", "binaries/airgap-bundle", "manifests/local-path-storage.yaml", "packages/pyyaml-6.0.2-cp311-manylinux_x86_64.whl")
 		got := codes(Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileCPUOnly)))
-		assert.Equal(t, map[string]string{"binary:yq": FindingArtifactMissing, "manifest:local-path-storage": FindingArtifactMissing, "package:pyyaml": FindingArtifactMissing}, got)
+		assert.Equal(t, map[string]string{"binary:yq": FindingArtifactMissing, "binary:airgap-bundle": FindingArtifactMissing,
+			"manifest:local-path-storage": FindingArtifactMissing, "package:pyyaml": FindingArtifactMissing}, got)
+	})
+	t.Run("the bundle must carry its snapshot", func(t *testing.T) {
+		f := strip(t, "snapshot")
+		o := f.opts(imagesnapshot.ProfileCPUOnly)
+		o.Scope, o.Facts, o.SnapshotPath = ScopeBundle, nil, ""
+		assert.Equal(t, map[string]string{"snapshot:snapshot": FindingArtifactMissing}, codes(Verify(ctx, f.dir, o)))
 	})
 }
 
@@ -289,8 +296,7 @@ func TestVerify_GPUPrerequisitesArePresentOrInstallableFromTheBundle(t *testing.
 		f.build()
 		o := f.opts(imagesnapshot.ProfileFullFeature)
 		got := codes(Verify(ctx, f.dir, o))
-		assert.Equal(t, FindingArtifactMissing, got["package:nvidia-closure"], "fullfeature with the nvidia component still needs the closure")
-		assert.NotContains(t, got, "node:gpu-1", "a host whose driver and toolkit are installed needs nothing from it")
+		assert.Empty(t, got, "a host whose driver and toolkit are installed needs nothing from the closure (--skip-nvidia-closure)")
 		fresh(o.Facts)
 		findings := Verify(ctx, f.dir, o)
 		require.Equal(t, FindingGPUDriver, codes(findings)["node:gpu-1"])
@@ -447,6 +453,7 @@ func resave(t *testing.T, f *fixture) {
 	p, _, err := (imagesnapshot.Store{Dir: t.TempDir()}).Put(f.snap)
 	require.NoError(t, err)
 	f.snapshot = p
+	carrySnapshot(t, f.dir, p)
 }
 
 // Generate then enforce (MPR-193 criterion 2): the install preflight compares the
@@ -502,4 +509,71 @@ func messageOf(findings []Finding, component string) string {
 		}
 	}
 	return ""
+}
+
+// An add-on list may pin an image as name:tag@digest. k0s then records it under three
+// names (as given, name:tag, name@digest), all one image; the aliases are not unmapped.
+func TestVerify_K0sReferenceAliasesAreTheSameImage(t *testing.T) {
+	f := newFixture(t)
+	pinned := "registry.k8s.io/ingress-nginx/controller:v1.12.1@" + digestOf("ingress controller")
+	refs := append(append([]string(nil), addonImages...), pinned)
+	ociArchiveWithDigests(t, filepath.Join(f.dir, "images/addon-images.tar"), refs, map[string]string{pinned: digestOf("ingress controller")})
+	write(t, filepath.Join(f.dir, "images/addon-images.list"), strings.Join(refs, "\n")+"\n")
+	// The snapshot has the pinned image too (made from the same lists).
+	for _, e := range f.snap.Spec.Entries {
+		require.NotEqual(t, pinned, e.Source)
+	}
+	f.snap.Spec.Entries = append(f.snap.Spec.Entries, imagesnapshot.Entry{
+		Image:  imagesnapshot.Image{Component: "addon-controller", Source: pinned, Profiles: imagesnapshot.Profiles, Owner: "unassigned", Origin: "addon-list"},
+		Digest: digestOf("ingress controller"), SourceDigest: digestOf("ingress controller"), Platforms: []string{imagesnapshot.Platform},
+		Status: imagesnapshot.StatusVerified, MirrorRef: testMirror + "/registry.k8s.io/ingress-nginx/controller@" + digestOf("ingress controller")})
+	resave(t, f)
+	m := f.build()
+	n := 0
+	for _, im := range m.Spec.ArchiveImages {
+		if strings.Contains(im.Ref, "ingress-nginx") {
+			n++
+		}
+	}
+	require.Equal(t, 3, n, "k0s records the pinned image under three names")
+	o := f.opts(imagesnapshot.ProfileCPUOnly)
+	o.Input.AddonRefs = refs
+	assert.Empty(t, Verify(ctx, f.dir, o))
+
+	// An alias with another digest is a digest mismatch, every spelling of it, never "unmapped".
+	ociArchiveWithDigests(t, filepath.Join(f.dir, "images/addon-images.tar"), refs, map[string]string{pinned: digestOf("someone else's build")})
+	require.NoError(t, os.Remove(filepath.Join(f.dir, ManifestFile)))
+	require.NoError(t, os.Remove(filepath.Join(f.dir, ChecksumFile)))
+	f.build()
+	got := Verify(ctx, f.dir, o)
+	assert.False(t, hasCode(got, FindingArchiveUnmapped), "%v", got)
+	mismatches := 0
+	for _, g := range got {
+		if g.Code == FindingArchiveDigest {
+			mismatches++
+		}
+	}
+	assert.Equal(t, 3, mismatches, "each of the three names is the wrong build")
+}
+
+// Two images of one repository: an alias is matched by its digest, not by being first.
+func TestVerify_AnAliasIsMatchedByDigestAmongImagesOfOneRepository(t *testing.T) {
+	f := newFixture(t)
+	older := "registry.k8s.io/ingress-nginx/controller:v1.11.0"
+	pinned := "registry.k8s.io/ingress-nginx/controller:v1.12.1@" + digestOf("v1.12.1")
+	refs := append(append([]string(nil), addonImages...), older, pinned)
+	ociArchiveWithDigests(t, filepath.Join(f.dir, "images/addon-images.tar"), refs, map[string]string{pinned: digestOf("v1.12.1")})
+	write(t, filepath.Join(f.dir, "images/addon-images.list"), strings.Join(refs, "\n")+"\n")
+	entry := func(source, digest string) imagesnapshot.Entry {
+		return imagesnapshot.Entry{Image: imagesnapshot.Image{Component: "addon-controller", Source: source, Profiles: imagesnapshot.Profiles, Owner: "unassigned", Origin: "addon-list"},
+			Digest: digest, SourceDigest: digest, Platforms: []string{imagesnapshot.Platform}, Status: imagesnapshot.StatusVerified,
+			MirrorRef: testMirror + "/registry.k8s.io/ingress-nginx/controller@" + digest}
+	}
+	// The older tag comes first, so "the first image of the repository" would be wrong.
+	f.snap.Spec.Entries = append(f.snap.Spec.Entries, entry(older, digestOf(older)), entry(pinned, digestOf("v1.12.1")))
+	resave(t, f)
+	f.build()
+	o := f.opts(imagesnapshot.ProfileCPUOnly)
+	o.Input.AddonRefs = refs
+	assert.Empty(t, Verify(ctx, f.dir, o))
 }

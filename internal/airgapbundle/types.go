@@ -22,6 +22,8 @@ const (
 	Kind          = "AirgapBundleManifest"
 	// ManifestFile and ChecksumFile are written at the top of the bundle directory.
 	ManifestFile = "bundle-manifest.json"
+	// SnapshotFile is where the bundle carries its image snapshot.
+	SnapshotFile = "snapshot/manifest.json"
 	ChecksumFile = ManifestFile + ".sha256"
 	// Platform is the only platform the AI Tier supports.
 	Platform = imagesnapshot.Platform
@@ -36,6 +38,7 @@ const (
 	RoleImageArchive = "image-archive" // images/<name>-images.tar
 	RoleImageList    = "image-list"    // images/<name>-images.list
 	RolePackage      = "package"       // packages/<name>/... or packages/<name>-*
+	RoleSnapshot     = "snapshot"      // snapshot/manifest.json(.sha256): the image snapshot the install uses
 	RoleMetadata     = "metadata"      // top-level text files that describe the bundle
 	RoleOther        = "other"         // anything else; recorded and checksummed like the rest
 )

@@ -77,6 +77,8 @@ type requirement struct {
 // the cluster binaries, storage and image archives always, and each add-on only when
 // its component is installed.
 var requirements = []requirement{
+	{RoleSnapshot, "snapshot", ""},
+	{RoleBinary, "airgap-bundle", ""},
 	{RoleBinary, "k0s", ""},
 	{RoleBinary, "yq", ""},
 	{RoleImageArchive, "k0s", ""},
@@ -91,7 +93,9 @@ var requirements = []requirement{
 	{RoleChart, "kuberay-operator", "kuberay"},
 	{RoleChart, "metallb", "metallb"},
 	{RoleManifest, "nvidia-device-plugin", "nvidia"},
-	{RolePackage, "nvidia-closure", "nvidia"},
+	// The NVIDIA closure is not required as such: a GPU node with its driver and toolkit
+	// already installed needs nothing from it (airgap_install.sh --skip-nvidia-closure).
+	// checkHost requires it exactly for the nodes that need a driver or toolkit installed.
 }
 
 // Verify checks the bundle in dir for an install of opts.Profile and reports every
@@ -316,8 +320,10 @@ func installRefs(opts VerifyOptions) []imagesnapshot.InstallRef {
 // by checkArchives.
 func checkArchivesAgainstSnapshot(m *Manifest, snap *imagesnapshot.Snapshot) []Finding {
 	bySource := map[string]imagesnapshot.Entry{}
+	byRepo := map[string][]imagesnapshot.Entry{}
 	for _, e := range snap.Spec.Entries {
 		bySource[canonical(e.Source)] = e
+		byRepo[repository(e.Source)] = append(byRepo[repository(e.Source)], e)
 	}
 	var out []Finding
 	for _, im := range m.Spec.ArchiveImages {
@@ -325,6 +331,20 @@ func checkArchivesAgainstSnapshot(m *Manifest, snap *imagesnapshot.Snapshot) []F
 			continue
 		}
 		e, ok := bySource[canonical(im.Ref)]
+		if !ok {
+			// k0s records a name:tag@digest reference under every spelling (as given,
+			// name:tag and name@digest). An alias is the snapshot's image when it is in
+			// the same repository with that image's digest.
+			for _, cand := range byRepo[repository(im.Ref)] {
+				if im.Digest == cand.Digest || im.Digest == cand.SourceDigest {
+					e, ok = cand, true
+					break
+				}
+			}
+			if !ok && len(byRepo[repository(im.Ref)]) > 0 {
+				e, ok = byRepo[repository(im.Ref)][0], true // same repository, other build: a mismatch below
+			}
+		}
 		switch {
 		case !ok:
 			out = append(out, Finding{Component: im.Ref, Code: FindingArchiveUnmapped,
@@ -518,4 +538,13 @@ func packageFormat(osID string) string {
 		return "deb"
 	}
 	return ""
+}
+
+// repository is registry/repository of a reference, without its tag or digest.
+func repository(ref string) string {
+	p, err := imagesnapshot.ParseRef(ref)
+	if err != nil {
+		return strings.TrimSpace(ref)
+	}
+	return p.Registry + "/" + p.Repository
 }
