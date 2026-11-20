@@ -1,0 +1,1492 @@
+{
+  "scope": "live MPR-191 readiness smoke on existing CPU cluster; real schema Jobs, kubelet and EndpointSlice controller; no manufactured status",
+  "date": "2026-11-19",
+  "cluster": "agentruntime-dev",
+  "candidate": {
+    "baseCommit": "bac158828b34ac574354153f76539f54b9f96986",
+    "sourceFingerprintSha256": "1af9ae1e6bf74752f474190b764878bd0eb83eb3a3f2b1bc2e9bbc00a844d2ab",
+    "binarySha256": "aa714c823e2f7e56d7a17be7d1ec95f1592ec04769164dbf163107571eefc380",
+    "goVersion": "go version go1.26.10 darwin/arm64",
+    "target": "linux/amd64",
+    "CGO_ENABLED": "0",
+    "includesRevisionAnnotationFix": true
+  },
+  "operatorExecution": "both production reconcilers in namespace-scoped Linux binary; impersonated test ServiceAccount with namespaced binding to generated source role; shared legacy operator kept running and denied only fixture writes",
+  "imageDigests": {
+    "runtime": "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219",
+    "provider": "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5",
+    "schema": "sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987"
+  },
+  "liveContainerImageIDsVerified": true,
+  "desiredRuntimeReplicas": 2,
+  "passed": true,
+  "cases": [
+    {
+      "case": "initial-schema-and-all-replicas-ready",
+      "passed": true,
+      "elapsedSeconds": 38.66,
+      "serviceHealthStatus": 200,
+      "desiredReplicas": 2
+    },
+    {
+      "case": "kubelet-probe-failure-and-superseded-rollout-not-ready",
+      "passed": true,
+      "elapsedSeconds": 33.98,
+      "availableReplicas": 2,
+      "updatedReplicas": 1
+    },
+    {
+      "case": "probe-recovery",
+      "passed": true,
+      "elapsedSeconds": 2.51
+    },
+    {
+      "case": "selector-mismatch-and-missing-endpoints-not-ready",
+      "passed": true,
+      "elapsedSeconds": 2.12,
+      "healthyRuntimeReplicas": 2,
+      "readyEndpoints": 0,
+      "elapsedScope": "resumed observation of an already-held fault; not injection-to-detection latency"
+    },
+    {
+      "case": "endpoint-recovery",
+      "passed": true,
+      "elapsedSeconds": 1.2
+    },
+    {
+      "case": "recorded-schema-success-reused-after-job-removal",
+      "passed": true,
+      "elapsedSeconds": 3.6
+    },
+    {
+      "case": "controller-restart-and-noop-stability",
+      "passed": true,
+      "elapsedSeconds": 13.89
+    },
+    {
+      "case": "schema-failure-current-generation-and-safe-diagnostics",
+      "passed": true,
+      "elapsedSeconds": 16.34
+    },
+    {
+      "case": "schema-retry-recovery",
+      "passed": true,
+      "elapsedSeconds": 4.94
+    }
+  ],
+  "elapsedTimeLimit": "Functional polling timings, not performance guarantees; endpoint-loss case resumed an existing held fault.",
+  "productFix": "Preserve deployment.kubernetes.io/revision on Deployment metadata and exclude it from Pod templates to stop generation churn.",
+  "attemptNotes": [
+    "Initial disposable PostgreSQL fixture needed runtime-specific PG_SSLMODE and DATABASE_URL; corrected fixture only.",
+    "First complete rollout exposed the product revision-annotation loop; fixed code, added unit/API-server regressions, reran full local suite and live tests.",
+    "EndpointSlice checker treated null endpoints as iterable; corrected checker and resumed final six cases with the same fixed binary and fixture."
+  ],
+  "conditionSnapshots": [
+    {
+      "phase": "initial-schema",
+      "atUTC": "2026-11-19T11:00:31.700465+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21122431",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "waiting for schema Job completion",
+            "observedGeneration": 1,
+            "reason": "Pending",
+            "status": "False",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "waiting for PostgresSchemaSetup",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "waiting for PostgresSchemaSetup",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "waiting for PostgresSchemaSetup",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "waiting for schema Job completion",
+            "observedGeneration": 1,
+            "reason": "Pending",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21122428",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:00:29Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": null,
+      "runtimePods": [],
+      "readyEndpointCount": 0,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": null
+    },
+    {
+      "phase": "healthy",
+      "atUTC": "2026-11-19T11:01:06.935211+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21122621",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:04Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:00:34Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:04Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:04Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21122622",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:01:04Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:04Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 1,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 1,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "probe-failure",
+      "atUTC": "2026-11-19T11:01:41.370046+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21122652",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:07Z",
+            "message": "waiting for all 2 desired runtime replicas: 1 updated, 2 ready, 2 available, 3 total",
+            "observedGeneration": 1,
+            "reason": "RolloutPending",
+            "status": "False",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:07Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:07Z",
+            "message": "a ready application endpoint must target a current owned runtime Pod passing its readiness probe",
+            "observedGeneration": 1,
+            "reason": "EndpointTargetMismatch",
+            "status": "False",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:07Z",
+            "message": "waiting for all 2 desired runtime replicas: 1 updated, 2 ready, 2 available, 3 total",
+            "observedGeneration": 1,
+            "reason": "RolloutPending",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21122641",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:01:07Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:07Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 2,
+        "templateSha256": "78bf47ab7aa9e4bd0c687813bd6ab3444680c1757f2c65942269aeba9ede0759",
+        "status": {
+          "observedGeneration": 2,
+          "replicas": 3,
+          "updatedReplicas": 1,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 1
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "False",
+          "deleting": false,
+          "containerReady": [
+            false
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "probe-recovery",
+      "atUTC": "2026-11-19T11:01:44.189546+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21122795",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21122796",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "endpoint-loss",
+      "atUTC": "2026-11-19T11:06:37.947675+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21122805",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:44Z",
+            "message": "runtime Service selector must match the runtime workload labels",
+            "observedGeneration": 1,
+            "reason": "SelectorMismatch",
+            "status": "False",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:44Z",
+            "message": "waiting for Deployment and Service observation",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:44Z",
+            "message": "runtime Service selector must match the runtime workload labels",
+            "observedGeneration": 1,
+            "reason": "SelectorMismatch",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21122806",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:01:44Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:44Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 0,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "endpoint-recovery",
+      "atUTC": "2026-11-19T11:06:39.303659+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123575",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123576",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "before-schema-job-removal",
+      "atUTC": "2026-11-19T11:06:40.809915+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123575",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123576",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "schema-job-removed",
+      "atUTC": "2026-11-19T11:06:42.904323+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123587",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123576",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 0,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "before-noop",
+      "atUTC": "2026-11-19T11:06:47.188690+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123587",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123576",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 0,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "restart-noop",
+      "atUTC": "2026-11-19T11:06:56.794391+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123587",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:00:33Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:01:42Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123576",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:38Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 0,
+      "recordedSchemaAppliedHash": "8d9d2aaaac9d8d07"
+    },
+    {
+      "phase": "schema-failure",
+      "atUTC": "2026-11-19T11:07:13.129440+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123719",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "schema Job exhausted its retry limit; change schemaRetryNonce to retry",
+            "observedGeneration": 1,
+            "reason": "Failed",
+            "status": "False",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "waiting for PostgresSchemaSetup",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "waiting for PostgresSchemaSetup",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "waiting for PostgresSchemaSetup",
+            "observedGeneration": 1,
+            "reason": "Blocked",
+            "status": "Unknown",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "schema Job exhausted its retry limit; change schemaRetryNonce to retry",
+            "observedGeneration": 1,
+            "reason": "Failed",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123635",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:06:57Z",
+            "message": "AgentRuntime AIService readiness-agentruntime-mltk must report Ready=True for its current generation; inspect its readiness conditions",
+            "observedGeneration": 1,
+            "reason": "AgentRuntimeNotReady",
+            "status": "False",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 1,
+      "recordedSchemaAppliedHash": null
+    },
+    {
+      "phase": "schema-recovery",
+      "atUTC": "2026-11-19T11:07:18.410769+00:00",
+      "aiService": {
+        "generation": 1,
+        "resourceVersion": "21123762",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "schema setup completed for the current inputs",
+            "observedGeneration": 1,
+            "reason": "Succeeded",
+            "status": "True",
+            "type": "PostgresSchemaSetupReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "all desired runtime replicas are updated, ready and available",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeDeploymentReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "runtime application Service and selector are configured",
+            "observedGeneration": 1,
+            "reason": "Configured",
+            "status": "True",
+            "type": "AgentRuntimeServiceReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "runtime Service has a matching ready application endpoint",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "AgentRuntimeEndpointReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "schema is current; all desired runtime replicas and the Service endpoint are ready",
+            "observedGeneration": 1,
+            "reason": "Available",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "platform": {
+        "generation": 1,
+        "resourceVersion": "21123763",
+        "observedGeneration": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "stage succeeded",
+            "observedGeneration": 1,
+            "reason": "Reconciled",
+            "status": "True",
+            "type": "AIServiceStatusReady"
+          },
+          {
+            "lastTransitionTime": "2026-11-19T11:07:16Z",
+            "message": "all stages completed successfully",
+            "observedGeneration": 1,
+            "reason": "AllReconciled",
+            "status": "True",
+            "type": "Ready"
+          }
+        ]
+      },
+      "deployment": {
+        "generation": 3,
+        "templateSha256": "4cdc9bb7910c9dd337d3ed6079263893c34450d9cdb087eed0e46f322b5b38ec",
+        "status": {
+          "observedGeneration": 3,
+          "replicas": 2,
+          "updatedReplicas": 2,
+          "readyReplicas": 2,
+          "availableReplicas": 2,
+          "unavailableReplicas": 0
+        }
+      },
+      "runtimePods": [
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        },
+        {
+          "ready": "True",
+          "deleting": false,
+          "containerReady": [
+            true
+          ],
+          "runtimeImageDigests": [
+            "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219"
+          ],
+          "providerImageDigests": [
+            "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5"
+          ]
+        }
+      ],
+      "readyEndpointCount": 2,
+      "schemaJobCount": 2,
+      "recordedSchemaAppliedHash": "8d2bacd4914647ee"
+    }
+  ],
+  "cleanup": {
+    "namespaceRemoved": true,
+    "validatingadmissionpolicyRemoved": true,
+    "validatingadmissionpolicybindingRemoved": true,
+    "clusterroleRemoved": true,
+    "originalWebhookSelectorsRestored": true,
+    "originalCRDSpecsRestored": true,
+    "operatorSpecUnchangedAndReady": true,
+    "sharedDeploymentGenerationAndPodUIDsUnchanged": true,
+    "sharedPlatformAndRuntimeReady": true,
+    "allThreeNodesReady": true,
+    "noScopedControllerPidFile": true,
+    "passed": true,
+    "atUTC": "2026-11-19T11:15:37.979223+00:00",
+    "allTemporaryIngressRulesRemoved": true,
+    "originalSecurityGroupRulesExactlyRestored": true,
+    "noPersistentSshControlSocket": true,
+    "remoteTestDirectoryRemoved": true,
+    "existingKubeconfigPreserved": true
+  },
+  "limits": [
+    "Candidate was a scoped binary, not an operator image or installation/upgrade qualification.",
+    "Deleted completed Job models TTL cleanup; actual 24-hour TTL timing was not tested.",
+    "No product invocation, streaming/inference, continuous database health, GPU/fullfeature, TLS or OS matrix qualification."
+  ],
+  "privateEvidenceExcludedFromGit": true,
+  "jiraChanged": false
+}

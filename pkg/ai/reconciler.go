@@ -2,16 +2,21 @@ package ai_platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
 	"strings"
+	"time"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
+	featurecommon "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -45,62 +50,43 @@ func New(p *aiApi.AIPlatform, client client.Client, scheme *runtime.Scheme, reco
 	}
 }
 
-func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatform) (reconcile.Result, error) {
-
-	var conditions []metav1.Condition
+func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatform) (result reconcile.Result, retErr error) {
+	before := p.DeepCopy().Status
+	setCondition := func(kind string, status metav1.ConditionStatus, reason, message string) {
+		// Preserve transition times and unrelated conditions so repeated child
+		// observations can settle without producing further status events.
+		meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{Type: kind, Status: status, Reason: reason, Message: message, ObservedGeneration: p.Generation})
+	}
 	defer func() {
-		// Fetch the latest version of the CR before updating the status
-		latest := &aiApi.AIPlatform{}
-		namespacedName := client.ObjectKey{Namespace: p.Namespace, Name: p.Name}
-		if err := r.Get(ctx, namespacedName, latest); err != nil {
-			log.FromContext(ctx).Error(err, "failed to fetch latest CR")
-			return
+		p.Status.ObservedGeneration = p.Generation
+		p.Status.Profile = p.Spec.ResolvedProfile()
+		if !equality.Semantic.DeepEqual(before, p.Status) {
+			// Keep the resourceVersion from this observation. A conflict must cause
+			// a fresh evaluation rather than copying old results onto a newer spec.
+			retErr = errors.Join(retErr, r.Status().Update(ctx, p))
 		}
-		latest.Status = p.Status
-		latest.Status.Conditions = conditions
-		latest.Status.ObservedGeneration = p.Generation
-		// Publish the effective profile so it is observable without re-deriving
-		// the omitted/legacy-"full" compatibility rule.
-		latest.Status.Profile = p.Spec.ResolvedProfile()
-		latest.Status.RayServiceName = p.Status.RayServiceName
-		latest.Status.VectorDbServiceName = p.Status.VectorDbServiceName
-		_ = r.Status().Update(ctx, latest)
 	}()
 	var scaleResult reconcile.Result
 	stages := r.stagesFor(p, &scaleResult)
 
 	for _, stage := range stages {
 		err := stage.fn(ctx, p)
-		cond := metav1.Condition{
-			Type:               stage.name + "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "Reconciled",
-			Message:            "stage succeeded",
-			LastTransitionTime: metav1.Now(),
-		}
 		if err != nil {
-			cond.Status = metav1.ConditionFalse
-			cond.Reason = "Error"
-			cond.Message = err.Error()
-			//r.Recorder.Event(p, corev1.EventTypeWarning, stage.name+"Failed", err.Error())
-		} else {
-			//r.Recorder.Event(p, corev1.EventTypeNormal, stage.name+"Succeeded", "stage succeeded")
-		}
-		conditions = append(conditions, cond)
-		if err != nil {
+			var pending *agentRuntimeNotReadyError
+			if errors.As(err, &pending) {
+				// An unhealthy child is an observed waiting state, not a failed API
+				// operation. Publish it and retry without error-driven backoff.
+				setCondition(stage.name+"Ready", metav1.ConditionFalse, "AgentRuntimeNotReady", pending.Error())
+				setCondition("Ready", metav1.ConditionFalse, "AgentRuntimeNotReady", pending.Error())
+				return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			setCondition(stage.name+"Ready", metav1.ConditionFalse, "Error", err.Error())
+			setCondition("Ready", metav1.ConditionFalse, "ReconcileFailed", stage.name+" reconciliation has not completed")
 			return reconcile.Result{}, err
 		}
+		setCondition(stage.name+"Ready", metav1.ConditionTrue, "Reconciled", "stage succeeded")
 	}
-
-	// all done
-	conditions = append(conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "AllReconciled",
-		Message:            "all stages completed successfully",
-		LastTransitionTime: metav1.Now(),
-	})
-
+	setCondition("Ready", metav1.ConditionTrue, "AllReconciled", "all stages completed successfully")
 	return scaleResult, nil
 }
 
@@ -452,8 +438,16 @@ func cleanServiceTemplate(svc *corev1.Service) {
 	svc.Status = corev1.ServiceStatus{}
 }
 
-// CheckAIServiceStatus verifies that all AIService children have successful conditions.
-// Returns an error if any AIService has failed conditions, preventing AIPlatform from marking itself as Ready.
+// Keep ordinary child health waiting distinct from failures to read or reconcile
+// resources so the caller can use a bounded readiness retry.
+type agentRuntimeNotReadyError struct{ name string }
+
+func (e *agentRuntimeNotReadyError) Error() string {
+	return fmt.Sprintf("AgentRuntime AIService %s must report Ready=True for its current generation; inspect its readiness conditions", e.name)
+}
+
+// CheckAIServiceStatus requires current runtime readiness and retains the
+// existing error-condition checks for other feature types.
 func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platform *aiApi.AIPlatform) error {
 	log := log.FromContext(ctx)
 
@@ -467,10 +461,31 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 	); err != nil {
 		return fmt.Errorf("failed to list AIService children: %w", err)
 	}
+	byName := make(map[string]*aiApi.AIService, len(children.Items))
+	for i := range children.Items {
+		byName[children.Items[i].Name] = &children.Items[i]
+	}
+	// Check configured runtimes even when they are absent from the child list;
+	// deletion must not make the remaining children appear collectively healthy.
+	for _, feature := range platform.Spec.Features {
+		if feature.Name != agentRuntimeFeatureName {
+			continue
+		}
+		name := featureServiceName(platform.Name, feature)
+		child := byName[name]
+		if child == nil || child.Spec.Feature.Name != agentRuntimeFeatureName || !metav1.IsControlledBy(child, platform) || !featurecommon.IsCurrentServiceReady(child) {
+			return &agentRuntimeNotReadyError{name: name}
+		}
+	}
 
 	// Check each child's status conditions
 	for i := range children.Items {
 		child := &children.Items[i]
+		if child.Spec.Feature.Name == agentRuntimeFeatureName {
+			// Runtime health was checked above using current Ready, regardless of
+			// reason text. Retain the legacy error-reason rule for other features.
+			continue
+		}
 
 		// Check if AIService has any failed conditions
 		for _, cond := range child.Status.Conditions {

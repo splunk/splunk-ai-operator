@@ -21,7 +21,9 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,7 +33,6 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -43,6 +44,7 @@ const (
 	maxDNSLabelLength                  = 63
 	mtlsTerminationOperator            = "operator"
 	sharedPackagesPath                 = "/shared-packages"
+	deploymentRevisionAnnotation       = "deployment.kubernetes.io/revision"
 	schemaSetupImageEnv                = "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP"
 	schemaJobInputHashAnnotation       = "ai.splunk.com/agentruntime-schema-input-hash"
 	schemaJobManagedAnnotation         = "ai.splunk.com/agentruntime-schema-job"
@@ -126,14 +128,17 @@ func ensureAgentRuntimeSchemaStatus(ai *aiv1.AIService) *aiv1.AgentRuntimeSchema
 	return ai.Status.FeatureStatus.AgentRuntime.Schema
 }
 
-func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
-	log := log.FromContext(ctx)
-
-	var conditions []metav1.Condition
+func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) (retErr error) {
+	previousStatus := aiservice.DeepCopy().Status
+	// Persist progress on early returns as well as success. Joining errors keeps
+	// a failed status write visible without hiding the original stage failure.
 	defer func() {
-		aiservice.Status.Conditions = conditions
 		aiservice.Status.ObservedGeneration = aiservice.Generation
-		_ = r.Status().Update(ctx, aiservice)
+		if !equality.Semantic.DeepEqual(previousStatus, aiservice.Status) {
+			// Update retains the resourceVersion precondition: an observation of an
+			// older generation must not be rebased onto a concurrently changed spec.
+			retErr = errors.Join(retErr, r.Status().Update(ctx, aiservice))
+		}
 	}()
 
 	stages := []struct {
@@ -151,45 +156,46 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 		{"ServiceMonitor", r.reconcileServiceMonitor},
 	}
 
-	for _, stage := range stages {
+	for index, stage := range stages {
 		err := stage.fn(ctx, aiservice)
-
-		cond := metav1.Condition{
-			Type:               stage.name + "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "Reconciled",
-			Message:            "stage succeeded",
-			LastTransitionTime: metav1.Now(),
-		}
 		if err != nil {
-			cond.Status = metav1.ConditionFalse
-			cond.Reason = "Error"
-			cond.Message = err.Error()
+			reason, message := "ReconcileFailed", stage.name+" reconciliation failed; check configuration, operator permissions and events"
 			var schemaErr *schemaStageError
 			if errors.As(err, &schemaErr) {
-				cond.Reason = schemaErr.reason
-				cond.Message = schemaErr.message
+				reason, message = schemaErr.reason, schemaErr.message
 			}
-		} else if stage.name == "PostgresSchemaSetup" {
-			cond.Reason = "Succeeded"
-			cond.Message = "schema setup completed for the current inputs"
-		}
-		conditions = append(conditions, cond)
-		if err != nil {
-			log.Error(err, "stage failed", "stage", stage.name)
+			if stage.name == "PostgresSchemaSetup" && reason == "Pending" {
+				// Keep the last terminal outcome useful during a retry without
+				// presenting it as the outcome of the new schema attempt.
+				if old := meta.FindStatusCondition(aiservice.Status.Conditions, schemaReady); old != nil {
+					if old.Reason == "Failed" || old.Reason == "TimedOut" {
+						message += "; previous outcome: " + old.Reason
+					} else if _, prior, ok := strings.Cut(old.Message, "; previous outcome: "); ok {
+						message += "; previous outcome: " + prior
+					}
+				}
+			}
+			setRuntimeCondition(aiservice, stage.name+"Ready", metav1.ConditionFalse, reason, message)
+			// Later gates were not evaluated for these inputs. Clear their apparent
+			// success while retaining bounded context about prior failures.
+			for _, later := range stages[index+1:] {
+				blockRuntimeCondition(aiservice, later.name+"Ready", stage.name)
+			}
+			blockRuntimeCondition(aiservice, endpointReady, stage.name)
+			setRuntimeCondition(aiservice, "Ready", metav1.ConditionFalse, reason, message)
 			return err
 		}
+		// These gates are evaluated from observed health after both objects exist.
+		if stage.name == "AgentRuntimeDeployment" || stage.name == "AgentRuntimeService" {
+			continue
+		}
+		reason, message := "Reconciled", "stage succeeded"
+		if stage.name == "PostgresSchemaSetup" {
+			reason, message = "Succeeded", "schema setup completed for the current inputs"
+		}
+		setRuntimeCondition(aiservice, stage.name+"Ready", metav1.ConditionTrue, reason, message)
 	}
-
-	conditions = append(conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "AllReconciled",
-		Message:            "all resources are up-to-date",
-		LastTransitionTime: metav1.Now(),
-	})
-
-	return nil
+	return r.observeReadiness(ctx, aiservice)
 }
 
 func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1.AIService) error {
@@ -678,6 +684,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 	}
 
 	labels, annotations := labelsAndAnnotations(ai)
+	delete(annotations, deploymentRevisionAnnotation)
 	selectorLabels := agentRuntimeSelectorLabels(ai)
 	containerName := agentRuntimeWorkloadName(ai.Name)
 	env := buildAgentRuntimeEnv(ai, config.AgentModule)
@@ -718,7 +725,17 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		// Kubernetes owns the Deployment revision. Removing it makes its
+		// controller restore it and advance generation on every observation.
+		// Keep it on Deployment metadata only, never in the Pod template.
+		deploymentAnnotations := make(map[string]string, len(annotations)+1)
+		for name, value := range annotations {
+			deploymentAnnotations[name] = value
+		}
+		if revision, ok := deployment.Annotations[deploymentRevisionAnnotation]; ok {
+			deploymentAnnotations[deploymentRevisionAnnotation] = revision
+		}
+		deployment.ObjectMeta.Annotations = deploymentAnnotations
 		deployment.Spec.Replicas = &ai.Spec.Replicas
 
 		if deployment.Spec.Selector == nil {
@@ -916,6 +933,12 @@ func (r *AgentRuntimeReconciler) reconcileServiceMonitor(ctx context.Context, ai
 func agentRuntimeWorkloadName(aiServiceName string) string {
 	return boundedDNSLabel(aiServiceName)
 }
+
+// WorkloadName identifies runtime Pod labels when mapping backend events.
+func WorkloadName(aiServiceName string) string { return agentRuntimeWorkloadName(aiServiceName) }
+
+// ServiceName identifies EndpointSlices for an AgentRuntime AIService.
+func ServiceName(aiServiceName string) string { return agentRuntimeServiceName(aiServiceName) }
 
 func agentRuntimeSelectorLabels(ai *aiv1.AIService) map[string]string {
 	workloadName := agentRuntimeWorkloadName(ai.Name)
