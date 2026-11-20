@@ -22,7 +22,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/splunk/splunk-ai-operator/internal/candidatecontract"
 	"github.com/splunk/splunk-ai-operator/internal/imagesnapshot"
 )
 
@@ -113,65 +112,10 @@ func (f *inputFlags) register(fs *flag.FlagSet) {
 }
 
 func (f *inputFlags) load() (imagesnapshot.InventoryInput, error) {
-	var in imagesnapshot.InventoryInput
-	var m candidatecontract.Manifest
-	if err := candidatecontract.Read(f.candidate, &m); err != nil {
-		return in, fmt.Errorf("candidate manifest: %w", err)
-	}
-	if err := m.Validate(); err != nil {
-		return in, fmt.Errorf("candidate manifest %s is not a valid candidate record: %w", f.candidate, err)
-	}
-	raw, err := os.ReadFile(f.candidate)
-	if err != nil {
-		return in, err
-	}
-	in.Candidate, in.CandidateChecksum = &m, imagesnapshot.Checksum(raw)
-
-	if f.config != "" {
-		if err := imagesnapshot.ReadFile(f.config, &in.Installer); err != nil {
-			return in, fmt.Errorf("installer config: %w", err)
-		}
-	} else {
-		// With no installer configuration there is no installer whose defaults apply.
-		in.NoInstallerDefaults = true
-	}
-	in.Values = map[string]*imagesnapshot.RenderedValues{}
-	for profile, path := range map[string]string{imagesnapshot.ProfileCPUOnly: f.cpuOnlyValues, imagesnapshot.ProfileFullFeature: f.fullFeatureValues} {
-		if path == "" {
-			continue
-		}
-		var v imagesnapshot.RenderedValues
-		if err := imagesnapshot.ReadFile(path, &v); err != nil {
-			return in, fmt.Errorf("rendered values for %s: %w", profile, err)
-		}
-		if v.Profile.Effective != "" && v.Profile.Effective != profile {
-			return in, fmt.Errorf("%s is the rendered profile %q, not %q", path, v.Profile.Effective, profile)
-		}
-		in.Values[profile] = &v
-	}
-	if in.AddonRefs, err = readLines(f.addonList); err != nil {
-		return in, err
-	}
-	if in.K0sRefs, err = readLines(f.k0sList); err != nil {
-		return in, err
-	}
-	if f.owners != "" {
-		if err := imagesnapshot.ReadFile(f.owners, &in.Owners); err != nil {
-			return in, fmt.Errorf("owners: %w", err)
-		}
-	}
-	return in, nil
-}
-
-func readLines(path string) ([]string, error) {
-	if path == "" {
-		return nil, nil
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return strings.Split(string(b), "\n"), nil
+	return imagesnapshot.LoadInput(imagesnapshot.InputFiles{
+		Candidate: f.candidate, Config: f.config, CPUOnlyValues: f.cpuOnlyValues, FullFeatureValues: f.fullFeatureValues,
+		AddonList: f.addonList, K0sList: f.k0sList, Owners: f.owners,
+	})
 }
 
 func parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
