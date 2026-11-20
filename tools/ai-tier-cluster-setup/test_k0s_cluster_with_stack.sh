@@ -1087,6 +1087,238 @@ assert_eq "order: manifest after checksums" "yes" "$([[ $(_line '^# ── 9. Ch
 assert_eq "order: bundle check before the installer runs" "yes" "$([[ $(_line '^# ── 9c. Check the bundle') -lt $(_line '^# ── 12. Run the installer') ]] && echo yes || echo no)"
 assert_eq "the bundle check fails closed" "1" "$(grep -A6 '^# ── 9c. Check the bundle' "${AIRGAP_SCRIPT}" | grep -c 'nothing was transferred or installed' | tr -d '[:space:]')"
 
+# ── MPR-193: the install-side air-gap preflight ────────────────────────────────
+suite "air-gap install preflight (MPR-193)"
+
+_ip_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+
+# A bundle with a checksummed manifest that lists the tool with its checksum.
+_ip_bundle() {
+  local d="$1" tool_body="$2" sum
+  mkdir -p "${d}/binaries"
+  printf '%s' "${tool_body}" > "${d}/binaries/airgap-bundle"; chmod +x "${d}/binaries/airgap-bundle"
+  sum="$(shasum -a 256 "${d}/binaries/airgap-bundle" 2>/dev/null | awk '{print $1}')"
+  [[ -n "${sum}" ]] || sum="$(sha256sum "${d}/binaries/airgap-bundle" | awk '{print $1}')"
+  printf '{"metadata":{"id":"bundle-1"},"spec":{"snapshot":{"id":"snap-1"},"files":[{"path":"binaries/airgap-bundle","sha256":"%s"}]}}' "${sum}" > "${d}/bundle-manifest.json"
+  sum="$(shasum -a 256 "${d}/bundle-manifest.json" 2>/dev/null | awk '{print $1}')"
+  [[ -n "${sum}" ]] || sum="$(sha256sum "${d}/bundle-manifest.json" | awk '{print $1}')"
+  printf '%s  bundle-manifest.json\n' "${sum}" > "${d}/bundle-manifest.json.sha256"
+}
+
+_ip_run() ( eval "$(_extract_fn _sha256_of)"; eval "$(_extract_fn airgap_bundle_tool)"; airgap_bundle_tool "$1"; echo "rc=$?" )
+_ip_dir="$(mktemp -d)"
+_ip_bundle "${_ip_dir}/ok" $'#!/usr/bin/env bash\nexit 0\n'
+_ip_has "tool: a tool matching the manifest is trusted" "$(_ip_run "${_ip_dir}/ok")" "${_ip_dir}/ok/binaries/airgap-bundle"
+_ip_bundle "${_ip_dir}/swapped" $'#!/usr/bin/env bash\nexit 0\n'
+printf '#!/usr/bin/env bash\necho pwned\n' > "${_ip_dir}/swapped/binaries/airgap-bundle"
+_ip_has "tool: a replaced tool is refused" "$(_ip_run "${_ip_dir}/swapped")" "does not match the bundle manifest"
+_ip_bundle "${_ip_dir}/edited" $'#!/usr/bin/env bash\nexit 0\n'
+printf ' ' >> "${_ip_dir}/edited/bundle-manifest.json"
+_ip_has "tool: an edited manifest is refused" "$(_ip_run "${_ip_dir}/edited")" "does not match its checksum file"
+mkdir -p "${_ip_dir}/empty"
+_ip_has "tool: a bundle without a manifest is refused" "$(_ip_run "${_ip_dir}/empty")" "no checksummed bundle-manifest.json"
+rm -rf "${_ip_dir}"
+
+eval "$(_extract_fn _node_platform)"
+assert_eq "platform: x86_64 is linux/amd64" "linux/amd64" "$(_node_platform x86_64)"
+assert_eq "platform: aarch64 is linux/arm64" "linux/arm64" "$(_node_platform aarch64)"
+assert_eq "platform: an unreported architecture stays empty" "" "$(_node_platform "")"
+
+# The facts collector, against stubbed SSH and kubectl: a controller, a CPU worker, and a
+# GPU worker on an existing cluster.
+_ip_facts() (
+  eval "$(_extract_fn _node_platform)"; eval "$(_extract_fn _read_model_marker)"
+  eval "$(_extract_fn model_artifacts_config_name)"; eval "$(_extract_fn collect_airgap_host_facts)"
+  yq() { "${YQ_BIN}" "$@"; }
+  ssh_exec() {
+    if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0-503.40.1.el9_5.x86_64\n'; return 0; fi
+    if [[ "$2" == *lspci* ]]; then printf '%s\n%s\n%s\n' "${_IP_DEVICES:-2}" "${_IP_DRIVER-550.54.15}" "${_IP_RUNTIME:-true}"; return 0; fi
+  }
+  kubectl() { [[ "$*" == "get nodes -o json" ]] && echo '{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.3"}],"allocatable":{"nvidia.com/gpu":"2"}}}]}'; }
+  EXISTING_CONTROLLER_IPS="10.0.0.1"; EXISTING_WORKER_IPS="10.0.0.2 10.0.0.3"; CPU_WORKER_COUNT=1; GPU_WORKER_COUNT=1
+  OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
+  local out; out="$(mktemp)"
+  collect_airgap_host_facts "${out}" "$1" >/dev/null 2>&1
+  cat "${out}"; rm -f "${out}"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _f="$(_ip_facts fullfeature)"
+  assert_eq "facts: every node is reported" "3" "$(jq '.nodes | length' <<< "${_f}")"
+  assert_eq "facts: platform, OS and kernel" "linux/amd64 rhel 5.14.0-503.40.1.el9_5.x86_64" "$(jq -r '.nodes[0] | "\(.platform) \(.os) \(.kernel)"' <<< "${_f}")"
+  assert_eq "facts: only the workers after the CPU workers are GPU nodes" "10.0.0.3" "$(jq -r '[.nodes[] | select(.gpu) | .name] | join(",")' <<< "${_f}")"
+  assert_eq "facts: GPU devices, driver and toolkit" "2 550.54.15 true" "$(jq -r '.nodes[2].gpu | "\(.devices) \(.driver) \(.runtime)"' <<< "${_f}")"
+  assert_eq "facts: schedulable GPUs come from the existing cluster by node IP" "2" "$(jq -r '.nodes[2].gpu.allocatable' <<< "${_f}")"
+  assert_eq "facts: without an object store no model is claimed staged" "0" "$(jq '.stagedModels | length' <<< "${_f}")"
+  _f="$(_IP_DRIVER="" _IP_RUNTIME=false _IP_DEVICES=garbage _ip_facts fullfeature)"
+  assert_eq "facts: a fresh GPU host reports no driver and no toolkit" " false" "$(jq -r '.nodes[2].gpu | "\(.driver) \(.runtime)"' <<< "${_f}")"
+  assert_eq "facts: an unparsable device count is zero, not a guess" "0" "$(jq -r '.nodes[2].gpu.devices' <<< "${_f}")"
+fi
+
+# The preflight's wiring: the call site, and how the tool's outcome becomes the result.
+assert_eq "preflight: the bundle check runs in air-gap mode, before the summary" "1" \
+  "$(_extract_fn preflight_checks | grep -A2 'AIRGAP_MODE:-false}" == "true"' | grep -c 'preflight_check_airgap_bundle' | tr -d '[:space:]')"
+assert_eq "preflight: it comes after the SSH dependency checks" "yes" \
+  "$(_extract_fn preflight_checks | awk '/preflight_check_remote_deps/{a=NR} /preflight_check_airgap_bundle/{b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
+_ip_pre() (
+  PF_FAILS=0; PF_WARN=0
+  pf_header() { :; }; pf_ok() { echo "OK: $*"; }; pf_fail() { echo "FAIL: $*"; PF_FAILS=$((PF_FAILS+1)); }
+  eval "$(_extract_fn _sha256_of)"; eval "$(_extract_fn airgap_bundle_tool)"; eval "$(_extract_fn preflight_check_airgap_bundle)"
+  ai_platform_profile_resolved() { echo cpuOnly; }
+  collect_airgap_host_facts() { echo '{"nodes":[]}' > "$1"; }
+  render_ai_platform_profile_values() { echo "profile: {effective: cpuOnly}"; }
+  airgap_registry_config_dir() { :; }
+  CONFIG_FILE=/dev/null; LOG_DIR="$(mktemp -d)"
+  preflight_check_airgap_bundle
+  echo "fails=${PF_FAILS}"
+)
+_ip_dir="$(mktemp -d)"
+_ip_bundle "${_ip_dir}/pass" $'#!/usr/bin/env bash\necho "OK: complete"; exit 0\n'
+_out="$(AIRGAP_BUNDLE_DIR="${_ip_dir}/pass" _ip_pre)"
+_ip_has "preflight: a passing bundle is reported with its bundle and snapshot IDs" "${_out}" "OK: bundle bundle-1, snapshot snap-1: complete for cpuOnly"
+_ip_has "preflight: and nothing fails" "${_out}" "fails=0"
+_ip_bundle "${_ip_dir}/findings" $'#!/usr/bin/env bash\necho "[MIRROR_MISSING_IMAGE] slim: gone" >&2; echo "[BUNDLE_FILE_MISSING] binaries/k0s: absent" >&2; echo "FAILED: 2 problem(s)" >&2; exit 1\n'
+_out="$(AIRGAP_BUNDLE_DIR="${_ip_dir}/findings" _ip_pre)"
+_ip_has "preflight: each finding fails by name" "${_out}" "FAIL: [MIRROR_MISSING_IMAGE] slim: gone"
+_ip_has "preflight: every finding is reported" "${_out}" "FAIL: [BUNDLE_FILE_MISSING] binaries/k0s: absent"
+_ip_has "preflight: and the install stops with nothing changed" "${_out}" "nothing was changed"
+_ip_has "preflight: three failures (two findings and the verdict)" "${_out}" "fails=3"
+_ip_bundle "${_ip_dir}/broken" $'#!/usr/bin/env bash\necho "error: --profile must be cpuOnly or fullfeature" >&2; exit 2\n'
+_ip_has "preflight: a tool that cannot run fails, never passes" "$(AIRGAP_BUNDLE_DIR="${_ip_dir}/broken" _ip_pre)" "could not run (exit 2)"
+_ip_has "preflight: no bundle directory fails" "$(AIRGAP_BUNDLE_DIR="" _ip_pre)" "AIRGAP_BUNDLE_DIR is not set to a staged bundle"
+rm -rf "${_ip_dir}"
+
+# ── MPR-193: no download fallback in an air-gapped install ────────────────────
+suite "air-gap no download fallback (MPR-193)"
+
+_nd() ( err() { echo "ERR: $*"; exit 1; }; eval "$(_extract_fn airgap_no_download)"; airgap_no_download "the kuberay-operator chart" "KUBERAY_CHART_PATH=<unset>"; echo "rc=$?" )
+_out="$(AIRGAP_MODE=true _nd)"
+assert_eq "no-download: an air-gapped install fails by name" "yes" "$([[ "${_out}" == *"ERR: Air-gap install: the kuberay-operator chart is not available from the bundle (KUBERAY_CHART_PATH=<unset>)"* && "${_out}" != *"rc=0"* ]] && echo yes || echo no)"
+assert_eq "no-download: a connected install is unaffected" "rc=0" "$(AIRGAP_MODE=false _nd)"
+
+# Every public fallback in the installer is guarded.
+assert_eq "no-download: every helm repo add fallback is guarded" "$(grep -c 'helm repo add' "${SCRIPT}" | tr -d ' ')" \
+  "$(grep -B1 'helm repo add' "${SCRIPT}" | grep -c 'airgap_no_download' | tr -d ' ')"
+for _v in CERT_MANAGER_MANIFEST_URL LOCAL_PATH_MANIFEST_URL NVIDIA_DEVICE_PLUGIN_MANIFEST_URL YQ_DOWNLOAD_URL; do
+  assert_eq "no-download: the ${_v} default is guarded" "1" \
+    "$(grep -A1 "\${${_v}:-https" "${SCRIPT}" | grep -c 'airgap_no_download' | tr -d ' ')"
+done
+
+# ── MPR-193: registry pull Secrets by reference ────────────────────────────────
+suite "registry pull Secrets by reference (MPR-193)"
+
+_ps_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+_ps_dir="$(mktemp -d)"
+printf '{"auths":{"mirror.airgap.local:5000":{"auth":"bWlycm9yOnMzY3IzdA=="}}}' > "${_ps_dir}/mirror.json"
+printf 'not json' > "${_ps_dir}/bad.json"
+
+_ps() ( # _ps <config body> <function> [args]: run a pull-secret helper against a config
+  local body="$1"; shift
+  printf '%s' "${body}" > "${_ps_dir}/cfg.yaml"
+  CONFIG_FILE="${_ps_dir}/cfg.yaml"
+  yq() { "${YQ_BIN}" "$@"; }
+  log() { echo "LOG: $*"; }; err() { echo "ERR: $*"; exit 1; }
+  ensure_namespace() { :; }
+  # kubectl stub: Secrets listed in _PS_EXISTING exist with type _PS_TYPE; record calls.
+  kubectl() {
+    echo "KUBECTL $*" >> "${_ps_dir}/calls"
+    case "$*" in
+      "get secret "*" -o jsonpath={.type}") echo "${_PS_TYPE:-kubernetes.io/dockerconfigjson}"; return 0 ;;
+      "get secret "*) local n="$3"; [[ " ${_PS_EXISTING:-} " == *" ${n} "* ]]; return $? ;;
+      "apply -f -") cat > "${_ps_dir}/applied.yaml"; return 0 ;;
+      create*) echo "kind: Secret"; return 0 ;;
+    esac
+  }
+  for f in configured_pull_secret_names _pull_secret_file validate_pull_secret_config ensure_configured_pull_secrets image_pull_secret_names; do
+    eval "$(_extract_fn "${f}")"
+  done
+  "$@"
+  echo "rc=$?"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _good=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: mirror.json\n'
+  cp "${_ps_dir}/mirror.json" "${_ps_dir}/mirror.json.keep"
+  assert_eq "validate: a name and a Docker configuration relative to the config are valid" "rc=0" "$(_ps "${_good}" validate_pull_secret_config)"
+  _ps_has "validate: an invalid Secret name" "$(_ps $'images:\n  imagePullSecrets:\n    - name: Mirror_Pull\n' validate_pull_secret_config)" "must be a Kubernetes Secret name"
+  _ps_has "validate: a name listed twice" "$(_ps $'images:\n  imagePullSecrets:\n    - name: a\n    - name: a\n' validate_pull_secret_config)" "a is listed twice"
+  _ps_has "validate: an unreadable Docker configuration" "$(_ps $'images:\n  imagePullSecrets:\n    - name: a\n      dockerConfigFile: nowhere.json\n' validate_pull_secret_config)" "is not a readable file"
+  _ps_has "validate: a file that is not a Docker configuration" "$(_ps $'images:\n  imagePullSecrets:\n    - name: a\n      dockerConfigFile: bad.json\n' validate_pull_secret_config)" "is not a Docker configuration"
+  assert_eq "validate: no setting is valid" "rc=0" "$(_ps $'images: {}\n' validate_pull_secret_config)"
+
+  rm -f "${_ps_dir}/calls" "${_ps_dir}/applied.yaml"
+  _out="$(_ps "${_good}" ensure_configured_pull_secrets ai-platform)"
+  _ps_has "ensure: a missing Secret is created from its Docker configuration" "${_out}" "pull Secret ai-platform/mirror-pull created"
+  _ps_has "ensure: as a dockerconfigjson Secret from that file" "$(cat "${_ps_dir}/calls")" "create secret generic mirror-pull --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=${_ps_dir}/mirror.json -n ai-platform"
+  assert_eq "ensure: the credentials never reach the output" "no" "$([[ "${_out}" == *bWlycm9y* ]] && echo yes || echo no)"
+  _ps_has "ensure: an existing dockerconfigjson Secret is used" "$(_PS_EXISTING=mirror-pull _ps "${_good}" ensure_configured_pull_secrets ai-platform)" "pull Secret ai-platform/mirror-pull present"
+  _ps_has "ensure: an existing Secret of another type fails closed" \
+    "$(_PS_EXISTING=mirror-pull _PS_TYPE=Opaque _ps "${_good}" ensure_configured_pull_secrets ai-platform)" "is of type 'Opaque', not kubernetes.io/dockerconfigjson"
+  _ps_has "ensure: a missing Secret without a Docker configuration fails closed" \
+    "$(_ps $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n' ensure_configured_pull_secrets ai-platform)" "does not exist and images.imagePullSecrets[0].dockerConfigFile is not set"
+
+  _names="$(_PS_EXISTING="ecr-registry-secret mirror-pull" _ps $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n    - name: ecr-registry-secret\n' image_pull_secret_names ai-platform)"
+  assert_eq "names: present Secrets, installer-created and configured, without duplicates" $'ecr-registry-secret\nmirror-pull\nrc=0' "${_names}"
+fi
+rm -rf "${_ps_dir}"
+
+# Every place that lists pull Secrets uses the same names.
+assert_eq "names: the CR and both operator Deployments use image_pull_secret_names" "3" \
+  "$(grep -c 'for secret_name in \$(image_pull_secret_names' "${SCRIPT}" | tr -d ' ')"
+assert_eq "names: no fixed list remains" "0" \
+  "$(grep -c 'for secret_name in ecr-registry-secret docker-hub-secret' "${SCRIPT}" | tr -d ' ')"
+assert_eq "ensure: configured Secrets are ensured in all three namespaces, failures not swallowed" "3" \
+  "$(grep -c '^  ensure_configured_pull_secrets "' "${SCRIPT}" | tr -d ' ')"
+
+# ── MPR-193: node images by digest; the install record ─────────────────────────
+suite "air-gap node digests and install record (MPR-193)"
+
+_nr_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+_nr_dir="$(mktemp -d)"
+mkdir -p "${_nr_dir}/bundle/images"
+printf 'quay.io/k0sproject/coredns:1.11.3\n' > "${_nr_dir}/bundle/images/k0s-images.list"
+cat > "${_nr_dir}/bundle/bundle-manifest.json" <<'JSON'
+{"metadata":{"id":"bundle-7"},"spec":{"snapshot":{"id":"snap-7","checksum":"abc","mirror":"mirror.airgap.local:5000/ai-tier"},
+ "archiveImages":[{"ref":"quay.io/k0sproject/coredns:1.11.3","digest":"sha256:1111","archive":"images/k0s-images.tar"},
+                  {"ref":"quay.io/k0sproject/coredns@sha256:1111","digest":"sha256:1111","archive":"images/k0s-images.tar"}]}}
+JSON
+_nr_node() ( # _nr_node <digest the node reports>
+  warn() { echo "WARN: $*"; }; log() { echo "LOG: $*"; }
+  airgap_k0s_image_bundles_enabled() { return 0; }
+  ssh_exec() {
+    if [[ "$2" == *"list -q"* ]]; then echo "quay.io/k0sproject/coredns:1.11.3"; return 0; fi
+    printf 'REF TYPE DIGEST SIZE\nquay.io/k0sproject/coredns:1.11.3 application/vnd.oci.image.index.v1+json %s 10MiB\n' "${_nr_digest}"
+  }
+  local _nr_digest="$1"
+  AIRGAP_K0S_IMAGE_DIR="${_nr_dir}/bundle/images"; AIRGAP_BUNDLE_DIR="${_nr_dir}/bundle"
+  eval "$(_extract_fn verify_airgap_bundle_images_on_node)"
+  verify_airgap_bundle_images_on_node 10.0.0.1
+  echo "rc=$?"
+)
+if command -v jq >/dev/null 2>&1; then
+  _nr_has "node digests: the bundle's image passes" "$(_nr_node sha256:1111)" "rc=0"
+  _out="$(_nr_node sha256:9999)"
+  _nr_has "node digests: another build under the same tag fails" "${_out}" "rc=1"
+  _nr_has "node digests: and names both digests" "${_out}" "quay.io/k0sproject/coredns:1.11.3: node has sha256:9999, bundle has sha256:1111"
+fi
+
+_nr_rec() (
+  log() { :; }; ai_platform_profile_resolved() { echo fullfeature; }
+  AIRGAP_MODE=true; AIRGAP_BUNDLE_DIR="${_nr_dir}/bundle"; LOG_DIR="${_nr_dir}/logs"
+  eval "$(_extract_fn write_airgap_install_record)"
+  write_airgap_install_record "$1"
+  cat "${LOG_DIR}/airgap-install-record.json"
+)
+if command -v jq >/dev/null 2>&1; then
+  _rec="$(_nr_rec started)"
+  assert_eq "record: the bundle, snapshot, profile and status" "bundle-7 snap-7 abc fullfeature started" \
+    "$(jq -r '"\(.bundleId) \(.snapshotId) \(.snapshotChecksum) \(.profile) \(.status)"' <<< "${_rec}")"
+  assert_eq "record: no credential-looking field" "0" "$(grep -ciE 'password|token|auth' <<< "${_rec}" | tr -d ' ')"
+  assert_eq "record: written only in air-gap mode" "no" \
+    "$( (log() { :; }; AIRGAP_MODE=false; AIRGAP_BUNDLE_DIR="${_nr_dir}/bundle"; LOG_DIR="${_nr_dir}/logs2"; eval "$(_extract_fn write_airgap_install_record)"; write_airgap_install_record started); [[ -f "${_nr_dir}/logs2/airgap-install-record.json" ]] && echo yes || echo no)"
+fi
+rm -rf "${_nr_dir}"
+assert_eq "record: written once the preflight passes and again at the end" "3" \
+  "$(_extract_fn main_install | grep -c 'write_airgap_install_record "' | tr -d ' ')"
+
 _exercise_airgap_bundle_helpers() (
   local mode="$1" fixture_dir
   fixture_dir=$(mktemp -d)
@@ -2398,6 +2630,10 @@ _render_cr() {
 }
 _render_cr_inner() {
   eval "$(_extract_fn install_ai_platform_cr)"
+  # install_ai_platform_cr lists pull Secrets through these (MPR-193).
+  for _f in configured_pull_secret_names _pull_secret_file ensure_configured_pull_secrets image_pull_secret_names; do
+    eval "$(_extract_fn "${_f}")"
+  done
   sleep() { :; }
   jq() { :; }
   kubectl() { if [[ " $* " == *" apply "* && " $* " == *" -f - "* ]]; then cat; fi; return 0; }

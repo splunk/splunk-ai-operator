@@ -612,6 +612,7 @@ ensure_yq() {
   case "${os}" in
     Linux)
       url="${YQ_DOWNLOAD_URL:-https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}}"
+      [[ "${url}" == file://* ]] || airgap_no_download "yq" "YQ_DOWNLOAD_URL is not a bundle file"
       log "Installing yq ${YQ_VERSION} (linux-${arch})..."
       # file:// is a URI — curl rejects a relative path in it, so copy instead.
       if [[ "${url}" == file://* ]]; then
@@ -926,6 +927,14 @@ validate_single_controller_topology() {
     return 1
   fi
   return 0
+}
+
+# airgap_no_download <artifact> <how the bundle supplies it>: in an air-gapped install,
+# fail by name instead of falling back to a public download (ERD §14.4.4: no public
+# fallback during customer installation). Outside air-gap mode it does nothing.
+airgap_no_download() {
+  [[ "${AIRGAP_MODE:-false}" == "true" ]] || return 0
+  err "Air-gap install: $1 is not available from the bundle ($2). An air-gapped install never falls back to a download; re-stage the bundle with airgap_install.sh."
 }
 
 # ====== IMAGE HELPERS ======
@@ -2046,6 +2055,15 @@ preflight_checks() {
   # to a multi-minute install that would fail at ImagePullBackOff otherwise.
   preflight_check_registry
 
+  pf_header "Registry pull Secrets"
+  local _pull_problems
+  _pull_problems="$(validate_pull_secret_config)"
+  if [[ -n "${_pull_problems}" ]]; then
+    while IFS= read -r _p; do pf_fail "${_p}"; done <<< "${_pull_problems}"
+  elif [[ -n "$(configured_pull_secret_names)" ]]; then
+    pf_ok "images.imagePullSecrets: $(configured_pull_secret_names | paste -sd, -)"
+  fi
+
   pf_header "Infrastructure mode"
   pf_ok "Using existing infrastructure (on-prem/baremetal)"
   pf_ok "Controller IPs: ${EXISTING_CONTROLLER_IPS}"
@@ -2072,6 +2090,10 @@ preflight_checks() {
 
   # Validate remote node software prerequisites
   preflight_check_remote_deps
+
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    preflight_check_airgap_bundle
+  fi
 
   pf_summary
 }
@@ -2261,6 +2283,28 @@ verify_airgap_bundle_images_on_node() {
     for _missing in "${missing[@]:0:20}"; do warn "    - ${_missing}"; done
     (( ${#missing[@]} > 20 )) && warn "    ... and $((${#missing[@]} - 20)) more"
     return 1
+  fi
+
+  # By digest too (MPR-193): the image a node imported under each name must be the one
+  # the bundle manifest records, so a node cannot run another build under the same tag.
+  local manifest="${AIRGAP_BUNDLE_DIR:-}/bundle-manifest.json"
+  if [[ -f "${manifest}" ]] && command -v jq >/dev/null 2>&1; then
+    local listing wrong=() ref want got
+    if ! listing=$(ssh_exec "${node_ip}" "sudo k0s ctr -n k8s.io images list 2>/dev/null"); then
+      warn "  Could not list containerd image digests on ${node_ip}."
+      return 1
+    fi
+    while IFS=$'\t' read -r ref want; do
+      [[ -n "${ref}" ]] || continue
+      got=$(awk -v r="${ref}" '$1 == r {print $3; exit}' <<<"${listing}")
+      [[ -z "${got}" || "${got}" == "${want}" ]] || wrong+=("${ref}: node has ${got}, bundle has ${want}")
+    done < <(jq -r '.spec.archiveImages[]? | select(.digest != "") | "\(.ref)\t\(.digest)"' "${manifest}" 2>/dev/null)
+    if (( ${#wrong[@]} > 0 )); then
+      warn "  ${node_ip} holds ${#wrong[@]} image(s) whose digest is not the bundle's:"
+      local _w
+      for _w in "${wrong[@]:0:20}"; do warn "    - ${_w}"; done
+      return 1
+    fi
   fi
 
   log "  ✓ Verified all bundled image references on ${node_ip}"
@@ -2680,6 +2724,217 @@ preflight_check_registry() {
 # SSHs to every node and reports what is present vs missing BEFORE install.
 # Does not install anything — surfaces gaps so the operator can fix them
 # upfront rather than hitting a silent failure mid-run.
+# ====== AIR-GAP BUNDLE PREFLIGHT (MPR-193) ======
+# Before anything changes, the bundle's own airgap-bundle tool checks the bundle, the
+# image snapshot and mirror, the install configuration and the target hosts, and every
+# problem is reported by name. See docs/agent-runtime/airgap-bundle.md.
+
+_sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+# airgap_bundle_tool <bundle dir>: print the bundle's airgap-bundle tool after checking it
+# against the bundle manifest, so a replaced tool cannot vouch for the bundle. Prints the
+# reason and returns 1 when it cannot be trusted.
+airgap_bundle_tool() {
+  local dir="$1" manifest="$1/bundle-manifest.json" tool="$1/binaries/airgap-bundle" want got
+  if [[ ! -f "${manifest}" || ! -f "${manifest}.sha256" ]]; then
+    echo "the bundle has no checksummed bundle-manifest.json: re-stage it with airgap_install.sh"; return 1
+  fi
+  want="$(awk '{print $1; exit}' "${manifest}.sha256")"
+  got="$(_sha256_of "${manifest}")"
+  [[ -n "${want}" && "${want}" == "${got}" ]] || { echo "bundle-manifest.json does not match its checksum file"; return 1; }
+  want="$(jq -r '.spec.files[] | select(.path == "binaries/airgap-bundle") | .sha256' "${manifest}" 2>/dev/null)"
+  [[ -n "${want}" && -f "${tool}" ]] || { echo "the bundle has no binaries/airgap-bundle tool"; return 1; }
+  got="$(_sha256_of "${tool}")"
+  [[ "${want}" == "${got}" ]] || { echo "binaries/airgap-bundle does not match the bundle manifest: it was replaced or damaged"; return 1; }
+  [[ -x "${tool}" ]] || chmod +x "${tool}" 2>/dev/null || { echo "binaries/airgap-bundle is not executable"; return 1; }
+  printf '%s\n' "${tool}"
+}
+
+# _node_platform <uname -m>: os/arch as the bundle names platforms.
+_node_platform() {
+  case "$1" in
+    x86_64|amd64) echo "linux/amd64" ;;
+    aarch64|arm64) echo "linux/arm64" ;;
+    "") echo "" ;;
+    *) echo "linux/$1" ;;
+  esac
+}
+
+# _read_model_marker <artifact id>: print the object store's staging marker for a model
+# artifact, or nothing. Read-only, with the same tools and credentials the installer's
+# model staging uses.
+_read_model_marker() {
+  local id="$1"
+  case "${OBJ_STORE_TYPE:-}" in
+    aws)
+      command -v aws >/dev/null 2>&1 || return 0
+      AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER:-}" AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD:-}" \
+        aws s3 cp "s3://${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete" - --region "${REGION:-us-east-2}" 2>/dev/null || true
+      ;;
+    minio|seaweedfs|s3compat)
+      command -v mc >/dev/null 2>&1 && [[ -n "${OBJ_STORE_ENDPOINT:-}" ]] || return 0
+      mc alias set airgap_preflight "${OBJ_STORE_ENDPOINT}" "${MINIO_ROOT_USER:-}" "${MINIO_ROOT_PASSWORD:-}" --api S3v4 >/dev/null 2>&1 || return 0
+      mc cat "airgap_preflight/${OBJ_STORE_BUCKET}/staging_state/${id}/.staging_complete" 2>/dev/null || true
+      ;;
+  esac
+}
+
+# collect_airgap_host_facts <output file> <profile>: observe the target read-only and write
+# the host facts airgap-bundle verify checks: every node's platform, OS and kernel; for
+# GPU nodes the NVIDIA devices, loaded driver, container toolkit and, on an existing
+# cluster, schedulable nvidia.com/gpu; and the model artifacts already staged.
+collect_airgap_host_facts() {
+  local out="$1" profile="$2"
+  local -a ctrl_ips worker_ips
+  IFS=' ' read -ra ctrl_ips <<< "${EXISTING_CONTROLLER_IPS:-}"
+  IFS=' ' read -ra worker_ips <<< "${EXISTING_WORKER_IPS:-}"
+
+  # Schedulable GPUs per node InternalIP, when the nodes already form a cluster.
+  local alloc_json="{}"
+  if kubectl get nodes -o json >/dev/null 2>&1; then
+    alloc_json="$(kubectl get nodes -o json 2>/dev/null | jq -c '[.items[] | {ip: ([.status.addresses[] | select(.type=="InternalIP") | .address][0]),
+      gpu: ((.status.allocatable["nvidia.com/gpu"] // "0") | tonumber)}] | map({(.ip): .gpu}) | add // {}' 2>/dev/null || echo "{}")"
+  fi
+
+  local nodes="[]" ip idx=0 is_gpu info platform os_id kernel
+  local -a all=()
+  for ip in "${ctrl_ips[@]}"; do [[ -n "${ip}" ]] && all+=("ctrl:${ip}"); done
+  for ip in "${worker_ips[@]}"; do [[ -n "${ip}" ]] && all+=("worker:${ip}"); done
+  for entry in "${all[@]}"; do
+    ip="${entry#*:}"; is_gpu=false
+    if [[ "${entry}" == worker:* ]]; then
+      # GPU workers are the workers after the CPU workers, as install_nvidia_host_drivers counts them.
+      [[ ${idx} -ge ${CPU_WORKER_COUNT:-0} && ${GPU_WORKER_COUNT:-0} -gt 0 ]] && is_gpu=true
+      idx=$((idx + 1))
+    fi
+    info="$(ssh_exec "${ip}" 'uname -m; . /etc/os-release 2>/dev/null; echo "${ID:-}"; uname -r' 2>/dev/null || true)"
+    platform="$(_node_platform "$(sed -n 1p <<< "${info}")")"
+    os_id="$(sed -n 2p <<< "${info}")"
+    kernel="$(sed -n 3p <<< "${info}")"
+    local node
+    node="$(jq -n --arg name "${ip}" --arg platform "${platform}" --arg os "${os_id}" --arg kernel "${kernel}" \
+      '{name: $name, platform: $platform, os: $os, kernel: $kernel}')"
+    if [[ "${is_gpu}" == "true" ]]; then
+      local g devices driver runtime
+      g="$(ssh_exec "${ip}" '
+        n=$( (lspci -nn 2>/dev/null || true) | grep -i nvidia | grep -Ec "\[030[02]\]" || true)
+        m=$( (nvidia-smi -L 2>/dev/null || true) | grep -c "^GPU " || true)
+        [ "${m:-0}" -gt "${n:-0}" ] && n=$m
+        echo "${n:-0}"
+        nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1
+        if command -v nvidia-container-runtime >/dev/null 2>&1 || command -v nvidia-ctk >/dev/null 2>&1; then echo true; else echo false; fi
+      ' 2>/dev/null || true)"
+      devices="$(sed -n 1p <<< "${g}")"; driver="$(sed -n 2p <<< "${g}")"; runtime="$(sed -n 3p <<< "${g}")"
+      [[ "${devices}" =~ ^[0-9]+$ ]] || devices=0
+      [[ "${runtime}" == "true" ]] || runtime=false
+      node="$(jq -c --argjson devices "${devices}" --arg driver "${driver}" --argjson runtime "${runtime}" \
+        --argjson alloc "${alloc_json}" --arg ip "${ip}" \
+        '. + {gpu: ({devices: $devices, driver: $driver, runtime: $runtime} + (if $alloc[$ip] != null then {allocatable: $alloc[$ip]} else {} end))}' <<< "${node}")"
+    fi
+    nodes="$(jq -c --argjson n "${node}" '. + [$n]' <<< "${nodes}")"
+  done
+
+  # Model artifacts already staged (fullfeature): the marker's recorded source.
+  local staged="[]"
+  if [[ "${profile}" == "fullfeature" ]]; then
+    local cfg id marker src
+    cfg="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" 2>/dev/null && pwd)/$(model_artifacts_config_name "${DEFAULT_ACCELERATOR:-}" 2>/dev/null)"
+    if [[ -f "${cfg}" ]]; then
+      while IFS= read -r id; do
+        [[ -n "${id}" && "${id}" != "null" ]] || continue
+        marker="$(_read_model_marker "${id}")"
+        src="$(sed -n 's/^hf_url=//p' <<< "${marker}" | head -1)"
+        [[ -n "${src}" ]] && staged="$(jq -c --arg id "${id}" --arg src "${src}" '. + [{id: $id, source: $src}]' <<< "${staged}")"
+      done < <(yq eval '.artifact-configs[].artifact-id' "${cfg}" 2>/dev/null)
+    fi
+  fi
+  jq -n --argjson nodes "${nodes}" --argjson staged "${staged}" '{nodes: $nodes, stagedModels: $staged}' > "${out}"
+}
+
+# airgap_registry_config_dir: a Docker configuration directory holding the mirror
+# credentials from the first images.imagePullSecrets entry with a dockerConfigFile, for
+# the tool's read-only mirror check. Empty output: use the host's own configuration.
+airgap_registry_config_dir() {
+  local f
+  f="$(yq eval '[.images.imagePullSecrets[]? | select(.dockerConfigFile != null) | .dockerConfigFile][0] // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ -z "${f}" || "${f}" == "null" ]] && return 0
+  [[ "${f}" == /* ]] || f="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)/${f}"
+  [[ -r "${f}" ]] || return 0
+  local d
+  d="$(mktemp -d)"
+  cp "${f}" "${d}/config.json" && chmod 600 "${d}/config.json"
+  printf '%s\n' "${d}"
+}
+
+# preflight_check_airgap_bundle: the air-gap install preflight. Nothing is changed.
+preflight_check_airgap_bundle() {
+  pf_header "Air-gap bundle (MPR-193)"
+  local dir="${AIRGAP_BUNDLE_DIR:-}"
+  if [[ -z "${dir}" || ! -d "${dir}" ]]; then
+    pf_fail "AIRGAP_BUNDLE_DIR is not set to a staged bundle: run the install through airgap_install.sh, or export it with the bundle's airgap-env.sh"
+    return 0
+  fi
+  local tool
+  if ! tool="$(airgap_bundle_tool "${dir}")"; then
+    pf_fail "air-gap bundle tool cannot be trusted: ${tool}"
+    return 0
+  fi
+  local profile work facts values report regcfg rc=0
+  profile="$(ai_platform_profile_resolved)"
+  [[ "${profile}" == "cpuOnly" ]] || profile="fullfeature"
+  work="$(mktemp -d)"
+  facts="${work}/host-facts.json"
+  values="${work}/profile-values.yaml"
+  report="${LOG_DIR:-${work}}/airgap-preflight-report.json"
+  collect_airgap_host_facts "${facts}" "${profile}"
+  render_ai_platform_profile_values > "${values}" 2>/dev/null || true
+  local -a args=(verify --bundle "${dir}" --profile "${profile}" --scope install
+    --config "${CONFIG_FILE}" --facts "${facts}" --report "${report}"
+    --candidate "$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)/config/agent-runtime/candidate-manifest.yaml")
+  [[ -s "${values}" ]] && { [[ "${profile}" == "cpuOnly" ]] && args+=(--values-cpuonly "${values}") || args+=(--values-fullfeature "${values}"); }
+  [[ "${IMAGE_REGISTRY_INSECURE:-false}" == "true" ]] && args+=(--insecure)
+  regcfg="$(airgap_registry_config_dir)"
+  local output
+  if [[ -n "${regcfg}" ]]; then
+    output="$(DOCKER_CONFIG="${regcfg}" "${tool}" "${args[@]}" 2>&1)" || rc=$?
+    rm -rf "${regcfg}"
+  else
+    output="$("${tool}" "${args[@]}" 2>&1)" || rc=$?
+  fi
+  rm -rf "${work}"
+  if [[ ${rc} -eq 0 ]]; then
+    pf_ok "bundle $(jq -r '.metadata.id' "${dir}/bundle-manifest.json"), snapshot $(jq -r '.spec.snapshot.id' "${dir}/bundle-manifest.json"): complete for ${profile}"
+    AIRGAP_BUNDLE_ID="$(jq -r '.metadata.id' "${dir}/bundle-manifest.json")"
+    AIRGAP_SNAPSHOT_ID="$(jq -r '.spec.snapshot.id' "${dir}/bundle-manifest.json")"
+    return 0
+  fi
+  local line
+  while IFS= read -r line; do
+    [[ "${line}" == \[* ]] && pf_fail "${line}"
+  done <<< "${output}"
+  [[ ${rc} -eq 1 ]] || pf_fail "airgap-bundle verify could not run (exit ${rc}): $(tail -1 <<< "${output}")"
+  pf_fail "air-gap preflight failed for ${profile}: nothing was changed (report: ${report})"
+}
+
+# write_airgap_install_record <status>: record which bundle and image snapshot an
+# air-gapped install used (ERD NFR-7), in LOG_DIR/airgap-install-record.json. It holds
+# identities and digests only, never a credential.
+write_airgap_install_record() {
+  local status="$1" manifest="${AIRGAP_BUNDLE_DIR:-}/bundle-manifest.json"
+  [[ "${AIRGAP_MODE:-false}" == "true" && -f "${manifest}" ]] || return 0
+  mkdir -p "${LOG_DIR}" 2>/dev/null || return 0
+  jq -n --slurpfile m "${manifest}" --arg status "${status}" --arg profile "$(ai_platform_profile_resolved)" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+      recordType: "airgap-install", status: $status, recordedAt: $at, profile: $profile,
+      bundleId: $m[0].metadata.id, snapshotId: $m[0].spec.snapshot.id,
+      snapshotChecksum: $m[0].spec.snapshot.checksum, mirror: $m[0].spec.snapshot.mirror}' \
+    > "${LOG_DIR}/airgap-install-record.json" 2>/dev/null \
+    && log "Air-gap install record (${status}): ${LOG_DIR}/airgap-install-record.json"
+  return 0
+}
+
 preflight_check_remote_deps() {
   pf_header "Remote node dependencies"
   local _all_ips=()
@@ -3458,6 +3713,7 @@ PYSCRIPT"
   # from M2 into the controller's kubectl over ssh stdin (`apply -f -`).
   log "Installing local-path storage provisioner..."
   local _lp_url="${LOCAL_PATH_MANIFEST_URL:-https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml}"
+  [[ "${_lp_url}" == file://* ]] || airgap_no_download "the local-path-storage manifest" "LOCAL_PATH_MANIFEST_URL is not a bundle file"
   if [[ "${_lp_url}" == file://* ]]; then
     ssh_exec "${controller_ip}" "sudo k0s kubectl apply -f -" < "${_lp_url#file://}"
   else
@@ -4186,6 +4442,7 @@ install_cert_manager() {
   # set. `apply -f` accepts a local path or an http(s) URL but NOT the file://
   # scheme, so strip it to a bare path for air-gap bundle manifests.
   local _cm_url="${CERT_MANAGER_MANIFEST_URL:-https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml}"
+  [[ "${_cm_url}" == file://* ]] || airgap_no_download "the cert-manager manifest" "CERT_MANAGER_MANIFEST_URL is not a bundle file"
   [[ "${_cm_url}" == file://* ]] && _cm_url="${_cm_url#file://}"
   kubectl apply -f "${_cm_url}"
 
@@ -5577,6 +5834,7 @@ RTEOF
   local manifest
   manifest=$(mktemp)
   local nvidia_manifest_url="${NVIDIA_DEVICE_PLUGIN_MANIFEST_URL:-https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${ver}/deployments/static/nvidia-device-plugin.yml}"
+  [[ "${nvidia_manifest_url}" == file://* ]] || airgap_no_download "the NVIDIA device plugin manifest" "NVIDIA_DEVICE_PLUGIN_MANIFEST_URL is not a bundle file"
   # file:// is a URI, so curl rejects a relative path in it. Copy the bare path
   # instead, which works whether the bundle dir is absolute or relative.
   if [[ "${nvidia_manifest_url}" == file://* ]]; then
@@ -5637,6 +5895,7 @@ install_kube_prometheus() {
     chart_ref="${PROMETHEUS_CHART_PATH}"
     log "  Using local chart: ${chart_ref}"
   else
+    airgap_no_download "the kube-prometheus-stack chart" "PROMETHEUS_CHART_PATH=${PROMETHEUS_CHART_PATH:-<unset>}"
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
     helm repo update prometheus-community
     chart_ref="prometheus-community/kube-prometheus-stack"
@@ -5663,6 +5922,7 @@ install_otel_operator_and_contrib_collector() {
     chart_ref="${OTEL_CHART_PATH}"
     log "  Using local chart: ${chart_ref}"
   else
+    airgap_no_download "the opentelemetry-operator chart" "OTEL_CHART_PATH=${OTEL_CHART_PATH:-<unset>}"
     helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
     helm repo update open-telemetry
     chart_ref="open-telemetry/opentelemetry-operator"
@@ -5689,6 +5949,7 @@ install_ray_operator() {
     chart_ref="${KUBERAY_CHART_PATH}"
     log "  Using local chart: ${chart_ref}"
   else
+    airgap_no_download "the kuberay-operator chart" "KUBERAY_CHART_PATH=${KUBERAY_CHART_PATH:-<unset>}"
     helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
     helm repo update kuberay
     chart_ref="kuberay/kuberay-operator"
@@ -5729,6 +5990,7 @@ install_splunk_operator() {
   # Create image pull secrets in splunk-operator namespace BEFORE applying manifests
   log "Creating image pull secrets in ${splunk_operator_ns} namespace..."
   create_image_pull_secrets "${splunk_operator_ns}" >/dev/null 2>&1 || true
+  ensure_configured_pull_secrets "${splunk_operator_ns}"
 
   # Use server-side apply: idempotent, handles CRDs without annotation size
   # limits, and never deletes resources (unlike replace --force).
@@ -5739,7 +6001,7 @@ install_splunk_operator() {
   # Patch splunk-operator deployment with imagePullSecrets if any exist
   log "Checking for imagePullSecrets to add to Splunk Operator deployment..."
   local secrets_patch=""
-  for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
+  for secret_name in $(image_pull_secret_names "${splunk_operator_ns}"); do
     if kubectl get secret "${secret_name}" -n "${splunk_operator_ns}" &>/dev/null 2>&1; then
       secrets_patch+='{"name":"'"${secret_name}"'"},'
       log "  Found secret: ${secret_name}"
@@ -5858,6 +6120,7 @@ install_splunk_ai_operator() {
   # Create image pull secrets in operator namespace BEFORE applying manifests
   log "Creating image pull secrets in ${ai_operator_ns} namespace..."
   create_image_pull_secrets "${ai_operator_ns}" >/dev/null 2>&1 || true
+  ensure_configured_pull_secrets "${ai_operator_ns}"
 
   # Ensure cert-manager webhook is ready before applying (artifacts.yaml contains
   # Certificate and Issuer resources that require the webhook to be responsive)
@@ -5938,7 +6201,7 @@ install_splunk_ai_operator() {
     # Patch deployment with imagePullSecrets if any exist
     log "Checking for imagePullSecrets to add to operator deployment..."
     local secrets_patch=""
-    for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
+    for secret_name in $(image_pull_secret_names "${ai_operator_ns}"); do
       if kubectl get secret "${secret_name}" -n "${ai_operator_ns}" &>/dev/null 2>&1; then
         secrets_patch+='{"name":"'"${secret_name}"'"},'
         log "  Found secret: ${secret_name}"
@@ -6075,6 +6338,88 @@ EOF
 }
 
 # ====== CREATE IMAGE PULL SECRETS FROM CONFIG ======
+# ====== REGISTRY PULL SECRETS BY REFERENCE (MPR-193) ======
+# images.imagePullSecrets: [{name, dockerConfigFile?}] names Kubernetes Secrets the
+# install pulls with (ERD FR-14, §14.4.2: Secret references, a missing or malformed Secret
+# fails closed). A Secret that does not exist is created from dockerConfigFile, a Docker
+# configuration file on the installer host; its contents are never logged. Every named
+# Secret is listed on the AIPlatform CR (the operator passes it to every pod, the schema
+# Job included) and on the operator and Splunk Operator Deployments.
+
+configured_pull_secret_names() {
+  yq eval '.images.imagePullSecrets[]?.name // ""' "${CONFIG_FILE}" 2>/dev/null | awk 'NF && $0 != "null"'
+}
+
+# _pull_secret_file <index>: the entry's dockerConfigFile, absolute, or "".
+_pull_secret_file() {
+  local f
+  f="$(yq eval ".images.imagePullSecrets[$1].dockerConfigFile // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  [[ -z "${f}" || "${f}" == "null" ]] && return 0
+  [[ "${f}" == /* ]] || f="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)/${f}"
+  printf '%s\n' "${f}"
+}
+
+# validate_pull_secret_config: print one line per problem in images.imagePullSecrets,
+# without reading any cluster. Nothing is printed for a valid (or absent) setting.
+validate_pull_secret_config() {
+  local count i name file seen=" "
+  count="$(yq eval '(.images.imagePullSecrets // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+  [[ "${count}" =~ ^[0-9]+$ ]] || count=0
+  for ((i=0; i<count; i++)); do
+    name="$(yq eval ".images.imagePullSecrets[$i].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    if [[ ! "${name}" =~ ^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$ ]]; then
+      echo "images.imagePullSecrets[$i].name must be a Kubernetes Secret name (lower-case letters, digits, '-' and '.')"
+      continue
+    fi
+    [[ "${seen}" == *" ${name} "* ]] && echo "images.imagePullSecrets[$i]: ${name} is listed twice"
+    seen+="${name} "
+    file="$(_pull_secret_file "$i")"
+    [[ -z "${file}" ]] && continue
+    if [[ ! -r "${file}" ]]; then
+      echo "images.imagePullSecrets[$i].dockerConfigFile is not a readable file"
+    elif ! jq -e '.auths | type == "object"' "${file}" >/dev/null 2>&1; then
+      echo "images.imagePullSecrets[$i].dockerConfigFile is not a Docker configuration (a JSON object with \"auths\")"
+    fi
+  done
+}
+
+# ensure_configured_pull_secrets <namespace>: make every images.imagePullSecrets Secret
+# exist in the namespace as a kubernetes.io/dockerconfigjson Secret. Fails closed.
+ensure_configured_pull_secrets() {
+  local ns="$1" count i name file type
+  count="$(yq eval '(.images.imagePullSecrets // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+  [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]] || return 0
+  ensure_namespace "${ns}"
+  for ((i=0; i<count; i++)); do
+    name="$(yq eval ".images.imagePullSecrets[$i].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    if kubectl get secret "${name}" -n "${ns}" >/dev/null 2>&1; then
+      type="$(kubectl get secret "${name}" -n "${ns}" -o jsonpath='{.type}' 2>/dev/null || echo "")"
+      [[ "${type}" == "kubernetes.io/dockerconfigjson" ]] \
+        || err "Pull Secret ${ns}/${name} is of type '${type:-unknown}', not kubernetes.io/dockerconfigjson: it cannot authenticate image pulls."
+      log "  ✓ pull Secret ${ns}/${name} present"
+      continue
+    fi
+    file="$(_pull_secret_file "$i")"
+    [[ -n "${file}" ]] || err "Pull Secret ${ns}/${name} does not exist and images.imagePullSecrets[$i].dockerConfigFile is not set; create the Secret or name the Docker configuration to create it from."
+    kubectl create secret generic "${name}" --type=kubernetes.io/dockerconfigjson \
+      --from-file=.dockerconfigjson="${file}" -n "${ns}" --dry-run=client -o yaml 2>/dev/null \
+      | kubectl apply -f - >/dev/null 2>&1 \
+      || err "Creating pull Secret ${ns}/${name} from images.imagePullSecrets[$i].dockerConfigFile failed."
+    log "  ✓ pull Secret ${ns}/${name} created from its dockerConfigFile (contents not logged)"
+  done
+}
+
+# image_pull_secret_names <namespace>: the pull Secrets present in the namespace, the
+# installer-created ones and every images.imagePullSecrets name, without duplicates.
+image_pull_secret_names() {
+  local ns="$1" name
+  { printf '%s\n' ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; configured_pull_secret_names; } \
+    | awk 'NF && !seen[$0]++' | while IFS= read -r name; do
+      kubectl get secret "${name}" -n "${ns}" >/dev/null 2>&1 && printf '%s\n' "${name}"
+    done
+  return 0
+}
+
 create_image_pull_secrets() {
   local ns="$1"
   ensure_namespace "${ns}"
@@ -7060,7 +7405,7 @@ EOF
   local secrets_yaml=""
 
   # Check for all possible secrets and add to YAML if they exist
-  for secret_name in ecr-registry-secret docker-hub-secret gcr-secret acr-secret custom-registry-secret; do
+  for secret_name in $(image_pull_secret_names "${AI_NS}"); do
     if kubectl get secret "${secret_name}" -n "${AI_NS}" &>/dev/null 2>&1; then
       secrets_yaml+="      - name: ${secret_name}"$'\n'
     fi
@@ -7350,6 +7695,7 @@ install_metallb() {
     metallb_chart_ref="${METALLB_CHART_PATH}"
     log "  Using local chart: ${metallb_chart_ref}"
   else
+    airgap_no_download "the metallb chart" "METALLB_CHART_PATH=${METALLB_CHART_PATH:-<unset>}"
     helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1 || true
     helm repo update >/dev/null 2>&1 || true
     metallb_chart_ref="metallb/metallb"
@@ -7741,6 +8087,7 @@ install_ai_platform_stack() {
 
   # Create image pull secrets before Splunk Standalone (it uses the default SA which needs ECR creds)
   create_image_pull_secrets "${AI_NS}"
+  ensure_configured_pull_secrets "${AI_NS}"
 
   # Install Splunk before AIPlatform when the selected profile includes it.
   if component_enabled splunk-standalone; then
@@ -8987,6 +9334,7 @@ main_install() {
   preflight_checks
   step_ok
   phase_end "Preflight"
+  write_airgap_install_record "started"
 
   phase_start "Model Staging"
   if [[ "${MODEL_STAGING_ENABLED}" == "true" ]]; then
@@ -9229,6 +9577,11 @@ main_install() {
   # banner should NOT cause callers chaining via `&&` to silently abort.
   # The banner already tells the operator what's wrong; failing the exit
   # code on top of that just breaks automation.
+  if [[ "${VERIFY_RC:-0}" -eq 0 ]]; then
+    write_airgap_install_record "completed"
+  else
+    write_airgap_install_record "completed-not-ready"
+  fi
   show_platform_access_info || true
 }
 
