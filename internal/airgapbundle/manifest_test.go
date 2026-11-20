@@ -53,7 +53,7 @@ func TestBuild_RecordsEveryFileWithItsRoleSizeAndChecksum(t *testing.T) {
 
 	assert.Len(t, m.Spec.ArchiveImages, len(k0sImages)+len(addonImages))
 	for _, im := range m.Spec.ArchiveImages {
-		assert.Equal(t, digestOf("archive:"+im.Ref), im.Digest, im.Ref)
+		assert.Equal(t, digestOf(im.Ref), im.Digest, im.Ref)
 	}
 	assert.Equal(t, "v1.36.1+k0s.0", m.Spec.Versions["k0s_version"])
 	assert.Equal(t, []string{"all-minilm-l6-v2", "cross-encoder"}, []string{m.Spec.Models[0].ID, m.Spec.Models[1].ID})

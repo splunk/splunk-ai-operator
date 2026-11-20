@@ -15,25 +15,27 @@ import (
 
 // Finding codes. Each finding names the offending artifact, node or model.
 const (
-	FindingManifestInvalid    = "BUNDLE_MANIFEST_INVALID"   // no readable, checksummed, valid bundle manifest
-	FindingFileMissing        = "BUNDLE_FILE_MISSING"       // a listed file is absent
-	FindingFileChanged        = "BUNDLE_FILE_CHANGED"       // a listed file has another size or checksum
-	FindingFileUnlisted       = "BUNDLE_FILE_UNLISTED"      // the bundle holds a file its manifest does not list
-	FindingArtifactMissing    = "REQUIRED_ARTIFACT_MISSING" // the profile needs a binary, chart, manifest, package or archive the bundle lacks
-	FindingArchiveImage       = "ARCHIVE_IMAGE_MISSING"     // an image list names an image its archive does not hold
-	FindingArchiveUnpinned    = "ARCHIVE_IMAGE_UNPINNED"    // an archive image has no manifest digest
-	FindingSnapshotMismatch   = "SNAPSHOT_MISMATCH"         // the snapshot is not the one the bundle was made for
-	FindingFactsMissing       = "HOST_FACTS_MISSING"        // the install preflight was given no host facts
-	FindingArch               = "NODE_PLATFORM_MISMATCH"    // a node is not linux/amd64, or did not report its platform
-	FindingGPUNodeMissing     = "GPU_NODE_MISSING"          // fullfeature, and no GPU node was reported
-	FindingGPUDriver          = "GPU_DRIVER_MISSING"        // a GPU node has no NVIDIA driver loaded
-	FindingGPURuntime         = "GPU_RUNTIME_MISSING"       // a GPU node has no NVIDIA container runtime
-	FindingGPUCapacity        = "GPU_CAPACITY_INSUFFICIENT" // fewer schedulable GPUs than the profile needs
-	FindingModelInventory     = "MODEL_INVENTORY_MISSING"   // fullfeature, and the bundle records no model artifacts
-	FindingModelMissing       = "MODEL_ARTIFACT_MISSING"    // a required model artifact is not staged
-	FindingModelMismatch      = "MODEL_ARTIFACT_MISMATCH"   // a staged model artifact has another source or checksum
-	ScopeBundle               = "bundle"                    // verify the bundle alone, as on the staging host
-	ScopeInstall              = "install"                   // verify everything an install needs
+	FindingManifestInvalid    = "BUNDLE_MANIFEST_INVALID"       // no readable, checksummed, valid bundle manifest
+	FindingFileMissing        = "BUNDLE_FILE_MISSING"           // a listed file is absent
+	FindingFileChanged        = "BUNDLE_FILE_CHANGED"           // a listed file has another size or checksum
+	FindingFileUnlisted       = "BUNDLE_FILE_UNLISTED"          // the bundle holds a file its manifest does not list
+	FindingArtifactMissing    = "REQUIRED_ARTIFACT_MISSING"     // the profile needs a binary, chart, manifest, package or archive the bundle lacks
+	FindingArchiveImage       = "ARCHIVE_IMAGE_MISSING"         // an image list names an image its archive does not hold
+	FindingArchiveUnpinned    = "ARCHIVE_IMAGE_UNPINNED"        // an archive image has no manifest digest
+	FindingArchiveDigest      = "ARCHIVE_IMAGE_DIGEST_MISMATCH" // an archive image is not the snapshot's image (another digest or architecture)
+	FindingArchiveUnmapped    = "ARCHIVE_IMAGE_UNMAPPED"        // an archive image the snapshot has no entry for
+	FindingSnapshotMismatch   = "SNAPSHOT_MISMATCH"             // the snapshot is not the one the bundle was made for
+	FindingFactsMissing       = "HOST_FACTS_MISSING"            // the install preflight was given no host facts
+	FindingArch               = "NODE_PLATFORM_MISMATCH"        // a node is not linux/amd64, or did not report its platform
+	FindingGPUNodeMissing     = "GPU_NODE_MISSING"              // fullfeature, and no GPU node was reported
+	FindingGPUDriver          = "GPU_DRIVER_MISSING"            // a GPU node has no NVIDIA driver loaded
+	FindingGPURuntime         = "GPU_RUNTIME_MISSING"           // a GPU node has no NVIDIA container runtime
+	FindingGPUCapacity        = "GPU_CAPACITY_INSUFFICIENT"     // fewer schedulable GPUs than the profile needs
+	FindingModelInventory     = "MODEL_INVENTORY_MISSING"       // fullfeature, and the bundle records no model artifacts
+	FindingModelMissing       = "MODEL_ARTIFACT_MISSING"        // a required model artifact is not staged
+	FindingModelMismatch      = "MODEL_ARTIFACT_MISMATCH"       // a staged model artifact has another source or checksum
+	ScopeBundle               = "bundle"                        // verify the bundle alone, as on the staging host
+	ScopeInstall              = "install"                       // verify everything an install needs
 	defaultGPUsForFullfeature = 1
 )
 
@@ -260,8 +262,9 @@ func checkSnapshot(ctx context.Context, m *Manifest, opts VerifyOptions) []Findi
 	if err != nil {
 		return []Finding{{Component: "snapshot", Code: FindingSnapshotMismatch, Message: imagesnapshot.Sanitize(err.Error())}}
 	}
+	out := checkArchivesAgainstSnapshot(m, snap)
 	if opts.Input.Candidate == nil {
-		return []Finding{{Component: "snapshot", Code: FindingSnapshotMismatch, Message: "no candidate manifest was given to derive the image inventory from"}}
+		return append(out, Finding{Component: "snapshot", Code: FindingSnapshotMismatch, Message: "no candidate manifest was given to derive the image inventory from"})
 	}
 	inv, err := imagesnapshot.BuildInventory(opts.Input)
 	if err != nil {
@@ -271,7 +274,36 @@ func checkSnapshot(ctx context.Context, m *Manifest, opts VerifyOptions) []Findi
 	if reg == nil {
 		reg = &imagesnapshot.Remote{}
 	}
-	return imagesnapshot.Preflight(ctx, reg, snap, inv, opts.Profile)
+	return append(out, imagesnapshot.Preflight(ctx, reg, snap, inv, opts.Profile)...)
+}
+
+// checkArchivesAgainstSnapshot checks that every image in the bundle's archives is the
+// image the snapshot resolved for that reference: its linux/amd64 manifest, or the index
+// that holds it. The snapshot proved that digest is linux/amd64, so a match settles both
+// the digest and the architecture (ERD §14.4.4). An image without a digest is reported
+// by checkArchives.
+func checkArchivesAgainstSnapshot(m *Manifest, snap *imagesnapshot.Snapshot) []Finding {
+	bySource := map[string]imagesnapshot.Entry{}
+	for _, e := range snap.Spec.Entries {
+		bySource[canonical(e.Source)] = e
+	}
+	var out []Finding
+	for _, im := range m.Spec.ArchiveImages {
+		if im.Digest == "" {
+			continue
+		}
+		e, ok := bySource[canonical(im.Ref)]
+		switch {
+		case !ok:
+			out = append(out, Finding{Component: im.Ref, Code: FindingArchiveUnmapped,
+				Message: fmt.Sprintf("%s holds it, but snapshot %s has no entry for it, so its digest and architecture are unverified", im.Archive, snap.Metadata.ID)})
+		case im.Digest != e.Digest && im.Digest != e.SourceDigest:
+			out = append(out, Finding{Component: im.Ref, Code: FindingArchiveDigest,
+				Message: fmt.Sprintf("%s holds %s; snapshot %s resolved it to %s (linux/amd64)", im.Archive, short(im.Digest), snap.Metadata.ID, short(e.Digest)) +
+					" — a different build or platform than the one mirrored and verified"})
+		}
+	}
+	return out
 }
 
 // checkHost checks the target's nodes, GPU capacity and staged model artifacts.

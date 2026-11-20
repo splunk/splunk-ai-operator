@@ -81,6 +81,13 @@ func write(t *testing.T, p, body string) {
 // `k0s airgap bundle-artifacts` does.
 func ociArchive(t *testing.T, p string, refs []string) {
 	t.Helper()
+	ociArchiveWithDigests(t, p, refs, nil)
+}
+
+// ociArchiveWithDigests is ociArchive with chosen digests for some images; the others
+// hold the image the registry resolves the reference to.
+func ociArchiveWithDigests(t *testing.T, p string, refs []string, digests map[string]string) {
+	t.Helper()
 	type desc struct {
 		MediaType   string            `json:"mediaType"`
 		Digest      string            `json:"digest"`
@@ -93,7 +100,7 @@ func ociArchive(t *testing.T, p string, refs []string) {
 	}
 	idx.SchemaVersion = 2
 	for _, r := range refs {
-		idx.Manifests = append(idx.Manifests, desc{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: digestOf("archive:" + r), Size: 100,
+		idx.Manifests = append(idx.Manifests, desc{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: pick(digests, r), Size: 100,
 			Annotations: map[string]string{"io.containerd.image.name": r, "org.opencontainers.image.ref.name": r[strings.LastIndex(r, ":")+1:]}})
 	}
 	b, err := json.Marshal(idx)
@@ -225,4 +232,11 @@ func hasCode(findings []Finding, code string) bool {
 		}
 	}
 	return false
+}
+
+func pick(digests map[string]string, ref string) string {
+	if d, ok := digests[ref]; ok {
+		return d
+	}
+	return digestOf(ref)
 }

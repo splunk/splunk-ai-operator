@@ -74,7 +74,7 @@ func (e *env) archive(rel string, refs []string) {
 	idx.SchemaVersion = 2
 	for _, r := range refs {
 		idx.Manifests = append(idx.Manifests, map[string]any{"mediaType": "application/vnd.oci.image.manifest.v1+json",
-			"digest": digestOf("archive:" + r), "size": 1, "annotations": map[string]string{"io.containerd.image.name": r}})
+			"digest": digestOf(r), "size": 1, "annotations": map[string]string{"io.containerd.image.name": r}})
 	}
 	b, _ := json.Marshal(idx)
 	var buf bytes.Buffer

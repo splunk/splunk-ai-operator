@@ -292,3 +292,79 @@ func TestValidate_NamesEveryInconsistency(t *testing.T) {
 	blocked := &BlockedError{[]Finding{{Component: "a", Code: "C", Message: "m"}}}
 	assert.Equal(t, "import refused: [C] a: m", blocked.Error())
 }
+
+// ERD §14.4.4: wrong-digest and wrong-architecture artifacts fail preflight, archives
+// included. An archive image must be the snapshot's image: its linux/amd64 manifest or
+// the index that holds it.
+func TestVerify_ArchiveImagesMustBeTheSnapshotsImages(t *testing.T) {
+	entryFor := func(f *fixture, ref string) imagesnapshot.Entry {
+		for _, e := range f.snap.Spec.Entries {
+			if e.Source == ref {
+				return e
+			}
+		}
+		t.Fatalf("no snapshot entry for %s", ref)
+		return imagesnapshot.Entry{}
+	}
+	t.Run("the same image passes", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		assert.Empty(t, Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileCPUOnly)))
+	})
+	t.Run("another build under the same tag is a digest mismatch", func(t *testing.T) {
+		f := newFixture(t)
+		rebuildArchive(t, f, "images/k0s-images.tar", map[string]string{k0sImages[1]: digestOf("rebuilt pause")})
+		f.build()
+		got := Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileCPUOnly))
+		require.Equal(t, map[string]string{k0sImages[1]: FindingArchiveDigest}, codes(got))
+		assert.Contains(t, got[0].Message, "resolved it to "+short(entryFor(f, k0sImages[1]).Digest)+" (linux/amd64)")
+	})
+	t.Run("the index of a multi-platform image is accepted", func(t *testing.T) {
+		f := newFixture(t)
+		// The snapshot recorded an index digest that differs from the amd64 manifest;
+		// an archive exported by index is the same image.
+		for i := range f.snap.Spec.Entries {
+			if f.snap.Spec.Entries[i].Source == k0sImages[0] {
+				f.snap.Spec.Entries[i].SourceDigest = digestOf("coredns index")
+			}
+		}
+		resave(t, f)
+		rebuildArchive(t, f, "images/k0s-images.tar", map[string]string{k0sImages[0]: digestOf("coredns index")})
+		f.build()
+		assert.Empty(t, Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileCPUOnly)))
+	})
+	t.Run("an archive image the snapshot does not know is unmapped", func(t *testing.T) {
+		f := newFixture(t)
+		extra := "docker.io/library/busybox:1.36"
+		ociArchive(t, filepath.Join(f.dir, "images/addon-images.tar"), append(append([]string(nil), addonImages...), extra))
+		f.build()
+		got := Verify(ctx, f.dir, f.opts(imagesnapshot.ProfileFullFeature))
+		assert.Equal(t, map[string]string{extra: FindingArchiveUnmapped}, codes(got))
+	})
+	t.Run("the bundle scope has no snapshot to compare with and does not claim it", func(t *testing.T) {
+		f := newFixture(t)
+		rebuildArchive(t, f, "images/k0s-images.tar", map[string]string{k0sImages[1]: digestOf("rebuilt pause")})
+		f.build()
+		o := VerifyOptions{Scope: ScopeBundle, Profile: imagesnapshot.ProfileCPUOnly, Input: f.input}
+		assert.Empty(t, Verify(ctx, f.dir, o))
+	})
+}
+
+// rebuildArchive rewrites an archive, overriding the digest of the named images.
+func rebuildArchive(t *testing.T, f *fixture, rel string, digests map[string]string) {
+	t.Helper()
+	refs := k0sImages
+	if strings.Contains(rel, "addon") {
+		refs = addonImages
+	}
+	ociArchiveWithDigests(t, filepath.Join(f.dir, rel), refs, digests)
+}
+
+// resave stores the fixture's (edited) snapshot under a new ID so the bundle is built for it.
+func resave(t *testing.T, f *fixture) {
+	t.Helper()
+	f.snap.Metadata.ID = "snap-edited"
+	p, _, err := (imagesnapshot.Store{Dir: t.TempDir()}).Put(f.snap)
+	require.NoError(t, err)
+	f.snapshot = p
+}
