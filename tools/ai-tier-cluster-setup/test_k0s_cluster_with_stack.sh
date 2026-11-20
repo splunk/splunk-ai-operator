@@ -1936,8 +1936,6 @@ assert_problem "non-string profile (number) is an invalid value" \
 
 # Missing required references, for both profiles.
 for _p in cpuonly fullfeature; do
-  assert_eq "${_p}: the AITK image is optional for now (MPR-188)" "" \
-    "$(_profile_problems "$(_profile_cfg "${_p}" "${_p}-aitk" 'del(.images.aitk)')")"
   assert_problem "${_p}: missing SLIM image" \
     "$(_profile_cfg "${_p}" "${_p}-slim" 'del(.images.slim)')" "[PROFILE_MISSING_REFERENCE] images.slim.apiImage"
   assert_problem "${_p}: missing runtime base image" \
@@ -1961,7 +1959,7 @@ for _p in cpuonly fullfeature; do
   assert_problem "${_p}: missing agentruntime feature" \
     "$(_profile_cfg "${_p}" "${_p}-noar" 'del(.aiPlatform.features[1])')" "the 'agentruntime' feature is required"
   assert_problem "${_p}: whitespace in an image reference" \
-    "$(_profile_cfg "${_p}" "${_p}-ws" '.images.aitk.image = "bad ref"')" "[PROFILE_INVALID_VALUE] images.aitk.image"
+    "$(_profile_cfg "${_p}" "${_p}-ws" '.images.slim.apiImage = "bad ref"')" "[PROFILE_INVALID_VALUE] images.slim.apiImage"
 done
 
 # Messages name fields and never echo credentials.
@@ -1970,7 +1968,7 @@ assert_eq "problem messages never echo credentials" "0" "$(printf '%s' "${_creds
 
 # Compatibility rule: an omitted profile keeps pre-profile behaviour; "full"
 # is the legacy spelling of fullfeature.
-_legacy="$(_profile_cfg fullfeature legacy 'del(.aiPlatform.profile) | del(.images.aitk) | del(.aiPlatform.features)')"
+_legacy="$(_profile_cfg fullfeature legacy 'del(.aiPlatform.profile) | del(.aiPlatform.features)')"
 assert_eq "omitted profile: no profile checks apply" "" "$(_profile_problems "${_legacy}")"
 assert_eq "omitted profile resolves to fullfeature" "fullfeature" "$(_profile_run "${_legacy}" ai_platform_profile_resolved)"
 assert_rc "omitted profile is not explicit" 1 _profile_run "${_legacy}" ai_platform_profile_explicit
@@ -1980,7 +1978,7 @@ assert_contains() { assert_eq "$1" "yes" "$([[ "$3" == *"$2"* ]] && echo yes || 
 # Legacy "full" is valid but keeps pre-profile behaviour: it does not opt in to
 # the Launchpad requirements, so an existing SAIA configuration that spells it
 # keeps working.
-_full_saia="$(_profile_cfg fullfeature full-saia '.aiPlatform.profile = "full" | del(.images.aitk) | del(.images.slim) | del(.images.agentRuntime) | .aiPlatform.features = [{"name": "saia", "version": "1.1.0"}]')"
+_full_saia="$(_profile_cfg fullfeature full-saia '.aiPlatform.profile = "full" | del(.images.slim) | del(.images.agentRuntime) | .aiPlatform.features = [{"name": "saia", "version": "1.1.0"}]')"
 assert_eq "legacy 'full' with an existing SAIA config has no problems" "" "$(_profile_problems "${_full_saia}")"
 assert_rc "legacy 'full' is set" 0 _profile_run "${_full_saia}" ai_platform_profile_set
 assert_rc "legacy 'full' is not an opt-in (not explicit)" 1 _profile_run "${_full_saia}" ai_platform_profile_explicit
@@ -2284,7 +2282,7 @@ for _p in cpuonly fullfeature; do
   assert_eq "golden ${_p} values: kuberay" "${_want_ray}" "$(command yq eval '.components.kuberay' "${_g}")"
   assert_eq "golden ${_p} values: nvidia follows GPU workers" "${_want_ray}" "$(command yq eval '.components.nvidia' "${_g}")"
   assert_eq "golden ${_p} values: no null or empty reference" "0" "$(grep -cE ': "(null)?"$' "${_g}" | tr -d ' ')" 
-  for _k in .images.agentRuntime.base .images.agentRuntime.schemaSetup .images.slim .images.aitk; do
+  for _k in .images.agentRuntime.base .images.agentRuntime.schemaSetup .images.slim; do
     assert_eq "golden ${_p} values: ${_k} is a registry reference" "yes" \
       "$([[ "$(command yq eval "${_k}" "${_g}")" == registry.example.internal/* ]] && echo yes || echo no)"
   done
@@ -2292,6 +2290,8 @@ for _p in cpuonly fullfeature; do
     "$([[ "$(command yq eval '.images.agentRuntime.providers.mltk' "${_g}")" == */ai-agent-runtime-provider-mltk:* ]] && echo yes || echo no)"
   assert_eq "golden ${_p} values: provider module present" "yes" \
     "$([[ "$(command yq eval '.images.agentRuntime.modules.mltk' "${_g}")" == *:* ]] && echo yes || echo no)"
+  # AITK is a Splunk app, not an image: nothing in cluster setup renders or depends on it.
+  assert_eq "golden ${_p} values: no AITK setting" "null" "$(command yq eval '.images.aitk' "${_g}")"
   assert_eq "golden ${_p} values: no credential-looking keys" "0" "$(grep -ciE 'password|token|secretkey|apikey' "${_g}" | tr -d ' ')"
   assert_eq "golden ${_p} CR: valid YAML" "0" "$(command yq eval '.' "${_gc}" >/dev/null 2>&1; echo $?)"
   assert_eq "golden ${_p} CR: spec.profile" "${_want_profile}" "$(command yq eval '.spec.profile' "${_gc}")"

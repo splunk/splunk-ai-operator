@@ -847,7 +847,6 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   SAIA_API_V2_IMAGE="$(yq eval '.images.saia.apiV2Image' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SAIA_DATALOADER_IMAGE="$(yq eval '.images.saia.dataLoaderImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
   SLIM_API_IMAGE="$(yq eval '.images.slim.apiImage' "$CONFIG_FILE" 2>/dev/null || echo "")"
-  AITK_IMAGE="$(yq eval '.images.aitk.image // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   # Per-run image snapshot manifest (output of the MPR-187 mirror step); optional.
   SNAPSHOT_MANIFEST="$(yq eval '.images.snapshotManifest // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
   AGENT_RUNTIME_BASE_IMAGE="$(yq eval '.images.agentRuntime.baseImage // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
@@ -1283,12 +1282,6 @@ ai_platform_profile_problems() {
   _profile_ref_check "images.agentRuntime.baseImage" "${AGENT_RUNTIME_BASE_IMAGE:-}"
   _profile_ref_check "images.agentRuntime.schemaSetupImage" "${AGENT_RUNTIME_SCHEMA_SETUP_IMAGE:-}"
   _profile_ref_check "images.slim.apiImage" "${SLIM_API_IMAGE:-}"
-  # images.aitk.image is optional for now: nothing in the operator or the
-  # air-gap bundle consumes it yet (to be decided with MPR-188). When given it
-  # must still be a safe scalar, because it is rendered into the values file.
-  if ! _profile_ref_missing "${AITK_IMAGE:-}" && _profile_value_unsafe "${AITK_IMAGE}"; then
-    echo "[PROFILE_INVALID_VALUE] images.aitk.image: must not contain whitespace, control characters, quotes or backslashes"
-  fi
   if [[ -n "${SNAPSHOT_MANIFEST:-}" && "${SNAPSHOT_MANIFEST}" != "null" ]] && _profile_value_unsafe "${SNAPSHOT_MANIFEST}"; then
     echo "[PROFILE_INVALID_VALUE] images.snapshotManifest: must not contain whitespace, control characters, quotes or backslashes"
   fi
@@ -1460,7 +1453,6 @@ render_ai_platform_profile_values() {
     echo "      \"$(_profile_q "${provider}")\": \"$(_profile_q "$(P="${provider}" yq eval '.images.agentRuntime.providerModules[strenv(P)] // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")")\""
   done
   echo "  slim: \"$(_profile_q "$(_profile_image_url "${SLIM_API_IMAGE:-}")")\""
-  echo "  aitk: \"$(_profile_q "$(_profile_image_url "${AITK_IMAGE:-}")")\""
   echo "features:"
   for ((i=0; i<count; i++)); do
     name=$(yq eval ".aiPlatform.features[${i}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")

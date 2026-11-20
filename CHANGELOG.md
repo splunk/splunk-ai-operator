@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README badges reorganized into logical categories
 - Modular GitHub Actions workflows using `workflow_call`
 
+### Removed
+- The installer setting `images.aitk.image`, an unused pass-through that implied AITK is a container image. AITK is the Splunk app `Splunk_ML_Toolkit`; nothing in cluster setup depends on it, and `render-profile` no longer renders an `aitk` key. A configuration that still sets it is unaffected: the key is ignored.
+
 ### Documentation
 - Added deployment guides for EKS and k0s clusters
 - Created comprehensive API documentation

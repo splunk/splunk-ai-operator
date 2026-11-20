@@ -67,12 +67,10 @@ from 1 to 100. Rejected values are not echoed in error messages: an unsupported 
 YAML integer of at least 1 (the same rule `install` enforces). Duplicate feature
 identities (`agentruntime` is keyed by provider) are rejected, as in the webhook.
 
-Optional: `images.aitk.image`. The MPR-188 contract settles this: AITK is the Splunk
-app `Splunk_ML_Toolkit` (label "AI Toolkit", version 6.2.0) installed on Splunk,
-not a container image, so the key is not required and nothing in the operator or
-the air-gap bundle consumes it. It is kept as an optional pass-through (validated
-as a safe scalar and rendered into the values file) so existing configurations
-keep working.
+AITK is the Splunk app `Splunk_ML_Toolkit` (label "AI Toolkit", version 6.2.0),
+installed on Splunk. It is not a container image, and nothing in cluster setup
+depends on it: the installer has no AITK setting, `render-profile` renders none,
+and neither the image snapshot nor the air-gap bundle includes it.
 
 Optional: `images.snapshotManifest`, the per-run image snapshot manifest
 (MPR-187 output). It is passed through to the rendered values unchanged. A
