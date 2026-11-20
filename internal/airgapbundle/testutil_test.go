@@ -14,11 +14,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 
 	"github.com/splunk/splunk-ai-operator/internal/imagesnapshot"
 )
 
 const (
+	gpuKernel     = "5.14.0-503.40.1.el9_5.x86_64"
 	candidatePath = "../../config/agent-runtime/candidate-manifest.yaml"
 	testMirror    = "mirror.airgap.local:5000/ai-tier"
 )
@@ -62,13 +64,14 @@ func (f *fakeRegistry) Copy(context.Context, string, string) error { return nil 
 // fixture is a complete staged bundle for both profiles, the snapshot made from the
 // same inventory, and the inputs that inventory is derived from.
 type fixture struct {
-	t        *testing.T
-	dir      string // the staged bundle
-	snapshot string // the snapshot's manifest.json
-	snap     *imagesnapshot.Snapshot
-	input    imagesnapshot.InventoryInput
-	models   []Model
-	reg      *fakeRegistry
+	t             *testing.T
+	dir           string // the staged bundle
+	snapshot      string // the snapshot's manifest.json
+	installConfig string // the generated installer configuration naming the mirror references
+	snap          *imagesnapshot.Snapshot
+	input         imagesnapshot.InventoryInput
+	models        []Model
+	reg           *fakeRegistry
 }
 
 func write(t *testing.T, p, body string) {
@@ -158,6 +161,9 @@ func stageBundle(t *testing.T, dir string) {
 	write(t, filepath.Join(dir, "charts/metallb-0.14.8.tgz"), "chart")
 	write(t, filepath.Join(dir, "packages/nvidia-closure/repodata/repomd.xml"), "<repomd/>")
 	write(t, filepath.Join(dir, "packages/nvidia-closure/nvidia-driver-550.rpm"), "rpm")
+	write(t, filepath.Join(dir, "packages/nvidia-closure/nvidia-container-toolkit-1.17.3-1.x86_64.rpm"), "rpm")
+	write(t, filepath.Join(dir, "packages/nvidia-closure/.target-kernels"), gpuKernel+"\n")
+	write(t, filepath.Join(dir, "packages/nvidia-closure/.pkg-format"), "rpm\n")
 	write(t, filepath.Join(dir, "packages/nvidia-closure.manifest"), "kernels=5.14\n")
 	write(t, filepath.Join(dir, "packages/pyyaml-6.0.2-cp311-manylinux_x86_64.whl"), "wheel")
 	write(t, filepath.Join(dir, "packages/pyyaml.filename"), "pyyaml-6.0.2-cp311-manylinux_x86_64.whl\n")
@@ -171,15 +177,30 @@ func newFixture(t *testing.T) *fixture {
 	root := t.TempDir()
 	f := &fixture{t: t, dir: filepath.Join(root, "airgap-bundle-20261120-101500"), reg: &fakeRegistry{missing: map[string]bool{}}}
 	stageBundle(t, f.dir)
-	var err error
-	f.input, err = imagesnapshot.LoadInput(imagesnapshot.InputFiles{Candidate: candidatePath,
-		AddonList: filepath.Join(f.dir, "images/addon-images.list"), K0sList: filepath.Join(f.dir, "images/k0s-images.list")})
+	lists := imagesnapshot.InputFiles{Candidate: candidatePath,
+		AddonList: filepath.Join(f.dir, "images/addon-images.list"), K0sList: filepath.Join(f.dir, "images/k0s-images.list")}
+	// The snapshot is made from the source configuration: where the images come from.
+	src := lists
+	src.Config = filepath.Join(root, "source-config.yaml")
+	write(t, src.Config, "images:\n  operator: {image: docker.io/splunk/splunk-ai-operator:candidate-1}\n  ray: {headImage: docker.io/rayproject/ray:2.44.0, workerImage: docker.io/rayproject/ray:2.44.0}\n  weaviate: {image: docker.io/semitechnologies/weaviate:stable}\n")
+	srcInput, err := imagesnapshot.LoadInput(src)
 	require.NoError(t, err)
-	inv, err := imagesnapshot.BuildInventory(f.input)
+	inv, err := imagesnapshot.BuildInventory(srcInput)
 	require.NoError(t, err)
 	f.snap, err = imagesnapshot.Create(context.Background(), f.reg, inv, imagesnapshot.Options{Mirror: testMirror, ID: "snap-1"})
 	require.NoError(t, err)
 	f.snapshot, _, err = (imagesnapshot.Store{Dir: filepath.Join(root, "snapshots")}).Put(f.snap)
+	require.NoError(t, err)
+	// The install uses the generated configuration: every image from the mirror, by digest.
+	f.installConfig = filepath.Join(root, "install-config.yaml")
+	cfg, err := imagesnapshot.InstallConfig(f.snap, srcInput.Candidate.Spec.RuntimeVersion)
+	require.NoError(t, err)
+	b, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	write(t, f.installConfig, string(b))
+	installFiles := lists
+	installFiles.Config = f.installConfig
+	f.input, err = imagesnapshot.LoadInput(installFiles)
 	require.NoError(t, err)
 	f.models = []Model{
 		{ID: "all-minilm-l6-v2", Source: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"},
@@ -205,7 +226,7 @@ func (f *fixture) facts() *HostFacts {
 	h := &HostFacts{Nodes: []Node{
 		{Name: "controller", Platform: "linux/amd64"},
 		{Name: "cpu-1", Platform: "linux/amd64"},
-		{Name: "gpu-1", Platform: "linux/amd64", GPU: &GPU{Driver: "550.54.15", Runtime: true, Allocatable: 2}},
+		{Name: "gpu-1", Platform: "linux/amd64", OS: "rhel", Kernel: gpuKernel, GPU: &GPU{Devices: 2, Driver: "550.54.15", Runtime: true}},
 	}}
 	for _, m := range f.models {
 		h.StagedModels = append(h.StagedModels, StagedModel{ID: m.ID, Source: m.Source, SHA256: m.SHA256})

@@ -584,3 +584,28 @@ func TestCreate_MirrorsVersionedBasePinsAndExtraProviders(t *testing.T) {
 	assert.Contains(t, errs, "agent-runtime-base: ")
 	assert.Contains(t, errs, "is the image of component agent-runtime-base-v1-9-0, not of agent-runtime-base")
 }
+
+// install-config produces the settings that make compare pass: generate, then enforce.
+func TestInstallConfig_GeneratesSettingsThatCompareAccepts(t *testing.T) {
+	e := newEnv(t)
+	code, _, errs := e.run(append([]string{"create", "--mirror", e.dst.Host, "--store", e.store, "--id", "run-1"}, e.inputs()...)...)
+	require.Equal(t, 0, code, errs)
+
+	code, out, errs := e.run("install-config", "--store", e.store, "--id", "run-1", "--candidate", e.candidate)
+	require.Equal(t, 0, code, errs)
+	assert.Contains(t, out, "# Installer image settings for snapshot run-1")
+	assert.Contains(t, out, "baseImages:", "the candidate's runtimeVersion pin is set")
+	assert.NotContains(t, out, "registry:", "images.registry is left unset")
+	generated := e.write("generated.yaml", out+"splunk: {enabled: true}\n")
+	for _, profile := range []string{"cpuOnly", "fullfeature"} {
+		code, stdout, errs := e.run("compare", "--store", e.store, "--id", "run-1", "--profile", profile, "--candidate", e.candidate, "--config", generated)
+		assert.Equal(t, 0, code, "%s: %s", profile, errs)
+		assert.Contains(t, stdout, "OK:")
+	}
+
+	// The candidate must be the one the snapshot was made from.
+	other := e.write("other-candidate.yaml", string(mustRead(t, e.candidate))+"# edited after the snapshot\n")
+	code, _, errs = e.run("install-config", "--store", e.store, "--id", "run-1", "--candidate", other)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, errs, "is not the candidate record snapshot run-1 was made from")
+}

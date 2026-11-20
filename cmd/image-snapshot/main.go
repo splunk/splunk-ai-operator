@@ -6,6 +6,7 @@
 //	image-snapshot verify    --store DIR --id ID --profile cpuOnly|fullfeature ...
 //	image-snapshot compare   --store DIR --id ID --profile ... ...
 //	image-snapshot refresh   --store DIR --previous ID --id ID ...
+//	image-snapshot install-config --store DIR --id ID [--candidate FILE]
 //
 // It reads registry credentials only from the local Docker configuration, never
 // writes one, and exits 0 when everything is in order, 1 when a snapshot is blocked
@@ -20,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sigs.k8s.io/yaml"
 	"strings"
 
 	"github.com/splunk/splunk-ai-operator/internal/imagesnapshot"
@@ -43,6 +45,8 @@ commands:
   verify      preflight: check the mirror against a stored snapshot for one profile
   compare     check the images an install will use against a stored snapshot
   refresh     derive a new snapshot from a stored one, redoing only what changed
+  install-config  print the installer images: settings that use the snapshot's
+              digest-pinned mirror references
 
 Run "image-snapshot <command> -h" for the flags of a command.`
 
@@ -64,6 +68,8 @@ func run(args []string, stdout, stderr io.Writer, newRegistry registryFactory) i
 		err = cmdCompare(args[1:], stdout, stderr)
 	case "refresh":
 		err = cmdRefresh(ctx, args[1:], stdout, stderr, newRegistry)
+	case "install-config":
+		err = cmdInstallConfig(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, usage)
 		return 0
@@ -447,4 +453,45 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// cmdInstallConfig prints the installer images: settings that make an install pull every
+// configured image from the snapshot's mirror, by digest. The air-gap preflight compares
+// the configuration an install uses with the snapshot, so a setting left pointing at a
+// source registry fails there; this command produces settings that pass.
+func cmdInstallConfig(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("install-config", flag.ContinueOnError)
+	var sf snapshotFlags
+	sf.register(fs, "id")
+	candidate := fs.String("candidate", defaultCandidate, "agent-runtime candidate manifest (its runtimeVersion selects the versioned base pin)")
+	if err := parse(fs, args, stderr); err != nil {
+		return err
+	}
+	snap, err := sf.read()
+	if err != nil {
+		return err
+	}
+	runtimeVersion := ""
+	if *candidate != "" {
+		in, err := imagesnapshot.LoadInput(imagesnapshot.InputFiles{Candidate: *candidate})
+		if err != nil {
+			return err
+		}
+		if in.CandidateChecksum != snap.Spec.Candidate.Checksum {
+			return fmt.Errorf("%s is not the candidate record snapshot %s was made from", *candidate, snap.Metadata.ID)
+		}
+		runtimeVersion = in.Candidate.Spec.RuntimeVersion
+	}
+	cfg, err := imagesnapshot.InstallConfig(snap, runtimeVersion)
+	if err != nil {
+		return err
+	}
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "# Installer image settings for snapshot %s (mirror %s). Merge into the installer\n", snap.Metadata.ID, snap.Spec.Mirror)
+	fmt.Fprintf(stdout, "# configuration and leave images.registry unset: every reference is complete and digest-pinned.\n")
+	_, err = stdout.Write(b)
+	return err
 }

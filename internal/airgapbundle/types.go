@@ -118,18 +118,26 @@ type Node struct {
 	Name string `json:"name"`
 	// Platform is os/architecture as the node reports it, for example linux/amd64.
 	Platform string `json:"platform"`
+	// OS is the ID from the node's /etc/os-release (rhel, rocky, ubuntu, ...).
+	OS string `json:"os,omitempty"`
+	// Kernel is the node's running kernel (uname -r).
+	Kernel string `json:"kernel,omitempty"`
 	// GPU is set for a node that is meant to run GPU workloads.
 	GPU *GPU `json:"gpu,omitempty"`
 }
 
-// GPU is what a GPU node offers.
+// GPU is what a GPU node offers, observed read-only before an install changes anything.
 type GPU struct {
-	// Driver is the NVIDIA driver version, empty when no driver is loaded.
+	// Devices is the number of NVIDIA GPUs the host has (from lspci, or nvidia-smi -L
+	// when a driver is loaded).
+	Devices int `json:"devices"`
+	// Driver is the loaded NVIDIA driver version, empty when none is loaded.
 	Driver string `json:"driver"`
-	// Runtime reports whether the NVIDIA container runtime is configured.
+	// Runtime reports whether the NVIDIA container toolkit is installed.
 	Runtime bool `json:"runtime"`
-	// Allocatable is the node's schedulable nvidia.com/gpu count.
-	Allocatable int `json:"allocatable"`
+	// Allocatable is the node's schedulable nvidia.com/gpu count. It is known only when
+	// the node is already part of a cluster (an install with cluster.useExisting).
+	Allocatable *int `json:"allocatable,omitempty"`
 }
 
 // StagedModel is a model artifact the object store holds, with its staging marker.

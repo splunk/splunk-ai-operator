@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,8 +26,10 @@ const (
 	FindingArchiveDigest      = "ARCHIVE_IMAGE_DIGEST_MISMATCH" // an archive image is not the snapshot's image (another digest or architecture)
 	FindingArchiveUnmapped    = "ARCHIVE_IMAGE_UNMAPPED"        // an archive image the snapshot has no entry for
 	FindingSnapshotMismatch   = "SNAPSHOT_MISMATCH"             // the snapshot is not the one the bundle was made for
+	FindingInstallConfig      = "INSTALL_CONFIG_MISSING"        // the install preflight has no install references to compare with the snapshot
 	FindingFactsMissing       = "HOST_FACTS_MISSING"            // the install preflight was given no host facts
 	FindingArch               = "NODE_PLATFORM_MISMATCH"        // a node is not linux/amd64, or did not report its platform
+	FindingGPUDevices         = "GPU_DEVICES_MISSING"           // a GPU node reports no NVIDIA GPU
 	FindingGPUNodeMissing     = "GPU_NODE_MISSING"              // fullfeature, and no GPU node was reported
 	FindingGPUDriver          = "GPU_DRIVER_MISSING"            // a GPU node has no NVIDIA driver loaded
 	FindingGPURuntime         = "GPU_RUNTIME_MISSING"           // a GPU node has no NVIDIA container runtime
@@ -111,7 +114,7 @@ func Verify(ctx context.Context, dir string, opts VerifyOptions) []Finding {
 	}
 	if opts.Scope == ScopeInstall {
 		out = append(out, checkSnapshot(ctx, m, opts)...)
-		out = append(out, checkHost(m, opts)...)
+		out = append(out, checkHost(dir, m, opts)...)
 	}
 	sortFindings(out)
 	return out
@@ -263,18 +266,47 @@ func checkSnapshot(ctx context.Context, m *Manifest, opts VerifyOptions) []Findi
 		return []Finding{{Component: "snapshot", Code: FindingSnapshotMismatch, Message: imagesnapshot.Sanitize(err.Error())}}
 	}
 	out := checkArchivesAgainstSnapshot(m, snap)
-	if opts.Input.Candidate == nil {
-		return append(out, Finding{Component: "snapshot", Code: FindingSnapshotMismatch, Message: "no candidate manifest was given to derive the image inventory from"})
+	// The candidate record at install time must be the one the snapshot was made from.
+	if opts.Input.Candidate != nil && opts.Input.CandidateChecksum != snap.Spec.Candidate.Checksum {
+		out = append(out, Finding{Component: "candidate-manifest", Code: imagesnapshot.FindingCandidate,
+			Message: fmt.Sprintf("the candidate manifest is not the record snapshot %s was made from (revision %d)", snap.Metadata.ID, snap.Spec.Candidate.Revision)})
 	}
-	inv, err := imagesnapshot.BuildInventory(opts.Input)
-	if err != nil {
-		return []Finding{{Component: "inventory", Code: FindingSnapshotMismatch, Message: imagesnapshot.Sanitize(err.Error())}}
-	}
+	// Every entry the profile needs is in the mirror, by digest, for linux/amd64. The
+	// install's own configuration names the mirror, so the snapshot is the inventory.
 	reg := opts.Registry
 	if reg == nil {
 		reg = &imagesnapshot.Remote{}
 	}
-	return append(out, imagesnapshot.Preflight(ctx, reg, snap, inv, opts.Profile)...)
+	out = append(out, imagesnapshot.Preflight(ctx, reg, snap, imagesnapshot.SnapshotInventory(snap), opts.Profile)...)
+	// Every image the install configures is its component's mirror reference, pinned to
+	// the snapshot's digest. Images delivered in the bundle's archives are checked
+	// against the archives instead (checkArchivesAgainstSnapshot).
+	refs := installRefs(opts)
+	if len(refs) == 0 {
+		return append(out, Finding{Component: "install-config", Code: FindingInstallConfig,
+			Message: "no install references to check: give the installer configuration the install uses (its images: settings, from image-snapshot install-config)"})
+	}
+	return append(out, imagesnapshot.Compare(snap, opts.Profile, refs)...)
+}
+
+// installRefs are the references the install configures for the profile, without the
+// images that reach the nodes in the bundle's image archives.
+func installRefs(opts VerifyOptions) []imagesnapshot.InstallRef {
+	archived := map[string]bool{}
+	for _, list := range [][]string{opts.Input.AddonRefs, opts.Input.K0sRefs} {
+		for _, r := range list {
+			if r = strings.TrimSpace(r); r != "" && !strings.HasPrefix(r, "#") {
+				archived[canonical(r)] = true
+			}
+		}
+	}
+	var out []imagesnapshot.InstallRef
+	for _, r := range imagesnapshot.InstallRefs(opts.Profile, opts.Input) {
+		if !archived[canonical(r.Ref)] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // checkArchivesAgainstSnapshot checks that every image in the bundle's archives is the
@@ -307,11 +339,11 @@ func checkArchivesAgainstSnapshot(m *Manifest, snap *imagesnapshot.Snapshot) []F
 }
 
 // checkHost checks the target's nodes, GPU capacity and staged model artifacts.
-func checkHost(m *Manifest, opts VerifyOptions) []Finding {
+func checkHost(dir string, m *Manifest, opts VerifyOptions) []Finding {
 	f := opts.Facts
 	if f == nil || len(f.Nodes) == 0 {
 		return []Finding{{Component: "host", Code: FindingFactsMissing,
-			Message: "the install preflight needs the target's node facts (platform, and for fullfeature GPU driver, runtime and capacity)"}}
+			Message: "the install preflight needs the target's node facts (platform, and for fullfeature the GPU devices, driver, runtime, OS and kernel)"}}
 	}
 	var out []Finding
 	for _, n := range f.Nodes {
@@ -331,23 +363,41 @@ func checkHost(m *Manifest, opts VerifyOptions) []Finding {
 	if want <= 0 {
 		want = defaultGPUsForFullfeature
 	}
+	closure := readNVIDIAClosure(dir, m)
 	total, gpuNodes := 0, 0
 	for _, n := range f.Nodes {
 		if n.GPU == nil {
 			continue
 		}
 		gpuNodes++
-		usable := true
-		if strings.TrimSpace(n.GPU.Driver) == "" {
-			out = append(out, Finding{Component: "node:" + n.Name, Code: FindingGPUDriver, Message: "has no NVIDIA driver loaded"})
-			usable = false
+		g := n.GPU
+		capacity := g.Devices
+		if g.Allocatable != nil {
+			capacity = *g.Allocatable // the node is in a cluster: what it can schedule
 		}
-		if !n.GPU.Runtime {
-			out = append(out, Finding{Component: "node:" + n.Name, Code: FindingGPURuntime, Message: "has no NVIDIA container runtime configured"})
-			usable = false
+		if g.Devices <= 0 && capacity <= 0 {
+			out = append(out, Finding{Component: "node:" + n.Name, Code: FindingGPUDevices, Message: "reports no NVIDIA GPU"})
+			continue
 		}
-		if usable {
-			total += n.GPU.Allocatable
+		// The driver is loaded, or the bundle can install it offline for this exact kernel.
+		driverOK := strings.TrimSpace(g.Driver) != ""
+		if !driverOK {
+			if why := closure.cannotInstallDriver(n); why != "" {
+				out = append(out, Finding{Component: "node:" + n.Name, Code: FindingGPUDriver, Message: "has no NVIDIA driver loaded, and " + why})
+			} else {
+				driverOK = true
+			}
+		}
+		// The container toolkit is installed, or the bundle's closure carries it. A node
+		// whose driver cannot be provided is reported for the driver alone: the toolkit
+		// is installed from the same closure, after it.
+		runtimeOK := g.Runtime || (driverOK && closure.toolkit)
+		if !runtimeOK && driverOK {
+			out = append(out, Finding{Component: "node:" + n.Name, Code: FindingGPURuntime,
+				Message: "has no NVIDIA container toolkit, and the bundle's nvidia-closure does not carry it"})
+		}
+		if driverOK && runtimeOK {
+			total += capacity
 		}
 	}
 	switch {
@@ -355,7 +405,7 @@ func checkHost(m *Manifest, opts VerifyOptions) []Finding {
 		out = append(out, Finding{Component: "host", Code: FindingGPUNodeMissing, Message: "fullfeature runs its hosted models on GPU capacity, and no GPU node was reported"})
 	case total < want:
 		out = append(out, Finding{Component: "host", Code: FindingGPUCapacity,
-			Message: fmt.Sprintf("%d schedulable nvidia.com/gpu on usable GPU nodes; fullfeature needs %d", total, want)})
+			Message: fmt.Sprintf("%d NVIDIA GPU(s) on GPU nodes whose driver and runtime are present or installable; fullfeature needs %d", total, want)})
 	}
 	staged := map[string]StagedModel{}
 	for _, s := range f.StagedModels {
@@ -396,4 +446,76 @@ func short(sum string) string {
 		return "(none)"
 	}
 	return s
+}
+
+// nvidiaClosure is what the bundle's offline NVIDIA package closure can install.
+type nvidiaClosure struct {
+	present   bool
+	kernels   map[string]bool // the kernels it carries headers for (.target-kernels)
+	pkgFormat string          // rpm or deb (.pkg-format)
+	toolkit   bool            // it carries the NVIDIA container toolkit
+}
+
+// readNVIDIAClosure reads the closure metadata airgap_install.sh writes. Only files the
+// manifest lists are read; their integrity is checked by checkFiles.
+func readNVIDIAClosure(dir string, m *Manifest) nvidiaClosure {
+	c := nvidiaClosure{kernels: map[string]bool{}}
+	for _, f := range m.Spec.Files {
+		if f.Role != RolePackage || f.Name != "nvidia-closure" {
+			continue
+		}
+		c.present = true
+		base := path.Base(f.Path)
+		switch {
+		case base == ".target-kernels":
+			if b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(f.Path))); err == nil {
+				for _, k := range strings.FieldsFunc(string(b), func(r rune) bool { return r == ',' || r == '\n' || r == ' ' || r == '\t' }) {
+					c.kernels[k] = true
+				}
+			}
+		case base == ".pkg-format":
+			if b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(f.Path))); err == nil {
+				c.pkgFormat = strings.TrimSpace(string(b))
+			}
+		case strings.HasPrefix(base, "nvidia-container-toolkit"):
+			c.toolkit = true
+		}
+	}
+	if c.present && c.pkgFormat == "" {
+		c.pkgFormat = "rpm" // airgap_install.sh's default, as the installer reads it
+	}
+	return c
+}
+
+// cannotInstallDriver says why the closure cannot install a driver on the node, or "".
+func (c nvidiaClosure) cannotInstallDriver(n Node) string {
+	switch {
+	case !c.present:
+		return "the bundle has no nvidia-closure to install one from"
+	case n.Kernel == "":
+		return "the node did not report its kernel, so the closure's coverage cannot be checked"
+	case !c.kernels[n.Kernel]:
+		var have []string
+		for k := range c.kernels {
+			have = append(have, k)
+		}
+		sort.Strings(have)
+		return fmt.Sprintf("the bundle's nvidia-closure has no packages for its kernel %s (it covers %s); re-stage with --gpu-kernels %s",
+			n.Kernel, strings.Join(have, ", "), n.Kernel)
+	}
+	if want := packageFormat(n.OS); want != "" && want != c.pkgFormat {
+		return fmt.Sprintf("the bundle's nvidia-closure holds %s packages and the node runs %s (%s)", c.pkgFormat, n.OS, want)
+	}
+	return ""
+}
+
+// packageFormat is the package format of an os-release ID, "" when unknown.
+func packageFormat(osID string) string {
+	switch strings.ToLower(strings.TrimSpace(osID)) {
+	case "rhel", "centos", "rocky", "almalinux", "ol", "fedora", "amzn":
+		return "rpm"
+	case "ubuntu", "debian":
+		return "deb"
+	}
+	return ""
 }

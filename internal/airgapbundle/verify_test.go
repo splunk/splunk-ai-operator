@@ -233,14 +233,9 @@ func TestVerify_HostPrerequisites(t *testing.T) {
 	assert.Equal(t, map[string]string{"host": FindingFactsMissing}, codes(Verify(ctx, f.dir, noFacts)), "no facts at all is not a pass")
 	assert.Equal(t, map[string]string{"node:cpu-1": FindingArch}, run(imagesnapshot.ProfileCPUOnly, func(h *HostFacts) { h.Nodes[1].Platform = "linux/arm64" }))
 	assert.Equal(t, map[string]string{"node:cpu-1": FindingArch}, run(imagesnapshot.ProfileCPUOnly, func(h *HostFacts) { h.Nodes[1].Platform = "" }))
-
 	assert.Equal(t, map[string]string{"host": FindingGPUNodeMissing}, run(imagesnapshot.ProfileFullFeature, func(h *HostFacts) { h.Nodes[2].GPU = nil }))
-	assert.Equal(t, map[string]string{"node:gpu-1": FindingGPUDriver, "host": FindingGPUCapacity},
-		run(imagesnapshot.ProfileFullFeature, func(h *HostFacts) { h.Nodes[2].GPU.Driver = "" }), "a node without a driver offers no usable GPUs")
-	assert.Equal(t, map[string]string{"node:gpu-1": FindingGPURuntime, "host": FindingGPUCapacity},
-		run(imagesnapshot.ProfileFullFeature, func(h *HostFacts) { h.Nodes[2].GPU.Runtime = false }))
-	assert.Equal(t, map[string]string{"host": FindingGPUCapacity}, run(imagesnapshot.ProfileFullFeature, func(h *HostFacts) { h.Nodes[2].GPU.Allocatable = 0 }))
-
+	assert.Equal(t, map[string]string{"node:gpu-1": FindingGPUDevices, "host": FindingGPUCapacity},
+		run(imagesnapshot.ProfileFullFeature, func(h *HostFacts) { h.Nodes[2].GPU.Devices = 0 }), "a GPU node without GPUs")
 	// cpuOnly has no GPU prerequisite, whatever the GPU node looks like.
 	assert.Empty(t, run(imagesnapshot.ProfileCPUOnly, func(h *HostFacts) { h.Nodes[2].GPU = &GPU{} }))
 
@@ -249,18 +244,103 @@ func TestVerify_HostPrerequisites(t *testing.T) {
 	assert.Equal(t, map[string]string{"host": FindingGPUCapacity}, codes(Verify(ctx, f.dir, o)), "two GPUs are not three")
 }
 
+// The fullfeature GPU rule, before any change: a driver and container toolkit that are
+// either present or installable offline from the bundle's nvidia-closure for the
+// node's exact kernel and package format, and enough NVIDIA GPUs.
+func TestVerify_GPUPrerequisitesArePresentOrInstallableFromTheBundle(t *testing.T) {
+	fresh := func(h *HostFacts) { h.Nodes[2].GPU.Driver, h.Nodes[2].GPU.Runtime = "", false }
+	t.Run("a fresh GPU host the closure covers passes", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		fresh(o.Facts)
+		assert.Empty(t, Verify(ctx, f.dir, o), "the installer will install the driver and toolkit offline")
+	})
+	t.Run("a kernel the closure does not cover fails before any change", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		fresh(o.Facts)
+		o.Facts.Nodes[2].Kernel = "5.14.0-570.el9.x86_64"
+		got := Verify(ctx, f.dir, o)
+		c := codes(got)
+		assert.Equal(t, FindingGPUDriver, c["node:gpu-1"])
+		assert.Equal(t, FindingGPUCapacity, c["host"], "an uninstallable node offers no usable GPUs")
+		for _, g := range got {
+			if g.Code == FindingGPUDriver {
+				assert.Contains(t, g.Message, "no packages for its kernel 5.14.0-570.el9.x86_64")
+				assert.Contains(t, g.Message, "--gpu-kernels 5.14.0-570.el9.x86_64")
+			}
+		}
+	})
+	t.Run("a package format that does not fit the node's OS", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		fresh(o.Facts)
+		o.Facts.Nodes[2].OS = "ubuntu"
+		got := Verify(ctx, f.dir, o)
+		require.Equal(t, FindingGPUDriver, codes(got)["node:gpu-1"])
+		assert.Contains(t, messageOf(got, "node:gpu-1"), "holds rpm packages and the node runs ubuntu (deb)")
+	})
+	t.Run("no closure in the bundle: only a pre-installed driver will do", func(t *testing.T) {
+		f := newFixture(t)
+		require.NoError(t, os.RemoveAll(filepath.Join(f.dir, "packages/nvidia-closure")))
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		got := codes(Verify(ctx, f.dir, o))
+		assert.Equal(t, FindingArtifactMissing, got["package:nvidia-closure"], "fullfeature with the nvidia component still needs the closure")
+		assert.NotContains(t, got, "node:gpu-1", "a host whose driver and toolkit are installed needs nothing from it")
+		fresh(o.Facts)
+		findings := Verify(ctx, f.dir, o)
+		require.Equal(t, FindingGPUDriver, codes(findings)["node:gpu-1"])
+		assert.Contains(t, messageOf(findings, "node:gpu-1"), "the bundle has no nvidia-closure to install one from")
+	})
+	t.Run("a closure without the toolkit cannot provide the runtime", func(t *testing.T) {
+		f := newFixture(t)
+		require.NoError(t, os.Remove(filepath.Join(f.dir, "packages/nvidia-closure/nvidia-container-toolkit-1.17.3-1.x86_64.rpm")))
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		o.Facts.Nodes[2].GPU.Runtime = false
+		assert.Equal(t, map[string]string{"node:gpu-1": FindingGPURuntime, "host": FindingGPUCapacity}, codes(Verify(ctx, f.dir, o)))
+	})
+	t.Run("an unreported kernel cannot be checked against the closure", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		fresh(o.Facts)
+		o.Facts.Nodes[2].Kernel = ""
+		findings := Verify(ctx, f.dir, o)
+		require.Equal(t, FindingGPUDriver, codes(findings)["node:gpu-1"])
+		assert.Contains(t, messageOf(findings, "node:gpu-1"), "did not report its kernel")
+	})
+	t.Run("on an existing cluster the schedulable count is what counts", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		zero := 0
+		o.Facts.Nodes[2].GPU.Allocatable = &zero
+		assert.Equal(t, map[string]string{"host": FindingGPUCapacity}, codes(Verify(ctx, f.dir, o)),
+			"two GPUs on the host, none schedulable")
+		two := 2
+		o.Facts.Nodes[2].GPU.Allocatable = &two
+		assert.Empty(t, Verify(ctx, f.dir, o))
+	})
+}
+
 func TestVerify_ReportsEveryProblemAtOnceInAStableOrder(t *testing.T) {
 	f := newFixture(t)
 	f.build()
 	require.NoError(t, os.Remove(filepath.Join(f.dir, "binaries/k0s")))
 	o := f.opts(imagesnapshot.ProfileFullFeature)
-	o.Facts.Nodes[2].GPU.Runtime = false
+	o.Facts.Nodes[2].GPU.Driver = ""
+	o.Facts.Nodes[2].Kernel = "6.0.0-unknown"
 	o.Facts.StagedModels = nil
 	a, b := Verify(ctx, f.dir, o), Verify(ctx, f.dir, o)
 	assert.Equal(t, a, b)
 	c := codes(a)
 	assert.Equal(t, FindingFileMissing, c["binaries/k0s"])
-	assert.Equal(t, FindingGPURuntime, c["node:gpu-1"])
+	assert.Equal(t, FindingGPUDriver, c["node:gpu-1"])
 	assert.Equal(t, FindingModelMissing, c["model:cross-encoder"])
 	assert.True(t, hasCode(a, FindingGPUCapacity))
 }
@@ -367,4 +447,59 @@ func resave(t *testing.T, f *fixture) {
 	p, _, err := (imagesnapshot.Store{Dir: t.TempDir()}).Put(f.snap)
 	require.NoError(t, err)
 	f.snapshot = p
+}
+
+// Generate then enforce (MPR-193 criterion 2): the install preflight compares the
+// configuration the install uses with the snapshot.
+func TestVerify_TheInstallConfigurationMustUseTheMirrorByDigest(t *testing.T) {
+	t.Run("a setting left at its source registry", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileCPUOnly)
+		o.Input.Installer.Images.Operator.Image = "docker.io/splunk/splunk-ai-operator:candidate-1"
+		got := Verify(ctx, f.dir, o)
+		assert.Equal(t, map[string]string{"splunk-ai-operator": imagesnapshot.FindingSourceRegistry}, codes(got))
+		for _, ref := range f.reg.Describes {
+			assert.True(t, strings.HasPrefix(ref, testMirror+"/"), "found without contacting the source registry: %s", ref)
+		}
+	})
+	t.Run("a mutable tag in the mirror", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		ref := o.Input.Installer.Images.Weaviate.Image
+		o.Input.Installer.Images.Weaviate.Image = ref[:strings.Index(ref, "@")] + ":stable"
+		assert.Equal(t, map[string]string{"weaviate": imagesnapshot.FindingUnaccounted}, codes(Verify(ctx, f.dir, o)))
+	})
+	t.Run("no install configuration is not a pass", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileCPUOnly)
+		o.Input.Installer = imagesnapshot.InstallerConfig{}
+		o.Input.NoInstallerDefaults = true
+		assert.Equal(t, map[string]string{"install-config": FindingInstallConfig}, codes(Verify(ctx, f.dir, o)))
+	})
+	t.Run("the candidate changed after the snapshot", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileCPUOnly)
+		o.Input.CandidateChecksum = strings.Repeat("e", 64)
+		assert.Equal(t, map[string]string{"candidate-manifest": imagesnapshot.FindingCandidate}, codes(Verify(ctx, f.dir, o)))
+	})
+	t.Run("archive images are not mistaken for install settings", func(t *testing.T) {
+		f := newFixture(t)
+		f.build()
+		o := f.opts(imagesnapshot.ProfileFullFeature)
+		require.NotEmpty(t, o.Input.AddonRefs, "the bundle's add-on list names tag references at their source registries")
+		assert.Empty(t, Verify(ctx, f.dir, o), "they are checked against the archives, not the mirror settings")
+	})
+}
+
+func messageOf(findings []Finding, component string) string {
+	for _, f := range findings {
+		if f.Component == component {
+			return f.Message
+		}
+	}
+	return ""
 }

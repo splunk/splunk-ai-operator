@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 
 	"github.com/splunk/splunk-ai-operator/internal/airgapbundle"
 	"github.com/splunk/splunk-ai-operator/internal/imagesnapshot"
@@ -55,6 +56,7 @@ type env struct {
 	t                  *testing.T
 	dir, bundle, store string
 	snapshot           string
+	installConfig      string
 	snap               *imagesnapshot.Snapshot
 	reg                *mirrorRegistry
 }
@@ -103,7 +105,9 @@ func newEnv(t *testing.T) *env {
 	e.archive("bundle/images/k0s-images.tar", k0s)
 	e.archive("bundle/images/addon-images.tar", addon)
 
-	in, err := imagesnapshot.LoadInput(imagesnapshot.InputFiles{Candidate: candidate,
+	// The snapshot is made from the source installer configuration, which brings in the
+	// installer's default images (Fluent Bit, OpenTelemetry, nginx) as an install would.
+	in, err := imagesnapshot.LoadInput(imagesnapshot.InputFiles{Candidate: candidate, Config: e.write("source-config.yaml", "{}\n"),
 		K0sList: filepath.Join(e.bundle, "images/k0s-images.list"), AddonList: filepath.Join(e.bundle, "images/addon-images.list")})
 	require.NoError(t, err)
 	inv, err := imagesnapshot.BuildInventory(in)
@@ -112,6 +116,12 @@ func newEnv(t *testing.T) *env {
 	require.NoError(t, err)
 	e.snapshot, _, err = (imagesnapshot.Store{Dir: filepath.Join(e.dir, "snapshots")}).Put(e.snap)
 	require.NoError(t, err)
+	// The install configuration names every configured image by its mirror digest.
+	cfg, err := imagesnapshot.InstallConfig(e.snap, in.Candidate.Spec.RuntimeVersion)
+	require.NoError(t, err)
+	b, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	e.installConfig = e.write("install-config.yaml", string(b))
 	e.write("models.yaml", "artifact-configs:\n  - artifact-id: all-minilm-l6-v2\n    hf-url: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2\n")
 	return e
 }
@@ -125,7 +135,7 @@ func (e *env) run(args ...string) (int, string, string) {
 func (e *env) facts(gpu bool, staged bool) string {
 	f := airgapbundle.HostFacts{Nodes: []airgapbundle.Node{{Name: "cpu-1", Platform: "linux/amd64"}}}
 	if gpu {
-		f.Nodes = append(f.Nodes, airgapbundle.Node{Name: "gpu-1", Platform: "linux/amd64", GPU: &airgapbundle.GPU{Driver: "550", Runtime: true, Allocatable: 1}})
+		f.Nodes = append(f.Nodes, airgapbundle.Node{Name: "gpu-1", Platform: "linux/amd64", GPU: &airgapbundle.GPU{Devices: 1, Driver: "550", Runtime: true}})
 	}
 	if staged {
 		f.StagedModels = []airgapbundle.StagedModel{{ID: "all-minilm-l6-v2", Source: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"}}
@@ -136,7 +146,7 @@ func (e *env) facts(gpu bool, staged bool) string {
 
 func (e *env) verify(profile, facts string, extra ...string) (int, string, string) {
 	return e.run(append([]string{"verify", "--bundle", e.bundle, "--profile", profile, "--snapshot", e.snapshot,
-		"--candidate", candidate, "--facts", facts}, extra...)...)
+		"--candidate", candidate, "--config", e.installConfig, "--facts", facts}, extra...)...)
 }
 
 func TestEndToEnd_ManifestVerifyImport(t *testing.T) {
@@ -257,4 +267,14 @@ func TestVerify_ReadsMetalLBInstallFromTheConfiguration(t *testing.T) {
 	code, _, errs = e.run("verify", "--bundle", e.bundle, "--profile", "cpuOnly", "--scope", "bundle", "--config", on)
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "[REQUIRED_ARTIFACT_MISSING] chart:metallb")
+}
+
+// The install preflight refuses a configuration that does not name the mirror.
+func TestVerify_WithoutTheInstallConfigurationFails(t *testing.T) {
+	e := newEnv(t)
+	code, _, errs := e.run("manifest", "--bundle", e.bundle, "--snapshot", e.snapshot)
+	require.Equal(t, 0, code, errs)
+	code, _, errs = e.run("verify", "--bundle", e.bundle, "--profile", "cpuOnly", "--snapshot", e.snapshot, "--candidate", candidate, "--facts", e.facts(false, false))
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errs, "[INSTALL_CONFIG_MISSING] install-config")
 }
