@@ -28,6 +28,9 @@ _current_suite=""
 
 suite() { _current_suite="$1"; }
 
+# Define shared assertions before the profile cases that invoke them.
+assert_contains() { assert_eq "$1" "yes" "$([[ "$3" == *"$2"* ]] && echo yes || echo no)"; }
+
 assert_eq() {
   local desc="$1" expected="$2" actual="$3"
   if [[ -n "${FILTER}" && "${_current_suite} ${desc}" != *"${FILTER}"* ]]; then
@@ -102,6 +105,7 @@ _load_functions() {
 
   eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn render_agentruntime_checkpoint_secret_manifest)"
+  eval "$(_extract_fn validate_agentruntime_checkpoint_config)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn ai_platform_profile_resolved)"
   eval "$(_extract_fn ai_platform_profile_explicit)"
@@ -160,7 +164,11 @@ _checkpoint_profile_manifest=$(
   need() { :; }
   yq() { "${YQ_BIN}" "$@"; }
   local_secret_capture="$(mktemp)"
-  kubectl() { cat >"${local_secret_capture}"; }
+  kubectl() {
+    # A missing Secret is an empty successful read with --ignore-not-found.
+    [[ " $* " == *" get secret "* ]] && return 0
+    cat >"${local_secret_capture}"
+  }
   CONFIG_FILE="${SCRIPT_DIR}/k0s-cluster-config-agentruntime.yaml"
   AI_NS="ai-platform"
   AGENT_RUNTIME_CHECKPOINT_DB_URL='postgresql://user:password@db.example/checkpoints'
@@ -1977,6 +1985,8 @@ echo "▶ AIP-4614 native-HTTPS internal Splunk"
 
 _render_internal_splunk_https_manifests() (
   local capture_dir="$1"
+  # This fixture contains no AgentRuntime feature or checkpoint credentials.
+  create_agentruntime_checkpoint_secrets() { :; }
   eval "$(_extract_fn internal_splunk_management_url)"
   eval "$(_extract_fn internal_splunk_pod_name)"
   eval "$(_extract_fn _internal_splunk_btool_http_value)"
@@ -2071,6 +2081,9 @@ EOF
   DEFAULT_ACCELERATOR=L40S
   VECTORDB_SIZE=50Gi
   WORKER_IMAGE_REGISTRY=''
+  AI_SIDECAR_ENVOY=false
+  AI_SIDECAR_OTEL=false
+  AI_SIDECAR_PROMETHEUS=false
 
   install_splunk_standalone
   install_ai_platform_cr
@@ -2594,7 +2607,6 @@ assert_eq "omitted profile resolves to fullfeature" "fullfeature" "$(_profile_ru
 assert_rc "omitted profile is not explicit" 1 _profile_run "${_legacy}" ai_platform_profile_explicit
 assert_eq "legacy 'full' resolves to fullfeature" "fullfeature" \
   "$(_profile_run "$(_profile_cfg fullfeature fullalias '.aiPlatform.profile = "full"')" ai_platform_profile_resolved)"
-assert_contains() { assert_eq "$1" "yes" "$([[ "$3" == *"$2"* ]] && echo yes || echo no)"; }
 # Legacy "full" is valid but keeps pre-profile behaviour: it does not opt in to
 # the Launchpad requirements, so an existing SAIA configuration that spells it
 # keeps working.
@@ -2725,6 +2737,8 @@ assert_problem "zero minReplicas is rejected" \
   "$(_profile_cfg cpuonly min0 '.aiPlatform.features[1].minReplicas = 0')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].minReplicas"
 assert_problem "minReplicas above maxReplicas is rejected" \
   "$(_profile_cfg cpuonly minmax '.aiPlatform.features[1].minReplicas = 5 | .aiPlatform.features[1].maxReplicas = 2')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
+assert_problem "minReplicas above the default maxReplicas is rejected" \
+  "$(_profile_cfg cpuonly minaboveimplicitmax '.aiPlatform.features[1].minReplicas = 5 | del(.aiPlatform.features[1].maxReplicas)')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
 assert_problem "targetCPUUtilization above 100 is rejected" \
   "$(_profile_cfg cpuonly cpu101 '.aiPlatform.features[1].targetCPUUtilization = 101')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].targetCPUUtilization"
 assert_problem "a feature entry without a name is rejected" \
@@ -2950,6 +2964,11 @@ _render_cr_inner() {
   for _f in configured_pull_secret_names _pull_secret_file ensure_configured_pull_secrets image_pull_secret_names; do
     eval "$(_extract_fn "${_f}")"
   done
+  eval "$(_extract_fn create_agentruntime_checkpoint_secrets)"
+  eval "$(_extract_fn k0s_feature_enabled)"
+  k0s_agentruntime_feature_enabled() { k0s_feature_enabled agentruntime; }
+  need() { :; }
+  AGENT_RUNTIME_CHECKPOINT_DB_URL='postgresql://fixture-user:fixture-password@fixture-db:5432/checkpoints'
   sleep() { :; }
   jq() { :; }
   kubectl() { if [[ " $* " == *" apply "* && " $* " == *" -f - "* ]]; then cat; fi; return 0; }

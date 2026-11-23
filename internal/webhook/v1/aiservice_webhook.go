@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/credentials"
 )
 
 // nolint:unused
@@ -261,24 +262,13 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 			"checkpointDbSecretRef must be specified for agentruntime",
 		))
 	}
+	// Admission checks values supplied to either service env entry point. Secret
+	// contents are checked by reconciliation so deployment ordering stays flexible.
+	allErrs = append(allErrs, credentials.ValidatePostgresEnvironment(aiservice.Spec.Feature.Env, fldPath.Child("features", "env"))...)
+	allErrs = append(allErrs, credentials.ValidatePostgresEnvironment(aiservice.Spec.Env, fldPath.Child("env"))...)
 
-	if aiservice.Spec.MinReplicas != nil && aiservice.Spec.MaxReplicas != nil &&
-		*aiservice.Spec.MinReplicas > *aiservice.Spec.MaxReplicas {
-		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("maxReplicas"),
-			*aiservice.Spec.MaxReplicas,
-			"maxReplicas must be greater than or equal to minReplicas",
-		))
-	}
-
-	if aiservice.Spec.TargetCPUUtilization != nil &&
-		(*aiservice.Spec.TargetCPUUtilization < 1 || *aiservice.Spec.TargetCPUUtilization > 100) {
-		allErrs = append(allErrs, field.Invalid(
-			fldPath.Child("targetCPUUtilization"),
-			*aiservice.Spec.TargetCPUUtilization,
-			"targetCPUUtilization must be between 1 and 100 when set",
-		))
-	}
+	policy := aiv1.ResolveAgentRuntimeAutoscaling(aiservice.Spec.MinReplicas, aiservice.Spec.MaxReplicas, aiservice.Spec.TargetCPUUtilization)
+	allErrs = append(allErrs, policy.Validate(fldPath)...)
 
 	return allErrs
 }

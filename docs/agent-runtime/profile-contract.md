@@ -67,6 +67,19 @@ from 1 to 100. Rejected values are not echoed in error messages: an unsupported 
 YAML integer of at least 1 (the same rule `install` enforces). Duplicate feature
 identities (`agentruntime` is keyed by provider) are rejected, as in the webhook.
 
+AgentRuntime uses CPU autoscaling in both profiles. The defaults are
+`minReplicas: 1`, `maxReplicas: 4`, and `targetCPUUtilization: 60`. Each
+override is optional. The effective minimum must be at most the effective
+maximum, so a minimum above 4 requires an explicit maximum.
+
+Adding the feature starts its Deployment at the configured minimum and
+creates its HPA. A standalone AIService can seed a new Deployment with
+`spec.replicas` inside its effective bounds. Other startup counts fall back
+to the minimum. The HPA controls the live replica count after creation.
+Changing the HPA bounds updates the policy and Kubernetes converges to the
+new range. Removing the feature deletes the owned HPA and Deployment through
+the AIService without removing the referenced checkpoint Secret.
+
 AITK is the Splunk app `Splunk_ML_Toolkit` (label "AI Toolkit", version 6.2.0),
 installed on Splunk. It is not a container image, and nothing in cluster setup
 depends on it: the installer has no AITK setting, `render-profile` renders none,
@@ -84,7 +97,15 @@ references, ports, probes and the Secret contract; see
 only loader selection required (no `AGENT_LOADERS` map). The checkpoint Secret
 the examples reference is `mltk-postgres-conn`, a Secret of type `Opaque` in the
 AIService namespace with the keys `DATABASE_URL`, `PG_HOST`, `PG_PORT`, `PG_USER`,
-`PG_PASSWORD` and `PG_DBNAME`; the installer never creates or changes it. Image
+`PG_PASSWORD` and `PG_DBNAME`. Deployment configuration creates it through
+`aiPlatform.agentRuntime.checkpointSecrets[]` with `create: true` and a
+`databaseUrlEnv` deployment-time input. Both profile examples use that path.
+The Secret is created before AIPlatform application. An identical existing
+Secret is reused without a version-changing write; conflicting content fails
+safely instead of silently overwriting credentials. Set `create: false` to use
+an independently managed Secret without reading or modifying it in the installer.
+See [PostgreSQL Secret deployment](postgres-secrets.md) for inputs and migration.
+Image
 references in the examples stay sanitized placeholders; the immutable digests of
 the candidate images are resolved by the mirror step (MPR-187).
 

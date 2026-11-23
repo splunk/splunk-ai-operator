@@ -69,13 +69,15 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 
 	checkpointSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "mltk-postgres", Namespace: "default", ResourceVersion: "1"},
+		Type:       corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			"PG_HOST":     []byte("postgres.default.svc.cluster.local"),
-			"PG_PORT":     []byte("5432"),
-			"PG_USER":     []byte("user"),
-			"PG_PASSWORD": []byte("password"),
-			"PG_DBNAME":   []byte("checkpoints"),
-			"PGSSLMODE":   []byte("verify-full"),
+			"DATABASE_URL": []byte("postgresql://user:password@postgres.default.svc.cluster.local:5432/checkpoints"),
+			"PG_HOST":      []byte("postgres.default.svc.cluster.local"),
+			"PG_PORT":      []byte("5432"),
+			"PG_USER":      []byte("user"),
+			"PG_PASSWORD":  []byte("password"),
+			"PG_DBNAME":    []byte("checkpoints"),
+			"PGSSLMODE":    []byte("verify-full"),
 		},
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai, checkpointSecret).Build()
@@ -205,6 +207,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	deployment := &appsv1.Deployment{}
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "stack-agentruntime-mltk-agentruntime-deployment", Namespace: "default"}, deployment))
+	require.Equal(t, ptr(int32(1)), deployment.Spec.Replicas)
 	require.Len(t, deployment.Spec.Template.Spec.InitContainers, 1)
 	assert.Equal(t, "fetch-provider-wheel", deployment.Spec.Template.Spec.InitContainers[0].Name)
 	assert.Equal(t, "docker.io/splunk/agent-runtime-provider-mltk:test", deployment.Spec.Template.Spec.InitContainers[0].Image)
@@ -311,12 +314,12 @@ func TestAgentRuntimeReconciler_DefaultsOmittedHPAFields(t *testing.T) {
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "stack-agentruntime-mltk-agentruntime-hpa", Namespace: "default"}, hpa))
 	require.NotNil(t, hpa.Spec.MinReplicas)
-	assert.Equal(t, defaultMinReplicas, *hpa.Spec.MinReplicas)
-	assert.Equal(t, defaultMaxReplicas, hpa.Spec.MaxReplicas)
+	assert.Equal(t, int32(1), *hpa.Spec.MinReplicas)
+	assert.Equal(t, int32(4), hpa.Spec.MaxReplicas)
 	require.Len(t, hpa.Spec.Metrics, 1)
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource)
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
-	assert.Equal(t, defaultTargetCPUUtilization, *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
+	assert.Equal(t, int32(60), *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
 	assert.Nil(t, ai.Spec.MinReplicas)
 	assert.Nil(t, ai.Spec.MaxReplicas)
 	assert.Nil(t, ai.Spec.TargetCPUUtilization)
@@ -585,7 +588,7 @@ func assertEnv(t *testing.T, env []corev1.EnvVar, name, value string) {
 	t.Fatalf("missing env %s", name)
 }
 
-func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {
+func TestValidateSchemaSetupCredentialsRejectsFeatureEnvFallback(t *testing.T) {
 	secret := &corev1.Secret{Data: map[string][]byte{"DATABASE_URL": []byte("postgresql://legacy")}}
 	featureEnv := map[string]string{
 		"PG_HOST":     "postgres",
@@ -594,9 +597,9 @@ func TestValidateSchemaSetupCredentialsAllowsFeatureEnvFallback(t *testing.T) {
 		"PG_DBNAME":   "checkpoints",
 	}
 
-	require.NoError(t, validateSchemaSetupCredentials(secret, featureEnv))
-	require.NoError(t, validateSchemaSetupCredentials(secret, nil))
-	require.NoError(t, validateSchemaSetupCredentials(&corev1.Secret{Data: map[string][]byte{
+	require.Error(t, validateSchemaSetupCredentials(secret, featureEnv))
+	require.Error(t, validateSchemaSetupCredentials(secret, nil))
+	require.Error(t, validateSchemaSetupCredentials(&corev1.Secret{Type: corev1.SecretTypeOpaque, Data: map[string][]byte{
 		"PG_HOST":     []byte("postgres"),
 		"PG_USER":     []byte("user"),
 		"PG_PASSWORD": []byte("password"),

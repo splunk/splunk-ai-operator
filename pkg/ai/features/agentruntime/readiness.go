@@ -3,6 +3,7 @@ package agentruntime
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
@@ -41,19 +42,36 @@ func blockRuntimeCondition(ai *aiv1.AIService, kind, stage string) {
 	if old := meta.FindStatusCondition(ai.Status.Conditions, kind); old != nil {
 		if old.Reason == "Blocked" {
 			_, prior, ok := strings.Cut(old.Message, "; previous observation: ")
-			if ok {
-				message += "; previous observation: " + prior
+			parts := strings.Fields(prior)
+			if ok && len(parts) == 4 && parts[1] == "at" && parts[2] == "generation" {
+				if generation, err := strconv.ParseInt(parts[3], 10, 64); err == nil {
+					message += fmt.Sprintf("; previous observation: %s at generation %d", safePriorReason(parts[0]), generation)
+				}
 			}
 		} else if old.Status == metav1.ConditionFalse {
 			// Older operator versions copied raw API errors into messages. Retain
 			// the diagnostic reason and generation without copying those payloads.
-			message += fmt.Sprintf("; previous observation: %s at generation %d", old.Reason, old.ObservedGeneration)
+			message += fmt.Sprintf("; previous observation: %s at generation %d", safePriorReason(old.Reason), old.ObservedGeneration)
 		}
 	}
 	if len(message) > 512 {
 		message = message[:512]
 	}
 	setRuntimeCondition(ai, kind, metav1.ConditionUnknown, "Blocked", message)
+}
+
+// Persisted conditions can predate safe diagnostics. Retain useful known
+// outcomes without trusting arbitrary reason strings or historical messages.
+func safePriorReason(reason string) string {
+	switch reason {
+	case "Failed", "TimedOut", "Pending", "Superseded", "ReconcileFailed", "InvalidCheckpointSecret", "CheckpointSecretMissing", "InvalidCheckpointEnvironment", "InvalidConfiguration",
+		"DeploymentMissing", "ObservationFailed", "DeploymentUnavailable", "ReplicaTargetMismatch", "DeploymentNotObserved",
+		"SelectorMismatch", "RolloutPending", "PodsNotReady", "ServiceMissing", "ServiceUnavailable", "ServicePortMismatch",
+		"EndpointSliceMismatch", "EndpointTargetMismatch", "EndpointsPending":
+		return reason
+	default:
+		return "Unknown"
+	}
 }
 
 // observeReadiness runs after both objects have been reconciled. Waiting for
@@ -116,11 +134,12 @@ func (r *AgentRuntimeReconciler) observeDeployment(ctx context.Context, ai *aiv1
 		fail("DeploymentUnavailable", "runtime Deployment must be owned by this AIService and not terminating")
 		return pods, nil
 	}
-	want := ai.Spec.Replicas
-	if want <= 0 || dep.Spec.Replicas == nil || *dep.Spec.Replicas != want {
-		fail("ReplicaTargetMismatch", "waiting for a positive runtime Deployment replica target matching the AIService")
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas <= 0 {
+		fail("ReplicaTargetMismatch", "waiting for a positive runtime Deployment replica target")
 		return pods, nil
 	}
+	// The HPA can change the desired count independently of the AIService.
+	want := *dep.Spec.Replicas
 	if dep.Status.ObservedGeneration < dep.Generation {
 		fail("DeploymentNotObserved", "waiting for the Deployment controller to observe the current generation")
 		return pods, nil

@@ -1,0 +1,106 @@
+{
+  "date": "2026-11-23",
+  "branch": "codex/MPR-195-secret-references-redaction",
+  "base_commit": "636d408e483d7a7d488d1fe007215d365abfd85d",
+  "go_version": "go1.26.10",
+  "local_api_server": "Kubernetes 1.35.0",
+  "go_non_e2e": {
+    "packages_with_tests_passed": 22,
+    "packages_without_tests": 12,
+    "failures": [],
+    "skipped_tests": [
+      "TestReconcile",
+      "TestReconcileOpenTelemetryCollector",
+      "TestLive_ResolvesRealPublicImages",
+      "TestLive_MirrorsARealImageIntact",
+      "TestLive_MirrorsTheCandidatesFromECR",
+      "TestStorageClient_ListObjects/S3_client_(will_fail_without_credentials)"
+    ]
+  },
+  "installer_secret_tests": {
+    "passed": 9,
+    "failed": 0
+  },
+  "renderer_contract_parity_cases": 10,
+  "installer_real_api_test": "passed, production helper and real kubectl",
+  "profile_rendering": {
+    "cpuOnly": "matches profile-values golden",
+    "fullfeature": "matches profile-values golden"
+  },
+  "go_vet": "passed",
+  "shell_syntax": "passed",
+  "format_and_diff_check": "passed",
+  "installer_suite": {
+    "passed": 579,
+    "failed": 8,
+    "skipped": 0,
+    "failures": [
+      "otelCollector mutable tag ':latest' is checked (Codex follow-up)",
+      "nginx untagged image is checked",
+      "fluentBit mutable tag ':preview' is checked",
+      "splunk.image (internal mode) mutable tag is checked",
+      "splunk.operatorImage (internal mode) mutable tag is checked",
+      "untagged image behind a registry port is NOT mistaken for tagged",
+      "ray.headImage mutable 'stable*' tag is checked",
+      "validate command passes the cpuOnly example (expected rc=0, got rc=1)"
+    ]
+  },
+  "clean_baseline_installer_suite": {
+    "passed": 572,
+    "failed": 13,
+    "skipped": 0,
+    "failures": [
+      "otelCollector mutable tag ':latest' is checked (Codex follow-up)",
+      "nginx untagged image is checked",
+      "fluentBit mutable tag ':preview' is checked",
+      "splunk.image (internal mode) mutable tag is checked",
+      "splunk.operatorImage (internal mode) mutable tag is checked",
+      "untagged image behind a registry port is NOT mistaken for tagged",
+      "ray.headImage mutable 'stable*' tag is checked",
+      "rendered aiplatform manifest is non-empty",
+      "rendered aiplatform manifest is valid YAML (expected rc=0, got rc=1)",
+      "AIPlatform endpoint renders the same internal HTTPS Service URL",
+      "oauth issuer and AIPlatform endpoint are byte-identical",
+      "OTel HEC endpoint follows the effective HTTP listener on port 8088",
+      "validate command passes the cpuOnly example (expected rc=0, got rc=1)"
+    ]
+  },
+  "new_installer_failure_descriptions": [],
+  "source_sha256": {
+    "cmd/agentruntime-live/main.go": "e313cbc7cc9371b1af86c9ade212d31e7e2ed90a62400a380d6470a37f3adc3f",
+    "helm-chart/splunk-ai-platform/values.yaml": "0a2629bc9bf5646e8554eaed1e16edcbefc004a49b2f218380e023435f944957",
+    "internal/candidatecontract/render.go": "6aa04256ee5c5ad8a34f3f96678c201d7854467a744a91a5f8c1155340dbc5b3",
+    "internal/controller/agentruntime_credentials_test.go": "ac36436a3e3f9078f866c1fc8ff82fda27052b202fc49bb5c1351d7b8782db77",
+    "internal/controller/aiplatform_cpuonly_e2e_envtest_test.go": "30967442087508c93bee54e0759024c2ee3948f999ad600ce34d4056dcffe672",
+    "internal/controller/checkpoint_installer_envtest_test.go": "56bcb075dad6f23ed14acf6c6bfbf377cb6c503eac9c7519222315280992f345",
+    "internal/webhook/v1/aiplatform_webhook.go": "bd7d1fd88963599b9bcfe45fb5a3fc42608095a867cf9d61c4d3780c5c5d6fc5",
+    "internal/webhook/v1/aiservice_webhook.go": "bf24d29eaa4409480ecf015256cce2698feeedeeeaa86ed744a6fe6e04a542dc",
+    "internal/webhook/v1/postgres_credentials_envtest_test.go": "5d383c97c09c9d0131c5d7561035f12b1b5f29dc25332abe8b07b7a0e977e86e",
+    "pkg/ai/credentials/installer_contract_test.go": "ce3810c7e96821937b3003b1f1f8d20c173fe70bb7ab0e40d40b3e3827de0e44",
+    "pkg/ai/credentials/postgres.go": "189fc0cba17cad817019bea2e688234b1db5e4f1cd884ad2fd6fb1a1dcf2a186",
+    "pkg/ai/credentials/postgres_test.go": "512ae4ba572b7c86be5279308285cb8fbf9095002c4acdd97ac8af11e945af64",
+    "pkg/ai/features/agentruntime/credentials_test.go": "a113eb7791e4a4e93adc93d1bc45860de9ecd3b9e2e361e2888abab5af727230",
+    "pkg/ai/features/agentruntime/errors.go": "9902d4a09f8cd5d576c28b4b7993b43e4987f149ab09e0a3a4985375a95c62fd",
+    "pkg/ai/features/agentruntime/impl.go": "edacc7faeda84e75137f3ae764f9c3f7f6c99a492b3cf912d7b07ee7b2ae4ad2",
+    "pkg/ai/features/agentruntime/impl_test.go": "1babee7cc82655f62f4daf4e7f66bc587bfb16e0dbaf9dbc8bace562b4756c12",
+    "pkg/ai/features/agentruntime/readiness.go": "25d0a7f89a62a1a4946008ba13493382aa792ea546a4f4551de8c43eb7ec41cd",
+    "pkg/ai/features/agentruntime/schema_lifecycle_test.go": "5e5f07dd53ef24dab76c6f208545bfc4cf21d12ceb83f22c165bf5604119aa48",
+    "pkg/ai/reconciler.go": "fa5d7e8b8de30a63eea2a8bb78f35bbdbaba298264962e59504576c16f939c05",
+    "tools/ai-tier-cluster-setup/examples/profile-cpuonly.yaml": "dd3a50f8475a51fcc6d4a22e5aff4a5b60b9dfd332135a17bb544efed40d8142",
+    "tools/ai-tier-cluster-setup/examples/profile-fullfeature.yaml": "fb6351f07a96c74c880ba49f97b8e4f01c7ea3673f177a1def10a5c243e28f67",
+    "tools/ai-tier-cluster-setup/k0s_cluster_with_stack.sh": "bf49419e5cdd00d22177234a6084b8ffb50c601c4827c6a56e6432d02fb4e1cc",
+    "tools/ai-tier-cluster-setup/test_checkpoint_secrets.py": "ad67f5da829eaa81268d0859a08efab900a589646b0fc7a023d0bc9ed16df5ec",
+    "tools/ai-tier-cluster-setup/test_k0s_cluster_with_stack.sh": "f3f29c8e2a6a9552e476ce668532502e0d6afd0adff199e388584ca80b5813f3"
+  },
+  "live_validation": "11 scenarios passed; see mpr-195-live-results.json",
+  "review": {
+    "passes": [
+      "security",
+      "installer",
+      "Go/Kubernetes reliability"
+    ],
+    "model_diversity": "same model; independent contexts",
+    "resolved_findings": 3,
+    "unresolved_in_scope_findings": 0
+  }
+}
