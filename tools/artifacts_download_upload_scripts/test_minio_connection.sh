@@ -2,8 +2,8 @@
 # Test script to diagnose MinIO connectivity and bucket creation issues
 
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
-MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
-MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
+: "${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in the environment}"
+: "${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in the environment}"
 MINIO_BUCKET="${MINIO_BUCKET:-ai-platform-bucket}"
 
 echo "=========================================="
@@ -13,7 +13,6 @@ echo ""
 echo "Configuration:"
 echo "  Endpoint: $MINIO_ENDPOINT"
 echo "  Username: $MINIO_ROOT_USER"
-echo "  Password: ${MINIO_ROOT_PASSWORD:0:3}***"
 echo "  Bucket:   $MINIO_BUCKET"
 echo ""
 

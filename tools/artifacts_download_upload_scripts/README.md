@@ -291,23 +291,24 @@ Diagnostic script to test S3-compatible object store connectivity (MinIO, Seawee
 - Tests bucket creation permissions
 - Provides detailed troubleshooting information
 
+**Prerequisites:**
+- Export `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` from your approved credential store.
+- Installing the MinIO Client (`mc`) may require sudo.
+
 **Usage:**
 ```bash
 ./test_minio_connection.sh
 ```
 
-Or with custom settings (use generic names; MINIO_* also accepted):
+To set a different endpoint or bucket:
 ```bash
-S3COMPAT_OBJECT_STORE_ENDPOINT=http://localhost:9000 S3COMPAT_OBJECT_STORE_BUCKET=nexus ./test_minio_connection.sh
+MINIO_ENDPOINT=http://localhost:9000 MINIO_BUCKET=nexus ./test_minio_connection.sh
 ```
 
-Or with sudo if dependency installation fails:
+If you must run the script with sudo and your sudo policy permits preserving these variables:
 ```bash
-sudo ./test_minio_connection.sh
+sudo --preserve-env=MINIO_ROOT_USER,MINIO_ROOT_PASSWORD ./test_minio_connection.sh
 ```
-
-**Prerequisites:**
-- May require sudo for installing MinIO Client (mc)
 
 **When to use:**
 - Before running upload scripts for the first time
