@@ -101,8 +101,10 @@ aiPlatform:
       minReplicas: 1
       maxReplicas: 4
       targetCPUUtilization: 60
-      checkpointDbSecretRef: "mltk-postgres-conn"   # external Secret, created by the customer
+      checkpointDbSecretRef: "mltk-postgres-conn"   # created by the deployment configuration below
   agentRuntime:
     checkpointSecrets:
       - name: "mltk-postgres-conn"
-        create: false    # never created or modified by the installer
+        create: true
+        # Supply this input at deployment time; keep credential values out of this file.
+        databaseUrlEnv: "AGENT_RUNTIME_CHECKPOINT_DB_URL"

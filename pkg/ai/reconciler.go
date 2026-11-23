@@ -10,6 +10,7 @@ import (
 	"time"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/credentials"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
 	featurecommon "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -147,7 +149,14 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 	// Build the desired set of child service names
 	desired := make(map[string]struct{}, len(platform.Spec.Features))
 
-	for _, feature := range platform.Spec.Features {
+	for i, feature := range platform.Spec.Features {
+		// Older objects may predate admission rules. Reject credential literals
+		// before persisting a second copy in an operator-generated child.
+		if feature.Name == agentRuntimeFeatureName {
+			if errs := credentials.ValidatePostgresEnvironment(feature.Env, field.NewPath("spec", "features").Index(i).Child("env")); len(errs) > 0 {
+				return errs.ToAggregate()
+			}
+		}
 		serviceName := featureServiceName(platform.Name, feature)
 		desired[serviceName] = struct{}{}
 

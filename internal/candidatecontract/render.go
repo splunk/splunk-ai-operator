@@ -118,8 +118,12 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	// Synthetic credentials satisfy startup rendering only. They are never
 	// returned in the snapshot and no PostgreSQL process is started or contacted.
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: m.Spec.Contract.SecretKeys.Name, Namespace: namespace}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{}}
-	for _, key := range requiredSecretKeys {
-		secret.Data[key] = []byte("offline-placeholder")
+	for key, value := range map[string]string{
+		"DATABASE_URL": "postgresql://offline-user:offline-password@offline-postgres:5432/checkpoints",
+		"PG_HOST":      "offline-postgres", "PG_PORT": "5432", "PG_USER": "offline-user",
+		"PG_PASSWORD": "offline-password", "PG_DBNAME": "checkpoints",
+	} {
+		secret.Data[key] = []byte(value)
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}, &aiv1.AIPlatform{}, &batchv1.Job{}).WithObjects(platform, runtimeService, slimService, secret).Build()
 	ctx := context.Background()

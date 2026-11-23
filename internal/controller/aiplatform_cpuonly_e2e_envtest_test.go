@@ -111,7 +111,8 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 		ns := "default"
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "e2e-pg", Namespace: ns},
-			StringData: map[string]string{"PG_HOST": "h", "PG_PORT": "5432", "PG_USER": "u", "PG_PASSWORD": "p", "PG_DBNAME": "d"},
+			Type:       corev1.SecretTypeOpaque,
+			StringData: map[string]string{"DATABASE_URL": "postgresql://u:p@h:5432/d", "PG_HOST": "h", "PG_PORT": "5432", "PG_USER": "u", "PG_PASSWORD": "p", "PG_DBNAME": "d"},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, secret) })

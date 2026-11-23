@@ -1408,6 +1408,11 @@ ai_platform_profile_cr_input_problems() {
 validate_ai_platform_profile_config() {
   local problems
   problems="$(ai_platform_profile_problems)"
+  if [[ -z "${problems}" ]] && ai_platform_profile_explicit; then
+    # Credential inputs are not read during offline validation; this checks
+    # only the supported creation declarations and CR environment settings.
+    problems="$(validate_agentruntime_checkpoint_config 2>&1)" || { printf '%s\n' "${problems}"; return 1; }
+  fi
   [[ -z "${problems}" ]] && return 0
   printf '%s\n' "${problems}"
   return 1
@@ -6820,6 +6825,58 @@ wait_for_splunk_standalone() {
   log "✓ Splunk Standalone is ready"
 }
 
+# Validate only names and configuration shape here. Credential environment
+# inputs are resolved at deployment time, so offline profile rendering does not
+# need or expose a password. Errors deliberately contain fixed field paths.
+validate_agentruntime_checkpoint_config() {
+  yq -o=json '.aiPlatform // {}' "${CONFIG_FILE}" 2>/dev/null | python3 -c '
+import json, re, sys
+try:
+    platform = json.load(sys.stdin)
+    features = platform.get("features") or []
+    entries = (platform.get("agentRuntime") or {}).get("checkpointSecrets", [])
+    if entries is None:
+        entries = []
+    if not isinstance(entries, list):
+        raise ValueError("aiPlatform.agentRuntime.checkpointSecrets must be a list")
+    refs = {f.get("checkpointDbSecretRef") for f in features if f.get("name") == "agentruntime"}
+    forbidden = {"DATABASE_URL", "PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DBNAME", "PGHOST", "PGHOSTADDR", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE"}
+    for f in features:
+        if f.get("name") == "agentruntime" and forbidden.intersection(f.get("env") or {}):
+            raise ValueError("aiPlatform.features.env PostgreSQL connection settings must use checkpointDbSecretRef")
+        if f.get("name") == "agentruntime" and any((f.get("env") or {}).get(k, "") not in ("", "disable", "allow", "prefer", "require", "verify-ca", "verify-full") for k in ("PGSSLMODE", "PG_SSLMODE")):
+            raise ValueError("aiPlatform.features.env PostgreSQL SSL mode is unsupported")
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets entries must be mappings")
+        name = entry.get("name")
+        if not isinstance(name, str) or len(name) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", label) for label in name.split(".")):
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets.name must be a Kubernetes Secret name")
+        if name in seen or name not in refs:
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets.name must be unique and match an agentruntime checkpointDbSecretRef")
+        seen.add(name)
+        if type(entry.get("create", True)) is not bool:
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets.create must be a boolean")
+        env = entry.get("databaseUrlEnv", "AGENT_RUNTIME_CHECKPOINT_DB_URL")
+        if not isinstance(env, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env):
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets.databaseUrlEnv must name an environment variable")
+        if "databaseUrl" in entry and not isinstance(entry["databaseUrl"], str):
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets.databaseUrl must be a string")
+        if entry.get("pgSslMode", "") not in ("", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"):
+            raise ValueError("aiPlatform.agentRuntime.checkpointSecrets.pgSslMode is unsupported")
+except ValueError as error:
+    # Only the fixed validation messages above are safe to return. JSON errors
+    # contain source text/positions and must never escape into the session log.
+    message = str(error) if type(error) is ValueError else "invalid checkpoint Secret configuration"
+    print("[PROFILE_INVALID_VALUE] " + message, file=sys.stderr)
+    sys.exit(1)
+except (TypeError, AttributeError):
+    print("[PROFILE_INVALID_VALUE] invalid checkpoint Secret configuration shape", file=sys.stderr)
+    sys.exit(1)
+'
+}
+
 # ====== INSTALL AI PLATFORM CR ======
 render_agentruntime_checkpoint_secret_manifest() {
   local name="$1" namespace="$2" pg_ssl_mode="${3:-}"
@@ -6829,25 +6886,47 @@ render_agentruntime_checkpoint_secret_manifest() {
   python3 -c '
 import base64
 import json
+import re
 import sys
 from urllib.parse import parse_qs, unquote, urlsplit
 
-url = sys.stdin.read().strip()
 try:
+    url = sys.stdin.read().strip()
+    url.encode("utf-8")
     parsed = urlsplit(url)
     if parsed.scheme not in ("postgres", "postgresql"):
         raise ValueError()
     host = parsed.hostname
-    port = parsed.port or 5432
-    user = unquote(parsed.username or "")
-    password = unquote(parsed.password or "")
-    dbname = unquote(parsed.path[1:] if parsed.path.startswith("/") else "")
-    if not all((host, user, password, dbname)):
+    # Python accepts raw userinfo and hosts that Go net/url rejects. Refuse
+    # those before persisting a Secret that reconciliation could never use.
+    userinfo = parsed.netloc.rsplit("@", 1)[0]
+    if re.search(r"[^A-Za-z0-9_.:~!$&\x27()*+,;=%@-]", userinfo) or any(ord(c) < 32 or ord(c) == 127 for c in url):
         raise ValueError()
-    ssl_modes = parse_qs(parsed.query, keep_blank_values=True).get("sslmode", [])
-    if len(ssl_modes) > 1:
+    if host is None or "\\" in host or any(c in host for c in "<>\"^`{|}"):
         raise ValueError()
-except ValueError:
+    hostname, zone, suffix = host.partition("%25")
+    if any(int(m[1], 16) < 128 for m in re.finditer(r"%([0-9a-fA-F]{2})", hostname)):
+        raise ValueError()
+    if "%" in host and not zone:
+        raise ValueError()
+    host = unquote(host, errors="strict")
+    port = parsed.port if parsed.port is not None else 5432
+    user = unquote(parsed.username or "", errors="strict")
+    password = unquote(parsed.password or "", errors="strict")
+    dbname = unquote(parsed.path[1:] if parsed.path.startswith("/") else "", errors="strict")
+    if re.search(r"%(?![0-9a-fA-F]{2})", url) or not all(v.strip() for v in (host, user, password, dbname)) or not 1 <= port <= 65535 or parsed.fragment or any(c in host for c in ", /\t"):
+        raise ValueError()
+    if any(c in url for c in "\x00\r\n") or any(any(c in v for c in "\x00\r\n") for v in (host, user, password, dbname)):
+        raise ValueError()
+    if "=" in dbname or dbname.startswith(("postgres://", "postgresql://")) or ";" in parsed.query:
+        raise ValueError()
+    options = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    if any(len(v) != 1 for v in options.values()) or {k.lower() for k in options}.intersection({"host", "hostaddr", "port", "user", "password", "dbname", "service", "servicefile", "passfile"}):
+        raise ValueError()
+    ssl_modes = options.get("sslmode", [])
+    if ssl_modes and ssl_modes[0] not in ("disable", "allow", "prefer", "require", "verify-ca", "verify-full"):
+        raise ValueError()
+except (ValueError, UnicodeError):
     print("Invalid PostgreSQL checkpoint URL: expected a postgres/postgresql URL with host, user, password, and database", file=sys.stderr)
     sys.exit(1)
 
@@ -6880,6 +6959,9 @@ print(json.dumps(manifest, separators=(",", ":")))
 create_agentruntime_checkpoint_secrets() {
   k0s_agentruntime_feature_enabled || return 0
 
+  need python3
+  validate_agentruntime_checkpoint_config || { err "Invalid checkpoint Secret deployment configuration"; return 1; }
+
   local count
   count=$(yq eval '.aiPlatform.agentRuntime.checkpointSecrets // [] | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
   if [[ "${count}" == "0" ]]; then
@@ -6887,9 +6969,7 @@ create_agentruntime_checkpoint_secrets() {
     return 0
   fi
 
-  need python3
-
-  local i name database_url env_var create_flag pg_ssl_mode
+  local i name database_url env_var create_flag pg_ssl_mode manifest existing
   for ((i=0; i<count; i++)); do
     create_flag="$(yq eval ".aiPlatform.agentRuntime.checkpointSecrets[${i}].create" "${CONFIG_FILE}" 2>/dev/null || echo "null")"
     [[ -z "${create_flag}" || "${create_flag}" == "null" ]] && create_flag="true"
@@ -6905,15 +6985,48 @@ create_agentruntime_checkpoint_secrets() {
       database_url="${!env_var:-}"
     fi
     if [[ -z "${database_url}" ]]; then
-      warn "Skipping checkpoint DB Secret/${name}: set aiPlatform.agentRuntime.checkpointSecrets[${i}].databaseUrl or export ${env_var}."
-      continue
+      err "Checkpoint Secret creation requires its configured deployment-time database URL input"
+      return 1
     fi
 
-    log "Creating/updating agent-runtime checkpoint DB secret '${name}' in ${AI_NS} (value from config/env, not logged)..."
-    if ! printf '%s' "${database_url}" | \
-        render_agentruntime_checkpoint_secret_manifest "${name}" "${AI_NS}" "${pg_ssl_mode}" | \
-        kubectl -n "${AI_NS}" apply -f - >/dev/null; then
-      err "Failed to create agent-runtime checkpoint DB Secret/${name}"
+    if ! manifest=$(printf '%s' "${database_url}" | render_agentruntime_checkpoint_secret_manifest "${name}" "${AI_NS}" "${pg_ssl_mode}"); then
+      err "Invalid checkpoint Secret credential input"
+      return 1
+    fi
+    # Avoid an apply on identical inputs: even metadata-only version changes
+    # invalidate schema identity. Never overwrite customer-managed credentials
+    # or start an implicit rotation of a running runtime during installer reruns.
+    if ! existing=$(kubectl -n "${AI_NS}" get secret "${name}" --ignore-not-found -o json 2>/dev/null); then
+      err "Cannot inspect checkpoint Secret; check permissions and API availability"
+      return 1
+    fi
+    if [[ -n "${existing}" ]]; then
+      if ! printf '%s\n%s' "${manifest}" "${existing}" | python3 -c '
+import base64, json, sys
+try:
+    desired, existing = (json.loads(part) for part in sys.stdin.read().split("\n", 1))
+    same = existing.get("type") == "Opaque" and all(existing.get("data", {}).get(k) == v for k, v in desired["data"].items())
+    # Extra libpq connection aliases can override otherwise identical fields.
+    aliases = {"PGHOST", "PGHOSTADDR", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE"}
+    same = same and not aliases.intersection(existing.get("data", {}))
+    for key in ("PGSSLMODE", "PG_SSLMODE"):
+        mode = base64.b64decode(existing.get("data", {}).get(key, ""), validate=True).decode("utf-8")
+        same = same and mode in ("", "disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+    sys.exit(0 if same else 1)
+except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+    sys.exit(1)
+'; then
+        err "Checkpoint Secret already exists with different content; preserve it and use an explicit credential-management workflow"
+        return 1
+      fi
+      log "Checkpoint Secret/${name} already matches; preserving its resource version"
+      continue
+    fi
+    # The manifest travels only on stdin. kubectl can echo rejected Secret data
+    # in stderr, so report a bounded failure instead of forwarding its payload.
+    if ! printf '%s' "${manifest}" | kubectl -n "${AI_NS}" create -f - >/dev/null 2>&1; then
+      err "Cannot create checkpoint Secret; check configuration, permissions and API availability"
+      return 1
     fi
     log "✓ Agent-runtime checkpoint DB secret ready: ${name}"
   done
@@ -6921,6 +7034,10 @@ create_agentruntime_checkpoint_secrets() {
 
 install_ai_platform_cr() {
   log "============================================"
+
+  # Required credentials must be valid before cleanup or AIPlatform application
+  # can start schema/runtime reconciliation. Reference-only entries are untouched.
+  create_agentruntime_checkpoint_secrets || return 1
   log "Creating AIPlatform Custom Resource"
   log "============================================"
 
@@ -7060,8 +7177,6 @@ EOF
       --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
     log "✓ Object storage credentials secret ready"
   fi
-
-  create_agentruntime_checkpoint_secrets
 
   # Build imagePullSecrets YAML from created secrets
   local image_pull_secrets=""
