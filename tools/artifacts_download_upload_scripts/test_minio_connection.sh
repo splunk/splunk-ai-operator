@@ -1,10 +1,27 @@
 #!/bin/bash
 # Test script to diagnose MinIO connectivity and bucket creation issues
 
-MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
-: "${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in the environment}"
-: "${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in the environment}"
-MINIO_BUCKET="${MINIO_BUCKET:-ai-platform-bucket}"
+# Generic names (preferred); fallback to MINIO_* for backward compatibility
+OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-${MINIO_ENDPOINT:-http://127.0.0.1:9000}}"
+OBJECT_STORE_BUCKET="${OBJECT_STORE_BUCKET:-${MINIO_BUCKET:-ai-platform-bucket}}"
+OBJECT_STORE_ACCESS_KEY="${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-}}}"
+OBJECT_STORE_SECRET_KEY="${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY:-}}}"
+if [[ -z "$OBJECT_STORE_ACCESS_KEY" || -z "$OBJECT_STORE_SECRET_KEY" ]]; then
+    echo "Error: object-store credentials are required."
+    echo "Set OBJECT_STORE_ACCESS_KEY and OBJECT_STORE_SECRET_KEY (or MINIO_ROOT_USER and MINIO_ROOT_PASSWORD)."
+    exit 1
+fi
+if [[ "$OBJECT_STORE_SECRET_KEY" == [mM][iI][nN][iI][oO][aA][dD][mM][iI][nN] ||
+      "$OBJECT_STORE_SECRET_KEY" == [sS][eE][aA][wW][eE][eE][dD][fF][sS] ]]; then
+    echo "Error: refusing factory-default credentials or a predictable secret (secret key minioadmin or seaweedfs, case-insensitive)."
+    echo "Configure the object store with unique credentials and pass them via OBJECT_STORE_ACCESS_KEY/OBJECT_STORE_SECRET_KEY."
+    exit 1
+fi
+# Internal use (script uses one set)
+MINIO_ENDPOINT="${OBJECT_STORE_ENDPOINT}"
+MINIO_BUCKET="${OBJECT_STORE_BUCKET}"
+MINIO_ROOT_USER="${OBJECT_STORE_ACCESS_KEY}"
+MINIO_ROOT_PASSWORD="${OBJECT_STORE_SECRET_KEY}"
 
 echo "=========================================="
 echo "MinIO Connection Test"
