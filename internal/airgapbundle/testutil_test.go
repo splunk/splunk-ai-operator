@@ -64,14 +64,15 @@ func (f *fakeRegistry) Copy(context.Context, string, string) error { return nil 
 // fixture is a complete staged bundle for both profiles, the snapshot made from the
 // same inventory, and the inputs that inventory is derived from.
 type fixture struct {
-	t             *testing.T
-	dir           string // the staged bundle
-	snapshot      string // the snapshot's manifest.json
-	installConfig string // the generated installer configuration naming the mirror references
-	snap          *imagesnapshot.Snapshot
-	input         imagesnapshot.InventoryInput
-	models        []Model
-	reg           *fakeRegistry
+	t        *testing.T
+	dir      string // the staged bundle
+	snapshot string // the snapshot's manifest.json
+	snap     *imagesnapshot.Snapshot
+	// inputs are each profile's install inputs, read from the configuration install-config
+	// generated for that profile: every image from the mirror, by digest.
+	inputs map[string]imagesnapshot.InventoryInput
+	models []Model
+	reg    *fakeRegistry
 }
 
 func write(t *testing.T, p, body string) {
@@ -207,17 +208,19 @@ func newFixture(t *testing.T) *fixture {
 	f.snapshot, _, err = (imagesnapshot.Store{Dir: filepath.Join(root, "snapshots")}).Put(f.snap)
 	require.NoError(t, err)
 	carrySnapshot(t, f.dir, f.snapshot)
-	// The install uses the generated configuration: every image from the mirror, by digest.
-	f.installConfig = filepath.Join(root, "install-config.yaml")
-	cfg, err := imagesnapshot.InstallConfig(f.snap, srcInput.Candidate.Spec.RuntimeVersion)
-	require.NoError(t, err)
-	b, err := yaml.Marshal(cfg)
-	require.NoError(t, err)
-	write(t, f.installConfig, string(b))
-	installFiles := lists
-	installFiles.Config = f.installConfig
-	f.input, err = imagesnapshot.LoadInput(installFiles)
-	require.NoError(t, err)
+	// Each profile installs with the configuration generated for it.
+	f.inputs = map[string]imagesnapshot.InventoryInput{}
+	for _, profile := range imagesnapshot.Profiles {
+		cfg, err := imagesnapshot.InstallConfig(f.snap, profile, srcInput.Candidate.Spec.RuntimeVersion)
+		require.NoError(t, err)
+		b, err := yaml.Marshal(cfg)
+		require.NoError(t, err)
+		installFiles := lists
+		installFiles.Config = filepath.Join(root, "install-config-"+profile+".yaml")
+		write(t, installFiles.Config, string(b))
+		f.inputs[profile], err = imagesnapshot.LoadInput(installFiles)
+		require.NoError(t, err)
+	}
 	f.models = []Model{
 		{ID: "all-minilm-l6-v2", Source: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"},
 		{ID: "cross-encoder", Source: "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2", SHA256: strings.Repeat("c", 64)},
@@ -251,7 +254,7 @@ func (f *fixture) facts() *HostFacts {
 }
 
 func (f *fixture) opts(profile string) VerifyOptions {
-	return VerifyOptions{Profile: profile, Input: f.input, SnapshotPath: f.snapshot, Registry: f.reg, Facts: f.facts()}
+	return VerifyOptions{Profile: profile, Input: f.inputs[profile], SnapshotPath: f.snapshot, Registry: f.reg, Facts: f.facts()}
 }
 
 func codes(findings []Finding) map[string]string { // component -> code

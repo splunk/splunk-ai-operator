@@ -2051,6 +2051,10 @@ preflight_checks() {
     ASIA*) pf_fail "objectStore.auth.rootUser '${MINIO_ROOT_USER}' is an STS temporary key (ASIA…). The k0s installer does not propagate AWS_SESSION_TOKEN; use a permanent IAM access key (AKIA…) instead. To mint one: aws iam create-access-key --user-name <iam-user>." ;;
   esac
 
+  # Decide once, read-only, which cluster the checks below read (the one main_install will
+  # use, or none for a fresh install); the readers run in subshells and reuse the result.
+  resolve_target_cluster
+
   # Verify the image registry is reachable and credentials work before committing
   # to a multi-minute install that would fail at ImagePullBackOff otherwise.
   preflight_check_registry
@@ -2593,8 +2597,20 @@ preflight_check_registry() {
 
   local auth_header=""
 
+  # The images.imagePullSecrets references are this install's own credentials for its
+  # registry (MPR-193): a dockerConfigFile, or the Secret already in the target cluster.
+  # They come first; the legacy imagePullSecrets.* settings otherwise. Never printed.
+  local _ref_cfg _ref_auth=""
+  if _ref_cfg="$(mktemp)"; then
+    pull_secret_docker_config "${_ref_cfg}" && _ref_auth="$(docker_config_registry_auth "${_ref_cfg}" "${IMAGE_REGISTRY}")"
+    rm -f "${_ref_cfg}"
+  fi
+
   # Resolve auth credentials by registry type
-  if [[ "${IMAGE_REGISTRY}" == *.dkr.ecr.*.amazonaws.com ]]; then
+  if [[ -n "${_ref_auth}" ]]; then
+    auth_header="Authorization: Basic ${_ref_auth}"
+
+  elif [[ "${IMAGE_REGISTRY}" == *.dkr.ecr.*.amazonaws.com ]]; then
     # ECR: exchange AWS credentials for a short-lived token
     local _ecr_region="${ECR_REGION:-${REGION:-us-east-2}}"
     if ! command -v aws &>/dev/null; then
@@ -2704,7 +2720,7 @@ preflight_check_registry() {
       pf_ok "Registry auth OK: manifest reachable for ${probe_repo}:${probe_tag}"
       ;;
     401|403)
-      pf_fail "Registry credentials rejected (HTTP ${manifest_http_code}) for ${IMAGE_REGISTRY}. Check imagePullSecrets config — images will fail to pull at deploy time."
+      pf_fail "Registry credentials rejected (HTTP ${manifest_http_code}) for ${IMAGE_REGISTRY}. Check the credentials for it in images.imagePullSecrets (or the legacy imagePullSecrets settings) — images will fail to pull at deploy time."
       ;;
     404)
       # 404 on the manifest means registry is reachable + auth works, but this specific
@@ -2791,11 +2807,12 @@ collect_airgap_host_facts() {
   IFS=' ' read -ra ctrl_ips <<< "${EXISTING_CONTROLLER_IPS:-}"
   IFS=' ' read -ra worker_ips <<< "${EXISTING_WORKER_IPS:-}"
 
-  # Schedulable GPUs per node InternalIP, when the nodes already form a cluster.
-  local alloc_json="{}"
-  if kubectl get nodes -o json >/dev/null 2>&1; then
-    alloc_json="$(kubectl get nodes -o json 2>/dev/null | jq -c '[.items[] | {ip: ([.status.addresses[] | select(.type=="InternalIP") | .address][0]),
-      gpu: ((.status.allocatable["nvidia.com/gpu"] // "0") | tonumber)}] | map({(.ip): .gpu}) | add // {}' 2>/dev/null || echo "{}")"
+  # Schedulable GPUs per node InternalIP, when the nodes already form the cluster this
+  # install will use (target_kubectl; never the installer host's ambient kubeconfig).
+  local alloc_json="{}" nodes_json
+  if nodes_json="$(target_kubectl get nodes -o json 2>/dev/null)" && [[ -n "${nodes_json}" ]]; then
+    alloc_json="$(jq -c '[.items[] | {ip: ([.status.addresses[] | select(.type=="InternalIP") | .address][0]),
+      gpu: ((.status.allocatable["nvidia.com/gpu"] // "0") | tonumber)}] | map({(.ip): .gpu}) | add // {}' <<< "${nodes_json}" 2>/dev/null || echo "{}")"
   fi
 
   local nodes="[]" ip idx=0 is_gpu info platform os_id kernel
@@ -2860,19 +2877,19 @@ collect_airgap_host_facts() {
   jq -n --argjson nodes "${nodes}" --argjson staged "${staged}" '{nodes: $nodes, stagedModels: $staged}' > "${out}"
 }
 
-# airgap_registry_config_dir: a Docker configuration directory holding the mirror
-# credentials from the first images.imagePullSecrets entry with a dockerConfigFile, for
+# airgap_registry_config_dir: a Docker configuration directory holding the registry
+# credentials of the images.imagePullSecrets references (pull_secret_docker_config), for
 # the tool's read-only mirror check. Empty output: use the host's own configuration.
 airgap_registry_config_dir() {
-  local f
-  f="$(yq eval '[.images.imagePullSecrets[]? | select(.dockerConfigFile != null) | .dockerConfigFile][0] // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
-  [[ -z "${f}" || "${f}" == "null" ]] && return 0
-  [[ "${f}" == /* ]] || f="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)/${f}"
-  [[ -r "${f}" ]] || return 0
   local d
-  d="$(mktemp -d)"
-  cp "${f}" "${d}/config.json" && chmod 600 "${d}/config.json"
-  printf '%s\n' "${d}"
+  d="$(mktemp -d)" || return 0
+  chmod 700 "${d}"
+  if pull_secret_docker_config "${d}/config.json"; then
+    printf '%s\n' "${d}"
+  else
+    rm -rf "${d}"
+  fi
+  return 0
 }
 
 # preflight_check_airgap_bundle: the air-gap install preflight. Nothing is changed.
@@ -6344,6 +6361,57 @@ EOF
   log "ECR repository permissions configured"
 }
 
+# ====== THE TARGET CLUSTER, READ-ONLY, BEFORE THE INSTALL (MPR-193) ======
+# The preflight runs before main_install picks the cluster it will use (and exports its
+# KUBECONFIG), so a preflight that read "kubectl" would read whatever cluster the installer
+# host's kubeconfig points at: not the target when the install reaches an existing k0s
+# cluster over SSH, and possibly another cluster altogether.
+#
+# resolve_target_cluster decides, the way main_install does and without changing anything,
+# how to read the cluster this install will use. It sets TARGET_CLUSTER_ACCESS to
+#   local  useExisting auto or force, and KUBECONFIG names a reachable cluster whose context
+#          contains cluster.name (any context with force)
+#   ssh    k0s already runs on the first controller: read with `sudo k0s kubectl` there
+#          (TARGET_CLUSTER_CONTROLLER)
+#   none   there is no cluster yet: a fresh install
+TARGET_CLUSTER_ACCESS=""
+TARGET_CLUSTER_CONTROLLER=""
+resolve_target_cluster() {
+  [[ -n "${TARGET_CLUSTER_ACCESS}" ]] && return 0
+  TARGET_CLUSTER_ACCESS=none
+  TARGET_CLUSTER_CONTROLLER=""
+  if [[ "${USE_EXISTING:-never}" == "auto" || "${USE_EXISTING:-never}" == "force" ]] && [[ -n "${KUBECONFIG:-}" ]] \
+     && timeout 5 kubectl cluster-info >/dev/null 2>&1; then
+    local context
+    context="$(kubectl config current-context 2>/dev/null || echo unknown)"
+    if [[ "${context}" == *"${CLUSTER_NAME}"* || "${USE_EXISTING}" == "force" ]]; then
+      TARGET_CLUSTER_ACCESS=local
+      return 0
+    fi
+  fi
+  local -a controllers=()
+  IFS=' ' read -ra controllers <<< "${EXISTING_CONTROLLER_IPS:-}"
+  local controller="${controllers[0]:-}"
+  if [[ -n "${controller}" ]] \
+     && ssh_exec "${controller}" "command -v k0s >/dev/null 2>&1 && sudo k0s status >/dev/null 2>&1" >/dev/null 2>&1; then
+    TARGET_CLUSTER_ACCESS=ssh
+    TARGET_CLUSTER_CONTROLLER="${controller}"
+  fi
+  return 0
+}
+
+# target_kubectl get ...: read the target cluster (see resolve_target_cluster). Only "get"
+# is allowed (exit 2 otherwise); exit 1 when there is no cluster to read.
+target_kubectl() {
+  [[ "${1:-}" == "get" ]] || return 2
+  resolve_target_cluster
+  case "${TARGET_CLUSTER_ACCESS}" in
+    local) kubectl "$@" ;;
+    ssh)   ssh_exec "${TARGET_CLUSTER_CONTROLLER}" "sudo k0s kubectl $(printf '%q ' "$@")" ;;
+    *)     return 1 ;;
+  esac
+}
+
 # ====== CREATE IMAGE PULL SECRETS FROM CONFIG ======
 # ====== REGISTRY PULL SECRETS BY REFERENCE (MPR-193) ======
 # images.imagePullSecrets: [{name, dockerConfigFile?}] names Kubernetes Secrets the
@@ -6364,6 +6432,65 @@ _pull_secret_file() {
   [[ -z "${f}" || "${f}" == "null" ]] && return 0
   [[ "${f}" == /* ]] || f="$(cd "$(dirname "${CONFIG_FILE}")" && pwd)/${f}"
   printf '%s\n' "${f}"
+}
+
+# pull_secret_docker_config <out>: write to <out> the registry credentials the
+# images.imagePullSecrets references carry, as one Docker configuration: each entry's
+# dockerConfigFile, or for an entry without one, its Secret as it already exists in the
+# target cluster (read-only, from the first namespace that has it). For a registry named by
+# more than one entry the first entry wins. Returns 1 when no reference carries any. The
+# contents are never printed.
+pull_secret_docker_config() {
+  local out="$1" count i file name ns data work
+  count="$(yq eval '(.images.imagePullSecrets // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+  [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]] || return 1
+  work="$(mktemp -d)" || return 1
+  chmod 700 "${work}"
+  for ((i=0; i<count; i++)); do
+    file="$(_pull_secret_file "$i")"
+    if [[ -n "${file}" ]]; then
+      [[ -r "${file}" ]] && jq -e '.auths | type == "object"' "${file}" >/dev/null 2>&1 && cp "${file}" "${work}/${i}.json"
+      continue
+    fi
+    name="$(yq eval ".images.imagePullSecrets[$i].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -n "${name}" && "${name}" != "null" ]] || continue
+    while IFS= read -r ns; do
+      [[ -n "${ns}" ]] || continue
+      data="$(target_kubectl get secret "${name}" -n "${ns}" -o json 2>/dev/null \
+              | jq -r 'select(.type == "kubernetes.io/dockerconfigjson") | .data[".dockerconfigjson"] // empty' 2>/dev/null)" || data=""
+      if [[ -n "${data}" ]]; then
+        printf '%s' "${data}" | base64 --decode > "${work}/${i}.json" 2>/dev/null
+        jq -e '.auths | type == "object"' "${work}/${i}.json" >/dev/null 2>&1 || rm -f "${work}/${i}.json"
+        break
+      fi
+    done < <(pull_secret_namespaces)
+    data=""
+  done
+  local -a parts=()
+  for ((i=0; i<count; i++)); do [[ -f "${work}/${i}.json" ]] && parts+=("${work}/${i}.json"); done
+  local rc=1
+  if [[ ${#parts[@]} -gt 0 ]] \
+     && jq -s '{auths: (reduce .[] as $c ({}; ($c.auths // {}) + .))}' "${parts[@]}" > "${out}" 2>/dev/null; then
+    chmod 600 "${out}"
+    rc=0
+  fi
+  rm -rf "${work}"
+  return ${rc}
+}
+
+# docker_config_registry_auth <docker config> <registry>: print the base64 "user:password"
+# the configuration holds for the registry's host, or nothing. A key may be a bare host or
+# a URL with a scheme and path (https://host/v2/), and Docker Hub's index.docker.io and
+# registry-1.docker.io are docker.io. "auth" is used, else "username" and "password".
+docker_config_registry_auth() {
+  jq -r --arg h "$2" '
+    def norm: sub("^[A-Za-z][A-Za-z0-9+.-]*://"; "") | split("/")[0]
+              | if . == "index.docker.io" or . == "registry-1.docker.io" then "docker.io" else . end;
+    ($h | norm) as $want
+    | [(.auths // {}) | to_entries[] | select((.key | norm) == $want) | .value
+       | if (.auth // "") != "" then .auth
+         elif (.username // "") != "" and (.password // "") != "" then ("\(.username):\(.password)" | @base64)
+         else empty end][0] // empty' "$1" 2>/dev/null
 }
 
 # validate_pull_secret_config: print one line per problem in images.imagePullSecrets,
@@ -6415,28 +6542,29 @@ pull_secret_namespaces() {
 # validate_pull_secret_refs: print one line per images.imagePullSecrets reference without a
 # dockerConfigFile that cannot be satisfied: the install cannot create it, so it must
 # already exist as a kubernetes.io/dockerconfigjson Secret in every namespace that uses it.
-# Before a cluster exists such a reference can never be satisfied.
+# Before a cluster exists such a reference can never be satisfied. The cluster read is the
+# one the install will use (target_kubectl), never the installer host's ambient kubeconfig.
 validate_pull_secret_refs() {
   local count i name file ns type have_cluster=false
   count="$(yq eval '(.images.imagePullSecrets // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
   [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]] || return 0
-  kubectl get namespaces >/dev/null 2>&1 && have_cluster=true
+  target_kubectl get namespaces >/dev/null 2>&1 && have_cluster=true
   for ((i=0; i<count; i++)); do
     file="$(_pull_secret_file "$i")"
     [[ -n "${file}" ]] && continue   # created from the file during install
     name="$(yq eval ".images.imagePullSecrets[$i].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
     [[ -n "${name}" && "${name}" != "null" ]] || continue
     if [[ "${have_cluster}" != "true" ]]; then
-      echo "images.imagePullSecrets[$i] (${name}) has no dockerConfigFile, and the cluster cannot be read (or does not exist yet), so the Secret cannot already exist there: give a dockerConfigFile to create it"
+      echo "images.imagePullSecrets[$i] (${name}) has no dockerConfigFile, and no cluster exists yet for this install (or it cannot be read), so the Secret cannot already exist there: give a dockerConfigFile to create it"
       continue
     fi
     while IFS= read -r ns; do
       [[ -n "${ns}" ]] || continue
-      if ! kubectl get secret "${name}" -n "${ns}" >/dev/null 2>&1; then
+      if ! target_kubectl get secret "${name}" -n "${ns}" >/dev/null 2>&1; then
         echo "images.imagePullSecrets[$i]: Secret ${ns}/${name} does not exist and has no dockerConfigFile to create it from"
         continue
       fi
-      type="$(kubectl get secret "${name}" -n "${ns}" -o jsonpath='{.type}' 2>/dev/null || echo "")"
+      type="$(target_kubectl get secret "${name}" -n "${ns}" -o jsonpath='{.type}' 2>/dev/null || echo "")"
       [[ "${type}" == "kubernetes.io/dockerconfigjson" ]] \
         || echo "images.imagePullSecrets[$i]: Secret ${ns}/${name} is of type '${type:-unknown}', not kubernetes.io/dockerconfigjson"
     done < <(pull_secret_namespaces)

@@ -65,6 +65,9 @@ FAILED: bundle bundle-staging for fullfeature (bundle scope): 1 problem(s) found
 exit=1
 
 ### 4. Install settings generated from the snapshot (image-snapshot install-config)
+[Note added after the PR #286 reviews: captured at 571e94c. install-config now takes --profile
+and sets images.registry to the mirror host; for this cpuOnly install it would leave out nginx,
+a fullfeature image, and the header comment reads differently. The references are unchanged.]
 # Installer image settings for snapshot smoke-1 (mirror 10.0.39.38:5099/ai-tier). Merge into the installer
 # configuration and leave images.registry unset: every reference is complete and digest-pinned.
 images:

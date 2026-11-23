@@ -357,7 +357,7 @@ func TestVerify_ArchiveListsMatchHowEverTheReferenceIsSpelled(t *testing.T) {
 	ociArchive(t, filepath.Join(f.dir, "images/addon-images.tar"), []string{"docker.io/library/busybox:1.36", "quay.io/kuberay/operator:v1.2.2"})
 	write(t, filepath.Join(f.dir, "images/addon-images.list"), "busybox:1.36\nquay.io/kuberay/operator:v1.2.2\n")
 	f.build()
-	got := Verify(ctx, f.dir, VerifyOptions{Scope: ScopeBundle, Profile: imagesnapshot.ProfileFullFeature, Input: f.input})
+	got := Verify(ctx, f.dir, VerifyOptions{Scope: ScopeBundle, Profile: imagesnapshot.ProfileFullFeature, Input: f.inputs[imagesnapshot.ProfileFullFeature]})
 	assert.Empty(t, got)
 }
 
@@ -431,7 +431,7 @@ func TestVerify_ArchiveImagesMustBeTheSnapshotsImages(t *testing.T) {
 		f := newFixture(t)
 		rebuildArchive(t, f, "images/k0s-images.tar", map[string]string{k0sImages[1]: digestOf("rebuilt pause")})
 		f.build()
-		o := VerifyOptions{Scope: ScopeBundle, Profile: imagesnapshot.ProfileCPUOnly, Input: f.input}
+		o := VerifyOptions{Scope: ScopeBundle, Profile: imagesnapshot.ProfileCPUOnly, Input: f.inputs[imagesnapshot.ProfileCPUOnly]}
 		assert.Empty(t, Verify(ctx, f.dir, o))
 	})
 }

@@ -1134,7 +1134,8 @@ _ip_facts() (
     if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0-503.40.1.el9_5.x86_64\n'; return 0; fi
     if [[ "$2" == *lspci* ]]; then printf '%s\n%s\n%s\n' "${_IP_DEVICES:-2}" "${_IP_DRIVER-550.54.15}" "${_IP_RUNTIME:-true}"; return 0; fi
   }
-  kubectl() { [[ "$*" == "get nodes -o json" ]] && echo '{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.3"}],"allocatable":{"nvidia.com/gpu":"2"}}}]}'; }
+  # The target cluster (see resolve_target_cluster), here an existing one.
+  target_kubectl() { [[ "$*" == "get nodes -o json" ]] && echo '{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.3"}],"allocatable":{"nvidia.com/gpu":"2"}}}]}'; }
   EXISTING_CONTROLLER_IPS="10.0.0.1"; EXISTING_WORKER_IPS="10.0.0.2 10.0.0.3"; CPU_WORKER_COUNT=1; GPU_WORKER_COUNT=1
   OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
   local out; out="$(mktemp)"
@@ -1334,7 +1335,7 @@ _rf_gpu() ( # _rf_gpu <fake bin dir>: the GPU worker's facts as the collector re
     if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0-503.40.1.el9_5.x86_64\n'; return 0; fi
     env -i PATH="${bin}:/usr/bin:/bin" bash -c "$2"
   }
-  kubectl() { return 1; }
+  target_kubectl() { return 1; }   # a fresh install: no cluster yet
   EXISTING_CONTROLLER_IPS=""; EXISTING_WORKER_IPS="10.0.0.3"; CPU_WORKER_COUNT=0; GPU_WORKER_COUNT=1
   OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
   local out; out="$(mktemp)"
@@ -1394,7 +1395,8 @@ _rf_refs() ( # _rf_refs <config body>: the problems validate_pull_secret_refs re
   yq() { "${YQ_BIN}" "$@"; }
   AI_NS=ai-platform
   component_enabled() { [[ " ${_RF_COMPONENTS:-ai-operator} " == *" $1 "* ]]; }
-  kubectl() {
+  # The target cluster (see resolve_target_cluster), read as the install will read it.
+  target_kubectl() {
     case "$*" in
       "get namespaces") [[ "${_RF_CLUSTER:-yes}" == yes ]]; return $? ;;
       "get secret "*" -o jsonpath={.type}") echo "${_RF_TYPE:-kubernetes.io/dockerconfigjson}"; return 0 ;;
@@ -1407,7 +1409,7 @@ _rf_refs() ( # _rf_refs <config body>: the problems validate_pull_secret_refs re
 )
 if [[ -n "${YQ_BIN}" ]]; then
   _ref=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n'
-  _rf_has "refs: on a fresh install a name-only reference fails in preflight" "$(_RF_CLUSTER=no _rf_refs "${_ref}")" "has no dockerConfigFile, and the cluster cannot be read (or does not exist yet)"
+  _rf_has "refs: on a fresh install a name-only reference fails in preflight" "$(_RF_CLUSTER=no _rf_refs "${_ref}")" "has no dockerConfigFile, and no cluster exists yet for this install"
   _out="$(_RF_HAVE="ai-platform/mirror-pull" _rf_refs "${_ref}")"
   _rf_has "refs: a Secret missing in one namespace that uses it is named" "${_out}" "Secret splunk-ai-operator-system/mirror-pull does not exist"
   assert_eq "refs: and only that namespace" "1" "$(grep -c . <<< "${_out}" | tr -d ' ')"
@@ -1421,6 +1423,217 @@ if [[ -n "${YQ_BIN}" ]]; then
 fi
 assert_eq "refs: the preflight reports them with the setting's own problems" "1" \
   "$(_extract_fn preflight_checks | grep -c 'validate_pull_secret_config; validate_pull_secret_refs' | tr -d ' ')"
+
+suite "air-gap review fixes, round 2 (MPR-193)"
+
+# Shared fakes. A remote controller whose `sudo k0s kubectl` is _r2_remote_kubectl: the SSH
+# command is re-parsed by a shell, as the controller's would, so quoting is exercised too.
+_r2_fakes() {
+  yq() { "${YQ_BIN}" "$@"; }
+  timeout() { shift; "$@"; }
+  ssh_exec() {
+    local host="$1" cmd="$2"
+    echo "${host}: ${cmd}" >> "${_R2_SSH_LOG:-/dev/null}"
+    case "${cmd}" in
+      *"sudo k0s status"*) [[ "${_R2_K0S:-no}" == yes && "${host}" == "${_R2_K0S_HOST:-10.0.0.1}" ]]; return $? ;;
+      "sudo k0s kubectl "*) eval "_r2_remote_kubectl ${cmd#sudo k0s kubectl }"; return $? ;;
+    esac
+    return 1
+  }
+  # The target cluster as either route sees it: namespaces, Secrets (ns/name=type[:data]) and nodes.
+  _r2_remote_kubectl() {
+    case "$1 $2" in
+      "get namespaces") return 0 ;;
+      "get nodes") echo '{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.3"}],"allocatable":{"nvidia.com/gpu":"2"}}}]}'; return 0 ;;
+      "get secret")
+        local name="$3" ns="$5" e
+        for e in ${_R2_SECRETS:-}; do
+          if [[ "${e%%=*}" == "${ns}/${name}" ]]; then
+            local v="${e#*=}" type data
+            type="${v%%:*}"; data=""; [[ "${v}" == *:* ]] && data="${v#*:}"
+            case "${*:6}" in
+              "-o jsonpath={.type}") echo "${type}" ;;
+              "-o json") jq -n --arg t "${type}" --arg d "${data}" '{type: $t, data: (if $d == "" then {} else {".dockerconfigjson": $d} end)}' ;;
+            esac
+            return 0
+          fi
+        done
+        return 1 ;;
+    esac
+    return 1
+  }
+  # The installer host's own kubectl: its kubeconfig reaches _R2_LOCAL (target, other, or none).
+  kubectl() {
+    case "$*" in
+      "cluster-info") [[ "${_R2_LOCAL:-none}" != none ]]; return $? ;;
+      "config current-context") echo "${_R2_CONTEXT:-k0s-ai-tier}"; return 0 ;;
+    esac
+    # An unrelated cluster ("other") answers as readily as the target would.
+    [[ "${_R2_LOCAL:-none}" != none ]] || return 1
+    _r2_remote_kubectl "$@"
+  }
+  USE_EXISTING="${_R2_USE_EXISTING:-auto}"; CLUSTER_NAME=ai-tier
+  EXISTING_CONTROLLER_IPS="${_R2_CTRL-10.0.0.1}"; EXISTING_WORKER_IPS="10.0.0.2 10.0.0.3"
+  [[ "${_R2_LOCAL:-none}" == none ]] && unset KUBECONFIG || KUBECONFIG=/tmp/fake-kubeconfig
+  AI_NS=ai-platform; TARGET_CLUSTER_ACCESS=""; TARGET_CLUSTER_CONTROLLER=""
+  component_enabled() { [[ " ${_R2_COMPONENTS:-ai-operator} " == *" $1 "* ]]; }
+  local f
+  for f in resolve_target_cluster target_kubectl _pull_secret_file pull_secret_namespaces validate_pull_secret_refs \
+           pull_secret_docker_config docker_config_registry_auth airgap_registry_config_dir; do
+    eval "$(_extract_fn "${f}" 2>/dev/null)"
+  done
+}
+
+# B. The target cluster is the one main_install will use, resolved read-only before it.
+_r2_resolve() ( _r2_fakes; resolve_target_cluster >/dev/null 2>&1; echo "${TARGET_CLUSTER_ACCESS}${TARGET_CLUSTER_CONTROLLER:+@${TARGET_CLUSTER_CONTROLLER}}" )
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  assert_eq "target: an existing cluster reached over SSH (no local kubeconfig) is read on its controller" "ssh@10.0.0.1" "$(_R2_K0S=yes _r2_resolve)"
+  assert_eq "target: KUBECONFIG naming the cluster is used, as main_install uses it" "local" "$(_R2_LOCAL=target _R2_K0S=yes _r2_resolve)"
+  assert_eq "target: a KUBECONFIG for another context is not the target; the controller is" "ssh@10.0.0.1" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _R2_K0S=yes _r2_resolve)"
+  assert_eq "target: useExisting force takes KUBECONFIG whatever its context" "local" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _R2_USE_EXISTING=force _r2_resolve)"
+  assert_eq "target: useExisting never ignores KUBECONFIG, but k0s on the controller is still reused" "ssh@10.0.0.1" "$(_R2_LOCAL=target _R2_USE_EXISTING=never _R2_K0S=yes _r2_resolve)"
+  assert_eq "target: a fresh install has no cluster" "none" "$(_r2_resolve)"
+  assert_eq "target: and neither has an install whose ambient kubeconfig is some other cluster" "none" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _r2_resolve)"
+  assert_eq "target: no controllers configured, no cluster" "none" "$(_R2_CTRL="" _R2_K0S=yes _r2_resolve)"
+
+  _r2_tk() ( _r2_fakes; local log; log="$(mktemp)"; _R2_SSH_LOG="${log}"; target_kubectl "$@" >/dev/null 2>&1; echo "rc=$?"; grep 'k0s kubectl' "${log}"; rm -f "${log}" )
+  _out="$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson" _r2_tk get secret mirror-pull -n ai-platform -o 'jsonpath={.type}')"
+  _rf_has "target: over SSH it runs k0s kubectl on the first controller" "${_out}" "10.0.0.1: sudo k0s kubectl get secret mirror-pull -n ai-platform -o jsonpath=\\{.type\\}"
+  _rf_has "target: and the arguments survive the remote shell" "${_out}" "rc=0"
+  assert_eq "target: it only reads (a write verb is refused)" "rc=2" "$(_R2_K0S=yes _r2_tk delete secret mirror-pull -n ai-platform | head -1)"
+  assert_eq "target: and nothing is sent for it" "1" "$(_R2_K0S=yes _r2_tk delete secret mirror-pull -n ai-platform | grep -c . | tr -d ' ')"
+  assert_eq "target: with no cluster it fails without contacting one" "rc=1" "$(_r2_tk get namespaces)"
+
+  _r2_refs() ( _r2_fakes; local cfg; cfg="$(mktemp)"; printf '%s' "$1" > "${cfg}"; CONFIG_FILE="${cfg}"; validate_pull_secret_refs; rm -f "${cfg}" )
+  _ref=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n'
+  _both="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson splunk-ai-operator-system/mirror-pull=kubernetes.io/dockerconfigjson"
+  assert_eq "refs: Secrets present on an SSH-discovered existing cluster satisfy name-only references" "" \
+    "$(_R2_K0S=yes _R2_SECRETS="${_both}" _r2_refs "${_ref}")"
+  _rf_has "refs: and one missing there is still named" "$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson" _r2_refs "${_ref}")" \
+    "Secret splunk-ai-operator-system/mirror-pull does not exist"
+  _rf_has "refs: as is one of the wrong type" "$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=Opaque splunk-ai-operator-system/mirror-pull=kubernetes.io/dockerconfigjson" _r2_refs "${_ref}")" \
+    "is of type 'Opaque'"
+  _rf_has "refs: an unrelated cluster in the ambient kubeconfig is not consulted" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _R2_SECRETS="${_both}" _r2_refs "${_ref}")" \
+    "has no dockerConfigFile, and no cluster exists yet"
+  assert_eq "refs: KUBECONFIG naming the target is read directly" "" "$(_R2_LOCAL=target _R2_SECRETS="${_both}" _r2_refs "${_ref}")"
+
+  _r2_alloc() (
+    _r2_fakes
+    eval "$(_extract_fn _node_platform)"; eval "$(_extract_fn _read_model_marker)"
+    eval "$(_extract_fn model_artifacts_config_name)"; eval "$(_extract_fn collect_airgap_host_facts)"
+    ssh_exec_orig="$(declare -f ssh_exec)"
+    eval "${ssh_exec_orig/ssh_exec/_r2_ssh}"
+    ssh_exec() {
+      if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0\n'; return 0; fi
+      if [[ "$2" == *lspci* ]]; then printf '2\n550.54.15\ntrue\n'; return 0; fi
+      _r2_ssh "$@"
+    }
+    CPU_WORKER_COUNT=1; GPU_WORKER_COUNT=1; OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
+    local out; out="$(mktemp)"; collect_airgap_host_facts "${out}" cpuOnly >/dev/null 2>&1
+    jq -r '.nodes[2].gpu.allocatable // "none"' "${out}"; rm -f "${out}"
+  )
+  assert_eq "facts: schedulable GPUs of an SSH-discovered existing cluster come from its controller" "2" "$(_R2_K0S=yes _r2_alloc)"
+  assert_eq "facts: none claimed on a fresh install" "none" "$(_r2_alloc)"
+  assert_eq "facts: nor from an unrelated cluster in the ambient kubeconfig" "none" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _r2_alloc)"
+fi
+assert_eq "target: the preflight resolves it once, before the first check that reads it" "yes" \
+  "$(_extract_fn preflight_checks | awk '/^  resolve_target_cluster$/{a=NR} /^  preflight_check_registry$/{b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _r2_once() ( _r2_fakes; local log; log="$(mktemp)"; _R2_SSH_LOG="${log}"; resolve_target_cluster
+    local i; for i in 1 2 3; do _x="$(target_kubectl get namespaces)"; done
+    grep -c 'k0s status' "${log}" | tr -d ' '; rm -f "${log}" )
+  assert_eq "target: once resolved, later reads (in subshells) do not probe the controller again" "1" "$(_R2_K0S=yes _r2_once)"
+fi
+assert_eq "target: validate_pull_secret_refs reads only through target_kubectl" "0" \
+  "$(_extract_fn validate_pull_secret_refs | grep -vE '^\s*#' | grep -cE '(^|[^_])kubectl ' | tr -d ' ')"
+assert_eq "target: and so does the facts collector" "0" \
+  "$(_extract_fn collect_airgap_host_facts | grep -vE '^\s*#' | grep -cE '(^|[^_])kubectl ' | tr -d ' ')"
+
+# A. The registry preflight authenticates with the images.imagePullSecrets credentials.
+_R2_PASS='s3cr3t-Pa55'
+_R2_AUTH="$(printf 'mirror-user:%s' "${_R2_PASS}" | base64 | tr -d '\n')"
+_r2_auth() ( _r2_fakes; docker_config_registry_auth "$1" "$2" )
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _r2_dir="$(mktemp -d)"
+  for key in "10.0.39.38:5099" "https://10.0.39.38:5099" "http://10.0.39.38:5099/" "https://10.0.39.38:5099/v2/"; do
+    jq -n --arg k "${key}" --arg a "${_R2_AUTH}" '{auths: {($k): {auth: $a}}}' > "${_r2_dir}/c.json"
+    assert_eq "auth: a Docker configuration key spelled ${key} matches the registry" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5099)"
+  done
+  jq -n --arg p "${_R2_PASS}" '{auths: {"10.0.39.38:5099": {username: "mirror-user", password: $p}}}' > "${_r2_dir}/c.json"
+  assert_eq "auth: username and password are used when there is no auth field" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5099)"
+  assert_eq "auth: a registry with a path is matched by its host" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5099/ai-tier)"
+  assert_eq "auth: another registry's credentials are not used" "" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5100)"
+  jq -n --arg a "${_R2_AUTH}" '{auths: {"https://index.docker.io/v1/": {auth: $a}}}' > "${_r2_dir}/c.json"
+  assert_eq "auth: Docker Hub's legacy key is docker.io" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" docker.io)"
+  rm -rf "${_r2_dir}"
+
+  # A fake registry: /v2/ answers 401; a manifest answers 200 only with the expected Basic credentials.
+  _r2_registry() ( # _r2_registry <config body> [dockerConfigFile json]: the preflight's results
+    _r2_fakes
+    local d; d="$(mktemp -d)"
+    printf '%s' "$1" > "${d}/cluster.yaml"; CONFIG_FILE="${d}/cluster.yaml"
+    [[ -n "${2:-}" ]] && printf '%s' "$2" > "${d}/mirror-auth.json"
+    [[ -n "${_R2_STALE:-}" ]] && printf '%s' "${_R2_STALE}" > "${d}/stale.json"
+    pf_header() { :; }; pf_ok() { echo "OK: $*"; }; pf_warn() { echo "WARN: $*"; }; pf_fail() { echo "FAIL: $*"; }
+    curl() {
+      local a url="${*: -1}" hdr=""
+      for a in "$@"; do [[ "${a}" == "Authorization: Basic "* ]] && hdr="${a#Authorization: Basic }"; done
+      [[ " $* " == *" -D - "* ]] && return 0
+      case "${url}" in
+        */v2/) echo 401 ;;
+        */manifests/*) [[ "${hdr}" == "${_R2_AUTH}" ]] && echo 200 || echo 401 ;;
+        *) echo 000 ;;
+      esac
+    }
+    eval "$(_extract_fn build_image_url)"; eval "$(_extract_fn preflight_check_registry)"
+    IMAGE_REGISTRY=10.0.39.38:5099; IMAGE_REGISTRY_INSECURE=true
+    SLIM_API_IMAGE="10.0.39.38:5099/ai-tier/ml-platform/slim-api@sha256:$(printf 'a%.0s' {1..64})"
+    IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED=false IMAGE_PULL_SECRETS_ACR_ENABLED=false IMAGE_PULL_SECRETS_CUSTOM_ENABLED=false
+    preflight_check_registry 2>&1
+    rm -rf "${d}"
+  )
+  _cfg=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n'
+  _json="$(jq -n --arg a "${_R2_AUTH}" '{auths: {"10.0.39.38:5099": {auth: $a}}}')"
+  _out="$(_r2_registry "${_cfg}" "${_json}")"
+  _rf_has "registry: credentials given only as a dockerConfigFile reference authenticate the mirror check" "${_out}" "OK: Registry auth OK"
+  assert_eq "registry: and the preflight records no failure" "0" "$(grep -c '^FAIL' <<< "${_out}" | tr -d ' ')"
+  assert_eq "registry: the credentials are never printed" "0" "$(grep -cE "${_R2_PASS}|${_R2_AUTH}" <<< "${_out}" | tr -d ' ')"
+  _out="$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson:$(printf '%s' "${_json}" | base64 | tr -d '\n')" \
+          _r2_registry $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n')"
+  _rf_has "registry: a name-only reference's existing Secret authenticates it too (read-only, from the target cluster)" "${_out}" "OK: Registry auth OK"
+  assert_eq "registry: still never printed" "0" "$(grep -cE "${_R2_PASS}|${_R2_AUTH}" <<< "${_out}" | tr -d ' ')"
+  _out="$(_r2_registry "${_cfg}" "$(jq -n --arg a "$(printf 'mirror-user:wrong' | base64)" '{auths: {"10.0.39.38:5099": {auth: $a}}}')")"
+  _rf_has "registry: wrong referenced credentials still fail by name" "${_out}" "FAIL: Registry credentials rejected (HTTP 401)"
+  _rf_has "registry: and the message names the setting to fix" "${_out}" "images.imagePullSecrets"
+  _out="$(_r2_registry "${_cfg}" "$(jq -n --arg a "${_R2_AUTH}" '{auths: {"other.example.com": {auth: $a}}}')")"
+  _rf_has "registry: credentials for another registry do not apply" "${_out}" "FAIL: Registry credentials rejected (HTTP 401)"
+  _cfg2=$'images:\n  imagePullSecrets:\n    - name: other-pull\n      dockerConfigFile: other.json\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n'
+  _out="$(_r2_registry "${_cfg2}" "${_json}")"
+  _rf_has "registry: the matching reference is found even when it is not the first" "${_out}" "OK: Registry auth OK"
+
+  _out="$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=Opaque:$(printf '%s' "${_json}" | base64 | tr -d '\n')" \
+          _r2_registry $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n')"
+  _rf_has "registry: a Secret that is not kubernetes.io/dockerconfigjson is not used for credentials" "${_out}" "FAIL: Registry credentials rejected (HTTP 401)"
+  _cfg3=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n    - name: stale-pull\n      dockerConfigFile: stale.json\n'
+  _out="$(_R2_STALE="$(jq -n --arg a "$(printf 'mirror-user:stale' | base64)" '{auths: {"10.0.39.38:5099": {auth: $a}}}')" _r2_registry "${_cfg3}" "${_json}")"
+  _rf_has "registry: when two references name the mirror, the first one's credentials are used" "${_out}" "OK: Registry auth OK"
+  _cfg4=$'images:\n  imagePullSecrets:\n    - name: stale-pull\n      dockerConfigFile: stale.json\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n'
+  _out="$(_R2_STALE="$(jq -n --arg a "$(printf 'mirror-user:stale' | base64)" '{auths: {"10.0.39.38:5099": {auth: $a}}}')" _r2_registry "${_cfg4}" "${_json}")"
+  _rf_has "registry: and that is the order given (a stale first entry is the one tried)" "${_out}" "FAIL: Registry credentials rejected"
+
+  # The bundle check's mirror access uses the same credentials.
+  _r2_cfgdir() ( _r2_fakes; local d; d="$(mktemp -d)"; printf '%s' "$1" > "${d}/cluster.yaml"; CONFIG_FILE="${d}/cluster.yaml"
+    [[ -n "${2:-}" ]] && printf '%s' "$2" > "${d}/mirror-auth.json"
+    local out; out="$(airgap_registry_config_dir)"
+    if [[ -n "${out}" ]]; then echo "mode=$(stat -f %Lp "${out}/config.json" 2>/dev/null || stat -c %a "${out}/config.json")"; jq -r --arg h 10.0.39.38:5099 '.auths[$h].auth == env.R2A' "${out}/config.json"; rm -rf "${out}"; else echo none; fi
+    rm -rf "${d}" )
+  export R2A="${_R2_AUTH}"
+  assert_eq "bundle check: a later reference's dockerConfigFile reaches the tool" $'mode=600\ntrue' "$(_r2_cfgdir "${_cfg2}" "${_json}")"
+  assert_eq "bundle check: so does a name-only reference's existing Secret" $'mode=600\ntrue' \
+    "$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson:$(printf '%s' "${_json}" | base64 | tr -d '\n')" _r2_cfgdir $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n')"
+  assert_eq "bundle check: no reference, the host's own configuration" "none" "$(_r2_cfgdir 'images: {}')"
+  unset R2A
+fi
 
 _exercise_airgap_bundle_helpers() (
   local mode="$1" fixture_dir

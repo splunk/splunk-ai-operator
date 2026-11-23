@@ -6,7 +6,7 @@
 //	image-snapshot verify    --store DIR --id ID --profile cpuOnly|fullfeature ...
 //	image-snapshot compare   --store DIR --id ID --profile ... ...
 //	image-snapshot refresh   --store DIR --previous ID --id ID ...
-//	image-snapshot install-config --store DIR --id ID [--candidate FILE]
+//	image-snapshot install-config --store DIR --id ID --profile cpuOnly|fullfeature [--candidate FILE]
 //
 // It reads registry credentials only from the local Docker configuration, never
 // writes one, and exits 0 when everything is in order, 1 when a snapshot is blocked
@@ -45,8 +45,8 @@ commands:
   verify      preflight: check the mirror against a stored snapshot for one profile
   compare     check the images an install will use against a stored snapshot
   refresh     derive a new snapshot from a stored one, redoing only what changed
-  install-config  print the installer images: settings that use the snapshot's
-              digest-pinned mirror references
+  install-config  print the installer images: settings for one profile that use the
+              snapshot's digest-pinned mirror references
 
 Run "image-snapshot <command> -h" for the flags of a command.`
 
@@ -463,9 +463,13 @@ func cmdInstallConfig(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("install-config", flag.ContinueOnError)
 	var sf snapshotFlags
 	sf.register(fs, "id")
+	profile := fs.String("profile", "", "cpuOnly or fullfeature (required): only this profile's settings are printed")
 	candidate := fs.String("candidate", defaultCandidate, "agent-runtime candidate manifest (its runtimeVersion selects the versioned base pin)")
 	if err := parse(fs, args, stderr); err != nil {
 		return err
+	}
+	if !validProfile(*profile) {
+		return fmt.Errorf("--profile must be cpuOnly or fullfeature")
 	}
 	snap, err := sf.read()
 	if err != nil {
@@ -482,7 +486,7 @@ func cmdInstallConfig(args []string, stdout, stderr io.Writer) error {
 		}
 		runtimeVersion = in.Candidate.Spec.RuntimeVersion
 	}
-	cfg, err := imagesnapshot.InstallConfig(snap, runtimeVersion)
+	cfg, err := imagesnapshot.InstallConfig(snap, *profile, runtimeVersion)
 	if err != nil {
 		return err
 	}
@@ -490,7 +494,7 @@ func cmdInstallConfig(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "# Installer image settings for snapshot %s (mirror %s). Merge into the installer\n", snap.Metadata.ID, snap.Spec.Mirror)
+	fmt.Fprintf(stdout, "# Installer image settings for %s from snapshot %s (mirror %s). Merge into the %s installer\n", *profile, snap.Metadata.ID, snap.Spec.Mirror, *profile)
 	fmt.Fprintf(stdout, "# configuration. images.registry names the mirror host, so the installer configures the nodes for it\n")
 	fmt.Fprintf(stdout, "# (set images.registryInsecure: true for a plain-HTTP mirror); the references are complete and digest-pinned.\n")
 	_, err = stdout.Write(b)

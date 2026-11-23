@@ -177,9 +177,11 @@ image-snapshot compare --store snapshots/launchpad --id run-42 --profile cpuOnly
 image-snapshot refresh --store snapshots/launchpad --previous run-42 --id run-43 <the new inputs>
 ```
 
-`install-config` prints the installer `images:` settings that make an install pull every
-configured image from the snapshot's mirror by digest. That includes the versioned base pin
-for the candidate's `runtimeVersion`. It also sets `images.registry` to the mirror's host,
+`install-config --profile cpuOnly|fullfeature` prints the installer `images:` settings that
+make an install of that profile pull every configured image from the snapshot's mirror by
+digest. Only the profile's own images are included, so one snapshot made for both profiles
+serves each (the installer rejects Ray, Weaviate and SAIA settings for cpuOnly). That
+includes the versioned base pin for the candidate's `runtimeVersion`. It also sets `images.registry` to the mirror's host,
 because the installer configures the nodes for that registry only. The air-gapped install preflight compares the
 configuration it is given with the snapshot (see [airgap-bundle.md](airgap-bundle.md)).
 

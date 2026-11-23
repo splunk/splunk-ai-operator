@@ -591,21 +591,33 @@ func TestInstallConfig_GeneratesSettingsThatCompareAccepts(t *testing.T) {
 	code, _, errs := e.run(append([]string{"create", "--mirror", e.dst.Host, "--store", e.store, "--id", "run-1"}, e.inputs()...)...)
 	require.Equal(t, 0, code, errs)
 
-	code, out, errs := e.run("install-config", "--store", e.store, "--id", "run-1", "--candidate", e.candidate)
-	require.Equal(t, 0, code, errs)
-	assert.Contains(t, out, "# Installer image settings for snapshot run-1")
-	assert.Contains(t, out, "baseImages:", "the candidate's runtimeVersion pin is set")
-	assert.Contains(t, out, "registry: "+e.dst.Host, "images.registry names the mirror host")
-	generated := e.write("generated.yaml", out+"splunk: {enabled: true}\n")
 	for _, profile := range []string{"cpuOnly", "fullfeature"} {
+		code, out, errs := e.run("install-config", "--store", e.store, "--id", "run-1", "--profile", profile, "--candidate", e.candidate)
+		require.Equal(t, 0, code, errs)
+		assert.Contains(t, out, "# Installer image settings for "+profile+" from snapshot run-1")
+		assert.Contains(t, out, "baseImages:", "the candidate's runtimeVersion pin is set")
+		assert.Contains(t, out, "registry: "+e.dst.Host, "images.registry names the mirror host")
+		if profile == "cpuOnly" {
+			assert.NotContains(t, out, "weaviate", "cpuOnly gets no fullfeature-only setting: the installer rejects it")
+		} else {
+			assert.Contains(t, out, "weaviate:", "fixture: fullfeature uses Weaviate")
+		}
+		generated := e.write("generated-"+profile+".yaml", out+"splunk: {enabled: true}\n")
 		code, stdout, errs := e.run("compare", "--store", e.store, "--id", "run-1", "--profile", profile, "--candidate", e.candidate, "--config", generated)
 		assert.Equal(t, 0, code, "%s: %s", profile, errs)
 		assert.Contains(t, stdout, "OK:")
 	}
 
+	// The profile is required: one snapshot serves both, and each gets only its own settings.
+	for _, args := range [][]string{{}, {"--profile", "gpu"}} {
+		code, _, errs := e.run(append([]string{"install-config", "--store", e.store, "--id", "run-1", "--candidate", e.candidate}, args...)...)
+		assert.Equal(t, 2, code, "%v", args)
+		assert.Contains(t, errs, "--profile must be cpuOnly or fullfeature", "%v", args)
+	}
+
 	// The candidate must be the one the snapshot was made from.
 	other := e.write("other-candidate.yaml", string(mustRead(t, e.candidate))+"# edited after the snapshot\n")
-	code, _, errs = e.run("install-config", "--store", e.store, "--id", "run-1", "--candidate", other)
+	code, _, errs = e.run("install-config", "--store", e.store, "--id", "run-1", "--profile", "cpuOnly", "--candidate", other)
 	assert.Equal(t, 2, code)
 	assert.Contains(t, errs, "is not the candidate record snapshot run-1 was made from")
 }

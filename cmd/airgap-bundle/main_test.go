@@ -56,7 +56,7 @@ type env struct {
 	t                  *testing.T
 	dir, bundle, store string
 	snapshot           string
-	installConfig      string
+	installConfigs     map[string]string // profile -> generated install configuration
 	snap               *imagesnapshot.Snapshot
 	reg                *mirrorRegistry
 }
@@ -121,12 +121,15 @@ func newEnv(t *testing.T) *env {
 		require.NoError(t, err)
 		e.write(filepath.Join("bundle/snapshot", name), string(b))
 	}
-	// The install configuration names every configured image by its mirror digest.
-	cfg, err := imagesnapshot.InstallConfig(e.snap, in.Candidate.Spec.RuntimeVersion)
-	require.NoError(t, err)
-	b, err := yaml.Marshal(cfg)
-	require.NoError(t, err)
-	e.installConfig = e.write("install-config.yaml", string(b))
+	// Each profile's install configuration names its images by their mirror digests.
+	e.installConfigs = map[string]string{}
+	for _, profile := range imagesnapshot.Profiles {
+		cfg, err := imagesnapshot.InstallConfig(e.snap, profile, in.Candidate.Spec.RuntimeVersion)
+		require.NoError(t, err)
+		b, err := yaml.Marshal(cfg)
+		require.NoError(t, err)
+		e.installConfigs[profile] = e.write("install-config-"+profile+".yaml", string(b))
+	}
 	e.write("models.yaml", "artifact-configs:\n  - artifact-id: all-minilm-l6-v2\n    hf-url: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2\n")
 	return e
 }
@@ -151,7 +154,7 @@ func (e *env) facts(gpu bool, staged bool) string {
 
 func (e *env) verify(profile, facts string, extra ...string) (int, string, string) {
 	return e.run(append([]string{"verify", "--bundle", e.bundle, "--profile", profile, "--snapshot", e.snapshot,
-		"--candidate", candidate, "--config", e.installConfig, "--facts", facts}, extra...)...)
+		"--candidate", candidate, "--config", e.installConfigs[profile], "--facts", facts}, extra...)...)
 }
 
 func TestEndToEnd_ManifestVerifyImport(t *testing.T) {
@@ -291,6 +294,6 @@ func TestTheBundlesOwnSnapshotIsTheDefault(t *testing.T) {
 	require.Equal(t, 0, code, errs)
 	assert.Contains(t, out, "snapshot snap-1")
 	code, _, errs = e.run("verify", "--bundle", e.bundle, "--profile", "cpuOnly", "--candidate", candidate,
-		"--config", e.installConfig, "--facts", e.facts(false, false))
+		"--config", e.installConfigs["cpuOnly"], "--facts", e.facts(false, false))
 	assert.Equal(t, 0, code, errs)
 }

@@ -25,10 +25,11 @@ Deployments.
 
 | Check | Result |
 |---|---|
-| Go: `internal/airgapbundle`, `cmd/airgap-bundle`, `internal/imagesnapshot`, `cmd/image-snapshot` | 215 tests and subtests pass, 0 fail; race detector clean; statement coverage 87.5%, 88.1%, 91.9% and 86.3% |
-| Mutation checks on `internal/airgapbundle` | 48 deliberate breakages, each caught by a failing test (checksums, sizes, unlisted files, component gates, MetalLB, archive lists, digests, aliases and architecture, the snapshot and mirror checks, the install-configuration comparison, facts, platform, every GPU rule, models, the import's verification, resume, pruning and refusals, write-once, path safety) |
-| Mutation checks on `image-snapshot install-config` | 6 deliberate breakages, each caught |
-| Installer suite (`test_k0s_cluster_with_stack.sh`) | 644 passed and the same 12 pre-existing failures as the base (73 new tests). The OpenShift suite passes, 238 tests |
+| Go: `internal/airgapbundle`, `cmd/airgap-bundle`, `internal/imagesnapshot`, `cmd/image-snapshot` | 219 tests and subtests pass, 0 fail; race detector clean; statement coverage 87.6%, 88.1%, 92.0% and 86.5% |
+| Mutation checks on `internal/airgapbundle` | 50 deliberate breakages, each caught by a failing test (checksums, sizes, unlisted files, component gates, MetalLB, archive lists, digests, aliases and architecture, the snapshot and mirror checks, the install-configuration comparison, facts, platform, every GPU rule, models, the import's verification, resume, pruning and refusals, write-once, path safety) |
+| Mutation checks on `image-snapshot install-config` | 12 deliberate breakages, each caught (including the profile filter, the unknown-profile refusal and the CLI's required `--profile`) |
+| Mutation checks on the installer's target-cluster and registry-credential code | 19 deliberate breakages, each caught (the target-cluster choice, read-only `get`, SSH quoting, caching, the readers' route; key matching, `username`/`password`, Docker Hub, Secret-sourced credentials and their type, first-reference-wins, file mode, the message) |
+| Installer suite (`test_k0s_cluster_with_stack.sh`) | 709 passed and the same 12 pre-existing failures as the base (the 48 tests of the second review round included). The OpenShift suite passes, 238 tests |
 | Module | `go build ./...`, `go vet`; all 23 non-e2e packages pass |
 | Real format | the archive reader was checked against k0s v1.36.3's `airgap bundle-artifacts` source and against real archives it wrote during the smoke |
 
@@ -140,6 +141,32 @@ Four review findings were valid and are fixed, each with a test that fails witho
 4. **Secret references without a file.** These are now checked in the preflight, before any
    change, in every namespace that uses them. On a fresh install they fail at once, because
    such a Secret cannot exist yet. A Secret of another type fails too.
+
+## PR #286 review fixes, round 2
+
+Three more review findings were valid and are fixed, each with tests that fail without the fix:
+
+1. **Referenced credentials in the registry check.** The installer's registry check
+   authenticated only with the legacy `imagePullSecrets.*` settings. A mirror whose
+   credentials were given only as an `images.imagePullSecrets` reference therefore failed
+   the preflight, although the credentials were valid. The check now uses the reference's
+   `dockerConfigFile`, or, for a name-only reference, its existing Secret in the target
+   cluster (read-only, `kubernetes.io/dockerconfigjson` only). The first reference for a
+   registry wins, and keys are matched by host. The bundle check's mirror access uses the same
+   credentials, which are never printed. The test runs the real check against a fake
+   registry that requires Basic auth.
+2. **The target cluster.** The pull-Secret check and the GPU-allocatable fact read the
+   installer host's kubectl. For an existing cluster reached over SSH, that is not the
+   target: `main_install` exports its `KUBECONFIG` only after the preflight. The tests also
+   showed that the checks read any cluster the host's kubeconfig named, even an unrelated one.
+   The preflight now decides the target first, the way `main_install` does. It reads that
+   cluster only with `get`, through `KUBECONFIG` when that names it, or with
+   `sudo k0s kubectl` on the first controller.
+3. **Per-profile install settings.** `install-config` printed every entry of a snapshot made
+   for both profiles. Merged into a cpuOnly configuration, these settings made the installer
+   reject it (Ray, Weaviate and SAIA settings). `install-config` now requires `--profile` and
+   prints only that profile's entries. The test reads the installer's own cpuOnly rejection
+   list.
 
 ## Design decisions
 

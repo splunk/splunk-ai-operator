@@ -18,9 +18,12 @@ var candidateKeys = map[string]string{
 // or a provider) that may itself contain dots.
 var mapSettings = []string{"images.agentRuntime.baseImages.", "images.agentRuntime.providerImages."}
 
-// InstallConfig returns the installer `images:` settings that make an install use the
-// snapshot's images: every setting an entry came from, set to that entry's
-// digest-pinned mirror reference. runtimeVersion is the candidate's runtimeVersion;
+// InstallConfig returns the installer `images:` settings that make an install of the
+// profile use the snapshot's images: every setting an entry the profile needs came from,
+// set to that entry's digest-pinned mirror reference. Entries of the other profile only
+// are left out: the installer's cpuOnly validation rejects Ray, Weaviate and SAIA
+// settings, so one snapshot made for both profiles gives each its own settings.
+// runtimeVersion is the candidate's runtimeVersion;
 // the operator resolves the candidate's base through the versioned pin
 // images.agentRuntime.baseImages.<runtimeVersion>, so that pin is set to the candidate
 // base too.
@@ -33,7 +36,10 @@ var mapSettings = []string{"images.agentRuntime.baseImages.", "images.agentRunti
 // have no installer setting and are not included. A mirror reference the installer
 // would not use as it is (build_image_url prefixes images.registry to a reference
 // whose host has no dot and is not an IP address) is an error, not a silent rewrite.
-func InstallConfig(snap *Snapshot, runtimeVersion string) (map[string]any, error) {
+func InstallConfig(snap *Snapshot, profile, runtimeVersion string) (map[string]any, error) {
+	if !hasProfile(Profiles, profile) {
+		return nil, fmt.Errorf("profile %q is not one of %s", profile, strings.Join(Profiles, ", "))
+	}
 	if err := Validate(snap); err != nil {
 		return nil, err
 	}
@@ -49,6 +55,9 @@ func InstallConfig(snap *Snapshot, runtimeVersion string) (map[string]any, error
 		return nil
 	}
 	for _, e := range snap.Spec.Entries {
+		if !hasProfile(e.Profiles, profile) {
+			continue
+		}
 		var err error
 		switch origin := e.Origin; {
 		case strings.HasPrefix(origin, "installer-config:"):
@@ -70,7 +79,7 @@ func InstallConfig(snap *Snapshot, runtimeVersion string) (map[string]any, error
 		}
 	}
 	if len(settings) == 0 {
-		return nil, fmt.Errorf("snapshot %s has no image the installer configures", snap.Metadata.ID)
+		return nil, fmt.Errorf("snapshot %s has no image the installer configures for %s", snap.Metadata.ID, profile)
 	}
 	settings["images.registry"] = MirrorHost(snap.Spec.Mirror)
 	out := map[string]any{}
