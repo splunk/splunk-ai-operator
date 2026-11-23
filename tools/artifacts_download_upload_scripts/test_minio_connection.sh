@@ -110,7 +110,8 @@ echo ""
 # Configure alias
 echo "[3/6] Configuring MinIO Client alias..."
 ALIAS_NAME="test-minio"
-mc alias set "$ALIAS_NAME" "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" --api S3v4 > /dev/null 2>&1
+# Pass the secret key on stdin so it does not appear in the process list
+printf '%s\n' "$MINIO_ROOT_PASSWORD" | mc alias set --api S3v4 "$ALIAS_NAME" "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" > /dev/null 2>&1
 
 if [ $? -eq 0 ]; then
     echo "✓ Alias configured successfully"

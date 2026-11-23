@@ -292,22 +292,19 @@ Diagnostic script to test S3-compatible object store connectivity (MinIO, Seawee
 - Provides detailed troubleshooting information
 
 **Prerequisites:**
-- Export `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` from your approved credential store.
-- Installing the MinIO Client (`mc`) may require sudo.
+- Set `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` from your approved credential store. The script has no default credentials.
+- Run it as your normal user. The script uses `sudo` itself only if it needs to install the MinIO Client (`mc`) into `/usr/local/bin`.
 
 **Usage:**
 ```bash
+export MINIO_ROOT_USER=<access-key>
+read -rsp 'MinIO root password: ' MINIO_ROOT_PASSWORD; echo; export MINIO_ROOT_PASSWORD   # not echoed or saved to history
 ./test_minio_connection.sh
 ```
 
-To set a different endpoint or bucket:
+To test a different endpoint or bucket:
 ```bash
 MINIO_ENDPOINT=http://localhost:9000 MINIO_BUCKET=nexus ./test_minio_connection.sh
-```
-
-If you must run the script with sudo and your sudo policy permits preserving these variables:
-```bash
-sudo --preserve-env=MINIO_ROOT_USER,MINIO_ROOT_PASSWORD ./test_minio_connection.sh
 ```
 
 **When to use:**
