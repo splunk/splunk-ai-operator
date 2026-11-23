@@ -2119,6 +2119,8 @@ assert_problem "zero minReplicas is rejected" \
   "$(_profile_cfg cpuonly min0 '.aiPlatform.features[1].minReplicas = 0')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].minReplicas"
 assert_problem "minReplicas above maxReplicas is rejected" \
   "$(_profile_cfg cpuonly minmax '.aiPlatform.features[1].minReplicas = 5 | .aiPlatform.features[1].maxReplicas = 2')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
+assert_problem "minReplicas above the default maxReplicas is rejected" \
+  "$(_profile_cfg cpuonly minaboveimplicitmax '.aiPlatform.features[1].minReplicas = 5 | del(.aiPlatform.features[1].maxReplicas)')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].maxReplicas"
 assert_problem "targetCPUUtilization above 100 is rejected" \
   "$(_profile_cfg cpuonly cpu101 '.aiPlatform.features[1].targetCPUUtilization = 101')" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].targetCPUUtilization"
 assert_problem "a feature entry without a name is rejected" \

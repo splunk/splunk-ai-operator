@@ -306,10 +306,6 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	}
 	aiPlatformScheme := "http"
 	aiPlatformURL := ""
-	replicas := int32(1)
-	if feature.Name == agentRuntimeFeatureName && feature.MinReplicas != nil {
-		replicas = *feature.MinReplicas
-	}
 	serviceAccountName := feature.ServiceAccountName
 	if feature.Name == agentRuntimeFeatureName && serviceAccountName == "" {
 		serviceAccountName = name + "-sa"
@@ -374,14 +370,15 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 				Name:       platform.Name,
 				Namespace:  platform.Namespace,
 			},
-			ServiceAccountName:    serviceAccountName,
-			TaskVolume:            taskObjectStorage,
-			SplunkConfiguration:   platform.Spec.SplunkConfiguration,
-			VectorDbUrl:           vectorDbUrl,
-			AIPlatformUrl:         aiPlatformURL,
-			AgentRuntimeUrl:       agentRuntimeURL,
-			AIPlatformScheme:      aiPlatformScheme,
-			Replicas:              replicas,
+			ServiceAccountName:  serviceAccountName,
+			TaskVolume:          taskObjectStorage,
+			SplunkConfiguration: platform.Spec.SplunkConfiguration,
+			VectorDbUrl:         vectorDbUrl,
+			AIPlatformUrl:       aiPlatformURL,
+			AgentRuntimeUrl:     agentRuntimeURL,
+			AIPlatformScheme:    aiPlatformScheme,
+			// AgentRuntime takes its floor from MinReplicas.
+			Replicas:              1,
 			Port:                  80,
 			Resources:             resources,
 			MinReplicas:           cloneInt32Ptr(feature.MinReplicas),

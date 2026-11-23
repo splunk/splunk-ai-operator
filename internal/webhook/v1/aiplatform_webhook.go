@@ -577,21 +577,8 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 					"checkpointDbSecretRef must be specified for agentruntime",
 				))
 			}
-			if feature.MinReplicas != nil && feature.MaxReplicas != nil && *feature.MinReplicas > *feature.MaxReplicas {
-				allErrs = append(allErrs, field.Invalid(
-					featurePath.Child("maxReplicas"),
-					*feature.MaxReplicas,
-					"maxReplicas must be greater than or equal to minReplicas",
-				))
-			}
-			if feature.TargetCPUUtilization != nil &&
-				(*feature.TargetCPUUtilization < 1 || *feature.TargetCPUUtilization > 100) {
-				allErrs = append(allErrs, field.Invalid(
-					featurePath.Child("targetCPUUtilization"),
-					*feature.TargetCPUUtilization,
-					"targetCPUUtilization must be between 1 and 100 when set",
-				))
-			}
+			policy := aiv1.ResolveAgentRuntimeAutoscaling(feature.MinReplicas, feature.MaxReplicas, feature.TargetCPUUtilization)
+			allErrs = append(allErrs, policy.Validate(featurePath)...)
 		} else if feature.Provider != "" {
 			allErrs = append(allErrs, field.Forbidden(
 				featurePath.Child("provider"),

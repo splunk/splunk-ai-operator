@@ -207,6 +207,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	deployment := &appsv1.Deployment{}
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "stack-agentruntime-mltk-agentruntime-deployment", Namespace: "default"}, deployment))
+	require.Equal(t, ptr(int32(1)), deployment.Spec.Replicas)
 	require.Len(t, deployment.Spec.Template.Spec.InitContainers, 1)
 	assert.Equal(t, "fetch-provider-wheel", deployment.Spec.Template.Spec.InitContainers[0].Name)
 	assert.Equal(t, "docker.io/splunk/agent-runtime-provider-mltk:test", deployment.Spec.Template.Spec.InitContainers[0].Image)
@@ -313,12 +314,12 @@ func TestAgentRuntimeReconciler_DefaultsOmittedHPAFields(t *testing.T) {
 	require.NoError(t, fakeClient.Get(context.Background(),
 		types.NamespacedName{Name: "stack-agentruntime-mltk-agentruntime-hpa", Namespace: "default"}, hpa))
 	require.NotNil(t, hpa.Spec.MinReplicas)
-	assert.Equal(t, defaultMinReplicas, *hpa.Spec.MinReplicas)
-	assert.Equal(t, defaultMaxReplicas, hpa.Spec.MaxReplicas)
+	assert.Equal(t, int32(1), *hpa.Spec.MinReplicas)
+	assert.Equal(t, int32(4), hpa.Spec.MaxReplicas)
 	require.Len(t, hpa.Spec.Metrics, 1)
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource)
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
-	assert.Equal(t, defaultTargetCPUUtilization, *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
+	assert.Equal(t, int32(60), *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
 	assert.Nil(t, ai.Spec.MinReplicas)
 	assert.Nil(t, ai.Spec.MaxReplicas)
 	assert.Nil(t, ai.Spec.TargetCPUUtilization)

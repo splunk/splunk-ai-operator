@@ -276,7 +276,9 @@ func TestReconcileFeatures_CreatesAgentRuntimeServicePerProvider(t *testing.T) {
 	seca := &aiApi.AIService{}
 	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "my-ai-agentruntime-seca", Namespace: "default"}, seca))
 	assert.Equal(t, "seca", seca.Spec.Feature.Provider)
-	assert.Equal(t, int32(2), seca.Spec.Replicas)
+	assert.Equal(t, int32(1), seca.Spec.Replicas)
+	require.NotNil(t, seca.Spec.MinReplicas)
+	assert.Equal(t, int32(2), *seca.Spec.MinReplicas)
 	assert.Equal(t, "seca-postgres", seca.Spec.CheckpointDbSecretRef)
 	assert.Equal(t, "my-ai-agentruntime-seca-sa", seca.Spec.ServiceAccountName)
 }

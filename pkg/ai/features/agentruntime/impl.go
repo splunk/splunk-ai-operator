@@ -37,9 +37,6 @@ import (
 )
 
 const (
-	defaultMinReplicas           int32 = 1
-	defaultMaxReplicas           int32 = 4
-	defaultTargetCPUUtilization  int32 = 60
 	defaultAgentRuntimeHTTPPort  int32 = 8080
 	defaultAgentRuntimeMetrics   int32 = 9090
 	maxDNSLabelLength                  = 63
@@ -200,6 +197,11 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 }
 
 func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1.AIService) error {
+	policy := aiv1.ResolveAgentRuntimeAutoscaling(ai.Spec.MinReplicas, ai.Spec.MaxReplicas, ai.Spec.TargetCPUUtilization)
+	if errs := policy.Validate(field.NewPath("spec")); len(errs) != 0 {
+		return schemaState("InvalidConfiguration", errs.ToAggregate().Error())
+	}
+
 	// Validate old objects as well as webhook-admitted ones. Explicit env values
 	// override envFrom, even when empty, so connection keys must be Secret-only.
 	for _, input := range []struct {
@@ -308,9 +310,6 @@ func (r *AgentRuntimeReconciler) validateAIPlatformReady(aiPlatform *aiv1.AIPlat
 }
 
 func defaultAgentRuntimeSpec(ai *aiv1.AIService) {
-	if ai.Spec.Replicas == 0 {
-		ai.Spec.Replicas = resolvedMinReplicas(ai)
-	}
 	if ai.Spec.ServiceAccountName == "" {
 		ai.Spec.ServiceAccountName = ai.Name + "-sa"
 	}
@@ -735,7 +734,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 		return fmt.Errorf("ownerref on Deployment: %w", err)
 	}
 
-	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
 		// Kubernetes owns the Deployment revision. Removing it makes its
 		// controller restore it and advance generation on every observation.
@@ -748,7 +747,19 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 			deploymentAnnotations[deploymentRevisionAnnotation] = revision
 		}
 		deployment.ObjectMeta.Annotations = deploymentAnnotations
-		deployment.Spec.Replicas = &ai.Spec.Replicas
+		if deployment.ResourceVersion == "" {
+			policy := aiv1.ResolveAgentRuntimeAutoscaling(ai.Spec.MinReplicas, ai.Spec.MaxReplicas, ai.Spec.TargetCPUUtilization)
+			replicas := policy.MinReplicas
+			owner := metav1.GetControllerOf(ai)
+			platformManaged := owner != nil && owner.APIVersion == aiv1.GroupVersion.String() && owner.Kind == "AIPlatform"
+			if !platformManaged && ai.Spec.Replicas >= policy.MinReplicas && ai.Spec.Replicas <= policy.MaxReplicas {
+				replicas = ai.Spec.Replicas
+			}
+			deployment.Spec.Replicas = &replicas
+		}
+		// Once created, the Deployment's replica count belongs to the HPA.
+		// Leaving it untouched in this merge patch preserves even a scale
+		// change made after the Deployment was read.
 
 		if deployment.Spec.Selector == nil {
 			deployment.Spec.Selector = &metav1.LabelSelector{
@@ -857,9 +868,7 @@ func (r *AgentRuntimeReconciler) reconcileHPA(ctx context.Context, ai *aiv1.AISe
 		return fmt.Errorf("ownerref on HPA: %w", err)
 	}
 
-	minReplicas := resolvedMinReplicas(ai)
-	maxReplicas := resolvedMaxReplicas(ai)
-	targetCPU := resolvedTargetCPUUtilization(ai)
+	policy := aiv1.ResolveAgentRuntimeAutoscaling(ai.Spec.MinReplicas, ai.Spec.MaxReplicas, ai.Spec.TargetCPUUtilization)
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
 		hpa.Spec = autoscalingv2.HorizontalPodAutoscalerSpec{
 			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
@@ -867,15 +876,15 @@ func (r *AgentRuntimeReconciler) reconcileHPA(ctx context.Context, ai *aiv1.AISe
 				Kind:       "Deployment",
 				Name:       ai.Name + "-agentruntime-deployment",
 			},
-			MinReplicas: &minReplicas,
-			MaxReplicas: maxReplicas,
+			MinReplicas: &policy.MinReplicas,
+			MaxReplicas: policy.MaxReplicas,
 			Metrics: []autoscalingv2.MetricSpec{{
 				Type: autoscalingv2.ResourceMetricSourceType,
 				Resource: &autoscalingv2.ResourceMetricSource{
 					Name: corev1.ResourceCPU,
 					Target: autoscalingv2.MetricTarget{
 						Type:               autoscalingv2.UtilizationMetricType,
-						AverageUtilization: &targetCPU,
+						AverageUtilization: &policy.TargetCPUUtilization,
 					},
 				},
 			}},
@@ -886,32 +895,6 @@ func (r *AgentRuntimeReconciler) reconcileHPA(ctx context.Context, ai *aiv1.AISe
 		return fmt.Errorf("create/update HPA: %w", err)
 	}
 	return nil
-}
-
-func resolvedMinReplicas(ai *aiv1.AIService) int32 {
-	if ai.Spec.MinReplicas != nil {
-		return *ai.Spec.MinReplicas
-	}
-	return defaultMinReplicas
-}
-
-func resolvedMaxReplicas(ai *aiv1.AIService) int32 {
-	maxReplicas := defaultMaxReplicas
-	if ai.Spec.MaxReplicas != nil {
-		maxReplicas = *ai.Spec.MaxReplicas
-	}
-	minReplicas := resolvedMinReplicas(ai)
-	if maxReplicas < minReplicas {
-		return minReplicas
-	}
-	return maxReplicas
-}
-
-func resolvedTargetCPUUtilization(ai *aiv1.AIService) int32 {
-	if ai.Spec.TargetCPUUtilization != nil {
-		return *ai.Spec.TargetCPUUtilization
-	}
-	return defaultTargetCPUUtilization
 }
 
 func (r *AgentRuntimeReconciler) reconcileServiceMonitor(ctx context.Context, ai *aiv1.AIService) error {
