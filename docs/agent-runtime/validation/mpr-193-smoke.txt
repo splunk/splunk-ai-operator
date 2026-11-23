@@ -1,0 +1,205 @@
+MPR-193 network-isolated installer smoke: captured output
+==========================================================
+Cluster: fullfeature-dev (k0s v1.36.3, containerd 2.3.3, Ubuntu 24.04.5; controller 10.0.39.38,
+CPU workers 10.0.39.100 and 10.0.39.102, GPU worker 10.0.39.12 with 2 GPUs).
+Private mirror: a throwaway registry on the controller at 10.0.39.38:5099, plain HTTP. Steps 1-5
+used a first, in-memory registry; it ran out of memory on the SLIM layer and was replaced by CNCF
+Distribution v3.1.2 (on-disk, 1 GiB memory cap). The images were mirrored into it again with
+identical references (snapshot smoke-1-remirror), the install preflight passed again, and step 6
+ran against it. Tool and operator: built from feat/MPR-193-offline-bundle @ 571e94c.
+Runs: 2026-11-20 (steps 1-5) and 2026-11-23 (step 6). Digests are shortened in places; nothing
+here is a credential. The ECR token used for mirroring was deleted after each use.
+
+### 1. Real bundle staged on the controller (k0s airgap list-images / bundle-artifacts)
+--- staged:
+744M	bundle-staging
+  4 bundle-staging/images/addon-images.list
+ 13 bundle-staging/images/k0s-images.list
+ 17 total
+total 458908
+drwxrwxr-x 2 ubuntu ubuntu      4096 Nov 20 16:45 .
+drwxrwxr-x 6 ubuntu ubuntu      4096 Nov 20 16:45 ..
+-rw-rw-r-- 1 ubuntu ubuntu       183 Nov 20 16:45 addon-images.list
+-rw------- 1 ubuntu ubuntu  61142016 Nov 20 16:45 addon-images.tar
+-rw-rw-r-- 1 ubuntu ubuntu       583 Nov 20 16:45 k0s-images.list
+-rw------- 1 ubuntu ubuntu 408759296 Nov 20 16:45 k0s-images.tar
+exit=0
+
+### 2. Snapshot: every inventory image resolved, mirrored by digest and verified
+  verified  agent-runtime-base             658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime:202609221052-eae3b33005a5
+  verified  agent-runtime-provider-mltk    658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk:202609221517-f4466f2ccd
+  verified  agent-runtime-schema-setup     658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup:202609171357-39c5803f686e
+  verified  cert-manager                   quay.io/jetstack/cert-manager-cainjector:v1.13.0
+  verified  cert-manager                   quay.io/jetstack/cert-manager-controller:v1.13.0
+  verified  cert-manager                   quay.io/jetstack/cert-manager-webhook:v1.13.0
+  verified  fluent-bit                     fluent/fluent-bit:1.9.6
+  verified  k0s-apiserver-network-proxy-agent quay.io/k0sproject/apiserver-network-proxy-agent:v0.36.0-k0s.0
+  verified  k0s-calico-cni                 quay.io/k0sproject/calico-cni:v3.32.1-0
+  verified  k0s-calico-kube-controllers    quay.io/k0sproject/calico-kube-controllers:v3.32.1-0
+  verified  k0s-calico-node                quay.io/k0sproject/calico-node:v3.32.1-0
+  verified  k0s-cni-node                   quay.io/k0sproject/cni-node:1.8.0-k0s.0
+  verified  k0s-coredns                    quay.io/k0sproject/coredns:1.14.3-k0s.0
+  verified  k0s-envoy-distroless           quay.io/k0sproject/envoy-distroless:v1.37.2
+  verified  k0s-kube-proxy                 quay.io/k0sproject/kube-proxy:v1.36.3
+  verified  k0s-kube-router                quay.io/k0sproject/kube-router:v2.10.0-iptables1.8.13-k0s.0
+  verified  k0s-metrics-server             quay.io/k0sproject/metrics-server:v0.8.1-0
+  verified  k0s-pause                      quay.io/k0sproject/pause:3.10.2-0
+  verified  k0s-pushgateway-ttl            quay.io/k0sproject/pushgateway-ttl:1.4.0-k0s.1
+  verified  k0s-traefik                    quay.io/k0sproject/traefik:v3.7.6-k0s.0
+  verified  local-path-provisioner         rancher/local-path-provisioner:v0.0.24
+  verified  nginx                          docker.io/library/nginx:1.27-alpine
+  verified  slim                           658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:es-runtime-sync-create-ready-21d4bf15f-20261116-amd64
+  snapshot smoke-1: 23 images mirrored and verified
+  manifest: snapshots/smoke-1/manifest.json
+  sha256:   54c6ca7d49634ef8857af6908a76935545aac7bb52aa430349f5f9ca5b9fcbdf
+  exit=0 token-removed=yes
+
+### 3. Bundle manifest and the bundle check (staging scope), both profiles
+bundle mpr193-smoke-1: 16 files, 17 archive images, 0 model artifacts, snapshot smoke-1
+=== bundle check, cpuOnly (this bundle's profile)
+OK: bundle bundle-staging is complete for cpuOnly (bundle scope)
+exit=0
+=== bundle check, fullfeature (same bundle: expected to be incomplete)
+[MODEL_INVENTORY_MISSING] models: fullfeature loads model artifacts, and the bundle manifest records none: build it with the model configuration
+FAILED: bundle bundle-staging for fullfeature (bundle scope): 1 problem(s) found; nothing was changed
+exit=1
+
+### 4. Install settings generated from the snapshot (image-snapshot install-config)
+# Installer image settings for snapshot smoke-1 (mirror 10.0.39.38:5099/ai-tier). Merge into the installer
+# configuration and leave images.registry unset: every reference is complete and digest-pinned.
+images:
+  agentRuntime:
+    baseImage: 10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime@sha256:ddedf855e675…
+    baseImages:
+      v2.0.0: 10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime@sha256:ddedf855e675…
+    providerImages:
+      mltk: 10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk@sha256:d73301133cf6…
+    schemaSetupImage: 10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30…
+  fluentBit:
+    image: 10.0.39.38:5099/ai-tier/docker.io/fluent/fluent-bit@sha256:1eca5fea66c7…
+  nginx:
+    image: 10.0.39.38:5099/ai-tier/docker.io/library/nginx@sha256:62223d644fa2…
+  slim:
+    apiImage: 10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api@sha256:f4ea9e5f9e9a…
+
+Host facts used for the install preflight (read-only, from the Kubernetes API's nodeInfo,
+because the controller has no SSH access to the workers):
+{"name":"ip-10-0-39-100","platform":"linux/amd64","os":"ubuntu","kernel":"7.0.0-1014-aws"}
+{"name":"ip-10-0-39-102","platform":"linux/amd64","os":"ubuntu","kernel":"7.0.0-1014-aws"}
+{"name":"ip-10-0-39-12","platform":"linux/amd64","os":"ubuntu","kernel":"7.0.0-1017-aws"}
+{"name":"ip-10-0-39-38","platform":"linux/amd64","os":"ubuntu","kernel":"7.0.0-1014-aws"}
+
+Install preflight, cpuOnly, against the real mirror:
+OK: bundle bundle-staging is complete for cpuOnly (install scope)
+exit=0
+
+### 5a. Negative checks: one image, one binary, one model artifact reference
+### 1. one image removed from the mirror (fluent-bit)
+  delete: 202
+[MIRROR_MISSING_IMAGE] fluent-bit: 10.0.39.38:5099/ai-tier/docker.io/fluent/fluent-bit@sha256:1eca5fea66c7… is not available in the mirror: GET http://10.0.39.38:5099/v2/ai-tier/docker.io/fluent/fluent-bit/manifests/sha256:1eca5fea66c7…...
+FAILED: bundle bundle-staging for cpuOnly (install scope): 1 problem(s) found; nothing was changed
+exit=1
+  mirror requests during this check: 130 (all to http://10.0.39.38:5099; no other registry is contacted)
+  restore: 201
+exit=0
+  mirror requests during this check: 132 (all to http://10.0.39.38:5099; no other registry is contacted)
+### 2. one required binary removed from the bundle (binaries/k0s)
+[BUNDLE_FILE_MISSING] binaries/k0s: the binary k0s is listed but absent
+FAILED: bundle bundle-staging for cpuOnly (install scope): 1 problem(s) found; nothing was changed
+exit=1
+  mirror requests during this check: 132 (all to http://10.0.39.38:5099; no other registry is contacted)
+exit=0
+  mirror requests during this check: 132 (all to http://10.0.39.38:5099; no other registry is contacted)
+### 3. one model artifact reference missing (fullfeature, real model configuration)
+bundle mpr193-smoke-full: 16 files, 17 archive images, 10 model artifacts, snapshot smoke-1
+  staged models: 9 of 10; GPU nodes: 1
+[MODEL_ARTIFACT_MISSING] model:all-minilm-l6-v2: is not staged in the object store; stage it from the offline artifacts (there is no download in an air-gapped install)
+FAILED: bundle bundle-full for fullfeature (install scope): 1 problem(s) found; nothing was changed
+exit=1
+  mirror requests during this check: 138 (all to http://10.0.39.38:5099; no other registry is contacted)
+
+### 5b. Import: idempotent, and resumable after an interrupted transfer (SIGKILL)
+### import 1
+OK: bundle mpr193-smoke-1 imported at imported/mpr193-smoke-1 (16 files copied, 0 reused from an interrupted import)
+exit=0
+### import 2 (same bundle again)
+OK: bundle mpr193-smoke-1 is already imported at imported/mpr193-smoke-1; nothing changed
+exit=0
+### interrupted import, then retry
+/home/ubuntu/mpr193-smoke/import.sh: line 8: 2006762 Killed                  timeout -s KILL 1 ./airgap-bundle import --from bundle-staging --to imported-int
+interrupted: exit=137
+  .
+  ..
+  .partial-mpr193-smoke-1
+  partial files left: 2
+OK: bundle mpr193-smoke-1 imported at imported-int/mpr193-smoke-1 (15 files copied, 1 reused from an interrupted import)
+exit=0
+  .
+  ..
+  mpr193-smoke-1
+### the imported bundle passes the install preflight
+OK: bundle imported-int/mpr193-smoke-1 is complete for cpuOnly (install scope)
+exit=0
+### a tampered imported bundle is refused, not overwritten
+[BUNDLE_FILE_CHANGED] binaries/yq: is 9961625 bytes, the manifest records 9961624 (truncated or replaced)
+FAILED: import of bundle-staging refused: 1 problem(s); nothing was accepted
+exit=1
+
+### 6. Readiness with public egress blocked (cpuOnly platform in namespace mpr193-smoke)
+The CPU workers' containerd was given a temporary registry host entry for the mirror; the shared
+operator ran from the mirror with its agent-runtime and SLIM images pointed at the mirror (same
+digests). All of it was reverted afterwards.
+### cpuOnly platform mpr193-cpuonly (namespace mpr193-smoke): status
+  ValidateReady=True
+  SidecarsReady=True
+  rayAutoscalerRBACReady=True
+  AIServiceReady=True
+  AIServiceStatusReady=True
+  Ready=True
+### pods, readiness and image (every image from the private mirror, by digest)
+  mpr193-cpuonly-agentruntime-mltk-agentruntime-deployment-6pf7d9  Running  ready=true  10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk@sha256:d73301133cf6 10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime@sha256:ddedf855e675
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-dxv8n  Succeeded  ready=false  10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30
+  mpr193-cpuonly-slim-slim-deployment-6cbf5546d9-ck849  Running  ready=true  10.0.39.38:5099/ai-tier/docker.io/splunk/ai-tier-slim-service@sha256:8fdb46e72445
+  mpr193-egress-probe  Succeeded  ready=false  10.0.39.38:5099/ai-tier/docker.io/library/postgres@sha256:2d5c77ae9b0e
+  mpr193-postgres-664785bbdc-b9g8q  Running  ready=true  10.0.39.38:5099/ai-tier/docker.io/library/postgres@sha256:2d5c77ae9b0e
+### images of the platform that are not from the mirror (expect none)
+  none
+### kubelet pull events in the namespace
+  mpr193-cpuonly-agentruntime-mltk-agentruntime-deployment-6pf7d9   Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk@sha256:d73301133cf6" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-agentruntime-deployment-6pf7d9   Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime@sha256:ddedf855e675" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-29gqk    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2ccrd    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2dvzt    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2gwhw    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2l9p7    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2nsm8    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2r77b    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2rss2    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-2wr27    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+  mpr193-cpuonly-agentruntime-mltk-schema-e26e8a87827aaf0c-42t9z    Container image "10.0.39.38:5099/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup@sha256:5877fcbdea30" already present on machine and can be accessed by the pod
+### mirror access log: manifest requests by client node and user agent, for this namespace's images
+### egress from inside the namespace (deny-public-egress NetworkPolicy)
+  registry-1.docker.io:443 BLOCKED
+  658391232643.dkr.ecr.us-west-2.amazonaws.com:443 BLOCKED
+  1.1.1.1:443 BLOCKED
+  mpr193-postgres:5432 CONNECTED
+### SLIM to runtime inside the namespace (the product route's in-cluster hop)
+  runtime Service: mpr193-cpuonly-agentruntime-mltk-svc endpoints: 10.244.253.145
+### the profiles' image inventories differ as specified (from the smoke's source configuration)
+  cpuOnly: agent-runtime-base, agent-runtime-provider-mltk, agent-runtime-schema-setup, cert-manager, fluent-bit, local-path-provisioner, slim
+  fullfeature: agent-runtime-base, agent-runtime-provider-mltk, agent-runtime-schema-setup, cert-manager, fluent-bit, local-path-provisioner, nginx, slim
+
+### 6b. The mirror's access log: every manifest request made by a node's containerd
+10.0.39.100 - - [20/Nov/2026:17:19:42 +0000] "HEAD /v2/ai-tier/docker.io/library/postgres/manifests/sha256:2d5c77ae9b0e… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.102 - - [20/Nov/2026:17:22:23 +0000] "HEAD /v2/ai-tier/docker.io/library/postgres/manifests/sha256:2d5c77ae9b0e… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.100 - - [20/Nov/2026:17:23:55 +0000] "HEAD /v2/ai-tier/docker.io/splunk/ai-tier-slim-service/manifests/sha256:8fdb46e72445… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.102 - - [20/Nov/2026:17:23:55 +0000] "HEAD /v2/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup/manifests/sha256:5877fcbdea30… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.102 - - [20/Nov/2026:17:24:00 +0000] "HEAD /v2/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-provider-mltk/manifests/sha256:d73301133cf6… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.102 - - [20/Nov/2026:17:24:02 +0000] "HEAD /v2/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime/manifests/sha256:ddedf855e675… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.100 - - [20/Nov/2026:17:26:04 +0000] "HEAD /v2/ai-tier/docker.io/library/postgres/manifests/sha256:2d5c77ae9b0e… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.100 - - [20/Nov/2026:17:26:04 +0000] "HEAD /v2/ai-tier/docker.io/library/postgres/manifests/sha256:2d5c77ae9b0e… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.100 - - [21/Nov/2026:17:23:59 +0000] "HEAD /v2/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup/manifests/sha256:5877fcbdea30… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.100 - - [21/Nov/2026:17:23:59 +0000] "GET /v2/ai-tier/658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/agent-runtime-schema-setup/manifests/sha256:5877fcbdea30… HTTP/1.1" 200 2818 "" "containerd/2.3.3"
+10.0.39.100 - - [23/Nov/2026:04:20:07 +0000] "HEAD /v2/ai-tier/splunk-ai-operator/manifests/sha256:6147420697ca… HTTP/1.1" 200 0 "" "containerd/2.3.3"
+10.0.39.100 - - [23/Nov/2026:04:20:07 +0000] "GET /v2/ai-tier/splunk-ai-operator/manifests/sha256:6147420697ca… HTTP/1.1" 200 2532 "" "containerd/2.3.3"
+10.0.39.102 - - [23/Nov/2026:04:45:05 +0000] "HEAD /v2/ai-tier/docker.io/library/postgres/manifests/sha256:2d5c77ae9b0e… HTTP/1.1" 200 0 "" "containerd/2.3.3"
