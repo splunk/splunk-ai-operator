@@ -595,7 +595,7 @@ func TestInstallConfig_GeneratesSettingsThatCompareAccepts(t *testing.T) {
 	require.Equal(t, 0, code, errs)
 	assert.Contains(t, out, "# Installer image settings for snapshot run-1")
 	assert.Contains(t, out, "baseImages:", "the candidate's runtimeVersion pin is set")
-	assert.NotContains(t, out, "registry:", "images.registry is left unset")
+	assert.Contains(t, out, "registry: "+e.dst.Host, "images.registry names the mirror host")
 	generated := e.write("generated.yaml", out+"splunk: {enabled: true}\n")
 	for _, profile := range []string{"cpuOnly", "fullfeature"} {
 		code, stdout, errs := e.run("compare", "--store", e.store, "--id", "run-1", "--profile", profile, "--candidate", e.candidate, "--config", generated)

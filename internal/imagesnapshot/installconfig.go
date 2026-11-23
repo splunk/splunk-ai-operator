@@ -25,6 +25,10 @@ var mapSettings = []string{"images.agentRuntime.baseImages.", "images.agentRunti
 // images.agentRuntime.baseImages.<runtimeVersion>, so that pin is set to the candidate
 // base too.
 //
+// images.registry is set to the mirror's host: the installer configures the nodes' access
+// to a registry (plain HTTP when images.registryInsecure is true) only for images.registry.
+// It does not prefix these references, which already name a registry host.
+//
 // Images that reach the nodes in the bundle's image archives (the add-on and k0s lists)
 // have no installer setting and are not included. A mirror reference the installer
 // would not use as it is (build_image_url prefixes images.registry to a reference
@@ -68,6 +72,7 @@ func InstallConfig(snap *Snapshot, runtimeVersion string) (map[string]any, error
 	if len(settings) == 0 {
 		return nil, fmt.Errorf("snapshot %s has no image the installer configures", snap.Metadata.ID)
 	}
+	settings["images.registry"] = MirrorHost(snap.Spec.Mirror)
 	out := map[string]any{}
 	paths := make([]string, 0, len(settings))
 	for p := range settings {
@@ -78,6 +83,12 @@ func InstallConfig(snap *Snapshot, runtimeVersion string) (map[string]any, error
 		putPath(out, splitSetting(p), settings[p])
 	}
 	return out, nil
+}
+
+// MirrorHost is the registry host (and port) of a mirror: "10.0.39.38:5099/ai-tier" -> "10.0.39.38:5099".
+func MirrorHost(mirror string) string {
+	host, _, _ := strings.Cut(strings.TrimSpace(mirror), "/")
+	return host
 }
 
 // splitSetting splits a dotted setting path into keys, keeping the free-form last key of

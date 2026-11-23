@@ -179,7 +179,8 @@ image-snapshot refresh --store snapshots/launchpad --previous run-42 --id run-43
 
 `install-config` prints the installer `images:` settings that make an install pull every
 configured image from the snapshot's mirror by digest. That includes the versioned base pin
-for the candidate's `runtimeVersion`. The air-gapped install preflight compares the
+for the candidate's `runtimeVersion`. It also sets `images.registry` to the mirror's host,
+because the installer configures the nodes for that registry only. The air-gapped install preflight compares the
 configuration it is given with the snapshot (see [airgap-bundle.md](airgap-bundle.md)).
 
 `create --resolve-only` resolves digests and platforms and stops, copying and storing

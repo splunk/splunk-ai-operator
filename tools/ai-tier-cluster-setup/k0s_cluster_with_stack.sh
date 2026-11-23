@@ -2057,7 +2057,7 @@ preflight_checks() {
 
   pf_header "Registry pull Secrets"
   local _pull_problems
-  _pull_problems="$(validate_pull_secret_config)"
+  _pull_problems="$(validate_pull_secret_config; validate_pull_secret_refs)"
   if [[ -n "${_pull_problems}" ]]; then
     while IFS= read -r _p; do pf_fail "${_p}"; done <<< "${_pull_problems}"
   elif [[ -n "$(configured_pull_secret_names)" ]]; then
@@ -2800,9 +2800,10 @@ collect_airgap_host_facts() {
 
   local nodes="[]" ip idx=0 is_gpu info platform os_id kernel
   local -a all=()
-  for ip in "${ctrl_ips[@]}"; do [[ -n "${ip}" ]] && all+=("ctrl:${ip}"); done
-  for ip in "${worker_ips[@]}"; do [[ -n "${ip}" ]] && all+=("worker:${ip}"); done
-  for entry in "${all[@]}"; do
+  # ${a[@]+...}: an empty list must not abort under set -u (bash before 4.4).
+  for ip in ${ctrl_ips[@]+"${ctrl_ips[@]}"}; do [[ -n "${ip}" ]] && all+=("ctrl:${ip}"); done
+  for ip in ${worker_ips[@]+"${worker_ips[@]}"}; do [[ -n "${ip}" ]] && all+=("worker:${ip}"); done
+  for entry in ${all[@]+"${all[@]}"}; do
     ip="${entry#*:}"; is_gpu=false
     if [[ "${entry}" == worker:* ]]; then
       # GPU workers are the workers after the CPU workers, as install_nvidia_host_drivers counts them.
@@ -2823,11 +2824,17 @@ collect_airgap_host_facts() {
         m=$( (nvidia-smi -L 2>/dev/null || true) | grep -c "^GPU " || true)
         [ "${m:-0}" -gt "${n:-0}" ] && n=$m
         echo "${n:-0}"
-        nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1
+        # Always one line for the driver, empty when none is loaded: without nvidia-smi the
+        # pipeline prints nothing, which would shift the toolkit flag into this field, and a
+        # failing nvidia-smi prints an error that is not a version.
+        d=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d "\r ")
+        case "$d" in [0-9]*.[0-9]*) ;; *) d="" ;; esac
+        printf "%s\n" "$d"
         if command -v nvidia-container-runtime >/dev/null 2>&1 || command -v nvidia-ctk >/dev/null 2>&1; then echo true; else echo false; fi
       ' 2>/dev/null || true)"
       devices="$(sed -n 1p <<< "${g}")"; driver="$(sed -n 2p <<< "${g}")"; runtime="$(sed -n 3p <<< "${g}")"
       [[ "${devices}" =~ ^[0-9]+$ ]] || devices=0
+      [[ "${driver}" =~ ^[0-9]+(\.[0-9]+)+$ ]] || driver=""
       [[ "${runtime}" == "true" ]] || runtime=false
       node="$(jq -c --argjson devices "${devices}" --arg driver "${driver}" --argjson runtime "${runtime}" \
         --argjson alloc "${alloc_json}" --arg ip "${ip}" \
@@ -6383,6 +6390,59 @@ validate_pull_secret_config() {
   done
 }
 
+# patch_default_sa_pull_secrets <namespace>: give the namespace's default ServiceAccount every
+# pull Secret present there (the installer-created ones and every images.imagePullSecrets
+# reference), for workloads that set none themselves, such as the Splunk Standalone pod.
+patch_default_sa_pull_secrets() {
+  local ns="$1" secrets
+  # A patch replaces the whole list, so keep any entries the ServiceAccount already has.
+  secrets="$( { kubectl get serviceaccount default -n "${ns}" -o json 2>/dev/null | jq -r '.imagePullSecrets[]?.name' 2>/dev/null
+                image_pull_secret_names "${ns}"; } | awk 'NF && !seen[$0]++' | jq -R . | jq -sc 'map({name: .})')"
+  [[ -n "${secrets}" && "${secrets}" != "[]" ]] || return 0
+  log "Patching default ServiceAccount in ${ns} with pull Secrets: $(jq -r 'map(.name) | join(", ")' <<< "${secrets}")"
+  kubectl patch serviceaccount default -n "${ns}" -p "{\"imagePullSecrets\": ${secrets}}" >/dev/null 2>&1 \
+    || warn "Could not patch the default ServiceAccount in ${ns}"
+}
+
+# pull_secret_namespaces: the namespaces whose workloads use the configured pull Secrets.
+pull_secret_namespaces() {
+  echo "${AI_NS}"
+  component_enabled ai-operator && echo "splunk-ai-operator-system"
+  component_enabled splunk-operator && echo "splunk-operator"
+  return 0
+}
+
+# validate_pull_secret_refs: print one line per images.imagePullSecrets reference without a
+# dockerConfigFile that cannot be satisfied: the install cannot create it, so it must
+# already exist as a kubernetes.io/dockerconfigjson Secret in every namespace that uses it.
+# Before a cluster exists such a reference can never be satisfied.
+validate_pull_secret_refs() {
+  local count i name file ns type have_cluster=false
+  count="$(yq eval '(.images.imagePullSecrets // []) | length' "${CONFIG_FILE}" 2>/dev/null || echo 0)"
+  [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]] || return 0
+  kubectl get namespaces >/dev/null 2>&1 && have_cluster=true
+  for ((i=0; i<count; i++)); do
+    file="$(_pull_secret_file "$i")"
+    [[ -n "${file}" ]] && continue   # created from the file during install
+    name="$(yq eval ".images.imagePullSecrets[$i].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")"
+    [[ -n "${name}" && "${name}" != "null" ]] || continue
+    if [[ "${have_cluster}" != "true" ]]; then
+      echo "images.imagePullSecrets[$i] (${name}) has no dockerConfigFile, and the cluster cannot be read (or does not exist yet), so the Secret cannot already exist there: give a dockerConfigFile to create it"
+      continue
+    fi
+    while IFS= read -r ns; do
+      [[ -n "${ns}" ]] || continue
+      if ! kubectl get secret "${name}" -n "${ns}" >/dev/null 2>&1; then
+        echo "images.imagePullSecrets[$i]: Secret ${ns}/${name} does not exist and has no dockerConfigFile to create it from"
+        continue
+      fi
+      type="$(kubectl get secret "${name}" -n "${ns}" -o jsonpath='{.type}' 2>/dev/null || echo "")"
+      [[ "${type}" == "kubernetes.io/dockerconfigjson" ]] \
+        || echo "images.imagePullSecrets[$i]: Secret ${ns}/${name} is of type '${type:-unknown}', not kubernetes.io/dockerconfigjson"
+    done < <(pull_secret_namespaces)
+  done
+}
+
 # ensure_configured_pull_secrets <namespace>: make every images.imagePullSecrets Secret
 # exist in the namespace as a kubernetes.io/dockerconfigjson Secret. Fails closed.
 ensure_configured_pull_secrets() {
@@ -7060,13 +7120,8 @@ data:
       when: "'/mnt/splunk-cert' in (lookup('file', item.path, errors='ignore') | default('', true))"
 YAML
 
-  # Ensure default ServiceAccount has imagePullSecrets for ECR
-  if kubectl get secret ecr-registry-secret -n "${AI_NS}" &>/dev/null; then
-    log "Patching default ServiceAccount with ecr-registry-secret..."
-    kubectl patch serviceaccount default -n "${AI_NS}" \
-      -p '{"imagePullSecrets": [{"name": "ecr-registry-secret"}]}' 2>/dev/null || \
-      warn "Could not patch default ServiceAccount"
-  fi
+  # The Standalone pod runs as the namespace's default ServiceAccount.
+  patch_default_sa_pull_secrets "${AI_NS}"
 
   # Standalone app repo: uses customer-managed S3-compatible object storage.
   #

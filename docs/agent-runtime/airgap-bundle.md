@@ -43,10 +43,10 @@ change. A failed preflight stops the install with nothing changed.
 | Image snapshot | `images.snapshotManifest` in the cluster config, or `AIRGAP_SNAPSHOT_MANIFEST` | Required. Copied into the bundle at `snapshot/manifest.json` (+ `.sha256`). |
 | `airgap-bundle` tool | built from this repository by `airgap_install.sh`, or `AIRGAP_BUNDLE_BINARY` (a prebuilt linux/amd64 binary, for CI) | Staged at `binaries/airgap-bundle`. The installer checks its checksum against the bundle manifest before running it. |
 | Bundle directory | `AIRGAP_BUNDLE_DIR` (exported by `airgap_install.sh`, or by the bundle's `airgap-env.sh`) | The imported bundle. |
-| Install configuration | the cluster config, with the output of `image-snapshot install-config` merged into `images:` | Every configured AI Tier image must be its component's mirror reference by digest. Leave `images.registry` unset. |
+| Install configuration | the cluster config, with the output of `image-snapshot install-config` merged into `images:` | Every configured AI Tier image must be its component's mirror reference by digest. `images.registry` must be the mirror's host (for example `10.0.39.38:5099`), which `install-config` sets. The installer configures the nodes' access to a registry only for `images.registry`. It does not prefix the generated references, which already name the mirror. |
 | Registry credentials | `images.imagePullSecrets: [{name, dockerConfigFile?}]` | Secret references. A missing Secret is created as `kubernetes.io/dockerconfigjson` from `dockerConfigFile` (never logged). A missing Secret without a file, or a Secret of another type, fails. Each name is listed on the AIPlatform CR (every pod, the schema Job included) and on the operator and Splunk Operator Deployments. The first `dockerConfigFile` also authenticates the preflight's mirror check. |
 | Model artifacts (fullfeature) | the model configuration the installer selects for `aiPlatform.defaultAcceleratorType` | Recorded in the bundle manifest; must be staged in the object store with a matching staging marker. |
-| Plain-HTTP mirror | `images.registryInsecure: true` | Passed to the preflight as `--insecure`. |
+| Plain-HTTP mirror | `images.registryInsecure: true` | The installer then configures every node's containerd for plain HTTP to `images.registry`, and passes `--insecure` to the preflight. Use `false` for an HTTPS mirror. |
 
 ## Commands
 
@@ -96,6 +96,7 @@ anything credential-shaped. `--report FILE` also writes them as JSON:
 | `ARCHIVE_IMAGE_UNMAPPED` | image | an archive image the snapshot has no entry for |
 | `SNAPSHOT_MISMATCH` | `snapshot` | the snapshot is missing or not the one the bundle was made for |
 | `INSTALL_CONFIG_MISSING` | `install-config` | no install references to compare with the snapshot |
+| `INSTALL_REGISTRY_MISMATCH` | `images.registry` | `images.registry` is not the mirror host, so the nodes would not be configured for the mirror |
 | `HOST_FACTS_MISSING` | `host` | the install preflight was given no host facts |
 | `NODE_PLATFORM_MISMATCH` | `node:<name>` | a node is not linux/amd64, or did not report its platform |
 | `GPU_NODE_MISSING` | `host` | fullfeature, and no GPU node was reported |
@@ -170,7 +171,7 @@ that runs the preflight itself writes the same JSON. Unknown fields are rejected
 |---|---|
 | `platform`, `os`, `kernel` | `uname -m`, `/etc/os-release` `ID`, `uname -r` over SSH |
 | `gpu.devices` | NVIDIA display/3D controllers in `lspci -nn`, or `nvidia-smi -L` |
-| `gpu.driver` | `nvidia-smi --query-gpu=driver_version` (empty: no driver loaded) |
+| `gpu.driver` | `nvidia-smi --query-gpu=driver_version`, kept only when it is a version such as `550.54.15` (empty: no driver loaded, `nvidia-smi` absent, or failing) |
 | `gpu.runtime` | `nvidia-container-runtime` or `nvidia-ctk` present |
 | `gpu.allocatable` | the node's `nvidia.com/gpu` allocatable, only when the nodes already form a cluster |
 | `stagedModels` | each model's `staging_state/<id>/.staging_complete` marker in the object store |
@@ -204,9 +205,14 @@ schedulable-capacity checks still apply.
    (MPR-183). Never pass secret values as parameters.
 2. `airgap-bundle import --from <transferred bundle> --to <bundles dir>`. Exit 1: stop, the
    bundle is damaged or a different bundle holds the ID.
+   Each `images.imagePullSecrets` entry without a `dockerConfigFile` must already exist as a
+   `kubernetes.io/dockerconfigjson` Secret in every namespace that uses it (the AI namespace,
+   `splunk-ai-operator-system`, and `splunk-operator` when it is installed). The preflight
+   checks this; on a fresh cluster give a `dockerConfigFile` instead.
 3. Merge `image-snapshot install-config --snapshot <bundle>/snapshot/manifest.json` into the
-   install configuration's `images:`, and set `images.imagePullSecrets` to the mirror's
-   Secret reference.
+   install configuration's `images:` (it also sets `images.registry` to the mirror host), set
+   `images.registryInsecure` for a plain-HTTP mirror, and set `images.imagePullSecrets` to
+   the mirror's Secret reference.
 4. `export AIRGAP_BUNDLE_DIR=<bundles dir>/<bundle id>`, `source "$AIRGAP_BUNDLE_DIR/airgap-env.sh"`,
    then run `k0s_cluster_with_stack.sh install` with `cluster.airgap: true`. A preflight
    failure exits nonzero with nothing changed; publish `airgap-preflight-report.json`.

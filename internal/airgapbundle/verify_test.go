@@ -484,7 +484,7 @@ func TestVerify_TheInstallConfigurationMustUseTheMirrorByDigest(t *testing.T) {
 		o := f.opts(imagesnapshot.ProfileCPUOnly)
 		o.Input.Installer = imagesnapshot.InstallerConfig{}
 		o.Input.NoInstallerDefaults = true
-		assert.Equal(t, map[string]string{"install-config": FindingInstallConfig}, codes(Verify(ctx, f.dir, o)))
+		assert.Equal(t, map[string]string{"install-config": FindingInstallConfig, "images.registry": FindingInstallRegistry}, codes(Verify(ctx, f.dir, o)))
 	})
 	t.Run("the candidate changed after the snapshot", func(t *testing.T) {
 		f := newFixture(t)
@@ -576,4 +576,23 @@ func TestVerify_AnAliasIsMatchedByDigestAmongImagesOfOneRepository(t *testing.T)
 	o := f.opts(imagesnapshot.ProfileCPUOnly)
 	o.Input.AddonRefs = refs
 	assert.Empty(t, Verify(ctx, f.dir, o))
+}
+
+// The installer configures the nodes for images.registry only (plain HTTP when
+// registryInsecure is true), so an install whose images.registry is not the mirror host
+// would pass the image checks and then fail to pull on the nodes.
+func TestVerify_ImagesRegistryMustBeTheMirrorHost(t *testing.T) {
+	f := newFixture(t)
+	f.build()
+	o := f.opts(imagesnapshot.ProfileCPUOnly)
+	require.Equal(t, "mirror.airgap.local:5000", o.Input.Installer.Images.Registry, "install-config sets it")
+	assert.Empty(t, Verify(ctx, f.dir, o))
+	o.Input.Installer.Images.Registry = "mirror.airgap.local:5000/"
+	assert.Empty(t, Verify(ctx, f.dir, o), "a trailing slash is the same host")
+	for _, bad := range []string{"", "registry.other.local", "mirror.airgap.local:5000/ai-tier"} {
+		o.Input.Installer.Images.Registry = bad
+		got := Verify(ctx, f.dir, o)
+		require.Equal(t, map[string]string{"images.registry": FindingInstallRegistry}, codes(got), "registry %q", bad)
+		assert.Contains(t, messageOf(got, "images.registry"), "not the mirror host mirror.airgap.local:5000")
+	}
 }

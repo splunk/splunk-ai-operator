@@ -1319,6 +1319,109 @@ rm -rf "${_nr_dir}"
 assert_eq "record: written once the preflight passes and again at the end" "3" \
   "$(_extract_fn main_install | grep -c 'write_airgap_install_record "' | tr -d ' ')"
 
+# ── MPR-193 review fixes (PR #286) ─────────────────────────────────────────────
+suite "air-gap review fixes (MPR-193)"
+
+_rf_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+
+# 1. GPU facts from the real SSH payload, run against fake host tools.
+_rf_gpu() ( # _rf_gpu <fake bin dir>: the GPU worker's facts as the collector reports them
+  local bin="$1"
+  eval "$(_extract_fn _node_platform)"; eval "$(_extract_fn _read_model_marker)"
+  eval "$(_extract_fn model_artifacts_config_name)"; eval "$(_extract_fn collect_airgap_host_facts)"
+  yq() { "${YQ_BIN}" "$@"; }
+  ssh_exec() {
+    if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0-503.40.1.el9_5.x86_64\n'; return 0; fi
+    env -i PATH="${bin}:/usr/bin:/bin" bash -c "$2"
+  }
+  kubectl() { return 1; }
+  EXISTING_CONTROLLER_IPS=""; EXISTING_WORKER_IPS="10.0.0.3"; CPU_WORKER_COUNT=0; GPU_WORKER_COUNT=1
+  OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
+  local out; out="$(mktemp)"
+  collect_airgap_host_facts "${out}" cpuOnly >/dev/null 2>&1
+  jq -r '.nodes[0].gpu | "\(.devices)|\(.driver)|\(.runtime)"' "${out}"; rm -f "${out}"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _rf_bin="$(mktemp -d)"
+  printf '#!/bin/sh\necho "01:00.0 3D controller [0302]: NVIDIA Corporation GA102 [10de:2236]"\necho "02:00.0 3D controller [0302]: NVIDIA Corporation GA102 [10de:2236]"\n' > "${_rf_bin}/lspci"
+  chmod +x "${_rf_bin}/lspci"
+  assert_eq "GPU facts: a fresh host without nvidia-smi or the toolkit has no driver and no runtime" "2||false" "$(_rf_gpu "${_rf_bin}")"
+  printf '#!/bin/sh\necho "NVIDIA-SMI has failed because it couldn'"'"'t communicate with the NVIDIA driver."\nexit 9\n' > "${_rf_bin}/nvidia-smi"
+  chmod +x "${_rf_bin}/nvidia-smi"
+  assert_eq "GPU facts: a failing nvidia-smi is no driver, not its error text" "2||false" "$(_rf_gpu "${_rf_bin}")"
+  printf '#!/bin/sh\ncase "$1" in -L) echo "GPU 0: NVIDIA L40S (UUID: GPU-a)"; echo "GPU 1: NVIDIA L40S (UUID: GPU-b)";; *) echo "550.54.15";; esac\n' > "${_rf_bin}/nvidia-smi"
+  printf '#!/bin/sh\nexit 0\n' > "${_rf_bin}/nvidia-ctk"; chmod +x "${_rf_bin}/nvidia-smi" "${_rf_bin}/nvidia-ctk"
+  assert_eq "GPU facts: a provisioned host reports its driver and toolkit" "2|550.54.15|true" "$(_rf_gpu "${_rf_bin}")"
+  rm -rf "${_rf_bin}"
+fi
+
+# 3. The default ServiceAccount (the Splunk Standalone pod's) gets every pull Secret present.
+_rf_sa() ( # prints the patch kubectl was given
+  log() { :; }; warn() { echo "WARN: $*"; }
+  yq() { "${YQ_BIN}" "$@"; }
+  local cfg; cfg="$(mktemp)"; printf 'images:\n  imagePullSecrets:\n    - name: mirror-pull\n' > "${cfg}"; CONFIG_FILE="${cfg}"
+  kubectl() {
+    case "$*" in
+      "get secret "*) [[ " ${_RF_PRESENT} " == *" $3 "* ]]; return $? ;;
+      "get serviceaccount default "*) echo "${_RF_SA:-{\}}"; return 0 ;;
+      "patch serviceaccount default "*) echo "PATCH ${*: -1}" >> "${_RF_PATCHES}"; return 0 ;;
+    esac
+  }
+  for f in configured_pull_secret_names image_pull_secret_names patch_default_sa_pull_secrets; do eval "$(_extract_fn "${f}")"; done
+  _RF_PATCHES="$(mktemp)"
+  patch_default_sa_pull_secrets ai-platform
+  cat "${_RF_PATCHES}"
+  rm -f "${cfg}" "${_RF_PATCHES}"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  assert_eq "Standalone SA: the configured Secret is attached along with the installer-created ones" \
+    'PATCH {"imagePullSecrets": [{"name":"ecr-registry-secret"},{"name":"mirror-pull"}]}' "$(_RF_PRESENT="ecr-registry-secret mirror-pull" _rf_sa)"
+  assert_eq "Standalone SA: a configured Secret alone is attached" \
+    'PATCH {"imagePullSecrets": [{"name":"mirror-pull"}]}' "$(_RF_PRESENT="mirror-pull" _rf_sa)"
+  assert_eq "Standalone SA: nothing present, nothing patched" "" "$(_RF_PRESENT="" _rf_sa)"
+  assert_eq "Standalone SA: entries the ServiceAccount already has are kept" \
+    'PATCH {"imagePullSecrets": [{"name":"site-registry"},{"name":"mirror-pull"}]}' \
+    "$(_RF_PRESENT="mirror-pull" _RF_SA='{"imagePullSecrets":[{"name":"site-registry"}]}' _rf_sa)"
+fi
+assert_eq "Standalone SA: install_splunk_standalone uses the helper, not a hard-coded Secret" "1" \
+  "$(_extract_fn install_splunk_standalone | grep -c 'patch_default_sa_pull_secrets "${AI_NS}"' | tr -d ' ')"
+assert_eq "Standalone SA: no hard-coded ecr-registry-secret patch remains" "0" \
+  "$(grep -c "imagePullSecrets\": \[{\"name\": \"ecr-registry-secret\"}\]" "${SCRIPT}" | tr -d ' ')"
+
+# 4. Name-only Secret references are checked in preflight, before any change.
+_rf_refs() ( # _rf_refs <config body>: the problems validate_pull_secret_refs reports
+  local cfg; cfg="$(mktemp)"; printf '%s' "$1" > "${cfg}"; CONFIG_FILE="${cfg}"
+  yq() { "${YQ_BIN}" "$@"; }
+  AI_NS=ai-platform
+  component_enabled() { [[ " ${_RF_COMPONENTS:-ai-operator} " == *" $1 "* ]]; }
+  kubectl() {
+    case "$*" in
+      "get namespaces") [[ "${_RF_CLUSTER:-yes}" == yes ]]; return $? ;;
+      "get secret "*" -o jsonpath={.type}") echo "${_RF_TYPE:-kubernetes.io/dockerconfigjson}"; return 0 ;;
+      "get secret "*) [[ " ${_RF_HAVE:-} " == *" $5/$3 "* ]]; return $? ;;
+    esac
+  }
+  for f in _pull_secret_file pull_secret_namespaces validate_pull_secret_refs; do eval "$(_extract_fn "${f}")"; done
+  validate_pull_secret_refs
+  rm -f "${cfg}"
+)
+if [[ -n "${YQ_BIN}" ]]; then
+  _ref=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n'
+  _rf_has "refs: on a fresh install a name-only reference fails in preflight" "$(_RF_CLUSTER=no _rf_refs "${_ref}")" "has no dockerConfigFile, and the cluster cannot be read (or does not exist yet)"
+  _out="$(_RF_HAVE="ai-platform/mirror-pull" _rf_refs "${_ref}")"
+  _rf_has "refs: a Secret missing in one namespace that uses it is named" "${_out}" "Secret splunk-ai-operator-system/mirror-pull does not exist"
+  assert_eq "refs: and only that namespace" "1" "$(grep -c . <<< "${_out}" | tr -d ' ')"
+  assert_eq "refs: present everywhere with the right type is fine" "" "$(_RF_HAVE="ai-platform/mirror-pull splunk-ai-operator-system/mirror-pull" _rf_refs "${_ref}")"
+  _rf_has "refs: a Secret of another type fails in preflight" \
+    "$(_RF_HAVE="ai-platform/mirror-pull splunk-ai-operator-system/mirror-pull" _RF_TYPE=Opaque _rf_refs "${_ref}")" "is of type 'Opaque'"
+  _rf_has "refs: the Splunk Operator namespace counts when it is installed" \
+    "$(_RF_COMPONENTS="ai-operator splunk-operator" _RF_HAVE="ai-platform/mirror-pull splunk-ai-operator-system/mirror-pull" _rf_refs "${_ref}")" "Secret splunk-operator/mirror-pull does not exist"
+  assert_eq "refs: a reference with a dockerConfigFile is created during install, not checked here" "" \
+    "$(_RF_CLUSTER=no _rf_refs $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: /tmp/x.json\n')"
+fi
+assert_eq "refs: the preflight reports them with the setting's own problems" "1" \
+  "$(_extract_fn preflight_checks | grep -c 'validate_pull_secret_config; validate_pull_secret_refs' | tr -d ' ')"
+
 _exercise_airgap_bundle_helpers() (
   local mode="$1" fixture_dir
   fixture_dir=$(mktemp -d)

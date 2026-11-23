@@ -89,7 +89,8 @@ func TestInstallConfig_SetsEverySettingAnEntryCameFromToItsMirrorReference(t *te
 		assert.Contains(t, v, "@sha256:", "every setting is digest-pinned")
 		assert.True(t, strings.HasPrefix(v.(string), fakeMirror+"/"), "and in the mirror")
 	}
-	assert.Nil(t, get(cfg, "images", "registry"), "the references are complete; images.registry is not set")
+	assert.Equal(t, "mirror.airgap.local:5000", get(cfg, "images", "registry"),
+		"images.registry names the mirror host, so the installer configures the nodes for it")
 }
 
 // Generate then enforce: an installer configuration with the generated settings is
@@ -158,4 +159,10 @@ func TestSplitSetting_KeepsDottedVersionsWhole(t *testing.T) {
 	assert.Equal(t, []string{"images", "agentRuntime", "baseImages", "v1.9.0-rc.1"}, splitSetting("images.agentRuntime.baseImages.v1.9.0-rc.1"))
 	assert.Equal(t, []string{"images", "agentRuntime", "providerImages", "mltk"}, splitSetting("images.agentRuntime.providerImages.mltk"))
 	assert.Equal(t, []string{"images", "ray", "headImage"}, splitSetting("images.ray.headImage"))
+}
+
+func TestMirrorHost(t *testing.T) {
+	assert.Equal(t, "10.0.39.38:5099", MirrorHost("10.0.39.38:5099/ai-tier"))
+	assert.Equal(t, "mirror.example.com", MirrorHost("mirror.example.com"))
+	assert.Equal(t, "mirror.example.com:443", MirrorHost(" mirror.example.com:443/a/b "))
 }

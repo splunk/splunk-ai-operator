@@ -491,7 +491,8 @@ func cmdInstallConfig(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "# Installer image settings for snapshot %s (mirror %s). Merge into the installer\n", snap.Metadata.ID, snap.Spec.Mirror)
-	fmt.Fprintf(stdout, "# configuration and leave images.registry unset: every reference is complete and digest-pinned.\n")
+	fmt.Fprintf(stdout, "# configuration. images.registry names the mirror host, so the installer configures the nodes for it\n")
+	fmt.Fprintf(stdout, "# (set images.registryInsecure: true for a plain-HTTP mirror); the references are complete and digest-pinned.\n")
 	_, err = stdout.Write(b)
 	return err
 }

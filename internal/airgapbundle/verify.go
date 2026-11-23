@@ -27,6 +27,7 @@ const (
 	FindingArchiveUnmapped    = "ARCHIVE_IMAGE_UNMAPPED"        // an archive image the snapshot has no entry for
 	FindingSnapshotMismatch   = "SNAPSHOT_MISMATCH"             // the snapshot is not the one the bundle was made for
 	FindingInstallConfig      = "INSTALL_CONFIG_MISSING"        // the install preflight has no install references to compare with the snapshot
+	FindingInstallRegistry    = "INSTALL_REGISTRY_MISMATCH"     // images.registry is not the mirror host, so the nodes are not configured for the mirror
 	FindingFactsMissing       = "HOST_FACTS_MISSING"            // the install preflight was given no host facts
 	FindingArch               = "NODE_PLATFORM_MISMATCH"        // a node is not linux/amd64, or did not report its platform
 	FindingGPUDevices         = "GPU_DEVICES_MISSING"           // a GPU node reports no NVIDIA GPU
@@ -282,6 +283,16 @@ func checkSnapshot(ctx context.Context, m *Manifest, opts VerifyOptions) []Findi
 		reg = &imagesnapshot.Remote{}
 	}
 	out = append(out, imagesnapshot.Preflight(ctx, reg, snap, imagesnapshot.SnapshotInventory(snap), opts.Profile)...)
+	// The installer configures the nodes' access to a registry (plain HTTP when
+	// images.registryInsecure is true) only for images.registry, so it must name the mirror.
+	got := strings.TrimSuffix(strings.TrimSpace(opts.Input.Installer.Images.Registry), "/")
+	if want := imagesnapshot.MirrorHost(snap.Spec.Mirror); got != want {
+		if got == "" {
+			got = "unset"
+		}
+		out = append(out, Finding{Component: "images.registry", Code: FindingInstallRegistry,
+			Message: fmt.Sprintf("is %s, not the mirror host %s: the installer configures the nodes for images.registry only, so they could not pull from the mirror (image-snapshot install-config sets it)", got, want)})
+	}
 	// Every image the install configures is its component's mirror reference, pinned to
 	// the snapshot's digest. Images delivered in the bundle's archives are checked
 	// against the archives instead (checkArchivesAgainstSnapshot).

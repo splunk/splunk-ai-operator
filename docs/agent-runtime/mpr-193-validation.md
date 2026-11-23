@@ -117,6 +117,30 @@ Deployments.
   `konnectivity-agent` and `node-exporter` on the controller node once; Kubernetes restarted
   them. The replacement ran under a memory cap.
 
+## PR #286 review fixes
+
+Four review findings were valid and are fixed, each with a test that fails without the fix:
+
+1. **GPU facts.** On a GPU host without `nvidia-smi`, the collector's driver line was
+   missing, so the toolkit flag shifted into it (`driver: "false"`). A fresh host then passed
+   the preflight as if a driver were loaded, without the closure having to cover its kernel.
+   The driver line is now always emitted, and is kept only when it is a version. The test runs
+   the real SSH payload against fake `lspci`, `nvidia-smi` and `nvidia-ctk` executables:
+   - a fresh host without `nvidia-smi`;
+   - a host where `nvidia-smi` is present but failing;
+   - a provisioned host.
+2. **Plain-HTTP mirror.** The installer configures the nodes for `images.registry` only, and
+   `install-config` had said to leave it unset. `install-config` now sets `images.registry` to
+   the mirror's host, and the install preflight reports `INSTALL_REGISTRY_MISMATCH` when it is
+   anything else. The smoke had needed a hand-written node configuration for exactly this
+   reason.
+3. **Splunk Standalone.** Its default ServiceAccount now gets every pull Secret present,
+   configured ones included, merged with any it already had. Before, it got only
+   `ecr-registry-secret`.
+4. **Secret references without a file.** These are now checked in the preflight, before any
+   change, in every namespace that uses them. On a fresh install they fail at once, because
+   such a Secret cannot exist yet. A Secret of another type fails too.
+
 ## Design decisions
 
 The decisions and their basis in the ERD and Jira are recorded in the pull request. In
