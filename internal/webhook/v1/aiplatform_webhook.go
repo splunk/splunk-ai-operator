@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/credentials"
 )
 
 // nolint:unused
@@ -552,6 +553,9 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 
 		identity := feature.Name
 		if feature.Name == "agentruntime" {
+			// The parent must reject literals before they can be persisted in its
+			// generated AIService and override the checkpoint Secret's envFrom.
+			allErrs = append(allErrs, credentials.ValidatePostgresEnvironment(feature.Env, featurePath.Child("env"))...)
 			if feature.Provider == "" {
 				allErrs = append(allErrs, field.Required(
 					featurePath.Child("provider"),

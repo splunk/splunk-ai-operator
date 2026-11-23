@@ -16,6 +16,7 @@ import (
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/credentials"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -137,7 +138,7 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 		if !equality.Semantic.DeepEqual(previousStatus, aiservice.Status) {
 			// Update retains the resourceVersion precondition: an observation of an
 			// older generation must not be rebased onto a concurrently changed spec.
-			retErr = errors.Join(retErr, r.Status().Update(ctx, aiservice))
+			retErr = errors.Join(retErr, safeRuntimeError(r.Status().Update(ctx, aiservice), "cannot persist runtime status; check API availability and operator permissions"))
 		}
 	}()
 
@@ -170,7 +171,7 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 				if old := meta.FindStatusCondition(aiservice.Status.Conditions, schemaReady); old != nil {
 					if old.Reason == "Failed" || old.Reason == "TimedOut" {
 						message += "; previous outcome: " + old.Reason
-					} else if _, prior, ok := strings.Cut(old.Message, "; previous outcome: "); ok {
+					} else if _, prior, ok := strings.Cut(old.Message, "; previous outcome: "); ok && (prior == "Failed" || prior == "TimedOut") {
 						message += "; previous outcome: " + prior
 					}
 				}
@@ -183,7 +184,7 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 			}
 			blockRuntimeCondition(aiservice, endpointReady, stage.name)
 			setRuntimeCondition(aiservice, "Ready", metav1.ConditionFalse, reason, message)
-			return err
+			return safeRuntimeError(err, message)
 		}
 		// These gates are evaluated from observed health after both objects exist.
 		if stage.name == "AgentRuntimeDeployment" || stage.name == "AgentRuntimeService" {
@@ -195,17 +196,30 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 		}
 		setRuntimeCondition(aiservice, stage.name+"Ready", metav1.ConditionTrue, reason, message)
 	}
-	return r.observeReadiness(ctx, aiservice)
+	return safeRuntimeError(r.observeReadiness(ctx, aiservice), "cannot observe runtime readiness; check API availability and operator permissions")
 }
 
 func (r *AgentRuntimeReconciler) validateAIService(ctx context.Context, ai *aiv1.AIService) error {
+	// Validate old objects as well as webhook-admitted ones. Explicit env values
+	// override envFrom, even when empty, so connection keys must be Secret-only.
+	for _, input := range []struct {
+		values map[string]string
+		path   *field.Path
+	}{
+		{ai.Spec.Feature.Env, field.NewPath("spec", "features", "env")},
+		{ai.Spec.Env, field.NewPath("spec", "env")},
+	} {
+		if errs := credentials.ValidatePostgresEnvironment(input.values, input.path); len(errs) != 0 {
+			return schemaState("InvalidCheckpointEnvironment", errs.ToAggregate().Error())
+		}
+	}
 	if ai.Spec.Feature.Provider == "" {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "provider must be set for agentruntime")
 		return fmt.Errorf("provider must be set for agentruntime")
 	}
 	if _, err := resolveAgentRuntimeConfig(ai); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
-		return err
+		return schemaState("InvalidConfiguration", err.Error())
 	}
 	if _, err := resolveSchemaSetupImage(); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", err.Error())
@@ -440,10 +454,13 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 		Name:      ai.Spec.CheckpointDbSecretRef,
 		Namespace: ai.Namespace,
 	}, checkpointSecret); err != nil {
-		return fmt.Errorf("get checkpoint DB Secret %q: %w", ai.Spec.CheckpointDbSecretRef, err)
+		if apierrors.IsNotFound(err) {
+			return schemaState("CheckpointSecretMissing", "checkpoint DB Secret is missing in the AIService namespace")
+		}
+		return safeRuntimeError(err, "cannot read checkpoint DB Secret; check operator permissions and API availability")
 	}
 	if err := validateSchemaSetupCredentials(checkpointSecret, ai.Spec.Feature.Env); err != nil {
-		return err
+		return schemaState("InvalidCheckpointSecret", err.Error())
 	}
 	state := ensureAgentRuntimeSchemaStatus(ai)
 
@@ -604,15 +621,10 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 }
 
 func validateSchemaSetupCredentials(secret *corev1.Secret, featureEnv map[string]string) error {
-	if strings.TrimSpace(featureEnv["DATABASE_URL"]) != "" || len(secret.Data["DATABASE_URL"]) > 0 {
-		return nil
+	if errs := credentials.ValidatePostgresEnvironment(featureEnv, field.NewPath("spec", "features", "env")); len(errs) != 0 {
+		return errs.ToAggregate()
 	}
-	for _, name := range []string{"PG_HOST", "PG_USER", "PG_DBNAME", "PG_PASSWORD"} {
-		if strings.TrimSpace(featureEnv[name]) == "" && len(secret.Data[name]) == 0 {
-			return fmt.Errorf("postgres schema setup requires %s in checkpoint DB Secret or agentruntime feature env", name)
-		}
-	}
-	return nil
+	return credentials.ValidatePostgresSecret(secret)
 }
 
 func buildFeatureEnv(values map[string]string) []corev1.EnvVar {

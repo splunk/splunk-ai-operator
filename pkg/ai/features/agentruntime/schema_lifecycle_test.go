@@ -52,7 +52,12 @@ func schemaTestReconciler(t *testing.T) (*AgentRuntimeReconciler, *aiv1.AIServic
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "checkpoint", Namespace: "default", ResourceVersion: "1"},
-		Data:       map[string][]byte{"DATABASE_URL": []byte("postgresql://user:secret@db/checkpoint?sslmode=disable")},
+		Type:       corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"DATABASE_URL": []byte("postgresql://user:secret@db/checkpoint?sslmode=disable"),
+			"PG_HOST":      []byte("db"), "PG_PORT": []byte("5432"), "PG_USER": []byte("user"),
+			"PG_PASSWORD": []byte("secret"), "PG_DBNAME": []byte("checkpoint"),
+		},
 	}
 	// Match the API server's separate spec and status writes; otherwise a fake
 	// status update could also persist an unsubmitted retry or input change.
@@ -226,7 +231,7 @@ func TestSchemaDigestAndSecretVersionRerunAfterSuccess(t *testing.T) {
 			case "secret version":
 				secret := &corev1.Secret{}
 				require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "checkpoint", Namespace: "default"}, secret))
-				secret.Data["PG_PORT"] = []byte("5432")
+				secret.Data["unrelated-key"] = []byte("version-change")
 				require.NoError(t, r.Update(context.Background(), secret))
 			case "postgres config":
 				ai.Spec.Feature.Env = map[string]string{"PG_SSLMODE": "require"}
