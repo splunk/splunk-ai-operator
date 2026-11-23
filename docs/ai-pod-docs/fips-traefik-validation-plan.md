@@ -1,289 +1,86 @@
-# FIPS Traefik validation plan for Splunk AI POD
+# Splunk AI POD Traefik validation record
 
-**Status: Plan only.** No Splunk AI POD/OpenShift environment has been tested for
-this document. The successful Traefik checks in the AI-Tier k0s environment are
-not evidence that the same configuration works or is qualified on AI POD.
+**Updated:** 2026-11-12
+**Result:** The in-cluster Traefik request paths required for SAIA and Slim were exercised. Traefik terminated public TLS, forwarded requests to the existing HTTP Routes, and made a certificate-verified HTTPS connection to Splunk for the tested token-validation callbacks. This is functional network evidence, not FIPS certification evidence.
 
-## Purpose and scope
+This record is limited to the Splunk AI POD OpenShift test. It does not use a cloud-hosted Splunk deployment. The customer-facing reference is [FIPS-mode Traefik for Splunk AI POD](./fips-traefik-customer-setup.md). Only the public ingress, browser CORS, and callback paths described below were tested.
 
-This plan covers a separate Splunk AI POD deployment, using the OpenShift AI
-POD deployment described by [`openshift-readme.md`](./openshift-readme.md). It
-defines the checks needed to validate the same network boundary used in the
-k0s test:
+## Tested architecture
 
-- TLS terminates at a customer-managed, FIPS-configured Traefik gateway outside
-  the OpenShift cluster.
-- Traefik forwards SAIA and Slim requests to the existing OpenShift HTTP Routes
-  over plain HTTP.
-- SAIA and Slim use a private HTTP listener on Traefik for Splunk token
-  validation. Traefik opens a separate, certificate-verified HTTPS connection
-  to external Splunk on port 8089.
-- No TLS is introduced on the Traefik-to-OpenShift-router, router-to-service,
-  or workload-to-private-Traefik legs.
-
-The plan is for an external Splunk integration. The AI POD documentation says
-external Splunk integration is limited to JWT validation on port 8089; external
-HEC/OTel is not a supported or qualified path in that deployment workflow. Do
-not add HEC validation to this plan unless product support is confirmed.
-
-## AI POD facts to preserve
-
-The repository describes AI POD as an installer deployed onto an existing
-OpenShift cluster. Its generated SAIA and Slim Routes are HTTP Routes backed by
-ClusterIP Services, target service port 8080, and do not set `spec.tls`. The
-installation workflow does not configure or qualify HTTPS Routes or workload
-mTLS. This plan keeps those routes HTTP and places the customer-managed Traefik
-gateway in front of the OpenShift router.
-
-Because Traefik is outside the cluster, it cannot route directly to a
-ClusterIP. The proposed inbound handoff is therefore HTTP from Traefik to the
-OpenShift router on TCP 80, with the original Route host and request path
-preserved. The OpenShift router then forwards HTTP to the Route's service. This
-handoff is a design assumption to validate in the target cluster before
-changing DNS or production traffic.
-
-## Proposed traffic flow
-
-~~~mermaid
+```mermaid
 flowchart LR
-  B[Browser] -->|HTTPS 443; TLS terminates here| T[External FIPS Traefik]
-  E[External Splunk / AITK] -->|HTTPS 443; TLS terminates here| T
-  T -->|HTTP 80; preserve Route host and path| R[OpenShift router]
-  R -->|HTTP Route to service port 8080| A[SAIA Service]
-  R -->|HTTP Route to service port 8080| L[Slim Service]
-  A -->|HTTP to private Traefik listener :8080| T
-  L -->|HTTP to private Traefik listener :8080| T
-  T -->|Verified HTTPS :8089| S[External Splunk]
-~~~
+  C[Browser or Splunk client] -->|HTTPS; TLS passthrough at OpenShift Route| O[OpenShift router]
+  O -->|encrypted connection| T[Traefik in ai-platform]
+  T -->|TLS terminates; HTTP to internal router| OI[OpenShift internal router]
+  OI -->|existing HTTP Route| S[SAIA]
+  OI -->|existing HTTP Route| L[Slim]
+  S -->|HTTP private callback :8080| T
+  L -->|HTTP private callback :8080| T
+  T -->|HTTPS :8089; certificate and SAN verified| X[Splunk]
+```
 
-The callback is a workload-initiated request/response, not a webhook. The
-private Traefik listener must not be internet-facing. The callback targets to
-test first are:
+The public OpenShift Routes used for the test were TLS passthrough Routes to
+Traefik. The existing SAIA and Slim Routes remained HTTP. Traefik forwarded
+public requests to the in-cluster OpenShift router on port 80, with the
+existing application Route host supplied so the router selected the right
+backend. The private callback listener was a ClusterIP Service on port 8080
+and had no OpenShift Route.
 
-| Method | Path | Unauthenticated probe expectation |
-|---|---|---|
-| GET | `/services/authorization/tokens-keys` | HTTP 200 from Splunk |
-| GET | `/services/authentication/current-context` | HTTP 401 without a token; HTTP 200 in an authenticated application flow |
+## Completed validation
 
-SAIA search operations require their own exact method/path routes. Add those
-only after observing the requests from the deployed SAIA version. Do not make
-Traefik a catch-all proxy for `/services/*`.
+| Area | Test and observed result |
+|---|---|
+| Traefik runtime | One Traefik 3.6.14 replica ran Ready in `ai-platform`, on linux/amd64. It used `GODEBUG=fips140=only`, non-root execution, a read-only root filesystem, dropped capabilities, and the RuntimeDefault seccomp profile. |
+| Public TLS | HTTPS health requests to both temporary public hosts returned HTTP 200 with certificate verification enabled. Chrome loaded the test hosts without a certificate warning after the test CA was trusted. |
+| Public routing | Traefik forwarded requests over HTTP to the internal OpenShift router while preserving the application path and query and selecting the existing SAIA or Slim Route host. SAIA and Slim health checks returned HTTP 200. |
+| SAIA | Metadata and v2 query requests returned HTTP 200. The SAIA browser history flow loaded: the browser preflights returned 204 and conversation list, detail, and item requests returned 200. The saved conversation rendered. |
+| Slim | `/tenant/slim-api/v1alpha1/chat/models` and a non-streaming v2 completion returned HTTP 200. The completion response matched the test phrase. |
+| Slim browser CORS | The Slim application returned HTTP 400 to the initial preflight. A test-only Traefik CORS middleware allowed the exact local origin `http://127.0.0.1:8000` and observed request headers. Chrome `fetch` then read the deliberately unauthenticated HTTP 401 response, demonstrating that the browser accepted the preflight and response CORS headers. |
+| Callback route selection | From both SAIA and Slim, GET `/services/authorization/tokens-keys` returned HTTP 200 and unauthenticated GET `/services/authentication/current-context` returned HTTP 401 through the private Traefik callback router. An earlier authenticated test through the application relay returned HTTP 200 for current-context. |
+| Callback TLS | The actual callback IngressRoute was temporarily pointed to a transparent TCP tunnel that forwarded encrypted bytes to laptop Splunk. Traefik used an HTTPS upstream with the test CA and `serverName: splunk-laptop-relay.test`; certificate chain and SAN verification succeeded. Traefik logs showed the callback router and HTTPS upstream for requests from both workloads. TLS terminated at Splunk. |
 
-## Test prerequisites and access needed
+The direct HTTPS callback test used a transparent tunnel only to carry TCP
+between the cluster and a laptop Splunk listener bound to loopback. The tunnel
+did not terminate TLS or modify HTTP. Its Kubernetes resources were removed
+after the test, and the callback route was restored to the existing test relay.
+No TLS verification was disabled.
 
-Before testing, identify the target AI POD environment and collect:
+## Separate analysis and limitations
 
-1. A read-only `oc` context for the OpenShift cluster, its version, the AI POD
-   namespace, and the deployed AIPlatform and Splunk integration mode.
-2. The actual SAIA and Slim Route hosts, backing Services, and the OpenShift
-   router's reachable HTTP address. Confirm that the external gateway can
-   reach that router on TCP 80.
-3. A customer-controlled Traefik gateway location, FQDNs, test certificate and
-   CA, and approval to make a reversible DNS/firewall change during a test
-   window.
-4. The external Splunk management address, certificate SAN, issuing CA, and a
-   test account that can perform the required token and search operations.
-   Splunk Enterprise must also trust the Traefik certificate for AITK HTTPS
-   calls; if using a private test CA, confirm the effective `SSL_CERT_FILE`
-   used by the AITK HTTPX client points to a readable bundle with public roots
-   and the test CA.
-5. The OpenShift pod egress/NAT addresses seen by Traefik. Allow only those
-   required sources to the private Traefik listener on TCP 8080.
-6. The exact approved Traefik image digest, FIPS-mode configuration, and the
-   customer's applicable crypto policy. A runtime flag or successful TLS
-   handshake alone is not a FIPS certification claim.
+- **Direct network route to laptop Splunk:** A direct connection from the
+  workloads to the laptop interfaces timed out because Docker published
+  Splunk's management port on loopback. The tunnel allowed Traefik's own TLS
+  validation and callback routing to be tested; it does not prove a direct
+  cluster-to-laptop network route. This is a limitation of this laptop test
+  topology, not evidence about customer networks.
+- **Customer network topology:** The test used an in-cluster Traefik
+  Deployment and the OpenShift internal router. A customer's DNS, firewall,
+  network policies, router exposure, and Splunk endpoint are not established
+  by this lab result.
+- **Callback scope:** Only the two token-validation GET paths listed above
+  were allowed and exercised. This test does not validate every Splunk REST
+  path that a SAIA feature might use. Do not treat the two-path router as a
+  general `/services/*` proxy.
+- **CORS scope:** The Slim CORS result is specific to the local test origin and
+  the observed headers. A different Splunk Web origin or header set needs its
+  own preflight check.
+- **FIPS qualification:** The test process had `GODEBUG=fips140=only`. Go
+  documents this as a best-effort setting for testing, assessment, and
+  debugging, not a production setting. The exact linked Go Cryptographic
+  Module, build provenance, approved operating environment, and application
+  validation are not established. Do not describe this test as certified or
+  qualified FIPS operation. See the [Go FIPS 140-3 guidance](https://go.dev/doc/security/fips140)
+  and [NIST certificate 5247](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/5247).
+- **Out of scope:** AITK UI, Slim streaming, broad negative or resilience tests,
+  and SAIA search-tool route discovery were not part of the requested POD
+  ingress/callback validation.
 
-Do not collect bearer tokens, cookies, private keys, or full environment dumps
-as evidence. Use a dedicated test window and a rollback contact for DNS and
-firewall changes.
+## Test environment state
 
-## Execution plan
-
-### 1. Capture the baseline without changing the cluster
-
-Record the OpenShift version and current workload health. Capture only resource
-metadata and non-secret configuration:
-
-~~~sh
-oc version
-oc get clusteroperators
-oc get routes -n "$AI_POD_NAMESPACE" -o wide
-oc get services -n "$AI_POD_NAMESPACE" -o wide
-oc get endpoints -n "$AI_POD_NAMESPACE"
-oc get pods -n "$AI_POD_NAMESPACE" -o wide
-oc get networkpolicy -n "$AI_POD_NAMESPACE"
-~~~
-
-Confirm that the SAIA and Slim Routes are HTTP, that each has ready service
-endpoints on port 8080, and that the existing applications work before the
-gateway change. Record route hosts and router address; do not infer these from
-the k0s NodePort configuration.
-
-### 2. Prepare Traefik and the network boundary
-
-Use a dedicated external gateway and a pinned image. Configure a public HTTPS
-entry point on TCP 443 and a separate private HTTP callback entry point on TCP
-8080. Keep callback access restricted to the observed OpenShift egress sources.
-
-For the public routes, target the OpenShift router over HTTP on TCP 80. Preserve
-the Route host, path, query string, authorization/request headers, and streaming
-response. Use the existing Route hostnames as the public FQDNs if the customer
-DNS/certificate design permits; otherwise, configure a matching OpenShift Route
-host only after confirming the AI POD deployment supports that change. If the
-public FQDN differs from the generated Route host, first decide and test the
-host-routing behavior. Do not silently rewrite a host or API prefix to make a
-route appear to pass.
-
-For callback routes, configure exact GET routes for the two token-validation
-paths above. The service must target
-`https://<SPLUNK_PRIVATE_FQDN_OR_IP>:8089` using a `serversTransport` with
-certificate verification enabled, the correct trusted root CA, and a
-`serverName` that matches the Splunk certificate SAN. Do not use
-`insecureSkipVerify`, `curl -k`, or a TLS downgrade.
-
-Network rules should allow:
-
-- Intended browser and Splunk Enterprise clients to Traefik TCP 443.
-- Traefik to the OpenShift router TCP 80.
-- OpenShift workload egress to Traefik's private TCP 8080 listener.
-- Traefik to external Splunk TCP 8089.
-
-Block direct workload access to external Splunk TCP 8089 and do not expose the
-private Traefik listener publicly. Confirm actual source NAT before tightening
-the source allowlist; OpenShift node/pod addressing is environment-specific.
-
-### 3. Validate the public SAIA and Slim ingress
-
-From a client that trusts the test CA, verify DNS, certificate chain/SAN, and
-TLS without disabling certificate validation. During pre-DNS testing, use
-`curl --resolve` so the URL hostname and certificate verification remain
-correct:
-
-~~~sh
-curl --cacert "$TRAEFIK_CA" \
-  --resolve "$SAIA_FQDN:443:$TRAEFIK_PUBLIC_IP" \
-  "https://$SAIA_FQDN/health"
-
-curl --cacert "$TRAEFIK_CA" \
-  --resolve "$SLIM_FQDN:443:$TRAEFIK_PUBLIC_IP" \
-  "https://$SLIM_FQDN/health"
-~~~
-
-Expected result: the deployed health endpoints return their documented success
-status, and Traefik logs show the correct router and HTTP OpenShift-router
-upstream. Confirm the upstream request reaches the generated Route by preserving
-its host. A Traefik 404, OpenShift router 404, or OpenShift Route 503 must be
-diagnosed at the layer that produced it.
-
-Then test the actual clients:
-
-- **SAIA/browser:** Configure the Splunk AI Assistant URL as
-  `https://<SAIA_FQDN>`. Open the assistant and exercise a simple request. If
-  Splunk Web and SAIA have different origins, capture the exact browser preflight
-  path, requested headers, response status, and CORS response headers. Do not
-  include cookies or tokens in evidence.
-- **Slim/AITK:** Configure the **Splunk AI tier** connection as
-  `https://<SLIM_FQDN>/tenant/slim-api/v1alpha1`. Test the connection and load
-  the model list from Splunk Enterprise. This must be tested from the Splunk
-  host, not only from an administrator laptop.
-
-### 4. Validate AITK inference through Slim
-
-After the connection test succeeds, run a minimal inference from Splunk AI
-Toolkit Search using a configured test connection:
-
-~~~spl
-| makeresults
-| ai prompt="Reply exactly: AI POD Slim path passed" connection="<AITK_CONNECTION_NAME>"
-~~~
-
-Expected result: the prompt returns successfully, Splunk's `mlspl.log` shows a
-successful request, Slim records the corresponding chat-completions request,
-and public Traefik access logs show the request routed to the Slim OpenShift
-Route. Record the request ID and timestamps, but redact tokens and cookies.
-If the Traefik certificate uses a private CA, verify AITK's effective
-`SSL_CERT_FILE` and CA bundle before running the inference. Keep certificate
-verification enabled and preserve the normal public roots in the bundle.
-
-### 5. Validate the SAIA/Slim callbacks to external Splunk
-
-Set the AIPlatform trusted issuer to the private HTTP Traefik issuer URL, for
-example `http://<TRAEFIK_PRIVATE_FQDN_OR_IP>:8080`, and ensure it matches the
-issuer used by the Splunk-minted interactive token. Treat `SPLUNK_ISSUERS` as a
-JWT issuer allowlist, not as a CA bundle or TLS setting. Do not print or save
-the token while checking its issuer claim.
-
-From both a SAIA pod and a Slim pod, probe the two exact paths through the
-private Traefik listener. Expected unauthenticated results are JWKS HTTP 200
-and current-context HTTP 401. The authenticated SAIA and AITK application
-flows must produce successful current-context checks. Correlate each test's
-timestamp with Traefik access logs showing the callback path, selected router,
-upstream service, response status, and the OpenShift node/pod source as
-available. Verify the configured upstream is the verified HTTPS Splunk
-service, not a direct pod-to-Splunk connection.
-
-For SAIA search-tool validation, exercise a simple, deterministic search and
-confirm the exact observed parser, job, export/result, or control API paths are
-routed through the private listener to Splunk. A successful JWKS check does
-not prove that the SAIA search API route set is complete. Do not claim the
-search-tool flow is validated unless the response contains actual search
-results and the matching route/upstream records are available.
-
-### 6. Run negative and resilience checks
-
-- Confirm the private callback listener is unreachable from an unapproved
-  client network.
-- Confirm SAIA and Slim pods cannot connect directly to external Splunk TCP
-  8089, while their requests through private Traefik succeed.
-- Confirm an invalid CA/SAN is rejected in an isolated test; never disable
-  verification to make the test pass.
-- Confirm `OPTIONS` preflight, streaming inference responses, long-running
-  requests, timeouts, and response buffering using the deployed app versions.
-- Confirm a restart or route reload does not remove the configured routers or
-  CA trust. Do not restart production workloads solely to complete a test.
-
-### 7. Record evidence and close out
-
-Capture an evidence table with actual values and statuses:
-
-| Validation | Evidence to record | Status |
-|---|---|---|
-| OpenShift baseline | Version, namespace, Route hosts, Services, endpoints | Not run |
-| Traefik FIPS setup | Image digest, runtime mode, policy evidence | Not run |
-| Public TLS | FQDN, SAN/chain, negotiated TLS, HTTP status | Not run |
-| Host/path routing | SAIA and Slim Route, path preserved, upstream/status | Not run |
-| Browser CORS | Exact preflight request and response headers | Not run |
-| AITK connection/model list | Splunk-host result and request path | Not run |
-| AITK inference | Request ID, Splunk log, Slim log, success status | Not run |
-| SAIA/Slim callbacks | JWKS/current-context logs and verified upstream | Not run |
-| SAIA search tools | Successful search results and matching route logs | Not run |
-| Isolation | Direct 8089 blocked; private 8080 restricted | Not run |
-| Streaming/timeouts | Request duration and unbuffered response evidence | Not run |
-
-Keep the test CA, client IP, certificate/key material, bearer token, and browser
-cookies out of this document. The final validated guide should replace `Not run`
-only with test evidence and should preserve any limitations, including source
-NAT ambiguity or lack of pod-level identity in access logs.
-
-## Rollback
-
-Before testing, save the current DNS, firewall, gateway, AIPlatform, and app
-endpoint values. If a check fails or is stopped:
-
-1. Restore DNS to the previous OpenShift ingress address.
-2. Remove the temporary gateway-to-router and workload-to-private-listener
-   firewall allowances.
-3. Restore the prior SAIA and AITK endpoint and trusted-issuer values.
-4. Remove only the test Traefik routes/certificates created for this exercise.
-5. Verify the original HTTP OpenShift Routes and application health are
-   restored.
-
-Do not run the AI POD installer cleanup command as a rollback; it can remove
-installer-owned AI POD resources and is outside this test's scope.
-
-## Inputs required to execute this plan
-
-The plan can be converted into a tested customer procedure once the target
-OpenShift AI POD cluster is identified and access is available, along with the
-router address, external Splunk endpoint/certificate, DNS/firewall change
-window, and an authorized test account for SAIA and AITK.
+The test Traefik Deployment, public passthrough Routes, and test CORS middleware
+remain in the test namespace. The temporary raw TCP tunnel and its TLS
+transport/Secret are removed. The private callback route currently points to
+`ai-pod-laptop-callback-relay` on HTTP port 19444; the test-only Slim CORS
+middleware remains attached to the Slim test route. These are test resources,
+not customer configuration. They were left in place so the laptop test path
+was not broken by cleanup. No production workloads were changed.
