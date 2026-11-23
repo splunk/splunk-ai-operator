@@ -106,7 +106,8 @@ func TestRuntimeReadinessGates(t *testing.T) {
 	}{
 		{"healthy", func(f *readinessFixture) {}, "Ready", "Available"},
 		{"missing deployment", func(f *readinessFixture) { f.dep = nil }, deploymentReady, "DeploymentMissing"},
-		{"zero replicas", func(f *readinessFixture) { f.ai.Spec.Replicas = 0 }, deploymentReady, "ReplicaTargetMismatch"},
+		{"HPA chose a different count", func(f *readinessFixture) { f.ai.Spec.Replicas = 1 }, "Ready", "Available"},
+		{"zero replicas", func(f *readinessFixture) { f.dep.Spec.Replicas = ptr(int32(0)) }, deploymentReady, "ReplicaTargetMismatch"},
 		{"stale deployment", func(f *readinessFixture) { f.dep.Status.ObservedGeneration-- }, deploymentReady, "DeploymentNotObserved"},
 		{"partial update", func(f *readinessFixture) { f.dep.Status.UpdatedReplicas = 1 }, deploymentReady, "RolloutPending"},
 		{"partial availability", func(f *readinessFixture) { f.dep.Status.AvailableReplicas = 1 }, deploymentReady, "RolloutPending"},
@@ -170,7 +171,7 @@ func TestRuntimeReadinessGates(t *testing.T) {
 			require.NotNil(t, ready)
 			assert.Equal(t, f.ai.Generation, ready.ObservedGeneration)
 			want := metav1.ConditionFalse
-			if tc.name == "healthy" {
+			if tc.kind == "Ready" && tc.reason == "Available" {
 				want = metav1.ConditionTrue
 			}
 			assert.Equal(t, want, ready.Status)

@@ -1120,6 +1120,11 @@ ai_platform_profile_feature_problems() {
     if [[ "${ftarget}" =~ ^[1-9][0-9]{0,2}$ ]] && (( ftarget > 100 )); then
       echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].targetCPUUtilization: must be an integer from 1 to 100"
     fi
+    # Match the AgentRuntime policy defaults when comparing partial overrides.
+    if [[ "${fname_value}" == "agentruntime" ]]; then
+      fmin="${fmin:-1}"
+      fmax="${fmax:-4}"
+    fi
     if [[ "${fmin}" =~ ^[1-9][0-9]{0,5}$ && "${fmax}" =~ ^[1-9][0-9]{0,5}$ ]] && (( fmin > fmax )); then
       echo "[PROFILE_INVALID_VALUE] aiPlatform.features[${i}].maxReplicas: must be greater than or equal to minReplicas"
     fi

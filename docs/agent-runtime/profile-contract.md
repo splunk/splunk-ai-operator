@@ -67,6 +67,19 @@ from 1 to 100. Rejected values are not echoed in error messages: an unsupported 
 YAML integer of at least 1 (the same rule `install` enforces). Duplicate feature
 identities (`agentruntime` is keyed by provider) are rejected, as in the webhook.
 
+AgentRuntime uses CPU autoscaling in both profiles. The defaults are
+`minReplicas: 1`, `maxReplicas: 4`, and `targetCPUUtilization: 60`. Each
+override is optional. The effective minimum must be at most the effective
+maximum, so a minimum above 4 requires an explicit maximum.
+
+Adding the feature starts its Deployment at the configured minimum and
+creates its HPA. A standalone AIService can seed a new Deployment with
+`spec.replicas` inside its effective bounds. Other startup counts fall back
+to the minimum. The HPA controls the live replica count after creation.
+Changing the HPA bounds updates the policy and Kubernetes converges to the
+new range. Removing the feature deletes the owned HPA and Deployment through
+the AIService without removing the referenced checkpoint Secret.
+
 Optional: `images.aitk.image`. The MPR-188 contract settles this: AITK is the Splunk
 app `Splunk_ML_Toolkit` (label "AI Toolkit", version 6.2.0) installed on Splunk,
 not a container image, so the key is not required and nothing in the operator or

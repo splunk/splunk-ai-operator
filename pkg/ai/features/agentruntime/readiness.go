@@ -134,11 +134,12 @@ func (r *AgentRuntimeReconciler) observeDeployment(ctx context.Context, ai *aiv1
 		fail("DeploymentUnavailable", "runtime Deployment must be owned by this AIService and not terminating")
 		return pods, nil
 	}
-	want := ai.Spec.Replicas
-	if want <= 0 || dep.Spec.Replicas == nil || *dep.Spec.Replicas != want {
-		fail("ReplicaTargetMismatch", "waiting for a positive runtime Deployment replica target matching the AIService")
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas <= 0 {
+		fail("ReplicaTargetMismatch", "waiting for a positive runtime Deployment replica target")
 		return pods, nil
 	}
+	// The HPA can change the desired count independently of the AIService.
+	want := *dep.Spec.Replicas
 	if dep.Status.ObservedGeneration < dep.Generation {
 		fail("DeploymentNotObserved", "waiting for the Deployment controller to observe the current generation")
 		return pods, nil
