@@ -14,7 +14,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // buildTestScheme creates a scheme with the types reconcileSlimService needs.
@@ -113,6 +115,7 @@ func Test_reconcileSlimService_ServiceTypeVariations(t *testing.T) {
 			require.NoError(t, fakeClient.Get(context.Background(),
 				types.NamespacedName{Name: ai.Name + "-slim-service", Namespace: "default"}, svc))
 
+			assert.True(t, metav1.IsControlledBy(svc, ai))
 			assert.Equal(t, tc.wantType, svc.Spec.Type)
 			if tc.wantNodePort != 0 {
 				require.NotEmpty(t, svc.Spec.Ports)
@@ -127,6 +130,66 @@ func Test_reconcileSlimService_ServiceTypeVariations(t *testing.T) {
 				}
 				require.NotNil(t, httpPort, "expected an http port on the slim service")
 				assert.Equal(t, tc.wantNodePort, httpPort.NodePort)
+			}
+		})
+	}
+}
+
+func TestSlimReconciler_ReconcilesOnlyOwnedServices(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildTestScheme(t)
+	ai := &aiv1.AIService{ObjectMeta: metav1.ObjectMeta{Name: "slim", Namespace: "default", UID: "current-uid"}}
+
+	for _, service := range []struct {
+		name      string
+		reconcile func(*SlimReconciler, context.Context, *aiv1.AIService) error
+	}{
+		{slimServiceName(ai.Name), (*SlimReconciler).reconcileSlimService},
+		{ai.Name + "-slim-metrics-service", (*SlimReconciler).reconcileSlimMetricsService},
+	} {
+		t.Run(service.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				ownerName string
+				ownerUID  types.UID
+			}{
+				{name: "unowned"},
+				{name: "other controller", ownerName: "other-slim", ownerUID: "other-uid"},
+				{name: "previous controller UID", ownerName: ai.Name, ownerUID: "previous-uid"},
+				{name: "current controller", ownerName: ai.Name, ownerUID: ai.UID},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					svc := &corev1.Service{
+						ObjectMeta: metav1.ObjectMeta{Name: service.name, Namespace: ai.Namespace},
+						Spec: corev1.ServiceSpec{
+							Type:     corev1.ServiceTypeLoadBalancer,
+							Selector: map[string]string{"app": "old-workload"},
+							Ports:    []corev1.ServicePort{{Name: "old-port", Port: 81}},
+						},
+					}
+					if tc.ownerUID != "" {
+						owner := ai.DeepCopy()
+						owner.Name, owner.UID = tc.ownerName, tc.ownerUID
+						require.NoError(t, controllerutil.SetControllerReference(owner, svc, scheme))
+					}
+					c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc).Build()
+					r := &SlimReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+					key := client.ObjectKeyFromObject(svc)
+					require.NoError(t, c.Get(ctx, key, svc))
+					before := svc.DeepCopy()
+
+					err := service.reconcile(r, ctx, ai)
+					require.NoError(t, c.Get(ctx, key, svc))
+					if tc.ownerUID != ai.UID {
+						require.ErrorContains(t, err, "is not controlled by")
+						assert.Equal(t, before, svc)
+						return
+					}
+					require.NoError(t, err)
+					assert.True(t, metav1.IsControlledBy(svc, ai))
+					assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+					assert.Equal(t, map[string]string{"app": ai.Name, "component": ai.Name}, svc.Spec.Selector)
+				})
 			}
 		})
 	}

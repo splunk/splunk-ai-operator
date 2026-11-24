@@ -6,10 +6,23 @@ import (
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+// EnsureServiceControllerReference claims a new Service or preserves ownership
+// of an existing one. Call it in the mutation callback after the Service is read.
+func EnsureServiceControllerReference(scheme *runtime.Scheme, owner client.Object, service *corev1.Service) error {
+	// A controller with the same name can have a different UID after recreation.
+	// An existing Service also needs an explicit owner before we change where it routes.
+	if service.ResourceVersion != "" && !metav1.IsControlledBy(service, owner) {
+		return fmt.Errorf("Service %s/%s is not controlled by %s/%s",
+			service.Namespace, service.Name, owner.GetNamespace(), owner.GetName())
+	}
+	return controllerutil.SetControllerReference(owner, service, scheme)
+}
 
 // ServiceAccountOptions describes the feature-owned ServiceAccount to reconcile.
 // Labels and annotations are limited to values managed by the caller; unrelated

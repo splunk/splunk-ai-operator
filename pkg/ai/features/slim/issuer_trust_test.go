@@ -88,20 +88,21 @@ func TestSLIMIssuerTrustValidationAndRendering(t *testing.T) {
 			}
 			r := &SlimReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
 
-			override, err := r.validateIssuerTrust(ctx, ai, tt.required)
+			trust, err := r.validateIssuerTrust(ctx, ai, tt.required)
 			if tt.wantError != "" {
 				require.ErrorContains(t, err, tt.wantError)
 				assert.NotContains(t, err.Error(), canary)
 				return
 			}
 			require.NoError(t, err)
-			volumes, mounts, env := appendIssuerTrust(tt.caRef, override, nil, nil, nil)
+			volumes, mounts, env := appendIssuerTrust(tt.caRef, trust.hostOverride, nil, nil, nil)
 			if tt.caRef == nil {
 				assert.Empty(t, volumes)
 				assert.Empty(t, mounts)
 				assert.Empty(t, env)
 				return
 			}
+			assert.NotEmpty(t, trust.hash)
 			require.Len(t, volumes, 1)
 			require.NotNil(t, volumes[0].Secret)
 			assert.Equal(t, "issuer-ca", volumes[0].Secret.SecretName)

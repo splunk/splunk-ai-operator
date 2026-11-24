@@ -3,6 +3,7 @@ package slim
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -22,29 +23,45 @@ import (
 )
 
 const (
-	issuerCAKey           = "ca.crt"
-	issuerCAVolume        = "splunk-issuer-ca"
-	issuerCAPath          = "/etc/splunk-issuer-ca"
-	issuerHostOverrideEnv = "SPLUNK_ISSUER_HOST_OVERRIDE"
+	issuerCAKey               = "ca.crt"
+	issuerCAVolume            = "splunk-issuer-ca"
+	issuerCAPath              = "/etc/splunk-issuer-ca"
+	issuerHostOverrideEnv     = "SPLUNK_ISSUER_HOST_OVERRIDE"
+	issuerTrustHashAnnotation = "splunk-ai-operator/issuer-trust-hash"
 )
 
-// validateIssuerTrust returns the verified form of the optional transport host
-// override. Pin it in the pod env so ConfigMap edits must be validated before
-// they can take effect on a replacement pod.
-func (r *SlimReconciler) validateIssuerTrust(ctx context.Context, ai *aiv1.AIService, required bool) (string, error) {
+type issuerTrust struct {
+	hostOverride string
+	hash         string
+	needsDrain   bool
+}
+
+func (trust issuerTrust) revisionLabel() string {
+	if trust.hash == "" {
+		return ""
+	}
+	// Kubernetes limits label values to 63 characters. A 128-bit prefix still
+	// distinguishes trust revisions while the full digest remains on the template.
+	return trust.hash[:32]
+}
+
+// validateIssuerTrust pins the verified host override in the Pod environment
+// and identifies the trust revision that must finish rolling out before serving.
+func (r *SlimReconciler) validateIssuerTrust(ctx context.Context, ai *aiv1.AIService, required bool) (issuerTrust, error) {
 	config := &ai.Spec.SplunkConfiguration
 	if config.CACertRef == nil {
 		if required {
-			return "", errors.New("spec.splunkConfiguration.caCertRef.name is required for SLIM to verify the Splunk issuer")
+			return issuerTrust{}, errors.New("spec.splunkConfiguration.caCertRef.name is required for SLIM to verify the Splunk issuer")
 		}
-		return "", nil
+		return issuerTrust{}, nil
 	}
 	name := config.CACertRef.Name
 	if len(validation.IsDNS1123Subdomain(name)) != 0 {
-		return "", errors.New("spec.splunkConfiguration.caCertRef.name must be a Kubernetes Secret name")
+		return issuerTrust{}, errors.New("spec.splunkConfiguration.caCertRef.name must be a Kubernetes Secret name")
 	}
-	if buildSplunkIssuersVal(ai) == "" {
-		return "", errors.New("spec.splunkConfiguration must identify at least one Splunk token issuer")
+	issuers := buildSplunkIssuersVal(ai)
+	if issuers == "" {
+		return issuerTrust{}, errors.New("spec.splunkConfiguration must identify at least one Splunk token issuer")
 	}
 	if config.SplunkCustomResourceRef.Name != "" {
 		// Validate the derived primary issuer before combining it with the
@@ -53,37 +70,39 @@ func (r *SlimReconciler) validateIssuerTrust(ctx context.Context, ai *aiv1.AISer
 		primary.Spec.SplunkConfiguration.TrustedIssuers = nil
 		address := strings.TrimPrefix(buildSplunkIssuersVal(&primary), "https://")
 		if !validIssuerAddress(address, false) {
-			return "", errors.New("spec.splunkConfiguration.splunkCustomResourceRef must identify a valid Splunk Service address")
+			return issuerTrust{}, errors.New("spec.splunkConfiguration.splunkCustomResourceRef must identify a valid Splunk Service address")
 		}
 	} else if config.Endpoint != "" && !validIssuerAddress(config.Endpoint, true) {
-		return "", errors.New("spec.splunkConfiguration.endpoint must identify an HTTPS issuer")
+		return issuerTrust{}, errors.New("spec.splunkConfiguration.endpoint must identify an HTTPS issuer")
 	}
 	for i, issuer := range config.TrustedIssuers {
 		if !validIssuerAddress(issuer, true) {
-			return "", fmt.Errorf("spec.splunkConfiguration.trustedIssuers[%d] must identify an HTTPS issuer", i)
+			return issuerTrust{}, fmt.Errorf("spec.splunkConfiguration.trustedIssuers[%d] must identify an HTTPS issuer", i)
 		}
 	}
 
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: name}, secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", errors.New("spec.splunkConfiguration.caCertRef names a Secret missing from the SLIM namespace")
+			return issuerTrust{}, errors.New("spec.splunkConfiguration.caCertRef names a Secret missing from the SLIM namespace")
 		}
-		return "", errors.New("cannot read spec.splunkConfiguration.caCertRef Secret")
+		return issuerTrust{}, errors.New("cannot read spec.splunkConfiguration.caCertRef Secret")
 	}
-	if !validIssuerCABundle(secret.Data[issuerCAKey], time.Now()) {
-		return "", errors.New("spec.splunkConfiguration.caCertRef Secret must have a ca.crt key with currently valid PEM CA certificates")
+	bundle := secret.Data[issuerCAKey]
+	if !validIssuerCABundle(bundle, time.Now()) {
+		return issuerTrust{}, errors.New("spec.splunkConfiguration.caCertRef Secret must have a ca.crt key with currently valid PEM CA certificates")
 	}
 
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: ai.Name + "-slim-config"}, cm); err != nil && !apierrors.IsNotFound(err) {
-		return "", errors.New("cannot read SLIM issuer configuration")
+		return issuerTrust{}, errors.New("cannot read SLIM issuer configuration")
 	}
 	override := cm.Data[issuerHostOverrideEnv]
 	if override != "" && !validIssuerAddress(override, false) {
-		return "", errors.New("SLIM SPLUNK_ISSUER_HOST_OVERRIDE must be a hostname or host:port for HTTPS")
+		return issuerTrust{}, errors.New("SLIM SPLUNK_ISSUER_HOST_OVERRIDE must be a hostname or host:port for HTTPS")
 	}
-	return override, nil
+	hash := sha256.Sum256([]byte(strings.Join([]string{name, issuers, override, string(bundle)}, "\x00")))
+	return issuerTrust{hostOverride: override, hash: fmt.Sprintf("%x", hash)}, nil
 }
 
 func validIssuerAddress(value string, allowIssuerURL bool) bool {

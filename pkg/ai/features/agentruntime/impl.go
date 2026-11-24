@@ -833,11 +833,10 @@ func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Service failed")
-		return fmt.Errorf("ownerref on Service: %w", err)
-	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		if err := common.EnsureServiceControllerReference(r.Scheme, ai, svc); err != nil {
+			return err
+		}
 		svc.ObjectMeta.Labels = labels
 		svc.ObjectMeta.Annotations = annotations
 		svc.Spec.Selector = selectorLabels

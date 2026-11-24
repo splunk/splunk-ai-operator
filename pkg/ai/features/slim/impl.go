@@ -51,7 +51,13 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 	before := aiservice.DeepCopy().Status
 	var conditions []metav1.Condition
 	var route runtimeRoute
-	var issuerHostOverride string
+	var routeErr error
+	var trust issuerTrust
+	var slimReady bool
+	var rejectedTrust bool
+	wasManaged := meta.FindStatusCondition(before.Conditions, agentRouteAvailable) != nil
+	previousTrust := meta.FindStatusCondition(before.Conditions, "IssuerTrustReady")
+	previouslyRejected := previousTrust != nil && previousTrust.Reason == issuerRejectedReason
 	setCondition := func(condition metav1.Condition) {
 		if prior := meta.FindStatusCondition(before.Conditions, condition.Type); prior != nil && prior.Status == condition.Status {
 			condition.LastTransitionTime = prior.LastTransitionTime
@@ -73,12 +79,26 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		name string
 		fn   func(context.Context, *aiv1.AIService) error
 	}{
+		{"IssuerTrust", func(ctx context.Context, ai *aiv1.AIService) error {
+			// Check trust even if Runtime or Ray prerequisites are unavailable.
+			route, routeErr = r.resolveRuntimeRoute(ctx, ai)
+			var err error
+			trust, err = r.validateIssuerTrust(ctx, ai, route.managed || wasManaged)
+			if err != nil {
+				rejectedTrust = true
+				return errors.Join(err, r.suspendSlimServing(ctx, ai))
+			}
+			if trust.hash != "" || previouslyRejected {
+				trust.needsDrain, err = r.prepareSlimIssuerTrust(ctx, ai, trust.hash, previouslyRejected)
+				rejectedTrust = err != nil && trust.needsDrain
+				return err
+			}
+			return nil
+		}},
 		{"Validate", r.validateAIService},
 		{"AgentRouteConfig", func(ctx context.Context, ai *aiv1.AIService) error {
-			var err error
-			route, err = r.resolveRuntimeRoute(ctx, ai)
-			if err != nil {
-				return err
+			if routeErr != nil {
+				return routeErr
 			}
 			if route.platform == nil && before.FeatureStatus != nil && before.FeatureStatus.Slim != nil {
 				// Keep the last working Deployment configuration when a Runtime
@@ -93,8 +113,7 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 					return err
 				}
 			}
-			issuerHostOverride, err = r.validateIssuerTrust(ctx, ai, route.managed)
-			return err
+			return nil
 		}},
 		{"ServiceAccount", r.reconcileServiceAccount},
 		{"SlimConfigMap", r.reconcileSlimConfigMap},
@@ -106,9 +125,13 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 			if origin == "" {
 				origin = route.origin()
 			}
-			return r.reconcileSlimDeploymentWithRoute(ctx, ai, origin, issuerHostOverride, route.managed)
+			var err error
+			slimReady, err = r.reconcileSlimDeploymentWithRoute(ctx, ai, origin, trust, route.managed)
+			return err
 		}},
-		{"SlimService", r.reconcileSlimService},
+		{"SlimService", func(ctx context.Context, ai *aiv1.AIService) error {
+			return r.reconcileSlimServiceWithAvailability(ctx, ai, (trust.hash == "" && !trust.needsDrain) || slimReady, trust.revisionLabel())
+		}},
 		{"SlimMetricsService", r.reconcileSlimMetricsService},
 		{"ServiceMonitor", r.reconcileServiceMonitor},
 	}
@@ -126,11 +149,14 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		if err != nil {
 			cond.Status = metav1.ConditionFalse
 			cond.Reason = "Error"
+			if stage.name == "IssuerTrust" && rejectedTrust {
+				cond.Reason = issuerRejectedReason
+			}
 			cond.Message = err.Error()
 		}
 		setCondition(cond)
 		if err != nil {
-			if route.managed || meta.FindStatusCondition(before.Conditions, agentRouteAvailable) != nil {
+			if route.managed || wasManaged {
 				setAgentRouteCondition(aiservice, metav1.ConditionFalse, "ConfigurationUnavailable", "SLIM route configuration is unavailable; inspect SLIM reconciliation conditions")
 			}
 			log.Error(err, "stage failed", "stage", stage.name)
@@ -147,9 +173,9 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 	})
 
 	if route.managed {
-		return r.reconcileAgentRouteStatus(ctx, aiservice, route)
+		return r.reconcileAgentRouteStatus(ctx, aiservice, route, slimReady, trust.revisionLabel())
 	}
-	if meta.FindStatusCondition(before.Conditions, agentRouteAvailable) != nil {
+	if wasManaged {
 		setAgentRouteCondition(aiservice, metav1.ConditionFalse, "RuntimeUnavailable", "The platform no longer has a managed AgentRuntime route")
 	}
 	return nil
@@ -560,14 +586,15 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	if err != nil {
 		return err
 	}
-	override, err := r.validateIssuerTrust(ctx, ai, false)
+	trust, err := r.validateIssuerTrust(ctx, ai, false)
 	if err != nil {
 		return err
 	}
-	return r.reconcileSlimDeploymentWithRoute(ctx, ai, origin, override, false)
+	_, err = r.reconcileSlimDeploymentWithRoute(ctx, ai, origin, trust, false)
+	return err
 }
 
-func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, ai *aiv1.AIService, agentRuntimeURL, issuerHostOverride string, managed bool) error {
+func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, ai *aiv1.AIService, agentRuntimeURL string, trust issuerTrust, managed bool) (bool, error) {
 	featureConfigName := fmt.Sprintf("splunk-%s-feature-config", ai.Name)
 
 	volumes := []corev1.Volume{
@@ -610,7 +637,7 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 			corev1.EnvVar{Name: "SPLUNK_ISSUERS", Value: buildSplunkIssuersVal(ai)},
 		)
 	}
-	volumes, mounts, env = appendIssuerTrust(ai.Spec.SplunkConfiguration.CACertRef, issuerHostOverride, volumes, mounts, env)
+	volumes, mounts, env = appendIssuerTrust(ai.Spec.SplunkConfiguration.CACertRef, trust.hostOverride, volumes, mounts, env)
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		volumes = append(volumes, corev1.Volume{
@@ -643,7 +670,7 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ai.Name + "-slim-deployment",
+			Name:      slimDeploymentName(ai.Name),
 			Namespace: ai.Namespace,
 		},
 	}
@@ -672,10 +699,9 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 		annotations[k] = v
 	}
 	delete(annotations, deploymentRevisionAnnotation)
-
-	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
-		return fmt.Errorf("ownerref on Deployment: %w", err)
+	delete(annotations, issuerTrustHashAnnotation)
+	if trust.hash != "" {
+		annotations[issuerTrustHashAnnotation] = trust.hash
 	}
 
 	containers := []corev1.Container{{
@@ -712,6 +738,33 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 	}}
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+		if deployment.ResourceVersion != "" {
+			if !metav1.IsControlledBy(deployment, ai) {
+				return errors.New("SLIM Deployment is not controlled by this AIService")
+			}
+			stopped := deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0
+			if trust.needsDrain && !stopped {
+				// The Service can record a rejection even if the first scale-down failed.
+				zero := int32(0)
+				deployment.Spec.Replicas = &zero
+				return nil
+			}
+			if stopped {
+				drained, err := r.slimWorkloadDrained(ctx, ai, deployment)
+				if err != nil || !drained {
+					return err
+				}
+			}
+		}
+		if trust.needsDrain {
+			// Keep the Service blocked until the replacement rollout finishes.
+			if err := r.blockSlimService(ctx, ai, slimRolloutBlocked); err != nil {
+				return err
+			}
+		}
+		if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
+			return err
+		}
 		deployment.ObjectMeta.Labels = labels
 		// Runtime readiness wakes this reconciler. Preserve the Deployment
 		// controller's revision so those events do not cause generation churn.
@@ -730,7 +783,7 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      map[string]string{"app": ai.Name, "component": ai.Name},
+				Labels:      slimServiceSelector(ai, "", trust.revisionLabel()),
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
@@ -749,9 +802,9 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Deployment failed")
-		return fmt.Errorf("create/update Deployment: %w", err)
+		return false, fmt.Errorf("create/update Deployment: %w", err)
 	}
-	return nil
+	return slimRolloutReady(ai, deployment), nil
 }
 
 // reconcileSlimService ensures the public-facing Service, which may be exposed via
@@ -759,6 +812,10 @@ func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, a
 // port so that enabling public exposure never publishes /metrics or consumes an
 // extra NodePort; metrics are served by reconcileSlimMetricsService instead.
 func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AIService) error {
+	return r.reconcileSlimServiceWithAvailability(ctx, ai, true, "")
+}
+
+func (r *SlimReconciler) reconcileSlimServiceWithAvailability(ctx context.Context, ai *aiv1.AIService, serving bool, trustRevision string) error {
 	serviceTemplate := ai.Spec.ServiceTemplate.DeepCopy()
 	cleanServiceTemplate(serviceTemplate)
 
@@ -798,17 +855,24 @@ func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AISe
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Service failed")
-		return fmt.Errorf("ownerref on Service: %w", err)
-	}
 	// Type, Ports, and Selector are all set inside the mutate callback because
 	// CreateOrUpdate reloads the live Service from the cluster before invoking it,
 	// so any values set on svc beforehand are discarded on updates.
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		if err := common.EnsureServiceControllerReference(r.Scheme, ai, svc); err != nil {
+			return err
+		}
 		svc.ObjectMeta.Labels = labels
 		svc.ObjectMeta.Annotations = annotations
-		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
+		var blocked string
+		if !serving {
+			blocked = slimRolloutBlocked
+			if svc.Spec.Selector[slimRouteDisabledLabel] == slimIssuerRejected {
+				blocked = slimIssuerRejected
+			}
+		}
+		svc.Spec.Selector = slimServiceSelector(ai, blocked, trustRevision)
+		svc.Spec.PublishNotReadyAddresses = false
 		svc.Spec.Ports = ports
 		svc.Spec.Type = svcType
 		return nil
@@ -830,11 +894,10 @@ func (r *SlimReconciler) reconcileSlimMetricsService(ctx context.Context, ai *ai
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on metrics Service failed")
-		return fmt.Errorf("ownerref on metrics Service: %w", err)
-	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		if err := common.EnsureServiceControllerReference(r.Scheme, ai, svc); err != nil {
+			return err
+		}
 		svc.ObjectMeta.Labels = map[string]string{"app": ai.Name, "component": ai.Name}
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
 		svc.Spec.Ports = []corev1.ServicePort{

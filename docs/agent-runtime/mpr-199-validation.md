@@ -33,9 +33,12 @@ Kustomize uses the same public image defaults as the installer examples. Supply 
 
 The regenerated bundle includes the managed route schema and the read/watch permissions needed for Runtime ReplicaSets and EndpointSlices. The `cpuOnly` and `fullfeature` installer profile renders matched their checked-in expectations. All 17 focused bundle assertions passed, including config-driven image overrides in both profiles and preservation of a fully qualified Runtime schema image digest.
 
-## Acceptance gaps
+## Blocker fixes and local verification
 
-- The Runtime and SLIM Service reconcilers must check ownership of an existing Service after loading it and before mutating it.
-- An invalid issuer-trust update withdraws route availability while previously configured SLIM Pods can still serve saved callers. Data-plane fail-closed enforcement for this case needs coverage.
-- Route publication can precede completion of the SLIM rollout. One authorization probe during an issuer change received a response from a Pod with the previous configuration.
-- The managed path activates for explicit canonical profiles. Route configuration supplied with an omitted or legacy profile needs an explicit compatibility policy.
+| Blocker | Verified locally |
+| --- | --- |
+| Service ownership | Runtime and SLIM Service reconciliation checks the existing Service's controller UID before modifying it. Regression cases cover creation, owned updates, and refusal to mutate unowned, foreign-owned, or stale-UID Services. |
+| Issuer trust | Both profiles withdraw the application Service's backends and request a scale-down on invalid trust while retaining the Service and saved URL. Rapid repair waits for old Pods to drain. The `fullfeature` case also covers a failed scale-down write and unavailable Ray. |
+| SLIM rollout | Both profiles withhold route availability and Service routing until the current SLIM Deployment is fully available. A Runtime-only outage preserves the saved URL and healthy SLIM Service. The local Kubernetes API test verifies rollout status watches, trust rejection and recovery, and selection of the new issuer revision after replacing the CA under the same Secret name. |
+
+All 24 packages in the local non-E2E Go suite passed. The follow-up checks used local fixtures and a local API server with simulated workload status. The focused live results above are from the earlier revision. The managed route uses explicit canonical profiles.

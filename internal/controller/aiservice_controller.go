@@ -56,9 +56,23 @@ const aiServiceFinalizer = "ai.splunk.com/aiservice-protect"
 // AIServiceReconciler reconciles a AIService object
 type AIServiceReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
-	Config   *config.OperatorConfig // injected runtime config
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	Config    *config.OperatorConfig // injected runtime config
+	apiReader client.Reader
+}
+
+type slimResourceClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c slimResourceClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+func (c slimResourceClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.reader.List(ctx, list, opts...)
 }
 
 // +kubebuilder:rbac:groups=ai.splunk.com,resources=aiservices,verbs=get;list;watch;create;update;patch;delete
@@ -179,7 +193,13 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	handlerInit := time.Now()
-	handler, err := factory.New(ctx, r.Client, r.Scheme, ai, r.Recorder)
+	featureClient := r.Client
+	if featureName == "slim" && r.apiReader != nil {
+		// Trust repair can race with the Deployment and Service caches. Read
+		// current resources before deciding whether to restore SLIM traffic.
+		featureClient = slimResourceClient{Client: r.Client, reader: r.apiReader}
+	}
+	handler, err := factory.New(ctx, featureClient, r.Scheme, ai, r.Recorder)
 	telemetry.ObserveReconcileStage(ctx, "handler_init", handlerInit)
 	if err != nil {
 		log.Error(err, "failed to initialize feature handler", "feature", featureName)
@@ -223,6 +243,10 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	telemetry.ObserveReconcileResult(ctx, "success")
+	if featureName == "slim" && ai.Spec.SplunkConfiguration.CACertRef != nil {
+		// Certificate expiry can invalidate trust without an event on the Secret.
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -259,6 +283,7 @@ func aiServiceGlobalEventFilter() predicate.Predicate {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.apiReader = mgr.GetAPIReader()
 	// Register the reverse lookup before watches start using it to map events.
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeWorkloadIndex, runtimeWorkloadKeys); err != nil {
 		return err

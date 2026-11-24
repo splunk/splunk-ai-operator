@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"strings"
 
@@ -67,7 +68,7 @@ func (route runtimeRoute) origin() string {
 	return agentruntime.FeatureServiceURL(route.platform.Name, route.provider, route.platform.Namespace, route.platform.Spec.ClusterDomain)
 }
 
-func (r *SlimReconciler) reconcileAgentRouteStatus(ctx context.Context, ai *aiv1.AIService, route runtimeRoute) error {
+func (r *SlimReconciler) reconcileAgentRouteStatus(ctx context.Context, ai *aiv1.AIService, route runtimeRoute, slimReady bool, trustRevision string) error {
 	runtime := &aiv1.AIService{}
 	key := client.ObjectKey{Namespace: route.platform.Namespace, Name: agentruntime.FeatureAIServiceName(route.platform.Name, route.provider)}
 	if err := r.Get(ctx, key, runtime); err != nil {
@@ -89,8 +90,12 @@ func (r *SlimReconciler) reconcileAgentRouteStatus(ctx context.Context, ai *aiv1
 		setAgentRouteCondition(ai, metav1.ConditionFalse, reason, message)
 		return nil
 	}
+	if !slimReady {
+		setAgentRouteCondition(ai, metav1.ConditionFalse, "SLIMRolloutPending", "Waiting for all replicas of the current SLIM Deployment to become available")
+		return nil
+	}
 
-	endpoint, err := r.aitkEndpoint(ctx, ai)
+	endpoint, err := r.aitkEndpoint(ctx, ai, trustRevision)
 	if err != nil {
 		setAgentRouteCondition(ai, metav1.ConditionFalse, "SLIMEndpointUnavailable", "Waiting for a valid owned SLIM application Service")
 		return err
@@ -99,7 +104,7 @@ func (r *SlimReconciler) reconcileAgentRouteStatus(ctx context.Context, ai *aiv1
 		ai.Status.FeatureStatus = &aiv1.AIServiceFeatureStatus{}
 	}
 	ai.Status.FeatureStatus.Slim = &aiv1.SlimRouteStatus{AITKEndpoint: endpoint}
-	setAgentRouteCondition(ai, metav1.ConditionTrue, "EndpointAvailable", "SLIM endpoint is published for a ready AgentRuntime")
+	setAgentRouteCondition(ai, metav1.ConditionTrue, "EndpointAvailable", "SLIM and AgentRuntime are ready for the published endpoint")
 	return nil
 }
 
@@ -126,7 +131,7 @@ func validateAITKOrigin(ai *aiv1.AIService) error {
 	return nil
 }
 
-func (r *SlimReconciler) aitkEndpoint(ctx context.Context, ai *aiv1.AIService) (string, error) {
+func (r *SlimReconciler) aitkEndpoint(ctx context.Context, ai *aiv1.AIService, trustRevision string) (string, error) {
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: slimServiceName(ai.Name)}, svc); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -136,7 +141,7 @@ func (r *SlimReconciler) aitkEndpoint(ctx context.Context, ai *aiv1.AIService) (
 	}
 	if !metav1.IsControlledBy(svc, ai) || svc.DeletionTimestamp != nil || svc.Spec.ClusterIP == "" ||
 		svc.Spec.ClusterIP == corev1.ClusterIPNone || svc.Spec.PublishNotReadyAddresses ||
-		len(svc.Spec.Selector) != 2 || svc.Spec.Selector["app"] != ai.Name || svc.Spec.Selector["component"] != ai.Name {
+		!maps.Equal(svc.Spec.Selector, slimServiceSelector(ai, "", trustRevision)) {
 		return "", errors.New("SLIM application Service must select the intended SLIM workload")
 	}
 	for _, port := range svc.Spec.Ports {
