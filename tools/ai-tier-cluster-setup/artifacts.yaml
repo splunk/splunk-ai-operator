@@ -1071,10 +1071,6 @@ spec:
                       maxLength: 253
                       minLength: 1
                       type: string
-                    schemaRetryNonce:
-                      description: SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
-                      maxLength: 128
-                      type: string
                     env:
                       additionalProperties:
                         type: string
@@ -1112,6 +1108,11 @@ spec:
                     runtimeVersion:
                       description: RuntimeVersion optionally pins the shared agent-runtime
                         base image version.
+                      type: string
+                    schemaRetryNonce:
+                      description: SchemaRetryNonce requests one new agentruntime
+                        schema Job when changed after a terminal failure.
+                      maxLength: 128
                       type: string
                     serviceAccountName:
                       description: ServiceAccountName is the name of the service account
@@ -2880,6 +2881,27 @@ spec:
               splunkConfiguration:
                 description: SplunkConfiguration defines the Splunk integration configuration
                 properties:
+                  aitkSlimOrigin:
+                    description: |-
+                      AITKSlimOrigin optionally advertises an existing HTTPS gateway to AITK.
+                      Supply only the origin. The operator appends the SLIM API path.
+                    type: string
+                  caCertRef:
+                    description: |-
+                      CACertRef names a Secret in the AIService namespace whose ca.crt key
+                      contains the PEM CA bundle SLIM uses to verify the Splunk token issuer.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   endpoint:
                     description: |-
                       Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
@@ -4221,10 +4243,6 @@ spec:
                     maxLength: 253
                     minLength: 1
                     type: string
-                  schemaRetryNonce:
-                    description: SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
-                    maxLength: 128
-                    type: string
                   env:
                     additionalProperties:
                       type: string
@@ -4262,6 +4280,11 @@ spec:
                   runtimeVersion:
                     description: RuntimeVersion optionally pins the shared agent-runtime
                       base image version.
+                    type: string
+                  schemaRetryNonce:
+                    description: SchemaRetryNonce requests one new agentruntime schema
+                      Job when changed after a terminal failure.
+                    maxLength: 128
                     type: string
                   serviceAccountName:
                     description: ServiceAccountName is the name of the service account
@@ -4982,6 +5005,27 @@ spec:
                 description: SplunkConfiguration specifies the Splunk configuration
                   for the AIService
                 properties:
+                  aitkSlimOrigin:
+                    description: |-
+                      AITKSlimOrigin optionally advertises an existing HTTPS gateway to AITK.
+                      Supply only the origin. The operator appends the SLIM API path.
+                    type: string
+                  caCertRef:
+                    description: |-
+                      CACertRef names a Secret in the AIService namespace whose ca.crt key
+                      contains the PEM CA bundle SLIM uses to verify the Splunk token issuer.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   endpoint:
                     description: |-
                       Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
@@ -5403,6 +5447,15 @@ spec:
                             type: string
                         type: object
                     type: object
+                  slim:
+                    description: SlimRouteStatus describes the endpoint a Splunk administrator
+                      can save in AITK.
+                    properties:
+                      aitkEndpoint:
+                        description: AITKEndpoint is the last published URL. Check
+                          AgentRouteAvailable before using it.
+                        type: string
+                    type: object
                 type: object
               observedGeneration:
                 format: int64
@@ -5677,6 +5730,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - autoscaling
   resources:
   - horizontalpodautoscalers
@@ -5711,6 +5772,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - monitoring
@@ -5943,15 +6012,15 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: RELATED_IMAGE_RAY_HEAD
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17
+          value: docker.io/splunk/ai-tier-ray-head:v1.0
         - name: RELATED_IMAGE_RAY_WORKER
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17
+          value: docker.io/splunk/ai-tier-ray-worker:v1.0
         - name: RELATED_IMAGE_WEAVIATE
           value: semitechnologies/weaviate:stable-v1.28-007846a
         - name: RELATED_IMAGE_SAIA_API
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1
+          value: docker.io/splunk/ai-tier-saia-api:v1.0
         - name: RELATED_IMAGE_SLIM_API
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim/slim-api:build-1
+          value: docker.io/splunk/ai-tier-slim-service:v1.0
         - name: RELATED_IMAGE_AGENT_RUNTIME_BASE
           value: docker.io/splunk/agent-runtime:latest
         - name: RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP
@@ -5961,7 +6030,7 @@ spec:
         - name: RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK
           value: agentcore_operations.loader:MLTKAgentLoader
         - name: RELATED_IMAGE_POST_INSTALL_HOOK
-          value: 667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1
+          value: docker.io/splunk/ai-tier-saia-data-loader:v1.0
         - name: RELATED_IMAGE_FLUENT_BIT
           value: fluent/fluent-bit:1.9.6
         - name: RELATED_IMAGE_OTEL_COLLECTOR

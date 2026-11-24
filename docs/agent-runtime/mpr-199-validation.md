@@ -27,6 +27,12 @@ On 24 November 2026, focused checks used the selected MPR-188 images and the exa
 
 The CPU-only fixture ran the production platform and service reconcilers. The fullfeature fixture used the production service reconciler with the existing Ray prerequisites. These checks compare separate installations of the canonical profiles. MPR-194 owns product invocation and streaming. The live status check called Runtime `/service/ready` through SLIM. The Runtime API prefix was checked against the candidate contract and rendered configuration.
 
+## Installer bundle
+
+Kustomize uses the same public image defaults as the installer examples. Supply private images through `images.ray.headImage`, `images.ray.workerImage`, `images.saia.apiImage`, `images.saia.dataLoaderImage`, and `images.slim.apiImage`. Set `images.registry` to qualify relative image references or supply fully qualified references directly.
+
+The regenerated bundle includes the managed route schema and the read/watch permissions needed for Runtime ReplicaSets and EndpointSlices. The `cpuOnly` and `fullfeature` installer profile renders matched their checked-in expectations. All 17 focused bundle assertions passed, including config-driven image overrides in both profiles and preservation of a fully qualified Runtime schema image digest.
+
 ## Acceptance gaps
 
 - The Runtime and SLIM Service reconcilers must check ownership of an existing Service after loading it and before mutating it.

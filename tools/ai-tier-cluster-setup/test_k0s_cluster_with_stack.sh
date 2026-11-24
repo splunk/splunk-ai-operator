@@ -2851,6 +2851,72 @@ assert_eq "cpuOnly and fullfeature values differ exactly where the profiles diff
   "aiPlatformSpec.profile components.kuberay components.nvidia nodes.gpuWorkers profile.configured profile.effective " \
   "$(_changed_keys "${_PROFILE_GOLDEN}/profile-values-cpuonly.expected.yaml" "${_PROFILE_GOLDEN}/profile-values-fullfeature.expected.yaml")"
 
+# Exercise the manifest the installer applies as well as the profile values.
+# Private registry references should come from the test configuration only.
+_configure_profile_manifest() {
+  local output="$1"
+  local -a TMP_FILES=()
+  SPLUNK_AI_FILE="${SCRIPT_DIR}/artifacts.yaml"
+  configure_images || return 1
+  cp "${SPLUNK_AI_FILE}" "${output}"
+  rm -f "${TMP_FILES[@]}"
+}
+
+suite "account-neutral installer manifest"
+assert_eq "the embedded bundle has no account-specific ECR references" "no" \
+  "$(if grep -Eq '[0-9]{12}\.dkr\.ecr\.' "${SCRIPT_DIR}/artifacts.yaml"; then echo yes; else echo no; fi)"
+for _profile in cpuonly fullfeature; do
+  _image_cfg="$(_profile_cfg "${_profile}" "image-overrides-${_profile}" \
+    '.images.registry = "registry.example.invalid:5000" |
+     .images.slim.apiImage = "ai/slim:candidate" |
+     .images.agentRuntime.baseImages."v2.0.0" = "ai/runtime:v2" |
+     .images.agentRuntime.schemaSetupImage = "mirror.example.invalid:5001/ai/schema@sha256:1111111111111111111111111111111111111111111111111111111111111111"')"
+  if [[ "${_profile}" == "fullfeature" ]]; then
+    command yq -i '
+      .aiPlatform.features += [{"name": "saia"}] |
+      .images.saia = {"apiImage": "ai/saia:v1", "apiV2Image": "ai/saia-v2:v1", "dataLoaderImage": "ai/data-loader:v1"}
+    ' "${_image_cfg}"
+  fi
+  _manifest="${_PROFILE_TMP}/image-overrides-${_profile}-artifacts.yaml"
+  assert_rc "${_profile}: configure images in the generated bundle" 0 \
+    _profile_run "${_image_cfg}" _configure_profile_manifest "${_manifest}"
+  _manager_env="$(command yq -o=json '
+    select(.kind == "Deployment" and .metadata.name == "splunk-ai-operator-controller-manager") |
+    .spec.template.spec.containers[] | select(.name == "manager") | .env
+  ' "${_manifest}" 2>/dev/null | command jq -r '
+    map(select(has("value"))) | map({key: .name, value: .value}) | from_entries
+  ')"
+  assert_eq "${_profile}: SLIM image is qualified using the configured registry" \
+    "registry.example.invalid:5000/ai/slim:candidate" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_SLIM_API)"
+  assert_eq "${_profile}: versioned Runtime base comes from installer config" \
+    "registry.example.invalid:5000/ai/runtime:v2" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0)"
+  assert_eq "${_profile}: fully qualified schema image keeps its registry and digest" \
+    "mirror.example.invalid:5001/ai/schema@sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP)"
+  if [[ "${_profile}" == "cpuonly" ]]; then
+    _ray_head="docker.io/splunk/ai-tier-ray-head:v1.0"
+    _ray_worker="docker.io/splunk/ai-tier-ray-worker:v1.0"
+    _saia_api="docker.io/splunk/ai-tier-saia-api:v1.0"
+    _saia_loader="docker.io/splunk/ai-tier-saia-data-loader:v1.0"
+  else
+    _ray_head="registry.example.invalid:5000/rayproject/ray:2.44.0"
+    _ray_worker="${_ray_head}"
+    _saia_api="registry.example.invalid:5000/ai/saia:v1"
+    _saia_loader="registry.example.invalid:5000/ai/data-loader:v1"
+  fi
+  assert_eq "${_profile}: Ray head uses the effective profile image" "${_ray_head}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_RAY_HEAD)"
+  assert_eq "${_profile}: Ray worker uses the effective profile image" "${_ray_worker}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_RAY_WORKER)"
+  assert_eq "${_profile}: SAIA API uses the effective profile image" "${_saia_api}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_SAIA_API)"
+  assert_eq "${_profile}: post-install hook uses the effective profile image" "${_saia_loader}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_POST_INSTALL_HOOK)"
+done
+suite "deployment profile"
+
 # cpuOnly must not carry Ray, Weaviate or SAIA images: install would inject them
 # into the operator Deployment although nothing deploys them.
 for _leak in 'ray.headImage:rayproject/ray:2.44.0' 'ray.workerImage:rayproject/ray:2.44.0' 'weaviate.image:weaviate:1' 'saia.apiImage:s/a:1' 'saia.apiV2Image:s/a2:1' 'saia.dataLoaderImage:s/dl:1'; do

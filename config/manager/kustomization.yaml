@@ -3,22 +3,23 @@ resources:
 
 
 
-# currently patch is set to change deployment environment variables
+# Keep generated manifests portable. Installers overwrite these public
+# image defaults from their deployment configuration when overrides are set.
 patches:
 - patch: "- op: add\n  path: /spec/template/spec/containers/0/env\n  value: \n  -
     name: WATCH_NAMESPACE\n    value: WATCH_NAMESPACE_VALUE\n  - name: RELATED_IMAGE_SPLUNK_ENTERPRISE\n
     \   value: splunk/splunk:10.2.0-dev1\n  - name: OPERATOR_NAME\n    value: splunk-operator\n
     \ - name: POD_NAME\n    valueFrom:\n      fieldRef:\n        fieldPath: metadata.name\n
-    \ - name: RELATED_IMAGE_RAY_HEAD\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-head:build-17\"\n
-    \ - name: RELATED_IMAGE_RAY_WORKER\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/ray/ray-worker-gpu:build-17\"\n
+    \ - name: RELATED_IMAGE_RAY_HEAD\n    value: \"docker.io/splunk/ai-tier-ray-head:v1.0\"\n
+    \ - name: RELATED_IMAGE_RAY_WORKER\n    value: \"docker.io/splunk/ai-tier-ray-worker:v1.0\"\n
     \ - name: RELATED_IMAGE_WEAVIATE\n    value: \"semitechnologies/weaviate:stable-v1.28-007846a\"\n
-    \ - name: RELATED_IMAGE_SAIA_API\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-api:build-1\"\n
-    \ - name: RELATED_IMAGE_SLIM_API\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim/slim-api:build-1\"\n
+    \ - name: RELATED_IMAGE_SAIA_API\n    value: \"docker.io/splunk/ai-tier-saia-api:v1.0\"\n
+    \ - name: RELATED_IMAGE_SLIM_API\n    value: \"docker.io/splunk/ai-tier-slim-service:v1.0\"\n
     \ - name: RELATED_IMAGE_AGENT_RUNTIME_BASE\n    value: \"docker.io/splunk/agent-runtime:latest\"\n
     \ - name: RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP\n    value: \"docker.io/splunk/agent-runtime-schema-setup:latest\"\n
     \ - name: RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK\n    value: \"docker.io/splunk/agent-runtime-provider-mltk:latest\"\n
     \ - name: RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK\n    value: \"agentcore_operations.loader:MLTKAgentLoader\"\n
-    \ - name: RELATED_IMAGE_POST_INSTALL_HOOK\n    value: \"667741767953.dkr.ecr.us-west-2.amazonaws.com/ml-platform/saia/saia-data-loader:build-1\"\n
+    \ - name: RELATED_IMAGE_POST_INSTALL_HOOK\n    value: \"docker.io/splunk/ai-tier-saia-data-loader:v1.0\"\n
     \ - name: RELATED_IMAGE_FLUENT_BIT\n    value: \"fluent/fluent-bit:1.9.6\"\n  -
     name: RELATED_IMAGE_OTEL_COLLECTOR\n    value: \"otel/opentelemetry-collector-contrib:0.122.1\"\n
     \ - name: MODEL_VERSION\n    value: \"v0.3.14-36-g1549f5a\"\n  - name: RAY_VERSION\n
