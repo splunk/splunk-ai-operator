@@ -15,7 +15,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,14 +55,24 @@ const (
 )
 
 // Reconcile runs reconciliation stages for the CR.
-func (r *SaiaReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
+func (r *SaiaReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) (retErr error) {
 	log := log.FromContext(ctx)
 
+	previous := aiservice.Status.DeepCopy()
 	var conditions []metav1.Condition
+	setCondition := func(condition metav1.Condition) {
+		// Repeated observations of the same status are not transitions.
+		if old := meta.FindStatusCondition(previous.Conditions, condition.Type); old != nil && old.Status == condition.Status {
+			condition.LastTransitionTime = old.LastTransitionTime
+		}
+		conditions = append(conditions, condition)
+	}
 	defer func() {
 		aiservice.Status.Conditions = conditions
 		aiservice.Status.ObservedGeneration = aiservice.Generation
-		_ = r.Status().Update(ctx, aiservice)
+		if !equality.Semantic.DeepEqual(previous, &aiservice.Status) {
+			retErr = errors.Join(retErr, r.Status().Update(ctx, aiservice))
+		}
 	}()
 
 	stages := []struct {
@@ -102,14 +114,14 @@ func (r *SaiaReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		} else {
 			//		r.Recorder.Event(ai, corev1.EventTypeNormal, stage.name+"Succeeded", "stage succeeded")
 		}
-		conditions = append(conditions, cond)
+		setCondition(cond)
 		if err != nil {
 			log.Error(err, "stage failed", "stage", stage.name)
 			return err
 		}
 	}
 
-	conditions = append(conditions, metav1.Condition{
+	setCondition(metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionTrue,
 		Reason:             "AllReconciled",
@@ -1132,7 +1144,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		// Set mutable fields that can be updated
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		deployment.Spec.Replicas = &ai.Spec.Replicas
 
 		// Set selector only on creation (immutable field)
@@ -1143,6 +1155,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 		}
 
 		// Always update the pod template
+		currentTemplate := deployment.Spec.Template
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      map[string]string{"app": ai.Name, "component": ai.Name},
@@ -1191,6 +1204,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
+		common.PreservePodTemplateDefaults(&deployment.Spec.Template, &currentTemplate)
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Deployment failed")
@@ -1258,7 +1272,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		deployment.Spec.Replicas = &ai.Spec.V2.Replicas
 
 		if deployment.Spec.Selector == nil {
@@ -1267,6 +1281,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 			}
 		}
 
+		currentTemplate := deployment.Spec.Template
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      map[string]string{"app": ai.Name, "component": component},
@@ -1318,6 +1333,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
+		common.PreservePodTemplateDefaults(&deployment.Spec.Template, &currentTemplate)
 		return nil
 	}); err != nil {
 		return fmt.Errorf("create/update v2 Deployment: %w", err)
@@ -1397,7 +1413,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		deployment.Spec.Replicas = &ai.Spec.V2Worker.Replicas
 
 		if deployment.Spec.Selector == nil {
@@ -1406,6 +1422,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 			}
 		}
 
+		currentTemplate := deployment.Spec.Template
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      map[string]string{"app": ai.Name, "component": component},
@@ -1450,6 +1467,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
+		common.PreservePodTemplateDefaults(&deployment.Spec.Template, &currentTemplate)
 		return nil
 	}); err != nil {
 		return fmt.Errorf("create/update v2 worker Deployment: %w", err)
@@ -1660,7 +1678,7 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		deployment.Spec.Replicas = &replicas
 
 		if deployment.Spec.Selector == nil {
@@ -1669,6 +1687,7 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 			}
 		}
 
+		currentTemplate := deployment.Spec.Template
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      map[string]string{"app": ai.Name, "component": component},
@@ -1725,6 +1744,7 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
+		common.PreservePodTemplateDefaults(&deployment.Spec.Template, &currentTemplate)
 		return nil
 	}); err != nil {
 		return fmt.Errorf("create/update nginx Deployment: %w", err)
@@ -1753,8 +1773,8 @@ func (r *SaiaReconciler) reconcileSAIAv1Service(
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": component}
 		svc.Spec.Ports = []corev1.ServicePort{
-			{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
-			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088)},
+			{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080), Protocol: corev1.ProtocolTCP},
+			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088), Protocol: corev1.ProtocolTCP},
 		}
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 		return nil
@@ -1785,8 +1805,8 @@ func (r *SaiaReconciler) reconcileSAIAv2Service(
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": component}
 		svc.Spec.Ports = []corev1.ServicePort{
-			{Name: "http", Port: 8000, TargetPort: intstr.FromInt(8000)},
-			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088)},
+			{Name: "http", Port: 8000, TargetPort: intstr.FromInt(8000), Protocol: corev1.ProtocolTCP},
+			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088), Protocol: corev1.ProtocolTCP},
 		}
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 		return nil
@@ -1809,11 +1829,11 @@ func (r *SaiaReconciler) reconcileSAIAService(
 	nginxComponent := ai.Name + "-nginx"
 
 	ports := []corev1.ServicePort{
-		{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
+		{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080), Protocol: corev1.ProtocolTCP},
 	}
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		ports = append(ports, corev1.ServicePort{
-			Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443),
+			Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443), Protocol: corev1.ProtocolTCP,
 		})
 	}
 	svc := &corev1.Service{
@@ -1859,6 +1879,7 @@ func (r *SaiaReconciler) reconcileSAIAService(
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": nginxComponent}
+		common.PreserveAllocatedNodePorts(svc.Spec.Type, ports, svc.Spec.Ports)
 		svc.Spec.Ports = ports
 		return nil
 	}); err != nil {

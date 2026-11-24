@@ -3,6 +3,7 @@ package raybuilder
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
@@ -550,6 +551,9 @@ func TestBuilder_makeWorkerTemplate(t *testing.T) {
 			cfg: InstanceDetail{
 				Tier:       "tier-1",
 				GPUsPerPod: 2,
+				Env: map[string]string{
+					"TEST_Z": "last", "SERVICE_NAME": "worker-service", "TEST_A": "first", "TEST_M": "middle",
+				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("8"),
@@ -572,9 +576,15 @@ func TestBuilder_makeWorkerTemplate(t *testing.T) {
 
 				// Verify environment variables
 				envMap := make(map[string]string)
+				var customEnv []string
 				for _, env := range rayWorker.Env {
 					envMap[env.Name] = env.Value
+					if strings.HasPrefix(env.Name, "TEST_") {
+						customEnv = append(customEnv, env.Name)
+					}
 				}
+				assert.Equal(t, []string{"TEST_A", "TEST_M", "TEST_Z"}, customEnv)
+				assert.Equal(t, "worker-service", envMap["SERVICE_NAME"])
 				assert.Equal(t, "nvidia-a100", envMap["DEFAULT_GPU_TYPE"])
 				assert.Equal(t, "nvidia-a100", envMap["GPU_TYPE"])
 				assert.NotContains(t, envMap, "RAY_HEAD_SERVICE_HOST")

@@ -2,7 +2,6 @@ package sidecars
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -16,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -152,7 +152,8 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 		return fmt.Errorf("yaml to json conversion: %w", err)
 	}
 
-	// unmarshal into map[string]interface{}
+	// Decode using the same representation as an unstructured API read,
+	// including int64 values for whole numbers in the collector config.
 	var cfg map[string]interface{}
 	if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
 		return fmt.Errorf("json unmarshal: %w", err)
@@ -162,11 +163,11 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 	specMap := map[string]interface{}{
 		"mode":  "sidecar",
 		"image": ResolveImage("RELATED_IMAGE_OTEL_COLLECTOR", s.ai.Spec.Images.OTelImage),
-		"env": []map[string]interface{}{
-			{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
-			{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
-			{"name": "NAMESPACE", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.namespace"}}},
-			{"name": "CLUSTER_NAME", "value": s.ai.Spec.ClusterDomain},
+		"env": []interface{}{
+			map[string]interface{}{"name": "SPLUNK_ACCESS_TOKEN", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": s.ai.Spec.SplunkConfiguration.SecretRef.Name, "key": "hec_token"}}},
+			map[string]interface{}{"name": "POD_NAME", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.name"}}},
+			map[string]interface{}{"name": "NAMESPACE", "valueFrom": map[string]interface{}{"fieldRef": map[string]interface{}{"fieldPath": "metadata.namespace"}}},
+			map[string]interface{}{"name": "CLUSTER_NAME", "value": s.ai.Spec.ClusterDomain},
 		},
 		"config": cfg,
 	}
@@ -178,7 +179,14 @@ func (s *Builder) reconcileOpenTelemetryCollector(ctx context.Context, p *aiApi.
 	u.SetNamespace(s.ai.Namespace)
 
 	_, err = controllerutil.CreateOrUpdate(ctx, s.Client, u, func() error {
-		u.Object["spec"] = specMap
+		// Keep collector admission defaults such as replicas and upgrade
+		// strategy. The operator still replaces the fields it renders, including
+		// the complete config, so removing a config entry takes effect.
+		for key, value := range specMap {
+			if err := unstructured.SetNestedField(u.Object, value, "spec", key); err != nil {
+				return err
+			}
+		}
 		u.SetLabels(map[string]string{"app": s.ai.Name + "-ray"})
 		if len(u.GetFinalizers()) == 0 {
 			u.SetFinalizers([]string{"opentelemetrycollector.opentelemetry.io/finalizer"})

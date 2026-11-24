@@ -81,13 +81,22 @@ func ReconcileCertificate(
 		if err := controllerutil.SetControllerReference(owner, cert, scheme); err != nil {
 			return err
 		}
-		cert.Spec = *opts.Spec.DeepCopy()
+		desired := opts.Spec.DeepCopy()
+		PreserveCertificateIssuerDefaults(desired, &cert.Spec)
+		cert.Spec = *desired
 		return nil
 	})
 	if err != nil {
 		return cert, result, fmt.Errorf("reconcile Certificate %q: %w", opts.Name, err)
 	}
 	return cert, result, nil
+}
+
+// PreserveCertificateIssuerDefaults keeps issuer defaults persisted by newer
+// cert-manager webhooks. Older versions can leave the same fields unset.
+func PreserveCertificateIssuerDefaults(desired, current *certmanagerv1.CertificateSpec) {
+	preserveDefault(&desired.IssuerRef.Kind, current.IssuerRef.Kind, "Issuer")
+	preserveDefault(&desired.IssuerRef.Group, current.IssuerRef.Group, certmanagerv1.SchemeGroupVersion.Group)
 }
 
 func mergeMetadata(obj client.Object, labels, annotations map[string]string) {

@@ -214,7 +214,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 		var slimAI aiv1.AIService
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-slim"}, &slimAI)).To(Succeed())
 		Expect(slimAI.Status.FeatureStatus).To(BeNil(), "SLIM must not acquire AgentRuntime status")
-		verifyRuntimeReadinessWithControllers(&ai, p)
+		verifyRuntimeReadinessWithControllers(&ai, p, sch)
 
 		// Nothing Ray or Weaviate was ever created.
 		var deps appsv1.DeploymentList

@@ -3,6 +3,7 @@ package slim
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -14,7 +15,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,14 +43,22 @@ type SlimReconciler struct {
 	Recorder record.EventRecorder
 }
 
-func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
+func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) (retErr error) {
 	log := log.FromContext(ctx)
 
+	previous := aiservice.DeepCopy().Status
 	var conditions []metav1.Condition
 	defer func() {
+		for i := range conditions {
+			if old := meta.FindStatusCondition(previous.Conditions, conditions[i].Type); old != nil && old.Status == conditions[i].Status {
+				conditions[i].LastTransitionTime = old.LastTransitionTime
+			}
+		}
 		aiservice.Status.Conditions = conditions
 		aiservice.Status.ObservedGeneration = aiservice.Generation
-		_ = r.Status().Update(ctx, aiservice)
+		if !equality.Semantic.DeepEqual(previous, aiservice.Status) {
+			retErr = errors.Join(retErr, r.Status().Update(ctx, aiservice))
+		}
 	}()
 
 	stages := []struct {
@@ -481,7 +492,7 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 		return fmt.Errorf("ownerref on Certificate: %w", err)
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
-		cert.Spec = certmanagerv1.CertificateSpec{
+		desired := certmanagerv1.CertificateSpec{
 			SecretName: ai.Spec.MTLS.SecretName,
 			IssuerRef:  ai.Spec.MTLS.IssuerRef,
 			DNSNames:   ai.Spec.MTLS.DNSNames,
@@ -490,6 +501,8 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 				certmanagerv1.UsageClientAuth,
 			},
 		}
+		common.PreserveCertificateIssuerDefaults(&desired, &cert.Spec)
+		cert.Spec = desired
 		return nil
 	}); err != nil {
 		r.Recorder.Eventf(ai, corev1.EventTypeWarning, "MTLSCertificateCreationFailed", "Failed to create/update Certificate: %v", err)
@@ -656,7 +669,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		deployment.Spec.Replicas = &ai.Spec.Replicas
 
 		if deployment.Spec.Selector == nil {
@@ -665,7 +678,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			}
 		}
 
-		deployment.Spec.Template = corev1.PodTemplateSpec{
+		template := corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      map[string]string{"app": ai.Name, "component": ai.Name},
 				Annotations: annotations,
@@ -683,6 +696,8 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
+		common.PreservePodTemplateDefaults(&template, &deployment.Spec.Template)
+		deployment.Spec.Template = template
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Deployment failed")
@@ -700,11 +715,11 @@ func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AISe
 	cleanServiceTemplate(serviceTemplate)
 
 	ports := []corev1.ServicePort{
-		{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
+		{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080), Protocol: corev1.ProtocolTCP},
 	}
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		ports = append(ports, corev1.ServicePort{
-			Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443),
+			Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443), Protocol: corev1.ProtocolTCP,
 		})
 	}
 
@@ -746,6 +761,7 @@ func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AISe
 		svc.ObjectMeta.Labels = labels
 		svc.ObjectMeta.Annotations = annotations
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
+		common.PreserveAllocatedNodePorts(svcType, ports, svc.Spec.Ports)
 		svc.Spec.Ports = ports
 		svc.Spec.Type = svcType
 		return nil
@@ -775,7 +791,7 @@ func (r *SlimReconciler) reconcileSlimMetricsService(ctx context.Context, ai *ai
 		svc.ObjectMeta.Labels = map[string]string{"app": ai.Name, "component": ai.Name}
 		svc.Spec.Selector = map[string]string{"app": ai.Name, "component": ai.Name}
 		svc.Spec.Ports = []corev1.ServicePort{
-			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088)},
+			{Name: "metrics", Port: 8088, TargetPort: intstr.FromInt(8088), Protocol: corev1.ProtocolTCP},
 		}
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 		return nil
