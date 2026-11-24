@@ -54,8 +54,6 @@ images:
     image: "splunk/splunk-ai-operator:candidate-1"
   slim:
     apiImage: "splunk/ai-tier-slim-service:candidate-1"
-  aitk:        # optional pass-through; AITK is a Splunk app (Splunk_ML_Toolkit), not a container image (MPR-188), and nothing consumes this
-    image: "splunk/ai-tier-aitk:candidate-1"
   agentRuntime:
     baseImage: "splunk/ai-agent-runtime:candidate-1"
     schemaSetupImage: "splunk/ai-agent-runtime-schema-setup:candidate-1"

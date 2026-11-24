@@ -17,7 +17,6 @@ images:
     modules:
       "mltk": "agentcore_operations.loader:MLTKAgentLoader"
   slim: "registry.example.internal/splunk/ai-tier-slim-service:candidate-1"
-  aitk: "registry.example.internal/splunk/ai-tier-aitk:candidate-1"
 features:
   - "slim"
   - "agentruntime"

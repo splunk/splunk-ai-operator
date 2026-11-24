@@ -6,6 +6,7 @@
 //	image-snapshot verify    --store DIR --id ID --profile cpuOnly|fullfeature ...
 //	image-snapshot compare   --store DIR --id ID --profile ... ...
 //	image-snapshot refresh   --store DIR --previous ID --id ID ...
+//	image-snapshot install-config --store DIR --id ID --profile cpuOnly|fullfeature [--candidate FILE]
 //
 // It reads registry credentials only from the local Docker configuration, never
 // writes one, and exits 0 when everything is in order, 1 when a snapshot is blocked
@@ -20,9 +21,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sigs.k8s.io/yaml"
 	"strings"
 
-	"github.com/splunk/splunk-ai-operator/internal/candidatecontract"
 	"github.com/splunk/splunk-ai-operator/internal/imagesnapshot"
 )
 
@@ -44,6 +45,8 @@ commands:
   verify      preflight: check the mirror against a stored snapshot for one profile
   compare     check the images an install will use against a stored snapshot
   refresh     derive a new snapshot from a stored one, redoing only what changed
+  install-config  print the installer images: settings for one profile that use the
+              snapshot's digest-pinned mirror references
 
 Run "image-snapshot <command> -h" for the flags of a command.`
 
@@ -65,6 +68,8 @@ func run(args []string, stdout, stderr io.Writer, newRegistry registryFactory) i
 		err = cmdCompare(args[1:], stdout, stderr)
 	case "refresh":
 		err = cmdRefresh(ctx, args[1:], stdout, stderr, newRegistry)
+	case "install-config":
+		err = cmdInstallConfig(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, usage)
 		return 0
@@ -113,65 +118,10 @@ func (f *inputFlags) register(fs *flag.FlagSet) {
 }
 
 func (f *inputFlags) load() (imagesnapshot.InventoryInput, error) {
-	var in imagesnapshot.InventoryInput
-	var m candidatecontract.Manifest
-	if err := candidatecontract.Read(f.candidate, &m); err != nil {
-		return in, fmt.Errorf("candidate manifest: %w", err)
-	}
-	if err := m.Validate(); err != nil {
-		return in, fmt.Errorf("candidate manifest %s is not a valid candidate record: %w", f.candidate, err)
-	}
-	raw, err := os.ReadFile(f.candidate)
-	if err != nil {
-		return in, err
-	}
-	in.Candidate, in.CandidateChecksum = &m, imagesnapshot.Checksum(raw)
-
-	if f.config != "" {
-		if err := imagesnapshot.ReadFile(f.config, &in.Installer); err != nil {
-			return in, fmt.Errorf("installer config: %w", err)
-		}
-	} else {
-		// With no installer configuration there is no installer whose defaults apply.
-		in.NoInstallerDefaults = true
-	}
-	in.Values = map[string]*imagesnapshot.RenderedValues{}
-	for profile, path := range map[string]string{imagesnapshot.ProfileCPUOnly: f.cpuOnlyValues, imagesnapshot.ProfileFullFeature: f.fullFeatureValues} {
-		if path == "" {
-			continue
-		}
-		var v imagesnapshot.RenderedValues
-		if err := imagesnapshot.ReadFile(path, &v); err != nil {
-			return in, fmt.Errorf("rendered values for %s: %w", profile, err)
-		}
-		if v.Profile.Effective != "" && v.Profile.Effective != profile {
-			return in, fmt.Errorf("%s is the rendered profile %q, not %q", path, v.Profile.Effective, profile)
-		}
-		in.Values[profile] = &v
-	}
-	if in.AddonRefs, err = readLines(f.addonList); err != nil {
-		return in, err
-	}
-	if in.K0sRefs, err = readLines(f.k0sList); err != nil {
-		return in, err
-	}
-	if f.owners != "" {
-		if err := imagesnapshot.ReadFile(f.owners, &in.Owners); err != nil {
-			return in, fmt.Errorf("owners: %w", err)
-		}
-	}
-	return in, nil
-}
-
-func readLines(path string) ([]string, error) {
-	if path == "" {
-		return nil, nil
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return strings.Split(string(b), "\n"), nil
+	return imagesnapshot.LoadInput(imagesnapshot.InputFiles{
+		Candidate: f.candidate, Config: f.config, CPUOnlyValues: f.cpuOnlyValues, FullFeatureValues: f.fullFeatureValues,
+		AddonList: f.addonList, K0sList: f.k0sList, Owners: f.owners,
+	})
 }
 
 func parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
@@ -503,4 +453,50 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// cmdInstallConfig prints the installer images: settings that make an install pull every
+// configured image from the snapshot's mirror, by digest. The air-gap preflight compares
+// the configuration an install uses with the snapshot, so a setting left pointing at a
+// source registry fails there; this command produces settings that pass.
+func cmdInstallConfig(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("install-config", flag.ContinueOnError)
+	var sf snapshotFlags
+	sf.register(fs, "id")
+	profile := fs.String("profile", "", "cpuOnly or fullfeature (required): only this profile's settings are printed")
+	candidate := fs.String("candidate", defaultCandidate, "agent-runtime candidate manifest (its runtimeVersion selects the versioned base pin)")
+	if err := parse(fs, args, stderr); err != nil {
+		return err
+	}
+	if !validProfile(*profile) {
+		return fmt.Errorf("--profile must be cpuOnly or fullfeature")
+	}
+	snap, err := sf.read()
+	if err != nil {
+		return err
+	}
+	runtimeVersion := ""
+	if *candidate != "" {
+		in, err := imagesnapshot.LoadInput(imagesnapshot.InputFiles{Candidate: *candidate})
+		if err != nil {
+			return err
+		}
+		if in.CandidateChecksum != snap.Spec.Candidate.Checksum {
+			return fmt.Errorf("%s is not the candidate record snapshot %s was made from", *candidate, snap.Metadata.ID)
+		}
+		runtimeVersion = in.Candidate.Spec.RuntimeVersion
+	}
+	cfg, err := imagesnapshot.InstallConfig(snap, *profile, runtimeVersion)
+	if err != nil {
+		return err
+	}
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "# Installer image settings for %s from snapshot %s (mirror %s). Merge into the %s installer\n", *profile, snap.Metadata.ID, snap.Spec.Mirror, *profile)
+	fmt.Fprintf(stdout, "# configuration. images.registry names the mirror host, so the installer configures the nodes for it\n")
+	fmt.Fprintf(stdout, "# (set images.registryInsecure: true for a plain-HTTP mirror); the references are complete and digest-pinned.\n")
+	_, err = stdout.Write(b)
+	return err
 }

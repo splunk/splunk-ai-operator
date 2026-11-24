@@ -1023,6 +1023,626 @@ assert_eq "k0s system image bundle uses retry helper" \
 assert_eq "add-on image bundle uses retry helper" \
   "1" "$(grep -A12 'Building add-on image bundle (pulls' "${AIRGAP_SCRIPT}" | grep -c 'build_k0s_airgap_bundle' | tr -d '[:space:]')"
 
+# ── MPR-193: the bundle carries its tool, snapshot and manifest ───────────────
+suite "air-gap bundle staging (MPR-193)"
+
+# _ab_has <description> <haystack> <needle>
+_ab_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+
+# Runs one staging helper from airgap_install.sh in a subshell, with err() exiting as it does
+# there. Prints the helper's output, then "rc=<status>".
+_airgap_stage_helper() (
+  local fn="$1"; shift
+  log() { :; }; warn() { :; }; err() { echo "ERR: $*"; exit 1; }
+  # Earlier suites stub yq with a function; these helpers read real config files.
+  yq() { "${YQ_BIN}" "$@"; }
+  REPO_ROOT="${AIRGAP_TEST_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+  AIRGAP_BUNDLE_BINARY="${AIRGAP_BUNDLE_BINARY:-}"
+  AIRGAP_SNAPSHOT_MANIFEST="${AIRGAP_SNAPSHOT_MANIFEST:-}"
+  eval "$(_extract_airgap_fn "${fn}")"
+  "${fn}" "$@"
+  echo "rc=$?"
+)
+
+_ab_dir="$(mktemp -d)"
+mkdir -p "${_ab_dir}/cfg/snapshots/run-1"
+printf '{}' > "${_ab_dir}/cfg/snapshots/run-1/manifest.json"
+printf 'x  manifest.json\n' > "${_ab_dir}/cfg/snapshots/run-1/manifest.json.sha256"
+printf 'images:\n  snapshotManifest: snapshots/run-1/manifest.json\naiPlatform:\n  profile: cpuOnly\n' > "${_ab_dir}/cfg/cpu.yaml"
+printf 'aiPlatform:\n  defaultAcceleratorType: H100\n' > "${_ab_dir}/cfg/full.yaml"
+
+assert_eq "snapshot: images.snapshotManifest is resolved relative to the config file" \
+  "${_ab_dir}/cfg/snapshots/run-1/manifest.json" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper resolve_snapshot_manifest | head -1)"
+assert_eq "snapshot: AIRGAP_SNAPSHOT_MANIFEST wins over the config" \
+  "${_ab_dir}/cfg/snapshots/run-1/manifest.json" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" AIRGAP_SNAPSHOT_MANIFEST="${_ab_dir}/cfg/snapshots/run-1/manifest.json" _airgap_stage_helper resolve_snapshot_manifest | head -1)"
+_out="$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" _airgap_stage_helper resolve_snapshot_manifest)"
+_ab_has "snapshot: none configured fails closed" "${_out}" "ERR: An image snapshot is required"
+rm "${_ab_dir}/cfg/snapshots/run-1/manifest.json.sha256"
+_out="$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper resolve_snapshot_manifest)"
+_ab_has "snapshot: a missing checksum file fails closed" "${_out}" "its checksum file"
+
+assert_eq "profile: cpuOnly is read from the config" "cpuOnly" "$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper bundle_profile | head -1)"
+assert_eq "profile: omitted is fullfeature" "fullfeature" "$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" _airgap_stage_helper bundle_profile | head -1)"
+_ab_has "models: H100 uses the quantized configuration" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/full.yaml" _airgap_stage_helper bundle_model_config | head -1)" "model_artifacts_configs_quantized.yaml"
+_ab_has "models: no accelerator uses the unquantized configuration (as the installer does)" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/cpu.yaml" _airgap_stage_helper bundle_model_config | head -1)" "model_artifacts_configs_unquantized.yaml"
+printf 'aiPlatform:\n  defaultAcceleratorType: tpu\n' > "${_ab_dir}/cfg/tpu.yaml"
+_ab_has "models: an unknown accelerator fails" \
+  "$(CONFIG_FILE="${_ab_dir}/cfg/tpu.yaml" _airgap_stage_helper bundle_model_config)" "ERR: Unsupported aiPlatform.defaultAcceleratorType 'tpu'"
+
+printf '#!/usr/bin/env bash\nexit 0\n' > "${_ab_dir}/prebuilt"; chmod +x "${_ab_dir}/prebuilt"
+_ab_has "tool: a prebuilt AIRGAP_BUNDLE_BINARY is staged" \
+  "$(AIRGAP_BUNDLE_BINARY="${_ab_dir}/prebuilt" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/staged")" "rc=0"
+assert_eq "tool: the staged copy is executable" "yes" "$([[ -x "${_ab_dir}/staged" ]] && echo yes || echo no)"
+printf 'not executable' > "${_ab_dir}/noexec"
+_ab_has "tool: a non-executable AIRGAP_BUNDLE_BINARY is refused" \
+  "$(AIRGAP_BUNDLE_BINARY="${_ab_dir}/noexec" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/x")" "is not an executable file"
+printf '#!/usr/bin/env bash\nexit 3\n' > "${_ab_dir}/broken"; chmod +x "${_ab_dir}/broken"
+_ab_has "tool: a binary that does not run here is refused" \
+  "$(AIRGAP_BUNDLE_BINARY="${_ab_dir}/broken" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/y")" "does not run on this host"
+_ab_has "tool: without Go or a prebuilt binary staging fails closed" \
+  "$(AIRGAP_TEST_REPO_ROOT="${_ab_dir}/no-repo" _airgap_stage_helper stage_airgap_bundle_tool "${_ab_dir}/z")" "Cannot stage the airgap-bundle tool"
+rm -rf "${_ab_dir}"
+
+# The order matters: the snapshot is staged before the checksums, the manifest after them,
+# and the bundle is checked before anything is transferred or installed.
+_line() { grep -n "$1" "${AIRGAP_SCRIPT}" | head -1 | cut -d: -f1; }
+assert_eq "order: snapshot before checksums" "yes" "$([[ $(_line '^# ── 8b. Image snapshot') -lt $(_line '^# ── 9. Checksums') ]] && echo yes || echo no)"
+assert_eq "order: manifest after checksums" "yes" "$([[ $(_line '^# ── 9. Checksums') -lt $(_line '^# ── 9b. Bundle manifest') ]] && echo yes || echo no)"
+assert_eq "order: bundle check before the installer runs" "yes" "$([[ $(_line '^# ── 9c. Check the bundle') -lt $(_line '^# ── 12. Run the installer') ]] && echo yes || echo no)"
+assert_eq "the bundle check fails closed" "1" "$(grep -A6 '^# ── 9c. Check the bundle' "${AIRGAP_SCRIPT}" | grep -c 'nothing was transferred or installed' | tr -d '[:space:]')"
+
+# ── MPR-193: the install-side air-gap preflight ────────────────────────────────
+suite "air-gap install preflight (MPR-193)"
+
+_ip_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+
+# A bundle with a checksummed manifest that lists the tool with its checksum.
+_ip_bundle() {
+  local d="$1" tool_body="$2" sum
+  mkdir -p "${d}/binaries"
+  printf '%s' "${tool_body}" > "${d}/binaries/airgap-bundle"; chmod +x "${d}/binaries/airgap-bundle"
+  sum="$(shasum -a 256 "${d}/binaries/airgap-bundle" 2>/dev/null | awk '{print $1}')"
+  [[ -n "${sum}" ]] || sum="$(sha256sum "${d}/binaries/airgap-bundle" | awk '{print $1}')"
+  printf '{"metadata":{"id":"bundle-1"},"spec":{"snapshot":{"id":"snap-1"},"files":[{"path":"binaries/airgap-bundle","sha256":"%s"}]}}' "${sum}" > "${d}/bundle-manifest.json"
+  sum="$(shasum -a 256 "${d}/bundle-manifest.json" 2>/dev/null | awk '{print $1}')"
+  [[ -n "${sum}" ]] || sum="$(sha256sum "${d}/bundle-manifest.json" | awk '{print $1}')"
+  printf '%s  bundle-manifest.json\n' "${sum}" > "${d}/bundle-manifest.json.sha256"
+}
+
+_ip_run() ( eval "$(_extract_fn _sha256_of)"; eval "$(_extract_fn airgap_bundle_tool)"; airgap_bundle_tool "$1"; echo "rc=$?" )
+_ip_dir="$(mktemp -d)"
+_ip_bundle "${_ip_dir}/ok" $'#!/usr/bin/env bash\nexit 0\n'
+_ip_has "tool: a tool matching the manifest is trusted" "$(_ip_run "${_ip_dir}/ok")" "${_ip_dir}/ok/binaries/airgap-bundle"
+_ip_bundle "${_ip_dir}/swapped" $'#!/usr/bin/env bash\nexit 0\n'
+printf '#!/usr/bin/env bash\necho pwned\n' > "${_ip_dir}/swapped/binaries/airgap-bundle"
+_ip_has "tool: a replaced tool is refused" "$(_ip_run "${_ip_dir}/swapped")" "does not match the bundle manifest"
+_ip_bundle "${_ip_dir}/edited" $'#!/usr/bin/env bash\nexit 0\n'
+printf ' ' >> "${_ip_dir}/edited/bundle-manifest.json"
+_ip_has "tool: an edited manifest is refused" "$(_ip_run "${_ip_dir}/edited")" "does not match its checksum file"
+mkdir -p "${_ip_dir}/empty"
+_ip_has "tool: a bundle without a manifest is refused" "$(_ip_run "${_ip_dir}/empty")" "no checksummed bundle-manifest.json"
+rm -rf "${_ip_dir}"
+
+eval "$(_extract_fn _node_platform)"
+assert_eq "platform: x86_64 is linux/amd64" "linux/amd64" "$(_node_platform x86_64)"
+assert_eq "platform: aarch64 is linux/arm64" "linux/arm64" "$(_node_platform aarch64)"
+assert_eq "platform: an unreported architecture stays empty" "" "$(_node_platform "")"
+
+# The facts collector, against stubbed SSH and kubectl: a controller, a CPU worker, and a
+# GPU worker on an existing cluster.
+_ip_facts() (
+  eval "$(_extract_fn _node_platform)"; eval "$(_extract_fn _read_model_marker)"
+  eval "$(_extract_fn model_artifacts_config_name)"; eval "$(_extract_fn collect_airgap_host_facts)"
+  yq() { "${YQ_BIN}" "$@"; }
+  ssh_exec() {
+    if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0-503.40.1.el9_5.x86_64\n'; return 0; fi
+    if [[ "$2" == *lspci* ]]; then printf '%s\n%s\n%s\n' "${_IP_DEVICES:-2}" "${_IP_DRIVER-550.54.15}" "${_IP_RUNTIME:-true}"; return 0; fi
+  }
+  # The target cluster (see resolve_target_cluster), here an existing one.
+  target_kubectl() { [[ "$*" == "get nodes -o json" ]] && echo '{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.3"}],"allocatable":{"nvidia.com/gpu":"2"}}}]}'; }
+  EXISTING_CONTROLLER_IPS="10.0.0.1"; EXISTING_WORKER_IPS="10.0.0.2 10.0.0.3"; CPU_WORKER_COUNT=1; GPU_WORKER_COUNT=1
+  OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
+  local out; out="$(mktemp)"
+  collect_airgap_host_facts "${out}" "$1" >/dev/null 2>&1
+  cat "${out}"; rm -f "${out}"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _f="$(_ip_facts fullfeature)"
+  assert_eq "facts: every node is reported" "3" "$(jq '.nodes | length' <<< "${_f}")"
+  assert_eq "facts: platform, OS and kernel" "linux/amd64 rhel 5.14.0-503.40.1.el9_5.x86_64" "$(jq -r '.nodes[0] | "\(.platform) \(.os) \(.kernel)"' <<< "${_f}")"
+  assert_eq "facts: only the workers after the CPU workers are GPU nodes" "10.0.0.3" "$(jq -r '[.nodes[] | select(.gpu) | .name] | join(",")' <<< "${_f}")"
+  assert_eq "facts: GPU devices, driver and toolkit" "2 550.54.15 true" "$(jq -r '.nodes[2].gpu | "\(.devices) \(.driver) \(.runtime)"' <<< "${_f}")"
+  assert_eq "facts: schedulable GPUs come from the existing cluster by node IP" "2" "$(jq -r '.nodes[2].gpu.allocatable' <<< "${_f}")"
+  assert_eq "facts: without an object store no model is claimed staged" "0" "$(jq '.stagedModels | length' <<< "${_f}")"
+  _f="$(_IP_DRIVER="" _IP_RUNTIME=false _IP_DEVICES=garbage _ip_facts fullfeature)"
+  assert_eq "facts: a fresh GPU host reports no driver and no toolkit" " false" "$(jq -r '.nodes[2].gpu | "\(.driver) \(.runtime)"' <<< "${_f}")"
+  assert_eq "facts: an unparsable device count is zero, not a guess" "0" "$(jq -r '.nodes[2].gpu.devices' <<< "${_f}")"
+fi
+
+# The preflight's wiring: the call site, and how the tool's outcome becomes the result.
+assert_eq "preflight: the bundle check runs in air-gap mode, before the summary" "1" \
+  "$(_extract_fn preflight_checks | grep -A2 'AIRGAP_MODE:-false}" == "true"' | grep -c 'preflight_check_airgap_bundle' | tr -d '[:space:]')"
+assert_eq "preflight: it comes after the SSH dependency checks" "yes" \
+  "$(_extract_fn preflight_checks | awk '/preflight_check_remote_deps/{a=NR} /preflight_check_airgap_bundle/{b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
+_ip_pre() (
+  PF_FAILS=0; PF_WARN=0
+  pf_header() { :; }; pf_ok() { echo "OK: $*"; }; pf_fail() { echo "FAIL: $*"; PF_FAILS=$((PF_FAILS+1)); }
+  eval "$(_extract_fn _sha256_of)"; eval "$(_extract_fn airgap_bundle_tool)"; eval "$(_extract_fn preflight_check_airgap_bundle)"
+  ai_platform_profile_resolved() { echo cpuOnly; }
+  collect_airgap_host_facts() { echo '{"nodes":[]}' > "$1"; }
+  render_ai_platform_profile_values() { echo "profile: {effective: cpuOnly}"; }
+  airgap_registry_config_dir() { :; }
+  CONFIG_FILE=/dev/null; LOG_DIR="$(mktemp -d)"
+  preflight_check_airgap_bundle
+  echo "fails=${PF_FAILS}"
+)
+_ip_dir="$(mktemp -d)"
+_ip_bundle "${_ip_dir}/pass" $'#!/usr/bin/env bash\necho "OK: complete"; exit 0\n'
+_out="$(AIRGAP_BUNDLE_DIR="${_ip_dir}/pass" _ip_pre)"
+_ip_has "preflight: a passing bundle is reported with its bundle and snapshot IDs" "${_out}" "OK: bundle bundle-1, snapshot snap-1: complete for cpuOnly"
+_ip_has "preflight: and nothing fails" "${_out}" "fails=0"
+_ip_bundle "${_ip_dir}/findings" $'#!/usr/bin/env bash\necho "[MIRROR_MISSING_IMAGE] slim: gone" >&2; echo "[BUNDLE_FILE_MISSING] binaries/k0s: absent" >&2; echo "FAILED: 2 problem(s)" >&2; exit 1\n'
+_out="$(AIRGAP_BUNDLE_DIR="${_ip_dir}/findings" _ip_pre)"
+_ip_has "preflight: each finding fails by name" "${_out}" "FAIL: [MIRROR_MISSING_IMAGE] slim: gone"
+_ip_has "preflight: every finding is reported" "${_out}" "FAIL: [BUNDLE_FILE_MISSING] binaries/k0s: absent"
+_ip_has "preflight: and the install stops with nothing changed" "${_out}" "nothing was changed"
+_ip_has "preflight: three failures (two findings and the verdict)" "${_out}" "fails=3"
+_ip_bundle "${_ip_dir}/broken" $'#!/usr/bin/env bash\necho "error: --profile must be cpuOnly or fullfeature" >&2; exit 2\n'
+_ip_has "preflight: a tool that cannot run fails, never passes" "$(AIRGAP_BUNDLE_DIR="${_ip_dir}/broken" _ip_pre)" "could not run (exit 2)"
+_ip_has "preflight: no bundle directory fails" "$(AIRGAP_BUNDLE_DIR="" _ip_pre)" "AIRGAP_BUNDLE_DIR is not set to a staged bundle"
+rm -rf "${_ip_dir}"
+
+# ── MPR-193: no download fallback in an air-gapped install ────────────────────
+suite "air-gap no download fallback (MPR-193)"
+
+_nd() ( err() { echo "ERR: $*"; exit 1; }; eval "$(_extract_fn airgap_no_download)"; airgap_no_download "the kuberay-operator chart" "KUBERAY_CHART_PATH=<unset>"; echo "rc=$?" )
+_out="$(AIRGAP_MODE=true _nd)"
+assert_eq "no-download: an air-gapped install fails by name" "yes" "$([[ "${_out}" == *"ERR: Air-gap install: the kuberay-operator chart is not available from the bundle (KUBERAY_CHART_PATH=<unset>)"* && "${_out}" != *"rc=0"* ]] && echo yes || echo no)"
+assert_eq "no-download: a connected install is unaffected" "rc=0" "$(AIRGAP_MODE=false _nd)"
+
+# Every public fallback in the installer is guarded.
+assert_eq "no-download: every helm repo add fallback is guarded" "$(grep -c 'helm repo add' "${SCRIPT}" | tr -d ' ')" \
+  "$(grep -B1 'helm repo add' "${SCRIPT}" | grep -c 'airgap_no_download' | tr -d ' ')"
+for _v in CERT_MANAGER_MANIFEST_URL LOCAL_PATH_MANIFEST_URL NVIDIA_DEVICE_PLUGIN_MANIFEST_URL YQ_DOWNLOAD_URL; do
+  assert_eq "no-download: the ${_v} default is guarded" "1" \
+    "$(grep -A1 "\${${_v}:-https" "${SCRIPT}" | grep -c 'airgap_no_download' | tr -d ' ')"
+done
+
+# ── MPR-193: registry pull Secrets by reference ────────────────────────────────
+suite "registry pull Secrets by reference (MPR-193)"
+
+_ps_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+_ps_dir="$(mktemp -d)"
+printf '{"auths":{"mirror.airgap.local:5000":{"auth":"bWlycm9yOnMzY3IzdA=="}}}' > "${_ps_dir}/mirror.json"
+printf 'not json' > "${_ps_dir}/bad.json"
+
+_ps() ( # _ps <config body> <function> [args]: run a pull-secret helper against a config
+  local body="$1"; shift
+  printf '%s' "${body}" > "${_ps_dir}/cfg.yaml"
+  CONFIG_FILE="${_ps_dir}/cfg.yaml"
+  yq() { "${YQ_BIN}" "$@"; }
+  log() { echo "LOG: $*"; }; err() { echo "ERR: $*"; exit 1; }
+  ensure_namespace() { :; }
+  # kubectl stub: Secrets listed in _PS_EXISTING exist with type _PS_TYPE; record calls.
+  kubectl() {
+    echo "KUBECTL $*" >> "${_ps_dir}/calls"
+    case "$*" in
+      "get secret "*" -o jsonpath={.type}") echo "${_PS_TYPE:-kubernetes.io/dockerconfigjson}"; return 0 ;;
+      "get secret "*) local n="$3"; [[ " ${_PS_EXISTING:-} " == *" ${n} "* ]]; return $? ;;
+      "apply -f -") cat > "${_ps_dir}/applied.yaml"; return 0 ;;
+      create*) echo "kind: Secret"; return 0 ;;
+    esac
+  }
+  for f in configured_pull_secret_names _pull_secret_file validate_pull_secret_config ensure_configured_pull_secrets image_pull_secret_names; do
+    eval "$(_extract_fn "${f}")"
+  done
+  "$@"
+  echo "rc=$?"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _good=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: mirror.json\n'
+  cp "${_ps_dir}/mirror.json" "${_ps_dir}/mirror.json.keep"
+  assert_eq "validate: a name and a Docker configuration relative to the config are valid" "rc=0" "$(_ps "${_good}" validate_pull_secret_config)"
+  _ps_has "validate: an invalid Secret name" "$(_ps $'images:\n  imagePullSecrets:\n    - name: Mirror_Pull\n' validate_pull_secret_config)" "must be a Kubernetes Secret name"
+  _ps_has "validate: a name listed twice" "$(_ps $'images:\n  imagePullSecrets:\n    - name: a\n    - name: a\n' validate_pull_secret_config)" "a is listed twice"
+  _ps_has "validate: an unreadable Docker configuration" "$(_ps $'images:\n  imagePullSecrets:\n    - name: a\n      dockerConfigFile: nowhere.json\n' validate_pull_secret_config)" "is not a readable file"
+  _ps_has "validate: a file that is not a Docker configuration" "$(_ps $'images:\n  imagePullSecrets:\n    - name: a\n      dockerConfigFile: bad.json\n' validate_pull_secret_config)" "is not a Docker configuration"
+  assert_eq "validate: no setting is valid" "rc=0" "$(_ps $'images: {}\n' validate_pull_secret_config)"
+
+  rm -f "${_ps_dir}/calls" "${_ps_dir}/applied.yaml"
+  _out="$(_ps "${_good}" ensure_configured_pull_secrets ai-platform)"
+  _ps_has "ensure: a missing Secret is created from its Docker configuration" "${_out}" "pull Secret ai-platform/mirror-pull created"
+  _ps_has "ensure: as a dockerconfigjson Secret from that file" "$(cat "${_ps_dir}/calls")" "create secret generic mirror-pull --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=${_ps_dir}/mirror.json -n ai-platform"
+  assert_eq "ensure: the credentials never reach the output" "no" "$([[ "${_out}" == *bWlycm9y* ]] && echo yes || echo no)"
+  _ps_has "ensure: an existing dockerconfigjson Secret is used" "$(_PS_EXISTING=mirror-pull _ps "${_good}" ensure_configured_pull_secrets ai-platform)" "pull Secret ai-platform/mirror-pull present"
+  _ps_has "ensure: an existing Secret of another type fails closed" \
+    "$(_PS_EXISTING=mirror-pull _PS_TYPE=Opaque _ps "${_good}" ensure_configured_pull_secrets ai-platform)" "is of type 'Opaque', not kubernetes.io/dockerconfigjson"
+  _ps_has "ensure: a missing Secret without a Docker configuration fails closed" \
+    "$(_ps $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n' ensure_configured_pull_secrets ai-platform)" "does not exist and images.imagePullSecrets[0].dockerConfigFile is not set"
+
+  _names="$(_PS_EXISTING="ecr-registry-secret mirror-pull" _ps $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n    - name: ecr-registry-secret\n' image_pull_secret_names ai-platform)"
+  assert_eq "names: present Secrets, installer-created and configured, without duplicates" $'ecr-registry-secret\nmirror-pull\nrc=0' "${_names}"
+fi
+rm -rf "${_ps_dir}"
+
+# Every place that lists pull Secrets uses the same names.
+assert_eq "names: the CR and both operator Deployments use image_pull_secret_names" "3" \
+  "$(grep -c 'for secret_name in \$(image_pull_secret_names' "${SCRIPT}" | tr -d ' ')"
+assert_eq "names: no fixed list remains" "0" \
+  "$(grep -c 'for secret_name in ecr-registry-secret docker-hub-secret' "${SCRIPT}" | tr -d ' ')"
+assert_eq "ensure: configured Secrets are ensured in all three namespaces, failures not swallowed" "3" \
+  "$(grep -c '^  ensure_configured_pull_secrets "' "${SCRIPT}" | tr -d ' ')"
+
+# ── MPR-193: node images by digest; the install record ─────────────────────────
+suite "air-gap node digests and install record (MPR-193)"
+
+_nr_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+_nr_dir="$(mktemp -d)"
+mkdir -p "${_nr_dir}/bundle/images"
+printf 'quay.io/k0sproject/coredns:1.11.3\n' > "${_nr_dir}/bundle/images/k0s-images.list"
+cat > "${_nr_dir}/bundle/bundle-manifest.json" <<'JSON'
+{"metadata":{"id":"bundle-7"},"spec":{"snapshot":{"id":"snap-7","checksum":"abc","mirror":"mirror.airgap.local:5000/ai-tier"},
+ "archiveImages":[{"ref":"quay.io/k0sproject/coredns:1.11.3","digest":"sha256:1111","archive":"images/k0s-images.tar"},
+                  {"ref":"quay.io/k0sproject/coredns@sha256:1111","digest":"sha256:1111","archive":"images/k0s-images.tar"}]}}
+JSON
+_nr_node() ( # _nr_node <digest the node reports>
+  warn() { echo "WARN: $*"; }; log() { echo "LOG: $*"; }
+  airgap_k0s_image_bundles_enabled() { return 0; }
+  ssh_exec() {
+    if [[ "$2" == *"list -q"* ]]; then echo "quay.io/k0sproject/coredns:1.11.3"; return 0; fi
+    printf 'REF TYPE DIGEST SIZE\nquay.io/k0sproject/coredns:1.11.3 application/vnd.oci.image.index.v1+json %s 10MiB\n' "${_nr_digest}"
+  }
+  local _nr_digest="$1"
+  AIRGAP_K0S_IMAGE_DIR="${_nr_dir}/bundle/images"; AIRGAP_BUNDLE_DIR="${_nr_dir}/bundle"
+  eval "$(_extract_fn verify_airgap_bundle_images_on_node)"
+  verify_airgap_bundle_images_on_node 10.0.0.1
+  echo "rc=$?"
+)
+if command -v jq >/dev/null 2>&1; then
+  _nr_has "node digests: the bundle's image passes" "$(_nr_node sha256:1111)" "rc=0"
+  _out="$(_nr_node sha256:9999)"
+  _nr_has "node digests: another build under the same tag fails" "${_out}" "rc=1"
+  _nr_has "node digests: and names both digests" "${_out}" "quay.io/k0sproject/coredns:1.11.3: node has sha256:9999, bundle has sha256:1111"
+fi
+
+_nr_rec() (
+  log() { :; }; ai_platform_profile_resolved() { echo fullfeature; }
+  AIRGAP_MODE=true; AIRGAP_BUNDLE_DIR="${_nr_dir}/bundle"; LOG_DIR="${_nr_dir}/logs"
+  eval "$(_extract_fn write_airgap_install_record)"
+  write_airgap_install_record "$1"
+  cat "${LOG_DIR}/airgap-install-record.json"
+)
+if command -v jq >/dev/null 2>&1; then
+  _rec="$(_nr_rec started)"
+  assert_eq "record: the bundle, snapshot, profile and status" "bundle-7 snap-7 abc fullfeature started" \
+    "$(jq -r '"\(.bundleId) \(.snapshotId) \(.snapshotChecksum) \(.profile) \(.status)"' <<< "${_rec}")"
+  assert_eq "record: no credential-looking field" "0" "$(grep -ciE 'password|token|auth' <<< "${_rec}" | tr -d ' ')"
+  assert_eq "record: written only in air-gap mode" "no" \
+    "$( (log() { :; }; AIRGAP_MODE=false; AIRGAP_BUNDLE_DIR="${_nr_dir}/bundle"; LOG_DIR="${_nr_dir}/logs2"; eval "$(_extract_fn write_airgap_install_record)"; write_airgap_install_record started); [[ -f "${_nr_dir}/logs2/airgap-install-record.json" ]] && echo yes || echo no)"
+fi
+rm -rf "${_nr_dir}"
+assert_eq "record: written once the preflight passes and again at the end" "3" \
+  "$(_extract_fn main_install | grep -c 'write_airgap_install_record "' | tr -d ' ')"
+
+# ── MPR-193 review fixes (PR #286) ─────────────────────────────────────────────
+suite "air-gap review fixes (MPR-193)"
+
+_rf_has() { assert_eq "$1" "yes" "$([[ "$2" == *"$3"* ]] && echo yes || echo no)"; }
+
+# 1. GPU facts from the real SSH payload, run against fake host tools.
+_rf_gpu() ( # _rf_gpu <fake bin dir>: the GPU worker's facts as the collector reports them
+  local bin="$1"
+  eval "$(_extract_fn _node_platform)"; eval "$(_extract_fn _read_model_marker)"
+  eval "$(_extract_fn model_artifacts_config_name)"; eval "$(_extract_fn collect_airgap_host_facts)"
+  yq() { "${YQ_BIN}" "$@"; }
+  ssh_exec() {
+    if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0-503.40.1.el9_5.x86_64\n'; return 0; fi
+    env -i PATH="${bin}:/usr/bin:/bin" bash -c "$2"
+  }
+  target_kubectl() { return 1; }   # a fresh install: no cluster yet
+  EXISTING_CONTROLLER_IPS=""; EXISTING_WORKER_IPS="10.0.0.3"; CPU_WORKER_COUNT=0; GPU_WORKER_COUNT=1
+  OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
+  local out; out="$(mktemp)"
+  collect_airgap_host_facts "${out}" cpuOnly >/dev/null 2>&1
+  jq -r '.nodes[0].gpu | "\(.devices)|\(.driver)|\(.runtime)"' "${out}"; rm -f "${out}"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _rf_bin="$(mktemp -d)"
+  printf '#!/bin/sh\necho "01:00.0 3D controller [0302]: NVIDIA Corporation GA102 [10de:2236]"\necho "02:00.0 3D controller [0302]: NVIDIA Corporation GA102 [10de:2236]"\n' > "${_rf_bin}/lspci"
+  chmod +x "${_rf_bin}/lspci"
+  assert_eq "GPU facts: a fresh host without nvidia-smi or the toolkit has no driver and no runtime" "2||false" "$(_rf_gpu "${_rf_bin}")"
+  printf '#!/bin/sh\necho "NVIDIA-SMI has failed because it couldn'"'"'t communicate with the NVIDIA driver."\nexit 9\n' > "${_rf_bin}/nvidia-smi"
+  chmod +x "${_rf_bin}/nvidia-smi"
+  assert_eq "GPU facts: a failing nvidia-smi is no driver, not its error text" "2||false" "$(_rf_gpu "${_rf_bin}")"
+  printf '#!/bin/sh\ncase "$1" in -L) echo "GPU 0: NVIDIA L40S (UUID: GPU-a)"; echo "GPU 1: NVIDIA L40S (UUID: GPU-b)";; *) echo "550.54.15";; esac\n' > "${_rf_bin}/nvidia-smi"
+  printf '#!/bin/sh\nexit 0\n' > "${_rf_bin}/nvidia-ctk"; chmod +x "${_rf_bin}/nvidia-smi" "${_rf_bin}/nvidia-ctk"
+  assert_eq "GPU facts: a provisioned host reports its driver and toolkit" "2|550.54.15|true" "$(_rf_gpu "${_rf_bin}")"
+  rm -rf "${_rf_bin}"
+fi
+
+# 3. The default ServiceAccount (the Splunk Standalone pod's) gets every pull Secret present.
+_rf_sa() ( # prints the patch kubectl was given
+  log() { :; }; warn() { echo "WARN: $*"; }
+  yq() { "${YQ_BIN}" "$@"; }
+  local cfg; cfg="$(mktemp)"; printf 'images:\n  imagePullSecrets:\n    - name: mirror-pull\n' > "${cfg}"; CONFIG_FILE="${cfg}"
+  kubectl() {
+    case "$*" in
+      "get secret "*) [[ " ${_RF_PRESENT} " == *" $3 "* ]]; return $? ;;
+      "get serviceaccount default "*) echo "${_RF_SA:-{\}}"; return 0 ;;
+      "patch serviceaccount default "*) echo "PATCH ${*: -1}" >> "${_RF_PATCHES}"; return 0 ;;
+    esac
+  }
+  for f in configured_pull_secret_names image_pull_secret_names patch_default_sa_pull_secrets; do eval "$(_extract_fn "${f}")"; done
+  _RF_PATCHES="$(mktemp)"
+  patch_default_sa_pull_secrets ai-platform
+  cat "${_RF_PATCHES}"
+  rm -f "${cfg}" "${_RF_PATCHES}"
+)
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  assert_eq "Standalone SA: the configured Secret is attached along with the installer-created ones" \
+    'PATCH {"imagePullSecrets": [{"name":"ecr-registry-secret"},{"name":"mirror-pull"}]}' "$(_RF_PRESENT="ecr-registry-secret mirror-pull" _rf_sa)"
+  assert_eq "Standalone SA: a configured Secret alone is attached" \
+    'PATCH {"imagePullSecrets": [{"name":"mirror-pull"}]}' "$(_RF_PRESENT="mirror-pull" _rf_sa)"
+  assert_eq "Standalone SA: nothing present, nothing patched" "" "$(_RF_PRESENT="" _rf_sa)"
+  assert_eq "Standalone SA: entries the ServiceAccount already has are kept" \
+    'PATCH {"imagePullSecrets": [{"name":"site-registry"},{"name":"mirror-pull"}]}' \
+    "$(_RF_PRESENT="mirror-pull" _RF_SA='{"imagePullSecrets":[{"name":"site-registry"}]}' _rf_sa)"
+fi
+assert_eq "Standalone SA: install_splunk_standalone uses the helper, not a hard-coded Secret" "1" \
+  "$(_extract_fn install_splunk_standalone | grep -c 'patch_default_sa_pull_secrets "${AI_NS}"' | tr -d ' ')"
+assert_eq "Standalone SA: no hard-coded ecr-registry-secret patch remains" "0" \
+  "$(grep -c "imagePullSecrets\": \[{\"name\": \"ecr-registry-secret\"}\]" "${SCRIPT}" | tr -d ' ')"
+
+# 4. Name-only Secret references are checked in preflight, before any change.
+_rf_refs() ( # _rf_refs <config body>: the problems validate_pull_secret_refs reports
+  local cfg; cfg="$(mktemp)"; printf '%s' "$1" > "${cfg}"; CONFIG_FILE="${cfg}"
+  yq() { "${YQ_BIN}" "$@"; }
+  AI_NS=ai-platform
+  component_enabled() { [[ " ${_RF_COMPONENTS:-ai-operator} " == *" $1 "* ]]; }
+  # The target cluster (see resolve_target_cluster), read as the install will read it.
+  target_kubectl() {
+    case "$*" in
+      "get namespaces") [[ "${_RF_CLUSTER:-yes}" == yes ]]; return $? ;;
+      "get secret "*" -o jsonpath={.type}") echo "${_RF_TYPE:-kubernetes.io/dockerconfigjson}"; return 0 ;;
+      "get secret "*) [[ " ${_RF_HAVE:-} " == *" $5/$3 "* ]]; return $? ;;
+    esac
+  }
+  for f in _pull_secret_file pull_secret_namespaces validate_pull_secret_refs; do eval "$(_extract_fn "${f}")"; done
+  validate_pull_secret_refs
+  rm -f "${cfg}"
+)
+if [[ -n "${YQ_BIN}" ]]; then
+  _ref=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n'
+  _rf_has "refs: on a fresh install a name-only reference fails in preflight" "$(_RF_CLUSTER=no _rf_refs "${_ref}")" "has no dockerConfigFile, and no cluster exists yet for this install"
+  _out="$(_RF_HAVE="ai-platform/mirror-pull" _rf_refs "${_ref}")"
+  _rf_has "refs: a Secret missing in one namespace that uses it is named" "${_out}" "Secret splunk-ai-operator-system/mirror-pull does not exist"
+  assert_eq "refs: and only that namespace" "1" "$(grep -c . <<< "${_out}" | tr -d ' ')"
+  assert_eq "refs: present everywhere with the right type is fine" "" "$(_RF_HAVE="ai-platform/mirror-pull splunk-ai-operator-system/mirror-pull" _rf_refs "${_ref}")"
+  _rf_has "refs: a Secret of another type fails in preflight" \
+    "$(_RF_HAVE="ai-platform/mirror-pull splunk-ai-operator-system/mirror-pull" _RF_TYPE=Opaque _rf_refs "${_ref}")" "is of type 'Opaque'"
+  _rf_has "refs: the Splunk Operator namespace counts when it is installed" \
+    "$(_RF_COMPONENTS="ai-operator splunk-operator" _RF_HAVE="ai-platform/mirror-pull splunk-ai-operator-system/mirror-pull" _rf_refs "${_ref}")" "Secret splunk-operator/mirror-pull does not exist"
+  assert_eq "refs: a reference with a dockerConfigFile is created during install, not checked here" "" \
+    "$(_RF_CLUSTER=no _rf_refs $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: /tmp/x.json\n')"
+fi
+assert_eq "refs: the preflight reports them with the setting's own problems" "1" \
+  "$(_extract_fn preflight_checks | grep -c 'validate_pull_secret_config; validate_pull_secret_refs' | tr -d ' ')"
+
+suite "air-gap review fixes, round 2 (MPR-193)"
+
+# Shared fakes. A remote controller whose `sudo k0s kubectl` is _r2_remote_kubectl: the SSH
+# command is re-parsed by a shell, as the controller's would, so quoting is exercised too.
+_r2_fakes() {
+  yq() { "${YQ_BIN}" "$@"; }
+  timeout() { shift; "$@"; }
+  ssh_exec() {
+    local host="$1" cmd="$2"
+    echo "${host}: ${cmd}" >> "${_R2_SSH_LOG:-/dev/null}"
+    case "${cmd}" in
+      *"sudo k0s status"*) [[ "${_R2_K0S:-no}" == yes && "${host}" == "${_R2_K0S_HOST:-10.0.0.1}" ]]; return $? ;;
+      "sudo k0s kubectl "*) eval "_r2_remote_kubectl ${cmd#sudo k0s kubectl }"; return $? ;;
+    esac
+    return 1
+  }
+  # The target cluster as either route sees it: namespaces, Secrets (ns/name=type[:data]) and nodes.
+  _r2_remote_kubectl() {
+    case "$1 $2" in
+      "get namespaces") return 0 ;;
+      "get nodes") echo '{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.3"}],"allocatable":{"nvidia.com/gpu":"2"}}}]}'; return 0 ;;
+      "get secret")
+        local name="$3" ns="$5" e
+        for e in ${_R2_SECRETS:-}; do
+          if [[ "${e%%=*}" == "${ns}/${name}" ]]; then
+            local v="${e#*=}" type data
+            type="${v%%:*}"; data=""; [[ "${v}" == *:* ]] && data="${v#*:}"
+            case "${*:6}" in
+              "-o jsonpath={.type}") echo "${type}" ;;
+              "-o json") jq -n --arg t "${type}" --arg d "${data}" '{type: $t, data: (if $d == "" then {} else {".dockerconfigjson": $d} end)}' ;;
+            esac
+            return 0
+          fi
+        done
+        return 1 ;;
+    esac
+    return 1
+  }
+  # The installer host's own kubectl: its kubeconfig reaches _R2_LOCAL (target, other, or none).
+  kubectl() {
+    case "$*" in
+      "cluster-info") [[ "${_R2_LOCAL:-none}" != none ]]; return $? ;;
+      "config current-context") echo "${_R2_CONTEXT:-k0s-ai-tier}"; return 0 ;;
+    esac
+    # An unrelated cluster ("other") answers as readily as the target would.
+    [[ "${_R2_LOCAL:-none}" != none ]] || return 1
+    _r2_remote_kubectl "$@"
+  }
+  USE_EXISTING="${_R2_USE_EXISTING:-auto}"; CLUSTER_NAME=ai-tier
+  EXISTING_CONTROLLER_IPS="${_R2_CTRL-10.0.0.1}"; EXISTING_WORKER_IPS="10.0.0.2 10.0.0.3"
+  [[ "${_R2_LOCAL:-none}" == none ]] && unset KUBECONFIG || KUBECONFIG=/tmp/fake-kubeconfig
+  AI_NS=ai-platform; TARGET_CLUSTER_ACCESS=""; TARGET_CLUSTER_CONTROLLER=""
+  component_enabled() { [[ " ${_R2_COMPONENTS:-ai-operator} " == *" $1 "* ]]; }
+  local f
+  for f in resolve_target_cluster target_kubectl _pull_secret_file pull_secret_namespaces validate_pull_secret_refs \
+           pull_secret_docker_config docker_config_registry_auth airgap_registry_config_dir; do
+    eval "$(_extract_fn "${f}" 2>/dev/null)"
+  done
+}
+
+# B. The target cluster is the one main_install will use, resolved read-only before it.
+_r2_resolve() ( _r2_fakes; resolve_target_cluster >/dev/null 2>&1; echo "${TARGET_CLUSTER_ACCESS}${TARGET_CLUSTER_CONTROLLER:+@${TARGET_CLUSTER_CONTROLLER}}" )
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  assert_eq "target: an existing cluster reached over SSH (no local kubeconfig) is read on its controller" "ssh@10.0.0.1" "$(_R2_K0S=yes _r2_resolve)"
+  assert_eq "target: KUBECONFIG naming the cluster is used, as main_install uses it" "local" "$(_R2_LOCAL=target _R2_K0S=yes _r2_resolve)"
+  assert_eq "target: a KUBECONFIG for another context is not the target; the controller is" "ssh@10.0.0.1" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _R2_K0S=yes _r2_resolve)"
+  assert_eq "target: useExisting force takes KUBECONFIG whatever its context" "local" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _R2_USE_EXISTING=force _r2_resolve)"
+  assert_eq "target: useExisting never ignores KUBECONFIG, but k0s on the controller is still reused" "ssh@10.0.0.1" "$(_R2_LOCAL=target _R2_USE_EXISTING=never _R2_K0S=yes _r2_resolve)"
+  assert_eq "target: a fresh install has no cluster" "none" "$(_r2_resolve)"
+  assert_eq "target: and neither has an install whose ambient kubeconfig is some other cluster" "none" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _r2_resolve)"
+  assert_eq "target: no controllers configured, no cluster" "none" "$(_R2_CTRL="" _R2_K0S=yes _r2_resolve)"
+
+  _r2_tk() ( _r2_fakes; local log; log="$(mktemp)"; _R2_SSH_LOG="${log}"; target_kubectl "$@" >/dev/null 2>&1; echo "rc=$?"; grep 'k0s kubectl' "${log}"; rm -f "${log}" )
+  _out="$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson" _r2_tk get secret mirror-pull -n ai-platform -o 'jsonpath={.type}')"
+  _rf_has "target: over SSH it runs k0s kubectl on the first controller" "${_out}" "10.0.0.1: sudo k0s kubectl get secret mirror-pull -n ai-platform -o jsonpath=\\{.type\\}"
+  _rf_has "target: and the arguments survive the remote shell" "${_out}" "rc=0"
+  assert_eq "target: it only reads (a write verb is refused)" "rc=2" "$(_R2_K0S=yes _r2_tk delete secret mirror-pull -n ai-platform | head -1)"
+  assert_eq "target: and nothing is sent for it" "1" "$(_R2_K0S=yes _r2_tk delete secret mirror-pull -n ai-platform | grep -c . | tr -d ' ')"
+  assert_eq "target: with no cluster it fails without contacting one" "rc=1" "$(_r2_tk get namespaces)"
+
+  _r2_refs() ( _r2_fakes; local cfg; cfg="$(mktemp)"; printf '%s' "$1" > "${cfg}"; CONFIG_FILE="${cfg}"; validate_pull_secret_refs; rm -f "${cfg}" )
+  _ref=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n'
+  _both="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson splunk-ai-operator-system/mirror-pull=kubernetes.io/dockerconfigjson"
+  assert_eq "refs: Secrets present on an SSH-discovered existing cluster satisfy name-only references" "" \
+    "$(_R2_K0S=yes _R2_SECRETS="${_both}" _r2_refs "${_ref}")"
+  _rf_has "refs: and one missing there is still named" "$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson" _r2_refs "${_ref}")" \
+    "Secret splunk-ai-operator-system/mirror-pull does not exist"
+  _rf_has "refs: as is one of the wrong type" "$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=Opaque splunk-ai-operator-system/mirror-pull=kubernetes.io/dockerconfigjson" _r2_refs "${_ref}")" \
+    "is of type 'Opaque'"
+  _rf_has "refs: an unrelated cluster in the ambient kubeconfig is not consulted" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _R2_SECRETS="${_both}" _r2_refs "${_ref}")" \
+    "has no dockerConfigFile, and no cluster exists yet"
+  assert_eq "refs: KUBECONFIG naming the target is read directly" "" "$(_R2_LOCAL=target _R2_SECRETS="${_both}" _r2_refs "${_ref}")"
+
+  _r2_alloc() (
+    _r2_fakes
+    eval "$(_extract_fn _node_platform)"; eval "$(_extract_fn _read_model_marker)"
+    eval "$(_extract_fn model_artifacts_config_name)"; eval "$(_extract_fn collect_airgap_host_facts)"
+    ssh_exec_orig="$(declare -f ssh_exec)"
+    eval "${ssh_exec_orig/ssh_exec/_r2_ssh}"
+    ssh_exec() {
+      if [[ "$2" == *"uname -m"* ]]; then printf 'x86_64\nrhel\n5.14.0\n'; return 0; fi
+      if [[ "$2" == *lspci* ]]; then printf '2\n550.54.15\ntrue\n'; return 0; fi
+      _r2_ssh "$@"
+    }
+    CPU_WORKER_COUNT=1; GPU_WORKER_COUNT=1; OBJ_STORE_TYPE=""; DEFAULT_ACCELERATOR="l40s"
+    local out; out="$(mktemp)"; collect_airgap_host_facts "${out}" cpuOnly >/dev/null 2>&1
+    jq -r '.nodes[2].gpu.allocatable // "none"' "${out}"; rm -f "${out}"
+  )
+  assert_eq "facts: schedulable GPUs of an SSH-discovered existing cluster come from its controller" "2" "$(_R2_K0S=yes _r2_alloc)"
+  assert_eq "facts: none claimed on a fresh install" "none" "$(_r2_alloc)"
+  assert_eq "facts: nor from an unrelated cluster in the ambient kubeconfig" "none" "$(_R2_LOCAL=other _R2_CONTEXT=prod-east _r2_alloc)"
+fi
+assert_eq "target: the preflight resolves it once, before the first check that reads it" "yes" \
+  "$(_extract_fn preflight_checks | awk '/^  resolve_target_cluster$/{a=NR} /^  preflight_check_registry$/{b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _r2_once() ( _r2_fakes; local log; log="$(mktemp)"; _R2_SSH_LOG="${log}"; resolve_target_cluster
+    local i; for i in 1 2 3; do _x="$(target_kubectl get namespaces)"; done
+    grep -c 'k0s status' "${log}" | tr -d ' '; rm -f "${log}" )
+  assert_eq "target: once resolved, later reads (in subshells) do not probe the controller again" "1" "$(_R2_K0S=yes _r2_once)"
+fi
+assert_eq "target: validate_pull_secret_refs reads only through target_kubectl" "0" \
+  "$(_extract_fn validate_pull_secret_refs | grep -vE '^\s*#' | grep -cE '(^|[^_])kubectl ' | tr -d ' ')"
+assert_eq "target: and so does the facts collector" "0" \
+  "$(_extract_fn collect_airgap_host_facts | grep -vE '^\s*#' | grep -cE '(^|[^_])kubectl ' | tr -d ' ')"
+
+# A. The registry preflight authenticates with the images.imagePullSecrets credentials.
+_R2_PASS='s3cr3t-Pa55'
+_R2_AUTH="$(printf 'mirror-user:%s' "${_R2_PASS}" | base64 | tr -d '\n')"
+_r2_auth() ( _r2_fakes; docker_config_registry_auth "$1" "$2" )
+if [[ -n "${YQ_BIN}" ]] && command -v jq >/dev/null 2>&1; then
+  _r2_dir="$(mktemp -d)"
+  for key in "10.0.39.38:5099" "https://10.0.39.38:5099" "http://10.0.39.38:5099/" "https://10.0.39.38:5099/v2/"; do
+    jq -n --arg k "${key}" --arg a "${_R2_AUTH}" '{auths: {($k): {auth: $a}}}' > "${_r2_dir}/c.json"
+    assert_eq "auth: a Docker configuration key spelled ${key} matches the registry" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5099)"
+  done
+  jq -n --arg p "${_R2_PASS}" '{auths: {"10.0.39.38:5099": {username: "mirror-user", password: $p}}}' > "${_r2_dir}/c.json"
+  assert_eq "auth: username and password are used when there is no auth field" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5099)"
+  assert_eq "auth: a registry with a path is matched by its host" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5099/ai-tier)"
+  assert_eq "auth: another registry's credentials are not used" "" "$(_r2_auth "${_r2_dir}/c.json" 10.0.39.38:5100)"
+  jq -n --arg a "${_R2_AUTH}" '{auths: {"https://index.docker.io/v1/": {auth: $a}}}' > "${_r2_dir}/c.json"
+  assert_eq "auth: Docker Hub's legacy key is docker.io" "${_R2_AUTH}" "$(_r2_auth "${_r2_dir}/c.json" docker.io)"
+  rm -rf "${_r2_dir}"
+
+  # A fake registry: /v2/ answers 401; a manifest answers 200 only with the expected Basic credentials.
+  _r2_registry() ( # _r2_registry <config body> [dockerConfigFile json]: the preflight's results
+    _r2_fakes
+    local d; d="$(mktemp -d)"
+    printf '%s' "$1" > "${d}/cluster.yaml"; CONFIG_FILE="${d}/cluster.yaml"
+    [[ -n "${2:-}" ]] && printf '%s' "$2" > "${d}/mirror-auth.json"
+    [[ -n "${_R2_STALE:-}" ]] && printf '%s' "${_R2_STALE}" > "${d}/stale.json"
+    pf_header() { :; }; pf_ok() { echo "OK: $*"; }; pf_warn() { echo "WARN: $*"; }; pf_fail() { echo "FAIL: $*"; }
+    curl() {
+      local a url="${*: -1}" hdr=""
+      for a in "$@"; do [[ "${a}" == "Authorization: Basic "* ]] && hdr="${a#Authorization: Basic }"; done
+      [[ " $* " == *" -D - "* ]] && return 0
+      case "${url}" in
+        */v2/) echo 401 ;;
+        */manifests/*) [[ "${hdr}" == "${_R2_AUTH}" ]] && echo 200 || echo 401 ;;
+        *) echo 000 ;;
+      esac
+    }
+    eval "$(_extract_fn build_image_url)"; eval "$(_extract_fn preflight_check_registry)"
+    IMAGE_REGISTRY=10.0.39.38:5099; IMAGE_REGISTRY_INSECURE=true
+    SLIM_API_IMAGE="10.0.39.38:5099/ai-tier/ml-platform/slim-api@sha256:$(printf 'a%.0s' {1..64})"
+    IMAGE_PULL_SECRETS_DOCKERHUB_ENABLED=false IMAGE_PULL_SECRETS_ACR_ENABLED=false IMAGE_PULL_SECRETS_CUSTOM_ENABLED=false
+    preflight_check_registry 2>&1
+    rm -rf "${d}"
+  )
+  _cfg=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n'
+  _json="$(jq -n --arg a "${_R2_AUTH}" '{auths: {"10.0.39.38:5099": {auth: $a}}}')"
+  _out="$(_r2_registry "${_cfg}" "${_json}")"
+  _rf_has "registry: credentials given only as a dockerConfigFile reference authenticate the mirror check" "${_out}" "OK: Registry auth OK"
+  assert_eq "registry: and the preflight records no failure" "0" "$(grep -c '^FAIL' <<< "${_out}" | tr -d ' ')"
+  assert_eq "registry: the credentials are never printed" "0" "$(grep -cE "${_R2_PASS}|${_R2_AUTH}" <<< "${_out}" | tr -d ' ')"
+  _out="$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson:$(printf '%s' "${_json}" | base64 | tr -d '\n')" \
+          _r2_registry $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n')"
+  _rf_has "registry: a name-only reference's existing Secret authenticates it too (read-only, from the target cluster)" "${_out}" "OK: Registry auth OK"
+  assert_eq "registry: still never printed" "0" "$(grep -cE "${_R2_PASS}|${_R2_AUTH}" <<< "${_out}" | tr -d ' ')"
+  _out="$(_r2_registry "${_cfg}" "$(jq -n --arg a "$(printf 'mirror-user:wrong' | base64)" '{auths: {"10.0.39.38:5099": {auth: $a}}}')")"
+  _rf_has "registry: wrong referenced credentials still fail by name" "${_out}" "FAIL: Registry credentials rejected (HTTP 401)"
+  _rf_has "registry: and the message names the setting to fix" "${_out}" "images.imagePullSecrets"
+  _out="$(_r2_registry "${_cfg}" "$(jq -n --arg a "${_R2_AUTH}" '{auths: {"other.example.com": {auth: $a}}}')")"
+  _rf_has "registry: credentials for another registry do not apply" "${_out}" "FAIL: Registry credentials rejected (HTTP 401)"
+  _cfg2=$'images:\n  imagePullSecrets:\n    - name: other-pull\n      dockerConfigFile: other.json\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n'
+  _out="$(_r2_registry "${_cfg2}" "${_json}")"
+  _rf_has "registry: the matching reference is found even when it is not the first" "${_out}" "OK: Registry auth OK"
+
+  _out="$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=Opaque:$(printf '%s' "${_json}" | base64 | tr -d '\n')" \
+          _r2_registry $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n')"
+  _rf_has "registry: a Secret that is not kubernetes.io/dockerconfigjson is not used for credentials" "${_out}" "FAIL: Registry credentials rejected (HTTP 401)"
+  _cfg3=$'images:\n  imagePullSecrets:\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n    - name: stale-pull\n      dockerConfigFile: stale.json\n'
+  _out="$(_R2_STALE="$(jq -n --arg a "$(printf 'mirror-user:stale' | base64)" '{auths: {"10.0.39.38:5099": {auth: $a}}}')" _r2_registry "${_cfg3}" "${_json}")"
+  _rf_has "registry: when two references name the mirror, the first one's credentials are used" "${_out}" "OK: Registry auth OK"
+  _cfg4=$'images:\n  imagePullSecrets:\n    - name: stale-pull\n      dockerConfigFile: stale.json\n    - name: mirror-pull\n      dockerConfigFile: mirror-auth.json\n'
+  _out="$(_R2_STALE="$(jq -n --arg a "$(printf 'mirror-user:stale' | base64)" '{auths: {"10.0.39.38:5099": {auth: $a}}}')" _r2_registry "${_cfg4}" "${_json}")"
+  _rf_has "registry: and that is the order given (a stale first entry is the one tried)" "${_out}" "FAIL: Registry credentials rejected"
+
+  # The bundle check's mirror access uses the same credentials.
+  _r2_cfgdir() ( _r2_fakes; local d; d="$(mktemp -d)"; printf '%s' "$1" > "${d}/cluster.yaml"; CONFIG_FILE="${d}/cluster.yaml"
+    [[ -n "${2:-}" ]] && printf '%s' "$2" > "${d}/mirror-auth.json"
+    local out; out="$(airgap_registry_config_dir)"
+    if [[ -n "${out}" ]]; then echo "mode=$(stat -f %Lp "${out}/config.json" 2>/dev/null || stat -c %a "${out}/config.json")"; jq -r --arg h 10.0.39.38:5099 '.auths[$h].auth == env.R2A' "${out}/config.json"; rm -rf "${out}"; else echo none; fi
+    rm -rf "${d}" )
+  export R2A="${_R2_AUTH}"
+  assert_eq "bundle check: a later reference's dockerConfigFile reaches the tool" $'mode=600\ntrue' "$(_r2_cfgdir "${_cfg2}" "${_json}")"
+  assert_eq "bundle check: so does a name-only reference's existing Secret" $'mode=600\ntrue' \
+    "$(_R2_K0S=yes _R2_SECRETS="ai-platform/mirror-pull=kubernetes.io/dockerconfigjson:$(printf '%s' "${_json}" | base64 | tr -d '\n')" _r2_cfgdir $'images:\n  imagePullSecrets:\n    - name: mirror-pull\n')"
+  assert_eq "bundle check: no reference, the host's own configuration" "none" "$(_r2_cfgdir 'images: {}')"
+  unset R2A
+fi
+
 _exercise_airgap_bundle_helpers() (
   local mode="$1" fixture_dir
   fixture_dir=$(mktemp -d)
@@ -1949,8 +2569,6 @@ assert_problem "non-string profile (number) is an invalid value" \
 
 # Missing required references, for both profiles.
 for _p in cpuonly fullfeature; do
-  assert_eq "${_p}: the AITK image is optional for now (MPR-188)" "" \
-    "$(_profile_problems "$(_profile_cfg "${_p}" "${_p}-aitk" 'del(.images.aitk)')")"
   assert_problem "${_p}: missing SLIM image" \
     "$(_profile_cfg "${_p}" "${_p}-slim" 'del(.images.slim)')" "[PROFILE_MISSING_REFERENCE] images.slim.apiImage"
   assert_problem "${_p}: missing runtime base image" \
@@ -1974,7 +2592,7 @@ for _p in cpuonly fullfeature; do
   assert_problem "${_p}: missing agentruntime feature" \
     "$(_profile_cfg "${_p}" "${_p}-noar" 'del(.aiPlatform.features[1])')" "the 'agentruntime' feature is required"
   assert_problem "${_p}: whitespace in an image reference" \
-    "$(_profile_cfg "${_p}" "${_p}-ws" '.images.aitk.image = "bad ref"')" "[PROFILE_INVALID_VALUE] images.aitk.image"
+    "$(_profile_cfg "${_p}" "${_p}-ws" '.images.slim.apiImage = "bad ref"')" "[PROFILE_INVALID_VALUE] images.slim.apiImage"
 done
 
 # Messages name fields and never echo credentials.
@@ -1983,7 +2601,7 @@ assert_eq "problem messages never echo credentials" "0" "$(printf '%s' "${_creds
 
 # Compatibility rule: an omitted profile keeps pre-profile behaviour; "full"
 # is the legacy spelling of fullfeature.
-_legacy="$(_profile_cfg fullfeature legacy 'del(.aiPlatform.profile) | del(.images.aitk) | del(.aiPlatform.features)')"
+_legacy="$(_profile_cfg fullfeature legacy 'del(.aiPlatform.profile) | del(.aiPlatform.features)')"
 assert_eq "omitted profile: no profile checks apply" "" "$(_profile_problems "${_legacy}")"
 assert_eq "omitted profile resolves to fullfeature" "fullfeature" "$(_profile_run "${_legacy}" ai_platform_profile_resolved)"
 assert_rc "omitted profile is not explicit" 1 _profile_run "${_legacy}" ai_platform_profile_explicit
@@ -1992,7 +2610,7 @@ assert_eq "legacy 'full' resolves to fullfeature" "fullfeature" \
 # Legacy "full" is valid but keeps pre-profile behaviour: it does not opt in to
 # the Launchpad requirements, so an existing SAIA configuration that spells it
 # keeps working.
-_full_saia="$(_profile_cfg fullfeature full-saia '.aiPlatform.profile = "full" | del(.images.aitk) | del(.images.slim) | del(.images.agentRuntime) | .aiPlatform.features = [{"name": "saia", "version": "1.1.0"}]')"
+_full_saia="$(_profile_cfg fullfeature full-saia '.aiPlatform.profile = "full" | del(.images.slim) | del(.images.agentRuntime) | .aiPlatform.features = [{"name": "saia", "version": "1.1.0"}]')"
 assert_eq "legacy 'full' with an existing SAIA config has no problems" "" "$(_profile_problems "${_full_saia}")"
 assert_rc "legacy 'full' is set" 0 _profile_run "${_full_saia}" ai_platform_profile_set
 assert_rc "legacy 'full' is not an opt-in (not explicit)" 1 _profile_run "${_full_saia}" ai_platform_profile_explicit
@@ -2298,7 +2916,7 @@ for _p in cpuonly fullfeature; do
   assert_eq "golden ${_p} values: kuberay" "${_want_ray}" "$(command yq eval '.components.kuberay' "${_g}")"
   assert_eq "golden ${_p} values: nvidia follows GPU workers" "${_want_ray}" "$(command yq eval '.components.nvidia' "${_g}")"
   assert_eq "golden ${_p} values: no null or empty reference" "0" "$(grep -cE ': "(null)?"$' "${_g}" | tr -d ' ')" 
-  for _k in .images.agentRuntime.base .images.agentRuntime.schemaSetup .images.slim .images.aitk; do
+  for _k in .images.agentRuntime.base .images.agentRuntime.schemaSetup .images.slim; do
     assert_eq "golden ${_p} values: ${_k} is a registry reference" "yes" \
       "$([[ "$(command yq eval "${_k}" "${_g}")" == registry.example.internal/* ]] && echo yes || echo no)"
   done
@@ -2306,6 +2924,8 @@ for _p in cpuonly fullfeature; do
     "$([[ "$(command yq eval '.images.agentRuntime.providers.mltk' "${_g}")" == */ai-agent-runtime-provider-mltk:* ]] && echo yes || echo no)"
   assert_eq "golden ${_p} values: provider module present" "yes" \
     "$([[ "$(command yq eval '.images.agentRuntime.modules.mltk' "${_g}")" == *:* ]] && echo yes || echo no)"
+  # AITK is a Splunk app, not an image: nothing in cluster setup renders or depends on it.
+  assert_eq "golden ${_p} values: no AITK setting" "null" "$(command yq eval '.images.aitk' "${_g}")"
   assert_eq "golden ${_p} values: no credential-looking keys" "0" "$(grep -ciE 'password|token|secretkey|apikey' "${_g}" | tr -d ' ')"
   assert_eq "golden ${_p} CR: valid YAML" "0" "$(command yq eval '.' "${_gc}" >/dev/null 2>&1; echo $?)"
   assert_eq "golden ${_p} CR: spec.profile" "${_want_profile}" "$(command yq eval '.spec.profile' "${_gc}")"
@@ -2340,6 +2960,10 @@ _render_cr() {
 }
 _render_cr_inner() {
   eval "$(_extract_fn install_ai_platform_cr)"
+  # install_ai_platform_cr lists pull Secrets through these (MPR-193).
+  for _f in configured_pull_secret_names _pull_secret_file ensure_configured_pull_secrets image_pull_secret_names; do
+    eval "$(_extract_fn "${_f}")"
+  done
   eval "$(_extract_fn create_agentruntime_checkpoint_secrets)"
   eval "$(_extract_fn k0s_feature_enabled)"
   k0s_agentruntime_feature_enabled() { k0s_feature_enabled agentruntime; }
