@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -312,6 +313,7 @@ func (r *AIServiceReconciler) reconcileStatus(ctx context.Context, p *aiv1.AISer
 	if p.Spec.Feature.Name == "agentruntime" {
 		return nil
 	}
+	previousStatus := p.Status.DeepCopy()
 	// reflect observedGeneration
 	p.Status.ObservedGeneration = p.Generation
 
@@ -351,6 +353,11 @@ func (r *AIServiceReconciler) reconcileStatus(ctx context.Context, p *aiv1.AISer
 	// FIXME: add AIService scale fields, set them here:
 	// telemetry.SetDesiredReplicas(ctx, p.Spec.Replicas)
 	// telemetry.SetReadyReplicas(ctx, p.Status.ReadyReplicas)
+
+	// Feature reconcilers may already have persisted the current conditions.
+	if equality.Semantic.DeepEqual(previousStatus, &p.Status) {
+		return nil
+	}
 
 	// telemetry: API latency/counter for status update
 	apiStart := time.Now()

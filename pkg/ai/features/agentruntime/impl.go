@@ -42,7 +42,6 @@ const (
 	maxDNSLabelLength                  = 63
 	mtlsTerminationOperator            = "operator"
 	sharedPackagesPath                 = "/shared-packages"
-	deploymentRevisionAnnotation       = "deployment.kubernetes.io/revision"
 	schemaSetupImageEnv                = "RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP"
 	schemaJobInputHashAnnotation       = "ai.splunk.com/agentruntime-schema-input-hash"
 	schemaJobManagedAnnotation         = "ai.splunk.com/agentruntime-schema-job"
@@ -695,7 +694,6 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 	}
 
 	labels, annotations := labelsAndAnnotations(ai)
-	delete(annotations, deploymentRevisionAnnotation)
 	selectorLabels := agentRuntimeSelectorLabels(ai)
 	containerName := agentRuntimeWorkloadName(ai.Name)
 	env := buildAgentRuntimeEnv(ai, config.AgentModule)
@@ -736,17 +734,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 
 	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		// Kubernetes owns the Deployment revision. Removing it makes its
-		// controller restore it and advance generation on every observation.
-		// Keep it on Deployment metadata only, never in the Pod template.
-		deploymentAnnotations := make(map[string]string, len(annotations)+1)
-		for name, value := range annotations {
-			deploymentAnnotations[name] = value
-		}
-		if revision, ok := deployment.Annotations[deploymentRevisionAnnotation]; ok {
-			deploymentAnnotations[deploymentRevisionAnnotation] = revision
-		}
-		deployment.ObjectMeta.Annotations = deploymentAnnotations
+		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		if deployment.ResourceVersion == "" {
 			policy := aiv1.ResolveAgentRuntimeAutoscaling(ai.Spec.MinReplicas, ai.Spec.MaxReplicas, ai.Spec.TargetCPUUtilization)
 			replicas := policy.MinReplicas
@@ -767,7 +755,7 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 			}
 		}
 
-		deployment.Spec.Template = corev1.PodTemplateSpec{
+		template := corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      selectorLabels,
 				Annotations: annotations,
@@ -811,6 +799,8 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 				ImagePullSecrets: ai.Spec.ImagePullSecrets,
 			},
 		}
+		common.PreservePodTemplateDefaults(&template, &deployment.Spec.Template)
+		deployment.Spec.Template = template
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Deployment failed")
@@ -821,8 +811,8 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 
 func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.AIService) error {
 	ports := []corev1.ServicePort{
-		{Name: "http", Port: defaultAgentRuntimeHTTPPort, TargetPort: intstr.FromInt(int(defaultAgentRuntimeHTTPPort))},
-		{Name: "metrics", Port: defaultAgentRuntimeMetrics, TargetPort: intstr.FromInt(int(defaultAgentRuntimeMetrics))},
+		{Name: "http", Protocol: corev1.ProtocolTCP, Port: defaultAgentRuntimeHTTPPort, TargetPort: intstr.FromInt(int(defaultAgentRuntimeHTTPPort))},
+		{Name: "metrics", Protocol: corev1.ProtocolTCP, Port: defaultAgentRuntimeMetrics, TargetPort: intstr.FromInt(int(defaultAgentRuntimeMetrics))},
 	}
 
 	// AgentRuntime is an in-cluster MVP endpoint. Keep the Service ClusterIP-only

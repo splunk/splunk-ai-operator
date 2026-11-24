@@ -157,3 +157,42 @@ func TestReconcileCertificate_RejectsConflictingOwner(t *testing.T) {
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "service-tls", Namespace: "default"}, stored))
 	assert.Equal(t, types.UID("other-uid"), stored.OwnerReferences[0].UID)
 }
+
+func TestReconcileCertificate_KeepsPersistedIssuerDefaults(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildResourceTestScheme(t)
+	owner := newResourceTestOwner("service", "service-uid")
+	opts := CertificateOptions{
+		Name: "service-tls",
+		Spec: certmanagerv1.CertificateSpec{
+			SecretName: "service-tls-secret",
+			IssuerRef:  cmmeta.ObjectReference{Name: "issuer"},
+		},
+	}
+	stored := &certmanagerv1.Certificate{
+		ObjectMeta: metav1.ObjectMeta{Name: opts.Name, Namespace: owner.Namespace},
+		Spec:       *opts.Spec.DeepCopy(),
+	}
+	stored.Spec.IssuerRef.Kind = "Issuer"
+	stored.Spec.IssuerRef.Group = certmanagerv1.SchemeGroupVersion.Group
+	require.NoError(t, controllerutil.SetControllerReference(owner, stored, scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stored).Build()
+
+	cert, result, err := ReconcileCertificate(ctx, fakeClient, scheme, owner, opts)
+	require.NoError(t, err)
+	require.Equal(t, controllerutil.OperationResultNone, result)
+	assert.Equal(t, stored.Spec.IssuerRef, cert.Spec.IssuerRef)
+
+	unqualifiedIssuer := opts.Spec.IssuerRef
+	opts.Spec.IssuerRef = cmmeta.ObjectReference{Name: "external", Kind: "ExternalIssuer", Group: "issuer.example"}
+	cert, result, err = ReconcileCertificate(ctx, fakeClient, scheme, owner, opts)
+	require.NoError(t, err)
+	require.Equal(t, controllerutil.OperationResultUpdated, result)
+	assert.Equal(t, opts.Spec.IssuerRef, cert.Spec.IssuerRef)
+
+	opts.Spec.IssuerRef = unqualifiedIssuer
+	cert, result, err = ReconcileCertificate(ctx, fakeClient, scheme, owner, opts)
+	require.NoError(t, err)
+	require.Equal(t, controllerutil.OperationResultUpdated, result)
+	assert.Equal(t, unqualifiedIssuer, cert.Spec.IssuerRef)
+}

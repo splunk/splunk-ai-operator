@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -12,7 +14,11 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -22,7 +28,7 @@ func stringPtr(value string) *string { return &value }
 // Called with both production controllers running in the cpuOnly/no-Ray spec.
 // Status writes emulate workload controllers and kubelet observations only;
 // the local API server does not execute probes or populate workload status.
-func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AIPlatform) {
+func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AIPlatform, scheme *runtime.Scheme) {
 	By("keeping runtime and parent unready after object creation")
 	ready := func(obj client.Object) metav1.ConditionStatus {
 		switch o := obj.(type) {
@@ -154,6 +160,35 @@ func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AI
 	}, 6*time.Second, 100*time.Millisecond).Should(Equal([]string{aiVersion, parentVersion, deploymentVersion}))
 	Expect(dep.Annotations).To(HaveKeyWithValue("deployment.kubernetes.io/revision", "1"))
 	Expect(dep.Spec.Template.Annotations).NotTo(HaveKey("deployment.kubernetes.io/revision"))
+
+	By("skipping write requests when the Runtime workload already matches API defaults")
+	// The API server can reapply defaults without changing the stored resource
+	// version, so also observe the write requests made during a direct reconcile.
+	directClient, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	Expect(err).NotTo(HaveOccurred())
+	var writes []string
+	counted := interceptor.NewClient(directClient, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			writes = append(writes, fmt.Sprintf("update %T %s", obj, obj.GetName()))
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			data, err := patch.Data(obj)
+			if err != nil {
+				return err
+			}
+			writes = append(writes, fmt.Sprintf("patch %T %s: %s", obj, obj.GetName(), data))
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes = append(writes, fmt.Sprintf("update %T %s/%s", obj, obj.GetName(), name))
+			return c.SubResource(name).Update(ctx, obj, opts...)
+		},
+	})
+	reconciler := &AIServiceReconciler{Client: counted, Scheme: counted.Scheme(), Recorder: record.NewFakeRecorder(20)}
+	_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ai)})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(writes).To(BeEmpty())
 
 	By("reconciling Service spec changes even without a generation change")
 	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), svc)).To(Succeed())
