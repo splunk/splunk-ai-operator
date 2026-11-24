@@ -3,7 +3,9 @@ package slim
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
 	"sort"
@@ -14,7 +16,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,7 +32,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
-	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
 	common "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/splunk/splunk-ai-operator/pkg/splunkutils"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -40,14 +43,30 @@ type SlimReconciler struct {
 	Recorder record.EventRecorder
 }
 
-func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
+const deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
+
+func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) (retErr error) {
 	log := log.FromContext(ctx)
 
+	before := aiservice.DeepCopy().Status
 	var conditions []metav1.Condition
+	var route runtimeRoute
+	var issuerHostOverride string
+	setCondition := func(condition metav1.Condition) {
+		if prior := meta.FindStatusCondition(before.Conditions, condition.Type); prior != nil && prior.Status == condition.Status {
+			condition.LastTransitionTime = prior.LastTransitionTime
+		}
+		conditions = append(conditions, condition)
+	}
 	defer func() {
+		if condition := meta.FindStatusCondition(aiservice.Status.Conditions, agentRouteAvailable); condition != nil {
+			conditions = append(conditions, *condition)
+		}
 		aiservice.Status.Conditions = conditions
 		aiservice.Status.ObservedGeneration = aiservice.Generation
-		_ = r.Status().Update(ctx, aiservice)
+		if !equality.Semantic.DeepEqual(before, aiservice.Status) {
+			retErr = errors.Join(retErr, r.Status().Update(ctx, aiservice))
+		}
 	}()
 
 	stages := []struct {
@@ -55,11 +74,40 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		fn   func(context.Context, *aiv1.AIService) error
 	}{
 		{"Validate", r.validateAIService},
+		{"AgentRouteConfig", func(ctx context.Context, ai *aiv1.AIService) error {
+			var err error
+			route, err = r.resolveRuntimeRoute(ctx, ai)
+			if err != nil {
+				return err
+			}
+			if route.platform == nil && before.FeatureStatus != nil && before.FeatureStatus.Slim != nil {
+				// Keep the last working Deployment configuration when a Runtime
+				// feature is removed. An empty origin prevents this SLIM image from starting.
+				return errors.New("the published agent route no longer has a configured AgentRuntime")
+			}
+			if route.managed {
+				if ai.Spec.AgentRuntimeUrl != "" && strings.TrimRight(ai.Spec.AgentRuntimeUrl, "/") != route.origin() {
+					return errors.New("spec.agentRuntimeUrl must match the selected internal AgentRuntime Service origin")
+				}
+				if err := validateAITKOrigin(ai); err != nil {
+					return err
+				}
+			}
+			issuerHostOverride, err = r.validateIssuerTrust(ctx, ai, route.managed)
+			return err
+		}},
 		{"ServiceAccount", r.reconcileServiceAccount},
 		{"SlimConfigMap", r.reconcileSlimConfigMap},
 		{"FeatureConfigMap", r.reconcileFeatureConfigMap},
 		{"Certificate", r.reconcileCertificate},
-		{"SlimDeployment", r.reconcileSlimDeployment},
+		{"SlimDeployment", func(ctx context.Context, ai *aiv1.AIService) error {
+			// Use the same dependency snapshot for the Deployment and status.
+			origin := strings.TrimRight(ai.Spec.AgentRuntimeUrl, "/")
+			if origin == "" {
+				origin = route.origin()
+			}
+			return r.reconcileSlimDeploymentWithRoute(ctx, ai, origin, issuerHostOverride, route.managed)
+		}},
 		{"SlimService", r.reconcileSlimService},
 		{"SlimMetricsService", r.reconcileSlimMetricsService},
 		{"ServiceMonitor", r.reconcileServiceMonitor},
@@ -80,14 +128,17 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 			cond.Reason = "Error"
 			cond.Message = err.Error()
 		}
-		conditions = append(conditions, cond)
+		setCondition(cond)
 		if err != nil {
+			if route.managed || meta.FindStatusCondition(before.Conditions, agentRouteAvailable) != nil {
+				setAgentRouteCondition(aiservice, metav1.ConditionFalse, "ConfigurationUnavailable", "SLIM route configuration is unavailable; inspect SLIM reconciliation conditions")
+			}
 			log.Error(err, "stage failed", "stage", stage.name)
 			return err
 		}
 	}
 
-	conditions = append(conditions, metav1.Condition{
+	setCondition(metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionTrue,
 		Reason:             "AllReconciled",
@@ -95,6 +146,12 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		LastTransitionTime: metav1.Now(),
 	})
 
+	if route.managed {
+		return r.reconcileAgentRouteStatus(ctx, aiservice, route)
+	}
+	if meta.FindStatusCondition(before.Conditions, agentRouteAvailable) != nil {
+		setAgentRouteCondition(aiservice, metav1.ConditionFalse, "RuntimeUnavailable", "The platform no longer has a managed AgentRuntime route")
+	}
 	return nil
 }
 
@@ -207,30 +264,11 @@ func (r *SlimReconciler) agentRuntimeURL(ctx context.Context, ai *aiv1.AIService
 	if ai.Spec.AgentRuntimeUrl != "" {
 		return strings.TrimRight(ai.Spec.AgentRuntimeUrl, "/"), nil
 	}
-	if ai.Spec.AIPlatformRef.Name == "" {
-		return "", nil // Standalone model-only SLIM has no runtime dependency.
-	}
-	platform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	route, err := r.resolveRuntimeRoute(ctx, ai)
 	if err != nil {
-		return "", fmt.Errorf("resolving AI_TIER_AGENT_RUNTIME_URL: %w", err)
+		return "", err
 	}
-	var runtimeFeature *aiv1.FeatureSpec
-	for i := range platform.Spec.Features {
-		feature := &platform.Spec.Features[i]
-		if feature.Name != "agentruntime" {
-			continue
-		}
-		if runtimeFeature != nil {
-			return "", fmt.Errorf("spec.features: multiple agentruntime features cannot resolve AI_TIER_AGENT_RUNTIME_URL")
-		}
-		runtimeFeature = feature
-	}
-	if runtimeFeature == nil {
-		return "", nil
-	}
-	// An empty clusterDomain (a platform read without CRD defaulting) becomes
-	// cluster.local inside ServiceURL, so it is not repeated here.
-	return agentruntime.FeatureServiceURL(platform.Name, runtimeFeature.Provider, platform.Namespace, platform.Spec.ClusterDomain), nil
+	return route.origin(), nil
 }
 
 func (r *SlimReconciler) validateAIPlatformReady(ctx context.Context, aiPlatform *aiv1.AIPlatform) error {
@@ -518,6 +556,18 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 }
 
 func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.AIService) error {
+	origin, err := r.agentRuntimeURL(ctx, ai)
+	if err != nil {
+		return err
+	}
+	override, err := r.validateIssuerTrust(ctx, ai, false)
+	if err != nil {
+		return err
+	}
+	return r.reconcileSlimDeploymentWithRoute(ctx, ai, origin, override, false)
+}
+
+func (r *SlimReconciler) reconcileSlimDeploymentWithRoute(ctx context.Context, ai *aiv1.AIService, agentRuntimeURL, issuerHostOverride string, managed bool) error {
 	featureConfigName := fmt.Sprintf("splunk-%s-feature-config", ai.Name)
 
 	volumes := []corev1.Volume{
@@ -547,14 +597,20 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	// not serve model traffic, so the suffix must NOT be present here.
 	platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
 	platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
-	agentRuntimeURL, err := r.agentRuntimeURL(ctx, ai)
-	if err != nil {
-		return err
-	}
 	env := []corev1.EnvVar{
 		{Name: "PLATFORM_URL", Value: platformURL},
 		{Name: "AI_TIER_AGENT_RUNTIME_URL", Value: agentRuntimeURL},
 	}
+	if managed {
+		// CMP token verification and the candidate's route prefix require these
+		// settings even when the inherited ConfigMap contains manual overrides.
+		env = append(env,
+			corev1.EnvVar{Name: "DEPLOYMENT_TYPE", Value: "AITIER"},
+			corev1.EnvVar{Name: "API_VERSION", Value: "v1alpha1"},
+			corev1.EnvVar{Name: "SPLUNK_ISSUERS", Value: buildSplunkIssuersVal(ai)},
+		)
+	}
+	volumes, mounts, env = appendIssuerTrust(ai.Spec.SplunkConfiguration.CACertRef, issuerHostOverride, volumes, mounts, env)
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		volumes = append(volumes, corev1.Volume{
@@ -615,6 +671,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
+	delete(annotations, deploymentRevisionAnnotation)
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
@@ -656,7 +713,13 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		// Runtime readiness wakes this reconciler. Preserve the Deployment
+		// controller's revision so those events do not cause generation churn.
+		revision, hasRevision := deployment.Annotations[deploymentRevisionAnnotation]
+		deployment.ObjectMeta.Annotations = maps.Clone(annotations)
+		if hasRevision {
+			deployment.ObjectMeta.Annotations[deploymentRevisionAnnotation] = revision
+		}
 		deployment.Spec.Replicas = &ai.Spec.Replicas
 
 		if deployment.Spec.Selector == nil {
@@ -731,7 +794,7 @@ func (r *SlimReconciler) reconcileSlimService(ctx context.Context, ai *aiv1.AISe
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ai.Name + "-slim-service",
+			Name:      slimServiceName(ai.Name),
 			Namespace: ai.Namespace,
 		},
 	}

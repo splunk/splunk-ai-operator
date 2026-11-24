@@ -2872,6 +2872,27 @@ spec:
               splunkConfiguration:
                 description: SplunkConfiguration defines the Splunk integration configuration
                 properties:
+                  aitkSlimOrigin:
+                    description: |-
+                      AITKSlimOrigin optionally advertises an existing HTTPS gateway to AITK.
+                      Supply only the origin. The operator appends the SLIM API path.
+                    type: string
+                  caCertRef:
+                    description: |-
+                      CACertRef names a Secret in the AIService namespace whose ca.crt key
+                      contains the PEM CA bundle SLIM uses to verify the Splunk token issuer.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   endpoint:
                     description: |-
                       Endpoint is the Splunk management/JWKS URL used as the JWT issuer for

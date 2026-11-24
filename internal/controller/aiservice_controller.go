@@ -226,16 +226,20 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
-// aiServiceEventFilter is the controller-wide event filter. Owned-resource
-// predicates are combined with this filter, so ConfigMap data changes must be
-// admitted here as well as by the ConfigMap-specific Owns predicate. This is
-// required for values snapshotted into pod templates, such as EMBEDDING_MODEL.
+// aiServiceEventFilter admits ordinary AIService changes. It also admits
+// ConfigMap data changes in the global filter for values copied into pod templates.
 func aiServiceEventFilter() predicate.Predicate {
 	return predicate.Or(
 		common.GenerationChangedPredicate(),
 		common.AnnotationChangedPredicate(),
 		common.LabelChangedPredicate(),
 		common.ConfigMapChangedPredicate(),
+		predicate.Funcs{
+			CreateFunc:  func(event.CreateEvent) bool { return false },
+			DeleteFunc:  func(event.DeleteEvent) bool { return false },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+			UpdateFunc:  aiServiceRouteLifecycleChanged,
+		},
 	)
 }
 
@@ -245,10 +249,11 @@ func aiServiceGlobalEventFilter() predicate.Predicate {
 	// health changes wake the AIService without waiting for a retry.
 	return predicate.Or(
 		aiServiceEventFilter(),
-		checkpointSecretChangedPredicate(),
+		referencedSecretChangedPredicate(),
 		common.JobChangedPredicate(),
 		common.DeploymentChangedPredicate(),
 		runtimeBackendChangedPredicate(),
+		agentRuntimeReadyChangedPredicate(),
 	)
 }
 
@@ -263,7 +268,9 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&aiv1.AIService{}).
+		// Runtime readiness wakes its SLIM sibling through the separate watch.
+		// The primary watch ignores status-only writes to avoid self-triggering.
+		For(&aiv1.AIService{}, builder.WithPredicates(aiServiceEventFilter())).
 		Named("aiservice").
 		// Owned resources with specific predicates to avoid reconciliation loops
 		Owns(&corev1.ServiceAccount{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
@@ -280,6 +287,7 @@ func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&appsv1.ReplicaSet{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
+		Watches(&aiv1.AIService{}, handler.EnqueueRequestsFromMapFunc(r.findSlimSiblingsForRuntime), builder.WithPredicates(agentRuntimeReadyChangedPredicate())).
 		// Watch referenced AIPlatform (not owned by AIService)
 		Watches(
 			&aiv1.AIPlatform{},
@@ -289,12 +297,12 @@ func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 				common.AnnotationChangedPredicate(),
 			)),
 		).
-		// Watch the referenced checkpoint Secret because it is user-owned and not
-		// an AIService child resource.
+		// Checkpoint credentials and SLIM issuer trust can reference user-owned
+		// Secrets, so the owned-resource watch alone cannot pick up changes.
 		Watches(
 			&corev1.Secret{},
-			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForCheckpointSecret),
-			builder.WithPredicates(checkpointSecretChangedPredicate()),
+			handler.EnqueueRequestsFromMapFunc(r.findAIServicesForReferencedSecret),
+			builder.WithPredicates(referencedSecretChangedPredicate()),
 		).
 		// Add predicates to filter events and avoid unnecessary reconciliations
 		WithEventFilter(aiServiceGlobalEventFilter()).
@@ -395,29 +403,36 @@ func (r *AIServiceReconciler) findAIServicesForPlatform(ctx context.Context, pla
 	return requests
 }
 
-// findAIServicesForCheckpointSecret maps a checkpoint Secret to AgentRuntime
-// AIService objects that reference it in the same namespace.
-func (r *AIServiceReconciler) findAIServicesForCheckpointSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+// findAIServicesForReferencedSecret wakes same-namespace consumers of
+// checkpoint credentials or SLIM issuer trust.
+func (r *AIServiceReconciler) findAIServicesForReferencedSecret(ctx context.Context, secret client.Object) []reconcile.Request {
 	log := logf.FromContext(ctx)
 	var services aiv1.AIServiceList
 	if err := r.List(ctx, &services, client.InNamespace(secret.GetNamespace())); err != nil {
-		log.Error(err, "failed to list AIServices for checkpoint Secret", "secret", secret.GetName())
+		log.Error(err, "failed to list AIServices for referenced Secret", "secret", secret.GetName())
 		return nil
 	}
 
 	requests := make([]reconcile.Request, 0)
-	for _, svc := range services.Items {
-		if svc.Spec.Feature.Name == "agentruntime" && svc.Spec.CheckpointDbSecretRef == secret.GetName() {
-			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
-				Name:      svc.Name,
-				Namespace: svc.Namespace,
-			}})
+	for i := range services.Items {
+		svc := &services.Items[i]
+		var reference string
+		switch svc.Spec.Feature.Name {
+		case "agentruntime":
+			reference = svc.Spec.CheckpointDbSecretRef
+		case "slim":
+			if ca := svc.Spec.SplunkConfiguration.CACertRef; ca != nil {
+				reference = ca.Name
+			}
+		}
+		if reference != "" && reference == secret.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(svc)})
 		}
 	}
 	return requests
 }
 
-func checkpointSecretChangedPredicate() predicate.Predicate {
+func referencedSecretChangedPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			_, ok := e.Object.(*corev1.Secret)

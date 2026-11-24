@@ -50,7 +50,7 @@ func newReadinessFixture(t *testing.T) *readinessFixture {
 	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "runtime-rs", Namespace: ai.Namespace, UID: "rs-uid", Labels: agentRuntimeSelectorLabels(ai)}, Spec: appsv1.ReplicaSetSpec{Template: *dep.Spec.Template.DeepCopy()}}
 	rs.Spec.Template.Labels[appsv1.DefaultDeploymentUniqueLabelKey] = "current"
 	require.NoError(t, controllerutil.SetControllerReference(dep, rs, sch))
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: ServiceName(ai.Name), Namespace: ai.Namespace, UID: "svc-uid"}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "10.96.0.1", Selector: agentRuntimeSelectorLabels(ai), Ports: []corev1.ServicePort{{Name: "http", Port: 8080, TargetPort: intstr.FromInt32(8080)}}}}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: ServiceName(ai.Name), Namespace: ai.Namespace, UID: "svc-uid"}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "10.96.0.1", Selector: agentRuntimeSelectorLabels(ai), Ports: runtimeServicePorts()}}
 	require.NoError(t, controllerutil.SetControllerReference(ai, svc, sch))
 	slice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "runtime-endpoints", Namespace: ai.Namespace, Labels: map[string]string{discoveryv1.LabelServiceName: svc.Name}}, AddressType: discoveryv1.AddressTypeIPv4, Ports: []discoveryv1.EndpointPort{{Name: ptr("http"), Port: ptr(int32(8080)), Protocol: ptr(corev1.ProtocolTCP)}}}
 	require.NoError(t, controllerutil.SetControllerReference(svc, slice, sch))
@@ -127,6 +127,11 @@ func TestRuntimeReadinessGates(t *testing.T) {
 		{"service selector", func(f *readinessFixture) { f.svc.Spec.Selector = map[string]string{"app": "foreign"} }, serviceReady, "SelectorMismatch"},
 		{"headless service", func(f *readinessFixture) { f.svc.Spec.ClusterIP = corev1.ClusterIPNone }, serviceReady, "ServiceUnavailable"},
 		{"service port", func(f *readinessFixture) { f.svc.Spec.Ports[0].TargetPort = intstr.FromInt32(9090) }, serviceReady, "ServicePortMismatch"},
+		{"extra service port", func(f *readinessFixture) {
+			f.svc.Spec.Ports = append(f.svc.Spec.Ports, corev1.ServicePort{Name: "extra", Port: 8443, TargetPort: intstr.FromInt32(8443)})
+		}, serviceReady, "ServicePortMismatch"},
+		{"unready addresses", func(f *readinessFixture) { f.svc.Spec.PublishNotReadyAddresses = true }, serviceReady, "ServiceUnavailable"},
+		{"external address", func(f *readinessFixture) { f.svc.Spec.ExternalIPs = []string{"192.0.2.10"} }, serviceReady, "ServiceUnavailable"},
 		{"no slices", func(f *readinessFixture) { f.slice = nil }, endpointReady, "EndpointsPending"},
 		{"no endpoints", func(f *readinessFixture) { f.slice.Endpoints = nil }, endpointReady, "EndpointsPending"},
 		{"nonready endpoints", func(f *readinessFixture) {

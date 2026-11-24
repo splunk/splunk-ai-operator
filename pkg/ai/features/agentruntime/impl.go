@@ -820,11 +820,6 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 }
 
 func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.AIService) error {
-	ports := []corev1.ServicePort{
-		{Name: "http", Port: defaultAgentRuntimeHTTPPort, TargetPort: intstr.FromInt(int(defaultAgentRuntimeHTTPPort))},
-		{Name: "metrics", Port: defaultAgentRuntimeMetrics, TargetPort: intstr.FromInt(int(defaultAgentRuntimeMetrics))},
-	}
-
 	// AgentRuntime is an in-cluster MVP endpoint. Keep the Service ClusterIP-only
 	// until a future cross-namespace/external exposure contract is defined.
 	svcType := corev1.ServiceTypeClusterIP
@@ -846,14 +841,24 @@ func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.
 		svc.ObjectMeta.Labels = labels
 		svc.ObjectMeta.Annotations = annotations
 		svc.Spec.Selector = selectorLabels
-		svc.Spec.Ports = ports
+		svc.Spec.Ports = runtimeServicePorts()
 		svc.Spec.Type = svcType
+		// Do not let Service edits expose the internal runtime or bypass Pod readiness.
+		svc.Spec.ExternalIPs = nil
+		svc.Spec.PublishNotReadyAddresses = false
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Service failed")
 		return fmt.Errorf("create/update Service: %w", err)
 	}
 	return nil
+}
+
+func runtimeServicePorts() []corev1.ServicePort {
+	return []corev1.ServicePort{
+		{Name: "http", Port: defaultAgentRuntimeHTTPPort, TargetPort: intstr.FromInt32(defaultAgentRuntimeHTTPPort), Protocol: corev1.ProtocolTCP},
+		{Name: "metrics", Port: defaultAgentRuntimeMetrics, TargetPort: intstr.FromInt32(defaultAgentRuntimeMetrics), Protocol: corev1.ProtocolTCP},
+	}
 }
 
 func (r *AgentRuntimeReconciler) reconcileHPA(ctx context.Context, ai *aiv1.AIService) error {
@@ -953,11 +958,16 @@ func ServiceURL(aiServiceName, namespace, clusterDomain string) string {
 // FeatureServiceURL resolves a provider feature before the generated AIService
 // exists, using the same DNS length bound as the AIPlatform's feature name.
 func FeatureServiceURL(platformName, provider, namespace, clusterDomain string) string {
+	return ServiceURL(FeatureAIServiceName(platformName, provider), namespace, clusterDomain)
+}
+
+// FeatureAIServiceName identifies the generated child for a Runtime provider.
+func FeatureAIServiceName(platformName, provider string) string {
 	name := platformName + "-agentruntime"
 	if provider != "" {
 		name += "-" + provider
 	}
-	return ServiceURL(boundedDNSLabel(name), namespace, clusterDomain)
+	return boundedDNSLabel(name)
 }
 
 func agentRuntimeServiceName(aiServiceName string) string {
