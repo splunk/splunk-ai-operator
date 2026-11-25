@@ -1,0 +1,176 @@
+MPR-202 cluster validation: deletion removes only operator-owned objects and keeps customer data
+====================================================================================================
+Cluster: fullfeature-dev (k0s v1.36.3, Ubuntu 24.04.5; controller 10.0.39.38, CPU workers .100 and
+.102, GPU worker .12). Run on 2026-11-24.
+Operator: the branch build (feat/MPR-202-owned-deletion on e85b253, binary sha256 bff2ff1c...),
+run from a read-only hostPath on the controller in place of the deployed operator
+(localhost/splunk-ai-operator:fullfeature-95fcc22). The branch's CRDs and ClusterRole were applied
+for the test.
+Restore: the operator Deployment, both ClusterRoles and both CRDs were restored from backups taken
+first, and each was compared with its backup ("identical"). Both test namespaces were deleted and
+/opt/mpr202 removed.
+Nothing here is a credential. The test PostgreSQL passwords were generated on the controller and never
+printed. "owned" means the object's owner references name the AIService's UID: that is what
+garbage collection removes.
+
+### 0. The live fullfeature platform under the branch operator (baseline, then throughout)
+AIPlatform/fullfeature-dev-ai-platform Ready=True/AllReconciled fin=null
+AIService/fullfeature-dev-ai-platform-agentruntime-mltk Ready=True/Available fin=null
+AIService/fullfeature-dev-ai-platform-saia Ready=True/AllReconciled fin=null
+AIService/fullfeature-dev-ai-platform-slim Ready=True/AllReconciled fin=null
+runtime owned set: ConfigMap, Deployment, HPA, schema Job, Service, ServiceAccount, ServiceMonitor,
+  all controlled by the AIService. No OwnershipConflict on any live object.
+live checkpoint tables before and after the whole test: checkpoints=12 checkpoint_writes=56
+  checkpoint_blobs=18 checkpoint_migrations=9 (unchanged)
+Expected effects of a newer operator (not of this change): the schema Job ran once (the old operator
+  recorded no schema status), succeeded, and is owned by the runtime; SLIM rolled once (an environment
+  variable added after 95fcc22).
+
+### 1. cpuOnly platform: the owned set, and what is not owned (namespace mpr202-cpu)
+runtime AIService mpr202-cpu-agentruntime-mltk, Ready=True/Available
+owned by the runtime:
+  ConfigMap/mpr202-cpu-agentruntime-mltk-agentruntime-config
+  Deployment/mpr202-cpu-agentruntime-mltk-agentruntime-deployment
+  HorizontalPodAutoscaler/mpr202-cpu-agentruntime-mltk-agentruntime-hpa
+  Job/mpr202-cpu-agentruntime-mltk-schema-1419d1d9cae7fd4b
+  Service/mpr202-cpu-agentruntime-mltk-svc
+  ServiceMonitor/mpr202-cpu-agentruntime-mltk-agentruntime-metrics
+not owned (customer-managed):
+  ServiceAccount/mpr202-customer-sa (named in features[].serviceAccountName; the Deployment runs as it)
+  ConfigMap/mpr202-cpu-agentruntime-mltk-agentruntime-config-backup (a name extending the runtime's)
+  Secret/mpr202-pg (checkpoint Secret), Secret/ecr-registry-secret (pull Secret)
+  Deployment/mpr202-postgres, Service/mpr202-postgres (the "customer" PostgreSQL)
+marker checkpoint rows written (thread mpr202-marker):
+  checkpoints 2 e483947153e4c3ca16d1b69906c46a15
+  writes 1 418b767336156dd52bb3f48e831a658e
+  blobs 1 7627c0a388927d856a4f5cb7495bdf6e
+
+### 2. Remove the features (spec.features: [])
+removing only agentruntime is refused by the webhook under cpuOnly, as documented:
+  spec.features: Required value: profile cpuOnly routes the slim feature to AgentRuntime, so an
+  agentruntime feature is required alongside it
+removed: the runtime's six owned objects and SLIM's own objects; nothing new appeared
+kept, each at its original resourceVersion, with no owner reference:
+  sa/mpr202-customer-sa, cm/...-agentruntime-config-backup, secret/mpr202-pg,
+  secret/ecr-registry-secret, deploy/mpr202-postgres, svc/mpr202-postgres
+owned by the deleted runtime's UID afterwards: none
+markers afterwards: identical checksums; table row counts unchanged
+repeated: the same removal again -> "patched (no change)"; deleting the gone AIService -> rc=0
+
+### 3. Same-named customer objects, a partial install and an API failure (platform mpr202-cf)
+customer ServiceAccount mpr202-cf-agentruntime-mltk-sa created first:
+  ServiceAccountReady False OwnershipConflict: ServiceAccount mpr202-cpu/mpr202-cf-agentruntime-mltk-sa
+  already exists and is not managed by this AIService; it was left unchanged: rename or remove it
+  Ready False OwnershipConflict (same message); customer SA resourceVersion 1985156 -> 1985156, no owner
+  the customer deletes it -> the operator creates its own
+customer ConfigMap mpr202-cf-agentruntime-mltk-agentruntime-config:
+  AgentRuntimeConfigMapReady False OwnershipConflict (same form); resourceVersion 1985159 -> 1985159,
+  data {"customer":"data"}, no owner; the customer deletes it -> recovered
+checkpoint Secret missing (partial install):
+  PostgresSchemaSetupReady False CheckpointSecretMissing
+  owned so far: ConfigMap, ServiceAccount (nothing unowned)
+the operator loses permission to create HPAs (ClusterRole edited), then the Secret is created:
+  AgentRuntimeHPAReady False ReconcileFailed; operator log: forbidden
+  owned during the failure: ConfigMap, Deployment, schema Job, Service, ServiceAccount
+permission restored at t=21s -> Ready=True/Available at t=49s, full owned set (7), no delete issued
+
+### 4. fullfeature rules: standalone runtimes referencing the live fullfeature platform (mpr202-full)
+mpr202-full-a: mTLS (operator termination, operator-generated Secret name), metrics on
+mpr202-full-b: mTLS with mtls.secretName: mpr202-user-tls
+both Ready=True/Available at t=40s; both Certificates Ready (self-signed Issuer, customer-managed)
+TLS Secrets after issuance:
+  mpr202-full-a-tls: certificate=mpr202-full-a-agentruntime-cert owners=[AIService mpr202-full-a,
+    non-controller]
+  mpr202-user-tls:   certificate=mpr202-full-b-agentruntime-cert owners=[]
+owned by mpr202-full-a: Certificate, ConfigMap, Deployment, HPA, schema Job, Secret (the TLS Secret),
+  Service, ServiceAccount, ServiceMonitor
+owned by mpr202-full-b: the same without the TLS Secret and the ServiceMonitor
+both deleted: at t=2s no AIService, nothing owned by either UID, no runtime pod
+kept: Secret/mpr202-user-tls (tls.crt, tls.key), Issuer/mpr202-selfsigned (Ready), mpr202-pg,
+  ecr-registry-secret, the PostgreSQL Deployment and Service
+markers (thread mpr202-full-marker: 3 checkpoints, 1 write): identical after the deletion
+
+### 5. Finalizers added by 2025-08 builds
+an AIService with ai.splunk.com/aiservice-protect and an AIPlatform with
+ai.splunk.com/aiplatform-protect, kept by the operator until deleted, then gone at t=1s with nothing
+owned left
+
+### 6. The operator killed during an install
+killed 0.3 s after the platform was created (only SA, ConfigMap and schema Job existed): the new
+operator completed the install (Ready at t=82s); every object under the runtime's names is controlled
+by the runtime; none is unowned. Repeated with the kill at 3 s: the same.
+
+### 7. The OwnershipConflict event
+the operator's ClusterRole grants no permission on events outside its own namespace, so every event it
+emits on an AIService is rejected (pre-existing: "Server rejected event ... events is forbidden").
+With events create/patch granted for the test:
+  Warning OwnershipConflict on AIService/mpr202-ev count=12: ConfigMap
+  mpr202-full/mpr202-ev-agentruntime-config already exists and is not managed by this AIService; it was
+  left unchanged: rename or remove it
+The temporary permission was removed afterwards.
+
+### 8. Deleting the platforms (four cpuOnly platforms in mpr202-cpu)
+before: 4 platforms, 6 AIServices, 51 objects
+t=2s  no platform, no AIService, 23 owned objects still going
+t=6s  no owned object left; t=34s the last runtime pods finished terminating
+kept: the checkpoint Secrets, the pull Secret, PostgreSQL, the customer ServiceAccount and ConfigMap
+markers (thread mpr202-marker): identical to the first record
+
+### 9. Pre-existing finding: the newer operator rewrites the live SAIA and SLIM Deployments constantly
+During the test the six live fullfeature Deployments' generations rose by about 2,300 in an hour; the
+deployed operator (95fcc22) had reached about 1,710 in 8 days, and adds none in a minute. A/B on the
+live platform, one minute to settle then three measured, the same CRDs and ClusterRole:
+  base ai-agent-runtime (e85b253, without MPR-202):  +1180 generations in 3 minutes
+  MPR-202 branch:                                    +1186 generations in 3 minutes
+So it comes from code merged after 95fcc22, not from this change. Two reads of the SAIA Deployment spec
+4 seconds apart are identical: a field is set and reverted between them. Templates, replicas and
+readiness were unaffected, and are identical to the baseline after the restore.
+
+### 10. Restore
+operator Deployment spec: identical to the backup; image localhost/splunk-ai-operator:fullfeature-95fcc22
+ClusterRole splunk-ai-operator-manager-role and -metrics-auth-role rules: identical
+CRD aiplatforms.ai.splunk.com and aiservices.ai.splunk.com spec: identical
+test namespaces left: 0; /opt/mpr202 removed
+live platform: AIPlatform and its three AIServices Ready=True; Deployment and StatefulSet templates,
+replicas and readiness identical to the baseline; +0 generations in 60 s under the original operator;
+live checkpoint counts unchanged
+
+### 11. Root cause of the churn in section 9 (bisected on the live platform, then restored)
+  3e4bb99 (the mainline merge just before MPR-189): +0 Deployment generations in 3 minutes
+  955dd11 (MPR-189, "bound schema Jobs and make replay safe"): +1272 in 3 minutes
+A watch of the SAIA Deployment under 955dd11 saw 48 versions in 20 s with an identical spec. The
+loop is in the metadata annotations: the SAIA and SLIM Deployment mutators replace
+metadata.annotations wholesale, dropping deployment.kubernetes.io/revision. The Deployment
+controller restores it, and the API server bumps a Deployment's generation on any annotation
+change, so each write costs two generations and a status update (observedGeneration). Before
+955dd11, the controller's global event filter needed a generation, label or annotation change on
+the event, so that status-only update was filtered out. 955dd11 added DeploymentChangedPredicate
+(status changes) to the global filter, so each status update now wakes the AIService reconcile,
+which writes again. AgentRuntime has the same mutator shape but was fixed in 488a9a2 (it keeps the
+revision annotation); SAIA and SLIM were not. Restored afterwards: operator spec, ClusterRoles and
+CRDs identical to the backups, +0 generations in 60 s, live checkpoints unchanged, all Ready.
+
+### 12. Retest on ai-agent-runtime 9d4a0cd (PR #290) + MPR-202 + the events RBAC rule (2026-11-25)
+Binary sha256 59b17994...; the branch's CRDs and ClusterRole (now with create/patch on core events).
+Every scenario of sections 1-8 was run again in one pass; the cluster was restored on exit.
+  churn (PR #290): live fullfeature Deployments +0 generations in 3 minutes at the start and +0 in
+    2 minutes at the end (section 9: about +1180 before #290)
+  events: no "events is forbidden" rejection in the whole run; events are recorded on the live
+    AIServices; the OwnershipConflict Warning appeared on the AIService with the operator's own
+    ClusterRole, no temporary grant:
+      Warning OwnershipConflict count=10: ServiceAccount mpr202-cpu/mpr202-cf-agentruntime-mltk-sa
+      already exists and is not managed by this AIService; it was left unchanged: rename or remove it
+  cpuOnly feature removal: the runtime's six owned objects and SLIM's removed within 7 s; the customer
+    ServiceAccount, the similarly named ConfigMap, both Secrets and PostgreSQL kept at their
+    resourceVersions; marker checksums identical; repeated removal and delete are no-ops
+  same-named ServiceAccount and ConfigMap: OwnershipConflict, unchanged, recovered after removal;
+    missing checkpoint Secret: CheckpointSecretMissing with only owned objects; HPA create permission
+    removed: AgentRuntimeHPAReady ReconcileFailed, nothing deleted, Ready 28 s after it was restored
+  fullfeature runtimes: Ready in 40 s; operator-generated TLS Secret owned (non-controller) and
+    removed; user-named TLS Secret and Issuer kept; markers identical
+  2025-08 finalizers: both objects gone at t=2s; operator killed at 0.3 s and 3 s into an install:
+    every object owned, none unowned, Ready at t=56s; operator restarts 0
+  four platforms deleted: nothing owned left at t=38s; customer objects kept; markers identical
+  restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; test
+    namespaces 0; live platform Ready, templates/replicas/readiness identical to the baseline, live
+    checkpoint counts unchanged
