@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	//"sigs.k8s.io/controller-runtime/pkg/client"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -520,4 +521,65 @@ func TestCheckAIServiceStatus_FailsWhenServiceHasFailedCondition(t *testing.T) {
 	assert.Contains(t, err.Error(), "my-ai-feature1")
 	assert.Contains(t, err.Error(), "PostInstallHookReady")
 	assert.Contains(t, err.Error(), "still running")
+}
+
+// MPR-202: removing a feature deletes only that feature's AIService, and only one this
+// platform controls (matched by UID). The index the operator uses keys children by
+// their controller's name, so an AIService left by an earlier platform of the same
+// name is listed too; it belongs to garbage collection, not to this platform. A
+// customer's AIService (no controller) is never listed.
+func TestReconcileFeatures_PrunesOnlyItsOwnRemovedFeatures(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildTestScheme(t)
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(aiApi.AddToScheme(scheme))
+
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai", Namespace: "default", UID: "platform-uid"},
+		Spec: aiApi.AIPlatformSpec{
+			Profile:       aiApi.AIPlatformProfileCPUOnly,
+			Features:      []aiApi.FeatureSpec{{Name: "agentruntime", Provider: "mltk", CheckpointDbSecretRef: "mltk-postgres"}},
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "/data"},
+		},
+	}
+	child := func(name string, owner *metav1.OwnerReference) *aiApi.AIService {
+		s := &aiApi.AIService{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: aiApi.AIServiceSpec{Feature: aiApi.FeatureSpec{Name: "agentruntime", Provider: "seca"}}}
+		if owner != nil {
+			s.OwnerReferences = []metav1.OwnerReference{*owner}
+		}
+		return s
+	}
+	controller := true
+	ref := func(uid types.UID) *metav1.OwnerReference {
+		return &metav1.OwnerReference{APIVersion: aiApi.GroupVersion.String(), Kind: "AIPlatform", Name: "my-ai", UID: uid, Controller: &controller}
+	}
+	removed := child("my-ai-agentruntime-seca", ref("platform-uid"))
+	earlier := child("my-ai-agentruntime-old", ref("earlier-platform-uid"))
+	customer := child("my-ai-agentruntime-customer", nil)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(platform, removed, earlier, customer).
+		WithStatusSubresource(&aiApi.AIService{}).
+		// The index the operator registers (internal/controller): the controller's name.
+		WithIndex(&aiApi.AIService{}, ownerKey, func(obj client.Object) []string {
+			owner := metav1.GetControllerOf(obj)
+			if owner == nil || owner.APIVersion != aiApi.GroupVersion.String() || owner.Kind != "AIPlatform" {
+				return nil
+			}
+			return []string{owner.Name}
+		}).
+		Build()
+	r := &AIPlatformReconciler{Client: fakeClient, Scheme: scheme}
+	require.NoError(t, r.ReconcileFeatures(ctx, platform))
+
+	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(removed), &aiApi.AIService{})
+	assert.True(t, apierrors.IsNotFound(err), "the removed feature's AIService is deleted, got %v", err)
+	assert.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(earlier), &aiApi.AIService{}), "an earlier platform's AIService is left to garbage collection")
+	assert.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(customer), &aiApi.AIService{}), "a customer's AIService is never touched")
+	assert.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "my-ai-agentruntime-mltk"}, &aiApi.AIService{}))
+
+	// Idempotent: a second pass deletes nothing more and does not fail on what is gone.
+	require.NoError(t, r.ReconcileFeatures(ctx, platform))
+	assert.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(earlier), &aiApi.AIService{}))
 }

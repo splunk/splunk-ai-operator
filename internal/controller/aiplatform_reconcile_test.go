@@ -24,12 +24,17 @@ import (
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/config"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var _ = Describe("AIPlatform reconcileStatus", func() {
@@ -148,7 +153,7 @@ var _ = Describe("AIPlatform reconcileStatus", func() {
 	})
 })
 
-var _ = Describe("AIPlatform finalizePlatform", func() {
+var _ = Describe("AIPlatform deletion (MPR-202): no finalizer, owner references only", func() {
 	var (
 		reconciler  *AIPlatformReconciler
 		fakeClient  client.Client
@@ -161,8 +166,11 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 		ctx = context.Background()
 		namespace = "finalize-test"
 
-		s := scheme.Scheme
-		_ = aiv1.AddToScheme(s)
+		// A private scheme: writing the shared client-go scheme here races with event
+		// recorders that envtest specs leave running.
+		s := runtime.NewScheme()
+		Expect(clientgoscheme.AddToScheme(s)).To(Succeed())
+		Expect(aiv1.AddToScheme(s)).To(Succeed())
 
 		fakeClient = fake.NewClientBuilder().
 			WithScheme(s).
@@ -200,147 +208,57 @@ var _ = Describe("AIPlatform finalizePlatform", func() {
 		Expect(fakeClient.Create(ctx, ns)).To(Succeed())
 	})
 
-	Context("When finalizing platform with no children", func() {
-		It("should return done=true immediately", func() {
-			platform := &aiv1.AIPlatform{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      platformKey.Name,
-					Namespace: platformKey.Namespace,
-					UID:       "test-uid",
-				},
-				Spec: aiv1.AIPlatformSpec{
-					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
-						Path:   "s3://test-bucket",
-						Region: "us-west-2",
-					},
-				},
-			}
+	newPlatform := func(finalizers ...string) *aiv1.AIPlatform {
+		return &aiv1.AIPlatform{
+			ObjectMeta: metav1.ObjectMeta{Name: platformKey.Name, Namespace: platformKey.Namespace, UID: "platform-uid", Finalizers: finalizers},
+			Spec:       aiv1.AIPlatformSpec{ObjectStorage: aiv1.ObjectStorageSpec{Path: "s3://test-bucket", Region: "us-west-2"}},
+		}
+	}
+	newChild := func(platform *aiv1.AIPlatform) *aiv1.AIService {
+		controller := true
+		return &aiv1.AIService{
+			ObjectMeta: metav1.ObjectMeta{Name: "child-service", Namespace: platformKey.Namespace,
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: aiv1.GroupVersion.String(), Kind: "AIPlatform",
+					Name: platform.Name, UID: platform.UID, Controller: &controller}}},
+			Spec: aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+				TaskVolume: aiv1.ObjectStorageSpec{Path: "s3://test-bucket/tasks", Region: "us-west-2"}},
+		}
+	}
 
-			Expect(fakeClient.Create(ctx, platform)).To(Succeed())
+	It("releases the finalizer an early build added at once, without deleting anything itself", func() {
+		platform := newPlatform(aiPlatformFinalizer)
+		Expect(fakeClient.Create(ctx, platform)).To(Succeed())
+		child := newChild(platform)
+		Expect(fakeClient.Create(ctx, child)).To(Succeed())
+		Expect(fakeClient.Delete(ctx, platform)).To(Succeed())
 
-			// Call finalizePlatform
-			done, err := reconciler.finalizePlatform(ctx, platform)
-			Expect(err).To(Succeed())
-			Expect(done).To(BeTrue())
-		})
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: platformKey})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(ctrl.Result{}), "nothing to wait for")
+		Expect(errors.IsNotFound(fakeClient.Get(ctx, platformKey, &aiv1.AIPlatform{}))).To(BeTrue(), "the platform is deleted, not held")
+		// Its AIServices are removed by garbage collection through their owner
+		// references (the fake client has none), not by the operator.
+		Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(child), &aiv1.AIService{})).To(Succeed())
 	})
 
-	Context("When finalizing platform with AIService children", func() {
-		It("should delete children and return done=false until cleanup complete", func() {
-			platform := &aiv1.AIPlatform{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      platformKey.Name,
-					Namespace: platformKey.Namespace,
-					UID:       "test-uid",
-				},
-				Spec: aiv1.AIPlatformSpec{
-					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
-						Path:   "s3://test-bucket",
-						Region: "us-west-2",
-					},
-				},
-			}
-
-			Expect(fakeClient.Create(ctx, platform)).To(Succeed())
-
-			// Create owned AIService
-			trueVal := true
-			service := &aiv1.AIService{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "child-service",
-					Namespace: platformKey.Namespace,
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: aiv1.GroupVersion.String(),
-							Kind:       "AIPlatform",
-							Name:       platform.Name,
-							UID:        platform.UID,
-							Controller: &trueVal,
-						},
-					},
-				},
-				Spec: aiv1.AIServiceSpec{
-					Feature: aiv1.FeatureSpec{
-						Name: "saia",
-					},
-					TaskVolume: aiv1.ObjectStorageSpec{
-						Path:   "s3://test-bucket/tasks",
-						Region: "us-west-2",
-					},
-					AIPlatformRef: corev1.ObjectReference{
-						Name:      platform.Name,
-						Namespace: platform.Namespace,
-					},
-					VectorDbUrl: "http://weaviate:8080",
-				},
-			}
-
-			Expect(fakeClient.Create(ctx, service)).To(Succeed())
-
-			// Call finalizePlatform first time - should attempt delete
-			done, err := reconciler.finalizePlatform(ctx, platform)
-			Expect(err).To(Succeed())
-			Expect(done).To(BeFalse()) // Not done yet, children still exist
-
-			// Verify service still exists (deletion may be pending)
-			retrieved := &aiv1.AIService{}
-			err = fakeClient.Get(ctx, types.NamespacedName{
-				Name:      service.Name,
-				Namespace: service.Namespace,
-			}, retrieved)
-			// Service may or may not exist depending on fake client behavior
-			// The important thing is finalizePlatform returned false
-		})
-
-		It("should return done=true when all children are deleted", func() {
-			platform := &aiv1.AIPlatform{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      platformKey.Name,
-					Namespace: platformKey.Namespace,
-					UID:       "test-uid-2",
-				},
-				Spec: aiv1.AIPlatformSpec{
-					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
-						Path:   "s3://test-bucket",
-						Region: "us-west-2",
-					},
-				},
-			}
-
-			Expect(fakeClient.Create(ctx, platform)).To(Succeed())
-
-			// No children - should return done immediately
-			done, err := reconciler.finalizePlatform(ctx, platform)
-			Expect(err).To(Succeed())
-			Expect(done).To(BeTrue())
-		})
+	It("never adds a finalizer", func() {
+		platform := newPlatform()
+		platform.Spec.Profile = aiv1.AIPlatformProfileCPUOnly // a complete reconcile without a Ray fixture
+		Expect(fakeClient.Create(ctx, platform)).To(Succeed())
+		_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: platformKey})
+		got := &aiv1.AIPlatform{}
+		Expect(fakeClient.Get(ctx, platformKey, got)).To(Succeed())
+		Expect(got.Finalizers).To(BeEmpty())
 	})
 
-	Context("When finalizePlatform encounters errors", func() {
-		It("should handle list errors gracefully", func() {
-			// Create platform in a namespace that doesn't exist
-			platform := &aiv1.AIPlatform{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "error-platform",
-					Namespace: "non-existent-namespace",
-					UID:       "test-uid-error",
-				},
-				Spec: aiv1.AIPlatformSpec{
-					ServiceAccountName: "test-sa",
-					ObjectStorage: aiv1.ObjectStorageSpec{
-						Path:   "s3://test-bucket",
-						Region: "us-west-2",
-					},
-				},
-			}
-
-			// Call finalizePlatform - should handle gracefully
-			// Note: fake client may or may not error on list in non-existent namespace
-			_, _ = reconciler.finalizePlatform(ctx, platform)
-			// We just verify it doesn't panic
-		})
+	It("keeps another controller's finalizer", func() {
+		platform := newPlatform(aiPlatformFinalizer, "example.com/other")
+		Expect(fakeClient.Create(ctx, platform)).To(Succeed())
+		Expect(fakeClient.Delete(ctx, platform)).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: platformKey})
+		Expect(err).NotTo(HaveOccurred())
+		got := &aiv1.AIPlatform{}
+		Expect(fakeClient.Get(ctx, platformKey, got)).To(Succeed())
+		Expect(got.Finalizers).To(Equal([]string{"example.com/other"}))
 	})
 })

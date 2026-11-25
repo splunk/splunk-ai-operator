@@ -43,6 +43,9 @@ import (
 )
 
 const ownerKey = ".metadata.controller"
+
+// aiPlatformFinalizer was added by early builds (2025-08) and is no longer added;
+// the operator only removes it, so such platforms can still be deleted.
 const aiPlatformFinalizer = "ai.splunk.com/aiplatform-protect"
 
 // +kubebuilder:rbac:groups=ai.splunk.com,resources=aiplatforms,verbs=get;list;watch;create;update;patch;delete
@@ -90,25 +93,15 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	// deletion flow
+	// Deletion (MPR-202): the operator adds no finalizer. Everything it creates for
+	// the platform is owned through controller references, so Kubernetes garbage
+	// collection removes it, and nothing the operator does can block a deletion. A
+	// platform still carrying the finalizer an early build added is released at once.
 	if p.DeletionTimestamp != nil {
-		// only act if our finalizer is present
 		if containsString(p.Finalizers, aiPlatformFinalizer) {
-			// 1) run cleanup for platform‑level resources
-			// delete or detach external resources here
-			// example: ensure Ray and Weaviate are removed
-			if done, err := r.finalizePlatform(ctx, p); err != nil {
-				// transient error, requeue
-				return ctrl.Result{}, err
-			} else if !done {
-				// still waiting on children to disappear, requeue soon
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-
-			// 2) remove finalizer, allow deletion to complete
 			p.Finalizers = removeString(p.Finalizers, aiPlatformFinalizer)
 			if err := r.Update(ctx, p); err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, client.IgnoreNotFound(err)
 			}
 		}
 		return ctrl.Result{}, nil
@@ -248,30 +241,5 @@ func optionalResourcePresent(mgr ctrl.Manager, group, version, kind string) (boo
 	if err != nil {
 		return false, err
 	}
-	return true, nil
-}
-
-// finalizePlatform deletes platform‑owned children and waits until they are gone.
-// Return (true, nil) when it is safe to remove the finalizer.
-func (r *AIPlatformReconciler) finalizePlatform(ctx context.Context, p *aiv1.AIPlatform) (bool, error) {
-	// delete AIService children, they may in turn delete lower layers they own
-	{
-		var services aiv1.AIServiceList
-		if err := r.List(ctx, &services,
-			client.InNamespace(p.Namespace),
-			client.MatchingFields{ownerKey: p.Name},
-		); err != nil {
-			return false, err
-		}
-		for i := range services.Items {
-			svc := &services.Items[i]
-			// best effort delete
-			_ = r.Delete(ctx, svc)
-		}
-		if len(services.Items) > 0 {
-			return false, nil // wait for GC
-		}
-	}
-
 	return true, nil
 }
