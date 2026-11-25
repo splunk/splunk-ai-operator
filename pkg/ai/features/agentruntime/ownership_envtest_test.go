@@ -419,6 +419,34 @@ func TestOwnership(t *testing.T) {
 		e.unchanged(foreign, foreign.ResourceVersion)
 	})
 
+	t.Run("an operator-named TLS Secret the user later names in mtls.secretName is released", func(t *testing.T) {
+		ai := e.newService("tls-later", aiv1.AIPlatformProfileCPUOnly, nil)
+		e.install(ai)
+		tls := e.issue("tls-later-tls", "tls-later-agentruntime-cert")
+		// Another owner reference that must survive the release.
+		other := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "tls-later-other-owner", Namespace: "default"}}
+		require.NoError(t, e.c.Create(ctx, other))
+		require.NoError(t, e.c.Get(ctx, client.ObjectKeyFromObject(tls), tls))
+		require.NoError(t, controllerutil.SetOwnerReference(other, tls, e.c.Scheme()))
+		require.NoError(t, e.c.Update(ctx, tls))
+		require.NoError(t, e.reconcile(ai))
+		assert.Contains(t, e.collectable(ai.UID), "*v1.Secret/tls-later-tls", "claimed while the name is the operator's")
+
+		// The user names that same Secret to keep it.
+		require.NoError(t, e.c.Get(ctx, client.ObjectKeyFromObject(ai), ai))
+		ai.Spec.MTLS.SecretName = "tls-later-tls"
+		require.NoError(t, e.c.Update(ctx, ai))
+		require.NoError(t, e.reconcile(ai))
+		assert.NotContains(t, e.collectable(ai.UID), "*v1.Secret/tls-later-tls", "released: it survives the AIService")
+		require.NoError(t, e.c.Get(ctx, client.ObjectKeyFromObject(tls), tls))
+		require.Len(t, tls.OwnerReferences, 1, "the other owner reference is kept")
+		assert.Equal(t, other.UID, tls.OwnerReferences[0].UID)
+		rv := tls.ResourceVersion
+		require.NoError(t, e.reconcile(ai))
+		require.NoError(t, e.c.Get(ctx, client.ObjectKeyFromObject(tls), tls))
+		assert.Equal(t, rv, tls.ResourceVersion, "idempotent")
+	})
+
 	t.Run("a partial install and an API failure leave only owned objects, and delete nothing", func(t *testing.T) {
 		ai := e.newService("partial", aiv1.AIPlatformProfileCPUOnly, nil)
 		require.Error(t, e.reconcile(ai), "interrupted: the schema Job has not completed")

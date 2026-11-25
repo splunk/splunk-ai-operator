@@ -56,7 +56,9 @@ Secrets, model artifacts, and shared AI Tier infrastructure remain." Evidence:
 The TLS Secret is recognised by the `cert-manager.io/certificate-name` annotation that
 cert-manager writes. A Secret you created yourself under the generated name `<svc>-tls`
 would already have been overwritten by cert-manager. If you need to keep such a Secret,
-set `mtls.secretName` to it instead: a Secret you name is never owned.
+set `mtls.secretName` to it instead: a Secret you name is never owned. Naming the
+operator-generated Secret this way also keeps it: the operator removes its owner reference
+on the next pass, so the Secret survives the AIService.
 
 When the feature is platform-managed, the AIService itself is owned by its AIPlatform.
 Removing the feature from `AIPlatform.spec.features` deletes only that feature's

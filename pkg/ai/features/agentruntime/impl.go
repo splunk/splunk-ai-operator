@@ -453,11 +453,45 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 			},
 		},
 	})
-	if err != nil || ai.Spec.MTLS.SecretName != "" {
-		// A Secret the user named stays theirs: it is not removed with the AIService.
+	if err != nil {
 		return err
 	}
+	if ai.Spec.MTLS.SecretName != "" {
+		// A Secret the user named stays theirs: it is not removed with the AIService.
+		// If it is one the operator claimed under its generated name before the user
+		// named it, the claim is released.
+		return r.releaseNamedSecret(ctx, ai, secretName)
+	}
 	return r.ownIssuedSecret(ctx, ai, secretName, certificateName)
+}
+
+// releaseNamedSecret removes this AIService's owner reference (matched by UID) from a
+// Secret the user names in mtls.secretName, keeping any other owner reference, so the
+// Secret survives the AIService (MPR-202).
+func (r *AgentRuntimeReconciler) releaseNamedSecret(ctx context.Context, ai *aiv1.AIService, secretName string) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ai.Namespace, Name: secretName}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get named TLS Secret: %w", err)
+	}
+	refs := secret.GetOwnerReferences()
+	kept := refs[:0:0]
+	for _, ref := range refs {
+		if ref.UID != ai.UID {
+			kept = append(kept, ref)
+		}
+	}
+	if len(kept) == len(refs) {
+		return nil
+	}
+	patch := client.MergeFromWithOptions(secret.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	secret.SetOwnerReferences(kept)
+	if err := r.Patch(ctx, secret, patch); err != nil {
+		return fmt.Errorf("release named TLS Secret: %w", err)
+	}
+	return nil
 }
 
 // certManagerCertificateNameAnnotation is set by cert-manager on the Secret it issues

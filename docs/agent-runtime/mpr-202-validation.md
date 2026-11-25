@@ -55,7 +55,8 @@ cascade itself needs a cluster.
 | Check | Result |
 |---|---|
 | New and updated Go tests | 24 tests and subtests in `common`, `agentruntime` (envtest) and `pkg/ai`, and 5 controller specs |
-| Mutation checks | 30 deliberate breakages of the new rules (including making the helpers' default path strict, which would change SAIA), each caught by a failing test. One first-run miss was a real test gap (the user-named ServiceAccount path swallowing an API failure) and was closed |
+| Mutation checks | 32 deliberate breakages of the new rules (including making the helpers' default path strict, which would change SAIA), each caught by a failing test. One first-run miss was a real test gap (the user-named ServiceAccount path swallowing an API failure) and was closed |
+| PR #291 review (Codex) | an operator-named TLS Secret that the user later names in `mtls.secretName` kept the AIService's owner reference and would have been deleted with it. It is now released (other owner references kept); envtest reproduces the sequence; 2 more mutations, each caught |
 | Independent review | no correctness bug. Its five minor points were addressed: a user-named ServiceAccount is now never owned; a same-named schema Job is reported as `OwnershipConflict`; SAIA's conflict event names the object; the TLS-Secret rule is documented; a vacuous assertion was fixed |
 | Module | `go build ./...` and `go vet`; all 24 non-e2e packages pass; race detector clean on `common`, `agentruntime`, `saia` and `pkg/ai` |
 | Controller suite | passes repeatedly. Under the race detector, some spec orders report a race on the base branch too (seeds 8, 13 and 16 there): older specs register types in the shared client-go scheme (`scheme.Scheme`) while an envtest manager's event recorder reads it. The new specs use a private scheme and add no such write. The existing ones are left for a separate fix |
