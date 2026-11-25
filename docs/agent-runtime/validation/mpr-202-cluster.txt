@@ -174,3 +174,17 @@ Every scenario of sections 1-8 was run again in one pass; the cluster was restor
   restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; test
     namespaces 0; live platform Ready, templates/replicas/readiness identical to the baseline, live
     checkpoint counts unchanged
+
+### 13. PR #291 review fix (6b88171): an operator-named TLS Secret the user later names is released
+Binary sha256 b4ef9225...; standalone runtime mpr202-tls-later with operator-terminated mTLS and no
+mtls.secretName, against the live fullfeature platform; restored on exit.
+1. secretName unset: mpr202-tls-later-tls written by cert-manager for this Certificate (ca.crt,
+   tls.crt, tls.key), owners [AIService/mpr202-tls-later, non-controller]
+2. mtls.secretName set to mpr202-tls-later-tls: within 3 s owners [] (released); runtime stays
+   Ready=True/Available; the Secret is no longer in the runtime's owned set; resourceVersion
+   unchanged 20 s later (idempotent)
+3. AIService deleted: at t=2s no AIService and nothing owned left; the TLS Secret is still there with
+   its three keys, no owner, same resourceVersion; the Issuer is kept; no event rejected
+restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; the test
+namespace finished terminating; live platform Ready, workloads identical to the baseline, live
+checkpoints unchanged
