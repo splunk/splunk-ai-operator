@@ -298,7 +298,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 		Expect(ai.Status.SchemaJobId).To(BeEmpty(), "AgentRuntime must not use the legacy SAIA schema Job field")
 		aitkEndpoint := fmt.Sprintf("http://%s-slim-slim-service.%s.svc.cluster.local:8080/tenant/slim-api/v1alpha1", name, ns)
 		slimRolloutObserved := false
-		verifyRuntimeReadinessWithControllers(&ai, p, func(want metav1.ConditionStatus) {
+		verifyRuntimeReadinessWithControllers(&ai, p, sch, func(want metav1.ConditionStatus) {
 			if !slimRolloutObserved && want == metav1.ConditionTrue {
 				By("withholding the endpoint until the current SLIM rollout is observed")
 				expectSlimRoute(metav1.ConditionFalse, "", "SLIMRolloutPending")

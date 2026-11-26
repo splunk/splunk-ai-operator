@@ -6,6 +6,7 @@ import (
 	"os"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	featurecommon "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -115,6 +116,7 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 	}
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+		previousTemplate := sts.Spec.Template.DeepCopy()
 		// Set immutable fields only if StatefulSet is being created (UID will be empty for new objects)
 		if sts.UID == "" {
 			sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
@@ -210,6 +212,9 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 				{Name: "GRPC_PORT", Value: "50051"},
 			},
 		}}
+		// The API defaults fields on containers and their ports before storing
+		// them. Keep those defaults so an unchanged StatefulSet is not rewritten.
+		featurecommon.PreservePodTemplateDefaults(&sts.Spec.Template, previousTemplate)
 		return nil
 	}); err != nil {
 		r.Recorder.Eventf(instance, corev1.EventTypeWarning, "WeaviateCreationFailed", "Failed to create/update Weaviate: %v", err)
@@ -235,11 +240,13 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 		svc.Spec.Ports = []corev1.ServicePort{
 			{
 				Name:       "http",
+				Protocol:   corev1.ProtocolTCP,
 				Port:       80,
 				TargetPort: intstr.FromInt(8080),
 			},
 			{
 				Name:       "grpc",
+				Protocol:   corev1.ProtocolTCP,
 				Port:       50051,
 				TargetPort: intstr.FromInt(50051),
 			},

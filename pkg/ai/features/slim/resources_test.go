@@ -116,6 +116,7 @@ func TestSlimDeploymentCarriesPlacementAndNoGPU(t *testing.T) {
 }
 
 func TestSlimDeployment_SecondReconcileWritesNothing(t *testing.T) {
+	const deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
 	r, _ := slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
 	ai := slimService(testAgentRuntimeURL)
 	ai.Spec.NodeSelector = map[string]string{"splunk.ai/workload-type": "cpu"}

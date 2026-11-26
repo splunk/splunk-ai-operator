@@ -179,6 +179,11 @@ var _ = Describe("AIService reconcileStatus", func() {
 				Namespace: service.Namespace,
 			}, retrieved)).To(Succeed())
 			Expect(retrieved.Status.ObservedGeneration).To(Equal(int64(2)))
+
+			version := retrieved.ResourceVersion
+			Expect(reconciler.reconcileStatus(ctx, retrieved)).To(Succeed())
+			Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(retrieved), retrieved)).To(Succeed())
+			Expect(retrieved.ResourceVersion).To(Equal(version), "stable status should not be written again")
 		})
 	})
 })

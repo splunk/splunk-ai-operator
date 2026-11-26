@@ -321,6 +321,7 @@ func TestRuntimeStatusPersistenceFailureIsReturned(t *testing.T) {
 }
 
 func TestRuntimeDeploymentPreservesControllerRevisionWithoutTemplateChurn(t *testing.T) {
+	const deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
 	r, ai, job := schemaTestReconciler(t)
 	ctx := context.Background()
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}

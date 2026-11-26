@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"text/template"
 	"time"
@@ -1035,8 +1037,10 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 	combinedEnv := make([]corev1.EnvVar, len(defaultEnv))
 	copy(combinedEnv, defaultEnv)
 
-	// Add cfg.Env entries, cfg.Env values override defaultEnv if same key exists
-	for key, value := range cfg.Env {
+	// Keep override positions and append new keys in a stable order. A map's
+	// iteration order would otherwise change the worker template on reconciliation.
+	for _, key := range slices.Sorted(maps.Keys(cfg.Env)) {
+		value := cfg.Env[key]
 		found := false
 		for i, envVar := range combinedEnv {
 			if envVar.Name == key {
