@@ -1,0 +1,106 @@
+{
+  "date": "2026-11-26",
+  "operatorBaseCommit": "c7d300ccc4830d662d6b5ca49dadee87356a52ab",
+  "kubernetesAPIServerVersion": "1.35.0",
+  "goVersion": "1.26.10",
+  "pythonVersion": "3.13.12",
+  "nonE2EGoPackageResults": {
+    "passed": 24,
+    "noTests": 12,
+    "failed": 0
+  },
+  "passingCheckpointTests": [
+    "TestCheckpointSecretFailureAndCorrection",
+    "TestCheckpointSecretFailureAndCorrection/malformed",
+    "TestCheckpointSecretFailureAndCorrection/missing",
+    "TestCheckpointWiringSurvivesPodReplacement",
+    "TestCheckpointWiringSurvivesPodReplacement/cpuOnly",
+    "TestCheckpointWiringSurvivesPodReplacement/fullfeature",
+    "TestRuntimeReadySurvivesSchemaTTLAndUnrelatedGeneration",
+    "TestSchemaFailurePersistsAndNonceRetries"
+  ],
+  "simulatedReplacementSnapshots": {
+    "cpuOnly": [
+      {
+        "phase": "before",
+        "podUID": "healthy-pod",
+        "secretRef": "default/checkpoint",
+        "secretVersion": "1",
+        "deploymentVersion": "3",
+        "templateHash": "94c32e45cf621f71",
+        "schemaJob": "schema-lifecycle-schema-a85004b3375edd8e",
+        "schemaJobVersion": "2",
+        "schemaHash": "a85004b3375edd8e",
+        "ready": "True",
+        "observedGeneration": "0"
+      },
+      {
+        "phase": "replacement",
+        "podUID": "replacement-pod",
+        "secretRef": "default/checkpoint",
+        "secretVersion": "1",
+        "deploymentVersion": "3",
+        "templateHash": "94c32e45cf621f71",
+        "schemaJob": "schema-lifecycle-schema-a85004b3375edd8e",
+        "schemaJobVersion": "2",
+        "schemaHash": "a85004b3375edd8e",
+        "ready": "True",
+        "observedGeneration": "0"
+      },
+      {
+        "phase": "unrelated-reconcile",
+        "podUID": "replacement-pod",
+        "secretRef": "default/checkpoint",
+        "secretVersion": "1",
+        "deploymentVersion": "3",
+        "templateHash": "94c32e45cf621f71",
+        "schemaJob": "schema-lifecycle-schema-a85004b3375edd8e",
+        "schemaJobVersion": "2",
+        "schemaHash": "a85004b3375edd8e",
+        "ready": "True",
+        "observedGeneration": "1"
+      }
+    ],
+    "fullfeature": [
+      {
+        "phase": "before",
+        "podUID": "healthy-pod",
+        "secretRef": "default/checkpoint",
+        "secretVersion": "1",
+        "deploymentVersion": "3",
+        "templateHash": "2a966268a3d4012d",
+        "schemaJob": "schema-lifecycle-schema-a85004b3375edd8e",
+        "schemaJobVersion": "2",
+        "schemaHash": "a85004b3375edd8e",
+        "ready": "True",
+        "observedGeneration": "0"
+      },
+      {
+        "phase": "replacement",
+        "podUID": "replacement-pod",
+        "secretRef": "default/checkpoint",
+        "secretVersion": "1",
+        "deploymentVersion": "3",
+        "templateHash": "2a966268a3d4012d",
+        "schemaJob": "schema-lifecycle-schema-a85004b3375edd8e",
+        "schemaJobVersion": "2",
+        "schemaHash": "a85004b3375edd8e",
+        "ready": "True",
+        "observedGeneration": "0"
+      },
+      {
+        "phase": "unrelated-reconcile",
+        "podUID": "replacement-pod",
+        "secretRef": "default/checkpoint",
+        "secretVersion": "1",
+        "deploymentVersion": "3",
+        "templateHash": "2a966268a3d4012d",
+        "schemaJob": "schema-lifecycle-schema-a85004b3375edd8e",
+        "schemaJobVersion": "2",
+        "schemaHash": "a85004b3375edd8e",
+        "ready": "True",
+        "observedGeneration": "1"
+      }
+    ]
+  }
+}

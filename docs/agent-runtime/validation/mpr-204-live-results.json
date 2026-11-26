@@ -1,0 +1,140 @@
+{
+  "after": {
+    "candidateImageDigestsVerified": true,
+    "checkpointWiring": {
+      "deploymentSecretRef": "checkpoint",
+      "noConnectionLiterals": true,
+      "podSecretRef": "checkpoint",
+      "schemaSecretRef": "checkpoint",
+      "secretResourceVersion": "22655779",
+      "secretUID": "e25db712-faa6-4fea-a8b1-8b498896ef1a"
+    },
+    "databaseOid": "16384",
+    "observedUtc": "2026-11-26T07:54:52.134606+00:00",
+    "platformReady": {
+      "observedGeneration": 2,
+      "reason": "AllReconciled",
+      "status": "True"
+    },
+    "postgresPVC": {
+      "bound": true,
+      "name": "postgres",
+      "uid": "99a434ea-43c7-49b8-b002-5b81c0489387"
+    },
+    "postgresService": {
+      "name": "postgres",
+      "uid": "a6852b55-2f84-4147-bf9e-1c99100050a1"
+    },
+    "runtimeDeployment": {
+      "generation": 2,
+      "name": "checkpoint-smoke-agentruntime-mltk-agentruntime-deployment",
+      "templateSHA256": "6eccea12e209688bce9e01c12de0298e30ae30f5ac2d524c87fe7409a2bcd0ec",
+      "uid": "86daaadb-620f-4768-9d82-ca5de839ef18"
+    },
+    "runtimePod": {
+      "isServiceBackend": true,
+      "name": "checkpoint-smoke-agentruntime-mltk-agentruntime-deploymentgnqz2",
+      "ready": {
+        "observedGeneration": 1,
+        "status": "True"
+      },
+      "uid": "a8c0d717-c607-4167-9994-5c060f45ad8e"
+    },
+    "runtimeReady": {
+      "observedGeneration": 2,
+      "reason": "Available",
+      "status": "True"
+    },
+    "runtimeService": {
+      "name": "checkpoint-smoke-agentruntime-mltk-svc",
+      "uid": "e5666451-0626-4099-abc2-c573171f5020"
+    },
+    "schemaJob": {
+      "appliedHash": "9c440658b321f59a",
+      "complete": true,
+      "name": "checkpoint-smoke-agentruntime-mltk-schema-9c440658b321f59a",
+      "uid": "fd954d12-99a5-4944-9206-9cdd6c1d4ce0"
+    },
+    "sqlMarkerPresent": true
+  },
+  "before": {
+    "candidateImageDigestsVerified": true,
+    "checkpointWiring": {
+      "deploymentSecretRef": "checkpoint",
+      "noConnectionLiterals": true,
+      "podSecretRef": "checkpoint",
+      "schemaSecretRef": "checkpoint",
+      "secretResourceVersion": "22655779",
+      "secretUID": "e25db712-faa6-4fea-a8b1-8b498896ef1a"
+    },
+    "databaseOid": "16384",
+    "observedUtc": "2026-11-26T07:54:16.813771+00:00",
+    "platformReady": {
+      "observedGeneration": 2,
+      "reason": "AllReconciled",
+      "status": "True"
+    },
+    "postgresPVC": {
+      "bound": true,
+      "name": "postgres",
+      "uid": "99a434ea-43c7-49b8-b002-5b81c0489387"
+    },
+    "postgresService": {
+      "name": "postgres",
+      "uid": "a6852b55-2f84-4147-bf9e-1c99100050a1"
+    },
+    "runtimeDeployment": {
+      "generation": 2,
+      "name": "checkpoint-smoke-agentruntime-mltk-agentruntime-deployment",
+      "templateSHA256": "6eccea12e209688bce9e01c12de0298e30ae30f5ac2d524c87fe7409a2bcd0ec",
+      "uid": "86daaadb-620f-4768-9d82-ca5de839ef18"
+    },
+    "runtimePod": {
+      "isServiceBackend": true,
+      "name": "checkpoint-smoke-agentruntime-mltk-agentruntime-deploymentr45c7",
+      "ready": {
+        "observedGeneration": 1,
+        "status": "True"
+      },
+      "uid": "138a01b4-6f4d-4002-b993-96bbd23e0ea6"
+    },
+    "runtimeReady": {
+      "observedGeneration": 2,
+      "reason": "Available",
+      "status": "True"
+    },
+    "runtimeService": {
+      "name": "checkpoint-smoke-agentruntime-mltk-svc",
+      "uid": "e5666451-0626-4099-abc2-c573171f5020"
+    },
+    "schemaJob": {
+      "appliedHash": "9c440658b321f59a",
+      "complete": true,
+      "name": "checkpoint-smoke-agentruntime-mltk-schema-9c440658b321f59a",
+      "uid": "fd954d12-99a5-4944-9206-9cdd6c1d4ce0"
+    },
+    "sqlMarkerPresent": true
+  },
+  "cleanupPassed": true,
+  "cluster": "agentruntime-dev",
+  "controllerSHA256": "f28d6440a8d20f8d369b79e8916f27c43b57cd43c84d4a499ca011873a94540a",
+  "fixtureDatabase": "checkpoints",
+  "originalCRDAndWebhookConfigurationRestored": true,
+  "profile": "cpuOnly",
+  "replacementPassed": true,
+  "restorationChecks": {
+    "fixtureResourcesAbsent": true,
+    "installerScratchRemoved": true,
+    "originalAPIAndAdmissionShapeVerified": true,
+    "originalIngressRulesPreserved": true,
+    "temporaryAccessRuleRemoved": true
+  },
+  "sourceCommit": "c7d300ccc4830d662d6b5ca49dadee87356a52ab",
+  "temporaryCRDFieldCount": 3,
+  "testScope": "Operator-only production reconciliation and Pod replacement with a synthetic PostgreSQL marker",
+  "verifiedImageDigests": {
+    "provider": "sha256:d73301133cf67ce561bd04b52a5f7947134cad955c18bba1ab2ea0537c0319f5",
+    "runtime": "sha256:ddedf855e6751625d1eae206793fe3cd14d72c6934609fe2c0641c9a8eae5219",
+    "schema": "sha256:5877fcbdea301b945af0be55eeb33bcb30c93b0e3b1906a58be779680650d987"
+  }
+}

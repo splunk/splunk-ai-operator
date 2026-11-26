@@ -39,6 +39,11 @@ func (c *staleSchemaJobClient) Get(ctx context.Context, key client.ObjectKey, ob
 
 func schemaTestReconciler(t *testing.T) (*AgentRuntimeReconciler, *aiv1.AIService, *batchv1.Job) {
 	t.Helper()
+	return schemaTestReconcilerWithPlatform(t, nil)
+}
+
+func schemaTestReconcilerWithPlatform(t *testing.T, platform *aiv1.AIPlatform) (*AgentRuntimeReconciler, *aiv1.AIService, *batchv1.Job) {
+	t.Helper()
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_BASE", "docker.io/splunk/agent-runtime:test")
 	t.Setenv("RELATED_IMAGE_AGENT_RUNTIME_PROVIDER_MLTK", "docker.io/splunk/agent-runtime-provider-mltk:test")
 	t.Setenv("RELATED_AGENT_RUNTIME_MODULE_PROVIDER_MLTK", "agentcore_operations.loader:MLTKAgentLoader")
@@ -54,14 +59,20 @@ func schemaTestReconciler(t *testing.T) (*AgentRuntimeReconciler, *aiv1.AIServic
 		ObjectMeta: metav1.ObjectMeta{Name: "checkpoint", Namespace: "default", ResourceVersion: "1"},
 		Type:       corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			"DATABASE_URL": []byte("postgresql://user:secret@db/checkpoint?sslmode=disable"),
+			"DATABASE_URL": []byte("postgresql://user:checkpoint-password-canary@db/checkpoint?sslmode=disable"),
 			"PG_HOST":      []byte("db"), "PG_PORT": []byte("5432"), "PG_USER": []byte("user"),
-			"PG_PASSWORD": []byte("secret"), "PG_DBNAME": []byte("checkpoint"),
+			"PG_PASSWORD": []byte("checkpoint-password-canary"), "PG_DBNAME": []byte("checkpoint"),
 		},
+	}
+	objects := []client.Object{ai, secret}
+	if platform != nil {
+		ai.Spec.AIPlatformUrl = ""
+		ai.Spec.AIPlatformRef = corev1.ObjectReference{Name: platform.Name, Namespace: platform.Namespace}
+		objects = append(objects, platform)
 	}
 	// Match the API server's separate spec and status writes; otherwise a fake
 	// status update could also persist an unsubmitted retry or input change.
-	client := fake.NewClientBuilder().WithScheme(buildAgentRuntimeTestScheme(t)).WithStatusSubresource(&aiv1.AIService{}).WithObjects(ai, secret).Build()
+	client := fake.NewClientBuilder().WithScheme(buildAgentRuntimeTestScheme(t)).WithStatusSubresource(&aiv1.AIService{}).WithObjects(objects...).Build()
 	r := &AgentRuntimeReconciler{Client: client, Scheme: buildAgentRuntimeTestScheme(t), Recorder: record.NewFakeRecorder(10)}
 	require.Error(t, r.Reconcile(context.Background(), ai))
 	job := &batchv1.Job{}
