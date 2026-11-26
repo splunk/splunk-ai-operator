@@ -28,6 +28,7 @@ import (
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	common "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	"github.com/splunk/splunk-ai-operator/pkg/splunkutils"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -604,6 +605,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
+				SecurityContext:    podsecurity.RuntimeDefaultSeccomp(),
 				ServiceAccountName: ai.Spec.ServiceAccountName,
 				Containers:         containers,
 				Volumes:            volumes,

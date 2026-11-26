@@ -29,6 +29,7 @@ import (
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	common "github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	"github.com/splunk/splunk-ai-operator/pkg/splunkutils"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -665,7 +666,8 @@ func (r *SaiaReconciler) reconcilePostInstallHook(
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					SecurityContext: podsecurity.RuntimeDefaultSeccomp(),
+					RestartPolicy:   corev1.RestartPolicyNever,
 					// Wait for Weaviate to accept connections before running
 					// the schema setup container. This eliminates the
 					// error-pod churn that occurred when the Job was created
@@ -1172,6 +1174,7 @@ func (r *SaiaReconciler) reconcileSAIADeployment(
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
+				SecurityContext:    podsecurity.RuntimeDefaultSeccomp(),
 				ServiceAccountName: ai.Spec.ServiceAccountName,
 				Containers: []corev1.Container{{
 					Name:            ai.Name,
@@ -1296,6 +1299,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Deployment(
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
+				SecurityContext:    podsecurity.RuntimeDefaultSeccomp(),
 				ServiceAccountName: ai.Spec.ServiceAccountName,
 				Containers: []corev1.Container{{
 					Name:            "saia-v2-api",
@@ -1435,6 +1439,7 @@ func (r *SaiaReconciler) reconcileSAIAv2Worker(
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
+				SecurityContext:    podsecurity.RuntimeDefaultSeccomp(),
 				ServiceAccountName: ai.Spec.ServiceAccountName,
 				Containers: []corev1.Container{{
 					Name:            "saia-v2-worker",
@@ -1694,6 +1699,7 @@ func (r *SaiaReconciler) reconcileNginxDeployment(
 				Annotations: annotations,
 			},
 			Spec: corev1.PodSpec{
+				SecurityContext: podsecurity.RuntimeDefaultSeccomp(),
 				Containers: []corev1.Container{{
 					Name:            "nginx",
 					Image:           nginxImage,

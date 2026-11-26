@@ -1388,6 +1388,66 @@ assert_eq "Standalone mounts the JWT signing Secret" "1" \
 assert_eq "readiness requires the per-installation certFile" "1" \
   "$(extract_function _internal_splunk_runtime_matches_desired | grep -c 'SPLUNK_JWT_SIGNING_MOUNT}/signer.pem' || true)"
 
+# PSB SEC-RUN-ASLR: AI workload pods set seccompProfile RuntimeDefault, so the AI
+# namespace needs an anyuid copy that allows runtime/default.
+eval "$(grep '^readonly AI_SECCOMP_SCC=' "${SCRIPT}")"
+eval "$(extract_function ai_seccomp_scc_manifest)"
+eval "$(extract_function ensure_ai_seccomp_scc)"
+if command -v jq >/dev/null 2>&1; then
+  ANYUID_FIXTURE='{"apiVersion":"security.openshift.io/v1","kind":"SecurityContextConstraints","metadata":{"name":"anyuid","uid":"x","resourceVersion":"1","annotations":{"release.openshift.io/create-only":"true"}},"priority":10,"runAsUser":{"type":"RunAsAny"},"allowPrivilegedContainer":false,"requiredDropCapabilities":["MKNOD"],"groups":["system:cluster-admins"],"users":["someone"]}'
+  scc_manifest=$(
+    oc() { [[ "$*" == "get scc anyuid -o json" ]] && printf '%s\n' "${ANYUID_FIXTURE}"; }
+    ai_seccomp_scc_manifest "system:serviceaccounts:ai-platform"
+  )
+  assert_eq "AI seccomp SCC is named for the installer" "${AI_SECCOMP_SCC}" \
+    "$(jq -r '.metadata.name' <<<"${scc_manifest}")"
+  assert_eq "AI seccomp SCC allows only runtime/default" '["runtime/default"]' \
+    "$(jq -c '.seccompProfiles' <<<"${scc_manifest}")"
+  assert_eq "AI seccomp SCC keeps the anyuid priority" "10" \
+    "$(jq -r '.priority' <<<"${scc_manifest}")"
+  assert_eq "AI seccomp SCC keeps the anyuid UID strategy" "RunAsAny" \
+    "$(jq -r '.runAsUser.type' <<<"${scc_manifest}")"
+  assert_eq "AI seccomp SCC keeps the anyuid privilege settings" "false" \
+    "$(jq -r '.allowPrivilegedContainer' <<<"${scc_manifest}")"
+  assert_eq "AI seccomp SCC is granted only to the AI namespace" '["system:serviceaccounts:ai-platform"]|[]' \
+    "$(jq -c '.groups' <<<"${scc_manifest}")|$(jq -c '.users' <<<"${scc_manifest}")"
+  assert_eq "AI seccomp SCC drops anyuid server metadata" '["annotations","name"]' \
+    "$(jq -c '.metadata | keys' <<<"${scc_manifest}")"
+else
+  echo "  SKIP: jq not installed; AI seccomp SCC manifest checks skipped"
+fi
+assert_eq "AI seccomp SCC sorts after anyuid at the same priority" "true" \
+  "$([[ "anyuid" < "${AI_SECCOMP_SCC}" ]] && echo true || echo false)"
+
+_run_ensure_ai_seccomp_scc() (
+  local scc_exists="$1"
+  AI_NS="ai-platform"
+  oc() {
+    printf 'oc %s\n' "$*" >> "${ai_scc_log}"
+    case "$*" in
+      "get scc ${AI_SECCOMP_SCC}") [[ "${scc_exists}" == "true" ]] ;;
+      "create -f -") cat >/dev/null ;;
+    esac
+  }
+  ai_seccomp_scc_manifest() { echo '{}'; }
+  record_owned_component() { printf 'owned %s\n' "$1" >> "${ai_scc_log}"; }
+  ensure_owned_scc_group() { printf 'group %s %s %s\n' "$@" >> "${ai_scc_log}"; }
+  ensure_ai_seccomp_scc
+)
+ai_scc_log=$(mktemp)
+_run_ensure_ai_seccomp_scc false
+assert_eq "a new AI seccomp SCC is created and recorded as owned" "1|1|0" \
+  "$(grep -c '^oc create -f -$' "${ai_scc_log}")|$(grep -c '^owned scc_ai_seccomp_created$' "${ai_scc_log}")|$(grep -c '^group ' "${ai_scc_log}" || true)"
+: > "${ai_scc_log}"
+_run_ensure_ai_seccomp_scc true
+assert_eq "an existing AI seccomp SCC is only granted to the AI namespace" "0|1" \
+  "$(grep -c '^oc create' "${ai_scc_log}" || true)|$(grep -c "^group ${AI_SECCOMP_SCC} system:serviceaccounts:ai-platform scc_ai_seccomp_ai_namespace$" "${ai_scc_log}")"
+rm -f "${ai_scc_log}"
+assert_eq "install grants the AI seccomp SCC with the namespace SCCs" "1" \
+  "$(extract_function grant_privileged_scc | grep -c '^  ensure_ai_seccomp_scc$' || true)"
+assert_eq "delete removes the AI seccomp SCC only when the installer created it" "1" \
+  "$(grep -c 'component_is_owned scc_ai_seccomp_created && oc delete scc "${AI_SECCOMP_SCC}"' "${SCRIPT}" || true)"
+
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
 ((FAIL == 0))

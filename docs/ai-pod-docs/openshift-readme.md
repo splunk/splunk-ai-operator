@@ -1047,9 +1047,23 @@ When `openshift.grantPrivilegedSCC` is `"true"`, the installer grants
 namespace-wide `anyuid` and `privileged` access to the AI workload namespace
 and `privileged` access to the Splunk AI Operator namespace.
 
+The Splunk AI Operator sets `seccompProfile: RuntimeDefault` on every workload
+pod that it creates: the Ray head and workers, SAIA (v1, v2, v2 worker, NGINX
+and the vector DB setup job), SLIM and Weaviate. This seccomp profile prevents a
+process from turning off address space layout randomization (PSB SEC-RUN-ASLR). The built-in `anyuid`
+SCC does not allow a seccomp profile. Thus the installer also creates the
+`splunk-ai-anyuid-seccomp` SCC and grants it to the AI workload namespace. This
+SCC is a copy of `anyuid` that also allows `runtime/default`. It has the same
+priority as `anyuid`, so pods without a seccomp profile continue to use
+`anyuid`.
+
 Set `openshift.grantPrivilegedSCC: false` only when a cluster administrator has
 already granted the required SCC access. This setting disables the installer's
 namespace-wide SCC grants; it does not remove the workloads' SCC requirements.
+In this case, the service accounts in the AI workload namespace must have an
+SCC that allows `runAsUser: RunAsAny` and the `runtime/default` seccomp
+profile. If they do not, OpenShift admits the AI workload pods with
+`restricted-v2` and a random UID, which the workload images do not support.
 
 This setting is not a global SCC switch. The installer always applies the
 following component-specific grants required by its current manifests:

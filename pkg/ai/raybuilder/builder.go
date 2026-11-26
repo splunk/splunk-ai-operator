@@ -16,6 +16,7 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	enterpriseApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/internal/telemetry"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder/raystatus"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
@@ -1011,6 +1012,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 		}},
 	}
 
+	spec.SecurityContext = podsecurity.RuntimeDefaultSeccomp()
 	spec.NodeSelector = b.ai.Spec.CPUSchedulingSpec.NodeSelector
 	spec.Tolerations = b.ai.Spec.CPUSchedulingSpec.Tolerations
 	spec.Affinity = b.ai.Spec.CPUSchedulingSpec.Affinity
@@ -1104,6 +1106,8 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 		},
 		},
 	}
+
+	spec.SecurityContext = podsecurity.RuntimeDefaultSeccomp()
 
 	// apply scheduling
 	spec.NodeSelector = b.ai.Spec.GPUSchedulingSpec.NodeSelector
