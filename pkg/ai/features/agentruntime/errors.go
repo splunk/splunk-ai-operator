@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -23,6 +24,11 @@ func safeRuntimeError(err error, message string) error {
 	var state *schemaStageError
 	if errors.As(err, &state) {
 		return state
+	}
+	// An ownership conflict carries only an object's kind, namespace and name.
+	var conflict *common.OwnershipConflictError
+	if errors.As(err, &conflict) {
+		return conflict
 	}
 	var status apierrors.APIStatus
 	if errors.As(err, &status) {

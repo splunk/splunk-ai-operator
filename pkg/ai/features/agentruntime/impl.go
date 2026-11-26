@@ -158,8 +158,13 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 		if err != nil {
 			reason, message := "ReconcileFailed", stage.name+" reconciliation failed; check configuration, operator permissions and events"
 			var schemaErr *schemaStageError
+			var conflict *common.OwnershipConflictError
 			if errors.As(err, &schemaErr) {
 				reason, message = schemaErr.reason, schemaErr.message
+			} else if errors.As(err, &conflict) {
+				// Names only (kind, namespace, name): never object content.
+				reason, message = "OwnershipConflict", conflict.Error()
+				r.Recorder.Event(aiservice, corev1.EventTypeWarning, "OwnershipConflict", message)
 			}
 			if stage.name == "PostgresSchemaSetup" && reason == "Pending" {
 				// Keep the last terminal outcome useful during a retry without
@@ -368,14 +373,22 @@ func completeResourceBudgets(r *corev1.ResourceRequirements) {
 	}
 }
 
+// reconcileServiceAccount creates the runtime's ServiceAccount. The default name,
+// <AIService>-sa, is the operator's (the AIPlatform also fills it in): a same-named
+// object it does not own is an ownership conflict. Any other name is one the user
+// chose, so the ServiceAccount is the customer's and is never owned: it is used if
+// it exists, and created without an owner reference if not (MPR-202).
 func (r *AgentRuntimeReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.AIService) error {
+	defaultName := ai.Name + "-sa"
 	serviceAccountName := ai.Spec.ServiceAccountName
 	if serviceAccountName == "" {
-		serviceAccountName = ai.Name + "-sa"
+		serviceAccountName = defaultName
 	}
 
 	if _, err := common.ReconcileServiceAccount(ctx, r.Client, r.Scheme, ai, common.ServiceAccountOptions{
-		Name: serviceAccountName,
+		Name:            serviceAccountName,
+		RefuseUnowned:   true,
+		CustomerManaged: serviceAccountName != defaultName,
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update ServiceAccount failed")
 		return fmt.Errorf("create/update ServiceAccount: %w", err)
@@ -395,10 +408,10 @@ func (r *AgentRuntimeReconciler) reconcileConfigMap(ctx context.Context, ai *aiv
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, cm, r.Scheme); err != nil {
-		return fmt.Errorf("ownerref on ConfigMap: %w", err)
-	}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		if err := common.ClaimOrRefuse(ai, cm, r.Scheme); err != nil {
+			return err
+		}
 		cm.Data = map[string]string{
 			"provider":       ai.Spec.Feature.Provider,
 			"featureVersion": ai.Spec.Version,
@@ -421,9 +434,11 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 	}
 	workloadName := agentRuntimeWorkloadName(ai.Name)
 	serviceName := agentRuntimeServiceName(ai.Name)
+	certificateName := ai.Name + "-agentruntime-cert"
 
 	_, _, err := common.ReconcileCertificate(ctx, r.Client, r.Scheme, ai, common.CertificateOptions{
-		Name: ai.Name + "-agentruntime-cert",
+		Name:          certificateName,
+		RefuseUnowned: true,
 		Spec: certmanagerv1.CertificateSpec{
 			SecretName: secretName,
 			DNSNames: []string{
@@ -438,7 +453,82 @@ func (r *AgentRuntimeReconciler) reconcileCertificate(ctx context.Context, ai *a
 			},
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if ai.Spec.MTLS.SecretName != "" {
+		// A Secret the user named stays theirs: it is not removed with the AIService.
+		// If it is one the operator claimed under its generated name before the user
+		// named it, the claim is released.
+		return r.releaseNamedSecret(ctx, ai, secretName)
+	}
+	return r.ownIssuedSecret(ctx, ai, secretName, certificateName)
+}
+
+// releaseNamedSecret removes this AIService's owner reference (matched by UID) from a
+// Secret the user names in mtls.secretName, keeping any other owner reference, so the
+// Secret survives the AIService (MPR-202).
+func (r *AgentRuntimeReconciler) releaseNamedSecret(ctx context.Context, ai *aiv1.AIService, secretName string) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ai.Namespace, Name: secretName}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get named TLS Secret: %w", err)
+	}
+	refs := secret.GetOwnerReferences()
+	kept := refs[:0:0]
+	for _, ref := range refs {
+		if ref.UID != ai.UID {
+			kept = append(kept, ref)
+		}
+	}
+	if len(kept) == len(refs) {
+		return nil
+	}
+	patch := client.MergeFromWithOptions(secret.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	secret.SetOwnerReferences(kept)
+	if err := r.Patch(ctx, secret, patch); err != nil {
+		return fmt.Errorf("release named TLS Secret: %w", err)
+	}
+	return nil
+}
+
+// certManagerCertificateNameAnnotation is set by cert-manager on the Secret it issues
+// for a Certificate.
+const certManagerCertificateNameAnnotation = "cert-manager.io/certificate-name"
+
+// ownIssuedSecret makes the TLS Secret cert-manager issued for the runtime's
+// Certificate, under the operator-generated name, removable with the AIService
+// (MPR-202). cert-manager creates it without an owner by default, so it would
+// otherwise outlive the AIService. It is claimed only when cert-manager wrote it for
+// this Certificate, and with a non-controller reference: cert-manager may itself be
+// configured to make the Certificate its controller. The Secret appears only after
+// issuance, so a later pass claims it.
+func (r *AgentRuntimeReconciler) ownIssuedSecret(ctx context.Context, ai *aiv1.AIService, secretName, certificateName string) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ai.Namespace, Name: secretName}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // not issued yet
+		}
+		return fmt.Errorf("get issued TLS Secret: %w", err)
+	}
+	if secret.Annotations[certManagerCertificateNameAnnotation] != certificateName {
+		return nil // not written for this Certificate: not ours to remove
+	}
+	for _, ref := range secret.OwnerReferences {
+		if ref.UID == ai.UID {
+			return nil
+		}
+	}
+	patch := client.MergeFromWithOptions(secret.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	if err := controllerutil.SetOwnerReference(ai, secret, r.Scheme); err != nil {
+		return fmt.Errorf("owner reference on issued TLS Secret: %w", err)
+	}
+	if err := r.Patch(ctx, secret, patch); err != nil {
+		return fmt.Errorf("claim issued TLS Secret: %w", err)
+	}
+	return nil
 }
 
 func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Context, ai *aiv1.AIService) error {
@@ -488,7 +578,8 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 	err = r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ai.Namespace}, job)
 	if err == nil {
 		if !metav1.IsControlledBy(job, ai) || job.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
-			return schemaState("Failed", "schema Job name is occupied by an unmanaged resource")
+			// Another object holds the name: never adopted, rewritten or deleted (MPR-202).
+			return &common.OwnershipConflictError{Kind: "Job", Namespace: ai.Namespace, Name: jobName}
 		}
 		if schemaJobSucceeded(job) {
 			// A previously successful input can become desired again after a
@@ -727,12 +818,10 @@ func (r *AgentRuntimeReconciler) reconcileDeployment(ctx context.Context, ai *ai
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
-		return fmt.Errorf("ownerref on Deployment: %w", err)
-	}
-
 	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, deployment, func() error {
+		if err := common.ClaimOrRefuse(ai, deployment, r.Scheme); err != nil {
+			return err
+		}
 		deployment.ObjectMeta.Labels = labels
 		deployment.ObjectMeta.Annotations = common.PreserveDeploymentRevision(deployment, annotations)
 		if deployment.ResourceVersion == "" {
@@ -828,11 +917,10 @@ func (r *AgentRuntimeReconciler) reconcileService(ctx context.Context, ai *aiv1.
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, svc, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Service failed")
-		return fmt.Errorf("ownerref on Service: %w", err)
-	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		if err := common.ClaimOrRefuse(ai, svc, r.Scheme); err != nil {
+			return err
+		}
 		svc.ObjectMeta.Labels = labels
 		svc.ObjectMeta.Annotations = annotations
 		svc.Spec.Selector = selectorLabels
@@ -853,13 +941,11 @@ func (r *AgentRuntimeReconciler) reconcileHPA(ctx context.Context, ai *aiv1.AISe
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, hpa, r.Scheme); err != nil {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on HPA failed")
-		return fmt.Errorf("ownerref on HPA: %w", err)
-	}
-
 	policy := aiv1.ResolveAgentRuntimeAutoscaling(ai.Spec.MinReplicas, ai.Spec.MaxReplicas, ai.Spec.TargetCPUUtilization)
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
+		if err := common.ClaimOrRefuse(ai, hpa, r.Scheme); err != nil {
+			return err
+		}
 		hpa.Spec = autoscalingv2.HorizontalPodAutoscalerSpec{
 			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
 				APIVersion: "apps/v1",
@@ -898,10 +984,10 @@ func (r *AgentRuntimeReconciler) reconcileServiceMonitor(ctx context.Context, ai
 			Namespace: ai.Namespace,
 		},
 	}
-	if err := controllerutil.SetControllerReference(ai, sm, r.Scheme); err != nil {
-		return fmt.Errorf("ownerref on ServiceMonitor: %w", err)
-	}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sm, func() error {
+		if err := common.ClaimOrRefuse(ai, sm, r.Scheme); err != nil {
+			return err
+		}
 		sm.Spec = monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{
 				MatchLabels: agentRuntimeSelectorLabels(ai),

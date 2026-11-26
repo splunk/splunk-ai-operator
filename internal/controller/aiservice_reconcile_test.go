@@ -24,6 +24,7 @@ import (
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/config"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -301,6 +302,32 @@ var _ = Describe("AIService Reconcile Edge Cases", func() {
 			// Should requeue after delay
 			Expect(err).To(BeNil())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		})
+	})
+
+	Context("When service still carries the finalizer an early build added (MPR-202)", func() {
+		It("releases it at once and deletes nothing itself", func() {
+			service := &aiv1.AIService{
+				ObjectMeta: metav1.ObjectMeta{Name: "legacy-finalizer-service", Namespace: namespace,
+					Finalizers: []string{aiServiceFinalizer}},
+				Spec: aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+					TaskVolume: aiv1.ObjectStorageSpec{Path: "s3://test-bucket/tasks", Region: "us-west-2"}},
+			}
+			Expect(fakeClient.Create(ctx, service)).To(Succeed())
+			// A customer-managed Secret the runtime references stays, whatever happens.
+			checkpoint := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "legacy-checkpoint", Namespace: namespace}}
+			Expect(fakeClient.Create(ctx, checkpoint)).To(Succeed())
+			Expect(fakeClient.Delete(ctx, service)).To(Succeed())
+
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: service.Name, Namespace: namespace}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+			Expect(apierrors.IsNotFound(fakeClient.Get(ctx, client.ObjectKeyFromObject(service), &aiv1.AIService{}))).To(BeTrue())
+			Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(checkpoint), &corev1.Secret{})).To(Succeed())
+
+			// Repeated: the AIService is already gone, which is not an error.
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: service.Name, Namespace: namespace}})
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 

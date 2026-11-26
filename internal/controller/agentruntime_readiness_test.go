@@ -109,4 +109,14 @@ func TestRuntimeReadinessRBACMatchesHelm(t *testing.T) {
 		}
 		assert.True(t, found, "missing read-only access for %s/%s", resource.group, resource.name)
 	}
+	// The event recorders write Events on AIServices and AIPlatforms in any namespace;
+	// without this every event outside the operator's own namespace is rejected.
+	events := false
+	for _, rule := range source.Rules {
+		if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "" && len(rule.Resources) == 1 && rule.Resources[0] == "events" {
+			assert.ElementsMatch(t, []string{"create", "patch"}, rule.Verbs)
+			events = true
+		}
+	}
+	assert.True(t, events, "missing create/patch on core events")
 }

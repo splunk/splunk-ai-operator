@@ -52,6 +52,8 @@ import (
 	"github.com/splunk/splunk-ai-operator/pkg/config"
 )
 
+// aiServiceFinalizer was added by early builds (2025-08) and is no longer added;
+// the operator only removes it, so such AIServices can still be deleted.
 const aiServiceFinalizer = "ai.splunk.com/aiservice-protect"
 
 // AIServiceReconciler reconciles a AIService object
@@ -82,6 +84,8 @@ type AIServiceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// The event recorders write Events on AIServices and AIPlatforms in their own namespaces.
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="core",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="monitoring",resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;get;list;watch;update;patch;delete
@@ -140,27 +144,16 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		Feature:   featureName,
 	})
 
-	// deletion handling with finalizer
+	// Deletion (MPR-202): the operator adds no finalizer and runs no cleanup. Every
+	// object a feature creates is owned through a controller reference, so garbage
+	// collection removes it, and customer-managed data (the PostgreSQL database and its
+	// checkpoints, referenced Secrets, PVCs, model artifacts) is never touched. An
+	// AIService still carrying the finalizer an early build added is released at once.
 	if ai.DeletionTimestamp != nil {
-		// run feature specific finalization if needed
 		if containsString(ai.Finalizers, aiServiceFinalizer) {
-			if factory, ok := features.FeatureFactories[featureName]; ok {
-				if handler, err := factory.New(ctx, r.Client, r.Scheme, ai, r.Recorder); err == nil {
-					// TODO - define Finalize handlers
-					if f, ok := handler.(interface {
-						Finalize(context.Context, *aiv1.AIService) error
-					}); ok {
-						if err := f.Finalize(ctx, ai); err != nil {
-							telemetry.ObserveReconcileError(ctx, "finalize")
-							return ctrl.Result{}, err
-						}
-					}
-				}
-			}
-			// remove finalizer
 			ai.Finalizers = removeString(ai.Finalizers, aiServiceFinalizer)
 			if err := r.Update(ctx, ai); err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, client.IgnoreNotFound(err)
 			}
 		}
 		telemetry.ObserveReconcileResult(ctx, "success")
