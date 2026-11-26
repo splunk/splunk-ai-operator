@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"os"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -29,6 +28,7 @@ import (
 	"github.com/splunk/splunk-ai-operator/pkg/config"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -118,7 +118,7 @@ var _ = Describe("AIPlatform Reconcile Error Handling", func() {
 	})
 
 	Context("When reconciling with finalizer during deletion", func() {
-		It("should wait for children to be deleted", func() {
+		It("releases the legacy finalizer without waiting for children", func() {
 			platform := &aiv1.AIPlatform{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       platformKey.Name,
@@ -187,16 +187,14 @@ var _ = Describe("AIPlatform Reconcile Error Handling", func() {
 			// Mark platform for deletion
 			Expect(fakeClient.Delete(ctx, platform)).To(Succeed())
 
-			// First reconcile - should try to delete children
+			// MPR-202: the legacy finalizer is released at once; children go by
+			// garbage collection, so there is nothing to wait for.
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: platformKey,
 			})
-
-			// Should requeue waiting for children to be deleted
 			Expect(err).To(BeNil())
-			if result.RequeueAfter > 0 {
-				Expect(result.RequeueAfter).To(Equal(5 * time.Second))
-			}
+			Expect(result.RequeueAfter).To(BeZero())
+			Expect(errors.IsNotFound(fakeClient.Get(ctx, platformKey, &aiv1.AIPlatform{}))).To(BeTrue())
 		})
 	})
 

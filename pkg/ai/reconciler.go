@@ -237,6 +237,12 @@ func (r *AIPlatformReconciler) ReconcileFeatures(ctx context.Context, platform *
 
 	for i := range children.Items {
 		child := &children.Items[i]
+		// The index matches the controller's name only. An AIService left by an
+		// earlier platform of the same name is garbage collection's to remove, not
+		// this platform's (MPR-202: ownership is matched by UID).
+		if !metav1.IsControlledBy(child, platform) {
+			continue
+		}
 		if _, keep := desired[child.Name]; !keep {
 			if err := r.Delete(ctx, child); client.IgnoreNotFound(err) != nil {
 				return err

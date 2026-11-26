@@ -12,6 +12,7 @@ import (
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -286,7 +287,9 @@ func TestAgentRuntimeReconciler_ReconcilesOnlyOwnedService(t *testing.T) {
 			err := r.reconcileService(ctx, ai)
 			require.NoError(t, c.Get(ctx, key, svc))
 			if tc.ownerUID != ai.UID {
-				require.ErrorContains(t, err, "is not controlled by")
+				var conflict *common.OwnershipConflictError
+				require.ErrorAs(t, err, &conflict)
+				assert.Equal(t, &common.OwnershipConflictError{Kind: "Service", Namespace: key.Namespace, Name: key.Name}, conflict)
 				assert.Equal(t, before, svc)
 				return
 			}
