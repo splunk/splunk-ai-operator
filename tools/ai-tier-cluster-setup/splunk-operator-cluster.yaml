@@ -55421,7 +55421,7 @@ spec:
       - args:
         - --leader-elect
         - --health-probe-bind-address=:8081
-        - --pprof
+        - --pprof=false
         command:
         - /manager
         env:
