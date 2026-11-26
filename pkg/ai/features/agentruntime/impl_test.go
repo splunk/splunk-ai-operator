@@ -12,6 +12,7 @@ import (
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const testSchemaImage = "docker.io/splunk/agent-runtime-schema-setup@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -230,6 +232,7 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 		types.NamespacedName{Name: "stack-agentruntime-mltk-svc", Namespace: "default"}, svc))
 	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
 	assert.Equal(t, map[string]string{"app": ai.Name, "component": ai.Name}, svc.Spec.Selector)
+	assert.True(t, metav1.IsControlledBy(svc, ai))
 
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
 	require.NoError(t, fakeClient.Get(context.Background(),
@@ -242,6 +245,63 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource)
 	require.NotNil(t, hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
 	assert.Equal(t, int32(60), *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization)
+}
+
+func TestAgentRuntimeReconciler_ReconcilesOnlyOwnedService(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "default", UID: "current-uid"}}
+
+	for _, tc := range []struct {
+		name      string
+		ownerName string
+		ownerUID  types.UID
+	}{
+		{name: "unowned"},
+		{name: "other controller", ownerName: "other-runtime", ownerUID: "other-uid"},
+		{name: "previous controller UID", ownerName: ai.Name, ownerUID: "previous-uid"},
+		{name: "current controller", ownerName: ai.Name, ownerUID: ai.UID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: agentRuntimeServiceName(ai.Name), Namespace: ai.Namespace},
+				Spec: corev1.ServiceSpec{
+					Type:                     corev1.ServiceTypeNodePort,
+					Selector:                 map[string]string{"app": "old-workload"},
+					Ports:                    []corev1.ServicePort{{Name: "old-port", Port: 81, NodePort: 30081}},
+					ExternalIPs:              []string{"192.0.2.1"},
+					PublishNotReadyAddresses: true,
+				},
+			}
+			if tc.ownerUID != "" {
+				owner := ai.DeepCopy()
+				owner.Name, owner.UID = tc.ownerName, tc.ownerUID
+				require.NoError(t, controllerutil.SetControllerReference(owner, svc, scheme))
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc).Build()
+			r := &AgentRuntimeReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+			key := ctrlclient.ObjectKeyFromObject(svc)
+			require.NoError(t, c.Get(ctx, key, svc))
+			before := svc.DeepCopy()
+
+			err := r.reconcileService(ctx, ai)
+			require.NoError(t, c.Get(ctx, key, svc))
+			if tc.ownerUID != ai.UID {
+				var conflict *common.OwnershipConflictError
+				require.ErrorAs(t, err, &conflict)
+				assert.Equal(t, &common.OwnershipConflictError{Kind: "Service", Namespace: key.Namespace, Name: key.Name}, conflict)
+				assert.Equal(t, before, svc)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, metav1.IsControlledBy(svc, ai))
+			assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+			assert.Equal(t, agentRuntimeSelectorLabels(ai), svc.Spec.Selector)
+			assert.Equal(t, runtimeServicePorts(), svc.Spec.Ports)
+			assert.Empty(t, svc.Spec.ExternalIPs)
+			assert.False(t, svc.Spec.PublishNotReadyAddresses)
+		})
+	}
 }
 
 func TestAgentRuntimeReconciler_ReconcilesServiceMonitorLikeSAIA(t *testing.T) {

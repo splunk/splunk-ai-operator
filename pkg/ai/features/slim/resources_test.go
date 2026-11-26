@@ -116,6 +116,7 @@ func TestSlimDeploymentCarriesPlacementAndNoGPU(t *testing.T) {
 }
 
 func TestSlimDeployment_SecondReconcileWritesNothing(t *testing.T) {
+	const deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
 	r, _ := slimReconciler(t, slimPlatform(aiv1.AIPlatformProfileCPUOnly, false))
 	ai := slimService(testAgentRuntimeURL)
 	ai.Spec.NodeSelector = map[string]string{"splunk.ai/workload-type": "cpu"}
@@ -125,9 +126,14 @@ func TestSlimDeployment_SecondReconcileWritesNothing(t *testing.T) {
 	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
 	var first appsv1.Deployment
 	require.NoError(t, r.Client.Get(context.Background(), key, &first))
+	first.Annotations[deploymentRevisionAnnotation] = "3"
+	require.NoError(t, r.Client.Update(context.Background(), &first))
+	ai.Annotations = map[string]string{deploymentRevisionAnnotation: "999"}
 
 	require.NoError(t, r.reconcileSlimDeployment(context.Background(), ai))
 	var second appsv1.Deployment
 	require.NoError(t, r.Client.Get(context.Background(), key, &second))
+	assert.Equal(t, "3", second.Annotations[deploymentRevisionAnnotation])
+	assert.NotContains(t, second.Spec.Template.Annotations, deploymentRevisionAnnotation)
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion, "the second reconcile rewrote the Deployment")
 }

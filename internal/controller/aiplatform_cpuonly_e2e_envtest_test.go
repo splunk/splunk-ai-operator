@@ -2,7 +2,14 @@ package controller
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +26,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -48,6 +56,26 @@ func serviceMonitorStandIn() *apiextensionsv1.CustomResourceDefinition {
 			}},
 		},
 	}
+}
+
+// The test API server stores the trust inputs, while reconciliation validates
+// the CA without making a request to Splunk.
+func slimIssuerCA() []byte {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	Expect(err).NotTo(HaveOccurred())
+	now := time.Now()
+	certificate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Synthetic Splunk issuer CA"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, &key.PublicKey, key)
+	Expect(err).NotTo(HaveOccurred())
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 // End to end, with the two real controllers and the real handlers on a real
@@ -118,11 +146,22 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, secret) })
 
 		name := fmt.Sprintf("e2e-%d", time.Now().UnixNano()%1000000)
+		ca := slimIssuerCA()
+		caSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-splunk-ca", Namespace: ns},
+			Data:       map[string][]byte{"ca.crt": ca},
+		}
+		Expect(k8sClient.Create(ctx, caSecret)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, caSecret) })
 		p := &aiv1.AIPlatform{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: aiv1.AIPlatformSpec{
 				Profile:       aiv1.AIPlatformProfileCPUOnly,
 				ObjectStorage: aiv1.ObjectStorageSpec{Path: "s3://bucket", Region: "us-west-2"},
+				SplunkConfiguration: aiv1.SplunkConfigurationSpec{
+					TrustedIssuers: []string{"https://splunk.example.invalid:8089"},
+					CACertRef:      &corev1.LocalObjectReference{Name: caSecret.Name},
+				},
 				Features: []aiv1.FeatureSpec{
 					{Name: "slim", Version: "1.0.0"},
 					{Name: "agentruntime", Provider: "mltk", CheckpointDbSecretRef: "e2e-pg"},
@@ -133,6 +172,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, p) })
 
 		// SLIM reaches its Deployment with no Ray in the picture.
+		slimKey := client.ObjectKey{Namespace: ns, Name: name + "-slim"}
 		var slimDep appsv1.Deployment
 		Eventually(func() error {
 			select {
@@ -140,7 +180,15 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 				return fmt.Errorf("manager stopped: %v", err)
 			default:
 			}
-			return k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-slim-slim-deployment"}, &slimDep)
+			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-slim-slim-deployment"}, &slimDep); err != nil {
+				var currentPlatform aiv1.AIPlatform
+				var currentSLIM aiv1.AIService
+				platformErr := k8sClient.Get(ctx, client.ObjectKeyFromObject(p), &currentPlatform)
+				slimErr := k8sClient.Get(ctx, slimKey, &currentSLIM)
+				return fmt.Errorf("waiting for SLIM Deployment: %w. Platform conditions %v (read error: %v). SLIM conditions %v (read error: %v)",
+					err, currentPlatform.Status.Conditions, platformErr, currentSLIM.Status.Conditions, slimErr)
+			}
+			return nil
 		}, 60*time.Second, time.Second).Should(Succeed())
 
 		envOf := func(d *appsv1.Deployment) map[string]string {
@@ -151,12 +199,49 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 			return m
 		}
 		slimEnv := envOf(&slimDep)
-		// MPR-188: SLIM always receives both variables. With no Ray platform behind a
-		// cpuOnly platform PLATFORM_URL carries the (empty) resolved input, which is an
-		// observation of this fixture, not a constraint: a supplied value is kept.
+		// Both variables are present even though there is no Ray model service.
+		// The Runtime origin can be rendered before the caller route is available.
 		Expect(slimEnv).To(HaveKeyWithValue("PLATFORM_URL", ""), "cpuOnly SLIM has no Ray platform URL to derive")
 		Expect(slimEnv).To(HaveKey("AI_TIER_AGENT_RUNTIME_URL"))
-		Expect(slimEnv["AI_TIER_AGENT_RUNTIME_URL"]).To(MatchRegexp(`^http://%s-agentruntime-mltk-svc\.default\.svc\.cluster\.local:8080$`, name))
+		Expect(slimEnv["AI_TIER_AGENT_RUNTIME_URL"]).To(Equal(fmt.Sprintf("http://%s-agentruntime-mltk-svc.%s.svc.cluster.local:8080", name, ns)))
+
+		expectSlimRoute := func(want metav1.ConditionStatus, published, reason string) {
+			Eventually(func(g Gomega) {
+				var slimAI aiv1.AIService
+				g.Expect(k8sClient.Get(ctx, slimKey, &slimAI)).To(Succeed())
+				condition := meta.FindStatusCondition(slimAI.Status.Conditions, "AgentRouteAvailable")
+				g.Expect(condition).NotTo(BeNil())
+				g.Expect(condition.Status).To(Equal(want))
+				g.Expect(condition.ObservedGeneration).To(Equal(slimAI.Generation))
+				if reason != "" {
+					g.Expect(condition.Reason).To(Equal(reason))
+				}
+				var endpoint string
+				if feature := slimAI.Status.FeatureStatus; feature != nil {
+					g.Expect(feature.AgentRuntime).To(BeNil(), "SLIM must not acquire Runtime status")
+					if feature.Slim != nil {
+						endpoint = feature.Slim.AITKEndpoint
+					}
+				}
+				g.Expect(endpoint).To(Equal(published))
+			}, 3*time.Second, 50*time.Millisecond).Should(Succeed())
+		}
+		// A local API server runs the real watches but has no workload controller.
+		// Record simulated Deployment status for the applied replica count.
+		setSlimDeploymentStatus := func(generationOffset int64) {
+			Eventually(func() error {
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(&slimDep), &slimDep); err != nil {
+					return err
+				}
+				replicas := *slimDep.Spec.Replicas
+				slimDep.Status = appsv1.DeploymentStatus{
+					ObservedGeneration: slimDep.Generation + generationOffset,
+					Replicas:           replicas, UpdatedReplicas: replicas, AvailableReplicas: replicas, ReadyReplicas: replicas,
+				}
+				return k8sClient.Status().Update(ctx, &slimDep)
+			}, 3*time.Second, 50*time.Millisecond).Should(Succeed())
+		}
+		expectSlimRoute(metav1.ConditionFalse, "", "RuntimeUnavailable")
 
 		// AgentRuntime passes validation (no Ray wait, no platform URL) and reaches the
 		// schema Job, the first stage after validation, rather than failing on Ray.
@@ -211,10 +296,73 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 		Expect(ai.Status.FeatureStatus.AgentRuntime.Schema).NotTo(BeNil())
 		Expect(ai.Status.FeatureStatus.AgentRuntime.Schema.AppliedHash).NotTo(BeEmpty())
 		Expect(ai.Status.SchemaJobId).To(BeEmpty(), "AgentRuntime must not use the legacy SAIA schema Job field")
-		var slimAI aiv1.AIService
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-slim"}, &slimAI)).To(Succeed())
-		Expect(slimAI.Status.FeatureStatus).To(BeNil(), "SLIM must not acquire AgentRuntime status")
-		verifyRuntimeReadinessWithControllers(&ai, p, sch)
+		aitkEndpoint := fmt.Sprintf("http://%s-slim-slim-service.%s.svc.cluster.local:8080/tenant/slim-api/v1alpha1", name, ns)
+		slimRolloutObserved := false
+		verifyRuntimeReadinessWithControllers(&ai, p, sch, func(want metav1.ConditionStatus) {
+			if !slimRolloutObserved && want == metav1.ConditionTrue {
+				By("withholding the endpoint until the current SLIM rollout is observed")
+				expectSlimRoute(metav1.ConditionFalse, "", "SLIMRolloutPending")
+				setSlimDeploymentStatus(-1)
+				expectSlimRoute(metav1.ConditionFalse, "", "SLIMRolloutPending")
+				setSlimDeploymentStatus(0)
+				slimRolloutObserved = true
+			}
+			expectSlimRoute(want, aitkEndpoint, "")
+		})
+
+		By("withdrawing SLIM traffic on invalid issuer trust and recovering without changing the saved endpoint")
+		var slimService corev1.Service
+		slimServiceKey := client.ObjectKey{Namespace: ns, Name: name + "-slim-slim-service"}
+		Expect(k8sClient.Get(ctx, slimServiceKey, &slimService)).To(Succeed())
+		serviceUID, serviceIP := slimService.UID, slimService.Spec.ClusterIP
+		expectSLIMReplicas := func(want int32) {
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&slimDep), &slimDep)).To(Succeed())
+				g.Expect(slimDep.Spec.Replicas).To(HaveValue(Equal(want)))
+			}, 3*time.Second, 50*time.Millisecond).Should(Succeed())
+		}
+		expectSLIMTraffic := func(want bool) {
+			Expect(k8sClient.Get(ctx, slimServiceKey, &slimService)).To(Succeed())
+			Expect(slimService.UID).To(Equal(serviceUID))
+			Expect(slimService.Spec.ClusterIP).To(Equal(serviceIP))
+			_, blocked := slimService.Spec.Selector["ai.splunk.com/slim-route-disabled"]
+			Expect(blocked).To(Equal(!want))
+		}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(caSecret), caSecret)).To(Succeed())
+		caSecret.Data["ca.crt"] = []byte("invalid CA fixture")
+		Expect(k8sClient.Update(ctx, caSecret)).To(Succeed())
+		expectSlimRoute(metav1.ConditionFalse, aitkEndpoint, "ConfigurationUnavailable")
+		expectSLIMReplicas(0)
+		expectSLIMTraffic(false)
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(caSecret), caSecret)).To(Succeed())
+		caSecret.Data["ca.crt"] = ca
+		Expect(k8sClient.Update(ctx, caSecret)).To(Succeed())
+		expectSlimRoute(metav1.ConditionFalse, aitkEndpoint, "SLIMRolloutPending")
+		expectSLIMReplicas(0)
+		expectSLIMTraffic(false)
+		setSlimDeploymentStatus(0)
+		expectSLIMReplicas(1)
+		expectSLIMTraffic(false)
+		setSlimDeploymentStatus(0)
+		expectSlimRoute(metav1.ConditionTrue, aitkEndpoint, "EndpointAvailable")
+		expectSLIMTraffic(true)
+
+		By("rolling SLIM on a valid CA replacement under the same Secret name")
+		previousGeneration := slimDep.Generation
+		previousTrustRevision := slimDep.Spec.Template.Labels["ai.splunk.com/slim-issuer-revision"]
+		Expect(previousTrustRevision).NotTo(BeEmpty())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(caSecret), caSecret)).To(Succeed())
+		caSecret.Data["ca.crt"] = slimIssuerCA()
+		Expect(k8sClient.Update(ctx, caSecret)).To(Succeed())
+		expectSlimRoute(metav1.ConditionFalse, aitkEndpoint, "SLIMRolloutPending")
+		expectSLIMReplicas(1)
+		Expect(slimDep.Generation).To(BeNumerically(">", previousGeneration))
+		expectSLIMTraffic(false)
+		setSlimDeploymentStatus(0)
+		expectSlimRoute(metav1.ConditionTrue, aitkEndpoint, "EndpointAvailable")
+		expectSLIMTraffic(true)
+		Expect(slimService.Spec.Selector["ai.splunk.com/slim-issuer-revision"]).NotTo(Equal(previousTrustRevision))
+		Expect(slimService.Spec.Selector["ai.splunk.com/slim-issuer-revision"]).To(Equal(slimDep.Spec.Template.Labels["ai.splunk.com/slim-issuer-revision"]))
 
 		// Nothing Ray or Weaviate was ever created.
 		var deps appsv1.DeploymentList

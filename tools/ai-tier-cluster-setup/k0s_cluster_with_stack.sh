@@ -1139,7 +1139,44 @@ ai_platform_profile_feature_problems() {
   done
 }
 
+# Render the route references only. The SLIM reconciler checks the published
+# endpoint and reads the existing issuer CA Secret in its own namespace.
+render_slim_route_config() {
+  local ca_name="" ca_type origin="" origin_type name_type
+  local origin_re='^https://(\[[A-Fa-f0-9:.]+\]|[A-Za-z0-9.-]+)(:[0-9]+)?/?$'
+  if ! ca_type=$(yq eval '.splunk.caCertRef | tag' "${CONFIG_FILE}" 2>/dev/null) || \
+     ! origin_type=$(yq eval '.splunk.aitkSlimOrigin | tag' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "[PROFILE_INVALID_VALUE] splunk: unable to read SLIM route configuration"
+    return 1
+  fi
+  if [[ -n "${ca_type}" && "${ca_type}" != "!!null" ]]; then
+    name_type=$(yq eval '.splunk.caCertRef.name | tag' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    ca_name=$(yq eval '.splunk.caCertRef.name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ "${ca_type}" != "!!map" || "${name_type}" != "!!str" ]] || ! _profile_is_dns_subdomain "${ca_name}"; then
+      echo "[PROFILE_INVALID_VALUE] splunk.caCertRef.name: must be a Kubernetes Secret name (a DNS-1123 subdomain)"
+      return 1
+    fi
+  fi
+  if [[ -n "${origin_type}" && "${origin_type}" != "!!null" ]]; then
+    origin=$(yq eval '.splunk.aitkSlimOrigin' "${CONFIG_FILE}" 2>/dev/null || echo "")
+    if [[ "${origin_type}" != "!!str" ]] || { [[ -n "${origin}" ]] && [[ ! "${origin}" =~ ${origin_re} ]]; }; then
+      echo "[PROFILE_INVALID_VALUE] splunk.aitkSlimOrigin: must be an HTTPS origin with an optional port"
+      return 1
+    fi
+  fi
+  if [[ -n "${ca_name}" ]]; then
+    printf '    caCertRef:\n      name: "%s"\n' "${ca_name}"
+  fi
+  if [[ -n "${origin}" ]]; then
+    printf '    aitkSlimOrigin: "%s"\n' "${origin}"
+  fi
+}
+
 ai_platform_profile_problems() {
+  local route_config
+  if ! route_config=$(render_slim_route_config); then
+    echo "${route_config}"
+  fi
   local tag="${AI_PLATFORM_PROFILE_TAG:-!!null}" profile="${AI_PLATFORM_PROFILE:-}"
   [[ "${tag}" == "!!null" ]] && return 0   # omitted: legacy behaviour, nothing to check
   if [[ "${tag}" != "!!str" ]]; then
@@ -1446,6 +1483,12 @@ render_ai_platform_profile_values() {
     echo "  profile: ${resolved}"
   else
     echo "  profile: \"\"   # omitted in the CR; resolves to fullfeature"
+  fi
+  local slim_route_yaml
+  slim_route_yaml="$(render_slim_route_config)" || return 1
+  if [[ -n "${slim_route_yaml}" ]]; then
+    echo "  splunkConfiguration:"
+    printf '%s\n' "${slim_route_yaml}"
   fi
   echo "images:"
   echo "  snapshotManifest: \"$(_profile_q "${SNAPSHOT_MANIFEST:-}")\""
@@ -7560,6 +7603,12 @@ except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
 install_ai_platform_cr() {
   log "============================================"
 
+  local slim_route_yaml
+  if ! slim_route_yaml="$(render_slim_route_config)"; then
+    err "${slim_route_yaml}"
+    return 1
+  fi
+
   # Required credentials must be valid before cleanup or AIPlatform application
   # can start schema/runtime reconciliation. Reference-only entries are untouched.
   create_agentruntime_checkpoint_secrets || return 1
@@ -7597,7 +7646,7 @@ install_ai_platform_cr() {
   fi
 
   # Splunk configuration block for the AIPlatform CR. Rendered by mode:
-  #   disabled — omits splunkConfiguration; trustedIssuers still written if set.
+  #   disabled — emits only configured issuers and route references.
   #   internal — point at the in-cluster Standalone as JWT issuer + HEC + operator-managed secret.
   #   external — create a Secret (key hec_token) from the SPLUNK_HEC_TOKEN env
   #              var and point at the customer's external Splunk as JWT issuer/HEC endpoint.
@@ -7629,6 +7678,7 @@ install_ai_platform_cr() {
       name: ${splunk_secret}
       namespace: ${AI_NS}
 ${trusted_issuers_yaml}
+${slim_route_yaml}
 EOF
 )
       ;;
@@ -7664,17 +7714,19 @@ EOF
       name: ${SPLUNK_EXTERNAL_SECRET_NAME}
       namespace: ${AI_NS}
 ${trusted_issuers_yaml}
+${slim_route_yaml}
 EOF
 )
       ;;
     *)
-      if [[ -n "${trusted_issuers_yaml}" ]]; then
-        log "Splunk disabled — writing trustedIssuers only (${trusted_issuers_count} issuer(s))"
+      if [[ -n "${trusted_issuers_yaml}" || -n "${slim_route_yaml}" ]]; then
+        log "Bundled Splunk disabled — rendering configured issuer and route settings"
         splunk_config_yaml=$(cat <<EOF
 
-  # Splunk configuration (disabled — trustedIssuers only for JWT validation)
+  # Splunk issuer and route settings without bundled Splunk
   splunkConfiguration:
 ${trusted_issuers_yaml}
+${slim_route_yaml}
 EOF
 )
       else

@@ -347,6 +347,11 @@ type SplunkConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	SecretRef corev1.SecretReference `json:"secretRef,omitempty"`
 
+	// CACertRef names a Secret in the AIService namespace whose ca.crt key
+	// contains the PEM CA bundle SLIM uses to verify the Splunk token issuer.
+	// +optional
+	CACertRef *corev1.LocalObjectReference `json:"caCertRef,omitempty"`
+
 	// Endpoint is the Splunk management/JWKS URL used as the JWT issuer for
 	// SAIA/Slim token validation (mutually exclusive with SplunkCustomResourceRef).
 	// Either Endpoint or SplunkCustomResourceRef must be provided.
@@ -378,6 +383,11 @@ type SplunkConfigurationSpec struct {
 	// In external or disabled modes, SPLUNK_ISSUERS is populated solely from this list.
 	// +optional
 	TrustedIssuers []string `json:"trustedIssuers,omitempty"`
+
+	// AITKSlimOrigin optionally advertises an existing HTTPS gateway to AITK.
+	// Supply only the origin. The operator appends the SLIM API path.
+	// +optional
+	AITKSlimOrigin string `json:"aitkSlimOrigin,omitempty"`
 }
 
 // ReplicasSpec sets min/max worker replicas

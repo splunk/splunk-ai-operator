@@ -28,7 +28,7 @@ func stringPtr(value string) *string { return &value }
 // Called with both production controllers running in the cpuOnly/no-Ray spec.
 // Status writes emulate workload controllers and kubelet observations only;
 // the local API server does not execute probes or populate workload status.
-func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AIPlatform, scheme *runtime.Scheme) {
+func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AIPlatform, scheme *runtime.Scheme, assertSlimRoute func(metav1.ConditionStatus)) {
 	By("keeping runtime and parent unready after object creation")
 	ready := func(obj client.Object) metav1.ConditionStatus {
 		switch o := obj.(type) {
@@ -85,6 +85,7 @@ func verifyRuntimeReadinessWithControllers(ai *aiv1.AIService, platform *aiv1.AI
 	DeferCleanup(func() { _ = k8sClient.Delete(ctx, slice) })
 	assertReady := func(want metav1.ConditionStatus) {
 		Eventually(func() metav1.ConditionStatus { return ready(ai) }, 3*time.Second, 25*time.Millisecond).Should(Equal(want), "runtime event must update readiness before the five-second fallback")
+		assertSlimRoute(want)
 		Eventually(func() metav1.ConditionStatus { return ready(platform) }, 3*time.Second, 25*time.Millisecond).Should(Equal(want), "child readiness must wake the parent")
 	}
 	By("propagating endpoint-only loss and recovery")

@@ -244,22 +244,43 @@ func (r *AgentRuntimeReconciler) observeService(ctx context.Context, ai *aiv1.AI
 		fail("ObservationFailed", "cannot read the runtime Service; check operator permissions and API availability")
 		return nil, fmt.Errorf("observe runtime Service: %w", err)
 	}
-	if svc.DeletionTimestamp != nil || !metav1.IsControlledBy(svc, ai) || svc.Spec.Type != corev1.ServiceTypeClusterIP || svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == corev1.ClusterIPNone {
-		fail("ServiceUnavailable", "waiting for an owned, nonterminating runtime ClusterIP Service")
+	reason, message := ApplicationServiceProblem(svc, ai)
+	if reason != "" {
+		fail(reason, message)
 		return nil, nil
+	}
+	setRuntimeCondition(ai, serviceReady, metav1.ConditionTrue, "Configured", "runtime application Service and selector are configured")
+	return svc, nil
+}
+
+// ApplicationServiceProblem validates the routing surface shared by Runtime readiness
+// and its SLIM consumer. A valid Service still needs ready, owned backends.
+func ApplicationServiceProblem(svc *corev1.Service, ai *aiv1.AIService) (reason, message string) {
+	if svc.DeletionTimestamp != nil || !metav1.IsControlledBy(svc, ai) ||
+		svc.Spec.Type != corev1.ServiceTypeClusterIP || svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == corev1.ClusterIPNone ||
+		svc.Spec.PublishNotReadyAddresses || len(svc.Spec.ExternalIPs) != 0 {
+		return "ServiceUnavailable", "waiting for an owned runtime ClusterIP Service that only publishes ready backends"
 	}
 	if !equality.Semantic.DeepEqual(svc.Spec.Selector, agentRuntimeSelectorLabels(ai)) {
-		fail("SelectorMismatch", "runtime Service selector must match the runtime workload labels")
-		return nil, nil
+		return "SelectorMismatch", "runtime Service selector must match the runtime workload labels"
 	}
-	for _, port := range svc.Spec.Ports {
-		if port.Name == "http" && port.Port == defaultAgentRuntimeHTTPPort && port.TargetPort == intstr.FromInt32(defaultAgentRuntimeHTTPPort) && (port.Protocol == "" || port.Protocol == corev1.ProtocolTCP) {
-			setRuntimeCondition(ai, serviceReady, metav1.ConditionTrue, "Configured", "runtime application Service and selector are configured")
-			return svc, nil
+	expected := runtimeServicePorts()
+	if len(svc.Spec.Ports) == len(expected) {
+		matched := 0
+		for _, want := range expected {
+			for _, got := range svc.Spec.Ports {
+				if got.Name == want.Name && got.Port == want.Port && got.TargetPort == want.TargetPort &&
+					(got.Protocol == "" || got.Protocol == want.Protocol) && got.NodePort == 0 {
+					matched++
+					break
+				}
+			}
+		}
+		if matched == len(expected) {
+			return "", ""
 		}
 	}
-	fail("ServicePortMismatch", "runtime Service must route TCP application traffic to port 8080")
-	return nil, nil
+	return "ServicePortMismatch", "runtime Service must expose only the TCP application and metrics ports"
 }
 
 // observeEndpoints cross-checks advertised routing with independently verified

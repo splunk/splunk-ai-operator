@@ -105,8 +105,8 @@ func runtimeBackendChangedPredicate() predicate.Predicate {
 	}
 }
 
-// Only the readiness projection wakes the parent; arbitrary child spec/status
-// writes must not restore the previous parent/child spec reconciliation loop.
+// Route consumers depend on the current readiness and ownership of a runtime.
+// Ignore unrelated status changes and timestamps to keep reconciles stable.
 func agentRuntimeReadyChangedPredicate() predicate.Predicate {
 	isRuntime := func(obj client.Object) bool {
 		ai, ok := obj.(*aiv1.AIService)
@@ -123,8 +123,9 @@ func agentRuntimeReadyChangedPredicate() predicate.Predicate {
 		return struct {
 			Generation, Observed int64
 			Deleted              bool
+			Owner                *metav1.OwnerReference
 			Ready                metav1.Condition
-		}{ai.Generation, ai.Status.ObservedGeneration, ai.DeletionTimestamp != nil, c}
+		}{ai.Generation, ai.Status.ObservedGeneration, ai.DeletionTimestamp != nil, metav1.GetControllerOf(ai), c}
 	}
 	return predicate.Funcs{
 		CreateFunc:  func(e event.CreateEvent) bool { return isRuntime(e.Object) },
@@ -133,7 +134,59 @@ func agentRuntimeReadyChangedPredicate() predicate.Predicate {
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			old, oldOK := e.ObjectOld.(*aiv1.AIService)
 			current, newOK := e.ObjectNew.(*aiv1.AIService)
-			return oldOK && newOK && (isRuntime(old) || isRuntime(current)) && !reflect.DeepEqual(projection(old), projection(current))
+			if !oldOK || !newOK {
+				return false
+			}
+			wasRuntime, remainsRuntime := isRuntime(old), isRuntime(current)
+			// The mapped watch receives both objects. A feature or owner change
+			// must wake the previously dependent sibling as well as any new one.
+			return wasRuntime != remainsRuntime || (remainsRuntime && !reflect.DeepEqual(projection(old), projection(current)))
 		},
 	}
+}
+
+func aiServiceRouteLifecycleChanged(e event.UpdateEvent) bool {
+	old, oldOK := e.ObjectOld.(*aiv1.AIService)
+	current, newOK := e.ObjectNew.(*aiv1.AIService)
+	if !oldOK || !newOK {
+		return false
+	}
+	feature := current.Spec.Feature.Name
+	if feature != "agentruntime" && feature != "slim" {
+		return false
+	}
+	// Ownership and the start of deletion can change without a spec update.
+	return (old.DeletionTimestamp == nil) != (current.DeletionTimestamp == nil) ||
+		!reflect.DeepEqual(metav1.GetControllerOf(old), metav1.GetControllerOf(current))
+}
+
+// A readiness event only affects the SLIM feature owned by the same platform
+// instance. The event carries the former owner even after a runtime is deleted.
+func (r *AIServiceReconciler) findSlimSiblingsForRuntime(ctx context.Context, obj client.Object) []reconcile.Request {
+	runtime, ok := obj.(*aiv1.AIService)
+	if !ok || runtime.Spec.Feature.Name != "agentruntime" {
+		return nil
+	}
+	owner := metav1.GetControllerOf(runtime)
+	if owner == nil || owner.APIVersion != aiv1.GroupVersion.String() || owner.Kind != "AIPlatform" || owner.UID == "" {
+		return nil
+	}
+
+	var services aiv1.AIServiceList
+	if err := r.List(ctx, &services, client.InNamespace(runtime.Namespace)); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "cannot find SLIM for runtime readiness event", "platform", owner.Name)
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range services.Items {
+		slim := &services.Items[i]
+		if slim.Spec.Feature.Name != "slim" || slim.DeletionTimestamp != nil {
+			continue
+		}
+		slimOwner := metav1.GetControllerOf(slim)
+		if slimOwner != nil && slimOwner.UID == owner.UID && slimOwner.Name == owner.Name && slimOwner.Kind == owner.Kind && slimOwner.APIVersion == owner.APIVersion {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(slim)})
+		}
+	}
+	return requests
 }

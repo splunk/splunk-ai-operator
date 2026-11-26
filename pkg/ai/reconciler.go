@@ -266,12 +266,10 @@ func clusterDomainOrDefault(domain string) string {
 }
 
 func featureServiceName(platformName string, feature aiApi.FeatureSpec) string {
-	name := fmt.Sprintf("%s-%s", platformName, feature.Name)
-	if feature.Name == agentRuntimeFeatureName && feature.Provider != "" {
-		name = fmt.Sprintf("%s-%s", name, feature.Provider)
-		return boundedDNSLabel(name)
+	if feature.Name == agentRuntimeFeatureName {
+		return agentruntime.FeatureAIServiceName(platformName, feature.Provider)
 	}
-	return name
+	return fmt.Sprintf("%s-%s", platformName, feature.Name)
 }
 
 func boundedDNSLabel(name string) string {

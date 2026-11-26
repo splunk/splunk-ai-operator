@@ -119,6 +119,7 @@ _load_functions() {
   eval "$(_extract_fn _profile_feature_field_check)"
   eval "$(_extract_fn ai_platform_profile_feature_problems)"
   eval "$(_extract_fn ai_platform_profile_cr_input_problems)"
+  eval "$(_extract_fn render_slim_route_config)"
   eval "$(_extract_fn ai_platform_profile_problems)"
   eval "$(_extract_fn validate_ai_platform_profile_config)"
   eval "$(_extract_fn config_bool)"
@@ -1994,6 +1995,7 @@ _render_internal_splunk_https_manifests() (
   eval "$(_extract_fn _read_internal_splunk_state)"
   eval "$(_extract_fn _apply_internal_splunk_standalone_cr)"
   eval "$(_extract_fn install_splunk_standalone)"
+  eval "$(_extract_fn render_slim_route_config)"
   eval "$(_extract_fn install_ai_platform_cr)"
 
   log() { :; }
@@ -2468,7 +2470,7 @@ _profile_run() {
               _profile_ref_missing _profile_ref_check _profile_is_dns_subdomain \
               _profile_feature_subdomain_check _profile_feature_field_check \
               ai_platform_profile_feature_problems ai_platform_profile_cr_input_problems \
-              ai_platform_profile_problems \
+              render_slim_route_config ai_platform_profile_problems \
               validate_ai_platform_profile_config _profile_image_url \
               render_ai_platform_profile_values; do
       eval "$(_extract_fn "${_f}")"
@@ -2704,6 +2706,19 @@ assert_eq "an aws object store does not require an endpoint to be valid" "" \
 assert_eq "the generic-input rules do not apply to legacy full" "" \
   "$(_profile_problems "$(_profile_cfg fullfeature legacygeneric '.aiPlatform.profile = "full" | .cluster.name = "Bad_Name" | .cluster.region = "no yes"')")"
 
+# The installer renders only validated route references and omits them for
+# deployments whose configuration does not opt in.
+_slim_route_bad_name="$(_profile_cfg cpuonly badcaname '.splunk.caCertRef.name = "BAD-PRIVATE-CANARY"')"
+_slim_route_bad_url="$(_profile_cfg fullfeature badorigin '.splunk.aitkSlimOrigin = "https://PRIVATE-CANARY@splunk.example/"')"
+assert_problem "a malformed Splunk issuer CA reference is rejected" \
+  "${_slim_route_bad_name}" "[PROFILE_INVALID_VALUE] splunk.caCertRef.name"
+assert_problem "an AITK endpoint cannot contain URL user-info" \
+  "${_slim_route_bad_url}" "[PROFILE_INVALID_VALUE] splunk.aitkSlimOrigin"
+assert_eq "issuer CA diagnostics omit the rejected reference value" "no" \
+  "$(if [[ "$(_profile_problems "${_slim_route_bad_name}")" == *PRIVATE-CANARY* ]]; then echo yes; else echo no; fi)"
+assert_eq "AITK endpoint diagnostics omit the rejected URL" "no" \
+  "$(if [[ "$(_profile_problems "${_slim_route_bad_url}")" == *PRIVATE-CANARY* ]]; then echo yes; else echo no; fi)"
+
 # Rejected values are not echoed back, and sidecar flags must be real booleans.
 for _sf in '"2x"' '0' '"<script>"'; do
   _sf_out="$(_profile_problems "$(_profile_cfg cpuonly "sfecho-${_sf//[^a-z0-9]/}" ".aiPlatform.scaleFactor = ${_sf}")")"
@@ -2835,6 +2850,72 @@ _changed_keys() {
 assert_eq "cpuOnly and fullfeature values differ exactly where the profiles differ" \
   "aiPlatformSpec.profile components.kuberay components.nvidia nodes.gpuWorkers profile.configured profile.effective " \
   "$(_changed_keys "${_PROFILE_GOLDEN}/profile-values-cpuonly.expected.yaml" "${_PROFILE_GOLDEN}/profile-values-fullfeature.expected.yaml")"
+
+# Exercise the manifest the installer applies as well as the profile values.
+# Private registry references should come from the test configuration only.
+_configure_profile_manifest() {
+  local output="$1"
+  local -a TMP_FILES=()
+  SPLUNK_AI_FILE="${SCRIPT_DIR}/artifacts.yaml"
+  configure_images || return 1
+  cp "${SPLUNK_AI_FILE}" "${output}"
+  rm -f "${TMP_FILES[@]}"
+}
+
+suite "account-neutral installer manifest"
+assert_eq "the embedded bundle has no account-specific ECR references" "no" \
+  "$(if grep -Eq '[0-9]{12}\.dkr\.ecr\.' "${SCRIPT_DIR}/artifacts.yaml"; then echo yes; else echo no; fi)"
+for _profile in cpuonly fullfeature; do
+  _image_cfg="$(_profile_cfg "${_profile}" "image-overrides-${_profile}" \
+    '.images.registry = "registry.example.invalid:5000" |
+     .images.slim.apiImage = "ai/slim:candidate" |
+     .images.agentRuntime.baseImages."v2.0.0" = "ai/runtime:v2" |
+     .images.agentRuntime.schemaSetupImage = "mirror.example.invalid:5001/ai/schema@sha256:1111111111111111111111111111111111111111111111111111111111111111"')"
+  if [[ "${_profile}" == "fullfeature" ]]; then
+    command yq -i '
+      .aiPlatform.features += [{"name": "saia"}] |
+      .images.saia = {"apiImage": "ai/saia:v1", "apiV2Image": "ai/saia-v2:v1", "dataLoaderImage": "ai/data-loader:v1"}
+    ' "${_image_cfg}"
+  fi
+  _manifest="${_PROFILE_TMP}/image-overrides-${_profile}-artifacts.yaml"
+  assert_rc "${_profile}: configure images in the generated bundle" 0 \
+    _profile_run "${_image_cfg}" _configure_profile_manifest "${_manifest}"
+  _manager_env="$(command yq -o=json '
+    select(.kind == "Deployment" and .metadata.name == "splunk-ai-operator-controller-manager") |
+    .spec.template.spec.containers[] | select(.name == "manager") | .env
+  ' "${_manifest}" 2>/dev/null | command jq -r '
+    map(select(has("value"))) | map({key: .name, value: .value}) | from_entries
+  ')"
+  assert_eq "${_profile}: SLIM image is qualified using the configured registry" \
+    "registry.example.invalid:5000/ai/slim:candidate" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_SLIM_API)"
+  assert_eq "${_profile}: versioned Runtime base comes from installer config" \
+    "registry.example.invalid:5000/ai/runtime:v2" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_AGENT_RUNTIME_BASE_V2_0_0)"
+  assert_eq "${_profile}: fully qualified schema image keeps its registry and digest" \
+    "mirror.example.invalid:5001/ai/schema@sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_AGENT_RUNTIME_SCHEMA_SETUP)"
+  if [[ "${_profile}" == "cpuonly" ]]; then
+    _ray_head="docker.io/splunk/ai-tier-ray-head:v1.0"
+    _ray_worker="docker.io/splunk/ai-tier-ray-worker:v1.0"
+    _saia_api="docker.io/splunk/ai-tier-saia-api:v1.0"
+    _saia_loader="docker.io/splunk/ai-tier-saia-data-loader:v1.0"
+  else
+    _ray_head="registry.example.invalid:5000/rayproject/ray:2.44.0"
+    _ray_worker="${_ray_head}"
+    _saia_api="registry.example.invalid:5000/ai/saia:v1"
+    _saia_loader="registry.example.invalid:5000/ai/data-loader:v1"
+  fi
+  assert_eq "${_profile}: Ray head uses the effective profile image" "${_ray_head}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_RAY_HEAD)"
+  assert_eq "${_profile}: Ray worker uses the effective profile image" "${_ray_worker}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_RAY_WORKER)"
+  assert_eq "${_profile}: SAIA API uses the effective profile image" "${_saia_api}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_SAIA_API)"
+  assert_eq "${_profile}: post-install hook uses the effective profile image" "${_saia_loader}" \
+    "$(printf '%s' "${_manager_env}" | command jq -r .RELATED_IMAGE_POST_INSTALL_HOOK)"
+done
+suite "deployment profile"
 
 # cpuOnly must not carry Ray, Weaviate or SAIA images: install would inject them
 # into the operator Deployment although nothing deploys them.
@@ -2980,6 +3061,15 @@ for _p in cpuonly fullfeature; do
   [[ "${UPDATE_GOLDEN:-}" == "1" ]] && printf '%s\n' "${_cr}" > "${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml"
   assert_eq "${_p}: rendered AIPlatform CR matches the golden file" \
     "$(cat "${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml" 2>/dev/null)" "${_cr}"
+done
+for _p in cpuonly fullfeature; do
+  _slim_route_cfg="$(_profile_cfg "${_p}" "${_p}-slim-route" '.splunk.caCertRef.name = "issuer-ca" | .splunk.aitkSlimOrigin = "https://slim.example:8443"')"
+  assert_eq "${_p}: profile values preserve the CA reference and AITK origin" \
+    "issuer-ca,https://slim.example:8443" \
+    "$(_profile_run "${_slim_route_cfg}" render_ai_platform_profile_values | command yq eval '[.aiPlatformSpec.splunkConfiguration.caCertRef.name, .aiPlatformSpec.splunkConfiguration.aitkSlimOrigin] | join(",")' -)"
+  assert_eq "${_p}: installed CR preserves route references with bundled Splunk disabled" \
+    "issuer-ca,https://slim.example:8443" \
+    "$(_render_cr "${_slim_route_cfg}" | command yq eval '[.spec.splunkConfiguration.caCertRef.name, .spec.splunkConfiguration.aitkSlimOrigin] | join(",")' -)"
 done
 # A numeric-only ServiceAccount name is a valid DNS name but must stay a YAML string in the CR.
 _num_sa="$(_profile_cfg cpuonly numsa '.aiPlatform.features[1].serviceAccountName = "123"')"

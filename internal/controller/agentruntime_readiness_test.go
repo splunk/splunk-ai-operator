@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
@@ -52,17 +53,109 @@ func TestRuntimeReadinessEventPredicates(t *testing.T) {
 	changed := ai.DeepCopy()
 	changed.Status.Conditions[0].Status = metav1.ConditionFalse
 	changed.Status.Conditions[0].Reason = "Pending"
-	assert.True(t, agentRuntimeReadyChangedPredicate().Update(event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}))
+	readinessEvent := event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}
+	assert.True(t, agentRuntimeReadyChangedPredicate().Update(readinessEvent))
+	assert.True(t, aiServiceGlobalEventFilter().Update(readinessEvent))
+	assert.False(t, aiServiceEventFilter().Update(readinessEvent), "the primary watch should ignore runtime status writes")
+	assert.True(t, agentRuntimeReadyChangedPredicate().Create(event.CreateEvent{Object: ai}))
+	assert.True(t, agentRuntimeReadyChangedPredicate().Delete(event.DeleteEvent{Object: ai}))
 	changed = ai.DeepCopy()
 	changed.Status.Conditions[0].LastTransitionTime = metav1.Now()
-	assert.False(t, agentRuntimeReadyChangedPredicate().Update(event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}), "timestamp-only child writes must not wake the parent")
+	assert.False(t, agentRuntimeReadyChangedPredicate().Update(event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}), "timestamp-only writes must not wake route consumers")
 	changed = ai.DeepCopy()
 	changed.Spec.VectorDbUrl = "unrelated"
 	assert.False(t, agentRuntimeReadyChangedPredicate().Update(event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}))
+	changed.OwnerReferences = []metav1.OwnerReference{{Controller: boolPtr(true), UID: "new-platform"}}
+	ownershipEvent := event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}
+	assert.True(t, agentRuntimeReadyChangedPredicate().Update(ownershipEvent))
+	assert.True(t, aiServiceEventFilter().Update(ownershipEvent))
+	changed = ai.DeepCopy()
 	ai.Spec.Feature.Name = "slim"
+	assert.True(t, agentRuntimeReadyChangedPredicate().Update(event.UpdateEvent{ObjectOld: changed, ObjectNew: ai}), "a departing Runtime's former sibling must reconcile")
 	changed.Spec.Feature.Name = "slim"
 	changed.Status.Conditions[0].Status = metav1.ConditionFalse
 	assert.False(t, agentRuntimeReadyChangedPredicate().Update(event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}))
+	changed = ai.DeepCopy()
+	deletingAt := metav1.Now()
+	changed.DeletionTimestamp = &deletingAt
+	assert.True(t, aiServiceEventFilter().Update(event.UpdateEvent{ObjectOld: ai, ObjectNew: changed}), "starting SLIM deletion must reconcile the primary object")
+}
+
+func TestRuntimeReadinessEventsMapToOwnedSlimSibling(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, aiv1.AddToScheme(scheme))
+	owner := metav1.OwnerReference{
+		APIVersion: aiv1.GroupVersion.String(), Kind: "AIPlatform",
+		Name: "test-platform", UID: "test-platform-uid", Controller: boolPtr(true),
+	}
+	runtime := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "test", OwnerReferences: []metav1.OwnerReference{owner}},
+		Spec:       aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime"}},
+	}
+	slim := runtime.DeepCopy()
+	slim.Name = "slim"
+	slim.Spec.Feature.Name = "slim"
+	otherNamespace := slim.DeepCopy()
+	otherNamespace.Namespace = "other"
+	otherPlatform := slim.DeepCopy()
+	otherPlatform.Name = "other-slim"
+	otherPlatform.OwnerReferences[0].UID = "old-platform-uid"
+	standalone := slim.DeepCopy()
+	standalone.Name = "standalone-slim"
+	standalone.OwnerReferences = nil
+	terminating := slim.DeepCopy()
+	terminating.Name = "terminating-slim"
+	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	terminating.Finalizers = []string{"test.example.org/hold"}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(runtime, slim, otherNamespace, otherPlatform, standalone, terminating).Build()
+	r := &AIServiceReconciler{Client: c}
+	requests := r.findSlimSiblingsForRuntime(context.Background(), runtime)
+	require.Len(t, requests, 1)
+	assert.Equal(t, client.ObjectKeyFromObject(slim), requests[0].NamespacedName)
+
+	unownedRuntime := runtime.DeepCopy()
+	unownedRuntime.OwnerReferences = nil
+	assert.Empty(t, r.findSlimSiblingsForRuntime(context.Background(), unownedRuntime))
+	assert.Empty(t, r.findSlimSiblingsForRuntime(context.Background(), slim))
+}
+
+func TestReferencedSecretEventsMapToCheckpointAndSlimTrustConsumers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, aiv1.AddToScheme(scheme))
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "referenced-secret", ResourceVersion: "1"}}
+	runtime := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: secret.Namespace},
+		Spec:       aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime"}, CheckpointDbSecretRef: secret.Name},
+	}
+	slim := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "slim", Namespace: secret.Namespace},
+		Spec: aiv1.AIServiceSpec{
+			Feature:             aiv1.FeatureSpec{Name: "slim"},
+			SplunkConfiguration: aiv1.SplunkConfigurationSpec{CACertRef: &corev1.LocalObjectReference{Name: secret.Name}},
+		},
+	}
+	otherNamespace := slim.DeepCopy()
+	otherNamespace.Namespace = "other"
+	otherSecret := slim.DeepCopy()
+	otherSecret.Name = "other-slim"
+	otherSecret.Spec.SplunkConfiguration.CACertRef.Name = "unrelated-secret"
+	saia := slim.DeepCopy()
+	saia.Name = "saia"
+	saia.Spec.Feature.Name = "saia"
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(runtime, slim, otherNamespace, otherSecret, saia).Build()
+	r := &AIServiceReconciler{Client: c}
+	var actual []client.ObjectKey
+	for _, request := range r.findAIServicesForReferencedSecret(context.Background(), secret) {
+		actual = append(actual, request.NamespacedName)
+	}
+	assert.ElementsMatch(t, []client.ObjectKey{client.ObjectKeyFromObject(runtime), client.ObjectKeyFromObject(slim)}, actual)
+	updatedSecret := secret.DeepCopy()
+	updatedSecret.ResourceVersion = "2"
+	update := event.UpdateEvent{ObjectOld: secret, ObjectNew: updatedSecret}
+	assert.True(t, referencedSecretChangedPredicate().Update(update))
+	assert.True(t, aiServiceGlobalEventFilter().Update(update))
+	assert.True(t, referencedSecretChangedPredicate().Delete(event.DeleteEvent{Object: updatedSecret}))
 }
 
 func TestRuntimeBackendEventsMapWithoutDirectOwner(t *testing.T) {

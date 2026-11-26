@@ -19,6 +19,13 @@ package v1
 // AIServiceFeatureStatus holds status owned by individual AIService features.
 type AIServiceFeatureStatus struct {
 	AgentRuntime *AgentRuntimeStatus `json:"agentRuntime,omitempty"`
+	Slim         *SlimRouteStatus    `json:"slim,omitempty"`
+}
+
+// SlimRouteStatus describes the endpoint a Splunk administrator can save in AITK.
+type SlimRouteStatus struct {
+	// AITKEndpoint is the last published URL. Check AgentRouteAvailable before using it.
+	AITKEndpoint string `json:"aitkEndpoint,omitempty"`
 }
 
 // AgentRuntimeStatus holds AgentRuntime-specific observed state.
