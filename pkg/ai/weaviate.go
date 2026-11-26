@@ -6,6 +6,7 @@ import (
 	"os"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -130,6 +131,8 @@ func (r *AIPlatformReconciler) ReconcileWeaviateDatabase(ctx context.Context, in
 		sts.Spec.Template.Spec.NodeSelector = instance.Spec.CPUSchedulingSpec.NodeSelector
 		// Propagate imagePullSecrets from AIPlatform spec
 		sts.Spec.Template.Spec.ImagePullSecrets = instance.Spec.Images.ImagePullSecrets
+		// PSB SEC-RUN-ASLR: no process in the pod can turn ASLR off.
+		sts.Spec.Template.Spec.SecurityContext = podsecurity.RuntimeDefaultSeccomp()
 
 		// Determine PVC configuration
 		volumeMounts := []corev1.VolumeMount{}

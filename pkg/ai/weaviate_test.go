@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	aiApi "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -149,6 +150,8 @@ func TestReconcileWeaviateDatabase(t *testing.T) {
 		err = fc.Get(ctx, types.NamespacedName{Name: platformName + "-weaviate", Namespace: ns}, sts)
 		assert.NoError(t, err)
 		assert.Equal(t, "weaviate:test", sts.Spec.Template.Spec.Containers[0].Image)
+		// PSB SEC-RUN-ASLR (FR3): RuntimeDefault seccomp blocks "setarch -R".
+		assert.Equal(t, podsecurity.RuntimeDefaultSeccomp(), sts.Spec.Template.Spec.SecurityContext)
 
 		// Verify container exposes both http (8080) and grpc (50051) ports
 		containerPorts := sts.Spec.Template.Spec.Containers[0].Ports

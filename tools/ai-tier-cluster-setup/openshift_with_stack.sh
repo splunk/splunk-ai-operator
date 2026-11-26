@@ -1795,42 +1795,43 @@ restore_installer_node_labels() {
   done < <(oc get nodes -o json 2>/dev/null | jq -r --arg prefix "${annotation_prefix}" '.items[] | select(any((.metadata.annotations // {} | keys[]) ; startswith($prefix))) | .metadata.name')
 }
 
-# ====== OPENSHIFT: RAY SECCOMP SCC ======
+# ====== OPENSHIFT: AI WORKLOAD SECCOMP SCC ======
 # PSB SEC-RUN-ASLR: the Splunk AI Operator sets seccompProfile RuntimeDefault on
-# the Ray head and worker pods, so that no process in them can turn ASLR off
-# (personality ADDR_NO_RANDOMIZE, "setarch -R"). The built-in anyuid SCC allows
-# no seccomp profile, so these pods would fall through to restricted-v2 and get
-# a random UID that the Ray images do not support.
+# every workload pod it creates (Ray, SAIA, SLIM, SECA, Weaviate), so that no
+# process in them can turn ASLR off (personality ADDR_NO_RANDOMIZE,
+# "setarch -R"). The built-in anyuid SCC allows no seccomp profile, so these
+# pods would fall through to restricted-v2 and get a random UID that the
+# workload images do not support.
 #
 # This SCC is a copy of anyuid that also allows runtime/default. It keeps the
 # anyuid priority and its name sorts after "anyuid", so OpenShift still admits
 # pods without a seccomp profile through anyuid.
-readonly RAY_SECCOMP_SCC="splunk-ai-anyuid-seccomp"
+readonly AI_SECCOMP_SCC="splunk-ai-anyuid-seccomp"
 
-ray_seccomp_scc_manifest() {
+ai_seccomp_scc_manifest() {
   local group="$1"
   oc get scc anyuid -o json \
-    | jq --arg name "${RAY_SECCOMP_SCC}" --arg group "${group}" '
+    | jq --arg name "${AI_SECCOMP_SCC}" --arg group "${group}" '
         del(.metadata) | .metadata = {
           name: $name,
-          annotations: {"kubernetes.io/description": "anyuid plus the runtime/default seccomp profile, for Splunk AI Ray pods (PSB SEC-RUN-ASLR)."}
+          annotations: {"kubernetes.io/description": "anyuid plus the runtime/default seccomp profile, for Splunk AI workload pods (PSB SEC-RUN-ASLR)."}
         }
         | .seccompProfiles = ["runtime/default"]
         | .users = []
         | .groups = [$group]'
 }
 
-ensure_ray_seccomp_scc() {
+ensure_ai_seccomp_scc() {
   local group="system:serviceaccounts:${AI_NS}" manifest
-  if oc get scc "${RAY_SECCOMP_SCC}" &>/dev/null; then
-    ensure_owned_scc_group "${RAY_SECCOMP_SCC}" "${group}" scc_ray_seccomp_ai_namespace
+  if oc get scc "${AI_SECCOMP_SCC}" &>/dev/null; then
+    ensure_owned_scc_group "${AI_SECCOMP_SCC}" "${group}" scc_ai_seccomp_ai_namespace
     return 0
   fi
-  manifest=$(ray_seccomp_scc_manifest "${group}") \
-    || err "Could not read the anyuid SCC to create ${RAY_SECCOMP_SCC}"
+  manifest=$(ai_seccomp_scc_manifest "${group}") \
+    || err "Could not read the anyuid SCC to create ${AI_SECCOMP_SCC}"
   printf '%s\n' "${manifest}" | oc create -f - >/dev/null \
-    || err "Failed to create SCC ${RAY_SECCOMP_SCC}"
-  record_owned_component scc_ray_seccomp_created
+    || err "Failed to create SCC ${AI_SECCOMP_SCC}"
+  record_owned_component scc_ai_seccomp_created
 }
 
 # ====== OPENSHIFT: GRANT PRIVILEGED SCC ======
@@ -1854,8 +1855,8 @@ grant_privileged_scc() {
   # - privileged: also on AI platform so Splunk Standalone can write to hostPath PVCs.
   ensure_owned_scc_group privileged "system:serviceaccounts:${ai_operator_ns}" scc_privileged_ai_operator
   ensure_owned_scc_group anyuid "system:serviceaccounts:${AI_NS}" scc_anyuid_ai_namespace
-  # - splunk-ai-anyuid-seccomp: Ray head and worker pods (anyuid + RuntimeDefault seccomp).
-  ensure_ray_seccomp_scc
+  # - splunk-ai-anyuid-seccomp: operator-created AI workload pods (anyuid + RuntimeDefault seccomp).
+  ensure_ai_seccomp_scc
   ensure_owned_scc_group privileged "system:serviceaccounts:${AI_NS}" scc_privileged_ai_namespace
   # Splunk Operator pod adds NET_BIND_SERVICE capability which anyuid blocks; needs privileged.
   ensure_owned_scc_group privileged "system:serviceaccounts:splunk-operator" scc_privileged_splunk_operator
@@ -4398,8 +4399,8 @@ main_delete() {
   # ── 12. SCC grants added during install ──
   component_is_owned scc_privileged_ai_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${ai_operator_ns}" 2>/dev/null || true
   component_is_owned scc_anyuid_ai_namespace && oc adm policy remove-scc-from-group anyuid "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-  component_is_owned scc_ray_seccomp_ai_namespace && oc adm policy remove-scc-from-group "${RAY_SECCOMP_SCC}" "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
-  component_is_owned scc_ray_seccomp_created && oc delete scc "${RAY_SECCOMP_SCC}" --ignore-not-found=true 2>/dev/null || true
+  component_is_owned scc_ai_seccomp_ai_namespace && oc adm policy remove-scc-from-group "${AI_SECCOMP_SCC}" "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
+  component_is_owned scc_ai_seccomp_created && oc delete scc "${AI_SECCOMP_SCC}" --ignore-not-found=true 2>/dev/null || true
   component_is_owned scc_privileged_ai_namespace && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${AI_NS}" 2>/dev/null || true
   component_is_owned scc_privileged_splunk_operator && oc adm policy remove-scc-from-group privileged "system:serviceaccounts:${splunk_operator_ns}" 2>/dev/null || true
   component_is_owned scc_anyuid_cert_manager && oc adm policy remove-scc-from-user anyuid -z cert-manager -n cert-manager 2>/dev/null || true

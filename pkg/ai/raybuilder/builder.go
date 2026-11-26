@@ -16,6 +16,7 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	enterpriseApi "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/internal/telemetry"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder/raystatus"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
@@ -1011,7 +1012,7 @@ func (b *Builder) makeHeadTemplate() corev1.PodTemplateSpec {
 		}},
 	}
 
-	spec.SecurityContext = rayPodSecurityContext()
+	spec.SecurityContext = podsecurity.RuntimeDefaultSeccomp()
 	spec.NodeSelector = b.ai.Spec.CPUSchedulingSpec.NodeSelector
 	spec.Tolerations = b.ai.Spec.CPUSchedulingSpec.Tolerations
 	spec.Affinity = b.ai.Spec.CPUSchedulingSpec.Affinity
@@ -1106,7 +1107,7 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 		},
 	}
 
-	spec.SecurityContext = rayPodSecurityContext()
+	spec.SecurityContext = podsecurity.RuntimeDefaultSeccomp()
 
 	// apply scheduling
 	spec.NodeSelector = b.ai.Spec.GPUSchedulingSpec.NodeSelector
@@ -1134,27 +1135,6 @@ func (b *Builder) makeWorkerTemplate(cfg InstanceDetail) corev1.PodTemplateSpec 
 	}
 
 	return corev1.PodTemplateSpec{Spec: spec}
-}
-
-// rayPodSecurityContext returns the pod security context for the Ray head and
-// worker pods. It applies to every container in the pod, including the
-// autoscaler sidecar that KubeRay adds to the head pod.
-//
-// PSB SEC-RUN-ASLR: the RuntimeDefault seccomp profile of the container runtime
-// rejects personality(ADDR_NO_RANDOMIZE), so a process in a Ray pod cannot
-// start a program with address space layout randomization turned off (for
-// example with "setarch -R"). A pod without a seccomp profile runs unconfined
-// unless the kubelet sets --seccomp-default.
-//
-// On OpenShift the built-in anyuid SCC rejects a pod that sets a seccomp
-// profile. The OpenShift installer creates an anyuid copy that allows
-// runtime/default (see tools/ai-tier-cluster-setup/openshift_with_stack.sh).
-func rayPodSecurityContext() *corev1.PodSecurityContext {
-	return &corev1.PodSecurityContext{
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		},
-	}
 }
 
 func SetImageRegistry(key, defaultValue string) string {

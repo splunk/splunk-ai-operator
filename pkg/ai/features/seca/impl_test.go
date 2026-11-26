@@ -3,6 +3,7 @@ package seca
 import (
 	"testing"
 
+	"github.com/splunk/splunk-ai-operator/pkg/ai/podsecurity"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -22,6 +23,9 @@ func TestDeployment(t *testing.T) {
 	assert.Equal(t, "test-service-seca", deployment.Name)
 	assert.Equal(t, "test-namespace", deployment.Namespace)
 	assert.Equal(t, map[string]string{"app": "seca"}, deployment.Labels)
+
+	// PSB SEC-RUN-ASLR (FR3): RuntimeDefault seccomp blocks "setarch -R".
+	assert.Equal(t, podsecurity.RuntimeDefaultSeccomp(), deployment.Spec.Template.Spec.SecurityContext)
 
 	// Verify replicas
 	assert.NotNil(t, deployment.Spec.Replicas)
