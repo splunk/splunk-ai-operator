@@ -17,10 +17,13 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -40,6 +43,7 @@ import (
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/internal/controller"
 	webhookv1 "github.com/splunk/splunk-ai-operator/internal/webhook/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime/upgrade"
 	"github.com/splunk/splunk-ai-operator/pkg/config"
 
 	// +kubebuilder:scaffold:imports
@@ -73,6 +77,7 @@ func main() {
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	var modeFlag string
+	var checkAgentRuntimeUpgrade bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -92,12 +97,22 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&modeFlag, "mode", "normal", "operator mode: normal|debug|simulate")
+	flag.BoolVar(&checkAgentRuntimeUpgrade, "check-agentruntime-upgrade", false, "Validate saved AgentRuntime upgrade prerequisites and exit.")
 
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if checkAgentRuntimeUpgrade {
+		if err := runAgentRuntimeUpgradePreflight(); err != nil {
+			fmt.Fprintln(os.Stderr, "AgentRuntime upgrade preflight failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("AgentRuntime upgrade preflight passed")
+		return
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -303,4 +318,14 @@ func parseMode(flagVal string) config.OperatorMode {
 	default:
 		return config.ModeNormal
 	}
+}
+
+func runAgentRuntimeUpgradePreflight() error {
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return upgrade.CheckCluster(ctx, cfg)
 }

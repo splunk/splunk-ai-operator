@@ -120,6 +120,7 @@ aiPlatform:
       checkpointDbSecretRef: "mltk-postgres-conn"
       # Match the live DNS and checkpoint pods before installing or upgrading.
       networkPolicy:
+        metricsDisabled: true
         dns:
           namespace: kube-system
           podSelector:

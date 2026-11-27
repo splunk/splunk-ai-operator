@@ -34,6 +34,7 @@ spec:
       targetCPUUtilization: 60
       checkpointDbSecretRef: "mltk-postgres-conn"
       networkPolicy:
+        metricsDisabled: true
         dns:
           namespace: kube-system
           podSelector:

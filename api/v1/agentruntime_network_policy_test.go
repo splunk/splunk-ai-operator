@@ -45,6 +45,26 @@ func TestAgentRuntimeNetworkPolicyValidation(t *testing.T) {
 	}
 }
 
+func TestAgentRuntimeMetricsPolicyValidation(t *testing.T) {
+	path := field.NewPath("spec", "features", "networkPolicy")
+	policy := &AgentRuntimeNetworkPolicy{
+		DNS:        AgentRuntimeNetworkPeer{PodSelector: map[string]string{"k8s-app": "kube-dns"}},
+		PostgreSQL: AgentRuntimeNetworkDestination{Peer: AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "postgres"}}, Port: 5432},
+	}
+	require.ErrorContains(t, policy.ValidateMetrics(path, true).ToAggregate(), "networkPolicy.metrics")
+	require.Empty(t, policy.ValidateMetrics(path, false))
+
+	policy.MetricsDisabled = true
+	require.Empty(t, policy.Validate(path, false))
+	require.Empty(t, policy.ValidateMetrics(path, true))
+
+	policy.Metrics = &AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "prometheus"}}
+	require.ErrorContains(t, policy.Validate(path, false).ToAggregate(), "cannot be combined with metricsDisabled")
+	policy.MetricsDisabled = false
+	require.Empty(t, policy.Validate(path, false))
+	require.Empty(t, policy.ValidateMetrics(path, true))
+}
+
 func TestIsPrivateNetworkPrefix(t *testing.T) {
 	for _, prefix := range []string{"10.0.0.0/8", "172.16.1.5/32", "192.168.0.0/16", "fd00:abcd::/64"} {
 		assert.True(t, isPrivateNetworkPrefix(prefix), prefix)

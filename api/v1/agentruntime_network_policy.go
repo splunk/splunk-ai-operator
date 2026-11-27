@@ -20,6 +20,10 @@ type AgentRuntimeNetworkPolicy struct {
 	SLIM *AgentRuntimeNetworkPeer `json:"slim,omitempty"`
 	// Metrics selects the scraper on the runtime metrics port.
 	Metrics *AgentRuntimeNetworkPeer `json:"metrics,omitempty"`
+	// MetricsDisabled explicitly disables scraping and removes the owned ServiceMonitor.
+	MetricsDisabled bool `json:"metricsDisabled,omitempty"`
+	// ManagedRay allows the head pods of the owning fullfeature RayService.
+	ManagedRay bool `json:"managedRay,omitempty"`
 	// RuntimeEgress lists additional TCP destinations, such as model and MCP backends.
 	RuntimeEgress []AgentRuntimeNetworkDestination `json:"runtimeEgress,omitempty"`
 }
@@ -57,12 +61,23 @@ func (p *AgentRuntimeNetworkPolicy) Validate(path *field.Path, requireSLIM bool)
 		errs = append(errs, field.Required(path.Child("slim"), "must select the SLIM caller for a standalone AgentRuntime"))
 	}
 	if p.Metrics != nil {
+		if p.MetricsDisabled {
+			errs = append(errs, field.Forbidden(path.Child("metrics"), "cannot be combined with metricsDisabled"))
+		}
 		errs = append(errs, p.Metrics.validate(path.Child("metrics"), false)...)
 	}
 	for i, dest := range p.RuntimeEgress {
 		errs = append(errs, dest.validate(path.Child("runtimeEgress").Index(i))...)
 	}
 	return errs
+}
+
+// ValidateMetrics requires enabled runtimes to declare a scraper or explicitly opt out.
+func (p *AgentRuntimeNetworkPolicy) ValidateMetrics(path *field.Path, enabled bool) field.ErrorList {
+	if p != nil && enabled && p.Metrics == nil && !p.MetricsDisabled {
+		return field.ErrorList{field.Required(path.Child("metrics"), "must select an approved scraper or set metricsDisabled to true")}
+	}
+	return nil
 }
 
 func (d AgentRuntimeNetworkDestination) validate(path *field.Path) field.ErrorList {

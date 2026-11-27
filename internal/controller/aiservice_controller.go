@@ -286,6 +286,9 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeWorkloadIndex, runtimeWorkloadKeys); err != nil {
 		return err
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeRayPlatformIndex, runtimeRayPlatformKeys); err != nil {
+		return err
+	}
 	return r.setupController(mgr)
 }
 
@@ -309,6 +312,7 @@ func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 		Owns(&monitoringv1.ServiceMonitor{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// These resources belong to Services, ReplicaSets or Deployments rather
 		// than directly to the AIService; map their observations explicitly.
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.findManagedRayConsumers), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&appsv1.ReplicaSet{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).

@@ -38,6 +38,7 @@ spec:
       targetCPUUtilization: 60
       checkpointDbSecretRef: "mltk-postgres-conn"
       networkPolicy:
+        metricsDisabled: true
         dns:
           namespace: kube-system
           podSelector:
@@ -47,12 +48,7 @@ spec:
             podSelector:
               app: checkpoint-db
           port: 5432
-        runtimeEgress:
-          - peer:
-              podSelector:
-                ray.io/cluster: replace-with-active-ray-cluster
-                ray.io/node-type: head
-            port: 8000
+        managedRay: true
   # Storage configuration
   storage:
     vectorDB:

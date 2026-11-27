@@ -4,14 +4,18 @@ import (
 	"context"
 	"testing"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,7 +28,8 @@ func testNetworkPolicy() *aiv1.AgentRuntimeNetworkPolicy {
 		PostgreSQL: aiv1.AgentRuntimeNetworkDestination{
 			Peer: aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "postgres"}}, Port: 5432,
 		},
-		SLIM: &aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "slim"}},
+		SLIM:    &aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "slim"}},
+		Metrics: &aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "prometheus"}},
 	}
 }
 
@@ -65,11 +70,11 @@ func TestAgentRuntimeNetworkAndDisruptionResources(t *testing.T) {
 	selector, err := metav1.LabelSelectorAsSelector(&runtimePolicy.Spec.PodSelector)
 	require.NoError(t, err)
 	require.True(t, selector.Matches(labels.Set(agentRuntimeSelectorLabels(ai))))
-	require.False(t, selector.Matches(labels.Set(schemaSelectorLabels(ai))))
+	require.False(t, selector.Matches(labels.Set(SchemaSelectorLabels(ai.Name))))
 	selector, err = metav1.LabelSelectorAsSelector(&schemaPolicy.Spec.PodSelector)
 	require.NoError(t, err)
-	require.True(t, selector.Matches(labels.Set(schemaSelectorLabels(ai))))
-	require.False(t, selector.Matches(labels.Set(schemaSelectorLabels(&aiv1.AIService{ObjectMeta: metav1.ObjectMeta{Name: "another-runtime"}}))))
+	require.True(t, selector.Matches(labels.Set(SchemaSelectorLabels(ai.Name))))
+	require.False(t, selector.Matches(labels.Set(SchemaSelectorLabels("another-runtime"))))
 	require.Empty(t, schemaPolicy.Spec.Ingress)
 	require.Len(t, runtimePolicy.Spec.Ingress, 2)
 	require.Equal(t, int32(8080), runtimePolicy.Spec.Ingress[0].Ports[0].Port.IntVal)
@@ -118,7 +123,10 @@ func TestAgentRuntimePolicyUsesStagedParentAllowlist(t *testing.T) {
 	ai := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "stack-agentruntime-mltk", Namespace: "default", UID: "runtime-uid",
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(platform, aiv1.GroupVersion.WithKind("AIPlatform"))}},
-		Spec: aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"}},
+		Spec: aiv1.AIServiceSpec{
+			Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
+			Metrics: aiv1.MetricsConfig{Enabled: true},
+		},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, platform).Build()
 	r := &AgentRuntimeReconciler{Client: c, Scheme: scheme}
@@ -126,7 +134,22 @@ func TestAgentRuntimePolicyUsesStagedParentAllowlist(t *testing.T) {
 	np := &networkingv1.NetworkPolicy{}
 	key := client.ObjectKey{Namespace: ai.Namespace, Name: ai.Name + "-network"}
 	require.NoError(t, c.Get(ctx, key, np))
+	// A valid stale child copy selects a different SLIM, which must never be used.
 	require.Equal(t, map[string]string{"app": "stack-slim", "component": "stack-slim"}, np.Spec.Ingress[0].From[0].PodSelector.MatchLabels)
+	require.Len(t, np.Spec.Ingress, 2)
+	require.NoError(t, r.reconcileServiceMonitor(ctx, ai))
+	monitorKey := client.ObjectKey{Namespace: ai.Namespace, Name: ai.Name + "-agentruntime-metrics"}
+	require.NoError(t, c.Get(ctx, monitorKey, &monitoringv1.ServiceMonitor{}))
+
+	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(platform), platform))
+	platform.Spec.Features[0].NetworkPolicy.Metrics = nil
+	platform.Spec.Features[0].NetworkPolicy.MetricsDisabled = true
+	require.NoError(t, c.Update(ctx, platform))
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, ai))
+	require.NoError(t, c.Get(ctx, key, np))
+	require.Len(t, np.Spec.Ingress, 1)
+	require.NoError(t, r.reconcileServiceMonitor(ctx, ai))
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, monitorKey, &monitoringv1.ServiceMonitor{})))
 
 	// A same-named customer policy must not be edited or adopted.
 	require.NoError(t, c.Delete(ctx, np))
@@ -136,4 +159,108 @@ func TestAgentRuntimePolicyUsesStagedParentAllowlist(t *testing.T) {
 	require.NoError(t, c.Get(ctx, key, np))
 	require.Equal(t, customer.Spec, np.Spec)
 	require.Empty(t, np.OwnerReferences)
+	guardKey := client.ObjectKey{Namespace: ai.Namespace, Name: policyGuardName(ai, runtimePolicySuffix)}
+	guard := &networkingv1.NetworkPolicy{}
+	require.NoError(t, c.Get(ctx, guardKey, guard))
+	require.True(t, metav1.IsControlledBy(guard, ai))
+	require.Equal(t, isolatedNetworkSpec(agentRuntimeSelectorLabels(ai)), guard.Spec)
+
+	require.NoError(t, c.Delete(ctx, customer))
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, ai))
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, guardKey, guard)))
+	require.NoError(t, c.Get(ctx, key, np))
+	require.True(t, metav1.IsControlledBy(np, ai))
+	require.Len(t, np.Spec.Ingress, 1)
+}
+
+func TestAgentRuntimeMetricsOptOutRemovesOnlyOwnedMonitor(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "default", UID: "runtime-uid"},
+		Spec: aiv1.AIServiceSpec{
+			Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
+			Metrics: aiv1.MetricsConfig{Enabled: true, Path: "/metrics"},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &AgentRuntimeReconciler{Client: c, Scheme: scheme}
+	monitorKey := client.ObjectKey{Namespace: ai.Namespace, Name: ai.Name + "-agentruntime-metrics"}
+	monitor := &monitoringv1.ServiceMonitor{}
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, ai))
+	require.NoError(t, r.reconcileServiceMonitor(ctx, ai))
+	require.NoError(t, c.Get(ctx, monitorKey, monitor))
+	require.True(t, metav1.IsControlledBy(monitor, ai))
+
+	config := ai.Spec.Feature.NetworkPolicy
+	config.Metrics = nil
+	require.ErrorContains(t, r.reconcileNetworkPolicies(ctx, ai), "must select an approved scraper")
+	config.MetricsDisabled = true
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, ai))
+	require.NoError(t, r.reconcileServiceMonitor(ctx, ai))
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, monitorKey, monitor)))
+	policy := &networkingv1.NetworkPolicy{}
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: dnsLabelName(ai.Name, runtimePolicySuffix)}, policy))
+	require.Len(t, policy.Spec.Ingress, 1)
+	require.Equal(t, int32(8080), policy.Spec.Ingress[0].Ports[0].Port.IntVal)
+	require.Len(t, policy.Spec.Egress, 2)
+
+	foreign := &monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: monitorKey.Name, Namespace: monitorKey.Namespace}}
+	require.NoError(t, c.Create(ctx, foreign))
+	require.NoError(t, r.reconcileServiceMonitor(ctx, ai))
+	require.NoError(t, c.Get(ctx, monitorKey, monitor))
+	require.Equal(t, foreign.ResourceVersion, monitor.ResourceVersion)
+}
+
+func TestAgentRuntimeIsolatesLegacySchemaJobByUID(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildAgentRuntimeTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "default", UID: "runtime-uid"},
+		Spec:       aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()}},
+	}
+	legacy := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "schema-legacy", Namespace: ai.Namespace, UID: types.UID("legacy-uid"),
+			Annotations:     map[string]string{schemaJobManagedAnnotation: schemaJobManagedValue},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ai, aiv1.GroupVersion.WithKind("AIService"))},
+		},
+		Spec: batchv1.JobSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{batchv1.ControllerUidLabel: "legacy-uid"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				"app": "customer-app", "component": schemaComponent, batchv1.ControllerUidLabel: "legacy-uid",
+			}}},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	unrelated := legacy.DeepCopy()
+	unrelated.Name = "other-job"
+	unrelated.UID = "other-uid"
+	unrelated.OwnerReferences = nil
+	unrelated.Spec.Selector.MatchLabels[batchv1.ControllerUidLabel] = "other-uid"
+	unrelated.Spec.Template.Labels[batchv1.ControllerUidLabel] = "other-uid"
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai, legacy, unrelated).WithStatusSubresource(legacy).Build()
+	r := &AgentRuntimeReconciler{Client: c, Scheme: scheme}
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, ai))
+
+	key := client.ObjectKey{Namespace: ai.Namespace, Name: dnsLabelName(ai.Name, legacySchemaPolicySuffix)}
+	policy := &networkingv1.NetworkPolicy{}
+	require.NoError(t, c.Get(ctx, key, policy))
+	require.True(t, metav1.IsControlledBy(policy, ai))
+	selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
+	require.NoError(t, err)
+	require.True(t, selector.Matches(labels.Set(legacy.Spec.Template.Labels)))
+	require.False(t, selector.Matches(labels.Set(unrelated.Spec.Template.Labels)))
+	require.Empty(t, policy.Spec.Ingress)
+	require.Len(t, policy.Spec.Egress, 2)
+	require.Equal(t, int32(5432), policy.Spec.Egress[1].Ports[0].Port.IntVal)
+	state := &batchv1.Job{}
+	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(legacy), state))
+	require.Equal(t, legacy.Spec, state.Spec)
+	state.Status.Active = 0
+	state.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	require.NoError(t, c.Status().Update(ctx, state))
+	require.NoError(t, r.reconcileNetworkPolicies(ctx, ai))
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, key, policy)))
+	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(legacy), state))
 }

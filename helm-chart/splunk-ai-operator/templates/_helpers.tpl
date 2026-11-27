@@ -53,3 +53,12 @@ Define namespace of release and allow for namespace override
 {{- define "splunk-ai-operator.namespace" -}}
 {{- default .Release.Namespace .Values.namespaceOverride }}
 {{- end }}
+
+{{/* Deployment and pre-upgrade validation use the same candidate image. */}}
+{{- define "splunk-ai-operator.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion | default "latest" | toString) -}}
+{{- end -}}
+{{- end }}

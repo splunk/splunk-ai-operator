@@ -90,7 +90,8 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	const namespace = "candidate-validation"
 	// Explicit fixture peers exercise reconciliation without inferring policy from URLs.
 	allowlist := &aiv1.AgentRuntimeNetworkPolicy{
-		DNS: aiv1.AgentRuntimeNetworkPeer{Namespace: "kube-system", PodSelector: map[string]string{"k8s-app": "kube-dns"}},
+		MetricsDisabled: true,
+		DNS:             aiv1.AgentRuntimeNetworkPeer{Namespace: "kube-system", PodSelector: map[string]string{"k8s-app": "kube-dns"}},
 		PostgreSQL: aiv1.AgentRuntimeNetworkDestination{
 			Peer: aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "offline-postgres"}}, Port: 5432,
 		},

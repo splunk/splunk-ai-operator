@@ -648,7 +648,7 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 
 	labels, annotations := labelsAndAnnotations(ai)
 	// Keep the schema policy selector stable even when labels are supplied by the caller.
-	for key, value := range schemaSelectorLabels(ai) {
+	for key, value := range SchemaSelectorLabels(ai.Name) {
 		labels[key] = value
 	}
 	annotations[schemaJobInputHashAnnotation] = inputHash
@@ -984,17 +984,25 @@ func (r *AgentRuntimeReconciler) reconcileHPA(ctx context.Context, ai *aiv1.AISe
 }
 
 func (r *AgentRuntimeReconciler) reconcileServiceMonitor(ctx context.Context, ai *aiv1.AIService) error {
+	name := ai.Name + "-agentruntime-metrics"
 	if !ai.Spec.Metrics.Enabled {
-		return nil
+		return r.deleteOwnedObject(ctx, ai, &monitoringv1.ServiceMonitor{}, name)
+	}
+	config, _, err := r.resolveNetworkPolicy(ctx, ai)
+	if err != nil {
+		return err
+	}
+	if config.MetricsDisabled {
+		return r.deleteOwnedObject(ctx, ai, &monitoringv1.ServiceMonitor{}, name)
 	}
 
 	sm := &monitoringv1.ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ai.Name + "-agentruntime-metrics",
+			Name:      name,
 			Namespace: ai.Namespace,
 		},
 	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sm, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, sm, func() error {
 		if err := common.ClaimOrRefuse(ai, sm, r.Scheme); err != nil {
 			return err
 		}

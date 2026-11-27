@@ -1123,6 +1123,10 @@ spec:
                                 pod must match.
                               type: object
                           type: object
+                        managedRay:
+                          description: ManagedRay allows the head pods of the owning
+                            fullfeature RayService.
+                          type: boolean
                         metrics:
                           description: Metrics selects the scraper on the runtime
                             metrics port.
@@ -1143,6 +1147,10 @@ spec:
                                 pod must match.
                               type: object
                           type: object
+                        metricsDisabled:
+                          description: MetricsDisabled explicitly disables scraping
+                            and removes the owned ServiceMonitor.
+                          type: boolean
                         postgresql:
                           description: PostgreSQL is the checkpoint database used
                             by the runtime and schema Job.
@@ -4435,6 +4443,10 @@ spec:
                               must match.
                             type: object
                         type: object
+                      managedRay:
+                        description: ManagedRay allows the head pods of the owning
+                          fullfeature RayService.
+                        type: boolean
                       metrics:
                         description: Metrics selects the scraper on the runtime metrics
                           port.
@@ -4455,6 +4467,10 @@ spec:
                               must match.
                             type: object
                         type: object
+                      metricsDisabled:
+                        description: MetricsDisabled explicitly disables scraping
+                          and removes the owned ServiceMonitor.
+                        type: boolean
                       postgresql:
                         description: PostgreSQL is the checkpoint database used by
                           the runtime and schema Job.

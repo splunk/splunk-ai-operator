@@ -274,7 +274,9 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 	allErrs = append(allErrs, policy.Validate(fldPath)...)
 	owner := metav1.GetControllerOf(aiservice)
 	platformManaged := owner != nil && owner.APIVersion == aiv1.GroupVersion.String() && owner.Kind == "AIPlatform"
-	allErrs = append(allErrs, aiservice.Spec.Feature.NetworkPolicy.Validate(fldPath.Child("features", "networkPolicy"), !platformManaged)...)
+	networkPath := fldPath.Child("features", "networkPolicy")
+	allErrs = append(allErrs, aiservice.Spec.Feature.NetworkPolicy.Validate(networkPath, !platformManaged)...)
+	allErrs = append(allErrs, aiservice.Spec.Feature.NetworkPolicy.ValidateMetrics(networkPath, aiservice.Spec.Metrics.Enabled)...)
 
 	return allErrs
 }

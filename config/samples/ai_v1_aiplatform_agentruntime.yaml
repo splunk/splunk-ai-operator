@@ -30,6 +30,7 @@ spec:
       targetCPUUtilization: 60
       checkpointDbSecretRef: mltk-postgres-conn
       networkPolicy:
+        metricsDisabled: true
         dns:
           namespace: kube-system
           podSelector:
@@ -40,4 +41,5 @@ spec:
             podSelector:
               app: postgres
           port: 5432
-        # Add the actual model-serving and MCP selectors or private CIDRs for your deployment.
+        managedRay: true
+        # Add the actual MCP selectors or private CIDRs for your deployment.

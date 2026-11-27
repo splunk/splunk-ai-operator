@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -19,15 +22,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-const schemaComponent = "agentruntime-schema-setup"
+const (
+	schemaComponent          = "agentruntime-schema-setup"
+	runtimePolicySuffix      = "network"
+	schemaPolicySuffix       = "schema-network"
+	legacySchemaPolicySuffix = "schema-network-legacy"
+	disruptionBudgetSuffix   = "agentruntime-pdb"
+)
 
-func schemaSelectorLabels(ai *aiv1.AIService) map[string]string {
-	return map[string]string{"app": agentRuntimeWorkloadName(ai.Name), "component": schemaComponent}
+// ManagedResourceNames returns the names reserved for the AIService during an upgrade.
+func ManagedResourceNames(aiServiceName string) (runtimePolicy, schemaPolicy, budget string) {
+	return dnsLabelName(aiServiceName, runtimePolicySuffix), dnsLabelName(aiServiceName, schemaPolicySuffix), dnsLabelName(aiServiceName, disruptionBudgetSuffix)
+}
+
+// SchemaSelectorLabels identifies pods from new schema Jobs for this AIService.
+func SchemaSelectorLabels(aiServiceName string) map[string]string {
+	return map[string]string{"app": agentRuntimeWorkloadName(aiServiceName), "component": schemaComponent}
 }
 
 func (r *AgentRuntimeReconciler) reconcileDisruptionBudget(ctx context.Context, ai *aiv1.AIService) error {
 	budget := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{
-		Name: dnsLabelName(ai.Name, "agentruntime-pdb"), Namespace: ai.Namespace,
+		Name: dnsLabelName(ai.Name, disruptionBudgetSuffix), Namespace: ai.Namespace,
 	}}
 	_, err := controllerutil.CreateOrPatch(ctx, r.Client, budget, func() error {
 		if err := common.ClaimOrRefuse(ai, budget, r.Scheme); err != nil {
@@ -46,7 +61,7 @@ func (r *AgentRuntimeReconciler) reconcileDisruptionBudget(ctx context.Context, 
 
 func (r *AgentRuntimeReconciler) reconcileNetworkPolicies(ctx context.Context, ai *aiv1.AIService) error {
 	runtimeSpec := isolatedNetworkSpec(agentRuntimeSelectorLabels(ai))
-	schemaSpec := isolatedNetworkSpec(schemaSelectorLabels(ai))
+	schemaSpec := isolatedNetworkSpec(SchemaSelectorLabels(ai.Name))
 	config, slim, configErr := r.resolveNetworkPolicy(ctx, ai)
 	var invalid *schemaStageError
 	if configErr != nil && !errors.As(configErr, &invalid) {
@@ -67,6 +82,17 @@ func (r *AgentRuntimeReconciler) reconcileNetworkPolicies(ctx context.Context, a
 		for _, destination := range config.RuntimeEgress {
 			runtimeSpec.Egress = append(runtimeSpec.Egress, networkEgress(destination))
 		}
+		if config.ManagedRay {
+			ray, err := r.managedRayNetworkRules(ctx, ai)
+			if err != nil {
+				if !errors.As(err, &invalid) {
+					return err // A transient read failure must preserve the last reconciled policy.
+				}
+				configErr = err // Persist baseline isolation while the Ray route is unavailable.
+			} else {
+				runtimeSpec.Egress = append(runtimeSpec.Egress, ray...)
+			}
+		}
 		if slim != nil {
 			runtimeSpec.Ingress = append(runtimeSpec.Ingress, networkIngress(*slim, defaultAgentRuntimeHTTPPort))
 		}
@@ -79,8 +105,9 @@ func (r *AgentRuntimeReconciler) reconcileNetworkPolicies(ctx context.Context, a
 	// on invalid inputs so pre-existing workloads do not keep open access.
 	// Try both policies even if one name conflicts with an existing object.
 	applyErr := errors.Join(
-		r.reconcileNetworkPolicy(ctx, ai, "schema-network", schemaSpec),
-		r.reconcileNetworkPolicy(ctx, ai, "network", runtimeSpec),
+		r.reconcilePolicyWithGuard(ctx, ai, schemaPolicySuffix, schemaSpec),
+		r.reconcilePolicyWithGuard(ctx, ai, runtimePolicySuffix, runtimeSpec),
+		r.reconcileLegacySchemaPolicy(ctx, ai, schemaSpec),
 	)
 	if applyErr != nil {
 		return applyErr
@@ -91,9 +118,10 @@ func (r *AgentRuntimeReconciler) reconcileNetworkPolicies(ctx context.Context, a
 func (r *AgentRuntimeReconciler) resolveNetworkPolicy(ctx context.Context, ai *aiv1.AIService) (*aiv1.AgentRuntimeNetworkPolicy, *aiv1.AgentRuntimeNetworkPeer, error) {
 	config := ai.Spec.Feature.NetworkPolicy
 	owner := metav1.GetControllerOf(ai)
-	managed := owner != nil && owner.APIVersion == aiv1.GroupVersion.String() && owner.Kind == "AIPlatform"
+	managed := owner != nil && owner.APIVersion == aiv1.GroupVersion.String() && owner.Kind == "AIPlatform" &&
+		ai.Name == FeatureAIServiceName(owner.Name, ai.Spec.Feature.Provider)
 	var platform *aiv1.AIPlatform
-	if managed && (config == nil || config.SLIM == nil) {
+	if managed {
 		platform = &aiv1.AIPlatform{}
 		err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: owner.Name}, platform)
 		if err != nil && !apierrors.IsNotFound(err) {
@@ -102,18 +130,19 @@ func (r *AgentRuntimeReconciler) resolveNetworkPolicy(ctx context.Context, ai *a
 		if err != nil || platform.UID != owner.UID {
 			return nil, nil, schemaState("InvalidNetworkPolicy", "cannot resolve the owning AIPlatform for the AgentRuntime network policy")
 		}
-		if config == nil {
-			// Upgrade preflight saves the allowlist on the parent first. An older
-			// controller may not have copied it to the generated AIService yet.
-			for _, feature := range platform.Spec.Features {
-				if feature.Name == ai.Spec.Feature.Name && feature.Provider == ai.Spec.Feature.Provider {
-					config = feature.NetworkPolicy
-					break
-				}
+		// The staged allowlist on the parent takes effect before the generated
+		// AIService is refreshed. Its old copy may grant access since removed.
+		config = nil
+		for _, feature := range platform.Spec.Features {
+			if feature.Name == ai.Spec.Feature.Name && feature.Provider == ai.Spec.Feature.Provider {
+				config = feature.NetworkPolicy
+				break
 			}
 		}
 	}
-	if errs := config.Validate(field.NewPath("spec", "features", "networkPolicy"), !managed); len(errs) != 0 {
+	path := field.NewPath("spec", "features", "networkPolicy")
+	errs := append(config.Validate(path, !managed), config.ValidateMetrics(path, ai.Spec.Metrics.Enabled || managed)...)
+	if len(errs) != 0 {
 		return nil, nil, schemaState("InvalidNetworkPolicy", errs.ToAggregate().Error())
 	}
 	if config.SLIM != nil || platform == nil {
@@ -134,9 +163,93 @@ func isolatedNetworkSpec(labels map[string]string) networkingv1.NetworkPolicySpe
 	}
 }
 
-func (r *AgentRuntimeReconciler) reconcileNetworkPolicy(ctx context.Context, ai *aiv1.AIService, suffix string, spec networkingv1.NetworkPolicySpec) error {
+func (r *AgentRuntimeReconciler) reconcileLegacySchemaPolicy(ctx context.Context, ai *aiv1.AIService, spec networkingv1.NetworkPolicySpec) error {
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(ai.Namespace)); err != nil {
+		return fmt.Errorf("read schema Jobs for policy migration: %w", err)
+	}
+	var legacyUIDs []string
+	var incompatibleJob bool
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if !metav1.IsControlledBy(job, ai) || job.Annotations[schemaJobManagedAnnotation] != schemaJobManagedValue {
+			continue
+		}
+		if job.Status.Active == 0 && (schemaJobSucceeded(job) || schemaJobFailed(job)) {
+			continue
+		}
+		labels := job.Spec.Template.Labels
+		if labels["app"] == spec.PodSelector.MatchLabels["app"] && labels["component"] == schemaComponent {
+			continue
+		}
+		uid := string(job.UID)
+		if uid == "" || job.Spec.Selector == nil || job.Spec.Selector.MatchLabels[batchv1.ControllerUidLabel] != uid || labels[batchv1.ControllerUidLabel] != uid {
+			incompatibleJob = true
+			continue
+		}
+		legacyUIDs = append(legacyUIDs, uid)
+	}
+	if len(legacyUIDs) == 0 && !incompatibleJob {
+		return errors.Join(
+			r.deleteOwnedObject(ctx, ai, &networkingv1.NetworkPolicy{}, dnsLabelName(ai.Name, legacySchemaPolicySuffix)),
+			r.deleteOwnedObject(ctx, ai, &networkingv1.NetworkPolicy{}, policyGuardName(ai, legacySchemaPolicySuffix)),
+		)
+	}
+	var err error
+	if len(legacyUIDs) > 0 {
+		// Job UIDs select only the verified migrations, including their retry pods.
+		// A customer app label may be shared by unrelated workloads.
+		slices.Sort(legacyUIDs)
+		spec.PodSelector = metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+			Key: batchv1.ControllerUidLabel, Operator: metav1.LabelSelectorOpIn, Values: legacyUIDs,
+		}}}
+		err = r.reconcilePolicyWithGuard(ctx, ai, legacySchemaPolicySuffix, spec)
+	}
+	if incompatibleJob {
+		return errors.Join(err, schemaState("SchemaPolicyMigrationBlocked", "an active schema Job has no verified pod UID selector; wait for it to finish before completing the network policy upgrade"))
+	}
+	return err
+}
+
+func policyGuardName(ai *aiv1.AIService, suffix string) string {
+	return dnsLabelName(ai.Name, suffix+"-guard-"+shortHash(string(ai.UID)))
+}
+
+func (r *AgentRuntimeReconciler) reconcilePolicyWithGuard(ctx context.Context, ai *aiv1.AIService, suffix string, spec networkingv1.NetworkPolicySpec) error {
+	name := dnsLabelName(ai.Name, suffix)
+	guardName := policyGuardName(ai, suffix)
+	err := r.reconcileNetworkPolicy(ctx, ai, name, spec)
+	if err == nil {
+		return r.deleteOwnedObject(ctx, ai, &networkingv1.NetworkPolicy{}, guardName)
+	}
+	var conflict *common.OwnershipConflictError
+	if !errors.As(err, &conflict) {
+		return err
+	}
+	// Isolate existing pods even when a foreign object prevents creation of the
+	// intended policy. Keep the conflict visible and leave the foreign object alone.
+	spec.Ingress = nil
+	spec.Egress = nil
+	return errors.Join(err, r.reconcileNetworkPolicy(ctx, ai, guardName, spec))
+}
+
+func (r *AgentRuntimeReconciler) deleteOwnedObject(ctx context.Context, ai *aiv1.AIService, obj client.Object, name string) error {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: name}, obj); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
+	if !metav1.IsControlledBy(obj, ai) {
+		return nil
+	}
+	uid, version := obj.GetUID(), obj.GetResourceVersion()
+	return client.IgnoreNotFound(r.Delete(ctx, obj, client.Preconditions{UID: &uid, ResourceVersion: &version}))
+}
+
+func (r *AgentRuntimeReconciler) reconcileNetworkPolicy(ctx context.Context, ai *aiv1.AIService, name string, spec networkingv1.NetworkPolicySpec) error {
 	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
-		Name: dnsLabelName(ai.Name, suffix), Namespace: ai.Namespace,
+		Name: name, Namespace: ai.Namespace,
 	}}
 	_, err := controllerutil.CreateOrPatch(ctx, r.Client, policy, func() error {
 		if err := common.ClaimOrRefuse(ai, policy, r.Scheme); err != nil {
@@ -146,7 +259,7 @@ func (r *AgentRuntimeReconciler) reconcileNetworkPolicy(ctx context.Context, ai 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile %s: %w", suffix, err)
+		return fmt.Errorf("reconcile network policy %s: %w", name, err)
 	}
 	return nil
 }

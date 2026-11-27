@@ -4,6 +4,8 @@ import (
 	"context"
 	"reflect"
 
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/features/agentruntime"
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,7 +20,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const runtimeWorkloadIndex = "agentruntime.backend"
+const (
+	runtimeWorkloadIndex    = "agentruntime.backend"
+	runtimeRayPlatformIndex = "agentruntime.rayPlatform"
+)
 
 // Index the rendered names so backend events can find their AIService without
 // guessing names from labels that may have been shortened for Kubernetes limits.
@@ -42,6 +47,9 @@ func (r *AIServiceReconciler) findRuntimeServicesForBackend(ctx context.Context,
 			key = "service/" + name
 		}
 	case *corev1.Pod:
+		if o.Labels[rayutils.RayNodeTypeLabelKey] == string(rayv1.HeadNode) {
+			return r.findManagedRayConsumers(ctx, o)
+		}
 		if app := o.Labels["app"]; app != "" && o.Labels["component"] == app {
 			key = "pod/" + app
 		}
@@ -56,6 +64,58 @@ func (r *AIServiceReconciler) findRuntimeServicesForBackend(ctx context.Context,
 	var services aiv1.AIServiceList
 	if err := r.List(ctx, &services, client.InNamespace(obj.GetNamespace()), client.MatchingFields{runtimeWorkloadIndex: key}); err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "cannot map runtime backend event")
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(services.Items))
+	for i := range services.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&services.Items[i])})
+	}
+	return requests
+}
+
+// Index by the referenced platform, which has the same name as its RayService.
+func runtimeRayPlatformKeys(obj client.Object) []string {
+	ai := obj.(*aiv1.AIService)
+	policy := ai.Spec.Feature.NetworkPolicy
+	ref := ai.Spec.AIPlatformRef
+	if ai.Spec.Feature.Name != "agentruntime" || policy == nil || !policy.ManagedRay || ref.Name == "" {
+		return nil
+	}
+	if ref.Namespace == "" {
+		ref.Namespace = ai.Namespace
+	}
+	return []string{ref.Namespace + "/" + ref.Name}
+}
+
+// Pending head Pod events stage the replacement path. The stable head Service
+// event follows the actual cutover, including when a pending event was missed.
+func (r *AIServiceReconciler) findManagedRayConsumers(ctx context.Context, obj client.Object) []reconcile.Request {
+	owner := metav1.GetControllerOf(obj)
+	if owner == nil || owner.APIVersion != rayv1.GroupVersion.String() {
+		return nil
+	}
+	if _, isPod := obj.(*corev1.Pod); isPod {
+		if owner.Kind != "RayCluster" {
+			return nil
+		}
+		cluster := &rayv1.RayCluster{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: owner.Name}, cluster); err != nil || cluster.UID != owner.UID {
+			return nil
+		}
+		owner = metav1.GetControllerOf(cluster)
+	}
+	if owner == nil || owner.APIVersion != rayv1.GroupVersion.String() || owner.Kind != "RayService" {
+		return nil
+	}
+	if service, ok := obj.(*corev1.Service); ok {
+		name, err := rayutils.GenerateHeadServiceName(rayutils.RayServiceCRD, rayv1.RayClusterSpec{}, owner.Name)
+		if err != nil || service.Name != name {
+			return nil
+		}
+	}
+	var services aiv1.AIServiceList
+	if err := r.List(ctx, &services, client.MatchingFields{runtimeRayPlatformIndex: obj.GetNamespace() + "/" + owner.Name}); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "cannot map managed Ray event")
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(services.Items))

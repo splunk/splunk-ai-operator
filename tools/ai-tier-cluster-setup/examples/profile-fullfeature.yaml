@@ -107,6 +107,7 @@ aiPlatform:
       checkpointDbSecretRef: "mltk-postgres-conn"   # created by the deployment configuration below
       # Replace these sample peers with the selectors or approved private ranges for this deployment.
       networkPolicy:
+        metricsDisabled: true
         dns:
           namespace: kube-system
           podSelector:
@@ -116,12 +117,7 @@ aiPlatform:
             podSelector:
               app: checkpoint-db
           port: 5432
-        runtimeEgress:
-          - peer:
-              podSelector:
-                ray.io/cluster: replace-with-active-ray-cluster
-                ray.io/node-type: head
-            port: 8000
+        managedRay: true
   agentRuntime:
     checkpointSecrets:
       - name: "mltk-postgres-conn"

@@ -2537,31 +2537,106 @@ assert_rc "runtime network policy rejects a namespace with no pod selector" 1 _p
   "$(_profile_cfg cpuonly broad-network-policy 'del(.aiPlatform.features[1].networkPolicy.dns.podSelector)')" \
   validate_agentruntime_network_policy_config
 
+assert_rc "runtime network policy requires a metrics choice for a managed runtime" 1 _profile_run \
+  "$(_profile_cfg cpuonly no-metrics-choice 'del(.aiPlatform.features[1].networkPolicy.metricsDisabled) | del(.aiPlatform.features[1].networkPolicy.metrics)')" \
+  validate_agentruntime_network_policy_config
+assert_rc "runtime network policy rejects a metrics peer with scraping opted out" 1 _profile_run \
+  "$(_profile_cfg cpuonly contradictory-metrics '.aiPlatform.features[1].networkPolicy.metricsDisabled = true | .aiPlatform.features[1].networkPolicy.metrics = {"podSelector":{"app":"prometheus"}}')" \
+  validate_agentruntime_network_policy_config
+assert_rc "runtime network policy rejects managed Ray for cpuOnly" 1 _profile_run \
+  "$(_profile_cfg cpuonly invalid-managed-ray '.aiPlatform.features[1].networkPolicy.managedRay = true')" \
+  validate_agentruntime_network_policy_config
+
 _network_policy_upgrade() (
-  local case="$1" policy
-  policy='{"dns":{"podSelector":{"app":"dns"}},"postgresql":{"peer":{"cidr":"10.0.0.1/32"},"port":5432},"slim":{"podSelector":{"app":"slim"}}}'
-  kubectl() {
+  local case="$1" policy runtime_name=platform-agentruntime policy_name=platform-agentruntime-network policy_schema
+  policy_schema='{"type":"object","properties":{"dns":{"type":"object"},"postgresql":{"type":"object"},"slim":{"type":"object"},"metrics":{"type":"object"},"runtimeEgress":{"type":"array"},"metricsDisabled":{"type":"boolean"},"managedRay":{"type":"boolean"}}}'
+  policy='{"dns":{"podSelector":{"app":"dns"}},"postgresql":{"peer":{"cidr":"10.0.0.1/32"},"port":5432},"slim":{"podSelector":{"app":"slim"}},"metricsDisabled":true}'
+  if [[ "${case}" == long-name-collision ]]; then
+    runtime_name=runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    policy_name=runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-26b93520-schema-network
+  elif [[ "${case}" == standalone* ]]; then
+    runtime_name=runtime
+  fi
+  target_kubectl() {
+    [[ "$1" == get ]] || return 1
     case "$2" in
       crd)
         [[ "${case}" != unavailable ]] || return 1
         [[ "${case}" != new-install ]] || return 0
-        printf '%s\n' customresourcedefinition.apiextensions.k8s.io/aiplatforms.ai.splunk.com \
-          customresourcedefinition.apiextensions.k8s.io/aiservices.ai.splunk.com
+        local feature_schema
+        [[ "${case}" == old-schema || "${case}" == empty-cluster ]] && policy_schema=null
+        feature_schema=$(printf '{"properties":{"networkPolicy":%s}}' "${policy_schema}")
+        if [[ "$3" == aiplatforms.ai.splunk.com ]]; then
+          feature_schema=$(printf '{"items":%s}' "${feature_schema}")
+        fi
+        printf '{"metadata":{"name":"%s"},"spec":{"versions":[{"name":"v1","served":true,"schema":{"openAPIV3Schema":{"properties":{"spec":{"properties":{"features":%s}}}}}}]}}\n' "$3" "${feature_schema}"
         ;;
       aiplatforms.ai.splunk.com)
-        if [[ "${case}" == old-platform ]]; then
+        if [[ "${case}" == empty-cluster ]]; then
+          printf '%s\n' '{"items":[]}'
+        elif [[ "${case}" == standalone-ray-cpuonly ]]; then
+          printf '%s\n' '{"items":[{"metadata":{"namespace":"test","name":"platform","uid":"platform-1"},"spec":{"profile":"cpuOnly","features":[]}}]}'
+        elif [[ "${case}" == old-platform ]]; then
           printf '%s\n' '{"items":[{"metadata":{"namespace":"test","name":"platform","uid":"platform-1"},"spec":{"features":[{"name":"agentruntime"}]}}]}'
         else
           printf '{"items":[{"metadata":{"namespace":"test","name":"platform","uid":"platform-1"},"spec":{"features":[{"name":"agentruntime","networkPolicy":%s}]}}]}\n' "${policy}"
         fi
         ;;
       aiservices.ai.splunk.com)
-        local owner_uid=platform-1
+        local owner_uid=platform-1 standalone_policy
         [[ "${case}" == stale-owner ]] && owner_uid=platform-0
-        if [[ "${case}" == standalone ]]; then
-          printf '{"items":[{"metadata":{"namespace":"test","name":"runtime"},"spec":{"features":{"name":"agentruntime","networkPolicy":%s}}}]}\n' "${policy}"
+        case "${case}" in
+          standalone | long-name-collision)
+            printf '{"items":[{"metadata":{"namespace":"test","name":"%s","uid":"runtime-1"},"spec":{"features":{"name":"agentruntime","networkPolicy":%s}}}]}\n' "${runtime_name}" "${policy}"
+            ;;
+          standalone-metrics-*)
+            standalone_policy="$(command jq -c 'del(.metricsDisabled)' <<< "${policy}")"
+            printf '{"items":[{"metadata":{"namespace":"test","name":"%s","uid":"runtime-1"},"spec":{"features":{"name":"agentruntime","networkPolicy":%s},"metrics":{"enabled":%s}}}]}\n' "${runtime_name}" "${standalone_policy}" "${case##*-}"
+            ;;
+          standalone-ray-*)
+            local ref=platform origin='http://platform-head-svc.test.svc.cluster.local:8000'
+            case "${case}" in
+              standalone-ray-absent) ref="" ;;
+              standalone-ray-missing) ref=missing ;;
+              standalone-ray-wrong-origin) origin='http://platform-head-svc.test.svc.cluster.local:8080' ;;
+            esac
+            standalone_policy="$(command jq -c '.managedRay = true' <<< "${policy}")"
+            printf '{"items":[{"metadata":{"namespace":"test","name":"runtime","uid":"runtime-1"},"spec":{"features":{"name":"agentruntime","networkPolicy":%s},"aiPlatformRef":{"name":"%s"},"aiPlatformUrl":"%s"}}]}\n' "${standalone_policy}" "${ref}" "${origin}"
+            ;;
+          missing-child | empty-cluster)
+            printf '%s\n' '{"items":[]}'
+            ;;
+          foreign-child)
+            printf '{"items":[{"metadata":{"namespace":"test","name":"%s","uid":"runtime-1"},"spec":{"features":{"name":"saia"}}}]}\n' "${runtime_name}"
+            ;;
+          *)
+            printf '{"items":[{"metadata":{"namespace":"test","name":"%s","uid":"runtime-1","ownerReferences":[{"controller":true,"kind":"AIPlatform","apiVersion":"ai.splunk.com/v1","name":"platform","uid":"%s"}]},"spec":{"features":{"name":"agentruntime"}}}]}\n' "${runtime_name}" "${owner_uid}"
+            ;;
+        esac
+        ;;
+      networkpolicies.networking.k8s.io)
+        case "${case}" in
+          foreign-policy | missing-child | long-name-collision)
+            printf '{"items":[{"metadata":{"namespace":"test","name":"%s"}}]}\n' "${policy_name}"
+            ;;
+          another-namespace)
+            printf '{"items":[{"metadata":{"namespace":"other","name":"%s"}}]}\n' "${policy_name}"
+            ;;
+          owned-policy | stale-policy)
+            local policy_owner=runtime-1
+            [[ "${case}" == stale-policy ]] && policy_owner=runtime-0
+            printf '{"items":[{"metadata":{"namespace":"test","name":"%s","ownerReferences":[{"controller":true,"uid":"%s"}]}}]}\n' "${policy_name}" "${policy_owner}"
+            ;;
+          *)
+            printf '%s\n' '{"items":[]}'
+            ;;
+        esac
+        ;;
+      poddisruptionbudgets.policy)
+        if [[ "${case}" == foreign-budget ]]; then
+          printf '%s\n' '{"items":[{"metadata":{"namespace":"test","name":"platform-agentruntime-agentruntime-pdb"}}]}'
         else
-          printf '{"items":[{"metadata":{"namespace":"test","name":"runtime","ownerReferences":[{"controller":true,"kind":"AIPlatform","apiVersion":"ai.splunk.com/v1","name":"platform","uid":"%s"}]},"spec":{"features":{"name":"agentruntime"}}}]}\n' "${owner_uid}"
+          printf '%s\n' '{"items":[]}'
         fi
         ;;
       *) return 1 ;;
@@ -2571,12 +2646,40 @@ _network_policy_upgrade() (
 )
 assert_rc "runtime network policy upgrade reads a managed allowlist from the current platform" 0 _network_policy_upgrade managed
 assert_rc "runtime network policy upgrade accepts a staged standalone allowlist" 0 _network_policy_upgrade standalone
+assert_rc "runtime network policy upgrade permits standalone metrics to be turned off in spec" 0 _network_policy_upgrade standalone-metrics-false
+assert_rc "runtime network policy upgrade requires a choice for enabled standalone metrics" 1 _network_policy_upgrade standalone-metrics-true
+assert_rc "runtime network policy upgrade accepts a managed Ray reference to a legacy fullfeature platform" 0 _network_policy_upgrade standalone-ray-legacy
+assert_contains "runtime network policy upgrade requires a managed Ray platform reference" 'managedRay: requires a fullfeature AIPlatform' \
+  "$(_network_policy_upgrade standalone-ray-absent 2>&1 || true)"
+assert_rc "runtime network policy upgrade rejects an unresolved managed Ray platform reference" 1 _network_policy_upgrade standalone-ray-missing
+assert_rc "runtime network policy upgrade rejects a managed Ray reference to a cpuOnly platform" 1 _network_policy_upgrade standalone-ray-cpuonly
+assert_contains "runtime network policy upgrade rejects an incompatible explicit Ray URL" 'aiPlatformUrl: managedRay requires the referenced AIPlatform head Service on port 8000' \
+  "$(_network_policy_upgrade standalone-ray-wrong-origin 2>&1 || true)"
 assert_rc "runtime network policy checks allow a new install without existing CRDs" 0 _network_policy_upgrade new-install
+assert_rc "runtime network policy upgrade skips schema staging without existing runtimes" 0 _network_policy_upgrade empty-cluster
+assert_contains "runtime network policy upgrade requires candidate CRD schemas" 'stage the updated AIPlatform and AIService CRD schemas' \
+  "$(_network_policy_upgrade old-schema 2>&1 || true)"
+assert_contains "runtime network policy upgrade blocks a generated child name occupied by a different feature" 'AIService test/platform-agentruntime: generated AgentRuntime name is occupied' \
+  "$(_network_policy_upgrade foreign-child 2>&1 || true)"
 assert_rc "runtime network policy upgrade blocks an unstaged platform" 1 _network_policy_upgrade old-platform
 assert_rc "runtime network policy upgrade blocks an unstaged service with a stale owner UID" 1 _network_policy_upgrade stale-owner
 assert_rc "runtime network policy upgrade fails if cluster inspection is unavailable" 1 _network_policy_upgrade unavailable
-assert_eq "runtime network policy preflight precedes bundled CRD and Deployment changes" yes \
-  "$(_extract_fn install_splunk_ai_operator | awk '/preflight_agentruntime_policy_upgrade/{a=NR} /kubectl apply/{if (!b) b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
+assert_rc "runtime network policy upgrade permits a policy controlled by the current runtime" 0 _network_policy_upgrade owned-policy
+assert_rc "runtime network policy upgrade ignores a matching name in another namespace" 0 _network_policy_upgrade another-namespace
+assert_rc "runtime network policy upgrade blocks a policy with a stale runtime UID" 1 _network_policy_upgrade stale-policy
+assert_rc "runtime network policy upgrade blocks a policy with the future child name" 1 _network_policy_upgrade missing-child
+assert_contains "runtime network policy upgrade identifies a foreign policy" 'NetworkPolicy test/platform-agentruntime-network' \
+  "$(_network_policy_upgrade foreign-policy 2>&1 || true)"
+assert_contains "runtime network policy upgrade checks the hashed schema policy name" 'schema-network: name is occupied' \
+  "$(_network_policy_upgrade long-name-collision 2>&1 || true)"
+assert_contains "runtime network policy upgrade identifies a foreign budget" 'PodDisruptionBudget test/platform-agentruntime-agentruntime-pdb' \
+  "$(_network_policy_upgrade foreign-budget 2>&1 || true)"
+assert_eq "runtime network policy preflight uses the selected cluster before install actions" yes \
+  "$(_extract_fn preflight_checks | awk '/resolve_target_cluster/{a=NR} /preflight_agentruntime_policy_upgrade/{b=NR} /preflight_check_registry/{c=NR} END{print (a && a<b && b<c) ? "yes" : "no"}')"
+assert_eq "runtime network policy preflight precedes model staging" yes \
+  "$(_extract_fn main_install | awk '/^  preflight_checks$/{a=NR} /^    stage_model_artifacts$/{if (!b) b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
+assert_eq "runtime network policy recheck precedes bundled CRD and Deployment changes" yes \
+  "$(_extract_fn install_splunk_ai_operator | awk '/preflight_agentruntime_policy_upgrade kubectl/{a=NR} /kubectl apply/{if (!b) b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
 
 # cpuOnly contradictions: each is reported with a stable code and field name.
 assert_problem "cpuOnly rejects nodes.gpuWorkers > 0" \
@@ -2699,7 +2802,7 @@ assert_problem "duplicate agentruntime provider is a conflict" \
 assert_problem "duplicate slim feature is a conflict" \
   "$(_profile_cfg cpuonly dupslim '.aiPlatform.features += [.aiPlatform.features[0]]')" "[PROFILE_CONFLICT] aiPlatform.features[2].name: duplicate feature entry"
 assert_eq "two different agentruntime providers are not duplicates" "" \
-  "$(_profile_problems "$(_profile_cfg cpuonly twoprov '.aiPlatform.features += [{"name": "agentruntime", "provider": "other", "checkpointDbSecretRef": "x"}] | .images.agentRuntime.providerImages.other = "splunk/other:1" | .images.agentRuntime.providerModules.other = "other.loader:Loader"')")"
+  "$(_profile_problems "$(_profile_cfg cpuonly twoprov '.aiPlatform.features += [{"name": "agentruntime", "provider": "other", "checkpointDbSecretRef": "x"}] | .aiPlatform.features[2].networkPolicy = .aiPlatform.features[1].networkPolicy | .images.agentRuntime.providerImages.other = "splunk/other:1" | .images.agentRuntime.providerModules.other = "other.loader:Loader"')")"
 for _prov in 'Bad_Name' 'a.b' 'a"b' '-lead' "$(printf 'a%.0s' $(seq 1 64))"; do
   assert_problem "provider '${_prov:0:12}' must be a DNS-1123 label" \
     "$(_profile_cfg cpuonly "prov-${#_prov}-${_prov//[^a-zA-Z0-9]/}" ".aiPlatform.features[1].provider = \"${_prov//\"/\\\"}\"")" "[PROFILE_INVALID_VALUE] aiPlatform.features[1].provider"
@@ -3115,6 +3218,12 @@ _render_cr_inner() {
   SPLUNK_MODE=disabled
   install_ai_platform_cr 2>&1 | sed -n '/^apiVersion: ai.splunk.com/,$p' | grep -v '^[[:space:]]*$'
 }
+_alias_cfg="$(_profile_cfg cpuonly aliased-network-policy '.aiPlatform.features[1].networkPolicy.metricsDisabled = true | {"networkDefaults": .aiPlatform.features[1].networkPolicy} + . | .networkDefaults anchor = "runtime_policy" | .aiPlatform.features[1].networkPolicy alias = "runtime_policy"')"
+assert_contains "runtime network policy test fixture uses a YAML alias" 'networkPolicy: *runtime_policy' "$(cat "${_alias_cfg}")"
+assert_rc "runtime network policy validation accepts a YAML alias" 0 _profile_run "${_alias_cfg}" validate_agentruntime_network_policy_config
+assert_eq "runtime network policy renders aliases as self-contained YAML" \
+  "$(command yq -o=json -I=0 eval 'explode(.) | .aiPlatform.features[1].networkPolicy' "${_alias_cfg}")" \
+  "$(_render_cr "${_alias_cfg}" | command yq -o=json -I=0 eval '.spec.features[1].networkPolicy' -)"
 for _p in cpuonly fullfeature; do
   _cr="$(_render_cr "${_PROFILE_DIR}/profile-${_p}.yaml")"
   [[ "${UPDATE_GOLDEN:-}" == "1" ]] && printf '%s\n' "${_cr}" > "${_PROFILE_GOLDEN}/aiplatform-cr-${_p}.expected.yaml"

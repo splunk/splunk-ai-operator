@@ -172,6 +172,7 @@ spec:
       provider: launchpad
       checkpointDbSecretRef: pg
       networkPolicy:
+        metricsDisabled: true
         dns: {namespace: kube-system, podSelector: {k8s-app: kube-dns}}
         postgresql: {peer: {podSelector: {app: postgres}}, port: 5432}
   objectStorage: {path: s3://bucket, region: us-west-2}

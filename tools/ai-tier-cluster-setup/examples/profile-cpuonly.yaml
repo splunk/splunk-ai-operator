@@ -102,6 +102,7 @@ aiPlatform:
       checkpointDbSecretRef: "mltk-postgres-conn"   # created by the deployment configuration below
       # Replace these sample peers with the selectors or approved private ranges for this deployment.
       networkPolicy:
+        metricsDisabled: true
         dns:
           namespace: kube-system
           podSelector:
