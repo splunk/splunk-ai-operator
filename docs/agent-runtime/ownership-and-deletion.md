@@ -129,6 +129,13 @@ The operator also records a Warning event with the same text on the AIService
 - **It was left by an earlier AIService of the same name that was just deleted.**
   Garbage collection removes it shortly, and the retry then succeeds without action.
 
+For a NetworkPolicy (`AgentRuntimeNetworkPolicyReady`), the operator also creates an
+owned deny-only guard, `<svc>-network-guard-<hash>` or `<svc>-schema-network-guard-<hash>`,
+for the pods the policy was meant for. Until the name is freed, those pods get only
+what other policies in the namespace allow, the customer's same-named one included. The
+guard is deleted once the operator's own policy is in place, and is removed with the
+AIService in any case.
+
 ## Upgrading
 
 When a generated NetworkPolicy name is occupied, the operator creates an owned

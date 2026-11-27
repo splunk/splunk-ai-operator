@@ -331,6 +331,10 @@ func TestOwnership(t *testing.T) {
 			{"ServiceMonitor", "ServiceMonitor", func(n string) client.Object {
 				return &monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: n + "-agentruntime-metrics", Namespace: "default", Labels: labels}}
 			}},
+			{"PodDisruptionBudget", "AgentRuntimeDisruptionBudget", func(n string) client.Object {
+				return &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: n + "-agentruntime-pdb", Namespace: "default"},
+					Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: ptr(intstr.FromInt32(2)), Selector: &metav1.LabelSelector{MatchLabels: labels}}}
+			}},
 		}
 		for _, tc := range cases {
 			t.Run(tc.kind, func(t *testing.T) {
@@ -357,6 +361,64 @@ func TestOwnership(t *testing.T) {
 				// A retry still refuses and still changes nothing.
 				require.Error(t, e.reconcile(ai))
 				e.unchanged(customer, rv)
+				require.NoError(t, e.c.Delete(ctx, ai))
+			})
+		}
+	})
+
+	t.Run("a same-named NetworkPolicy it does not own is refused and left unchanged, behind an owned deny-only guard", func(t *testing.T) {
+		for _, tc := range []struct{ suffix, other string }{
+			{runtimePolicySuffix, schemaPolicySuffix},
+			{schemaPolicySuffix, runtimePolicySuffix},
+		} {
+			t.Run(tc.suffix, func(t *testing.T) {
+				name := "conflict-np-" + tc.suffix
+				customer := &networkingv1.NetworkPolicy{
+					ObjectMeta: metav1.ObjectMeta{Name: dnsLabelName(name, tc.suffix), Namespace: "default"},
+					Spec: networkingv1.NetworkPolicySpec{
+						PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "customer"}},
+						Ingress:     []networkingv1.NetworkPolicyIngressRule{{}},
+					},
+				}
+				require.NoError(t, e.c.Create(ctx, customer))
+				rv := customer.ResourceVersion
+				ai := e.newService(name, aiv1.AIPlatformProfileCPUOnly, nil)
+
+				err := e.reconcile(ai)
+				var conflict *common.OwnershipConflictError
+				require.ErrorAs(t, err, &conflict)
+				cond := meta.FindStatusCondition(ai.Status.Conditions, "AgentRuntimeNetworkPolicyReady")
+				require.NotNil(t, cond)
+				assert.Equal(t, "OwnershipConflict", cond.Reason)
+				assert.Contains(t, cond.Message, "NetworkPolicy default/"+customer.Name)
+				e.unchanged(customer, rv)
+
+				// The pods the policy was meant for are isolated by an owned guard, and
+				// the other policy is still created and owned.
+				guard := &networkingv1.NetworkPolicy{}
+				guardKey := client.ObjectKey{Namespace: "default", Name: policyGuardName(ai, tc.suffix)}
+				require.NoError(t, e.c.Get(ctx, guardKey, guard))
+				assert.True(t, metav1.IsControlledBy(guard, ai))
+				assert.Empty(t, guard.Spec.Ingress)
+				assert.Empty(t, guard.Spec.Egress)
+				collectable := e.collectable(ai.UID)
+				assert.Contains(t, collectable, "*v1.NetworkPolicy/"+guard.Name)
+				assert.Contains(t, collectable, "*v1.NetworkPolicy/"+dnsLabelName(name, tc.other))
+				assert.NotContains(t, collectable, "*v1.NetworkPolicy/"+customer.Name)
+
+				// A retry still refuses and still changes nothing.
+				require.Error(t, e.reconcile(ai))
+				e.unchanged(customer, rv)
+
+				// Once the customer removes theirs, the operator's own policy replaces the guard.
+				require.NoError(t, e.c.Delete(ctx, customer))
+				_ = e.reconcile(ai) // the schema stage may still be pending
+				assert.NotNil(t, meta.FindStatusCondition(ai.Status.Conditions, "AgentRuntimeNetworkPolicyReady"))
+				assert.Equal(t, metav1.ConditionTrue, meta.FindStatusCondition(ai.Status.Conditions, "AgentRuntimeNetworkPolicyReady").Status)
+				collectable = e.collectable(ai.UID)
+				assert.Contains(t, collectable, "*v1.NetworkPolicy/"+customer.Name)
+				assert.NotContains(t, collectable, "*v1.NetworkPolicy/"+guard.Name)
+				assert.True(t, apierrors.IsNotFound(e.c.Get(ctx, guardKey, &networkingv1.NetworkPolicy{})))
 				require.NoError(t, e.c.Delete(ctx, ai))
 			})
 		}

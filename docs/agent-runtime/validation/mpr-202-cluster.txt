@@ -188,3 +188,37 @@ mtls.secretName, against the live fullfeature platform; restored on exit.
 restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; the test
 namespace finished terminating; live platform Ready, workloads identical to the baseline, live
 checkpoints unchanged
+
+### 14. MPR-276: PodDisruptionBudget and NetworkPolicy ownership and deletion (2026-11-27)
+ai-agent-runtime 83d8ae8 (PR #295, MPR-205) with MPR-276's tests; binary sha256 dc7c9739..., its
+manager cache limited to mpr276-cpu and the operator namespace for this run so the live platform was
+not reconciled by it; the branch's CRDs and ClusterRole. cpuOnly AIPlatform (SLIM + AgentRuntime,
+networkPolicy with kube-dns, the fixture PostgreSQL and metricsDisabled) in namespace mpr276-cpu,
+whose customer objects were created first: a NetworkPolicy and a PodDisruptionBudget under the exact
+names the operator uses, and two more whose names only extend them (-backup). Restored on exit.
+1. same-named NetworkPolicy: AgentRuntimeNetworkPolicyReady=False/OwnershipConflict within 5 s,
+     NetworkPolicy mpr276-cpu/mpr276-cpu-agentruntime-mltk-network already exists and is not managed
+     by this AIService; it was left unchanged: rename or remove it
+   Ready=False/OwnershipConflict and a Warning event with the same text. Customer policy at the same
+   resourceVersion, also 20 s later. An owned deny-only guard, mpr276-cpu-agentruntime-mltk-network-
+   guard-3301b7af, selects the runtime pods with policyTypes [Ingress, Egress] and no rules; the
+   schema policy was still created and owned
+2. the customer deletes its policy: AgentRuntimeNetworkPolicyReady=True within 25 s, the operator's
+   own policy is in place and the guard is deleted
+3. same-named PodDisruptionBudget: after schema setup succeeded,
+   AgentRuntimeDisruptionBudgetReady=False/OwnershipConflict naming
+   PodDisruptionBudget mpr276-cpu/mpr276-cpu-agentruntime-mltk-agentruntime-pdb; customer budget at
+   the same resourceVersion and with no owner, also 20 s later
+4. the customer deletes its budget: Ready=True/Available within 15 s, every stage True. Owned by the
+   runtime: ServiceAccount, ConfigMap, schema Job, Deployment, Service, HPA, both NetworkPolicies and
+   the PodDisruptionBudget (maxUnavailable 1, disruptionsAllowed 1)
+5. checkpoint marker written, then the AIPlatform deleted: at t=2s no AIService or AIPlatform and
+   nothing owned left. Left in the namespace: only the customer's -backup NetworkPolicy and
+   PodDisruptionBudget, at their resourceVersions; the checkpoint and pull Secrets and the
+   PostgreSQL Deployment unchanged; marker checksum and checkpoint table counts identical
+6. the live platform: AIService generations unchanged, no NetworkPolicy or PodDisruptionBudget in
+   ai-platform, no log line for it, no event rejected
+restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; the test
+namespace gone; live platform Ready, templates/replicas/readiness identical to the baseline, live
+checkpoint counts unchanged. The live Deployments' generations rose by 1, from restoring the original
+operator: every restart of that build does this (recorded 2026-11-17)

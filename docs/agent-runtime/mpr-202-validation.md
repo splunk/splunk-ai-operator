@@ -39,7 +39,7 @@ Each of these was reproduced on a real API server (envtest) before the fix:
 | # | Criterion | Implementation | Evidence |
 |---|---|---|---|
 | 1 | Ownership inventory of operator-owned objects, and separately the external and customer-managed ones | [ownership-and-deletion.md](ownership-and-deletion.md), "Inventory" | `TestOwnership/every_object_the_feature_creates_is_owned,...` checks the inventory against what garbage collection would remove |
-| 2 | Deleting the CR removes each feature-owned object and no shared one; orphans from an interrupted reconcile follow an explicit rule, without label-only deletion | Every object is created owned (`common.ClaimOrRefuse`). A same-named object that is not ours is refused, by UID (`OwnershipConflict`). Nothing is deleted by label. Pruning matches by UID | `TestOwnership` (inventory, same-named objects, partial install); `TestClaimOrRefuse`; `TestReconcileFeatures_PrunesOnlyItsOwnRemovedFeatures` |
+| 2 | Deleting the CR removes each feature-owned object and no shared one; orphans from an interrupted reconcile follow an explicit rule, without label-only deletion | Every object is created owned (`common.ClaimOrRefuse`), the PodDisruptionBudget and both NetworkPolicies included. A same-named object that is not ours is refused, by UID (`OwnershipConflict`); for a NetworkPolicy the operator also isolates the intended pods with an owned deny-only guard. Nothing is deleted by label. Pruning matches by UID | `TestOwnership` (inventory, same-named objects including the PodDisruptionBudget and both NetworkPolicies, partial install); `TestClaimOrRefuse`; `TestReconcileFeatures_PrunesOnlyItsOwnRemovedFeatures`; `TestAgentRuntimeMetricsOptOutRemovesOnlyOwnedMonitor` |
 | 3 | PostgreSQL and checkpoint data stay readable; referenced Secrets, PVCs and model artifacts stay; no finalizer blocks deletion | The checkpoint Secret, user-named Secrets and ServiceAccounts are never owned. The runtime uses no PVC. No finalizer is added, and a legacy one is released at once | `TestOwnership` (checkpoint Secret and similarly named object unchanged; the AIService is gone on delete); controller specs "releases the finalizer an early build added", "never adds a finalizer", "keeps another controller's finalizer"; checkpoint readback on the cluster (below) |
 | 4 | Repeated deletion and reconciliation are idempotent; a missing owned object counts as removed; an API failure is surfaced and retried without deleting customer objects | Stage errors set the condition and are retried. A missing owned object is recreated | `TestOwnership` (idempotent passes leave every resourceVersion unchanged; a deleted ConfigMap is recreated; an injected `ServiceUnavailable` on the Deployment is surfaced, the retry completes, and no delete is issued); a repeated reconcile of a deleted AIService is not an error |
 | 5 | Both profiles follow the same rules; hosted-model resources only where the operator owns their lifecycle | The same resource set in both profiles. Hosted-model resources belong to the AIPlatform, not the feature | `TestOwnership` runs the inventory case for `cpuOnly` and for `fullfeature` |
@@ -93,10 +93,32 @@ captured output).
   1,180 generation bumps in 3 minutes, and the base `ai-agent-runtime` build does the same as
   this branch (A/B on the live platform). Templates, replicas and readiness were unaffected.
 
-## Not done yet
+## PodDisruptionBudget and NetworkPolicy (MPR-276)
 
-- **PodDisruptionBudget and NetworkPolicy** do not exist yet (MPR-205). Built with the
-  same helper, they will follow the same rule; their deletion tests belong with them.
+MPR-205 (PR #295) added the PodDisruptionBudget `<svc>-agentruntime-pdb` and the
+NetworkPolicies `<svc>-network` and `<svc>-schema-network`, created through
+`common.ClaimOrRefuse`, and added them to the inventory and partial-install cases of
+`TestOwnership`. MPR-276 completes the coverage:
+
+| Check | Result |
+|---|---|
+| Same-named customer PodDisruptionBudget | refused with `OwnershipConflict` on `AgentRuntimeDisruptionBudgetReady`, left at its resourceVersion, still refused on retry |
+| Same-named customer NetworkPolicy, runtime and schema | refused with `OwnershipConflict` on `AgentRuntimeNetworkPolicyReady` and left unchanged. The intended pods are isolated by an owned deny-only guard, and the other policy is still created owned. Once the customer's policy is removed, the operator's own replaces the guard, which is deleted |
+| Mutation checks | 8 deliberate breakages, each caught: the budget or a policy adopting or overwriting a customer object; no guard, a guard that keeps allow rules, a guard never removed, the conflict swallowed; and the metrics-off cleanup deleting a ServiceMonitor it does not own |
+
+On fullfeature-dev (2026-11-27, section 14 of the captured output), a cpuOnly platform
+whose namespace already held a customer NetworkPolicy and PodDisruptionBudget under the
+operator's names:
+- each was refused with `OwnershipConflict` and a Warning event, and left unchanged. The
+  runtime pods sat behind an owned deny-only guard until the customer's policy was
+  removed; the install then completed;
+- deleting the platform removed the runtime's owned objects, both policies and the budget
+  included, within 2 seconds;
+- customer policies and budgets with similar names, the Secrets and PostgreSQL stayed at
+  their resourceVersions, and the checkpoint marker read back identical.
+
+MPR-205's own runs also deleted an AIService on agentruntime-dev and fullfeature-dev, with
+the same result.
 
 ## Follow-ups outside this story
 
@@ -108,6 +130,6 @@ captured output).
   objects the way the AgentRuntime feature used to (owner reference set before
   `CreateOrUpdate`), so a same-named customer object may be overwritten there. If that
   is wanted, it needs its own ticket.
-- Turning mTLS or metrics off later leaves the earlier Certificate or ServiceMonitor
-  until the AIService is deleted. For the ServiceMonitor, that is MPR-208's first
-  criterion.
+- Turning mTLS off later leaves the earlier Certificate until the AIService is deleted.
+  Turning metrics off now deletes the ServiceMonitor, but only one this AIService
+  controls, pinned to its UID and resourceVersion (MPR-205).
