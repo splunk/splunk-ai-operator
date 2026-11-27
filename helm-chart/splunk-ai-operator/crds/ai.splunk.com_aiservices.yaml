@@ -1094,6 +1094,154 @@ spec:
                     - slim
                     - agentruntime
                     type: string
+                  networkPolicy:
+                    description: |-
+                      NetworkPolicy declares the exact peers that may communicate with AgentRuntime.
+                      It is required for the agentruntime feature.
+                    properties:
+                      dns:
+                        description: DNS selects the pods handling DNS on UDP and
+                          TCP port 53.
+                        properties:
+                          cidr:
+                            description: CIDR is a canonical IPv4 private-use or IPv6
+                              unique-local prefix.
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace selects one named namespace. If omitted, pod labels select within
+                              the runtime namespace.
+                            type: string
+                          podSelector:
+                            additionalProperties:
+                              type: string
+                            description: PodSelector contains the labels a peer pod
+                              must match.
+                            type: object
+                        type: object
+                      managedRay:
+                        description: ManagedRay allows the head pods of the owning
+                          fullfeature RayService.
+                        type: boolean
+                      metrics:
+                        description: Metrics selects the scraper on the runtime metrics
+                          port.
+                        properties:
+                          cidr:
+                            description: CIDR is a canonical IPv4 private-use or IPv6
+                              unique-local prefix.
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace selects one named namespace. If omitted, pod labels select within
+                              the runtime namespace.
+                            type: string
+                          podSelector:
+                            additionalProperties:
+                              type: string
+                            description: PodSelector contains the labels a peer pod
+                              must match.
+                            type: object
+                        type: object
+                      metricsDisabled:
+                        description: MetricsDisabled explicitly disables scraping
+                          and removes the owned ServiceMonitor.
+                        type: boolean
+                      postgresql:
+                        description: PostgreSQL is the checkpoint database used by
+                          the runtime and schema Job.
+                        properties:
+                          peer:
+                            description: AgentRuntimeNetworkPeer selects pods by exact
+                              labels or an explicit private CIDR.
+                            properties:
+                              cidr:
+                                description: CIDR is a canonical IPv4 private-use
+                                  or IPv6 unique-local prefix.
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace selects one named namespace. If omitted, pod labels select within
+                                  the runtime namespace.
+                                type: string
+                              podSelector:
+                                additionalProperties:
+                                  type: string
+                                description: PodSelector contains the labels a peer
+                                  pod must match.
+                                type: object
+                            type: object
+                          port:
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                        required:
+                        - peer
+                        - port
+                        type: object
+                      runtimeEgress:
+                        description: RuntimeEgress lists additional TCP destinations,
+                          such as model and MCP backends.
+                        items:
+                          description: AgentRuntimeNetworkDestination allows one TCP
+                            port on the specified peer.
+                          properties:
+                            peer:
+                              description: AgentRuntimeNetworkPeer selects pods by
+                                exact labels or an explicit private CIDR.
+                              properties:
+                                cidr:
+                                  description: CIDR is a canonical IPv4 private-use
+                                    or IPv6 unique-local prefix.
+                                  type: string
+                                namespace:
+                                  description: |-
+                                    Namespace selects one named namespace. If omitted, pod labels select within
+                                    the runtime namespace.
+                                  type: string
+                                podSelector:
+                                  additionalProperties:
+                                    type: string
+                                  description: PodSelector contains the labels a peer
+                                    pod must match.
+                                  type: object
+                              type: object
+                            port:
+                              format: int32
+                              maximum: 65535
+                              minimum: 1
+                              type: integer
+                          required:
+                          - peer
+                          - port
+                          type: object
+                        type: array
+                      slim:
+                        description: |-
+                          SLIM selects the caller on the runtime application port. A platform-managed
+                          runtime can omit this field to allow its sibling SLIM feature.
+                        properties:
+                          cidr:
+                            description: CIDR is a canonical IPv4 private-use or IPv6
+                              unique-local prefix.
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace selects one named namespace. If omitted, pod labels select within
+                              the runtime namespace.
+                            type: string
+                          podSelector:
+                            additionalProperties:
+                              type: string
+                            description: PodSelector contains the labels a peer pod
+                              must match.
+                            type: object
+                        type: object
+                    required:
+                    - dns
+                    - postgresql
+                    type: object
                   provider:
                     description: Provider identifies the product team for multi-provider
                       features such as agentruntime.

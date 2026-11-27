@@ -20,6 +20,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,8 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 	require.NoError(t, aiv1.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 	require.NoError(t, discoveryv1.AddToScheme(s))
+	require.NoError(t, networkingv1.AddToScheme(s))
+	require.NoError(t, policyv1.AddToScheme(s))
 	require.NoError(t, appsv1.AddToScheme(s))
 	require.NoError(t, autoscalingv2.AddToScheme(s))
 	require.NoError(t, batchv1.AddToScheme(s))
@@ -59,9 +63,10 @@ func TestAgentRuntimeFactoryHandler_ReconcilesLifecycle(t *testing.T) {
 		},
 		Spec: aiv1.AIServiceSpec{
 			Feature: aiv1.FeatureSpec{
-				Name:     "agentruntime",
-				Provider: "mltk",
-				Env:      map[string]string{"PG_SSLMODE": "require"},
+				Name:          "agentruntime",
+				Provider:      "mltk",
+				NetworkPolicy: testNetworkPolicy(),
+				Env:           map[string]string{"PG_SSLMODE": "require"},
 			},
 			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
 			CheckpointDbSecretRef: "mltk-postgres",
@@ -173,8 +178,9 @@ func TestAgentRuntimeReconciler_BuildsDeploymentServiceAndHPA(t *testing.T) {
 		},
 		Spec: aiv1.AIServiceSpec{
 			Feature: aiv1.FeatureSpec{
-				Name:     "agentruntime",
-				Provider: "mltk",
+				Name:          "agentruntime",
+				Provider:      "mltk",
+				NetworkPolicy: testNetworkPolicy(),
 				Env: map[string]string{
 					"PG_DBNAME": "checkpoints",
 					"PG_HOST":   "postgres.default.svc.cluster.local",
@@ -313,7 +319,7 @@ func TestAgentRuntimeReconciler_ReconcilesServiceMonitorLikeSAIA(t *testing.T) {
 			UID:       types.UID("agent-runtime-monitor-uid"),
 		},
 		Spec: aiv1.AIServiceSpec{
-			Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature: aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			Metrics: aiv1.MetricsConfig{
 				Enabled: true,
 				Path:    "/custom-metrics",
@@ -354,8 +360,9 @@ func TestAgentRuntimeReconciler_DefaultsOmittedHPAFields(t *testing.T) {
 		},
 		Spec: aiv1.AIServiceSpec{
 			Feature: aiv1.FeatureSpec{
-				Name:     "agentruntime",
-				Provider: "mltk",
+				Name:          "agentruntime",
+				Provider:      "mltk",
+				NetworkPolicy: testNetworkPolicy(),
 			},
 			Replicas: 1,
 		},
@@ -411,8 +418,9 @@ func TestAgentRuntimeReconciler_BoundsSelectorsForLongAIServiceName(t *testing.T
 		},
 		Spec: aiv1.AIServiceSpec{
 			Feature: aiv1.FeatureSpec{
-				Name:     "agentruntime",
-				Provider: "mltk",
+				Name:          "agentruntime",
+				Provider:      "mltk",
+				NetworkPolicy: testNetworkPolicy(),
 			},
 			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
 			CheckpointDbSecretRef: "mltk-postgres",
@@ -553,7 +561,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenValidationFails(t *testing
 			UID:       types.UID("invalid-ai-service-uid"),
 		},
 		Spec: aiv1.AIServiceSpec{
-			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
 			CheckpointDbSecretRef: "mltk-postgres",
 			Replicas:              1,
@@ -594,7 +602,7 @@ func TestAgentRuntimeReconcileStopsBeforeResourcesWhenAgentModuleIsInvalid(t *te
 			UID:       types.UID("invalid-module-ai-service-uid"),
 		},
 		Spec: aiv1.AIServiceSpec{
-			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			AIPlatformUrl:         "http://ray-head.default.svc.cluster.local:8000",
 			CheckpointDbSecretRef: "mltk-postgres",
 			Replicas:              1,
@@ -718,7 +726,7 @@ func TestAgentRuntimeReconcileCertificate_UsesCommonReconciler(t *testing.T) {
 			UID:       types.UID("agent-runtime-ai-service-uid"),
 		},
 		Spec: aiv1.AIServiceSpec{
-			Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			MTLS:          aiv1.MTLSConfig{Enabled: true, Termination: "operator", IssuerRef: cmmeta.ObjectReference{Name: "issuer", Kind: "ClusterIssuer"}},
 			Replicas:      1,
 			AIPlatformUrl: "http://platform:8000",

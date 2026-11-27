@@ -240,11 +240,13 @@ var _ = Describe("AIPlatform Webhook", func() {
 						Name:                  "agentruntime",
 						Provider:              "mltk",
 						CheckpointDbSecretRef: "mltk-postgres",
+						NetworkPolicy:         agentRuntimePolicyForAdmission(),
 					},
 					{
 						Name:                  "agentruntime",
 						Provider:              "seca",
 						CheckpointDbSecretRef: "seca-postgres",
+						NetworkPolicy:         agentRuntimePolicyForAdmission(),
 					},
 				}, featuresPath)
 				Expect(errs).To(BeEmpty())
@@ -267,12 +269,13 @@ var _ = Describe("AIPlatform Webhook", func() {
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("Duplicate value"))
 			})
 
-			It("should require provider and checkpoint secret for agentruntime", func() {
+			It("should require provider, checkpoint secret and network policy for agentruntime", func() {
 				errs := validator.validateFeatures([]aiv1.FeatureSpec{
 					{Name: "agentruntime"},
 				}, featuresPath)
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("provider"))
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("checkpointDbSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("spec.features[0].networkPolicy"))
 			})
 
 			It("should continue to reject duplicate non-provider feature names", func() {

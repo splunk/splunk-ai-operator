@@ -30,6 +30,8 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -130,7 +132,7 @@ func (e *ownershipEnv) newService(name string, profile aiv1.AIPlatformProfile, e
 	ai := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: aiv1.AIServiceSpec{
-			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			AIPlatformRef:         corev1.ObjectReference{Name: "platform-" + strings.ToLower(string(profile)), Namespace: "default"},
 			CheckpointDbSecretRef: "checkpoint",
 			TaskVolume:            aiv1.ObjectStorageSpec{Path: "s3://fixture", Region: "us-west-2"},
@@ -184,7 +186,7 @@ func (e *ownershipEnv) collectable(uid types.UID) []string {
 	var out []string
 	for _, l := range []client.ObjectList{&corev1.ServiceAccountList{}, &corev1.ConfigMapList{}, &corev1.SecretList{},
 		&batchv1.JobList{}, &appsv1.DeploymentList{}, &corev1.ServiceList{}, &autoscalingv2.HorizontalPodAutoscalerList{},
-		&monitoringv1.ServiceMonitorList{}, &certmanagerv1.CertificateList{}} {
+		&monitoringv1.ServiceMonitorList{}, &certmanagerv1.CertificateList{}, &networkingv1.NetworkPolicyList{}, &policyv1.PodDisruptionBudgetList{}} {
 		require.NoError(e.t, e.c.List(e.ctx, l, client.InNamespace("default")))
 		items, err := meta.ExtractList(l)
 		require.NoError(e.t, err)
@@ -211,6 +213,9 @@ func inventory(ai *aiv1.AIService, schemaJob string, extra ...string) []string {
 		"*v1.Service/" + agentRuntimeServiceName(ai.Name),
 		"*v2.HorizontalPodAutoscaler/" + ai.Name + "-agentruntime-hpa",
 		"*v1.ServiceMonitor/" + ai.Name + "-agentruntime-metrics",
+		"*v1.NetworkPolicy/" + ai.Name + "-network",
+		"*v1.NetworkPolicy/" + ai.Name + "-schema-network",
+		"*v1.PodDisruptionBudget/" + ai.Name + "-agentruntime-pdb",
 	}
 	out = append(out, extra...)
 	sort.Strings(out)
@@ -452,7 +457,7 @@ func TestOwnership(t *testing.T) {
 		require.Error(t, e.reconcile(ai), "interrupted: the schema Job has not completed")
 		job := agentRuntimeSchemaStatus(t, ai).JobName
 		assert.Equal(t, []string{"*v1.Certificate/partial-agentruntime-cert", "*v1.ConfigMap/partial-agentruntime-config",
-			"*v1.Job/" + job, "*v1.ServiceAccount/partial-sa"}, e.collectable(ai.UID))
+			"*v1.Job/" + job, "*v1.NetworkPolicy/partial-network", "*v1.NetworkPolicy/partial-schema-network", "*v1.ServiceAccount/partial-sa"}, e.collectable(ai.UID))
 		e.finishSchema(ai)
 
 		var deletes []string
@@ -487,7 +492,7 @@ func (e *ownershipEnv) ownedObjects(ai *aiv1.AIService) []client.Object {
 	var out []client.Object
 	for _, l := range []client.ObjectList{&corev1.ServiceAccountList{}, &corev1.ConfigMapList{}, &corev1.SecretList{},
 		&batchv1.JobList{}, &appsv1.DeploymentList{}, &corev1.ServiceList{}, &autoscalingv2.HorizontalPodAutoscalerList{},
-		&monitoringv1.ServiceMonitorList{}, &certmanagerv1.CertificateList{}} {
+		&monitoringv1.ServiceMonitorList{}, &certmanagerv1.CertificateList{}, &networkingv1.NetworkPolicyList{}, &policyv1.PodDisruptionBudgetList{}} {
 		require.NoError(e.t, e.c.List(e.ctx, l, client.InNamespace("default")))
 		items, err := meta.ExtractList(l)
 		require.NoError(e.t, err)

@@ -161,8 +161,30 @@ var _ = Describe("AIPlatform profile admission through a real API server", func(
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("agentruntime feature is required"))
 
-		good := fromYAML("apiVersion: ai.splunk.com/v1\nkind: AIPlatform\nmetadata: {name: profile-slim-agent}\nspec:\n  profile: cpuOnly\n  features: [{name: slim}, {name: agentruntime, provider: launchpad, checkpointDbSecretRef: pg}]\n  objectStorage: {path: s3://bucket, region: us-west-2}\n")
+		good := fromYAML(`apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata: {name: profile-slim-agent}
+spec:
+  profile: cpuOnly
+  features:
+    - name: slim
+    - name: agentruntime
+      provider: launchpad
+      checkpointDbSecretRef: pg
+      networkPolicy:
+        metricsDisabled: true
+        dns: {namespace: kube-system, podSelector: {k8s-app: kube-dns}}
+        postgresql: {peer: {podSelector: {app: postgres}}, port: 5432}
+  objectStorage: {path: s3://bucket, region: us-west-2}
+`)
 		Expect(create(good)).To(Succeed())
+		features, _, err := unstructured.NestedSlice(good.Object, "spec", "features")
+		Expect(err).NotTo(HaveOccurred())
+		delete(features[1].(map[string]interface{}), "networkPolicy")
+		Expect(unstructured.SetNestedSlice(good.Object, features, "spec", "features")).To(Succeed())
+		err = k8sClient.Update(ctx, good)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.features[1].networkPolicy"))
 	})
 
 	It("rejects cpuOnly with a GPU setting (the webhook is live)", func() {

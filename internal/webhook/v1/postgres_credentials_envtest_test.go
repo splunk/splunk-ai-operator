@@ -46,7 +46,7 @@ var _ = Describe("PostgreSQL credential admission", func() {
 			if topLevel {
 				svc.Name = "pg-direct-top-level"
 			}
-			svc.Spec.Feature = aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"}
+			svc.Spec.Feature = aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: agentRuntimePolicyForAdmission()}
 			svc.Spec.CheckpointDbSecretRef = "checkpoint"
 			svc.Spec.Resources = corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("128Mi"), corev1.ResourceEphemeralStorage: resource.MustParse("64Mi")},

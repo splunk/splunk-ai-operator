@@ -172,6 +172,14 @@ func (v *AIPlatformCustomValidator) validate(aiplatform *aiv1.AIPlatform, enforc
 
 	// Validate the deployment profile and settings that contradict it
 	allErrs = append(allErrs, aiplatform.Spec.ValidateProfile(field.NewPath("spec"))...)
+	if aiplatform.Spec.ResolvedProfile() == aiv1.AIPlatformProfileCPUOnly {
+		for i, feature := range aiplatform.Spec.Features {
+			if feature.NetworkPolicy != nil && feature.NetworkPolicy.ManagedRay {
+				path := field.NewPath("spec", "features").Index(i).Child("networkPolicy", "managedRay")
+				allErrs = append(allErrs, field.Forbidden(path, "managedRay requires a fullfeature AIPlatform"))
+			}
+		}
+	}
 	if placement := aiplatform.Spec.ValidatePlacement(field.NewPath("spec")); enforceFullFeaturePlacement {
 		allErrs = append(allErrs, placement...)
 	} else {
@@ -579,11 +587,17 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 			}
 			policy := aiv1.ResolveAgentRuntimeAutoscaling(feature.MinReplicas, feature.MaxReplicas, feature.TargetCPUUtilization)
 			allErrs = append(allErrs, policy.Validate(featurePath)...)
+			networkPath := featurePath.Child("networkPolicy")
+			allErrs = append(allErrs, feature.NetworkPolicy.Validate(networkPath, false)...)
+			allErrs = append(allErrs, feature.NetworkPolicy.ValidateMetrics(networkPath, true)...)
 		} else if feature.Provider != "" {
 			allErrs = append(allErrs, field.Forbidden(
 				featurePath.Child("provider"),
 				"provider is only supported for agentruntime",
 			))
+		}
+		if feature.Name != "agentruntime" && feature.NetworkPolicy != nil {
+			allErrs = append(allErrs, field.Forbidden(featurePath.Child("networkPolicy"), "networkPolicy is only supported for agentruntime"))
 		}
 
 		// Check for duplicate feature identities. agentruntime uses provider as

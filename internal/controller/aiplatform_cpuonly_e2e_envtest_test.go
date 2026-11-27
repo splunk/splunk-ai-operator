@@ -164,7 +164,7 @@ var _ = Describe("cpuOnly AIPlatform end to end without KubeRay", func() {
 				},
 				Features: []aiv1.FeatureSpec{
 					{Name: "slim", Version: "1.0.0"},
-					{Name: "agentruntime", Provider: "mltk", CheckpointDbSecretRef: "e2e-pg"},
+					{Name: "agentruntime", Provider: "mltk", CheckpointDbSecretRef: "e2e-pg", NetworkPolicy: agentRuntimePolicyForControllerTest()},
 				},
 			},
 		}

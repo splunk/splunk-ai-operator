@@ -50,7 +50,7 @@ func TestAgentRuntimeReconcilePreservesHPAScale(t *testing.T) {
 	ai := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "hpa-runtime", Namespace: "default"},
 		Spec: aiv1.AIServiceSpec{
-			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			AIPlatformUrl:         "http://ray.default.svc:8000",
 			CheckpointDbSecretRef: "checkpoint",
 			Replicas:              2,

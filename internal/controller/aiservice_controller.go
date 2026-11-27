@@ -43,6 +43,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/splunk/splunk-ai-operator/internal/controller/common"
@@ -92,6 +94,8 @@ func (c slimResourceClient) List(ctx context.Context, list client.ObjectList, op
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -282,6 +286,9 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeWorkloadIndex, runtimeWorkloadKeys); err != nil {
 		return err
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &aiv1.AIService{}, runtimeRayPlatformIndex, runtimeRayPlatformKeys); err != nil {
+		return err
+	}
 	return r.setupController(mgr)
 }
 
@@ -299,10 +306,13 @@ func (r *AIServiceReconciler) setupController(mgr ctrl.Manager) error {
 		Owns(&batchv1.Job{}, builder.WithPredicates(common.JobChangedPredicate())).
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(common.DeploymentChangedPredicate())).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&policyv1.PodDisruptionBudget{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&networkingv1.NetworkPolicy{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.Service{}, builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, runtimeBackendChangedPredicate()))).
 		Owns(&monitoringv1.ServiceMonitor{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// These resources belong to Services, ReplicaSets or Deployments rather
 		// than directly to the AIService; map their observations explicitly.
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.findManagedRayConsumers), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).
 		Watches(&appsv1.ReplicaSet{}, handler.EnqueueRequestsFromMapFunc(r.findRuntimeServicesForBackend), builder.WithPredicates(runtimeBackendChangedPredicate())).

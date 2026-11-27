@@ -51,7 +51,7 @@ func schemaTestReconcilerWithPlatform(t *testing.T, platform *aiv1.AIPlatform) (
 	ai := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "schema-lifecycle", Namespace: "default", UID: types.UID("schema-lifecycle-uid")},
 		Spec: aiv1.AIServiceSpec{
-			Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+			Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: testNetworkPolicy()},
 			AIPlatformUrl: "http://ray.default.svc:8000", CheckpointDbSecretRef: "checkpoint", Replicas: 1,
 		},
 	}

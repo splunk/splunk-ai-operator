@@ -1457,6 +1457,9 @@ validate_ai_platform_profile_config() {
     # only the supported creation declarations and CR environment settings.
     problems="$(validate_agentruntime_checkpoint_config 2>&1)" || { printf '%s\n' "${problems}"; return 1; }
   fi
+  if [[ -z "${problems}" ]]; then
+    problems="$(validate_agentruntime_network_policy_config 2>&1)" || { printf '%s\n' "${problems}"; return 1; }
+  fi
   [[ -z "${problems}" ]] && return 0
   printf '%s\n' "${problems}"
   return 1
@@ -2107,6 +2110,19 @@ preflight_checks() {
   # Decide once, read-only, which cluster the checks below read (the one main_install will
   # use, or none for a fresh install); the readers run in subshells and reuse the result.
   resolve_target_cluster
+
+  if component_enabled ai-operator && [[ -f "${SPLUNK_AI_FILE}" ]]; then
+    pf_header "AgentRuntime upgrade readiness"
+    if [[ "${TARGET_CLUSTER_ACCESS}" != "none" ]]; then
+      if preflight_agentruntime_policy_upgrade; then
+        pf_ok "Existing AgentRuntime allowlists and policy ownership checked"
+      else
+        pf_fail "Stage the candidate AIPlatform and AIService CRD schemas, save every AgentRuntime allowlist, and resolve policy name conflicts before upgrading the operator."
+      fi
+    elif [[ "${USE_EXISTING:-never}" == "force" ]]; then
+      pf_fail "Cannot inspect the existing cluster required by cluster.useExisting=force."
+    fi
+  fi
 
   # Verify the image registry is reachable and credentials work before committing
   # to a multi-minute install that would fail at ImagePullBackOff otherwise.
@@ -6190,6 +6206,9 @@ install_splunk_ai_operator() {
     return 0
   fi
 
+  # Recheck the active API just before rollout in case the cluster changed since preflight.
+  preflight_agentruntime_policy_upgrade kubectl || err "Stage the candidate AIPlatform and AIService CRD schemas, save every AgentRuntime allowlist, and resolve policy name conflicts before upgrading the operator."
+
   # Create namespace for AI Operator
   local ai_operator_ns="splunk-ai-operator-system"
   ensure_namespace "${ai_operator_ns}"
@@ -6463,6 +6482,310 @@ target_kubectl() {
     ssh)   ssh_exec "${TARGET_CLUSTER_CONTROLLER}" "sudo k0s kubectl $(printf '%q ' "$@")" ;;
     *)     return 1 ;;
   esac
+}
+
+# Validate configured and stored allowlists without consulting dependency
+# Secrets. Invalid fields are reported without echoing their contents.
+agentruntime_network_policy_problems() {
+  python3 -c '
+import ipaddress
+import json
+import re
+import sys
+from urllib.parse import urlsplit
+
+errors = []
+private = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
+))
+dns_label = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+label_text = re.compile(r"[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?")
+
+def problem(path, message):
+    errors.append(f"{path}: {message}")
+
+def mapping(value, path, fields):
+    if not isinstance(value, dict):
+        problem(path, "required object")
+        return False
+    if value.keys() - fields:
+        problem(path, "contains unknown fields")
+    return True
+
+def is_dns_label(value):
+    return len(value) <= 63 and dns_label.fullmatch(value) is not None
+
+def is_label_key(value):
+    prefix, sep, name = value.rpartition("/")
+    return (
+        len(name) <= 63 and label_text.fullmatch(name) is not None
+        and (not sep or (len(prefix) <= 253 and all(is_dns_label(part) for part in prefix.split("."))))
+    )
+
+def validate_peer(value, path, allow_cidr=False):
+    if not mapping(value, path, {"namespace", "podSelector", "cidr"}):
+        return
+    namespace = value.get("namespace", "")
+    selector = value.get("podSelector", {})
+    cidr = value.get("cidr", "")
+    if not isinstance(namespace, str) or (namespace and not is_dns_label(namespace)):
+        problem(path + ".namespace", "must be a Kubernetes namespace name")
+    if not isinstance(cidr, str):
+        problem(path + ".cidr", "must be a CIDR string")
+        return
+    if allow_cidr and cidr:
+        if namespace or selector:
+            problem(path, "a CIDR cannot be combined with a namespace or pod selector")
+        try:
+            prefix_length = cidr.rpartition("/")[2]
+            network = ipaddress.ip_network(cidr, strict=True)
+            if "/" not in cidr or "%" in cidr or re.fullmatch(r"0|[1-9][0-9]{0,2}", prefix_length) is None or not any(
+                network.version == block.version and network.subnet_of(block) for block in private
+            ):
+                raise ValueError
+        except ValueError:
+            problem(path + ".cidr", "must be a private IPv4 or IPv6 CIDR with no host bits")
+        return
+    if cidr:
+        problem(path + ".cidr", "only pod selectors are allowed for this peer")
+    if not isinstance(selector, dict) or not selector:
+        problem(path + ".podSelector", "a nonempty pod selector is required")
+    elif any(
+        not is_label_key(key) or not isinstance(label, str) or len(label) > 63
+        or (label and label_text.fullmatch(label) is None)
+        for key, label in selector.items()
+    ):
+        problem(path + ".podSelector", "must contain valid Kubernetes label selectors")
+
+def validate_destination(value, path):
+    if not mapping(value, path, {"peer", "port"}):
+        return
+    validate_peer(value.get("peer"), path + ".peer", allow_cidr=True)
+    port = value.get("port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        problem(path + ".port", "must be an integer from 1 to 65535")
+
+def validate_feature(feature, path, require_slim=False, require_metrics=True, profile=None):
+    if not isinstance(feature, dict):
+        problem(path, "must be a feature object")
+        return
+    policy = feature.get("networkPolicy")
+    path += ".networkPolicy"
+    if feature.get("name") != "agentruntime":
+        if policy is not None:
+            problem(path, "only supported for the agentruntime feature")
+        return
+    if not mapping(policy, path, {"dns", "postgresql", "slim", "metrics", "metricsDisabled", "managedRay", "runtimeEgress"}):
+        return
+    validate_peer(policy.get("dns"), path + ".dns")
+    validate_destination(policy.get("postgresql"), path + ".postgresql")
+    if require_slim or policy.get("slim") is not None:
+        validate_peer(policy.get("slim"), path + ".slim")
+    metrics_disabled = policy.get("metricsDisabled", False)
+    if type(metrics_disabled) is not bool:
+        problem(path + ".metricsDisabled", "must be a boolean")
+    if policy.get("metrics") is not None:
+        validate_peer(policy["metrics"], path + ".metrics")
+        if metrics_disabled is True:
+            problem(path + ".metricsDisabled", "cannot be combined with a metrics peer")
+    elif require_metrics and metrics_disabled is not True:
+        problem(path + ".metrics", "select a metrics peer or set metricsDisabled to true")
+    managed_ray = policy.get("managedRay", False)
+    if type(managed_ray) is not bool:
+        problem(path + ".managedRay", "must be a boolean")
+    elif managed_ray and profile not in ("", "full", "fullfeature"):
+        problem(path + ".managedRay", "requires a fullfeature AIPlatform")
+    egress = policy.get("runtimeEgress", [])
+    if isinstance(egress, list):
+        for index, destination in enumerate(egress):
+            validate_destination(destination, f"{path}.runtimeEgress[{index}]")
+    else:
+        problem(path + ".runtimeEgress", "must be a list of destinations")
+
+def validate_managed_ray_url(spec, platform_ref, path):
+    origin = spec.get("aiPlatformUrl")
+    if not origin:
+        return
+    namespace, name = platform_ref
+    # Match the RayService head name generated by KubeRay, including truncation.
+    head = (name + "-head-svc")[-50:]
+    if not head[0].isalpha():
+        head = "r" + head[1:]
+    domain = spec.get("clusterDomain") or "cluster.local"
+    expected = f"{head}.{namespace}.svc.{domain}:8000"
+    try:
+        authority = urlsplit(origin).netloc.rsplit("@", 1)[-1]
+    except ValueError:
+        authority = ""
+    if authority != expected:
+        problem(path, "managedRay requires the referenced AIPlatform head Service on port 8000")
+
+def validate_features(features, path, profile):
+    if isinstance(features, list):
+        for index, feature in enumerate(features):
+            validate_feature(feature, f"{path}[{index}]", profile=profile)
+    else:
+        problem(path, "must be a list")
+
+def short_hash(name):
+    # Match the bounded Kubernetes resource names generated by AgentRuntime.
+    value = 2166136261
+    for byte in name.encode("utf-8"):
+        value = ((value ^ byte) * 16777619) & 0xffffffff
+    return f"{value:08x}"
+
+def short_name(name, suffix=""):
+    full = name + ("-" + suffix if suffix else "")
+    if len(full) <= 63:
+        return full
+    hashed = short_hash(full)
+    tail = "-" + hashed + ("-" + suffix if suffix else "")
+    prefix = name[:63 - len(tail)]
+    return (prefix.rstrip("-") or prefix) + tail
+
+def validate_resilience_ownership(resources, runtimes, suffixes, kind):
+    expected = {(namespace, short_name(name, suffix)): uid
+                for (namespace, name), uid in runtimes.items() for suffix in suffixes}
+    for resource in resources:
+        metadata = resource["metadata"]
+        key = (metadata["namespace"], metadata["name"])
+        if key not in expected:
+            continue
+        uid = expected[key]
+        if not uid or not any(owner.get("controller") and owner.get("uid") == uid
+                              for owner in metadata.get("ownerReferences", [])):
+            problem(f"{kind} {key[0]}/{key[1]}", "name is occupied by an object the AgentRuntime does not control")
+
+def has_network_policy_schema(crd, platform):
+    if not crd or crd["metadata"].get("deletionTimestamp"):
+        return False
+    for version in crd["spec"]["versions"]:
+        if version["name"] != "v1" or not version.get("served"):
+            continue
+        schema = version.get("schema", {}).get("openAPIV3Schema", {})
+        spec = schema.get("properties", {}).get("spec", {})
+        features = spec.get("properties", {}).get("features", {})
+        if platform:
+            features = features.get("items", {})
+        policy = features.get("properties", {}).get("networkPolicy") or {}
+        fields = {"dns": "object", "postgresql": "object", "slim": "object", "metrics": "object",
+                  "runtimeEgress": "array", "metricsDisabled": "boolean", "managedRay": "boolean"}
+        return policy.get("type") == "object" and all(
+            policy.get("properties", {}).get(key, {}).get("type") == kind for key, kind in fields.items()
+        )
+    return False
+
+try:
+    data = json.load(sys.stdin)
+    if sys.argv[1] == "config":
+        for entry in data:
+            validate_feature(entry["value"], "aiPlatform.features[{}]".format(entry["key"]), profile=sys.argv[2])
+    else:
+        platform_crd, service_crd = data[:2]
+        platforms, services, policies, budgets = (listing["items"] for listing in data[2:])
+        managed_runtimes = {}
+        platform_profiles = {}
+        runtime_names = {}
+        for platform in platforms:
+            metadata = platform["metadata"]
+            namespace, name = metadata["namespace"], metadata["name"]
+            if metadata.get("deletionTimestamp"):
+                continue
+            spec = platform["spec"]
+            profile = spec.get("profile") or ""
+            platform_profiles[(namespace, name)] = profile
+            features = spec.get("features", [])
+            if features:
+                validate_features(features, f"AIPlatform {namespace}/{name} spec.features", profile)
+                for feature in features:
+                    if isinstance(feature, dict) and feature.get("name") == "agentruntime":
+                        provider = feature.get("provider")
+                        full_name = name + "-agentruntime" + ("-" + provider if provider else "")
+                        key = (namespace, short_name(full_name))
+                        managed_runtimes[key] = (name, metadata["uid"], provider)
+                        runtime_names[key] = None
+        for service in services:
+            metadata = service["metadata"]
+            namespace, name = metadata["namespace"], metadata["name"]
+            if metadata.get("deletionTimestamp"):
+                continue
+            spec = service["spec"]
+            feature = spec.get("features", {})
+            runtime = isinstance(feature, dict) and feature.get("name") == "agentruntime"
+            key = (namespace, name)
+            if key in managed_runtimes:
+                platform, uid, provider = managed_runtimes[key]
+                managed = runtime and feature.get("provider") == provider and any(
+                    owner.get("controller") and owner.get("kind") == "AIPlatform"
+                    and owner.get("apiVersion") == "ai.splunk.com/v1"
+                    and owner.get("name") == platform and owner.get("uid") == uid
+                    for owner in metadata.get("ownerReferences", [])
+                )
+                if managed:
+                    # The parent policy is authoritative for the generated child during the upgrade.
+                    runtime_names[key] = metadata["uid"]
+                    continue
+                problem(f"AIService {namespace}/{name}", "generated AgentRuntime name is occupied by another AIService")
+            if runtime:
+                runtime_names[key] = metadata["uid"]
+            ref = spec.get("aiPlatformRef") or {}
+            platform_ref = (ref.get("namespace") or namespace, ref.get("name"))
+            profile = platform_profiles.get(platform_ref)
+            service_path = f"AIService {namespace}/{name} spec"
+            validate_feature(feature, service_path + ".features", require_slim=True,
+                             require_metrics=(spec.get("metrics") or {}).get("enabled", False) is True, profile=profile)
+            policy = feature.get("networkPolicy") if runtime else None
+            if isinstance(policy, dict) and policy.get("managedRay") is True and profile in ("", "full", "fullfeature"):
+                validate_managed_ray_url(spec, platform_ref, service_path + ".aiPlatformUrl")
+        if runtime_names:
+            if not has_network_policy_schema(platform_crd, True) or not has_network_policy_schema(service_crd, False):
+                problem("AgentRuntime allowlist preflight", "stage the updated AIPlatform and AIService CRD schemas")
+            validate_resilience_ownership(policies, runtime_names, ("network", "schema-network"), "NetworkPolicy")
+            validate_resilience_ownership(budgets, runtime_names, ("agentruntime-pdb",), "PodDisruptionBudget")
+except (AttributeError, KeyError, TypeError, ValueError):
+    problem("AgentRuntime allowlist preflight", "could not read feature definitions")
+
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    sys.exit(1)
+' "$@"
+}
+
+validate_agentruntime_network_policy_config() {
+  local features
+  # Retain the index for diagnostics and skip Python for configurations that
+  # neither enable AgentRuntime nor supply a policy on another feature.
+  if ! features=$(yq -o=json eval '
+    [(.aiPlatform.features // []) | to_entries | .[] |
+      select(.value.name == "agentruntime" or (.value | has("networkPolicy")))]
+  ' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "aiPlatform.features: could not read AgentRuntime allowlist configuration" >&2
+    return 1
+  fi
+  if [[ "${features}" == "[]" ]]; then
+    return 0
+  fi
+  printf '%s\n' "${features}" | agentruntime_network_policy_problems config "$(ai_platform_profile_resolved)"
+}
+
+preflight_agentruntime_policy_upgrade() {
+  local reader="${1:-target_kubectl}" platform_crd service_crd platforms services policies budgets
+  local empty='{"items":[]}'
+  platforms="${empty}"
+  services="${empty}"
+  platform_crd=$("${reader}" get crd aiplatforms.ai.splunk.com --ignore-not-found -o json) || return 1
+  service_crd=$("${reader}" get crd aiservices.ai.splunk.com --ignore-not-found -o json) || return 1
+  [[ -z "${platform_crd}${service_crd}" ]] && return 0
+  if [[ -n "${platform_crd}" ]]; then
+    platforms=$("${reader}" get aiplatforms.ai.splunk.com --all-namespaces -o json) || return 1
+  fi
+  if [[ -n "${service_crd}" ]]; then
+    services=$("${reader}" get aiservices.ai.splunk.com --all-namespaces -o json) || return 1
+  fi
+  policies=$("${reader}" get networkpolicies.networking.k8s.io --all-namespaces -o json) || return 1
+  budgets=$("${reader}" get poddisruptionbudgets.policy --all-namespaces -o json) || return 1
+  printf '[%s,%s,%s,%s,%s,%s]\n' "${platform_crd:-null}" "${service_crd:-null}" "${platforms}" "${services}" "${policies}" "${budgets}" \
+    | agentruntime_network_policy_problems upgrade
 }
 
 # ====== CREATE IMAGE PULL SECRETS FROM CONFIG ======
@@ -7844,7 +8167,7 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint fenv_yaml
+      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint fenv_yaml fpolicy_yaml
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -7855,6 +8178,8 @@ EOF
       ftarget=$(yq eval ".aiPlatform.features[$i].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fcheckpoint=$(yq eval ".aiPlatform.features[$i].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fenv_yaml=$(yq eval ".aiPlatform.features[$i].env // {}" "${CONFIG_FILE}" 2>/dev/null || echo "{}")
+      # Resolve aliases before extracting the policy, which becomes a separate YAML document.
+      fpolicy_yaml=$(yq -M eval "explode(.) | .aiPlatform.features[$i].networkPolicy // \"\"" "${CONFIG_FILE}")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
@@ -7864,6 +8189,12 @@ EOF
         [[ -n "$fmax" && "$fmax" != "null" ]] && features_yaml+="      maxReplicas: ${fmax}"$'\n'
         [[ -n "$ftarget" && "$ftarget" != "null" ]] && features_yaml+="      targetCPUUtilization: ${ftarget}"$'\n'
         [[ -n "$fcheckpoint" && "$fcheckpoint" != "null" ]] && features_yaml+="      checkpointDbSecretRef: \"${fcheckpoint}\""$'\n'
+        if [[ -n "${fpolicy_yaml}" ]]; then
+          features_yaml+="      networkPolicy:"$'\n'
+          while IFS= read -r line; do
+            features_yaml+="        ${line}"$'\n'
+          done <<< "${fpolicy_yaml}"
+        fi
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: \"${fsa}\""$'\n'
         if [[ -n "$fenv_yaml" && "$fenv_yaml" != "{}" && "$fenv_yaml" != "null" ]]; then
           features_yaml+="      env:"$'\n'
@@ -10278,6 +10609,12 @@ validate_config() {
     fi
   else
     echo -e "  \033[1;32m✔\033[0m aiPlatform.profile omitted (resolves to fullfeature; pre-profile behaviour)" >&2
+    if ! _profile_problems=$(validate_agentruntime_network_policy_config 2>&1); then
+      while IFS= read -r _profile_line; do
+        echo -e "  \033[1;31m✖\033[0m ${_profile_line}" >&2
+        errors=$(( errors + 1 ))
+      done <<< "${_profile_problems}"
+    fi
   fi
   if [[ "$(ai_platform_profile_resolved)" != "cpuOnly" ]]; then
   _vcheck "aiPlatform.defaultAcceleratorType" \

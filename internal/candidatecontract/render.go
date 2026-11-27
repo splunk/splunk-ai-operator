@@ -17,6 +17,8 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -80,16 +82,25 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 		}()
 	}
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{aiv1.AddToScheme, corev1.AddToScheme, appsv1.AddToScheme, batchv1.AddToScheme, autoscalingv2.AddToScheme, monitoringv1.AddToScheme, certmanagerv1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{aiv1.AddToScheme, corev1.AddToScheme, appsv1.AddToScheme, batchv1.AddToScheme, autoscalingv2.AddToScheme, networkingv1.AddToScheme, policyv1.AddToScheme, monitoringv1.AddToScheme, certmanagerv1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			return nil, fmt.Errorf("render.scheme: %w", err)
 		}
 	}
 	const namespace = "candidate-validation"
+	// Explicit fixture peers exercise reconciliation without inferring policy from URLs.
+	allowlist := &aiv1.AgentRuntimeNetworkPolicy{
+		MetricsDisabled: true,
+		DNS:             aiv1.AgentRuntimeNetworkPeer{Namespace: "kube-system", PodSelector: map[string]string{"k8s-app": "kube-dns"}},
+		PostgreSQL: aiv1.AgentRuntimeNetworkDestination{
+			Peer: aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "offline-postgres"}}, Port: 5432,
+		},
+		SLIM: &aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "candidate-slim", "component": "candidate-slim"}},
+	}
 	carrier := m.Spec.Components["launchpadCarrier"]
 	platform := &aiv1.AIPlatform{
 		ObjectMeta: metav1.ObjectMeta{Name: "candidate", Namespace: namespace, UID: "offline-platform"},
-		Spec:       aiv1.AIPlatformSpec{Profile: aiv1.AIPlatformProfile(profile), Features: []aiv1.FeatureSpec{{Name: "agentruntime", Provider: carrier.Provider}, {Name: "slim"}}},
+		Spec:       aiv1.AIPlatformSpec{Profile: aiv1.AIPlatformProfile(profile), Features: []aiv1.FeatureSpec{{Name: "agentruntime", Provider: carrier.Provider, NetworkPolicy: allowlist}, {Name: "slim"}}},
 	}
 	if profile == "fullfeature" {
 		platform.Status.RayServiceName = "candidate-ray-head"
@@ -101,7 +112,7 @@ func renderWithPlatformURL(m *Manifest, profile string, matrix *Matrix, platform
 	runtimeService := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "candidate-agentruntime-" + carrier.Provider, Namespace: namespace, UID: "offline-runtime"},
 		Spec: aiv1.AIServiceSpec{
-			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: carrier.Provider},
+			Feature:               aiv1.FeatureSpec{Name: "agentruntime", Provider: carrier.Provider, NetworkPolicy: allowlist},
 			RuntimeVersion:        m.Spec.RuntimeVersion,
 			CheckpointDbSecretRef: m.Spec.Contract.SecretKeys.Name,
 			AIPlatformRef:         corev1.ObjectReference{Name: platform.Name, Namespace: namespace},

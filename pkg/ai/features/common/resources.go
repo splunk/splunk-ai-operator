@@ -196,3 +196,8 @@ func claim(owner, obj client.Object, scheme *runtime.Scheme, refuseUnowned bool)
 	}
 	return controllerutil.SetControllerReference(owner, obj, scheme)
 }
+
+// SLIMPodSelector identifies the stable SLIM workload across trust revisions.
+func SLIMPodSelector(aiServiceName string) map[string]string {
+	return map[string]string{"app": aiServiceName, "component": aiServiceName}
+}

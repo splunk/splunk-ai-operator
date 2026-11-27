@@ -164,6 +164,7 @@ func serviceWithResources(feature string, res corev1.ResourceRequirements) *aiv1
 	s.Spec.Feature = aiv1.FeatureSpec{Name: feature}
 	if feature == "agentruntime" {
 		s.Spec.Feature.Provider = "mltk"
+		s.Spec.Feature.NetworkPolicy = agentRuntimePolicyForAdmission()
 		s.Spec.CheckpointDbSecretRef = "checkpoint-db"
 	}
 	s.Spec.Resources = res

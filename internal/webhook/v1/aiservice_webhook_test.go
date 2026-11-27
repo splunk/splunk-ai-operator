@@ -18,12 +18,15 @@ package v1
 
 import (
 	"strings"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
@@ -210,8 +213,9 @@ var _ = Describe("AIService Webhook", func() {
 				aiservice := &aiv1.AIService{
 					Spec: aiv1.AIServiceSpec{
 						Feature: aiv1.FeatureSpec{
-							Name:     "agentruntime",
-							Provider: "mltk",
+							Name:          "agentruntime",
+							Provider:      "mltk",
+							NetworkPolicy: agentRuntimePolicyForAdmission(),
 						},
 						CheckpointDbSecretRef: "mltk-postgres",
 						MinReplicas:           int32PtrForWebhookTest(1),
@@ -224,7 +228,7 @@ var _ = Describe("AIService Webhook", func() {
 				Expect(errs).To(BeEmpty())
 			})
 
-			It("should require provider and checkpoint secret for agentruntime", func() {
+			It("should require provider, checkpoint secret and network policy for agentruntime", func() {
 				aiservice := &aiv1.AIService{
 					Spec: aiv1.AIServiceSpec{
 						Feature: aiv1.FeatureSpec{Name: "agentruntime"},
@@ -234,6 +238,7 @@ var _ = Describe("AIService Webhook", func() {
 				errs := validator.validateAgentRuntimeFields(aiservice, fldPath)
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("spec.features.provider"))
 				Expect(errs.ToAggregate().Error()).To(ContainSubstring("checkpointDbSecretRef"))
+				Expect(errs.ToAggregate().Error()).To(ContainSubstring("spec.features.networkPolicy"))
 			})
 
 			It("should reject provider on non-agentruntime features", func() {
@@ -256,4 +261,34 @@ var _ = Describe("AIService Webhook", func() {
 
 func int32PtrForWebhookTest(value int32) *int32 {
 	return &value
+}
+
+func TestAIServiceWebhook_StandaloneNetworkPolicyRequiresSLIM(t *testing.T) {
+	service := serviceWithResources("agentruntime", corev1.ResourceRequirements{})
+	service.Spec.Feature.NetworkPolicy.SLIM = nil
+	validator := &AIServiceCustomValidator{}
+	path := field.NewPath("spec")
+	require.ErrorContains(t, validator.validateAgentRuntimeFields(service, path).ToAggregate(), "spec.features.networkPolicy.slim")
+
+	controller := true
+	service.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: aiv1.GroupVersion.String(),
+		Kind:       "AIPlatform",
+		Name:       "platform",
+		UID:        "platform-uid",
+		Controller: &controller,
+	}}
+	require.Empty(t, validator.validateAgentRuntimeFields(service, path))
+}
+
+func agentRuntimePolicyForAdmission() *aiv1.AgentRuntimeNetworkPolicy {
+	return &aiv1.AgentRuntimeNetworkPolicy{
+		MetricsDisabled: true,
+		DNS:             aiv1.AgentRuntimeNetworkPeer{Namespace: "kube-system", PodSelector: map[string]string{"k8s-app": "kube-dns"}},
+		PostgreSQL: aiv1.AgentRuntimeNetworkDestination{
+			Peer: aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "postgres"}},
+			Port: 5432,
+		},
+		SLIM: &aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "slim"}},
+	}
 }

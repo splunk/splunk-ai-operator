@@ -75,6 +75,18 @@ features: []
 #   targetCPUUtilization: 60
 #   checkpointDbSecretRef: "mltk-postgres-conn"
 #   # PostgreSQL connection values belong in the referenced Secret, never feature env.
+#   networkPolicy:
+#     metricsDisabled: true  # Or configure a metrics scraper peer.
+#     managedRay: true  # Use the fullfeature platform’s stable Ray head Service.
+#     dns:
+#       namespace: kube-system
+#       podSelector:
+#         k8s-app: kube-dns
+#     postgresql:
+#       peer:
+#         podSelector:
+#           app: checkpoint-db
+#       port: 5432
 
 # headGroupSpec:
 #   # Service account name for the Ray head group

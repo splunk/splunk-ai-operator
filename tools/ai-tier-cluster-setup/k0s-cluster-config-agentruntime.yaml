@@ -118,6 +118,18 @@ aiPlatform:
       maxReplicas: 2
       targetCPUUtilization: 60
       checkpointDbSecretRef: "mltk-postgres-conn"
+      # Match the live DNS and checkpoint pods before installing or upgrading.
+      networkPolicy:
+        metricsDisabled: true
+        dns:
+          namespace: kube-system
+          podSelector:
+            k8s-app: kube-dns
+        postgresql:
+          peer:
+            podSelector:
+              app: checkpoint-db
+          port: 5432
   agentRuntime:
     checkpointSecrets:
       - name: "mltk-postgres-conn"

@@ -22,15 +22,16 @@ Secrets, model artifacts, and shared AI Tier infrastructure remain." Evidence:
    feature uses, and this AIService (matched by UID) does not control it, the operator
    does not adopt, rewrite or delete it. The stage fails with reason
    `OwnershipConflict`, and the message names the object; see "Troubleshooting".
-3. **Nothing is deleted by label.** The operator selects nothing for deletion by label or
-   name pattern. Removal is always garbage collection through owner references.
+3. **Cleanup verifies ownership.** Deleting the AIService garbage collects its
+   resources. For cleanup during reconciliation, the operator verifies the
+   controller UID before deleting an individual object.
 4. **No finalizer.** The operator adds no finalizer and runs no cleanup on deletion, so
    an unavailable PostgreSQL server, registry or other dependency cannot hold a deletion.
    Builds from 2025-08 added `ai.splunk.com/aiservice-protect` and
    `ai.splunk.com/aiplatform-protect`. An object that still carries one is released at
    once when it is deleted.
-5. **Failures are retried, never answered with a delete.** A Kubernetes API failure fails
-   the stage, sets its condition to `False` and is retried. A missing owned object is
+5. **API failures are retried.** A Kubernetes API failure fails the stage, sets
+   its condition to `False` and is retried. A missing required resource is
    recreated, and an owned object that is already gone counts as removed.
 
 ## Inventory
@@ -50,8 +51,10 @@ Secrets, model artifacts, and shared AI Tier infrastructure remain." Evidence:
 | Deployment (and its ReplicaSets and Pods) | `<svc>-agentruntime-deployment` | after schema success |
 | Service | `<svc>-svc` | after schema success |
 | HorizontalPodAutoscaler | `<svc>-agentruntime-hpa` | after schema success |
-| ServiceMonitor | `<svc>-agentruntime-metrics` | `metrics.enabled` |
-| PodDisruptionBudget, NetworkPolicy | — | not created yet (MPR-205); they will follow the same rule |
+| ServiceMonitor | `<svc>-agentruntime-metrics` | metrics are enabled with an approved scraper and `networkPolicy.metricsDisabled` is unset or false |
+| PodDisruptionBudget | `<svc>-agentruntime-pdb` | after schema success |
+| NetworkPolicy | `<svc>-network`, `<svc>-schema-network` | for every AgentRuntime service, before schema setup |
+| Temporary NetworkPolicy | `<svc>-schema-network-legacy` or an ownership-conflict guard | while migrating unfinished legacy schema Jobs or resolving a policy-name conflict |
 
 The TLS Secret is recognised by the `cert-manager.io/certificate-name` annotation that
 cert-manager writes. A Secret you created yourself under the generated name `<svc>-tls`
@@ -100,7 +103,7 @@ references name the AIService) and what must remain:
 ```sh
 NS=ai-platform SVC=ai-agentruntime-mltk
 UID=$(kubectl get aiservice "$SVC" -n "$NS" -o jsonpath='{.metadata.uid}')
-kubectl get serviceaccount,configmap,secret,job,deployment,service,hpa,servicemonitor,certificate -n "$NS" -o json \
+kubectl get serviceaccount,configmap,secret,job,deployment,service,hpa,servicemonitor,certificate,poddisruptionbudget,networkpolicy -n "$NS" -o json \
   | jq -r --arg uid "$UID" '.items[] | select(any(.metadata.ownerReferences[]?; .uid == $uid)) | "\(.kind)/\(.metadata.name)"'
 ```
 
@@ -128,8 +131,14 @@ The operator also records a Warning event with the same text on the AIService
 
 ## Upgrading
 
-Objects created by earlier operator builds are already owned, so an upgrade causes no
-conflict. Earlier builds also adopted, or created and owned, the ServiceAccount named in
+When a generated NetworkPolicy name is occupied, the operator creates an owned
+deny-only guard for the matching pods and reports the conflict. Kubernetes
+combines NetworkPolicy allowances, including any overlapping external policies.
+The operator removes the guard once it reconciles the intended NetworkPolicy.
+The [upgrade procedure](disruption-and-network-policy.md#configure-and-upgrade)
+describes how to check generated names and save the allowlists before rollout.
+
+Earlier builds adopted, or created and owned, the ServiceAccount named in
 `features[].serviceAccountName`. After the upgrade the operator removes its own owner
 reference from that ServiceAccount on the next pass, keeping any other, so the
 ServiceAccount is no longer deleted with the AIService.
