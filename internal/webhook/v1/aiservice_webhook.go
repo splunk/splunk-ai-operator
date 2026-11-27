@@ -232,6 +232,9 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 	var allErrs field.ErrorList
 
 	if aiservice.Spec.Feature.Name != "agentruntime" {
+		if aiservice.Spec.Feature.NetworkPolicy != nil {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("features", "networkPolicy"), "networkPolicy is only supported for agentruntime"))
+		}
 		if aiservice.Spec.Feature.Provider != "" {
 			allErrs = append(allErrs, field.Forbidden(
 				fldPath.Child("features").Child("provider"),
@@ -269,6 +272,9 @@ func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AI
 
 	policy := aiv1.ResolveAgentRuntimeAutoscaling(aiservice.Spec.MinReplicas, aiservice.Spec.MaxReplicas, aiservice.Spec.TargetCPUUtilization)
 	allErrs = append(allErrs, policy.Validate(fldPath)...)
+	owner := metav1.GetControllerOf(aiservice)
+	platformManaged := owner != nil && owner.APIVersion == aiv1.GroupVersion.String() && owner.Kind == "AIPlatform"
+	allErrs = append(allErrs, aiservice.Spec.Feature.NetworkPolicy.Validate(fldPath.Child("features", "networkPolicy"), !platformManaged)...)
 
 	return allErrs
 }

@@ -142,12 +142,14 @@ func (r *AgentRuntimeReconciler) Reconcile(ctx context.Context, aiservice *aiv1.
 		name string
 		fn   func(context.Context, *aiv1.AIService) error
 	}{
+		{"AgentRuntimeNetworkPolicy", r.reconcileNetworkPolicies},
 		{"Validate", r.validateAIService},
 		{"ServiceAccount", r.reconcileServiceAccount},
 		{"AgentRuntimeConfigMap", r.reconcileConfigMap},
 		{"Certificate", r.reconcileCertificate},
 		{"PostgresSchemaSetup", r.reconcilePostgresSchemaSetup},
 		{"AgentRuntimeDeployment", r.reconcileDeployment},
+		{"AgentRuntimeDisruptionBudget", r.reconcileDisruptionBudget},
 		{"AgentRuntimeService", r.reconcileService},
 		{"AgentRuntimeHPA", r.reconcileHPA},
 		{"ServiceMonitor", r.reconcileServiceMonitor},
@@ -645,7 +647,10 @@ func (r *AgentRuntimeReconciler) reconcilePostgresSchemaSetup(ctx context.Contex
 	}
 
 	labels, annotations := labelsAndAnnotations(ai)
-	labels["component"] = "agentruntime-schema-setup"
+	// Keep the schema policy selector stable even when labels are supplied by the caller.
+	for key, value := range schemaSelectorLabels(ai) {
+		labels[key] = value
+	}
 	annotations[schemaJobInputHashAnnotation] = inputHash
 	annotations["ai.splunk.com/agentruntime-schema-image-digest"] = strings.SplitN(schemaImage, "@", 2)[1]
 	annotations[schemaJobManagedAnnotation] = schemaJobManagedValue

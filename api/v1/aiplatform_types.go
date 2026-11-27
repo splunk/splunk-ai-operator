@@ -230,6 +230,9 @@ type FeatureSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	CheckpointDbSecretRef string `json:"checkpointDbSecretRef,omitempty"`
+	// NetworkPolicy declares the exact peers that may communicate with AgentRuntime.
+	// It is required for the agentruntime feature.
+	NetworkPolicy *AgentRuntimeNetworkPolicy `json:"networkPolicy,omitempty"`
 	// SchemaRetryNonce requests one new agentruntime schema Job when changed after a terminal failure.
 	// Reusing the same value never retries the migration.
 	// +kubebuilder:validation:Optional

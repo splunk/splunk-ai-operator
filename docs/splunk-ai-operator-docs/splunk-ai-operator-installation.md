@@ -301,6 +301,10 @@ kubectl get certificates -n splunk-ai-operator-system
 
 ### Upgrade Operator
 
+For an upgrade that introduces AgentRuntime network policies, stage the updated CRDs and
+save the AgentRuntime allowlists before upgrading the operator. Follow the
+[AgentRuntime upgrade sequence](../agent-runtime/disruption-and-network-policy.md#configure-and-upgrade).
+
 ```bash
 # Upgrade to new version
 helm upgrade splunk-ai-operator \

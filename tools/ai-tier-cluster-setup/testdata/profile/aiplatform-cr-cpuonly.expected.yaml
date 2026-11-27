@@ -33,6 +33,20 @@ spec:
       maxReplicas: 4
       targetCPUUtilization: 60
       checkpointDbSecretRef: "mltk-postgres-conn"
+      networkPolicy:
+        dns:
+          namespace: kube-system
+          podSelector:
+            k8s-app: kube-dns
+        postgresql:
+          peer:
+            podSelector:
+              app: checkpoint-db
+          port: 5432
+        runtimeEgress:
+          - peer:
+              cidr: 10.20.0.10/32
+            port: 443
   # CPU scheduler
   cpuScheduler:
     nodeSelector:

@@ -62,6 +62,7 @@ var _ = Describe("AIPlatform controller in a cluster without KubeRay", func() {
 			started <- mgr.Start(mctx)
 		}()
 
+		runtimePolicy := agentRuntimePolicyForControllerTest()
 		p := &aiv1.AIPlatform{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("nokuberay-%d", time.Now().UnixNano()%1000000), Namespace: "default"},
 			Spec: aiv1.AIPlatformSpec{
@@ -69,7 +70,7 @@ var _ = Describe("AIPlatform controller in a cluster without KubeRay", func() {
 				ObjectStorage: aiv1.ObjectStorageSpec{Path: "s3://bucket", Region: "us-west-2"},
 				Features: []aiv1.FeatureSpec{
 					{Name: "slim", Version: "1.0.0"},
-					{Name: "agentruntime", Provider: "launchpad", CheckpointDbSecretRef: "pg"},
+					{Name: "agentruntime", Provider: "launchpad", CheckpointDbSecretRef: "pg", NetworkPolicy: runtimePolicy},
 				},
 			},
 		}
@@ -107,12 +108,17 @@ var _ = Describe("AIPlatform controller in a cluster without KubeRay", func() {
 
 		// SLIM is pointed at the AgentRuntime Service (cpuOnly has no Ray URL).
 		for _, c := range children.Items {
-			if !metav1.IsControlledBy(&c, p) || c.Spec.Feature.Name != "slim" {
+			if !metav1.IsControlledBy(&c, p) {
 				continue
 			}
-			Expect(c.Spec.AIPlatformUrl).To(BeEmpty())
-			Expect(c.Spec.AgentRuntimeUrl).To(MatchRegexp(`^http://.+-svc\.default\.svc\.cluster\.local:8080$`))
-			Expect(c.Spec.AgentRuntimeUrl).To(ContainSubstring(p.Name + "-agentruntime-launchpad"))
+			switch c.Spec.Feature.Name {
+			case "agentruntime":
+				Expect(c.Spec.Feature.NetworkPolicy).To(Equal(runtimePolicy))
+			case "slim":
+				Expect(c.Spec.AIPlatformUrl).To(BeEmpty())
+				Expect(c.Spec.AgentRuntimeUrl).To(MatchRegexp(`^http://.+-svc\.default\.svc\.cluster\.local:8080$`))
+				Expect(c.Spec.AgentRuntimeUrl).To(ContainSubstring(p.Name + "-agentruntime-launchpad"))
+			}
 		}
 	})
 })

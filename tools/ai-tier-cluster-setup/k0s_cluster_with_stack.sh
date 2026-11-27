@@ -1457,6 +1457,9 @@ validate_ai_platform_profile_config() {
     # only the supported creation declarations and CR environment settings.
     problems="$(validate_agentruntime_checkpoint_config 2>&1)" || { printf '%s\n' "${problems}"; return 1; }
   fi
+  if [[ -z "${problems}" ]]; then
+    problems="$(validate_agentruntime_network_policy_config 2>&1)" || { printf '%s\n' "${problems}"; return 1; }
+  fi
   [[ -z "${problems}" ]] && return 0
   printf '%s\n' "${problems}"
   return 1
@@ -6190,6 +6193,9 @@ install_splunk_ai_operator() {
     return 0
   fi
 
+  # Check the saved definitions before the bundled CRDs and controller roll.
+  preflight_agentruntime_policy_upgrade || err "Stage the candidate AIPlatform and AIService CRD schemas and save every AgentRuntime allowlist before upgrading the operator."
+
   # Create namespace for AI Operator
   local ai_operator_ns="splunk-ai-operator-system"
   ensure_namespace "${ai_operator_ns}"
@@ -6463,6 +6469,189 @@ target_kubectl() {
     ssh)   ssh_exec "${TARGET_CLUSTER_CONTROLLER}" "sudo k0s kubectl $(printf '%q ' "$@")" ;;
     *)     return 1 ;;
   esac
+}
+
+# Validate configured and stored allowlists without consulting dependency
+# Secrets. Invalid fields are reported without echoing their contents.
+agentruntime_network_policy_problems() {
+  python3 -c '
+import ipaddress
+import json
+import re
+import sys
+
+errors = []
+private = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
+))
+dns_label = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+label_text = re.compile(r"[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?")
+
+def problem(path, message):
+    errors.append(f"{path}: {message}")
+
+def mapping(value, path, fields):
+    if not isinstance(value, dict):
+        problem(path, "required object")
+        return False
+    if value.keys() - fields:
+        problem(path, "contains unknown fields")
+    return True
+
+def is_dns_label(value):
+    return len(value) <= 63 and dns_label.fullmatch(value) is not None
+
+def is_label_key(value):
+    prefix, sep, name = value.rpartition("/")
+    return (
+        len(name) <= 63 and label_text.fullmatch(name) is not None
+        and (not sep or (len(prefix) <= 253 and all(is_dns_label(part) for part in prefix.split("."))))
+    )
+
+def validate_peer(value, path, allow_cidr=False):
+    if not mapping(value, path, {"namespace", "podSelector", "cidr"}):
+        return
+    namespace = value.get("namespace", "")
+    selector = value.get("podSelector", {})
+    cidr = value.get("cidr", "")
+    if not isinstance(namespace, str) or (namespace and not is_dns_label(namespace)):
+        problem(path + ".namespace", "must be a Kubernetes namespace name")
+    if not isinstance(cidr, str):
+        problem(path + ".cidr", "must be a CIDR string")
+        return
+    if allow_cidr and cidr:
+        if namespace or selector:
+            problem(path, "a CIDR cannot be combined with a namespace or pod selector")
+        try:
+            prefix_length = cidr.rpartition("/")[2]
+            network = ipaddress.ip_network(cidr, strict=True)
+            if "/" not in cidr or "%" in cidr or re.fullmatch(r"0|[1-9][0-9]{0,2}", prefix_length) is None or not any(
+                network.version == block.version and network.subnet_of(block) for block in private
+            ):
+                raise ValueError
+        except ValueError:
+            problem(path + ".cidr", "must be a private IPv4 or IPv6 CIDR with no host bits")
+        return
+    if cidr:
+        problem(path + ".cidr", "only pod selectors are allowed for this peer")
+    if not isinstance(selector, dict) or not selector:
+        problem(path + ".podSelector", "a nonempty pod selector is required")
+    elif any(
+        not is_label_key(key) or not isinstance(label, str) or len(label) > 63
+        or (label and label_text.fullmatch(label) is None)
+        for key, label in selector.items()
+    ):
+        problem(path + ".podSelector", "must contain valid Kubernetes label selectors")
+
+def validate_destination(value, path):
+    if not mapping(value, path, {"peer", "port"}):
+        return
+    validate_peer(value.get("peer"), path + ".peer", allow_cidr=True)
+    port = value.get("port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        problem(path + ".port", "must be an integer from 1 to 65535")
+
+def validate_feature(feature, path, require_slim=False):
+    if not isinstance(feature, dict):
+        problem(path, "must be a feature object")
+        return
+    policy = feature.get("networkPolicy")
+    path += ".networkPolicy"
+    if feature.get("name") != "agentruntime":
+        if policy is not None:
+            problem(path, "only supported for the agentruntime feature")
+        return
+    if not mapping(policy, path, {"dns", "postgresql", "slim", "metrics", "runtimeEgress"}):
+        return
+    validate_peer(policy.get("dns"), path + ".dns")
+    validate_destination(policy.get("postgresql"), path + ".postgresql")
+    if require_slim or policy.get("slim") is not None:
+        validate_peer(policy.get("slim"), path + ".slim")
+    if policy.get("metrics") is not None:
+        validate_peer(policy["metrics"], path + ".metrics")
+    egress = policy.get("runtimeEgress", [])
+    if isinstance(egress, list):
+        for index, destination in enumerate(egress):
+            validate_destination(destination, f"{path}.runtimeEgress[{index}]")
+    else:
+        problem(path + ".runtimeEgress", "must be a list of destinations")
+
+def validate_features(features, path):
+    if isinstance(features, list):
+        for index, feature in enumerate(features):
+            validate_feature(feature, f"{path}[{index}]")
+    else:
+        problem(path, "must be a list")
+
+try:
+    data = json.load(sys.stdin)
+    if sys.argv[1] == "config":
+        for entry in data:
+            validate_feature(entry["value"], "aiPlatform.features[{}]".format(entry["key"]))
+    else:
+        platforms, services = (listing["items"] for listing in data)
+        managed_runtimes = set()
+        for platform in platforms:
+            metadata = platform["metadata"]
+            namespace, name = metadata["namespace"], metadata["name"]
+            if not metadata.get("deletionTimestamp"):
+                features = platform["spec"].get("features", [])
+                validate_features(features, f"AIPlatform {namespace}/{name} spec.features")
+                for feature in features:
+                    if isinstance(feature, dict) and feature.get("name") == "agentruntime":
+                        managed_runtimes.add((namespace, name, metadata["uid"], feature.get("provider")))
+        for service in services:
+            metadata = service["metadata"]
+            namespace, name = metadata["namespace"], metadata["name"]
+            if metadata.get("deletionTimestamp"):
+                continue
+            feature = service["spec"].get("features", {})
+            if any(
+                owner.get("controller") and owner.get("kind") == "AIPlatform"
+                and owner.get("apiVersion") == "ai.splunk.com/v1"
+                and isinstance(feature, dict) and feature.get("name") == "agentruntime"
+                and (namespace, owner.get("name"), owner.get("uid"), feature.get("provider")) in managed_runtimes
+                for owner in metadata.get("ownerReferences", [])
+            ):
+                continue
+            validate_feature(feature, f"AIService {namespace}/{name} spec.features", require_slim=True)
+except (KeyError, TypeError, ValueError):
+    problem("AgentRuntime allowlist preflight", "could not read feature definitions")
+
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    sys.exit(1)
+' "$1"
+}
+
+validate_agentruntime_network_policy_config() {
+  local features
+  # Retain the index for diagnostics and skip Python for configurations that
+  # neither enable AgentRuntime nor supply a policy on another feature.
+  if ! features=$(yq -o=json eval '
+    [(.aiPlatform.features // []) | to_entries | .[] |
+      select(.value.name == "agentruntime" or (.value | has("networkPolicy")))]
+  ' "${CONFIG_FILE}" 2>/dev/null); then
+    echo "aiPlatform.features: could not read AgentRuntime allowlist configuration" >&2
+    return 1
+  fi
+  if [[ "${features}" == "[]" ]]; then
+    return 0
+  fi
+  printf '%s\n' "${features}" | agentruntime_network_policy_problems config
+}
+
+preflight_agentruntime_policy_upgrade() {
+  local crds platforms='{"items":[]}' services='{"items":[]}'
+  crds=$(kubectl get crd aiplatforms.ai.splunk.com aiservices.ai.splunk.com --ignore-not-found -o name) || return 1
+  [[ -z "${crds}" ]] && return 0
+  if [[ "${crds}" == *"/aiplatforms.ai.splunk.com"* ]]; then
+    platforms=$(kubectl get aiplatforms.ai.splunk.com --all-namespaces -o json) || return 1
+  fi
+  if [[ "${crds}" == *"/aiservices.ai.splunk.com"* ]]; then
+    services=$(kubectl get aiservices.ai.splunk.com --all-namespaces -o json) || return 1
+  fi
+  printf '[%s,%s]\n' "${platforms}" "${services}" | agentruntime_network_policy_problems upgrade
 }
 
 # ====== CREATE IMAGE PULL SECRETS FROM CONFIG ======
@@ -7844,7 +8033,7 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint fenv_yaml
+      local fname fver fsa fprovider fruntime fmin fmax ftarget fcheckpoint fenv_yaml fpolicy_yaml
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -7855,6 +8044,7 @@ EOF
       ftarget=$(yq eval ".aiPlatform.features[$i].targetCPUUtilization // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fcheckpoint=$(yq eval ".aiPlatform.features[$i].checkpointDbSecretRef // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fenv_yaml=$(yq eval ".aiPlatform.features[$i].env // {}" "${CONFIG_FILE}" 2>/dev/null || echo "{}")
+      fpolicy_yaml=$(yq -M eval ".aiPlatform.features[$i].networkPolicy // \"\"" "${CONFIG_FILE}")
       if [[ -n "$fname" && "$fname" != "null" ]]; then
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
@@ -7864,6 +8054,12 @@ EOF
         [[ -n "$fmax" && "$fmax" != "null" ]] && features_yaml+="      maxReplicas: ${fmax}"$'\n'
         [[ -n "$ftarget" && "$ftarget" != "null" ]] && features_yaml+="      targetCPUUtilization: ${ftarget}"$'\n'
         [[ -n "$fcheckpoint" && "$fcheckpoint" != "null" ]] && features_yaml+="      checkpointDbSecretRef: \"${fcheckpoint}\""$'\n'
+        if [[ -n "${fpolicy_yaml}" ]]; then
+          features_yaml+="      networkPolicy:"$'\n'
+          while IFS= read -r line; do
+            features_yaml+="        ${line}"$'\n'
+          done <<< "${fpolicy_yaml}"
+        fi
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: \"${fsa}\""$'\n'
         if [[ -n "$fenv_yaml" && "$fenv_yaml" != "{}" && "$fenv_yaml" != "null" ]]; then
           features_yaml+="      env:"$'\n'
@@ -10278,6 +10474,12 @@ validate_config() {
     fi
   else
     echo -e "  \033[1;32m✔\033[0m aiPlatform.profile omitted (resolves to fullfeature; pre-profile behaviour)" >&2
+    if ! _profile_problems=$(validate_agentruntime_network_policy_config 2>&1); then
+      while IFS= read -r _profile_line; do
+        echo -e "  \033[1;31m✖\033[0m ${_profile_line}" >&2
+        errors=$(( errors + 1 ))
+      done <<< "${_profile_problems}"
+    fi
   fi
   if [[ "$(ai_platform_profile_resolved)" != "cpuOnly" ]]; then
   _vcheck "aiPlatform.defaultAcceleratorType" \

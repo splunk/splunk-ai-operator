@@ -106,6 +106,9 @@ _load_functions() {
   eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn render_agentruntime_checkpoint_secret_manifest)"
   eval "$(_extract_fn validate_agentruntime_checkpoint_config)"
+  eval "$(_extract_fn agentruntime_network_policy_problems)"
+  eval "$(_extract_fn validate_agentruntime_network_policy_config)"
+  eval "$(_extract_fn preflight_agentruntime_policy_upgrade)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn ai_platform_profile_resolved)"
   eval "$(_extract_fn ai_platform_profile_explicit)"
@@ -2471,6 +2474,7 @@ _profile_run() {
               _profile_feature_subdomain_check _profile_feature_field_check \
               ai_platform_profile_feature_problems ai_platform_profile_cr_input_problems \
               render_slim_route_config ai_platform_profile_problems \
+              agentruntime_network_policy_problems validate_agentruntime_network_policy_config \
               validate_ai_platform_profile_config _profile_image_url \
               render_ai_platform_profile_values; do
       eval "$(_extract_fn "${_f}")"
@@ -2521,6 +2525,58 @@ for _p in cpuonly fullfeature; do
   assert_rc "valid ${_p} example passes validate_ai_platform_profile_config" 0 \
     _profile_run "${_PROFILE_DIR}/profile-${_p}.yaml" validate_ai_platform_profile_config
 done
+
+# A configured peer must stay narrow before any controller rollout.
+assert_rc "runtime network policy requires an allowlist" 1 _profile_run \
+  "$(_profile_cfg cpuonly no-network-policy 'del(.aiPlatform.features[1].networkPolicy)')" \
+  validate_agentruntime_network_policy_config
+assert_rc "runtime network policy rejects a public CIDR" 1 _profile_run \
+  "$(_profile_cfg cpuonly public-network-policy '.aiPlatform.features[1].networkPolicy.runtimeEgress[0].peer.cidr = "0.0.0.0/0"')" \
+  validate_agentruntime_network_policy_config
+assert_rc "runtime network policy rejects a namespace with no pod selector" 1 _profile_run \
+  "$(_profile_cfg cpuonly broad-network-policy 'del(.aiPlatform.features[1].networkPolicy.dns.podSelector)')" \
+  validate_agentruntime_network_policy_config
+
+_network_policy_upgrade() (
+  local case="$1" policy
+  policy='{"dns":{"podSelector":{"app":"dns"}},"postgresql":{"peer":{"cidr":"10.0.0.1/32"},"port":5432},"slim":{"podSelector":{"app":"slim"}}}'
+  kubectl() {
+    case "$2" in
+      crd)
+        [[ "${case}" != unavailable ]] || return 1
+        [[ "${case}" != new-install ]] || return 0
+        printf '%s\n' customresourcedefinition.apiextensions.k8s.io/aiplatforms.ai.splunk.com \
+          customresourcedefinition.apiextensions.k8s.io/aiservices.ai.splunk.com
+        ;;
+      aiplatforms.ai.splunk.com)
+        if [[ "${case}" == old-platform ]]; then
+          printf '%s\n' '{"items":[{"metadata":{"namespace":"test","name":"platform","uid":"platform-1"},"spec":{"features":[{"name":"agentruntime"}]}}]}'
+        else
+          printf '{"items":[{"metadata":{"namespace":"test","name":"platform","uid":"platform-1"},"spec":{"features":[{"name":"agentruntime","networkPolicy":%s}]}}]}\n' "${policy}"
+        fi
+        ;;
+      aiservices.ai.splunk.com)
+        local owner_uid=platform-1
+        [[ "${case}" == stale-owner ]] && owner_uid=platform-0
+        if [[ "${case}" == standalone ]]; then
+          printf '{"items":[{"metadata":{"namespace":"test","name":"runtime"},"spec":{"features":{"name":"agentruntime","networkPolicy":%s}}}]}\n' "${policy}"
+        else
+          printf '{"items":[{"metadata":{"namespace":"test","name":"runtime","ownerReferences":[{"controller":true,"kind":"AIPlatform","apiVersion":"ai.splunk.com/v1","name":"platform","uid":"%s"}]},"spec":{"features":{"name":"agentruntime"}}}]}\n' "${owner_uid}"
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  preflight_agentruntime_policy_upgrade
+)
+assert_rc "runtime network policy upgrade reads a managed allowlist from the current platform" 0 _network_policy_upgrade managed
+assert_rc "runtime network policy upgrade accepts a staged standalone allowlist" 0 _network_policy_upgrade standalone
+assert_rc "runtime network policy checks allow a new install without existing CRDs" 0 _network_policy_upgrade new-install
+assert_rc "runtime network policy upgrade blocks an unstaged platform" 1 _network_policy_upgrade old-platform
+assert_rc "runtime network policy upgrade blocks an unstaged service with a stale owner UID" 1 _network_policy_upgrade stale-owner
+assert_rc "runtime network policy upgrade fails if cluster inspection is unavailable" 1 _network_policy_upgrade unavailable
+assert_eq "runtime network policy preflight precedes bundled CRD and Deployment changes" yes \
+  "$(_extract_fn install_splunk_ai_operator | awk '/preflight_agentruntime_policy_upgrade/{a=NR} /kubectl apply/{if (!b) b=NR} END{print (a && b && a<b) ? "yes" : "no"}')"
 
 # cpuOnly contradictions: each is reported with a stable code and field name.
 assert_problem "cpuOnly rejects nodes.gpuWorkers > 0" \
@@ -3022,6 +3078,9 @@ for _p in cpuonly fullfeature; do
   assert_eq "golden ${_p} CR: checkpoint Secret is the contract's Secret" \
     "$(command yq eval '.spec.contract.secretKeys.name' "${_cm}")" \
     "$(command yq eval '.spec.features[] | select(.name == "agentruntime") | .checkpointDbSecretRef' "${_gc}")"
+  assert_eq "golden ${_p} CR: preserves the configured network policy" \
+    "$(command yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .networkPolicy' "${_PROFILE_DIR}/profile-${_p}.yaml")" \
+    "$(command yq eval '.spec.features[] | select(.name == "agentruntime") | .networkPolicy' "${_gc}")"
   assert_eq "golden ${_p} values: provider module is the contract's AGENT_MODULE" \
     "$(command yq eval '.spec.components.launchpadCarrier.agentModule' "${_cm}")" \
     "$(command yq eval '.images.agentRuntime.modules.mltk' "${_g}")"

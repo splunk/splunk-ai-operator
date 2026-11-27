@@ -7,6 +7,7 @@ import (
 	"maps"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
+	"github.com/splunk/splunk-ai-operator/pkg/ai/features/common"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,7 +29,7 @@ func slimDeploymentName(name string) string {
 }
 
 func slimServiceSelector(ai *aiv1.AIService, blocked, trustRevision string) map[string]string {
-	selector := map[string]string{"app": ai.Name, "component": ai.Name}
+	selector := common.SLIMPodSelector(ai.Name)
 	if blocked != "" {
 		// No SLIM Pod has this label. A nonempty selector lets the EndpointSlice
 		// controller withdraw its endpoints while preserving the Service address.

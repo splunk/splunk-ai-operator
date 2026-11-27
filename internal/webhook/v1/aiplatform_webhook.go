@@ -579,11 +579,15 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 			}
 			policy := aiv1.ResolveAgentRuntimeAutoscaling(feature.MinReplicas, feature.MaxReplicas, feature.TargetCPUUtilization)
 			allErrs = append(allErrs, policy.Validate(featurePath)...)
+			allErrs = append(allErrs, feature.NetworkPolicy.Validate(featurePath.Child("networkPolicy"), false)...)
 		} else if feature.Provider != "" {
 			allErrs = append(allErrs, field.Forbidden(
 				featurePath.Child("provider"),
 				"provider is only supported for agentruntime",
 			))
+		}
+		if feature.Name != "agentruntime" && feature.NetworkPolicy != nil {
+			allErrs = append(allErrs, field.Forbidden(featurePath.Child("networkPolicy"), "networkPolicy is only supported for agentruntime"))
 		}
 
 		// Check for duplicate feature identities. agentruntime uses provider as

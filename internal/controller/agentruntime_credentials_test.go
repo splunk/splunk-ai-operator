@@ -29,6 +29,16 @@ import (
 
 const checkpointCanary = "checkpoint-credential-canary-2026"
 
+func agentRuntimePolicyForControllerTest() *aiv1.AgentRuntimeNetworkPolicy {
+	return &aiv1.AgentRuntimeNetworkPolicy{
+		DNS: aiv1.AgentRuntimeNetworkPeer{Namespace: "kube-system", PodSelector: map[string]string{"k8s-app": "kube-dns"}},
+		PostgreSQL: aiv1.AgentRuntimeNetworkDestination{
+			Peer: aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "postgres"}},
+			Port: 5432,
+		},
+	}
+}
+
 type credentialFaultClient struct {
 	client.Client
 	fault string
@@ -69,8 +79,10 @@ func TestAgentRuntimeCredentialDiagnosticsThroughController(t *testing.T) {
 			s := runtime.NewScheme()
 			require.NoError(t, scheme.AddToScheme(s))
 			require.NoError(t, aiv1.AddToScheme(s))
+			policy := agentRuntimePolicyForControllerTest()
+			policy.SLIM = &aiv1.AgentRuntimeNetworkPeer{PodSelector: map[string]string{"app": "slim"}}
 			ai := &aiv1.AIService{ObjectMeta: metav1.ObjectMeta{Name: "credential-runtime", Namespace: "default", UID: "credential-runtime-uid"}, Spec: aiv1.AIServiceSpec{
-				Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"},
+				Feature:       aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: policy},
 				AIPlatformUrl: "http://ray:8000", CheckpointDbSecretRef: "checkpoint", Replicas: 1,
 			}}
 			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "checkpoint", Namespace: "default"}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{

@@ -148,7 +148,7 @@ var _ = Describe("SLIM reconciliation on the Kubernetes API", func() {
 })
 
 func prepareManagedSLIMStabilityFixture(slim *aiv1.AIService, profile aiv1.AIPlatformProfile) {
-	runtimeFeature := aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk"}
+	runtimeFeature := aiv1.FeatureSpec{Name: "agentruntime", Provider: "mltk", NetworkPolicy: agentRuntimePolicyForControllerTest()}
 	platform := &aiv1.AIPlatform{
 		ObjectMeta: metav1.ObjectMeta{Name: "route-fixture", Namespace: slim.Namespace},
 		Spec: aiv1.AIPlatformSpec{

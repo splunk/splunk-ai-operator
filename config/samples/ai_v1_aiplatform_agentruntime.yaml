@@ -29,3 +29,15 @@ spec:
       maxReplicas: 4
       targetCPUUtilization: 60
       checkpointDbSecretRef: mltk-postgres-conn
+      networkPolicy:
+        dns:
+          namespace: kube-system
+          podSelector:
+            k8s-app: kube-dns
+        postgresql:
+          peer:
+            namespace: default
+            podSelector:
+              app: postgres
+          port: 5432
+        # Add the actual model-serving and MCP selectors or private CIDRs for your deployment.

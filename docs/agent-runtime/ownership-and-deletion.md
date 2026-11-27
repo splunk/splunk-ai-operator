@@ -51,7 +51,8 @@ Secrets, model artifacts, and shared AI Tier infrastructure remain." Evidence:
 | Service | `<svc>-svc` | after schema success |
 | HorizontalPodAutoscaler | `<svc>-agentruntime-hpa` | after schema success |
 | ServiceMonitor | `<svc>-agentruntime-metrics` | `metrics.enabled` |
-| PodDisruptionBudget, NetworkPolicy | — | not created yet (MPR-205); they will follow the same rule |
+| PodDisruptionBudget | `<svc>-agentruntime-pdb` | after schema success |
+| NetworkPolicy | `<svc>-network`, `<svc>-schema-network` | for every AgentRuntime service, before schema setup |
 
 The TLS Secret is recognised by the `cert-manager.io/certificate-name` annotation that
 cert-manager writes. A Secret you created yourself under the generated name `<svc>-tls`
@@ -100,7 +101,7 @@ references name the AIService) and what must remain:
 ```sh
 NS=ai-platform SVC=ai-agentruntime-mltk
 UID=$(kubectl get aiservice "$SVC" -n "$NS" -o jsonpath='{.metadata.uid}')
-kubectl get serviceaccount,configmap,secret,job,deployment,service,hpa,servicemonitor,certificate -n "$NS" -o json \
+kubectl get serviceaccount,configmap,secret,job,deployment,service,hpa,servicemonitor,certificate,poddisruptionbudget,networkpolicy -n "$NS" -o json \
   | jq -r --arg uid "$UID" '.items[] | select(any(.metadata.ownerReferences[]?; .uid == $uid)) | "\(.kind)/\(.metadata.name)"'
 ```
 
