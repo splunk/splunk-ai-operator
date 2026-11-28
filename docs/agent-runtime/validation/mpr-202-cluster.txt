@@ -188,3 +188,78 @@ mtls.secretName, against the live fullfeature platform; restored on exit.
 restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; the test
 namespace finished terminating; live platform Ready, workloads identical to the baseline, live
 checkpoints unchanged
+
+### 14. MPR-276: PodDisruptionBudget and NetworkPolicy ownership and deletion (2026-11-27)
+ai-agent-runtime 83d8ae8 (PR #295, MPR-205) with MPR-276's tests; binary sha256 dc7c9739..., its
+manager cache limited to mpr276-cpu and the operator namespace for this run so the live platform was
+not reconciled by it; the branch's CRDs and ClusterRole. cpuOnly AIPlatform (SLIM + AgentRuntime,
+networkPolicy with kube-dns, the fixture PostgreSQL and metricsDisabled) in namespace mpr276-cpu,
+whose customer objects were created first: a NetworkPolicy and a PodDisruptionBudget under the exact
+names the operator uses, and two more whose names only extend them (-backup). Restored on exit.
+1. same-named NetworkPolicy: AgentRuntimeNetworkPolicyReady=False/OwnershipConflict within 5 s,
+     NetworkPolicy mpr276-cpu/mpr276-cpu-agentruntime-mltk-network already exists and is not managed
+     by this AIService; it was left unchanged: rename or remove it
+   Ready=False/OwnershipConflict and a Warning event with the same text. Customer policy at the same
+   resourceVersion, also 20 s later. An owned deny-only guard, mpr276-cpu-agentruntime-mltk-network-
+   guard-3301b7af, selects the runtime pods with policyTypes [Ingress, Egress] and no rules; the
+   schema policy was still created and owned
+2. the customer deletes its policy: AgentRuntimeNetworkPolicyReady=True within 25 s, the operator's
+   own policy is in place and the guard is deleted
+3. same-named PodDisruptionBudget: after schema setup succeeded,
+   AgentRuntimeDisruptionBudgetReady=False/OwnershipConflict naming
+   PodDisruptionBudget mpr276-cpu/mpr276-cpu-agentruntime-mltk-agentruntime-pdb; customer budget at
+   the same resourceVersion and with no owner, also 20 s later
+4. the customer deletes its budget: Ready=True/Available within 15 s, every stage True. Owned by the
+   runtime: ServiceAccount, ConfigMap, schema Job, Deployment, Service, HPA, both NetworkPolicies and
+   the PodDisruptionBudget (maxUnavailable 1, disruptionsAllowed 1)
+5. checkpoint marker written, then the AIPlatform deleted: at t=2s no AIService or AIPlatform and
+   nothing owned left. Left in the namespace: only the customer's -backup NetworkPolicy and
+   PodDisruptionBudget, at their resourceVersions; the checkpoint and pull Secrets and the
+   PostgreSQL Deployment unchanged; marker checksum and checkpoint table counts identical
+6. the live platform: AIService generations unchanged, no NetworkPolicy or PodDisruptionBudget in
+   ai-platform, no log line for it, no event rejected
+restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; the test
+namespace gone; live platform Ready, templates/replicas/readiness identical to the baseline, live
+checkpoint counts unchanged. The live Deployments' generations rose by 1, from restoring the original
+operator: every restart of that build does this (recorded 2026-11-17)
+
+### 15. Combined MPR-202 retest on ai-agent-runtime 83d8ae8 (PR #295, MPR-205) + MPR-276 (2026-11-27)
+Every scenario of sections 1-8, 13 and 14 in one pass, rewritten for MPR-205: each runtime declares
+networkPolicy (kube-dns, the fixture PostgreSQL; platform-managed: metricsDisabled; standalone: the
+live SLIM peer, managedRay and, for one runtime, the Prometheus metrics peer), and the owned set
+includes PodDisruptionBudgets and NetworkPolicies. Binary sha256 edf46b5c..., the branch's CRDs and
+ClusterRole. Test-build-only change: its two reconcilers return at once outside mpr202-cpu,
+mpr202-full and mpr276-cpu, so the live platform (no networkPolicy) was read but never reconciled;
+the cache stays cluster-wide. Restored on exit.
+  cpuOnly platform: Ready in 55 s; the runtime owned exactly ConfigMap, schema Job, Deployment,
+    Service, HPA, PodDisruptionBudget and both NetworkPolicies; the user-named ServiceAccount unowned
+  feature removal: those 8 gone in 3 s, nothing else; kept unchanged: the customer ServiceAccount, the
+    -backup ConfigMap, NetworkPolicy and PodDisruptionBudget, both Secrets, PostgreSQL; marker
+    checksums and row counts identical; repeated removal and deleting the gone AIService are no-ops
+  same-named ServiceAccount and ConfigMap: OwnershipConflict, Warning event (operator's own
+    ClusterRole), unchanged; missing checkpoint Secret: CheckpointSecretMissing with only owned
+    objects; HPA create removed: AgentRuntimeHPAReady ReconcileFailed, nothing deleted, Ready 35 s
+    after the permission came back
+  fullfeature runtimes with mTLS: Ready in 40 s; operator-generated TLS Secret owned (non-controller),
+    with the ServiceMonitor, PDB and both policies; all owned objects gone in 3 s; user-named TLS
+    Secret and Issuer kept; markers identical
+  operator-named TLS Secret later named by the user: released in 3 s, unchanged 20 s later, kept
+    after the AIService was deleted
+  2025-08 finalizers: AIService and AIPlatform gone at t=2s, nothing owned left
+  operator killed 0.3 s and 3 s into an install: Ready in 45 s and 25 s, every object owned
+  four platforms (6 AIServices, 38 objects) deleted: nothing owned left at t=6s; customer objects
+    kept; markers identical
+  MPR-276 (section 14 again): same results
+  live platform: AIServices, AIPlatform, workloads and the live runtime's owned set at the same
+    resourceVersions and generations; no NetworkPolicy or PodDisruptionBudget in ai-platform; no
+    event rejected; no panic
+  restore: operator Deployment spec, both ClusterRoles and both CRDs identical to the backups; test
+    namespaces 0; live platform Ready, templates/replicas/readiness identical, live checkpoints
+    unchanged (restoring the original operator again raised the live Deployments' generations by 1)
+Operator errors for mpr202-cpu, by message (targeted rerun of the cpuOnly part, same results):
+  during the install: SLIM "caCertRef.name is required" 45 (the fixture platform has no Splunk
+    configuration; required since MPR-199), "waiting for schema Job completion" 22, status-write
+    conflicts 5
+  after the removal: SLIM 3, one AIPlatform update conflict, and twice "networkPolicy: Required
+    value" from a last reconcile of the terminating runtime after its platform entry was removed;
+    it created nothing (no owned object left at t=4s, nothing new in the namespace)
