@@ -120,6 +120,10 @@ operator's names:
 MPR-205's own runs also deleted an AIService on agentruntime-dev and fullfeature-dev, with
 the same result.
 
+Every MPR-202 cluster scenario was then run again in one pass on `ai-agent-runtime`
+83d8ae8 with MPR-276 (section 15 of the captured output), with each runtime declaring its
+`networkPolicy`: all passed, and the live platform was left untouched.
+
 ## Follow-ups outside this story
 
 - SLIM and SAIA are unchanged. Neither the ERD nor MPR-202 covers their ownership: the
